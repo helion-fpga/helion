@@ -98,8 +98,99 @@ impl Device {
         p
     }
 
-    pub fn devices_dir() -> PathBuf {
+    /// Compile-time HAD tree (`$workspace/devices/helion`). Last-resort fallback
+    /// so `cargo test` works; packaged binaries must not rely on this alone.
+    pub fn compile_time_devices_dir() -> PathBuf {
         Self::workspace_root().join("devices/helion")
+    }
+
+    /// Candidate HAD directories, in search order:
+    /// `HELION_HAD`, next to the executable, `Helion.app/Contents/Resources`,
+    /// cwd, then the compile-time workspace.
+    pub fn had_search_paths_from(
+        had_env: Option<&Path>,
+        exe: Option<&Path>,
+        cwd: Option<&Path>,
+        compile_time: &Path,
+    ) -> Vec<PathBuf> {
+        let mut v = Vec::new();
+        let mut push = |p: PathBuf| {
+            if !v.iter().any(|q| q == &p) {
+                v.push(p);
+            }
+        };
+        if let Some(p) = had_env {
+            push(p.to_path_buf());
+            push(p.join("devices/helion"));
+            push(p.join("helion"));
+        }
+        if let Some(exe) = exe {
+            if let Some(dir) = exe.parent() {
+                push(dir.join("devices/helion"));
+                // Helion.app/Contents/MacOS/<bin> -> Contents/Resources/devices/helion
+                push(dir.join("../Resources/devices/helion"));
+                // target/{debug,release}/helion -> repo devices/helion
+                push(dir.join("../../devices/helion"));
+                // target/<triple>/{debug,release}/helion
+                push(dir.join("../../../devices/helion"));
+            }
+        }
+        if let Some(cwd) = cwd {
+            push(cwd.join("devices/helion"));
+        }
+        push(compile_time.to_path_buf());
+        v
+    }
+
+    pub fn had_search_paths() -> Vec<PathBuf> {
+        Self::had_search_paths_from(
+            std::env::var_os("HELION_HAD")
+                .or_else(|| std::env::var_os("HELION_HAD_DIR"))
+                .or_else(|| std::env::var_os("HELION_DEVICES"))
+                .map(PathBuf::from)
+                .as_deref(),
+            std::env::current_exe().ok().as_deref(),
+            std::env::current_dir().ok().as_deref(),
+            &Self::compile_time_devices_dir(),
+        )
+    }
+
+    /// First candidate that contains a `parts/` directory.
+    pub fn resolve_devices_dir(
+        had_env: Option<&Path>,
+        exe: Option<&Path>,
+        cwd: Option<&Path>,
+        compile_time: &Path,
+    ) -> PathBuf {
+        Self::had_search_paths_from(had_env, exe, cwd, compile_time)
+            .into_iter()
+            .find(|p| p.join("parts").is_dir())
+            .unwrap_or_else(|| compile_time.to_path_buf())
+    }
+
+    /// Runtime HAD root. `HELION_HAD` wins; then exe-relative (Mac .app
+    /// Resources included); then cwd; then `CARGO_MANIFEST_DIR`.
+    pub fn devices_dir() -> PathBuf {
+        Self::resolve_devices_dir(
+            std::env::var_os("HELION_HAD")
+                .or_else(|| std::env::var_os("HELION_HAD_DIR"))
+                .or_else(|| std::env::var_os("HELION_DEVICES"))
+                .map(PathBuf::from)
+                .as_deref(),
+            std::env::current_exe().ok().as_deref(),
+            std::env::current_dir().ok().as_deref(),
+            &Self::compile_time_devices_dir(),
+        )
+    }
+
+    /// RTL examples shipped next to HAD (`$root/examples` in the repo,
+    /// `Contents/Resources/examples` in Helion.app).
+    pub fn examples_dir() -> PathBuf {
+        Self::devices_dir()
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("examples"))
+            .unwrap_or_else(|| Self::workspace_root().join("examples"))
     }
 
     /// Load a part by name (`HL10T-C32-1`) from HAD TOML. This is the shipped API.
@@ -473,6 +564,61 @@ mod tests {
         assert_eq!(d.n_bram, 8);
         assert_eq!(d.bram_sites().count(), 8);
         assert_eq!(d.bram_sites().next().unwrap().kind, SiteKind::Bram);
+    }
+
+    #[test]
+    fn runtime_had_path_is_not_only_cargo_manifest_dir() {
+        let compile = Device::compile_time_devices_dir();
+        assert!(
+            compile.join("parts/HL10T-C32-1.toml").is_file(),
+            "compile-time HAD must still exist for cargo test: {}",
+            compile.display()
+        );
+
+        // HELION_HAD wins over compile-time, even when both have parts/.
+        let tmp = std::env::temp_dir().join(format!(
+            "helion-had-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("parts")).unwrap();
+        std::fs::write(tmp.join("parts/.helion-had-marker"), b"runtime").unwrap();
+        let got = Device::resolve_devices_dir(Some(&tmp), None, None, &compile);
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            tmp.canonicalize().unwrap(),
+            "HELION_HAD must win over CARGO_MANIFEST_DIR"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Mac .app Resources path is in the search list (layout, not existence).
+        let exe = Path::new("/Applications/Helion.app/Contents/MacOS/helion-ide");
+        let paths = Device::had_search_paths_from(None, Some(exe), None, &compile);
+        assert!(
+            paths.iter().any(|p| p.to_string_lossy().contains("Resources/devices/helion")),
+            "search must include Helion.app Resources HAD: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == &compile),
+            "search must still include compile-time HAD: {paths:?}"
+        );
+
+        // Empty env falls back to a dir that actually has parts/.
+        let fallback = Device::resolve_devices_dir(None, None, None, &compile);
+        assert!(
+            fallback.join("parts").is_dir(),
+            "fallback HAD has no parts/: {}",
+            fallback.display()
+        );
+        let ex = Device::examples_dir();
+        assert!(
+            ex.join("counter.sv").is_file(),
+            "examples must be locatable next to HAD: {}",
+            ex.display()
+        );
     }
 
     #[test]
