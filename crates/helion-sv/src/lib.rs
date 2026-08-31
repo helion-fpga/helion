@@ -299,6 +299,7 @@ struct Inst {
     name: String,
     /// child port → parent net (ident)
     conns: Vec<(String, String)>,
+    params: Vec<(String, u128)>,
 }
 
 #[derive(Clone, Debug)]
@@ -309,6 +310,8 @@ struct Rtl {
     nbas: Vec<(String, Option<usize>, RExpr)>, // lhs name, optional bit, rhs
     assigns: Vec<(String, Option<usize>, RExpr)>,
     insts: Vec<Inst>,
+    params: Vec<(String, u128)>,
+    toks: Vec<Tok>,
 }
 
 fn strip_comments(s: &str) -> String {
@@ -355,7 +358,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
     let kws = [
         "module", "endmodule", "input", "output", "logic", "wire", "reg", "always_ff", "always",
         "begin", "end", "posedge", "negedge", "assign", "inout", "if", "else", "always_comb",
-        "case", "endcase", "default", "generate", "endgenerate", "genvar", "for", "int",
+        "case", "casez", "casex", "endcase", "default", "generate", "endgenerate", "genvar",
+        "for", "int", "parameter", "localparam", "initial",
     ];
     while i < chars.len() {
         let c = chars[i];
@@ -461,6 +465,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
 struct P<'a> {
     t: &'a [Tok],
     i: usize,
+    params: HashMap<String, u128>,
 }
 
 impl<'a> P<'a> {
@@ -500,22 +505,81 @@ impl<'a> P<'a> {
         if !self.eat_sym('[') {
             return Ok(1);
         }
-        let msb = match self.bump() {
-            Some(Tok::Number(v, _)) => *v as usize,
-            _ => return Err("msb".into()),
-        };
+        let msb = const_u(self)? as usize;
         if !self.eat_sym(':') {
             return Err("range :".into());
         }
-        let lsb = match self.bump() {
-            Some(Tok::Number(v, _)) => *v as usize,
-            _ => return Err("lsb".into()),
-        };
+        let lsb = const_u(self)? as usize;
         if !self.eat_sym(']') {
             return Err("]".into());
         }
         Ok(msb.max(lsb) - msb.min(lsb) + 1)
     }
+}
+
+fn const_atom(p: &mut P) -> Result<u128, String> {
+    if p.eat_sym('(') {
+        let v = const_u(p)?;
+        if !p.eat_sym(')') {
+            return Err("const )".into());
+        }
+        return Ok(v);
+    }
+    match p.peek() {
+        Some(Tok::Number(v, _)) => {
+            let n = *v;
+            p.bump();
+            Ok(n)
+        }
+        Some(Tok::Ident(s)) => {
+            let name = s.clone();
+            p.bump();
+            p.params
+                .get(&name)
+                .copied()
+                .ok_or_else(|| format!("unknown param {name}"))
+        }
+        other => Err(format!("const atom {other:?}")),
+    }
+}
+
+fn const_u(p: &mut P) -> Result<u128, String> {
+    let mut v = const_atom(p)?;
+    loop {
+        if p.eat_sym('+') {
+            v = v.saturating_add(const_atom(p)?);
+        } else if p.eat_sym('-') {
+            v = v.saturating_sub(const_atom(p)?);
+        } else if p.eat_sym('*') {
+            v = v.saturating_mul(const_atom(p)?);
+        } else {
+            break;
+        }
+    }
+    Ok(v)
+}
+
+fn const_cond(p: &mut P) -> Result<bool, String> {
+    let l = const_u(p)?;
+    if matches!(p.peek(), Some(Tok::Eq)) {
+        p.bump();
+        return Ok(l == const_u(p)?);
+    }
+    if matches!(p.peek(), Some(Tok::Ne)) {
+        p.bump();
+        return Ok(l != const_u(p)?);
+    }
+    if matches!(p.peek(), Some(Tok::Le)) {
+        p.bump();
+        return Ok(l <= const_u(p)?);
+    }
+    if p.eat_sym('<') {
+        return Ok(l < const_u(p)?);
+    }
+    if p.eat_sym('>') {
+        return Ok(l > const_u(p)?);
+    }
+    Ok(l != 0)
 }
 
 fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
@@ -719,10 +783,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     if !p.eat_sym('=') {
         return Err("for =".into());
     }
-    let start = match p.bump() {
-        Some(Tok::Number(v, _)) => *v as usize,
-        _ => return Err("for start".into()),
-    };
+    let start = const_u(p)? as usize;
     if !p.eat_sym(';') {
         return Err("for ;".into());
     }
@@ -735,10 +796,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     } else {
         return Err("for cmp".into());
     };
-    let end = match p.bump() {
-        Some(Tok::Number(v, _)) => *v as usize,
-        _ => return Err("for end".into()),
-    };
+    let end = const_u(p)? as usize;
     let end = if inclusive { end + 1 } else { end };
     if !p.eat_sym(';') {
         return Err("for ;2".into());
@@ -787,7 +845,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
                 other => other.clone(),
             })
             .collect();
-        let mut sp = P { t: &toks, i: 0 };
+        let mut sp = P { t: &toks, i: 0, params: p.params.clone() };
         out.extend(parse_seq_block(&mut sp, block)?);
         i += step;
     }
@@ -866,7 +924,7 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
         }
         return Ok(out);
     }
-    if p.eat_kw("case") {
+    if p.eat_kw("case") || p.eat_kw("casez") || p.eat_kw("casex") {
         if !p.eat_sym('(') {
             return Err("case (".into());
         }
@@ -925,7 +983,7 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     let s = strip_comments(source);
     let toks = tokenize(&s)?;
-    let mut p = P { t: &toks, i: 0 };
+    let mut p = P { t: &toks, i: 0, params: HashMap::new() };
     let mut mods = Vec::new();
     while p.peek().is_some() {
         if p.eat_sym(';') {
@@ -946,11 +1004,149 @@ fn parse_rtl(source: &str) -> Result<Rtl, String> {
         .ok_or_else(|| "no module".into())
 }
 
+fn parse_param_assigns(p: &mut P) -> Result<Vec<(String, u128)>, String> {
+    let mut out = Vec::new();
+    if !p.eat_sym('#') {
+        return Ok(out);
+    }
+    if !p.eat_sym('(') {
+        return Ok(out);
+    }
+    let mut pos = 0usize;
+    loop {
+        if p.eat_sym(')') {
+            break;
+        }
+        if p.peek().is_none() {
+            return Err("param list )".into());
+        }
+        let _ = p.eat_kw("parameter");
+        let _ = p.eat_kw("localparam");
+        if p.eat_sym('.') {
+            let name = p.ident()?;
+            if !p.eat_sym('(') {
+                return Err("param .name(".into());
+            }
+            let val = const_u(p)?;
+            if !p.eat_sym(')') {
+                return Err("param .name)".into());
+            }
+            out.push((name, val));
+        } else if matches!(p.peek(), Some(Tok::Ident(_))) {
+            let name = p.ident()?;
+            if !p.eat_sym('=') {
+                return Err("param =".into());
+            }
+            let val = const_u(p)?;
+            out.push((name, val));
+        } else {
+            let val = const_u(p)?;
+            out.push((format!("#{pos}"), val));
+            pos += 1;
+        }
+        let _ = p.eat_sym(',');
+    }
+    Ok(out)
+}
+
+fn apply_params(p: &mut P, assigns: Vec<(String, u128)>, ordered: &mut Vec<(String, u128)>) {
+    for (k, v) in assigns {
+        let mut key = k.clone();
+        let mut val = v;
+        if let Some(rest) = k.strip_prefix('#') {
+            if let Ok(i) = rest.parse::<usize>() {
+                if let Some((name, _)) = ordered.get(i) {
+                    key = name.clone();
+                }
+            }
+        }
+        // Overrides already in p.params win over defaults.
+        if let Some(ov) = p.params.get(&key).copied() {
+            val = ov;
+        } else {
+            p.params.insert(key.clone(), val);
+        }
+        if let Some(slot) = ordered.iter_mut().find(|(n, _)| n == &key) {
+            slot.1 = val;
+        } else {
+            ordered.push((key, val));
+        }
+    }
+}
+
+fn skip_begin_end(p: &mut P) -> Result<(), String> {
+    let mut depth = 1i32;
+    while depth > 0 {
+        match p.bump() {
+            Some(Tok::Kw(k)) if k == "begin" => depth += 1,
+            Some(Tok::Kw(k)) if k == "end" => depth -= 1,
+            None => return Err("unterminated begin".into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn skip_item_or_block(p: &mut P) -> Result<(), String> {
+    if p.eat_kw("begin") {
+        if p.eat_sym(':') {
+            let _ = p.ident();
+        }
+        return skip_begin_end(p);
+    }
+    let mut depth = 0i32;
+    while p.peek().is_some() {
+        if depth == 0 && p.eat_sym(';') {
+            break;
+        }
+        match p.peek() {
+            Some(Tok::Kw(k)) if k == "begin" => {
+                p.bump();
+                depth += 1;
+            }
+            Some(Tok::Kw(k)) if k == "end" => {
+                p.bump();
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            }
+            Some(Tok::Kw(k)) if k == "endgenerate" || k == "endmodule" || k == "else" => {
+                if depth == 0 {
+                    break;
+                }
+                p.bump();
+            }
+            None => break,
+            _ => {
+                p.bump();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_net_ref(p: &mut P) -> Result<String, String> {
+    let name = p.ident()?;
+    if p.eat_sym('[') {
+        let idx = const_u(p)? as usize;
+        if !p.eat_sym(']') {
+            return Err("net ]".into());
+        }
+        return Ok(format!("{name}_{idx}"));
+    }
+    Ok(name)
+}
+
 fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
+    let tok_start = p.i;
     if !p.eat_kw("module") {
         return Err("expected module".into());
     }
     let module = p.ident()?;
+    let mut param_order: Vec<(String, u128)> = Vec::new();
+    let header_params = parse_param_assigns(&mut p)?;
+    apply_params(&mut p, header_params, &mut param_order);
     let mut ports = Vec::new();
     let mut signals = Vec::new();
     if p.eat_sym('(') {
@@ -979,30 +1175,153 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut insts = Vec::new();
     let mut pending_keep = false;
     let mut pending_md = false;
-    while !p.eat_kw("endmodule") {
+    parse_module_items(
+        &mut p,
+        &mut ports,
+        &mut signals,
+        &mut nbas,
+        &mut assigns,
+        &mut insts,
+        &mut param_order,
+        &mut pending_keep,
+        &mut pending_md,
+        "endmodule",
+    )?;
+    let toks = p.t[tok_start..p.i].to_vec();
+    Ok(Rtl {
+        module,
+        ports,
+        signals,
+        nbas,
+        assigns,
+        insts,
+        params: param_order,
+        toks,
+    })
+}
+
+fn parse_module_items(
+    mut p: &mut P,
+    ports: &mut Vec<(String, PortDir, usize)>,
+    signals: &mut Vec<Signal>,
+    nbas: &mut Vec<Nba>,
+    assigns: &mut Vec<(String, Option<usize>, RExpr)>,
+    insts: &mut Vec<Inst>,
+    param_order: &mut Vec<(String, u128)>,
+    pending_keep: &mut bool,
+    pending_md: &mut bool,
+    endkw: &str,
+) -> Result<(), String> {
+    while !p.eat_kw(endkw) {
         if p.peek().is_none() {
-            return Err("unterminated module".into());
+            return Err(format!("unterminated until {endkw}"));
+        }
+        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "end" || k == "endmodule" || k == "endgenerate") {
+            break;
         }
         while let Some((k, v)) = parse_attr(&mut p) {
             let on = v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes");
             if k.eq_ignore_ascii_case("keep") || k.eq_ignore_ascii_case("dont_touch") {
-                pending_keep = on;
+                *pending_keep = on;
             }
             if k.eq_ignore_ascii_case("mark_debug") {
-                pending_md = on;
+                *pending_md = on;
             }
         }
-        if p.eat_kw("generate") || p.eat_kw("endgenerate") {
+        if p.eat_kw("generate") {
+            parse_module_items(
+                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                "endgenerate",
+            )?;
             continue;
+        }
+        if p.eat_kw("endgenerate") {
+            break;
         }
         if p.eat_kw("genvar") {
             let _ = p.ident();
             let _ = p.eat_sym(';');
             continue;
         }
-        if p.eat_kw("for") {
-            nbas.extend(parse_for_unroll(&mut p)?);
+        if p.eat_kw("parameter") || p.eat_kw("localparam") {
+            let name = p.ident()?;
+            if !p.eat_sym('=') {
+                return Err("parameter =".into());
+            }
+            let val = const_u(p)?;
+            let _ = p.eat_sym(';');
+            p.params.entry(name.clone()).or_insert(val);
+            if !param_order.iter().any(|(n, _)| n == &name) {
+                param_order.push((name, val));
+            }
             continue;
+        }
+        if p.eat_kw("if") {
+            if !p.eat_sym('(') {
+                return Err("genif (".into());
+            }
+            let yes = const_cond(p)?;
+            if !p.eat_sym(')') {
+                return Err("genif )".into());
+            }
+            let then_begin = p.eat_kw("begin");
+            if p.eat_sym(':') {
+                let _ = p.ident();
+            }
+            if yes {
+                if then_begin {
+                    parse_module_items(
+                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                        "end",
+                    )?;
+                } else {
+                    // one module item; require a following else/endgenerate/endmodule delimiter
+                    parse_module_items(
+                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                        "else",
+                    )?;
+                    // parse_module_items consumed the else keyword — put it back
+                    p.i -= 1;
+                }
+            } else if then_begin {
+                skip_begin_end(p)?;
+            } else {
+                skip_item_or_block(p)?;
+            }
+            if p.eat_kw("else") {
+                let eb = p.eat_kw("begin");
+                if p.eat_sym(':') {
+                    let _ = p.ident();
+                }
+                if yes {
+                    if eb {
+                        skip_begin_end(p)?;
+                    } else {
+                        skip_item_or_block(p)?;
+                    }
+                } else if eb {
+                    parse_module_items(
+                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                        "end",
+                    )?;
+                } else {
+                    skip_item_or_block(p)?;
+                    p.i = p.i.saturating_sub(0);
+                }
+            }
+            continue;
+        }
+        if p.eat_kw("for") {
+            // Unroll: NBA body and/or instantiations.
+            let save = p.i;
+            match parse_for_unroll_module(p, nbas, insts, assigns) {
+                Ok(()) => continue,
+                Err(_) => {
+                    p.i = save;
+                    nbas.extend(parse_for_unroll(p)?);
+                    continue;
+                }
+            }
         }
         if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output") {
             let dir = parse_port_dir(&mut p).unwrap();
@@ -1012,12 +1331,12 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
             ports.push((n.clone(), dir, w));
             if !signals.iter().any(|s| s.name == n) {
                 signals.push(Signal {
-                name: n,
-                width: w,
-                depth: 0,
-                keep: false,
-                mark_debug: false,
-            });
+                    name: n,
+                    width: w,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
             }
             let _ = p.eat_sym(';');
             continue;
@@ -1027,17 +1346,11 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
             let n = p.ident()?;
             let mut depth = 0usize;
             if p.eat_sym('[') {
-                let hi = match p.bump() {
-                    Some(Tok::Number(v, _)) => *v as usize,
-                    _ => return Err("mem msb".into()),
-                };
+                let hi = const_u(p)? as usize;
                 if !p.eat_sym(':') {
                     return Err("mem :".into());
                 }
-                let lo = match p.bump() {
-                    Some(Tok::Number(v, _)) => *v as usize,
-                    _ => return Err("mem lsb".into()),
-                };
+                let lo = const_u(p)? as usize;
                 if !p.eat_sym(']') {
                     return Err("mem ]".into());
                 }
@@ -1048,13 +1361,17 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                     name: n,
                     width: w,
                     depth,
-                    keep: pending_keep,
-                    mark_debug: pending_md,
+                    keep: *pending_keep,
+                    mark_debug: *pending_md,
                 });
             }
-            pending_keep = false;
-            pending_md = false;
+            *pending_keep = false;
+            *pending_md = false;
             let _ = p.eat_sym(';');
+            continue;
+        }
+        if p.eat_kw("initial") {
+            skip_item_or_block(p)?;
             continue;
         }
         if p.eat_kw("assign") {
@@ -1090,17 +1407,122 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 continue;
             }
         }
-        // skip unknown token to avoid infinite loop
         p.bump();
     }
-    Ok(Rtl {
-        module,
-        ports,
-        signals,
-        nbas,
-        assigns,
-        insts,
-    })
+    Ok(())
+}
+
+fn parse_for_unroll_module(
+    p: &mut P,
+    nbas: &mut Vec<Nba>,
+    insts: &mut Vec<Inst>,
+    assigns: &mut Vec<(String, Option<usize>, RExpr)>,
+) -> Result<(), String> {
+    if !p.eat_sym('(') {
+        return Err("for (".into());
+    }
+    let _ = p.eat_kw("int");
+    let _ = p.eat_kw("genvar");
+    let var = p.ident()?;
+    if !p.eat_sym('=') {
+        return Err("for =".into());
+    }
+    let start = const_u(p)? as usize;
+    if !p.eat_sym(';') {
+        return Err("for ;".into());
+    }
+    let _ = p.ident();
+    let inclusive = if matches!(p.peek(), Some(Tok::Le)) {
+        p.bump();
+        true
+    } else if p.eat_sym('<') {
+        false
+    } else {
+        return Err("for cmp".into());
+    };
+    let end = const_u(p)? as usize;
+    let end = if inclusive { end + 1 } else { end };
+    if !p.eat_sym(';') {
+        return Err("for ;2".into());
+    }
+    let _ = p.ident();
+    let _ = p.eat_sym('=');
+    let _ = p.ident();
+    let _ = p.eat_sym('+');
+    let step = match p.peek() {
+        Some(Tok::Number(v, _)) => {
+            let n = (*v as usize).max(1);
+            p.bump();
+            n
+        }
+        _ => 1,
+    };
+    if !p.eat_sym(')') {
+        return Err("for )".into());
+    }
+    let block = p.eat_kw("begin");
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
+    let start_i = p.i;
+    if block {
+        skip_begin_end(p)?;
+    } else {
+        while p.peek().is_some() && !matches!(p.peek(), Some(Tok::Sym(';'))) {
+            p.bump();
+        }
+        let _ = p.eat_sym(';');
+    }
+    let body = p.t[start_i..p.i].to_vec();
+    let mut i = start;
+    while i < end {
+        let toks: Vec<Tok> = body
+            .iter()
+            .map(|t| match t {
+                Tok::Ident(s) if s == &var => Tok::Number(i as u128, 32),
+                other => other.clone(),
+            })
+            .collect();
+        let mut sp = P {
+            t: &toks,
+            i: 0,
+            params: p.params.clone(),
+        };
+        let mut dummy_ports = Vec::new();
+        let mut dummy_sigs = Vec::new();
+        let mut dummy_params = Vec::new();
+        let mut pk = false;
+        let mut pmd = false;
+        let mut local_nbas = Vec::new();
+        let mut local_assigns = Vec::new();
+        let mut local_insts = Vec::new();
+        if block {
+            parse_module_items(
+                &mut sp,
+                &mut dummy_ports,
+                &mut dummy_sigs,
+                &mut local_nbas,
+                &mut local_assigns,
+                &mut local_insts,
+                &mut dummy_params,
+                &mut pk,
+                &mut pmd,
+                "end",
+            )?;
+        } else if let Ok(inst) = parse_inst(&mut sp) {
+            local_insts.push(inst);
+        } else {
+            local_nbas.extend(parse_seq_block(&mut sp, false)?);
+        }
+        for mut inst in local_insts {
+            inst.name = format!("{}_{i}", inst.name);
+            insts.push(inst);
+        }
+        nbas.extend(local_nbas);
+        assigns.extend(local_assigns);
+        i += step;
+    }
+    Ok(())
 }
 
 fn parse_inst(p: &mut P) -> Result<Inst, String> {
@@ -1112,20 +1534,13 @@ fn parse_inst(p: &mut P) -> Result<Inst, String> {
             return Err("inst module".into());
         }
     };
-    if p.eat_sym('#') {
-        let mut depth = 0i32;
-        if p.eat_sym('(') {
-            depth = 1;
+    let params = match parse_param_assigns(p) {
+        Ok(v) => v,
+        Err(_) => {
+            p.i = start;
+            return Err("inst params".into());
         }
-        while depth > 0 {
-            match p.bump() {
-                Some(Tok::Sym('(')) => depth += 1,
-                Some(Tok::Sym(')')) => depth -= 1,
-                None => break,
-                _ => {}
-            }
-        }
-    }
+    };
     let name = match p.bump() {
         Some(Tok::Ident(s)) => s.clone(),
         _ => {
@@ -1156,7 +1571,7 @@ fn parse_inst(p: &mut P) -> Result<Inst, String> {
                 p.i = start;
                 return Err("inst .port(".into());
             }
-            let net = p.ident().map_err(|_| {
+            let net = parse_net_ref(p).map_err(|_| {
                 p.i = start;
                 "inst net".to_string()
             })?;
@@ -1166,20 +1581,22 @@ fn parse_inst(p: &mut P) -> Result<Inst, String> {
             }
             conns.push((port, net));
         } else {
-            let net = match p.bump() {
-                Some(Tok::Ident(s)) => s.clone(),
-                _ => {
-                    p.i = start;
-                    return Err("inst pos".into());
-                }
-            };
+            let net = parse_net_ref(p).map_err(|_| {
+                p.i = start;
+                "inst pos".to_string()
+            })?;
             conns.push((format!("#{pos}"), net));
             pos += 1;
         }
         let _ = p.eat_sym(',');
     }
     let _ = p.eat_sym(';');
-    Ok(Inst { module, name, conns })
+    Ok(Inst {
+        module,
+        name,
+        conns,
+        params,
+    })
 }
 
 fn sig_width(rtl: &Rtl, name: &str) -> usize {
@@ -1567,10 +1984,50 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
     }
 }
 
+fn elaborate_rtl(src: &Rtl, overrides: &HashMap<String, u128>) -> Result<Rtl, String> {
+    if overrides.is_empty() {
+        return Ok(src.clone());
+    }
+    if src.toks.is_empty() {
+        return Err(format!("module {} has no tokens to re-elaborate", src.module));
+    }
+    let mut p = P {
+        t: &src.toks,
+        i: 0,
+        params: overrides.clone(),
+    };
+    parse_one_module(&mut p)
+}
+
+fn inst_overrides(inst: &Inst, child: &Rtl) -> HashMap<String, u128> {
+    let mut ov = HashMap::new();
+    for (k, v) in &inst.params {
+        if let Some(rest) = k.strip_prefix('#') {
+            if let Ok(i) = rest.parse::<usize>() {
+                if let Some((name, _)) = child.params.get(i) {
+                    ov.insert(name.clone(), *v);
+                    continue;
+                }
+            }
+        }
+        ov.insert(k.clone(), *v);
+    }
+    ov
+}
+
 fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String> {
-    let src = mods
+    flatten_module_ov(mods, name, &HashMap::new())
+}
+
+fn flatten_module_ov(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    overrides: &HashMap<String, u128>,
+) -> Result<Rtl, String> {
+    let proto = mods
         .get(name)
         .ok_or_else(|| format!("unknown module {name}"))?;
+    let src = elaborate_rtl(proto, overrides)?;
     let mut out = Rtl {
         module: src.module.clone(),
         ports: src.ports.clone(),
@@ -1578,9 +2035,15 @@ fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String
         nbas: src.nbas.clone(),
         assigns: src.assigns.clone(),
         insts: Vec::new(),
+        params: src.params.clone(),
+        toks: src.toks.clone(),
     };
     for inst in &src.insts {
-        let child = flatten_module(mods, &inst.module)?;
+        let child_proto = mods
+            .get(&inst.module)
+            .ok_or_else(|| format!("unknown module {}", inst.module))?;
+        let ov = inst_overrides(inst, child_proto);
+        let child = flatten_module_ov(mods, &inst.module, &ov)?;
         let prefix = format!("{}_", inst.name);
         let mut subst: HashMap<String, String> = HashMap::new();
         for s in &child.signals {
@@ -1617,9 +2080,7 @@ fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String
     Ok(out)
 }
 
-pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
-    let _tree = parse_sv(source, origin)?;
-    let mods = parse_source(source)?;
+fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
     let map: HashMap<String, Rtl> = mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
     let instantiated: HashMap<String, ()> = mods
         .iter()
@@ -1633,6 +2094,37 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
         .ok_or_else(|| "no top module".to_string())?;
     let flat = flatten_module(&map, &top.module)?;
     synth_rtl(&flat)
+}
+
+pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
+    let _tree = parse_sv(source, origin)?;
+    synth_from_parsed(parse_source(source)?)
+}
+
+/// Elaborate many SV files together. Each file is parsed by sv-parser, then
+/// modules are merged so a top in file B can instantiate a child defined in file A.
+pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
+    if files.is_empty() {
+        return Err("no sources".into());
+    }
+    let mut all = String::new();
+    for (origin, src) in files {
+        let _tree = parse_sv(src, origin)?;
+        all.push_str(src);
+        all.push_str("
+");
+    }
+    synth_from_parsed(parse_source(&all)?)
+}
+
+pub fn synth_sv_files(paths: &[&Path]) -> Result<Design, String> {
+    let mut owned: Vec<(String, String)> = Vec::new();
+    for p in paths {
+        let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+        owned.push((p.display().to_string(), text));
+    }
+    let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    synth_sv_sources(&refs)
 }
 
 pub fn synth_sv_path(path: &Path) -> Result<Design, String> {
@@ -1853,5 +2345,100 @@ endmodule
             "{:?}",
             d.marked_debug_nets()
         );
+    }
+
+    #[test]
+    fn module_parameter_propagates_to_width() {
+        let child = r#"
+module tog #(parameter N = 1) (input logic clk, output logic led);
+  logic [N-1:0] q;
+  always_ff @(posedge clk) begin
+    for (int i = 0; i < N; i = i + 1) begin
+      q[i] <= ~q[i];
+    end
+  end
+  assign led = q[0];
+endmodule
+"#;
+        let d1 = synth_sv(child, "t1.sv").unwrap();
+        assert_eq!(d1.lut_inits().len(), 1, "default N=1 must be one LUT {:?}", d1.lut_inits());
+        let top = r#"
+module tog #(parameter N = 1) (input logic clk, output logic q);
+  logic [N-1:0] r;
+  always_ff @(posedge clk) begin
+    for (int i = 0; i < N; i = i + 1) r[i] <= ~r[i];
+  end
+  assign q = r[0];
+endmodule
+module top(input logic clk, output logic led);
+  tog #(.N(4)) u0(.clk(clk), .q(led));
+endmodule
+"#;
+        let d4 = synth_sv(top, "t4.sv").unwrap();
+        assert_eq!(
+            d4.lut_inits().len(),
+            4,
+            "N=4 must unroll four inverters, got {:?}",
+            d4.lut_inits()
+        );
+        assert!(d4.lut_inits().iter().all(|&i| i == 0x5555_5555_5555_5555));
+    }
+
+    #[test]
+    fn generate_if_selects_real_branch() {
+        let src = r#"
+module m #(parameter USE_INC = 0) (input logic clk, output logic led);
+  logic [3:0] q;
+  generate
+    if (USE_INC == 1) begin
+      always_ff @(posedge clk) q <= q + 1;
+    end else begin
+      always_ff @(posedge clk) begin
+        q[0] <= ~q[0];
+        q[1] <= ~q[1];
+        q[2] <= ~q[2];
+        q[3] <= ~q[3];
+      end
+    end
+  endgenerate
+  assign led = q[3];
+endmodule
+"#;
+        let inv = synth_sv(src, "g0.sv").unwrap();
+        assert_eq!(inv.lut_inits().len(), 4);
+        assert!(inv.lut_inits().iter().all(|&i| i == 0x5555_5555_5555_5555), "else branch is four inverters {:?}", inv.lut_inits());
+        let inc_src = src.replace("USE_INC = 0", "USE_INC = 1");
+        let inc = synth_sv(&inc_src, "g1.sv").unwrap();
+        assert_eq!(inc.lut_inits(), INC4_INIT.to_vec(), "if branch must be the incrementer");
+        assert_ne!(inv.lut_inits(), inc.lut_inits());
+    }
+
+    #[test]
+    fn multi_file_cross_instantiation_is_real_cells() {
+        let child = r#"
+module child #(parameter W = 1) (input logic clk, output logic q);
+  logic [W-1:0] r;
+  always_ff @(posedge clk) begin
+    for (int i = 0; i < W; i = i + 1) r[i] <= ~r[i];
+  end
+  assign q = r[0];
+endmodule
+"#;
+        let top = r#"
+module top(input logic clk, output logic led);
+  child #(.W(4)) u0(.clk(clk), .q(led));
+endmodule
+"#;
+        let d = synth_sv_sources(&[("child.sv", child), ("top.sv", top)]).unwrap();
+        assert_eq!(d.name, "top");
+        assert_eq!(
+            d.lut_inits().len(),
+            4,
+            "cross-file child #(.W(4)) must produce 4 LUT cells, got {:?}",
+            d.lut_inits()
+        );
+        // Concatenating in the wrong order (top first) must still find child.
+        let d2 = synth_sv_sources(&[("top.sv", top), ("child.sv", child)]).unwrap();
+        assert_eq!(d2.lut_inits().len(), 4);
     }
 }
