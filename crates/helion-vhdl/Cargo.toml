@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 helion-ir = { workspace = true }
+helion-sv = { workspace = true }
 
 [dev-dependencies]
 helion-device = { workspace = true }

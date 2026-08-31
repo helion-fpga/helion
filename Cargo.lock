@@ -231,6 +231,7 @@ dependencies = [
  "helion-pack",
  "helion-place",
  "helion-route",
+ "helion-sv",
 ]
 
 [[package]]
