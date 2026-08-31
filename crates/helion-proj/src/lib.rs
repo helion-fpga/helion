@@ -4,7 +4,7 @@ use helion_bits::{bitgen, eco_lut, Bitstream};
 use helion_device::Device;
 use helion_ir::{CellKind, Design};
 use helion_pack::{pack, Packed};
-use helion_place::{place, Placed};
+use helion_place::{place_with, PlaceOpts, Placed};
 use helion_route::{route, Routed};
 use helion_sta::{create_clock, report_timing_routed};
 use helion_hw::prog_sim;
@@ -61,7 +61,9 @@ impl Session {
     pub fn place_design(&mut self, dev: &Device) -> Result<(), String> {
         let d = self.design.as_ref().ok_or("place_design: no design")?;
         let packed = pack(d, dev)?;
-        let placed = place(&packed, dev)?;
+        // Same timing_weight as `helion run` / `helion qor` so Tcl/IDE WNS
+        // matches the published QoR table (9640 ps on counter.sv).
+        let placed = place_with(&packed, dev, PlaceOpts { timing_weight: 0.75 })?;
         self.packed = Some(packed);
         self.placed = Some(placed);
         self.routed = None;
