@@ -21,6 +21,8 @@ members = [
     "crates/helion-lab",
     "crates/helion-lib",
     "crates/helion-drc",
+    "crates/helion-vhdl",
+    "crates/helion-hls",
 ]
 
 [workspace.package]
@@ -50,3 +52,5 @@ helion-gui = { path = "crates/helion-gui" }
 helion-lab = { path = "crates/helion-lab" }
 helion-lib = { path = "crates/helion-lib" }
 helion-drc = { path = "crates/helion-drc" }
+helion-vhdl = { path = "crates/helion-vhdl" }
+helion-hls = { path = "crates/helion-hls" }

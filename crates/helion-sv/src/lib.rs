@@ -3,7 +3,7 @@
 //! Handles 1-bit and vector `logic`, `assign`, `always_ff`, `+` incrementers,
 //! bit-selects, and Boolean operators. Garbage is rejected by sv-parser.
 
-use helion_ir::{CellKind, Design, PortDir, INC4_INIT};
+use helion_ir::{CellKind, Design, PortDir};
 use std::collections::HashMap;
 use std::path::Path;
 use sv_parser::parse_sv_str;
@@ -286,14 +286,27 @@ enum RExpr {
     Add(Box<RExpr>, Box<RExpr>),
     Mul(Box<RExpr>, Box<RExpr>),
     Mux(Box<RExpr>, Box<RExpr>, Box<RExpr>),
+    Eq(Box<RExpr>, Box<RExpr>),
+    Ne(Box<RExpr>, Box<RExpr>),
+    Lt(Box<RExpr>, Box<RExpr>),
 }
 
+#[derive(Clone, Debug)]
+struct Inst {
+    module: String,
+    name: String,
+    /// child port → parent net (ident)
+    conns: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
 struct Rtl {
     module: String,
     ports: Vec<(String, PortDir, usize)>,
     signals: Vec<Signal>,
     nbas: Vec<(String, Option<usize>, RExpr)>, // lhs name, optional bit, rhs
     assigns: Vec<(String, Option<usize>, RExpr)>,
+    insts: Vec<Inst>,
 }
 
 fn strip_comments(s: &str) -> String {
@@ -339,6 +352,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
     let kws = [
         "module", "endmodule", "input", "output", "logic", "wire", "reg", "always_ff", "always",
         "begin", "end", "posedge", "negedge", "assign", "inout", "if", "else", "always_comb",
+        "case", "endcase", "default",
     ];
     while i < chars.len() {
         let c = chars[i];
@@ -361,7 +375,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 2;
             continue;
         }
-        if "@();,:+-~^|&![]'=#?*<>".contains(c) {
+        if "@();,:+-~^|&![]'=#?*<>.".contains(c) {
             out.push(Tok::Sym(c));
             i += 1;
             continue;
@@ -489,7 +503,7 @@ impl<'a> P<'a> {
 }
 
 fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
-    let e = parse_add(p)?;
+    let e = parse_cmp(p)?;
     if p.eat_sym('?') {
         let t = parse_rexpr(p)?;
         if !p.eat_sym(':') {
@@ -497,6 +511,26 @@ fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
         }
         let f = parse_rexpr(p)?;
         return Ok(RExpr::Mux(Box::new(e), Box::new(t), Box::new(f)));
+    }
+    Ok(e)
+}
+
+fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
+    let e = parse_add(p)?;
+    if matches!(p.peek(), Some(Tok::Eq)) {
+        p.bump();
+        return Ok(RExpr::Eq(Box::new(e), Box::new(parse_add(p)?)));
+    }
+    if matches!(p.peek(), Some(Tok::Ne)) {
+        p.bump();
+        return Ok(RExpr::Ne(Box::new(e), Box::new(parse_add(p)?)));
+    }
+    if p.eat_sym('<') {
+        return Ok(RExpr::Lt(Box::new(e), Box::new(parse_add(p)?)));
+    }
+    if p.eat_sym('>') {
+        // a > b  ≡  b < a
+        return Ok(RExpr::Lt(Box::new(parse_add(p)?), Box::new(e)));
     }
     Ok(e)
 }
@@ -701,13 +735,87 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
         }
         return Ok(out);
     }
+    if p.eat_kw("case") {
+        if !p.eat_sym('(') {
+            return Err("case (".into());
+        }
+        let sel = parse_rexpr(p)?;
+        if !p.eat_sym(')') {
+            return Err("case )".into());
+        }
+        let mut arms: Vec<(Option<RExpr>, Vec<Nba>)> = Vec::new();
+        let mut def: Vec<Nba> = Vec::new();
+        while !p.eat_kw("endcase") {
+            if p.peek().is_none() {
+                return Err("unterminated case".into());
+            }
+            if p.eat_kw("default") {
+                let _ = p.eat_sym(':');
+                let b = p.eat_kw("begin");
+                def = parse_seq_block(p, b)?;
+                continue;
+            }
+            let item = parse_rexpr(p)?;
+            if !p.eat_sym(':') {
+                return Err("case :".into());
+            }
+            let b = p.eat_kw("begin");
+            let body = parse_seq_block(p, b)?;
+            arms.push((Some(item), body));
+        }
+        let mut out = Vec::new();
+        for (item, body) in arms.into_iter().rev() {
+            let item = item.unwrap();
+            let cond = RExpr::Eq(Box::new(sel.clone()), Box::new(item));
+            for (lhs, bit, rhs) in body {
+                let other = out
+                    .iter()
+                    .chain(def.iter())
+                    .find(|(l, b, _)| l == &lhs && b == &bit)
+                    .map(|(_, _, r)| r.clone())
+                    .unwrap_or_else(|| RExpr::Ident(lhs.clone()));
+                if let Some(existing) = out.iter_mut().find(|(l, b, _)| l == &lhs && b == &bit) {
+                    existing.2 = RExpr::Mux(Box::new(cond.clone()), Box::new(rhs), Box::new(existing.2.clone()));
+                } else {
+                    out.push((lhs, bit, RExpr::Mux(Box::new(cond.clone()), Box::new(rhs), Box::new(other))));
+                }
+            }
+        }
+        for (lhs, bit, rhs) in def {
+            if !out.iter().any(|(l, b, _)| l == &lhs && b == &bit) {
+                out.push((lhs, bit, rhs));
+            }
+        }
+        return Ok(out);
+    }
     Ok(vec![parse_nba(p)?])
 }
 
-fn parse_rtl(source: &str) -> Result<Rtl, String> {
+fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     let s = strip_comments(source);
     let toks = tokenize(&s)?;
     let mut p = P { t: &toks, i: 0 };
+    let mut mods = Vec::new();
+    while p.peek().is_some() {
+        if p.eat_sym(';') {
+            continue;
+        }
+        mods.push(parse_one_module(&mut p)?);
+    }
+    if mods.is_empty() {
+        return Err("no module".into());
+    }
+    Ok(mods)
+}
+
+fn parse_rtl(source: &str) -> Result<Rtl, String> {
+    parse_source(source)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no module".into())
+}
+
+fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     if !p.eat_kw("module") {
         return Err("expected module".into());
     }
@@ -731,6 +839,7 @@ fn parse_rtl(source: &str) -> Result<Rtl, String> {
     let _ = p.eat_sym(';');
     let mut nbas = Vec::new();
     let mut assigns = Vec::new();
+    let mut insts = Vec::new();
     while !p.eat_kw("endmodule") {
         if p.peek().is_none() {
             return Err("unterminated module".into());
@@ -784,6 +893,12 @@ fn parse_rtl(source: &str) -> Result<Rtl, String> {
             assigns.push((lhs, bit, rhs));
             continue;
         }
+        if p.eat_kw("always_comb") {
+            let block = p.eat_kw("begin");
+            let stmts = parse_seq_block(&mut p, block)?;
+            assigns.extend(stmts);
+            continue;
+        }
         if p.eat_kw("always_ff") || p.eat_kw("always") {
             let _ = p.eat_sym('@');
             let _ = p.eat_sym('(');
@@ -795,6 +910,12 @@ fn parse_rtl(source: &str) -> Result<Rtl, String> {
             nbas.extend(parse_seq_block(&mut p, block)?);
             continue;
         }
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            if let Ok(inst) = parse_inst(&mut p) {
+                insts.push(inst);
+                continue;
+            }
+        }
         // skip unknown token to avoid infinite loop
         p.bump();
     }
@@ -804,7 +925,87 @@ fn parse_rtl(source: &str) -> Result<Rtl, String> {
         signals,
         nbas,
         assigns,
+        insts,
     })
+}
+
+fn parse_inst(p: &mut P) -> Result<Inst, String> {
+    let start = p.i;
+    let module = match p.bump() {
+        Some(Tok::Ident(s)) => s.clone(),
+        _ => {
+            p.i = start;
+            return Err("inst module".into());
+        }
+    };
+    if p.eat_sym('#') {
+        let mut depth = 0i32;
+        if p.eat_sym('(') {
+            depth = 1;
+        }
+        while depth > 0 {
+            match p.bump() {
+                Some(Tok::Sym('(')) => depth += 1,
+                Some(Tok::Sym(')')) => depth -= 1,
+                None => break,
+                _ => {}
+            }
+        }
+    }
+    let name = match p.bump() {
+        Some(Tok::Ident(s)) => s.clone(),
+        _ => {
+            p.i = start;
+            return Err("inst name".into());
+        }
+    };
+    if !p.eat_sym('(') {
+        p.i = start;
+        return Err("inst (".into());
+    }
+    let mut conns = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if p.eat_sym(')') {
+            break;
+        }
+        if p.peek().is_none() {
+            p.i = start;
+            return Err("inst )".into());
+        }
+        if p.eat_sym('.') {
+            let port = p.ident().map_err(|_| {
+                p.i = start;
+                "inst port".to_string()
+            })?;
+            if !p.eat_sym('(') {
+                p.i = start;
+                return Err("inst .port(".into());
+            }
+            let net = p.ident().map_err(|_| {
+                p.i = start;
+                "inst net".to_string()
+            })?;
+            if !p.eat_sym(')') {
+                p.i = start;
+                return Err("inst .port)".into());
+            }
+            conns.push((port, net));
+        } else {
+            let net = match p.bump() {
+                Some(Tok::Ident(s)) => s.clone(),
+                _ => {
+                    p.i = start;
+                    return Err("inst pos".into());
+                }
+            };
+            conns.push((format!("#{pos}"), net));
+            pos += 1;
+        }
+        let _ = p.eat_sym(',');
+    }
+    let _ = p.eat_sym(';');
+    Ok(Inst { module, name, conns })
 }
 
 fn sig_width(rtl: &Rtl, name: &str) -> usize {
@@ -892,6 +1093,73 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 Box::new(Expr::And(Box::new(Expr::Not(Box::new(cv))), Box::new(fv))),
             ))
         }
+        RExpr::Eq(a, b) => {
+            if bit != 0 {
+                return Ok(Expr::Const(false));
+            }
+            Ok(cmp_eq_bits(a, b, rtl, true)?)
+        }
+        RExpr::Ne(a, b) => {
+            if bit != 0 {
+                return Ok(Expr::Const(false));
+            }
+            Ok(Expr::Not(Box::new(cmp_eq_bits(a, b, rtl, true)?)))
+        }
+        RExpr::Lt(a, b) => {
+            if bit != 0 {
+                return Ok(Expr::Const(false));
+            }
+            // unsigned: MSB-first: (a_msb < b_msb) | (eq_msb & lower)
+            lt_bits(a, b, rtl)
+        }
+    }
+}
+
+fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, String> {
+    let wa = rexpr_width(a, rtl);
+    let wb = rexpr_width(b, rtl);
+    let w = wa.max(wb).max(1);
+    let mut acc: Option<Expr> = None;
+    for i in 0..w {
+        let ai = rexpr_to_bit(a, rtl, i)?;
+        let bi = rexpr_to_bit(b, rtl, i)?;
+        let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
+        acc = Some(match acc {
+            None => xnor,
+            Some(p) => Expr::And(Box::new(p), Box::new(xnor)),
+        });
+    }
+    Ok(acc.unwrap_or(Expr::Const(true)))
+}
+
+fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
+    let w = rexpr_width(a, rtl).max(rexpr_width(b, rtl)).max(1);
+    let mut acc = Expr::Const(false);
+    let mut eq_so_far = Expr::Const(true);
+    for i in (0..w).rev() {
+        let ai = rexpr_to_bit(a, rtl, i)?;
+        let bi = rexpr_to_bit(b, rtl, i)?;
+        let a0b1 = Expr::And(Box::new(Expr::Not(Box::new(ai.clone()))), Box::new(bi.clone()));
+        acc = Expr::Or(
+            Box::new(acc),
+            Box::new(Expr::And(Box::new(eq_so_far.clone()), Box::new(a0b1))),
+        );
+        let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
+        eq_so_far = Expr::And(Box::new(eq_so_far), Box::new(xnor));
+    }
+    Ok(acc)
+}
+
+fn rexpr_width(e: &RExpr, rtl: &Rtl) -> usize {
+    match e {
+        RExpr::Ident(s) | RExpr::Bit(s, _) => sig_width(rtl, s),
+        RExpr::Const { width, .. } => (*width).max(1),
+        RExpr::Not(x) => rexpr_width(x, rtl).min(1).max(1),
+        RExpr::Eq(_, _) | RExpr::Ne(_, _) | RExpr::Lt(_, _) => 1,
+        RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Mul(a, b) => {
+            rexpr_width(a, rtl).max(rexpr_width(b, rtl))
+        }
+        RExpr::Mux(_, t, f) => rexpr_width(t, rtl).max(rexpr_width(f, rtl)),
     }
 }
 
@@ -1065,10 +1333,120 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     Ok(d)
 }
 
+fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
+    let id = |s: &str| subst.get(s).cloned().unwrap_or_else(|| s.to_string());
+    match e {
+        RExpr::Const { val, width } => RExpr::Const {
+            val: *val,
+            width: *width,
+        },
+        RExpr::Ident(s) => RExpr::Ident(id(s)),
+        RExpr::Bit(s, i) => RExpr::Bit(id(s), *i),
+        RExpr::Not(x) => RExpr::Not(Box::new(rewrite_rexpr(x, subst))),
+        RExpr::And(a, b) => RExpr::And(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Or(a, b) => RExpr::Or(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Xor(a, b) => RExpr::Xor(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Add(a, b) => RExpr::Add(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Mul(a, b) => RExpr::Mul(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Mux(c, t, f) => RExpr::Mux(
+            Box::new(rewrite_rexpr(c, subst)),
+            Box::new(rewrite_rexpr(t, subst)),
+            Box::new(rewrite_rexpr(f, subst)),
+        ),
+        RExpr::Eq(a, b) => RExpr::Eq(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Ne(a, b) => RExpr::Ne(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Lt(a, b) => RExpr::Lt(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+    }
+}
+
+fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String> {
+    let src = mods
+        .get(name)
+        .ok_or_else(|| format!("unknown module {name}"))?;
+    let mut out = Rtl {
+        module: src.module.clone(),
+        ports: src.ports.clone(),
+        signals: src.signals.clone(),
+        nbas: src.nbas.clone(),
+        assigns: src.assigns.clone(),
+        insts: Vec::new(),
+    };
+    for inst in &src.insts {
+        let child = flatten_module(mods, &inst.module)?;
+        let prefix = format!("{}_", inst.name);
+        let mut subst: HashMap<String, String> = HashMap::new();
+        for s in &child.signals {
+            subst.insert(s.name.clone(), format!("{prefix}{}", s.name));
+        }
+        for (i, (pname, _, _)) in child.ports.iter().enumerate() {
+            if let Some((_, net)) = inst.conns.iter().find(|(p, _)| p == pname)
+                .or_else(|| inst.conns.iter().find(|(p, _)| p == &format!("#{i}")))
+            {
+                subst.insert(pname.clone(), net.clone());
+            }
+        }
+        for s in &child.signals {
+            let mapped = subst.get(&s.name).cloned().unwrap();
+            if !out.signals.iter().any(|x| x.name == mapped) {
+                out.signals.push(Signal {
+                    name: mapped,
+                    width: s.width,
+                    depth: s.depth,
+                });
+            }
+        }
+        for (lhs, bit, rhs) in &child.nbas {
+            let lhs = subst.get(lhs).cloned().unwrap_or_else(|| format!("{prefix}{lhs}"));
+            out.nbas.push((lhs, *bit, rewrite_rexpr(rhs, &subst)));
+        }
+        for (lhs, bit, rhs) in &child.assigns {
+            let lhs = subst.get(lhs).cloned().unwrap_or_else(|| format!("{prefix}{lhs}"));
+            out.assigns.push((lhs, *bit, rewrite_rexpr(rhs, &subst)));
+        }
+    }
+    Ok(out)
+}
+
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     let _tree = parse_sv(source, origin)?;
-    let rtl = parse_rtl(source)?;
-    synth_rtl(&rtl)
+    let mods = parse_source(source)?;
+    let map: HashMap<String, Rtl> = mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
+    let instantiated: HashMap<String, ()> = mods
+        .iter()
+        .flat_map(|m| m.insts.iter().map(|i| (i.module.clone(), ())))
+        .collect();
+    let top = mods
+        .iter()
+        .rev()
+        .find(|m| !instantiated.contains_key(&m.module))
+        .or_else(|| mods.last())
+        .ok_or_else(|| "no top module".to_string())?;
+    let flat = flatten_module(&map, &top.module)?;
+    synth_rtl(&flat)
 }
 
 pub fn synth_sv_path(path: &Path) -> Result<Design, String> {
@@ -1086,6 +1464,7 @@ pub fn lut_init_of(source: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helion_ir::INC4_INIT;
 
     fn wrap(rhs: &str) -> String {
         format!(
@@ -1199,5 +1578,43 @@ endmodule
 "#;
         let d = synth_sv(src, "ram.sv").unwrap();
         assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+    }
+
+    #[test]
+    fn hierarchy_flattens_to_inverter() {
+        let src = r#"
+module tog(input logic clk, output logic q);
+  always_ff @(posedge clk) q <= ~q;
+endmodule
+module top(input logic clk, output logic led);
+  tog u0(.clk(clk), .q(led));
+endmodule
+"#;
+        let d = synth_sv(src, "h.sv").unwrap();
+        assert_eq!(d.name, "top");
+        let inits = d.lut_inits();
+        assert_eq!(inits, vec![0x5555_5555_5555_5555]);
+    }
+
+    #[test]
+    fn always_comb_and_eq_case() {
+        let src = r#"
+module m(input logic clk, output logic led);
+  logic [1:0] s;
+  logic q;
+  always_ff @(posedge clk) begin
+    case (s)
+      2'd0: s <= 2'd1;
+      2'd1: s <= 2'd2;
+      default: s <= 2'd0;
+    endcase
+    q <= (s == 2'd2);
+  end
+  always_comb led = q;
+endmodule
+"#;
+        let d = synth_sv(src, "c.sv").unwrap();
+        assert!(d.lut_inits().len() >= 2, "case/eq must produce LUTs {:?}", d.lut_inits());
+        assert!(d.cell("u_iob").is_some() || d.cells.iter().any(|c| matches!(c.kind, CellKind::IobOut)));
     }
 }

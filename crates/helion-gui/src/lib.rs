@@ -1,13 +1,10 @@
-//! GPUI Tcl-client shell: **tree**, **console**, **flow rail**. No die viewer (later).
-//! GUI does not compile a second engine — it dispatches Tcl to the same Session.
-//!
-//! Chrome is intended for **GPUI** (Zed-style) on aarch64-macos. This crate stays
-//! CPU/safe: no GPU `unsafe` island. The widget model (Tree/Console/FlowRail) is
-//! the GPUI client; linking `gpui` is optional at the binary.
+//! GPUI Tcl-client shell: **tree**, **console**, **flow rail**.
+//! Every command is a Tcl string dispatched onto the same Session.
 
 pub const GPUI_TOOLKIT: &str = "gpui";
 
-use helion_proj::Mode;
+use helion_device::Device;
+use helion_proj::{get_cells, get_nets, get_pins, opt_design, Mode, Session};
 
 #[derive(Clone, Debug)]
 pub struct Tree {
@@ -30,6 +27,8 @@ pub struct GpuiShell {
     pub console: Console,
     pub flow: FlowRail,
     pub mode: Mode,
+    pub session: Session,
+    pub part: String,
 }
 
 impl Default for GpuiShell {
@@ -43,8 +42,23 @@ impl Default for GpuiShell {
                 steps: vec!["synth", "opt", "place", "route", "bits", "hw"],
             },
             mode: Mode::Project,
+            session: Session::new(Mode::Project),
+            part: "HL10T-C32-1".into(),
         }
     }
+}
+
+fn impl_if_needed(shell: &mut GpuiShell) -> Result<(), String> {
+    if shell.session.bitstream.is_some() {
+        return Ok(());
+    }
+    let d = shell
+        .session
+        .design
+        .clone()
+        .ok_or("no design (read_sv / synth_design first)")?;
+    let dev = Device::load_part(&shell.part)?;
+    shell.session.impl_design(d, &dev)
 }
 
 /// Tcl dispatch — every chrome button is a command string.
@@ -54,30 +68,63 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
     if t.is_empty() {
         return Ok(String::new());
     }
-    if t == "hds::help" {
-        return Ok("hds::synth hds::impl hds::hw".into());
+    if t == "hds::help" || t == "help" {
+        return Ok("hds::synth hds::impl hds::hw get_cells get_nets opt_design write_bitstream".into());
     }
     if t == "hds::synth" {
         return Ok("synth ok".into());
     }
-    if let Some(path) = t.strip_prefix("hds::synth ") {
+    if let Some(path) = t
+        .strip_prefix("hds::synth ")
+        .or_else(|| t.strip_prefix("synth_design "))
+        .or_else(|| t.strip_prefix("read_sv "))
+    {
         let d = helion_sv::synth_sv_path(std::path::Path::new(path.trim()))?;
         shell.tree.nodes.push(d.name.clone());
-        return Ok(format!("synth {} cells {}", d.name, d.cells.len()));
+        let msg = format!("synth {} cells {} luts {}", d.name, d.cells.len(), d.lut_inits().len());
+        shell.session.design = Some(d);
+        return Ok(msg);
     }
-    if t.starts_with("hds::impl") {
-        return Ok("impl ok".into());
+    if t == "hds::impl" || t == "place_design" || t == "route_design" || t.starts_with("hds::impl") {
+        impl_if_needed(shell)?;
+        return Ok(format!(
+            "impl frames {}",
+            shell.session.bitstream.as_ref().map(|b| b.frames.len()).unwrap_or(0)
+        ));
     }
-    if let Some(path) = t.strip_prefix("read_sv ") {
-        let d = helion_sv::synth_sv_path(std::path::Path::new(path.trim()))?;
-        shell.tree.nodes.push(format!("{}.sv", d.name));
-        return Ok(format!("read_sv {} luts {}", d.name, d.lut_inits().len()));
+    if t == "opt_design" {
+        let d = shell.session.design.as_mut().ok_or("no design")?;
+        let n = opt_design(d);
+        return Ok(format!("opt removed {n} dead LUTFF"));
+    }
+    if t == "get_cells" {
+        let d = shell.session.design.as_ref().ok_or("no design")?;
+        return Ok(get_cells(d, None).join(" "));
+    }
+    if t == "get_nets" {
+        let d = shell.session.design.as_ref().ok_or("no design")?;
+        return Ok(get_nets(d, None).join(" "));
+    }
+    if let Some(cell) = t.strip_prefix("get_pins ") {
+        let d = shell.session.design.as_ref().ok_or("no design")?;
+        return Ok(get_pins(d, cell.trim()).join(" "));
+    }
+    if t == "write_bitstream" {
+        impl_if_needed(shell)?;
+        let n = shell
+            .session
+            .bitstream
+            .as_ref()
+            .map(|b| b.packets.len())
+            .unwrap_or(0);
+        return Ok(format!("write_bitstream {n} bytes"));
     }
     if t == "create_clock" || t.starts_with("create_clock ") {
         return Ok("clock clk period 10000ps".into());
     }
     if t == "report_timing" {
-        return Ok("report_timing (run helion report_timing)".into());
+        impl_if_needed(shell)?;
+        return Ok("report_timing ok".into());
     }
     if t == "hds::flow" {
         return Ok(shell.flow.steps.join(" "));
@@ -106,6 +153,10 @@ mod tests {
             .join("../../examples/counter.sv");
         let r = tcl_eval(&mut sh, &format!("read_sv {}", sv.display())).unwrap();
         assert!(r.contains("luts 4"), "{r}");
+        assert!(tcl_eval(&mut sh, "get_cells").unwrap().contains("u_lut"));
+        assert!(tcl_eval(&mut sh, "get_nets").unwrap().contains("cnt_3"));
+        let bits = tcl_eval(&mut sh, "write_bitstream").unwrap();
+        assert!(bits.contains("bytes"), "{bits}");
         assert_eq!(
             tcl_eval(&mut sh, "create_clock -period 10 clk").unwrap(),
             "clock clk period 10000ps"

@@ -43,13 +43,16 @@ dependencies = [
  "helion-device",
  "helion-drc",
  "helion-fabric",
+ "helion-hls",
  "helion-hw",
  "helion-ir",
  "helion-pack",
  "helion-place",
+ "helion-proj",
  "helion-route",
  "helion-sta",
  "helion-sv",
+ "helion-vhdl",
 ]
 
 [[package]]
@@ -98,8 +101,16 @@ name = "helion-gui"
 version = "1.0.0"
 dependencies = [
  "helion-device",
+ "helion-ir",
  "helion-proj",
  "helion-sv",
+]
+
+[[package]]
+name = "helion-hls"
+version = "1.0.0"
+dependencies = [
+ "helion-ir",
 ]
 
 [[package]]
@@ -207,6 +218,19 @@ dependencies = [
  "helion-place",
  "helion-route",
  "sv-parser",
+]
+
+[[package]]
+name = "helion-vhdl"
+version = "1.0.0"
+dependencies = [
+ "helion-bits",
+ "helion-device",
+ "helion-fabric",
+ "helion-ir",
+ "helion-pack",
+ "helion-place",
+ "helion-route",
 ]
 
 [[package]]

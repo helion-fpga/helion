@@ -61,4 +61,35 @@ fn version_and_doctor() {
     assert!(util.status.success(), "{}", String::from_utf8_lossy(&util.stderr));
     let uo = String::from_utf8_lossy(&util.stdout);
     assert!(uo.contains("LUTFF=4/8192"), "{uo}");
+
+    let hier = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/hier.sv");
+    let hrun = Command::new(bin)
+        .args(["run", hier.to_str().unwrap(), "--cycles", "8"])
+        .output()
+        .expect("hier run");
+    assert!(hrun.status.success(), "{}", String::from_utf8_lossy(&hrun.stderr));
+    let ho = String::from_utf8_lossy(&hrun.stdout);
+    assert!(ho.contains("changes="), "{ho}");
+    assert!(!ho.contains("changes=0"), "hier LED must toggle: {ho}");
+
+    let vhd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/blinky.vhd");
+    let vr = Command::new(bin)
+        .args(["synth", vhd.to_str().unwrap()])
+        .output()
+        .expect("vhdl synth");
+    assert!(vr.status.success(), "{}", String::from_utf8_lossy(&vr.stderr));
+    assert!(String::from_utf8_lossy(&vr.stdout).contains("luts=1"), "{}", String::from_utf8_lossy(&vr.stdout));
+
+    let prj = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/blinky.prj");
+    let pr = Command::new(bin)
+        .args(["project", prj.to_str().unwrap()])
+        .output()
+        .expect("project");
+    assert!(pr.status.success(), "{}", String::from_utf8_lossy(&pr.stderr));
+    let po = String::from_utf8_lossy(&pr.stdout);
+    assert!(po.contains("PACKAGE_PIN=1"), "{po}");
+    assert!(po.contains("create_clock=1"), "{po}");
 }

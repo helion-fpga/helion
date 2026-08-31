@@ -1,0 +1,16 @@
+[package]
+name = "helion-vhdl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-ir = { workspace = true }
+
+[dev-dependencies]
+helion-device = { workspace = true }
+helion-pack = { workspace = true }
+helion-place = { workspace = true }
+helion-route = { workspace = true }
+helion-bits = { workspace = true }
+helion-fabric = { workspace = true }
