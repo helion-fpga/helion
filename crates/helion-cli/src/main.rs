@@ -466,6 +466,9 @@ fn doctor() {
         "  FeatureMap INIT[0] minor {} bit {}; FRACTURE minor {} bit {}",
         loc.far.minor, loc.bit, frac.far.minor, frac.bit
     );
+    for line in dev.report_featuremap().lines() {
+        println!("  {line}");
+    }
     let mut tap = Tap::new(&dev);
     let st = tap.program(&Bitstream::empty(&dev)).unwrap();
     println!(
