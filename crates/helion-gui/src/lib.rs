@@ -3,6 +3,7 @@
 
 pub const GPUI_TOOLKIT: &str = "gpui";
 
+pub mod doctor;
 pub mod ide;
 pub use ide::{ConsoleLine, FlowStep, IdeModel, NetlistTree, StepState, Utilization};
 

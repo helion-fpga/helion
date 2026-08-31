@@ -1,0 +1,132 @@
+//! Headless `--version` / `--doctor` for the IDE binary.
+//! No window, no GPU: the same strings the Mac user prints to sanity-check a build.
+
+use helion_device::Device;
+use std::fmt::Write;
+use std::process::Command;
+
+pub fn version_line() -> String {
+    format!("helion-ide {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Compile-time target triple. `aarch64-apple-darwin` on the Mac build; whatever
+/// this host is when the Linux CI binary is built. Never guessed at runtime.
+pub fn target_triple() -> &'static str {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        "aarch64-apple-darwin"
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    {
+        "x86_64-apple-darwin"
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        "aarch64-unknown-linux-gnu"
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        "x86_64-unknown-linux-gnu"
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "x86_64", target_os = "linux"),
+    )))]
+    {
+        "unknown"
+    }
+}
+
+/// Toolchain + HAD + target triple, one block the user can paste.
+pub fn doctor_report() -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "{}", version_line());
+    let _ = writeln!(s, "target {triple}", triple = target_triple());
+    let _ = writeln!(
+        s,
+        "host {arch}-{os}",
+        arch = std::env::consts::ARCH,
+        os = std::env::consts::OS
+    );
+    match Command::new("rustc").arg("-vV").output() {
+        Ok(o) if o.status.success() => {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if line.starts_with("release:")
+                    || line.starts_with("host:")
+                    || line.starts_with("llvm:")
+                {
+                    let _ = writeln!(s, "rustc {line}");
+                }
+            }
+        }
+        Ok(o) => {
+            let _ = writeln!(
+                s,
+                "rustc not usable: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(s, "rustc not on PATH: {e}");
+        }
+    }
+    match Device::load_part("HL10T-C32-1") {
+        Ok(dev) => {
+            let _ = writeln!(
+                s,
+                "HAD {} idcode {:#010x} LUT6={} BRAM18={} DSP={}",
+                dev.part,
+                dev.idcode,
+                dev.lut6_count(),
+                dev.n_bram,
+                dev.n_dsp
+            );
+            let _ = writeln!(s, "  {}", dev.report_die());
+        }
+        Err(e) => {
+            let _ = writeln!(s, "HAD load failed: {e}");
+        }
+    }
+    let _ = writeln!(s, "ok");
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_prints_toolchain_had_and_triple() {
+        let d = doctor_report();
+        assert!(d.starts_with("helion-ide 1.0.0"), "{d}");
+        assert!(d.contains("target "), "{d}");
+        assert!(d.contains("rustc release:") || d.contains("rustc not"), "{d}");
+        assert!(
+            d.contains("HAD HL10T-C32-1"),
+            "doctor must load the HAD part: {d}"
+        );
+        assert!(
+            d.contains("0x00011a1f") || d.contains("0x00011A1F"),
+            "doctor must print the HAD idcode: {d}"
+        );
+        assert!(d.contains("LUT6=8192"), "{d}");
+        assert!(d.trim_end().ends_with("ok"), "{d}");
+        // This Linux VM is not aarch64-apple-darwin; the Mac triple is a compile-time cfg.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                d.contains("aarch64-apple-darwin") || d.contains("x86_64-apple-darwin"),
+                "{d}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                !d.contains("aarch64-apple-darwin"),
+                "Linux build must not lie about being a Mac binary: {d}"
+            );
+        }
+    }
+}
