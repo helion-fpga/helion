@@ -14,6 +14,8 @@ pub struct Packed {
 #[derive(Clone, Debug)]
 pub struct PackedBram {
     pub cell: String,
+    /// INIT words from IR attr `INIT` (comma-separated hex).
+    pub init: Vec<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,8 +112,17 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     let mut brams = Vec::new();
     for c in &design.cells {
         if matches!(c.kind, CellKind::Bram18) {
+            let init = c
+                .attrs
+                .get("INIT")
+                .unwrap_or("")
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
+                .collect();
             brams.push(PackedBram {
                 cell: c.name.clone(),
+                init,
             });
         }
     }

@@ -4,7 +4,7 @@
 //! bit-selects, and Boolean operators. Garbage is rejected by sv-parser.
 
 use helion_ir::{CellKind, Design, PortDir};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use sv_parser::parse_sv_str;
 
@@ -278,7 +278,7 @@ struct Signal {
 
 #[derive(Clone, Debug)]
 enum RExpr {
-    Const { val: u128, width: usize }, // width kept for based-number round-trip
+    Const { val: u128, width: usize, care: u128 }, // care bits: 1 = specified (casez)
     Ident(String),
     Bit(String, usize),
     Not(Box<RExpr>),
@@ -312,6 +312,7 @@ struct Rtl {
     insts: Vec<Inst>,
     params: Vec<(String, u128)>,
     toks: Vec<Tok>,
+    mem_inits: HashMap<String, BTreeMap<usize, u128>>,
 }
 
 fn strip_comments(s: &str) -> String {
@@ -343,6 +344,8 @@ fn strip_comments(s: &str) -> String {
 enum Tok {
     Ident(String),
     Number(u128, usize),
+    /// based number with x/z/? don't-care bits (casez).
+    Pat { val: u128, care: u128, width: usize },
     Kw(String),
     Str(String),
     Sym(char),
@@ -445,12 +448,55 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                     }
                 }
                 let mut digits = String::new();
-                while i < chars.len() && chars[i].is_ascii_hexdigit() {
-                    digits.push(chars[i]);
+                while i < chars.len() {
+                    let ch = chars[i];
+                    let ok = ch.is_ascii_hexdigit()
+                        || matches!(ch, 'x' | 'X' | 'z' | 'Z' | '?');
+                    if !ok {
+                        break;
+                    }
+                    digits.push(ch);
                     i += 1;
                 }
-                let val = u128::from_str_radix(&digits, base).unwrap_or(0);
-                out.push(Tok::Number(val, width));
+                let mut val = 0u128;
+                let mut care = 0u128;
+                let mut dc = false;
+                if base == 2 {
+                    for (off, ch) in digits.chars().enumerate() {
+                        let bit = width.saturating_sub(off + 1);
+                        match ch {
+                            '1' => {
+                                val |= 1u128 << bit;
+                                care |= 1u128 << bit;
+                            }
+                            '0' => {
+                                care |= 1u128 << bit;
+                            }
+                            _ => {
+                                dc = true;
+                            }
+                        }
+                    }
+                } else {
+                    let parsed = u128::from_str_radix(
+                        &digits
+                            .chars()
+                            .map(|c| if matches!(c, 'x' | 'X' | 'z' | 'Z' | '?') { '0' } else { c })
+                            .collect::<String>(),
+                        base,
+                    )
+                    .unwrap_or(0);
+                    val = parsed;
+                    care = if width >= 128 { u128::MAX } else { (1u128 << width.max(1)) - 1 };
+                    if digits.chars().any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?')) {
+                        dc = true;
+                    }
+                }
+                if dc {
+                    out.push(Tok::Pat { val, care, width });
+                } else {
+                    out.push(Tok::Number(val, width));
+                }
             } else {
                 let val: u128 = n.parse().unwrap_or(0);
                 out.push(Tok::Number(val, 32));
@@ -676,9 +722,18 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         return Ok(e);
     }
     match p.bump() {
-        Some(Tok::Number(v, w)) => Ok(RExpr::Const {
-            val: *v,
-            width: *w,
+        Some(Tok::Number(v, w)) => {
+            let care = if *w >= 128 { u128::MAX } else { (1u128 << (*w).max(1)) - 1 };
+            Ok(RExpr::Const {
+                val: *v,
+                width: *w,
+                care,
+            })
+        }
+        Some(Tok::Pat { val, care, width }) => Ok(RExpr::Const {
+            val: *val,
+            width: *width,
+            care: *care,
         }),
         Some(Tok::Ident(s)) => {
             let name = s.clone();
@@ -1175,6 +1230,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut insts = Vec::new();
     let mut pending_keep = false;
     let mut pending_md = false;
+    let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
     parse_module_items(
         &mut p,
         &mut ports,
@@ -1185,6 +1241,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         &mut param_order,
         &mut pending_keep,
         &mut pending_md,
+        &mut mem_inits,
         "endmodule",
     )?;
     let toks = p.t[tok_start..p.i].to_vec();
@@ -1197,6 +1254,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         insts,
         params: param_order,
         toks,
+        mem_inits,
     })
 }
 
@@ -1210,6 +1268,7 @@ fn parse_module_items(
     param_order: &mut Vec<(String, u128)>,
     pending_keep: &mut bool,
     pending_md: &mut bool,
+    mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
     endkw: &str,
 ) -> Result<(), String> {
     while !p.eat_kw(endkw) {
@@ -1230,7 +1289,7 @@ fn parse_module_items(
         }
         if p.eat_kw("generate") {
             parse_module_items(
-                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
                 "endgenerate",
             )?;
             continue;
@@ -1271,13 +1330,13 @@ fn parse_module_items(
             if yes {
                 if then_begin {
                     parse_module_items(
-                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
                         "end",
                     )?;
                 } else {
                     // one module item; require a following else/endgenerate/endmodule delimiter
                     parse_module_items(
-                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
                         "else",
                     )?;
                     // parse_module_items consumed the else keyword — put it back
@@ -1301,7 +1360,7 @@ fn parse_module_items(
                     }
                 } else if eb {
                     parse_module_items(
-                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md,
+                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
                         "end",
                     )?;
                 } else {
@@ -1314,7 +1373,7 @@ fn parse_module_items(
         if p.eat_kw("for") {
             // Unroll: NBA body and/or instantiations.
             let save = p.i;
-            match parse_for_unroll_module(p, nbas, insts, assigns) {
+            match parse_for_unroll_module(p, nbas, insts, assigns, mem_inits) {
                 Ok(()) => continue,
                 Err(_) => {
                     p.i = save;
@@ -1371,7 +1430,31 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("initial") {
-            skip_item_or_block(p)?;
+            let block = p.eat_kw("begin");
+            loop {
+                if block && p.eat_kw("end") {
+                    break;
+                }
+                if p.peek().is_none() {
+                    break;
+                }
+                match parse_nba(p) {
+                    Ok((lhs, bit, rhs)) => {
+                        if let RExpr::Const { val, .. } = rhs {
+                            mem_inits
+                                .entry(lhs)
+                                .or_default()
+                                .insert(bit.unwrap_or(0), val);
+                        }
+                    }
+                    Err(_) => {
+                        skip_item_or_block(p)?;
+                    }
+                }
+                if !block {
+                    break;
+                }
+            }
             continue;
         }
         if p.eat_kw("assign") {
@@ -1417,6 +1500,7 @@ fn parse_for_unroll_module(
     nbas: &mut Vec<Nba>,
     insts: &mut Vec<Inst>,
     assigns: &mut Vec<(String, Option<usize>, RExpr)>,
+    mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
 ) -> Result<(), String> {
     if !p.eat_sym('(') {
         return Err("for (".into());
@@ -1507,6 +1591,7 @@ fn parse_for_unroll_module(
                 &mut dummy_params,
                 &mut pk,
                 &mut pmd,
+                mem_inits,
                 "end",
             )?;
         } else if let Ok(inst) = parse_inst(&mut sp) {
@@ -1648,8 +1733,11 @@ fn rexpr_ident(e: &RExpr) -> Option<String> {
 
 fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     match e {
-        RExpr::Const { val, width } => {
+        RExpr::Const { val, width, care } => {
             let _ = width;
+            if (care >> bit) & 1 == 0 {
+                return Ok(Expr::Const(false));
+            }
             Ok(Expr::Const((val >> bit) & 1 == 1))
         }
         RExpr::Ident(s) => {
@@ -1673,7 +1761,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             Box::new(rexpr_to_bit(a, rtl, bit)?),
             Box::new(rexpr_to_bit(b, rtl, bit)?),
         )),
-        RExpr::Add(_, _) => Err("add must be expanded as incrementer".into()),
+        RExpr::Add(a, b) => adder_sum_bit(a, b, rtl, bit),
         RExpr::Mul(_, _) => Err("mul is a DSP primitive, not a LUT cone".into()),
         RExpr::Mux(c, t, f) => {
             let cv = rexpr_to_bit(c, rtl, 0)?;
@@ -1706,12 +1794,38 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     }
 }
 
+fn const_care_of(e: &RExpr) -> u128 {
+    match e {
+        RExpr::Const { care, .. } => *care,
+        _ => u128::MAX,
+    }
+}
+
+fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    let mut cin = Expr::Const(false);
+    let mut sum = Expr::Const(false);
+    for i in 0..=bit {
+        let ai = rexpr_to_bit(a, rtl, i)?;
+        let bi = rexpr_to_bit(b, rtl, i)?;
+        let axb = Expr::Xor(Box::new(ai.clone()), Box::new(bi.clone()));
+        sum = Expr::Xor(Box::new(axb.clone()), Box::new(cin.clone()));
+        let ab = Expr::And(Box::new(ai), Box::new(bi));
+        let cin_axb = Expr::And(Box::new(cin), Box::new(axb));
+        cin = Expr::Or(Box::new(ab), Box::new(cin_axb));
+    }
+    Ok(sum)
+}
+
 fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, String> {
     let wa = rexpr_width(a, rtl);
     let wb = rexpr_width(b, rtl);
     let w = wa.max(wb).max(1);
+    let care = const_care_of(a) & const_care_of(b);
     let mut acc: Option<Expr> = None;
     for i in 0..w {
+        if (care >> i) & 1 == 0 {
+            continue;
+        }
         let ai = rexpr_to_bit(a, rtl, i)?;
         let bi = rexpr_to_bit(b, rtl, i)?;
         let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
@@ -1807,8 +1921,6 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut n_bram = 0usize;
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
-            d.add_cell(format!("u_bram{n_bram}"), CellKind::Bram18);
-            n_bram += 1;
             continue;
         }
         if is_mac_rhs(rhs) {
@@ -1841,6 +1953,40 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(inc)),
                     ));
                 }
+            } else if rexpr_is_plus_one(f)
+                && rexpr_ident(f).as_deref() == Some(lhs.as_str())
+                && matches!(t.as_ref(), RExpr::Ident(s) if s == lhs)
+            {
+                // saturating / hold: if (cond) cnt <= cnt; else cnt <= cnt+1
+                for i in 0..w {
+                    let inc = inc_bit_expr(lhs, w, i);
+                    let c = rexpr_to_bit(cond, rtl, 0)?;
+                    let hold = Expr::Var(bit_name(lhs, w, i));
+                    reg_bits.push((
+                        bit_name(lhs, w, i),
+                        Expr::Or(
+                            Box::new(Expr::And(Box::new(c.clone()), Box::new(hold))),
+                            Box::new(Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(inc))),
+                        ),
+                    ));
+                }
+            } else if rexpr_is_plus_one(t)
+                && rexpr_ident(t).as_deref() == Some(lhs.as_str())
+                && matches!(f.as_ref(), RExpr::Ident(s) if s == lhs)
+            {
+                // clock enable: if (en) cnt <= cnt+1
+                for i in 0..w {
+                    let inc = inc_bit_expr(lhs, w, i);
+                    let c = rexpr_to_bit(cond, rtl, 0)?;
+                    let hold = Expr::Var(bit_name(lhs, w, i));
+                    reg_bits.push((
+                        bit_name(lhs, w, i),
+                        Expr::Or(
+                            Box::new(Expr::And(Box::new(c.clone()), Box::new(inc))),
+                            Box::new(Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(hold))),
+                        ),
+                    ));
+                }
             } else {
                 for i in 0..w {
                     reg_bits.push((bit_name(lhs, w, i), rexpr_to_bit(rhs, rtl, i)?));
@@ -1852,6 +1998,42 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
         }
     }
+    let mut mem_names: HashSet<String> = HashSet::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if sig_depth(rtl, lhs) > 0 {
+            mem_names.insert(lhs.clone());
+        }
+    }
+    for k in rtl.mem_inits.keys() {
+        mem_names.insert(k.clone());
+    }
+    for name in &mem_names {
+        let cell = format!("u_bram{n_bram}");
+        d.add_cell(&cell, CellKind::Bram18);
+        let depth = sig_depth(rtl, name).max(
+            rtl.mem_inits
+                .get(name)
+                .and_then(|m| m.keys().max().copied())
+                .map(|a| a + 1)
+                .unwrap_or(0),
+        );
+        let mut words = vec![0u64; depth.max(1).min(1024)];
+        if let Some(init) = rtl.mem_inits.get(name) {
+            for (addr, val) in init {
+                if *addr < words.len() {
+                    words[*addr] = *val as u64;
+                }
+            }
+        }
+        let hex = words
+            .iter()
+            .map(|w| format!("{w:x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = d.set_cell_attr(&cell, "INIT", hex);
+        n_bram += 1;
+    }
+
     if reg_bits.is_empty() && n_mac == 0 && n_bram == 0 {
         return Err("no registered bits".into());
     }
@@ -1937,9 +2119,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
     let id = |s: &str| subst.get(s).cloned().unwrap_or_else(|| s.to_string());
     match e {
-        RExpr::Const { val, width } => RExpr::Const {
+        RExpr::Const { val, width, care } => RExpr::Const {
             val: *val,
             width: *width,
+            care: *care,
         },
         RExpr::Ident(s) => RExpr::Ident(id(s)),
         RExpr::Bit(s, i) => RExpr::Bit(id(s), *i),
@@ -2037,6 +2220,7 @@ fn flatten_module_ov(
         insts: Vec::new(),
         params: src.params.clone(),
         toks: src.toks.clone(),
+        mem_inits: src.mem_inits.clone(),
     };
     for inst in &src.insts {
         let child_proto = mods
@@ -2440,5 +2624,154 @@ endmodule
         // Concatenating in the wrong order (top first) must still find child.
         let d2 = synth_sv_sources(&[("top.sv", top), ("child.sv", child)]).unwrap();
         assert_eq!(d2.lut_inits().len(), 4);
+    }
+
+    #[test]
+    fn clock_enable_occupies_lut_pin() {
+        let bare = wrap("~q");
+        let en = r#"
+module m(input logic clk, input logic en, output logic led);
+  logic q;
+  always_ff @(posedge clk) begin
+    if (en) q <= ~q;
+  end
+  assign led = q;
+endmodule
+"#;
+        let a = lut_init_of(&bare).unwrap();
+        let d = synth_sv(en, "en.sv").unwrap();
+        let b = d.lut_inits()[0];
+        assert_eq!(a, 0x5555_5555_5555_5555);
+        assert_ne!(a, b, "enable must change INIT vs bare inverter {b:#x}");
+        assert!(d.ports.iter().any(|p| p.name == "en"));
+    }
+
+    #[test]
+    fn saturating_add_holds_at_max_in_fabric() {
+        let src = r#"
+module sat(input logic clk, output logic led);
+  logic [3:0] cnt;
+  always_ff @(posedge clk) begin
+    if (cnt == 4'hF) cnt <= cnt;
+    else cnt <= cnt + 1;
+  end
+  assign led = cnt[3];
+endmodule
+"#;
+        let d = synth_sv(src, "sat.sv").unwrap();
+        assert_ne!(
+            d.lut_inits(),
+            INC4_INIT.to_vec(),
+            "sat compare must occupy LUT pins so INIT != bare incrementer"
+        );
+        let dev = helion_device::Device::load_part("HL10T-C32-1").unwrap();
+        let p = helion_pack::pack(&d, &dev).unwrap();
+        let pl = helion_place::place(&p, &dev).unwrap();
+        let r = helion_route::route(&pl, &dev).unwrap();
+        let bits = helion_bits::bitgen(&dev, &r).unwrap();
+        let mut fab = helion_fabric::Fabric::new(&dev);
+        fab.program(&bits).unwrap();
+        fab.finish_startup();
+        let iob = r.iob_src[0].iob;
+        let mut w = Vec::new();
+        for _ in 0..16 {
+            fab.step_user();
+            w.push(fab.led_at(iob.0, iob.1));
+        }
+        let bits: String = w.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        assert_eq!(
+            bits, "0000000111111111",
+            "saturating counter must stick at 15 (LED=1), not wrap: {bits}"
+        );
+    }
+
+    #[test]
+    fn casez_dont_care_differs_from_exact_case() {
+        let z = r#"
+module m(input logic clk, output logic led);
+  logic [1:0] s;
+  always_ff @(posedge clk) begin
+    casez (s)
+      2'b0?: s <= 2'b11;
+      default: s <= 2'b00;
+    endcase
+  end
+  assign led = s[1];
+endmodule
+"#;
+        let c = r#"
+module m(input logic clk, output logic led);
+  logic [1:0] s;
+  always_ff @(posedge clk) begin
+    case (s)
+      2'b00: s <= 2'b11;
+      default: s <= 2'b00;
+    endcase
+  end
+  assign led = s[1];
+endmodule
+"#;
+        let dz = synth_sv(z, "z.sv").unwrap();
+        let dc = synth_sv(c, "c.sv").unwrap();
+        assert_ne!(
+            dz.lut_inits(),
+            dc.lut_inits(),
+            "casez 2'b0? must match 00 and 01, not only 00: z={:?} c={:?}",
+            dz.lut_inits(),
+            dc.lut_inits()
+        );
+    }
+
+    #[test]
+    fn bram_init_appears_in_fabric_not_only_pack() {
+        let src = r#"
+module rom(input logic clk, output logic led);
+  logic [7:0] mem [0:3];
+  logic q;
+  initial begin
+    mem[0] = 8'hA5;
+    mem[1] = 8'h3C;
+    mem[2] = 8'h00;
+    mem[3] = 8'hFF;
+  end
+  always_ff @(posedge clk) begin
+    mem[0] <= mem[0];
+    q <= ~q;
+  end
+  assign led = q;
+endmodule
+"#;
+        let d = synth_sv(src, "rom.sv").unwrap();
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("must infer BRAM18");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT attr must carry mem[0]=A5, got {init}");
+        assert!(init.contains("3c"), "INIT attr must carry mem[1]=3C, got {init}");
+        let dev = helion_device::Device::load_part("HL10T-C32-1").unwrap();
+        let p = helion_pack::pack(&d, &dev).unwrap();
+        assert_eq!(p.brams.len(), 1);
+        assert_eq!(p.brams[0].init.get(0).copied().unwrap_or(0), 0xA5);
+        assert_eq!(p.brams[0].init.get(1).copied().unwrap_or(0), 0x3C);
+        let pl = helion_place::place(&p, &dev).unwrap();
+        let r = helion_route::route(&pl, &dev).unwrap();
+        let bits = helion_bits::bitgen(&dev, &r).unwrap();
+        let mut fab = helion_fabric::Fabric::new(&dev);
+        fab.program(&bits).unwrap();
+        assert_eq!(fab.bram_init_word(0, 0), 0xA5, "fabric must see programmed INIT[0]");
+        assert_eq!(fab.bram_init_word(0, 1), 0x3C, "fabric must see programmed INIT[1]");
+        assert_eq!(fab.bram_init_word(0, 3), 0xFF);
+        let src2 = src.replace("8'hA5", "8'h11").replace("8'h3C", "8'h22");
+        let d2 = synth_sv(&src2, "rom2.sv").unwrap();
+        let p2 = helion_pack::pack(&d2, &dev).unwrap();
+        let pl2 = helion_place::place(&p2, &dev).unwrap();
+        let r2 = helion_route::route(&pl2, &dev).unwrap();
+        let bits2 = helion_bits::bitgen(&dev, &r2).unwrap();
+        fab.program(&bits2).unwrap();
+        assert_eq!(fab.bram_init_word(0, 0), 0x11);
+        assert_eq!(fab.bram_init_word(0, 1), 0x22);
+        assert_ne!(bits.frames, bits2.frames, "different ROM contents must change bitstream");
     }
 }

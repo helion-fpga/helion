@@ -361,6 +361,29 @@ impl Fabric {
             .map(|c| c.q[ble as usize])
             .unwrap_or(false)
     }
+
+    /// Read programmed BRAM INIT word `addr` of BRAM major `idx` (not pack-only).
+    pub fn bram_init_word(&self, idx: u16, addr: usize) -> u64 {
+        let minor = 1u8 + addr as u8;
+        self.frames
+            .get(&(Far::BRAM, idx, minor))
+            .copied()
+            .unwrap_or(0) as u64
+    }
+
+    /// Overlay frames without wiping the rest of the die (DFX partial).
+    pub fn program_partial(&mut self, bits: &Bitstream) -> Result<(), String> {
+        if bits.idcode != self.idcode {
+            return Err(format!(
+                "idcode mismatch bitstream {:#010x} fabric {:#010x}",
+                bits.idcode, self.idcode
+            ));
+        }
+        for (k, w) in &bits.frames {
+            self.frames.insert(*k, *w);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
