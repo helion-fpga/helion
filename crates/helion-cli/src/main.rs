@@ -419,6 +419,7 @@ fn hw(args: Vec<String>) {
 fn doctor() {
     println!("helion doctor");
     let dev = Device::load_part("HL10T-C32-1").expect("HAD");
+    println!("  {}", dev.report_die());
     println!(
         "  HAD {}: {}×{} CLB, {} LUT6, {} BRAM18, idcode {:#010x}",
         dev.part,

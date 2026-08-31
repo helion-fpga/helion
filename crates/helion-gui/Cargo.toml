@@ -9,3 +9,7 @@ helion-proj = { workspace = true }
 helion-device = { workspace = true }
 helion-sv = { workspace = true }
 helion-ir = { workspace = true }
+helion-sta = { workspace = true }
+helion-hw = { workspace = true }
+helion-bits = { workspace = true }
+helion-debug = { workspace = true }

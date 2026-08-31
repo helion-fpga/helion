@@ -82,10 +82,29 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         let d = helion_sv::synth_sv_path(std::path::Path::new(path.trim()))?;
         shell.tree.nodes.push(d.name.clone());
         let msg = format!("synth {} cells {} luts {}", d.name, d.cells.len(), d.lut_inits().len());
-        shell.session.design = Some(d);
+        shell.session.synth_design(d);
         return Ok(msg);
     }
-    if t == "hds::impl" || t == "place_design" || t == "route_design" || t.starts_with("hds::impl") {
+    if t == "place_design" {
+        let dev = Device::load_part(&shell.part)?;
+        shell.session.place_design(&dev)?;
+        return Ok(format!(
+            "place_design sites {}",
+            shell.session.placed.as_ref().map(|p| p.lutff_sites.len()).unwrap_or(0)
+        ));
+    }
+    if t == "route_design" {
+        let dev = Device::load_part(&shell.part)?;
+        if shell.session.placed.is_none() {
+            shell.session.place_design(&dev)?;
+        }
+        shell.session.route_design(&dev)?;
+        return Ok(format!(
+            "route_design hops {}",
+            shell.session.routed.as_ref().and_then(|r| r.iob_src.first()).map(|i| i.hops).unwrap_or(0)
+        ));
+    }
+    if t == "hds::impl" || t.starts_with("hds::impl") {
         impl_if_needed(shell)?;
         return Ok(format!(
             "impl frames {}",
@@ -145,7 +164,50 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
     }
     if t == "report_timing" {
         impl_if_needed(shell)?;
-        return Ok("report_timing ok".into());
+        let dev = Device::load_part(&shell.part)?;
+        return shell.session.report_timing(&dev);
+    }
+    if t == "report_utilization" {
+        impl_if_needed(shell)?;
+        let dev = Device::load_part(&shell.part)?;
+        return shell.session.report_utilization(&dev);
+    }
+    if t == "open_hw_manager" {
+        shell.session.open_hw_manager();
+        return Ok("open_hw_manager sim".into());
+    }
+    if t == "program_hw" || t == "program_hw_devices" {
+        let dev = Device::load_part(&shell.part)?;
+        if shell.session.bitstream.is_none() {
+            impl_if_needed(shell)?;
+        }
+        if !shell.session.hw_open {
+            shell.session.open_hw_manager();
+        }
+        return shell.session.program_hw(&dev);
+    }
+    if let Some(net) = t.strip_prefix("mark_debug ") {
+        shell.session.mark_debug(net.trim())?;
+        return Ok(format!("mark_debug {}", net.trim()));
+    }
+    if let Some(rest) = t.strip_prefix("eco ") {
+        impl_if_needed(shell)?;
+        let dev = Device::load_part(&shell.part)?;
+        let mut parts = rest.split_whitespace();
+        let cell = parts.next().unwrap_or("u_lut");
+        let init_s = parts.next().unwrap_or("0xAAAAAAAAAAAAAAAA");
+        let init = u64::from_str_radix(init_s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
+        shell.session.eco(&dev, cell, init)?;
+        return Ok(format!("eco {cell} {init:#x}"));
+    }
+    if t == "write_checkpoint" || t.starts_with("write_checkpoint ") {
+        let ck = shell.session.checkpoint();
+        return Ok(format!("write_checkpoint {} bytes hash {:#x}", ck.len(), shell.session.blinky_hash().unwrap_or(0)));
+    }
+    if t == "report_die" || t == "report_hw_targets" {
+        let dev = Device::load_part(&shell.part)?;
+        return Ok(dev.report_die());
     }
     if t == "hds::flow" {
         return Ok(shell.flow.steps.join(" "));
@@ -185,5 +247,36 @@ mod tests {
             tcl_eval(&mut sh, "create_clock -period 10 clk").unwrap(),
             "clock clk period 10000ps"
         );
+        let rt = tcl_eval(&mut sh, "report_timing").unwrap();
+        assert!(rt.contains("WNS_PS="), "report_timing must hit STA: {rt}");
+        let util = tcl_eval(&mut sh, "report_utilization").unwrap();
+        assert!(util.contains("LUTFF="), "{util}");
+        assert!(tcl_eval(&mut sh, "open_hw_manager").unwrap().contains("sim"));
+        let hw = tcl_eval(&mut sh, "program_hw").unwrap();
+        assert!(hw.contains("DONE=1"), "{hw}");
+        let md = tcl_eval(&mut sh, "mark_debug cnt_3").unwrap();
+        assert!(md.contains("cnt_3"), "{md}");
+        let eco = tcl_eval(&mut sh, "eco u_lut0 0xAAAAAAAAAAAAAAAA").unwrap();
+        assert!(eco.contains("eco"), "{eco}");
+        let ck = tcl_eval(&mut sh, "write_checkpoint").unwrap();
+        assert!(ck.contains("hash"), "{ck}");
+        let die = tcl_eval(&mut sh, "report_die").unwrap();
+        assert!(die.contains("HL10T-C32-1"), "{die}");
+        assert!(die.contains("LUT6=8192"), "{die}");
+    }
+
+    #[test]
+    fn tcl_place_route_are_stepwise_engines() {
+        let mut sh = GpuiShell::default();
+        let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/blinky.sv");
+        tcl_eval(&mut sh, &format!("synth_design {}", sv.display())).unwrap();
+        let pl = tcl_eval(&mut sh, "place_design").unwrap();
+        assert!(pl.contains("place_design"), "{pl}");
+        assert!(sh.session.routed.is_none(), "place must not route");
+        let rt = tcl_eval(&mut sh, "route_design").unwrap();
+        assert!(rt.contains("route_design"), "{rt}");
+        assert!(sh.session.bitstream.is_none(), "route must not bitgen");
+        let bits = tcl_eval(&mut sh, "write_bitstream").unwrap();
+        assert!(bits.contains("bytes"), "{bits}");
     }
 }
