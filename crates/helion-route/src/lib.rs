@@ -22,7 +22,12 @@ pub struct IobRoute {
     pub clb: (u32, u32),
     pub ble: u8,
     pub hops: u32,
+    /// Path delay in ps (hops × HOP_DELAY_PS). Used by STA.
+    pub delay_ps: i64,
 }
+
+/// One tile hop delay (ps). Folded into PathFinder negotiated cost.
+pub const HOP_DELAY_PS: i64 = 40;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ImuxRoute {
@@ -114,7 +119,8 @@ fn astar(
         for (nx, ny) in neighbors(dev, x, y) {
             let h = *hist.get(&(nx, ny)).unwrap_or(&0) as i64;
             let p = *pres.get(&(nx, ny)).unwrap_or(&0) as i64;
-            let step = 1 + h + p * pres_fac;
+            // delay-driven: hop delay dominates, congestion still negotiates
+            let step = HOP_DELAY_PS + h + p * pres_fac;
             let ng = gc + step;
             if ng < *g.get(&(nx, ny)).unwrap_or(&i64::MAX) {
                 g.insert((nx, ny), ng);
@@ -241,6 +247,7 @@ pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
             clb: *src,
             ble: *ble,
             hops,
+            delay_ps: hops as i64 * HOP_DELAY_PS,
         });
     }
     Ok(Routed {
@@ -280,6 +287,26 @@ mod tests {
         let pl = place(&p, &dev).unwrap();
         let r = route(&pl, &dev).unwrap();
         assert!(r.iob_src[0].clb.1 > r.iob_src[0].iob.1);
+    }
+
+    #[test]
+    fn delay_in_cost_makes_td_faster_than_wl() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
+        let td = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let r_wl = route(&wl, &dev).unwrap();
+        let r_td = route(&td, &dev).unwrap();
+        assert!(
+            r_td.iob_src[0].delay_ps < r_wl.iob_src[0].delay_ps,
+            "PathFinder delay must track placement (TD {}ps WL {}ps hops {} vs {})",
+            r_td.iob_src[0].delay_ps,
+            r_wl.iob_src[0].delay_ps,
+            r_td.iob_src[0].hops,
+            r_wl.iob_src[0].hops
+        );
+        assert_eq!(r_td.iob_src[0].delay_ps, r_td.iob_src[0].hops as i64 * HOP_DELAY_PS);
+        assert!(r_td.iob_src[0].hops >= 1);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use helion_ir::{CellKind, Design};
 use helion_place::Placed;
+use helion_route::Routed;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -22,6 +23,10 @@ pub struct TimingResult {
     pub endpoints: usize,
     pub r2r_ps: i64,
     pub iob_ps: i64,
+    pub setup_ps: i64,
+    pub hold_ps: i64,
+    pub hold_slack_ps: i64,
+    pub route_ps: i64,
 }
 
 pub fn create_clock(clocks: &mut Vec<Clock>, name: &str, period_ps: u64, source: &str) {
@@ -64,6 +69,7 @@ const SETUP_PS: i64 = 50;
 const PIN_PS: i64 = 20;
 const IOB_PS: i64 = 100;
 const HOP_PS: i64 = 40;
+const HOLD_REQ_PS: i64 = 20;
 
 fn lut_fanin(design: &Design, lut: &str) -> i64 {
     (0..6)
@@ -103,6 +109,10 @@ pub fn report_timing(design: &Design, clocks: &[Clock]) -> Result<TimingResult, 
         endpoints: ffs.max(1),
         r2r_ps: r2r,
         iob_ps: 0,
+        setup_ps: r2r,
+        hold_ps: FF_CKQ_PS,
+        hold_slack_ps: FF_CKQ_PS - HOLD_REQ_PS,
+        route_ps: 0,
     })
 }
 
@@ -129,8 +139,35 @@ pub fn report_timing_placed(
         .unwrap_or(0);
     r.iob_ps = iob_ps;
     let path = r.r2r_ps.max(iob_ps);
+    r.setup_ps = path;
+    r.hold_ps = FF_CKQ_PS + iob_ps.min(path);
+    r.route_ps = 0;
     r.wns_ps = clocks[0].period_ps as i64 - path;
     r.tns_ps = r.wns_ps.min(0);
+    r.hold_slack_ps = r.hold_ps - HOLD_REQ_PS;
+    Ok(r)
+}
+
+/// STA using PathFinder hop delay so WNS/hold/setup move with placement.
+pub fn report_timing_routed(
+    design: &Design,
+    routed: &Routed,
+    clocks: &[Clock],
+) -> Result<TimingResult, String> {
+    let mut r = report_timing_placed(design, &routed.placed, clocks)?;
+    let route_ps = routed
+        .iob_src
+        .iter()
+        .map(|x| x.delay_ps)
+        .max()
+        .unwrap_or(0);
+    r.route_ps = route_ps;
+    r.iob_ps = FF_CKQ_PS + route_ps + IOB_PS;
+    r.setup_ps = r.r2r_ps.max(r.iob_ps);
+    r.hold_ps = FF_CKQ_PS + route_ps;
+    r.wns_ps = clocks[0].period_ps as i64 - r.setup_ps;
+    r.tns_ps = r.wns_ps.min(0);
+    r.hold_slack_ps = r.hold_ps - HOLD_REQ_PS;
     Ok(r)
 }
 
@@ -248,6 +285,28 @@ mod tests {
             a.iob_ps
         );
         let _ = place(&p, &dev);
+    }
+
+    #[test]
+    fn routed_wns_hold_setup_move_with_placement() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_blinky();
+        let p = pack(&d, &dev).unwrap();
+        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
+        let td = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let r_wl = helion_route::route(&wl, &dev).unwrap();
+        let r_td = helion_route::route(&td, &dev).unwrap();
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let a = report_timing_routed(&d, &r_wl, &clks).unwrap();
+        let b = report_timing_routed(&d, &r_td, &clks).unwrap();
+        assert_ne!(a.wns_ps, b.wns_ps, "WNS must move with placement (WL {} TD {})", a.wns_ps, b.wns_ps);
+        assert_ne!(a.hold_ps, b.hold_ps, "hold must move with placement");
+        assert_ne!(a.setup_ps, b.setup_ps, "setup must move with placement");
+        assert!(b.wns_ps > a.wns_ps, "timing-driven must improve WNS (TD {} WL {})", b.wns_ps, a.wns_ps);
+        assert!(b.setup_ps < a.setup_ps);
+        assert!(b.hold_ps < a.hold_ps, "shorter route → less hold delay");
+        assert!(a.route_ps > 0 && b.route_ps > 0);
     }
 
     #[test]
