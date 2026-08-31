@@ -90,10 +90,14 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
         bs.frames.insert((Far::DSP, i as u16, 0), word);
     }
-    for (i, _b) in routed.placed.packed.brams.iter().enumerate() {
+    for (i, b) in routed.placed.packed.brams.iter().enumerate() {
         let site = routed.placed.bram_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
         bs.frames.insert((Far::BRAM, i as u16, 0), word);
+        for (wi, w) in b.init.iter().enumerate() {
+            let minor = 1u8 + (wi as u8);
+            bs.frames.insert((Far::BRAM, i as u16, minor), *w as u128);
+        }
     }
     bs.packets = encode_packets(dev.idcode, &bs.frames);
     Ok(bs)
