@@ -53,4 +53,12 @@ fn version_and_doctor() {
         "counter LED must be cnt[3] over 16 cycles, got {out}"
     );
     assert!(out.contains("ok"), "{out}");
+
+    let util = Command::new(bin)
+        .args(["report_utilization", counter.to_str().unwrap()])
+        .output()
+        .expect("util");
+    assert!(util.status.success(), "{}", String::from_utf8_lossy(&util.stderr));
+    let uo = String::from_utf8_lossy(&util.stdout);
+    assert!(uo.contains("LUTFF=4/8192"), "{uo}");
 }

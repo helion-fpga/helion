@@ -7,7 +7,7 @@ use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
 use helion_route::{route, Routed};
-use helion_sta::{create_clock, report_timing_placed, TimingResult};
+use helion_sta::{create_clock, load_sdc, report_timing_placed, TimingResult};
 use helion_sv::synth_sv_path;
 use std::path::Path;
 
@@ -59,6 +59,7 @@ fn main() {
         "impl" => cmd_impl(&args),
         "run" => cmd_run(&args),
         "report_timing" => cmd_timing(&args),
+        "report_utilization" => cmd_util(&args),
         "bitstream" => cmd_bits(&args),
         "--help" | "-h" | "help" => usage(),
         other => {
@@ -77,7 +78,8 @@ fn usage() {
   helion synth <file.sv> [--part P]
   helion impl <file.sv> [--part P]
   helion run <file.sv> [--cycles N] [--part P]
-  helion report_timing <file.sv>
+  helion report_timing <file.sv> [--sdc f.sdc]
+  helion report_utilization <file.sv>
   helion bitstream <file.sv> -o out.hbits
   helion hw program --cable sim",
         v = env!("CARGO_PKG_VERSION")
@@ -189,14 +191,52 @@ fn cmd_timing(args: &[String]) {
         eprintln!("report_timing: {e}");
         std::process::exit(1);
     });
+    let mut timing = c.timing.clone();
+    if let Some(sdc) = take_flag(args, "--sdc") {
+        let text = std::fs::read_to_string(&sdc).unwrap_or_else(|e| {
+            eprintln!("sdc {sdc}: {e}");
+            std::process::exit(1);
+        });
+        let mut clks = Vec::new();
+        load_sdc(&text, &mut clks).unwrap_or_else(|e| {
+            eprintln!("sdc: {e}");
+            std::process::exit(1);
+        });
+        timing = report_timing_placed(&c.design, &c.routed.placed, &clks).unwrap_or_else(|e| {
+            eprintln!("report_timing: {e}");
+            std::process::exit(1);
+        });
+    }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
         c.design.name,
-        c.timing.wns_ps,
-        c.timing.tns_ps,
-        c.timing.endpoints,
-        c.timing.r2r_ps,
-        c.timing.iob_ps
+        timing.wns_ps,
+        timing.tns_ps,
+        timing.endpoints,
+        timing.r2r_ps,
+        timing.iob_ps
+    );
+}
+
+fn cmd_util(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+        eprintln!("report_utilization: {e}");
+        std::process::exit(1);
+    });
+    let p = &c.routed.placed.packed;
+    println!(
+        "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        c.design.name,
+        p.lutffs.len(),
+        c.dev.lut6_count(),
+        p.iobs.len(),
+        c.dev.iob_sites().count(),
+        p.brams.len(),
+        c.dev.n_bram,
+        p.macs.len(),
+        c.dev.n_dsp
     );
 }
 
