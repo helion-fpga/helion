@@ -199,6 +199,74 @@ pub fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Read LUT INIT back from programmed frames via the HAD FeatureMap.
+pub fn readback_lut_init(dev: &Device, bits: &Bitstream, x: u32, y: u32, ble: u32) -> Result<u64, String> {
+    let mut init = 0u64;
+    for i in 0..64u32 {
+        let loc = dev.locate(&format!("CLB_X{x}Y{y}.BLE{ble}.LUT.INIT[{i}]"))?;
+        let frame = bits
+            .frames
+            .get(&(loc.far.block_type, loc.far.major, loc.far.minor))
+            .copied()
+            .unwrap_or(0);
+        if (frame >> loc.bit) & 1 == 1 {
+            init |= 1u64 << i;
+        }
+    }
+    Ok(init)
+}
+
+/// ECO: change one LUT INIT and rebuild the bitstream (other sites unchanged in intent).
+pub fn eco_lut(dev: &Device, routed: &Routed, cell: &str, new_init: u64) -> Result<Bitstream, String> {
+    let mut r = routed.clone();
+    let i = r
+        .placed
+        .packed
+        .lutffs
+        .iter()
+        .position(|l| l.lut_cell == cell || l.ff_cell == cell)
+        .ok_or_else(|| format!("eco: no LUT/FF cell {cell}"))?;
+    r.placed.packed.lutffs[i].init = new_init;
+    bitgen(dev, &r)
+}
+
+/// Partial bitstream: only CLB majors (and matching IOB columns) in `sites`.
+pub fn bitgen_pblock(
+    dev: &Device,
+    routed: &Routed,
+    sites: &[(u32, u32)],
+) -> Result<Bitstream, String> {
+    let full = bitgen(dev, routed)?;
+    let majors: std::collections::HashSet<u16> = sites
+        .iter()
+        .filter_map(|(x, y)| dev.clb_major(*x, *y))
+        .collect();
+    let iob_x: std::collections::HashSet<u32> = sites.iter().map(|(x, _)| *x).collect();
+    let mut frames = BTreeMap::new();
+    for ((b, maj, min), w) in &full.frames {
+        let keep = if *b == Far::CLB_IO_CLK {
+            majors.contains(maj)
+        } else if *b == Far::IOB {
+            iob_x.iter().any(|x| dev.iob_major(*x, 0) == Some(*maj))
+        } else {
+            false
+        };
+        if keep && *w != 0 {
+            frames.insert((*b, *maj, *min), *w);
+        }
+    }
+    if frames.is_empty() {
+        return Err("pblock produced no frames".into());
+    }
+    let mut bs = Bitstream {
+        idcode: dev.idcode,
+        frames,
+        packets: Vec::new(),
+    };
+    bs.packets = encode_packets(dev.idcode, &bs.frames);
+    Ok(bs)
+}
+
 fn sha256_lite(data: &[u8]) -> [u8; 32] {
     // 0.1 header hash: CRC32C repeated; not cryptographic. Field is 32 bytes.
     let c = crc32c(data);
@@ -246,5 +314,24 @@ mod tests {
             bs.frames.keys().any(|(b, _, _)| *b == Far::BRAM),
             "BRAM frame missing"
         );
+    }
+
+    #[test]
+    fn readback_and_eco_change_init() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let bs = bitgen(&dev, &r).unwrap();
+        let (site, ble) = r.placed.lutff_sites[0];
+        let init = readback_lut_init(&dev, &bs, site.x, site.y, ble as u32).unwrap();
+        assert_eq!(init, 0x5555_5555_5555_5555);
+        let eco = eco_lut(&dev, &r, "u_lut", 0xAAAA_AAAA_AAAA_AAAA).unwrap();
+        let init2 = readback_lut_init(&dev, &eco, site.x, site.y, ble as u32).unwrap();
+        assert_eq!(init2, 0xAAAA_AAAA_AAAA_AAAA);
+        assert_ne!(bs.frames, eco.frames);
+        let pb = bitgen_pblock(&dev, &r, &[(site.x, site.y)]).unwrap();
+        assert!(pb.frames.len() < bs.frames.len(), "partial must be smaller");
+        assert!(pb.frames.keys().all(|k| bs.frames.contains_key(k)));
     }
 }

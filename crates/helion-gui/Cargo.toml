@@ -8,3 +8,4 @@ license.workspace = true
 helion-proj = { workspace = true }
 helion-device = { workspace = true }
 helion-sv = { workspace = true }
+helion-ir = { workspace = true }

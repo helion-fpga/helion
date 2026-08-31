@@ -1,4 +1,4 @@
-use helion_bits::{bitgen, Bitstream};
+use helion_bits::{bitgen, bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
 use helion_device::Device;
 use helion_drc::check_routed;
 use helion_fabric::Fabric;
@@ -8,7 +8,10 @@ use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
 use helion_route::{route, Routed};
 use helion_sta::{create_clock, load_sdc, report_timing_placed, TimingResult};
+use helion_hls::synth_c_path;
+use helion_proj::load_prj;
 use helion_sv::synth_sv_path;
+use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
 
 struct Compiled {
@@ -19,8 +22,22 @@ struct Compiled {
     timing: TimingResult,
 }
 
+fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("sv")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "vhd" | "vhdl" => synth_vhdl_path(p),
+        "c" | "cc" | "cpp" => synth_c_path(p),
+        _ => synth_sv_path(p),
+    }
+}
+
 fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, String> {
-    let design = synth_sv_path(Path::new(path))?;
+    let design = synth_any(path)?;
     compile_design(design, part, timing_weight)
 }
 
@@ -61,6 +78,9 @@ fn main() {
         "report_timing" => cmd_timing(&args),
         "report_utilization" => cmd_util(&args),
         "bitstream" => cmd_bits(&args),
+        "eco" => cmd_eco(&args),
+        "pblock" => cmd_pblock(&args),
+        "project" => cmd_project(&args),
         "--help" | "-h" | "help" => usage(),
         other => {
             eprintln!("unknown command {other}");
@@ -80,7 +100,10 @@ fn usage() {
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv> [--sdc f.sdc]
   helion report_utilization <file.sv>
-  helion bitstream <file.sv> -o out.hbits
+  helion bitstream <file.sv|.vhd|.c> -o out.hbits
+  helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
+  helion pblock <file.sv>
+  helion project <file.prj>
   helion hw program --cable sim",
         v = env!("CARGO_PKG_VERSION")
     );
@@ -105,7 +128,7 @@ fn positional(args: &[String]) -> Option<&str> {
 fn cmd_synth(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let d = synth_sv_path(Path::new(path)).unwrap_or_else(|e| {
+    let d = synth_any(path).unwrap_or_else(|e| {
         eprintln!("synth: {e}");
         std::process::exit(1);
     });
@@ -257,6 +280,93 @@ fn cmd_bits(args: &[String]) {
     } else {
         println!("bitstream {} bytes={}", c.design.name, c.bits.packets.len());
     }
+}
+
+fn cmd_eco(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let cell = take_flag(args, "--cell").unwrap_or_else(|| "u_lut".into());
+    let init = take_flag(args, "--init").unwrap_or_else(|| "0xAAAAAAAAAAAAAAAA".into());
+    let new_init = u64::from_str_radix(init.trim_start_matches("0x").trim_start_matches("0X"), 16)
+        .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
+    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    let (site, ble) = c.routed.placed.lutff_sites[0];
+    let before = readback_lut_init(&c.dev, &c.bits, site.x, site.y, ble as u32).unwrap();
+    let after_bs = eco_lut(&c.dev, &c.routed, &cell, new_init).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    let after = readback_lut_init(&c.dev, &after_bs, site.x, site.y, ble as u32).unwrap();
+    println!("eco {cell} INIT {before:#x} -> {after:#x}");
+}
+
+fn cmd_pblock(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+        eprintln!("pblock: {e}");
+        std::process::exit(1);
+    });
+    let (site, _) = c.routed.placed.lutff_sites[0];
+    let pb = bitgen_pblock(&c.dev, &c.routed, &[(site.x, site.y)]).unwrap();
+    println!(
+        "pblock CLB_X{}Y{} frames {} / full {}",
+        site.x,
+        site.y,
+        pb.frames.len(),
+        c.bits.frames.len()
+    );
+}
+
+fn cmd_project(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.prj");
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("project {path}: {e}");
+        std::process::exit(1);
+    });
+    let prj = load_prj(&text).unwrap_or_else(|e| {
+        eprintln!("project: {e}");
+        std::process::exit(1);
+    });
+    let src = prj.sources.first().cloned().unwrap_or_default();
+    let src_path = {
+        let given = Path::new(&src);
+        let mut resolved = given.to_path_buf();
+        if !given.exists() {
+            for anc in Path::new(path).ancestors() {
+                let cand = anc.join(&src);
+                if cand.exists() {
+                    resolved = cand;
+                    break;
+                }
+                if let Some(name) = given.file_name() {
+                    let cand = anc.join(name);
+                    if cand.exists() {
+                        resolved = cand;
+                        break;
+                    }
+                }
+            }
+        }
+        resolved.to_string_lossy().into_owned()
+    };
+    let c = compile_sv(&src_path, &prj.part, 0.75).unwrap_or_else(|e| {
+        eprintln!("project impl: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "project {} part={} source={} lutffs={} PACKAGE_PIN={} create_clock={} frames={}",
+        path,
+        prj.part,
+        src,
+        c.routed.placed.packed.lutffs.len(),
+        prj.package_pins.len(),
+        prj.sdc.len(),
+        c.bits.frames.len()
+    );
 }
 
 fn hw(args: Vec<String>) {

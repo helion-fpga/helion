@@ -20,3 +20,6 @@ helion-sv = { workspace = true }
 helion-sta = { workspace = true }
 helion-hw = { workspace = true }
 helion-drc = { workspace = true }
+helion-vhdl = { workspace = true }
+helion-hls = { workspace = true }
+helion-proj = { workspace = true }

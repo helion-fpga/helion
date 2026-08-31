@@ -27,4 +27,6 @@ VHDL is 1.1, not a gate. Legal fence: no Project X-Ray, no UNISIM, no AMD/Intel/
 | sim | helion-fabric | 6-input IMUX LUT + FF + IOB + STAT |
 | hw | helion-hw | IEEE 1149.1 TAP, sim cable |
 
-Tcl client (tree / console / flow rail): `hds::synth`, `read_sv`, `create_clock`.
+Tcl client (tree / console / flow rail): `read_sv`, `get_cells`, `get_nets`, `opt_design`, `write_bitstream`, `create_clock`.
+
+Also: hierarchical SV, VHDL blinky (`examples/blinky.vhd`), HLS C (`examples/blinky.c`), ECO LUT INIT, partial pblock bitstreams.
