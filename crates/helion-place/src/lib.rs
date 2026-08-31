@@ -9,6 +9,7 @@ pub struct Placed {
     pub lutff_sites: Vec<(Site, u8)>,
     pub iob_sites: Vec<Site>,
     pub mac_sites: Vec<Site>,
+    pub bram_sites: Vec<Site>,
     pub timing_weight: f64,
     pub cost: f64,
 }
@@ -30,30 +31,39 @@ pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
 }
 
 pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Placed, String> {
+    let iob_all: Vec<Site> = dev.iob_sites().collect();
     let mut iob_sites = Vec::new();
-    let iob = dev.iob_sites().next();
-    if let Some(s) = iob {
-        if !packed.iobs.is_empty() {
-            iob_sites.push(s);
-        }
-    } else if !packed.iobs.is_empty() {
-        return Err("no IOB".into());
+    for (i, _) in packed.iobs.iter().enumerate() {
+        let s = iob_all
+            .get(i)
+            .copied()
+            .ok_or_else(|| format!("need {} IOB sites, device has {}", packed.iobs.len(), iob_all.len()))?;
+        iob_sites.push(s);
     }
 
     let mut lutff_sites = Vec::new();
     if !packed.lutffs.is_empty() {
-        let iob = iob.ok_or_else(|| "need IOB column for LUTFF".to_string())?;
+        let iob = iob_sites
+            .first()
+            .copied()
+            .or_else(|| iob_all.first().copied())
+            .ok_or_else(|| "need IOB column for LUTFF".to_string())?;
         let mut col: Vec<Site> = dev.clb_sites().filter(|s| s.x == iob.x).collect();
         if col.is_empty() {
             col = dev.clb_sites().collect();
         }
         col.sort_by_key(|s| s.y);
-        let near = col[0];
-        let mid = col[col.len() / 2];
-        let user = if opts.timing_weight > 0.0 { near } else { mid };
-        lutff_sites.push((user, 0));
-        for (i, _) in packed.lutffs.iter().enumerate().skip(1) {
-            lutff_sites.push((user, i as u8));
+        let n_ble = dev.n_ble.max(1) as usize;
+        let base = if opts.timing_weight > 0.0 {
+            0usize
+        } else {
+            col.len() / 2
+        };
+        for i in 0..packed.lutffs.len() {
+            let clb_off = i / n_ble;
+            let ble = (i % n_ble) as u8;
+            let idx = (base + clb_off).min(col.len() - 1);
+            lutff_sites.push((col[idx], ble));
         }
     }
 
@@ -68,6 +78,19 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
     }
     for (i, _) in packed.macs.iter().enumerate() {
         mac_sites.push(dsps[i]);
+    }
+
+    let mut bram_sites = Vec::new();
+    let brams: Vec<_> = dev.bram_sites().collect();
+    if packed.brams.len() > brams.len() {
+        return Err(format!(
+            "need {} BRAM sites, device has {}",
+            packed.brams.len(),
+            brams.len()
+        ));
+    }
+    for (i, _) in packed.brams.iter().enumerate() {
+        bram_sites.push(brams[i]);
     }
 
     let cost = if opts.timing_weight > 0.0 {
@@ -88,15 +111,25 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         lutff_sites,
         iob_sites,
         mac_sites,
+        bram_sites,
         timing_weight: opts.timing_weight,
         cost,
     })
 }
 
+pub fn lutff_of(placed: &Placed, ff_cell: &str) -> Option<(Site, u8)> {
+    placed
+        .packed
+        .lutffs
+        .iter()
+        .position(|l| l.ff_cell == ff_cell)
+        .map(|i| placed.lutff_sites[i])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_device::Device;
+    use helion_device::{Device, SiteKind};
     use helion_ir::{CellKind, Design};
     use helion_pack::pack;
 
@@ -134,6 +167,49 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         assert_eq!(pl.mac_sites.len(), 1);
-        assert_eq!(pl.mac_sites[0].kind, helion_device::SiteKind::Dsp);
+        assert_eq!(pl.mac_sites[0].kind, SiteKind::Dsp);
+    }
+
+    #[test]
+    fn places_bram_and_counter_distinct_bles() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        d.add_cell("u_bram", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        assert_eq!(pl.bram_sites.len(), 1);
+        assert_eq!(pl.bram_sites[0].kind, SiteKind::Bram);
+        let bles: Vec<u8> = pl.lutff_sites.iter().map(|(_, b)| *b).collect();
+        assert_eq!(bles, vec![0, 1, 2, 3]);
+        let sites: Vec<_> = pl.lutff_sites.iter().map(|(s, _)| (s.x, s.y)).collect();
+        assert!(sites.windows(2).all(|w| w[0] == w[1]), "4 LUTFFs fit one CLB");
+    }
+
+    #[test]
+    fn overflow_uses_next_clb() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::new("big");
+        d.add_port("clk", helion_ir::PortDir::In);
+        d.add_port("led", helion_ir::PortDir::Out);
+        for i in 0..9u32 {
+            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", format!("u_ff{i}"), "CLK");
+            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+        }
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("q0", "u_iob", "I");
+        d.connect("led", "u_iob", "PAD");
+        let p = pack(&d, &dev).unwrap();
+        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        assert_eq!(pl.lutff_sites.len(), 9);
+        assert_eq!(pl.lutff_sites[8].1, 0);
+        assert_ne!(
+            (pl.lutff_sites[0].0.x, pl.lutff_sites[0].0.y),
+            (pl.lutff_sites[8].0.x, pl.lutff_sites[8].0.y)
+        );
     }
 }

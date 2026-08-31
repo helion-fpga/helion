@@ -1,14 +1,12 @@
 [package]
-name = "helion-bits"
+name = "helion-drc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 helion-device = { workspace = true }
-helion-route = { workspace = true }
-
-[dev-dependencies]
 helion-ir = { workspace = true }
 helion-pack = { workspace = true }
 helion-place = { workspace = true }
+helion-route = { workspace = true }

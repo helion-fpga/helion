@@ -29,6 +29,14 @@ impl FeatureSet {
     pub fn set_ff_used(&mut self, x: u32, y: u32, ble: u32, used: bool) {
         self.set(format!("CLB_X{x}Y{y}.BLE{ble}.FF.USED"), used);
     }
+
+    pub fn set_imux(&mut self, x: u32, y: u32, mux: u32, sel: u8) {
+        for b in 0..5u32 {
+            if (sel >> b) & 1 == 1 {
+                self.set(format!("CLB_X{x}Y{y}.IMUX[{mux}][{b}]"), true);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,20 +65,16 @@ impl Bitstream {
     }
 }
 
-/// Bitgen a routed design: every LUTFF INIT/FF, I0 feedback, IOB src CLB/BLE, DSP USED.
+/// Bitgen a routed design: every LUTFF INIT/FF, IMUX from PathFinder, IOB src, DSP/BRAM USED.
 pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
     let mut feats = FeatureSet::new();
     for (i, lutff) in routed.placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = routed.placed.lutff_sites[i];
         feats.set_init(site.x, site.y, ble as u32, lutff.init);
         feats.set_ff_used(site.x, site.y, ble as u32, true);
-        let mux = (ble as u32) * 8;
-        let sel = 16u32 + ble as u32;
-        for b in 0..5u32 {
-            if (sel >> b) & 1 == 1 {
-                feats.set(format!("CLB_X{}Y{}.IMUX[{mux}][{b}]", site.x, site.y), true);
-            }
-        }
+    }
+    for m in &routed.imux {
+        feats.set_imux(m.x, m.y, m.mux, m.sel);
     }
     let mut bs = assemble(dev, &feats)?;
     for r in &routed.iob_src {
@@ -85,6 +89,11 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         let site = routed.placed.mac_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
         bs.frames.insert((Far::DSP, i as u16, 0), word);
+    }
+    for (i, _b) in routed.placed.packed.brams.iter().enumerate() {
+        let site = routed.placed.bram_sites[i];
+        let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
+        bs.frames.insert((Far::BRAM, i as u16, 0), word);
     }
     bs.packets = encode_packets(dev.idcode, &bs.frames);
     Ok(bs)
@@ -204,6 +213,10 @@ fn sha256_lite(data: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use helion_device::Device;
+    use helion_ir::{CellKind, Design};
+    use helion_pack::pack;
+    use helion_place::place;
+    use helion_route::route;
 
     #[test]
     fn assemble_sets_init0() {
@@ -216,5 +229,22 @@ mod tests {
         assert_eq!((frame >> loc.bit) & 1, 1);
         assert_eq!(loc.far.minor, 0);
         assert_eq!(loc.bit, 0);
+    }
+
+    #[test]
+    fn bram_bitgen_is_not_a_noop() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.add_cell("u_bram", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let bs = bitgen(&dev, &r).unwrap();
+        let empty = Bitstream::empty(&dev);
+        assert_ne!(bs.frames, empty.frames);
+        assert!(
+            bs.frames.keys().any(|(b, _, _)| *b == Far::BRAM),
+            "BRAM frame missing"
+        );
     }
 }

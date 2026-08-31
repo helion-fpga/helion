@@ -1,31 +1,221 @@
 use helion_bits::{bitgen, Bitstream};
 use helion_device::Device;
+use helion_drc::check_routed;
 use helion_fabric::Fabric;
 use helion_hw::{prog_sim, Tap};
 use helion_ir::Design;
 use helion_pack::pack;
-use helion_place::place;
-use helion_route::route;
+use helion_place::{place, place_with, PlaceOpts};
+use helion_route::{route, Routed};
+use helion_sta::{create_clock, report_timing_placed, TimingResult};
+use helion_sv::synth_sv_path;
+use std::path::Path;
+
+struct Compiled {
+    dev: Device,
+    design: Design,
+    routed: Routed,
+    bits: Bitstream,
+    timing: TimingResult,
+}
+
+fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, String> {
+    let design = synth_sv_path(Path::new(path))?;
+    compile_design(design, part, timing_weight)
+}
+
+fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Compiled, String> {
+    let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
+    let packed = pack(&design, &dev)?;
+    let placed = place_with(&packed, &dev, PlaceOpts { timing_weight })?;
+    let routed = route(&placed, &dev)?;
+    check_routed(&design, &routed, &dev).fail()?;
+    let bits = bitgen(&dev, &routed)?;
+    let mut clks = Vec::new();
+    create_clock(&mut clks, "clk", 10_000, "clk");
+    let timing = report_timing_placed(&design, &placed, &clks)?;
+    Ok(Compiled {
+        dev,
+        design,
+        routed,
+        bits,
+        timing,
+    })
+}
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let cmd = args.next().unwrap_or_else(|| "--help".into());
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        args.push("--help".into());
+    }
+    let cmd = args.remove(0);
     match cmd.as_str() {
         "--version" | "-V" | "version" => {
             println!("helion {}", env!("CARGO_PKG_VERSION"));
         }
         "doctor" => doctor(),
-        "hw" => hw(args.collect()),
-        "--help" | "-h" | "help" => {
-            eprintln!(
-                "helion {v}\n  helion --version\n  helion doctor\n  helion hw program --cable sim",
-                v = env!("CARGO_PKG_VERSION")
-            );
-        }
+        "hw" => hw(args),
+        "synth" => cmd_synth(&args),
+        "impl" => cmd_impl(&args),
+        "run" => cmd_run(&args),
+        "report_timing" => cmd_timing(&args),
+        "bitstream" => cmd_bits(&args),
+        "--help" | "-h" | "help" => usage(),
         other => {
             eprintln!("unknown command {other}");
+            usage();
             std::process::exit(2);
         }
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "helion {v}
+  helion --version
+  helion doctor
+  helion synth <file.sv> [--part P]
+  helion impl <file.sv> [--part P]
+  helion run <file.sv> [--cycles N] [--part P]
+  helion report_timing <file.sv>
+  helion bitstream <file.sv> -o out.hbits
+  helion hw program --cable sim",
+        v = env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn take_flag(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+fn positional(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-o" || args[i].starts_with("--") {
+            i += 2;
+            continue;
+        }
+        return Some(args[i].as_str());
+    }
+    None
+}
+
+fn cmd_synth(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let d = synth_sv_path(Path::new(path)).unwrap_or_else(|e| {
+        eprintln!("synth: {e}");
+        std::process::exit(1);
+    });
+    let luts = d.lut_inits();
+    println!(
+        "synth {} cells={} luts={} inits={luts:#x?} part={part}",
+        d.name,
+        d.cells.len(),
+        luts.len()
+    );
+}
+
+fn cmd_impl(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+        eprintln!("impl: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "impl {} lutffs={} iobs={} brams={} pathfinder_iters={} hops={} frames={}",
+        c.design.name,
+        c.routed.placed.packed.lutffs.len(),
+        c.routed.placed.packed.iobs.len(),
+        c.routed.placed.packed.brams.len(),
+        c.routed.pathfinder_iters,
+        c.routed.iob_src.first().map(|r| r.hops).unwrap_or(0),
+        c.bits.frames.len()
+    );
+}
+
+fn cmd_run(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let cycles: u32 = take_flag(args, "--cycles")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+        eprintln!("run: {e}");
+        std::process::exit(1);
+    });
+    let mut sim = Fabric::new(&c.dev);
+    sim.program(&c.bits).unwrap();
+    sim.finish_startup();
+    let iob = c.routed.iob_src[0].iob;
+    let mut wave = Vec::new();
+    let mut changes = 0u32;
+    let mut last = sim.led_at(iob.0, iob.1);
+    for i in 0..cycles {
+        sim.step_user();
+        let now = sim.led_at(iob.0, iob.1);
+        wave.push(now);
+        if now != last {
+            changes += 1;
+            last = now;
+        }
+        let _ = i;
+    }
+    let bits: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
+    println!(
+        "run {} part={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
+        c.design.name,
+        c.dev.part,
+        sim.stat.init as u8,
+        sim.stat.done as u8,
+        sim.stat.eos as u8,
+        sim.stat.gwe as u8,
+        sim.stat.gsr as u8,
+        sim.stat.gts as u8,
+        sim.stat.crc_err as u8
+    );
+    println!(
+        "WNS_PS={} R2R_PS={} IOB_PS={} LED[{cycles}]={bits} changes={changes}",
+        c.timing.wns_ps, c.timing.r2r_ps, c.timing.iob_ps
+    );
+    println!("ok");
+}
+
+fn cmd_timing(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+        eprintln!("report_timing: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
+        c.design.name,
+        c.timing.wns_ps,
+        c.timing.tns_ps,
+        c.timing.endpoints,
+        c.timing.r2r_ps,
+        c.timing.iob_ps
+    );
+}
+
+fn cmd_bits(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let out = take_flag(args, "-o").or_else(|| take_flag(args, "--output"));
+    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+        eprintln!("bitstream: {e}");
+        std::process::exit(1);
+    });
+    if let Some(p) = out {
+        std::fs::write(&p, &c.bits.packets).unwrap_or_else(|e| {
+            eprintln!("write {p}: {e}");
+            std::process::exit(1);
+        });
+        println!("wrote {p} {} bytes", c.bits.packets.len());
+    } else {
+        println!("bitstream {} bytes={}", c.design.name, c.bits.packets.len());
     }
 }
 
@@ -60,11 +250,12 @@ fn doctor() {
     println!("helion doctor");
     let dev = Device::load_part("HL10T-C32-1").expect("HAD");
     println!(
-        "  HAD {}: {}×{} CLB, {} LUT6, idcode {:#010x}",
+        "  HAD {}: {}×{} CLB, {} LUT6, {} BRAM18, idcode {:#010x}",
         dev.part,
         dev.interior_cols,
         dev.interior_rows,
         dev.lut6_count(),
+        dev.n_bram,
         dev.idcode
     );
     let loc = dev.locate("CLB_X2Y1.BLE0.LUT.INIT[0]").unwrap();
@@ -85,11 +276,17 @@ fn doctor() {
         st.gts as u8,
         st.crc_err as u8
     );
-    let packed = pack(&Design::structural_blinky(), &dev).unwrap();
-    let placed = place(&packed, &dev).unwrap();
-    let routed = route(&placed, &dev).unwrap();
-    let _ = bitgen(&dev, &routed).unwrap();
+    let c = compile_design(Design::structural_blinky(), "HL10T-C32-1", 0.0).unwrap();
+    let _ = place(&c.routed.placed.packed, &dev);
     let _ = Fabric::new(&dev);
-    println!("  blinky pack/place/route/bitgen: ok");
+    println!("  blinky pack/place/route/bitgen/drc: ok");
+    let cc = compile_design(Design::structural_counter(), "HL10T-C32-1", 0.75).unwrap();
+    println!(
+        "  counter lutffs={} iob_ble={} pathfinder={} WNS_PS={}",
+        cc.routed.placed.packed.lutffs.len(),
+        cc.routed.iob_src[0].ble,
+        cc.routed.pathfinder_iters,
+        cc.timing.wns_ps
+    );
     println!("ok");
 }

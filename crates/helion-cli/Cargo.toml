@@ -19,3 +19,4 @@ helion-route = { workspace = true }
 helion-sv = { workspace = true }
 helion-sta = { workspace = true }
 helion-hw = { workspace = true }
+helion-drc = { workspace = true }
