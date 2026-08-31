@@ -8,3 +8,9 @@ license.workspace = true
 helion-device = { workspace = true }
 helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
+
+[dev-dependencies]
+helion-ir = { workspace = true }
+helion-pack = { workspace = true }
+helion-place = { workspace = true }
+helion-route = { workspace = true }
