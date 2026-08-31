@@ -184,49 +184,215 @@ impl IoLocs {
 
 /// Vivado-style SDC subset: `create_clock -period <ns> [get_ports <name>]`.
 pub fn load_sdc(text: &str, clocks: &mut Vec<Clock>) -> Result<(), String> {
+    let x = load_xdc(text)?;
+    clocks.extend(x.clocks);
+    if clocks.is_empty() {
+        return Err("SDC contained no create_clock".into());
+    }
+    Ok(())
+}
+
+
+fn tcl_name(joined: &str, key: &str) -> Option<String> {
+    joined.split_once(key).and_then(|(_, r)| {
+        r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .find(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Constraints {
+    pub clocks: Vec<Clock>,
+    pub input_delay_ps: BTreeMap<String, i64>,
+    pub output_delay_ps: BTreeMap<String, i64>,
+    pub false_paths: Vec<String>,
+    pub package_pins: BTreeMap<String, String>,
+}
+
+impl Constraints {
+    pub fn apply(&self, design: &mut Design) -> Result<(), String> {
+        for (port, site) in &self.package_pins {
+            design.set_loc(port, site)?;
+        }
+        Ok(())
+    }
+}
+
+/// XDC/SDC: create_clock, create_generated_clock, set_input/output_delay,
+/// set_false_path, set_property PACKAGE_PIN.
+pub fn load_xdc(text: &str) -> Result<Constraints, String> {
+    let mut c = Constraints::default();
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
-        if !line.contains("create_clock") {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.is_empty() {
             continue;
         }
-        let mut period_ns: Option<f64> = None;
-        let mut source = "clk".to_string();
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        let mut i = 0;
-        while i < toks.len() {
-            if toks[i] == "-period" {
-                period_ns = toks.get(i + 1).and_then(|s| s.parse().ok());
-                i += 2;
-                continue;
+        match toks[0] {
+            "create_clock" => {
+                let mut period_ns: Option<f64> = None;
+                let mut name = String::new();
+                let mut source = "clk".to_string();
+                let mut i = 1;
+                while i < toks.len() {
+                    if toks[i] == "-period" {
+                        period_ns = toks.get(i + 1).and_then(|s| s.parse().ok());
+                        i += 2;
+                        continue;
+                    }
+                    if toks[i] == "-name" {
+                        name = toks.get(i + 1).unwrap_or(&"clk").to_string();
+                        i += 2;
+                        continue;
+                    }
+                    let joined = toks[i..].join(" ");
+                    if let Some(n) = tcl_name(&joined, "get_ports") {
+                        source = n;
+                    }
+                    i += 1;
+                }
+                let ns = period_ns.ok_or_else(|| format!("create_clock missing -period: {line}"))?;
+                let ps = (ns * 1000.0).round() as u64;
+                if name.is_empty() {
+                    name = source.clone();
+                }
+                create_clock(&mut c.clocks, &name, ps.max(1), &source);
             }
-            if toks[i] == "-name" {
-                i += 2;
-                continue;
+            "create_generated_clock" => {
+                let mut name = "genclk".to_string();
+                let mut master = c.clocks.first().map(|k| k.name.clone()).unwrap_or_else(|| "clk".into());
+                let mut divide_by = 2u32;
+                let mut source = String::new();
+                let mut i = 1;
+                while i < toks.len() {
+                    if toks[i] == "-name" {
+                        name = toks.get(i + 1).unwrap_or(&"genclk").to_string();
+                        i += 2;
+                        continue;
+                    }
+                    if toks[i] == "-divide_by" {
+                        divide_by = toks.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(2);
+                        i += 2;
+                        continue;
+                    }
+                    if toks[i] == "-source" {
+                        let joined = toks[i..].join(" ");
+                        if let Some(n) = tcl_name(&joined, "get_ports").or_else(|| tcl_name(&joined, "get_pins")) {
+                            master = n;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    let joined = toks[i..].join(" ");
+                    if let Some(n) = tcl_name(&joined, "get_pins").or_else(|| tcl_name(&joined, "get_ports")) {
+                        source = n;
+                    }
+                    i += 1;
+                }
+                if source.is_empty() {
+                    source = name.clone();
+                }
+                if c.clocks.iter().all(|k| k.name != master) {
+                    // fall back to first clock name for -source [get_ports clk]
+                    if let Some(k) = c.clocks.first() {
+                        master = k.name.clone();
+                    }
+                }
+                create_generated_clock(&mut c.clocks, &name, &master, divide_by, &source)?;
             }
-            if toks[i].contains("get_ports") {
-                if let Some(name) = toks[i]
-                    .split_once("get_ports")
-                    .and_then(|(_, r)| r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').find(|s| !s.is_empty()))
-                    .map(|s| s.to_string())
+            "set_input_delay" | "set_output_delay" => {
+                let is_out = toks[0] == "set_output_delay";
+                let mut delay_ns: Option<f64> = None;
+                let mut port = String::new();
+                let mut i = 1;
+                while i < toks.len() {
+                    if toks[i] == "-clock" {
+                        i += 2;
+                        continue;
+                    }
+                    if delay_ns.is_none() {
+                        if let Ok(v) = toks[i].parse::<f64>() {
+                            delay_ns = Some(v);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    let joined = toks[i..].join(" ");
+                    if let Some(n) = tcl_name(&joined, "get_ports") {
+                        port = n;
+                    }
+                    i += 1;
+                }
+                let ns = delay_ns.ok_or_else(|| format!("{line}: missing delay"))?;
+                let ps = (ns * 1000.0).round() as i64;
+                if port.is_empty() {
+                    return Err(format!("{line}: missing port"));
+                }
+                if is_out {
+                    c.output_delay_ps.insert(port, ps);
+                } else {
+                    c.input_delay_ps.insert(port, ps);
+                }
+            }
+            "set_false_path" => {
+                let joined = toks.join(" ");
+                if let Some(n) = tcl_name(&joined, "get_ports")
+                    .or_else(|| tcl_name(&joined, "get_pins"))
+                    .or_else(|| tcl_name(&joined, "get_cells"))
                 {
-                    if !name.is_empty() {
-                        source = name;
+                    c.false_paths.push(n);
+                } else {
+                    c.false_paths.push(joined);
+                }
+            }
+            "set_property" => {
+                if toks.get(1).copied() == Some("PACKAGE_PIN") && toks.len() >= 3 {
+                    let site = toks[2].to_string();
+                    let joined = toks[3..].join(" ");
+                    let port = tcl_name(&joined, "get_ports").unwrap_or_default();
+                    if !port.is_empty() {
+                        c.package_pins.insert(port, site);
                     }
                 }
             }
-            i += 1;
+            _ => {}
         }
-        let ns = period_ns.ok_or_else(|| format!("create_clock missing -period: {line}"))?;
-        let ps = (ns * 1000.0).round() as u64;
-        create_clock(clocks, &source, ps.max(1), &source);
     }
-    if clocks.is_empty() {
-        return Err("SDC contained no create_clock".into());
+    Ok(c)
+}
+
+pub fn apply_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
+    xdc.apply(design)
+}
+
+/// STA with XDC delays/false paths applied.
+pub fn report_timing_xdc(
+    design: &Design,
+    clocks: &[Clock],
+    xdc: &Constraints,
+) -> Result<TimingResult, String> {
+    let clks = if xdc.clocks.is_empty() {
+        clocks.to_vec()
+    } else {
+        xdc.clocks.clone()
+    };
+    let mut r = report_timing(design, &clks)?;
+    let false_out = !xdc.false_paths.is_empty();
+    let out_d = xdc.output_delay_ps.values().copied().max().unwrap_or(0);
+    let in_d = xdc.input_delay_ps.values().copied().max().unwrap_or(0);
+    if false_out {
+        r.iob_ps = 0;
+        r.setup_ps = r.r2r_ps;
+    } else {
+        r.setup_ps = r.r2r_ps + out_d + in_d;
     }
-    Ok(())
+    r.wns_ps = clks[0].period_ps as i64 - r.setup_ps;
+    r.tns_ps = r.wns_ps.min(0);
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -329,5 +495,50 @@ mod tests {
         let d = Design::structural_blinky();
         let r = report_timing(&d, &clks).unwrap();
         assert_ne!(r.wns_ps, 10_000);
+    }
+
+    #[test]
+    fn xdc_delays_false_path_package_pin_bound_in_place() {
+        let xdc = r#"
+create_clock -period 10.000 [get_ports clk]
+create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]
+set_input_delay -clock clk 1.5 [get_ports clk]
+set_output_delay -clock clk 2.0 [get_ports led]
+set_false_path -from [get_ports clk] -to [get_ports led]
+set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
+"#;
+        let c = load_xdc(xdc).unwrap();
+        assert_eq!(c.clocks.len(), 2);
+        assert!(c.clocks[1].generated);
+        assert_eq!(c.clocks[1].period_ps, 20_000);
+        assert_eq!(c.output_delay_ps["led"], 2000);
+        assert_eq!(c.input_delay_ps["clk"], 1500);
+        assert!(c.false_paths.iter().any(|p| p == "clk" || p == "led"));
+        assert_eq!(c.package_pins["led"], "IOB_X5Y0");
+
+        let mut d = Design::structural_blinky();
+        apply_xdc(&mut d, &c).unwrap();
+        assert_eq!(d.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("LOC"), Some("IOB_X5Y0"));
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        assert_eq!(pl.iob_sites[0].x, 5, "PACKAGE_PIN must bind IOB in place");
+        assert_eq!(pl.lutff_sites[0].0.x, 5);
+
+        let base = report_timing(&d, &c.clocks).unwrap();
+        let with_d = {
+            let mut only = c.clone();
+            only.false_paths.clear();
+            report_timing_xdc(&d, &c.clocks, &only).unwrap()
+        };
+        assert!(
+            with_d.wns_ps < base.wns_ps,
+            "output/input delay must worsen WNS ({} vs {})",
+            with_d.wns_ps,
+            base.wns_ps
+        );
+        let falsep = report_timing_xdc(&d, &c.clocks, &c).unwrap();
+        assert_eq!(falsep.setup_ps, falsep.r2r_ps, "false path must drop IOB from setup");
+        assert_ne!(with_d.wns_ps, falsep.wns_ps);
     }
 }
