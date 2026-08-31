@@ -3,9 +3,12 @@
 use helion_bits::{bitgen, eco_lut, Bitstream};
 use helion_device::Device;
 use helion_ir::{CellKind, Design};
-use helion_pack::pack;
-use helion_place::place;
+use helion_pack::{pack, Packed};
+use helion_place::{place, Placed};
 use helion_route::{route, Routed};
+use helion_sta::{create_clock, report_timing_routed};
+use helion_hw::prog_sim;
+use helion_debug::insert_ila;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -17,8 +20,13 @@ pub enum Mode {
 pub struct Session {
     pub mode: Mode,
     pub design: Option<Design>,
+    pub packed: Option<Packed>,
+    pub placed: Option<Placed>,
     pub bitstream: Option<Bitstream>,
     pub routed: Option<Routed>,
+    pub hw_open: bool,
+    pub programmed: bool,
+    pub part: String,
 }
 
 impl Session {
@@ -26,20 +34,153 @@ impl Session {
         Self {
             mode,
             design: None,
+            packed: None,
+            placed: None,
             bitstream: None,
             routed: None,
+            hw_open: false,
+            programmed: false,
+            part: "HL10T-C32-1".into(),
         }
     }
 
-    pub fn impl_design(&mut self, d: Design, dev: &Device) -> Result<(), String> {
-        let packed = pack(&d, dev)?;
-        let placed = place(&packed, dev)?;
-        let routed = route(&placed, dev)?;
-        let bits = bitgen(dev, &routed)?;
+    pub fn synth_design(&mut self, d: Design) {
         self.design = Some(d);
-        self.bitstream = Some(bits);
-        self.routed = Some(routed);
+        self.packed = None;
+        self.placed = None;
+        self.routed = None;
+        self.bitstream = None;
+        self.programmed = false;
+    }
+
+    pub fn opt_design_step(&mut self) -> Result<usize, String> {
+        let d = self.design.as_mut().ok_or("opt_design: no design")?;
+        Ok(opt_design(d))
+    }
+
+    pub fn place_design(&mut self, dev: &Device) -> Result<(), String> {
+        let d = self.design.as_ref().ok_or("place_design: no design")?;
+        let packed = pack(d, dev)?;
+        let placed = place(&packed, dev)?;
+        self.packed = Some(packed);
+        self.placed = Some(placed);
+        self.routed = None;
+        self.bitstream = None;
         Ok(())
+    }
+
+    pub fn route_design(&mut self, dev: &Device) -> Result<(), String> {
+        let placed = self.placed.as_ref().ok_or("route_design: not placed")?;
+        let routed = route(placed, dev)?;
+        self.routed = Some(routed);
+        self.bitstream = None;
+        Ok(())
+    }
+
+    pub fn write_bitstream(&mut self, dev: &Device) -> Result<&Bitstream, String> {
+        let routed = self.routed.as_ref().ok_or("write_bitstream: not routed")?;
+        let bits = bitgen(dev, routed)?;
+        self.bitstream = Some(bits);
+        Ok(self.bitstream.as_ref().unwrap())
+    }
+
+    pub fn write_hnf(&self) -> Result<String, String> {
+        Ok(self.design.as_ref().ok_or("write_hnf: no design")?.to_hnf())
+    }
+
+    pub fn report_timing(&self, dev: &Device) -> Result<String, String> {
+        let _ = dev;
+        let d = self.design.as_ref().ok_or("report_timing: no design")?;
+        let r = self.routed.as_ref().ok_or("report_timing: not routed")?;
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let t = report_timing_routed(d, r, &clks)?;
+        Ok(format!(
+            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
+            d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
+        ))
+    }
+
+    pub fn report_utilization(&self, dev: &Device) -> Result<String, String> {
+        let p = self
+            .placed
+            .as_ref()
+            .map(|pl| &pl.packed)
+            .or(self.packed.as_ref())
+            .ok_or("report_utilization: not packed")?;
+        Ok(format!(
+            "report_utilization LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+            p.lutffs.len(),
+            dev.lut6_count(),
+            p.iobs.len(),
+            dev.iob_sites().count(),
+            p.brams.len(),
+            dev.n_bram,
+            p.macs.len(),
+            dev.n_dsp
+        ))
+    }
+
+    pub fn open_hw_manager(&mut self) {
+        self.hw_open = true;
+    }
+
+    pub fn program_hw(&mut self, dev: &Device) -> Result<String, String> {
+        if !self.hw_open {
+            return Err("program_hw: open_hw_manager first".into());
+        }
+        let bits = self.bitstream.as_ref().ok_or("program_hw: no bitstream")?;
+        let st = prog_sim(dev, bits)?;
+        self.programmed = true;
+        Ok(format!(
+            "program_hw DONE={} GWE={} CRC_ERR={}",
+            st.done as u8, st.gwe as u8, st.crc_err as u8
+        ))
+    }
+
+    pub fn mark_debug(&mut self, net: &str) -> Result<(), String> {
+        let d = self.design.as_mut().ok_or("mark_debug: no design")?;
+        d.mark_debug(net)?;
+        insert_ila(d, net)?;
+        Ok(())
+    }
+
+    pub fn set_property(&mut self, key: &str, val: &str, obj: &str) -> Result<(), String> {
+        let d = self.design.as_mut().ok_or("set_property: no design")?;
+        if key.eq_ignore_ascii_case("DONT_TOUCH") || key.eq_ignore_ascii_case("keep") {
+            d.set_cell_attr(obj, "DONT_TOUCH", val)?;
+        } else if key.eq_ignore_ascii_case("mark_debug") {
+            d.set_net_attr(obj, "mark_debug", val)?;
+        } else if key.eq_ignore_ascii_case("LOC") || key.eq_ignore_ascii_case("PACKAGE_PIN") {
+            d.set_loc(obj, val)?;
+        } else {
+            d.set_cell_attr(obj, key, val)?;
+        }
+        Ok(())
+    }
+
+    pub fn impl_design(&mut self, d: Design, dev: &Device) -> Result<(), String> {
+        self.synth_design(d);
+        self.place_design(dev)?;
+        self.route_design(dev)?;
+        self.write_bitstream(dev)?;
+        Ok(())
+    }
+
+    pub fn restore_session(bytes: &[u8], dev: &Device) -> Result<Self, String> {
+        let (mode, hash, design) = Self::restore_with_ir(bytes)?;
+        let mut s = Self::new(mode);
+        s.part = dev.part.clone();
+        if let Some(d) = design {
+            s.impl_design(d, dev)?;
+        }
+        let h2 = s.blinky_hash().unwrap_or(0);
+        if h2 != hash {
+            return Err(format!(
+                "hckp restore hash mismatch stored {hash:#x} got {h2:#x}"
+            ));
+        }
+        Ok(s)
     }
 
     pub fn eco(&mut self, dev: &Device, cell: &str, new_init: u64) -> Result<(), String> {
@@ -310,6 +451,48 @@ mod tests {
         s.eco(&dev, "u_lut", 0xAAAA_AAAA_AAAA_AAAA).unwrap();
         assert_ne!(s.blinky_hash(), h0, "ECO must change bitstream hash");
         let _ = PortDir::In;
+    }
+
+    #[test]
+    fn tcl_session_steps_hit_engines_and_hckp_restores_hash() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::NonProject);
+        s.synth_design(Design::structural_counter());
+        assert!(s.design.is_some());
+        assert!(s.placed.is_none(), "synth must not place");
+        let n = s.opt_design_step().unwrap();
+        let _ = n;
+        s.place_design(&dev).unwrap();
+        assert!(s.placed.is_some());
+        assert!(s.routed.is_none(), "place_design must not route");
+        s.route_design(&dev).unwrap();
+        assert!(s.routed.is_some());
+        assert!(s.bitstream.is_none(), "route_design must not bitgen");
+        let bits = s.write_bitstream(&dev).unwrap();
+        assert!(!bits.frames.is_empty());
+        let hnf = s.write_hnf().unwrap();
+        assert!(hnf.starts_with("HNF 1"));
+        let t = s.report_timing(&dev).unwrap();
+        assert!(t.contains("WNS_PS="), "{t}");
+        assert!(t.contains("HOLD_PS="), "{t}");
+        assert!(!t.contains("report_timing ok"), "must hit STA engine: {t}");
+        let u = s.report_utilization(&dev).unwrap();
+        assert!(u.contains("LUTFF=4/8192"), "{u}");
+        s.set_property("DONT_TOUCH", "true", "u_lut0").unwrap();
+        assert!(s.design.as_ref().unwrap().cell("u_lut0").unwrap().attrs.flag("DONT_TOUCH"));
+        s.open_hw_manager();
+        let hw = s.program_hw(&dev).unwrap();
+        assert!(hw.contains("DONE=1"), "{hw}");
+        let h0 = s.blinky_hash().unwrap();
+        let ck = s.checkpoint();
+        let s2 = Session::restore_session(&ck, &dev).unwrap();
+        assert_eq!(s2.blinky_hash(), Some(h0), ".hckp restore must match bitstream hash");
+        let die = dev.report_die();
+        assert!(die.contains("HL10T-C32-1"));
+        s.mark_debug("q3").unwrap();
+        assert!(s.design.as_ref().unwrap().net("q3").unwrap().attrs.flag("mark_debug"));
+        assert!(get_cells(s.design.as_ref().unwrap(), None).iter().any(|c| c.contains("lut")));
+        assert!(!get_pins(s.design.as_ref().unwrap(), "u_lut0").is_empty());
     }
 
     #[test]

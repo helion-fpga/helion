@@ -100,9 +100,13 @@ dependencies = [
 name = "helion-gui"
 version = "1.0.0"
 dependencies = [
+ "helion-bits",
+ "helion-debug",
  "helion-device",
+ "helion-hw",
  "helion-ir",
  "helion-proj",
+ "helion-sta",
  "helion-sv",
 ]
 
@@ -172,12 +176,14 @@ name = "helion-proj"
 version = "1.0.0"
 dependencies = [
  "helion-bits",
+ "helion-debug",
  "helion-device",
  "helion-hw",
  "helion-ir",
  "helion-pack",
  "helion-place",
  "helion-route",
+ "helion-sta",
 ]
 
 [[package]]
@@ -205,6 +211,7 @@ dependencies = [
  "helion-ir",
  "helion-pack",
  "helion-place",
+ "helion-route",
 ]
 
 [[package]]

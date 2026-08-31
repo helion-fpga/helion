@@ -266,6 +266,23 @@ impl Device {
         &self.featuremap
     }
 
+    /// HAD die/device report (queried by doctor / Tcl, not hardcoded in CAD).
+    pub fn report_die(&self) -> String {
+        format!(
+            "die 0 part={} sku={} cols={} rows={} LUT6={} BRAM18={} DSP={} idcode={:#010x} sites_clb={} sites_iob={}",
+            self.part,
+            self.sku,
+            self.interior_cols,
+            self.interior_rows,
+            self.lut6_count(),
+            self.n_bram,
+            self.n_dsp,
+            self.idcode,
+            self.clb_sites().count(),
+            self.iob_sites().count()
+        )
+    }
+
     pub fn locate_clb(&self, x: u32, y: u32, feature: &str) -> Result<BitLoc, String> {
         let major = self
             .clb_major(x, y)
@@ -432,6 +449,17 @@ mod tests {
         let frac = d.locate("CLB_X2Y1.BLE0.LUT.FRACTURE").unwrap();
         assert_eq!(frac.far.minor, 4);
         assert_eq!(frac.bit, 0);
+    }
+
+    #[test]
+    fn report_die_is_from_had() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        let r = d.report_die();
+        assert!(r.contains("HL10T-C32-1"), "{r}");
+        assert!(r.contains("cols=32"), "{r}");
+        assert!(r.contains("LUT6=8192"), "{r}");
+        assert!(r.contains("0x00011a1f") || r.contains("0x00011A1F"), "{r}");
+        assert!(r.contains("BRAM18=8"), "{r}");
     }
 
     #[test]
