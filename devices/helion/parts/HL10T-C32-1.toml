@@ -1,0 +1,20 @@
+# Helion-T bring-up part. CAD must query this file, not hardcode a part name.
+part = "HL10T-C32-1"
+sku = "T"
+part_id = 1
+idcode = 0x00011A1F
+had_version = 1
+interior_cols = 32
+interior_rows = 32
+n_ble = 8
+# Grid: x=0 IO, x=1 CLK spine, x=2..33 CLB, x=34 IO; y=0 IO, y=1..32 interior, y=33 IO
+clb_x0 = 2
+clb_y0 = 1
+io_left = 1
+clk_spine = 1
+w = 80
+user_io = 32
+gclk = 8
+bram18 = 8
+mac27 = 0
+speed = 1

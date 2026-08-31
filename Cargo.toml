@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/helion-ir",
+    "crates/helion-device",
+    "crates/helion-bits",
+    "crates/helion-fabric",
+    "crates/helion-pack",
+    "crates/helion-place",
+    "crates/helion-route",
+    "crates/helion-cli",
+    "crates/helion-sv",
+    "crates/helion-sta",
+    "crates/helion-hw",
+    "crates/helion-debug",
+    "crates/helion-sim",
+    "crates/helion-ipxact",
+    "crates/helion-bd",
+    "crates/helion-proj",
+    "crates/helion-gui",
+    "crates/helion-lab",
+    "crates/helion-lib",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/helion-fpga/helion"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+helion-ir = { path = "crates/helion-ir" }
+helion-device = { path = "crates/helion-device" }
+helion-bits = { path = "crates/helion-bits" }
+helion-fabric = { path = "crates/helion-fabric" }
+helion-pack = { path = "crates/helion-pack" }
+helion-place = { path = "crates/helion-place" }
+helion-route = { path = "crates/helion-route" }
+helion-sv = { path = "crates/helion-sv" }
+helion-sta = { path = "crates/helion-sta" }
+helion-hw = { path = "crates/helion-hw" }
+helion-debug = { path = "crates/helion-debug" }
+helion-sim = { path = "crates/helion-sim" }
+helion-ipxact = { path = "crates/helion-ipxact" }
+helion-bd = { path = "crates/helion-bd" }
+helion-proj = { path = "crates/helion-proj" }
+helion-gui = { path = "crates/helion-gui" }
+helion-lab = { path = "crates/helion-lab" }
+helion-lib = { path = "crates/helion-lib" }

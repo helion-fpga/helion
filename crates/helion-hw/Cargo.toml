@@ -1,0 +1,10 @@
+[package]
+name = "helion-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-device = { workspace = true }
+helion-bits = { workspace = true }
+helion-fabric = { workspace = true }

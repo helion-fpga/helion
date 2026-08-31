@@ -1,0 +1,9 @@
+had_version = 1
+family = "helion"
+arch_gen = 10
+k = 6
+n_ble = 8
+ff_per_ble = 1
+frame_bits = 128
+clb_minors = 16
+sb = "uwilton"

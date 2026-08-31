@@ -1,0 +1,15 @@
+[package]
+name = "helion-debug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-device = { workspace = true }
+helion-bits = { workspace = true }
+helion-fabric = { workspace = true }
+helion-ir = { workspace = true }
+helion-pack = { workspace = true }
+helion-place = { workspace = true }
+helion-route = { workspace = true }
+helion-hw = { workspace = true }
