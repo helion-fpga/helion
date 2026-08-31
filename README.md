@@ -131,6 +131,8 @@ dist/Helion.app/Contents/MacOS/helion run \
     dist/Helion.app/Contents/Resources/examples/counter.sv --cycles 16
 ```
 
+`helion gui` execs the sibling `helion-ide` / `Helion` binary (same directory as the CLI).
+
 Without the `.app`, from the repo checkout:
 
 ```bash
