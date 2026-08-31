@@ -81,6 +81,7 @@ fn main() {
         "eco" => cmd_eco(&args),
         "pblock" => cmd_pblock(&args),
         "project" => cmd_project(&args),
+        "hnf" => cmd_hnf(&args),
         "--help" | "-h" | "help" => usage(),
         other => {
             eprintln!("unknown command {other}");
@@ -104,6 +105,7 @@ fn usage() {
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
   helion project <file.prj>
+  helion hnf <file.sv> [-o out.hnf]
   helion hw program --cable sim",
         v = env!("CARGO_PKG_VERSION")
     );
@@ -319,6 +321,24 @@ fn cmd_pblock(args: &[String]) {
         pb.frames.len(),
         c.bits.frames.len()
     );
+}
+
+fn cmd_hnf(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let d = synth_any(path).unwrap_or_else(|e| {
+        eprintln!("hnf: {e}");
+        std::process::exit(1);
+    });
+    let text = d.to_hnf();
+    if let Some(out) = take_flag(args, "-o").or_else(|| take_flag(args, "--output")) {
+        std::fs::write(&out, &text).unwrap_or_else(|e| {
+            eprintln!("write {out}: {e}");
+            std::process::exit(1);
+        });
+        println!("wrote {out} {} bytes", text.len());
+    } else {
+        print!("{text}");
+    }
 }
 
 fn cmd_project(args: &[String]) {

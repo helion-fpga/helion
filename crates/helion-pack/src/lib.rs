@@ -31,6 +31,8 @@ pub struct PackedLutFf {
 pub struct PackedIob {
     pub cell: String,
     pub from_net: String,
+    /// Optional `IOB_XxYy` from IR port LOC.
+    pub loc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,9 +86,16 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             let net = design
                 .net_on(&c.name, "I")
                 .ok_or_else(|| format!("IOB {} has no I net", c.name))?;
+            let pad = design.net_on(&c.name, "PAD").unwrap_or("");
+            let loc = design
+                .ports
+                .iter()
+                .find(|p| p.name == pad)
+                .and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
             iobs.push(PackedIob {
                 cell: c.name.clone(),
                 from_net: net.to_string(),
+                loc,
             });
         }
     }

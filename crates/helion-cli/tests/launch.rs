@@ -92,4 +92,13 @@ fn version_and_doctor() {
     let po = String::from_utf8_lossy(&pr.stdout);
     assert!(po.contains("PACKAGE_PIN=1"), "{po}");
     assert!(po.contains("create_clock=1"), "{po}");
+
+    let hnf = Command::new(bin)
+        .args(["hnf", counter.to_str().unwrap()])
+        .output()
+        .expect("hnf");
+    assert!(hnf.status.success(), "{}", String::from_utf8_lossy(&hnf.stderr));
+    let hs = String::from_utf8_lossy(&hnf.stdout);
+    assert!(hs.contains("HNF 1"), "{hs}");
+    assert!(hs.contains("cell u_lut"), "{hs}");
 }

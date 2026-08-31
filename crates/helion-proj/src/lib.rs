@@ -79,13 +79,23 @@ impl Session {
             Mode::Project => 1,
             Mode::NonProject => 2,
         });
-        if let Some(h) = self.blinky_hash() {
-            v.extend_from_slice(&h.to_le_bytes());
+        let h = self.blinky_hash().unwrap_or(0);
+        v.extend_from_slice(&h.to_le_bytes());
+        if let Some(d) = &self.design {
+            let hnf = d.to_hnf();
+            let b = hnf.as_bytes();
+            v.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            v.extend_from_slice(b);
         }
         v
     }
 
     pub fn restore(bytes: &[u8]) -> Result<(Mode, u32), String> {
+        let (m, h, _) = Self::restore_with_ir(bytes)?;
+        Ok((m, h))
+    }
+
+    pub fn restore_with_ir(bytes: &[u8]) -> Result<(Mode, u32, Option<Design>), String> {
         if bytes.len() < 9 || &bytes[0..4] != b"HCKP" {
             return Err("bad hckp".into());
         }
@@ -95,7 +105,18 @@ impl Session {
             _ => return Err("bad mode".into()),
         };
         let hash = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-        Ok((mode, hash))
+        let design = if bytes.len() >= 13 {
+            let n = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+            if bytes.len() >= 13 + n {
+                let text = std::str::from_utf8(&bytes[13..13 + n]).map_err(|e| e.to_string())?;
+                Some(Design::from_hnf(text)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok((mode, hash, design))
     }
 }
 
@@ -213,6 +234,9 @@ pub fn opt_design(d: &mut Design) -> usize {
         if iob_nets.contains(q) {
             continue;
         }
+        if c.attrs.flag("DONT_TOUCH") || c.attrs.flag("keep") || ff.attrs.flag("DONT_TOUCH") {
+            continue;
+        }
         drop.push(c.name.clone());
         drop.push(ff.name.clone());
     }
@@ -241,6 +265,10 @@ mod tests {
         assert_eq!(Some(h), proj.blinky_hash());
         let cells = get_cells(proj.design.as_ref().unwrap(), Some("lut"));
         assert_eq!(cells, vec!["u_lut"]);
+        let (_, _, ir) = Session::restore_with_ir(&ck).unwrap();
+        let ir = ir.expect("checkpoint must embed HNF");
+        assert_eq!(ir.name, "blinky");
+        assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
         assert!(get_pins(proj.design.as_ref().unwrap(), "u_lut").iter().any(|p| p.ends_with("/I0")));
     }
@@ -262,6 +290,19 @@ mod tests {
         assert!(d.cells.len() < before);
         assert!(d.cell("u_lut").is_some());
         assert!(d.cell("dead_lut").is_none());
+
+        let mut kept = Design::structural_blinky();
+        kept.add_cell("dead_lut", CellKind::Lut6 { init: 0 });
+        kept.add_cell("dead_ff", CellKind::Hff);
+        kept.connect("clk", "dead_ff", "CLK");
+        kept.connect("dead_d", "dead_lut", "O");
+        kept.connect("dead_d", "dead_ff", "D");
+        kept.connect("dead_q", "dead_ff", "Q");
+        kept.connect("dead_q", "dead_lut", "I0");
+        kept.dont_touch("dead_lut").unwrap();
+        let before = kept.cells.len();
+        assert_eq!(opt_design(&mut kept), 0);
+        assert_eq!(kept.cells.len(), before, "DONT_TOUCH must survive opt");
 
         let mut s = Session::new(Mode::NonProject);
         s.impl_design(Design::structural_blinky(), &dev).unwrap();

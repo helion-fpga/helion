@@ -30,3 +30,5 @@ VHDL is 1.1, not a gate. Legal fence: no Project X-Ray, no UNISIM, no AMD/Intel/
 Tcl client (tree / console / flow rail): `read_sv`, `get_cells`, `get_nets`, `opt_design`, `write_bitstream`, `create_clock`.
 
 Also: hierarchical SV, VHDL blinky (`examples/blinky.vhd`), HLS C (`examples/blinky.c`), ECO LUT INIT, partial pblock bitstreams.
+
+**IR (HNF):** cells/nets/ports carry `DONT_TOUCH`, `mark_debug`, `LOC`. `helion hnf file.sv` writes a round-trippable netlist. Checkpoints embed HNF. `(* keep *)` / `(* mark_debug *)` and `for` generate unroll into that IR.
