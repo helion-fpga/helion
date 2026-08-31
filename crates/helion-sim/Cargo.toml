@@ -1,0 +1,8 @@
+[package]
+name = "helion-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-ir = { workspace = true }

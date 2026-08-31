@@ -1,0 +1,16 @@
+# Helion-T + one DSP site for MAC27 pack/place (same LUT array as T).
+part = "HL10T-DSP1"
+sku = "T"
+part_id = 1
+idcode = 0x00011A1F
+had_version = 1
+interior_cols = 32
+interior_rows = 32
+n_ble = 8
+clb_x0 = 2
+clb_y0 = 1
+w = 80
+mac27 = 1
+dsp_x = 8
+dsp_y0 = 1
+speed = 1

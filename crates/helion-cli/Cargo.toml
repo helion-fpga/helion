@@ -1,0 +1,21 @@
+[package]
+name = "helion-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "helion"
+path = "src/main.rs"
+
+[dependencies]
+helion-device = { workspace = true }
+helion-bits = { workspace = true }
+helion-fabric = { workspace = true }
+helion-ir = { workspace = true }
+helion-pack = { workspace = true }
+helion-place = { workspace = true }
+helion-route = { workspace = true }
+helion-sv = { workspace = true }
+helion-sta = { workspace = true }
+helion-hw = { workspace = true }

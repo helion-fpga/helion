@@ -1,0 +1,10 @@
+[package]
+name = "helion-place"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-device = { workspace = true }
+helion-pack = { workspace = true }
+helion-ir = { workspace = true }
