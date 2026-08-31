@@ -71,6 +71,7 @@ fn main() {
             println!("helion {}", env!("CARGO_PKG_VERSION"));
         }
         "doctor" => doctor(),
+        "gui" => cmd_gui(),
         "hw" => hw(args),
         "synth" => cmd_synth(&args),
         "impl" => cmd_impl(&args),
@@ -97,6 +98,7 @@ fn usage() {
         "helion {v}
   helion --version
   helion doctor
+  helion gui
   helion synth <file.sv> [--part P]
   helion impl <file.sv> [--part P]
   helion run <file.sv> [--cycles N] [--part P]
@@ -447,8 +449,54 @@ fn hw(args: Vec<String>) {
     );
 }
 
+fn cmd_gui() {
+    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("helion").to_path_buf());
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    let candidates = [dir.join("Helion"), dir.join("helion-ide")];
+    let Some(gui) = candidates.into_iter().find(|p| p.is_file()) else {
+        eprintln!(
+            "helion-ide not found next to {}; build it with `cargo build -p helion-gui --bin helion-ide`",
+            exe.display()
+        );
+        std::process::exit(2);
+    };
+    let st = std::process::Command::new(&gui)
+        .args(std::env::args().skip(2))
+        .status();
+    match st {
+        Ok(s) if s.success() => {}
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("spawn {}: {e}", gui.display());
+            std::process::exit(127);
+        }
+    }
+}
+
 fn doctor() {
     println!("helion doctor");
+    println!("  target {}", env!("HELION_TARGET"));
+    println!(
+        "  host {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    match std::process::Command::new("rustc").arg("-vV").output() {
+        Ok(o) if o.status.success() => {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if line.starts_with("release:") || line.starts_with("host:") || line.starts_with("llvm:")
+                {
+                    println!("  rustc {line}");
+                }
+            }
+        }
+        Ok(o) => println!(
+            "  rustc not usable: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => println!("  rustc not on PATH: {e}"),
+    }
+    println!("  HAD path {}", Device::devices_dir().display());
     let dev = Device::load_part("HL10T-C32-1").expect("HAD");
     println!("  {}", dev.report_die());
     println!(

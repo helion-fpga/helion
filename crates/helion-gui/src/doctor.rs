@@ -9,34 +9,10 @@ pub fn version_line() -> String {
     format!("helion-ide {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Compile-time target triple. `aarch64-apple-darwin` on the Mac build; whatever
-/// this host is when the Linux CI binary is built. Never guessed at runtime.
+/// Compile-time target triple from cargo (`TARGET`). `aarch64-apple-darwin` on
+/// the Mac build; whatever this host is when the Linux binary is built.
 pub fn target_triple() -> &'static str {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        "aarch64-apple-darwin"
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    {
-        "x86_64-apple-darwin"
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-        "aarch64-unknown-linux-gnu"
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-        "x86_64-unknown-linux-gnu"
-    }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_os = "macos"),
-        all(target_arch = "x86_64", target_os = "macos"),
-        all(target_arch = "aarch64", target_os = "linux"),
-        all(target_arch = "x86_64", target_os = "linux"),
-    )))]
-    {
-        "unknown"
-    }
+    env!("HELION_TARGET")
 }
 
 /// Toolchain + HAD + target triple, one block the user can paste.
@@ -72,6 +48,7 @@ pub fn doctor_report() -> String {
             let _ = writeln!(s, "rustc not on PATH: {e}");
         }
     }
+    let _ = writeln!(s, "HAD path {}", Device::devices_dir().display());
     match Device::load_part("HL10T-C32-1") {
         Ok(dev) => {
             let _ = writeln!(
@@ -84,6 +61,9 @@ pub fn doctor_report() -> String {
                 dev.n_dsp
             );
             let _ = writeln!(s, "  {}", dev.report_die());
+            for line in dev.report_featuremap().lines() {
+                let _ = writeln!(s, "  {line}");
+            }
         }
         Err(e) => {
             let _ = writeln!(s, "HAD load failed: {e}");
@@ -112,6 +92,11 @@ mod tests {
             "doctor must print the HAD idcode: {d}"
         );
         assert!(d.contains("LUT6=8192"), "{d}");
+        assert!(d.contains("HAD path"), "{d}");
+        assert!(d.contains("featuremap part=HL10T-C32-1"), "{d}");
+        assert!(d.contains("BLE0.LUT.INIT[0] minor 0 bit 0"), "{d}");
+        assert!(!d.contains("MISSING"), "{d}");
+        assert!(d.contains(env!("HELION_TARGET")), "{d}");
         assert!(d.trim_end().ends_with("ok"), "{d}");
         // This Linux VM is not aarch64-apple-darwin; the Mac triple is a compile-time cfg.
         #[cfg(target_os = "macos")]

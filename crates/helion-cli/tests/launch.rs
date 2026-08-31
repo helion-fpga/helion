@@ -26,6 +26,31 @@ fn version_and_doctor() {
     assert!(out.contains("BLE0.LUT.INIT[0] minor 0 bit 0"), "{out}");
     assert!(out.contains("BLE0.LUT.FRACTURE minor 4 bit 0"), "{out}");
     assert!(!out.contains("MISSING"), "{out}");
+    assert!(
+        out.contains("target "),
+        "doctor must print the compile-time target triple: {out}"
+    );
+    assert!(
+        out.contains(env!("HELION_TARGET")),
+        "doctor target must match this binary's triple {}: {out}",
+        env!("HELION_TARGET")
+    );
+    assert!(
+        out.contains("HAD path"),
+        "doctor must print the runtime HAD path: {out}"
+    );
+    assert!(
+        out.contains("rustc release:") || out.contains("rustc not"),
+        "doctor must report the rustc toolchain: {out}"
+    );
+    assert!(out.contains("host "), "doctor must report host arch/os: {out}");
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(
+            !out.contains("aarch64-apple-darwin"),
+            "Linux doctor must not claim to be a Mac binary: {out}"
+        );
+    }
 
     let hw = Command::new(bin)
         .args(["hw", "program", "--cable", "sim"])

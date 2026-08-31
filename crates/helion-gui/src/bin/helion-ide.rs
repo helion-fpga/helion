@@ -6,28 +6,46 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::{doctor, FlowStep, IdeModel, StepState};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::Path;
 
-fn main() -> eframe::Result {
+fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--version") | Some("-V") | Some("version") => {
             println!("{}", doctor::version_line());
-            return Ok(());
+            return;
         }
         Some("--doctor") | Some("doctor") => {
             print!("{}", doctor::doctor_report());
-            return Ok(());
+            return;
         }
         Some("--help") | Some("-h") | Some("help") => {
             eprintln!(
                 "helion-ide {}
-  helion-ide              open the IDE window
+  helion-ide                         open the IDE window (eframe)
+  helion-ide --headless [file.sv]    synth + report_timing, print WNS (no window)
+  helion-ide --stdin                 Tcl console + flow rail on stdin (no window)
   helion-ide --version
   helion-ide --doctor
-  helion-ide --help",
+  helion-ide --help
+
+Windowed path is eframe when a display is available. This Linux host
+cannot verify the Mac .app; use scripts/build-macos-app.sh on Apple Silicon.",
                 env!("CARGO_PKG_VERSION")
             );
-            return Ok(());
+            return;
+        }
+        Some("--stdin") => {
+            run_stdin();
+            return;
+        }
+        Some("--headless") => {
+            match args.next() {
+                Some(path) => run_headless_oneshot(&path),
+                None => run_stdin(),
+            }
+            return;
         }
         Some(other) => {
             eprintln!("unknown argument {other}; try helion-ide --help");
@@ -35,7 +53,128 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
-    run_gui()
+    if !io::stdin().is_terminal() {
+        run_stdin();
+        return;
+    }
+    if let Err(e) = run_gui() {
+        eprintln!("helion-ide: window failed ({e}); falling back to stdin Tcl console");
+        eprintln!("hint: pass --stdin, or on macOS run scripts/build-macos-app.sh");
+        run_stdin();
+    }
+}
+
+fn parse_step(s: &str) -> Result<FlowStep, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "synth" | "synthesis" | "synth_design" => Ok(FlowStep::Synthesis),
+        "opt" | "opt_design" => Ok(FlowStep::Opt),
+        "place" | "place_design" => Ok(FlowStep::Place),
+        "route" | "route_design" => Ok(FlowStep::Route),
+        "bits" | "bitstream" | "write_bitstream" => Ok(FlowStep::Bitstream),
+        other => Err(format!("unknown flow step {other}")),
+    }
+}
+
+fn handle_line(ide: &mut IdeModel, line: &str) -> Result<String, String> {
+    let t = line.trim();
+    if t.is_empty() {
+        return Ok(String::new());
+    }
+    if t == "quit" || t == "exit" {
+        return Ok("__QUIT__".into());
+    }
+    if t == "help" {
+        return Ok(
+            "open <file> | flow synth|opt|place|route|bits | rail | tree | timing | util | <tcl>"
+                .into(),
+        );
+    }
+    if t == "rail" {
+        let s = FlowStep::ALL
+            .iter()
+            .map(|st| format!("{}={:?}", st.label(), ide.step_state(*st)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Ok(s);
+    }
+    if t == "tree" {
+        let mut o = String::new();
+        if let Some(top) = &ide.tree.top {
+            o.push_str(&format!("top={top}"));
+        }
+        for (c, k) in &ide.tree.cells {
+            o.push_str(&format!(" cell={c}:{k}"));
+        }
+        for n in &ide.tree.nets {
+            o.push_str(&format!(" net={n}"));
+        }
+        return Ok(o);
+    }
+    if t == "timing" {
+        return Ok(ide.timing_text());
+    }
+    if t == "util" {
+        return Ok(ide.utilization_text());
+    }
+    if let Some(path) = t.strip_prefix("open ") {
+        return ide.open_source(Path::new(path.trim()));
+    }
+    if let Some(step) = t.strip_prefix("flow ") {
+        return ide.run_step(parse_step(step)?);
+    }
+    ide.exec(t)
+}
+
+fn run_headless_oneshot(path: &str) {
+    let p = Path::new(path);
+    let mut ide = IdeModel::new();
+    if let Err(e) = ide.open_source(p) {
+        eprintln!("synth {}: {e}", p.display());
+        std::process::exit(1);
+    }
+    match ide.exec("report_timing") {
+        Ok(out) => {
+            println!("{out}");
+            if let Some(wns) = ide.wns_ps() {
+                if !out.contains("WNS_PS=") {
+                    println!("WNS_PS={wns}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("report_timing: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_stdin() {
+    let mut ide = IdeModel::new();
+    println!("{}", doctor::version_line());
+    println!("target {}", doctor::target_triple());
+    println!("part {}", ide.part());
+    println!("stdin Tcl console + flow rail. `help` for commands, `quit` to exit.");
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("stdin: {e}");
+                break;
+            }
+        };
+        match handle_line(&mut ide, &line) {
+            Ok(out) if out == "__QUIT__" => break,
+            Ok(out) => {
+                if !out.is_empty() {
+                    println!("{out}");
+                }
+            }
+            Err(e) => println!("ERROR {e}"),
+        }
+        let _ = stdout.flush();
+    }
 }
 
 fn run_gui() -> eframe::Result {
@@ -70,9 +209,7 @@ impl HelionIde {
     }
 
     fn example(&self, name: &str) -> std::path::PathBuf {
-        helion_device::Device::workspace_root()
-            .join("examples")
-            .join(name)
+        helion_device::Device::examples_dir().join(name)
     }
 }
 
