@@ -293,6 +293,42 @@ impl Device {
         )
     }
 
+    /// HAD FeatureMap text report: where the shipped packer puts each feature.
+    /// Queried by `helion doctor` and the Tcl `report_featuremap`; the CAD never
+    /// hardcodes these offsets.
+    pub fn report_featuremap(&self) -> String {
+        let fm = &self.featuremap;
+        let mut s = format!(
+            "featuremap part={} minors={} frame_bits={} features={} sites_clb={} sites_iob={} sites_bram={} sites_dsp={}\n",
+            self.part,
+            fm.n_minors,
+            fm.frame_bits,
+            fm.bits.len(),
+            self.clb_sites().count(),
+            self.iob_sites().count(),
+            self.bram_sites().count(),
+            self.dsp_sites().count()
+        );
+        for feature in [
+            "BLE0.LUT.INIT[0]",
+            "BLE0.LUT.INIT[63]",
+            "BLE7.LUT.INIT[0]",
+            "BLE0.LUT.FRACTURE",
+            "BLE0.FF.USED",
+            "BLE0.FF.INIT",
+            "IMUX[0][0]",
+            "IMUX[63][4]",
+        ] {
+            match fm.minor_bit(feature) {
+                Some((minor, bit)) => {
+                    s.push_str(&format!("  {feature} minor {minor} bit {bit}\n"));
+                }
+                None => s.push_str(&format!("  {feature} MISSING\n")),
+            }
+        }
+        s
+    }
+
     pub fn locate_clb(&self, x: u32, y: u32, feature: &str) -> Result<BitLoc, String> {
         let major = self
             .clb_major(x, y)
@@ -470,6 +506,32 @@ mod tests {
         assert!(r.contains("LUT6=8192"), "{r}");
         assert!(r.contains("0x00011a1f") || r.contains("0x00011A1F"), "{r}");
         assert!(r.contains("BRAM18=8"), "{r}");
+    }
+
+    #[test]
+    fn report_featuremap_is_from_the_packer() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        let r = d.report_featuremap();
+        assert!(r.contains("part=HL10T-C32-1"), "{r}");
+        assert!(r.contains("minors=16"), "{r}");
+        assert!(r.contains("frame_bits=128"), "{r}");
+        assert!(r.contains("sites_clb=1024"), "{r}");
+        assert!(r.contains("sites_bram=8"), "{r}");
+        assert!(!r.contains("MISSING"), "every reported feature must exist: {r}");
+        // The report must agree with locate(), not with a hardcoded string.
+        for feature in ["BLE0.LUT.INIT[0]", "BLE0.LUT.FRACTURE", "IMUX[0][0]"] {
+            let loc = d.locate(&format!("CLB_X2Y1.{feature}")).unwrap();
+            assert!(
+                r.contains(&format!("{feature} minor {} bit {}", loc.far.minor, loc.bit)),
+                "report row for {feature} must match locate() minor {} bit {}: {r}",
+                loc.far.minor,
+                loc.bit
+            );
+        }
+        // INIT[63] is the last bit of BLE0's 64-bit word.
+        assert!(r.contains("BLE0.LUT.INIT[63] minor 0 bit 63"), "{r}");
+        // BLE7 INIT starts a whole 64-bit group later.
+        assert!(r.contains("BLE7.LUT.INIT[0] minor 3 bit 64"), "{r}");
     }
 
     #[test]

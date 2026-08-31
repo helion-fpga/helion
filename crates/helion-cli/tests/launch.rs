@@ -19,6 +19,13 @@ fn version_and_doctor() {
     let out = String::from_utf8_lossy(&d.stdout);
     assert!(out.contains("0x00011a1f") || out.contains("0x00011A1F"), "{out}");
     assert!(out.contains("ok"), "{out}");
+    // doctor must publish the HAD die/site/FeatureMap text report.
+    assert!(out.contains("sites_clb=1024"), "doctor must report HAD CLB sites: {out}");
+    assert!(out.contains("sites_iob=32"), "doctor must report HAD IOB sites: {out}");
+    assert!(out.contains("featuremap part=HL10T-C32-1"), "{out}");
+    assert!(out.contains("BLE0.LUT.INIT[0] minor 0 bit 0"), "{out}");
+    assert!(out.contains("BLE0.LUT.FRACTURE minor 4 bit 0"), "{out}");
+    assert!(!out.contains("MISSING"), "{out}");
 
     let hw = Command::new(bin)
         .args(["hw", "program", "--cable", "sim"])
