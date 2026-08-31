@@ -456,6 +456,47 @@ mod tests {
         assert!(!fab.frame_bit(loc.far.block_type, loc.far.major, loc.far.minor, loc.bit));
     }
 
+    /// A bitstream that went out through `.hbits` packets and came back must
+    /// still program the die to the gold counter waveform.
+    #[test]
+    fn decoded_hbits_programs_gold_counter() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let bits = bitgen(&dev, &r).unwrap();
+        let (idcode, frames) = helion_bits::decode_packets(&bits.packets).unwrap();
+        assert_eq!(idcode, dev.idcode);
+        assert!(!frames.is_empty(), "decoded stream must carry frames");
+
+        let mut round_tripped = bits.clone();
+        round_tripped.frames = frames;
+        let iob = r.iob_src[0].iob;
+        let mut wave = Vec::new();
+        let mut fab = Fabric::new(&dev);
+        fab.program(&round_tripped).unwrap();
+        fab.finish_startup();
+        for _ in 0..16 {
+            fab.step_user();
+            wave.push(fab.led_at(iob.0, iob.1));
+        }
+        assert!(wave[0..7].iter().all(|b| !b), "cnt 1..7 LED=0 {wave:?}");
+        assert!(wave[7..15].iter().all(|b| *b), "cnt 8..15 LED=1 {wave:?}");
+        assert!(!wave[15], "wrap {wave:?}");
+
+        // Same waveform as the un-encoded bitstream: the stream is lossless.
+        let mut direct = Fabric::new(&dev);
+        direct.program(&bits).unwrap();
+        direct.finish_startup();
+        let gold: Vec<bool> = (0..16)
+            .map(|_| {
+                direct.step_user();
+                direct.led_at(iob.0, iob.1)
+            })
+            .collect();
+        assert_eq!(wave, gold);
+    }
+
     fn nine_inv(last_init: u64) -> Design {
         let mut d = Design::new("dfx");
         d.add_port("clk", PortDir::In);

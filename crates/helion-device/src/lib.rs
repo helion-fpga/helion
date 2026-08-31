@@ -56,6 +56,16 @@ impl Far {
             | ((self.major as u32) << 8)
             | (self.minor as u32)
     }
+
+    /// Inverse of [`Far::encode`] (`.hbits` decode / readback).
+    pub fn decode(word: u32) -> Self {
+        Self {
+            block_type: (word >> 28) as u8,
+            die: ((word >> 24) & 0xF) as u8,
+            major: ((word >> 8) & 0xFFFF) as u16,
+            minor: (word & 0xFF) as u8,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -460,6 +470,30 @@ mod tests {
         assert!(r.contains("LUT6=8192"), "{r}");
         assert!(r.contains("0x00011a1f") || r.contains("0x00011A1F"), "{r}");
         assert!(r.contains("BRAM18=8"), "{r}");
+    }
+
+    #[test]
+    fn far_encode_decode_round_trips() {
+        for (block, major, minor) in [
+            (Far::CLB_IO_CLK, 0u16, 0u8),
+            (Far::CLB_IO_CLK, 1023, 15),
+            (Far::IOB, 31, 0),
+            (Far::BRAM, 7, 9),
+            (Far::DSP, 3, 1),
+        ] {
+            let far = Far {
+                block_type: block,
+                die: 0,
+                major,
+                minor,
+            };
+            let back = Far::decode(far.encode());
+            assert_eq!(back, far, "FAR {far:?} must survive encode/decode");
+        }
+        // Consecutive FARs inside one major differ by 1 (frame runs rely on it).
+        let a = Far { block_type: Far::CLB_IO_CLK, die: 0, major: 5, minor: 3 };
+        let b = Far { block_type: Far::CLB_IO_CLK, die: 0, major: 5, minor: 4 };
+        assert_eq!(a.encode() + 1, b.encode());
     }
 
     #[test]

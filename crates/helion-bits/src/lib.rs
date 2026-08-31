@@ -118,40 +118,54 @@ pub fn assemble(dev: &Device, feats: &FeatureSet) -> Result<Bitstream, String> {
     Ok(bs)
 }
 
+/// A WRITE_FDRI length field is 16-bit, so a contiguous run is chunked at
+/// 4095 frames (65520 bytes) instead of silently truncating the length.
+pub const MAX_RUN_FRAMES: usize = 4095;
+
+/// `.hbits` header: HBIT, version, idcode, flags, body length, body hash, header CRC.
+pub const HBITS_HEADER_BYTES: usize = 4 + 2 + 4 + 4 + 8 + 32 + 4;
+
+/// Encode frames as `.hbits` packets. Only frames that carry configuration are
+/// written; a frame the stream never addresses keeps its reset value, so a
+/// 4-LUT design does not pay for every frame on the die.
 pub fn encode_packets(idcode: u32, frames: &BTreeMap<(u8, u16, u8), u128>) -> Vec<u8> {
     let mut body = Vec::new();
     // SYNC
     body.push(0x01);
     body.extend_from_slice(&4u16.to_le_bytes());
     body.extend_from_slice(b"HELI");
+    let mut run_start: Option<u32> = None;
     let mut last_far: Option<u32> = None;
     let mut run: Vec<u128> = Vec::new();
-    let mut keys: Vec<_> = frames.keys().copied().collect();
-    keys.sort();
-    for (block, major, minor) in keys {
+    // BTreeMap iterates in (block, major, minor) order already.
+    for ((block, major, minor), payload) in frames {
+        if *payload == 0 {
+            continue;
+        }
         let far = Far {
-            block_type: block,
+            block_type: *block,
             die: 0,
-            major,
-            minor,
+            major: *major,
+            minor: *minor,
         }
         .encode();
-        let payload = frames[&(block, major, minor)];
-        if let Some(prev) = last_far {
-            if far == prev + 1 {
-                run.push(payload);
-                last_far = Some(far);
-                continue;
+        let contiguous = last_far.map(|prev| far == prev + 1).unwrap_or(false);
+        if !contiguous || run.len() >= MAX_RUN_FRAMES {
+            if let Some(start) = run_start {
+                if !run.is_empty() {
+                    flush_run(&mut body, start, &run);
+                }
             }
-            flush_run(&mut body, prev + 1 - run.len() as u32, &run);
             run.clear();
+            run_start = Some(far);
         }
-        run.push(payload);
+        run.push(*payload);
         last_far = Some(far);
     }
-    if !run.is_empty() {
-        let start = last_far.unwrap() + 1 - run.len() as u32;
-        flush_run(&mut body, start, &run);
+    if let Some(start) = run_start {
+        if !run.is_empty() {
+            flush_run(&mut body, start, &run);
+        }
     }
     // CRC_CHECK
     body.push(0x21);
@@ -175,11 +189,88 @@ pub fn encode_packets(idcode: u32, frames: &BTreeMap<(u8, u16, u8), u128>) -> Ve
     out
 }
 
+/// Parse a `.hbits` stream back into (idcode, frames). Frames the stream does
+/// not address are absent, i.e. still at their reset value.
+pub fn decode_packets(bytes: &[u8]) -> Result<(u32, BTreeMap<(u8, u16, u8), u128>), String> {
+    if bytes.len() < HBITS_HEADER_BYTES || &bytes[0..4] != b"HBIT" {
+        return Err("not a .hbits stream".into());
+    }
+    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if version != 1 {
+        return Err(format!("unsupported .hbits version {version}"));
+    }
+    let idcode = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
+    let body_len = u64::from_le_bytes(bytes[14..22].try_into().unwrap()) as usize;
+    let stored_hash = &bytes[22..54];
+    let hdr_crc = u32::from_le_bytes(bytes[54..58].try_into().unwrap());
+    if crc32c(&bytes[..54]) != hdr_crc {
+        return Err("header CRC mismatch".into());
+    }
+    let body = bytes
+        .get(HBITS_HEADER_BYTES..HBITS_HEADER_BYTES + body_len)
+        .ok_or_else(|| "truncated .hbits body".to_string())?;
+    if sha256_lite(body) != stored_hash {
+        return Err("body hash mismatch".into());
+    }
+    let mut frames = BTreeMap::new();
+    let mut far = 0u32;
+    let mut synced = false;
+    let mut i = 0usize;
+    while i < body.len() {
+        let op = body[i];
+        let len = u16::from_le_bytes(
+            body.get(i + 1..i + 3)
+                .ok_or_else(|| "truncated packet header".to_string())?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let payload = body
+            .get(i + 3..i + 3 + len)
+            .ok_or_else(|| format!("truncated payload for packet {op:#04x}"))?;
+        match op {
+            0x01 => {
+                if payload != b"HELI" {
+                    return Err("bad SYNC word".into());
+                }
+                synced = true;
+            }
+            0x10 => {
+                if len != 4 {
+                    return Err("WRITE_FAR must be 4 bytes".into());
+                }
+                far = u32::from_le_bytes(payload.try_into().unwrap());
+            }
+            0x11 => {
+                if !synced {
+                    return Err("WRITE_FDRI before SYNC".into());
+                }
+                if len % 16 != 0 {
+                    return Err(format!("WRITE_FDRI length {len} is not a whole frame"));
+                }
+                for chunk in payload.chunks(16) {
+                    let f = Far::decode(far);
+                    frames.insert(
+                        (f.block_type, f.major, f.minor),
+                        u128::from_le_bytes(chunk.try_into().unwrap()),
+                    );
+                    far += 1;
+                }
+            }
+            0x21 => {}
+            0x02 => synced = false,
+            other => return Err(format!("unknown packet {other:#04x}")),
+        }
+        i += 3 + len;
+    }
+    Ok((idcode, frames))
+}
+
 fn flush_run(body: &mut Vec<u8>, far: u32, run: &[u128]) {
     body.push(0x10); // WRITE_FAR
     body.extend_from_slice(&4u16.to_le_bytes());
     body.extend_from_slice(&far.to_le_bytes());
     let bytes = run.len() * 16;
+    debug_assert!(bytes <= u16::MAX as usize, "FDRI run must fit the length field");
     body.push(0x11); // WRITE_FDRI
     body.extend_from_slice(&(bytes as u16).to_le_bytes());
     for w in run {
@@ -318,6 +409,82 @@ mod tests {
             bs.frames.keys().any(|(b, _, _)| *b == Far::BRAM),
             "BRAM frame missing"
         );
+    }
+
+    /// Dense encoding (every frame on the die, zeros included) as shipped through
+    /// commit 9b864af: 16384 CLB frames * 16 B. The sparse encoder must beat it.
+    const DENSE_BYTES: usize = 272_485;
+
+    #[test]
+    fn packet_stream_is_sparse_and_round_trips() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let bs = bitgen(&dev, &r).unwrap();
+
+        let nonzero: BTreeMap<(u8, u16, u8), u128> = bs
+            .frames
+            .iter()
+            .filter(|(_, w)| **w != 0)
+            .map(|(k, w)| (*k, *w))
+            .collect();
+        assert!(!nonzero.is_empty(), "counter must configure some frames");
+
+        // Sparse: only configured frames are written.
+        let (idcode, decoded) = decode_packets(&bs.packets).unwrap();
+        assert_eq!(idcode, dev.idcode);
+        assert_eq!(
+            decoded, nonzero,
+            "every configured frame must survive encode/decode and nothing else may be written"
+        );
+        assert!(
+            bs.packets.len() < DENSE_BYTES / 100,
+            "sparse .hbits must beat the dense {DENSE_BYTES} B stream by >100x, got {}",
+            bs.packets.len()
+        );
+        // Not a no-op: the stream still carries the LUT INIT payloads.
+        let (site, ble) = r.placed.lutff_sites[0];
+        let major = dev.clb_major(site.x, site.y).unwrap();
+        assert!(
+            decoded.keys().any(|(b, maj, _)| *b == Far::CLB_IO_CLK && *maj == major),
+            "the placed CLB major must be in the stream"
+        );
+        assert_eq!(
+            readback_lut_init(&dev, &bs, site.x, site.y, ble as u32).unwrap(),
+            helion_ir::INC4_INIT[0]
+        );
+    }
+
+    #[test]
+    fn fdri_runs_fit_the_length_field() {
+        // A dense die-wide write used to overflow the 16-bit FDRI length and
+        // silently truncate; runs are now chunked, so it decodes exactly.
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut frames = BTreeMap::new();
+        for major in 0..dev.n_clb() as u16 {
+            for minor in 0..dev.clb_minors as u8 {
+                frames.insert((Far::CLB_IO_CLK, major, minor), (major as u128) << 8 | minor as u128 | 1);
+            }
+        }
+        let packets = encode_packets(dev.idcode, &frames);
+        let (_, back) = decode_packets(&packets).unwrap();
+        assert_eq!(back.len(), frames.len(), "every frame must decode");
+        assert_eq!(back, frames);
+        assert!(frames.len() > MAX_RUN_FRAMES, "must exercise run chunking");
+    }
+
+    #[test]
+    fn decode_rejects_corrupt_stream() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let bs = Bitstream::empty(&dev);
+        assert!(decode_packets(b"nope").is_err());
+        let mut bad = bs.packets.clone();
+        bad[0] = b'X';
+        assert!(decode_packets(&bad).is_err(), "magic must be checked");
+        let mut crc = bs.packets.clone();
+        crc[6] ^= 0xFF;
+        assert!(decode_packets(&crc).is_err(), "header CRC must be checked");
     }
 
     #[test]
