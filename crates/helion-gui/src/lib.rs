@@ -3,6 +3,9 @@
 
 pub const GPUI_TOOLKIT: &str = "gpui";
 
+pub mod ide;
+pub use ide::{ConsoleLine, FlowStep, IdeModel, NetlistTree, StepState, Utilization};
+
 use helion_device::Device;
 use helion_proj::{get_cells, get_nets, get_pins, opt_design, Mode, Session};
 
@@ -69,7 +72,7 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         return Ok(String::new());
     }
     if t == "hds::help" || t == "help" {
-        return Ok("hds::synth hds::impl hds::hw get_cells get_nets opt_design write_bitstream".into());
+        return Ok("hds::synth hds::impl hds::hw get_cells get_nets opt_design write_bitstream report_die report_featuremap".into());
     }
     if t == "hds::synth" {
         return Ok("synth ok".into());
@@ -205,6 +208,10 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         let ck = shell.session.checkpoint();
         return Ok(format!("write_checkpoint {} bytes hash {:#x}", ck.len(), shell.session.blinky_hash().unwrap_or(0)));
     }
+    if t == "report_featuremap" {
+        let dev = Device::load_part(&shell.part)?;
+        return Ok(dev.report_featuremap());
+    }
     if t == "report_die" || t == "report_hw_targets" {
         let dev = Device::load_part(&shell.part)?;
         return Ok(dev.report_die());
@@ -263,6 +270,12 @@ mod tests {
         let die = tcl_eval(&mut sh, "report_die").unwrap();
         assert!(die.contains("HL10T-C32-1"), "{die}");
         assert!(die.contains("LUT6=8192"), "{die}");
+        assert!(die.contains("sites_clb=1024"), "die report must list HAD sites: {die}");
+        let fm = tcl_eval(&mut sh, "report_featuremap").unwrap();
+        assert!(fm.contains("featuremap part=HL10T-C32-1"), "{fm}");
+        assert!(fm.contains("BLE0.LUT.INIT[0] minor 0 bit 0"), "{fm}");
+        assert!(fm.contains("BLE0.LUT.FRACTURE minor 4 bit 0"), "{fm}");
+        assert!(!fm.contains("MISSING"), "{fm}");
     }
 
     #[test]
