@@ -111,6 +111,7 @@ name = "helion-hls"
 version = "1.0.0"
 dependencies = [
  "helion-ir",
+ "helion-sv",
 ]
 
 [[package]]
