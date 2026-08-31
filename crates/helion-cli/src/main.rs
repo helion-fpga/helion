@@ -80,6 +80,7 @@ fn main() {
         "bitstream" => cmd_bits(&args),
         "eco" => cmd_eco(&args),
         "pblock" => cmd_pblock(&args),
+        "qor" => cmd_qor(&args),
         "project" => cmd_project(&args),
         "hnf" => cmd_hnf(&args),
         "--help" | "-h" | "help" => usage(),
@@ -104,6 +105,7 @@ fn usage() {
   helion bitstream <file.sv|.vhd|.c> -o out.hbits
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
+  helion qor <file.sv>
   helion project <file.prj>
   helion hnf <file.sv> [-o out.hnf]
   helion hw program --cable sim",
@@ -320,6 +322,35 @@ fn cmd_pblock(args: &[String]) {
         site.y,
         pb.frames.len(),
         c.bits.frames.len()
+    );
+}
+
+/// One line of QoR for a design: the axes the README table publishes and
+/// `crates/helion-cli/tests/qor.rs` gates (LUT, WNS, bitstream size, wall time).
+fn cmd_qor(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/counter.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let t0 = std::time::Instant::now();
+    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+        eprintln!("qor: {e}");
+        std::process::exit(1);
+    });
+    let elapsed_ms = t0.elapsed().as_millis();
+    let p = &c.routed.placed.packed;
+    println!(
+        "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
+        c.design.name,
+        c.dev.part,
+        p.lutffs.len(),
+        p.iobs.len(),
+        p.brams.len(),
+        p.macs.len(),
+        c.timing.wns_ps,
+        c.timing.r2r_ps,
+        c.timing.iob_ps,
+        c.bits.frames.len(),
+        c.bits.packets.len(),
+        elapsed_ms
     );
 }
 
