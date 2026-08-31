@@ -71,3 +71,75 @@ Gold waveform: `helion run examples/counter.sv --cycles 16` → `LED[16]=0000000
 Wall time: `helion qor` reports `ELAPSED_MS` for the whole synth → pack → place →
 route → STA → bitgen flow (~30 ms per example here); the gate fails above
 2000 ms, so a flow that gets slower by an order of magnitude cannot land quietly.
+
+## Run on macOS (Apple Silicon)
+
+Native desktop target is **`aarch64-apple-darwin`**. This repository is developed
+and gated on Linux (`x86_64-unknown-linux-gnu` in CI).
+
+**Verified on Linux**
+
+- `cargo test --workspace --offline`
+- the headless IDE model (`helion-gui::IdeModel`): Tcl console, flow rail, netlist tree
+- `helion-ide --version` / `--doctor` / `--headless` / `--stdin` (no window)
+- `helion doctor` prints the compile-time target triple, rustc, and the runtime HAD path
+- `scripts/build-macos-app.sh --layout-only` assembles `Helion.app` (Info.plist, icon, HAD, examples)
+
+**Not verified on this host (Linux VM — no Apple SDK, no Mach-O, no display)**
+
+- `cargo build --release --target aarch64-apple-darwin`
+- launching `dist/Helion.app` / the eframe window on a Mac
+- codesign / notarization / `.icns` via `iconutil`
+
+On an **Apple Silicon Mac** with Xcode Command Line Tools and rustup 1.85+:
+
+```bash
+git clone https://github.com/saksham-45/helion.git
+cd helion
+git pull --ff-only
+
+rustup toolchain install 1.85.0
+rustup default 1.85.0
+rustup target add aarch64-apple-darwin
+
+# same suite that is green on Linux
+cargo test --workspace
+
+# native GUI + CLI bundle (runs `cargo build --release --target aarch64-apple-darwin`)
+./scripts/build-macos-app.sh
+open dist/Helion.app
+```
+
+The bundle lands at `dist/Helion.app`:
+
+| Path | What |
+|---|---|
+| `Contents/MacOS/Helion` | windowed IDE (`helion-ide`) |
+| `Contents/MacOS/helion` | CLI |
+| `Contents/Resources/devices/helion` | HAD (FeatureMap / parts) |
+| `Contents/Resources/examples` | `counter.sv`, `blinky.sv`, … |
+| `Contents/Info.plist` | `fpga.helion.ide`, arm64-only |
+
+Launch and sanity-check:
+
+```bash
+open dist/Helion.app
+dist/Helion.app/Contents/MacOS/Helion --version
+dist/Helion.app/Contents/MacOS/Helion --doctor
+dist/Helion.app/Contents/MacOS/helion doctor
+dist/Helion.app/Contents/MacOS/helion run \
+    dist/Helion.app/Contents/Resources/examples/counter.sv --cycles 16
+```
+
+Without the `.app`, from the repo checkout:
+
+```bash
+cargo run -p helion-gui --release --target aarch64-apple-darwin --bin helion-ide
+cargo run -p helion-cli --release --target aarch64-apple-darwin -- doctor
+cargo run -p helion-cli --release --target aarch64-apple-darwin -- run examples/counter.sv --cycles 16
+cargo run -p helion-cli --release --target aarch64-apple-darwin -- project examples/blinky.prj
+```
+
+`HELION_HAD` overrides the part database (otherwise the binary searches
+`Helion.app/Contents/Resources/devices/helion`, then cwd, then the compile-time tree).
+Native arm64 only — no Rosetta, no vendor bitstream, no Docker.
