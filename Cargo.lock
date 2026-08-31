@@ -125,6 +125,10 @@ dependencies = [
  "helion-bits",
  "helion-device",
  "helion-fabric",
+ "helion-ir",
+ "helion-pack",
+ "helion-place",
+ "helion-route",
 ]
 
 [[package]]
@@ -200,7 +204,14 @@ dependencies = [
 name = "helion-sim"
 version = "1.0.0"
 dependencies = [
+ "helion-bits",
+ "helion-device",
+ "helion-fabric",
  "helion-ir",
+ "helion-pack",
+ "helion-place",
+ "helion-route",
+ "helion-sv",
 ]
 
 [[package]]

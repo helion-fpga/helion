@@ -146,4 +146,102 @@ mod tests {
         assert!(w[7..15].iter().all(|b| *b), "{w:?}");
         assert!(!w[15], "{w:?}");
     }
+
+    fn fabric_wave(d: &Design, cycles: u32) -> Vec<bool> {
+        use helion_bits::bitgen;
+        use helion_device::Device;
+        use helion_fabric::Fabric;
+        use helion_pack::pack;
+        use helion_place::place;
+        use helion_route::route;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let bits = bitgen(&dev, &r).unwrap();
+        let mut fab = Fabric::new(&dev);
+        fab.program(&bits).unwrap();
+        fab.finish_startup();
+        let iob = r.iob_src[0].iob;
+        let mut w = Vec::new();
+        for _ in 0..cycles {
+            fab.step_user();
+            w.push(fab.led_at(iob.0, iob.1));
+        }
+        w
+    }
+
+    fn six_bit_counter() -> Design {
+        let mut d = Design::new("inc6");
+        d.add_port("clk", PortDir::In);
+        d.add_port("led", PortDir::Out);
+        // bit i INIT: q[i] ^ AND(q[0..i-1]); I0=LSB
+        fn inc_init(i: u32) -> u64 {
+            let mut w = 0u64;
+            for addr in 0..64u64 {
+                let qi = (addr >> i) & 1;
+                let mut cin = 1u64;
+                for j in 0..i {
+                    cin &= (addr >> j) & 1;
+                }
+                if i == 0 {
+                    w |= ((1 - qi) & 1) << addr;
+                } else {
+                    w |= (qi ^ cin) << addr;
+                }
+            }
+            w
+        }
+        for i in 0..6u32 {
+            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init: inc_init(i) });
+            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", format!("u_ff{i}"), "CLK");
+            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            for pin in 0..=i {
+                d.connect(format!("q{pin}"), format!("u_lut{i}"), format!("I{pin}"));
+            }
+        }
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("q5", "u_iob", "I");
+        d.connect("led", "u_iob", "PAD");
+        d
+    }
+
+    #[test]
+    fn six_pin_lut_is_occupied_and_matches_fabric() {
+        let d = six_bit_counter();
+        let lut5 = d.cell("u_lut5").unwrap();
+        let pins: Vec<_> = (0..6u8)
+            .filter(|p| d.net_on("u_lut5", &format!("I{p}")).is_some())
+            .collect();
+        assert_eq!(pins, vec![0, 1, 2, 3, 4, 5], "MSB incrementer must use all 6 LUT pins");
+        match lut5.kind {
+            CellKind::Lut6 { init } => assert_ne!(init, 0x5555_5555_5555_5555, "not a 1-pin inverter"),
+            _ => panic!("lut"),
+        }
+        let ev = run_tb(&d, 64);
+        let fab = fabric_wave(&d, 64);
+        assert_eq!(ev, fab, "event sim 6-pin must agree with fabric");
+        assert!(ev[0..31].iter().all(|b| !b), "cnt 1..31 LED=0 {ev:?}");
+        assert!(ev[31..63].iter().all(|b| *b), "cnt 32..63 LED=1");
+        assert!(!ev[63], "wrap");
+    }
+
+    #[test]
+    fn event_sim_agrees_with_fabric_on_counter_and_hier() {
+        let c = Design::structural_counter();
+        let ev = run_tb(&c, 16);
+        let fab = fabric_wave(&c, 16);
+        assert_eq!(ev, fab, "counter event vs fabric {ev:?} {fab:?}");
+
+        let hier = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/hier.sv");
+        let src = std::fs::read_to_string(&hier).unwrap();
+        let d = helion_sv::synth_sv(&src, "hier.sv").unwrap();
+        let evh = run_tb(&d, 8);
+        let fabh = fabric_wave(&d, 8);
+        assert_eq!(evh, fabh, "hier event vs fabric {evh:?} {fabh:?}");
+        assert!(evh.contains(&true) && evh.contains(&false), "hier must toggle {evh:?}");
+    }
 }
