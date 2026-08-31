@@ -145,6 +145,53 @@ impl IoLocs {
     }
 }
 
+/// Vivado-style SDC subset: `create_clock -period <ns> [get_ports <name>]`.
+pub fn load_sdc(text: &str, clocks: &mut Vec<Clock>) -> Result<(), String> {
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.contains("create_clock") {
+            continue;
+        }
+        let mut period_ns: Option<f64> = None;
+        let mut source = "clk".to_string();
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let mut i = 0;
+        while i < toks.len() {
+            if toks[i] == "-period" {
+                period_ns = toks.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+                continue;
+            }
+            if toks[i] == "-name" {
+                i += 2;
+                continue;
+            }
+            if toks[i].contains("get_ports") {
+                if let Some(name) = toks[i]
+                    .split_once("get_ports")
+                    .and_then(|(_, r)| r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').find(|s| !s.is_empty()))
+                    .map(|s| s.to_string())
+                {
+                    if !name.is_empty() {
+                        source = name;
+                    }
+                }
+            }
+            i += 1;
+        }
+        let ns = period_ns.ok_or_else(|| format!("create_clock missing -period: {line}"))?;
+        let ps = (ns * 1000.0).round() as u64;
+        create_clock(clocks, &source, ps.max(1), &source);
+    }
+    if clocks.is_empty() {
+        return Err("SDC contained no create_clock".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +259,16 @@ mod tests {
         io.set_pin_loc("led", &loc_s);
         assert_eq!(io.pins["led"], loc_s);
         assert!(dev.iob_major(site.x, site.y).is_some());
+    }
+
+    #[test]
+    fn sdc_create_clock_period_ns() {
+        let mut clks = Vec::new();
+        load_sdc("create_clock -period 10.000 [get_ports clk]\n", &mut clks).unwrap();
+        assert_eq!(clks[0].period_ps, 10_000);
+        assert_eq!(clks[0].source, "clk");
+        let d = Design::structural_blinky();
+        let r = report_timing(&d, &clks).unwrap();
+        assert_ne!(r.wns_ps, 10_000);
     }
 }
