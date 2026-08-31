@@ -382,15 +382,40 @@ impl Fabric {
         for (k, w) in &bits.frames {
             self.frames.insert(*k, *w);
         }
+        self.used = self
+            .clbs
+            .keys()
+            .copied()
+            .filter(|&(x, y)| {
+                let Some(major) = self.clb_major(x, y) else {
+                    return false;
+                };
+                (0..self.clb_minors).any(|minor| {
+                    self.frames
+                        .get(&(Far::CLB_IO_CLK, major, minor as u8))
+                        .copied()
+                        .unwrap_or(0)
+                        != 0
+                })
+            })
+            .collect();
         Ok(())
+    }
+
+    pub fn frame_word(&self, block: u8, major: u16, minor: u8) -> u128 {
+        self.frames.get(&(block, major, minor)).copied().unwrap_or(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_bits::{assemble, FeatureSet};
-    use helion_device::Device;
+    use helion_bits::{assemble, bitgen, bitgen_pblock, FeatureSet};
+    use helion_device::{Device, Far};
+    use helion_ir::{CellKind, Design, PortDir};
+    use helion_pack::pack;
+    use helion_place::{place_with, PlaceOpts};
+    use helion_route::route;
 
     #[test]
     fn empty_bitstream_startup_stat() {
@@ -429,5 +454,70 @@ mod tests {
         fab.program(&bits0).unwrap();
         assert!(!fab.eval_lut(2, 1, 0, 0));
         assert!(!fab.frame_bit(loc.far.block_type, loc.far.major, loc.far.minor, loc.bit));
+    }
+
+    fn nine_inv(last_init: u64) -> Design {
+        let mut d = Design::new("dfx");
+        d.add_port("clk", PortDir::In);
+        d.add_port("led", PortDir::Out);
+        for i in 0..9u32 {
+            let init = if i == 8 { last_init } else { 0x5555_5555_5555_5555 };
+            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init });
+            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", format!("u_ff{i}"), "CLK");
+            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+        }
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("q0", "u_iob", "I");
+        d.connect("led", "u_iob", "PAD");
+        d
+    }
+
+    #[test]
+    fn dfx_rm_swap_leaves_static_frames() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let da = nine_inv(0x5555_5555_5555_5555);
+        let db = nine_inv(0xAAAA_AAAA_AAAA_AAAA);
+        let pa = pack(&da, &dev).unwrap();
+        let pbk = pack(&db, &dev).unwrap();
+        let pla = place_with(&pa, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let plb = place_with(&pbk, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        assert_ne!(
+            (pla.lutff_sites[0].0.x, pla.lutff_sites[0].0.y),
+            (pla.lutff_sites[8].0.x, pla.lutff_sites[8].0.y),
+            "RM must occupy a different CLB"
+        );
+        let ra = route(&pla, &dev).unwrap();
+        let rb = route(&plb, &dev).unwrap();
+        let full_a = bitgen(&dev, &ra).unwrap();
+        let full_b = bitgen(&dev, &rb).unwrap();
+        let (sx, sy) = (pla.lutff_sites[0].0.x, pla.lutff_sites[0].0.y);
+        let (rx, ry) = (pla.lutff_sites[8].0.x, pla.lutff_sites[8].0.y);
+        let partial = bitgen_pblock(&dev, &rb, &[(rx, ry)]).unwrap();
+        let static_maj = dev.clb_major(sx, sy).unwrap();
+        let rm_maj = dev.clb_major(rx, ry).unwrap();
+        assert_ne!(static_maj, rm_maj);
+
+        let mut fab = Fabric::new(&dev);
+        fab.program(&full_a).unwrap();
+        fab.finish_startup();
+        let static_before: Vec<_> = (0..dev.clb_minors as u8)
+            .map(|m| fab.frame_word(Far::CLB_IO_CLK, static_maj, m))
+            .collect();
+        let rm_before = fab.lut_init(rx, ry, 0);
+        assert_eq!(rm_before, 0x5555_5555_5555_5555);
+
+        fab.program_partial(&partial).unwrap();
+        let static_after: Vec<_> = (0..dev.clb_minors as u8)
+            .map(|m| fab.frame_word(Far::CLB_IO_CLK, static_maj, m))
+            .collect();
+        assert_eq!(static_before, static_after, "static frames must be unchanged after RM swap");
+        let rm_after = fab.lut_init(rx, ry, 0);
+        assert_eq!(rm_after, 0xAAAA_AAAA_AAAA_AAAA, "RM LUT must swap");
+        assert_ne!(full_a.frames, full_b.frames);
+        assert!(partial.frames.keys().all(|(b, maj, _)| *b != Far::CLB_IO_CLK || *maj == rm_maj));
     }
 }

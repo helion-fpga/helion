@@ -129,6 +129,14 @@ impl SimCable {
         Ok(())
     }
 
+    pub fn program_partial(&mut self, bits: &Bitstream) -> Result<(), String> {
+        self.tap.fabric.program_partial(bits)
+    }
+
+    pub fn fabric(&self) -> &Fabric {
+        &self.tap.fabric
+    }
+
     pub fn stat(&self) -> Stat {
         self.tap.fabric.stat.clone()
     }
@@ -170,5 +178,56 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let st = prog_empty(&dev).unwrap();
         assert!(st.done && st.gwe && !st.crc_err);
+    }
+
+    #[test]
+    fn dfx_partial_on_sim_cable() {
+        use helion_bits::{bitgen, bitgen_pblock};
+        use helion_ir::{CellKind, Design, PortDir};
+        use helion_pack::pack;
+        use helion_place::{place_with, PlaceOpts};
+        use helion_route::route;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        fn nine(last: u64) -> Design {
+            let mut d = Design::new("dfx");
+            d.add_port("clk", PortDir::In);
+            d.add_port("led", PortDir::Out);
+            for i in 0..9u32 {
+                let init = if i == 8 { last } else { 0x5555_5555_5555_5555 };
+                d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init });
+                d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+                d.connect("clk", format!("u_ff{i}"), "CLK");
+                d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+                d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+                d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+                d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+            }
+            d.add_cell("u_iob", CellKind::IobOut);
+            d.connect("q0", "u_iob", "I");
+            d.connect("led", "u_iob", "PAD");
+            d
+        }
+        let pa = pack(&nine(0x5555_5555_5555_5555), &dev).unwrap();
+        let pb = pack(&nine(0xAAAA_AAAA_AAAA_AAAA), &dev).unwrap();
+        let pla = place_with(&pa, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let plb = place_with(&pb, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let ra = route(&pla, &dev).unwrap();
+        let rb = route(&plb, &dev).unwrap();
+        let full_a = bitgen(&dev, &ra).unwrap();
+        let (rx, ry) = (pla.lutff_sites[8].0.x, pla.lutff_sites[8].0.y);
+        let (sx, sy) = (pla.lutff_sites[0].0.x, pla.lutff_sites[0].0.y);
+        let partial = bitgen_pblock(&dev, &rb, &[(rx, ry)]).unwrap();
+        let mut cable = SimCable::open(&dev);
+        cable.program(&full_a).unwrap();
+        let st_maj = dev.clb_major(sx, sy).unwrap();
+        let before = cable.fabric().frame_word(helion_device::Far::CLB_IO_CLK, st_maj, 0);
+        cable.program_partial(&partial).unwrap();
+        let after = cable.fabric().frame_word(helion_device::Far::CLB_IO_CLK, st_maj, 0);
+        assert_eq!(before, after, "sim cable partial must not touch static frames");
+        assert_eq!(
+            cable.fabric().lut_init(rx, ry, 0),
+            0xAAAA_AAAA_AAAA_AAAA
+        );
+        assert!(cable.stat().done);
     }
 }
