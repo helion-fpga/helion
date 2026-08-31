@@ -46,6 +46,15 @@ pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Insert an ILA on every net with IR attr `mark_debug`.
+pub fn insert_marked(design: &mut Design) -> Result<usize, String> {
+    let nets = design.marked_debug_nets();
+    for n in &nets {
+        insert_ila(design, n)?;
+    }
+    Ok(nets.len())
+}
+
 pub fn compile(dev: &Device, design: &Design) -> Result<(helion_route::Routed, helion_bits::Bitstream), String> {
     let packed = pack(design, dev)?;
     let placed = place(&packed, dev)?;
@@ -108,5 +117,13 @@ mod tests {
     fn ila_unknown_net_fails() {
         let mut d = Design::structural_blinky();
         assert!(insert_ila(&mut d, "no_such").is_err());
+    }
+
+    #[test]
+    fn mark_debug_attr_inserts_ila() {
+        let mut d = Design::structural_blinky();
+        d.mark_debug("q").unwrap();
+        assert_eq!(insert_marked(&mut d).unwrap(), 1);
+        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Ila { .. })));
     }
 }

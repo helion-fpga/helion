@@ -26,6 +26,14 @@ impl Default for PlaceOpts {
     }
 }
 
+fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
+    let rest = loc.strip_prefix("IOB_X")?;
+    let (xs, ys) = rest.split_once('Y')?;
+    let x: u32 = xs.parse().ok()?;
+    let y: u32 = ys.parse().ok()?;
+    sites.iter().copied().find(|s| s.x == x && s.y == y)
+}
+
 pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
     place_with(packed, dev, PlaceOpts::default())
 }
@@ -33,11 +41,15 @@ pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
 pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Placed, String> {
     let iob_all: Vec<Site> = dev.iob_sites().collect();
     let mut iob_sites = Vec::new();
-    for (i, _) in packed.iobs.iter().enumerate() {
-        let s = iob_all
-            .get(i)
-            .copied()
-            .ok_or_else(|| format!("need {} IOB sites, device has {}", packed.iobs.len(), iob_all.len()))?;
+    for (i, iob) in packed.iobs.iter().enumerate() {
+        let s = if let Some(loc) = &iob.loc {
+            parse_iob_loc(loc, &iob_all)
+                .ok_or_else(|| format!("LOC {loc} is not an IOB site"))?
+        } else {
+            *iob_all.get(i).ok_or_else(|| {
+                format!("need {} IOB sites, device has {}", packed.iobs.len(), iob_all.len())
+            })?
+        };
         iob_sites.push(s);
     }
 
@@ -168,6 +180,19 @@ mod tests {
         let pl = place(&p, &dev).unwrap();
         assert_eq!(pl.mac_sites.len(), 1);
         assert_eq!(pl.mac_sites[0].kind, SiteKind::Dsp);
+    }
+
+    #[test]
+    fn loc_attr_selects_iob_site() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_loc("led", "IOB_X5Y0").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        assert_eq!(p.iobs[0].loc.as_deref(), Some("IOB_X5Y0"));
+        let pl = place(&p, &dev).unwrap();
+        assert_eq!(pl.iob_sites[0].x, 5);
+        assert_eq!(pl.iob_sites[0].y, 0);
+        assert_eq!(pl.lutff_sites[0].0.x, 5, "LUTFF follows LOC column");
     }
 
     #[test]

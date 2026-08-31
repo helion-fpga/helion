@@ -109,6 +109,27 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         let d = shell.session.design.as_ref().ok_or("no design")?;
         return Ok(get_pins(d, cell.trim()).join(" "));
     }
+    if let Some(rest) = t.strip_prefix("set_property ") {
+        let d = shell.session.design.as_mut().ok_or("no design")?;
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 3 {
+            let key = parts[0];
+            let val = parts[1].trim_matches('"');
+            let obj = parts[2].trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+            if key.eq_ignore_ascii_case("DONT_TOUCH") || key.eq_ignore_ascii_case("keep") {
+                d.set_cell_attr(obj, "DONT_TOUCH", val)?;
+            } else if key.eq_ignore_ascii_case("mark_debug") {
+                d.set_net_attr(obj, "mark_debug", val)?;
+            } else if key.eq_ignore_ascii_case("LOC") || key.eq_ignore_ascii_case("PACKAGE_PIN") {
+                d.set_loc(obj, val)?;
+            }
+            return Ok(format!("set_property {key} {val} {obj}"));
+        }
+    }
+    if t == "write_hnf" {
+        let d = shell.session.design.as_ref().ok_or("no design")?;
+        return Ok(d.to_hnf());
+    }
     if t == "write_bitstream" {
         impl_if_needed(shell)?;
         let n = shell
@@ -155,6 +176,9 @@ mod tests {
         assert!(r.contains("luts 4"), "{r}");
         assert!(tcl_eval(&mut sh, "get_cells").unwrap().contains("u_lut"));
         assert!(tcl_eval(&mut sh, "get_nets").unwrap().contains("cnt_3"));
+        let sp = tcl_eval(&mut sh, "set_property DONT_TOUCH true u_lut0").unwrap();
+        assert!(sp.contains("DONT_TOUCH"), "{sp}");
+        assert!(tcl_eval(&mut sh, "write_hnf").unwrap().starts_with("HNF 1"));
         let bits = tcl_eval(&mut sh, "write_bitstream").unwrap();
         assert!(bits.contains("bytes"), "{bits}");
         assert_eq!(
