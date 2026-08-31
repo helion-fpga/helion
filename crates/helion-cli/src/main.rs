@@ -7,7 +7,7 @@ use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
 use helion_route::{route, Routed};
-use helion_sta::{create_clock, load_sdc, report_timing_placed, TimingResult};
+use helion_sta::{create_clock, load_sdc, report_timing_routed, TimingResult};
 use helion_hls::synth_c_path;
 use helion_proj::load_prj;
 use helion_sv::synth_sv_path;
@@ -50,7 +50,7 @@ fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Comp
     let bits = bitgen(&dev, &routed)?;
     let mut clks = Vec::new();
     create_clock(&mut clks, "clk", 10_000, "clk");
-    let timing = report_timing_placed(&design, &placed, &clks)?;
+    let timing = report_timing_routed(&design, &routed, &clks)?;
     Ok(Compiled {
         dev,
         design,
@@ -227,7 +227,7 @@ fn cmd_timing(args: &[String]) {
             eprintln!("sdc: {e}");
             std::process::exit(1);
         });
-        timing = report_timing_placed(&c.design, &c.routed.placed, &clks).unwrap_or_else(|e| {
+        timing = report_timing_routed(&c.design, &c.routed, &clks).unwrap_or_else(|e| {
             eprintln!("report_timing: {e}");
             std::process::exit(1);
         });
