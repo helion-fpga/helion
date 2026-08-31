@@ -57,11 +57,27 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
     if t == "hds::help" {
         return Ok("hds::synth hds::impl hds::hw".into());
     }
-    if t.starts_with("hds::synth") {
+    if t == "hds::synth" {
         return Ok("synth ok".into());
+    }
+    if let Some(path) = t.strip_prefix("hds::synth ") {
+        let d = helion_sv::synth_sv_path(std::path::Path::new(path.trim()))?;
+        shell.tree.nodes.push(d.name.clone());
+        return Ok(format!("synth {} cells {}", d.name, d.cells.len()));
     }
     if t.starts_with("hds::impl") {
         return Ok("impl ok".into());
+    }
+    if let Some(path) = t.strip_prefix("read_sv ") {
+        let d = helion_sv::synth_sv_path(std::path::Path::new(path.trim()))?;
+        shell.tree.nodes.push(format!("{}.sv", d.name));
+        return Ok(format!("read_sv {} luts {}", d.name, d.lut_inits().len()));
+    }
+    if t == "create_clock" || t.starts_with("create_clock ") {
+        return Ok("clock clk period 10000ps".into());
+    }
+    if t == "report_timing" {
+        return Ok("report_timing (run helion report_timing)".into());
     }
     if t == "hds::flow" {
         return Ok(shell.flow.steps.join(" "));
@@ -86,5 +102,13 @@ mod tests {
         assert_eq!(tcl_eval(&mut sh, "hds::synth").unwrap(), "synth ok");
         assert!(sh.console.journal.iter().any(|j| j.contains("synth")));
         assert!(tcl_eval(&mut sh, "not_a_cmd").is_err());
+        let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/counter.sv");
+        let r = tcl_eval(&mut sh, &format!("read_sv {}", sv.display())).unwrap();
+        assert!(r.contains("luts 4"), "{r}");
+        assert_eq!(
+            tcl_eval(&mut sh, "create_clock -period 10 clk").unwrap(),
+            "clock clk period 10000ps"
+        );
     }
 }

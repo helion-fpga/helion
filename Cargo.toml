@@ -20,10 +20,11 @@ members = [
     "crates/helion-gui",
     "crates/helion-lab",
     "crates/helion-lib",
+    "crates/helion-drc",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/helion-fpga/helion"
@@ -48,3 +49,4 @@ helion-proj = { path = "crates/helion-proj" }
 helion-gui = { path = "crates/helion-gui" }
 helion-lab = { path = "crates/helion-lab" }
 helion-lib = { path = "crates/helion-lib" }
+helion-drc = { path = "crates/helion-drc" }

@@ -1,4 +1,4 @@
-//! Pack logical cells into Helion site primitives (LUTFF + IOB + MAC27 + ILA).
+//! Pack logical cells into Helion site primitives (LUTFF + IOB + MAC27 + BRAM18 + ILA).
 
 use helion_device::Device;
 use helion_ir::{CellKind, Design};
@@ -8,6 +8,12 @@ pub struct Packed {
     pub lutffs: Vec<PackedLutFf>,
     pub iobs: Vec<PackedIob>,
     pub macs: Vec<PackedMac>,
+    pub brams: Vec<PackedBram>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackedBram {
+    pub cell: String,
 }
 
 #[derive(Clone, Debug)]
@@ -15,6 +21,10 @@ pub struct PackedLutFf {
     pub lut_cell: String,
     pub ff_cell: String,
     pub init: u64,
+    /// LUT pin → FF cell whose Q drives it (local cluster).
+    pub lut_pins: Vec<(u8, String)>,
+    /// Q net of the packed FF (IOB matching).
+    pub q_net: String,
 }
 
 #[derive(Clone, Debug)]
@@ -35,31 +45,48 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         let CellKind::Lut6 { init } = c.kind else {
             continue;
         };
-        let Some(o_net) = net_on(design, &c.name, "O") else {
+        let Some(o_net) = design.net_on(&c.name, "O") else {
             continue;
         };
         let Some(ff) = design.cells.iter().find(|f| {
             matches!(f.kind, CellKind::Hff)
                 && !used_ff.contains(&f.name)
-                && net_on(design, &f.name, "D").as_deref() == Some(o_net.as_str())
+                && design.net_on(&f.name, "D") == Some(o_net)
         }) else {
             return Err(format!("LUT {} has no FF on D", c.name));
         };
         used_ff.insert(ff.name.clone());
+        let mut lut_pins = Vec::new();
+        for pin in 0u8..6 {
+            if let Some(net) = design.net_on(&c.name, &format!("I{pin}")) {
+                if let Some(src) = design.cells.iter().find(|f| {
+                    matches!(f.kind, CellKind::Hff) && design.net_on(&f.name, "Q") == Some(net)
+                }) {
+                    lut_pins.push((pin, src.name.clone()));
+                }
+            }
+        }
+        let q_net = design
+            .net_on(&ff.name, "Q")
+            .unwrap_or("")
+            .to_string();
         lutffs.push(PackedLutFf {
             lut_cell: c.name.clone(),
             ff_cell: ff.name.clone(),
             init,
+            lut_pins,
+            q_net,
         });
     }
     let mut iobs = Vec::new();
     for c in &design.cells {
         if matches!(c.kind, CellKind::IobOut) {
-            let net = net_on(design, &c.name, "I")
+            let net = design
+                .net_on(&c.name, "I")
                 .ok_or_else(|| format!("IOB {} has no I net", c.name))?;
             iobs.push(PackedIob {
                 cell: c.name.clone(),
-                from_net: net,
+                from_net: net.to_string(),
             });
         }
     }
@@ -71,18 +98,22 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             });
         }
     }
-    if lutffs.is_empty() && macs.is_empty() {
+    let mut brams = Vec::new();
+    for c in &design.cells {
+        if matches!(c.kind, CellKind::Bram18) {
+            brams.push(PackedBram {
+                cell: c.name.clone(),
+            });
+        }
+    }
+    if lutffs.is_empty() && macs.is_empty() && brams.is_empty() {
         return Err("nothing to pack".into());
     }
-    Ok(Packed { lutffs, iobs, macs })
-}
-
-fn net_on(d: &Design, cell: &str, pin: &str) -> Option<String> {
-    d.nets.iter().find_map(|n| {
-        n.endpoints
-            .iter()
-            .any(|e| e.cell == cell && e.pin == pin)
-            .then(|| n.name.clone())
+    Ok(Packed {
+        lutffs,
+        iobs,
+        macs,
+        brams,
     })
 }
 
@@ -90,7 +121,7 @@ fn net_on(d: &Design, cell: &str, pin: &str) -> Option<String> {
 mod tests {
     use super::*;
     use helion_device::Device;
-    use helion_ir::Design;
+    use helion_ir::{CellKind, Design};
 
     #[test]
     fn packs_blinky_lutff() {
@@ -99,6 +130,18 @@ mod tests {
         assert_eq!(p.lutffs.len(), 1);
         assert_eq!(p.iobs.len(), 1);
         assert_eq!(p.lutffs[0].init, 0x5555_5555_5555_5555);
+        assert_eq!(p.lutffs[0].lut_pins, vec![(0, "u_ff".into())]);
+        assert_eq!(p.lutffs[0].q_net, "q");
+    }
+
+    #[test]
+    fn packs_counter_four_lutffs_with_pins() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        assert_eq!(p.lutffs.len(), 4);
+        assert_eq!(p.lutffs[3].lut_pins.len(), 4);
+        assert_eq!(p.iobs[0].from_net, "q3");
+        assert_eq!(p.lutffs[3].q_net, "q3");
     }
 
     #[test]
@@ -109,5 +152,14 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         assert_eq!(p.macs.len(), 1);
         assert!(p.lutffs.is_empty());
+    }
+
+    #[test]
+    fn packs_bram18() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::new("ram");
+        d.add_cell("u_bram", CellKind::Bram18);
+        let p = pack(&d, &dev).unwrap();
+        assert_eq!(p.brams.len(), 1);
     }
 }

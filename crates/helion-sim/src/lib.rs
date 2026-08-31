@@ -7,7 +7,7 @@ use std::collections::HashMap;
 pub struct Sim {
     pub time: u64,
     lut_init: HashMap<String, u64>,
-    lut_i0_ff: HashMap<String, String>,
+    lut_pins: HashMap<String, Vec<(u8, String)>>,
     ff_d_lut: HashMap<String, String>,
     iob_from_ff: Option<String>,
     ff_q: HashMap<String, bool>,
@@ -22,13 +22,21 @@ impl Sim {
                 lut_init.insert(c.name.clone(), init);
             }
         }
-        let mut lut_i0_ff = HashMap::new();
+        let mut lut_pins: HashMap<String, Vec<(u8, String)>> = HashMap::new();
         let mut ff_d_lut = HashMap::new();
         for n in &d.nets {
-            let lut_i0 = n.endpoints.iter().find(|e| e.pin == "I0");
-            let ff_q = n.endpoints.iter().find(|e| e.pin == "Q");
-            if let (Some(l), Some(f)) = (lut_i0, ff_q) {
-                lut_i0_ff.insert(l.cell.clone(), f.cell.clone());
+            let ff_q = n.endpoints.iter().find(|e| e.pin == "Q").map(|e| e.cell.clone());
+            for e in &n.endpoints {
+                if let Some(rest) = e.pin.strip_prefix('I') {
+                    if let (Ok(pin), Some(ff)) = (rest.parse::<u8>(), ff_q.as_ref()) {
+                        if pin < 6 {
+                            lut_pins
+                                .entry(e.cell.clone())
+                                .or_default()
+                                .push((pin, ff.clone()));
+                        }
+                    }
+                }
             }
             let lut_o = n.endpoints.iter().find(|e| e.pin == "O");
             let ff_d = n.endpoints.iter().find(|e| e.pin == "D");
@@ -59,7 +67,7 @@ impl Sim {
         Self {
             time: 0,
             lut_init,
-            lut_i0_ff,
+            lut_pins,
             ff_d_lut,
             iob_from_ff,
             ff_q,
@@ -72,13 +80,16 @@ impl Sim {
         let mut next_q = HashMap::new();
         for (ff, lut) in &self.ff_d_lut {
             let init = self.lut_init.get(lut).copied().unwrap_or(0);
-            let i0 = self
-                .lut_i0_ff
-                .get(lut)
-                .and_then(|src| self.ff_q.get(src))
-                .copied()
-                .unwrap_or(false);
-            let o = (init >> (i0 as u64)) & 1 == 1;
+            let mut addr = 0u8;
+            if let Some(pins) = self.lut_pins.get(lut) {
+                for (pin, src) in pins {
+                    let bit = self.ff_q.get(src).copied().unwrap_or(false);
+                    if bit {
+                        addr |= 1 << pin;
+                    }
+                }
+            }
+            let o = (init >> (addr as u64)) & 1 == 1;
             next_q.insert(ff.clone(), o);
         }
         for (k, v) in next_q {
@@ -126,5 +137,13 @@ mod tests {
         z.connect("q", "u_iob", "I");
         let w = run_tb(&z, 4);
         assert!(w.iter().all(|&b| !b), "const0 LUT must not toggle LED: {w:?}");
+    }
+
+    #[test]
+    fn event_sim_counter_matches_fabric_gold() {
+        let w = run_tb(&Design::structural_counter(), 16);
+        assert!(w[0..7].iter().all(|b| !b), "{w:?}");
+        assert!(w[7..15].iter().all(|b| *b), "{w:?}");
+        assert!(!w[15], "{w:?}");
     }
 }

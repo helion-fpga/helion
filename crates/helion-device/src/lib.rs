@@ -22,6 +22,9 @@ pub struct Device {
     pub n_dsp: u32,
     pub dsp_x: u32,
     pub dsp_y0: u32,
+    pub n_bram: u32,
+    pub bram_x: u32,
+    pub bram_y0: u32,
     featuremap: FeatureMap,
 }
 
@@ -44,6 +47,7 @@ pub struct Far {
 impl Far {
     pub const CLB_IO_CLK: u8 = 0;
     pub const DSP: u8 = 2;
+    pub const BRAM: u8 = 3;
     pub const IOB: u8 = 5;
 
     pub fn encode(self) -> u32 {
@@ -73,6 +77,7 @@ pub enum SiteKind {
     Iob,
     Clk,
     Dsp,
+    Bram,
 }
 
 impl Device {
@@ -110,6 +115,9 @@ impl Device {
         let mut n_dsp = 0u32;
         let mut dsp_x = 8u32;
         let mut dsp_y0 = 1u32;
+        let mut n_bram = 0u32;
+        let mut bram_x = 10u32;
+        let mut bram_y0 = 1u32;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -135,6 +143,9 @@ impl Device {
                 "mac27" => n_dsp = parse_u32(v)?,
                 "dsp_x" => dsp_x = parse_u32(v)?,
                 "dsp_y0" => dsp_y0 = parse_u32(v)?,
+                "bram18" => n_bram = parse_u32(v)?,
+                "bram_x" => bram_x = parse_u32(v)?,
+                "bram_y0" => bram_y0 = parse_u32(v)?,
                 _ => {}
             }
         }
@@ -162,6 +173,9 @@ impl Device {
             n_dsp,
             dsp_x,
             dsp_y0,
+            n_bram,
+            bram_x,
+            bram_y0,
             featuremap,
         })
     }
@@ -196,6 +210,17 @@ impl Device {
             x,
             y: y0 + i * 2,
             kind: SiteKind::Dsp,
+        })
+    }
+
+    pub fn bram_sites(&self) -> impl Iterator<Item = Site> + '_ {
+        let n = self.n_bram;
+        let x = self.bram_x;
+        let y0 = self.bram_y0;
+        (0..n).map(move |i| Site {
+            x,
+            y: y0 + i * 2,
+            kind: SiteKind::Bram,
         })
     }
 
@@ -382,6 +407,9 @@ mod tests {
         let first = d.clb_sites().next().unwrap();
         assert_eq!(first.x, d.clb_x0);
         assert_eq!(first.y, d.clb_y0);
+        assert_eq!(d.n_bram, 8);
+        assert_eq!(d.bram_sites().count(), 8);
+        assert_eq!(d.bram_sites().next().unwrap().kind, SiteKind::Bram);
     }
 
     #[test]

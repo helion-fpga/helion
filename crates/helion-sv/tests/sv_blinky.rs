@@ -31,3 +31,28 @@ fn sv_blinky_through_pnr_toggles_led() {
     }
     assert!(changes >= 1, "SV blinky LED must toggle, changes={changes}");
 }
+
+#[test]
+fn sv_counter_through_pnr_is_cnt3() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
+    let design = synth_sv_path(&root).expect("sv-parser synth counter");
+    assert_eq!(design.lut_inits().len(), 4);
+    let dev = Device::load_part("HL10T-C32-1").unwrap();
+    let packed = pack(&design, &dev).unwrap();
+    let placed = place(&packed, &dev).unwrap();
+    let routed = route(&placed, &dev).unwrap();
+    assert_eq!(routed.iob_src[0].ble, 3);
+    let bits = bitgen(&dev, &routed).unwrap();
+    let mut sim = Fabric::new(&dev);
+    sim.program(&bits).unwrap();
+    sim.finish_startup();
+    let iob = routed.iob_src[0].iob;
+    let mut w = Vec::new();
+    for _ in 0..16 {
+        sim.step_user();
+        w.push(sim.led_at(iob.0, iob.1));
+    }
+    assert!(w[0..7].iter().all(|b| !b), "cnt 1..7 LED=0 {w:?}");
+    assert!(w[7..15].iter().all(|b| *b), "cnt 8..15 LED=1 {w:?}");
+    assert!(!w[15], "{w:?}");
+}

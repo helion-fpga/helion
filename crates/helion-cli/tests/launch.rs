@@ -27,4 +27,30 @@ fn version_and_doctor() {
     assert!(hw.status.success(), "{}", String::from_utf8_lossy(&hw.stderr));
     let hwo = String::from_utf8_lossy(&hw.stdout);
     assert!(hwo.contains("DONE=1"), "{hwo}");
+
+    let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/counter.sv");
+    let run = Command::new(bin)
+        .args([
+            "run",
+            counter.to_str().unwrap(),
+            "--cycles",
+            "16",
+        ])
+        .output()
+        .expect("helion run counter");
+    assert!(
+        run.status.success(),
+        "run failed: {} {}",
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(out.contains("DONE=1"), "{out}");
+    assert!(out.contains("LED[16]="), "{out}");
+    assert!(
+        out.contains("0000000111111110"),
+        "counter LED must be cnt[3] over 16 cycles, got {out}"
+    );
+    assert!(out.contains("ok"), "{out}");
 }

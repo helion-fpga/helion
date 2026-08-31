@@ -47,6 +47,8 @@ pub struct Fabric {
     pub clb_minors: u32,
     frames: BTreeMap<(u8, u16, u8), u128>,
     clbs: BTreeMap<(u32, u32), ClbState>,
+    /// CLBs with any programmed frame; eval skips empty tiles.
+    used: Vec<(u32, u32)>,
     /// IOB (x,y) -> pad output after GTS
     iobs: BTreeMap<(u32, u32), bool>,
     /// IOB (x,y) → (clb_x, clb_y, ble)
@@ -81,6 +83,7 @@ impl Fabric {
             clb_minors: dev.clb_minors,
             frames: BTreeMap::new(),
             clbs,
+            used: Vec::new(),
             iobs,
             iob_src: BTreeMap::new(),
             stat: Stat::reset(),
@@ -99,6 +102,23 @@ impl Fabric {
         self.stat = Stat::reset();
         self.cfg_steps = 0;
         self.iob_src.clear();
+        self.used = self
+            .clbs
+            .keys()
+            .copied()
+            .filter(|&(x, y)| {
+                let Some(major) = self.clb_major(x, y) else {
+                    return false;
+                };
+                (0..self.clb_minors).any(|minor| {
+                    self.frames
+                        .get(&(Far::CLB_IO_CLK, major, minor as u8))
+                        .copied()
+                        .unwrap_or(0)
+                        != 0
+                })
+            })
+            .collect();
         for ((block, major, minor), word) in &self.frames {
             if *block == Far::IOB && *minor == 0 && (word & 1) == 1 {
                 let ble = ((*word >> 1) & 7) as u8;
@@ -241,28 +261,51 @@ impl Fabric {
             .insert((iob_x, iob_y), (iob_x, iob_y + 1, ble));
     }
 
+    fn q_at(&self, x: u32, y: u32, ble: u8) -> bool {
+        self.clbs
+            .get(&(x, y))
+            .and_then(|c| c.q.get(ble as usize).copied())
+            .unwrap_or(false)
+    }
+
+    fn lut_o_at(&self, x: u32, y: u32, ble: u8) -> bool {
+        self.clbs
+            .get(&(x, y))
+            .and_then(|c| c.lut_o.get(ble as usize).copied())
+            .unwrap_or(false)
+    }
+
+    /// IMUX[4:0]: 0-7 south BLE Q, 8-15 north BLE Q, 16-23 local BLE Q, 24-31 local LUT O.
+    fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
+        if sel < 8 {
+            return self.q_at(x, y.saturating_sub(1), sel);
+        }
+        if sel < 16 {
+            return self.q_at(x, y + 1, sel - 8);
+        }
+        if sel < 24 {
+            return self.q_at(x, y, sel - 16);
+        }
+        self.lut_o_at(x, y, sel - 24)
+    }
+
     fn eval_comb(&mut self) {
-        let coords: Vec<(u32, u32)> = self.clbs.keys().copied().collect();
-        for (x, y) in coords {
-            for ble in 0..self.n_ble {
-                let sel = self.imux_sel(x, y, ble * 8); // pin I0 of this BLE
-                let i0 = if sel == 16 {
-                    // F0 = BLE0.Q in local_pop(0,0); for ble n, F0 is this BLE's Q when we use sel=16
-                    // local_pop(ble,0) feedback[0] = (ble + 0 + 0) % 16 = ble. We map F{k} for k<8 as BLE k Q.
-                    self.clbs[&(x, y)].q[ble as usize]
-                } else if sel == 16 + (ble as u8) {
-                    self.clbs[&(x, y)].q[ble as usize]
-                } else {
-                    // Default blinky: packer sets IMUX I0 to feedback of this BLE.
-                    // If IMUX is 0 (unprogrammed), still use Q when FF.USED (packed LUTFF).
-                    if self.clb_feature_bit(x, y, &format!("BLE{ble}.FF.USED")) {
-                        self.clbs[&(x, y)].q[ble as usize]
-                    } else {
-                        false
+        let coords = self.used.clone();
+        // Multi-pass so local LUT-O feedback (sel 24+k) settles.
+        for _ in 0..8 {
+            for (x, y) in &coords {
+                let (x, y) = (*x, *y);
+                for ble in 0..self.n_ble {
+                    let mut addr = 0u8;
+                    for pin in 0..6u32 {
+                        let sel = self.imux_sel(x, y, ble * 8 + pin);
+                        if self.decode_imux(x, y, sel) {
+                            addr |= 1 << pin;
+                        }
                     }
-                };
-                let o = self.eval_lut(x, y, ble, i0 as u8);
-                self.clbs.get_mut(&(x, y)).unwrap().lut_o[ble as usize] = o;
+                    let o = self.eval_lut(x, y, ble, addr);
+                    self.clbs.get_mut(&(x, y)).unwrap().lut_o[ble as usize] = o;
+                }
             }
         }
     }
@@ -271,7 +314,7 @@ impl Fabric {
         if !self.stat.gwe || self.stat.gsr {
             return;
         }
-        let coords: Vec<(u32, u32)> = self.clbs.keys().copied().collect();
+        let coords = self.used.clone();
         for (x, y) in coords {
             for ble in 0..self.n_ble {
                 if !self.clb_feature_bit(x, y, &format!("BLE{ble}.FF.USED")) {

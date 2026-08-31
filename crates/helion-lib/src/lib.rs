@@ -21,7 +21,7 @@ endmodule
 "#;
 
 pub fn cell_names() -> &'static [&'static str] {
-    &["LUT6", "HFF", "HCARRY", "MAC27", "HIDDR", "HODDR", "HBUFQ", "HSTARTUP"]
+    &["LUT6", "HFF", "HCARRY", "MAC27", "BRAM18", "HIDDR", "HODDR", "HBUFQ", "HSTARTUP"]
 }
 
 /// Map `p <= a * b + c` onto HELIONLIB MAC27 (site primitive).
