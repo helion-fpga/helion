@@ -144,10 +144,16 @@ else
     write_stub "$MACOS/helion-ide" helion-ide
 fi
 if [ -n "$CLI" ]; then
-    cp "$CLI" "$MACOS/helion"
-    chmod +x "$MACOS/helion"
+    # Default APFS is case-insensitive: `helion` would clobber `Helion` (the IDE).
+    if [ "$uname_s" = Darwin ]; then
+        cp "$CLI" "$MACOS/helion-cli"
+        chmod +x "$MACOS/helion-cli"
+    else
+        cp "$CLI" "$MACOS/helion"
+        chmod +x "$MACOS/helion"
+    fi
 else
-    write_stub "$MACOS/helion" helion
+    write_stub "$MACOS/helion-cli" helion
 fi
 
 # Runtime HAD: Device::devices_dir looks at Contents/MacOS/../Resources/devices/helion
@@ -172,6 +178,6 @@ if [ "$SKIP_BUILD" = "1" ]; then
     exit 0
 fi
 printf 'built %s\n' "$APP"
-printf '  MacOS: Helion + helion-ide + helion\n'
+printf '  MacOS: Helion + helion-ide + helion-cli\n'
 printf 'run:    open %s\n' "$APP"
 printf 'doctor: %s/helion doctor\n' "$MACOS"

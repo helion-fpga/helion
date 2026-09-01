@@ -46,11 +46,22 @@ impl Session {
 
     pub fn synth_design(&mut self, d: Design) {
         self.design = Some(d);
+        self.reset_impl();
+    }
+
+    /// Drop place/route/bitstream (Vivado `reset_run impl_1`). Keeps the synth netlist.
+    pub fn reset_impl(&mut self) {
         self.packed = None;
         self.placed = None;
         self.routed = None;
         self.bitstream = None;
         self.programmed = false;
+    }
+
+    /// Drop the synth netlist and every impl artifact (Vivado `reset_run synth_1`).
+    pub fn reset_synth(&mut self) {
+        self.design = None;
+        self.reset_impl();
     }
 
     pub fn opt_design_step(&mut self) -> Result<usize, String> {

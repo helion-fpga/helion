@@ -5,7 +5,14 @@ pub const GPUI_TOOLKIT: &str = "gpui";
 
 pub mod doctor;
 pub mod ide;
-pub use ide::{ConsoleLine, FlowStep, IdeModel, NetlistTree, StepState, Utilization};
+pub use ide::{
+    BdView, BottomTab, ConsoleLine, DesignRun, DeviceView, FindHit, FlowStep, HierarchyView,
+    HwManager, IdeMessage, IdeModel, IlaDashboard, IlaTrigger, IoPortView, LayoutKind, MsgSeverity,
+    NavSection, NetlistTree,
+    PackageDrawing, PackagePin, SchematicView, ScopeNode, SimObject, StepState, UltraFastStage,
+    Utilization,
+    Waveform, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
+};
 
 use helion_device::Device;
 use helion_proj::{get_cells, get_nets, get_pins, opt_design, Mode, Session};

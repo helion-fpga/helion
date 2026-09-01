@@ -14,4 +14,9 @@ helion-sta = { workspace = true }
 helion-hw = { workspace = true }
 helion-bits = { workspace = true }
 helion-debug = { workspace = true }
+helion-sim = { workspace = true }
+helion-fabric = { workspace = true }
+helion-drc = { workspace = true }
+helion-bd = { workspace = true }
+helion-ipxact = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
