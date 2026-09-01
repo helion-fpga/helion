@@ -957,12 +957,17 @@ name = "helion-gui"
 version = "1.0.0"
 dependencies = [
  "eframe",
+ "helion-bd",
  "helion-bits",
  "helion-debug",
  "helion-device",
+ "helion-drc",
+ "helion-fabric",
  "helion-hw",
+ "helion-ipxact",
  "helion-ir",
  "helion-proj",
+ "helion-sim",
  "helion-sta",
  "helion-sv",
 ]

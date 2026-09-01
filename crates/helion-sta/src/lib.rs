@@ -369,6 +369,22 @@ pub fn apply_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
     xdc.apply(design)
 }
 
+/// Apply `set_input_delay` / `set_output_delay` / `set_false_path` to an STA result.
+/// False paths drop the IOB contribution; I/O delays add to setup and move WNS.
+pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64) {
+    let false_out = !xdc.false_paths.is_empty();
+    let out_d = xdc.output_delay_ps.values().copied().max().unwrap_or(0);
+    let in_d = xdc.input_delay_ps.values().copied().max().unwrap_or(0);
+    if false_out {
+        r.iob_ps = 0;
+        r.setup_ps = r.r2r_ps;
+    } else if in_d != 0 || out_d != 0 {
+        r.setup_ps += out_d + in_d;
+    }
+    r.wns_ps = period_ps as i64 - r.setup_ps;
+    r.tns_ps = r.wns_ps.min(0);
+}
+
 /// STA with XDC delays/false paths applied.
 pub fn report_timing_xdc(
     design: &Design,
@@ -381,17 +397,19 @@ pub fn report_timing_xdc(
         xdc.clocks.clone()
     };
     let mut r = report_timing(design, &clks)?;
-    let false_out = !xdc.false_paths.is_empty();
-    let out_d = xdc.output_delay_ps.values().copied().max().unwrap_or(0);
-    let in_d = xdc.input_delay_ps.values().copied().max().unwrap_or(0);
-    if false_out {
-        r.iob_ps = 0;
-        r.setup_ps = r.r2r_ps;
-    } else {
-        r.setup_ps = r.r2r_ps + out_d + in_d;
-    }
-    r.wns_ps = clks[0].period_ps as i64 - r.setup_ps;
-    r.tns_ps = r.wns_ps.min(0);
+    apply_xdc_delays(&mut r, xdc, clks[0].period_ps);
+    Ok(r)
+}
+
+/// Routed STA plus XDC I/O delay / false path (UG893 Timing Constraints Apply).
+pub fn report_timing_routed_xdc(
+    design: &Design,
+    routed: &Routed,
+    clocks: &[Clock],
+    xdc: &Constraints,
+) -> Result<TimingResult, String> {
+    let mut r = report_timing_routed(design, routed, clocks)?;
+    apply_xdc_delays(&mut r, xdc, clocks[0].period_ps);
     Ok(r)
 }
 
@@ -526,11 +544,9 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(pl.lutff_sites[0].0.x, 5);
 
         let base = report_timing(&d, &c.clocks).unwrap();
-        let with_d = {
-            let mut only = c.clone();
-            only.false_paths.clear();
-            report_timing_xdc(&d, &c.clocks, &only).unwrap()
-        };
+        let mut only = c.clone();
+        only.false_paths.clear();
+        let with_d = report_timing_xdc(&d, &c.clocks, &only).unwrap();
         assert!(
             with_d.wns_ps < base.wns_ps,
             "output/input delay must worsen WNS ({} vs {})",
@@ -540,5 +556,20 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         let falsep = report_timing_xdc(&d, &c.clocks, &c).unwrap();
         assert_eq!(falsep.setup_ps, falsep.r2r_ps, "false path must drop IOB from setup");
         assert_ne!(with_d.wns_ps, falsep.wns_ps);
+
+        let routed = helion_route::route(&pl, &dev).unwrap();
+        let rbase = report_timing_routed(&d, &routed, &c.clocks).unwrap();
+        let rdel = report_timing_routed_xdc(&d, &routed, &c.clocks, &only).unwrap();
+        assert_eq!(
+            rdel.wns_ps,
+            rbase.wns_ps - 1500 - 2000,
+            "routed I/O delay must subtract from WNS ({} vs {})",
+            rdel.wns_ps,
+            rbase.wns_ps
+        );
+        let rfp = report_timing_routed_xdc(&d, &routed, &c.clocks, &c).unwrap();
+        assert_eq!(rfp.setup_ps, rfp.r2r_ps);
+        assert_eq!(rfp.iob_ps, 0);
+        assert_ne!(rdel.wns_ps, rfp.wns_ps);
     }
 }

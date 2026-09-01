@@ -2277,7 +2277,30 @@ fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
         .or_else(|| mods.last())
         .ok_or_else(|| "no top module".to_string())?;
     let flat = flatten_module(&map, &top.module)?;
-    synth_rtl(&flat)
+    let mut d = synth_rtl(&flat)?;
+    record_instances(&map, &top.module, &mut d, "");
+    Ok(d)
+}
+
+/// Keep the pre-flatten instance tree on HNF so the Hierarchy pane is not a cell list.
+fn record_instances(mods: &HashMap<String, Rtl>, module: &str, d: &mut Design, pfx: &str) {
+    let Some(rtl) = mods.get(module) else {
+        return;
+    };
+    for inst in &rtl.insts {
+        let name = if pfx.is_empty() {
+            inst.name.clone()
+        } else {
+            format!("{pfx}{}", inst.name)
+        };
+        d.instances.push(helion_ir::Instance {
+            name: name.clone(),
+            module: inst.module.clone(),
+            conns: inst.conns.clone(),
+            attrs: helion_ir::Attrs::default(),
+        });
+        record_instances(mods, &inst.module, d, &format!("{name}_"));
+    }
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
@@ -2456,6 +2479,9 @@ endmodule
         assert_eq!(d.name, "top");
         let inits = d.lut_inits();
         assert_eq!(inits, vec![0x5555_5555_5555_5555]);
+        assert_eq!(d.instances.len(), 1, "{:?}", d.instances);
+        assert_eq!(d.instances[0].name, "u0");
+        assert_eq!(d.instances[0].module, "tog");
     }
 
     #[test]
