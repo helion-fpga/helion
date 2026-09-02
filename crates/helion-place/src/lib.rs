@@ -2,6 +2,7 @@
 
 use helion_device::{Device, Site};
 use helion_pack::Packed;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct Placed {
@@ -129,6 +130,38 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
     })
 }
 
+/// UG986 Lab 2: reuse previous LUTFF/IOB sites for cells that kept their names.
+pub fn place_incremental(
+    packed: &Packed,
+    dev: &Device,
+    prev: &Placed,
+    opts: PlaceOpts,
+) -> Result<(Placed, usize), String> {
+    let mut placed = place_with(packed, dev, opts)?;
+    let mut reused = 0usize;
+    let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
+    for (i, lf) in packed.lutffs.iter().enumerate() {
+        if let Some(j) = prev
+            .packed
+            .lutffs
+            .iter()
+            .position(|p| p.lut_cell == lf.lut_cell)
+        {
+            let site = prev.lutff_sites[j];
+            placed.lutff_sites[i] = site;
+            used.insert((site.0.x, site.0.y, site.1));
+            reused += 1;
+        }
+    }
+    for (i, iob) in packed.iobs.iter().enumerate() {
+        if let Some(j) = prev.packed.iobs.iter().position(|p| p.cell == iob.cell) {
+            placed.iob_sites[i] = prev.iob_sites[j];
+        }
+    }
+    let _ = used;
+    Ok((placed, reused))
+}
+
 pub fn lutff_of(placed: &Placed, ff_cell: &str) -> Option<(Site, u8)> {
     placed
         .packed
@@ -236,5 +269,16 @@ mod tests {
             (pl.lutff_sites[0].0.x, pl.lutff_sites[0].0.y),
             (pl.lutff_sites[8].0.x, pl.lutff_sites[8].0.y)
         );
+    }
+
+    #[test]
+    fn incremental_reuses_named_lutff_sites() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_counter();
+        let p = pack(&d, &dev).unwrap();
+        let prev = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let (next, reused) = place_incremental(&p, &dev, &prev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        assert_eq!(reused, prev.lutff_sites.len());
+        assert_eq!(next.lutff_sites, prev.lutff_sites);
     }
 }

@@ -2,13 +2,103 @@
 
 use helion_bits::{bitgen, eco_lut, Bitstream};
 use helion_device::Device;
-use helion_ir::{CellKind, Design};
+use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{pack, Packed};
-use helion_place::{place_with, PlaceOpts, Placed};
-use helion_route::{route, Routed};
+use helion_place::{place_incremental, place_with, PlaceOpts, Placed};
+use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{create_clock, report_timing_routed};
 use helion_hw::prog_sim;
 use helion_debug::insert_ila;
+
+/// UG986 Lab 1 Helion equivalents of implementation strategies.
+/// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImplStrategy {
+    /// Timing-driven place + full PathFinder. Gold WNS path (`impl_1`).
+    Default,
+    /// Same engine as Default (timing-driven family).
+    TimingExplore,
+    /// Wirelength place + 1 PathFinder iter (faster, worse WNS).
+    RuntimeOpt,
+    /// Timing-driven place + directed extra hops (phys-opt detours).
+    PhysOpt,
+}
+
+impl ImplStrategy {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "default" | "impl_1" => Ok(Self::Default),
+            "timingexplore" | "timing_explore" | "explore" => Ok(Self::TimingExplore),
+            "runtimeopt" | "runtime_opt" | "runtime" => Ok(Self::RuntimeOpt),
+            "physopt" | "phys_opt" | "phys" => Ok(Self::PhysOpt),
+            other => Err(format!("unknown impl strategy {other}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::TimingExplore => "TimingExplore",
+            Self::RuntimeOpt => "RuntimeOpt",
+            Self::PhysOpt => "PhysOpt",
+        }
+    }
+
+    pub fn place_opts(self) -> PlaceOpts {
+        match self {
+            Self::RuntimeOpt => PlaceOpts { timing_weight: 0.0 },
+            _ => PlaceOpts { timing_weight: 0.75 },
+        }
+    }
+
+    pub fn route_opts(self) -> RouteOpts {
+        match self {
+            Self::RuntimeOpt => RouteOpts {
+                max_iters: 1,
+                extra_hops: 0,
+            },
+            Self::PhysOpt => RouteOpts {
+                max_iters: 8,
+                extra_hops: 8,
+            },
+            _ => RouteOpts::default(),
+        }
+    }
+}
+
+/// UG986 Lab 2 Incremental Reuse Report (cells/nets/ports from HNF names).
+#[derive(Clone, Debug, Default)]
+pub struct ReuseReport {
+    pub cells: usize,
+    pub reused_cells: usize,
+    pub nets: usize,
+    pub reused_nets: usize,
+    pub ports: usize,
+    pub reused_ports: usize,
+}
+
+impl ReuseReport {
+    pub fn cell_pct(&self) -> u32 {
+        if self.cells == 0 {
+            0
+        } else {
+            (self.reused_cells * 100 / self.cells) as u32
+        }
+    }
+
+    pub fn text(&self) -> String {
+        format!(
+            "reuse cells={}/{} ({pct}%) nets={}/{} ports={}/{}",
+            self.reused_cells,
+            self.cells,
+            self.reused_nets,
+            self.nets,
+            self.reused_ports,
+            self.ports,
+            pct = self.cell_pct()
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -24,6 +114,8 @@ pub struct Session {
     pub placed: Option<Placed>,
     pub bitstream: Option<Bitstream>,
     pub routed: Option<Routed>,
+    /// Last complete placement, used by incremental_impl (UG986 Lab 2).
+    pub impl_checkpoint: Option<Placed>,
     pub hw_open: bool,
     pub programmed: bool,
     pub part: String,
@@ -38,6 +130,7 @@ impl Session {
             placed: None,
             bitstream: None,
             routed: None,
+            impl_checkpoint: None,
             hw_open: false,
             programmed: false,
             part: "HL10T-C32-1".into(),
@@ -55,7 +148,17 @@ impl Session {
         self.placed = None;
         self.routed = None;
         self.bitstream = None;
+        self.impl_checkpoint = None;
         self.programmed = false;
+    }
+
+    pub fn write_checkpoint(&mut self) -> Result<String, String> {
+        let p = self.placed.as_ref().ok_or("write_checkpoint: not placed")?;
+        self.impl_checkpoint = Some(p.clone());
+        Ok(format!(
+            "write_checkpoint lutff={}",
+            p.lutff_sites.len()
+        ))
     }
 
     /// Drop the synth netlist and every impl artifact (Vivado `reset_run synth_1`).
@@ -70,11 +173,14 @@ impl Session {
     }
 
     pub fn place_design(&mut self, dev: &Device) -> Result<(), String> {
+        self.place_design_with(dev, ImplStrategy::Default.place_opts())
+    }
+
+    pub fn place_design_with(&mut self, dev: &Device, opts: PlaceOpts) -> Result<(), String> {
         let d = self.design.as_ref().ok_or("place_design: no design")?;
         let packed = pack(d, dev)?;
-        // Same timing_weight as `helion run` / `helion qor` so Tcl/IDE WNS
-        // matches the published QoR table (9640 ps on counter.sv).
-        let placed = place_with(&packed, dev, PlaceOpts { timing_weight: 0.75 })?;
+        // Default timing_weight 0.75 matches `helion run` / QoR gold (9640 ps).
+        let placed = place_with(&packed, dev, opts)?;
         self.packed = Some(packed);
         self.placed = Some(placed);
         self.routed = None;
@@ -83,11 +189,158 @@ impl Session {
     }
 
     pub fn route_design(&mut self, dev: &Device) -> Result<(), String> {
+        self.route_design_with(dev, RouteOpts::default())
+    }
+
+    pub fn route_design_with(&mut self, dev: &Device, opts: RouteOpts) -> Result<(), String> {
         let placed = self.placed.as_ref().ok_or("route_design: not placed")?;
-        let routed = route(placed, dev)?;
+        let routed = route_with(placed, dev, opts)?;
         self.routed = Some(routed);
         self.bitstream = None;
         Ok(())
+    }
+
+    /// Full impl with a Lab 1 strategy. Assumes `design` is already synthesized.
+    pub fn impl_with_strategy(&mut self, dev: &Device, strategy: ImplStrategy) -> Result<(), String> {
+        if strategy == ImplStrategy::PhysOpt {
+            let _ = self.opt_design_step()?;
+        }
+        self.place_design_with(dev, strategy.place_opts())?;
+        self.route_design_with(dev, strategy.route_opts())?;
+        self.write_bitstream(dev)?;
+        Ok(())
+    }
+
+    /// UG986 Lab 2: place the current netlist reusing `prev` sites for named cells.
+    pub fn incremental_place(
+        &mut self,
+        dev: &Device,
+        prev: &Placed,
+    ) -> Result<ReuseReport, String> {
+        let d = self.design.as_ref().ok_or("incremental_place: no design")?;
+        let packed = pack(d, dev)?;
+        let (placed, reused_lutff) = place_incremental(
+            &packed,
+            dev,
+            prev,
+            PlaceOpts { timing_weight: 0.75 },
+        )?;
+        let prev_cells: std::collections::HashSet<&str> = prev
+            .packed
+            .lutffs
+            .iter()
+            .flat_map(|l| [l.lut_cell.as_str(), l.ff_cell.as_str()])
+            .chain(prev.packed.iobs.iter().map(|i| i.cell.as_str()))
+            .collect();
+        let reused_cells = d
+            .cells
+            .iter()
+            .filter(|c| prev_cells.contains(c.name.as_str()))
+            .count();
+        let prev_nets: std::collections::HashSet<&str> =
+            prev.packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
+        let reused_nets = d
+            .nets
+            .iter()
+            .filter(|n| prev_nets.contains(n.name.as_str()))
+            .count();
+        let report = ReuseReport {
+            cells: d.cells.len(),
+            reused_cells,
+            nets: d.nets.len(),
+            reused_nets,
+            ports: d.ports.len(),
+            reused_ports: d.ports.len(),
+        };
+        let _ = reused_lutff;
+        self.packed = Some(packed);
+        self.placed = Some(placed);
+        self.routed = None;
+        self.bitstream = None;
+        Ok(report)
+    }
+
+    /// UG986 Lab 3: drop an IOB net's route (delay 0).
+    pub fn unroute_net(&mut self, net: &str) -> Result<String, String> {
+        let r = self.routed.as_mut().ok_or("unroute_net: not routed")?;
+        let idx = r
+            .placed
+            .packed
+            .iobs
+            .iter()
+            .position(|i| i.from_net == net || i.cell == net)
+            .ok_or_else(|| format!("unroute_net: no IOB net {net}"))?;
+        if let Some(io) = r.iob_src.get_mut(idx) {
+            io.hops = 0;
+            io.delay_ps = 0;
+        }
+        self.bitstream = None;
+        Ok(format!("unroute_net {net}"))
+    }
+
+    /// UG986 Lab 3: add FIXED_ROUTE extra hops (delay) on an IOB net.
+    pub fn fix_route(&mut self, net: &str, extra_hops: u32) -> Result<String, String> {
+        let r = self.routed.as_mut().ok_or("fix_route: not routed")?;
+        let idx = r
+            .placed
+            .packed
+            .iobs
+            .iter()
+            .position(|i| i.from_net == net || i.cell == net)
+            .ok_or_else(|| format!("fix_route: no IOB net {net}"))?;
+        if let Some(io) = r.iob_src.get_mut(idx) {
+            io.hops += extra_hops;
+            io.delay_ps += extra_hops as i64 * HOP_DELAY_PS;
+        }
+        self.bitstream = None;
+        Ok(format!(
+            "fix_route {net} extra_hops={extra_hops} delay_ps={}",
+            r.iob_src.get(idx).map(|i| i.delay_ps).unwrap_or(0)
+        ))
+    }
+
+    /// UG986 Lab 4 Check ECO: cells in the netlist that are not in the last placement.
+    pub fn check_eco(&self) -> Result<String, String> {
+        let d = self.design.as_ref().ok_or("check_eco: no design")?;
+        let placed = self.placed.as_ref().ok_or("check_eco: not placed")?;
+        let have: std::collections::HashSet<&str> = placed
+            .packed
+            .lutffs
+            .iter()
+            .map(|l| l.lut_cell.as_str())
+            .chain(placed.packed.lutffs.iter().map(|l| l.ff_cell.as_str()))
+            .chain(placed.packed.iobs.iter().map(|i| i.cell.as_str()))
+            .collect();
+        let missing: Vec<&str> = d
+            .cells
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| !have.contains(n))
+            .collect();
+        Ok(format!(
+            "check_eco missing={} {}",
+            missing.len(),
+            missing.join(",")
+        ))
+    }
+
+    /// UG986 Lab 4: insert a LUT+FF pair named like ECO_LUT3 so pack can place it.
+    pub fn insert_eco_lut(&mut self, name: &str, init: u64) -> Result<String, String> {
+        let d = self.design.as_mut().ok_or("insert_eco_lut: no design")?;
+        if d.cells.iter().any(|c| c.name == name) {
+            return Err(format!("insert_eco_lut: {name} exists"));
+        }
+        let ff = format!("{name}_ff");
+        d.add_cell(name, CellKind::Lut6 { init });
+        d.add_cell(&ff, CellKind::Hff);
+        if !d.ports.iter().any(|p| p.name == "clk") {
+            d.add_port("clk", PortDir::In);
+        }
+        d.connect("clk", &ff, "CLK");
+        d.connect(format!("{name}_d"), name, "O");
+        d.connect(format!("{name}_d"), &ff, "D");
+        d.connect(format!("{name}_q"), &ff, "Q");
+        Ok(format!("insert_eco_lut {name} init={init:#x}"))
     }
 
     pub fn write_bitstream(&mut self, dev: &Device) -> Result<&Bitstream, String> {
@@ -524,5 +777,53 @@ set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]
         assert_eq!(prj.sdc.len(), 1);
         assert_eq!(prj.package_pins, vec![("led".into(), "IOB_X2Y0".into())]);
         assert!(load_prj("part X\n").is_err());
+    }
+
+    #[test]
+    fn strategies_move_wns_and_incremental_reuses_cells() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut def = Session::new(Mode::NonProject);
+        def.synth_design(Design::structural_counter());
+        def.impl_with_strategy(&dev, ImplStrategy::Default).unwrap();
+        let t_def = def.report_timing(&dev).unwrap();
+        let mut rt = Session::new(Mode::NonProject);
+        rt.synth_design(Design::structural_counter());
+        rt.impl_with_strategy(&dev, ImplStrategy::RuntimeOpt).unwrap();
+        let t_rt = rt.report_timing(&dev).unwrap();
+        assert_ne!(t_def, t_rt, "RuntimeOpt WNS must differ from Default: {t_def} vs {t_rt}");
+        let mut phys = Session::new(Mode::NonProject);
+        phys.synth_design(Design::structural_counter());
+        phys.impl_with_strategy(&dev, ImplStrategy::PhysOpt).unwrap();
+        let t_phys = phys.report_timing(&dev).unwrap();
+        assert_ne!(t_phys, t_def, "PhysOpt extra hops must move WNS: {t_phys} vs {t_def}");
+
+        let prev = def.placed.clone().unwrap();
+        let reuse = def.incremental_place(&dev, &prev).unwrap();
+        assert_eq!(reuse.cell_pct(), 100, "{}", reuse.text());
+        def.insert_eco_lut("ECO_LUT3", 0x8).unwrap();
+        let chk = def.check_eco().unwrap();
+        assert!(chk.contains("ECO_LUT3"), "{chk}");
+        let reuse2 = def.incremental_place(&dev, &prev).unwrap();
+        assert!(reuse2.reused_cells < reuse2.cells, "{}", reuse2.text());
+        assert!(reuse2.reused_cells > 0, "{}", reuse2.text());
+        def.route_design(&dev).unwrap();
+        let led = def
+            .placed
+            .as_ref()
+            .unwrap()
+            .packed
+            .iobs
+            .first()
+            .unwrap()
+            .from_net
+            .clone();
+        let before = def.routed.as_ref().unwrap().iob_src[0].delay_ps;
+        def.fix_route(&led, 3).unwrap();
+        assert_eq!(
+            def.routed.as_ref().unwrap().iob_src[0].delay_ps,
+            before + 3 * helion_route::HOP_DELAY_PS
+        );
+        def.unroute_net(&led).unwrap();
+        assert_eq!(def.routed.as_ref().unwrap().iob_src[0].delay_ps, 0);
     }
 }

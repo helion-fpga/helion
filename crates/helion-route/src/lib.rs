@@ -16,7 +16,7 @@ pub struct Routed {
     pub overused: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct IobRoute {
     pub iob: (u32, u32),
     pub clb: (u32, u32),
@@ -24,6 +24,10 @@ pub struct IobRoute {
     pub hops: u32,
     /// Path delay in ps (hops × HOP_DELAY_PS). Used by STA.
     pub delay_ps: i64,
+    /// PathFinder tiles from CLB to IOB (inclusive). Extra hops are delay-only.
+    pub path: Vec<(u32, u32)>,
+    /// Packed IOB `from_net` this route drives (HNF net, not a chrome label).
+    pub net: String,
 }
 
 /// One tile hop delay (ps). Folded into PathFinder negotiated cost.
@@ -155,7 +159,29 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
     ))
 }
 
+/// UG986 Lab 1/3: router effort and directed extra hops (Helion equivalent of
+/// RuntimeOptimized vs FIXED_ROUTE detours). Default matches the gold PathFinder.
+#[derive(Clone, Copy, Debug)]
+pub struct RouteOpts {
+    pub max_iters: u32,
+    /// Added to every IOB route after PathFinder (Lab 3 directed delay).
+    pub extra_hops: u32,
+}
+
+impl Default for RouteOpts {
+    fn default() -> Self {
+        Self {
+            max_iters: 8,
+            extra_hops: 0,
+        }
+    }
+}
+
 pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
+    route_with(placed, dev, RouteOpts::default())
+}
+
+pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Routed, String> {
     let mut imux = Vec::new();
     for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = placed.lutff_sites[i];
@@ -215,9 +241,9 @@ pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
             overused: 0,
         });
     }
-    const MAX_ITERS: u32 = 8;
+    let max_iters = opts.max_iters.max(1);
     let mut last_paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
-    for iter in 0..MAX_ITERS {
+    for iter in 0..max_iters {
         iters = iter + 1;
         let mut pres: HashMap<(u32, u32), u32> = HashMap::new();
         let pres_fac = 1i64 + iter as i64;
@@ -241,13 +267,21 @@ pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
         }
     }
     for (i, (src, dst, ble)) in nets.iter().enumerate() {
-        let hops = last_paths[i].len().saturating_sub(1) as u32;
+        let hops = last_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
+        let net = placed
+            .packed
+            .iobs
+            .get(i)
+            .map(|io| io.from_net.clone())
+            .unwrap_or_default();
         iob_src.push(IobRoute {
             iob: *dst,
             clb: *src,
             ble: *ble,
             hops,
             delay_ps: hops as i64 * HOP_DELAY_PS,
+            path: last_paths[i].clone(),
+            net,
         });
     }
     Ok(Routed {
@@ -278,6 +312,14 @@ mod tests {
         assert!(r.pathfinder_iters >= 1);
         assert_eq!(r.overused, 0);
         assert!(r.iob_src[0].hops >= 1);
+        assert_eq!(r.iob_src[0].path.first().copied(), Some(r.iob_src[0].clb));
+        assert_eq!(r.iob_src[0].path.last().copied(), Some(r.iob_src[0].iob));
+        assert_eq!(
+            r.iob_src[0].path.len().saturating_sub(1) as u32,
+            r.iob_src[0].hops,
+            "PathFinder hops are tile steps, not a canned count"
+        );
+        assert!(!r.iob_src[0].net.is_empty(), "IOB route names the packed net");
     }
 
     #[test]
@@ -307,6 +349,36 @@ mod tests {
         );
         assert_eq!(r_td.iob_src[0].delay_ps, r_td.iob_src[0].hops as i64 * HOP_DELAY_PS);
         assert!(r_td.iob_src[0].hops >= 1);
+    }
+
+    #[test]
+    fn extra_hops_add_directed_delay() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let base = route(&pl, &dev).unwrap();
+        let detour = route_with(
+            &pl,
+            &dev,
+            RouteOpts {
+                max_iters: 8,
+                extra_hops: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            detour.iob_src[0].hops,
+            base.iob_src[0].hops + 3,
+            "Lab 3 FIXED_ROUTE extra hops"
+        );
+        assert_eq!(
+            detour.iob_src[0].delay_ps,
+            base.iob_src[0].delay_ps + 3 * HOP_DELAY_PS
+        );
+        assert_eq!(
+            detour.iob_src[0].path, base.iob_src[0].path,
+            "extra hops are directed delay, not a restyled PathFinder path"
+        );
     }
 
     #[test]

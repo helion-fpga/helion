@@ -286,6 +286,52 @@ fn paint_menu_rail(ctx: &egui::Context, model: &mut IdeModel) {
         });
 }
 
+fn paint_nav_section(ui: &mut egui::Ui, model: &mut IdeModel, sec: NavSection) {
+    let on = model.nav == sec;
+    let fill = if on {
+        Color32::from_rgb(0x1f, 0x4a, 0x38)
+    } else {
+        Color32::from_rgb(0x2b, 0x32, 0x3a)
+    };
+    let resp = ui.add(
+        egui::Button::new(RichText::new(sec.label()).color(Color32::from_rgb(
+            0xdc, 0xe0, 0xe4,
+        )))
+        .fill(fill)
+        .min_size(egui::vec2(ui.available_width(), 22.0)),
+    );
+    if resp.clicked() {
+        let _ = model.set_nav(sec);
+    }
+    resp.on_hover_text(format!("nav {}", sec.tcl()));
+}
+
+fn paint_nav_actions(ui: &mut egui::Ui, model: &mut IdeModel, sec: NavSection) {
+    let mut run = None;
+    ui.indent(format!("nav_actions_{}", sec.tcl()), |ui| {
+        for a in sec.actions() {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(a.label)
+                            .small()
+                            .color(Color32::from_rgb(0xc8, 0xf0, 0xd8)),
+                    )
+                    .fill(Color32::from_rgb(0x1a, 0x28, 0x22))
+                    .min_size(egui::vec2(ui.available_width(), 18.0)),
+                )
+                .on_hover_text(a.tcl)
+                .clicked()
+            {
+                run = Some(a.tcl);
+            }
+        }
+    });
+    if let Some(tcl) = run {
+        let _ = model.exec(tcl);
+    }
+}
+
 fn paint_navigator(ctx: &egui::Context, model: &mut IdeModel) {
     egui::SidePanel::left("navigator")
         .resizable(true)
@@ -293,28 +339,41 @@ fn paint_navigator(ctx: &egui::Context, model: &mut IdeModel) {
         .min_width(160.0)
         .show(ctx, |ui| {
             ui.label(RichText::new("Flow Navigator").strong().size(14.0));
-            ui.weak("UltraFast (UG949) stages on Helion engines");
+            ui.weak("UG949 UltraFast tree — stages on Helion engines");
             ui.add_space(4.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for sec in NavSection::ALL {
-                    let on = model.nav == sec;
-                    let fill = if on {
-                        Color32::from_rgb(0x1f, 0x4a, 0x38)
-                    } else {
-                        Color32::from_rgb(0x2b, 0x32, 0x3a)
-                    };
-                    let resp = ui.add(
-                        egui::Button::new(RichText::new(sec.label()).color(Color32::from_rgb(
-                            0xdc, 0xe0, 0xe4,
-                        )))
-                        .fill(fill)
-                        .min_size(egui::vec2(ui.available_width(), 22.0)),
-                    );
-                    if resp.clicked() {
-                        let _ = model.set_nav(sec);
-                    }
-                    resp.on_hover_text(format!("nav {}", sec.tcl()));
-                }
+                ui.collapsing("I/O AND DEVICE PLANNING", |ui| {
+                    paint_nav_section(ui, model, NavSection::BoardDevice);
+                    paint_nav_actions(ui, model, NavSection::BoardDevice);
+                });
+                ui.collapsing("PROJECT MANAGER", |ui| {
+                    paint_nav_section(ui, model, NavSection::ProjectManager);
+                    paint_nav_actions(ui, model, NavSection::ProjectManager);
+                    paint_nav_section(ui, model, NavSection::IpIntegrator);
+                    paint_nav_actions(ui, model, NavSection::IpIntegrator);
+                });
+                ui.collapsing("SIMULATION", |ui| {
+                    paint_nav_section(ui, model, NavSection::Simulation);
+                    paint_nav_actions(ui, model, NavSection::Simulation);
+                });
+                ui.collapsing("RTL ANALYSIS", |ui| {
+                    paint_nav_section(ui, model, NavSection::RtlAnalysis);
+                    paint_nav_actions(ui, model, NavSection::RtlAnalysis);
+                });
+                ui.collapsing("SYNTHESIS", |ui| {
+                    paint_nav_section(ui, model, NavSection::Synthesis);
+                    paint_nav_actions(ui, model, NavSection::Synthesis);
+                });
+                ui.collapsing("IMPLEMENTATION", |ui| {
+                    paint_nav_section(ui, model, NavSection::Implementation);
+                    paint_nav_actions(ui, model, NavSection::Implementation);
+                    paint_nav_section(ui, model, NavSection::TimingAnalysis);
+                    paint_nav_actions(ui, model, NavSection::TimingAnalysis);
+                });
+                ui.collapsing("PROGRAM AND DEBUG", |ui| {
+                    paint_nav_section(ui, model, NavSection::ProgramDebug);
+                    paint_nav_actions(ui, model, NavSection::ProgramDebug);
+                });
             });
         });
 }
@@ -407,13 +466,33 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                     let _ = model.sim_restart();
                 }
             });
+            let mut pick_scope = None;
             for s in &model.scopes {
-                ui.monospace(format!("{} ({})", s.name, s.kind));
+                let on = model.selected_scope.as_deref() == Some(s.name.as_str());
+                if ui
+                    .selectable_label(on, format!("{} ({})", s.name, s.kind))
+                    .clicked()
+                {
+                    pick_scope = Some(s.name.clone());
+                }
+            }
+            if let Some(name) = pick_scope {
+                let _ = model.select_scope(&name);
             }
             ui.separator();
             ui.label(RichText::new("Objects").strong());
+            ui.weak("click to add_wave");
+            let mut add = None;
             for o in &model.objects {
-                ui.monospace(format!("{} = {}", o.name, o.value));
+                if ui
+                    .selectable_label(false, format!("{} = {}", o.name, o.value))
+                    .clicked()
+                {
+                    add = Some(o.name.clone());
+                }
+            }
+            if let Some(name) = add {
+                let _ = model.add_wave(&name);
             }
         });
 }
@@ -464,26 +543,65 @@ fn paint_bottom(ctx: &egui::Context, model: &mut IdeModel) {
             });
             match model.bottom_tab {
                 BottomTab::Tcl => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Find").small());
+                        let find = egui::TextEdit::singleline(&mut model.console_find)
+                            .desired_width(180.0)
+                            .hint_text("find in journal")
+                            .font(egui::TextStyle::Monospace);
+                        let resp = ui.add(find);
+                        if ui.button("Find").clicked()
+                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        {
+                            let q = model.console_find.clone();
+                            let _ = model.find_console(&q);
+                        }
+                        if let Some(i) = model.console_selected {
+                            ui.weak(format!("sel={i}"));
+                        }
+                    });
+                    let selected = model.console_selected;
+                    let hits = model.console_find_hits.clone();
+                    let mut pick_line = None;
                     egui::ScrollArea::vertical()
                         .stick_to_bottom(true)
                         .max_height(ui.available_height() - 28.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for line in &model.console {
+                            for (i, line) in model.console.iter().enumerate() {
                                 let color = if line.ok {
                                     Color32::from_rgb(0xc8, 0xd0, 0xd8)
                                 } else {
                                     Color32::from_rgb(0xe0, 0x6c, 0x75)
                                 };
-                                ui.monospace(
-                                    RichText::new(format!("helion% {}", line.cmd))
-                                        .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
-                                );
+                                let on = selected == Some(i);
+                                let hit = hits.contains(&i);
+                                let cmd_col = if on {
+                                    Color32::from_rgb(0xe5, 0xc0, 0x7b)
+                                } else if hit {
+                                    Color32::from_rgb(0x7e, 0xc8, 0xe3)
+                                } else {
+                                    Color32::from_rgb(0x5e, 0xa8, 0xc3)
+                                };
+                                if ui
+                                    .selectable_label(
+                                        on,
+                                        RichText::new(format!("helion% {}", line.cmd))
+                                            .monospace()
+                                            .color(cmd_col),
+                                    )
+                                    .clicked()
+                                {
+                                    pick_line = Some(i);
+                                }
                                 if !line.out.is_empty() {
                                     ui.monospace(RichText::new(&line.out).color(color));
                                 }
                             }
                         });
+                    if let Some(i) = pick_line {
+                        let _ = model.select_console_line(&i.to_string());
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("helion%").monospace());
                         let edit = egui::TextEdit::singleline(&mut model.input)
@@ -589,7 +707,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Design Runs");
-    ui.weak("UG893 synth_1 / impl_1 on Helion engines — launch_runs / reset_runs");
+    ui.weak("UG986 Labs 1–4 Helion engines — strategies, incremental checkpoint, directed route, ECO");
     ui.horizontal(|ui| {
         if ui.button("Launch synth_1").clicked() {
             let _ = model.exec("launch_runs synth_1");
@@ -597,59 +715,170 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Launch impl_1").clicked() {
             let _ = model.exec("launch_runs impl_1");
         }
-        if ui.button("Reset synth_1").clicked() {
-            let _ = model.exec("reset_runs synth_1");
-        }
         if ui.button("Reset impl_1").clicked() {
             let _ = model.exec("reset_runs impl_1");
         }
+        if ui.button("Create RuntimeOpt").clicked() {
+            let _ = model.exec("create_run impl_runtime -strategy RuntimeOpt");
+            let _ = model.exec("launch_runs impl_runtime");
+        }
+        if ui.button("Create PhysOpt").clicked() {
+            let _ = model.exec("create_run impl_phys -strategy PhysOpt");
+            let _ = model.exec("launch_runs impl_phys");
+        }
+        if ui.button("Compare Runs").clicked() {
+            let _ = model.exec("compare_runs");
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Incremental Impl").clicked() {
+            let _ = model.exec("incremental_impl");
+        }
+        if ui.button("Fix Route +8 hops").clicked() {
+            if let Some(net) = model
+                .session()
+                .placed
+                .as_ref()
+                .and_then(|p| p.packed.iobs.first())
+                .map(|i| i.from_net.clone())
+            {
+                let _ = model.exec(&format!("fix_route {net} 8"));
+            }
+        }
+        if ui.button("Insert ECO_LUT3").clicked() {
+            let _ = model.exec("insert_eco_lut ECO_LUT3 0x8");
+        }
+        if ui.button("Check ECO").clicked() {
+            let _ = model.exec("check_eco");
+        }
+        if ui.button("Incremental Place+Route").clicked() {
+            let _ = model.exec("incremental_place");
+            let _ = model.exec("incremental_route");
+        }
     });
     ui.add_space(6.0);
-    ui.monospace("Name            Step              Status        Part           LUTFF  WNS_PS  hash");
+    ui.monospace(
+        "Name            Strategy       Status        LUTFF  WNS_PS  ms    reuse  hash",
+    );
     for r in &model.runs {
         ui.monospace(format!(
-            "{:<15} {:<17} {:<13} {:<14} {:<6} {:<7} {}",
+            "{:<15} {:<14} {:<13} {:<6} {:<7} {:<5} {:<6} {}",
             r.name,
-            r.step,
+            r.strategy,
             r.status,
-            r.part,
             r.lutff.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
             r.wns_ps.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            r.runtime_ms.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            r.reuse_pct
+                .map(|n| format!("{n}%"))
+                .unwrap_or_else(|| "-".into()),
             r.bitstream_hash
                 .map(|h| format!("{h:#010x}"))
                 .unwrap_or_else(|| "-".into()),
         ));
-        if let Some(top) = &r.top {
-            ui.weak(format!("  top={top}  cells={}", r.cells.unwrap_or(0)));
-        }
     }
     ui.add_space(8.0);
+    report_box(ui, "Compare (engine)", &model.compare_runs_text());
+    ui.add_space(6.0);
     report_box(ui, "Runs (engine)", &model.runs_text());
 }
 
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hierarchy");
-    ui.weak("UG893 — HNF top / instances / leaf cells");
-    ui.monospace(model.hierarchy_text());
+    ui.weak("UG893 Fig. 61 — nested boxes, area ∝ HNF cell/resource count (not a tree list)");
+    ui.monospace(model.hierarchy_drawing_text());
+    let drawing = model.hierarchy.drawing();
+    let selected = model.selected.clone();
     let mut pick = None;
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for (name, kind) in &model.hierarchy.nodes {
-            let on = model.selected.as_deref() == Some(name.as_str());
-            let label = if kind.starts_with("instance:") {
-                format!("  {name}  ({kind})")
-            } else if kind == "module" {
-                format!("{name}  [top]")
-            } else {
-                format!("    {name}  {kind}")
-            };
-            if ui
-                .selectable_label(on, RichText::new(label).monospace())
-                .clicked()
-            {
-                pick = Some(name.clone());
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let size = egui::vec2(
+                drawing.width.max(ui.available_width()).max(280.0),
+                drawing.height.max(180.0),
+            );
+            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+            if ui.is_rect_visible(rect) {
+                let p = ui.painter();
+                p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
+                let o = rect.min;
+                // Outer boxes first so nested leaves paint on top.
+                let mut ordered: Vec<_> = drawing.boxes.iter().collect();
+                ordered.sort_by(|a, b| (b.w * b.h).partial_cmp(&(a.w * a.h)).unwrap());
+                for b in ordered {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(o.x + b.x, o.y + b.y),
+                        egui::vec2(b.w, b.h),
+                    );
+                    let on = selected.as_deref() == Some(b.name.as_str());
+                    let fill = if b.kind == "module" {
+                        Color32::from_rgb(0x1a, 0x22, 0x1c)
+                    } else if b.kind.starts_with("instance:") || b.kind == "leaves" {
+                        Color32::from_rgb(0x2a, 0x32, 0x24)
+                    } else {
+                        Color32::from_rgb(0x3a, 0x42, 0x28)
+                    };
+                    p.rect_filled(r, 2.0, fill);
+                    p.rect_stroke(
+                        r,
+                        2.0,
+                        Stroke::new(
+                            if on { 2.0 } else { 1.0 },
+                            if on {
+                                Color32::from_rgb(0xe5, 0xc0, 0x7b)
+                            } else {
+                                Color32::from_rgb(0x7a, 0x84, 0x8e)
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        egui::pos2(r.left() + 6.0, r.top() + 3.0),
+                        egui::Align2::LEFT_TOP,
+                        &b.name,
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                    );
+                    p.text(
+                        egui::pos2(r.right() - 6.0, r.top() + 3.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{}", b.cells),
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(0x9a, 0xa4, 0xae),
+                    );
+                    if !b.kind.starts_with("instance:") && b.kind != "module" && b.kind != "leaves"
+                    {
+                        p.text(
+                            r.center() + egui::vec2(0.0, 6.0),
+                            egui::Align2::CENTER_CENTER,
+                            &b.kind,
+                            egui::FontId::monospace(9.0),
+                            Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                        );
+                    }
+                }
             }
-        }
-    });
+            if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let lx = pos.x - rect.left();
+                    let ly = pos.y - rect.top();
+                    // Prefer the smallest containing box (leaf over parent).
+                    let mut hit: Option<&helion_gui::HierBox> = None;
+                    for b in &drawing.boxes {
+                        if lx >= b.x && lx <= b.x + b.w && ly >= b.y && ly <= b.y + b.h {
+                            match hit {
+                                None => hit = Some(b),
+                                Some(h) if b.w * b.h < h.w * h.h => hit = Some(b),
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(b) = hit {
+                        pick = Some(b.name.clone());
+                    }
+                }
+            }
+        });
     if let Some(id) = pick {
         model.select(&id);
     }
@@ -678,7 +907,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Package");
-    ui.weak("UG893 HAD IOB package drawing (IOB_XxYy grid — not a BGA, not a pin table)");
+    ui.weak("UG893 Fig. 53 — HAD IOB pin circles on colored I/O bank regions (not a pin table)");
     ui.monospace(format!(
         "part={}  {}×{}  pins={}  assigned={}",
         model.package.part,
@@ -687,51 +916,165 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
         model.package_pins.len(),
         model.package_pins.iter().filter(|p| p.port.is_some()).count()
     ));
-    let mut pick: Option<String> = None;
-    egui::ScrollArea::both().show(ui, |ui| {
-        for dy in 0..model.package.rows {
-            let y = model.package.y0 + dy;
-            ui.horizontal(|ui| {
-                ui.weak(format!("Y{y}"));
-                for dx in 0..model.package.cols {
-                    let x = model.package.x0 + dx;
-                    if let Some(p) = model.package.pin_at(&model.package_pins, x, y) {
-                        let on = model.selected.as_deref() == Some(p.pin.as_str())
-                            || p.port.as_deref() == model.selected.as_deref();
-                        let label = match p.port.as_deref() {
-                            Some(port) => format!("X{}Y{}\n{port}", p.x, p.y),
-                            None => format!("X{}Y{}\n·", p.x, p.y),
-                        };
-                        if ui.selectable_label(on, RichText::new(label).monospace().small()).clicked()
-                        {
-                            pick = Some(p.pin.clone());
-                        }
-                    }
-                }
-            });
-        }
-        ui.separator();
-        ui.weak("Pin list (same HAD sites)");
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("unassigned")
+                .small()
+                .color(Color32::from_rgb(0x5a, 0x64, 0x6e)),
+        );
+        ui.label(
+            RichText::new("placed port")
+                .small()
+                .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
+        );
+        let mut seen = std::collections::HashSet::new();
         for p in &model.package_pins {
-            let on = model.selected.as_deref() == Some(p.pin.as_str())
-                || p.port.as_deref() == model.selected.as_deref();
-            if ui
-                .selectable_label(
-                    on,
-                    format!(
-                        "{}  X{}Y{}  {}",
-                        p.pin,
-                        p.x,
-                        p.y,
-                        p.port.as_deref().unwrap_or("-")
-                    ),
-                )
-                .clicked()
-            {
-                pick = Some(p.pin.clone());
+            if seen.insert(p.bank) {
+                let (r, g, b) = p.bank_rgb();
+                ui.label(
+                    RichText::new(format!("BANK{}", p.bank))
+                        .small()
+                        .color(Color32::from_rgb(r.saturating_add(40), g.saturating_add(40), b.saturating_add(40))),
+                );
             }
         }
     });
+    let cols = model.package.cols.max(1);
+    let rows = model.package.rows.max(1);
+    let x0 = model.package.x0;
+    let y0 = model.package.y0;
+    let cell = 18.0_f32;
+    let mut pick: Option<String> = None;
+    let selected = model.selected.clone();
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(cell * cols as f32 + 36.0, cell * rows as f32 + 20.0),
+                Sense::click(),
+            );
+            if ui.is_rect_visible(rect) {
+                let origin = egui::pos2(rect.left() + 28.0, rect.top() + 4.0);
+                let p = ui.painter();
+                p.rect_filled(rect, 0.0, Color32::from_rgb(0x0d, 0x10, 0x12));
+                // Fig. 53: colored I/O bank regions behind the pin circles.
+                let mut banks: std::collections::BTreeMap<u32, (u32, u32, u32, u32, (u8, u8, u8))> =
+                    std::collections::BTreeMap::new();
+                for pin in &model.package_pins {
+                    let e = banks.entry(pin.bank).or_insert((
+                        pin.x,
+                        pin.x,
+                        pin.y,
+                        pin.y,
+                        pin.bank_rgb(),
+                    ));
+                    e.0 = e.0.min(pin.x);
+                    e.1 = e.1.max(pin.x);
+                    e.2 = e.2.min(pin.y);
+                    e.3 = e.3.max(pin.y);
+                }
+                for (bank, (bx0, bx1, by0, by1, (br, bg, bb))) in &banks {
+                    let px = origin.x + (*bx0 - x0) as f32 * cell;
+                    let py = origin.y + (rows - 1 - (*by1 - y0)) as f32 * cell;
+                    let pw = (*bx1 - *bx0 + 1) as f32 * cell;
+                    let ph = (*by1 - *by0 + 1) as f32 * cell;
+                    let brct = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
+                    p.rect_filled(
+                        brct.shrink(1.0),
+                        2.0,
+                        Color32::from_rgba_unmultiplied(*br, *bg, *bb, 90),
+                    );
+                    p.rect_stroke(
+                        brct.shrink(1.0),
+                        2.0,
+                        Stroke::new(1.2, Color32::from_rgb(*br, *bg, *bb)),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        egui::pos2(brct.left() + 3.0, brct.top() + 1.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("BANK{bank}"),
+                        egui::FontId::monospace(8.0),
+                        Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                    );
+                }
+                for dx in 0..cols {
+                    let x = x0 + dx;
+                    let px = origin.x + dx as f32 * cell;
+                    if dx % 2 == 0 {
+                        p.text(
+                            egui::pos2(px + cell * 0.5, rect.bottom() - 2.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{x}"),
+                            egui::FontId::monospace(8.0),
+                            Color32::from_rgb(0x7a, 0x84, 0x8e),
+                        );
+                    }
+                }
+                for dy in 0..rows {
+                    let y = y0 + (rows - 1 - dy);
+                    let py = origin.y + dy as f32 * cell;
+                    p.text(
+                        egui::pos2(rect.left() + 4.0, py + cell * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        format!("Y{y}"),
+                        egui::FontId::monospace(8.0),
+                        Color32::from_rgb(0x7a, 0x84, 0x8e),
+                    );
+                    for dx in 0..cols {
+                        let x = x0 + dx;
+                        let px = origin.x + dx as f32 * cell;
+                        let c = egui::pos2(px + cell * 0.5, py + cell * 0.5);
+                        if let Some(pin) = model.package.pin_at(&model.package_pins, x, y) {
+                            let on = selected.as_deref() == Some(pin.pin.as_str())
+                                || pin.port.as_deref() == selected.as_deref();
+                            let fill = if pin.port.is_some() {
+                                Color32::from_rgb(0x7e, 0xc8, 0xe3)
+                            } else {
+                                Color32::from_rgb(0x3a, 0x44, 0x4e)
+                            };
+                            p.circle_filled(c, cell * 0.32, fill);
+                            if on {
+                                p.circle_stroke(
+                                    c,
+                                    cell * 0.38,
+                                    Stroke::new(1.6, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(pos) = resp.hover_pos() {
+                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
+                        let x = x0 + dx as u32;
+                        let y = y0 + (rows - 1 - dy as u32);
+                        if let Some(pin) = model.package.pin_at(&model.package_pins, x, y) {
+                            let tip = match pin.port.as_deref() {
+                                Some(port) => format!("{}  {port}", pin.pin),
+                                None => pin.pin.clone(),
+                            };
+                            resp.clone().on_hover_text(tip);
+                        }
+                    }
+                }
+            }
+            if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let origin = egui::pos2(rect.left() + 28.0, rect.top() + 4.0);
+                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
+                        let x = x0 + dx as u32;
+                        let y = y0 + (rows - 1 - dy as u32);
+                        if let Some(pin) = model.package.pin_at(&model.package_pins, x, y) {
+                            pick = Some(pin.pin.clone());
+                        }
+                    }
+                }
+            }
+        });
     if let Some(pin) = pick {
         let _ = model.select_package_pin(&pin);
     }
@@ -762,10 +1105,37 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     report_box(ui, "Timing (report_timing)", &model.timing_text());
 }
 
-fn paint_reports(ui: &mut egui::Ui, model: &IdeModel) {
+fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Reports");
     ui.add_space(6.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
+    if !model.timing_paths.is_empty() {
+        ui.add_space(6.0);
+        ui.label(RichText::new("Timing Paths (click → Schematic)").strong());
+        let mut pick_path = None;
+        for (i, p) in model.timing_paths.iter().enumerate() {
+            let on = model.selected_timing_path == Some(i);
+            if ui
+                .selectable_label(
+                    on,
+                    format!(
+                        "{}  {}→{}  slack_ps={} cells={}",
+                        p.name,
+                        p.startpoint,
+                        p.endpoint,
+                        p.slack_ps,
+                        p.cells.len()
+                    ),
+                )
+                .clicked()
+            {
+                pick_path = Some(i);
+            }
+        }
+        if let Some(i) = pick_path {
+            let _ = model.select_timing_path(&i.to_string());
+        }
+    }
     ui.add_space(8.0);
     report_box(ui, "Utilization (report_utilization)", &model.utilization_text());
     ui.add_space(8.0);
@@ -786,85 +1156,569 @@ fn paint_reports(ui: &mut egui::Ui, model: &IdeModel) {
     report_box(ui, "DRC (helion-drc)", &drc);
 }
 
+fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke) {
+    let d = b - a;
+    let len = d.length();
+    if len < 0.5 {
+        return;
+    }
+    let dir = d / len;
+    let mut t = 0.0;
+    while t < len {
+        let t1 = (t + 4.0).min(len);
+        p.line_segment([a + dir * t, a + dir * t1], stroke);
+        t += 8.0;
+    }
+}
+
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
-    ui.weak("HNF cells and nets — Expand Cone follows net endpoints");
+    ui.weak("UG893 Fig. 55/56/57 — HNF symbols, pin stubs, orthogonal nets (dotted = off-sheet, thick = bus)");
+    model
+        .schematic
+        .set_viewport(ui.available_width(), ui.available_height().max(240.0));
+    let drawing = model.schematic.drawing();
+    let n_cells = drawing
+        .symbols
+        .iter()
+        .filter(|s| !s.kind.starts_with("PORT"))
+        .count();
+    let n_ports = drawing
+        .symbols
+        .iter()
+        .filter(|s| s.kind.starts_with("PORT"))
+        .count();
+    let n_nets = {
+        let mut s = std::collections::HashSet::new();
+        for w in &drawing.wires {
+            s.insert(w.net.as_str());
+        }
+        s.len()
+    };
     ui.horizontal(|ui| {
+        if ui.button("Previous").clicked() {
+            let _ = model.schematic_previous_view();
+        }
+        if ui.button("Next").clicked() {
+            let _ = model.schematic_next_view();
+        }
+        if ui.button("Zoom Fit").clicked() {
+            let _ = model.schematic_zoom_fit();
+        }
         if ui.button("Expand Cone").clicked() {
             let _ = model.exec("expand_cone");
         }
         if ui.button("Collapse Cone").clicked() {
             let _ = model.exec("collapse_cone");
         }
-        ui.monospace(model.schematic_text().lines().next().unwrap_or(""));
+        if ui.button("Expand Inside").clicked() {
+            let _ = model.exec("expand_inside");
+        }
+        if ui.button("Collapse Inside").clicked() {
+            let _ = model.exec("collapse_inside");
+        }
+        // Fig. 55 sheet links: Cells / I/O Ports / Nets open Find Results.
+        if ui.link(format!("{n_cells} Cells")).clicked() {
+            let _ = model.exec("sheet_find cells");
+        }
+        if ui.link(format!("{n_ports} I/O Ports")).clicked() {
+            let _ = model.exec("sheet_find ports");
+        }
+        if ui.link(format!("{n_nets} Nets")).clicked() {
+            let _ = model.exec("sheet_find nets");
+        }
+        if let Some(root) = &model.schematic.cone_root {
+            ui.weak(format!("cone={root}"));
+        }
+        if let Some(inst) = &model.schematic.expand_inside {
+            ui.weak(format!("inside={inst}"));
+        }
+        ui.weak(format!("zoom={:.2}", model.schematic.camera.zoom));
     });
-    let mut pick = None;
-    let nodes: Vec<(String, String)> = model
-        .schematic
-        .visible_nodes()
-        .iter()
-        .map(|n| (n.name.clone(), n.kind.clone()))
-        .collect();
-    let edges: Vec<(String, String, String)> = model
-        .schematic
-        .visible_edges()
-        .iter()
-        .map(|e| (e.src.clone(), e.net.clone(), e.dst.clone()))
-        .collect();
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for (name, kind) in &nodes {
-            let on = model.selected.as_deref() == Some(name.as_str());
-            if ui
-                .selectable_label(on, format!("{name}  {kind}"))
-                .clicked()
-            {
-                pick = Some(name.clone());
+    if !model.timing_paths.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Timing paths").small());
+            let mut pick_path = None;
+            for (i, p) in model.timing_paths.iter().enumerate() {
+                let on = model.selected_timing_path == Some(i);
+                if ui
+                    .selectable_label(on, format!("{} slack={}", p.endpoint, p.slack_ps))
+                    .clicked()
+                {
+                    pick_path = Some(i);
+                }
             }
-        }
-        ui.separator();
-        for (src, net, dst) in &edges {
-            ui.monospace(format!("{src} —{net}→ {dst}"));
-        }
-    });
+            if let Some(i) = pick_path {
+                let _ = model.select_timing_path(&i.to_string());
+            }
+        });
+    }
+    let mut pick = None;
+    let mut expand = None;
+    let selected = model.selected.clone();
+    let cam = model.schematic.camera;
+    let z = cam.zoom.max(0.05);
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let size = egui::vec2(
+                (drawing.width * z + cam.pan_x.abs() + 8.0).max(ui.available_width()),
+                (drawing.height * z + cam.pan_y.abs() + 8.0).max(ui.available_height().max(240.0)),
+            );
+            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+            if ui.is_rect_visible(rect) {
+                let p = ui.painter();
+                p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
+                let o = egui::pos2(rect.min.x + cam.pan_x, rect.min.y + cam.pan_y);
+                let net_col = Color32::from_rgb(0x3d, 0xb8, 0x7a);
+                let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
+                let path_col = Color32::from_rgb(0xe0, 0x6c, 0x75);
+                for w in &drawing.wires {
+                    let pts: Vec<egui::Pos2> = w
+                        .points
+                        .iter()
+                        .map(|(x, y)| egui::pos2(o.x + *x * z, o.y + *y * z))
+                        .collect();
+                    let thick = if w.highlighted {
+                        4.2
+                    } else if w.width > 1 {
+                        3.6
+                    } else {
+                        1.4
+                    };
+                    let col = if w.highlighted { path_col } else { net_col };
+                    for pair in pts.windows(2) {
+                        if w.off_sheet {
+                            paint_dotted(p, pair[0], pair[1], Stroke::new(thick, col));
+                        } else {
+                            p.line_segment([pair[0], pair[1]], Stroke::new(thick, col));
+                        }
+                    }
+                    if let (Some(&a), Some(&b)) = (pts.first(), pts.get(1).or(pts.last())) {
+                        let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5 - 8.0);
+                        p.text(
+                            mid,
+                            egui::Align2::CENTER_BOTTOM,
+                            &w.net,
+                            egui::FontId::monospace(9.0),
+                            Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                        );
+                    }
+                }
+                for sy in &drawing.symbols {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(o.x + sy.x * z, o.y + sy.y * z),
+                        egui::vec2(sy.w * z, sy.h * z),
+                    );
+                    let on = selected.as_deref() == Some(sy.name.as_str());
+                    let port = sy.kind.starts_with("PORT");
+                    let fill = if sy.highlighted {
+                        Color32::from_rgb(0x5c, 0x2e, 0x1e)
+                    } else if on {
+                        Color32::from_rgb(0x3d, 0x4a, 0x28)
+                    } else if port || sy.kind == "IOB_OUT" {
+                        Color32::from_rgb(0x1e, 0x3a, 0x55)
+                    } else {
+                        Color32::from_rgb(0x2a, 0x32, 0x24)
+                    };
+                    let stroke = Stroke::new(
+                        if on || sy.highlighted { 2.0 } else { 1.0 },
+                        if sy.highlighted {
+                            path_col
+                        } else if on {
+                            gold
+                        } else {
+                            Color32::from_rgb(0x7a, 0x84, 0x8e)
+                        },
+                    );
+                    // UG893 Fig. 60: ports / IOB as right-pointing triangles; LUTs and FFs as boxes.
+                    if port || sy.kind == "IOB_OUT" {
+                        let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
+                        p.add(egui::Shape::convex_polygon(pts, fill, stroke));
+                    } else {
+                        p.rect_filled(r, 3.0, fill);
+                        p.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
+                    }
+                    p.text(
+                        egui::pos2(r.center().x, r.top() + 3.0),
+                        egui::Align2::CENTER_TOP,
+                        &sy.kind,
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                    );
+                    p.text(
+                        egui::pos2(r.center().x, r.bottom() - 3.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        &sy.name,
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                    );
+                    for pin in &sy.pins {
+                        let tip = egui::pos2(o.x + pin.x * z, o.y + pin.y * z);
+                        let edge = if pin.output {
+                            egui::pos2(r.right(), tip.y)
+                        } else {
+                            egui::pos2(r.left(), tip.y)
+                        };
+                        // UG893 Fig. pin stub: a short line inside and outside the symbol.
+                        let inner = if pin.output {
+                            egui::pos2(r.right() - 10.0, tip.y)
+                        } else {
+                            egui::pos2(r.left() + 10.0, tip.y)
+                        };
+                        let stub = Color32::from_rgb(0xdc, 0xe0, 0xe4);
+                        p.line_segment([inner, edge], Stroke::new(2.0, stub));
+                        p.line_segment([edge, tip], Stroke::new(2.0, stub));
+                        p.circle_filled(tip, 2.2, stub);
+                        let nc = pin.net.is_empty();
+                        let label = if nc {
+                            format!("{} n/c", pin.name)
+                        } else {
+                            pin.name.clone()
+                        };
+                        let label_pos = if pin.output {
+                            egui::pos2(r.right() - 4.0, tip.y)
+                        } else {
+                            egui::pos2(r.left() + 4.0, tip.y)
+                        };
+                        p.text(
+                            label_pos,
+                            if pin.output {
+                                egui::Align2::RIGHT_CENTER
+                            } else {
+                                egui::Align2::LEFT_CENTER
+                            },
+                            label,
+                            egui::FontId::monospace(9.0),
+                            if nc {
+                                Color32::from_rgb(0x6a, 0x72, 0x78)
+                            } else {
+                                Color32::from_rgb(0x9a, 0xa4, 0xae)
+                            },
+                        );
+                    }
+                }
+            }
+            if resp.clicked() || resp.double_clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let lx = (pos.x - rect.left() - cam.pan_x) / z;
+                    let ly = (pos.y - rect.top() - cam.pan_y) / z;
+                    for sy in drawing.symbols.iter().rev() {
+                        if lx >= sy.x
+                            && lx <= sy.x + sy.w
+                            && ly >= sy.y
+                            && ly <= sy.y + sy.h
+                        {
+                            pick = Some(sy.name.clone());
+                            if resp.double_clicked() && !sy.kind.starts_with("PORT") {
+                                expand = Some(sy.name.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     if let Some(id) = pick {
         model.select(&id);
+    }
+    if let Some(id) = expand {
+        if model.schematic.is_instance(&id) {
+            let _ = model.expand_inside(&id);
+        } else {
+            let _ = model.expand_cone(&id);
+        }
     }
 }
 
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Device / I/O Planning");
+    ui.heading("Device");
     ui.weak(format!(
-        "HAD {}  {}×{}  sites={}  (UltraFast board/device)",
+        "HAD {}  drawing {}×{} @ X{}Y{}  sites={} occupied={}  (UG893 floorplan, not a site list)",
         model.part(),
         model.device.cols,
         model.device.rows,
-        model.device.sites.len()
+        model.device.x0,
+        model.device.y0,
+        model.device.sites.len(),
+        model.device.occupied_count()
     ));
-    ui.label(RichText::new("I/O Ports").strong());
-    for p in &model.io_ports {
-        ui.monospace(format!(
-            "{}  {}  {}",
-            p.name,
-            p.dir,
-            p.site.as_deref().unwrap_or("(unplaced)")
-        ));
-    }
-    ui.separator();
-    let mut pick = None;
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for s in model.device.sites.iter().filter(|s| s.occupant.is_some()) {
-            let name = s.occupant.as_deref().unwrap();
-            let on = model.selected.as_deref() == Some(name);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("CLB")
+                .small()
+                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
+        );
+        ui.label(
+            RichText::new("IOB")
+                .small()
+                .color(Color32::from_rgb(0x5b, 0x9b, 0xd5)),
+        );
+        ui.label(
+            RichText::new("BRAM")
+                .small()
+                .color(Color32::from_rgb(0xb0, 0x7c, 0xe8)),
+        );
+        ui.label(
+            RichText::new("placed LUT")
+                .small()
+                .color(Color32::from_rgb(0xc8, 0xf0, 0xd8)),
+        );
+        ui.label(
+            RichText::new("placed I/O")
+                .small()
+                .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
+        );
+        ui.label(
+            RichText::new("clock region")
+                .small()
+                .color(Color32::from_rgb(0xb0, 0x7c, 0xe8)),
+        );
+        ui.label(
+            RichText::new("route")
+                .small()
+                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
+        );
+    });
+    let mut pick_port: Option<String> = None;
+    ui.collapsing("I/O Ports", |ui| {
+        if model.io_ports.is_empty() {
+            ui.weak("Synth a design to list ports.");
+        }
+        for p in &model.io_ports {
+            let on = model.selected.as_deref() == Some(p.name.as_str());
             if ui
-                .selectable_label(on, format!("X{}Y{:02} {}  {name}", s.x, s.y, format!("{:?}", s.kind)))
+                .selectable_label(
+                    on,
+                    format!(
+                        "{}  {}  {}",
+                        p.name,
+                        p.dir,
+                        p.site.as_deref().unwrap_or("(unplaced)")
+                    ),
+                )
                 .clicked()
             {
-                pick = Some(name.to_string());
+                pick_port = Some(p.name.clone());
             }
         }
     });
-    if let Some(id) = pick {
-        model.select(&id);
+    ui.separator();
+    let cols = model.device.cols.max(1);
+    let rows = model.device.rows.max(1);
+    let x0 = model.device.x0;
+    let y0 = model.device.y0;
+    let cell = 12.0_f32;
+    let grid_w = cell * cols as f32;
+    let grid_h = cell * rows as f32;
+    let mut pick_site: Option<(u32, u32)> = None;
+    let mut pick_region: Option<String> = None;
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(grid_w + 28.0, grid_h + 16.0),
+                Sense::click(),
+            );
+            if ui.is_rect_visible(rect) {
+                let origin = egui::pos2(rect.left() + 24.0, rect.top() + 4.0);
+                let p = ui.painter();
+                p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
+                for dx in 0..cols {
+                    let x = x0 + dx;
+                    let px = origin.x + dx as f32 * cell;
+                    if dx % 4 == 0 {
+                        p.text(
+                            egui::pos2(px + 1.0, rect.bottom() - 12.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{x}"),
+                            egui::FontId::monospace(8.0),
+                            Color32::from_rgb(0x7a, 0x84, 0x8e),
+                        );
+                    }
+                }
+                for dy in 0..rows {
+                    // HAD y=0 IOB at the bottom of the die (Vivado Y-up).
+                    let y = y0 + (rows - 1 - dy);
+                    let py = origin.y + dy as f32 * cell;
+                    if dy % 4 == 0 {
+                        p.text(
+                            egui::pos2(rect.left() + 2.0, py + 1.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{y}"),
+                            egui::FontId::monospace(8.0),
+                            Color32::from_rgb(0x7a, 0x84, 0x8e),
+                        );
+                    }
+                    for dx in 0..cols {
+                        let x = x0 + dx;
+                        let px = origin.x + dx as f32 * cell;
+                        let tile = egui::Rect::from_min_size(
+                            egui::pos2(px + 0.5, py + 0.5),
+                            egui::vec2(cell - 1.0, cell - 1.0),
+                        );
+                        let site = model.device.site_at(x, y);
+                        let fill = match site {
+                            Some(s) if s.occupant.is_some() => match s.occupancy_char() {
+                                'O' => Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                                'L' | 'C' => Color32::from_rgb(0x3d, 0xb8, 0x7a),
+                                _ => Color32::from_rgb(0xe5, 0xc0, 0x7b),
+                            },
+                            Some(s) => match s.kind {
+                                helion_device::SiteKind::Iob => Color32::from_rgb(0x1e, 0x3a, 0x55),
+                                helion_device::SiteKind::Bram => Color32::from_rgb(0x3a, 0x24, 0x52),
+                                helion_device::SiteKind::Dsp => Color32::from_rgb(0x52, 0x3a, 0x1e),
+                                helion_device::SiteKind::Clk => Color32::from_rgb(0x3a, 0x3a, 0x1e),
+                                helion_device::SiteKind::Clb => Color32::from_rgb(0x1a, 0x2e, 0x24),
+                            },
+                            None => Color32::from_rgb(0x0d, 0x10, 0x12),
+                        };
+                        p.rect_filled(tile, 1.0, fill);
+                        let selected = site.is_some_and(|s| {
+                            let id = model.selected.as_deref();
+                            id == s.occupant.as_deref()
+                                || id == Some(s.site_name().as_str())
+                                || s.bels.iter().any(|b| Some(b.as_str()) == id)
+                        });
+                        if selected {
+                            p.rect_stroke(
+                                tile,
+                                1.0,
+                                Stroke::new(1.5, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                    }
+                }
+                // Fig. 49: clock-region outlines over the die.
+                let purple = Color32::from_rgb(0xb0, 0x7c, 0xe8);
+                let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
+                for cr in &model.device.clock_regions {
+                    let px = origin.x + (cr.x0 - x0) as f32 * cell;
+                    let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
+                    let pw = cr.cols() as f32 * cell;
+                    let ph = cr.rows() as f32 * cell;
+                    let rr = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
+                    let on = model.selected.as_deref() == Some(cr.name.as_str());
+                    p.rect_stroke(
+                        rr,
+                        0.0,
+                        Stroke::new(if on { 3.0 } else { 2.0 }, if on { gold } else { purple }),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        egui::pos2(rr.left() + 3.0, rr.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        &cr.name,
+                        egui::FontId::monospace(9.0),
+                        if on { gold } else { purple },
+                    );
+                }
+                // PathFinder IOB nets over the die (UG893 Device routing, not occupancy restyle).
+                let route_col = Color32::from_rgb(0x3d, 0xb8, 0x7a);
+                let unroute_col = Color32::from_rgb(0x5a, 0x64, 0x6e);
+                for rt in &model.device.routes {
+                    if rt.tiles.len() < 2 {
+                        continue;
+                    }
+                    let col = if rt.highlighted {
+                        gold
+                    } else if rt.hops == 0 {
+                        unroute_col
+                    } else {
+                        route_col
+                    };
+                    let thick = if rt.highlighted { 2.6 } else { 1.7 };
+                    let mut pts = Vec::new();
+                    for &(x, y) in &rt.tiles {
+                        let dx = x.saturating_sub(x0);
+                        let dy = rows.saturating_sub(1).saturating_sub(y.saturating_sub(y0));
+                        let cx = origin.x + dx as f32 * cell + cell / 2.0;
+                        let cy = origin.y + dy as f32 * cell + cell / 2.0;
+                        pts.push(egui::pos2(cx, cy));
+                    }
+                    for w in pts.windows(2) {
+                        if rt.hops == 0 {
+                            paint_dotted(p, w[0], w[1], Stroke::new(thick, col));
+                        } else {
+                            p.line_segment([w[0], w[1]], Stroke::new(thick, col));
+                        }
+                    }
+                    if let (Some(&a), Some(&b)) = (pts.first(), pts.last()) {
+                        p.circle_filled(a, 2.4, col);
+                        p.circle_filled(b, 2.4, col);
+                    }
+                }
+                if let Some(pos) = resp.hover_pos() {
+                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
+                        let x = x0 + dx as u32;
+                        let y = y0 + (rows - 1 - dy as u32);
+                        let mut tip = String::new();
+                        if let Some(cr) = model.device.clock_region_at(x, y) {
+                            tip.push_str(&format!(
+                                "{}  sites={}",
+                                cr.name,
+                                cr.site_count(&model.device.sites)
+                            ));
+                        }
+                        if let Some(s) = model.device.site_at(x, y) {
+                            if !tip.is_empty() {
+                                tip.push(' ');
+                            }
+                            if s.bels.is_empty() {
+                                tip.push_str(&s.site_name());
+                            } else {
+                                tip.push_str(&format!("{}  {}", s.site_name(), s.bels.join(",")));
+                            }
+                        }
+                        if let Some(rt) = model.device.route_at(x, y) {
+                            if !tip.is_empty() {
+                                tip.push(' ');
+                            }
+                            tip.push_str(&format!(
+                                "route {} hops={} delay_ps={}",
+                                rt.net, rt.hops, rt.delay_ps
+                            ));
+                        }
+                        if !tip.is_empty() {
+                            resp.clone().on_hover_text(tip);
+                        }
+                    }
+                }
+            }
+            if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let origin = egui::pos2(rect.left() + 24.0, rect.top() + 4.0);
+                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
+                        let x = x0 + dx as u32;
+                        let y = y0 + (rows - 1 - dy as u32);
+                        let mut header = false;
+                        if let Some(cr) = model.device.clock_region_at(x, y) {
+                            let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
+                            if pos.y - py <= 14.0 {
+                                pick_region = Some(cr.name.clone());
+                                header = true;
+                            }
+                        }
+                        if !header {
+                            pick_site = Some((x, y));
+                        }
+                    }
+                }
+            }
+        });
+    if let Some(name) = pick_port {
+        model.select(&name);
+    }
+    if let Some(name) = pick_region {
+        let _ = model.select_clock_region(&name);
+    }
+    if let Some((x, y)) = pick_site {
+        let _ = model.select_device_site(&format!("X{x}Y{y}"));
     }
 }
 
@@ -1160,23 +2014,184 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("IP Catalog / Block Design");
-    if ui.button("Refresh catalog").clicked() {
-        let _ = model.exec("ip_catalog");
+    ui.heading("IP Integrator");
+    ui.weak("Helion-MM block design canvas — IP boxes and interface wires (not AXI, not a catalog dump)");
+    ui.horizontal(|ui| {
+        if ui.button("Refresh catalog").clicked() {
+            let _ = model.exec("ip_catalog");
+        }
+        if ui.button("Create Block Design").clicked() {
+            let _ = model.exec("create_bd");
+        }
+    });
+    ui.collapsing("IP Catalog (Helion-MM/ST)", |ui| {
+        for c in &model.ip_catalog {
+            ui.monospace(format!(
+                "{}  {}/{}  {}",
+                c.name, c.vendor, c.library, c.bus
+            ));
+        }
+    });
+    let drawing = model
+        .block_design
+        .as_ref()
+        .map(|bd| bd.drawing(&model.ip_catalog));
+    let Some(drawing) = drawing else {
+        ui.weak("Create Block Design to place Helion-MM IP on the canvas.");
+        return;
+    };
+    ui.monospace(format!(
+        "BD {}  {} IP  {} nets  ok={}",
+        model.block_design.as_ref().map(|b| b.name.as_str()).unwrap_or("-"),
+        drawing
+            .symbols
+            .iter()
+            .filter(|s| s.kind != "PORT_IN" && s.kind != "INTERCONNECT")
+            .count(),
+        drawing.wires.len(),
+        model.block_design.as_ref().map(|b| b.ok).unwrap_or(false)
+    ));
+    if !drawing.addresses.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Address Map (Helion-MM)").strong());
+        ui.monospace("Slave            Offset      Range");
+        for a in &drawing.addresses {
+            ui.monospace(format!(
+                "{:<16} 0x{:>08x}  0x{:x}",
+                a.slave, a.base, a.range
+            ));
+        }
     }
-    if ui.button("Create Block Design").clicked() {
-        let _ = model.exec("create_bd");
-    }
-    for c in &model.ip_catalog {
-        ui.monospace(format!(
-            "{}  {}/{}  {}",
-            c.name, c.vendor, c.library, c.bus
-        ));
-    }
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let size = egui::vec2(
+                drawing.width.max(ui.available_width()),
+                drawing.height.max(ui.available_height().max(200.0)),
+            );
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            if !ui.is_rect_visible(rect) {
+                return;
+            }
+            let p = ui.painter();
+            p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
+            let o = rect.min;
+            let net = Color32::from_rgb(0x3d, 0xb8, 0x7a);
+            let mm = Color32::from_rgb(0x7e, 0xc8, 0xe3);
+            for w in &drawing.wires {
+                let col = if w.net == "Helion-MM" { mm } else { net };
+                let thick = if w.net == "Helion-MM" { 3.4 } else { 1.6 };
+                let pts: Vec<egui::Pos2> = w
+                    .points
+                    .iter()
+                    .map(|(x, y)| egui::pos2(o.x + *x, o.y + *y))
+                    .collect();
+                for pair in pts.windows(2) {
+                    p.line_segment([pair[0], pair[1]], Stroke::new(thick, col));
+                }
+                if let Some(&a) = pts.first() {
+                    p.text(
+                        a + egui::vec2(4.0, -8.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        &w.net,
+                        egui::FontId::monospace(9.0),
+                        col,
+                    );
+                }
+            }
+            for sy in &drawing.symbols {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(o.x + sy.x, o.y + sy.y),
+                    egui::vec2(sy.w, sy.h),
+                );
+                if sy.kind == "PORT_IN" {
+                    let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
+                    p.add(egui::Shape::convex_polygon(
+                        pts,
+                        Color32::from_rgb(0x1e, 0x3a, 0x55),
+                        Stroke::new(1.0, Color32::from_rgb(0x7a, 0x84, 0x8e)),
+                    ));
+                } else {
+                    let fill = if sy.kind == "INTERCONNECT" {
+                        Color32::from_rgb(0x24, 0x2e, 0x3a)
+                    } else {
+                        Color32::from_rgb(0x2a, 0x32, 0x24)
+                    };
+                    p.rect_filled(r, 3.0, fill);
+                    p.rect_stroke(
+                        r,
+                        3.0,
+                        Stroke::new(1.0, Color32::from_rgb(0x7a, 0x84, 0x8e)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                p.text(
+                    egui::pos2(r.center().x, r.top() + 4.0),
+                    egui::Align2::CENTER_TOP,
+                    &sy.kind,
+                    egui::FontId::monospace(10.0),
+                    Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                );
+                p.text(
+                    egui::pos2(r.center().x, r.bottom() - 4.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    &sy.name,
+                    egui::FontId::monospace(10.0),
+                    Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                );
+                if !sy.bus.is_empty() {
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &sy.bus,
+                        egui::FontId::monospace(9.0),
+                        Color32::from_rgb(0x9a, 0xa4, 0xae),
+                    );
+                }
+                for pin in &sy.pins {
+                    let tip = egui::pos2(o.x + pin.x, o.y + pin.y);
+                    let edge = if pin.output {
+                        egui::pos2(r.right(), tip.y)
+                    } else {
+                        egui::pos2(r.left(), tip.y)
+                    };
+                    if pin.iface {
+                        let bar = egui::Rect::from_center_size(edge, egui::vec2(10.0, 16.0));
+                        p.rect_filled(bar, 1.0, mm);
+                        p.rect_stroke(
+                            bar,
+                            1.0,
+                            Stroke::new(1.0, Color32::from_rgb(0xdc, 0xe0, 0xe4)),
+                            egui::StrokeKind::Outside,
+                        );
+                        p.line_segment([edge, tip], Stroke::new(3.4, mm));
+                    } else {
+                        p.line_segment([edge, tip], Stroke::new(1.6, net));
+                        p.circle_filled(tip, 2.0, Color32::from_rgb(0xdc, 0xe0, 0xe4));
+                    }
+                    let label_pos = if pin.output {
+                        egui::pos2(r.right() - 4.0, tip.y)
+                    } else {
+                        egui::pos2(r.left() + 4.0, tip.y)
+                    };
+                    p.text(
+                        label_pos,
+                        if pin.output {
+                            egui::Align2::RIGHT_CENTER
+                        } else {
+                            egui::Align2::LEFT_CENTER
+                        },
+                        &pin.name,
+                        egui::FontId::monospace(8.0),
+                        Color32::from_rgb(0x9a, 0xa4, 0xae),
+                    );
+                }
+            }
+        });
     if let Some(bd) = &model.block_design {
-        ui.separator();
-        ui.label(RichText::new(format!("BD {} ok={}", bd.name, bd.ok)).strong());
-        ui.monospace(&bd.sv);
+        ui.collapsing("Generated SV", |ui| {
+            ui.monospace(&bd.sv);
+        });
     }
 }
 
