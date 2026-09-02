@@ -18,8 +18,8 @@ use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
-    report_clock_interaction, report_timing_routed_xdc, ClockInteraction, Constraints,
-    TimingResult,
+    report_clock_interaction, report_timing_routed_xdc, report_timing_summary, ClockInteraction,
+    Constraints, TimingResult, TimingSummary,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -299,6 +299,10 @@ impl NavSection {
                 NavAction {
                     label: "Report Timing",
                     tcl: "report_timing",
+                },
+                NavAction {
+                    label: "Report Timing Summary",
+                    tcl: "report_timing_summary",
                 },
                 NavAction {
                     label: "Report Clock Interaction",
@@ -2509,6 +2513,14 @@ impl IdeModel {
         } else if t == "report_clock_interaction" || t == "clock_interaction" {
             self.workspace = WorkspaceTab::ClockInteraction;
             Ok(self.clock_interaction_text())
+        } else if t == "report_timing_summary" || t == "timing_summary" {
+            self.workspace = WorkspaceTab::Reports;
+            Ok(self.timing_summary_text())
+        } else if let Some(rest) = t.strip_prefix("select_timing_summary ") {
+            let mut p = rest.split_whitespace();
+            let a = p.next().unwrap_or("");
+            let b = p.next();
+            self.select_timing_summary(a, b)
         } else if let Some(rest) = t.strip_prefix("select_clock_interaction ") {
             let mut p = rest.split_whitespace();
             let from = p.next().unwrap_or("");
@@ -4907,6 +4919,77 @@ impl IdeModel {
         ))
     }
 
+    /// UG903/UG949 Timing Summary pane: intra/inter-clock WNS/TNS/WHS/THS by path
+    /// group from STA, not a dump. Implicit analysis clock after synth; user
+    /// clocks from create_clock / group_path. Empty XDC keeps gold WNS.
+    pub fn timing_summary(&self) -> TimingSummary {
+        let clks = if !self.constraints.clocks.is_empty() {
+            self.constraints.clocks.clone()
+        } else if self.timing.is_some() || self.shell.session.design.is_some() {
+            self.clocks_for_sta()
+        } else {
+            return TimingSummary::default();
+        };
+        report_timing_summary(&clks, &self.constraints, self.timing.as_ref())
+    }
+
+    pub fn timing_summary_text(&self) -> String {
+        self.timing_summary().text()
+    }
+
+    /// Click a path-group row: properties + Reports workspace.
+    pub fn select_timing_summary(
+        &mut self,
+        a: &str,
+        b: Option<&str>,
+    ) -> Result<String, String> {
+        let report = self.timing_summary();
+        let group = if let Some(to) = b {
+            report.group(a, to).or_else(|| report.named(a))
+        } else {
+            report.named(a).or_else(|| report.group(a, a))
+        }
+        .ok_or_else(|| format!("select_timing_summary: no group {a}"))?;
+        let wns = group
+            .wns_ps
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "n/a".into());
+        let whs = group
+            .whs_ps
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "n/a".into());
+        self.selected = Some(if group.kind == helion_sta::PathGroupKind::Other {
+            group.name.clone()
+        } else {
+            format!("{}->{}", group.from, group.to)
+        });
+        self.properties = vec![
+            ("NAME".into(), group.name.clone()),
+            ("TYPE".into(), "timing_summary".into()),
+            ("KIND".into(), group.kind.as_str().into()),
+            ("FROM".into(), group.from.clone()),
+            ("TO".into(), group.to.clone()),
+            ("WNS_PS".into(), wns.clone()),
+            ("TNS_PS".into(), group.tns_ps.to_string()),
+            ("WHS_PS".into(), whs.clone()),
+            ("THS_PS".into(), group.ths_ps.to_string()),
+            ("FAILING_SETUP".into(), group.failing_setup.to_string()),
+            ("FAILING_HOLD".into(), group.failing_hold.to_string()),
+            ("ENDPOINTS".into(), group.endpoints.to_string()),
+        ];
+        self.workspace = WorkspaceTab::Reports;
+        Ok(format!(
+            "timing_summary NAME={} KIND={} FROM={} TO={} WNS_PS={wns} TNS_PS={} WHS_PS={whs} THS_PS={} endpoints={}",
+            group.name,
+            group.kind.as_str(),
+            group.from,
+            group.to,
+            group.tns_ps,
+            group.ths_ps,
+            group.endpoints
+        ))
+    }
+
     /// UG893 Timing Constraints pane text. Empty until create_clock /
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
@@ -6591,23 +6674,53 @@ impl IdeModel {
             props.push(("X1".into(), pb.x1.to_string()));
             props.push(("Y1".into(), pb.y1.to_string()));
         }
-        if let Some((from, to)) = id.split_once("->") {
-            if let Some(cell) = self.clock_interaction().cell(from, to).cloned() {
+        if self.workspace == WorkspaceTab::Reports {
+            if let Some(g) = self.timing_summary().named(&id).cloned().or_else(|| {
+                id.split_once("->")
+                    .and_then(|(from, to)| self.timing_summary().group(from, to).cloned())
+            }) {
                 if !props.iter().any(|(k, _)| k == "TYPE") {
-                    props.push(("TYPE".into(), "clock_interaction".into()));
+                    props.push(("TYPE".into(), "timing_summary".into()));
                 }
-                props.push(("FROM".into(), cell.from));
-                props.push(("TO".into(), cell.to));
-                props.push(("RELATION".into(), cell.relation.as_str().into()));
-                props.push(("COMMON_PS".into(), cell.common_period_ps.to_string()));
-                props.push(("REQ_PS".into(), cell.requirement_ps.to_string()));
+                props.push(("KIND".into(), g.kind.as_str().into()));
+                props.push(("FROM".into(), g.from));
+                props.push(("TO".into(), g.to));
                 props.push((
                     "WNS_PS".into(),
-                    cell.wns_ps
+                    g.wns_ps
                         .map(|w| w.to_string())
                         .unwrap_or_else(|| "n/a".into()),
                 ));
-                props.push(("PATHS".into(), cell.path_count.to_string()));
+                props.push(("TNS_PS".into(), g.tns_ps.to_string()));
+                props.push((
+                    "WHS_PS".into(),
+                    g.whs_ps
+                        .map(|w| w.to_string())
+                        .unwrap_or_else(|| "n/a".into()),
+                ));
+                props.push(("THS_PS".into(), g.ths_ps.to_string()));
+                props.push(("ENDPOINTS".into(), g.endpoints.to_string()));
+            }
+        }
+        if let Some((from, to)) = id.split_once("->") {
+            if self.workspace != WorkspaceTab::Reports {
+                if let Some(cell) = self.clock_interaction().cell(from, to).cloned() {
+                    if !props.iter().any(|(k, _)| k == "TYPE") {
+                        props.push(("TYPE".into(), "clock_interaction".into()));
+                    }
+                    props.push(("FROM".into(), cell.from));
+                    props.push(("TO".into(), cell.to));
+                    props.push(("RELATION".into(), cell.relation.as_str().into()));
+                    props.push(("COMMON_PS".into(), cell.common_period_ps.to_string()));
+                    props.push(("REQ_PS".into(), cell.requirement_ps.to_string()));
+                    props.push((
+                        "WNS_PS".into(),
+                        cell.wns_ps
+                            .map(|w| w.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                    ));
+                    props.push(("PATHS".into(), cell.path_count.to_string()));
+                }
             }
         }
         self.properties = props;
@@ -11383,6 +11496,200 @@ mod tests {
         );
         assert_eq!(
             blinky.clock_interaction().cell("clk", "clk").unwrap().wns_ps,
+            Some(bwns)
+        );
+    }
+
+    /// UG903/UG949 `report_timing_summary` pane is intra/inter-clock WNS/TNS/WHS/THS
+    /// by path group from STA — not a canned table. Empty XDC keeps gold WNS.
+    #[test]
+    fn timing_summary_pane_intra_inter_other_from_sta_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let empty = ide.timing_summary_text();
+        assert!(
+            empty.contains("no clocks"),
+            "idle pane has no canned summary: {empty}"
+        );
+        assert!(ide.timing_summary().groups.is_empty());
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_timing_summary"),
+            "Flow Navigator Timing Analysis must offer the pane"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        let hold = ide.timing.as_ref().unwrap().hold_slack_ps;
+        let tns = ide.timing.as_ref().unwrap().tns_ps;
+        let endpoints = ide.timing.as_ref().unwrap().endpoints;
+
+        let out = ide.exec("report_timing_summary").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert!(out.contains("KIND=intra"), "{out}");
+        assert!(out.contains("FROM=clk TO=clk"), "{out}");
+        assert!(out.contains(&format!("WNS_PS={gold}")), "{out}");
+        assert!(out.contains(&format!("WHS_PS={hold}")), "{out}");
+        assert!(out.contains(&format!("TNS_PS={tns}")), "{out}");
+        let r = ide.timing_summary();
+        assert_eq!(r.clocks.len(), 1, "{}", r.text());
+        assert_eq!(r.intra_count(), 1);
+        assert_eq!(r.inter_count(), 0);
+        assert_eq!(r.other_count(), 0);
+        let intra = r.group("clk", "clk").expect("intra-clock group");
+        assert_eq!(intra.kind, helion_sta::PathGroupKind::IntraClock);
+        assert_eq!(intra.wns_ps, Some(gold));
+        assert_eq!(intra.tns_ps, tns);
+        assert_eq!(intra.whs_ps, Some(hold));
+        assert_eq!(intra.ths_ps, hold.min(0));
+        assert_eq!(intra.endpoints, endpoints);
+        assert_eq!(r.wns_ps, Some(gold));
+        assert_eq!(r.whs_ps, Some(hold));
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening the pane must not move gold WNS"
+        );
+
+        let sel = ide.exec("select_timing_summary clk clk").unwrap();
+        assert!(sel.contains("KIND=intra"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "timing_summary"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WNS_PS" && v == &gold.to_string()),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WHS_PS" && v == &hold.to_string()),
+            "{:?}",
+            ide.properties
+        );
+
+        let gclk = ide
+            .exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(gclk.contains("PERIOD_PS=20000"), "{gclk}");
+        let r = ide.timing_summary();
+        assert_eq!(r.clocks.len(), 2, "{}", r.text());
+        assert_eq!(r.intra_count(), 2);
+        assert_eq!(r.inter_count(), 2);
+        let wns_div = ide.wns_ps().expect("STA after generated clock");
+        assert_eq!(wns_div, gold + 10_000);
+        assert_eq!(
+            r.group("clkdiv", "clkdiv").unwrap().wns_ps,
+            Some(wns_div),
+            "generated intra-clock WNS is STA, not a label"
+        );
+        assert_eq!(r.group("clk", "clk").unwrap().wns_ps, Some(gold));
+        let inter = r.group("clk", "clkdiv").unwrap();
+        assert_eq!(inter.kind, helion_sta::PathGroupKind::InterClock);
+        assert_ne!(inter.wns_ps, Some(gold), "inter-clock WNS uses dest period");
+
+        let virt = ide
+            .exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        assert!(virt.contains("PERIOD_PS=8000"), "{virt}");
+        let r = ide.timing_summary();
+        assert_eq!(r.clocks.len(), 3, "{}", r.text());
+        assert_eq!(r.inter_count(), 6);
+        let cdc = r.group("clk", "virt").expect("CDC group");
+        assert_eq!(cdc.kind, helion_sta::PathGroupKind::InterClock);
+        assert_ne!(
+            cdc.wns_ps,
+            Some(gold),
+            "inter-clock slack uses the destination period: {:?}",
+            cdc.wns_ps
+        );
+        let pane = ide.exec("report_timing_summary").unwrap();
+        assert!(pane.contains("KIND=inter"), "{pane}");
+        assert!(pane.contains("FROM=clk TO=virt"), "{pane}");
+
+        let cg = ide
+            .exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
+            .unwrap();
+        assert!(cg.contains("clock_groups=1"), "{cg}");
+        let r = ide.timing_summary();
+        assert!(r.group("clk", "virt").unwrap().wns_ps.is_none());
+        assert!(
+            r.group("clk", "clk").unwrap().wns_ps.is_some(),
+            "async CDC must not drop intra-clock STA WNS: {}",
+            r.text()
+        );
+
+        let mut gp = IdeModel::new();
+        gp.open_source(&example("counter.sv")).unwrap();
+        gp.run_step(FlowStep::Place).unwrap();
+        gp.run_step(FlowStep::Route).unwrap();
+        let gold2 = gp.wns_ps().expect("STA before group_path");
+        assert_eq!(gold2, gold, "empty XDC keeps gold WNS");
+        gp.exec("group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        gp.exec("group_path -name light -weight 1 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let r = gp.timing_summary();
+        assert_eq!(r.other_count(), 2, "{}", r.text());
+        let extra = r.named("extra").unwrap();
+        let light = r.named("light").unwrap();
+        assert_eq!(extra.kind, helion_sta::PathGroupKind::Other);
+        assert_ne!(
+            extra.wns_ps, light.wns_ps,
+            "group_path weight must move that group's WNS"
+        );
+        assert!(
+            extra.wns_ps.unwrap() < light.wns_ps.unwrap(),
+            "weight 2 must worsen WNS vs weight 1: extra={:?} light={:?}",
+            extra.wns_ps,
+            light.wns_ps
+        );
+        let sel = gp.exec("select_timing_summary extra").unwrap();
+        assert!(sel.contains("KIND=other"), "{sel}");
+        assert!(
+            gp.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "timing_summary"),
+            "{:?}",
+            gp.properties
+        );
+        assert!(
+            gp.properties
+                .iter()
+                .any(|(k, v)| k == "NAME" && v == "extra"),
+            "{:?}",
+            gp.properties
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let bwns = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(
+            bwns, gold,
+            "timing-summary WNS is per-design STA, not a canned pane"
+        );
+        assert_eq!(
+            blinky.timing_summary().group("clk", "clk").unwrap().wns_ps,
+            Some(bwns)
+        );
+        assert_eq!(
+            blinky.timing_summary().wns_ps,
             Some(bwns)
         );
     }
