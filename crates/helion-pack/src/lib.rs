@@ -35,6 +35,12 @@ pub struct PackedIob {
     pub from_net: String,
     /// Optional `IOB_XxYy` from IR port LOC.
     pub loc: Option<String>,
+    /// UG893 I/O Ports `DRIVE` (mA), copied from the PAD port.
+    pub drive: Option<String>,
+    /// UG893 I/O Ports `SLEW`.
+    pub slew: Option<String>,
+    /// UG893 I/O Ports `PULLTYPE`.
+    pub pulltype: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,15 +95,15 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 .net_on(&c.name, "I")
                 .ok_or_else(|| format!("IOB {} has no I net", c.name))?;
             let pad = design.net_on(&c.name, "PAD").unwrap_or("");
-            let loc = design
-                .ports
-                .iter()
-                .find(|p| p.name == pad)
-                .and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
+            let port = design.ports.iter().find(|p| p.name == pad);
+            let loc = port.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
             iobs.push(PackedIob {
                 cell: c.name.clone(),
                 from_net: net.to_string(),
                 loc,
+                drive: port.and_then(|p| p.attrs.get("DRIVE").map(|s| s.to_string())),
+                slew: port.and_then(|p| p.attrs.get("SLEW").map(|s| s.to_string())),
+                pulltype: port.and_then(|p| p.attrs.get("PULLTYPE").map(|s| s.to_string())),
             });
         }
     }
@@ -137,6 +143,18 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     })
 }
 
+/// Copy HNF port DRIVE / SLEW / PULLTYPE onto packed IOBs (post-pack set_property).
+pub fn apply_iob_electrical(design: &Design, iobs: &mut [PackedIob]) {
+    for iob in iobs.iter_mut() {
+        let pad = design.net_on(&iob.cell, "PAD").unwrap_or("");
+        if let Some(p) = design.ports.iter().find(|p| p.name == pad) {
+            iob.drive = p.attrs.get("DRIVE").map(|s| s.to_string());
+            iob.slew = p.attrs.get("SLEW").map(|s| s.to_string());
+            iob.pulltype = p.attrs.get("PULLTYPE").map(|s| s.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +180,17 @@ mod tests {
         assert_eq!(p.lutffs[3].lut_pins.len(), 4);
         assert_eq!(p.iobs[0].from_net, "q3");
         assert_eq!(p.lutffs[3].q_net, "q3");
+        assert!(p.iobs[0].drive.is_none());
+        assert!(p.iobs[0].slew.is_none());
+        assert!(p.iobs[0].pulltype.is_none());
+        let mut d = Design::structural_counter();
+        d.set_drive("led", "4").unwrap();
+        d.set_slew("led", "FAST").unwrap();
+        d.set_pulltype("led", "PULLUP").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        assert_eq!(p.iobs[0].drive.as_deref(), Some("4"));
+        assert_eq!(p.iobs[0].slew.as_deref(), Some("FAST"));
+        assert_eq!(p.iobs[0].pulltype.as_deref(), Some("PULLUP"));
     }
 
     #[test]

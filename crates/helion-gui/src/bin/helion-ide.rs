@@ -907,8 +907,10 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("I/O Planning");
-    ui.weak("UG893 — set_property PACKAGE_PIN re-places onto HAD IOB (place/STA), not a pin list");
+    ui.weak("UG893 — PACKAGE_PIN re-places; IOSTANDARD/DRIVE/SLEW/PULLTYPE hit HAD / STA / DRC / bitgen");
     let mut pick_port: Option<String> = None;
+    let mut set_iostd: Option<(String, &'static str)> = None;
+    let mut set_io: Option<(String, &'static str, &'static str)> = None;
     ui.collapsing("I/O Ports", |ui| {
         if model.io_ports.is_empty() {
             ui.weak("Synth a design to list ports.");
@@ -920,15 +922,71 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                 .as_deref()
                 .or(p.site.as_deref())
                 .unwrap_or("(unplaced)");
+            let std = p.iostandard.as_deref().unwrap_or("-");
+            let drv = p.drive.as_deref().unwrap_or("-");
+            let slew = p.slew.as_deref().unwrap_or("-");
+            let pull = p.pulltype.as_deref().unwrap_or("-");
             if ui
-                .selectable_label(on, format!("{}  {}  PACKAGE_PIN={pin}", p.name, p.dir))
+                .selectable_label(
+                    on,
+                    format!(
+                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}",
+                        p.name, p.dir
+                    ),
+                )
                 .clicked()
             {
                 pick_port = Some(p.name.clone());
             }
         }
         ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
+        if let Some(port) = model
+            .selected
+            .as_deref()
+            .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
+        {
+            ui.horizontal(|ui| {
+                ui.weak("IOSTANDARD");
+                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12"] {
+                    if ui.small_button(std).clicked() {
+                        set_iostd = Some((port.to_string(), std));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("DRIVE");
+                for ma in ["4", "8", "12", "16"] {
+                    if ui.small_button(ma).clicked() {
+                        set_io = Some((port.to_string(), "DRIVE", ma));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("SLEW");
+                for s in ["SLOW", "FAST"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "SLEW", s));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("PULLTYPE");
+                for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "PULLTYPE", s));
+                    }
+                }
+            });
+        }
     });
+    if let Some((port, std)) = set_iostd {
+        let _ = model.exec(&format!(
+            "set_property IOSTANDARD {std} [get_ports {port}]"
+        ));
+    }
+    if let Some((port, key, val)) = set_io {
+        let _ = model.exec(&format!("set_property {key} {val} [get_ports {port}]"));
+    }
     if let Some(name) = pick_port {
         model.select(&name);
     }
@@ -1123,7 +1181,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Timing Constraints");
-    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / I/O delay / false path Apply");
+    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / I/O delay / false path / multicycle / max_delay Apply");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Read examples/counter.sdc").clicked() {
@@ -1140,8 +1198,19 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("set_false_path -from [get_ports clk] -to [get_ports led]");
         }
     });
+    ui.horizontal(|ui| {
+        if ui.button("Apply set_multicycle_path 2 clk→led").clicked() {
+            let _ = model.exec("set_multicycle_path 2 -from [get_ports clk] -to [get_ports led]");
+        }
+        if ui.button("Apply set_multicycle_path -hold 1").clicked() {
+            let _ = model.exec("set_multicycle_path -hold 1 -from [get_ports clk] -to [get_ports led]");
+        }
+        if ui.button("Apply set_max_delay 5ns clk→led").clicked() {
+            let _ = model.exec("set_max_delay 5.0 -from [get_ports clk] -to [get_ports led]");
+        }
+    });
     ui.add_space(6.0);
-    report_box(ui, "Constraints (create_clock / I/O delay / false path)", &model.constraints_text());
+    report_box(ui, "Constraints (create_clock / I/O delay / false path / multicycle / max_delay)", &model.constraints_text());
     ui.add_space(8.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
 }
@@ -1527,6 +1596,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
         );
     });
     let mut pick_port: Option<String> = None;
+    let mut set_iostd: Option<(String, &'static str)> = None;
+    let mut set_io: Option<(String, &'static str, &'static str)> = None;
     ui.collapsing("I/O Ports", |ui| {
         if model.io_ports.is_empty() {
             ui.weak("Synth a design to list ports.");
@@ -1538,17 +1609,70 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 .as_deref()
                 .or(p.site.as_deref())
                 .unwrap_or("(unplaced)");
+            let std = p.iostandard.as_deref().unwrap_or("-");
+            let drv = p.drive.as_deref().unwrap_or("-");
+            let slew = p.slew.as_deref().unwrap_or("-");
+            let pull = p.pulltype.as_deref().unwrap_or("-");
             if ui
                 .selectable_label(
                     on,
-                    format!("{}  {}  PACKAGE_PIN={pin}", p.name, p.dir),
+                    format!(
+                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}",
+                        p.name, p.dir
+                    ),
                 )
                 .clicked()
             {
                 pick_port = Some(p.name.clone());
             }
         }
+        if let Some(port) = model
+            .selected
+            .as_deref()
+            .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
+        {
+            ui.horizontal(|ui| {
+                ui.weak("IOSTANDARD");
+                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12"] {
+                    if ui.small_button(std).clicked() {
+                        set_iostd = Some((port.to_string(), std));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("DRIVE");
+                for ma in ["4", "8", "12", "16"] {
+                    if ui.small_button(ma).clicked() {
+                        set_io = Some((port.to_string(), "DRIVE", ma));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("SLEW");
+                for s in ["SLOW", "FAST"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "SLEW", s));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("PULLTYPE");
+                for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "PULLTYPE", s));
+                    }
+                }
+            });
+        }
     });
+    if let Some((port, std)) = set_iostd {
+        let _ = model.exec(&format!(
+            "set_property IOSTANDARD {std} [get_ports {port}]"
+        ));
+    }
+    if let Some((port, key, val)) = set_io {
+        let _ = model.exec(&format!("set_property {key} {val} [get_ports {port}]"));
+    }
     let mut pick_pblock: Option<String> = None;
     ui.collapsing("Pblocks", |ui| {
         ui.weak("UG893 Floorplanning — create_pblock / resize_pblock hits place + bitgen_pblock");

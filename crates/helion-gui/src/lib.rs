@@ -154,6 +154,14 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
                 d.set_net_attr(obj, "mark_debug", val)?;
             } else if key.eq_ignore_ascii_case("LOC") || key.eq_ignore_ascii_case("PACKAGE_PIN") {
                 d.set_loc(obj, val)?;
+            } else if key.eq_ignore_ascii_case("IOSTANDARD") {
+                d.set_iostandard(obj, val)?;
+            } else if key.eq_ignore_ascii_case("DRIVE") {
+                d.set_drive(obj, val)?;
+            } else if key.eq_ignore_ascii_case("SLEW") {
+                d.set_slew(obj, val)?;
+            } else if key.eq_ignore_ascii_case("PULLTYPE") {
+                d.set_pulltype(obj, val)?;
             }
             return Ok(format!("set_property {key} {val} {obj}"));
         }

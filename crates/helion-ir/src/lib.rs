@@ -222,6 +222,22 @@ impl Design {
         self.set_port_attr(port, "LOC", site)
     }
 
+    pub fn set_iostandard(&mut self, port: &str, std: &str) -> Result<(), String> {
+        self.set_port_attr(port, "IOSTANDARD", std)
+    }
+
+    pub fn set_drive(&mut self, port: &str, ma: &str) -> Result<(), String> {
+        self.set_port_attr(port, "DRIVE", ma)
+    }
+
+    pub fn set_slew(&mut self, port: &str, slew: &str) -> Result<(), String> {
+        self.set_port_attr(port, "SLEW", slew)
+    }
+
+    pub fn set_pulltype(&mut self, port: &str, pull: &str) -> Result<(), String> {
+        self.set_port_attr(port, "PULLTYPE", pull)
+    }
+
     pub fn lut_inits(&self) -> Vec<u64> {
         self.cells
             .iter()
@@ -534,6 +550,10 @@ mod tests {
         d.mark_debug("q").unwrap();
         d.dont_touch("u_lut").unwrap();
         d.set_loc("led", "IOB_X2Y0").unwrap();
+        d.set_iostandard("led", "LVCMOS18").unwrap();
+        d.set_drive("led", "12").unwrap();
+        d.set_slew("led", "SLOW").unwrap();
+        d.set_pulltype("led", "NONE").unwrap();
         d.attrs.set("top", "blinky");
         let text = d.to_hnf();
         assert!(text.starts_with("HNF 1"), "{text}");
@@ -543,6 +563,22 @@ mod tests {
         assert!(back.net("q").unwrap().attrs.flag("mark_debug"));
         assert!(back.cell("u_lut").unwrap().attrs.flag("DONT_TOUCH"));
         assert_eq!(back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("LOC"), Some("IOB_X2Y0"));
+        assert_eq!(
+            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("IOSTANDARD"),
+            Some("LVCMOS18")
+        );
+        assert_eq!(
+            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("DRIVE"),
+            Some("12")
+        );
+        assert_eq!(
+            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("SLEW"),
+            Some("SLOW")
+        );
+        assert_eq!(
+            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("PULLTYPE"),
+            Some("NONE")
+        );
         assert_eq!(back.net_on("u_lut", "I0"), Some("q"));
     }
 

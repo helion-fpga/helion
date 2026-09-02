@@ -3,7 +3,7 @@
 use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
 use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
-use helion_pack::{pack, Packed};
+use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{create_clock, report_timing_routed};
@@ -381,10 +381,28 @@ impl Session {
     }
 
     pub fn write_bitstream(&mut self, dev: &Device) -> Result<&Bitstream, String> {
+        self.sync_iob_electrical();
         let routed = self.routed.as_ref().ok_or("write_bitstream: not routed")?;
         let bits = bitgen(dev, routed)?;
         self.bitstream = Some(bits);
         Ok(self.bitstream.as_ref().unwrap())
+    }
+
+    /// Push HNF port DRIVE / SLEW / PULLTYPE onto packed IOBs so bitgen sees
+    /// post-pack `set_property` without a re-pack.
+    fn sync_iob_electrical(&mut self) {
+        let Some(d) = self.design.clone() else {
+            return;
+        };
+        if let Some(p) = self.packed.as_mut() {
+            apply_iob_electrical(&d, &mut p.iobs);
+        }
+        if let Some(p) = self.placed.as_mut() {
+            apply_iob_electrical(&d, &mut p.packed.iobs);
+        }
+        if let Some(r) = self.routed.as_mut() {
+            apply_iob_electrical(&d, &mut r.placed.packed.iobs);
+        }
     }
 
     pub fn write_hnf(&self) -> Result<String, String> {
@@ -456,6 +474,14 @@ impl Session {
             d.set_net_attr(obj, "mark_debug", val)?;
         } else if key.eq_ignore_ascii_case("LOC") || key.eq_ignore_ascii_case("PACKAGE_PIN") {
             d.set_loc(obj, val)?;
+        } else if key.eq_ignore_ascii_case("IOSTANDARD") {
+            d.set_iostandard(obj, val)?;
+        } else if key.eq_ignore_ascii_case("DRIVE") {
+            d.set_drive(obj, val)?;
+        } else if key.eq_ignore_ascii_case("SLEW") {
+            d.set_slew(obj, val)?;
+        } else if key.eq_ignore_ascii_case("PULLTYPE") {
+            d.set_pulltype(obj, val)?;
         } else {
             d.set_cell_attr(obj, key, val)?;
         }
@@ -600,6 +626,10 @@ pub struct ProjectFile {
     pub sources: Vec<String>,
     pub sdc: Vec<String>,
     pub package_pins: Vec<(String, String)>,
+    pub iostandards: Vec<(String, String)>,
+    pub drives: Vec<(String, String)>,
+    pub slews: Vec<(String, String)>,
+    pub pulltypes: Vec<(String, String)>,
 }
 
 pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
@@ -642,6 +672,62 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                         .to_string();
                     if !port.is_empty() {
                         p.package_pins.push((port, site));
+                    }
+                } else if rest.first().copied() == Some("IOSTANDARD") && rest.len() >= 2 {
+                    let std = rest[1].to_string();
+                    let joined = rest[2..].join(" ");
+                    let port = joined
+                        .split_once("get_ports")
+                        .and_then(|(_, r)| {
+                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .find(|s| !s.is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    if !port.is_empty() {
+                        p.iostandards.push((port, std));
+                    }
+                } else if rest.first().copied() == Some("DRIVE") && rest.len() >= 2 {
+                    let val = rest[1].to_string();
+                    let joined = rest[2..].join(" ");
+                    let port = joined
+                        .split_once("get_ports")
+                        .and_then(|(_, r)| {
+                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .find(|s| !s.is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    if !port.is_empty() {
+                        p.drives.push((port, val));
+                    }
+                } else if rest.first().copied() == Some("SLEW") && rest.len() >= 2 {
+                    let val = rest[1].to_string();
+                    let joined = rest[2..].join(" ");
+                    let port = joined
+                        .split_once("get_ports")
+                        .and_then(|(_, r)| {
+                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .find(|s| !s.is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    if !port.is_empty() {
+                        p.slews.push((port, val));
+                    }
+                } else if rest.first().copied() == Some("PULLTYPE") && rest.len() >= 2 {
+                    let val = rest[1].to_string();
+                    let joined = rest[2..].join(" ");
+                    let port = joined
+                        .split_once("get_ports")
+                        .and_then(|(_, r)| {
+                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .find(|s| !s.is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    if !port.is_empty() {
+                        p.pulltypes.push((port, val));
                     }
                 }
             }
@@ -806,6 +892,10 @@ part HL10T-C32-1
 read_sv examples/blinky.sv
 create_clock -period 10.000 [get_ports clk]
 set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]
+set_property IOSTANDARD LVCMOS18 [get_ports led]
+set_property DRIVE 12 [get_ports led]
+set_property SLEW SLOW [get_ports led]
+set_property PULLTYPE NONE [get_ports led]
 "#,
         )
         .unwrap();
@@ -813,6 +903,10 @@ set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]
         assert_eq!(prj.sources, vec!["examples/blinky.sv"]);
         assert_eq!(prj.sdc.len(), 1);
         assert_eq!(prj.package_pins, vec![("led".into(), "IOB_X2Y0".into())]);
+        assert_eq!(prj.iostandards, vec![("led".into(), "LVCMOS18".into())]);
+        assert_eq!(prj.drives, vec![("led".into(), "12".into())]);
+        assert_eq!(prj.slews, vec![("led".into(), "SLOW".into())]);
+        assert_eq!(prj.pulltypes, vec![("led".into(), "NONE".into())]);
         assert!(load_prj("part X\n").is_err());
     }
 
