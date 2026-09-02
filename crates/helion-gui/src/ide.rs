@@ -1395,12 +1395,32 @@ impl WaveTrace {
     }
 }
 
+/// UG900 waveform marker: a named time on the engine sample grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaveMarker {
+    pub name: String,
+    pub sample: usize,
+}
+
+/// UG900 virtual bus: packed display of existing traces (LSB = first member).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtualBus {
+    pub name: String,
+    pub members: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Waveform {
     pub traces: Vec<WaveTrace>,
     pub cursor: usize,
     /// Picoseconds per sample (clock period). UG900 timescale ruler.
     pub timescale_ps: u64,
+    pub markers: Vec<WaveMarker>,
+    pub virtual_buses: Vec<VirtualBus>,
+    /// UG900 measurement cursor A (sample index). Independent of the main cursor.
+    pub cursor_a: Option<usize>,
+    /// UG900 measurement cursor B (sample index). Independent of the main cursor.
+    pub cursor_b: Option<usize>,
 }
 
 impl Default for Waveform {
@@ -1409,6 +1429,10 @@ impl Default for Waveform {
             traces: Vec::new(),
             cursor: 0,
             timescale_ps: 10_000,
+            markers: Vec::new(),
+            virtual_buses: Vec::new(),
+            cursor_a: None,
+            cursor_b: None,
         }
     }
 }
@@ -1444,8 +1468,77 @@ impl Waveform {
         self.cursor = if n == 0 { 0 } else { idx.min(n - 1) };
     }
 
+    /// UG900 cursor A on the engine sample grid. None when the wave is empty.
+    pub fn set_cursor_a(&mut self, idx: usize) {
+        let n = self.sample_len();
+        self.cursor_a = if n == 0 { None } else { Some(idx.min(n - 1)) };
+    }
+
+    /// UG900 cursor B on the engine sample grid. None when the wave is empty.
+    pub fn set_cursor_b(&mut self, idx: usize) {
+        let n = self.sample_len();
+        self.cursor_b = if n == 0 { None } else { Some(idx.min(n - 1)) };
+    }
+
+    /// Signed B−A in picoseconds (UG900 time-delta). None until both cursors sit.
+    pub fn time_delta_ps(&self) -> Option<i64> {
+        let a = self.cursor_a?;
+        let b = self.cursor_b?;
+        Some(self.time_ps(b) as i64 - self.time_ps(a) as i64)
+    }
+
     pub fn sample_len(&self) -> usize {
         self.traces.iter().map(|t| t.samples.len()).max().unwrap_or(0)
+    }
+
+    pub fn marker(&self, name: &str) -> Option<&WaveMarker> {
+        self.markers.iter().find(|m| m.name == name)
+    }
+
+    pub fn virtual_bus(&self, name: &str) -> Option<&VirtualBus> {
+        self.virtual_buses.iter().find(|v| v.name == name)
+    }
+
+    /// Rebuild packed virtual-bus traces from member engine samples.
+    pub fn rebuild_virtual_buses(&mut self) {
+        let defs = self.virtual_buses.clone();
+        let names: Vec<String> = defs.iter().map(|v| v.name.clone()).collect();
+        self.traces.retain(|t| !names.contains(&t.name));
+        for vb in defs {
+            let members: Vec<WaveTrace> = vb
+                .members
+                .iter()
+                .filter_map(|n| self.trace(n).cloned())
+                .collect();
+            if members.len() != vb.members.len() {
+                continue;
+            }
+            let n = members
+                .iter()
+                .map(|t| t.samples.len())
+                .min()
+                .unwrap_or(0);
+            let width: u8 = members
+                .iter()
+                .map(|m| m.width.max(1))
+                .fold(0u8, |a, w| a.saturating_add(w));
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut val = 0u64;
+                let mut bit = 0u32;
+                for m in &members {
+                    let w = m.width.max(1) as u32;
+                    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                    let v = m.samples.get(i).copied().unwrap_or(0) & mask;
+                    val |= v << bit;
+                    bit = bit.saturating_add(w);
+                }
+                samples.push(val);
+            }
+            let mut t = WaveTrace::bus(&vb.name, width.max(1));
+            t.samples = samples;
+            self.traces.push(t);
+        }
     }
 }
 
@@ -2395,6 +2488,21 @@ impl IdeModel {
             self.open_ultrafast(rest)
         } else if let Some(name) = t.strip_prefix("add_wave ") {
             self.add_wave(name.trim())
+        } else if let Some(rest) = t.strip_prefix("add_wave_marker ") {
+            self.add_wave_marker(rest)
+        } else if let Some(rest) = t.strip_prefix("add_wave_virtual_bus ") {
+            self.add_wave_virtual_bus(rest)
+        } else if t == "wave_cursors" {
+            self.workspace = WorkspaceTab::Wave;
+            Ok(self.wave_cursors_text())
+        } else if t == "wave_cursor_a" || t.starts_with("wave_cursor_a ") {
+            let rest = t.strip_prefix("wave_cursor_a").unwrap_or("").trim();
+            self.set_wave_ab_cursor(&format!("A {rest}"))
+        } else if t == "wave_cursor_b" || t.starts_with("wave_cursor_b ") {
+            let rest = t.strip_prefix("wave_cursor_b").unwrap_or("").trim();
+            self.set_wave_ab_cursor(&format!("B {rest}"))
+        } else if let Some(rest) = t.strip_prefix("wave_cursor ") {
+            self.set_wave_ab_cursor(rest)
         } else if let Some(rest) = t.strip_prefix("wave_radix ") {
             self.set_wave_radix(rest)
         } else if let Some(rest) = t.strip_prefix("wave_style ") {
@@ -3007,6 +3115,166 @@ impl IdeModel {
             .ok_or_else(|| format!("wave_style: no trace {name}"))?;
         t.style = style;
         Ok(format!("wave_style {name} {s}"))
+    }
+
+    /// UG900 waveform marker at a sample (or `-time` ps). Time is the engine
+    /// timescale, not a canned label.
+    pub fn add_wave_marker(&mut self, spec: &str) -> Result<String, String> {
+        let mut parts = spec.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or("add_wave_marker: need <name> [sample|-time ps]")?;
+        let rest: Vec<&str> = parts.collect();
+        let n = self.wave.sample_len();
+        if n == 0 {
+            return Err("add_wave_marker: no wave samples".into());
+        }
+        let sample = if rest.first().copied() == Some("-time") {
+            let ps: u64 = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or("add_wave_marker: -time needs ps")?;
+            (ps / self.wave.timescale_ps.max(1)) as usize
+        } else if let Some(s) = rest.first() {
+            s.parse()
+                .map_err(|_| format!("add_wave_marker: bad sample {s}"))?
+        } else {
+            self.wave.cursor
+        };
+        let sample = sample.min(n.saturating_sub(1));
+        self.wave.markers.retain(|m| m.name != name);
+        self.wave.markers.push(WaveMarker {
+            name: name.into(),
+            sample,
+        });
+        self.workspace = WorkspaceTab::Wave;
+        let time_ps = self.wave.time_ps(sample);
+        Ok(format!(
+            "add_wave_marker {name} sample={sample} TIME_PS={time_ps}"
+        ))
+    }
+
+    /// UG900 virtual bus: pack member traces (LSB = first member) into one
+    /// display object whose Value is the engine bits, not a dump.
+    pub fn add_wave_virtual_bus(&mut self, spec: &str) -> Result<String, String> {
+        let mut parts = spec.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or("add_wave_virtual_bus: need <name> <members...>")?
+            .to_string();
+        let members: Vec<String> = parts.map(|s| s.to_string()).collect();
+        if members.len() < 2 {
+            return Err("add_wave_virtual_bus: need at least two members".into());
+        }
+        for m in &members {
+            if !self.wave.has_trace(m) || self.wave.virtual_bus(m).is_some() {
+                return Err(format!("add_wave_virtual_bus: no trace {m}"));
+            }
+        }
+        self.wave.virtual_buses.retain(|v| v.name != name);
+        self.wave.virtual_buses.push(VirtualBus {
+            name: name.clone(),
+            members: members.clone(),
+        });
+        self.wave.rebuild_virtual_buses();
+        self.refresh_sim_objects();
+        self.workspace = WorkspaceTab::Wave;
+        let t = self
+            .wave
+            .trace(&name)
+            .ok_or("add_wave_virtual_bus: pack failed")?;
+        let value = t.value_at(self.wave.cursor);
+        Ok(format!(
+            "add_wave_virtual_bus {name} width={} members={} VALUE={value}",
+            t.width,
+            members.join(",")
+        ))
+    }
+
+    /// UG900 dual cursors A/B on the engine sample grid. Time-delta is B−A in
+    /// picoseconds from the wave timescale, not a canned interval.
+    pub fn set_wave_ab_cursor(&mut self, spec: &str) -> Result<String, String> {
+        let mut parts = spec.split_whitespace();
+        let which = parts
+            .next()
+            .ok_or("wave_cursor: need A|B [sample|-time ps]")?;
+        let is_a = match which.to_ascii_uppercase().as_str() {
+            "A" => true,
+            "B" => false,
+            other => return Err(format!("wave_cursor: unknown {other} (need A|B)")),
+        };
+        let rest: Vec<&str> = parts.collect();
+        let n = self.wave.sample_len();
+        if n == 0 {
+            return Err("wave_cursor: no wave samples".into());
+        }
+        let sample = if rest.first().copied() == Some("-time") {
+            let ps: u64 = rest
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or("wave_cursor: -time needs ps")?;
+            (ps / self.wave.timescale_ps.max(1)) as usize
+        } else if let Some(s) = rest.first() {
+            s.parse()
+                .map_err(|_| format!("wave_cursor: bad sample {s}"))?
+        } else {
+            self.wave.cursor
+        };
+        let sample = sample.min(n.saturating_sub(1));
+        if is_a {
+            self.wave.set_cursor_a(sample);
+        } else {
+            self.wave.set_cursor_b(sample);
+        }
+        self.workspace = WorkspaceTab::Wave;
+        let time_ps = self.wave.time_ps(sample);
+        let delta = match self.wave.time_delta_ps() {
+            Some(d) => d.to_string(),
+            None => "n/a".into(),
+        };
+        self.properties = vec![
+            ("NAME".into(), format!("cursor {which}")),
+            ("TYPE".into(), "wave_cursor".into()),
+            ("SAMPLE".into(), sample.to_string()),
+            ("TIME_PS".into(), time_ps.to_string()),
+            ("DELTA_PS".into(), delta.clone()),
+        ];
+        let tag = if is_a { "A" } else { "B" };
+        Ok(format!(
+            "wave_cursor {tag} sample={sample} TIME_PS={time_ps} DELTA_PS={delta}"
+        ))
+    }
+
+    /// UG900 A/B cursor pane dump: times, signed B−A, and Value-at-A/B from
+    /// engine samples (not a canned concatenation).
+    pub fn wave_cursors_text(&self) -> String {
+        let a = match self.wave.cursor_a {
+            Some(s) => format!("A_SAMPLE={s} A_TIME_PS={}", self.wave.time_ps(s)),
+            None => "A=-".into(),
+        };
+        let b = match self.wave.cursor_b {
+            Some(s) => format!("B_SAMPLE={s} B_TIME_PS={}", self.wave.time_ps(s)),
+            None => "B=-".into(),
+        };
+        let delta = match self.wave.time_delta_ps() {
+            Some(d) => format!("DELTA_PS={d}"),
+            None => "DELTA_PS=n/a".into(),
+        };
+        let mut s = format!("wave_cursors {a} {b} {delta}");
+        for t in &self.wave.traces {
+            let va = self
+                .wave
+                .cursor_a
+                .map(|i| t.value_at(i))
+                .unwrap_or_else(|| "-".into());
+            let vb = self
+                .wave
+                .cursor_b
+                .map(|i| t.value_at(i))
+                .unwrap_or_else(|| "-".into());
+            s.push_str(&format!(" {} A={} B={}", t.name, va, vb));
+        }
+        s
     }
 
     /// Cross-select: one identity shared by Netlist, Schematic, Device, Properties.
@@ -5030,13 +5298,38 @@ impl IdeModel {
         for c in &self.constraints.clocks {
             if c.generated {
                 let master = c.master.as_deref().unwrap_or("clk");
+                let ratio = if !c.edges.is_empty() {
+                    format!(
+                        "-edges {{{}}}",
+                        c.edges
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                } else if c.multiply_by > 1 {
+                    format!("-multiply_by {}", c.multiply_by)
+                } else {
+                    format!("-divide_by {}", c.divide_by)
+                };
+                let invert = if c.invert { " -invert" } else { "" };
+                let edges = if c.edges.is_empty() {
+                    "-".into()
+                } else {
+                    c.edges
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
                 lines.push(format!(
-                    "create_generated_clock -name {} -source [get_ports {master}] -divide_by {} [get_pins {}] PERIOD_PS={} DIVIDE_BY={} MASTER={master} generated=1",
+                    "create_generated_clock -name {} -source [get_ports {master}] {ratio}{invert} [get_pins {}] PERIOD_PS={} DIVIDE_BY={} MULTIPLY_BY={} INVERT={} EDGES={edges} MASTER={master} generated=1",
                     c.name,
-                    c.divide_by,
                     c.source,
                     c.period_ps,
-                    c.divide_by
+                    c.divide_by,
+                    c.multiply_by,
+                    u8::from(c.invert)
                 ));
             } else {
                 lines.push(format!(
@@ -5316,8 +5609,9 @@ impl IdeModel {
         Ok(format!("create_clock {name} PERIOD_PS={period} clocks={n}"))
     }
 
-    /// UG893 Timing Constraints Apply: `create_generated_clock -divide_by`
-    /// derives a new period from the master clock and feeds helion-sta (WNS
+    /// UG893 Timing Constraints Apply: `create_generated_clock -divide_by` /
+    /// `-multiply_by` / `-invert` / `-edges` derives a new period (and optional
+    /// half-cycle invert) from the master clock and feeds helion-sta (WNS
     /// moves). Empty XDC / no generated clock keeps gold WNS.
     pub fn apply_create_generated_clock(&mut self, cmd: &str) -> Result<String, String> {
         let xdc = {
@@ -5353,16 +5647,28 @@ impl IdeModel {
             .iter()
             .find(|c| c.generated)
             .ok_or_else(|| {
-                "create_generated_clock: missing -divide_by or unknown master".to_string()
+                "create_generated_clock: missing -divide_by/-multiply_by/-edges or unknown master"
+                    .to_string()
             })?;
         let n = extra.clocks.len();
         let period = gclk.period_ps;
         let name = gclk.name.clone();
         let div = gclk.divide_by;
+        let mul = gclk.multiply_by;
+        let invert = u8::from(gclk.invert);
+        let edges = if gclk.edges.is_empty() {
+            "-".into()
+        } else {
+            gclk.edges
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let master = gclk.master.clone().unwrap_or_else(|| "clk".into());
         self.merge_constraints(extra);
         Ok(format!(
-            "create_generated_clock {name} PERIOD_PS={period} DIVIDE_BY={div} MASTER={master} clocks={n}"
+            "create_generated_clock {name} PERIOD_PS={period} DIVIDE_BY={div} MULTIPLY_BY={mul} INVERT={invert} EDGES={edges} MASTER={master} clocks={n}"
         ))
     }
 
@@ -5561,7 +5867,8 @@ impl IdeModel {
             .filter(|(_, c)| c.generated)
             .max_by_key(|(_, c)| c.period_ps)
         {
-            // UG903 create_generated_clock: divide_by scales the analysis period/WNS.
+            // UG903 create_generated_clock: divide_by / multiply_by / edges scale
+            // the analysis period/WNS; -invert is a half-cycle setup.
             clks.swap(0, i);
         }
         clks
@@ -5628,6 +5935,15 @@ impl IdeModel {
         let n = self.wave.sample_len();
         if n > 0 {
             self.wave.set_cursor(n - 1);
+            if let Some(a) = self.wave.cursor_a {
+                self.wave.set_cursor_a(a);
+            }
+            if let Some(b) = self.wave.cursor_b {
+                self.wave.set_cursor_b(b);
+            }
+        } else {
+            self.wave.cursor_a = None;
+            self.wave.cursor_b = None;
         }
         let led = self
             .wave
@@ -5739,6 +6055,7 @@ impl IdeModel {
         if bus_w > 1 {
             Self::push_sample(&mut self.wave, "cnt", bus, bus_w, WaveStyle::Analog);
         }
+        self.wave.rebuild_virtual_buses();
         let n = self.wave.sample_len();
         if n > 0 {
             self.wave.set_cursor(n - 1);
@@ -5766,6 +6083,11 @@ impl IdeModel {
         }
         if let Some(t) = self.wave.trace("cnt") {
             push(&mut v, &mut seen, "cnt".into(), t.value_at(cur));
+        }
+        for vb in &self.wave.virtual_buses {
+            if let Some(t) = self.wave.trace(&vb.name) {
+                push(&mut v, &mut seen, vb.name.clone(), t.value_at(cur));
+            }
         }
         if let Some(d) = self.shell.session.design.as_ref() {
             for p in &d.ports {
@@ -7345,6 +7667,224 @@ mod tests {
         assert!(ide.objects.iter().any(|o| o.name == "led"));
     }
 
+    /// UG900 wave markers sit on the engine sample grid; a virtual bus packs
+    /// member traces (not a canned concatenation).
+    #[test]
+    fn wave_markers_and_virtual_bus_from_engine_samples() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        let gold = ide.fabric_led_bits(16).unwrap();
+        ide.sim_run(16).unwrap();
+        assert_eq!(ide.wave.bits_of("led").as_deref(), Some(gold.as_str()));
+        assert!(ide.wave.has_trace("cnt"), "packed LUTFF bus from fabric Q");
+        let cnt = ide.wave.trace("cnt").unwrap().samples.clone();
+        let cnt_w = ide.wave.trace("cnt").unwrap().width;
+
+        let e = ide.exec("add_wave_marker M0").unwrap();
+        assert!(e.contains("TIME_PS="), "{e}");
+        let mcur = ide.wave.marker("M0").expect("marker at cursor");
+        assert_eq!(mcur.sample, ide.wave.cursor);
+        assert_eq!(
+            ide.wave.time_ps(mcur.sample),
+            mcur.sample as u64 * ide.wave.timescale_ps
+        );
+
+        let out = ide.exec("add_wave_marker M4 4").unwrap();
+        assert!(out.contains("sample=4"), "{out}");
+        assert!(out.contains("TIME_PS=40000"), "{out}");
+        let m4 = ide.wave.marker("M4").unwrap();
+        assert_eq!(m4.sample, 4);
+        assert_eq!(ide.wave.time_ps(4), 40_000);
+        let tmark = ide.exec("add_wave_marker Mt -time 80000").unwrap();
+        assert!(tmark.contains("sample=8"), "{tmark}");
+        assert_eq!(ide.wave.marker("Mt").unwrap().sample, 8);
+        assert_eq!(ide.workspace, WorkspaceTab::Wave);
+
+        let vb = ide.exec("add_wave_virtual_bus vb led cnt").unwrap();
+        assert!(vb.contains("add_wave_virtual_bus vb"), "{vb}");
+        assert!(vb.contains(&format!("width={}", 1 + cnt_w)), "{vb}");
+        let packed = ide.wave.trace("vb").expect("virtual bus trace");
+        assert_eq!(packed.width, 1 + cnt_w);
+        assert_eq!(packed.samples.len(), 16);
+        for i in 0..16 {
+            let led_bit = u64::from(gold.as_bytes()[i] == b'1');
+            let expect = led_bit | (cnt[i] << 1);
+            assert_eq!(
+                packed.samples[i], expect,
+                "virtual bus sample {i} is packed engine bits, not a dump"
+            );
+        }
+        assert!(ide.wave.virtual_bus("vb").is_some());
+        assert!(
+            ide.objects.iter().any(|o| o.name == "vb"),
+            "{:?}",
+            ide.objects
+        );
+        let before = packed.samples.clone();
+        ide.exec("wave_radix vb hex").unwrap();
+        let hex = ide.wave.trace("vb").unwrap().value_at(ide.wave.cursor);
+        ide.exec("wave_radix vb binary").unwrap();
+        let bin = ide.wave.trace("vb").unwrap().value_at(ide.wave.cursor);
+        assert_ne!(bin, hex, "radix formats the packed bus: {bin} {hex}");
+        assert_eq!(
+            ide.wave.trace("vb").unwrap().samples,
+            before,
+            "radix must not mutate packed engine samples"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        blinky.run_step(FlowStep::Bitstream).unwrap();
+        blinky.sim_run(16).unwrap();
+        let gold_b = blinky.fabric_led_bits(16).unwrap();
+        assert_ne!(gold, gold_b, "LED wave is per-design from fabric");
+        if blinky.wave.has_trace("cnt") {
+            blinky.exec("add_wave_virtual_bus vb led cnt").unwrap();
+            assert_ne!(
+                blinky.wave.trace("vb").unwrap().samples,
+                before,
+                "virtual bus is per-design engine bits, not canned"
+            );
+        } else {
+            blinky.exec("add_wave led").unwrap();
+            let e = blinky.exec("add_wave_virtual_bus vb led missing");
+            assert!(e.unwrap_err().contains("no trace"), "missing member fails");
+        }
+
+        let mut fresh = IdeModel::new();
+        assert!(
+            fresh.exec("add_wave_marker x").unwrap_err().contains("no wave samples"),
+            "marker needs engine samples"
+        );
+        assert!(
+            ide.exec("add_wave_virtual_bus only led")
+                .unwrap_err()
+                .contains("at least two"),
+            "virtual bus needs two members"
+        );
+    }
+
+    /// UG900 A/B dual cursors sit on the engine sample grid; Δt is B−A in the
+    /// wave timescale, and Value-at-A/B is the fabric bits — not a canned pair.
+    #[test]
+    fn wave_ab_cursors_time_delta_from_engine_samples() {
+        let mut ide = IdeModel::new();
+        assert!(
+            ide.exec("wave_cursor_a").unwrap_err().contains("no wave samples"),
+            "A needs engine samples"
+        );
+        assert!(
+            ide.exec("wave_cursor B 1").unwrap_err().contains("no wave samples"),
+            "B needs engine samples"
+        );
+        let empty = ide.wave_cursors_text();
+        assert!(empty.contains("A=-"), "{empty}");
+        assert!(empty.contains("B=-"), "{empty}");
+        assert!(empty.contains("DELTA_PS=n/a"), "{empty}");
+        assert!(ide.wave.time_delta_ps().is_none());
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        let gold = ide.fabric_led_bits(16).unwrap();
+        ide.sim_run(16).unwrap();
+        assert_eq!(ide.wave.bits_of("led").as_deref(), Some(gold.as_str()));
+        let main = ide.wave.cursor;
+        assert_eq!(main, 15, "sim_run parks the main cursor on the last sample");
+
+        let a = ide.exec("wave_cursor_a 2").unwrap();
+        assert!(a.contains("wave_cursor A sample=2"), "{a}");
+        assert!(a.contains("TIME_PS=20000"), "{a}");
+        assert!(a.contains("DELTA_PS=n/a"), "{a}");
+        assert_eq!(ide.wave.cursor_a, Some(2));
+        assert_eq!(ide.wave.time_ps(2), 20_000);
+        assert_eq!(ide.wave.cursor, main, "placing A must not move the main cursor");
+        assert_eq!(ide.workspace, WorkspaceTab::Wave);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "wave_cursor"),
+            "{:?}",
+            ide.properties
+        );
+
+        let b = ide.exec("wave_cursor_b 8").unwrap();
+        assert!(b.contains("wave_cursor B sample=8"), "{b}");
+        assert!(b.contains("TIME_PS=80000"), "{b}");
+        assert!(b.contains("DELTA_PS=60000"), "{b}");
+        assert_eq!(ide.wave.cursor_b, Some(8));
+        assert_eq!(ide.wave.time_ps(8), 80_000);
+        assert_eq!(ide.wave.time_delta_ps(), Some(60_000));
+        assert_eq!(ide.wave.cursor, main, "placing B must not move the main cursor");
+
+        let pane = ide.exec("wave_cursors").unwrap();
+        assert!(pane.contains("A_SAMPLE=2 A_TIME_PS=20000"), "{pane}");
+        assert!(pane.contains("B_SAMPLE=8 B_TIME_PS=80000"), "{pane}");
+        assert!(pane.contains("DELTA_PS=60000"), "{pane}");
+        let led = ide.wave.trace("led").unwrap();
+        let va = led.value_at(2);
+        let vb = led.value_at(8);
+        assert!(pane.contains(&format!("led A={va} B={vb}")), "{pane}");
+        assert_eq!(va.chars().last().unwrap(), gold.as_bytes()[2] as char);
+        assert_eq!(vb.chars().last().unwrap(), gold.as_bytes()[8] as char);
+        if gold.as_bytes()[2] != gold.as_bytes()[8] {
+            assert_ne!(va, vb, "A/B values are engine bits at those samples");
+        }
+
+        let tmark = ide.exec("wave_cursor A -time 40000").unwrap();
+        assert!(tmark.contains("sample=4"), "{tmark}");
+        assert_eq!(ide.wave.cursor_a, Some(4));
+        assert_eq!(ide.wave.time_delta_ps(), Some(40_000));
+        let swapped = ide.exec("wave_cursor B 1").unwrap();
+        assert!(swapped.contains("DELTA_PS=-30000"), "{swapped}");
+        assert_eq!(ide.wave.time_delta_ps(), Some(-30_000));
+
+        ide.wave.set_cursor(10);
+        let at_main = ide.exec("wave_cursor_a").unwrap();
+        assert!(at_main.contains("sample=10"), "{at_main}");
+        assert_eq!(ide.wave.cursor_a, Some(10));
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        blinky.run_step(FlowStep::Bitstream).unwrap();
+        blinky.sim_run(16).unwrap();
+        let gold_b = blinky.fabric_led_bits(16).unwrap();
+        assert_ne!(gold, gold_b, "LED wave is per-design from fabric");
+        blinky.exec("wave_cursor_a 2").unwrap();
+        blinky.exec("wave_cursor_b 8").unwrap();
+        assert_eq!(blinky.wave.time_delta_ps(), Some(60_000));
+        let va_b = blinky.wave.trace("led").unwrap().value_at(2);
+        let vb_b = blinky.wave.trace("led").unwrap().value_at(8);
+        if gold.as_bytes()[2] != gold_b.as_bytes()[2] || gold.as_bytes()[8] != gold_b.as_bytes()[8]
+        {
+            assert_ne!(
+                (va.clone(), vb.clone()),
+                (va_b, vb_b),
+                "A/B values are per-design engine bits, not a dump"
+            );
+        }
+
+        ide.exec("wave_cursor_a 2").unwrap();
+        ide.exec("wave_cursor_b 8").unwrap();
+        assert_eq!(ide.wave.time_delta_ps(), Some(60_000));
+        ide.sim_restart().unwrap();
+        assert!(ide.wave.cursor_a.is_none());
+        assert!(ide.wave.cursor_b.is_none());
+        assert!(ide.wave.time_delta_ps().is_none());
+    }
+
     #[test]
     fn ultrafast_stages_open_engine_backed_panes() {
         let mut ide = IdeModel::new();
@@ -7670,6 +8210,134 @@ mod tests {
         let b1 = blinky.wns_ps().expect("blinky after divide_by 2");
         assert_eq!(b1, b0 + 10_000);
         assert_ne!(b1, wns20, "generated-clock WNS is per-design STA, not canned");
+    }
+
+    /// UG893/UG903 create_generated_clock -multiply_by / -invert / -edges
+    /// move helion-sta WNS — empty XDC keeps gold.
+    #[test]
+    fn timing_constraints_generated_clock_multiply_by_invert_edges_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns10 = ide.wns_ps().expect("STA WNS at default 10 ns");
+        assert_ne!(wns10, 0);
+        assert!(
+            ide.constraints_text().contains("no timing constraints"),
+            "{}",
+            ide.constraints_text()
+        );
+
+        let out = ide
+            .exec(
+                "create_generated_clock -name clk2x -source [get_ports clk] -multiply_by 2 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(out.contains("PERIOD_PS=5000"), "{out}");
+        assert!(out.contains("MULTIPLY_BY=2"), "{out}");
+        assert!(out.contains("INVERT=0"), "{out}");
+        assert_eq!(ide.clock_period_ps, 5_000);
+        assert!(
+            ide.constraints.clocks.iter().any(|c| {
+                c.generated && c.name == "clk2x" && c.period_ps == 5_000 && c.multiply_by == 2
+            }),
+            "{:?}",
+            ide.constraints.clocks
+        );
+        let pane = ide.constraints_text();
+        assert!(pane.contains("-multiply_by 2"), "{pane}");
+        assert!(pane.contains("MULTIPLY_BY=2"), "{pane}");
+        let wns_mul = ide.wns_ps().expect("STA after multiply_by 2");
+        assert_eq!(
+            wns_mul,
+            wns10 - 5_000,
+            "multiply_by 2 must halve the requirement: {wns10} vs {wns_mul}"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_mul}")),
+            "Tcl report_timing must use multiplied period: {rt}"
+        );
+
+        let mut inv = IdeModel::new();
+        inv.open_source(&example("counter.sv")).unwrap();
+        inv.run_step(FlowStep::Opt).unwrap();
+        inv.run_step(FlowStep::Place).unwrap();
+        inv.run_step(FlowStep::Route).unwrap();
+        let out_inv = inv
+            .exec(
+                "create_generated_clock -name clkinv -source [get_ports clk] -divide_by 1 -invert [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(out_inv.contains("PERIOD_PS=10000"), "{out_inv}");
+        assert!(out_inv.contains("INVERT=1"), "{out_inv}");
+        assert!(
+            inv.constraints
+                .clocks
+                .iter()
+                .any(|c| c.generated && c.invert && c.period_ps == 10_000),
+            "{:?}",
+            inv.constraints.clocks
+        );
+        let pane_inv = inv.constraints_text();
+        assert!(pane_inv.contains("-invert"), "{pane_inv}");
+        assert!(pane_inv.contains("INVERT=1"), "{pane_inv}");
+        let wns_inv = inv.wns_ps().expect("STA after invert");
+        assert_eq!(
+            wns_inv,
+            wns10 - 5_000,
+            "invert is a half-cycle setup: {wns10} vs {wns_inv}"
+        );
+
+        let mut edg = IdeModel::new();
+        edg.open_source(&example("counter.sv")).unwrap();
+        edg.run_step(FlowStep::Opt).unwrap();
+        edg.run_step(FlowStep::Place).unwrap();
+        edg.run_step(FlowStep::Route).unwrap();
+        let out_edg = edg
+            .exec(
+                "create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(out_edg.contains("PERIOD_PS=20000"), "{out_edg}");
+        assert!(out_edg.contains("EDGES=1,3,5"), "{out_edg}");
+        assert!(
+            edg.constraints.clocks.iter().any(|c| {
+                c.generated && c.name == "clkedg" && c.edges == vec![1, 3, 5] && c.period_ps == 20_000
+            }),
+            "{:?}",
+            edg.constraints.clocks
+        );
+        let pane_edg = edg.constraints_text();
+        assert!(pane_edg.contains("-edges {1 3 5}"), "{pane_edg}");
+        let wns_edg = edg.wns_ps().expect("STA after edges");
+        assert_eq!(
+            wns_edg,
+            wns10 + 10_000,
+            "edges {{1 3 5}} is divide-by-2: {wns10} vs {wns_edg}"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().expect("blinky gold WNS");
+        assert_ne!(b0, wns10, "gold WNS is per-design STA");
+        blinky
+            .exec(
+                "create_generated_clock -name clk2x -source [get_ports clk] -multiply_by 2 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        let b1 = blinky.wns_ps().expect("blinky after multiply_by 2");
+        assert_eq!(b1, b0 - 5_000);
+        assert_ne!(b1, wns_mul, "multiply_by WNS is per-design STA, not canned");
+        assert_eq!(
+            IdeModel::new().wns_ps(),
+            None,
+            "idle model has no canned WNS"
+        );
     }
 
     /// UG893 Timing Constraints Apply: set_bus_skew / group_path -weight
