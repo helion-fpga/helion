@@ -1202,7 +1202,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Timing Constraints");
-    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path Apply");
+    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path / max_time_borrow / data_check Apply");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Read examples/counter.sdc").clicked() {
@@ -1286,8 +1286,23 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
             );
         }
     });
+    ui.horizontal(|ui| {
+        if ui.button("Apply set_max_time_borrow 1ns").clicked() {
+            let _ = model.exec("set_max_time_borrow 1.0 [get_cells u_ff]");
+        }
+        if ui.button("Apply set_data_check -setup 0.5ns").clicked() {
+            let _ = model.exec(
+                "set_data_check -setup 0.5 -from [get_ports clk] -to [get_ports led]",
+            );
+        }
+        if ui.button("Apply set_data_check -hold 0.2ns").clicked() {
+            let _ = model.exec(
+                "set_data_check -hold 0.2 -from [get_ports clk] -to [get_ports led]",
+            );
+        }
+    });
     ui.add_space(6.0);
-    report_box(ui, "Constraints (create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path)", &model.constraints_text());
+    report_box(ui, "Constraints (create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path / max_time_borrow / data_check)", &model.constraints_text());
     ui.add_space(8.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
 }

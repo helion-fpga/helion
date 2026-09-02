@@ -2538,6 +2538,8 @@ impl IdeModel {
             || t.starts_with("set_bus_skew")
             || t == "group_path"
             || t.starts_with("group_path ")
+            || t.starts_with("set_max_time_borrow")
+            || t.starts_with("set_data_check")
         {
             self.apply_sdc_exception(t)
         } else if let Some(path) = t
@@ -4928,6 +4930,8 @@ impl IdeModel {
             && !self.constraints.operating_conditions.is_set()
             && self.constraints.bus_skews.is_empty()
             && self.constraints.path_groups.is_empty()
+            && self.constraints.max_time_borrows.is_empty()
+            && self.constraints.data_checks.is_empty()
             && self.constraints.package_pins.is_empty()
             && self.constraints.iostandards.is_empty()
             && self.constraints.drives.is_empty()
@@ -5003,6 +5007,19 @@ impl IdeModel {
             lines.push(format!(
                 "group_path -name {} -from {} -to {} WEIGHT_MILLI={} CRITICAL_RANGE_PS={}",
                 g.name, g.from, g.to, g.weight_milli, g.critical_range_ps
+            ));
+        }
+        for b in &self.constraints.max_time_borrows {
+            let obj = if b.object.is_empty() { "-" } else { &b.object };
+            lines.push(format!(
+                "set_max_time_borrow {obj} BORROW_PS={}",
+                b.borrow_ps
+            ));
+        }
+        for d in &self.constraints.data_checks {
+            lines.push(format!(
+                "set_data_check -from {} -to {} SETUP_PS={} HOLD_PS={}",
+                d.from, d.to, d.setup_ps, d.hold_ps
             ));
         }
         for g in &self.constraints.clock_groups {
@@ -5161,6 +5178,10 @@ impl IdeModel {
             .extend(extra.timing_derates);
         self.constraints.bus_skews.extend(extra.bus_skews);
         self.constraints.path_groups.extend(extra.path_groups);
+        self.constraints
+            .max_time_borrows
+            .extend(extra.max_time_borrows);
+        self.constraints.data_checks.extend(extra.data_checks);
         if extra.operating_conditions.voltage_set {
             self.constraints.operating_conditions.voltage_mv =
                 extra.operating_conditions.voltage_mv;
@@ -5268,7 +5289,7 @@ impl IdeModel {
     /// set_disable_timing / set_case_analysis / set_propagated_clock /
     /// set_clock_sense / set_input_jitter / set_system_jitter /
     /// set_timing_derate / set_operating_conditions / set_bus_skew /
-    /// group_path land in the pane
+    /// group_path / set_max_time_borrow / set_data_check land in the pane
     /// and feed helion-sta (setup/hold WNS move).
     pub fn apply_sdc_exception(&mut self, cmd: &str) -> Result<String, String> {
         let extra = load_xdc(cmd)?;
@@ -5291,9 +5312,11 @@ impl IdeModel {
             && !extra.operating_conditions.is_set()
             && extra.bus_skews.is_empty()
             && extra.path_groups.is_empty()
+            && extra.max_time_borrows.is_empty()
+            && extra.data_checks.is_empty()
         {
             return Err(format!(
-                "{cmd}: missing delay, false path, multicycle, max_delay, min_delay, clock_groups, uncertainty, latency, disable_timing, case_analysis, propagated_clock, clock_sense, input_jitter, system_jitter, timing_derate, operating_conditions, bus_skew, or group_path"
+                "{cmd}: missing delay, false path, multicycle, max_delay, min_delay, clock_groups, uncertainty, latency, disable_timing, case_analysis, propagated_clock, clock_sense, input_jitter, system_jitter, timing_derate, operating_conditions, bus_skew, group_path, max_time_borrow, or data_check"
             ));
         }
         let n_in = extra.input_delay_ps.len();
@@ -5321,6 +5344,8 @@ impl IdeModel {
         let n_oc = u8::from(extra.operating_conditions.is_set());
         let n_bs = extra.bus_skews.len();
         let n_gp = extra.path_groups.len();
+        let n_tb = extra.max_time_borrows.len();
+        let n_dc = extra.data_checks.len();
         let in_ps = extra.input_delay_ps.values().copied().max().unwrap_or(0);
         let out_ps = extra.output_delay_ps.values().copied().max().unwrap_or(0);
         let sm = extra.setup_mult();
@@ -5349,6 +5374,9 @@ impl IdeModel {
         let bs = extra.bus_skew_setup_ps().max(extra.bus_skew_hold_ps());
         let wm = extra.group_path_weight_milli();
         let cr = extra.group_path_critical_range_ps();
+        let tb = extra.time_borrow_ps();
+        let dcs = extra.data_check_setup_ps();
+        let dch = extra.data_check_hold_ps();
         let case = extra
             .case_analyses
             .first()
@@ -5368,7 +5396,7 @@ impl IdeModel {
             .unwrap_or(0);
         self.merge_constraints(extra);
         Ok(format!(
-            "apply_xdc input_delay={n_in} DELAY_PS={in_ps} output_delay={n_out} DELAY_PS={out_ps} false_path={n_fp} multicycle={n_mcp} SETUP_MULT={sm} HOLD_MULT={hm} max_delay={n_md} MAX_DELAY_PS={md_ps} min_delay={n_mind} MIN_DELAY_PS={mind_ps} clock_groups={n_cg} GROUPS={n_cgg} uncertainty={n_u} UNCERT_SETUP_PS={us} UNCERT_HOLD_PS={uh} latency={n_l} LATE_PS={late} EARLY_PS={early} disable_timing={n_dt} case_analysis={n_ca} CASE={case} propagated_clock={n_pc} CLK_NET_PS={clk_net} clock_sense={n_cs} SENSE={sense} input_jitter={n_ij} INPUT_JITTER_PS={ij} system_jitter={n_sj} SYSTEM_JITTER_PS={sj} timing_derate={n_td} LATE_MILLI={late_m} EARLY_MILLI={early_m} operating_conditions={n_oc} VOLTAGE_MV={vmv} TEMP_C={tc} OC_SCALE_MILLI={ocm} bus_skew={n_bs} BUS_SKEW_PS={bs} group_path={n_gp} WEIGHT_MILLI={wm} CRITICAL_RANGE_PS={cr}"
+            "apply_xdc input_delay={n_in} DELAY_PS={in_ps} output_delay={n_out} DELAY_PS={out_ps} false_path={n_fp} multicycle={n_mcp} SETUP_MULT={sm} HOLD_MULT={hm} max_delay={n_md} MAX_DELAY_PS={md_ps} min_delay={n_mind} MIN_DELAY_PS={mind_ps} clock_groups={n_cg} GROUPS={n_cgg} uncertainty={n_u} UNCERT_SETUP_PS={us} UNCERT_HOLD_PS={uh} latency={n_l} LATE_PS={late} EARLY_PS={early} disable_timing={n_dt} case_analysis={n_ca} CASE={case} propagated_clock={n_pc} CLK_NET_PS={clk_net} clock_sense={n_cs} SENSE={sense} input_jitter={n_ij} INPUT_JITTER_PS={ij} system_jitter={n_sj} SYSTEM_JITTER_PS={sj} timing_derate={n_td} LATE_MILLI={late_m} EARLY_MILLI={early_m} operating_conditions={n_oc} VOLTAGE_MV={vmv} TEMP_C={tc} OC_SCALE_MILLI={ocm} bus_skew={n_bs} BUS_SKEW_PS={bs} group_path={n_gp} WEIGHT_MILLI={wm} CRITICAL_RANGE_PS={cr} time_borrow={n_tb} BORROW_PS={tb} data_check={n_dc} DATA_CHECK_SETUP_PS={dcs} DATA_CHECK_HOLD_PS={dch}"
         ))
     }
 
@@ -5395,6 +5423,8 @@ impl IdeModel {
             && !extra.operating_conditions.is_set()
             && extra.bus_skews.is_empty()
             && extra.path_groups.is_empty()
+            && extra.max_time_borrows.is_empty()
+            && extra.data_checks.is_empty()
             && extra.package_pins.is_empty()
             && extra.iostandards.is_empty()
             && extra.drives.is_empty()
@@ -5430,9 +5460,11 @@ impl IdeModel {
         let n_oc = u8::from(extra.operating_conditions.is_set());
         let n_bs = extra.bus_skews.len();
         let n_gp = extra.path_groups.len();
+        let n_tb = extra.max_time_borrows.len();
+        let n_dc = extra.data_checks.len();
         self.merge_constraints(extra);
         Ok(format!(
-            "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md} min_delay={n_mind} clock_groups={n_cg} uncertainty={n_u} latency={n_l} disable_timing={n_dt} case_analysis={n_ca} propagated_clock={n_pc} clock_sense={n_cs} input_jitter={n_ij} system_jitter={n_sj} timing_derate={n_td} operating_conditions={n_oc} bus_skew={n_bs} group_path={n_gp}"
+            "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md} min_delay={n_mind} clock_groups={n_cg} uncertainty={n_u} latency={n_l} disable_timing={n_dt} case_analysis={n_ca} propagated_clock={n_pc} clock_sense={n_cs} input_jitter={n_ij} system_jitter={n_sj} timing_derate={n_td} operating_conditions={n_oc} bus_skew={n_bs} group_path={n_gp} time_borrow={n_tb} data_check={n_dc}"
         ))
     }
 
@@ -5456,7 +5488,8 @@ impl IdeModel {
     /// create_generated_clock) + I/O delay/false path/
     /// multicycle/max_delay/min_delay/clock_groups/uncertainty/latency/disable_timing/
     /// case_analysis/propagated_clock/clock_sense/input_jitter/system_jitter/
-    /// timing_derate/operating_conditions/bus_skew/group_path, the same
+    /// timing_derate/operating_conditions/bus_skew/group_path/max_time_borrow/
+    /// data_check, the same
     /// vector `refresh_reports` feeds `report_timing_routed_xdc`.
     /// Pulls place/route if needed so `read_sv` then `report_timing` still hits STA
     /// (old Tcl path).
@@ -7638,6 +7671,118 @@ mod tests {
         let b2 = blinky.wns_ps().unwrap();
         assert_eq!(b2, b1 - bsetup);
         assert_ne!(b2, wns_gp, "group_path WNS is per-design STA, not canned");
+    }
+
+    /// UG893/UG903 Timing Constraints Apply: set_max_time_borrow (latch steal)
+    /// and set_data_check (data-to-data) move helion-sta WNS — empty XDC keeps gold.
+    #[test]
+    fn timing_constraints_time_borrow_data_check_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before time borrow");
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.max_time_borrows.is_empty() && ide.constraints.data_checks.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let tb = ide
+            .exec("set_max_time_borrow 1.0 [get_cells u_ff]")
+            .unwrap();
+        assert!(tb.contains("time_borrow=1"), "{tb}");
+        assert!(tb.contains("BORROW_PS=1000"), "{tb}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.time_borrow_ps(), 1000);
+        assert!(
+            ide.constraints_text()
+                .contains("set_max_time_borrow u_ff BORROW_PS=1000"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_tb = ide.wns_ps().expect("STA after time borrow");
+        assert_eq!(
+            wns_tb,
+            wns0 + 1000,
+            "latch borrow 1 ns must improve WNS: {wns0} vs {wns_tb}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold0,
+            "time borrow must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_tb}")),
+            "report_timing must honor time borrow: {rt}"
+        );
+
+        let dc = ide
+            .exec("set_data_check -setup 0.5 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(dc.contains("data_check=1"), "{dc}");
+        assert!(dc.contains("DATA_CHECK_SETUP_PS=500"), "{dc}");
+        assert_eq!(ide.constraints.data_check_setup_ps(), 500);
+        assert_eq!(ide.constraints.data_check_hold_ps(), 0);
+        assert!(
+            ide.constraints_text()
+                .contains("set_data_check -from clk -to led SETUP_PS=500 HOLD_PS=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_dc = ide.wns_ps().expect("STA after setup data check");
+        assert_eq!(
+            wns_dc,
+            wns_tb - 500,
+            "setup data check 0.5 ns must worsen WNS: {wns_tb} vs {wns_dc}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold0,
+            "setup-only data check must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_dc}")),
+            "report_timing must honor data check: {rt}"
+        );
+
+        let dh = ide
+            .exec("set_data_check -hold 0.2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(dh.contains("DATA_CHECK_HOLD_PS=200"), "{dh}");
+        assert_eq!(ide.constraints.data_check_hold_ps(), 200);
+        let hold_dc = ide.timing.as_ref().expect("STA after hold data check").hold_slack_ps;
+        assert_eq!(ide.wns_ps().unwrap(), wns_dc, "hold data check must not move setup WNS");
+        assert_eq!(
+            hold_dc,
+            hold0 - 200,
+            "hold data check 0.2 ns must worsen hold slack: {hold_dc} vs {hold0}"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        assert_ne!(b0, wns0, "gold WNS is per-design STA");
+        blinky
+            .exec("set_max_time_borrow 1.0 [get_cells u_ff]")
+            .unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 + 1000);
+        assert_ne!(b1, wns_tb, "time-borrow WNS is per-design STA, not canned");
+        blinky
+            .exec("set_data_check -setup 0.5 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        assert_eq!(b2, b1 - 500);
+        assert_ne!(b2, wns_dc, "data-check WNS is per-design STA, not canned");
     }
 
     /// UG893 Timing Constraints Apply: set_input/output_delay and set_false_path
