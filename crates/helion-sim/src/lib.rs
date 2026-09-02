@@ -105,15 +105,88 @@ impl Sim {
 
     /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.
     pub fn object_values(&self) -> Vec<(String, String)> {
+        self.locals()
+            .into_iter()
+            .map(|l| (l.name, l.value))
+            .collect()
+    }
+
+    /// UG900 Memory: each LUT INIT is a 64×1 ROM (addr = LUT input, data = INIT bit).
+    pub fn memory_cells(&self) -> Vec<SimMemory> {
+        let mut v: Vec<SimMemory> = self
+            .lut_init
+            .iter()
+            .map(|(name, init)| SimMemory {
+                name: name.clone(),
+                kind: "lut_init".into(),
+                width: 1,
+                words: (0..64).map(|a| (init >> a) & 1).collect(),
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// UG900 Locals: current-scope sequential state from the event kernel.
+    pub fn locals(&self) -> Vec<SimLocal> {
         let bit = |b: bool| if b { "1".to_string() } else { "0".to_string() };
-        let mut v = vec![("led".to_string(), bit(self.led))];
+        let mut v = vec![SimLocal {
+            name: "led".into(),
+            kind: "port".into(),
+            value: bit(self.led),
+        }];
         let mut ffs: Vec<_> = self.ff_q.iter().collect();
         ffs.sort_by_key(|(n, _)| *n);
         for (n, q) in ffs {
-            v.push((n.clone(), bit(*q)));
+            v.push(SimLocal {
+                name: n.clone(),
+                kind: "reg".into(),
+                value: bit(*q),
+            });
         }
         v
     }
+
+    /// Probe a named signal for UG900 breakpoints (LED, FF Q, or LUT INIT word).
+    pub fn signal_value(&self, name: &str) -> Option<u64> {
+        if name.eq_ignore_ascii_case("led") {
+            return Some(u64::from(self.led));
+        }
+        if let Some(q) = self.ff_q.get(name) {
+            return Some(u64::from(*q));
+        }
+        self.lut_init.get(name).copied()
+    }
+}
+
+/// One UG900 Memory array: LUT INIT as a 64×1 ROM, or a packed sequential word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimMemory {
+    pub name: String,
+    pub kind: String,
+    pub width: u8,
+    pub words: Vec<u64>,
+}
+
+impl SimMemory {
+    pub fn packed_word(&self) -> u64 {
+        if self.width <= 1 {
+            self.words
+                .iter()
+                .enumerate()
+                .fold(0u64, |acc, (i, b)| acc | ((*b & 1) << i))
+        } else {
+            self.words.first().copied().unwrap_or(0)
+        }
+    }
+}
+
+/// One UG900 Locals row: live sequential probe from helion-sim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimLocal {
+    pub name: String,
+    pub kind: String,
+    pub value: String,
 }
 
 pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {
@@ -157,6 +230,37 @@ mod tests {
         assert!(w[0..7].iter().all(|b| !b), "{w:?}");
         assert!(w[7..15].iter().all(|b| *b), "{w:?}");
         assert!(!w[15], "{w:?}");
+    }
+
+    #[test]
+    fn memory_locals_are_lut_init_and_ff_q() {
+        let mut s = Sim::new(&Design::structural_counter());
+        let mem = s.memory_cells();
+        let lut0 = mem.iter().find(|m| m.name == "u_lut0").expect("u_lut0");
+        assert_eq!(lut0.kind, "lut_init");
+        assert_eq!(lut0.words.len(), 64);
+        assert_eq!(lut0.packed_word(), helion_ir::INC4_INIT[0]);
+        assert_eq!(lut0.words[0], 1, "0x5555… bit0 is 1");
+        let lut1 = mem.iter().find(|m| m.name == "u_lut1").expect("u_lut1");
+        assert_ne!(lut0.packed_word(), lut1.packed_word());
+
+        let mut blinky = Sim::new(&Design::structural_blinky());
+        let bmem = blinky.memory_cells();
+        let blut = bmem.iter().find(|m| m.name == "u_lut").expect("u_lut");
+        assert_eq!(blut.words[0], 0, "0xAAAA… bit0 is 0");
+        assert_ne!(blut.packed_word(), lut0.packed_word());
+
+        s.step_posedge(10);
+        let loc = s.locals();
+        assert!(
+            loc.iter().any(|l| l.name == "led" && l.kind == "port" && (l.value == "0" || l.value == "1")),
+            "{loc:?}"
+        );
+        assert!(
+            loc.iter().any(|l| l.kind == "reg" && (l.value == "0" || l.value == "1")),
+            "{loc:?}"
+        );
+        assert_eq!(s.signal_value("led"), Some(u64::from(s.led)));
     }
 
     fn fabric_wave(d: &Design, cycles: u32) -> Vec<bool> {
