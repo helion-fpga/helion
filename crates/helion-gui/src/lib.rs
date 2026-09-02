@@ -10,7 +10,7 @@ pub use ide::{
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
     HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
-    MemoryWordRow, BreakpointRow, MsgSeverity, NavAction, NavSection,
+    MemoryWordRow, BreakpointRow, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection,
     Pblock, ProjectSummaryGadget, PropertyRow, ReportCatalogRow,
     NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,

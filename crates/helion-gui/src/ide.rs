@@ -199,6 +199,150 @@ fn source_type_of(path: &str) -> &'static str {
     }
 }
 
+fn is_rtl_source(path: &str) -> bool {
+    matches!(source_type_of(path), "sv" | "verilog" | "vhdl")
+}
+
+fn lhs_ident(t: &str) -> Option<String> {
+    let s = t.trim();
+    let s = if let Some(rest) = s.strip_prefix("assign") {
+        if rest.starts_with(|c: char| c.is_whitespace()) {
+            rest.trim()
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+    let lhs = if let Some((l, _)) = s.split_once("<=") {
+        l
+    } else if let Some((l, r)) = s.split_once('=') {
+        if r.starts_with('=') {
+            return None;
+        }
+        l
+    } else {
+        return None;
+    };
+    let skip = [
+        "always_ff",
+        "always",
+        "posedge",
+        "negedge",
+        "clk",
+        "begin",
+        "assign",
+        "if",
+        "then",
+        "rising_edge",
+        "falling_edge",
+        "not",
+        "process",
+        "logic",
+        "wire",
+        "reg",
+        "std_logic",
+        "signal",
+    ];
+    lhs.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| {
+            !tok.is_empty()
+                && !skip.iter().any(|s| tok.eq_ignore_ascii_case(s))
+                && !tok.chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+        .last()
+        .map(|s| s.to_string())
+}
+
+/// Classify RTL into UG900 Source rows. Sequential `always_ff`/`process` bodies
+/// are the helion-sim posedge PC; `assign` maps to a live probe.
+fn classify_rtl_lines(src: &str) -> Vec<SourceLine> {
+    let mut lines = Vec::new();
+    let mut in_seq = false;
+    for (i, raw) in src.lines().enumerate() {
+        let line = i + 1;
+        let t = raw.trim();
+        let t_l = t.to_ascii_lowercase();
+        let mut kind = "other".to_string();
+        let mut executable = false;
+        let mut signal = None;
+        let is_seq_header = t_l.contains("always_ff")
+            || t_l.contains("always @")
+            || t_l.contains("always@")
+            || t_l.starts_with("process")
+            || t_l.contains(" process(")
+            || t_l.contains(" process ");
+        let is_seq_end = t_l == "end"
+            || t_l == "end;"
+            || t_l.starts_with("end;")
+            || t_l.contains("end process")
+            || t_l.contains("endprocess")
+            || (t_l.starts_with("end ")
+                && !t_l.starts_with("end if")
+                && !t_l.starts_with("end case")
+                && !t_l.starts_with("endmodule"));
+        if t.is_empty() {
+            kind = "blank".into();
+        } else if t.starts_with("//") || t_l.starts_with("--") {
+            kind = "comment".into();
+        } else if is_seq_header {
+            kind = "seq".into();
+            signal = lhs_ident(t);
+            executable = signal.is_some();
+            in_seq = !executable;
+        } else if in_seq {
+            kind = "seq".into();
+            if is_seq_end {
+                in_seq = false;
+            } else if t_l.starts_with("begin")
+                || t_l.starts_with("if ")
+                || t_l.starts_with("if(")
+                || t_l == "else"
+                || t_l.starts_with("else ")
+            {
+                executable = false;
+            } else {
+                signal = lhs_ident(t);
+                executable = signal.is_some();
+            }
+        } else if t_l.starts_with("assign ") {
+            kind = "assign".into();
+            signal = lhs_ident(t);
+            executable = true;
+        } else if t.contains("<=") && !t_l.starts_with("if") {
+            kind = "assign".into();
+            signal = lhs_ident(t);
+            executable = signal.is_some();
+        } else if t_l.starts_with("module")
+            || t_l.starts_with("endmodule")
+            || t_l.starts_with("input")
+            || t_l.starts_with("output")
+            || t_l.starts_with("inout")
+            || t_l.starts_with("logic")
+            || t_l.starts_with("wire")
+            || t_l.starts_with("reg")
+            || t_l.starts_with("entity")
+            || t_l.starts_with("architecture")
+            || t_l.starts_with("end entity")
+            || t_l.starts_with("end architecture")
+            || t_l.starts_with("signal ")
+            || t_l.starts_with("port")
+            || t == ");"
+            || t == "("
+        {
+            kind = "decl".into();
+        }
+        lines.push(SourceLine {
+            line,
+            text: raw.to_string(),
+            kind,
+            signal,
+            executable,
+        });
+    }
+    lines
+}
+
 fn primitive_of(kind: &CellKind) -> String {
     match kind {
         CellKind::Lut6 { .. } => "LUT6".into(),
@@ -509,6 +653,10 @@ impl NavSection {
                 NavAction {
                     label: "Run Simulation",
                     tcl: "run_simulation",
+                },
+                NavAction {
+                    label: "Source",
+                    tcl: "source",
                 },
                 NavAction {
                     label: "Memory",
@@ -2363,6 +2511,12 @@ pub struct BreakpointRow {
     pub condition: String,
     pub value: Option<u64>,
     pub hits: u32,
+    /// `signal` (Objects/Locals) or `line` (UG900 Source gutter).
+    pub kind: String,
+    /// RTL file for a line breakpoint.
+    pub file: Option<String>,
+    /// 1-based RTL line for a Source-window breakpoint.
+    pub line: Option<usize>,
 }
 
 impl BreakpointRow {
@@ -2374,15 +2528,105 @@ impl BreakpointRow {
         }
     }
 
+    pub fn kind_cell(&self) -> &str {
+        if self.kind.is_empty() {
+            "signal"
+        } else {
+            self.kind.as_str()
+        }
+    }
+
+    pub fn line_cell(&self) -> String {
+        self.line
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn signal_cell(&self) -> &str {
+        if self.signal.is_empty() {
+            "-"
+        } else {
+            self.signal.as_str()
+        }
+    }
+
     /// Clickable-grid dump row: UG900 Breakpoints Id/En/Signal/Cond/Hits, not a list dump.
     pub fn row_text(&self) -> String {
         format!(
-            "ID={} ENABLED={} SIGNAL={} CONDITION={} HITS={}",
+            "ID={} ENABLED={} SIGNAL={} CONDITION={} HITS={} KIND={} LINE={}",
             self.id,
             self.enabled_cell(),
-            self.signal,
+            self.signal_cell(),
             self.condition,
-            self.hits
+            self.hits,
+            self.kind_cell(),
+            self.line_cell()
+        )
+    }
+}
+
+/// One clickable row in the UG900 Source window (RTL + line-breakpoint gutter).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceLine {
+    /// 1-based file line.
+    pub line: usize,
+    pub text: String,
+    /// `seq` / `assign` / `decl` / `comment` / `blank` / `other`.
+    pub kind: String,
+    /// Helion-sim probe this line drives (`led`, `cnt`, `q`), if any.
+    pub signal: Option<String>,
+    /// Gutter may arm a breakpoint (always_ff body / assign).
+    pub executable: bool,
+}
+
+impl SourceLine {
+    pub fn type_cell(&self) -> &str {
+        if self.kind.is_empty() {
+            "other"
+        } else {
+            self.kind.as_str()
+        }
+    }
+
+    pub fn signal_cell(&self) -> &str {
+        self.signal.as_deref().filter(|s| !s.is_empty()).unwrap_or("-")
+    }
+
+    pub fn exec_cell(&self) -> &'static str {
+        if self.executable {
+            "1"
+        } else {
+            "0"
+        }
+    }
+
+    pub fn bp_cell(&self, armed: bool) -> &'static str {
+        if armed {
+            "1"
+        } else {
+            "0"
+        }
+    }
+
+    pub fn pc_cell(&self, pc: Option<usize>) -> &'static str {
+        if pc == Some(self.line) {
+            ">"
+        } else {
+            "-"
+        }
+    }
+
+    /// Clickable-grid dump row: UG900 Source Line/BP/Kind/Text, not a file dump.
+    pub fn row_text(&self, armed: bool, pc: Option<usize>) -> String {
+        format!(
+            "LINE={} BP={} PC={} KIND={} EXEC={} SIGNAL={} TEXT={}",
+            self.line,
+            self.bp_cell(armed),
+            self.pc_cell(pc),
+            self.type_cell(),
+            self.exec_cell(),
+            self.signal_cell(),
+            self.text.trim()
         )
     }
 }
@@ -3018,6 +3262,7 @@ pub enum WorkspaceTab {
     Schematic,
     Device,
     Wave,
+    Source,
     Memory,
     Breakpoints,
     Locals,
@@ -3432,6 +3677,11 @@ pub struct IdeModel {
     /// UG900 Locals: current-scope sequential probes.
     pub locals: Vec<LocalRow>,
     pub selected_local: Option<String>,
+    /// UG900 Source window: RTL lines + line-breakpoint gutter over helion-sim.
+    pub source_lines: Vec<SourceLine>,
+    pub selected_source_line: Option<usize>,
+    /// Sequential PC: always_ff/process body that the last `step_posedge` executed.
+    pub sim_pc_line: Option<usize>,
     bp_prev: HashMap<String, u64>,
     next_bp_id: usize,
     pub wave: Waveform,
@@ -3527,6 +3777,9 @@ impl IdeModel {
             selected_breakpoint: None,
             locals: Vec::new(),
             selected_local: None,
+            source_lines: Vec::new(),
+            selected_source_line: None,
+            sim_pc_line: None,
             bp_prev: HashMap::new(),
             next_bp_id: 1,
             wave: Waveform::default(),
@@ -3780,6 +4033,17 @@ impl IdeModel {
         } else if t == "sources" {
             self.layout = LayoutKind::Default;
             Ok(self.sources_text())
+        } else if t == "source" || t == "source_window" {
+            self.open_source_window()
+        } else if t == "select_source_line" || t.starts_with("select_source_line ") {
+            let spec = t.strip_prefix("select_source_line").unwrap_or("").trim();
+            self.select_source_line(spec)
+        } else if t == "toggle_bp_line" || t.starts_with("toggle_bp_line ") {
+            let spec = t.strip_prefix("toggle_bp_line").unwrap_or("").trim();
+            self.toggle_source_breakpoint(spec)
+        } else if t == "add_bp_line" || t.starts_with("add_bp_line ") {
+            let spec = t.strip_prefix("add_bp_line").unwrap_or("").trim();
+            self.toggle_source_breakpoint(spec)
         } else if t == "select_source" || t.starts_with("select_source ") {
             let spec = t.strip_prefix("select_source").unwrap_or("").trim();
             self.select_source(spec)
@@ -4511,6 +4775,7 @@ impl IdeModel {
         if !self.tree.sources.contains(&p) {
             self.tree.sources.push(p.clone());
         }
+        self.load_rtl_source(&p);
         self.run_step_from(FlowStep::Synthesis, Some(PathBuf::from(path)))
     }
 
@@ -5097,6 +5362,9 @@ impl IdeModel {
         self.selected_source = Some(row.parent.clone());
         self.selected = Some(row.name.clone());
         self.layout = LayoutKind::Default;
+        if is_rtl_source(&row.parent) {
+            self.load_rtl_source(&row.parent);
+        }
         self.refresh_properties();
         Ok(row.row_text())
     }
@@ -5916,6 +6184,220 @@ impl IdeModel {
         &self.breakpoints
     }
 
+    pub fn source_line_rows(&self) -> &[SourceLine] {
+        &self.source_lines
+    }
+
+    fn source_bp_armed(&self, line: usize) -> bool {
+        self.breakpoints
+            .iter()
+            .any(|b| b.line == Some(line) && b.enabled)
+    }
+
+    fn rtl_source_path(&self) -> Option<String> {
+        if let Some(p) = self.selected_source.as_ref() {
+            if is_rtl_source(p) {
+                return Some(p.clone());
+            }
+        }
+        self.tree
+            .sources
+            .iter()
+            .rev()
+            .find(|p| is_rtl_source(p))
+            .cloned()
+    }
+
+    fn load_rtl_source(&mut self, path: &str) {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        self.source_lines = classify_rtl_lines(&text);
+        self.selected_source_line = None;
+        self.sim_pc_line = None;
+    }
+
+    fn ensure_rtl_source(&mut self) -> Result<String, String> {
+        if !self.source_lines.is_empty() {
+            return Ok(self
+                .selected_source
+                .clone()
+                .or_else(|| self.rtl_source_path())
+                .unwrap_or_default());
+        }
+        let path = self
+            .rtl_source_path()
+            .ok_or_else(|| "source: add RTL first".to_string())?;
+        self.load_rtl_source(&path);
+        if self.source_lines.is_empty() {
+            return Err("source: empty file".into());
+        }
+        Ok(path)
+    }
+
+    fn advance_source_pc(&mut self) {
+        if self.source_lines.is_empty() {
+            if let Some(p) = self.rtl_source_path() {
+                let keep_sel = self.selected_source_line;
+                self.load_rtl_source(&p);
+                self.selected_source_line = keep_sel;
+            }
+        }
+        self.sim_pc_line = self
+            .source_lines
+            .iter()
+            .find(|l| l.executable && l.kind == "seq")
+            .map(|l| l.line);
+    }
+
+    /// UG900 Source window dump (Line/BP/Kind/Text), not a concatenated file dump.
+    pub fn source_window_text(&self) -> String {
+        let n = self.source_lines.len();
+        let file = self
+            .rtl_source_path()
+            .as_deref()
+            .map(source_basename)
+            .unwrap_or_else(|| "-".into());
+        let pc = self
+            .sim_pc_line
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let mut s = format!("source n={n} file={file} pc={pc}");
+        if n == 0 {
+            s.push_str(" no source — add RTL");
+            return s;
+        }
+        for l in &self.source_lines {
+            s.push('\n');
+            s.push_str(&l.row_text(self.source_bp_armed(l.line), self.sim_pc_line));
+        }
+        s
+    }
+
+    pub fn open_source_window(&mut self) -> Result<String, String> {
+        let path = self.ensure_rtl_source()?;
+        if self.selected_source.is_none() {
+            self.selected_source = Some(path);
+        }
+        self.workspace = WorkspaceTab::Source;
+        self.layout = LayoutKind::Simulation;
+        Ok(self.source_window_text())
+    }
+
+    /// Click a UG900 Source line (number or index) — Line/BP/Text table, not a dump.
+    pub fn select_source_line(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_source_line: empty".into());
+        }
+        self.ensure_rtl_source()?;
+        if self.source_lines.is_empty() {
+            return Err("select_source_line: no source".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            self.source_lines
+                .iter()
+                .position(|l| l.line == i)
+                .or_else(|| (i < self.source_lines.len()).then_some(i))
+                .ok_or_else(|| format!("select_source_line: no line {spec}"))?
+        } else {
+            return Err(format!("select_source_line: bad line {spec}"));
+        };
+        let row = self.source_lines[idx].clone();
+        self.selected_source_line = Some(row.line);
+        self.workspace = WorkspaceTab::Source;
+        self.layout = LayoutKind::Simulation;
+        let armed = self.source_bp_armed(row.line);
+        self.properties = vec![
+            ("NAME".into(), format!("{}:{}", source_basename(self.selected_source.as_deref().unwrap_or("")), row.line)),
+            ("TYPE".into(), "source_line".into()),
+            ("LINE".into(), row.line.to_string()),
+            ("KIND".into(), row.type_cell().to_string()),
+            ("EXEC".into(), row.exec_cell().into()),
+            ("SIGNAL".into(), row.signal_cell().into()),
+            ("BP".into(), row.bp_cell(armed).into()),
+            ("PC".into(), row.pc_cell(self.sim_pc_line).into()),
+            ("TEXT".into(), row.text.trim().to_string()),
+        ];
+        Ok(row.row_text(armed, self.sim_pc_line))
+    }
+
+    /// UG900 Source gutter: arm/disarm a line breakpoint tied to helion-sim.
+    pub fn toggle_source_breakpoint(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("toggle_bp_line: empty".into());
+        }
+        self.ensure_rtl_source()?;
+        let line = spec
+            .rsplit_once(':')
+            .map(|(_, n)| n)
+            .unwrap_or(spec)
+            .parse::<usize>()
+            .map_err(|_| format!("toggle_bp_line: bad line {spec}"))?;
+        let row = self
+            .source_lines
+            .iter()
+            .find(|l| l.line == line)
+            .cloned()
+            .ok_or_else(|| format!("toggle_bp_line: no line {line}"))?;
+        if !row.executable {
+            return Err(format!("toggle_bp_line: line {line} not executable"));
+        }
+        if let Some(id) = self
+            .breakpoints
+            .iter()
+            .find(|b| b.line == Some(line) && b.kind_cell() == "line")
+            .map(|b| b.id)
+        {
+            self.breakpoints.retain(|b| b.id != id);
+            if self.selected_breakpoint == Some(id) {
+                self.selected_breakpoint = None;
+            }
+            self.workspace = WorkspaceTab::Source;
+            return Ok(format!("toggle_bp_line {line} off"));
+        }
+        if self.event_sim.is_none() && self.fabric_sim.is_none() {
+            let _ = self.prepare_sim();
+        }
+        let id = self.next_bp_id;
+        self.next_bp_id += 1;
+        let signal = row.signal.clone().unwrap_or_default();
+        let condition = if row.kind == "seq" {
+            "line".into()
+        } else {
+            "change".into()
+        };
+        let file = self.rtl_source_path();
+        let bp = BreakpointRow {
+            id,
+            enabled: true,
+            signal: signal.clone(),
+            condition,
+            value: None,
+            hits: 0,
+            kind: "line".into(),
+            file,
+            line: Some(line),
+        };
+        self.selected_breakpoint = Some(id);
+        self.selected_source_line = Some(line);
+        self.workspace = WorkspaceTab::Source;
+        self.layout = LayoutKind::Simulation;
+        self.properties = vec![
+            ("NAME".into(), format!("bp{id}")),
+            ("TYPE".into(), "breakpoint".into()),
+            ("ID".into(), id.to_string()),
+            ("ENABLED".into(), "1".into()),
+            ("KIND".into(), "line".into()),
+            ("LINE".into(), line.to_string()),
+            ("SIGNAL".into(), if signal.is_empty() { "-".into() } else { signal }),
+            ("CONDITION".into(), bp.condition.clone()),
+            ("HITS".into(), "0".into()),
+        ];
+        let text = bp.row_text();
+        self.breakpoints.push(bp);
+        Ok(text)
+    }
+
     /// UG900 Memory table dump (Name/Type/Addr/Data), not a hex blob.
     pub fn memories_text(&self) -> String {
         let n = self.memories.len();
@@ -6189,6 +6671,9 @@ impl IdeModel {
             condition,
             value,
             hits: 0,
+            kind: "signal".into(),
+            file: None,
+            line: None,
         };
         self.selected_breakpoint = Some(id);
         self.workspace = WorkspaceTab::Breakpoints;
@@ -6235,7 +6720,9 @@ impl IdeModel {
             ("TYPE".into(), "breakpoint".into()),
             ("ID".into(), b.id.to_string()),
             ("ENABLED".into(), b.enabled_cell().into()),
-            ("SIGNAL".into(), b.signal.clone()),
+            ("KIND".into(), b.kind_cell().into()),
+            ("LINE".into(), b.line_cell()),
+            ("SIGNAL".into(), b.signal_cell().into()),
             ("CONDITION".into(), b.condition.clone()),
             ("HITS".into(), b.hits.to_string()),
         ];
@@ -6329,6 +6816,9 @@ impl IdeModel {
             }
             "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
             "memory" | "memories" | "select_memory" => self.workspace = WorkspaceTab::Memory,
+            "source" | "source_window" | "select_source_line" | "toggle_bp_line" | "add_bp_line" => {
+                self.workspace = WorkspaceTab::Source
+            }
             "breakpoints" | "add_bp" | "select_breakpoint" => {
                 self.workspace = WorkspaceTab::Breakpoints
             }
@@ -10757,6 +11247,7 @@ impl IdeModel {
         self.locals.clear();
         self.selected_local = None;
         self.bp_prev.clear();
+        self.sim_pc_line = None;
         for bp in &mut self.breakpoints {
             bp.hits = 0;
         }
@@ -10854,6 +11345,7 @@ impl IdeModel {
         }
         self.refresh_sim_objects();
         self.refresh_sim_debug();
+        self.advance_source_pc();
         Ok(())
     }
 
@@ -11235,36 +11727,66 @@ impl IdeModel {
         }
         let mut current: HashMap<String, u64> = HashMap::new();
         for bp in &self.breakpoints {
+            if bp.signal.is_empty() || bp.signal == "-" {
+                continue;
+            }
             if let Some(v) = self.sim_signal_value(&bp.signal) {
                 current.insert(bp.signal.clone(), v);
             }
         }
         let cycle = self.wave.sample_len();
+        let pc = self.sim_pc_line;
         let mut hit: Option<String> = None;
+        let mut hit_line = false;
         for bp in &mut self.breakpoints {
             if !bp.enabled {
                 continue;
             }
-            let Some(&cur) = current.get(&bp.signal) else {
-                continue;
-            };
-            let prev = self.bp_prev.get(&bp.signal).copied();
-            let fire = if let Some(expect) = bp.value {
-                cur == expect && prev != Some(cur)
+            let is_line = bp.kind_cell() == "line" && bp.line.is_some();
+            let fire = if is_line {
+                let line = bp.line.unwrap();
+                if pc == Some(line) {
+                    true
+                } else if let Some(&cur) = current.get(&bp.signal) {
+                    let prev = self.bp_prev.get(&bp.signal).copied();
+                    prev.map(|p| p != cur).unwrap_or(false)
+                } else {
+                    false
+                }
             } else {
-                prev.map(|p| p != cur).unwrap_or(false)
+                let Some(&cur) = current.get(&bp.signal) else {
+                    continue;
+                };
+                let prev = self.bp_prev.get(&bp.signal).copied();
+                if let Some(expect) = bp.value {
+                    cur == expect && prev != Some(cur)
+                } else {
+                    prev.map(|p| p != cur).unwrap_or(false)
+                }
             };
             if fire {
                 bp.hits = bp.hits.saturating_add(1);
+                let cur = current.get(&bp.signal).copied().unwrap_or(0);
+                let line_s = bp.line_cell();
                 hit = Some(format!(
-                    "id={} SIGNAL={} VALUE={cur} CONDITION={} HITS={} CYCLE={}",
-                    bp.id, bp.signal, bp.condition, bp.hits, cycle
+                    "id={} SIGNAL={} VALUE={cur} CONDITION={} HITS={} CYCLE={} LINE={} KIND={}",
+                    bp.id,
+                    bp.signal_cell(),
+                    bp.condition,
+                    bp.hits,
+                    cycle,
+                    line_s,
+                    bp.kind_cell()
                 ));
+                hit_line = is_line;
                 break;
             }
         }
         for (k, v) in current {
             self.bp_prev.insert(k, v);
+        }
+        if hit_line {
+            self.workspace = WorkspaceTab::Source;
         }
         hit
     }
@@ -17992,6 +18514,207 @@ mod tests {
             ide.exec("add_bp no_such")
                 .unwrap_err()
                 .contains("no signal")
+        );
+    }
+
+    /// UG900 Source window is a clickable RTL Line/BP/Kind/Text table whose
+    /// gutter breakpoints stop helion-sim (posedge PC + assign probes).
+    #[test]
+    fn ug900_source_window_rtl_line_breakpoints_from_helion_sim() {
+        let mut idle = IdeModel::new();
+        assert!(idle.source_line_rows().is_empty());
+        assert!(idle.selected_source_line.is_none());
+        assert!(idle.sim_pc_line.is_none());
+        let empty = idle.exec("source").unwrap_err();
+        assert!(
+            empty.contains("RTL") || empty.contains("source"),
+            "idle Source must refuse: {empty}"
+        );
+        assert!(
+            idle.exec("select_source_line")
+                .unwrap_err()
+                .contains("empty"),
+            "empty line click must refuse"
+        );
+        assert!(
+            idle.exec("toggle_bp_line")
+                .unwrap_err()
+                .contains("empty"),
+            "empty gutter click must refuse"
+        );
+        assert!(
+            NavSection::Simulation
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "source"),
+            "Flow Navigator Simulation must offer Source"
+        );
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        let table = ide.exec("source").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Source);
+        assert_eq!(ide.layout, LayoutKind::Simulation);
+        assert!(table.contains('\n'), "Source must be a line table: {table}");
+        assert!(table.contains("source n="), "{table}");
+        assert!(table.contains("file=counter.sv"), "{table}");
+        assert!(table.contains("LINE=8"), "{table}");
+        assert!(table.contains("KIND=seq"), "{table}");
+        assert!(table.contains("cnt <= cnt + 1"), "{table}");
+        assert!(table.contains("LINE=10"), "{table}");
+        assert!(table.contains("KIND=assign"), "{table}");
+        assert!(table.contains("assign led"), "{table}");
+        assert!(
+            !table.contains("q <= ~q"),
+            "counter Source is not blinky: {table}"
+        );
+        let seq = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.executable && l.kind == "seq")
+            .cloned()
+            .expect("always_ff body");
+        assert_eq!(seq.line, 8);
+        assert_eq!(seq.signal.as_deref(), Some("cnt"));
+        let asg = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.kind == "assign")
+            .cloned()
+            .expect("assign led");
+        assert_eq!(asg.line, 10);
+        assert_eq!(asg.signal.as_deref(), Some("led"));
+        assert!(
+            ide.source_line_rows()
+                .iter()
+                .any(|l| l.kind == "comment" && !l.executable),
+            "comments are not executable: {:?}",
+            ide.source_line_rows()
+        );
+
+        let click = ide.exec("select_source_line 8").unwrap();
+        assert!(click.contains("LINE=8"), "{click}");
+        assert!(click.contains("KIND=seq"), "{click}");
+        assert_eq!(ide.selected_source_line, Some(8));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "source_line"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.exec("select_source_line 99")
+                .unwrap_err()
+                .contains("no line"),
+            "unknown line must refuse"
+        );
+        let comment_ln = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.kind == "comment")
+            .map(|l| l.line)
+            .expect("comment");
+        assert!(
+            ide.exec(&format!("toggle_bp_line {comment_ln}"))
+                .unwrap_err()
+                .contains("not executable"),
+            "gutter on a comment must refuse"
+        );
+
+        let bp = ide.exec("toggle_bp_line 8").unwrap();
+        assert!(bp.contains("KIND=line"), "{bp}");
+        assert!(bp.contains("LINE=8"), "{bp}");
+        assert!(bp.contains("ENABLED=1"), "{bp}");
+        let bpt = ide.exec("breakpoints").unwrap();
+        assert!(bpt.contains("LINE=8"), "{bpt}");
+        assert!(bpt.contains("KIND=line"), "{bpt}");
+        let hit = ide.exec("sim_run 16").unwrap();
+        assert!(hit.contains("HIT"), "seq line BP must stop helion-sim: {hit}");
+        assert!(hit.contains("LINE=8"), "{hit}");
+        assert!(hit.contains("CYCLE=1"), "{hit}");
+        assert_eq!(ide.sim_pc_line, Some(8));
+        assert_eq!(ide.workspace, WorkspaceTab::Source);
+        let n = ide.wave.sample_len();
+        assert!(n < 16, "sim_run must stop at the line BP, not run out: n={n}");
+        assert!(
+            ide.breakpoints
+                .iter()
+                .any(|b| b.line == Some(8) && b.hits >= 1),
+            "hit count from engine: {:?}",
+            ide.breakpoints
+        );
+        let src_pc = ide.exec("source").unwrap();
+        assert!(src_pc.contains("PC=>") || src_pc.contains("pc=8"), "{src_pc}");
+        assert!(src_pc.contains("LINE=8 BP=1"), "{src_pc}");
+
+        ide.exec("disable_bp 1").unwrap();
+        let full = ide.exec("sim_run 16").unwrap();
+        assert!(
+            !full.contains("HIT"),
+            "disabled line BP must not stop: {full}"
+        );
+        assert_eq!(ide.wave.sample_len(), 16);
+        ide.exec("enable_bp 1").unwrap();
+        let hit2 = ide.exec("sim_run 16").unwrap();
+        assert!(hit2.contains("HIT"), "{hit2}");
+        ide.exec("toggle_bp_line 8").unwrap();
+        assert!(
+            ide.breakpoints.iter().all(|b| b.line != Some(8)),
+            "gutter toggle removes the line BP: {:?}",
+            ide.breakpoints
+        );
+
+        let asg_bp = ide.exec("toggle_bp_line 10").unwrap();
+        assert!(asg_bp.contains("LINE=10"), "{asg_bp}");
+        assert!(asg_bp.contains("SIGNAL=led"), "{asg_bp}");
+        let ahit = ide.exec("sim_run 16").unwrap();
+        assert!(ahit.contains("HIT"), "assign line BP tracks helion-sim led: {ahit}");
+        assert!(ahit.contains("LINE=10"), "{ahit}");
+        assert!(
+            ahit.contains("CYCLE=8") || ahit.contains("CYCLE=8"),
+            "led rises at cnt[3]: {ahit}"
+        );
+        let an = ide.wave.sample_len();
+        assert!(an < 16, "assign line BP must stop sim: n={an}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let bsrc = blinky.exec("source").unwrap();
+        assert!(bsrc.contains("file=blinky.sv"), "{bsrc}");
+        assert!(bsrc.contains("q <= ~q"), "{bsrc}");
+        assert!(
+            !bsrc.contains("cnt <= cnt + 1"),
+            "blinky Source is not counter: {bsrc}"
+        );
+        let bseq = blinky
+            .source_line_rows()
+            .iter()
+            .find(|l| l.executable && l.kind == "seq")
+            .expect("blinky seq");
+        assert_eq!(bseq.signal.as_deref(), Some("q"));
+        blinky.exec("toggle_bp_line 8").unwrap();
+        let bhit = blinky.exec("sim_run 16").unwrap();
+        assert!(bhit.contains("HIT"), "{bhit}");
+        assert!(bhit.contains("LINE=8"), "{bhit}");
+        assert_eq!(blinky.sim_pc_line, Some(8));
+
+        let mut fab = IdeModel::new();
+        fab.open_source(&example("counter.sv")).unwrap();
+        fab.run_step(FlowStep::Opt).unwrap();
+        fab.run_step(FlowStep::Place).unwrap();
+        fab.run_step(FlowStep::Route).unwrap();
+        fab.run_step(FlowStep::Bitstream).unwrap();
+        let gold_wns = fab.wns_ps();
+        fab.exec("toggle_bp_line 8").unwrap();
+        let fhit = fab.exec("sim_run 16").unwrap();
+        assert!(fhit.contains("HIT"), "fabric line BP: {fhit}");
+        assert!(fhit.contains("LINE=8"), "{fhit}");
+        assert!(fab.wave.sample_len() < 16);
+        assert_eq!(
+            fab.wns_ps(),
+            gold_wns,
+            "Source window must not disturb gold WNS"
         );
     }
 

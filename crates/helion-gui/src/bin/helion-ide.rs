@@ -622,6 +622,9 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                 let _ = model.select_local(&spec);
             }
             ui.horizontal(|ui| {
+                if ui.button("Source").clicked() {
+                    let _ = model.open_source_window();
+                }
                 if ui.button("Memory").clicked() {
                     let _ = model.open_memory();
                 }
@@ -1043,6 +1046,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Schematic,
             WorkspaceTab::Device,
             WorkspaceTab::Wave,
+            WorkspaceTab::Source,
             WorkspaceTab::Memory,
             WorkspaceTab::Breakpoints,
             WorkspaceTab::Locals,
@@ -1069,6 +1073,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Schematic => "Schematic",
                 WorkspaceTab::Device => "Device",
                 WorkspaceTab::Wave => "Waveform",
+                WorkspaceTab::Source => "Source",
                 WorkspaceTab::Memory => "Memory",
                 WorkspaceTab::Breakpoints => "Breakpoints",
                 WorkspaceTab::Locals => "Locals",
@@ -1104,6 +1109,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Schematic => paint_schematic(ui, model),
         WorkspaceTab::Device => paint_device(ui, model),
         WorkspaceTab::Wave => paint_wave(ui, model),
+        WorkspaceTab::Source => paint_source(ui, model),
         WorkspaceTab::Memory => paint_memory(ui, model),
         WorkspaceTab::Breakpoints => paint_breakpoints(ui, model),
         WorkspaceTab::Locals => paint_locals(ui, model),
@@ -3742,6 +3748,99 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     if let Some((x, y)) = pick_site {
         let _ = model.select_device_site(&format!("X{x}Y{y}"));
+    }
+}
+
+fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Source");
+    ui.weak(
+        "UG900 Source — RTL + line-breakpoint gutter over helion-sim posedge PC, not a file dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Run 16").clicked() {
+            let _ = model.sim_run(16);
+        }
+        if ui.button("Step").clicked() {
+            let _ = model.sim_step();
+        }
+        if ui.button("Restart").clicked() {
+            let _ = model.sim_restart();
+        }
+        if ui.button("Open").clicked() {
+            let _ = model.open_source_window();
+        }
+    });
+    let rows = model.source_line_rows().to_vec();
+    let selected = model.selected_source_line;
+    let pc = model.sim_pc_line;
+    let armed: Vec<usize> = model
+        .breakpoint_rows()
+        .iter()
+        .filter(|b| b.kind_cell() == "line" && b.enabled)
+        .filter_map(|b| b.line)
+        .collect();
+    let mut pick_line: Option<String> = None;
+    let mut pick_bp: Option<String> = None;
+    egui::ScrollArea::both()
+        .id_salt("ug900_source")
+        .show(ui, |ui| {
+            egui::Grid::new("ug900_source_table")
+                .spacing([8.0, 2.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("BP").strong());
+                    ui.label(RichText::new("Line").strong());
+                    ui.label(RichText::new("PC").strong());
+                    ui.label(RichText::new("Kind").strong());
+                    ui.label(RichText::new("Text").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no source — add RTL");
+                        ui.end_row();
+                    } else {
+                        for r in &rows {
+                            let on = selected == Some(r.line);
+                            let bp_on = armed.contains(&r.line);
+                            let bp_label = if r.executable {
+                                r.bp_cell(bp_on)
+                            } else {
+                                " "
+                            };
+                            if ui.selectable_label(bp_on, bp_label).clicked() {
+                                pick_bp = Some(r.line.to_string());
+                            }
+                            if ui
+                                .selectable_label(on, RichText::new(r.line.to_string()).monospace())
+                                .clicked()
+                            {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            let pc_txt = r.pc_cell(pc);
+                            if ui.selectable_label(pc == Some(r.line), pc_txt).clicked() {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            if ui.selectable_label(on, r.type_cell()).clicked() {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            if ui
+                                .selectable_label(on, RichText::new(r.text.trim()).monospace())
+                                .clicked()
+                            {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(spec) = pick_bp {
+        let _ = model.toggle_source_breakpoint(&spec);
+    }
+    if let Some(spec) = pick_line {
+        let _ = model.select_source_line(&spec);
     }
 }
 
