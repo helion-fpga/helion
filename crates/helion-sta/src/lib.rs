@@ -669,12 +669,16 @@ pub fn create_generated_clock_with(
     Ok(())
 }
 
-const LUT_PS: i64 = 150;
-const FF_CKQ_PS: i64 = 80;
-const SETUP_PS: i64 = 50;
-const PIN_PS: i64 = 20;
+/// LUT6 combinational arc (ps). UG903 pin-delay `cell` incr.
+pub const LUT_PS: i64 = 150;
+/// HFF clock-to-Q (ps). UG903 pin-delay `cell` incr on Q.
+pub const FF_CKQ_PS: i64 = 80;
+/// HFF D setup (ps). UG903 pin-delay `setup` incr.
+pub const SETUP_PS: i64 = 50;
+/// LUT input pin / net arc (ps). UG903 pin-delay `net` incr per fanin.
+pub const PIN_PS: i64 = 20;
 /// HAD default I/O pad (LVCMOS18). Gold WNS for counter uses this.
-const IOB_PS: i64 = 100;
+pub const IOB_PS: i64 = 100;
 const HOP_PS: i64 = 40;
 const HOLD_REQ_PS: i64 = 20;
 

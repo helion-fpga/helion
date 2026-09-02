@@ -21,7 +21,7 @@ use helion_sta::{
     report_cdc, report_clock_interaction, report_clock_networks, report_methodology,
     report_power, report_timing_routed_xdc, report_timing_summary, CdcReport,
     ClockInteraction, ClockNetworkReport, Constraints, MethodologyReport, PowerReport,
-    TimingResult, TimingSummary,
+    TimingResult, TimingSummary, FF_CKQ_PS, LUT_PS, PIN_PS, SETUP_PS,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -996,7 +996,24 @@ impl Default for SchematicCamera {
     }
 }
 
+/// One UG903 `report_timing` pin-delay row (Name / Delay Type / Incr / Path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimingPathPin {
+    pub cell: String,
+    /// `cell/pin` as Vivado's Name column.
+    pub pin: String,
+    /// `clk` / `cell` / `net` / `setup` / `iob`.
+    pub delay_type: String,
+    pub incr_ps: i64,
+    pub path_ps: i64,
+    pub net: String,
+    pub fanout: usize,
+    /// HAD site after Place (`CLB_XnYm` / `IOB_XnYm`), empty before.
+    pub location: String,
+}
+
 /// Fig. 59 STA path (cells/nets from endpoints), not a restyle of the full sheet.
+/// `pins` is the UG903 pin-delay table (incr/path from helion-sta arcs).
 #[derive(Clone, Debug)]
 pub struct TimingPath {
     pub name: String,
@@ -1006,6 +1023,29 @@ pub struct TimingPath {
     pub nets: Vec<String>,
     pub delay_ps: i64,
     pub slack_ps: i64,
+    pub pins: Vec<TimingPathPin>,
+}
+
+impl TimingPath {
+    /// Combinational + sequential cell arcs (not nets).
+    pub fn logic_ps(&self) -> i64 {
+        self.pins
+            .iter()
+            .filter(|p| {
+                p.delay_type == "cell" || p.delay_type == "setup" || p.delay_type == "iob"
+            })
+            .map(|p| p.incr_ps)
+            .sum()
+    }
+
+    /// Net / pin-load arcs.
+    pub fn net_ps(&self) -> i64 {
+        self.pins
+            .iter()
+            .filter(|p| p.delay_type == "net")
+            .map(|p| p.incr_ps)
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2911,6 +2951,8 @@ pub struct IdeModel {
     pub wave: Waveform,
     pub timing_paths: Vec<TimingPath>,
     pub selected_timing_path: Option<usize>,
+    /// UG903 pin-delay table selected Name (`cell/pin`).
+    pub selected_timing_pin: Option<String>,
     pub console_find: String,
     pub console_selected: Option<usize>,
     pub console_find_hits: Vec<usize>,
@@ -2977,6 +3019,7 @@ impl IdeModel {
             wave: Waveform::default(),
             timing_paths: Vec::new(),
             selected_timing_path: None,
+            selected_timing_pin: None,
             console_find: String::new(),
             console_selected: None,
             console_find_hits: Vec::new(),
@@ -3489,6 +3532,21 @@ impl IdeModel {
             self.select_timing_path(spec.trim())
         } else if t == "select_timing_path" {
             self.select_timing_path("0")
+        } else if t == "timing_path_table" || t == "report_timing_paths" {
+            self.workspace = WorkspaceTab::Reports;
+            if self.timing_paths.is_empty() {
+                let _ = self.report_timing_now();
+                self.sync_from_session();
+            }
+            Ok(self.timing_path_table_text())
+        } else if let Some(spec) = t.strip_prefix("select_timing_path_report ") {
+            self.select_timing_path_report(spec.trim())
+        } else if t == "select_timing_path_report" {
+            self.select_timing_path_report("0")
+        } else if let Some(spec) = t.strip_prefix("select_timing_pin ") {
+            self.select_timing_pin(spec.trim())
+        } else if t == "select_timing_pin" {
+            self.select_timing_pin("")
         } else if let Some(name) = t.strip_prefix("select_scope ") {
             self.select_scope(name.trim())
         } else if let Some(name) = t.strip_prefix("select_clock_region ") {
@@ -4734,27 +4792,8 @@ impl IdeModel {
 
     /// Fig. 59: isolate/highlight the STA path's cells and nets on the schematic.
     pub fn select_timing_path(&mut self, spec: &str) -> Result<String, String> {
-        if self.timing_paths.is_empty() {
-            let _ = self.report_timing_now();
-            self.sync_from_session();
-        }
-        if self.timing_paths.is_empty() {
-            return Err("select_timing_path: no STA endpoints".into());
-        }
-        let spec = spec.trim();
-        let idx = if let Ok(n) = spec.parse::<usize>() {
-            n
-        } else {
-            self.timing_paths
-                .iter()
-                .position(|p| {
-                    p.endpoint == spec
-                        || p.startpoint == spec
-                        || p.name == spec
-                        || p.cells.iter().any(|c| c == spec)
-                })
-                .ok_or_else(|| format!("select_timing_path: no path {spec}"))?
-        };
+        self.ensure_timing_paths()?;
+        let idx = self.timing_path_index(spec)?;
         let path = self
             .timing_paths
             .get(idx)
@@ -4764,6 +4803,7 @@ impl IdeModel {
             return Err("select_timing_path: path has no cells".into());
         }
         self.selected_timing_path = Some(idx);
+        self.selected_timing_pin = None;
         self.schematic.highlight_cells = path.cells.iter().cloned().collect();
         self.schematic.highlight_nets = path.nets.iter().cloned().collect();
         self.schematic.path_only = true;
@@ -4783,6 +4823,171 @@ impl IdeModel {
             path.slack_ps,
             self.schematic_drawing_text()
         ))
+    }
+
+    fn ensure_timing_paths(&mut self) -> Result<(), String> {
+        if self.timing_paths.is_empty() {
+            let _ = self.report_timing_now();
+            self.sync_from_session();
+        }
+        if self.timing_paths.is_empty() {
+            return Err("select_timing_path: no STA endpoints".into());
+        }
+        Ok(())
+    }
+
+    fn timing_path_index(&self, spec: &str) -> Result<usize, String> {
+        let spec = spec.trim();
+        if let Ok(n) = spec.parse::<usize>() {
+            if n < self.timing_paths.len() {
+                return Ok(n);
+            }
+            return Err(format!("select_timing_path: index {n} out of range"));
+        }
+        self.timing_paths
+            .iter()
+            .position(|p| {
+                p.endpoint == spec
+                    || p.startpoint == spec
+                    || p.name == spec
+                    || p.cells.iter().any(|c| c == spec)
+            })
+            .ok_or_else(|| format!("select_timing_path: no path {spec}"))
+    }
+
+    /// UG903 Reports window: select a path and stay on the pin-delay table.
+    pub fn select_timing_path_report(&mut self, spec: &str) -> Result<String, String> {
+        self.ensure_timing_paths()?;
+        let idx = self.timing_path_index(spec)?;
+        let path = self
+            .timing_paths
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| format!("select_timing_path: index {idx} out of range"))?;
+        if path.cells.is_empty() {
+            return Err("select_timing_path: path has no cells".into());
+        }
+        self.selected_timing_path = Some(idx);
+        self.selected_timing_pin = None;
+        self.selected_report = Some("report_timing".into());
+        self.workspace = WorkspaceTab::Reports;
+        if let Some(end) = path.cells.first() {
+            self.select(end);
+        }
+        Ok(self.timing_path_table_text())
+    }
+
+    fn find_timing_pin(&self, spec: &str) -> Result<(usize, TimingPathPin), String> {
+        let spec = spec.trim();
+        let mut order: Vec<usize> = Vec::new();
+        if let Some(p) = self.selected_timing_path {
+            order.push(p);
+        }
+        order.extend((0..self.timing_paths.len()).filter(|i| Some(*i) != self.selected_timing_path));
+        let as_idx = spec.parse::<usize>().ok();
+        for pi in order {
+            let path = &self.timing_paths[pi];
+            if let Some(n) = as_idx {
+                if let Some(pin) = path.pins.get(n) {
+                    return Ok((pi, pin.clone()));
+                }
+            }
+            if let Some(pin) = path.pins.iter().find(|p| {
+                p.pin.eq_ignore_ascii_case(spec)
+                    || p.cell.eq_ignore_ascii_case(spec)
+                    || p.pin.rsplit('/').next() == Some(spec)
+                    || p.net == spec
+            }) {
+                return Ok((pi, pin.clone()));
+            }
+        }
+        Err(format!("select_timing_pin: no pin {spec}"))
+    }
+
+    /// UG903 pin-delay Name click: properties for that STA pin, select the HNF cell.
+    pub fn select_timing_pin(&mut self, spec: &str) -> Result<String, String> {
+        self.ensure_timing_paths()?;
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_timing_pin: missing pin".into());
+        }
+        let (pi, pin) = self.find_timing_pin(spec)?;
+        let slack = self.timing_paths[pi].slack_ps;
+        self.selected_timing_path = Some(pi);
+        self.selected_timing_pin = Some(pin.pin.clone());
+        self.workspace = WorkspaceTab::Reports;
+        self.selected = Some(pin.cell.clone());
+        let net = if pin.net.is_empty() {
+            "-".to_string()
+        } else {
+            pin.net.clone()
+        };
+        let loc = if pin.location.is_empty() {
+            "-".to_string()
+        } else {
+            pin.location.clone()
+        };
+        self.properties = vec![
+            ("NAME".into(), pin.pin.clone()),
+            ("TYPE".into(), "timing_pin".into()),
+            ("CELL".into(), pin.cell.clone()),
+            ("PIN".into(), pin.pin.clone()),
+            ("DELAY_TYPE".into(), pin.delay_type.clone()),
+            ("INCR_PS".into(), pin.incr_ps.to_string()),
+            ("PATH_PS".into(), pin.path_ps.to_string()),
+            ("NET".into(), net.clone()),
+            ("FANOUT".into(), pin.fanout.to_string()),
+            ("LOCATION".into(), loc.clone()),
+            ("SLACK_PS".into(), slack.to_string()),
+        ];
+        Ok(format!(
+            "timing_pin {} type={} incr_ps={} path_ps={} net={} fanout={} loc={}",
+            pin.pin, pin.delay_type, pin.incr_ps, pin.path_ps, net, pin.fanout, loc
+        ))
+    }
+
+    /// UG903 pin-delay table dump (tests). Paint is a clickable grid, not this string.
+    pub fn timing_path_table_text(&self) -> String {
+        let sel = self
+            .selected_timing_path
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "-".into());
+        let mut s = format!(
+            "timing_paths n={} selected={} pins={}",
+            self.timing_paths.len(),
+            sel,
+            self.timing_paths
+                .iter()
+                .map(|p| p.pins.len())
+                .sum::<usize>()
+        );
+        for (i, p) in self.timing_paths.iter().enumerate() {
+            s.push_str(&format!(
+                "\npath[{i}] name={} from={} to={} slack_ps={} delay_ps={} logic_ps={} net_ps={} cells={} pins={}",
+                p.name,
+                p.startpoint,
+                p.endpoint,
+                p.slack_ps,
+                p.delay_ps,
+                p.logic_ps(),
+                p.net_ps(),
+                p.cells.len(),
+                p.pins.len()
+            ));
+            for pin in &p.pins {
+                s.push_str(&format!(
+                    " pin={}:type={}:incr_ps={}:path_ps={}:net={}:fanout={}:loc={}",
+                    pin.pin,
+                    pin.delay_type,
+                    pin.incr_ps,
+                    pin.path_ps,
+                    if pin.net.is_empty() { "-" } else { pin.net.as_str() },
+                    pin.fanout,
+                    if pin.location.is_empty() { "-" } else { pin.location.as_str() }
+                ));
+            }
+        }
+        s
     }
 
     /// UG900: click a Scope to populate Objects from helion-sim (filtered, not static).
@@ -8731,12 +8936,13 @@ impl IdeModel {
             _ => None,
         };
         self.timing_paths = match (self.shell.session.design.as_ref(), self.timing.as_ref()) {
-            (Some(d), Some(t)) => extract_timing_paths(d, t),
+            (Some(d), Some(t)) => extract_timing_paths(d, t, &self.device),
             _ => Vec::new(),
         };
         if let Some(i) = self.selected_timing_path {
             if i >= self.timing_paths.len() {
                 self.selected_timing_path = None;
+                self.selected_timing_pin = None;
             }
         }
     }
@@ -9816,8 +10022,194 @@ fn parse_site_xy(spec: &str) -> Result<(u32, u32), String> {
     Ok((x, y))
 }
 
+fn site_of(device: &DeviceView, cell: &str) -> String {
+    device
+        .occupant_of(cell)
+        .map(|s| s.site_name())
+        .unwrap_or_default()
+}
+
+fn net_fanout(design: &Design, net: &str) -> usize {
+    design
+        .net(net)
+        .map(|n| n.endpoints.len().saturating_sub(1).max(1))
+        .unwrap_or(1)
+}
+
+fn push_timing_pin(
+    pins: &mut Vec<TimingPathPin>,
+    cell: &str,
+    pin: &str,
+    delay_type: &str,
+    incr_ps: i64,
+    net: &str,
+    fanout: usize,
+    location: String,
+) {
+    let path_ps = pins.last().map(|p| p.path_ps).unwrap_or(0) + incr_ps;
+    pins.push(TimingPathPin {
+        cell: cell.to_string(),
+        pin: format!("{cell}/{pin}"),
+        delay_type: delay_type.to_string(),
+        incr_ps,
+        path_ps,
+        net: net.to_string(),
+        fanout,
+        location,
+    });
+}
+
+fn is_hff(design: &Design, name: &str) -> bool {
+    design
+        .cell(name)
+        .map(|c| matches!(c.kind, CellKind::Hff))
+        .unwrap_or(false)
+}
+
+/// UG903 r2r pin table: CkQ + LUT fanin×PIN + LUT comb + setup.
+fn r2r_pin_rows(
+    design: &Design,
+    device: &DeviceView,
+    start: &str,
+    lut: Option<&str>,
+    endpoint: &str,
+) -> Vec<TimingPathPin> {
+    let mut pins = Vec::new();
+    if is_hff(design, start) {
+        let clk_net = design.net_on(start, "C").unwrap_or("clk");
+        push_timing_pin(
+            &mut pins,
+            start,
+            "C",
+            "clk",
+            0,
+            clk_net,
+            net_fanout(design, clk_net),
+            site_of(device, start),
+        );
+        let qnet = design.net_on(start, "Q").unwrap_or("");
+        push_timing_pin(
+            &mut pins,
+            start,
+            "Q",
+            "cell",
+            FF_CKQ_PS,
+            qnet,
+            net_fanout(design, qnet),
+            site_of(device, start),
+        );
+    }
+    if let Some(lut) = lut {
+        for i in 0..6u8 {
+            let pn = format!("I{i}");
+            if let Some(inet) = design.net_on(lut, &pn) {
+                push_timing_pin(
+                    &mut pins,
+                    lut,
+                    &pn,
+                    "net",
+                    PIN_PS,
+                    inet,
+                    net_fanout(design, inet),
+                    site_of(device, lut),
+                );
+            }
+        }
+        let onet = design.net_on(lut, "O").unwrap_or("");
+        push_timing_pin(
+            &mut pins,
+            lut,
+            "O",
+            "cell",
+            LUT_PS,
+            onet,
+            net_fanout(design, onet),
+            site_of(device, lut),
+        );
+    }
+    let dnet = design.net_on(endpoint, "D").unwrap_or("");
+    push_timing_pin(
+        &mut pins,
+        endpoint,
+        "D",
+        "setup",
+        SETUP_PS,
+        dnet,
+        net_fanout(design, dnet),
+        site_of(device, endpoint),
+    );
+    pins
+}
+
+/// UG903 IOB pin table: CkQ + PathFinder net + pad. Sums to STA `iob_ps`.
+fn iob_pin_rows(
+    design: &Design,
+    device: &DeviceView,
+    t: &TimingResult,
+    start: &str,
+    iob: &str,
+) -> Vec<TimingPathPin> {
+    let mut pins = Vec::new();
+    let has_ff = is_hff(design, start);
+    let ckq = if has_ff && t.iob_ps > 0 { FF_CKQ_PS } else { 0 };
+    let route = if t.iob_ps > 0 { t.route_ps } else { 0 };
+    let pad_ps = (t.iob_ps - ckq - route).max(0);
+    if has_ff {
+        let clk_net = design.net_on(start, "C").unwrap_or("clk");
+        push_timing_pin(
+            &mut pins,
+            start,
+            "C",
+            "clk",
+            0,
+            clk_net,
+            net_fanout(design, clk_net),
+            site_of(device, start),
+        );
+        let qnet = design.net_on(start, "Q").unwrap_or("");
+        push_timing_pin(
+            &mut pins,
+            start,
+            "Q",
+            "cell",
+            ckq,
+            qnet,
+            net_fanout(design, qnet),
+            site_of(device, start),
+        );
+    }
+    let inet = design.net_on(iob, "I").unwrap_or("");
+    push_timing_pin(
+        &mut pins,
+        iob,
+        "I",
+        "net",
+        route,
+        inet,
+        net_fanout(design, inet),
+        site_of(device, iob),
+    );
+    let pad = design.net_on(iob, "PAD").unwrap_or("");
+    push_timing_pin(
+        &mut pins,
+        iob,
+        "PAD",
+        "iob",
+        pad_ps,
+        pad,
+        net_fanout(design, pad),
+        site_of(device, iob),
+    );
+    pins
+}
+
 /// STA endpoint paths: each FF and IOB, cells/nets walked off the HNF (Fig. 59).
-fn extract_timing_paths(design: &Design, t: &TimingResult) -> Vec<TimingPath> {
+/// Pin rows are UG903 incr/path delays from helion-sta arcs, not a name list.
+fn extract_timing_paths(
+    design: &Design,
+    t: &TimingResult,
+    device: &DeviceView,
+) -> Vec<TimingPath> {
     let mut paths = Vec::new();
     for c in &design.cells {
         if !matches!(c.kind, CellKind::Hff) {
@@ -9826,12 +10218,14 @@ fn extract_timing_paths(design: &Design, t: &TimingResult) -> Vec<TimingPath> {
         let mut cells = vec![c.name.clone()];
         let mut nets = Vec::new();
         let mut start = "clk".to_string();
+        let mut lut = None;
         if let Some(dnet) = design.net_on(&c.name, "D") {
             nets.push(dnet.to_string());
             if let Some(n) = design.nets.iter().find(|n| n.name == dnet) {
                 for e in &n.endpoints {
                     if e.pin == "O" && !cells.contains(&e.cell) {
                         cells.push(e.cell.clone());
+                        lut = Some(e.cell.clone());
                         for i in 0..6u8 {
                             let pin = format!("I{i}");
                             if let Some(inet) = design.net_on(&e.cell, &pin) {
@@ -9852,14 +10246,17 @@ fn extract_timing_paths(design: &Design, t: &TimingResult) -> Vec<TimingPath> {
                 }
             }
         }
+        let pins = r2r_pin_rows(design, device, &start, lut.as_deref(), &c.name);
+        let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.r2r_ps);
         paths.push(TimingPath {
             name: format!("{start}->{}", c.name),
             startpoint: start,
             endpoint: c.name.clone(),
             cells,
             nets,
-            delay_ps: t.r2r_ps,
+            delay_ps,
             slack_ps: t.wns_ps,
+            pins,
         });
     }
     for c in &design.cells {
@@ -9885,14 +10282,17 @@ fn extract_timing_paths(design: &Design, t: &TimingResult) -> Vec<TimingPath> {
                 nets.push(pad.to_string());
             }
         }
+        let pins = iob_pin_rows(design, device, t, &start, &c.name);
+        let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.iob_ps);
         paths.push(TimingPath {
             name: format!("{start}->{}", c.name),
             startpoint: start,
             endpoint: c.name.clone(),
             cells,
             nets,
-            delay_ps: t.iob_ps,
+            delay_ps,
             slack_ps: t.wns_ps,
+            pins,
         });
     }
     paths
@@ -13883,6 +14283,164 @@ mod tests {
                 assert!(p1.cells.contains(n), "path 1 cells only: {n} not in {:?}", p1.cells);
             }
         }
+    }
+
+    /// UG903 report_timing is a pin-delay table (incr/path from helion-sta), not a name list.
+    #[test]
+    fn reports_timing_paths_is_ug903_pin_delay_table() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("report_timing").unwrap();
+        let t = ide.timing.clone().expect("STA after report_timing");
+        assert!(
+            !ide.timing_paths.is_empty(),
+            "STA endpoints must become timing paths"
+        );
+        assert!(
+            ide.timing_paths.iter().all(|p| !p.pins.is_empty()),
+            "every path has pin-delay rows, not a name list: {:?}",
+            ide.timing_paths
+                .iter()
+                .map(|p| (p.name.as_str(), p.pins.len()))
+                .collect::<Vec<_>>()
+        );
+        let d = ide.design().unwrap();
+        for p in &ide.timing_paths {
+            let mut acc = 0i64;
+            for pin in &p.pins {
+                acc += pin.incr_ps;
+                assert_eq!(
+                    pin.path_ps, acc,
+                    "cumulative Path column: {} {}",
+                    pin.pin, pin.path_ps
+                );
+                assert!(
+                    pin.pin.contains('/'),
+                    "UG903 Name is cell/pin, not a dump token: {}",
+                    pin.pin
+                );
+                assert!(
+                    d.cells.iter().any(|c| c.name == pin.cell),
+                    "pin cell {} must be HNF, not chrome",
+                    pin.cell
+                );
+                assert!(
+                    matches!(
+                        pin.delay_type.as_str(),
+                        "clk" | "cell" | "net" | "setup" | "iob"
+                    ),
+                    "delay type {}",
+                    pin.delay_type
+                );
+            }
+            assert_eq!(acc, p.delay_ps, "last Path_ps equals path delay {}", p.name);
+            assert_eq!(p.logic_ps() + p.net_ps(), p.delay_ps);
+        }
+        let max_r2r = ide
+            .timing_paths
+            .iter()
+            .filter(|p| p.pins.iter().any(|r| r.delay_type == "setup"))
+            .map(|p| p.delay_ps)
+            .max();
+        assert_eq!(
+            max_r2r,
+            Some(t.r2r_ps),
+            "worst r2r pin sum is STA r2r_ps={}",
+            t.r2r_ps
+        );
+        let max_iob = ide
+            .timing_paths
+            .iter()
+            .filter(|p| p.pins.iter().any(|r| r.delay_type == "iob"))
+            .map(|p| p.delay_ps)
+            .max();
+        assert_eq!(
+            max_iob,
+            Some(t.iob_ps),
+            "IOB pin sum is STA iob_ps={}",
+            t.iob_ps
+        );
+        assert!(
+            ide.timing_paths
+                .iter()
+                .any(|p| p.pins.iter().any(|r| r.incr_ps == FF_CKQ_PS)),
+            "CkQ arc is helion-sta FF_CKQ_PS"
+        );
+        assert!(
+            ide.timing_paths
+                .iter()
+                .any(|p| p.pins.iter().any(|r| r.incr_ps == LUT_PS)),
+            "LUT comb arc is helion-sta LUT_PS"
+        );
+        assert!(
+            ide.timing_paths
+                .iter()
+                .any(|p| p.pins.iter().any(|r| r.location.starts_with("CLB_")
+                    || r.location.starts_with("IOB_"))),
+            "Place fills HAD Location, not empty chrome: {:?}",
+            ide.timing_paths
+                .iter()
+                .flat_map(|p| p.pins.iter().map(|r| r.location.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        let table = ide.exec("timing_path_table").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert!(table.contains("timing_paths n="), "{table}");
+        assert!(table.contains("pin="), "{table}");
+        assert!(table.contains("incr_ps="), "{table}");
+        assert!(table.contains("path_ps="), "{table}");
+        assert!(table.contains("type=cell"), "{table}");
+        assert!(table.contains("type=setup") || table.contains("type=iob"), "{table}");
+        assert!(!table.contains("AXI"), "{table}");
+
+        let r0 = ide.exec("select_timing_path_report 0").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert_eq!(ide.selected_timing_path, Some(0));
+        assert!(r0.contains("pin="), "{r0}");
+        let pin = ide.timing_paths[0]
+            .pins
+            .iter()
+            .find(|p| p.incr_ps > 0)
+            .cloned()
+            .expect("nonzero pin delay");
+        let out = ide.exec(&format!("select_timing_pin {}", pin.pin)).unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert_eq!(ide.selected.as_deref(), Some(pin.cell.as_str()));
+        assert_eq!(ide.selected_timing_pin.as_deref(), Some(pin.pin.as_str()));
+        assert!(out.contains("incr_ps="), "{out}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "timing_pin"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "INCR_PS" && v == pin.incr_ps.to_string()),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.exec("select_timing_pin")
+                .unwrap_err()
+                .contains("missing pin"),
+            "empty pin click must refuse"
+        );
+        assert!(
+            ide.exec("select_timing_pin no_such_pin")
+                .unwrap_err()
+                .contains("no pin"),
+            "unknown pin must refuse"
+        );
+        let gold = ide.wns_ps().expect("gold WNS");
+        assert_eq!(
+            ide.timing.as_ref().map(|x| x.wns_ps),
+            Some(gold),
+            "pin table must not move STA WNS"
+        );
     }
 
     /// Fig. 56 Expand Inside regenerates nested instance contents; primitives refuse.

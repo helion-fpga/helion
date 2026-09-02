@@ -14,6 +14,7 @@ pub use ide::{
     Pblock, ReportCatalogRow,
     NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
+    TimingPathPin,
     UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
     Waveform, WaveMarker, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
 };
