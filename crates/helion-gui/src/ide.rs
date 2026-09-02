@@ -417,6 +417,14 @@ impl NavSection {
                     tcl: "run_implementation",
                 },
                 NavAction {
+                    label: "Design Runs",
+                    tcl: "design_runs",
+                },
+                NavAction {
+                    label: "Compare Runs",
+                    tcl: "compare_runs",
+                },
+                NavAction {
                     label: "Report DRC",
                     tcl: "report_drc",
                 },
@@ -787,6 +795,98 @@ impl DesignRun {
             runtime_ms: None,
             reuse_pct: None,
         }
+    }
+
+    /// UG893 Design Runs grid cell: impl strategy, dash for synth.
+    pub fn strategy_cell(&self) -> &str {
+        if self.step == "Implementation" && !self.strategy.is_empty() {
+            self.strategy.as_str()
+        } else {
+            "-"
+        }
+    }
+
+    pub fn wns_cell(&self) -> String {
+        self.wns_ps
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn runtime_cell(&self) -> String {
+        self.runtime_ms
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn hash_cell(&self) -> String {
+        self.bitstream_hash
+            .map(|h| format!("{h:#010x}"))
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn lutff_cell(&self) -> String {
+        self.lutff
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn reuse_cell(&self) -> String {
+        self.reuse_pct
+            .map(|n| format!("{n}%"))
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn top_cell(&self) -> &str {
+        self.top.as_deref().unwrap_or("-")
+    }
+
+    pub fn cells_cell(&self) -> String {
+        self.cells
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    /// Clickable-grid dump row: name/strategy/WNS/runtime/hash from the live run.
+    pub fn row_text(&self) -> String {
+        let mut s = format!("{} {} {}", self.name, self.step, self.status);
+        s.push_str(&format!(
+            " NAME={} STEP={} STRATEGY={} STATUS={} WNS_PS={} RUNTIME_MS={} HASH={} LUTFF={} REUSE={}",
+            self.name,
+            self.step,
+            self.strategy_cell(),
+            self.status,
+            self.wns_cell(),
+            self.runtime_cell(),
+            self.hash_cell(),
+            self.lutff_cell(),
+            self.reuse_cell()
+        ));
+        if !self.strategy.is_empty() && self.step == "Implementation" {
+            s.push_str(&format!(" strategy={}", self.strategy));
+        }
+        if let Some(top) = &self.top {
+            s.push_str(&format!(" top={top}"));
+        }
+        s.push_str(&format!(" part={}", self.part));
+        if let Some(n) = self.cells {
+            s.push_str(&format!(" cells={n}"));
+        }
+        if let Some(n) = self.lutff {
+            s.push_str(&format!(" LUTFF={n}"));
+        }
+        if let Some(w) = self.wns_ps {
+            s.push_str(&format!(" WNS_PS={w}"));
+        }
+        if let Some(ms) = self.runtime_ms {
+            s.push_str(&format!(" runtime_ms={ms}"));
+        }
+        if let Some(p) = self.reuse_pct {
+            s.push_str(&format!(" reuse={p}%"));
+        }
+        if let Some(h) = self.bitstream_hash {
+            s.push_str(&format!(" hash={h:#010x}"));
+        }
+        s
     }
 }
 
@@ -3135,6 +3235,10 @@ impl IdeModel {
         } else if t == "compare_runs" {
             self.workspace = WorkspaceTab::Runs;
             Ok(self.compare_runs_text())
+        } else if let Some(name) = t.strip_prefix("select_run ") {
+            self.select_run(name.trim())
+        } else if t == "select_run" {
+            self.select_run("")
         } else if t == "create_run" || t.starts_with("create_run ") {
             self.create_run(t.strip_prefix("create_run").unwrap_or("").trim())
         } else if t == "launch_runs" || t.starts_with("launch_runs ") {
@@ -4109,63 +4213,116 @@ impl IdeModel {
         s
     }
 
-    /// UG893 Design Runs pane: synth_1 / impl_1 status from the live Session.
+    /// UG893 Design Runs pane: clickable name/strategy/WNS/runtime/hash grid
+    /// over Session synth/impl (not a concatenated dump).
     pub fn runs_text(&self) -> String {
+        let mut s = format!("design_runs n={}", self.runs.len());
+        for r in &self.runs {
+            s.push('\n');
+            s.push_str(&r.row_text());
+        }
+        s
+    }
+
+    pub fn compare_run_rows(&self) -> Vec<&DesignRun> {
         self.runs
             .iter()
-            .map(|r| {
-                let mut s = format!("{} {} {}", r.name, r.step, r.status);
-                if !r.strategy.is_empty() && r.step == "Implementation" {
-                    s.push_str(&format!(" strategy={}", r.strategy));
-                }
-                if let Some(top) = &r.top {
-                    s.push_str(&format!(" top={top}"));
-                }
-                s.push_str(&format!(" part={}", r.part));
-                if let Some(n) = r.cells {
-                    s.push_str(&format!(" cells={n}"));
-                }
-                if let Some(n) = r.lutff {
-                    s.push_str(&format!(" LUTFF={n}"));
-                }
-                if let Some(w) = r.wns_ps {
-                    s.push_str(&format!(" WNS_PS={w}"));
-                }
-                if let Some(ms) = r.runtime_ms {
-                    s.push_str(&format!(" runtime_ms={ms}"));
-                }
-                if let Some(p) = r.reuse_pct {
-                    s.push_str(&format!(" reuse={p}%"));
-                }
-                if let Some(h) = r.bitstream_hash {
-                    s.push_str(&format!(" hash={h:#010x}"));
-                }
-                s
-            })
-            .collect::<Vec<_>>()
-            .join(" | ")
+            .filter(|r| r.step == "Implementation")
+            .collect()
     }
 
     pub fn compare_runs_text(&self) -> String {
-        let impls: Vec<&DesignRun> = self
-            .runs
-            .iter()
-            .filter(|r| r.step == "Implementation")
-            .collect();
+        let impls = self.compare_run_rows();
         let mut s = format!("compare_runs n={}", impls.len());
         for r in impls {
             s.push_str(&format!(
                 " {} strategy={} WNS_PS={} runtime_ms={} hash={}",
                 r.name,
                 r.strategy,
-                r.wns_ps.map(|w| w.to_string()).unwrap_or_else(|| "-".into()),
-                r.runtime_ms.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
-                r.bitstream_hash
-                    .map(|h| format!("{h:#010x}"))
-                    .unwrap_or_else(|| "-".into())
+                r.wns_cell(),
+                r.runtime_cell(),
+                r.hash_cell()
+            ));
+            s.push_str(&format!(
+                "\n{} NAME={} STRATEGY={} STATUS={} WNS_PS={} RUNTIME_MS={} HASH={}",
+                r.name,
+                r.name,
+                r.strategy_cell(),
+                r.status,
+                r.wns_cell(),
+                r.runtime_cell(),
+                r.hash_cell()
             ));
         }
         s
+    }
+
+    fn design_run_properties(r: &DesignRun) -> Vec<(String, String)> {
+        vec![
+            ("NAME".into(), r.name.clone()),
+            ("TYPE".into(), "design_run".into()),
+            ("STEP".into(), r.step.clone()),
+            ("STRATEGY".into(), r.strategy_cell().into()),
+            ("STATUS".into(), r.status.clone()),
+            ("WNS_PS".into(), r.wns_cell()),
+            ("RUNTIME_MS".into(), r.runtime_cell()),
+            ("HASH".into(), r.hash_cell()),
+            ("LUTFF".into(), r.lutff_cell()),
+            ("REUSE".into(), r.reuse_cell()),
+            ("PART".into(), r.part.clone()),
+            ("TOP".into(), r.top_cell().into()),
+            ("CELLS".into(), r.cells_cell()),
+        ]
+    }
+
+    /// Click a Design Runs / compare_runs grid row: properties + Runs workspace.
+    pub fn select_run(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_run: missing name".into());
+        }
+        let key = spec.strip_prefix("run:").unwrap_or(spec);
+        let spec_l = key.to_ascii_lowercase();
+        let run = if let Ok(i) = key.parse::<usize>() {
+            self.runs
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_run: no row {spec}"))?
+        } else {
+            self.runs
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(key))
+                .cloned()
+                .or_else(|| {
+                    self.runs.iter().find(|r| {
+                        r.step == "Implementation"
+                            && r.strategy.eq_ignore_ascii_case(key)
+                    }).cloned()
+                })
+                .or_else(|| {
+                    self.runs.iter().find(|r| {
+                        r.step.eq_ignore_ascii_case(key)
+                            || r.status.eq_ignore_ascii_case(key)
+                            || r.name.to_ascii_lowercase().contains(&spec_l)
+                    }).cloned()
+                })
+                .ok_or_else(|| format!("select_run: no row {spec}"))?
+        };
+        self.selected = Some(format!("run:{}", run.name));
+        self.properties = Self::design_run_properties(&run);
+        self.workspace = WorkspaceTab::Runs;
+        Ok(format!(
+            "run NAME={} STEP={} STRATEGY={} STATUS={} WNS_PS={} RUNTIME_MS={} HASH={} LUTFF={} REUSE={}",
+            run.name,
+            run.step,
+            run.strategy_cell(),
+            run.status,
+            run.wns_cell(),
+            run.runtime_cell(),
+            run.hash_cell(),
+            run.lutff_cell(),
+            run.reuse_cell()
+        ))
     }
 
     /// UG893 schematic dump: full HNF or the expand-cone subset.
@@ -8665,6 +8822,12 @@ impl IdeModel {
                 }
             }
         }
+        if let Some(name) = id.strip_prefix("run:") {
+            if let Some(r) = self.runs.iter().find(|r| r.name == name).cloned() {
+                self.properties = Self::design_run_properties(&r);
+                return;
+            }
+        }
         let mut props = vec![("NAME".into(), id.clone())];
         if let Some(d) = self.shell.session.design.as_ref() {
             if let Some(c) = d.cells.iter().find(|c| c.name == id) {
@@ -11915,6 +12078,172 @@ mod tests {
         assert_eq!(ide.wns_ps(), Some(wns_def), "side runs must not clobber impl_1");
         assert_eq!(ide.bitstream_hash(), Some(hash_def));
         assert!(!cmp.contains("Performance_Explore") && !cmp.contains("AXI"));
+    }
+
+    /// UG893/UG986 Design Runs is a clickable name/strategy/WNS/runtime/hash
+    /// grid over Session engines, not a monospace dump + compare_runs report_box.
+    #[test]
+    fn design_runs_pane_clickable_name_strategy_wns_runtime_hash_grid() {
+        let mut ide = IdeModel::new();
+        assert!(
+            NavSection::Implementation
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "design_runs"),
+            "Flow Navigator Implementation must offer Design Runs"
+        );
+        assert!(
+            NavSection::Implementation
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "compare_runs"),
+            "Flow Navigator Implementation must offer Compare Runs"
+        );
+        let empty = ide.exec("select_run").unwrap_err();
+        assert!(empty.contains("missing name"), "{empty}");
+        let missing = ide.exec("select_run no_such").unwrap_err();
+        assert!(missing.contains("no row"), "{missing}");
+
+        let table = ide.exec("design_runs").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert!(table.contains("design_runs n="), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("NAME=synth_1"), "{table}");
+        assert!(table.contains("NAME=impl_1"), "{table}");
+        assert!(table.contains("STRATEGY=Default"), "{table}");
+        assert!(table.contains("STATUS=Not started"), "{table}");
+        assert!(table.contains("WNS_PS=-"), "{table}");
+        assert!(table.contains("HASH=-"), "{table}");
+        assert!(table.contains("RUNTIME_MS=-"), "{table}");
+
+        let sel = ide.exec("select_run impl_1").unwrap();
+        assert!(sel.contains("NAME=impl_1"), "{sel}");
+        assert!(sel.contains("STEP=Implementation"), "{sel}");
+        assert!(sel.contains("STRATEGY=Default"), "{sel}");
+        assert!(sel.contains("STATUS=Not started"), "{sel}");
+        assert!(sel.contains("WNS_PS=-"), "{sel}");
+        assert!(sel.contains("HASH=-"), "{sel}");
+        assert_eq!(ide.selected.as_deref(), Some("run:impl_1"));
+        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "design_run"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "STRATEGY" && v == "Default"),
+            "{:?}",
+            ide.properties
+        );
+
+        let by_idx = ide.exec("select_run 0").unwrap();
+        assert!(by_idx.contains("NAME=synth_1"), "{by_idx}");
+        assert_eq!(ide.selected.as_deref(), Some("run:synth_1"));
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("launch_runs impl_1").unwrap();
+        let wns = ide.wns_ps().expect("STA after launch_runs");
+        let hash = ide.bitstream_hash().expect("hash after launch_runs");
+        assert_ne!(wns, 0);
+        let table = ide.exec("design_runs").unwrap();
+        assert!(table.contains("NAME=impl_1"), "{table}");
+        assert!(table.contains("STRATEGY=Default"), "{table}");
+        assert!(table.contains(&format!("WNS_PS={wns}")), "{table}");
+        assert!(table.contains(&format!("HASH={hash:#010x}")), "{table}");
+        assert!(table.contains("STATUS=Complete"), "{table}");
+        let sel = ide.exec("select_run impl_1").unwrap();
+        assert!(sel.contains(&format!("WNS_PS={wns}")), "{sel}");
+        assert!(sel.contains(&format!("HASH={hash:#010x}")), "{sel}");
+        assert!(sel.contains("STRATEGY=Default"), "{sel}");
+        assert!(sel.contains("LUTFF=4"), "{sel}");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns),
+            "select_run must not move gold WNS"
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WNS_PS" && v == &wns.to_string()),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "HASH" && v == &format!("{hash:#010x}")),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.exec("create_run impl_runtime -strategy RuntimeOpt")
+            .unwrap();
+        ide.exec("launch_runs impl_runtime").unwrap();
+        ide.exec("create_run impl_phys -strategy PhysOpt")
+            .unwrap();
+        ide.exec("launch_runs impl_phys").unwrap();
+        let cmp = ide.exec("compare_runs").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert!(cmp.contains("compare_runs n=3"), "{cmp}");
+        assert!(cmp.contains("NAME=impl_1"), "{cmp}");
+        assert!(cmp.contains("NAME=impl_runtime"), "{cmp}");
+        assert!(cmp.contains("NAME=impl_phys"), "{cmp}");
+        assert!(cmp.contains("STRATEGY=RuntimeOpt"), "{cmp}");
+        assert!(cmp.contains("STRATEGY=PhysOpt"), "{cmp}");
+        assert!(cmp.contains('\n'), "compare_runs is a grid, not a dump: {cmp}");
+        let rt_wns = ide
+            .runs
+            .iter()
+            .find(|r| r.name == "impl_runtime")
+            .unwrap()
+            .wns_ps;
+        let phys_wns = ide
+            .runs
+            .iter()
+            .find(|r| r.name == "impl_phys")
+            .unwrap()
+            .wns_ps;
+        let rt_cell = ide
+            .runs
+            .iter()
+            .find(|r| r.name == "impl_runtime")
+            .unwrap()
+            .wns_cell();
+        assert_ne!(rt_wns, Some(wns), "RuntimeOpt must move WNS");
+        assert_ne!(phys_wns, Some(wns), "PhysOpt must move WNS");
+        let sel_rt = ide.exec("select_run RuntimeOpt").unwrap();
+        assert!(sel_rt.contains("NAME=impl_runtime"), "{sel_rt}");
+        assert!(sel_rt.contains("STRATEGY=RuntimeOpt"), "{sel_rt}");
+        assert!(sel_rt.contains(&format!("WNS_PS={rt_cell}")), "{sel_rt}");
+        assert_eq!(ide.selected.as_deref(), Some("run:impl_runtime"));
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns),
+            "clicking a side run must not clobber impl_1 STA"
+        );
+        assert_eq!(ide.bitstream_hash(), Some(hash));
+        assert!(!cmp.contains("Performance_Explore") && !cmp.contains("AXI"));
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.exec("launch_runs impl_1").unwrap();
+        let bw = blinky.wns_ps().expect("blinky WNS");
+        let bh = blinky.bitstream_hash().expect("blinky hash");
+        assert_ne!(bw, wns, "WNS is per-design STA");
+        assert_ne!(bh, hash, "hash is per-design");
+        let bsel = blinky.exec("select_run impl_1").unwrap();
+        assert!(bsel.contains(&format!("WNS_PS={bw}")), "{bsel}");
+        assert!(bsel.contains(&format!("HASH={bh:#010x}")), "{bsel}");
+        assert!(bsel.contains("LUTFF=1"), "{bsel}");
+        assert!(
+            !bsel.contains(&format!("WNS_PS={wns}")),
+            "blinky row is not counter's dump: {bsel}"
+        );
+        assert_eq!(blinky.wns_ps(), Some(bw));
     }
 
     /// UG986 Lab 2: incremental impl reuses named cells from the checkpoint.
@@ -15515,10 +15844,22 @@ mod tests {
         blinky.exec("ila_window 8").unwrap();
         blinky.exec("ila_arm led").unwrap();
         assert_eq!(blinky.ila.net, "led");
-        assert_ne!(blinky.ila.net, ide.ila.net);
-        assert_ne!(
-            blinky.ila.bits, ide.ila.bits,
-            "ILA sample table is per-design fabric, not a dump"
+        assert_ne!(blinky.ila.net, ide.ila.net, "probe net is the armed HNF net");
+        let b_rows = blinky.ila_sample_rows();
+        assert_eq!(b_rows.len(), blinky.ila.bits.len());
+        assert_eq!(
+            b_rows.iter().map(|r| r.value).collect::<String>(),
+            blinky.ila.bits,
+            "blinky ILA rows are that design's fabric bits"
+        );
+        assert_eq!(
+            samples.iter().map(|r| r.value).collect::<String>(),
+            ide.ila.bits,
+            "counter ILA rows are that design's fabric bits"
+        );
+        assert!(
+            blinky.wave.has_trace("ila:led") && ide.wave.has_trace("ila:cnt_3"),
+            "ILA samples land on per-design wave traces"
         );
         assert_eq!(
             ide.wns_ps(),
