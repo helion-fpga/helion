@@ -773,6 +773,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Find,
             WorkspaceTab::Package,
             WorkspaceTab::Runs,
+            WorkspaceTab::Bitstream,
         ] {
             let label = match tab {
                 WorkspaceTab::Reports => "Reports",
@@ -793,6 +794,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Find => "Find Results",
                 WorkspaceTab::Package => "Package",
                 WorkspaceTab::Runs => "Design Runs",
+                WorkspaceTab::Bitstream => "Bitstream",
             };
             if ui
                 .selectable_label(model.workspace == tab, label)
@@ -822,6 +824,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Find => paint_find(ui, model),
         WorkspaceTab::Package => paint_package(ui, model),
         WorkspaceTab::Runs => paint_runs(ui, model),
+        WorkspaceTab::Bitstream => paint_bitstream(ui, model),
     }
 }
 
@@ -1556,14 +1559,7 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(8.0);
     paint_utilization(ui, model);
     ui.add_space(8.0);
-    let bits = match (model.bitstream_hash(), model.bitstream_bytes()) {
-        (Some(h), Some(b)) => format!(
-            "hash={h:#010x} bytes={b} frames={}",
-            model.bitstream_frames().unwrap_or(0)
-        ),
-        _ => "no bitstream — run Bitstream".into(),
-    };
-    report_box(ui, "Bitstream", &bits);
+    paint_bitstream(ui, model);
     ui.add_space(8.0);
     paint_drc(ui, model);
     ui.add_space(8.0);
@@ -2141,6 +2137,79 @@ fn drc_severity_color(sev: DrcSeverity) -> Color32 {
         DrcSeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
         DrcSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
         DrcSeverity::Advisory => Color32::from_rgb(0x90, 0x60, 0xc0),
+    }
+}
+
+fn bitstream_block_color(block: &str) -> Color32 {
+    match block {
+        "CLB_IO_CLK" => Color32::from_rgb(0x3d, 0xb8, 0x7a),
+        "DSP" => Color32::from_rgb(0x90, 0x60, 0xc0),
+        "BRAM" => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        "IOB" => Color32::from_rgb(0x5a, 0xb0, 0xe0),
+        _ => Color32::from_rgb(0x9a, 0xa4, 0xae),
+    }
+}
+
+fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Bitstream");
+    ui.weak(
+        "helion-bits FAR table — configured frames (block / major / minor / ones), not a hash dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Generate Bitstream").clicked() {
+            let _ = model.exec("write_bitstream");
+        }
+        if ui.button("Report bitstream").clicked() {
+            let _ = model.exec("report_bitstream");
+        }
+    });
+    ui.add_space(6.0);
+    let report = model.bitstream_report();
+    if report.frames == 0 && report.bytes == 0 {
+        ui.label("no bitstream — run Bitstream");
+        return;
+    }
+    ui.label(format!(
+        "idcode={:#010x} hash={:#010x} bytes={} frames={} configured={}",
+        report.idcode, report.hash, report.bytes, report.frames, report.configured
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both().max_height(280.0).show(ui, |ui| {
+        egui::Grid::new("bitstream_far_table")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("FAR").strong());
+                ui.label(RichText::new("Block").strong());
+                ui.label(RichText::new("Die").strong());
+                ui.label(RichText::new("Major").strong());
+                ui.label(RichText::new("Minor").strong());
+                ui.label(RichText::new("Ones").strong());
+                ui.label(RichText::new("Word").strong());
+                ui.end_row();
+                for row in &report.rows {
+                    let far = row.far_hex();
+                    let on = selected.as_deref() == Some(far.as_str());
+                    let fill = bitstream_block_color(row.block_name());
+                    let btn = egui::Button::new(RichText::new(&far).color(Color32::BLACK))
+                        .fill(fill)
+                        .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some(far);
+                    }
+                    ui.label(row.block_name());
+                    ui.label(row.die.to_string());
+                    ui.label(row.major.to_string());
+                    ui.label(row.minor.to_string());
+                    ui.label(row.ones().to_string());
+                    ui.label(row.word_hex());
+                    ui.end_row();
+                }
+            });
+    });
+    if let Some(far) = pick {
+        let _ = model.select_bitstream_frame(&far);
     }
 }
 

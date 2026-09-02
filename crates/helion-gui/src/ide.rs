@@ -9,7 +9,7 @@
 use crate::{tcl_eval, GpuiShell};
 use helion_bd::{emit_sv, validate, BlockDesign};
 use helion_debug::{insert_arm_capture, IlaCapture};
-use helion_device::{Device, SiteKind};
+use helion_device::{Device, Far, SiteKind};
 use helion_drc::{check_placed, check_routed, Drc};
 use helion_fabric::{Fabric, Stat};
 use helion_ir::{CellKind, Design, PortDir};
@@ -469,6 +469,10 @@ impl NavSection {
                     tcl: "write_bitstream",
                 },
                 NavAction {
+                    label: "Bitstream Frames",
+                    tcl: "report_bitstream",
+                },
+                NavAction {
                     label: "Open Hardware Manager",
                     tcl: "open_hw_manager",
                 },
@@ -614,6 +618,135 @@ fn constraint_from_to(s: &str) -> (String, String) {
         (s.trim().to_string(), String::new())
     } else {
         (from, to)
+    }
+}
+
+/// One clickable FAR row in the bitstream pane (helion-bits frames, not a hash dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BitstreamFrame {
+    pub far: u32,
+    pub block: u8,
+    pub die: u8,
+    pub major: u16,
+    pub minor: u8,
+    pub word: u128,
+}
+
+impl BitstreamFrame {
+    fn from_key(block: u8, major: u16, minor: u8, word: u128) -> Self {
+        let far = Far {
+            block_type: block,
+            die: 0,
+            major,
+            minor,
+        };
+        Self {
+            far: far.encode(),
+            block,
+            die: far.die,
+            major,
+            minor,
+            word,
+        }
+    }
+
+    pub fn block_name(&self) -> &'static str {
+        match self.block {
+            Far::CLB_IO_CLK => "CLB_IO_CLK",
+            Far::DSP => "DSP",
+            Far::BRAM => "BRAM",
+            Far::IOB => "IOB",
+            _ => "UNKNOWN",
+        }
+    }
+
+    pub fn ones(&self) -> u32 {
+        self.word.count_ones()
+    }
+
+    pub fn far_hex(&self) -> String {
+        format!("{:#010x}", self.far)
+    }
+
+    pub fn word_hex(&self) -> String {
+        format!("{:#034x}", self.word)
+    }
+}
+
+/// helion-bits configuration memory: FAR-addressed frames from `bitgen`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BitstreamReport {
+    pub idcode: u32,
+    pub hash: u32,
+    pub bytes: usize,
+    pub frames: usize,
+    pub configured: usize,
+    pub rows: Vec<BitstreamFrame>,
+}
+
+impl BitstreamReport {
+    pub fn frame(&self, spec: &str) -> Option<&BitstreamFrame> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return self.rows.first();
+        }
+        if let Ok(i) = spec.parse::<usize>() {
+            if let Some(r) = self.rows.get(i) {
+                return Some(r);
+            }
+        }
+        let hex = spec.strip_prefix("0x").or_else(|| spec.strip_prefix("0X")).unwrap_or(spec);
+        if hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(far) = u32::from_str_radix(hex, 16) {
+                if let Some(r) = self.rows.iter().find(|f| f.far == far) {
+                    return Some(r);
+                }
+            }
+        }
+        let up = spec.to_ascii_uppercase();
+        if let Some(r) = self.rows.iter().find(|f| f.block_name() == up) {
+            return Some(r);
+        }
+        let mut p = spec.split_whitespace();
+        if let (Some(b), Some(maj), Some(min)) = (p.next(), p.next(), p.next()) {
+            let block = match b.to_ascii_uppercase().as_str() {
+                "CLB_IO_CLK" | "CLB" | "0" => Far::CLB_IO_CLK,
+                "DSP" | "2" => Far::DSP,
+                "BRAM" | "3" => Far::BRAM,
+                "IOB" | "5" => Far::IOB,
+                other => other.parse().ok()?,
+            };
+            let major: u16 = maj.parse().ok()?;
+            let minor: u8 = min.parse().ok()?;
+            return self
+                .rows
+                .iter()
+                .find(|f| f.block == block && f.major == major && f.minor == minor);
+        }
+        None
+    }
+
+    pub fn text(&self) -> String {
+        if self.frames == 0 && self.bytes == 0 {
+            return "no bitstream — run Bitstream".into();
+        }
+        let mut s = format!(
+            "bitstream idcode={:#010x} hash={:#010x} bytes={} frames={} configured={}",
+            self.idcode, self.hash, self.bytes, self.frames, self.configured
+        );
+        for (i, r) in self.rows.iter().enumerate() {
+            s.push_str(&format!(
+                "\n{i} FAR={} BLOCK={} DIE={} MAJOR={} MINOR={} ONES={} WORD={}",
+                r.far_hex(),
+                r.block_name(),
+                r.die,
+                r.major,
+                r.minor,
+                r.ones(),
+                r.word_hex()
+            ));
+        }
+        s
     }
 }
 
@@ -2244,6 +2377,7 @@ pub enum WorkspaceTab {
     Find,
     Package,
     Runs,
+    Bitstream,
 }
 
 /// UG893 Hierarchy — top module + instances + leaf primitives from HNF.
@@ -2675,6 +2809,70 @@ impl IdeModel {
         self.shell.session.bitstream.as_ref().map(|b| b.frames.len())
     }
 
+    /// helion-bits FAR table: configured (nonzero) frames from the Session bitstream.
+    pub fn bitstream_report(&self) -> BitstreamReport {
+        let Some(b) = self.shell.session.bitstream.as_ref() else {
+            return BitstreamReport::default();
+        };
+        let rows: Vec<BitstreamFrame> = b
+            .frames
+            .iter()
+            .filter(|(_, w)| **w != 0)
+            .map(|((block, major, minor), word)| {
+                BitstreamFrame::from_key(*block, *major, *minor, *word)
+            })
+            .collect();
+        BitstreamReport {
+            idcode: b.idcode,
+            hash: self.bitstream_hash().unwrap_or(0),
+            bytes: b.packets.len(),
+            frames: b.frames.len(),
+            configured: rows.len(),
+            rows,
+        }
+    }
+
+    pub fn bitstream_text(&self) -> String {
+        self.bitstream_report().text()
+    }
+
+    /// Click a FAR row: properties + Bitstream workspace.
+    pub fn select_bitstream_frame(&mut self, spec: &str) -> Result<String, String> {
+        let report = self.bitstream_report();
+        if report.rows.is_empty() {
+            return Err("select_bitstream_frame: no bitstream".into());
+        }
+        let row = report
+            .frame(spec)
+            .cloned()
+            .ok_or_else(|| format!("select_bitstream_frame: no FAR {spec}"))?;
+        self.selected = Some(row.far_hex());
+        self.properties = vec![
+            ("NAME".into(), row.far_hex()),
+            ("TYPE".into(), "bitstream_frame".into()),
+            ("FAR".into(), row.far_hex()),
+            ("BLOCK".into(), row.block_name().into()),
+            ("DIE".into(), row.die.to_string()),
+            ("MAJOR".into(), row.major.to_string()),
+            ("MINOR".into(), row.minor.to_string()),
+            ("ONES".into(), row.ones().to_string()),
+            ("WORD".into(), row.word_hex()),
+            ("IDCODE".into(), format!("{:#010x}", report.idcode)),
+            ("HASH".into(), format!("{:#010x}", report.hash)),
+        ];
+        self.workspace = WorkspaceTab::Bitstream;
+        Ok(format!(
+            "bitstream FAR={} BLOCK={} DIE={} MAJOR={} MINOR={} ONES={} WORD={}",
+            row.far_hex(),
+            row.block_name(),
+            row.die,
+            row.major,
+            row.minor,
+            row.ones(),
+            row.word_hex()
+        ))
+    }
+
     pub fn wns_ps(&self) -> Option<i64> {
         self.timing.as_ref().map(|t| t.wns_ps)
     }
@@ -2854,6 +3052,19 @@ impl IdeModel {
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0x8);
             self.shell.session.insert_eco_lut(name, init)
+        } else if t == "write_bitstream" {
+            let r = self.run_step(FlowStep::Bitstream);
+            if r.is_ok() {
+                self.workspace = WorkspaceTab::Bitstream;
+            }
+            r
+        } else if t == "report_bitstream" || t == "bitstream" {
+            self.workspace = WorkspaceTab::Bitstream;
+            Ok(self.bitstream_text())
+        } else if let Some(spec) = t.strip_prefix("select_bitstream_frame ") {
+            self.select_bitstream_frame(spec.trim())
+        } else if t == "select_bitstream_frame" {
+            self.select_bitstream_frame("0")
         } else if t == "report_drc" {
             self.run_drc()
         } else if t == "report_methodology" || t == "methodology" {
@@ -3169,7 +3380,7 @@ impl IdeModel {
             "synth_design" | "opt_design" | "schematic" => {
                 self.workspace = WorkspaceTab::Schematic;
             }
-            "write_bitstream" => self.workspace = WorkspaceTab::Reports,
+            "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
             _ => {}
         }
         Ok(format!(
@@ -3324,9 +3535,10 @@ impl IdeModel {
                 }
                 let b = self.shell.session.write_bitstream(&dev)?;
                 let (frames, bytes) = (b.frames.len(), b.packets.len());
+                let configured = b.frames.values().filter(|w| **w != 0).count();
                 let hash = self.shell.session.blinky_hash().unwrap_or(0);
                 Ok(format!(
-                    "write_bitstream frames={frames} bytes={bytes} hash={hash:#010x}"
+                    "write_bitstream frames={frames} bytes={bytes} hash={hash:#010x} configured={configured}"
                 ))
             }
         }
@@ -3459,7 +3671,11 @@ impl IdeModel {
             }
             UltraFastStage::ProgramDebug => {
                 if let Some(h) = self.bitstream_hash() {
-                    return Ok(format!("program_debug hash={h:#010x}"));
+                    let r = self.bitstream_report();
+                    return Ok(format!(
+                        "program_debug hash={h:#010x} configured={} frames={} bytes={}",
+                        r.configured, r.frames, r.bytes
+                    ));
                 }
                 if let Some(st) = &self.hw.stat {
                     return Ok(format!("program_debug DONE={}", st.done as u8));
@@ -8449,6 +8665,23 @@ impl IdeModel {
                 props.push(("USED".into(), row.used.to_string()));
                 props.push(("AVAILABLE".into(), row.available.to_string()));
                 props.push(("PCT".into(), row.pct().to_string()));
+            }
+        }
+        if self.workspace == WorkspaceTab::Bitstream {
+            let report = self.bitstream_report();
+            if let Some(row) = report.frame(&id).cloned() {
+                props.retain(|(k, _)| k != "TYPE" && k != "NAME");
+                props.insert(0, ("NAME".into(), row.far_hex()));
+                props.insert(1, ("TYPE".into(), "bitstream_frame".into()));
+                props.push(("FAR".into(), row.far_hex()));
+                props.push(("BLOCK".into(), row.block_name().into()));
+                props.push(("DIE".into(), row.die.to_string()));
+                props.push(("MAJOR".into(), row.major.to_string()));
+                props.push(("MINOR".into(), row.minor.to_string()));
+                props.push(("ONES".into(), row.ones().to_string()));
+                props.push(("WORD".into(), row.word_hex()));
+                props.push(("IDCODE".into(), format!("{:#010x}", report.idcode)));
+                props.push(("HASH".into(), format!("{:#010x}", report.hash)));
             }
         }
         if self.workspace == WorkspaceTab::Constraints {
@@ -14610,6 +14843,170 @@ mod tests {
                 .any(|(k, v)| k == "TYPE" && v == "drc"),
             "{:?}",
             util_ide.properties
+        );
+    }
+
+    /// Bitstream pane is a helion-bits FAR table, not a hash/bytes/frames dump.
+    #[test]
+    fn bitstream_far_table_from_helion_bits_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let empty = ide.bitstream_text();
+        assert!(
+            empty.contains("no bitstream"),
+            "idle bitstream has no canned FAR rows: {empty}"
+        );
+        assert!(ide.bitstream_report().rows.is_empty());
+        assert!(
+            NavSection::ProgramDebug
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "write_bitstream"),
+            "Flow Navigator Program and Debug must offer write_bitstream"
+        );
+        assert!(
+            NavSection::ProgramDebug
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_bitstream"),
+            "Flow Navigator Program and Debug must offer report_bitstream"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns_route = ide.wns_ps().expect("STA after route");
+        let e = ide.exec("select_bitstream_frame 0").unwrap_err();
+        assert!(e.contains("no bitstream"), "{e}");
+
+        let out = ide.exec("write_bitstream").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Bitstream);
+        let hash = ide.bitstream_hash().expect("hash after write_bitstream");
+        assert!(out.contains(&format!("{hash:#010x}")), "{out}");
+        assert!(out.contains("configured="), "{out}");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns_route),
+            "FAR table must not move gold WNS"
+        );
+
+        let report = ide.bitstream_report();
+        assert_eq!(report.hash, hash);
+        assert_eq!(report.bytes, ide.bitstream_bytes().unwrap());
+        assert_eq!(report.frames, ide.bitstream_frames().unwrap());
+        assert!(report.configured > 0, "{}", report.text());
+        assert_eq!(report.configured, report.rows.len());
+        assert_eq!(
+            report.idcode,
+            ide.session().bitstream.as_ref().unwrap().idcode
+        );
+        let bits = ide.session().bitstream.as_ref().unwrap();
+        let engine_cfg: Vec<_> = bits
+            .frames
+            .iter()
+            .filter(|(_, w)| **w != 0)
+            .collect();
+        assert_eq!(engine_cfg.len(), report.rows.len(), "rows are helion-bits frames");
+        for (row, ((block, major, minor), word)) in report.rows.iter().zip(engine_cfg.iter()) {
+            let far = helion_device::Far {
+                block_type: *block,
+                die: 0,
+                major: *major,
+                minor: *minor,
+            };
+            assert_eq!(row.far, far.encode());
+            assert_eq!(row.block, *block);
+            assert_eq!(row.major, *major);
+            assert_eq!(row.minor, *minor);
+            assert_eq!(row.word, **word);
+            assert_eq!(helion_device::Far::decode(row.far), far);
+            assert!(row.ones() > 0, "configured FAR {} has payload", row.far_hex());
+        }
+        assert!(
+            report.rows.iter().any(|r| r.block_name() == "CLB_IO_CLK"),
+            "counter LUT INIT must set CLB frames: {}",
+            report.text()
+        );
+        assert!(
+            report.rows.iter().any(|r| r.block_name() == "IOB"),
+            "counter pads must set IOB frames: {}",
+            report.text()
+        );
+
+        let table = ide.exec("report_bitstream").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Bitstream);
+        assert!(table.contains("FAR="), "pane is a FAR table: {table}");
+        assert!(table.contains("BLOCK=CLB_IO_CLK"), "{table}");
+        assert!(table.contains("BLOCK=IOB"), "{table}");
+        assert!(table.contains(&format!("hash={hash:#010x}")), "{table}");
+        assert!(
+            !table.starts_with("hash=") || table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
+
+        let first = report.rows[0].clone();
+        let sel = ide.exec(&format!("select_bitstream_frame {}", first.far_hex())).unwrap();
+        assert!(sel.contains(&format!("FAR={}", first.far_hex())), "{sel}");
+        assert!(sel.contains(&format!("BLOCK={}", first.block_name())), "{sel}");
+        assert!(sel.contains(&format!("ONES={}", first.ones())), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "bitstream_frame"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WORD" && v == &first.word_hex()),
+            "{:?}",
+            ide.properties
+        );
+        let by_idx = ide.exec("select_bitstream_frame 0").unwrap();
+        assert!(by_idx.contains(&format!("FAR={}", first.far_hex())), "{by_idx}");
+        let by_blk = ide
+            .exec(&format!(
+                "select_bitstream_frame {} {} {}",
+                first.block_name(),
+                first.major,
+                first.minor
+            ))
+            .unwrap();
+        assert!(by_blk.contains(&format!("FAR={}", first.far_hex())), "{by_blk}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        blinky.run_step(FlowStep::Bitstream).unwrap();
+        let br = blinky.bitstream_report();
+        assert!(br.configured > 0, "{}", br.text());
+        assert_ne!(
+            br.hash, report.hash,
+            "FAR table hash is per-design bitgen, not canned"
+        );
+        let same_word = report.rows.iter().any(|c| {
+            br.rows
+                .iter()
+                .any(|b| b.far == c.far && b.word == c.word)
+        });
+        assert!(
+            !same_word
+                || br.configured != report.configured
+                || br.rows.iter().map(|r| r.word).collect::<Vec<_>>()
+                    != report.rows.iter().map(|r| r.word).collect::<Vec<_>>(),
+            "counter vs blinky frames must differ: counter={} blinky={}",
+            report.text(),
+            br.text()
+        );
+        let bwns = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bwns, wns_route, "bitstream companion STA is per-design");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns_route),
+            "empty XDC gold WNS must hold after FAR table"
         );
     }
 }

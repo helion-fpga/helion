@@ -6,7 +6,7 @@ pub const GPUI_TOOLKIT: &str = "gpui";
 pub mod doctor;
 pub mod ide;
 pub use ide::{
-    BdAddrEntry, BdPin, BdView, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
+    BdAddrEntry, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
     HwManager, IdeMessage,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, LayoutKind, MsgSeverity, NavAction, NavSection,
