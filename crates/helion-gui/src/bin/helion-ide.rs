@@ -617,28 +617,7 @@ fn paint_bottom(ctx: &egui::Context, model: &mut IdeModel) {
                     });
                 }
                 BottomTab::Messages => {
-                    ui.weak(model.messages_text().lines().next().unwrap_or("messages"));
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for m in &model.messages {
-                                let c = match m.severity {
-                                    MsgSeverity::Error => Color32::from_rgb(0xe0, 0x6c, 0x75),
-                                    MsgSeverity::Warning => Color32::from_rgb(0xe5, 0xc0, 0x7b),
-                                    MsgSeverity::Info => Color32::from_rgb(0xc8, 0xd0, 0xd8),
-                                };
-                                ui.monospace(
-                                    RichText::new(format!(
-                                        "{} [{}] {}",
-                                        m.severity.tag(),
-                                        m.id,
-                                        m.text
-                                    ))
-                                    .color(c),
-                                );
-                            }
-                        });
+                    paint_messages(ui, model);
                 }
                 BottomTab::Log => {
                     egui::ScrollArea::vertical()
@@ -652,6 +631,125 @@ fn paint_bottom(ctx: &egui::Context, model: &mut IdeModel) {
                 }
             }
         });
+}
+
+fn msg_severity_color(sev: MsgSeverity) -> Color32 {
+    match sev {
+        MsgSeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
+        MsgSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        MsgSeverity::Info => Color32::from_rgb(0x6a, 0xb0, 0xd8),
+    }
+}
+
+fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.weak(
+        "UG893 Messages — clickable severity table (severity / id / engine text), not a colored dump",
+    );
+    let n_err = model
+        .messages
+        .iter()
+        .filter(|m| m.severity == MsgSeverity::Error)
+        .count();
+    let n_warn = model
+        .messages
+        .iter()
+        .filter(|m| m.severity == MsgSeverity::Warning)
+        .count();
+    let n_info = model
+        .messages
+        .iter()
+        .filter(|m| m.severity == MsgSeverity::Info)
+        .count();
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(
+                model.message_filter.is_none(),
+                format!("All {}", model.messages.len()),
+            )
+            .clicked()
+        {
+            let _ = model.filter_messages("all");
+        }
+        if ui
+            .selectable_label(
+                model.message_filter == Some(MsgSeverity::Error),
+                format!("Errors {n_err}"),
+            )
+            .clicked()
+        {
+            let _ = model.filter_messages("error");
+        }
+        if ui
+            .selectable_label(
+                model.message_filter == Some(MsgSeverity::Warning),
+                format!("Warnings {n_warn}"),
+            )
+            .clicked()
+        {
+            let _ = model.filter_messages("warning");
+        }
+        if ui
+            .selectable_label(
+                model.message_filter == Some(MsgSeverity::Info),
+                format!("Info {n_info}"),
+            )
+            .clicked()
+        {
+            let _ = model.filter_messages("info");
+        }
+    });
+    let selected = model.selected_message;
+    let rows: Vec<(usize, helion_gui::IdeMessage)> = model
+        .message_rows()
+        .into_iter()
+        .map(|(i, m)| (i, m.clone()))
+        .collect();
+    let mut pick: Option<usize> = None;
+    egui::ScrollArea::both()
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("messages_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("#").strong());
+                    ui.label(RichText::new("Severity").strong());
+                    ui.label(RichText::new("ID").strong());
+                    ui.label(RichText::new("Message").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no messages");
+                        ui.end_row();
+                    } else {
+                        for (i, m) in &rows {
+                            let on = selected == Some(*i);
+                            let fill = msg_severity_color(m.severity);
+                            ui.monospace(i.to_string());
+                            let btn = egui::Button::new(
+                                RichText::new(m.severity.tag()).color(Color32::BLACK),
+                            )
+                            .fill(fill)
+                            .selected(on);
+                            if ui.add(btn).clicked() {
+                                pick = Some(*i);
+                            }
+                            if ui.selectable_label(on, &m.id).clicked() {
+                                pick = Some(*i);
+                            }
+                            if ui.selectable_label(on, &m.text).clicked() {
+                                pick = Some(*i);
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(i) = pick {
+        let _ = model.select_message(&i.to_string());
+    }
 }
 
 fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {

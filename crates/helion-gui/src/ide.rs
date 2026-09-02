@@ -532,9 +532,19 @@ impl MsgSeverity {
             MsgSeverity::Error => "ERROR",
         }
     }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "error" | "errors" | "err" | "e" => Ok(Self::Error),
+            "warning" | "warnings" | "warn" | "w" => Ok(Self::Warning),
+            "info" | "information" | "i" => Ok(Self::Info),
+            other => Err(format!("unknown message severity {other}")),
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
+/// One clickable row in the UG893 Messages pane (not a colored dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdeMessage {
     pub severity: MsgSeverity,
     pub id: String,
@@ -2543,6 +2553,9 @@ pub struct IdeModel {
     pub pblocks: Vec<Pblock>,
     pub workspace: WorkspaceTab,
     pub bottom_tab: BottomTab,
+    /// UG893 Messages filter (None = All). Counts stay unfiltered.
+    pub message_filter: Option<MsgSeverity>,
+    pub selected_message: Option<usize>,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
 }
@@ -2600,6 +2613,8 @@ impl IdeModel {
             pblocks: Vec::new(),
             workspace: WorkspaceTab::Reports,
             bottom_tab: BottomTab::Tcl,
+            message_filter: None,
+            selected_message: None,
             event_sim: None,
             fabric_sim: None,
         };
@@ -2999,6 +3014,14 @@ impl IdeModel {
         } else if t == "messages" {
             self.bottom_tab = BottomTab::Messages;
             Ok(self.messages_text())
+        } else if let Some(spec) = t.strip_prefix("select_message ") {
+            self.select_message(spec.trim())
+        } else if t == "select_message" {
+            self.select_message("")
+        } else if let Some(spec) = t.strip_prefix("filter_messages ") {
+            self.filter_messages(spec.trim())
+        } else if t == "filter_messages" {
+            self.filter_messages("all")
         } else if t == "log" {
             self.bottom_tab = BottomTab::Log;
             Ok(self.log_text())
@@ -3030,11 +3053,131 @@ impl IdeModel {
             .iter()
             .filter(|m| m.severity == MsgSeverity::Info)
             .count();
-        let mut s = format!("messages errors={n_err} warnings={n_warn} info={n_info}");
-        for m in &self.messages {
+        let filter = match self.message_filter {
+            None => "all",
+            Some(MsgSeverity::Error) => "error",
+            Some(MsgSeverity::Warning) => "warning",
+            Some(MsgSeverity::Info) => "info",
+        };
+        let mut s = format!("messages errors={n_err} warnings={n_warn} info={n_info} filter={filter}");
+        let rows = self.message_rows();
+        if rows.is_empty() {
+            s.push_str("\nno messages");
+            return s;
+        }
+        for (i, m) in rows {
+            s.push_str(&format!(
+                "\n{i} SEVERITY={} ID={} TEXT={}",
+                m.severity.tag(),
+                m.id,
+                m.text
+            ));
             s.push_str(&format!("\n{} [{}] {}", m.severity.tag(), m.id, m.text));
         }
         s
+    }
+
+    /// Filtered clickable rows; indices are stable against the unfiltered journal.
+    pub fn message_rows(&self) -> Vec<(usize, &IdeMessage)> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| self.message_filter.map_or(true, |f| m.severity == f))
+            .collect()
+    }
+
+    /// UG893 Messages filter buttons (All / Errors / Warnings / Info).
+    pub fn filter_messages(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        self.message_filter = if spec.is_empty() || spec.eq_ignore_ascii_case("all") {
+            None
+        } else {
+            Some(MsgSeverity::parse(spec)?)
+        };
+        self.bottom_tab = BottomTab::Messages;
+        Ok(self.messages_text())
+    }
+
+    /// Click a Messages row: properties + navigate to the engine pane that produced it.
+    pub fn select_message(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_message: missing id".into());
+        }
+        if self.messages.is_empty() {
+            return Err("select_message: no messages".into());
+        }
+        let spec_l = spec.to_ascii_lowercase();
+        let pick = |list: &[(usize, &IdeMessage)]| {
+            list.iter()
+                .rev()
+                .find(|(_, m)| {
+                    m.id.eq_ignore_ascii_case(spec)
+                        || m.severity.tag().eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", m.severity.tag(), m.id).eq_ignore_ascii_case(spec)
+                        || m.text.to_ascii_lowercase().contains(&spec_l)
+                })
+                .map(|(i, m)| (*i, (*m).clone()))
+        };
+        let filtered = self.message_rows();
+        let (idx, m) = if let Ok(i) = spec.parse::<usize>() {
+            filtered
+                .iter()
+                .find(|(idx, _)| *idx == i)
+                .map(|(idx, m)| (*idx, (*m).clone()))
+                .or_else(|| self.messages.get(i).cloned().map(|m| (i, m)))
+                .ok_or_else(|| format!("select_message: no row {spec}"))?
+        } else {
+            pick(&filtered)
+                .or_else(|| {
+                    let all: Vec<(usize, &IdeMessage)> =
+                        self.messages.iter().enumerate().collect();
+                    pick(&all)
+                })
+                .ok_or_else(|| format!("select_message: no row {spec}"))?
+        };
+        self.selected_message = Some(idx);
+        self.selected = Some(format!("message:{idx}"));
+        self.bottom_tab = BottomTab::Messages;
+        self.properties = vec![
+            ("NAME".into(), m.id.clone()),
+            ("TYPE".into(), "message".into()),
+            ("SEVERITY".into(), m.severity.tag().into()),
+            ("ID".into(), m.id.clone()),
+            ("INDEX".into(), idx.to_string()),
+            ("TEXT".into(), m.text.clone()),
+        ];
+        match m.id.as_str() {
+            "report_timing" | "report_timing_summary" => {
+                self.workspace = WorkspaceTab::Reports;
+            }
+            "report_drc" => self.workspace = WorkspaceTab::Drc,
+            "report_methodology" => self.workspace = WorkspaceTab::Methodology,
+            "report_cdc" => self.workspace = WorkspaceTab::Cdc,
+            "report_power" => self.workspace = WorkspaceTab::Power,
+            "report_clock_interaction" => {
+                self.workspace = WorkspaceTab::ClockInteraction;
+            }
+            "report_clock_networks" => self.workspace = WorkspaceTab::ClockNetworks,
+            "report_utilization" => self.workspace = WorkspaceTab::Utilization,
+            "timing_constraints" | "report_timing_constraints" => {
+                self.workspace = WorkspaceTab::Constraints;
+            }
+            "place_design" | "route_design" | "device" => {
+                self.workspace = WorkspaceTab::Device;
+            }
+            "synth_design" | "opt_design" | "schematic" => {
+                self.workspace = WorkspaceTab::Schematic;
+            }
+            "write_bitstream" => self.workspace = WorkspaceTab::Reports,
+            _ => {}
+        }
+        Ok(format!(
+            "message INDEX={idx} SEVERITY={} ID={} TEXT={}",
+            m.severity.tag(),
+            m.id,
+            m.text
+        ))
     }
 
     /// UG893 Log pane: Tcl transcript of every console and rail command.
@@ -7996,6 +8139,21 @@ impl IdeModel {
             self.properties.clear();
             return;
         };
+        if let Some(rest) = id.strip_prefix("message:") {
+            if let Ok(i) = rest.parse::<usize>() {
+                if let Some(m) = self.messages.get(i) {
+                    self.properties = vec![
+                        ("NAME".into(), m.id.clone()),
+                        ("TYPE".into(), "message".into()),
+                        ("SEVERITY".into(), m.severity.tag().into()),
+                        ("ID".into(), m.id.clone()),
+                        ("INDEX".into(), i.to_string()),
+                        ("TEXT".into(), m.text.clone()),
+                    ];
+                    return;
+                }
+            }
+        }
         let mut props = vec![("NAME".into(), id.clone())];
         if let Some(d) = self.shell.session.design.as_ref() {
             if let Some(c) = d.cells.iter().find(|c| c.name == id) {
@@ -11428,6 +11586,129 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| m.id == "synth_design" && m.text.contains("blinky")),
+            "{:?}",
+            blinky.messages
+        );
+    }
+
+    /// UG893 Messages pane is a clickable severity table (filter + properties +
+    /// engine navigation), not a colored dump of the Tcl journal.
+    #[test]
+    fn messages_pane_clickable_severity_table() {
+        let mut ide = IdeModel::new();
+        assert!(ide.messages.is_empty());
+        assert!(ide.message_rows().is_empty());
+        assert!(
+            ide.select_message("0")
+                .unwrap_err()
+                .contains("no messages"),
+            "empty table must refuse a click"
+        );
+        let empty = ide.exec("messages").unwrap();
+        assert_eq!(ide.bottom_tab, BottomTab::Messages);
+        assert!(empty.contains("errors=0"), "{empty}");
+        assert!(empty.contains("filter=all"), "{empty}");
+        assert!(empty.contains("no messages"), "{empty}");
+
+        let e = ide.run_step(FlowStep::Synthesis).unwrap_err();
+        assert!(e.contains("source") || e.contains("synth"), "{e}");
+        let err_idx = ide
+            .messages
+            .iter()
+            .position(|m| m.severity == MsgSeverity::Error && m.id == "synth_design")
+            .expect("rail must journal Errors");
+        let table = ide.exec("messages").unwrap();
+        assert!(table.contains("SEVERITY=ERROR ID=synth_design"), "{table}");
+        let sel = ide.exec("select_message ERROR:synth_design").unwrap();
+        assert!(sel.contains("SEVERITY=ERROR"), "{sel}");
+        assert!(sel.contains("ID=synth_design"), "{sel}");
+        let want = format!("message:{err_idx}");
+        assert_eq!(ide.selected.as_deref(), Some(want.as_str()));
+        assert_eq!(ide.selected_message, Some(err_idx));
+        assert_eq!(ide.workspace, WorkspaceTab::Schematic);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "message"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        assert!(
+            ide.message_rows()
+                .iter()
+                .any(|(_, m)| m.severity == MsgSeverity::Info
+                    && m.id == "synth_design"
+                    && m.text.contains("cells=")),
+            "{:?}",
+            ide.messages
+        );
+
+        let ferr = ide.exec("filter_messages error").unwrap();
+        assert!(ferr.contains("filter=error"), "{ferr}");
+        assert!(
+            ide.message_rows()
+                .iter()
+                .all(|(_, m)| m.severity == MsgSeverity::Error),
+            "error filter must hide Info/Warning: {:?}",
+            ide.message_rows()
+                .iter()
+                .map(|(_, m)| (m.severity, m.id.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !ferr.contains("SEVERITY=INFO"),
+            "filtered table is not a dump of every line: {ferr}"
+        );
+        let esel = ide.exec("select_message ERROR:synth_design").unwrap();
+        assert!(esel.contains("SEVERITY=ERROR"), "{esel}");
+        assert!(esel.contains("ID=synth_design"), "{esel}");
+
+        ide.exec("filter_messages all").unwrap();
+        let e = ide.run_step(FlowStep::Route).unwrap_err();
+        assert!(e.contains("Place first"), "{e}");
+        let rsel = ide.exec("select_message route_design").unwrap();
+        assert!(rsel.contains("SEVERITY=ERROR"), "{rsel}");
+        assert!(rsel.contains("Place first"), "{rsel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Device);
+
+        ide.exec("report_timing").unwrap();
+        let wns = ide.wns_ps().expect("STA WNS");
+        assert_ne!(wns, 0);
+        let tsel = ide.exec("select_message report_timing").unwrap();
+        assert!(
+            tsel.contains(&format!("WNS_PS={wns}")),
+            "click must carry STA, not a stub: {tsel}"
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TEXT" && v.contains(&format!("WNS_PS={wns}"))),
+            "{:?}",
+            ide.properties
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.exec("report_timing").unwrap();
+        let bw = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bw, wns, "WNS is per-design");
+        let bsel = blinky.exec("select_message report_timing").unwrap();
+        assert!(bsel.contains(&format!("WNS_PS={bw}")), "{bsel}");
+        assert!(
+            !bsel.contains(&format!("WNS_PS={wns}")),
+            "Messages clicks are per-session, not canned: {bsel}"
+        );
+        assert_eq!(blinky.workspace, WorkspaceTab::Reports);
+        let btable = blinky.exec("filter_messages info").unwrap();
+        assert!(btable.contains("filter=info"), "{btable}");
+        assert!(
+            blinky
+                .message_rows()
+                .iter()
+                .any(|(_, m)| m.id == "synth_design" && m.text.contains("blinky")),
             "{:?}",
             blinky.messages
         );
