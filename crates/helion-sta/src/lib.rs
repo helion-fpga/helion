@@ -1,7 +1,9 @@
 //! Graph STA: create_clock / create_generated_clock (-divide_by / -multiply_by /
 //! -invert / -edges) / set_bus_skew / group_path / set_max_time_borrow /
-//! set_data_check / report_timing_summary / placed Manhattan.
+//! set_data_check / report_timing_summary / report_cdc / report_clock_networks /
+//! report_power / placed Manhattan.
 
+use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
 use helion_route::Routed;
@@ -346,6 +348,244 @@ impl TimingSummary {
             ));
         }
         lines.join("\n")
+    }
+}
+
+/// UG906 `report_cdc` severity (Critical / Warning / Info / Safe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdcSeverity {
+    Critical,
+    Warning,
+    Info,
+    Safe,
+}
+
+impl CdcSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "Critical",
+            Self::Warning => "Warning",
+            Self::Info => "Info",
+            Self::Safe => "Safe",
+        }
+    }
+}
+
+/// One inter-clock row of UG906 `report_cdc`.
+#[derive(Clone, Debug)]
+pub struct CdcViolation {
+    pub from: String,
+    pub to: String,
+    pub relation: ClockRelation,
+    pub severity: CdcSeverity,
+    /// Vivado-style check id (`CDC-10` missing sync, `CDC-15` exception, …).
+    pub check: String,
+    pub endpoints: usize,
+    pub synchronizer: bool,
+    pub wns_ps: Option<i64>,
+}
+
+/// UG906 Clock Domain Crossing report: STA clock pairs + XDC exceptions, not a dump.
+#[derive(Clone, Debug, Default)]
+pub struct CdcReport {
+    pub clocks: Vec<Clock>,
+    pub violations: Vec<CdcViolation>,
+}
+
+impl CdcReport {
+    pub fn violation(&self, from: &str, to: &str) -> Option<&CdcViolation> {
+        self.violations
+            .iter()
+            .find(|v| v.from == from && v.to == to)
+    }
+
+    pub fn critical_count(&self) -> usize {
+        self.violations
+            .iter()
+            .filter(|v| v.severity == CdcSeverity::Critical)
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.violations
+            .iter()
+            .filter(|v| v.severity == CdcSeverity::Warning)
+            .count()
+    }
+
+    pub fn info_count(&self) -> usize {
+        self.violations
+            .iter()
+            .filter(|v| v.severity == CdcSeverity::Info)
+            .count()
+    }
+
+    pub fn safe_count(&self) -> usize {
+        self.violations
+            .iter()
+            .filter(|v| v.severity == CdcSeverity::Safe)
+            .count()
+    }
+
+    pub fn text(&self) -> String {
+        if self.clocks.is_empty() {
+            return "no clocks — create_clock / report_cdc".into();
+        }
+        let mut lines = vec![format!(
+            "report_cdc clocks={} violations={} critical={} warning={} info={} safe={}",
+            self.clocks.len(),
+            self.violations.len(),
+            self.critical_count(),
+            self.warning_count(),
+            self.info_count(),
+            self.safe_count()
+        )];
+        for c in &self.clocks {
+            lines.push(format!(
+                "clock {} PERIOD_PS={} generated={} MASTER={}",
+                c.name,
+                c.period_ps,
+                u8::from(c.generated),
+                c.master.as_deref().unwrap_or("-")
+            ));
+        }
+        for v in &self.violations {
+            let wns = match v.wns_ps {
+                Some(w) => format!("WNS_PS={w}"),
+                None => "WNS_PS=n/a".into(),
+            };
+            lines.push(format!(
+                "FROM={} TO={} SEVERITY={} CHECK={} SYNC={} ENDPOINTS={} {wns} RELATION={}",
+                v.from,
+                v.to,
+                v.severity.as_str(),
+                v.check,
+                u8::from(v.synchronizer),
+                v.endpoints,
+                v.relation.as_str()
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// One clock tree of UG903 `report_clock_networks`.
+#[derive(Clone, Debug)]
+pub struct ClockNetwork {
+    pub name: String,
+    pub period_ps: u64,
+    pub source: String,
+    pub net: String,
+    pub generated: bool,
+    pub master: Option<String>,
+    /// FF CLK pins hanging on this net (HNF).
+    pub n_loads: usize,
+    /// HAD CLK-spine global buffers (1 per primary clock).
+    pub n_buffers: usize,
+    pub fanout: usize,
+    /// Place Manhattan insertion (ps). 0 until placed / generated local.
+    pub insertion_ps: i64,
+}
+
+/// UG903 Clock Networks report: STA clocks + HNF loads + HAD spine, not a dump.
+#[derive(Clone, Debug, Default)]
+pub struct ClockNetworkReport {
+    pub clocks: Vec<ClockNetwork>,
+    pub total_loads: usize,
+    pub total_buffers: usize,
+    pub max_insertion_ps: i64,
+}
+
+impl ClockNetworkReport {
+    pub fn network(&self, name: &str) -> Option<&ClockNetwork> {
+        self.clocks.iter().find(|c| c.name == name)
+    }
+
+    pub fn text(&self) -> String {
+        if self.clocks.is_empty() {
+            return "no clocks — create_clock / report_clock_networks".into();
+        }
+        let mut lines = vec![format!(
+            "report_clock_networks clocks={} loads={} buffers={} INSERTION_PS={}",
+            self.clocks.len(),
+            self.total_loads,
+            self.total_buffers,
+            self.max_insertion_ps
+        )];
+        for c in &self.clocks {
+            lines.push(format!(
+                "clock {} PERIOD_PS={} SOURCE={} NET={} generated={} MASTER={} loads={} buffers={} fanout={} INSERTION_PS={}",
+                c.name,
+                c.period_ps,
+                c.source,
+                c.net,
+                u8::from(c.generated),
+                c.master.as_deref().unwrap_or("-"),
+                c.n_loads,
+                c.n_buffers,
+                c.fanout,
+                c.insertion_ps
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// UG907 / UG893 `report_power`: HAD occupancy × STA clocks × PVT, not a dump.
+#[derive(Clone, Debug, Default)]
+pub struct PowerReport {
+    pub part: String,
+    pub voltage_mv: i64,
+    pub temperature_c: i64,
+    pub static_uw: i64,
+    pub dynamic_uw: i64,
+    pub total_uw: i64,
+    pub clocks_uw: i64,
+    pub logic_uw: i64,
+    pub signals_uw: i64,
+    pub io_uw: i64,
+    pub bram_uw: i64,
+    pub dsp_uw: i64,
+    pub lutff: usize,
+    pub lutff_cap: u32,
+    pub iob: usize,
+    pub iob_cap: usize,
+    pub bram: usize,
+    pub bram_cap: u32,
+    pub dsp: usize,
+    pub dsp_cap: u32,
+    pub f_mhz: i64,
+}
+
+impl PowerReport {
+    pub fn text(&self) -> String {
+        if self.part.is_empty() {
+            return "no design — synth / report_power".into();
+        }
+        format!(
+            "report_power part={} VOLTAGE_MV={} TEMP_C={} TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} CLOCKS_UW={} LOGIC_UW={} SIGNALS_UW={} IO_UW={} BRAM_UW={} DSP_UW={} F_MHZ={} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+            self.part,
+            self.voltage_mv,
+            self.temperature_c,
+            self.total_uw,
+            self.static_uw,
+            self.dynamic_uw,
+            self.clocks_uw,
+            self.logic_uw,
+            self.signals_uw,
+            self.io_uw,
+            self.bram_uw,
+            self.dsp_uw,
+            self.f_mhz,
+            self.lutff,
+            self.lutff_cap,
+            self.iob,
+            self.iob_cap,
+            self.bram,
+            self.bram_cap,
+            self.dsp,
+            self.dsp_cap
+        )
     }
 }
 
@@ -1544,6 +1784,318 @@ pub fn report_timing_summary(
         failing_hold,
         endpoints,
         groups,
+    }
+}
+
+fn cdc_check(relation: ClockRelation, synchronizer: bool) -> (&'static str, CdcSeverity) {
+    match relation {
+        ClockRelation::TimedUnsafe if synchronizer => ("CDC-1", CdcSeverity::Warning),
+        ClockRelation::TimedUnsafe => ("CDC-10", CdcSeverity::Critical),
+        ClockRelation::TimedDatapath => ("CDC-13", CdcSeverity::Warning),
+        ClockRelation::PartialFalsePath => ("CDC-14", CdcSeverity::Warning),
+        ClockRelation::Asynchronous => ("CDC-15", CdcSeverity::Info),
+        ClockRelation::Exclusive => ("CDC-16", CdcSeverity::Info),
+        ClockRelation::FalsePath => ("CDC-15", CdcSeverity::Safe),
+        ClockRelation::TimedGenerated | ClockRelation::Timed | ClockRelation::NoPaths => {
+            ("CDC-0", CdcSeverity::Safe)
+        }
+    }
+}
+
+fn clock_net_name(design: &Design, clk: &Clock) -> String {
+    if let Some((cell, pin)) = clk.source.split_once('/') {
+        if let Some(n) = design.net_on(cell, pin) {
+            return n.to_string();
+        }
+    }
+    if let Some(n) = design.net_on(&clk.source, "Q") {
+        return n.to_string();
+    }
+    clk.source.clone()
+}
+
+fn clock_ff_loads(design: &Design, net: &str) -> usize {
+    design
+        .cells
+        .iter()
+        .filter(|c| {
+            matches!(c.kind, CellKind::Hff) && design.net_on(&c.name, "CLK") == Some(net)
+        })
+        .count()
+}
+
+/// True when a capture FF on `to_net` is fed by a launch FF Q on `from_net`
+/// (single-FF synchronizer). Combinational LUT in between is not a sync.
+fn cdc_synchronizer(design: &Design, from_net: &str, to_net: &str) -> (usize, bool) {
+    let mut endpoints = 0usize;
+    let mut sync = false;
+    for c in &design.cells {
+        if !matches!(c.kind, CellKind::Hff) {
+            continue;
+        }
+        if design.net_on(&c.name, "CLK") != Some(to_net) {
+            continue;
+        }
+        let Some(d_net) = design.net_on(&c.name, "D") else {
+            continue;
+        };
+        let Some(net) = design.net(d_net) else {
+            continue;
+        };
+        let from_q = net.endpoints.iter().any(|e| {
+            e.pin == "Q" && design.net_on(&e.cell, "CLK") == Some(from_net)
+        });
+        let from_lut = net.endpoints.iter().any(|e| {
+            e.pin == "O"
+                && design.cell(&e.cell).is_some_and(|x| matches!(x.kind, CellKind::Lut6 { .. }))
+        });
+        if from_q || from_lut {
+            endpoints += 1;
+            if from_q && !from_lut {
+                sync = true;
+            }
+        }
+    }
+    (endpoints, sync)
+}
+
+/// UG906 `report_cdc`: inter-clock rows from STA clocks + XDC CDC exceptions.
+/// Optional HNF marks single-FF synchronizers. Empty clocks yield an empty
+/// report (not a canned table). Does not move WNS.
+pub fn report_cdc(
+    clocks: &[Clock],
+    xdc: &Constraints,
+    timing: Option<&TimingResult>,
+    design: Option<&Design>,
+) -> CdcReport {
+    let clocks = if clocks.is_empty() {
+        xdc.clocks.as_slice()
+    } else {
+        clocks
+    };
+    if clocks.is_empty() {
+        return CdcReport::default();
+    }
+    let interaction = report_clock_interaction(clocks, xdc, timing);
+    let mut violations = Vec::new();
+    for cell in &interaction.cells {
+        if cell.from == cell.to {
+            continue;
+        }
+        let (ep, sync) = match design {
+            Some(d) => {
+                let from = clocks.iter().find(|c| c.name == cell.from);
+                let to = clocks.iter().find(|c| c.name == cell.to);
+                match (from, to) {
+                    (Some(f), Some(t)) => {
+                        let fn_ = clock_net_name(d, f);
+                        let tn = clock_net_name(d, t);
+                        cdc_synchronizer(d, &fn_, &tn)
+                    }
+                    _ => (0, false),
+                }
+            }
+            None => (0, false),
+        };
+        let endpoints = if ep > 0 { ep } else { cell.path_count };
+        let (check, severity) = cdc_check(cell.relation, sync);
+        violations.push(CdcViolation {
+            from: cell.from.clone(),
+            to: cell.to.clone(),
+            relation: cell.relation,
+            severity,
+            check: check.into(),
+            endpoints,
+            synchronizer: sync,
+            wns_ps: cell.wns_ps,
+        });
+    }
+    CdcReport {
+        clocks: clocks.to_vec(),
+        violations,
+    }
+}
+
+/// UG903 `report_clock_networks`: one tree per STA clock. Loads are HNF FF
+/// CLK pins; buffers are the HAD CLK spine (1 per primary). Insertion is
+/// place Manhattan. Empty clocks yield an empty report (not a canned tree).
+pub fn report_clock_networks(
+    clocks: &[Clock],
+    design: Option<&Design>,
+    placed: Option<&Placed>,
+) -> ClockNetworkReport {
+    if clocks.is_empty() {
+        return ClockNetworkReport::default();
+    }
+    let insertion = placed.map(clock_network_delay_ps).unwrap_or(0);
+    let mut nets = Vec::with_capacity(clocks.len());
+    let mut total_loads = 0usize;
+    let mut total_buffers = 0usize;
+    let mut max_insertion_ps = 0i64;
+    for c in clocks {
+        let net = design
+            .map(|d| clock_net_name(d, c))
+            .unwrap_or_else(|| c.source.clone());
+        let n_loads = design.map(|d| clock_ff_loads(d, &net)).unwrap_or(0);
+        let n_buffers = usize::from(!c.generated);
+        let insertion_ps = if c.generated { 0 } else { insertion };
+        total_loads += n_loads;
+        total_buffers += n_buffers;
+        max_insertion_ps = max_insertion_ps.max(insertion_ps);
+        nets.push(ClockNetwork {
+            name: c.name.clone(),
+            period_ps: c.period_ps,
+            source: c.source.clone(),
+            net,
+            generated: c.generated,
+            master: c.master.clone(),
+            n_loads,
+            n_buffers,
+            fanout: n_loads,
+            insertion_ps,
+        });
+    }
+    ClockNetworkReport {
+        clocks: nets,
+        total_loads,
+        total_buffers,
+        max_insertion_ps,
+    }
+}
+
+fn occupancy_counts(design: Option<&Design>, placed: Option<&Placed>) -> (usize, usize, usize, usize, usize, usize) {
+    if let Some(p) = placed {
+        let nets = design.map(|d| d.nets.len()).unwrap_or(p.packed.lutffs.len());
+        (
+            p.packed.lutffs.len(),
+            p.packed.iobs.len(),
+            p.packed.brams.len(),
+            p.packed.macs.len(),
+            p.packed.lutffs.len(),
+            nets,
+        )
+    } else if let Some(d) = design {
+        let lutff = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        let iob = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::IobOut))
+            .count();
+        let bram = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Bram18))
+            .count();
+        let dsp = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Mac27))
+            .count();
+        let ff = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .count();
+        (lutff, iob, bram, dsp, ff, d.nets.len())
+    } else {
+        (0, 0, 0, 0, 0, 0)
+    }
+}
+
+/// UG907 `report_power`: vectorless on-chip power from HAD capacity, occupancy,
+/// STA clock frequency, and `set_operating_conditions` PVT. Empty design yields
+/// an empty report (not a canned wattage). Does not move WNS.
+pub fn report_power(
+    dev: &Device,
+    design: Option<&Design>,
+    placed: Option<&Placed>,
+    clocks: &[Clock],
+    oc: &OperatingConditions,
+) -> PowerReport {
+    if design.is_none() && placed.is_none() {
+        return PowerReport::default();
+    }
+    let (lutff, iob, bram, dsp, ff, nets) = occupancy_counts(design, placed);
+    let lutff_cap = dev.lut6_count();
+    let iob_cap = dev.iob_sites().count();
+    let bram_cap = dev.n_bram;
+    let dsp_cap = dev.n_dsp;
+    let voltage_mv = if oc.voltage_set && oc.voltage_mv > 0 {
+        oc.voltage_mv
+    } else {
+        1000
+    };
+    let temperature_c = if oc.temperature_set {
+        oc.temperature_c
+    } else {
+        25
+    };
+    let period_ps = clocks
+        .iter()
+        .map(|c| c.period_ps)
+        .min()
+        .unwrap_or(10_000)
+        .max(1);
+    let f_mhz = (1_000_000 / period_ps) as i64;
+    // Unused HAD tiles leak less than occupied (Vivado vectorless).
+    let unused_lut = (lutff_cap as i64).saturating_sub(lutff as i64);
+    let unused_io = (iob_cap as i64).saturating_sub(iob as i64);
+    let unused_bram = (bram_cap as i64).saturating_sub(bram as i64);
+    let unused_dsp = (dsp_cap as i64).saturating_sub(dsp as i64);
+    let static_base = lutff as i64 * 4
+        + unused_lut
+        + iob as i64 * 20
+        + unused_io * 5
+        + bram as i64 * 80
+        + unused_bram * 40
+        + dsp as i64 * 120
+        + unused_dsp * 50
+        + 20; // CLK spine
+    let clocks_dyn = ff as i64 * f_mhz * 4;
+    let logic_dyn = lutff as i64 * f_mhz * 2;
+    let signals_dyn = nets as i64 * f_mhz;
+    let io_dyn = iob as i64 * f_mhz * 20;
+    let bram_dyn = bram as i64 * f_mhz * 10;
+    let dsp_dyn = dsp as i64 * f_mhz * 15;
+    let dynamic_base = clocks_dyn + logic_dyn + signals_dyn + io_dyn + bram_dyn + dsp_dyn;
+    // P ~ V^2 (dynamic), leakage ~ V * (1 + k·ΔT). Gold 1.00 V / 25 °C = 1000 milli.
+    let dyn_milli = voltage_mv.saturating_mul(voltage_mv) / 1000;
+    let leak_milli = voltage_mv.saturating_mul(1000 + (temperature_c - 25).saturating_mul(8)) / 1000;
+    let scale = |uw: i64, milli: i64| uw.saturating_mul(milli.max(1)) / 1000;
+    let static_uw = scale(static_base, leak_milli);
+    let clocks_uw = scale(clocks_dyn, dyn_milli);
+    let logic_uw = scale(logic_dyn, dyn_milli);
+    let signals_uw = scale(signals_dyn, dyn_milli);
+    let io_uw = scale(io_dyn, dyn_milli);
+    let bram_uw = scale(bram_dyn, dyn_milli);
+    let dsp_uw = scale(dsp_dyn, dyn_milli);
+    let dynamic_uw = scale(dynamic_base, dyn_milli);
+    PowerReport {
+        part: dev.part.clone(),
+        voltage_mv,
+        temperature_c,
+        static_uw,
+        dynamic_uw,
+        total_uw: static_uw.saturating_add(dynamic_uw),
+        clocks_uw,
+        logic_uw,
+        signals_uw,
+        io_uw,
+        bram_uw,
+        dsp_uw,
+        lutff,
+        lutff_cap,
+        iob,
+        iob_cap,
+        bram,
+        bram_cap,
+        dsp,
+        dsp_cap,
+        f_mhz,
     }
 }
 
@@ -4022,5 +4574,240 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
             rs.wns_ps,
             "timing summary WNS is per-design STA, not canned"
         );
+    }
+
+    #[test]
+    fn report_cdc_from_sta_clocks_not_a_dump() {
+        let empty = report_cdc(&[], &Constraints::default(), None, None);
+        assert!(empty.clocks.is_empty());
+        assert!(empty.violations.is_empty());
+        assert!(empty.text().contains("no clocks"));
+
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let d = Design::structural_counter();
+        let t = report_timing(&d, &clks).unwrap();
+        let intra = report_cdc(&clks, &Constraints::default(), Some(&t), Some(&d));
+        assert_eq!(intra.clocks.len(), 1);
+        assert!(
+            intra.violations.is_empty(),
+            "intra-clock is not CDC: {}",
+            intra.text()
+        );
+
+        create_generated_clock(&mut clks, "clkdiv", "clk", 2, "u_ff/Q").unwrap();
+        create_clock(&mut clks, "virt", 8_000, "virt");
+        let r = report_cdc(&clks, &Constraints::default(), Some(&t), Some(&d));
+        assert_eq!(r.clocks.len(), 3);
+        assert_eq!(r.violations.len(), 6, "{}", r.text());
+        let unsafe_cdc = r.violation("clk", "virt").unwrap();
+        assert_eq!(unsafe_cdc.relation, ClockRelation::TimedUnsafe);
+        assert_eq!(unsafe_cdc.severity, CdcSeverity::Critical);
+        assert_eq!(unsafe_cdc.check, "CDC-10");
+        assert!(!unsafe_cdc.synchronizer);
+        assert_ne!(
+            unsafe_cdc.wns_ps,
+            Some(t.wns_ps),
+            "CDC slack uses dest period, not a canned copy: {:?}",
+            unsafe_cdc.wns_ps
+        );
+        assert_eq!(
+            r.violation("clk", "clkdiv").unwrap().severity,
+            CdcSeverity::Safe
+        );
+        assert!(r.critical_count() >= 2, "{}", r.text());
+
+        let mut async_xdc = Constraints::default();
+        async_xdc.clock_groups.push(ClockGroups {
+            asynchronous: true,
+            exclusive: false,
+            groups: vec![vec!["clk".into()], vec!["virt".into()]],
+        });
+        let ra = report_cdc(&clks, &async_xdc, Some(&t), Some(&d));
+        let v = ra.violation("clk", "virt").unwrap();
+        assert_eq!(v.severity, CdcSeverity::Info);
+        assert_eq!(v.check, "CDC-15");
+        assert!(v.wns_ps.is_none());
+        assert_eq!(
+            ra.violation("clk", "clkdiv").unwrap().severity,
+            CdcSeverity::Safe,
+            "async CDC must not drop generated-clock Safe rows"
+        );
+
+        let mut dp = Constraints::default();
+        dp.max_delays.push(MaxDelay {
+            from: "clk".into(),
+            to: "virt".into(),
+            delay_ps: 2_000,
+            datapath_only: true,
+        });
+        let rd = report_cdc(&clks, &dp, Some(&t), Some(&d));
+        let v = rd.violation("clk", "virt").unwrap();
+        assert_eq!(v.severity, CdcSeverity::Warning);
+        assert_eq!(v.check, "CDC-13");
+
+        let blinky = Design::structural_blinky();
+        let tb = report_timing(&blinky, &clks[..1]).unwrap();
+        let rb = report_cdc(&clks, &Constraints::default(), Some(&tb), Some(&blinky));
+        assert_ne!(
+            rb.violation("clk", "virt").unwrap().wns_ps,
+            r.violation("clk", "virt").unwrap().wns_ps,
+            "CDC WNS is per-design STA, not canned"
+        );
+    }
+
+    #[test]
+    fn report_clock_networks_from_hnf_and_had_not_a_dump() {
+        let empty = report_clock_networks(&[], None, None);
+        assert!(empty.clocks.is_empty());
+        assert!(empty.text().contains("no clocks"));
+
+        let d = Design::structural_counter();
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let packed = pack(&d, &dev).unwrap();
+        let placed = place(&packed, &dev).unwrap();
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let r = report_clock_networks(&clks, Some(&d), Some(&placed));
+        assert_eq!(r.clocks.len(), 1);
+        let clk = r.network("clk").unwrap();
+        assert_eq!(clk.n_loads, 4, "{}", r.text());
+        assert_eq!(clk.fanout, 4);
+        assert_eq!(clk.n_buffers, 1, "HAD CLK spine: one BUF per primary");
+        assert_eq!(clk.net, "clk");
+        assert!(
+            clk.insertion_ps > 0,
+            "placed insertion is HAD Manhattan: {}",
+            r.text()
+        );
+        assert_eq!(r.total_loads, 4);
+        assert_eq!(r.max_insertion_ps, clk.insertion_ps);
+
+        create_generated_clock(&mut clks, "clkdiv", "clk", 2, "u_ff0/Q").unwrap();
+        let rg = report_clock_networks(&clks, Some(&d), Some(&placed));
+        assert_eq!(rg.clocks.len(), 2);
+        let div = rg.network("clkdiv").unwrap();
+        assert!(div.generated);
+        assert_eq!(div.n_buffers, 0, "generated clocks are local, not gclk");
+        assert_eq!(div.insertion_ps, 0);
+        assert_eq!(div.net, "q0", "generated source pin maps to HNF net: {}", rg.text());
+        assert_eq!(div.n_loads, 0, "no FF is clocked by q0");
+        assert_eq!(rg.network("clk").unwrap().n_loads, 4);
+
+        let blinky = Design::structural_blinky();
+        let bp = pack(&blinky, &dev).unwrap();
+        let bplaced = place(&bp, &dev).unwrap();
+        let mut bclks = Vec::new();
+        create_clock(&mut bclks, "clk", 10_000, "clk");
+        let rb = report_clock_networks(&bclks, Some(&blinky), Some(&bplaced));
+        assert_eq!(rb.network("clk").unwrap().n_loads, 1, "{}", rb.text());
+        assert_ne!(
+            rb.total_loads, r.total_loads,
+            "clock-network loads are per-design HNF, not a dump"
+        );
+        assert_eq!(
+            rb.max_insertion_ps,
+            clock_network_delay_ps(&bplaced),
+            "blinky insertion is this placement's Manhattan"
+        );
+        assert_eq!(
+            r.max_insertion_ps,
+            clock_network_delay_ps(&placed),
+            "counter insertion is this placement's Manhattan"
+        );
+    }
+
+    #[test]
+    fn report_power_from_had_occupancy_and_sta_clocks() {
+        let empty = report_power(
+            &Device::load_part("HL10T-C32-1").unwrap(),
+            None,
+            None,
+            &[],
+            &OperatingConditions::default(),
+        );
+        assert!(empty.part.is_empty());
+        assert!(empty.text().contains("no design"));
+
+        let d = Design::structural_counter();
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let packed = pack(&d, &dev).unwrap();
+        let placed = place(&packed, &dev).unwrap();
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let p = report_power(&dev, Some(&d), Some(&placed), &clks, &OperatingConditions::default());
+        assert_eq!(p.part, "HL10T-C32-1");
+        assert_eq!(p.voltage_mv, 1000);
+        assert_eq!(p.temperature_c, 25);
+        assert_eq!(p.f_mhz, 100);
+        assert_eq!(p.lutff, 4, "{}", p.text());
+        assert_eq!(p.lutff_cap, dev.lut6_count());
+        assert_eq!(p.iob, 1);
+        assert!(p.total_uw > 0, "{}", p.text());
+        assert_eq!(p.total_uw, p.static_uw + p.dynamic_uw);
+        assert!(p.logic_uw > 0, "occupied LUTs draw dynamic: {}", p.text());
+        assert!(p.clocks_uw > 0, "FF clocks draw dynamic: {}", p.text());
+        assert_eq!(p.dsp_uw, 0);
+        let gold = report_timing_placed(&d, &placed, &clks).unwrap();
+
+        let blinky = Design::structural_blinky();
+        let bp = pack(&blinky, &dev).unwrap();
+        let bplaced = place(&bp, &dev).unwrap();
+        let pb = report_power(
+            &dev,
+            Some(&blinky),
+            Some(&bplaced),
+            &clks,
+            &OperatingConditions::default(),
+        );
+        assert_eq!(pb.lutff, 1, "{}", pb.text());
+        assert!(
+            p.total_uw > pb.total_uw,
+            "counter occupancy must draw more than blinky: counter={} blinky={}",
+            p.total_uw,
+            pb.total_uw
+        );
+        assert_ne!(p.logic_uw, pb.logic_uw);
+        assert_ne!(p.clocks_uw, pb.clocks_uw);
+
+        let mut oc = OperatingConditions::default();
+        oc.voltage_mv = 950;
+        oc.voltage_set = true;
+        let pv = report_power(&dev, Some(&d), Some(&placed), &clks, &oc);
+        assert_eq!(pv.voltage_mv, 950);
+        assert!(
+            pv.total_uw < p.total_uw,
+            "0.95 V must drop power vs 1.00 V: gold={} pvt={}",
+            p.total_uw,
+            pv.total_uw
+        );
+        oc.temperature_c = 85;
+        oc.temperature_set = true;
+        let pt = report_power(&dev, Some(&d), Some(&placed), &clks, &oc);
+        assert!(
+            pt.static_uw > pv.static_uw,
+            "85 C must raise leakage: 25C={} 85C={}",
+            pv.static_uw,
+            pt.static_uw
+        );
+
+        let mut fast = Vec::new();
+        create_clock(&mut fast, "clk", 5_000, "clk");
+        let pf = report_power(
+            &dev,
+            Some(&d),
+            Some(&placed),
+            &fast,
+            &OperatingConditions::default(),
+        );
+        assert_eq!(pf.f_mhz, 200);
+        assert!(
+            pf.dynamic_uw > p.dynamic_uw,
+            "2× f must raise dynamic: 100MHz={} 200MHz={}",
+            p.dynamic_uw,
+            pf.dynamic_uw
+        );
+        let gold2 = report_timing_placed(&d, &placed, &clks).unwrap();
+        assert_eq!(gold2.wns_ps, gold.wns_ps, "report_power must not move WNS");
     }
 }
