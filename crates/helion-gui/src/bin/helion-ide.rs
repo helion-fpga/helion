@@ -577,6 +577,58 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
             if let Some(spec) = pick_obj {
                 let _ = model.select_object(&spec);
             }
+            ui.separator();
+            ui.label(RichText::new("Locals").strong());
+            ui.weak(
+                "UG900 Locals — clickable Name/Type/Value over helion-sim/fabric sequential probes",
+            );
+            let locals = model.local_rows().to_vec();
+            let selected_local = model.selected_local.clone();
+            let mut pick_local = None;
+            egui::ScrollArea::vertical()
+                .id_salt("ug900_locals")
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("ug900_locals_table")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").strong());
+                            ui.label(RichText::new("Type").strong());
+                            ui.label(RichText::new("Value").strong());
+                            ui.end_row();
+                            if locals.is_empty() {
+                                ui.label("—");
+                                ui.label("—");
+                                ui.label("no locals — sim_run");
+                                ui.end_row();
+                            } else {
+                                for (i, l) in locals.iter().enumerate() {
+                                    let on = selected_local.as_deref() == Some(l.name.as_str());
+                                    if ui.selectable_label(on, &l.name).clicked() {
+                                        pick_local = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, l.type_cell()).clicked() {
+                                        pick_local = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, l.value_cell()).clicked() {
+                                        pick_local = Some(i.to_string());
+                                    }
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+            if let Some(spec) = pick_local {
+                let _ = model.select_local(&spec);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Memory").clicked() {
+                    let _ = model.open_memory();
+                }
+                if ui.button("Breakpoints").clicked() {
+                    let _ = model.open_breakpoints();
+                }
+            });
         });
 }
 
@@ -990,6 +1042,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Schematic,
             WorkspaceTab::Device,
             WorkspaceTab::Wave,
+            WorkspaceTab::Memory,
+            WorkspaceTab::Breakpoints,
+            WorkspaceTab::Locals,
             WorkspaceTab::Hardware,
             WorkspaceTab::Ip,
             WorkspaceTab::Constraints,
@@ -1012,6 +1067,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Schematic => "Schematic",
                 WorkspaceTab::Device => "Device",
                 WorkspaceTab::Wave => "Waveform",
+                WorkspaceTab::Memory => "Memory",
+                WorkspaceTab::Breakpoints => "Breakpoints",
+                WorkspaceTab::Locals => "Locals",
                 WorkspaceTab::Hardware => "Hardware",
                 WorkspaceTab::Ip => "IP / BD",
                 WorkspaceTab::Constraints => "Timing Constraints",
@@ -1043,6 +1101,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Schematic => paint_schematic(ui, model),
         WorkspaceTab::Device => paint_device(ui, model),
         WorkspaceTab::Wave => paint_wave(ui, model),
+        WorkspaceTab::Memory => paint_memory(ui, model),
+        WorkspaceTab::Breakpoints => paint_breakpoints(ui, model),
+        WorkspaceTab::Locals => paint_locals(ui, model),
         WorkspaceTab::Hardware => paint_hw(ui, model),
         WorkspaceTab::Ip => paint_ip(ui, model),
         WorkspaceTab::Constraints => paint_constraints(ui, model),
@@ -3574,6 +3635,240 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     if let Some((x, y)) = pick_site {
         let _ = model.select_device_site(&format!("X{x}Y{y}"));
+    }
+}
+
+fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Memory");
+    ui.weak(
+        "UG900 Memory — clickable Name/Type/Addr/Data table over helion-sim LUT INIT and fabric BLE/BRAM, not a hex dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Run 16").clicked() {
+            let _ = model.sim_run(16);
+        }
+        if ui.button("Step").clicked() {
+            let _ = model.sim_step();
+        }
+        if ui.button("Restart").clicked() {
+            let _ = model.sim_restart();
+        }
+    });
+    let blocks = model.memory_rows().to_vec();
+    let selected = model.selected_memory.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("ug900_memory")
+        .max_height(220.0)
+        .show(ui, |ui| {
+            egui::Grid::new("ug900_memory_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Type").strong());
+                    ui.label(RichText::new("Addr").strong());
+                    ui.label(RichText::new("Data").strong());
+                    ui.label(RichText::new("Width").strong());
+                    ui.label(RichText::new("Depth").strong());
+                    ui.end_row();
+                    if blocks.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no memories — sim_run");
+                        ui.end_row();
+                    } else {
+                        for (i, m) in blocks.iter().enumerate() {
+                            let on = selected.as_deref() == Some(m.name.as_str());
+                            if ui.selectable_label(on, &m.name).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, m.type_cell()).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, "0").clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, m.data_cell()).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            ui.label(m.width.to_string());
+                            ui.label(m.depth().to_string());
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(spec) = pick {
+        let _ = model.select_memory(&spec);
+    }
+    ui.separator();
+    ui.label(RichText::new("Contents").strong());
+    let words = model.memory_word_rows();
+    let sel_addr = model.selected_memory_addr;
+    let mut pick_addr: Option<usize> = None;
+    if words.is_empty() {
+        ui.weak("select a memory to view Addr/Data");
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt("ug900_memory_words")
+            .show(ui, |ui| {
+                egui::Grid::new("ug900_memory_words_table")
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Addr").strong());
+                        ui.label(RichText::new("Data").strong());
+                        ui.end_row();
+                        for r in &words {
+                            let on = sel_addr == Some(r.addr);
+                            if ui.selectable_label(on, r.addr.to_string()).clicked() {
+                                pick_addr = Some(r.addr);
+                            }
+                            if ui.selectable_label(on, &r.data).clicked() {
+                                pick_addr = Some(r.addr);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+    if let Some(addr) = pick_addr {
+        let _ = model.select_memory_word(&addr.to_string());
+    }
+}
+
+fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Breakpoints");
+    ui.weak(
+        "UG900 Breakpoints — clickable Id/Enabled/Signal/Condition/Hits over helion-sim/fabric, not a dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Add led == 1").clicked() {
+            let _ = model.add_breakpoint("led 1");
+        }
+        if ui.button("Add led change").clicked() {
+            let _ = model.add_breakpoint("led");
+        }
+        if ui.button("Run 16").clicked() {
+            let _ = model.sim_run(16);
+        }
+        if ui.button("Disable").clicked() {
+            let _ = model.set_breakpoint_enabled("", false);
+        }
+        if ui.button("Enable").clicked() {
+            let _ = model.set_breakpoint_enabled("", true);
+        }
+        if ui.button("Delete").clicked() {
+            let _ = model.delete_breakpoint("");
+        }
+    });
+    let rows = model.breakpoint_rows().to_vec();
+    let selected = model.selected_breakpoint;
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("ug900_breakpoints")
+        .show(ui, |ui| {
+            egui::Grid::new("ug900_breakpoints_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Id").strong());
+                    ui.label(RichText::new("Enabled").strong());
+                    ui.label(RichText::new("Signal").strong());
+                    ui.label(RichText::new("Condition").strong());
+                    ui.label(RichText::new("Hits").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no breakpoints — add_bp");
+                        ui.end_row();
+                    } else {
+                        for b in &rows {
+                            let on = selected == Some(b.id);
+                            let id = b.id.to_string();
+                            if ui.selectable_label(on, &id).clicked() {
+                                pick = Some(id.clone());
+                            }
+                            if ui.selectable_label(on, b.enabled_cell()).clicked() {
+                                pick = Some(id.clone());
+                            }
+                            if ui.selectable_label(on, &b.signal).clicked() {
+                                pick = Some(id.clone());
+                            }
+                            if ui.selectable_label(on, &b.condition).clicked() {
+                                pick = Some(id.clone());
+                            }
+                            if ui.selectable_label(on, b.hits.to_string()).clicked() {
+                                pick = Some(id.clone());
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(spec) = pick {
+        let _ = model.select_breakpoint(&spec);
+    }
+}
+
+fn paint_locals(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Locals");
+    ui.weak(
+        "UG900 Locals — clickable Name/Type/Value table over current-scope helion-sim/fabric probes, not a dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Run 16").clicked() {
+            let _ = model.sim_run(16);
+        }
+        if ui.button("Step").clicked() {
+            let _ = model.sim_step();
+        }
+        if ui.button("Restart").clicked() {
+            let _ = model.sim_restart();
+        }
+    });
+    let rows = model.local_rows().to_vec();
+    let selected = model.selected_local.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("ug900_locals_ws")
+        .show(ui, |ui| {
+            egui::Grid::new("ug900_locals_ws_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Type").strong());
+                    ui.label(RichText::new("Value").strong());
+                    ui.label(RichText::new("Scope").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no locals — sim_run");
+                        ui.end_row();
+                    } else {
+                        for (i, l) in rows.iter().enumerate() {
+                            let on = selected.as_deref() == Some(l.name.as_str());
+                            if ui.selectable_label(on, &l.name).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, l.type_cell()).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, l.value_cell()).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, &l.scope).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(spec) = pick {
+        let _ = model.select_local(&spec);
     }
 }
 

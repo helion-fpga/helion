@@ -15,7 +15,7 @@ use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_ipxact::{catalog as ipxact_catalog, to_xml, IpCore};
 use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
-use helion_sim::{Sim, SimLocal, SimMemory};
+use helion_sim::{Sim, SimLocal};
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
     report_cdc, report_clock_interaction, report_clock_networks, report_methodology,
@@ -10500,9 +10500,11 @@ impl IdeModel {
             fab.program(&bits)?;
             fab.finish_startup();
             self.fabric_sim = Some(fab);
+            self.event_sim = None;
             let _ = r;
         } else {
             self.event_sim = Some(Sim::new(&d));
+            self.fabric_sim = None;
         }
         self.wave.timescale_ps = self.clock_period_ps;
         if self.wave.traces.is_empty() {
@@ -10673,6 +10675,297 @@ impl IdeModel {
                 .filter(|o| self.object_in_scope(&o.name, &s))
                 .collect(),
         };
+    }
+
+    fn refresh_sim_debug(&mut self) {
+        self.memories = self.collect_memories();
+        if let Some(sel) = self.selected_memory.clone() {
+            if !self.memories.iter().any(|m| m.name == sel) {
+                self.selected_memory = None;
+                self.selected_memory_addr = None;
+            }
+        }
+        let all = self.collect_locals();
+        let scope = self
+            .selected_scope
+            .clone()
+            .or_else(|| self.scopes.first().map(|s| s.name.clone()));
+        self.locals = match scope {
+            None => all,
+            Some(s) => all
+                .into_iter()
+                .filter(|l| self.object_in_scope(&l.name, &s))
+                .collect(),
+        };
+        if let Some(sel) = self.selected_local.clone() {
+            if !self.locals.iter().any(|l| l.name == sel) {
+                self.selected_local = None;
+            }
+        }
+    }
+
+    fn upsert_memory(blocks: &mut Vec<MemoryBlock>, b: MemoryBlock) {
+        if let Some(existing) = blocks.iter_mut().find(|e| e.name == b.name) {
+            *existing = b;
+        } else {
+            blocks.push(b);
+        }
+    }
+
+    fn collect_memories(&self) -> Vec<MemoryBlock> {
+        let mut blocks: Vec<MemoryBlock> = Vec::new();
+        if let Some(sim) = &self.event_sim {
+            for m in sim.memory_cells() {
+                Self::upsert_memory(
+                    &mut blocks,
+                    MemoryBlock {
+                        name: m.name,
+                        kind: m.kind,
+                        width: m.width,
+                        words: m.words,
+                    },
+                );
+            }
+            let regs: Vec<SimLocal> = sim
+                .locals()
+                .into_iter()
+                .filter(|l| l.kind == "reg")
+                .collect();
+            if !regs.is_empty() {
+                let mut seq = 0u64;
+                for (i, l) in regs.iter().take(64).enumerate() {
+                    if l.value == "1" {
+                        seq |= 1 << i;
+                    }
+                }
+                Self::upsert_memory(
+                    &mut blocks,
+                    MemoryBlock {
+                        name: "seq".into(),
+                        kind: "seq".into(),
+                        width: regs.len().min(64) as u8,
+                        words: vec![seq],
+                    },
+                );
+            }
+        }
+        if let (Some(fab), Some(pl)) = (&self.fabric_sim, self.shell.session.placed.as_ref()) {
+            for (i, lf) in pl.packed.lutffs.iter().enumerate() {
+                if let Some((site, ble)) = pl.lutff_sites.get(i) {
+                    let init = fab.lut_init(site.x, site.y, *ble as u32);
+                    Self::upsert_memory(
+                        &mut blocks,
+                        MemoryBlock {
+                            name: lf.lut_cell.clone(),
+                            kind: "lut_init".into(),
+                            width: 1,
+                            words: (0..64).map(|a| (init >> a) & 1).collect(),
+                        },
+                    );
+                }
+            }
+            for (i, br) in pl.packed.brams.iter().enumerate() {
+                let mut words = br.init.clone();
+                if words.is_empty() {
+                    words.push(fab.bram_init_word(i as u16, 0));
+                } else {
+                    for (addr, w) in words.iter_mut().enumerate() {
+                        let live = fab.bram_init_word(i as u16, addr);
+                        if live != 0 {
+                            *w = live;
+                        }
+                    }
+                }
+                Self::upsert_memory(
+                    &mut blocks,
+                    MemoryBlock {
+                        name: br.cell.clone(),
+                        kind: "bram".into(),
+                        width: 64,
+                        words,
+                    },
+                );
+            }
+            let n = pl.lutff_sites.len().min(64);
+            if n > 0 {
+                let mut seq = 0u64;
+                for (i, (site, ble)) in pl.lutff_sites.iter().take(64).enumerate() {
+                    if fab.ble_q(site.x, site.y, *ble as u32) {
+                        seq |= 1 << i;
+                    }
+                }
+                Self::upsert_memory(
+                    &mut blocks,
+                    MemoryBlock {
+                        name: "seq".into(),
+                        kind: "seq".into(),
+                        width: n as u8,
+                        words: vec![seq],
+                    },
+                );
+            }
+        }
+        if blocks.is_empty() {
+            if let Some(d) = self.shell.session.design.as_ref() {
+                for c in &d.cells {
+                    if let CellKind::Lut6 { init } = c.kind {
+                        Self::upsert_memory(
+                            &mut blocks,
+                            MemoryBlock {
+                                name: c.name.clone(),
+                                kind: "lut_init".into(),
+                                width: 1,
+                                words: (0..64).map(|a| (init >> a) & 1).collect(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        blocks.sort_by(|a, b| a.name.cmp(&b.name));
+        blocks
+    }
+
+    fn collect_locals(&self) -> Vec<LocalRow> {
+        let scope = self
+            .selected_scope
+            .clone()
+            .or_else(|| self.scopes.first().map(|s| s.name.clone()))
+            .unwrap_or_else(|| "-".into());
+        let mut v = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push = |name: String, kind: String, value: String| {
+            if seen.insert(name.clone()) {
+                v.push(LocalRow {
+                    name,
+                    kind,
+                    value,
+                    scope: scope.clone(),
+                });
+            }
+        };
+        if let Some(sim) = &self.event_sim {
+            for l in sim.locals() {
+                push(l.name, l.kind, l.value);
+            }
+        }
+        if let (Some(fab), Some(pl)) = (&self.fabric_sim, self.shell.session.placed.as_ref()) {
+            let iob = self
+                .shell
+                .session
+                .routed
+                .as_ref()
+                .and_then(|r| r.iob_src.first());
+            if let Some(iob) = iob {
+                let led = fab.led_at(iob.iob.0, iob.iob.1);
+                push("led".into(), "port".into(), if led { "1" } else { "0" }.into());
+            }
+            for (i, lf) in pl.packed.lutffs.iter().enumerate() {
+                if let Some((site, ble)) = pl.lutff_sites.get(i) {
+                    let q = fab.ble_q(site.x, site.y, *ble as u32);
+                    push(
+                        lf.ff_cell.clone(),
+                        "reg".into(),
+                        if q { "1" } else { "0" }.into(),
+                    );
+                }
+            }
+        }
+        v
+    }
+
+    fn sim_signal_value(&self, name: &str) -> Option<u64> {
+        if let Some(sim) = &self.event_sim {
+            if let Some(v) = sim.signal_value(name) {
+                return Some(v);
+            }
+        }
+        if let Some(t) = self.wave.trace(name) {
+            if let Some(v) = t.samples.last().copied() {
+                return Some(v);
+            }
+        }
+        if let Some(m) = self.memories.iter().find(|m| m.name.eq_ignore_ascii_case(name)) {
+            return Some(m.packed_word());
+        }
+        if let Some(l) = self.locals.iter().find(|l| l.name.eq_ignore_ascii_case(name)) {
+            return match l.value.as_str() {
+                "1" => Some(1),
+                "0" => Some(0),
+                other => {
+                    let t = other.trim_start_matches("0x").trim_start_matches("0X");
+                    u64::from_str_radix(t, 16).ok().or_else(|| other.parse().ok())
+                }
+            };
+        }
+        if let (Some(fab), Some(pl)) = (&self.fabric_sim, self.shell.session.placed.as_ref()) {
+            if name.eq_ignore_ascii_case("led") {
+                if let Some(iob) = self.shell.session.routed.as_ref().and_then(|r| r.iob_src.first())
+                {
+                    return Some(u64::from(fab.led_at(iob.iob.0, iob.iob.1)));
+                }
+            }
+            if name.eq_ignore_ascii_case("seq") || name.eq_ignore_ascii_case("cnt") {
+                let mut seq = 0u64;
+                for (i, (site, ble)) in pl.lutff_sites.iter().take(64).enumerate() {
+                    if fab.ble_q(site.x, site.y, *ble as u32) {
+                        seq |= 1 << i;
+                    }
+                }
+                return Some(seq);
+            }
+            for (i, lf) in pl.packed.lutffs.iter().enumerate() {
+                if lf.ff_cell.eq_ignore_ascii_case(name)
+                    || lf.lut_cell.eq_ignore_ascii_case(name)
+                    || lf.q_net.eq_ignore_ascii_case(name)
+                {
+                    if let Some((site, ble)) = pl.lutff_sites.get(i) {
+                        return Some(u64::from(fab.ble_q(site.x, site.y, *ble as u32)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn check_breakpoints(&mut self) -> Option<String> {
+        if self.breakpoints.iter().all(|b| !b.enabled) {
+            return None;
+        }
+        let mut current: HashMap<String, u64> = HashMap::new();
+        for bp in &self.breakpoints {
+            if let Some(v) = self.sim_signal_value(&bp.signal) {
+                current.insert(bp.signal.clone(), v);
+            }
+        }
+        let cycle = self.wave.sample_len();
+        let mut hit: Option<String> = None;
+        for bp in &mut self.breakpoints {
+            if !bp.enabled {
+                continue;
+            }
+            let Some(&cur) = current.get(&bp.signal) else {
+                continue;
+            };
+            let prev = self.bp_prev.get(&bp.signal).copied();
+            let fire = if let Some(expect) = bp.value {
+                cur == expect && prev != Some(cur)
+            } else {
+                prev.map(|p| p != cur).unwrap_or(false)
+            };
+            if fire {
+                bp.hits = bp.hits.saturating_add(1);
+                hit = Some(format!(
+                    "id={} SIGNAL={} VALUE={cur} CONDITION={} HITS={} CYCLE={}",
+                    bp.id, bp.signal, bp.condition, bp.hits, cycle
+                ));
+                break;
+            }
+        }
+        for (k, v) in current {
+            self.bp_prev.insert(k, v);
+        }
+        hit
     }
 
     fn push_sample(wave: &mut Waveform, name: &str, v: u64, width: u8, style: WaveStyle) {
@@ -17146,6 +17439,249 @@ mod tests {
         assert_eq!(vb.type_cell(), "virtual_bus");
         assert_ne!(vb.value_cell(), "-");
         assert_eq!(counter.wave.bits_of("led").as_deref(), Some(gold.as_str()));
+    }
+
+    /// UG900 Memory / Breakpoints / Locals are clickable tables over helion-sim/fabric.
+    #[test]
+    fn ug900_memory_breakpoints_locals_from_helion_sim_fabric() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+
+        let mem = ide.exec("memory").unwrap();
+        assert!(mem.contains('\n'), "Memory must be a table: {mem}");
+        assert!(mem.contains("NAME=u_lut0"), "{mem}");
+        assert!(mem.contains("TYPE=lut_init"), "{mem}");
+        assert!(mem.contains("DATA=0x5555555555555555"), "{mem}");
+        assert!(mem.contains("DEPTH=64"), "{mem}");
+        assert!(mem.contains("NAME=u_lut3"), "{mem}");
+        assert!(
+            !mem.contains("NAME=u_lut "),
+            "counter memories are not blinky: {mem}"
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Memory);
+        assert_eq!(ide.layout, LayoutKind::Simulation);
+
+        let lut0 = ide
+            .memory_rows()
+            .iter()
+            .find(|m| m.name == "u_lut0")
+            .cloned()
+            .expect("u_lut0");
+        assert_eq!(lut0.type_cell(), "lut_init");
+        assert_eq!(lut0.packed_word(), helion_ir::INC4_INIT[0]);
+        assert_eq!(lut0.words[0], 1);
+        assert_eq!(lut0.words[1], 0);
+        let lut3 = ide
+            .memory_rows()
+            .iter()
+            .find(|m| m.name == "u_lut3")
+            .cloned()
+            .expect("u_lut3");
+        assert_eq!(lut3.packed_word(), helion_ir::INC4_INIT[3]);
+        assert_ne!(lut0.data_cell(), lut3.data_cell());
+
+        let sel = ide.exec("select_memory u_lut0").unwrap();
+        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        assert!(sel.contains("ADDR=0 DATA=1"), "{sel}");
+        assert_eq!(ide.selected_memory.as_deref(), Some("u_lut0"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "lut_init"),
+            "{:?}",
+            ide.properties
+        );
+        let word0 = ide.exec("select_memory_word 0").unwrap();
+        assert!(word0.contains("ADDR=0 DATA=1"), "{word0}");
+        let word1 = ide.exec("select_memory_word 1").unwrap();
+        assert!(word1.contains("ADDR=1 DATA=0"), "{word1}");
+        assert_eq!(ide.selected_memory_addr, Some(1));
+
+        let loc = ide.exec("locals").unwrap();
+        assert!(loc.contains('\n'), "Locals must be a table: {loc}");
+        assert!(loc.contains("NAME=led"), "{loc}");
+        assert!(loc.contains("TYPE=port"), "{loc}");
+        assert!(loc.contains("VALUE="), "{loc}");
+        assert!(
+            !loc.contains("led = "),
+            "not a name = value dump: {loc}"
+        );
+        assert!(
+            ide.local_rows()
+                .iter()
+                .any(|l| l.type_cell() == "reg" && (l.value == "0" || l.value == "1")),
+            "Locals are helion-sim FF probes: {:?}",
+            ide.local_rows()
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Locals);
+        let led_l = ide.exec("select_local led").unwrap();
+        assert!(led_l.contains("NAME=led"), "{led_l}");
+        assert_eq!(ide.selected_local.as_deref(), Some("led"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "port"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.sim_run(1).unwrap();
+        let seq1 = ide
+            .memory_rows()
+            .iter()
+            .find(|m| m.name == "seq")
+            .map(|m| m.packed_word())
+            .expect("seq after step");
+        ide.sim_run(8).unwrap();
+        let seq8 = ide
+            .memory_rows()
+            .iter()
+            .find(|m| m.name == "seq")
+            .map(|m| m.packed_word())
+            .expect("seq after 8");
+        assert_ne!(seq1, seq8, "seq memory is live helion-sim Q, not a static dump");
+
+        let bp = ide.exec("add_bp led 1").unwrap();
+        assert!(bp.contains("ID="), "{bp}");
+        assert!(bp.contains("SIGNAL=led"), "{bp}");
+        assert!(bp.contains("CONDITION===1") || bp.contains("CONDITION===1"), "{bp}");
+        assert!(bp.contains("ENABLED=1"), "{bp}");
+        let table = ide.exec("breakpoints").unwrap();
+        assert!(table.contains('\n'), "Breakpoints must be a table: {table}");
+        assert!(table.contains("SIGNAL=led"), "{table}");
+        assert_eq!(ide.workspace, WorkspaceTab::Breakpoints);
+        let hit = ide.exec("sim_run 16").unwrap();
+        assert!(hit.contains("HIT"), "value breakpoint must stop sim: {hit}");
+        assert!(hit.contains("SIGNAL=led"), "{hit}");
+        assert!(hit.contains("CYCLE=8") || hit.contains("CYCLE=8"), "{hit}");
+        assert!(
+            ide.breakpoints.iter().any(|b| b.signal == "led" && b.hits >= 1),
+            "hit count from engine: {:?}",
+            ide.breakpoints
+        );
+        let n = ide.wave.sample_len();
+        assert!(n < 16, "sim_run must stop at the breakpoint, not run to completion: n={n}");
+        let click = ide.exec("select_breakpoint 1").unwrap();
+        assert!(click.contains("SIGNAL=led"), "{click}");
+        assert_eq!(ide.selected_breakpoint, Some(1));
+        ide.exec("disable_bp 1").unwrap();
+        let full = ide.exec("sim_run 16").unwrap();
+        assert!(
+            !full.contains("HIT"),
+            "disabled breakpoint must not stop: {full}"
+        );
+        assert_eq!(ide.wave.sample_len(), 16);
+        ide.exec("enable_bp 1").unwrap();
+        let hit2 = ide.exec("sim_run 16").unwrap();
+        assert!(hit2.contains("HIT"), "{hit2}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let bmem = blinky.exec("memory").unwrap();
+        assert!(bmem.contains("NAME=u_lut"), "{bmem}");
+        assert!(!bmem.contains("NAME=u_lut0"), "blinky is not counter: {bmem}");
+        assert!(
+            blinky
+                .memory_rows()
+                .iter()
+                .any(|m| m.name == "u_lut" && m.packed_word() == 0x5555_5555_5555_5555),
+            "{:?}",
+            blinky.memory_rows()
+        );
+        let bloc = blinky.exec("locals").unwrap();
+        assert!(bloc.contains("NAME=led"), "{bloc}");
+        assert!(
+            blinky
+                .local_rows()
+                .iter()
+                .any(|l| l.name == "u_ff" && l.type_cell() == "reg"),
+            "blinky locals are u_ff, not counter u_ff0: {:?}",
+            blinky.local_rows()
+        );
+        assert!(
+            blinky.local_rows().iter().all(|l| !l.name.starts_with("u_ff0")),
+            "{:?}",
+            blinky.local_rows()
+        );
+
+        let mut hier = IdeModel::new();
+        hier.open_source(&example("hier.sv")).unwrap();
+        hier.sim_run(4).unwrap();
+        hier.exec("select_scope hier").unwrap();
+        let top_loc: Vec<String> = hier.local_rows().iter().map(|l| l.name.clone()).collect();
+        assert!(
+            hier.local_rows().iter().any(|l| l.name == "led"),
+            "top locals include LED: {top_loc:?}"
+        );
+        hier.exec("select_scope u0").unwrap();
+        let child_loc: Vec<String> = hier.local_rows().iter().map(|l| l.name.clone()).collect();
+        assert_ne!(child_loc, top_loc, "Locals filter by Scope, not a static dump");
+        assert!(
+            hier.local_rows()
+                .iter()
+                .any(|l| l.name.starts_with("u_ff") || l.name.starts_with("u0")),
+            "{child_loc:?}"
+        );
+        assert!(
+            hier.local_rows().iter().all(|l| l.name != "led"),
+            "LED stays in parent scope: {child_loc:?}"
+        );
+
+        let mut fab = IdeModel::new();
+        fab.open_source(&example("counter.sv")).unwrap();
+        fab.run_step(FlowStep::Opt).unwrap();
+        fab.run_step(FlowStep::Place).unwrap();
+        fab.run_step(FlowStep::Route).unwrap();
+        fab.run_step(FlowStep::Bitstream).unwrap();
+        let gold_wns = fab.wns_ps();
+        fab.sim_run(16).unwrap();
+        let fmem = fab.exec("memory").unwrap();
+        assert!(fmem.contains("NAME=u_lut0"), "{fmem}");
+        assert!(fmem.contains("TYPE=lut_init"), "{fmem}");
+        let flut0 = fab
+            .memory_rows()
+            .iter()
+            .find(|m| m.name == "u_lut0")
+            .expect("fabric u_lut0");
+        assert_eq!(
+            flut0.packed_word(),
+            helion_ir::INC4_INIT[0],
+            "fabric LUT INIT is programmed bitstream, not a placeholder"
+        );
+        assert!(
+            fab.memory_rows().iter().any(|m| m.name == "seq" && m.kind == "seq"),
+            "fabric sequential Q is a Memory row: {:?}",
+            fab.memory_rows()
+        );
+        let floc = fab.exec("locals").unwrap();
+        assert!(floc.contains("TYPE=reg"), "{floc}");
+        assert!(
+            fab.local_rows()
+                .iter()
+                .any(|l| l.value == "0" || l.value == "1"),
+            "fabric locals are BLE Q bits: {:?}",
+            fab.local_rows()
+        );
+        fab.exec("add_bp led 1").unwrap();
+        let fhit = fab.exec("sim_run 16").unwrap();
+        assert!(fhit.contains("HIT"), "fabric breakpoint: {fhit}");
+        assert!(fhit.contains("CYCLE=8") || fhit.contains("CYCLE=8"), "{fhit}");
+        assert_eq!(
+            fab.wns_ps(),
+            gold_wns,
+            "Memory/Breakpoints/Locals must not disturb gold WNS"
+        );
+
+        assert!(
+            ide.exec("select_memory no_such")
+                .unwrap_err()
+                .contains("no memory")
+        );
+        assert!(
+            ide.exec("add_bp no_such")
+                .unwrap_err()
+                .contains("no signal")
+        );
     }
 
     /// Fig. 49: click a clock region; Properties show name + HAD site count.
