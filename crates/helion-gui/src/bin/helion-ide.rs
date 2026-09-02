@@ -1683,32 +1683,126 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     paint_report_catalog(ui, model);
     ui.add_space(8.0);
     paint_timing_summary(ui, model);
-    if !model.timing_paths.is_empty() {
-        ui.add_space(6.0);
-        ui.label(RichText::new("Timing Paths (click → Schematic)").strong());
-        let mut pick_path = None;
-        for (i, p) in model.timing_paths.iter().enumerate() {
-            let on = model.selected_timing_path == Some(i);
-            if ui
-                .selectable_label(
-                    on,
-                    format!(
-                        "{}  {}→{}  slack_ps={} cells={}",
-                        p.name,
-                        p.startpoint,
-                        p.endpoint,
-                        p.slack_ps,
-                        p.cells.len()
-                    ),
-                )
-                .clicked()
-            {
-                pick_path = Some(i);
+    ui.add_space(8.0);
+    paint_timing_paths(ui, model);
+}
+
+fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.label(
+        RichText::new(
+            "Timing Paths (report_timing) — UG903 pin-delay table (Name / Type / Incr_ps / Path_ps)",
+        )
+        .strong(),
+    );
+    ui.weak("STA arcs from helion-sta, not a selectable path-name list.");
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report timing").clicked() {
+            let _ = model.exec("report_timing");
+        }
+        if ui.button("Show in Schematic").clicked() {
+            let spec = model
+                .selected_timing_path
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "0".into());
+            let _ = model.exec(&format!("select_timing_path {spec}"));
+        }
+    });
+    if model.timing_paths.is_empty() {
+        ui.label("no timing paths — report_timing / Route");
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Path Summary").strong());
+    let mut pick_path = None;
+    let selected_path = model.selected_timing_path;
+    egui::Grid::new("timing_path_summary")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Name").strong());
+            ui.label(RichText::new("From").strong());
+            ui.label(RichText::new("To").strong());
+            ui.label(RichText::new("Slack_ps").strong());
+            ui.label(RichText::new("Delay_ps").strong());
+            ui.label(RichText::new("Logic_ps").strong());
+            ui.label(RichText::new("Net_ps").strong());
+            ui.label(RichText::new("Pins").strong());
+            ui.end_row();
+            for (i, p) in model.timing_paths.iter().enumerate() {
+                let on = selected_path == Some(i);
+                if ui.selectable_label(on, &p.name).clicked() {
+                    pick_path = Some(i);
+                }
+                ui.label(&p.startpoint);
+                ui.label(&p.endpoint);
+                ui.label(p.slack_ps.to_string());
+                ui.label(p.delay_ps.to_string());
+                ui.label(p.logic_ps().to_string());
+                ui.label(p.net_ps().to_string());
+                ui.label(p.pins.len().to_string());
+                ui.end_row();
             }
-        }
-        if let Some(i) = pick_path {
-            let _ = model.select_timing_path(&i.to_string());
-        }
+        });
+    if let Some(i) = pick_path {
+        let _ = model.select_timing_path_report(&i.to_string());
+    }
+    let path = model
+        .selected_timing_path
+        .and_then(|i| model.timing_paths.get(i))
+        .or_else(|| model.timing_paths.first())
+        .cloned();
+    let Some(path) = path else {
+        return;
+    };
+    ui.add_space(6.0);
+    ui.label(RichText::new("Pin Delay").strong());
+    ui.label(format!(
+        "{}  slack_ps={} delay_ps={} logic_ps={} net_ps={}",
+        path.name,
+        path.slack_ps,
+        path.delay_ps,
+        path.logic_ps(),
+        path.net_ps()
+    ));
+    let selected_pin = model.selected_timing_pin.clone();
+    let mut pick_pin: Option<String> = None;
+    egui::ScrollArea::both().max_height(280.0).show(ui, |ui| {
+        egui::Grid::new("timing_pin_delay")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("Type").strong());
+                ui.label(RichText::new("Incr_ps").strong());
+                ui.label(RichText::new("Path_ps").strong());
+                ui.label(RichText::new("Net").strong());
+                ui.label(RichText::new("Fanout").strong());
+                ui.label(RichText::new("Location").strong());
+                ui.end_row();
+                for pin in &path.pins {
+                    let on = selected_pin.as_deref() == Some(pin.pin.as_str());
+                    if ui.selectable_label(on, &pin.pin).clicked() {
+                        pick_pin = Some(pin.pin.clone());
+                    }
+                    ui.label(&pin.delay_type);
+                    ui.label(pin.incr_ps.to_string());
+                    ui.label(pin.path_ps.to_string());
+                    ui.label(if pin.net.is_empty() {
+                        "-"
+                    } else {
+                        pin.net.as_str()
+                    });
+                    ui.label(pin.fanout.to_string());
+                    ui.label(if pin.location.is_empty() {
+                        "-"
+                    } else {
+                        pin.location.as_str()
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+    if let Some(pin) = pick_pin {
+        let _ = model.select_timing_pin(&pin);
     }
 }
 
