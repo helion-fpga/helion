@@ -3508,34 +3508,78 @@ fn paint_trace_shape(
     let _ = ns;
 }
 
+fn hw_stat_bit_color(name: &str, value: bool) -> Color32 {
+    if !value {
+        return Color32::from_rgb(0x6a, 0x74, 0x7e);
+    }
+    match name {
+        "CRC_ERR" => Color32::from_rgb(0xe0, 0x50, 0x50),
+        "GTS" | "GSR" => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        _ => Color32::from_rgb(0x3d, 0xb8, 0x7a),
+    }
+}
+
 fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hardware Manager");
-    ui.monospace(format!(
-        "target={} open={} programmed={}",
-        model.hw.target, model.hw.open, model.hw.programmed
-    ));
-    if ui.button("Open Hardware Manager").clicked() {
-        let _ = model.exec("open_hw_manager");
-    }
-    if ui.button("Program Device (sim)").clicked() {
-        let _ = model.exec("program_hw");
-    }
-    if let Some(st) = &model.hw.stat {
-        ui.monospace(format!(
-            "STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-            st.init as u8,
-            st.done as u8,
-            st.eos as u8,
-            st.gwe as u8,
-            st.gsr as u8,
-            st.gts as u8,
-            st.crc_err as u8
+    ui.weak(
+        "UG893 Hardware Manager / UG900 debug — helion-hw TAP STAT bits + ILA samples, not a one-liner",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Open Hardware Manager").clicked() {
+            let _ = model.exec("open_hw_manager");
+        }
+        if ui.button("Program Device (sim)").clicked() {
+            let _ = model.exec("program_hw");
+        }
+        if ui.button("Refresh STAT").clicked() {
+            let _ = model.exec("report_hw_stat");
+        }
+    });
+    let report = model.hw_stat_report();
+    if !report.open {
+        ui.label("no hardware — open_hw_manager");
+    } else {
+        ui.label(format!(
+            "target={} part={} idcode={:#010x} ir={:#04x} programmed={} word={}",
+            report.target,
+            report.part,
+            report.idcode,
+            report.ir,
+            u8::from(report.programmed),
+            report.word_hex()
         ));
+        let selected = model.selected.clone();
+        let mut pick: Option<String> = None;
+        egui::Grid::new("hw_stat_table")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Bit").strong());
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("Value").strong());
+                ui.label(RichText::new("Description").strong());
+                ui.end_row();
+                for b in &report.bits {
+                    let on = selected.as_deref() == Some(b.name.as_str());
+                    let fill = hw_stat_bit_color(&b.name, b.value);
+                    ui.monospace(b.bit.to_string());
+                    let btn = egui::Button::new(RichText::new(&b.name).color(Color32::BLACK))
+                        .fill(fill)
+                        .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some(b.name.clone());
+                    }
+                    ui.label(if b.value { "1" } else { "0" });
+                    ui.label(&b.description);
+                    ui.end_row();
+                }
+            });
+        if let Some(name) = pick {
+            let _ = model.select_hw_stat(&name);
+        }
     }
     ui.separator();
     ui.label(RichText::new("ILA Dashboard").strong());
     ui.weak("UG900 — trigger/window on helion-debug capture, samples on Wave");
-    ui.monospace(model.ila_dashboard_text());
     ui.horizontal(|ui| {
         if ui
             .selectable_label(model.ila.trigger == IlaTrigger::Rising, "Rising")
@@ -3565,14 +3609,51 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("ila_arm cnt_3");
         }
     });
-    let tname = format!("ila:{}", model.ila.net);
-    if let Some(t) = model.wave.trace(&tname) {
-        ui.weak(format!(
-            "wave {}  cursor={}  value={}",
-            t.name,
-            model.wave.cursor,
-            t.value_at(model.wave.cursor)
+    let samples = model.ila_sample_rows();
+    if samples.is_empty() {
+        ui.weak("no capture — Arm / Capture a marked net");
+    } else {
+        ui.label(format!(
+            "probe={} window={} trigger={} trigger_at={}",
+            if model.ila.net.is_empty() {
+                "-"
+            } else {
+                model.ila.net.as_str()
+            },
+            model.ila.window,
+            model.ila.trigger.tcl(),
+            model
+                .ila
+                .trigger_at
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into())
         ));
+        let cursor = model.wave.cursor;
+        let mut pick_s: Option<usize> = None;
+        egui::ScrollArea::both().max_height(220.0).show(ui, |ui| {
+            egui::Grid::new("ila_sample_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Sample").strong());
+                    ui.label(RichText::new("Time_ps").strong());
+                    ui.label(RichText::new("Value").strong());
+                    ui.label(RichText::new("Marker").strong());
+                    ui.end_row();
+                    for r in &samples {
+                        let on = cursor == r.sample;
+                        if ui.selectable_label(on, r.sample.to_string()).clicked() {
+                            pick_s = Some(r.sample);
+                        }
+                        ui.label(r.time_ps.to_string());
+                        ui.label(r.value.to_string());
+                        ui.label(if r.trigger { "TRIGGER" } else { "-" });
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some(i) = pick_s {
+            let _ = model.select_ila_sample(&i.to_string());
+        }
     }
 }
 

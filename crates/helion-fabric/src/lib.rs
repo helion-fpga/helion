@@ -4,7 +4,17 @@ use helion_bits::Bitstream;
 use helion_device::{Device, Far};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
+/// One bit of the Helion STAT TAP DR (`IR_STAT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatBit {
+    pub bit: u8,
+    pub name: &'static str,
+    pub value: bool,
+    pub description: &'static str,
+}
+
+/// Fabric status register (startup SM + CRC). Packed as a 32-bit TAP DR.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stat {
     pub init: bool,
     pub done: bool,
@@ -16,6 +26,21 @@ pub struct Stat {
 }
 
 impl Stat {
+    pub const BIT_CRC_ERR: u8 = 0;
+    pub const BIT_INIT: u8 = 1;
+    pub const BIT_GTS: u8 = 2;
+    pub const BIT_GSR: u8 = 3;
+    pub const BIT_GWE: u8 = 4;
+    pub const BIT_DONE: u8 = 5;
+    pub const BIT_EOS: u8 = 6;
+    /// Unconfigured: GTS and GSR asserted.
+    pub const RESET_WORD: u32 = (1 << Self::BIT_GTS) | (1 << Self::BIT_GSR);
+    /// After `finish_startup`: INIT | GWE | DONE | EOS.
+    pub const STARTUP_WORD: u32 = (1 << Self::BIT_INIT)
+        | (1 << Self::BIT_GWE)
+        | (1 << Self::BIT_DONE)
+        | (1 << Self::BIT_EOS);
+
     fn reset() -> Self {
         Self {
             init: false,
@@ -26,6 +51,64 @@ impl Stat {
             gsr: true,
             gts: true,
         }
+    }
+
+    /// Helion STAT TAP DR word (bit 0 = CRC_ERR … bit 6 = EOS).
+    pub fn word(&self) -> u32 {
+        (u32::from(self.crc_err) << Self::BIT_CRC_ERR)
+            | (u32::from(self.init) << Self::BIT_INIT)
+            | (u32::from(self.gts) << Self::BIT_GTS)
+            | (u32::from(self.gsr) << Self::BIT_GSR)
+            | (u32::from(self.gwe) << Self::BIT_GWE)
+            | (u32::from(self.done) << Self::BIT_DONE)
+            | (u32::from(self.eos) << Self::BIT_EOS)
+    }
+
+    pub fn bits(&self) -> [StatBit; 7] {
+        [
+            StatBit {
+                bit: Self::BIT_CRC_ERR,
+                name: "CRC_ERR",
+                value: self.crc_err,
+                description: "configuration CRC error",
+            },
+            StatBit {
+                bit: Self::BIT_INIT,
+                name: "INIT",
+                value: self.init,
+                description: "INIT complete",
+            },
+            StatBit {
+                bit: Self::BIT_GTS,
+                name: "GTS",
+                value: self.gts,
+                description: "global tri-state (I/O held)",
+            },
+            StatBit {
+                bit: Self::BIT_GSR,
+                name: "GSR",
+                value: self.gsr,
+                description: "global set/reset (FFs held)",
+            },
+            StatBit {
+                bit: Self::BIT_GWE,
+                name: "GWE",
+                value: self.gwe,
+                description: "global write enable",
+            },
+            StatBit {
+                bit: Self::BIT_DONE,
+                name: "DONE",
+                value: self.done,
+                description: "configuration done",
+            },
+            StatBit {
+                bit: Self::BIT_EOS,
+                name: "EOS",
+                value: self.eos,
+                description: "end of startup",
+            },
+        ]
     }
 }
 
@@ -431,6 +514,15 @@ mod tests {
         assert!(!fab.stat.gsr, "GSR");
         assert!(!fab.stat.gts, "GTS");
         assert!(!fab.stat.crc_err, "CRC_ERR");
+        assert_eq!(fab.stat.word(), Stat::STARTUP_WORD);
+        let names: Vec<_> = fab.stat.bits().iter().map(|b| b.name).collect();
+        assert_eq!(
+            names,
+            ["CRC_ERR", "INIT", "GTS", "GSR", "GWE", "DONE", "EOS"]
+        );
+        let reset = Fabric::new(&dev).stat;
+        assert_eq!(reset.word(), Stat::RESET_WORD);
+        assert_ne!(reset.word(), fab.stat.word(), "startup flips GTS/GSR → DONE");
     }
 
     #[test]

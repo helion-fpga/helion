@@ -8,7 +8,7 @@ pub mod ide;
 pub use ide::{
     BdAddrEntry, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
-    HwManager, IdeMessage,
+    HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, LayoutKind, MsgSeverity, NavAction, NavSection,
     ConstraintRow, ConstraintSection,
     Pblock,

@@ -11,7 +11,7 @@ use helion_bd::{emit_sv, validate, BlockDesign};
 use helion_debug::{insert_arm_capture, IlaCapture};
 use helion_device::{Device, Far, SiteKind};
 use helion_drc::{check_placed, check_routed, Drc};
-use helion_fabric::{Fabric, Stat};
+use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_ipxact::{pack_gpio, pack_uart, IpCore};
 use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
@@ -475,6 +475,10 @@ impl NavSection {
                 NavAction {
                     label: "Open Hardware Manager",
                     tcl: "open_hw_manager",
+                },
+                NavAction {
+                    label: "Hardware STAT",
+                    tcl: "report_hw_stat",
                 },
             ],
         }
@@ -2052,6 +2056,8 @@ pub struct HwManager {
     pub programmed: bool,
     pub target: String,
     pub stat: Option<Stat>,
+    pub idcode: Option<u32>,
+    pub ir: Option<u8>,
 }
 
 impl Default for HwManager {
@@ -2061,8 +2067,118 @@ impl Default for HwManager {
             programmed: false,
             target: "sim".into(),
             stat: None,
+            idcode: None,
+            ir: None,
         }
     }
+}
+
+/// One clickable STAT bit in the UG893 Hardware Manager (helion-hw TAP DR, not a one-liner).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HwStatRow {
+    pub bit: u8,
+    pub name: String,
+    pub value: bool,
+    pub description: String,
+}
+
+impl HwStatRow {
+    fn from_bit(b: StatBit) -> Self {
+        Self {
+            bit: b.bit,
+            name: b.name.into(),
+            value: b.value,
+            description: b.description.into(),
+        }
+    }
+}
+
+/// Helion-hw/fabric status-register pane: TAP IDCODE + STAT bits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HwStatReport {
+    pub open: bool,
+    pub programmed: bool,
+    pub target: String,
+    pub part: String,
+    pub idcode: u32,
+    pub ir: u8,
+    pub word: u32,
+    pub bits: Vec<HwStatRow>,
+}
+
+impl HwStatReport {
+    fn closed() -> Self {
+        Self {
+            open: false,
+            programmed: false,
+            target: "sim".into(),
+            part: String::new(),
+            idcode: 0,
+            ir: 0,
+            word: 0,
+            bits: Vec::new(),
+        }
+    }
+
+    pub fn bit(&self, spec: &str) -> Option<&HwStatRow> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return self
+                .bits
+                .iter()
+                .find(|b| b.name == "DONE")
+                .or(self.bits.first());
+        }
+        if let Ok(i) = spec.parse::<u8>() {
+            if let Some(b) = self.bits.iter().find(|b| b.bit == i) {
+                return Some(b);
+            }
+            if let Some(b) = self.bits.get(i as usize) {
+                return Some(b);
+            }
+        }
+        self.bits
+            .iter()
+            .find(|b| b.name.eq_ignore_ascii_case(spec))
+    }
+
+    pub fn word_hex(&self) -> String {
+        format!("{:#010x}", self.word)
+    }
+
+    pub fn text(&self) -> String {
+        if !self.open {
+            return "no hardware — open_hw_manager".into();
+        }
+        let mut s = format!(
+            "hw_stat target={} part={} idcode={:#010x} ir={:#04x} programmed={} word={}",
+            self.target,
+            self.part,
+            self.idcode,
+            self.ir,
+            u8::from(self.programmed),
+            self.word_hex()
+        );
+        for b in &self.bits {
+            s.push_str(&format!(
+                "\nBIT={} NAME={} VALUE={} DESC={}",
+                b.bit,
+                b.name,
+                u8::from(b.value),
+                b.description
+            ));
+        }
+        s
+    }
+}
+
+/// One ILA capture sample (fabric bit at the armed net, not a lamp).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IlaSampleRow {
+    pub sample: usize,
+    pub time_ps: u64,
+    pub value: char,
+    pub trigger: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3180,6 +3296,28 @@ impl IdeModel {
         } else if t == "ila_dashboard" {
             self.workspace = WorkspaceTab::Hardware;
             Ok(self.ila_dashboard_text())
+        } else if t == "open_hw_manager" {
+            let r = tcl_eval(&mut self.shell, t);
+            self.workspace = WorkspaceTab::Hardware;
+            r
+        } else if t == "program_hw" || t == "program_hw_devices" {
+            let r = tcl_eval(&mut self.shell, t);
+            self.hw.stat = None;
+            self.workspace = WorkspaceTab::Hardware;
+            r
+        } else if t == "report_hw" || t == "hw_stat" || t == "report_hw_stat" {
+            self.shell.session.open_hw_manager();
+            self.hw.open = true;
+            self.workspace = WorkspaceTab::Hardware;
+            Ok(self.hw_stat_text())
+        } else if let Some(spec) = t.strip_prefix("select_hw_stat ") {
+            self.select_hw_stat(spec.trim())
+        } else if t == "select_hw_stat" {
+            self.select_hw_stat("")
+        } else if let Some(spec) = t.strip_prefix("select_ila_sample ") {
+            self.select_ila_sample(spec.trim())
+        } else if t == "select_ila_sample" {
+            self.select_ila_sample("0")
         } else if let Some(rest) = t.strip_prefix("ila_trigger ") {
             self.set_ila_trigger(rest)
         } else if let Some(rest) = t.strip_prefix("ila_window ") {
@@ -7738,7 +7876,7 @@ impl IdeModel {
         } else {
             self.ila.bits.len()
         };
-        format!(
+        let mut s = format!(
             "ila dashboard net={} window={} trigger={} armed={} captured={} trigger_at={} bits={}",
             if self.ila.net.is_empty() {
                 "-"
@@ -7755,7 +7893,164 @@ impl IdeModel {
             } else {
                 self.ila.bits.as_str()
             }
-        )
+        );
+        for r in self.ila_sample_rows() {
+            s.push_str(&format!(
+                "\n{} SAMPLE={} TIME_PS={} VALUE={} MARKER={}",
+                r.sample,
+                r.sample,
+                r.time_ps,
+                r.value,
+                if r.trigger { "TRIGGER" } else { "-" }
+            ));
+        }
+        s
+    }
+
+    /// UG900 ILA dashboard rows: each fabric sample of the armed net.
+    pub fn ila_sample_rows(&self) -> Vec<IlaSampleRow> {
+        let ts = self.wave.timescale_ps.max(1);
+        self.ila
+            .bits
+            .chars()
+            .enumerate()
+            .map(|(i, value)| IlaSampleRow {
+                sample: i,
+                time_ps: i as u64 * ts,
+                value,
+                trigger: self.ila.trigger_at == Some(i),
+            })
+            .collect()
+    }
+
+    pub fn select_ila_sample(&mut self, spec: &str) -> Result<String, String> {
+        let rows = self.ila_sample_rows();
+        if rows.is_empty() {
+            return Err("select_ila_sample: no capture".into());
+        }
+        let spec = spec.trim();
+        let i: usize = if spec.is_empty() {
+            0
+        } else {
+            spec.parse()
+                .map_err(|_| format!("select_ila_sample: bad sample {spec}"))?
+        };
+        let row = rows
+            .get(i)
+            .ok_or_else(|| format!("select_ila_sample: no sample {spec}"))?;
+        self.wave.set_cursor(row.sample);
+        self.workspace = WorkspaceTab::Hardware;
+        self.selected = Some(format!("ila:{}", self.ila.net));
+        self.properties = vec![
+            ("NAME".into(), format!("ila:{}", self.ila.net)),
+            ("TYPE".into(), "ila_sample".into()),
+            ("SAMPLE".into(), row.sample.to_string()),
+            ("TIME_PS".into(), row.time_ps.to_string()),
+            ("VALUE".into(), row.value.to_string()),
+            ("TRIGGER".into(), u8::from(row.trigger).to_string()),
+            ("NET".into(), self.ila.net.clone()),
+        ];
+        Ok(format!(
+            "ila_sample SAMPLE={} TIME_PS={} VALUE={} MARKER={}",
+            row.sample,
+            row.time_ps,
+            row.value,
+            if row.trigger { "TRIGGER" } else { "-" }
+        ))
+    }
+
+    /// UG893 Hardware Manager STAT table from helion-hw TAP / fabric Stat.
+    pub fn hw_stat_report(&self) -> HwStatReport {
+        let open = self.hw.open || self.shell.session.hw_open;
+        if !open {
+            return HwStatReport::closed();
+        }
+        let Ok(dev) = self.device() else {
+            return HwStatReport::closed();
+        };
+        let programmed = self.hw.programmed || self.shell.session.programmed;
+        let (idcode, ir, stat) = if programmed {
+            if let Some(st) = &self.hw.stat {
+                if st.done {
+                    (
+                        self.hw.idcode.unwrap_or(dev.idcode),
+                        self.hw.ir.unwrap_or(helion_hw::IR_STAT),
+                        st.clone(),
+                    )
+                } else {
+                    self.programmed_stat(&dev)
+                        .unwrap_or_else(|| self.tap_stat(&dev))
+                }
+            } else {
+                self.programmed_stat(&dev)
+                    .unwrap_or_else(|| self.tap_stat(&dev))
+            }
+        } else {
+            self.tap_stat(&dev)
+        };
+        HwStatReport {
+            open: true,
+            programmed,
+            target: self.hw.target.clone(),
+            part: self.part().to_string(),
+            idcode,
+            ir,
+            word: stat.word(),
+            bits: stat.bits().into_iter().map(HwStatRow::from_bit).collect(),
+        }
+    }
+
+    pub fn hw_stat_text(&self) -> String {
+        self.hw_stat_report().text()
+    }
+
+    fn tap_stat(&self, dev: &helion_device::Device) -> (u32, u8, Stat) {
+        let mut tap = helion_hw::Tap::new(dev);
+        let idcode = tap.read_idcode();
+        let st = tap.read_stat();
+        (idcode, tap.ir, st)
+    }
+
+    fn programmed_stat(&self, dev: &helion_device::Device) -> Option<(u32, u8, Stat)> {
+        let bits = self.shell.session.bitstream.as_ref()?;
+        let st = helion_hw::prog_sim(dev, bits).ok()?;
+        Some((dev.idcode, helion_hw::IR_STAT, st))
+    }
+
+    /// Click a STAT bit: properties + Hardware workspace.
+    pub fn select_hw_stat(&mut self, spec: &str) -> Result<String, String> {
+        if !self.hw.open {
+            self.shell.session.open_hw_manager();
+            self.hw.open = true;
+        }
+        let report = self.hw_stat_report();
+        if report.bits.is_empty() {
+            return Err("select_hw_stat: open_hw_manager first".into());
+        }
+        let row = report
+            .bit(spec)
+            .cloned()
+            .ok_or_else(|| format!("select_hw_stat: no bit {spec}"))?;
+        self.selected = Some(row.name.clone());
+        self.workspace = WorkspaceTab::Hardware;
+        self.properties = vec![
+            ("NAME".into(), row.name.clone()),
+            ("TYPE".into(), "hw_stat".into()),
+            ("BIT".into(), row.bit.to_string()),
+            ("VALUE".into(), u8::from(row.value).to_string()),
+            ("DESC".into(), row.description.clone()),
+            ("WORD".into(), report.word_hex()),
+            ("IDCODE".into(), format!("{:#010x}", report.idcode)),
+            ("IR".into(), format!("{:#04x}", report.ir)),
+            ("PROGRAMMED".into(), u8::from(report.programmed).to_string()),
+        ];
+        Ok(format!(
+            "hw_stat BIT={} NAME={} VALUE={} WORD={}",
+            row.bit,
+            row.name,
+            u8::from(row.value),
+            report.word_hex()
+        ))
     }
 
     pub fn set_ila_trigger(&mut self, spec: &str) -> Result<String, String> {
@@ -8684,6 +8979,44 @@ impl IdeModel {
                 props.push(("HASH".into(), format!("{:#010x}", report.hash)));
             }
         }
+        if self.workspace == WorkspaceTab::Hardware {
+            let report = self.hw_stat_report();
+            if let Some(row) = report.bit(&id).cloned() {
+                props.retain(|(k, _)| k != "TYPE" && k != "NAME");
+                props.insert(0, ("NAME".into(), row.name.clone()));
+                props.insert(1, ("TYPE".into(), "hw_stat".into()));
+                props.push(("BIT".into(), row.bit.to_string()));
+                props.push(("VALUE".into(), u8::from(row.value).to_string()));
+                props.push(("DESC".into(), row.description));
+                props.push(("WORD".into(), report.word_hex()));
+                props.push(("IDCODE".into(), format!("{:#010x}", report.idcode)));
+                props.push(("IR".into(), format!("{:#04x}", report.ir)));
+                props.push((
+                    "PROGRAMMED".into(),
+                    u8::from(report.programmed).to_string(),
+                ));
+            }
+            if let Some(net) = id.strip_prefix("ila:") {
+                if net == self.ila.net {
+                    if let Some(row) = self
+                        .ila_sample_rows()
+                        .into_iter()
+                        .find(|r| r.sample == self.wave.cursor)
+                    {
+                        if !props.iter().any(|(k, _)| k == "TYPE") {
+                            props.retain(|(k, _)| k != "NAME");
+                            props.insert(0, ("NAME".into(), id.clone()));
+                            props.insert(1, ("TYPE".into(), "ila_sample".into()));
+                        }
+                        props.push(("SAMPLE".into(), row.sample.to_string()));
+                        props.push(("TIME_PS".into(), row.time_ps.to_string()));
+                        props.push(("VALUE".into(), row.value.to_string()));
+                        props.push(("TRIGGER".into(), u8::from(row.trigger).to_string()));
+                        props.push(("NET".into(), self.ila.net.clone()));
+                    }
+                }
+            }
+        }
         if self.workspace == WorkspaceTab::Constraints {
             if let Some(row) = self.constraint_rows().into_iter().find(|r| r.id == id) {
                 let from = if row.from.is_empty() {
@@ -8714,15 +9047,28 @@ impl IdeModel {
     fn refresh_hw(&mut self) {
         self.hw.open = self.shell.session.hw_open;
         self.hw.programmed = self.shell.session.programmed;
-        if self.hw.programmed && self.hw.stat.is_none() {
-            if let (Ok(dev), Some(bits)) = (
-                self.device(),
-                self.shell.session.bitstream.as_ref(),
-            ) {
-                if let Ok(st) = helion_hw::prog_sim(&dev, bits) {
-                    self.hw.stat = Some(st);
+        let Ok(dev) = self.device() else {
+            return;
+        };
+        if !self.hw.open {
+            return;
+        }
+        if self.hw.programmed {
+            let stale = self.hw.stat.as_ref().map(|s| !s.done).unwrap_or(true);
+            if stale {
+                if let Some(bits) = self.shell.session.bitstream.as_ref() {
+                    if let Ok(st) = helion_hw::prog_sim(&dev, bits) {
+                        self.hw.stat = Some(st);
+                        self.hw.idcode = Some(dev.idcode);
+                        self.hw.ir = Some(helion_hw::IR_STAT);
+                    }
                 }
             }
+        } else {
+            let mut tap = helion_hw::Tap::new(&dev);
+            self.hw.idcode = Some(tap.read_idcode());
+            self.hw.stat = Some(tap.read_stat());
+            self.hw.ir = Some(tap.ir);
         }
     }
 
@@ -15007,6 +15353,177 @@ mod tests {
             ide.wns_ps(),
             Some(wns_route),
             "empty XDC gold WNS must hold after FAR table"
+        );
+    }
+
+    /// Hardware Manager STAT is a helion-hw TAP / fabric status-register table, not a one-liner.
+    #[test]
+    fn hardware_manager_stat_table_from_fabric_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let idle = ide.hw_stat_text();
+        assert!(
+            idle.contains("no hardware"),
+            "idle Hardware Manager has no canned STAT bits: {idle}"
+        );
+        assert!(ide.hw_stat_report().bits.is_empty());
+        assert!(
+            NavSection::ProgramDebug
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "open_hw_manager"),
+            "Flow Navigator Program and Debug must offer open_hw_manager"
+        );
+        assert!(
+            NavSection::ProgramDebug
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_hw_stat"),
+            "Flow Navigator Program and Debug must offer report_hw_stat"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns_route = ide.wns_ps().expect("STA after route");
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        assert_eq!(ide.wns_ps(), Some(wns_route), "bitgen must not move gold WNS");
+
+        let open = ide.exec("open_hw_manager").unwrap();
+        assert!(open.contains("sim"), "{open}");
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        assert!(ide.hw.open);
+        assert!(!ide.hw.programmed);
+
+        let table = ide.exec("report_hw_stat").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        let reset = ide.hw_stat_report();
+        assert!(reset.open);
+        assert!(!reset.programmed);
+        assert_eq!(reset.word, Stat::RESET_WORD);
+        assert_eq!(reset.idcode, ide.device().unwrap().idcode);
+        assert_eq!(reset.ir, helion_hw::IR_STAT);
+        assert_eq!(reset.bits.len(), 7);
+        let gsr = reset.bit("GSR").expect("GSR row");
+        let gts = reset.bit("GTS").expect("GTS row");
+        let done = reset.bit("DONE").expect("DONE row");
+        assert!(gsr.value && gts.value, "unconfigured holds GSR/GTS: {table}");
+        assert!(!done.value && !reset.bit("INIT").unwrap().value);
+        assert!(!reset.bit("GWE").unwrap().value);
+        assert!(!reset.bit("EOS").unwrap().value);
+        assert!(!reset.bit("CRC_ERR").unwrap().value);
+        assert!(table.contains("BIT="), "pane is a STAT bit table: {table}");
+        assert!(table.contains("NAME=GSR"), "{table}");
+        assert!(table.contains("NAME=DONE"), "{table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
+        let sel = ide.exec("select_hw_stat GSR").unwrap();
+        assert!(sel.contains("NAME=GSR"), "{sel}");
+        assert!(sel.contains("VALUE=1"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "hw_stat"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "VALUE" && v == "1"),
+            "{:?}",
+            ide.properties
+        );
+
+        let prog = ide.exec("program_hw").unwrap();
+        assert!(prog.contains("DONE=1"), "{prog}");
+        assert!(ide.hw.programmed);
+        let started = ide.hw_stat_report();
+        assert_eq!(started.word, Stat::STARTUP_WORD);
+        assert_ne!(
+            started.word, reset.word,
+            "program flips GTS/GSR → DONE/GWE: reset={:#x} startup={:#x}",
+            reset.word, started.word
+        );
+        assert!(started.bit("DONE").unwrap().value);
+        assert!(started.bit("INIT").unwrap().value);
+        assert!(started.bit("GWE").unwrap().value);
+        assert!(started.bit("EOS").unwrap().value);
+        assert!(!started.bit("GSR").unwrap().value);
+        assert!(!started.bit("GTS").unwrap().value);
+        assert!(!started.bit("CRC_ERR").unwrap().value);
+        let by_bit = ide.exec("select_hw_stat 5").unwrap();
+        assert!(by_bit.contains("NAME=DONE"), "{by_bit}");
+        assert!(by_bit.contains("VALUE=1"), "{by_bit}");
+        assert_eq!(started.bit("5").map(|b| b.name.as_str()), Some("DONE"));
+        let engine = ide.hw.stat.as_ref().expect("cached fabric STAT");
+        assert_eq!(engine.word(), started.word);
+        for (row, bit) in started.bits.iter().zip(engine.bits()) {
+            assert_eq!(row.bit, bit.bit);
+            assert_eq!(row.name, bit.name);
+            assert_eq!(row.value, bit.value);
+        }
+
+        ide.exec("ila_window 8").unwrap();
+        ide.exec("ila_trigger rising").unwrap();
+        ide.exec("ila_arm cnt_3").unwrap();
+        let samples = ide.ila_sample_rows();
+        assert_eq!(samples.len(), ide.ila.bits.len());
+        assert_eq!(samples.len(), 8);
+        for (i, row) in samples.iter().enumerate() {
+            assert_eq!(row.sample, i);
+            assert_eq!(row.value, ide.ila.bits.chars().nth(i).unwrap());
+            assert_eq!(row.trigger, ide.ila.trigger_at == Some(i));
+            assert_eq!(row.time_ps, i as u64 * ide.wave.timescale_ps.max(1));
+        }
+        let dash = ide.exec("ila_dashboard").unwrap();
+        assert!(dash.contains("SAMPLE="), "ILA is a sample table: {dash}");
+        assert!(dash.contains(&format!("bits={}", ide.ila.bits)), "{dash}");
+        let trig = samples.iter().find(|r| r.trigger);
+        if let Some(t) = trig {
+            let hit = ide.exec(&format!("select_ila_sample {}", t.sample)).unwrap();
+            assert!(hit.contains("MARKER=TRIGGER"), "{hit}");
+            assert_eq!(ide.wave.cursor, t.sample);
+            assert!(
+                ide.properties
+                    .iter()
+                    .any(|(k, v)| k == "TYPE" && v == "ila_sample"),
+                "{:?}",
+                ide.properties
+            );
+        }
+
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns_route),
+            "STAT table must not move gold WNS"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        blinky.run_step(FlowStep::Bitstream).unwrap();
+        blinky.exec("open_hw_manager").unwrap();
+        blinky.exec("program_hw").unwrap();
+        let br = blinky.hw_stat_report();
+        assert_eq!(br.word, Stat::STARTUP_WORD);
+        assert_eq!(br.idcode, started.idcode);
+        blinky.exec("ila_window 8").unwrap();
+        blinky.exec("ila_arm led").unwrap();
+        assert_eq!(blinky.ila.net, "led");
+        assert_ne!(blinky.ila.net, ide.ila.net);
+        assert_ne!(
+            blinky.ila.bits, ide.ila.bits,
+            "ILA sample table is per-design fabric, not a dump"
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns_route),
+            "empty XDC gold WNS must hold after Hardware Manager STAT"
         );
     }
 }
