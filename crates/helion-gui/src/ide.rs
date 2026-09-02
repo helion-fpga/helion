@@ -431,6 +431,10 @@ impl NavSection {
             ],
             NavSection::TimingAnalysis => &[
                 NavAction {
+                    label: "Timing Constraints",
+                    tcl: "timing_constraints",
+                },
+                NavAction {
                     label: "Report Timing",
                     tcl: "report_timing",
                 },
@@ -535,6 +539,72 @@ pub struct IdeMessage {
     pub severity: MsgSeverity,
     pub id: String,
     pub text: String,
+}
+
+/// UG893 Timing Constraints Editor folder (clocks / I/O delay / exceptions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintSection {
+    Clocks,
+    IoDelay,
+    Exception,
+}
+
+impl ConstraintSection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clocks => "clocks",
+            Self::IoDelay => "io_delay",
+            Self::Exception => "exception",
+        }
+    }
+}
+
+/// One clickable row in the UG893 Timing Constraints pane (not a concatenated dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstraintRow {
+    pub id: String,
+    pub section: ConstraintSection,
+    pub kind: String,
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+fn constraint_from_to(s: &str) -> (String, String) {
+    fn obj(after: &str) -> String {
+        after
+            .split([' ', '\t', '[', ']', '{', '}'])
+            .map(str::trim)
+            .find(|t| {
+                !t.is_empty()
+                    && !t.starts_with('-')
+                    && !t.eq_ignore_ascii_case("get_ports")
+                    && !t.eq_ignore_ascii_case("get_pins")
+                    && !t.eq_ignore_ascii_case("get_clocks")
+                    && !t.eq_ignore_ascii_case("get_cells")
+                    && !t.eq_ignore_ascii_case("get_nets")
+            })
+            .unwrap_or("")
+            .trim_matches(|c: char| matches!(c, '[' | ']' | '{' | '}' | '"' | '\''))
+            .to_string()
+    }
+    let from = s
+        .split_once("-from")
+        .map(|(_, r)| obj(r))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let to = s
+        .split_once("-to")
+        .map(|(_, r)| obj(r))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    if from.is_empty() && to.is_empty() {
+        (s.trim().to_string(), String::new())
+    } else {
+        (from, to)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2817,6 +2887,11 @@ impl IdeModel {
             self.select_drc(id.trim())
         } else if let Some(res) = t.strip_prefix("select_utilization ") {
             self.select_utilization(res.trim())
+        } else if t == "timing_constraints" || t == "report_timing_constraints" {
+            self.workspace = WorkspaceTab::Constraints;
+            Ok(self.constraints_table_text())
+        } else if let Some(id) = t.strip_prefix("select_constraint ") {
+            self.select_constraint(id.trim())
         } else if t == "create_clock" || t.starts_with("create_clock ") {
             self.apply_create_clock(t)
         } else if t == "create_generated_clock" || t.starts_with("create_generated_clock ") {
@@ -5825,40 +5900,555 @@ impl IdeModel {
         ))
     }
 
+    /// UG893 Timing Constraints Editor: clickable clocks / I/O-delay / exception
+    /// rows from helion-sta XDC (not a concatenated dump). Empty XDC keeps gold WNS.
+    pub fn constraint_rows(&self) -> Vec<ConstraintRow> {
+        let mut rows = Vec::new();
+        let mut push = |section: ConstraintSection,
+                        kind: &str,
+                        id: String,
+                        name: String,
+                        from: String,
+                        to: String,
+                        value: String| {
+            rows.push(ConstraintRow {
+                id,
+                section,
+                kind: kind.into(),
+                name,
+                from,
+                to,
+                value,
+                enabled: true,
+            });
+        };
+        for c in &self.constraints.clocks {
+            let kind = if c.generated {
+                "create_generated_clock"
+            } else {
+                "create_clock"
+            };
+            let mut value = format!("PERIOD_PS={}", c.period_ps);
+            if c.generated {
+                let master = c.master.as_deref().unwrap_or("clk");
+                value.push_str(&format!(
+                    " DIVIDE_BY={} MULTIPLY_BY={} INVERT={} MASTER={master}",
+                    c.divide_by,
+                    c.multiply_by,
+                    u8::from(c.invert)
+                ));
+                if !c.edges.is_empty() {
+                    value.push_str(&format!(
+                        " EDGES={}",
+                        c.edges
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+            }
+            push(
+                ConstraintSection::Clocks,
+                kind,
+                format!("clock:{}", c.name),
+                c.name.clone(),
+                c.master.clone().unwrap_or_default(),
+                c.source.clone(),
+                value,
+            );
+        }
+        for (port, ps) in &self.constraints.input_delay_ps {
+            push(
+                ConstraintSection::IoDelay,
+                "set_input_delay",
+                format!("input_delay:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                format!("DELAY_PS={ps}"),
+            );
+        }
+        for (port, ps) in &self.constraints.output_delay_ps {
+            push(
+                ConstraintSection::IoDelay,
+                "set_output_delay",
+                format!("output_delay:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                format!("DELAY_PS={ps}"),
+            );
+        }
+        for (i, fp) in self.constraints.false_paths.iter().enumerate() {
+            let (from, to) = constraint_from_to(fp);
+            let name = if from.is_empty() && to.is_empty() {
+                fp.clone()
+            } else if to.is_empty() {
+                from.clone()
+            } else {
+                format!("{from}->{to}")
+            };
+            push(
+                ConstraintSection::Exception,
+                "set_false_path",
+                format!("false_path:{i}:{name}"),
+                name,
+                from,
+                to,
+                fp.clone(),
+            );
+        }
+        for (i, m) in self.constraints.multicycle_paths.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_multicycle_path",
+                format!("multicycle:{i}:{}->{}", m.from, m.to),
+                format!("{}->{}", m.from, m.to),
+                m.from.clone(),
+                m.to.clone(),
+                format!("SETUP_MULT={} HOLD_MULT={}", m.setup_mult, m.hold_mult),
+            );
+        }
+        for (i, m) in self.constraints.max_delays.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_max_delay",
+                format!("max_delay:{i}:{}->{}", m.from, m.to),
+                format!("{}->{}", m.from, m.to),
+                m.from.clone(),
+                m.to.clone(),
+                format!(
+                    "DELAY_PS={} datapath_only={}",
+                    m.delay_ps,
+                    u8::from(m.datapath_only)
+                ),
+            );
+        }
+        for (i, m) in self.constraints.min_delays.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_min_delay",
+                format!("min_delay:{i}:{}->{}", m.from, m.to),
+                format!("{}->{}", m.from, m.to),
+                m.from.clone(),
+                m.to.clone(),
+                format!(
+                    "DELAY_PS={} datapath_only={}",
+                    m.delay_ps,
+                    u8::from(m.datapath_only)
+                ),
+            );
+        }
+        for (i, b) in self.constraints.bus_skews.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_bus_skew",
+                format!("bus_skew:{i}:{}->{}", b.from, b.to),
+                format!("{}->{}", b.from, b.to),
+                b.from.clone(),
+                b.to.clone(),
+                format!(
+                    "SKEW_PS={} setup={} hold={}",
+                    b.skew_ps,
+                    u8::from(b.setup),
+                    u8::from(b.hold)
+                ),
+            );
+        }
+        for (i, g) in self.constraints.path_groups.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "group_path",
+                format!("group_path:{i}:{}", g.name),
+                g.name.clone(),
+                g.from.clone(),
+                g.to.clone(),
+                format!(
+                    "WEIGHT_MILLI={} CRITICAL_RANGE_PS={}",
+                    g.weight_milli, g.critical_range_ps
+                ),
+            );
+        }
+        for (i, b) in self.constraints.max_time_borrows.iter().enumerate() {
+            let obj = if b.object.is_empty() {
+                "-".into()
+            } else {
+                b.object.clone()
+            };
+            push(
+                ConstraintSection::Exception,
+                "set_max_time_borrow",
+                format!("max_time_borrow:{i}:{obj}"),
+                obj.clone(),
+                String::new(),
+                obj,
+                format!("BORROW_PS={}", b.borrow_ps),
+            );
+        }
+        for (i, d) in self.constraints.data_checks.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_data_check",
+                format!("data_check:{i}:{}->{}", d.from, d.to),
+                format!("{}->{}", d.from, d.to),
+                d.from.clone(),
+                d.to.clone(),
+                format!("SETUP_PS={} HOLD_PS={}", d.setup_ps, d.hold_ps),
+            );
+        }
+        for (i, g) in self.constraints.clock_groups.iter().enumerate() {
+            let kind_flag = if g.asynchronous {
+                "asynchronous"
+            } else if g.exclusive {
+                "exclusive"
+            } else {
+                "groups"
+            };
+            let from = g.groups.first().map(|grp| grp.join(",")).unwrap_or_default();
+            let to = g.groups.get(1).map(|grp| grp.join(",")).unwrap_or_default();
+            push(
+                ConstraintSection::Exception,
+                "set_clock_groups",
+                format!("clock_groups:{i}"),
+                kind_flag.into(),
+                from,
+                to,
+                format!("{kind_flag} groups={}", g.groups.len()),
+            );
+        }
+        for (i, u) in self.constraints.clock_uncertainties.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_clock_uncertainty",
+                format!("clock_uncertainty:{i}:{}->{}", u.from, u.to),
+                format!("{}->{}", u.from, u.to),
+                u.from.clone(),
+                u.to.clone(),
+                format!("SETUP_PS={} HOLD_PS={}", u.setup_ps, u.hold_ps),
+            );
+        }
+        for l in &self.constraints.clock_latencies {
+            push(
+                ConstraintSection::Exception,
+                "set_clock_latency",
+                format!("clock_latency:{}", l.clock),
+                l.clock.clone(),
+                l.clock.clone(),
+                String::new(),
+                format!(
+                    "LATE_PS={} EARLY_PS={} source={}",
+                    l.late_ps,
+                    l.early_ps,
+                    u8::from(l.source)
+                ),
+            );
+        }
+        for (i, d) in self.constraints.disable_timings.iter().enumerate() {
+            let name = if d.object.is_empty() {
+                format!("{}->{}", d.from, d.to)
+            } else {
+                d.object.clone()
+            };
+            push(
+                ConstraintSection::Exception,
+                "set_disable_timing",
+                format!("disable_timing:{i}:{name}"),
+                name,
+                d.from.clone(),
+                d.to.clone(),
+                d.object.clone(),
+            );
+        }
+        for c in &self.constraints.case_analyses {
+            push(
+                ConstraintSection::Exception,
+                "set_case_analysis",
+                format!("case_analysis:{}", c.object),
+                c.object.clone(),
+                String::new(),
+                c.object.clone(),
+                format!("VALUE={}", c.value),
+            );
+        }
+        for p in &self.constraints.propagated_clocks {
+            push(
+                ConstraintSection::Exception,
+                "set_propagated_clock",
+                format!("propagated_clock:{p}"),
+                p.clone(),
+                p.clone(),
+                String::new(),
+                "propagated=1".into(),
+            );
+        }
+        for s in &self.constraints.clock_senses {
+            push(
+                ConstraintSection::Exception,
+                "set_clock_sense",
+                format!("clock_sense:{}", s.object),
+                s.object.clone(),
+                String::new(),
+                s.object.clone(),
+                format!("SENSE={}", s.sense),
+            );
+        }
+        for j in &self.constraints.input_jitters {
+            push(
+                ConstraintSection::Exception,
+                "set_input_jitter",
+                format!("input_jitter:{}", j.clock),
+                j.clock.clone(),
+                j.clock.clone(),
+                String::new(),
+                format!("JITTER_PS={}", j.jitter_ps),
+            );
+        }
+        if self.constraints.system_jitter_ps != 0 {
+            push(
+                ConstraintSection::Exception,
+                "set_system_jitter",
+                "system_jitter".into(),
+                "system".into(),
+                String::new(),
+                String::new(),
+                format!("JITTER_PS={}", self.constraints.system_jitter_ps),
+            );
+        }
+        for (i, d) in self.constraints.timing_derates.iter().enumerate() {
+            push(
+                ConstraintSection::Exception,
+                "set_timing_derate",
+                format!("timing_derate:{i}"),
+                "derate".into(),
+                String::new(),
+                String::new(),
+                format!(
+                    "LATE_MILLI={} EARLY_MILLI={} cell={} net={}",
+                    d.late_milli,
+                    d.early_milli,
+                    u8::from(d.cell),
+                    u8::from(d.net)
+                ),
+            );
+        }
+        if self.constraints.operating_conditions.is_set() {
+            let oc = &self.constraints.operating_conditions;
+            push(
+                ConstraintSection::Exception,
+                "set_operating_conditions",
+                "operating_conditions".into(),
+                "pvt".into(),
+                String::new(),
+                String::new(),
+                format!(
+                    "VOLTAGE_MV={} TEMP_C={} SCALE_MILLI={}",
+                    oc.voltage_mv,
+                    oc.temperature_c,
+                    oc.scale_milli()
+                ),
+            );
+        }
+        for (port, pin) in &self.constraints.package_pins {
+            push(
+                ConstraintSection::Exception,
+                "set_property PACKAGE_PIN",
+                format!("package_pin:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                pin.clone(),
+            );
+        }
+        for (port, std) in &self.constraints.iostandards {
+            push(
+                ConstraintSection::Exception,
+                "set_property IOSTANDARD",
+                format!("iostandard:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                std.clone(),
+            );
+        }
+        for (port, ma) in &self.constraints.drives {
+            push(
+                ConstraintSection::Exception,
+                "set_property DRIVE",
+                format!("drive:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                ma.clone(),
+            );
+        }
+        for (port, slew) in &self.constraints.slews {
+            push(
+                ConstraintSection::Exception,
+                "set_property SLEW",
+                format!("slew:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                slew.clone(),
+            );
+        }
+        for (port, pull) in &self.constraints.pulltypes {
+            push(
+                ConstraintSection::Exception,
+                "set_property PULLTYPE",
+                format!("pulltype:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                pull.clone(),
+            );
+        }
+        for (port, term) in &self.constraints.diff_terms {
+            push(
+                ConstraintSection::Exception,
+                "set_property DIFF_TERM",
+                format!("diff_term:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                term.clone(),
+            );
+        }
+        for (port, term) in &self.constraints.in_terms {
+            push(
+                ConstraintSection::Exception,
+                "set_property IN_TERM",
+                format!("in_term:{port}"),
+                port.clone(),
+                String::new(),
+                port.clone(),
+                term.clone(),
+            );
+        }
+        for pb in &self.pblocks {
+            let mut value = if pb.ranged {
+                format!("RANGE={}", pb.range_text())
+            } else {
+                "pblock".into()
+            };
+            if !pb.cells.is_empty() {
+                value.push_str(&format!(" CELLS={}", pb.cells.join(",")));
+            }
+            push(
+                ConstraintSection::Exception,
+                "create_pblock",
+                format!("pblock:{}", pb.name),
+                pb.name.clone(),
+                String::new(),
+                String::new(),
+                value,
+            );
+        }
+        rows
+    }
+
+    pub fn constraints_table_text(&self) -> String {
+        let rows = self.constraint_rows();
+        if rows.is_empty() {
+            return "no timing constraints — create_clock / create_generated_clock / read_xdc"
+                .into();
+        }
+        let n_clk = rows
+            .iter()
+            .filter(|r| r.section == ConstraintSection::Clocks)
+            .count();
+        let n_io = rows
+            .iter()
+            .filter(|r| r.section == ConstraintSection::IoDelay)
+            .count();
+        let n_ex = rows
+            .iter()
+            .filter(|r| r.section == ConstraintSection::Exception)
+            .count();
+        let mut s = format!("constraints clocks={n_clk} io_delay={n_io} exceptions={n_ex}");
+        for r in &rows {
+            let from = if r.from.is_empty() { "-" } else { r.from.as_str() };
+            let to = if r.to.is_empty() { "-" } else { r.to.as_str() };
+            s.push_str(&format!(
+                "\n{} ID={} KIND={} NAME={} FROM={from} TO={to} VALUE={}",
+                r.section.as_str(),
+                r.id,
+                r.kind,
+                r.name,
+                r.value
+            ));
+        }
+        s
+    }
+
+    /// Click a clocks / I/O-delay / exception row: properties + Constraints workspace.
+    pub fn select_constraint(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_constraint: missing id".into());
+        }
+        let spec_l = spec.to_ascii_lowercase();
+        let rows = self.constraint_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.id.eq_ignore_ascii_case(spec))
+            .or_else(|| {
+                rows.iter().find(|r| {
+                    r.name.eq_ignore_ascii_case(spec)
+                        || r.kind.eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", r.kind, r.name).eq_ignore_ascii_case(spec)
+                        || format!("{}:{}->{}", r.kind, r.from, r.to).eq_ignore_ascii_case(spec)
+                        || r.id.to_ascii_lowercase().ends_with(&format!(":{spec_l}"))
+                        || spec_l.split_once(':').is_some_and(|(k, n)| {
+                            let n = n.trim();
+                            !n.is_empty()
+                                && r.id.to_ascii_lowercase().starts_with(&format!("{k}:"))
+                                && (r.name.eq_ignore_ascii_case(n)
+                                    || r.from.eq_ignore_ascii_case(n)
+                                    || r.id.to_ascii_lowercase().ends_with(&format!(":{n}")))
+                        })
+                })
+            })
+            .cloned()
+            .ok_or_else(|| format!("select_constraint: no row {spec}"))?;
+        let from = if row.from.is_empty() {
+            "-"
+        } else {
+            row.from.as_str()
+        };
+        let to = if row.to.is_empty() {
+            "-"
+        } else {
+            row.to.as_str()
+        };
+        self.selected = Some(row.id.clone());
+        self.properties = vec![
+            ("NAME".into(), row.name.clone()),
+            ("TYPE".into(), "constraint".into()),
+            ("SECTION".into(), row.section.as_str().into()),
+            ("KIND".into(), row.kind.clone()),
+            ("FROM".into(), from.into()),
+            ("TO".into(), to.into()),
+            ("VALUE".into(), row.value.clone()),
+            ("ENABLED".into(), u8::from(row.enabled).to_string()),
+            ("ID".into(), row.id.clone()),
+        ];
+        self.workspace = WorkspaceTab::Constraints;
+        Ok(format!(
+            "constraint ID={} SECTION={} KIND={} NAME={} FROM={from} TO={to} VALUE={}",
+            row.id,
+            row.section.as_str(),
+            row.kind,
+            row.name,
+            row.value
+        ))
+    }
+
     /// UG893 Timing Constraints pane text. Empty until create_clock /
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
-        if self.constraints.clocks.is_empty()
-            && self.constraints.input_delay_ps.is_empty()
-            && self.constraints.output_delay_ps.is_empty()
-            && self.constraints.false_paths.is_empty()
-            && self.constraints.multicycle_paths.is_empty()
-            && self.constraints.max_delays.is_empty()
-            && self.constraints.min_delays.is_empty()
-            && self.constraints.clock_groups.is_empty()
-            && self.constraints.clock_uncertainties.is_empty()
-            && self.constraints.clock_latencies.is_empty()
-            && self.constraints.disable_timings.is_empty()
-            && self.constraints.case_analyses.is_empty()
-            && self.constraints.propagated_clocks.is_empty()
-            && self.constraints.clock_senses.is_empty()
-            && self.constraints.input_jitters.is_empty()
-            && self.constraints.system_jitter_ps == 0
-            && self.constraints.timing_derates.is_empty()
-            && !self.constraints.operating_conditions.is_set()
-            && self.constraints.bus_skews.is_empty()
-            && self.constraints.path_groups.is_empty()
-            && self.constraints.max_time_borrows.is_empty()
-            && self.constraints.data_checks.is_empty()
-            && self.constraints.package_pins.is_empty()
-            && self.constraints.iostandards.is_empty()
-            && self.constraints.drives.is_empty()
-            && self.constraints.slews.is_empty()
-            && self.constraints.pulltypes.is_empty()
-            && self.constraints.diff_terms.is_empty()
-            && self.constraints.in_terms.is_empty()
-            && self.pblocks.is_empty()
-        {
+        if self.constraint_rows().is_empty() {
             return "no timing constraints — create_clock / create_generated_clock / read_xdc".into();
         }
         let mut lines = Vec::new();
@@ -7703,6 +8293,30 @@ impl IdeModel {
                 props.push(("PCT".into(), row.pct().to_string()));
             }
         }
+        if self.workspace == WorkspaceTab::Constraints {
+            if let Some(row) = self.constraint_rows().into_iter().find(|r| r.id == id) {
+                let from = if row.from.is_empty() {
+                    "-".into()
+                } else {
+                    row.from
+                };
+                let to = if row.to.is_empty() {
+                    "-".into()
+                } else {
+                    row.to
+                };
+                props.retain(|(k, _)| k != "TYPE" && k != "NAME");
+                props.insert(0, ("NAME".into(), row.name.clone()));
+                props.insert(1, ("TYPE".into(), "constraint".into()));
+                props.push(("SECTION".into(), row.section.as_str().into()));
+                props.push(("KIND".into(), row.kind));
+                props.push(("FROM".into(), from));
+                props.push(("TO".into(), to));
+                props.push(("VALUE".into(), row.value));
+                props.push(("ENABLED".into(), u8::from(row.enabled).to_string()));
+                props.push(("ID".into(), row.id));
+            }
+        }
         self.properties = props;
     }
 
@@ -8769,6 +9383,179 @@ mod tests {
             rt.contains(&format!("WNS_PS={pane_wns}")),
             "Tcl report_timing must use IdeModel clocks, not Session 10 ns: {rt} pane={pane_wns}"
         );
+    }
+
+    /// UG893 Timing Constraints pane is clickable clocks / I/O-delay / exception
+    /// tables from helion-sta XDC — not a concatenated report_box dump.
+    #[test]
+    fn timing_constraints_pane_clickable_clocks_io_delay_exception_table() {
+        let mut ide = IdeModel::new();
+        assert!(ide.constraint_rows().is_empty());
+        let empty = ide.exec("timing_constraints").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert!(
+            empty.contains("no timing constraints"),
+            "idle pane has no canned rows: {empty}"
+        );
+        assert!(
+            ide.exec("select_constraint clk")
+                .unwrap_err()
+                .contains("no row"),
+            "empty table must refuse a click"
+        );
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "timing_constraints"),
+            "Flow Navigator Timing Analysis must offer the pane"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("gold WNS");
+        assert_ne!(gold, 0);
+        assert!(
+            ide.constraint_rows().is_empty(),
+            "empty XDC must not invent constraint rows: {:?}",
+            ide.constraint_rows()
+        );
+        assert_eq!(ide.wns_ps(), Some(gold), "empty XDC keeps gold WNS");
+
+        ide.exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        let rows = ide.constraint_rows();
+        assert!(
+            rows.iter().any(|r| r.section == ConstraintSection::Clocks
+                && r.id == "clock:clk"
+                && r.kind == "create_clock"
+                && r.name == "clk"
+                && r.value.contains("PERIOD_PS=10000")),
+            "{rows:?}"
+        );
+        let table = ide.exec("timing_constraints").unwrap();
+        assert!(table.contains("clocks=1"), "{table}");
+        assert!(table.contains("io_delay=0"), "{table}");
+        assert!(table.contains("clocks ID=clock:clk"), "{table}");
+        let sel = ide.exec("select_constraint clock:clk").unwrap();
+        assert!(sel.contains("SECTION=clocks"), "{sel}");
+        assert!(sel.contains("KIND=create_clock"), "{sel}");
+        assert!(sel.contains("VALUE=PERIOD_PS=10000"), "{sel}");
+        assert_eq!(ide.selected.as_deref(), Some("clock:clk"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "constraint"),
+            "{:?}",
+            ide.properties
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "10 ns create_clock matches the default STA period"
+        );
+
+        ide.exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        ide.exec("set_input_delay -clock clk 1.5 [get_ports clk]")
+            .unwrap();
+        let rows = ide.constraint_rows();
+        assert!(
+            rows.iter().any(|r| r.section == ConstraintSection::IoDelay
+                && r.kind == "set_output_delay"
+                && r.name == "led"
+                && r.value.contains("DELAY_PS=2000")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.section == ConstraintSection::IoDelay
+                && r.kind == "set_input_delay"
+                && r.name == "clk"
+                && r.value.contains("DELAY_PS=1500")),
+            "{rows:?}"
+        );
+        let iod = ide.exec("select_constraint output_delay:led").unwrap();
+        assert!(iod.contains("SECTION=io_delay"), "{iod}");
+        assert!(iod.contains("KIND=set_output_delay"), "{iod}");
+        let table = ide.constraints_table_text();
+        assert!(table.contains("io_delay=2"), "{table}");
+        let wns_io = ide.wns_ps().expect("STA after I/O delay");
+        assert_eq!(
+            wns_io,
+            gold - 3500,
+            "I/O delay rows must feed helion-sta, not a dump: {gold} vs {wns_io}"
+        );
+
+        ide.exec("set_false_path -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        ide.exec("set_multicycle_path 2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let rows = ide.constraint_rows();
+        assert!(
+            rows.iter().any(|r| r.section == ConstraintSection::Exception
+                && r.kind == "set_false_path"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.kind == "set_multicycle_path"
+                && r.value.contains("SETUP_MULT=2")),
+            "{rows:?}"
+        );
+        let fp = ide.exec("select_constraint false_path:clk").unwrap();
+        assert!(fp.contains("SECTION=exception"), "{fp}");
+        assert!(fp.contains("KIND=set_false_path"), "{fp}");
+        let mcp = ide.exec("select_constraint multicycle:0:clk->led").unwrap();
+        assert!(mcp.contains("KIND=set_multicycle_path"), "{mcp}");
+        let table = ide.constraints_table_text();
+        assert!(table.contains("exceptions="), "{table}");
+        let t = ide.timing.as_ref().expect("STA after false path");
+        assert_eq!(t.iob_ps, 0, "false path must drop IOB from STA");
+        assert_ne!(t.wns_ps, wns_io, "exception rows must move WNS");
+
+        ide.exec(
+            "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+        )
+        .unwrap();
+        let rows = ide.constraint_rows();
+        assert!(
+            rows.iter().any(|r| r.section == ConstraintSection::Clocks
+                && r.kind == "create_generated_clock"
+                && r.name == "clkdiv"
+                && r.value.contains("DIVIDE_BY=2")),
+            "{rows:?}"
+        );
+        let gsel = ide.exec("select_constraint clock:clkdiv").unwrap();
+        assert!(gsel.contains("KIND=create_generated_clock"), "{gsel}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().expect("blinky gold");
+        assert_ne!(b0, gold, "gold WNS is per-design STA");
+        blinky
+            .exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        blinky
+            .exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        let brows = blinky.constraint_rows();
+        assert!(
+            brows.iter().any(|r| r.kind == "set_output_delay" && r.name == "led"),
+            "{brows:?}"
+        );
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 - 2000);
+        assert_ne!(
+            b1, wns_io,
+            "I/O-delay WNS is per-design STA, not a canned table"
+        );
+        let bsel = blinky.exec("select_constraint output_delay:led").unwrap();
+        assert!(bsel.contains("DELAY_PS=2000"), "{bsel}");
+        assert_eq!(blinky.workspace, WorkspaceTab::Constraints);
     }
 
     /// UG893 Timing Constraints Apply: create_generated_clock -divide_by is a
@@ -13330,5 +14117,218 @@ mod tests {
         assert_ne!(p.logic_uw, pb.logic_uw);
         let bwns = blinky.wns_ps().expect("blinky STA");
         assert_ne!(bwns, gold, "power WNS companion is per-design STA");
+    }
+
+    /// UG949 `report_methodology` + UG893 DRC/Utilization panes are engine-backed
+    /// violation/occupancy tables — not one-line dumps. Empty XDC keeps gold WNS.
+    #[test]
+    fn methodology_drc_utilization_panes_from_engines_not_dumps() {
+        let mut ide = IdeModel::new();
+        let empty_m = ide.methodology_text();
+        assert!(
+            empty_m.contains("no design"),
+            "idle methodology has no canned checks: {empty_m}"
+        );
+        assert!(ide.methodology_report().checks.is_empty());
+        let empty_u = ide.utilization_text();
+        assert!(
+            empty_u.contains("no placed") || empty_u.contains("Place"),
+            "idle occupancy is empty: {empty_u}"
+        );
+        assert!(ide.utilization_report().occupancy.is_empty());
+        let empty_d = ide.drc_text();
+        assert!(
+            empty_d.contains("no DRC") || empty_d.contains("Place"),
+            "idle DRC is empty: {empty_d}"
+        );
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_methodology"),
+            "Flow Navigator Timing Analysis must offer report_methodology"
+        );
+        assert!(
+            NavSection::Implementation
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_drc"),
+            "Flow Navigator Implementation must offer report_drc"
+        );
+        assert!(
+            NavSection::Implementation
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_utilization"),
+            "Flow Navigator Implementation must offer report_utilization"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+
+        let mout = ide.exec("report_methodology").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Methodology);
+        assert!(mout.contains("TIMING-1"), "{mout}");
+        assert!(mout.contains("TIMING-7"), "{mout}");
+        let m = ide.methodology_report();
+        assert_eq!(m.check("TIMING-7").unwrap().objects, "led");
+        assert!(
+            m.check("TIMING-6").is_none(),
+            "clk is a clock, not a data input: {}",
+            m.text()
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening methodology must not move gold WNS"
+        );
+
+        let sel = ide.exec("select_methodology TIMING-7").unwrap();
+        assert!(sel.contains("ID=TIMING-7"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "methodology"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "OBJECTS" && v == "led"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        let m = ide.methodology_report();
+        assert!(m.check("TIMING-1").is_none(), "{}", m.text());
+        assert!(m.check("TIMING-7").is_some(), "{}", m.text());
+        assert!(m.check("TIMING-24").is_some(), "{}", m.text());
+        assert_eq!(ide.wns_ps(), Some(gold), "create_clock 10 ns keeps gold WNS");
+
+        ide.exec("set_output_delay -clock clk 0.0 [get_ports led]")
+            .unwrap();
+        let m = ide.methodology_report();
+        assert!(
+            m.check("TIMING-7").is_none(),
+            "output delay must clear TIMING-7: {}",
+            m.text()
+        );
+
+        ide.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        let m = ide.methodology_report();
+        assert!(m.check("CDC-1").is_some(), "{}", m.text());
+        assert!(m.critical_count() >= 1, "{}", m.text());
+        ide.exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
+            .unwrap();
+        let m = ide.methodology_report();
+        assert!(
+            m.check("CDC-1").is_none(),
+            "async groups must clear CDC-1: {}",
+            m.text()
+        );
+
+        let mut util_ide = IdeModel::new();
+        util_ide.open_source(&example("counter.sv")).unwrap();
+        util_ide.run_step(FlowStep::Place).unwrap();
+        util_ide.run_step(FlowStep::Route).unwrap();
+        let gold_u = util_ide.wns_ps().expect("STA");
+        let uout = util_ide.exec("report_utilization").unwrap();
+        assert_eq!(util_ide.workspace, WorkspaceTab::Utilization);
+        assert!(uout.contains("LUTFF=4/8192"), "{uout}");
+        assert!(uout.contains("resource LUTFF"), "{uout}");
+        assert!(uout.contains("hier counter"), "{uout}");
+        let ur = util_ide.utilization_report();
+        let lut = ur.row("LUTFF").expect("LUTFF occupancy");
+        assert_eq!(lut.used, 4);
+        assert_eq!(lut.available, 8192);
+        assert_eq!(lut.pct(), 0);
+        assert_eq!(ur.hier("counter").unwrap().lut, 4);
+        assert_eq!(
+            util_ide.wns_ps(),
+            Some(gold_u),
+            "occupancy pane must not move gold WNS"
+        );
+        let usel = util_ide.exec("select_utilization LUTFF").unwrap();
+        assert!(usel.contains("RESOURCE=LUTFF"), "{usel}");
+        assert!(
+            util_ide
+                .properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "utilization"),
+            "{:?}",
+            util_ide.properties
+        );
+        assert!(
+            util_ide
+                .properties
+                .iter()
+                .any(|(k, v)| k == "USED" && v == "4"),
+            "{:?}",
+            util_ide.properties
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let br = blinky.utilization_report();
+        assert_eq!(br.row("LUTFF").unwrap().used, 1, "{}", br.text());
+        assert_eq!(br.hier("blinky").unwrap().lut, 1);
+        assert_ne!(
+            ur.row("LUTFF").unwrap().used,
+            br.row("LUTFF").unwrap().used,
+            "occupancy is per-design packed HAD, not a canned table"
+        );
+        let bwns = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bwns, gold_u, "utilization companion STA is per-design");
+
+        let dout = util_ide.exec("report_drc").unwrap();
+        assert_eq!(util_ide.workspace, WorkspaceTab::Drc);
+        assert!(
+            dout.contains("violations=0") || dout.contains("ok"),
+            "clean counter DRC: {dout}"
+        );
+        assert!(util_ide.drc.as_ref().unwrap().ok());
+        assert!(util_ide.drc.as_ref().unwrap().items.is_empty());
+
+        util_ide
+            .exec("set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]")
+            .unwrap();
+        util_ide
+            .exec("set_property PACKAGE_PIN IOB_X3Y0 [get_ports clk]")
+            .unwrap();
+        util_ide
+            .exec("set_property IOSTANDARD LVCMOS33 [get_ports led]")
+            .unwrap();
+        util_ide
+            .exec("set_property IOSTANDARD LVCMOS18 [get_ports clk]")
+            .unwrap();
+        let mix = util_ide.exec("report_drc").unwrap();
+        assert!(
+            mix.contains("IOSTD-2") || mix.contains("VCCO"),
+            "mixed VCCO must be a DRC row: {mix}"
+        );
+        let dr = util_ide.drc.clone().unwrap();
+        let row = dr.item("IOSTD-2").expect("structured DRC");
+        assert_eq!(row.severity, helion_drc::DrcSeverity::Error);
+        assert!(row.objects.contains("BANK"), "{}", row.objects);
+        let dsel = util_ide.exec("select_drc IOSTD-2").unwrap();
+        assert!(dsel.contains("ID=IOSTD-2"), "{dsel}");
+        assert!(
+            util_ide
+                .properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "drc"),
+            "{:?}",
+            util_ide.properties
+        );
     }
 }
