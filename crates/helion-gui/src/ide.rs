@@ -15,7 +15,7 @@ use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_ipxact::{catalog as ipxact_catalog, to_xml, IpCore};
 use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
-use helion_sim::Sim;
+use helion_sim::{Sim, SimLocal, SimMemory};
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
     report_cdc, report_clock_interaction, report_clock_networks, report_methodology,
@@ -470,6 +470,10 @@ impl NavSection {
                     tcl: "project_manager",
                 },
                 NavAction {
+                    label: "Project Settings",
+                    tcl: "project_settings",
+                },
+                NavAction {
                     label: "Sources",
                     tcl: "sources",
                 },
@@ -496,10 +500,24 @@ impl NavSection {
                     tcl: "create_bd",
                 },
             ],
-            NavSection::Simulation => &[NavAction {
-                label: "Run Simulation",
-                tcl: "run_simulation",
-            }],
+            NavSection::Simulation => &[
+                NavAction {
+                    label: "Run Simulation",
+                    tcl: "run_simulation",
+                },
+                NavAction {
+                    label: "Memory",
+                    tcl: "memory",
+                },
+                NavAction {
+                    label: "Breakpoints",
+                    tcl: "breakpoints",
+                },
+                NavAction {
+                    label: "Locals",
+                    tcl: "locals",
+                },
+            ],
             NavSection::RtlAnalysis => &[NavAction {
                 label: "Open Elaborated Schematic",
                 tcl: "open_elaborated_schematic",
@@ -2265,6 +2283,147 @@ impl SimObject {
     }
 }
 
+/// UG900 Memory window: LUT INIT / BRAM / packed sequential word from helion-sim/fabric.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryBlock {
+    pub name: String,
+    /// `lut_init` / `bram` / `seq`.
+    pub kind: String,
+    pub width: u8,
+    /// Addressable words (LUT INIT is 64×1).
+    pub words: Vec<u64>,
+}
+
+impl MemoryBlock {
+    pub fn depth(&self) -> usize {
+        self.words.len().max(1)
+    }
+
+    pub fn type_cell(&self) -> &str {
+        if self.kind.is_empty() {
+            "memory"
+        } else {
+            self.kind.as_str()
+        }
+    }
+
+    pub fn packed_word(&self) -> u64 {
+        if self.width <= 1 {
+            self.words
+                .iter()
+                .enumerate()
+                .fold(0u64, |acc, (i, b)| acc | ((*b & 1) << i))
+        } else {
+            self.words.first().copied().unwrap_or(0)
+        }
+    }
+
+    pub fn data_cell(&self) -> String {
+        format!("{:#x}", self.packed_word())
+    }
+
+    /// Clickable-grid dump row: UG900 Memory Name/Type/Addr/Data, not a hex dump.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} TYPE={} ADDR=0 DATA={} WIDTH={} DEPTH={}",
+            self.name,
+            self.type_cell(),
+            self.data_cell(),
+            self.width,
+            self.depth()
+        )
+    }
+}
+
+/// One address of a selected UG900 Memory array.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryWordRow {
+    pub addr: usize,
+    pub data: String,
+}
+
+impl MemoryWordRow {
+    pub fn row_text(&self) -> String {
+        format!("ADDR={} DATA={}", self.addr, self.data)
+    }
+}
+
+/// UG900 Breakpoints window: stop helion-sim/fabric on signal value or change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreakpointRow {
+    pub id: usize,
+    pub enabled: bool,
+    pub signal: String,
+    /// `change` or `==N`.
+    pub condition: String,
+    pub value: Option<u64>,
+    pub hits: u32,
+}
+
+impl BreakpointRow {
+    pub fn enabled_cell(&self) -> &'static str {
+        if self.enabled {
+            "1"
+        } else {
+            "0"
+        }
+    }
+
+    /// Clickable-grid dump row: UG900 Breakpoints Id/En/Signal/Cond/Hits, not a list dump.
+    pub fn row_text(&self) -> String {
+        format!(
+            "ID={} ENABLED={} SIGNAL={} CONDITION={} HITS={}",
+            self.id,
+            self.enabled_cell(),
+            self.signal,
+            self.condition,
+            self.hits
+        )
+    }
+}
+
+/// UG900 Locals window: current-scope sequential probes from helion-sim/fabric.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRow {
+    pub name: String,
+    pub kind: String,
+    pub value: String,
+    pub scope: String,
+}
+
+impl LocalRow {
+    pub fn type_cell(&self) -> &str {
+        if self.kind.is_empty() {
+            "reg"
+        } else {
+            self.kind.as_str()
+        }
+    }
+
+    pub fn value_cell(&self) -> &str {
+        if self.value.is_empty() {
+            "-"
+        } else {
+            self.value.as_str()
+        }
+    }
+
+    /// Clickable-grid dump row: UG900 Locals Name/Type/Value, not `name = value`.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} TYPE={} VALUE={} SCOPE={}",
+            self.name,
+            self.type_cell(),
+            self.value_cell(),
+            if self.scope.is_empty() {
+                "-"
+            } else {
+                self.scope.as_str()
+            }
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IoPortView {
     pub name: String,
@@ -2849,9 +3008,13 @@ impl BdView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Reports,
+    Settings,
     Schematic,
     Device,
     Wave,
+    Memory,
+    Breakpoints,
+    Locals,
     Hardware,
     Ip,
     Constraints,
@@ -3234,6 +3397,18 @@ pub struct IdeModel {
     pub objects: Vec<SimObject>,
     /// UG900 Objects selected Name (clickable Name/Type/Value table).
     pub selected_object: Option<String>,
+    /// UG900 Memory arrays from helion-sim LUT INIT / fabric BLE / BRAM.
+    pub memories: Vec<MemoryBlock>,
+    pub selected_memory: Option<String>,
+    pub selected_memory_addr: Option<usize>,
+    /// UG900 Breakpoints over helion-sim/fabric signals.
+    pub breakpoints: Vec<BreakpointRow>,
+    pub selected_breakpoint: Option<usize>,
+    /// UG900 Locals: current-scope sequential probes.
+    pub locals: Vec<LocalRow>,
+    pub selected_local: Option<String>,
+    bp_prev: HashMap<String, u64>,
+    next_bp_id: usize,
     pub wave: Waveform,
     pub timing_paths: Vec<TimingPath>,
     pub selected_timing_path: Option<usize>,
@@ -3262,6 +3437,10 @@ pub struct IdeModel {
     pub selected_source: Option<String>,
     /// UG893 Netlist selected Name (clickable Name/Type table).
     pub selected_netlist: Option<String>,
+    /// UG893 Project Settings selected Name (clickable Name/Value table).
+    pub selected_setting: Option<String>,
+    /// Active UG893 fileset (`sources_1` / `constrs_1` / `sim_1`).
+    pub active_fileset: String,
     pub package_pins: Vec<PackagePin>,
     pub package: PackageDrawing,
     /// UG893 Floorplanning Pblocks (source of truth; copied onto DeviceView).
@@ -3314,6 +3493,15 @@ impl IdeModel {
             selected_scope: None,
             objects: Vec::new(),
             selected_object: None,
+            memories: Vec::new(),
+            selected_memory: None,
+            selected_memory_addr: None,
+            breakpoints: Vec::new(),
+            selected_breakpoint: None,
+            locals: Vec::new(),
+            selected_local: None,
+            bp_prev: HashMap::new(),
+            next_bp_id: 1,
             wave: Waveform::default(),
             timing_paths: Vec::new(),
             selected_timing_path: None,
@@ -3335,6 +3523,8 @@ impl IdeModel {
             selected_find: None,
             selected_source: None,
             selected_netlist: None,
+            selected_setting: None,
+            active_fileset: "sources_1".into(),
             package_pins: Vec::new(),
             package: PackageDrawing::default(),
             pblocks: Vec::new(),
@@ -3546,6 +3736,14 @@ impl IdeModel {
         } else if t == "select_property" || t.starts_with("select_property ") {
             let spec = t.strip_prefix("select_property").unwrap_or("").trim();
             self.select_property(spec)
+        } else if t == "project_settings" || t == "settings" {
+            self.open_project_settings()
+        } else if t == "select_project_setting" || t.starts_with("select_project_setting ") {
+            let spec = t.strip_prefix("select_project_setting").unwrap_or("").trim();
+            self.select_project_setting(spec)
+        } else if t == "set_part" || t.starts_with("set_part ") {
+            let part = t.strip_prefix("set_part").unwrap_or("").trim();
+            self.set_part(part)
         } else if t == "sources" {
             self.layout = LayoutKind::Default;
             Ok(self.sources_text())
@@ -3613,6 +3811,11 @@ impl IdeModel {
                 .unwrap_or("");
             if key.eq_ignore_ascii_case("PACKAGE_PIN") || key.eq_ignore_ascii_case("LOC") {
                 self.apply_package_pin(t)
+            } else if key.eq_ignore_ascii_case("PART")
+                || key.eq_ignore_ascii_case("STRATEGY")
+                || key.eq_ignore_ascii_case("FILESET")
+            {
+                self.apply_project_setting(t)
             } else if key.eq_ignore_ascii_case("IOSTANDARD") {
                 self.apply_iostandard(t)
             } else if key.eq_ignore_ascii_case("DRIVE") {
@@ -3902,6 +4105,36 @@ impl IdeModel {
             self.select_object(spec.trim())
         } else if t == "select_object" {
             self.select_object("")
+        } else if t == "memory" || t == "memories" {
+            self.open_memory()
+        } else if t == "select_memory" || t.starts_with("select_memory ") {
+            let spec = t.strip_prefix("select_memory").unwrap_or("").trim();
+            self.select_memory(spec)
+        } else if t == "select_memory_word" || t.starts_with("select_memory_word ") {
+            let spec = t.strip_prefix("select_memory_word").unwrap_or("").trim();
+            self.select_memory_word(spec)
+        } else if t == "locals" {
+            self.open_locals()
+        } else if t == "select_local" || t.starts_with("select_local ") {
+            let spec = t.strip_prefix("select_local").unwrap_or("").trim();
+            self.select_local(spec)
+        } else if t == "breakpoints" {
+            self.open_breakpoints()
+        } else if t == "add_bp" || t.starts_with("add_bp ") {
+            let spec = t.strip_prefix("add_bp").unwrap_or("").trim();
+            self.add_breakpoint(spec)
+        } else if t == "select_breakpoint" || t.starts_with("select_breakpoint ") {
+            let spec = t.strip_prefix("select_breakpoint").unwrap_or("").trim();
+            self.select_breakpoint(spec)
+        } else if t == "enable_bp" || t.starts_with("enable_bp ") {
+            let spec = t.strip_prefix("enable_bp").unwrap_or("").trim();
+            self.set_breakpoint_enabled(spec, true)
+        } else if t == "disable_bp" || t.starts_with("disable_bp ") {
+            let spec = t.strip_prefix("disable_bp").unwrap_or("").trim();
+            self.set_breakpoint_enabled(spec, false)
+        } else if t == "delete_bp" || t.starts_with("delete_bp ") {
+            let spec = t.strip_prefix("delete_bp").unwrap_or("").trim();
+            self.delete_breakpoint(spec)
         } else if let Some(name) = t.strip_prefix("select_clock_region ") {
             self.select_clock_region(name.trim())
         } else if let Some(q) = t.strip_prefix("console_find ") {
@@ -5584,11 +5817,13 @@ impl IdeModel {
         self.selected_scope = Some(sc.name.clone());
         self.selected_object = None;
         self.refresh_sim_objects();
+        self.refresh_sim_debug();
         self.workspace = WorkspaceTab::Wave;
         self.properties = vec![
             ("NAME".into(), sc.name.clone()),
             ("TYPE".into(), sc.type_cell().to_string()),
             ("OBJECTS".into(), self.objects.len().to_string()),
+            ("LOCALS".into(), self.locals.len().to_string()),
         ];
         let mut s = format!("scope {} objects={}", sc.name, self.objects.len());
         for o in &self.objects {
@@ -5634,6 +5869,380 @@ impl IdeModel {
         ];
         let _ = self.add_wave(&o.name);
         Ok(o.row_text())
+    }
+
+    pub fn memory_rows(&self) -> &[MemoryBlock] {
+        &self.memories
+    }
+
+    pub fn local_rows(&self) -> &[LocalRow] {
+        &self.locals
+    }
+
+    pub fn breakpoint_rows(&self) -> &[BreakpointRow] {
+        &self.breakpoints
+    }
+
+    /// UG900 Memory table dump (Name/Type/Addr/Data), not a hex blob.
+    pub fn memories_text(&self) -> String {
+        let n = self.memories.len();
+        let mut s = format!("memory n={n}");
+        if n == 0 {
+            s.push_str(" no memories — sim_run");
+            return s;
+        }
+        for m in &self.memories {
+            s.push('\n');
+            s.push_str(&m.row_text());
+        }
+        s
+    }
+
+    /// Selected UG900 Memory contents (Addr/Data), not a concatenated INIT dump.
+    pub fn memory_word_rows(&self) -> Vec<MemoryWordRow> {
+        let Some(name) = self.selected_memory.as_deref() else {
+            return Vec::new();
+        };
+        let Some(m) = self.memories.iter().find(|b| b.name == name) else {
+            return Vec::new();
+        };
+        m.words
+            .iter()
+            .enumerate()
+            .map(|(addr, v)| MemoryWordRow {
+                addr,
+                data: if m.width <= 1 {
+                    if *v != 0 { "1" } else { "0" }.into()
+                } else {
+                    format!("{v:#x}")
+                },
+            })
+            .collect()
+    }
+
+    pub fn memory_words_text(&self) -> String {
+        let name = self.selected_memory.as_deref().unwrap_or("-");
+        let rows = self.memory_word_rows();
+        let mut s = format!("memory_words n={} name={name}", rows.len());
+        if rows.is_empty() {
+            s.push_str(" no words — select_memory");
+            return s;
+        }
+        for r in &rows {
+            s.push('\n');
+            s.push_str(&r.row_text());
+        }
+        s
+    }
+
+    /// UG900 Locals table dump (Name/Type/Value), not `name = value`.
+    pub fn locals_text(&self) -> String {
+        let n = self.locals.len();
+        let scope = self.selected_scope.as_deref().unwrap_or("-");
+        let mut s = format!("locals n={n} scope={scope}");
+        if n == 0 {
+            s.push_str(" no locals — sim_run");
+            return s;
+        }
+        for l in &self.locals {
+            s.push('\n');
+            s.push_str(&l.row_text());
+        }
+        s
+    }
+
+    /// UG900 Breakpoints table dump (Id/En/Signal/Cond/Hits).
+    pub fn breakpoints_text(&self) -> String {
+        let n = self.breakpoints.len();
+        let mut s = format!("breakpoints n={n}");
+        if n == 0 {
+            s.push_str(" no breakpoints");
+            return s;
+        }
+        for b in &self.breakpoints {
+            s.push('\n');
+            s.push_str(&b.row_text());
+        }
+        s
+    }
+
+    pub fn open_memory(&mut self) -> Result<String, String> {
+        if self.event_sim.is_none() && self.fabric_sim.is_none() {
+            self.prepare_sim()?;
+        }
+        self.refresh_sim_debug();
+        self.workspace = WorkspaceTab::Memory;
+        self.layout = LayoutKind::Simulation;
+        Ok(self.memories_text())
+    }
+
+    pub fn open_locals(&mut self) -> Result<String, String> {
+        if self.event_sim.is_none() && self.fabric_sim.is_none() {
+            self.prepare_sim()?;
+        }
+        self.refresh_sim_debug();
+        self.workspace = WorkspaceTab::Locals;
+        self.layout = LayoutKind::Simulation;
+        Ok(self.locals_text())
+    }
+
+    pub fn open_breakpoints(&mut self) -> Result<String, String> {
+        self.workspace = WorkspaceTab::Breakpoints;
+        self.layout = LayoutKind::Simulation;
+        Ok(self.breakpoints_text())
+    }
+
+    /// UG900: click a Memory row (name or index) — contents + Properties, not a dump.
+    pub fn select_memory(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_memory: empty".into());
+        }
+        if self.memories.is_empty() {
+            if self.event_sim.is_none() && self.fabric_sim.is_none() {
+                self.prepare_sim()?;
+            }
+            self.refresh_sim_debug();
+        }
+        if self.memories.is_empty() {
+            return Err("select_memory: no memories".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= self.memories.len() {
+                return Err(format!("select_memory: no row {spec}"));
+            }
+            i
+        } else {
+            self.memories
+                .iter()
+                .position(|m| m.name.eq_ignore_ascii_case(spec))
+                .ok_or_else(|| format!("select_memory: no memory {spec}"))?
+        };
+        let m = self.memories[idx].clone();
+        self.selected_memory = Some(m.name.clone());
+        self.selected_memory_addr = None;
+        self.workspace = WorkspaceTab::Memory;
+        self.properties = vec![
+            ("NAME".into(), m.name.clone()),
+            ("TYPE".into(), m.type_cell().to_string()),
+            ("ADDR".into(), "0".into()),
+            ("DATA".into(), m.data_cell()),
+            ("WIDTH".into(), m.width.to_string()),
+            ("DEPTH".into(), m.depth().to_string()),
+        ];
+        Ok(format!("{}\n{}", m.row_text(), self.memory_words_text()))
+    }
+
+    /// UG900: click a Memory address — Properties show Addr/Data from the engine word.
+    pub fn select_memory_word(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_memory_word: empty".into());
+        }
+        if self.selected_memory.is_none() {
+            return Err("select_memory_word: select a memory first".into());
+        }
+        let rows = self.memory_word_rows();
+        if rows.is_empty() {
+            return Err("select_memory_word: no words".into());
+        }
+        let addr = spec
+            .parse::<usize>()
+            .or_else(|_| spec.strip_prefix("0x").unwrap_or(spec).parse::<usize>())
+            .map_err(|_| format!("select_memory_word: bad addr {spec}"))?;
+        let row = rows
+            .iter()
+            .find(|r| r.addr == addr)
+            .ok_or_else(|| format!("select_memory_word: no addr {spec}"))?;
+        self.selected_memory_addr = Some(row.addr);
+        let name = self.selected_memory.clone().unwrap_or_default();
+        self.workspace = WorkspaceTab::Memory;
+        self.properties = vec![
+            ("NAME".into(), name.clone()),
+            ("TYPE".into(), "memory_word".into()),
+            ("ADDR".into(), row.addr.to_string()),
+            ("DATA".into(), row.data.clone()),
+        ];
+        Ok(format!("memory_word NAME={name} {}", row.row_text()))
+    }
+
+    /// UG900: click a Locals row (name or index) — add_wave + Properties.
+    pub fn select_local(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_local: empty".into());
+        }
+        if self.locals.is_empty() {
+            if self.event_sim.is_none() && self.fabric_sim.is_none() {
+                self.prepare_sim()?;
+            }
+            self.refresh_sim_debug();
+        }
+        if self.locals.is_empty() {
+            return Err("select_local: no locals".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= self.locals.len() {
+                return Err(format!("select_local: no row {spec}"));
+            }
+            i
+        } else {
+            self.locals
+                .iter()
+                .position(|l| l.name.eq_ignore_ascii_case(spec))
+                .ok_or_else(|| format!("select_local: no local {spec}"))?
+        };
+        let l = self.locals[idx].clone();
+        self.selected_local = Some(l.name.clone());
+        self.workspace = WorkspaceTab::Locals;
+        self.properties = vec![
+            ("NAME".into(), l.name.clone()),
+            ("TYPE".into(), l.type_cell().to_string()),
+            ("VALUE".into(), l.value_cell().to_string()),
+            ("SCOPE".into(), l.scope.clone()),
+        ];
+        let _ = self.add_wave(&l.name);
+        Ok(l.row_text())
+    }
+
+    pub fn add_breakpoint(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("add_bp: need <signal> [value]".into());
+        }
+        if self.event_sim.is_none() && self.fabric_sim.is_none() {
+            self.prepare_sim()?;
+        }
+        self.refresh_sim_debug();
+        let mut parts = spec.split_whitespace();
+        let signal = parts.next().unwrap().to_string();
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        let rest = rest.trim().trim_start_matches("==").trim();
+        let value = if rest.is_empty() {
+            None
+        } else {
+            let t = rest.trim_start_matches("0x").trim_start_matches("0X");
+            let v = if rest.starts_with("0x") || rest.starts_with("0X") {
+                u64::from_str_radix(t, 16)
+            } else {
+                rest.parse::<u64>()
+            }
+            .map_err(|_| format!("add_bp: bad value {rest}"))?;
+            Some(v)
+        };
+        if self.sim_signal_value(&signal).is_none() {
+            return Err(format!("add_bp: no signal {signal}"));
+        }
+        if let Some(existing) = self
+            .breakpoints
+            .iter_mut()
+            .find(|b| b.signal.eq_ignore_ascii_case(&signal) && b.value == value)
+        {
+            existing.enabled = true;
+            self.selected_breakpoint = Some(existing.id);
+            self.workspace = WorkspaceTab::Breakpoints;
+            return Ok(existing.row_text());
+        }
+        let condition = match value {
+            None => "change".into(),
+            Some(v) => format!("=={v}"),
+        };
+        let id = self.next_bp_id;
+        self.next_bp_id += 1;
+        let bp = BreakpointRow {
+            id,
+            enabled: true,
+            signal: signal.clone(),
+            condition,
+            value,
+            hits: 0,
+        };
+        self.selected_breakpoint = Some(id);
+        self.workspace = WorkspaceTab::Breakpoints;
+        self.properties = vec![
+            ("NAME".into(), format!("bp{id}")),
+            ("TYPE".into(), "breakpoint".into()),
+            ("ID".into(), id.to_string()),
+            ("ENABLED".into(), "1".into()),
+            ("SIGNAL".into(), signal),
+            ("CONDITION".into(), bp.condition.clone()),
+            ("HITS".into(), "0".into()),
+        ];
+        let text = bp.row_text();
+        self.breakpoints.push(bp);
+        Ok(text)
+    }
+
+    pub fn select_breakpoint(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_breakpoint: empty".into());
+        }
+        if self.breakpoints.is_empty() {
+            return Err("select_breakpoint: no breakpoints".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            self.breakpoints
+                .iter()
+                .position(|b| b.id == i)
+                .or_else(|| (i < self.breakpoints.len()).then_some(i))
+                .ok_or_else(|| format!("select_breakpoint: no row {spec}"))?
+        } else {
+            let name = spec.trim_start_matches("bp");
+            self.breakpoints
+                .iter()
+                .position(|b| b.signal.eq_ignore_ascii_case(spec) || b.id.to_string() == name)
+                .ok_or_else(|| format!("select_breakpoint: no breakpoint {spec}"))?
+        };
+        let b = self.breakpoints[idx].clone();
+        self.selected_breakpoint = Some(b.id);
+        self.workspace = WorkspaceTab::Breakpoints;
+        self.properties = vec![
+            ("NAME".into(), format!("bp{}", b.id)),
+            ("TYPE".into(), "breakpoint".into()),
+            ("ID".into(), b.id.to_string()),
+            ("ENABLED".into(), b.enabled_cell().into()),
+            ("SIGNAL".into(), b.signal.clone()),
+            ("CONDITION".into(), b.condition.clone()),
+            ("HITS".into(), b.hits.to_string()),
+        ];
+        Ok(b.row_text())
+    }
+
+    pub fn set_breakpoint_enabled(&mut self, spec: &str, enabled: bool) -> Result<String, String> {
+        if spec.trim().is_empty() {
+            let id = self
+                .selected_breakpoint
+                .ok_or("enable_bp: need id")?;
+            return self.set_breakpoint_enabled(&id.to_string(), enabled);
+        }
+        self.select_breakpoint(spec)?;
+        let id = self.selected_breakpoint.unwrap();
+        let b = self
+            .breakpoints
+            .iter_mut()
+            .find(|b| b.id == id)
+            .ok_or("enable_bp: missing")?;
+        b.enabled = enabled;
+        let text = b.row_text();
+        Ok(text)
+    }
+
+    pub fn delete_breakpoint(&mut self, spec: &str) -> Result<String, String> {
+        if spec.trim().is_empty() {
+            let id = self
+                .selected_breakpoint
+                .ok_or("delete_bp: need id")?;
+            return self.delete_breakpoint(&id.to_string());
+        }
+        self.select_breakpoint(spec)?;
+        let id = self.selected_breakpoint.unwrap();
+        self.breakpoints.retain(|b| b.id != id);
+        if self.selected_breakpoint == Some(id) {
+            self.selected_breakpoint = None;
+        }
+        self.workspace = WorkspaceTab::Breakpoints;
+        Ok(format!("delete_bp {id}"))
     }
 
     /// Fig. 49: select a clock region; Properties show name + HAD site count.
@@ -5686,6 +6295,11 @@ impl IdeModel {
                 self.workspace = WorkspaceTab::Schematic;
             }
             "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
+            "memory" | "memories" | "select_memory" => self.workspace = WorkspaceTab::Memory,
+            "breakpoints" | "add_bp" | "select_breakpoint" => {
+                self.workspace = WorkspaceTab::Breakpoints
+            }
+            "locals" | "select_local" => self.workspace = WorkspaceTab::Locals,
             _ => {}
         }
     }
@@ -7196,6 +7810,340 @@ impl IdeModel {
         let (name, value) = self.properties[idx].clone();
         self.selected_property = Some(name.clone());
         Ok(format!("property NAME={name} VALUE={value}"))
+    }
+
+    /// RTL vs constraint vs simulation fileset membership (UG893 Project Settings).
+    fn fileset_of_source(path: &str) -> &'static str {
+        match source_type_of(path) {
+            "constraint" => "constrs_1",
+            _ => "sources_1",
+        }
+    }
+
+    /// Files in a UG893 fileset (`sources_1` / `constrs_1` / `sim_1`) from Session RTL + XDC.
+    pub fn fileset_files(&self, name: &str) -> Vec<String> {
+        let key = match name.trim().to_ascii_lowercase().as_str() {
+            "sources_1" | "sources" | "sourceset" => "sources_1",
+            "constrs_1" | "constrs" | "constraints" => "constrs_1",
+            "sim_1" | "sim" | "simulation" => "sim_1",
+            _ => return Vec::new(),
+        };
+        self.tree
+            .sources
+            .iter()
+            .filter(|p| match key {
+                "constrs_1" => Self::fileset_of_source(p) == "constrs_1",
+                _ => Self::fileset_of_source(p) == "sources_1",
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn canon_fileset(name: &str) -> Result<&'static str, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "sources_1" | "sources" | "sourceset" => Ok("sources_1"),
+            "constrs_1" | "constrs" | "constraints" => Ok("constrs_1"),
+            "sim_1" | "sim" | "simulation" => Ok("sim_1"),
+            other => Err(format!("select_project_setting: unknown fileset {other}")),
+        }
+    }
+
+    fn impl_strategy_value(&self) -> String {
+        self.runs
+            .iter()
+            .find(|r| r.step == "Implementation" && r.name == "impl_1")
+            .or_else(|| self.runs.iter().find(|r| r.step == "Implementation"))
+            .map(|r| r.strategy.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Default".into())
+    }
+
+    fn target_language_value(&self) -> &'static str {
+        self.tree
+            .sources
+            .iter()
+            .find_map(|p| {
+                let t = source_type_of(p);
+                matches!(t, "sv" | "verilog" | "vhdl").then_some(t)
+            })
+            .unwrap_or("-")
+    }
+
+    fn top_value(&self) -> String {
+        self.tree
+            .top
+            .clone()
+            .or_else(|| self.shell.session.design.as_ref().map(|d| d.name.clone()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    fn fileset_files_cell(files: &[String]) -> String {
+        if files.is_empty() {
+            "-".into()
+        } else {
+            files
+                .iter()
+                .map(|p| source_basename(p))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+
+    /// UG893 Project Settings: clickable Name/Value rows over Session (part / top / fileset / strategy).
+    pub fn project_setting_rows(&self) -> Vec<PropertyRow> {
+        let fileset = if self.active_fileset.is_empty() {
+            "sources_1".to_string()
+        } else {
+            self.active_fileset.clone()
+        };
+        let mode = match self.shell.session.mode {
+            Mode::Project => "Project",
+            Mode::NonProject => "NonProject",
+        };
+        vec![
+            PropertyRow {
+                name: "PART".into(),
+                value: self.part().to_string(),
+            },
+            PropertyRow {
+                name: "TOP".into(),
+                value: self.top_value(),
+            },
+            PropertyRow {
+                name: "FILESET".into(),
+                value: fileset,
+            },
+            PropertyRow {
+                name: "STRATEGY".into(),
+                value: self.impl_strategy_value(),
+            },
+            PropertyRow {
+                name: "MODE".into(),
+                value: mode.into(),
+            },
+            PropertyRow {
+                name: "TARGET_LANGUAGE".into(),
+                value: self.target_language_value().into(),
+            },
+            PropertyRow {
+                name: "CLOCK_PERIOD_PS".into(),
+                value: self.clock_period_ps.to_string(),
+            },
+        ]
+    }
+
+    /// UG893 Project Settings dump (tests). Paint is a clickable grid, not this string.
+    pub fn project_settings_text(&self) -> String {
+        let rows = self.project_setting_rows();
+        let n = rows.len();
+        let part = rows
+            .iter()
+            .find(|r| r.name == "PART")
+            .map(|r| r.value.as_str())
+            .unwrap_or("-");
+        let top = rows
+            .iter()
+            .find(|r| r.name == "TOP")
+            .map(|r| r.value.as_str())
+            .unwrap_or("-");
+        let fileset = rows
+            .iter()
+            .find(|r| r.name == "FILESET")
+            .map(|r| r.value.as_str())
+            .unwrap_or("-");
+        let strategy = rows
+            .iter()
+            .find(|r| r.name == "STRATEGY")
+            .map(|r| r.value.as_str())
+            .unwrap_or("-");
+        let mut s = format!(
+            "project_settings n={n} part={part} top={top} fileset={fileset} strategy={strategy}"
+        );
+        for row in &rows {
+            s.push('\n');
+            s.push_str(&row.row_text());
+        }
+        s
+    }
+
+    pub fn open_project_settings(&mut self) -> Result<String, String> {
+        self.nav = NavSection::ProjectManager;
+        self.workspace = WorkspaceTab::Settings;
+        Ok(self.project_settings_text())
+    }
+
+    fn apply_project_setting(&mut self, cmd: &str) -> Result<String, String> {
+        let toks: Vec<&str> = cmd.split_whitespace().collect();
+        if toks.len() < 3 {
+            return Err("set_property: need KEY VALUE".into());
+        }
+        let key = toks[1];
+        let val = toks[2].trim_matches('"');
+        if key.eq_ignore_ascii_case("PART") {
+            self.set_part(val)
+        } else if key.eq_ignore_ascii_case("STRATEGY") {
+            self.set_impl_strategy(val)
+        } else if key.eq_ignore_ascii_case("FILESET") {
+            self.set_active_fileset(val)
+        } else {
+            Err(format!("set_property: unsupported project setting {key}"))
+        }
+    }
+
+    /// HAD part for the Session (`set_part` / Project Settings PART).
+    pub fn set_part(&mut self, part: &str) -> Result<String, String> {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("set_part: missing part".into());
+        }
+        let dev = Device::load_part(part)?;
+        self.shell.part = dev.part.clone();
+        self.shell.session.part = dev.part.clone();
+        for r in &mut self.runs {
+            r.part = dev.part.clone();
+        }
+        self.refresh_device();
+        self.refresh_package();
+        self.workspace = WorkspaceTab::Settings;
+        self.selected_setting = Some("PART".into());
+        self.refresh_project_setting_properties("PART");
+        Ok(format!("set_part {}", self.part()))
+    }
+
+    fn set_impl_strategy(&mut self, name: &str) -> Result<String, String> {
+        let strategy = ImplStrategy::parse(name)?;
+        if let Some(r) = self
+            .runs
+            .iter_mut()
+            .find(|r| r.name == "impl_1" && r.step == "Implementation")
+        {
+            r.strategy = strategy.label().into();
+        } else if let Some(r) = self
+            .runs
+            .iter_mut()
+            .find(|r| r.step == "Implementation")
+        {
+            r.strategy = strategy.label().into();
+        }
+        self.workspace = WorkspaceTab::Settings;
+        self.selected_setting = Some("STRATEGY".into());
+        self.refresh_project_setting_properties("STRATEGY");
+        Ok(format!("set_property STRATEGY {}", strategy.label()))
+    }
+
+    fn set_active_fileset(&mut self, name: &str) -> Result<String, String> {
+        let canon = Self::canon_fileset(name).map_err(|e| {
+            e.replace("select_project_setting:", "set_property FILESET:")
+        })?;
+        self.active_fileset = canon.into();
+        self.workspace = WorkspaceTab::Settings;
+        self.selected_setting = Some("FILESET".into());
+        self.refresh_project_setting_properties("FILESET");
+        Ok(format!("set_property FILESET {canon}"))
+    }
+
+    fn refresh_project_setting_properties(&mut self, name: &str) {
+        let rows = self.project_setting_rows();
+        let value = rows
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(name))
+            .map(|r| r.value.clone())
+            .unwrap_or_else(|| "-".into());
+        let mut props = vec![
+            ("NAME".into(), name.to_string()),
+            ("TYPE".into(), "project_setting".into()),
+            ("VALUE".into(), value.clone()),
+        ];
+        match name {
+            "PART" => {
+                if let Ok(dev) = self.device() {
+                    props.push(("IDCODE".into(), format!("{:#010x}", dev.idcode)));
+                    props.push(("LUT6".into(), dev.lut6_count().to_string()));
+                    props.push(("DSP".into(), dev.n_dsp.to_string()));
+                    props.push(("BRAM".into(), dev.n_bram.to_string()));
+                }
+            }
+            "TOP" => {
+                props.push(("CELLS".into(), self.tree.cells.len().to_string()));
+                props.push(("NETS".into(), self.tree.nets.len().to_string()));
+            }
+            "FILESET" => {
+                let files = self.fileset_files(&self.active_fileset);
+                props.push(("N".into(), files.len().to_string()));
+                props.push(("FILES".into(), Self::fileset_files_cell(&files)));
+                for fs in ["sources_1", "constrs_1", "sim_1"] {
+                    let f = self.fileset_files(fs);
+                    props.push((fs.to_ascii_uppercase().into(), Self::fileset_files_cell(&f)));
+                }
+            }
+            "STRATEGY" => {
+                let run = self
+                    .runs
+                    .iter()
+                    .find(|r| r.step == "Implementation" && r.name == "impl_1")
+                    .or_else(|| self.runs.iter().find(|r| r.step == "Implementation"));
+                props.push((
+                    "RUN".into(),
+                    run.map(|r| r.name.clone()).unwrap_or_else(|| "impl_1".into()),
+                ));
+                props.push((
+                    "STATUS".into(),
+                    run.map(|r| r.status.clone())
+                        .unwrap_or_else(|| "Not started".into()),
+                ));
+            }
+            "CLOCK_PERIOD_PS" => {
+                props.push(("UNIT".into(), "ps".into()));
+            }
+            _ => {}
+        }
+        self.properties = props;
+        self.selected_property = Some(name.to_string());
+    }
+
+    /// Click a UG893 Project Settings Name/Value row — highlight that setting, not a dump.
+    pub fn select_project_setting(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_project_setting: missing name".into());
+        }
+        if let Ok(fs) = Self::canon_fileset(spec) {
+            self.active_fileset = fs.into();
+            self.workspace = WorkspaceTab::Settings;
+            self.selected_setting = Some("FILESET".into());
+            self.refresh_project_setting_properties("FILESET");
+            let files = self.fileset_files(fs);
+            return Ok(format!(
+                "project_setting NAME=FILESET VALUE={fs} FILES={}",
+                Self::fileset_files_cell(&files)
+            ));
+        }
+        let rows = self.project_setting_rows();
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= rows.len() {
+                return Err(format!("select_project_setting: no row {spec}"));
+            }
+            i
+        } else {
+            rows.iter()
+                .position(|r| {
+                    r.name.eq_ignore_ascii_case(spec)
+                        || format!("{}={}", r.name, r.value).eq_ignore_ascii_case(spec)
+                        || format!("NAME={} VALUE={}", r.name, r.value).eq_ignore_ascii_case(spec)
+                })
+                .ok_or_else(|| format!("select_project_setting: no row {spec}"))?
+        };
+        let row = rows[idx].clone();
+        if row.name == "FILESET" {
+            if let Ok(fs) = Self::canon_fileset(&row.value) {
+                self.active_fileset = fs.into();
+            }
+        }
+        self.workspace = WorkspaceTab::Settings;
+        self.selected_setting = Some(row.name.clone());
+        self.refresh_project_setting_properties(&row.name);
+        Ok(format!("project_setting NAME={} VALUE={}", row.name, row.value))
     }
 
     pub fn refresh_ip_catalog(&mut self) {
@@ -9369,6 +10317,10 @@ impl IdeModel {
         let n_tb = extra.max_time_borrows.len();
         let n_dc = extra.data_checks.len();
         self.merge_constraints(extra);
+        let p = path.to_string();
+        if !self.tree.sources.contains(&p) {
+            self.tree.sources.push(p);
+        }
         Ok(format!(
             "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md} min_delay={n_mind} clock_groups={n_cg} uncertainty={n_u} latency={n_l} disable_timing={n_dt} case_analysis={n_ca} propagated_clock={n_pc} clock_sense={n_cs} input_jitter={n_ij} system_jitter={n_sj} timing_derate={n_td} operating_conditions={n_oc} bus_skew={n_bs} group_path={n_gp} time_borrow={n_tb} data_check={n_dc}"
         ))
@@ -9442,8 +10394,16 @@ impl IdeModel {
         self.wave.traces.clear();
         self.wave.cursor = 0;
         self.wave.timescale_ps = self.clock_period_ps;
+        self.bp_prev.clear();
+        let mut hit: Option<String> = None;
+        let mut ran = 0u32;
         for _ in 0..cycles {
             self.sim_step_inner()?;
+            ran += 1;
+            if let Some(h) = self.check_breakpoints() {
+                hit = Some(h);
+                break;
+            }
         }
         let n = self.wave.sample_len();
         if n > 0 {
@@ -9462,6 +10422,11 @@ impl IdeModel {
             .wave
             .bits_of("led")
             .unwrap_or_default();
+        if let Some(h) = hit {
+            return Ok(format!(
+                "sim_run HIT {h} cycles={ran}/{cycles} LED[{ran}]={led}"
+            ));
+        }
         Ok(format!("sim_run cycles={cycles} LED[{cycles}]={led}"))
     }
 
@@ -9485,6 +10450,15 @@ impl IdeModel {
         self.wave = Waveform::default();
         self.objects.clear();
         self.selected_object = None;
+        self.memories.clear();
+        self.selected_memory = None;
+        self.selected_memory_addr = None;
+        self.locals.clear();
+        self.selected_local = None;
+        self.bp_prev.clear();
+        for bp in &mut self.breakpoints {
+            bp.hits = 0;
+        }
         self.prepare_sim()?;
         Ok("sim_restart".into())
     }
@@ -9534,6 +10508,7 @@ impl IdeModel {
         if self.wave.traces.is_empty() {
             self.wave.traces.push(WaveTrace::scalar("led"));
         }
+        self.refresh_sim_debug();
         Ok(())
     }
 
@@ -9575,6 +10550,7 @@ impl IdeModel {
             self.wave.set_cursor(n - 1);
         }
         self.refresh_sim_objects();
+        self.refresh_sim_debug();
         Ok(())
     }
 
@@ -19606,6 +20582,225 @@ mod tests {
                 .unwrap_or(false),
             "{:?}",
             blinky.selected_source
+        );
+    }
+
+    /// UG893 Project Settings is a clickable part / top / fileset / strategy
+    /// Name/Value table over Session, not a collapsing dump.
+    #[test]
+    fn project_settings_pane_clickable_part_top_fileset_strategy_table() {
+        let mut ide = IdeModel::new();
+        assert!(ide.selected_setting.is_none());
+        assert_eq!(ide.active_fileset, "sources_1");
+        assert!(
+            ide.exec("select_project_setting")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_project_setting no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown setting must refuse"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "project_settings"),
+            "Flow Navigator Project Manager must offer Project Settings"
+        );
+
+        let idle = ide.exec("project_settings").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Settings);
+        assert_eq!(ide.nav, NavSection::ProjectManager);
+        assert!(idle.contains('\n'), "must not be a one-liner dump: {idle}");
+        assert!(idle.contains("project_settings n="), "{idle}");
+        assert!(idle.contains("part=HL10T-C32-1"), "{idle}");
+        assert!(idle.contains("top=-"), "{idle}");
+        assert!(idle.contains("fileset=sources_1"), "{idle}");
+        assert!(idle.contains("strategy=Default"), "{idle}");
+        assert!(idle.contains("NAME=PART VALUE=HL10T-C32-1"), "{idle}");
+        assert!(idle.contains("NAME=TOP VALUE=-"), "{idle}");
+        assert!(idle.contains("NAME=FILESET VALUE=sources_1"), "{idle}");
+        assert!(idle.contains("NAME=STRATEGY VALUE=Default"), "{idle}");
+        assert!(idle.contains("NAME=MODE VALUE=Project"), "{idle}");
+        let rows = ide.project_setting_rows();
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "PART" && r.value == "HL10T-C32-1"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.name == "TOP" && r.value == "-"),
+            "idle TOP is Session-empty, not a canned module: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "FILESET" && r.value == "sources_1"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "STRATEGY" && r.value == "Default"),
+            "{rows:?}"
+        );
+        let part = ide.exec("select_project_setting PART").unwrap();
+        assert!(part.contains("NAME=PART"), "{part}");
+        assert!(part.contains("VALUE=HL10T-C32-1"), "{part}");
+        assert_eq!(ide.selected_setting.as_deref(), Some("PART"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "project_setting"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, _)| k == "IDCODE" || k == "LUT6"),
+            "PART click exposes HAD, not a dump stub: {:?}",
+            ide.properties
+        );
+        let by_idx = ide.exec("select_project_setting 0").unwrap();
+        assert!(by_idx.contains("NAME=PART"), "{by_idx}");
+
+        let dsp = ide.exec("set_part HL10T-DSP1").unwrap();
+        assert!(dsp.contains("HL10T-DSP1"), "{dsp}");
+        assert_eq!(ide.part(), "HL10T-DSP1");
+        assert_eq!(ide.session().part, "HL10T-DSP1");
+        let dsp_table = ide.exec("project_settings").unwrap();
+        assert!(dsp_table.contains("NAME=PART VALUE=HL10T-DSP1"), "{dsp_table}");
+        assert!(
+            !dsp_table.contains("NAME=PART VALUE=HL10T-C32-1"),
+            "PART is Session-backed, not canned: {dsp_table}"
+        );
+        ide.exec("set_property PART HL10T-C32-1").unwrap();
+        assert_eq!(ide.part(), "HL10T-C32-1");
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        let table = ide.exec("project_settings").unwrap();
+        assert!(table.contains("top=counter"), "{table}");
+        assert!(table.contains("NAME=TOP VALUE=counter"), "{table}");
+        assert!(table.contains("NAME=TARGET_LANGUAGE VALUE=sv"), "{table}");
+        assert!(
+            ide.project_setting_rows()
+                .iter()
+                .any(|r| r.name == "TOP" && r.value == "counter"),
+            "{:?}",
+            ide.project_setting_rows()
+        );
+        let top = ide.exec("select_project_setting TOP").unwrap();
+        assert!(top.contains("NAME=TOP"), "{top}");
+        assert!(top.contains("VALUE=counter"), "{top}");
+        assert_eq!(ide.selected_setting.as_deref(), Some("TOP"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "CELLS" && v != "0"),
+            "TOP is HNF-backed: {:?}",
+            ide.properties
+        );
+
+        let fs = ide.exec("select_project_setting FILESET").unwrap();
+        assert!(fs.contains("NAME=FILESET"), "{fs}");
+        assert!(fs.contains("VALUE=sources_1"), "{fs}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "FILES" && v.contains("counter.sv")),
+            "FILESET lists Session RTL, not a dump: {:?}",
+            ide.properties
+        );
+        assert!(
+            ide.fileset_files("sources_1")
+                .iter()
+                .any(|p| p.ends_with("counter.sv")),
+            "{:?}",
+            ide.fileset_files("sources_1")
+        );
+
+        let xdc = example("counter.sdc");
+        ide.exec(&format!("read_xdc {}", xdc.display())).unwrap();
+        assert!(
+            ide.fileset_files("constrs_1")
+                .iter()
+                .any(|p| p.ends_with("counter.sdc")),
+            "XDC lands in constrs_1: {:?}",
+            ide.fileset_files("constrs_1")
+        );
+        let constrs = ide.exec("select_project_setting constrs_1").unwrap();
+        assert_eq!(ide.active_fileset, "constrs_1");
+        assert!(constrs.contains("NAME=FILESET"), "{constrs}");
+        assert!(constrs.contains("VALUE=constrs_1"), "{constrs}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "FILES" && v.contains("counter.sdc")),
+            "{:?}",
+            ide.properties
+        );
+        let after_fs = ide.exec("project_settings").unwrap();
+        assert!(after_fs.contains("NAME=FILESET VALUE=constrs_1"), "{after_fs}");
+        ide.exec("set_property FILESET sources_1").unwrap();
+        assert_eq!(ide.active_fileset, "sources_1");
+
+        ide.exec("set_property STRATEGY RuntimeOpt").unwrap();
+        let strat = ide.exec("project_settings").unwrap();
+        assert!(strat.contains("NAME=STRATEGY VALUE=RuntimeOpt"), "{strat}");
+        assert_eq!(ide.selected_setting.as_deref(), Some("STRATEGY"));
+        let strat_click = ide.exec("select_project_setting STRATEGY").unwrap();
+        assert!(strat_click.contains("VALUE=RuntimeOpt"), "{strat_click}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "RUN" && v == "impl_1"),
+            "{:?}",
+            ide.properties
+        );
+        ide.exec("set_property STRATEGY Default").unwrap();
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        let after = ide.exec("project_settings").unwrap();
+        assert!(after.contains("NAME=PART VALUE=HL10T-C32-1"), "{after}");
+        assert!(after.contains("NAME=TOP VALUE=counter"), "{after}");
+        ide.exec("select_project_setting CLOCK_PERIOD_PS").unwrap();
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Project Settings"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let btable = blinky.exec("project_settings").unwrap();
+        assert!(btable.contains("NAME=TOP VALUE=blinky"), "{btable}");
+        assert!(
+            !btable.contains("NAME=TOP VALUE=counter"),
+            "Project Settings are per-session, not canned: {btable}"
+        );
+        blinky.exec("select_project_setting FILESET").unwrap();
+        assert!(
+            blinky
+                .properties
+                .iter()
+                .any(|(k, v)| k == "FILES" && v.contains("blinky.sv")),
+            "{:?}",
+            blinky.properties
+        );
+        assert!(
+            !blinky
+                .properties
+                .iter()
+                .any(|(_, v)| v.contains("counter.sv")),
+            "blinky fileset is not counter: {:?}",
+            blinky.properties
         );
     }
 }

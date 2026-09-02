@@ -986,6 +986,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.horizontal(|ui| {
         for tab in [
             WorkspaceTab::Reports,
+            WorkspaceTab::Settings,
             WorkspaceTab::Schematic,
             WorkspaceTab::Device,
             WorkspaceTab::Wave,
@@ -1007,6 +1008,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         ] {
             let label = match tab {
                 WorkspaceTab::Reports => "Reports",
+                WorkspaceTab::Settings => "Project Settings",
                 WorkspaceTab::Schematic => "Schematic",
                 WorkspaceTab::Device => "Device",
                 WorkspaceTab::Wave => "Waveform",
@@ -1037,6 +1039,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.separator();
     match model.workspace {
         WorkspaceTab::Reports => paint_reports(ui, model),
+        WorkspaceTab::Settings => paint_project_settings(ui, model),
         WorkspaceTab::Schematic => paint_schematic(ui, model),
         WorkspaceTab::Device => paint_device(ui, model),
         WorkspaceTab::Wave => paint_wave(ui, model),
@@ -1055,6 +1058,55 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Package => paint_package(ui, model),
         WorkspaceTab::Runs => paint_runs(ui, model),
         WorkspaceTab::Bitstream => paint_bitstream(ui, model),
+    }
+}
+
+fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Project Settings");
+    ui.weak(
+        "UG893 Project Settings — clickable part / top / fileset / strategy Name/Value table over Session, not a dump",
+    );
+    let rows = model.project_setting_rows();
+    ui.label(format!(
+        "project_settings n={} part={} top={} fileset={} strategy={}",
+        rows.len(),
+        model.part(),
+        rows.iter()
+            .find(|r| r.name == "TOP")
+            .map(|r| r.value.as_str())
+            .unwrap_or("-"),
+        model.active_fileset,
+        rows.iter()
+            .find(|r| r.name == "STRATEGY")
+            .map(|r| r.value.as_str())
+            .unwrap_or("-"),
+    ));
+    let selected = model.selected_setting.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both()
+        .id_salt("ug893_project_settings")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("project_settings_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Value").strong());
+                    ui.end_row();
+                    for (i, r) in rows.iter().enumerate() {
+                        let on = selected.as_deref() == Some(r.name.as_str());
+                        if ui.selectable_label(on, &r.name).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        if ui.selectable_label(on, &r.value).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    if let Some(spec) = pick {
+        let _ = model.select_project_setting(&spec);
     }
 }
 
