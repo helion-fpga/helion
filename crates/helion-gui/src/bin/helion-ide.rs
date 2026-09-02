@@ -6,8 +6,8 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::{
-    doctor, BottomTab, FlowStep, IdeModel, IlaTrigger, LayoutKind, MsgSeverity, NavSection,
-    StepState, WaveRadix, WaveStyle, WorkspaceTab,
+    doctor, BottomTab, ClockRelation, FlowStep, IdeModel, IlaTrigger, LayoutKind, MsgSeverity,
+    NavSection, StepState, WaveRadix, WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -663,6 +663,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Hardware,
             WorkspaceTab::Ip,
             WorkspaceTab::Constraints,
+            WorkspaceTab::ClockInteraction,
             WorkspaceTab::Hierarchy,
             WorkspaceTab::Find,
             WorkspaceTab::Package,
@@ -676,6 +677,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Hardware => "Hardware",
                 WorkspaceTab::Ip => "IP / BD",
                 WorkspaceTab::Constraints => "Timing Constraints",
+                WorkspaceTab::ClockInteraction => "Clock Interaction",
                 WorkspaceTab::Hierarchy => "Hierarchy",
                 WorkspaceTab::Find => "Find Results",
                 WorkspaceTab::Package => "Package",
@@ -698,6 +700,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Hardware => paint_hw(ui, model),
         WorkspaceTab::Ip => paint_ip(ui, model),
         WorkspaceTab::Constraints => paint_constraints(ui, model),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, model),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, model),
         WorkspaceTab::Find => paint_find(ui, model),
         WorkspaceTab::Package => paint_package(ui, model),
@@ -1338,6 +1341,118 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
         None => "no DRC — run Place/Route".into(),
     };
     report_box(ui, "DRC (helion-drc)", &drc);
+    ui.add_space(8.0);
+    report_box(
+        ui,
+        "Clock Interaction (report_clock_interaction)",
+        &model.clock_interaction_text(),
+    );
+}
+
+fn clock_relation_color(rel: ClockRelation) -> Color32 {
+    match rel {
+        ClockRelation::Timed => Color32::from_rgb(0x3c, 0xb3, 0x71),
+        ClockRelation::TimedGenerated => Color32::from_rgb(0x6b, 0xc9, 0x6b),
+        ClockRelation::TimedUnsafe => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        ClockRelation::TimedDatapath => Color32::from_rgb(0xf0, 0x80, 0x40),
+        ClockRelation::FalsePath => Color32::from_rgb(0x90, 0x90, 0x90),
+        ClockRelation::PartialFalsePath => Color32::from_rgb(0xc0, 0x70, 0x40),
+        ClockRelation::Asynchronous => Color32::from_rgb(0x90, 0x60, 0xc0),
+        ClockRelation::Exclusive => Color32::from_rgb(0x50, 0x80, 0xc0),
+        ClockRelation::NoPaths => Color32::from_rgb(0x40, 0x40, 0x40),
+    }
+}
+
+fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Clock Interaction");
+    ui.weak(
+        "UG949 report_clock_interaction — STA From×To matrix (Timed / generated / unsafe CDC / async / exclusive / false path), not a dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report clock interaction").clicked() {
+            let _ = model.exec("report_clock_interaction");
+        }
+        if ui.button("Apply set_clock_groups async clk/virt").clicked() {
+            let _ = model.exec(
+                "set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]",
+            );
+        }
+        if ui.button("Apply set_false_path clk→virt").clicked() {
+            let _ = model.exec(
+                "set_false_path -from [get_clocks clk] -to [get_clocks virt]",
+            );
+        }
+        if ui.button("Apply set_max_delay -datapath_only 2ns").clicked() {
+            let _ = model.exec(
+                "set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]",
+            );
+        }
+    });
+    ui.add_space(6.0);
+    let report = model.clock_interaction();
+    if report.clocks.is_empty() {
+        ui.label("no clocks — create_clock / report_clock_interaction");
+        return;
+    }
+    let selected = model.selected.clone();
+    let mut pick: Option<(String, String)> = None;
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("clock_interaction_matrix")
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("From \\ To").strong());
+                for c in &report.clocks {
+                    ui.label(RichText::new(&c.name).strong());
+                }
+                ui.end_row();
+                for from in &report.clocks {
+                    ui.label(RichText::new(&from.name).strong());
+                    for to in &report.clocks {
+                        if let Some(cell) = report.cell(&from.name, &to.name) {
+                            let key = format!("{}->{}", cell.from, cell.to);
+                            let on = selected.as_deref() == Some(key.as_str());
+                            let fill = clock_relation_color(cell.relation);
+                            let wns = cell
+                                .wns_ps
+                                .map(|w| format!(" WNS_PS={w}"))
+                                .unwrap_or_default();
+                            let label = format!("{}{wns}", cell.relation.as_str());
+                            let btn = egui::Button::new(RichText::new(label).color(Color32::BLACK))
+                                .fill(fill)
+                                .selected(on);
+                            let resp = ui.add_sized([120.0, 40.0], btn);
+                            if resp.clicked() {
+                                pick = Some((cell.from.clone(), cell.to.clone()));
+                            }
+                            resp.on_hover_text(format!(
+                                "FROM={} TO={} {} COMMON_PS={} REQ_PS={} paths={}",
+                                cell.from,
+                                cell.to,
+                                cell.relation.as_str(),
+                                cell.common_period_ps,
+                                cell.requirement_ps,
+                                cell.path_count
+                            ));
+                        } else {
+                            ui.label("—");
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+    if let Some((from, to)) = pick {
+        let _ = model.select_clock_interaction(&from, &to);
+    }
+    ui.add_space(8.0);
+    report_box(
+        ui,
+        "Clock Interaction (report_clock_interaction)",
+        &model.clock_interaction_text(),
+    );
+    ui.add_space(8.0);
+    report_box(ui, "Timing (report_timing)", &model.timing_text());
 }
 
 fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke) {

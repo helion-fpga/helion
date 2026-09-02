@@ -15,6 +15,7 @@ pub use ide::{
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
     UltraFastStage, Utilization, Waveform, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
 };
+pub use helion_sta::{ClockInteraction, ClockInteractionCell, ClockRelation};
 
 use helion_device::Device;
 use helion_proj::{get_cells, get_nets, get_pins, opt_design, Mode, Session};

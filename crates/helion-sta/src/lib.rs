@@ -31,6 +31,148 @@ pub struct TimingResult {
     pub clk_net_ps: i64,
 }
 
+/// UG949 Clock Interaction Report (`report_clock_interaction`) cell class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockRelation {
+    /// Same clock or harmonic clocks sharing a root.
+    Timed,
+    /// Generated clock vs its master (same generated-clock tree).
+    TimedGenerated,
+    /// Unrelated clocks still timed — CDC without an exception.
+    TimedUnsafe,
+    /// `set_max_delay -datapath_only` covers the pair.
+    TimedDatapath,
+    /// `set_false_path` covers both clocks.
+    FalsePath,
+    /// Some but not all paths between the pair are excepted.
+    PartialFalsePath,
+    /// `set_clock_groups -asynchronous`.
+    Asynchronous,
+    /// `set_clock_groups -logically_exclusive` / `-physically_exclusive`.
+    Exclusive,
+    /// No timing paths between the pair.
+    NoPaths,
+}
+
+impl ClockRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timed => "Timed",
+            Self::TimedGenerated => "Timed (generated)",
+            Self::TimedUnsafe => "Timed (unsafe)",
+            Self::TimedDatapath => "Timed (datapath)",
+            Self::FalsePath => "False Path",
+            Self::PartialFalsePath => "Partial False Path",
+            Self::Asynchronous => "Asynchronous",
+            Self::Exclusive => "Exclusive",
+            Self::NoPaths => "No Paths",
+        }
+    }
+
+    /// Inter-clock CDC / exception (not intra-clock Timed).
+    pub fn is_cdc(self) -> bool {
+        matches!(
+            self,
+            Self::TimedUnsafe
+                | Self::TimedDatapath
+                | Self::FalsePath
+                | Self::PartialFalsePath
+                | Self::Asynchronous
+                | Self::Exclusive
+        )
+    }
+}
+
+/// One From×To cell of the UG949 Clock Interaction matrix.
+#[derive(Clone, Debug)]
+pub struct ClockInteractionCell {
+    pub from: String,
+    pub to: String,
+    pub relation: ClockRelation,
+    pub common_period_ps: u64,
+    pub requirement_ps: i64,
+    pub wns_ps: Option<i64>,
+    pub path_count: usize,
+}
+
+/// UG949 Clock Interaction Report: N×N matrix from STA clocks + XDC exceptions.
+#[derive(Clone, Debug, Default)]
+pub struct ClockInteraction {
+    pub clocks: Vec<Clock>,
+    pub cells: Vec<ClockInteractionCell>,
+}
+
+impl ClockInteraction {
+    pub fn cell(&self, from: &str, to: &str) -> Option<&ClockInteractionCell> {
+        self.cells.iter().find(|c| c.from == from && c.to == to)
+    }
+
+    pub fn timed_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.relation,
+                    ClockRelation::Timed | ClockRelation::TimedGenerated
+                )
+            })
+            .count()
+    }
+
+    pub fn unsafe_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|c| c.relation == ClockRelation::TimedUnsafe)
+            .count()
+    }
+
+    pub fn cdc_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|c| c.from != c.to && c.relation.is_cdc())
+            .count()
+    }
+
+    pub fn text(&self) -> String {
+        if self.clocks.is_empty() {
+            return "no clocks — create_clock / report_clock_interaction".into();
+        }
+        let mut lines = vec![format!(
+            "report_clock_interaction clocks={} cells={} timed={} unsafe={} cdc={}",
+            self.clocks.len(),
+            self.cells.len(),
+            self.timed_count(),
+            self.unsafe_count(),
+            self.cdc_count()
+        )];
+        for c in &self.clocks {
+            lines.push(format!(
+                "clock {} PERIOD_PS={} generated={} MASTER={}",
+                c.name,
+                c.period_ps,
+                u8::from(c.generated),
+                c.master.as_deref().unwrap_or("-")
+            ));
+        }
+        for cell in &self.cells {
+            let wns = match cell.wns_ps {
+                Some(w) => format!("WNS_PS={w}"),
+                None => "WNS_PS=n/a".into(),
+            };
+            lines.push(format!(
+                "FROM={} TO={} {} COMMON_PS={} REQ_PS={} {wns} paths={}",
+                cell.from,
+                cell.to,
+                cell.relation.as_str(),
+                cell.common_period_ps,
+                cell.requirement_ps,
+                cell.path_count
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
 pub fn create_clock(clocks: &mut Vec<Clock>, name: &str, period_ps: u64, source: &str) {
     clocks.push(Clock {
         name: name.into(),
@@ -580,6 +722,39 @@ impl Constraints {
         self.clock_groups.iter().any(|g| g.groups.len() >= 2)
     }
 
+    /// First `set_clock_groups` that places `a` and `b` in different groups.
+    pub fn clock_groups_for_pair(&self, a: &str, b: &str) -> Option<&ClockGroups> {
+        self.clock_groups.iter().find(|g| {
+            let ia = g.groups.iter().position(|grp| grp.iter().any(|n| n == a));
+            let ib = g.groups.iter().position(|grp| grp.iter().any(|n| n == b));
+            matches!((ia, ib), (Some(i), Some(j)) if i != j)
+        })
+    }
+
+    /// Inter-clock `set_false_path` whose stored tokens name both clocks.
+    pub fn false_path_covers_clocks(&self, from: &str, to: &str) -> bool {
+        if from == to {
+            return false;
+        }
+        self.false_paths
+            .iter()
+            .any(|fp| sdc_token_eq(fp, from) && sdc_token_eq(fp, to))
+    }
+
+    /// Tightest `set_max_delay -datapath_only` covering the clock pair (ps).
+    pub fn datapath_max_delay_covers(&self, from: &str, to: &str) -> Option<i64> {
+        self.max_delays
+            .iter()
+            .filter(|m| m.datapath_only)
+            .filter(|m| {
+                (!m.from.is_empty() && !m.to.is_empty())
+                    && ((m.from == from && m.to == to)
+                        || (sdc_token_eq(&m.from, from) && sdc_token_eq(&m.to, to)))
+            })
+            .map(|m| m.delay_ps)
+            .min()
+    }
+
     /// Largest setup `set_clock_uncertainty` in ps (0 if none).
     pub fn uncertainty_setup_ps(&self) -> i64 {
         self.clock_uncertainties
@@ -774,6 +949,157 @@ fn tcl_case_value(s: &str) -> Option<String> {
         "rising" => Some("rising".into()),
         "falling" => Some("falling".into()),
         _ => None,
+    }
+}
+
+fn sdc_token_eq(hay: &str, name: &str) -> bool {
+    hay.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|t| t == name)
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn lcm_u64(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    a / gcd_u64(a, b) * b
+}
+
+fn harmonic_periods(a: u64, b: u64) -> bool {
+    if a == 0 || b == 0 {
+        return false;
+    }
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    hi % lo == 0
+}
+
+fn clock_root<'a>(clocks: &'a [Clock], c: &'a Clock) -> &'a str {
+    let mut cur = c;
+    for _ in 0..8 {
+        match cur.master.as_deref() {
+            Some(m) => {
+                if let Some(p) = clocks.iter().find(|k| k.name == m) {
+                    cur = p;
+                } else {
+                    return m;
+                }
+            }
+            None => break,
+        }
+    }
+    &cur.name
+}
+
+fn classify_clock_pair(from: &Clock, to: &Clock, clocks: &[Clock], xdc: &Constraints) -> ClockRelation {
+    if from.name != to.name {
+        if let Some(g) = xdc.clock_groups_for_pair(&from.name, &to.name) {
+            if g.exclusive {
+                return ClockRelation::Exclusive;
+            }
+            if g.asynchronous {
+                return ClockRelation::Asynchronous;
+            }
+        }
+        if xdc.false_path_covers_clocks(&from.name, &to.name) {
+            return ClockRelation::FalsePath;
+        }
+        if xdc.datapath_max_delay_covers(&from.name, &to.name).is_some() {
+            return ClockRelation::TimedDatapath;
+        }
+    }
+    if from.name == to.name {
+        return ClockRelation::Timed;
+    }
+    let same_root = clock_root(clocks, from) == clock_root(clocks, to);
+    if same_root && (from.generated || to.generated) {
+        return ClockRelation::TimedGenerated;
+    }
+    if same_root && harmonic_periods(from.period_ps, to.period_ps) {
+        return ClockRelation::Timed;
+    }
+    ClockRelation::TimedUnsafe
+}
+
+fn analysis_requirement_ps(clocks: &[Clock], xdc: &Constraints) -> i64 {
+    xdc.max_delay_ps().unwrap_or_else(|| {
+        (clocks.first().map(|c| c.period_ps).unwrap_or(0) as i64)
+            .saturating_mul(xdc.setup_mult() as i64)
+    })
+}
+
+/// UG949 `report_clock_interaction`: From×To matrix from STA clocks and XDC CDC exceptions.
+/// Intra-clock WNS is the STA slack for that clock's period; async/false/exclusive cells
+/// have no WNS. Empty clocks yield an empty report (not a canned matrix).
+pub fn report_clock_interaction(
+    clocks: &[Clock],
+    xdc: &Constraints,
+    timing: Option<&TimingResult>,
+) -> ClockInteraction {
+    let clocks = if clocks.is_empty() {
+        xdc.clocks.as_slice()
+    } else {
+        clocks
+    };
+    if clocks.is_empty() {
+        return ClockInteraction::default();
+    }
+    let analysis_clocks = timing
+        .map(|t| t.clocks.as_slice())
+        .filter(|c| !c.is_empty())
+        .unwrap_or(clocks);
+    let analysis_req = analysis_requirement_ps(analysis_clocks, xdc);
+    let mut cells = Vec::with_capacity(clocks.len() * clocks.len());
+    for from in clocks {
+        for to in clocks {
+            let relation = classify_clock_pair(from, to, clocks, xdc);
+            let common_period_ps = lcm_u64(from.period_ps, to.period_ps);
+            let requirement_ps = xdc
+                .datapath_max_delay_covers(&from.name, &to.name)
+                .unwrap_or(to.period_ps as i64);
+            let excepted = matches!(
+                relation,
+                ClockRelation::FalsePath
+                    | ClockRelation::Asynchronous
+                    | ClockRelation::Exclusive
+                    | ClockRelation::NoPaths
+            );
+            let (wns_ps, path_count) = if excepted {
+                (None, 0)
+            } else if let Some(t) = timing {
+                let delay = analysis_req - t.wns_ps;
+                (
+                    Some(requirement_ps - delay),
+                    if from.name == to.name {
+                        t.endpoints
+                    } else {
+                        1
+                    },
+                )
+            } else {
+                (None, usize::from(from.name != to.name))
+            };
+            cells.push(ClockInteractionCell {
+                from: from.name.clone(),
+                to: to.name.clone(),
+                relation,
+                common_period_ps,
+                requirement_ps,
+                wns_ps,
+                path_count,
+            });
+        }
+    }
+    ClockInteraction {
+        clocks: clocks.to_vec(),
+        cells,
     }
 }
 
@@ -2686,5 +3012,94 @@ group_path -name holdg -critical_range 0.4 -from [get_ports clk] -to [get_ports 
             base.wns_ps - base.setup_ps - 300,
             "bus skew and group_path weight must stack"
         );
+    }
+
+    #[test]
+    fn report_clock_interaction_matrix_from_sta_clocks() {
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        create_generated_clock(&mut clks, "clkdiv", "clk", 2, "u_ff/Q").unwrap();
+        create_clock(&mut clks, "virt", 8_000, "virt");
+        let empty = report_clock_interaction(&[], &Constraints::default(), None);
+        assert!(empty.clocks.is_empty());
+        assert!(empty.cells.is_empty());
+        assert!(empty.text().contains("no clocks"));
+
+        let r = report_clock_interaction(&clks, &Constraints::default(), None);
+        assert_eq!(r.clocks.len(), 3);
+        assert_eq!(r.cells.len(), 9);
+        assert_eq!(r.cell("clk", "clk").unwrap().relation, ClockRelation::Timed);
+        assert_eq!(
+            r.cell("clk", "clkdiv").unwrap().relation,
+            ClockRelation::TimedGenerated
+        );
+        assert_eq!(
+            r.cell("clkdiv", "clk").unwrap().relation,
+            ClockRelation::TimedGenerated
+        );
+        assert_eq!(
+            r.cell("clk", "virt").unwrap().relation,
+            ClockRelation::TimedUnsafe
+        );
+        assert!(r.cdc_count() >= 2, "{}", r.text());
+
+        let mut async_xdc = Constraints::default();
+        async_xdc.clock_groups.push(ClockGroups {
+            asynchronous: true,
+            exclusive: false,
+            groups: vec![vec!["clk".into()], vec!["virt".into()]],
+        });
+        let ra = report_clock_interaction(&clks, &async_xdc, None);
+        assert_eq!(
+            ra.cell("clk", "virt").unwrap().relation,
+            ClockRelation::Asynchronous
+        );
+        assert!(ra.cell("clk", "virt").unwrap().wns_ps.is_none());
+        assert_eq!(ra.cell("clk", "clk").unwrap().relation, ClockRelation::Timed);
+
+        let mut ex = Constraints::default();
+        ex.clock_groups.push(ClockGroups {
+            asynchronous: false,
+            exclusive: true,
+            groups: vec![vec!["clkdiv".into()], vec!["virt".into()]],
+        });
+        let re = report_clock_interaction(&clks, &ex, None);
+        assert_eq!(
+            re.cell("clkdiv", "virt").unwrap().relation,
+            ClockRelation::Exclusive
+        );
+
+        let mut fp = Constraints::default();
+        fp.false_paths
+            .push("set_false_path -from [get_clocks clk] -to [get_clocks virt]".into());
+        let rf = report_clock_interaction(&clks, &fp, None);
+        assert_eq!(
+            rf.cell("clk", "virt").unwrap().relation,
+            ClockRelation::FalsePath
+        );
+
+        let mut dp = Constraints::default();
+        dp.max_delays.push(MaxDelay {
+            from: "clk".into(),
+            to: "virt".into(),
+            delay_ps: 2_000,
+            datapath_only: true,
+        });
+        let rd = report_clock_interaction(&clks, &dp, None);
+        assert_eq!(
+            rd.cell("clk", "virt").unwrap().relation,
+            ClockRelation::TimedDatapath
+        );
+        assert_eq!(rd.cell("clk", "virt").unwrap().requirement_ps, 2_000);
+
+        let d = Design::structural_counter();
+        let mut sta_clks = Vec::new();
+        create_clock(&mut sta_clks, "clk", 10_000, "clk");
+        let t = report_timing(&d, &sta_clks).unwrap();
+        let ri = report_clock_interaction(&sta_clks, &Constraints::default(), Some(&t));
+        let cell = ri.cell("clk", "clk").unwrap();
+        assert_eq!(cell.wns_ps, Some(t.wns_ps));
+        assert_eq!(cell.path_count, t.endpoints);
+        assert_ne!(t.wns_ps, 0);
     }
 }
