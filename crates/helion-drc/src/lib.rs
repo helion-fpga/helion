@@ -4,7 +4,7 @@ use helion_device::Device;
 use helion_ir::Design;
 use helion_place::Placed;
 use helion_route::Routed;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Debug, Default)]
 pub struct Drc {
@@ -63,7 +63,117 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
     if !placed.packed.lutffs.is_empty() && !has_clk {
         d.violations.push("no clock on registered design".into());
     }
+    check_iostandard(design, placed, dev, &mut d);
+    check_io_electrical(design, &mut d);
     d
+}
+
+fn parse_iob_xy(spec: &str) -> Option<(u32, u32)> {
+    let t = spec.trim();
+    let xoff = t.find('X')?;
+    let rest = &t[xoff + 1..];
+    let yoff = rest.find('Y')?;
+    let x = rest[..yoff].parse().ok()?;
+    let y = rest[yoff + 1..].parse().ok()?;
+    Some((x, y))
+}
+
+/// UG893 I/O Ports `IOSTANDARD`: HAD-legal standards and one VCCO per I/O bank.
+fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc) {
+    let mut by_bank: BTreeMap<u32, Vec<(String, String, u32)>> = BTreeMap::new();
+    for p in &design.ports {
+        let Some(std) = p.attrs.get("IOSTANDARD") else {
+            continue;
+        };
+        let Some(vcco) = Device::iostandard_vcco_mv(std) else {
+            d.violations.push(format!(
+                "IOSTANDARD {std} on {} is not a HAD I/O standard",
+                p.name
+            ));
+            continue;
+        };
+        let loc = p
+            .attrs
+            .get("LOC")
+            .and_then(parse_iob_xy)
+            .or_else(|| {
+                placed
+                    .iob_sites
+                    .iter()
+                    .zip(placed.packed.iobs.iter())
+                    .find_map(|(s, i)| {
+                        let hit = i.cell.contains(&p.name)
+                            || i.from_net == p.name
+                            || i.loc.as_deref() == Some(p.attrs.get("LOC").unwrap_or(""));
+                        hit.then_some((s.x, s.y))
+                    })
+            });
+        if let Some((x, y)) = loc {
+            if let Some(bank) = dev.iob_bank(x, y) {
+                by_bank
+                    .entry(bank)
+                    .or_default()
+                    .push((p.name.clone(), std.to_string(), vcco));
+            }
+        }
+    }
+    for (bank, ports) in by_bank {
+        let mut vccos: Vec<u32> = ports.iter().map(|p| p.2).collect();
+        vccos.sort_unstable();
+        vccos.dedup();
+        if vccos.len() > 1 {
+            let detail = ports
+                .iter()
+                .map(|(n, s, v)| format!("{n}={s}/{v}mV"))
+                .collect::<Vec<_>>()
+                .join(",");
+            d.violations.push(format!(
+                "IOSTANDARD VCCO mix on BANK{bank}: {detail}"
+            ));
+        }
+    }
+}
+
+/// UG893 I/O Ports DRIVE / SLEW / PULLTYPE: HAD-legal values and drive vs IOSTANDARD.
+fn check_io_electrical(design: &Design, d: &mut Drc) {
+    for p in &design.ports {
+        if let Some(drv) = p.attrs.get("DRIVE") {
+            match Device::parse_drive(drv) {
+                None => d.violations.push(format!(
+                    "DRIVE {drv} on {} is not a HAD drive strength",
+                    p.name
+                )),
+                Some(ma) => {
+                    if !Device::drive_legal_for_iostandard(p.attrs.get("IOSTANDARD"), ma) {
+                        let std = p
+                            .attrs
+                            .get("IOSTANDARD")
+                            .unwrap_or(Device::DEFAULT_IOSTANDARD);
+                        d.violations.push(format!(
+                            "DRIVE {ma} not legal for IOSTANDARD {std} on {}",
+                            p.name
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(s) = p.attrs.get("SLEW") {
+            if !Device::legal_slew(s) {
+                d.violations.push(format!(
+                    "SLEW {s} on {} is not a HAD slew (SLOW|FAST)",
+                    p.name
+                ));
+            }
+        }
+        if let Some(pt) = p.attrs.get("PULLTYPE") {
+            if !Device::legal_pulltype(pt) {
+                d.violations.push(format!(
+                    "PULLTYPE {pt} on {} is not a HAD pull (NONE|PULLUP|PULLDOWN|KEEPER)",
+                    p.name
+                ));
+            }
+        }
+    }
 }
 
 pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
@@ -117,5 +227,125 @@ mod tests {
         pl.packed.lutffs.push(pl.packed.lutffs[0].clone());
         let drc = check_placed(&d, &pl, &dev);
         assert!(!drc.ok(), "duplicate (site,BLE) must fail DRC: {:?}", drc.violations);
+    }
+
+    #[test]
+    fn unknown_iostandard_fails() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVDS_25").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "illegal IOSTANDARD must fail DRC: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("IOSTANDARD") && v.contains("HAD")),
+            "{:?}",
+            drc.violations
+        );
+    }
+
+    #[test]
+    fn iostandard_vcco_mix_on_bank_fails() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_loc("led", "IOB_X2Y0").unwrap();
+        d.set_loc("clk", "IOB_X3Y0").unwrap();
+        d.set_iostandard("led", "LVCMOS33").unwrap();
+        d.set_iostandard("clk", "LVCMOS18").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "mixed VCCO on one bank must fail: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("VCCO") && v.contains("BANK")),
+            "{:?}",
+            drc.violations
+        );
+    }
+
+    #[test]
+    fn lvcmos18_on_led_is_clean() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVCMOS18").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        check_routed(&d, &r, &dev).fail().unwrap();
+    }
+
+    #[test]
+    fn unknown_drive_slew_pulltype_fail() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_drive("led", "99").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "illegal DRIVE must fail DRC: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("DRIVE") && v.contains("HAD")),
+            "{:?}",
+            drc.violations
+        );
+
+        let mut d = Design::structural_blinky();
+        d.set_slew("led", "MEDIUM").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("SLEW")),
+            "{:?}",
+            drc.violations
+        );
+
+        let mut d = Design::structural_blinky();
+        d.set_pulltype("led", "PULL").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("PULLTYPE")),
+            "{:?}",
+            drc.violations
+        );
+    }
+
+    #[test]
+    fn drive_24_on_lvcmos18_fails_and_defaults_are_clean() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVCMOS18").unwrap();
+        d.set_drive("led", "24").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "DRIVE 24 vs LVCMOS18 must fail: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("DRIVE") && v.contains("IOSTANDARD")),
+            "{:?}",
+            drc.violations
+        );
+
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVCMOS18").unwrap();
+        d.set_drive("led", "12").unwrap();
+        d.set_slew("led", "SLOW").unwrap();
+        d.set_pulltype("led", "NONE").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        check_routed(&d, &r, &dev).fail().unwrap();
+
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVCMOS25").unwrap();
+        d.set_drive("led", "24").unwrap();
+        d.set_slew("led", "FAST").unwrap();
+        d.set_pulltype("led", "PULLUP").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        check_placed(&d, &pl, &dev).fail().unwrap();
     }
 }

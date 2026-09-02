@@ -363,6 +363,114 @@ impl Device {
         Some(dx as u16)
     }
 
+    /// HAD I/O bank: 8 consecutive IOB sites (Fig. 53 / UG893 I/O Planning).
+    pub const IOB_BANK_PINS: u32 = 8;
+    /// Default I/O standard for a 1.8 V HAD bank (gold STA pad delay).
+    pub const DEFAULT_IOSTANDARD: &'static str = "LVCMOS18";
+    /// Default LVCMOS drive (mA). Unset / 12 keeps gold STA pad delay.
+    pub const DEFAULT_DRIVE_MA: u32 = 12;
+    /// Default slew. Unset / SLOW keeps gold STA pad delay.
+    pub const DEFAULT_SLEW: &'static str = "SLOW";
+    /// Default pull. Unset / NONE keeps gold STA pad delay.
+    pub const DEFAULT_PULLTYPE: &'static str = "NONE";
+
+    pub fn iob_bank(&self, x: u32, y: u32) -> Option<u32> {
+        self.iob_major(x, y)
+            .map(|m| m as u32 / Self::IOB_BANK_PINS)
+    }
+
+    /// Bank VCCO in millivolts for a Helion I/O standard, or `None` if not in HAD.
+    pub fn iostandard_vcco_mv(std: &str) -> Option<u32> {
+        match std.trim().to_ascii_uppercase().as_str() {
+            "LVCMOS12" => Some(1200),
+            "LVCMOS15" | "SSTL15" | "SSTL15_I" => Some(1500),
+            "LVCMOS18" | "HSTL_I" | "HSTL_I_18" => Some(1800),
+            "LVCMOS25" => Some(2500),
+            "LVCMOS33" => Some(3300),
+            _ => None,
+        }
+    }
+
+    pub fn legal_iostandard(std: &str) -> bool {
+        Self::iostandard_vcco_mv(std).is_some()
+    }
+
+    /// HAD-legal drive strengths (mA).
+    pub fn legal_drive(ma: u32) -> bool {
+        matches!(ma, 2 | 4 | 6 | 8 | 12 | 16 | 24)
+    }
+
+    pub fn parse_drive(s: &str) -> Option<u32> {
+        let t = s
+            .trim()
+            .trim_end_matches(|c: char| c.eq_ignore_ascii_case(&'m') || c.eq_ignore_ascii_case(&'a'))
+            .trim();
+        t.parse().ok().filter(|&ma| Self::legal_drive(ma))
+    }
+
+    pub fn legal_slew(s: &str) -> bool {
+        matches!(s.trim().to_ascii_uppercase().as_str(), "SLOW" | "FAST")
+    }
+
+    pub fn legal_pulltype(s: &str) -> bool {
+        matches!(
+            s.trim().to_ascii_uppercase().as_str(),
+            "NONE" | "PULLUP" | "PULLDOWN" | "KEEPER"
+        )
+    }
+
+    /// Drive vs IOSTANDARD (unset standard is the HAD default LVCMOS18).
+    pub fn drive_legal_for_iostandard(std: Option<&str>, ma: u32) -> bool {
+        if !Self::legal_drive(ma) {
+            return false;
+        }
+        let std = std
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_IOSTANDARD.to_string());
+        match std.as_str() {
+            "LVCMOS12" => matches!(ma, 2 | 4 | 6 | 8),
+            "LVCMOS15" | "SSTL15" | "SSTL15_I" => matches!(ma, 2 | 4 | 6 | 8 | 12 | 16),
+            "LVCMOS18" | "HSTL_I" | "HSTL_I_18" => matches!(ma, 2 | 4 | 6 | 8 | 12 | 16),
+            "LVCMOS25" => matches!(ma, 4 | 8 | 12 | 16 | 24),
+            "LVCMOS33" => matches!(ma, 4 | 8 | 12 | 16),
+            _ => Self::legal_drive(ma),
+        }
+    }
+
+    /// IOB word bits above USED/BLE/Y. Defaults encode as 0 so gold bitgen holds.
+    pub fn iob_electrical_bits(drive: Option<&str>, slew: Option<&str>, pull: Option<&str>) -> u128 {
+        let mut w = 0u128;
+        if let Some(ma) = drive.and_then(Self::parse_drive) {
+            if ma != Self::DEFAULT_DRIVE_MA {
+                let code: u128 = match ma {
+                    2 => 1,
+                    4 => 2,
+                    6 => 3,
+                    8 => 4,
+                    16 => 6,
+                    24 => 7,
+                    _ => 0,
+                };
+                w |= code << 16;
+            }
+        }
+        if slew
+            .map(|s| s.trim().eq_ignore_ascii_case("FAST"))
+            .unwrap_or(false)
+        {
+            w |= 1u128 << 19;
+        }
+        let pcode = match pull.map(|s| s.trim().to_ascii_uppercase()).as_deref() {
+            Some("PULLUP") => 1u128,
+            Some("PULLDOWN") => 2,
+            Some("KEEPER") => 3,
+            _ => 0,
+        };
+        w |= pcode << 20;
+        w
+    }
+
     pub fn featuremap(&self) -> &FeatureMap {
         &self.featuremap
     }
@@ -641,6 +749,45 @@ mod tests {
         let frac = d.locate("CLB_X2Y1.BLE0.LUT.FRACTURE").unwrap();
         assert_eq!(frac.far.minor, 4);
         assert_eq!(frac.bit, 0);
+    }
+
+    #[test]
+    fn iob_bank_and_iostandard_from_had() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        assert_eq!(d.iob_bank(2, 0), Some(0));
+        assert_eq!(d.iob_bank(9, 0), Some(0), "8 pins per bank: dx=7 still BANK0");
+        assert_eq!(d.iob_bank(10, 0), Some(1));
+        assert!(d.iob_bank(0, 0).is_none(), "x=0 is not a HAD IOB");
+        assert!(Device::legal_iostandard("LVCMOS18"));
+        assert!(Device::legal_iostandard("lvcmos33"));
+        assert!(!Device::legal_iostandard("LVDS_25"));
+        assert_eq!(Device::iostandard_vcco_mv("LVCMOS18"), Some(1800));
+        assert_eq!(Device::iostandard_vcco_mv("LVCMOS33"), Some(3300));
+        assert_eq!(Device::DEFAULT_IOSTANDARD, "LVCMOS18");
+        assert!(Device::legal_drive(12));
+        assert!(Device::legal_drive(4));
+        assert!(!Device::legal_drive(5));
+        assert_eq!(Device::parse_drive("12mA"), Some(12));
+        assert!(Device::legal_slew("fast"));
+        assert!(!Device::legal_slew("MEDIUM"));
+        assert!(Device::legal_pulltype("PULLUP"));
+        assert!(!Device::legal_pulltype("PULL"));
+        assert!(Device::drive_legal_for_iostandard(None, 12));
+        assert!(Device::drive_legal_for_iostandard(Some("LVCMOS18"), 16));
+        assert!(!Device::drive_legal_for_iostandard(Some("LVCMOS18"), 24));
+        assert!(Device::drive_legal_for_iostandard(Some("LVCMOS25"), 24));
+        assert_eq!(Device::iob_electrical_bits(None, None, None), 0);
+        assert_eq!(
+            Device::iob_electrical_bits(Some("12"), Some("SLOW"), Some("NONE")),
+            0,
+            "defaults must not change the gold IOB word"
+        );
+        assert_ne!(Device::iob_electrical_bits(Some("4"), None, None), 0);
+        assert_ne!(Device::iob_electrical_bits(None, Some("FAST"), None), 0);
+        assert_ne!(Device::iob_electrical_bits(None, None, Some("PULLUP")), 0);
+        assert_eq!(Device::DEFAULT_DRIVE_MA, 12);
+        assert_eq!(Device::DEFAULT_SLEW, "SLOW");
+        assert_eq!(Device::DEFAULT_PULLTYPE, "NONE");
     }
 
     #[test]

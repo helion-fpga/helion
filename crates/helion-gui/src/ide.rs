@@ -17,7 +17,8 @@ use helion_ipxact::{pack_gpio, pack_uart, IpCore};
 use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
-    create_clock, load_xdc, report_timing_routed_xdc, Constraints, TimingResult,
+    create_clock, iostandard_pad_ps, port_pad_ps, load_xdc, report_timing_routed_xdc, Constraints,
+    TimingResult,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1493,6 +1494,14 @@ pub struct IoPortView {
     pub site: Option<String>,
     /// `set_property PACKAGE_PIN` / LOC constraint (may precede place).
     pub package_pin: Option<String>,
+    /// `set_property IOSTANDARD` — HAD-legal pad standard (STA pad delay / DRC VCCO).
+    pub iostandard: Option<String>,
+    /// `set_property DRIVE` — HAD-legal mA (STA pad delay / DRC vs IOSTANDARD / bitgen).
+    pub drive: Option<String>,
+    /// `set_property SLEW` — SLOW | FAST.
+    pub slew: Option<String>,
+    /// `set_property PULLTYPE` — NONE | PULLUP | PULLDOWN | KEEPER.
+    pub pulltype: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2422,6 +2431,14 @@ impl IdeModel {
                 .unwrap_or("");
             if key.eq_ignore_ascii_case("PACKAGE_PIN") || key.eq_ignore_ascii_case("LOC") {
                 self.apply_package_pin(t)
+            } else if key.eq_ignore_ascii_case("IOSTANDARD") {
+                self.apply_iostandard(t)
+            } else if key.eq_ignore_ascii_case("DRIVE") {
+                self.apply_drive(t)
+            } else if key.eq_ignore_ascii_case("SLEW") {
+                self.apply_slew(t)
+            } else if key.eq_ignore_ascii_case("PULLTYPE") {
+                self.apply_pulltype(t)
             } else {
                 tcl_eval(&mut self.shell, cmd)
             }
@@ -2477,6 +2494,8 @@ impl IdeModel {
         } else if t.starts_with("set_input_delay")
             || t.starts_with("set_output_delay")
             || t.starts_with("set_false_path")
+            || t.starts_with("set_multicycle_path")
+            || t.starts_with("set_max_delay")
         {
             self.apply_sdc_exception(t)
         } else if let Some(path) = t
@@ -3547,7 +3566,8 @@ impl IdeModel {
         s
     }
 
-    /// UG893 I/O Ports table: PACKAGE_PIN constraint + placed HAD site, not a pin dump.
+    /// UG893 I/O Ports table: PACKAGE_PIN + IOSTANDARD/DRIVE/SLEW/PULLTYPE
+    /// hitting HAD/STA/DRC/bitgen, not a pin dump.
     pub fn io_ports_text(&self) -> String {
         let n = self.io_ports.len();
         let assigned = self
@@ -3558,11 +3578,15 @@ impl IdeModel {
         let mut s = format!("io_ports n={n} assigned={assigned}");
         for p in &self.io_ports {
             s.push_str(&format!(
-                " {} {} PACKAGE_PIN={} placed={}",
+                " {} {} PACKAGE_PIN={} placed={} IOSTANDARD={} DRIVE={} SLEW={} PULLTYPE={}",
                 p.name,
                 p.dir,
                 p.package_pin.as_deref().unwrap_or("-"),
-                p.site.as_deref().unwrap_or("-")
+                p.site.as_deref().unwrap_or("-"),
+                p.iostandard.as_deref().unwrap_or("-"),
+                p.drive.as_deref().unwrap_or("-"),
+                p.slew.as_deref().unwrap_or("-"),
+                p.pulltype.as_deref().unwrap_or("-")
             ));
         }
         s
@@ -3950,6 +3974,198 @@ impl IdeModel {
             u8::from(was_placed),
             u8::from(was_routed)
         ))
+    }
+
+    /// Parse `set_property IOSTANDARD <std> [get_ports <port>]`.
+    fn apply_iostandard(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, std) = parse_port_prop_cmd(cmd, "IOSTANDARD")?;
+        self.set_iostandard(&port, &std)
+    }
+
+    /// I/O Planning `set_property IOSTANDARD`: bind HAD pad standard on the HNF
+    /// port so STA pad delay and DRC bank-VCCO see it — not a table label.
+    pub fn set_iostandard(&mut self, port: &str, std: &str) -> Result<String, String> {
+        let port = port.trim();
+        let std = std.trim();
+        if port.is_empty() || std.is_empty() {
+            return Err("set_property IOSTANDARD: need <std> [get_ports <port>]".into());
+        }
+        let std_up = std.to_ascii_uppercase();
+        if !Device::legal_iostandard(&std_up) {
+            return Err(format!(
+                "set_property IOSTANDARD: {std} is not a HAD I/O standard"
+            ));
+        }
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property IOSTANDARD: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property IOSTANDARD: no port {port}"));
+            }
+            d.set_iostandard(port, &std_up)?;
+        }
+        self.constraints
+            .iostandards
+            .insert(port.to_string(), std_up.clone());
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        let pad_ps = iostandard_pad_ps(Some(&std_up));
+        Ok(format!(
+            "set_property IOSTANDARD {std_up} {port} pad_ps={pad_ps}"
+        ))
+    }
+
+    fn apply_drive(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, val) = parse_port_prop_cmd(cmd, "DRIVE")?;
+        self.set_drive(&port, &val)
+    }
+
+    fn apply_slew(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, val) = parse_port_prop_cmd(cmd, "SLEW")?;
+        self.set_slew(&port, &val)
+    }
+
+    fn apply_pulltype(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, val) = parse_port_prop_cmd(cmd, "PULLTYPE")?;
+        self.set_pulltype(&port, &val)
+    }
+
+    /// I/O Planning `set_property DRIVE`: HAD mA on the HNF port so STA / DRC / bitgen see it.
+    pub fn set_drive(&mut self, port: &str, ma: &str) -> Result<String, String> {
+        let port = port.trim();
+        let ma = ma.trim();
+        if port.is_empty() || ma.is_empty() {
+            return Err("set_property DRIVE: need <ma> [get_ports <port>]".into());
+        }
+        let Some(parsed) = Device::parse_drive(ma) else {
+            return Err(format!("set_property DRIVE: {ma} is not a HAD drive strength"));
+        };
+        let drive = parsed.to_string();
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property DRIVE: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property DRIVE: no port {port}"));
+            }
+            d.set_drive(port, &drive)?;
+        }
+        self.constraints.drives.insert(port.to_string(), drive.clone());
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        let bitgen = self.maybe_rebitgen()?;
+        let pad_ps = self.port_pad_ps_now(port);
+        Ok(format!(
+            "set_property DRIVE {drive} {port} pad_ps={pad_ps} bitgen={}",
+            u8::from(bitgen)
+        ))
+    }
+
+    /// I/O Planning `set_property SLEW`: SLOW | FAST hits STA pad delay and bitgen.
+    pub fn set_slew(&mut self, port: &str, slew: &str) -> Result<String, String> {
+        let port = port.trim();
+        let slew = slew.trim();
+        if port.is_empty() || slew.is_empty() {
+            return Err("set_property SLEW: need <SLOW|FAST> [get_ports <port>]".into());
+        }
+        if !Device::legal_slew(slew) {
+            return Err(format!("set_property SLEW: {slew} is not a HAD slew (SLOW|FAST)"));
+        }
+        let slew_up = slew.to_ascii_uppercase();
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property SLEW: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property SLEW: no port {port}"));
+            }
+            d.set_slew(port, &slew_up)?;
+        }
+        self.constraints.slews.insert(port.to_string(), slew_up.clone());
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        let bitgen = self.maybe_rebitgen()?;
+        let pad_ps = self.port_pad_ps_now(port);
+        Ok(format!(
+            "set_property SLEW {slew_up} {port} pad_ps={pad_ps} bitgen={}",
+            u8::from(bitgen)
+        ))
+    }
+
+    /// I/O Planning `set_property PULLTYPE`: NONE | PULLUP | PULLDOWN | KEEPER.
+    pub fn set_pulltype(&mut self, port: &str, pull: &str) -> Result<String, String> {
+        let port = port.trim();
+        let pull = pull.trim();
+        if port.is_empty() || pull.is_empty() {
+            return Err("set_property PULLTYPE: need <type> [get_ports <port>]".into());
+        }
+        if !Device::legal_pulltype(pull) {
+            return Err(format!(
+                "set_property PULLTYPE: {pull} is not a HAD pull (NONE|PULLUP|PULLDOWN|KEEPER)"
+            ));
+        }
+        let pull_up = pull.to_ascii_uppercase();
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property PULLTYPE: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property PULLTYPE: no port {port}"));
+            }
+            d.set_pulltype(port, &pull_up)?;
+        }
+        self.constraints
+            .pulltypes
+            .insert(port.to_string(), pull_up.clone());
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        let bitgen = self.maybe_rebitgen()?;
+        let pad_ps = self.port_pad_ps_now(port);
+        Ok(format!(
+            "set_property PULLTYPE {pull_up} {port} pad_ps={pad_ps} bitgen={}",
+            u8::from(bitgen)
+        ))
+    }
+
+    fn port_pad_ps_now(&self, port: &str) -> i64 {
+        let p = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .and_then(|d| d.ports.iter().find(|p| p.name == port));
+        port_pad_ps(
+            p.and_then(|p| p.attrs.get("IOSTANDARD")),
+            p.and_then(|p| p.attrs.get("DRIVE")),
+            p.and_then(|p| p.attrs.get("SLEW")),
+            p.and_then(|p| p.attrs.get("PULLTYPE")),
+        )
+    }
+
+    fn maybe_rebitgen(&mut self) -> Result<bool, String> {
+        if self.shell.session.bitstream.is_none() || self.shell.session.routed.is_none() {
+            return Ok(false);
+        }
+        let dev = self.device()?;
+        self.shell.session.write_bitstream(&dev)?;
+        Ok(true)
     }
 
     /// Click a package pin: assigned pins cross-select the I/O port.
@@ -4514,7 +4730,13 @@ impl IdeModel {
             && self.constraints.input_delay_ps.is_empty()
             && self.constraints.output_delay_ps.is_empty()
             && self.constraints.false_paths.is_empty()
+            && self.constraints.multicycle_paths.is_empty()
+            && self.constraints.max_delays.is_empty()
             && self.constraints.package_pins.is_empty()
+            && self.constraints.iostandards.is_empty()
+            && self.constraints.drives.is_empty()
+            && self.constraints.slews.is_empty()
+            && self.constraints.pulltypes.is_empty()
             && self.pblocks.is_empty()
         {
             return "no timing constraints — create_clock / read_xdc".into();
@@ -4539,8 +4761,32 @@ impl IdeModel {
         for fp in &self.constraints.false_paths {
             lines.push(format!("set_false_path {fp}"));
         }
+        for m in &self.constraints.multicycle_paths {
+            lines.push(format!(
+                "set_multicycle_path -from {} -to {} SETUP_MULT={} HOLD_MULT={}",
+                m.from, m.to, m.setup_mult, m.hold_mult
+            ));
+        }
+        for m in &self.constraints.max_delays {
+            lines.push(format!(
+                "set_max_delay -from {} -to {} DELAY_PS={} datapath_only={}",
+                m.from, m.to, m.delay_ps, u8::from(m.datapath_only)
+            ));
+        }
         for (port, pin) in &self.constraints.package_pins {
             lines.push(format!("set_property PACKAGE_PIN {pin} {port}"));
+        }
+        for (port, std) in &self.constraints.iostandards {
+            lines.push(format!("set_property IOSTANDARD {std} {port}"));
+        }
+        for (port, ma) in &self.constraints.drives {
+            lines.push(format!("set_property DRIVE {ma} {port}"));
+        }
+        for (port, slew) in &self.constraints.slews {
+            lines.push(format!("set_property SLEW {slew} {port}"));
+        }
+        for (port, pull) in &self.constraints.pulltypes {
+            lines.push(format!("set_property PULLTYPE {pull} {port}"));
         }
         for pb in &self.pblocks {
             lines.push(format!("create_pblock {}", pb.name));
@@ -4566,7 +4812,15 @@ impl IdeModel {
                 self.constraints.false_paths.push(fp);
             }
         }
+        self.constraints
+            .multicycle_paths
+            .extend(extra.multicycle_paths);
+        self.constraints.max_delays.extend(extra.max_delays);
         self.constraints.package_pins.extend(extra.package_pins);
+        self.constraints.iostandards.extend(extra.iostandards);
+        self.constraints.drives.extend(extra.drives);
+        self.constraints.slews.extend(extra.slews);
+        self.constraints.pulltypes.extend(extra.pulltypes);
         if let Some(c) = self
             .constraints
             .clocks
@@ -4594,24 +4848,32 @@ impl IdeModel {
         Ok(format!("create_clock {name} PERIOD_PS={period} clocks={n}"))
     }
 
-    /// UG893 Timing Constraints Apply: set_input_delay / set_output_delay / set_false_path
-    /// land in the pane and feed helion-sta (WNS moves).
+    /// UG893 Timing Constraints Apply: set_input_delay / set_output_delay /
+    /// set_false_path / set_multicycle_path / set_max_delay land in the pane
+    /// and feed helion-sta (setup/hold WNS move).
     pub fn apply_sdc_exception(&mut self, cmd: &str) -> Result<String, String> {
         let extra = load_xdc(cmd)?;
         if extra.input_delay_ps.is_empty()
             && extra.output_delay_ps.is_empty()
             && extra.false_paths.is_empty()
+            && extra.multicycle_paths.is_empty()
+            && extra.max_delays.is_empty()
         {
-            return Err(format!("{cmd}: missing delay or false path"));
+            return Err(format!("{cmd}: missing delay, false path, multicycle, or max_delay"));
         }
         let n_in = extra.input_delay_ps.len();
         let n_out = extra.output_delay_ps.len();
         let n_fp = extra.false_paths.len();
+        let n_mcp = extra.multicycle_paths.len();
+        let n_md = extra.max_delays.len();
         let in_ps = extra.input_delay_ps.values().copied().max().unwrap_or(0);
         let out_ps = extra.output_delay_ps.values().copied().max().unwrap_or(0);
+        let sm = extra.setup_mult();
+        let hm = extra.hold_mult();
+        let md_ps = extra.max_delay_ps().unwrap_or(0);
         self.merge_constraints(extra);
         Ok(format!(
-            "apply_xdc input_delay={n_in} DELAY_PS={in_ps} output_delay={n_out} DELAY_PS={out_ps} false_path={n_fp}"
+            "apply_xdc input_delay={n_in} DELAY_PS={in_ps} output_delay={n_out} DELAY_PS={out_ps} false_path={n_fp} multicycle={n_mcp} SETUP_MULT={sm} HOLD_MULT={hm} max_delay={n_md} MAX_DELAY_PS={md_ps}"
         ))
     }
 
@@ -4622,7 +4884,13 @@ impl IdeModel {
             && extra.input_delay_ps.is_empty()
             && extra.output_delay_ps.is_empty()
             && extra.false_paths.is_empty()
+            && extra.multicycle_paths.is_empty()
+            && extra.max_delays.is_empty()
             && extra.package_pins.is_empty()
+            && extra.iostandards.is_empty()
+            && extra.drives.is_empty()
+            && extra.slews.is_empty()
+            && extra.pulltypes.is_empty()
         {
             return Err(format!("read_xdc {path}: no timing constraints"));
         }
@@ -4635,9 +4903,11 @@ impl IdeModel {
         let n_in = extra.input_delay_ps.len();
         let n_out = extra.output_delay_ps.len();
         let n_fp = extra.false_paths.len();
+        let n_mcp = extra.multicycle_paths.len();
+        let n_md = extra.max_delays.len();
         self.merge_constraints(extra);
         Ok(format!(
-            "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp}"
+            "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md}"
         ))
     }
 
@@ -4649,9 +4919,10 @@ impl IdeModel {
         clks
     }
 
-    /// Console `report_timing` uses IdeModel constraint clocks + I/O delay/false path,
-    /// the same vector `refresh_reports` feeds `report_timing_routed_xdc`. Pulls place/route
-    /// if needed so `read_sv` then `report_timing` still hits STA (old Tcl path).
+    /// Console `report_timing` uses IdeModel constraint clocks + I/O delay/false path/
+    /// multicycle/max_delay, the same vector `refresh_reports` feeds
+    /// `report_timing_routed_xdc`. Pulls place/route if needed so `read_sv` then
+    /// `report_timing` still hits STA (old Tcl path).
     pub fn report_timing_now(&mut self) -> Result<String, String> {
         if self.shell.session.design.is_none() {
             return Err("report_timing: no design".into());
@@ -5504,6 +5775,10 @@ impl IdeModel {
             return;
         };
         let locs = self.constraints.package_pins.clone();
+        let iostds = self.constraints.iostandards.clone();
+        let drives = self.constraints.drives.clone();
+        let slews = self.constraints.slews.clone();
+        let pulls = self.constraints.pulltypes.clone();
         let placed_iobs = self.shell.session.placed.as_ref().map(|p| {
             p.iob_sites
                 .iter()
@@ -5525,6 +5800,26 @@ impl IdeModel {
                     .get("LOC")
                     .map(|s| s.to_string())
                     .or_else(|| locs.get(&p.name).cloned());
+                let iostandard = p
+                    .attrs
+                    .get("IOSTANDARD")
+                    .map(|s| s.to_string())
+                    .or_else(|| iostds.get(&p.name).cloned());
+                let drive = p
+                    .attrs
+                    .get("DRIVE")
+                    .map(|s| s.to_string())
+                    .or_else(|| drives.get(&p.name).cloned());
+                let slew = p
+                    .attrs
+                    .get("SLEW")
+                    .map(|s| s.to_string())
+                    .or_else(|| slews.get(&p.name).cloned());
+                let pulltype = p
+                    .attrs
+                    .get("PULLTYPE")
+                    .map(|s| s.to_string())
+                    .or_else(|| pulls.get(&p.name).cloned());
                 let site = placed_iobs.as_ref().and_then(|v| {
                     // Match output port to IOB cell by net name or first IOB for `led`.
                     v.iter().find(|(cell, _)| {
@@ -5545,6 +5840,10 @@ impl IdeModel {
                     dir: dir.into(),
                     site,
                     package_pin,
+                    iostandard,
+                    drive,
+                    slew,
+                    pulltype,
                 }
             })
             .collect();
@@ -5586,6 +5885,11 @@ impl IdeModel {
                         PortDir::Inout => "INOUT".into(),
                     },
                 ));
+                for (k, v) in &p.attrs.map {
+                    if !props.iter().any(|(pk, _)| pk == k) {
+                        props.push((k.clone(), v.clone()));
+                    }
+                }
             }
         }
         if let Some(rt) = self.device.route_named(&id).cloned() {
@@ -5642,6 +5946,33 @@ impl IdeModel {
                 .and_then(|p| p.package_pin.clone().or(p.site.clone()))
             {
                 props.push(("PACKAGE_PIN".into(), pin));
+            }
+        }
+        if !props.iter().any(|(k, _)| k == "IOSTANDARD") {
+            if let Some(std) = self
+                .io_ports
+                .iter()
+                .find(|p| p.name == id)
+                .and_then(|p| p.iostandard.clone())
+            {
+                props.push(("IOSTANDARD".into(), std));
+            }
+        }
+        if let Some(p) = self.io_ports.iter().find(|p| p.name == id) {
+            if !props.iter().any(|(k, _)| k == "DRIVE") {
+                if let Some(v) = p.drive.clone() {
+                    props.push(("DRIVE".into(), v));
+                }
+            }
+            if !props.iter().any(|(k, _)| k == "SLEW") {
+                if let Some(v) = p.slew.clone() {
+                    props.push(("SLEW".into(), v));
+                }
+            }
+            if !props.iter().any(|(k, _)| k == "PULLTYPE") {
+                if let Some(v) = p.pulltype.clone() {
+                    props.push(("PULLTYPE".into(), v));
+                }
             }
         }
         if let Some(cr) = self.device.clock_region_named(&id).cloned() {
@@ -5770,6 +6101,35 @@ fn parse_package_pin_cmd(cmd: &str) -> Result<(String, String), String> {
             "set_property PACKAGE_PIN: missing [get_ports <port>]".to_string()
         })?;
     Ok((port, pin))
+}
+
+fn parse_port_prop_cmd(cmd: &str, want: &str) -> Result<(String, String), String> {
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    if toks.first().copied() != Some("set_property") {
+        return Err(format!(
+            "set_property {want}: need {want} <val> [get_ports <port>]"
+        ));
+    }
+    let key = toks.get(1).copied().unwrap_or("");
+    if !key.eq_ignore_ascii_case(want) {
+        return Err(format!("set_property: not a {want} ({key})"));
+    }
+    let val = toks
+        .get(2)
+        .ok_or_else(|| format!("set_property {want}: missing value"))?
+        .to_string();
+    let joined = toks.get(3..).unwrap_or(&[]).join(" ");
+    let port = tcl_ident(&joined, "get_ports")
+        .or_else(|| {
+            toks.get(3)
+                .map(|s| {
+                    s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| format!("set_property {want}: missing [get_ports <port>]"))?;
+    Ok((port, val))
 }
 
 fn parse_pblock_range(spec: &str) -> Result<(u32, u32, u32, u32), String> {
@@ -6590,6 +6950,126 @@ mod tests {
         let b1 = blinky.wns_ps().unwrap();
         assert_eq!(b1, b0 - 2000);
         assert_ne!(b1, wns_od, "I/O-delay WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_multicycle_path / set_max_delay
+    /// move helion-sta setup WNS and hold slack — not labels on a stub editor.
+    #[test]
+    fn timing_constraints_multicycle_max_delay_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before multicycle");
+        let setup0 = ide.timing.as_ref().unwrap().setup_ps;
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.multicycle_paths.is_empty() && ide.constraints.max_delays.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let mcp = ide
+            .exec("set_multicycle_path 2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(mcp.contains("multicycle=1"), "{mcp}");
+        assert!(mcp.contains("SETUP_MULT=2"), "{mcp}");
+        assert!(mcp.contains("HOLD_MULT=0"), "{mcp}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.setup_mult(), 2);
+        assert_eq!(ide.constraints.hold_mult(), 0);
+        assert!(
+            ide.constraints_text()
+                .contains("set_multicycle_path -from clk -to led SETUP_MULT=2 HOLD_MULT=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_mcp = ide.wns_ps().expect("STA after setup MCP 2");
+        assert_eq!(
+            wns_mcp,
+            wns0 + 10_000,
+            "setup MCP 2 must add one 10 ns period to WNS: {wns0} vs {wns_mcp}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().setup_ps,
+            setup0,
+            "MCP changes the requirement, not the path delay"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold0,
+            "setup-only MCP must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_mcp}")),
+            "report_timing must honor setup MCP: {rt}"
+        );
+
+        let hold = ide
+            .exec("set_multicycle_path -hold 1 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(hold.contains("HOLD_MULT=1"), "{hold}");
+        assert_eq!(ide.constraints.hold_mult(), 1);
+        assert!(
+            ide.constraints_text().contains("HOLD_MULT=1"),
+            "{}",
+            ide.constraints_text()
+        );
+        let hold_slack = ide.timing.as_ref().expect("STA after hold MCP").hold_slack_ps;
+        let wns_hold = ide.timing.as_ref().unwrap().wns_ps;
+        assert_eq!(wns_hold, wns_mcp, "hold MCP must not move setup WNS");
+        assert_eq!(
+            hold_slack,
+            hold0 - 10_000,
+            "hold MCP 1 must subtract one period from hold slack: {hold_slack} vs {hold0}"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("HOLD_SLACK_PS={hold_slack}")), "{rt}");
+
+        let md = ide
+            .exec("set_max_delay 5.0 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(md.contains("max_delay=1"), "{md}");
+        assert!(md.contains("MAX_DELAY_PS=5000"), "{md}");
+        assert_eq!(ide.constraints.max_delay_ps(), Some(5000));
+        assert!(
+            ide.constraints_text()
+                .contains("set_max_delay -from clk -to led DELAY_PS=5000 datapath_only=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_md = ide.wns_ps().expect("STA after max_delay");
+        assert_eq!(
+            wns_md,
+            5000 - setup0,
+            "set_max_delay 5 ns replaces the period/MCP requirement: {wns_md} vs setup {setup0}"
+        );
+        assert_ne!(wns_md, wns_mcp, "max_delay must move WNS off the MCP result");
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_md}")), "{rt}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        blinky
+            .exec("set_multicycle_path 2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 + 10_000);
+        assert_ne!(b1, wns_mcp, "MCP WNS is per-design STA, not canned");
+        blinky
+            .exec("set_max_delay 5.0 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        let bsetup = blinky.timing.as_ref().unwrap().setup_ps;
+        assert_eq!(b2, 5000 - bsetup);
+        assert_ne!(b2, wns_md, "max_delay WNS is per-design STA, not canned");
     }
 
     /// UG893 Hierarchy is HNF instances, not a restyled netlist cell list.
@@ -8411,6 +8891,300 @@ mod tests {
             Some("IOB_X8Y0")
         );
         assert!(ide.wns_ps().is_some());
+    }
+
+    /// UG893 I/O Ports: `set_property IOSTANDARD` hits HNF + HAD + STA pad delay
+    /// and DRC bank VCCO — not a table label.
+    #[test]
+    fn io_planning_iostandard_hits_sta_and_drc() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+
+        let wns0 = ide.wns_ps().expect("STA after route");
+        let iob0 = ide.timing.as_ref().unwrap().iob_ps;
+        assert_ne!(wns0, 0);
+        let dump = ide.exec("io_ports").unwrap();
+        assert!(dump.contains("led"), "{dump}");
+        assert!(dump.contains("IOSTANDARD=-"), "{dump}");
+        let led0 = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led port");
+        assert!(led0.iostandard.is_none(), "{led0:?}");
+
+        let out = ide
+            .exec("set_property IOSTANDARD LVCMOS33 [get_ports led]")
+            .unwrap();
+        assert!(out.contains("IOSTANDARD LVCMOS33"), "{out}");
+        assert!(out.contains("pad_ps="), "must report STA pad delay: {out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+        assert_eq!(ide.nav, NavSection::BoardDevice);
+
+        let std = ide
+            .design()
+            .unwrap()
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("IOSTANDARD"));
+        assert_eq!(std, Some("LVCMOS33"), "HNF port attr");
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after IOSTANDARD");
+        assert_eq!(led.iostandard.as_deref(), Some("LVCMOS33"), "{led:?}");
+        let ports = ide.exec("io_ports").unwrap();
+        assert!(ports.contains("IOSTANDARD=LVCMOS33"), "{ports}");
+        assert_eq!(
+            ide.constraints.iostandards.get("led").map(|s| s.as_str()),
+            Some("LVCMOS33")
+        );
+        let ctext = ide.constraints_text();
+        assert!(
+            ctext.contains("set_property IOSTANDARD LVCMOS33 led"),
+            "{ctext}"
+        );
+        assert_eq!(ide.selected_cell(), Some("led"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "IOSTANDARD" && v == "LVCMOS33"),
+            "{:?}",
+            ide.properties
+        );
+
+        let iob1 = ide.timing.as_ref().expect("STA after IOSTANDARD").iob_ps;
+        assert!(
+            iob1 > iob0,
+            "LVCMOS33 pad must slow IOB STA ({iob1} vs {iob0})"
+        );
+        let wns1 = ide.wns_ps().expect("STA after IOSTANDARD");
+        assert!(
+            wns1 < wns0,
+            "slower I/O standard must worsen WNS ({wns1} vs {wns0})"
+        );
+        assert_ne!(wns1, 0);
+
+        let e = ide
+            .exec("set_property IOSTANDARD LVDS_25 [get_ports led]")
+            .unwrap_err();
+        assert!(
+            e.contains("not a HAD"),
+            "illegal I/O standard must fail against HAD: {e}"
+        );
+        assert_eq!(
+            ide.design()
+                .unwrap()
+                .ports
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.attrs.get("IOSTANDARD")),
+            Some("LVCMOS33"),
+            "failed IOSTANDARD must not clobber HNF"
+        );
+
+        let clean = ide.exec("report_drc").unwrap();
+        assert!(
+            clean.contains("violations=0") || clean.contains("ok"),
+            "single LVCMOS33 on one port is legal: {clean}"
+        );
+
+        ide.exec("set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]")
+            .unwrap();
+        ide.exec("set_property PACKAGE_PIN IOB_X3Y0 [get_ports clk]")
+            .unwrap();
+        ide.exec("set_property IOSTANDARD LVCMOS18 [get_ports clk]")
+            .unwrap();
+        let mix = ide.exec("report_drc").unwrap();
+        assert!(
+            mix.contains("VCCO") || mix.contains("IOSTANDARD"),
+            "mixed 1.8/3.3 V on BANK0 must fail DRC: {mix}"
+        );
+        assert!(
+            !ide.drc.as_ref().unwrap().ok(),
+            "DRC must not be clean: {:?}",
+            ide.drc.as_ref().unwrap().violations
+        );
+
+        let back = ide
+            .exec("set_property IOSTANDARD LVCMOS18 [get_ports led]")
+            .unwrap();
+        assert!(back.contains("LVCMOS18"), "{back}");
+        let wns18 = ide.wns_ps().expect("STA after back to LVCMOS18");
+        assert_eq!(
+            wns18, wns0,
+            "LVCMOS18 must restore gold pad delay ({wns18} vs {wns0})"
+        );
+    }
+
+    /// UG893 I/O Ports: `set_property DRIVE / SLEW / PULLTYPE` hit HNF + HAD +
+    /// STA pad delay + DRC + bitgen — not table labels.
+    #[test]
+    fn io_planning_drive_slew_pulltype_hit_sta_drc_bitgen() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+
+        let wns0 = ide.wns_ps().expect("STA after route");
+        let iob0 = ide.timing.as_ref().unwrap().iob_ps;
+        let hash0 = ide.bitstream_hash().expect("bitgen before electrical");
+        assert_ne!(wns0, 0);
+        let dump = ide.exec("io_ports").unwrap();
+        assert!(dump.contains("DRIVE=-"), "{dump}");
+        assert!(dump.contains("SLEW=-"), "{dump}");
+        assert!(dump.contains("PULLTYPE=-"), "{dump}");
+        let led0 = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led port");
+        assert!(led0.drive.is_none(), "{led0:?}");
+        assert!(led0.slew.is_none(), "{led0:?}");
+        assert!(led0.pulltype.is_none(), "{led0:?}");
+
+        let out = ide
+            .exec("set_property DRIVE 4 [get_ports led]")
+            .unwrap();
+        assert!(out.contains("DRIVE 4"), "{out}");
+        assert!(out.contains("pad_ps="), "must report STA pad delay: {out}");
+        assert!(out.contains("bitgen=1"), "must re-bitgen: {out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+        assert_eq!(
+            ide.design()
+                .unwrap()
+                .ports
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.attrs.get("DRIVE")),
+            Some("4"),
+            "HNF port attr"
+        );
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after DRIVE");
+        assert_eq!(led.drive.as_deref(), Some("4"), "{led:?}");
+        let ports = ide.exec("io_ports").unwrap();
+        assert!(ports.contains("DRIVE=4"), "{ports}");
+        assert_eq!(
+            ide.constraints.drives.get("led").map(|s| s.as_str()),
+            Some("4")
+        );
+        let ctext = ide.constraints_text();
+        assert!(ctext.contains("set_property DRIVE 4 led"), "{ctext}");
+        assert!(
+            ide.properties.iter().any(|(k, v)| k == "DRIVE" && v == "4"),
+            "{:?}",
+            ide.properties
+        );
+        let iob1 = ide.timing.as_ref().expect("STA after DRIVE").iob_ps;
+        assert!(
+            iob1 > iob0,
+            "DRIVE 4 must slow IOB STA ({iob1} vs {iob0})"
+        );
+        let hash1 = ide.bitstream_hash().expect("bitgen after DRIVE");
+        assert_ne!(hash1, hash0, "DRIVE must change the IOB bitstream");
+
+        let e = ide.exec("set_property DRIVE 99 [get_ports led]").unwrap_err();
+        assert!(
+            e.contains("not a HAD"),
+            "illegal DRIVE must fail against HAD: {e}"
+        );
+        assert_eq!(
+            ide.design()
+                .unwrap()
+                .ports
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.attrs.get("DRIVE")),
+            Some("4"),
+            "failed DRIVE must not clobber HNF"
+        );
+
+        let slew = ide.exec("set_property SLEW FAST [get_ports led]").unwrap();
+        assert!(slew.contains("SLEW FAST"), "{slew}");
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after SLEW");
+        assert_eq!(led.slew.as_deref(), Some("FAST"), "{led:?}");
+        let iob2 = ide.timing.as_ref().expect("STA after SLEW").iob_ps;
+        assert!(
+            iob2 < iob1,
+            "FAST slew must speed IOB STA ({iob2} vs {iob1})"
+        );
+        let e = ide.exec("set_property SLEW MEDIUM [get_ports led]").unwrap_err();
+        assert!(e.contains("HAD") || e.contains("SLOW"), "{e}");
+
+        let pull = ide
+            .exec("set_property PULLTYPE PULLUP [get_ports led]")
+            .unwrap();
+        assert!(pull.contains("PULLTYPE PULLUP"), "{pull}");
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after PULLTYPE");
+        assert_eq!(led.pulltype.as_deref(), Some("PULLUP"), "{led:?}");
+        let iob3 = ide.timing.as_ref().expect("STA after PULLTYPE").iob_ps;
+        assert!(
+            iob3 > iob2,
+            "PULLUP must add pad load ({iob3} vs {iob2})"
+        );
+        let e = ide
+            .exec("set_property PULLTYPE PULL [get_ports led]")
+            .unwrap_err();
+        assert!(e.contains("HAD") || e.contains("PULLUP"), "{e}");
+
+        ide.exec("set_property DRIVE 24 [get_ports led]").unwrap();
+        let mix = ide.exec("report_drc").unwrap();
+        assert!(
+            mix.contains("DRIVE") || mix.contains("IOSTANDARD"),
+            "DRIVE 24 vs default LVCMOS18 must fail DRC: {mix}"
+        );
+        assert!(
+            !ide.drc.as_ref().unwrap().ok(),
+            "DRC must not be clean: {:?}",
+            ide.drc.as_ref().unwrap().violations
+        );
+
+        ide.exec("set_property DRIVE 12 [get_ports led]").unwrap();
+        ide.exec("set_property SLEW SLOW [get_ports led]").unwrap();
+        ide.exec("set_property PULLTYPE NONE [get_ports led]")
+            .unwrap();
+        let wns_back = ide.wns_ps().expect("STA after defaults");
+        assert_eq!(
+            wns_back, wns0,
+            "DRIVE 12 / SLOW / NONE must restore gold pad ({wns_back} vs {wns0})"
+        );
+        let iob_back = ide.timing.as_ref().unwrap().iob_ps;
+        assert_eq!(iob_back, iob0, "gold IOB pad must return ({iob_back} vs {iob0})");
+        let hash_back = ide.bitstream_hash().expect("bitgen after defaults");
+        assert_eq!(
+            hash_back, hash0,
+            "default electrical bits must restore gold bitstream"
+        );
+        let clean = ide.exec("report_drc").unwrap();
+        assert!(
+            clean.contains("violations=0") || clean.contains("ok"),
+            "defaults are legal: {clean}"
+        );
     }
 
     /// UG893 Floorplanning: `create_pblock` / `resize_pblock` re-places into a

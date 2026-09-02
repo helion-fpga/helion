@@ -81,8 +81,18 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         let major = dev
             .iob_major(r.iob.0, r.iob.1)
             .ok_or_else(|| format!("IOB_X{}Y{} has no major", r.iob.0, r.iob.1))?;
-        // bit0 USED, [3:1] BLE, [15:4] CLB y
-        let word = 1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4);
+        // bit0 USED, [3:1] BLE, [15:4] CLB y; [21:16] DRIVE/SLEW/PULLTYPE (0 = default)
+        let elec = routed
+            .placed
+            .packed
+            .iobs
+            .iter()
+            .find(|i| i.from_net == r.net)
+            .map(|i| {
+                Device::iob_electrical_bits(i.drive.as_deref(), i.slew.as_deref(), i.pulltype.as_deref())
+            })
+            .unwrap_or(0);
+        let word = 1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4) | elec;
         bs.frames.insert((Far::IOB, major, 0), word);
     }
     for (i, _m) in routed.placed.packed.macs.iter().enumerate() {
@@ -453,6 +463,48 @@ mod tests {
         assert_eq!(
             readback_lut_init(&dev, &bs, site.x, site.y, ble as u32).unwrap(),
             helion_ir::INC4_INIT[0]
+        );
+    }
+
+    #[test]
+    fn iob_drive_slew_pulltype_change_iob_frame() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let plain = Design::structural_counter();
+        let p = pack(&plain, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let a = bitgen(&dev, &r).unwrap();
+        let iob_a: Vec<_> = a
+            .frames
+            .iter()
+            .filter(|((b, _, _), _)| *b == Far::IOB)
+            .map(|(k, w)| (*k, *w))
+            .collect();
+        assert!(!iob_a.is_empty(), "counter must program an IOB frame");
+        assert!(
+            iob_a.iter().all(|(_, w)| (*w >> 16) == 0),
+            "default electrical bits must be 0: {iob_a:?}"
+        );
+
+        let mut d = Design::structural_counter();
+        d.set_drive("led", "4").unwrap();
+        d.set_slew("led", "FAST").unwrap();
+        d.set_pulltype("led", "PULLUP").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let b = bitgen(&dev, &r).unwrap();
+        let iob_b: Vec<_> = b
+            .frames
+            .iter()
+            .filter(|((blk, _, _), _)| *blk == Far::IOB)
+            .map(|(k, w)| (*k, *w))
+            .collect();
+        assert_ne!(iob_a, iob_b, "DRIVE/SLEW/PULLTYPE must change the IOB frame");
+        let elec = Device::iob_electrical_bits(Some("4"), Some("FAST"), Some("PULLUP"));
+        assert!(
+            iob_b.iter().any(|(_, w)| (*w & elec) == elec),
+            "IOB word must carry electrical bits {elec:#x}: {iob_b:?}"
         );
     }
 
