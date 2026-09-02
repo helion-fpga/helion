@@ -906,8 +906,35 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Package");
-    ui.weak("UG893 Fig. 53 — HAD IOB pin circles on colored I/O bank regions (not a pin table)");
+    ui.heading("I/O Planning");
+    ui.weak("UG893 — set_property PACKAGE_PIN re-places onto HAD IOB (place/STA), not a pin list");
+    let mut pick_port: Option<String> = None;
+    ui.collapsing("I/O Ports", |ui| {
+        if model.io_ports.is_empty() {
+            ui.weak("Synth a design to list ports.");
+        }
+        for p in &model.io_ports {
+            let on = model.selected.as_deref() == Some(p.name.as_str());
+            let pin = p
+                .package_pin
+                .as_deref()
+                .or(p.site.as_deref())
+                .unwrap_or("(unplaced)");
+            if ui
+                .selectable_label(on, format!("{}  {}  PACKAGE_PIN={pin}", p.name, p.dir))
+                .clicked()
+            {
+                pick_port = Some(p.name.clone());
+            }
+        }
+        ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
+    });
+    if let Some(name) = pick_port {
+        model.select(&name);
+    }
+    ui.separator();
+    ui.label(RichText::new("Package").strong());
+    ui.weak("UG893 Fig. 53 — HAD IOB pin circles on colored I/O bank regions");
     ui.monospace(format!(
         "part={}  {}×{}  pins={}  assigned={}",
         model.package.part,
@@ -1076,7 +1103,21 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
             }
         });
     if let Some(pin) = pick {
-        let _ = model.select_package_pin(&pin);
+        let selected_port = model.selected.clone().filter(|s| {
+            model.io_ports.iter().any(|p| p.name == *s)
+        });
+        let assigned = model
+            .package_pins
+            .iter()
+            .find(|p| p.pin == pin)
+            .and_then(|p| p.port.clone());
+        if let (Some(port), true) = (selected_port, assigned.is_none()) {
+            let _ = model.exec(&format!(
+                "set_property PACKAGE_PIN {pin} [get_ports {port}]"
+            ));
+        } else {
+            let _ = model.select_package_pin(&pin);
+        }
     }
 }
 
@@ -1479,6 +1520,11 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 .small()
                 .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
         );
+        ui.label(
+            RichText::new("pblock")
+                .small()
+                .color(Color32::from_rgb(0xe5, 0x9a, 0x3c)),
+        );
     });
     let mut pick_port: Option<String> = None;
     ui.collapsing("I/O Ports", |ui| {
@@ -1487,19 +1533,60 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
         for p in &model.io_ports {
             let on = model.selected.as_deref() == Some(p.name.as_str());
+            let pin = p
+                .package_pin
+                .as_deref()
+                .or(p.site.as_deref())
+                .unwrap_or("(unplaced)");
             if ui
                 .selectable_label(
                     on,
-                    format!(
-                        "{}  {}  {}",
-                        p.name,
-                        p.dir,
-                        p.site.as_deref().unwrap_or("(unplaced)")
-                    ),
+                    format!("{}  {}  PACKAGE_PIN={pin}", p.name, p.dir),
                 )
                 .clicked()
             {
                 pick_port = Some(p.name.clone());
+            }
+        }
+    });
+    let mut pick_pblock: Option<String> = None;
+    ui.collapsing("Pblocks", |ui| {
+        ui.weak("UG893 Floorplanning — create_pblock / resize_pblock hits place + bitgen_pblock");
+        ui.horizontal(|ui| {
+            if ui.button("Create pblock").clicked() {
+                let _ = model.exec("create_pblock");
+            }
+            if ui.button("Resize to CLOCKREGION_X1Y1").clicked() {
+                let name = model
+                    .pblocks
+                    .first()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "pblock_0".into());
+                if model.pblocks.is_empty() {
+                    let _ = model.exec("create_pblock pblock_0");
+                }
+                let _ = model.exec(&format!("resize_pblock {name} -add CLOCKREGION_X1Y1"));
+            }
+        });
+        if model.pblocks.is_empty() {
+            ui.weak("No pblocks — create_pblock then resize_pblock -add {CLB_X5Y1:CLB_X8Y8}.");
+        }
+        for p in &model.pblocks {
+            let on = model.selected.as_deref() == Some(p.name.as_str());
+            if ui
+                .selectable_label(
+                    on,
+                    format!(
+                        "{}  {}  cells={} frames={}",
+                        p.name,
+                        p.range_text(),
+                        p.cells.len(),
+                        p.frames
+                    ),
+                )
+                .clicked()
+            {
+                pick_pblock = Some(p.name.clone());
             }
         }
     });
@@ -1513,6 +1600,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     let grid_h = cell * rows as f32;
     let mut pick_site: Option<(u32, u32)> = None;
     let mut pick_region: Option<String> = None;
+    let mut click_pblock: Option<String> = None;
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -1593,6 +1681,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 // Fig. 49: clock-region outlines over the die.
                 let purple = Color32::from_rgb(0xb0, 0x7c, 0xe8);
                 let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
+                let amber = Color32::from_rgb(0xe5, 0x9a, 0x3c);
                 for cr in &model.device.clock_regions {
                     let px = origin.x + (cr.x0 - x0) as f32 * cell;
                     let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
@@ -1612,6 +1701,31 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                         &cr.name,
                         egui::FontId::monospace(9.0),
                         if on { gold } else { purple },
+                    );
+                }
+                // UG893 Floorplanning: Pblock rectangles (create_pblock / resize_pblock).
+                for pb in &model.pblocks {
+                    if !pb.ranged {
+                        continue;
+                    }
+                    let px = origin.x + (pb.x0 - x0) as f32 * cell;
+                    let py = origin.y + (rows - 1 - (pb.y1 - y0)) as f32 * cell;
+                    let pw = pb.cols() as f32 * cell;
+                    let ph = pb.rows() as f32 * cell;
+                    let rr = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
+                    let on = model.selected.as_deref() == Some(pb.name.as_str());
+                    p.rect_stroke(
+                        rr,
+                        0.0,
+                        Stroke::new(if on { 3.0 } else { 2.0 }, if on { gold } else { amber }),
+                        egui::StrokeKind::Inside,
+                    );
+                    p.text(
+                        egui::pos2(rr.left() + 3.0, rr.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        &pb.name,
+                        egui::FontId::monospace(9.0),
+                        if on { gold } else { amber },
                     );
                 }
                 // PathFinder IOB nets over the die (UG893 Device routing, not occupancy restyle).
@@ -1656,7 +1770,18 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                         let x = x0 + dx as u32;
                         let y = y0 + (rows - 1 - dy as u32);
                         let mut tip = String::new();
+                        if let Some(pb) = model.pblocks.iter().find(|p| p.contains(x, y)) {
+                            tip.push_str(&format!(
+                                "{}  {}  frames={}",
+                                pb.name,
+                                pb.range_text(),
+                                pb.frames
+                            ));
+                        }
                         if let Some(cr) = model.device.clock_region_at(x, y) {
+                            if !tip.is_empty() {
+                                tip.push(' ');
+                            }
                             tip.push_str(&format!(
                                 "{}  sites={}",
                                 cr.name,
@@ -1697,11 +1822,20 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                         let x = x0 + dx as u32;
                         let y = y0 + (rows - 1 - dy as u32);
                         let mut header = false;
-                        if let Some(cr) = model.device.clock_region_at(x, y) {
-                            let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
+                        if let Some(pb) = model.pblocks.iter().find(|p| p.contains(x, y)) {
+                            let py = origin.y + (rows - 1 - (pb.y1 - y0)) as f32 * cell;
                             if pos.y - py <= 14.0 {
-                                pick_region = Some(cr.name.clone());
+                                click_pblock = Some(pb.name.clone());
                                 header = true;
+                            }
+                        }
+                        if !header {
+                            if let Some(cr) = model.device.clock_region_at(x, y) {
+                                let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
+                                if pos.y - py <= 14.0 {
+                                    pick_region = Some(cr.name.clone());
+                                    header = true;
+                                }
                             }
                         }
                         if !header {
@@ -1713,6 +1847,12 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
         });
     if let Some(name) = pick_port {
         model.select(&name);
+    }
+    if let Some(name) = pick_pblock {
+        let _ = model.select_pblock(&name);
+    }
+    if let Some(name) = click_pblock {
+        let _ = model.select_pblock(&name);
     }
     if let Some(name) = pick_region {
         let _ = model.select_clock_region(&name);
