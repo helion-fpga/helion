@@ -453,9 +453,12 @@ fn paint_sources_netlist(ctx: &egui::Context, model: &mut IdeModel, tree_filter:
 fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
     egui::SidePanel::left("scopes")
         .resizable(true)
-        .default_width(220.0)
+        .default_width(260.0)
         .show(ctx, |ui| {
             ui.label(RichText::new("Scopes").strong());
+            ui.weak(
+                "UG900 Scopes — clickable Name/Type table over helion-sim, not a name (kind) dump",
+            );
             ui.horizontal(|ui| {
                 if ui.button("Run 16").clicked() {
                     let _ = model.sim_run(16);
@@ -467,33 +470,82 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                     let _ = model.sim_restart();
                 }
             });
+            let scopes = model.scope_rows().to_vec();
+            let selected_scope = model.selected_scope.clone();
             let mut pick_scope = None;
-            for s in &model.scopes {
-                let on = model.selected_scope.as_deref() == Some(s.name.as_str());
-                if ui
-                    .selectable_label(on, format!("{} ({})", s.name, s.kind))
-                    .clicked()
-                {
-                    pick_scope = Some(s.name.clone());
-                }
-            }
-            if let Some(name) = pick_scope {
-                let _ = model.select_scope(&name);
+            egui::ScrollArea::vertical()
+                .id_salt("ug900_scopes")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("ug900_scopes_table")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").strong());
+                            ui.label(RichText::new("Type").strong());
+                            ui.end_row();
+                            if scopes.is_empty() {
+                                ui.label("—");
+                                ui.label("no scopes — sim_run");
+                                ui.end_row();
+                            } else {
+                                for (i, s) in scopes.iter().enumerate() {
+                                    let on = selected_scope.as_deref() == Some(s.name.as_str());
+                                    if ui.selectable_label(on, &s.name).clicked() {
+                                        pick_scope = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, s.type_cell()).clicked() {
+                                        pick_scope = Some(i.to_string());
+                                    }
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+            if let Some(spec) = pick_scope {
+                let _ = model.select_scope(&spec);
             }
             ui.separator();
             ui.label(RichText::new("Objects").strong());
-            ui.weak("click to add_wave");
-            let mut add = None;
-            for o in &model.objects {
-                if ui
-                    .selectable_label(false, format!("{} = {}", o.name, o.value))
-                    .clicked()
-                {
-                    add = Some(o.name.clone());
-                }
-            }
-            if let Some(name) = add {
-                let _ = model.add_wave(&name);
+            ui.weak(
+                "UG900 Objects — clickable Name/Type/Value table over helion-sim, not a name = value dump",
+            );
+            let objects = model.object_rows().to_vec();
+            let selected_object = model.selected_object.clone();
+            let mut pick_obj = None;
+            egui::ScrollArea::vertical()
+                .id_salt("ug900_objects")
+                .show(ui, |ui| {
+                    egui::Grid::new("ug900_objects_table")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").strong());
+                            ui.label(RichText::new("Type").strong());
+                            ui.label(RichText::new("Value").strong());
+                            ui.end_row();
+                            if objects.is_empty() {
+                                ui.label("—");
+                                ui.label("—");
+                                ui.label("no objects — select a Scope");
+                                ui.end_row();
+                            } else {
+                                for (i, o) in objects.iter().enumerate() {
+                                    let on = selected_object.as_deref() == Some(o.name.as_str());
+                                    if ui.selectable_label(on, &o.name).clicked() {
+                                        pick_obj = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, o.type_cell()).clicked() {
+                                        pick_obj = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, o.value_cell()).clicked() {
+                                        pick_obj = Some(i.to_string());
+                                    }
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+            if let Some(spec) = pick_obj {
+                let _ = model.select_object(&spec);
             }
         });
 }
@@ -504,14 +556,50 @@ fn paint_properties(ctx: &egui::Context, model: &mut IdeModel) {
         .default_width(220.0)
         .show(ctx, |ui| {
             ui.label(RichText::new("Properties").strong());
-            if model.properties.is_empty() {
-                ui.weak("Select a cell, net, or port.");
-            }
-            for (k, v) in &model.properties {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(k).weak());
-                    ui.monospace(v);
+            ui.weak(
+                "UG893 Properties — clickable Name/Value table over the selected HNF/HAD/STA object, not a weak-key dump",
+            );
+            let obj = model
+                .properties_name()
+                .or(model.selected.as_deref())
+                .or(model.selected_ip.as_deref())
+                .unwrap_or("—");
+            ui.label(format!(
+                "properties n={} object={obj}",
+                model.properties.len()
+            ));
+            let selected = model.selected_property.clone();
+            let rows = model.property_rows();
+            let mut pick: Option<String> = None;
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("properties_table")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").strong());
+                            ui.label(RichText::new("Value").strong());
+                            ui.end_row();
+                            if rows.is_empty() {
+                                ui.label("—");
+                                ui.label("no properties — select a cell, net, or port");
+                                ui.end_row();
+                            } else {
+                                for (i, r) in rows.iter().enumerate() {
+                                    let on = selected.as_deref() == Some(r.name.as_str());
+                                    if ui.selectable_label(on, &r.name).clicked() {
+                                        pick = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, &r.value).clicked() {
+                                        pick = Some(i.to_string());
+                                    }
+                                    ui.end_row();
+                                }
+                            }
+                        });
                 });
+            if let Some(spec) = pick {
+                let _ = model.select_property(&spec);
             }
         });
 }
@@ -2837,22 +2925,34 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.weak(format!("zoom={:.2}", model.schematic.camera.zoom));
     });
     if !model.timing_paths.is_empty() {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Timing paths").small());
-            let mut pick_path = None;
-            for (i, p) in model.timing_paths.iter().enumerate() {
-                let on = model.selected_timing_path == Some(i);
-                if ui
-                    .selectable_label(on, format!("{} slack={}", p.endpoint, p.slack_ps))
-                    .clicked()
-                {
-                    pick_path = Some(i);
+        ui.label(RichText::new("Timing paths").small());
+        ui.weak(
+            "UG893 Fig. 55 — clickable Name/From/To/Slack_ps table from helion-sta, not endpoint slack= chips",
+        );
+        let mut pick_path = None;
+        let selected_path = model.selected_timing_path;
+        egui::Grid::new("schematic_timing_paths")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("From").strong());
+                ui.label(RichText::new("To").strong());
+                ui.label(RichText::new("Slack_ps").strong());
+                ui.end_row();
+                for (i, p) in model.timing_paths.iter().enumerate() {
+                    let on = selected_path == Some(i);
+                    if ui.selectable_label(on, &p.name).clicked() {
+                        pick_path = Some(i);
+                    }
+                    ui.label(&p.startpoint);
+                    ui.label(&p.endpoint);
+                    ui.label(p.slack_ps.to_string());
+                    ui.end_row();
                 }
-            }
-            if let Some(i) = pick_path {
-                let _ = model.select_timing_path(&i.to_string());
-            }
-        });
+            });
+        if let Some(i) = pick_path {
+            let _ = model.select_timing_path(&i.to_string());
+        }
     }
     let mut pick = None;
     let mut expand = None;
