@@ -1173,22 +1173,61 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Find Results");
-    ui.weak("find <cell|net|port|pin> against HNF/HAD");
-    if model.find_results.is_empty() {
-        ui.weak("No hits — `find u_lut0` in Tcl.");
-    }
-    let mut pick = None;
-    for h in &model.find_results {
-        let on = model.selected.as_deref() == Some(h.name.as_str());
-        if ui
-            .selectable_label(on, format!("{}  {}", h.kind, h.name))
-            .clicked()
-        {
-            pick = Some(h.name.clone());
+    ui.weak(
+        "UG893 Find Results — clickable Name/Type table over HNF/HAD find, not a kind-name dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Find cells").clicked() {
+            let _ = model.exec("sheet_find cells");
         }
-    }
+        if ui.button("Find ports").clicked() {
+            let _ = model.exec("sheet_find ports");
+        }
+        if ui.button("Find nets").clicked() {
+            let _ = model.exec("sheet_find nets");
+        }
+    });
+    ui.label(format!("find_results n={}", model.find_results.len()));
+    let selected = model.selected.clone();
+    let selected_find = model.selected_find;
+    let rows = model.find_rows().to_vec();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("find_results_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Type").strong());
+                    ui.label(RichText::new("Primitive").strong());
+                    ui.label(RichText::new("Parent").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no hits — `find u_lut0` in Tcl");
+                        ui.end_row();
+                    } else {
+                        for (i, h) in rows.iter().enumerate() {
+                            let on = selected_find == Some(i)
+                                || selected.as_deref() == Some(h.name.as_str());
+                            if ui.selectable_label(on, &h.name).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            if ui.selectable_label(on, h.type_cell()).clicked() {
+                                pick = Some(i.to_string());
+                            }
+                            ui.label(h.primitive_cell());
+                            ui.label(h.parent_cell());
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
     if let Some(id) = pick {
-        model.select(&id);
+        let _ = model.select_find(&id);
     }
 }
 
