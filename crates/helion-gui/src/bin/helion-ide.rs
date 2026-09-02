@@ -6,8 +6,9 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::{
-    doctor, BottomTab, CdcSeverity, ClockRelation, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MsgSeverity, NavSection, PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
+    doctor, BottomTab, CdcSeverity, ClockRelation, DrcSeverity, FlowStep, IdeModel, IlaTrigger,
+    LayoutKind, MethodologySeverity, MsgSeverity, NavSection, PathGroupKind, StepState, WaveRadix,
+    WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -667,6 +668,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Cdc,
             WorkspaceTab::ClockNetworks,
             WorkspaceTab::Power,
+            WorkspaceTab::Methodology,
+            WorkspaceTab::Drc,
+            WorkspaceTab::Utilization,
             WorkspaceTab::Hierarchy,
             WorkspaceTab::Find,
             WorkspaceTab::Package,
@@ -684,6 +688,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Cdc => "CDC",
                 WorkspaceTab::ClockNetworks => "Clock Networks",
                 WorkspaceTab::Power => "Power",
+                WorkspaceTab::Methodology => "Methodology",
+                WorkspaceTab::Drc => "DRC",
+                WorkspaceTab::Utilization => "Utilization",
                 WorkspaceTab::Hierarchy => "Hierarchy",
                 WorkspaceTab::Find => "Find Results",
                 WorkspaceTab::Package => "Package",
@@ -710,6 +717,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Cdc => paint_cdc(ui, model),
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, model),
         WorkspaceTab::Power => paint_power(ui, model),
+        WorkspaceTab::Methodology => paint_methodology(ui, model),
+        WorkspaceTab::Drc => paint_drc(ui, model),
+        WorkspaceTab::Utilization => paint_utilization(ui, model),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, model),
         WorkspaceTab::Find => paint_find(ui, model),
         WorkspaceTab::Package => paint_package(ui, model),
@@ -1365,7 +1375,7 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     }
     ui.add_space(8.0);
-    report_box(ui, "Utilization (report_utilization)", &model.utilization_text());
+    paint_utilization(ui, model);
     ui.add_space(8.0);
     let bits = match (model.bitstream_hash(), model.bitstream_bytes()) {
         (Some(h), Some(b)) => format!(
@@ -1376,12 +1386,9 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     };
     report_box(ui, "Bitstream", &bits);
     ui.add_space(8.0);
-    let drc = match &model.drc {
-        Some(d) if d.ok() => "report_drc violations=0 ok".into(),
-        Some(d) => format!("report_drc {}", d.violations.join("; ")),
-        None => "no DRC — run Place/Route".into(),
-    };
-    report_box(ui, "DRC (helion-drc)", &drc);
+    paint_drc(ui, model);
+    ui.add_space(8.0);
+    paint_methodology(ui, model);
     ui.add_space(8.0);
     report_box(
         ui,
@@ -1864,6 +1871,257 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     ));
     ui.add_space(8.0);
     report_box(ui, "Power (report_power)", &model.power_text());
+}
+
+fn methodology_severity_color(sev: MethodologySeverity) -> Color32 {
+    match sev {
+        MethodologySeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
+        MethodologySeverity::CriticalWarning => Color32::from_rgb(0xf0, 0x80, 0x40),
+        MethodologySeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        MethodologySeverity::Advisory => Color32::from_rgb(0x90, 0x60, 0xc0),
+    }
+}
+
+fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Methodology");
+    ui.weak(
+        "UG949 report_methodology — STA/XDC/HNF checks (TIMING-1/6/7/10/18/24, CDC-1), not a dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report methodology").clicked() {
+            let _ = model.exec("report_methodology");
+        }
+        if ui.button("Apply create_clock 10ns").clicked() {
+            let _ = model.exec("create_clock -period 10.000 [get_ports clk]");
+        }
+        if ui.button("Apply set_output_delay 0.5ns led").clicked() {
+            let _ = model.exec("set_output_delay 0.5 -clock [get_clocks clk] [get_ports led]");
+        }
+    });
+    ui.add_space(6.0);
+    if model.session().design.is_none() {
+        ui.label("no design — synth / report_methodology");
+        return;
+    }
+    let report = model.methodology_report();
+    ui.label(format!(
+        "checks={} errors={} critical={} warning={} advisory={}",
+        report.checks.len(),
+        report.error_count(),
+        report.critical_count(),
+        report.warning_count(),
+        report.advisory_count()
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("methodology_table")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("ID").strong());
+                ui.label(RichText::new("Severity").strong());
+                ui.label(RichText::new("Category").strong());
+                ui.label(RichText::new("Objects").strong());
+                ui.label(RichText::new("Message").strong());
+                ui.end_row();
+                for v in &report.checks {
+                    let on = selected.as_deref() == Some(v.id.as_str());
+                    let fill = methodology_severity_color(v.severity);
+                    let btn = egui::Button::new(RichText::new(&v.id).color(Color32::BLACK))
+                        .fill(fill)
+                        .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some(v.id.clone());
+                    }
+                    ui.label(v.severity.as_str());
+                    ui.label(&v.category);
+                    ui.label(if v.objects.is_empty() {
+                        "-"
+                    } else {
+                        v.objects.as_str()
+                    });
+                    ui.label(&v.message);
+                    ui.end_row();
+                }
+            });
+    });
+    if let Some(id) = pick {
+        let _ = model.select_methodology(&id);
+    }
+    ui.add_space(8.0);
+    report_box(
+        ui,
+        "Methodology (report_methodology)",
+        &model.methodology_text(),
+    );
+}
+
+fn drc_severity_color(sev: DrcSeverity) -> Color32 {
+    match sev {
+        DrcSeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
+        DrcSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        DrcSeverity::Advisory => Color32::from_rgb(0x90, 0x60, 0xc0),
+    }
+}
+
+fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("DRC");
+    ui.weak("UG893 DRC — helion-drc rule rows (severity / id / objects), not a one-line dump");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report DRC").clicked() {
+            let _ = model.exec("report_drc");
+        }
+    });
+    ui.add_space(6.0);
+    if model.session().placed.is_none() && model.session().routed.is_none() {
+        ui.label("no DRC — run Place/Route");
+        return;
+    }
+    let report = model.drc.clone().unwrap_or_else(|| model.drc_report());
+    ui.label(format!(
+        "violations={} errors={}",
+        report.violations.len(),
+        report.error_count()
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("drc_table")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("ID").strong());
+                ui.label(RichText::new("Severity").strong());
+                ui.label(RichText::new("Objects").strong());
+                ui.label(RichText::new("Message").strong());
+                ui.end_row();
+                if report.ok() {
+                    ui.label("—");
+                    ui.label("ok");
+                    ui.label("-");
+                    ui.label("no violations");
+                    ui.end_row();
+                } else {
+                    for v in &report.items {
+                        let on = selected.as_deref() == Some(v.id.as_str());
+                        let fill = drc_severity_color(v.severity);
+                        let btn = egui::Button::new(RichText::new(&v.id).color(Color32::BLACK))
+                            .fill(fill)
+                            .selected(on);
+                        if ui.add(btn).clicked() {
+                            pick = Some(v.id.clone());
+                        }
+                        ui.label(v.severity.as_str());
+                        ui.label(if v.objects.is_empty() {
+                            "-"
+                        } else {
+                            v.objects.as_str()
+                        });
+                        ui.label(&v.message);
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+    if let Some(id) = pick {
+        let _ = model.select_drc(&id);
+    }
+    ui.add_space(8.0);
+    report_box(ui, "DRC (report_drc)", &model.drc_text());
+}
+
+fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Utilization");
+    ui.weak(
+        "UG893 Utilization — HAD occupancy bars (used / available / pct) + HNF hierarchy, not a dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report utilization").clicked() {
+            let _ = model.exec("report_utilization");
+        }
+    });
+    ui.add_space(6.0);
+    let report = model.utilization_report();
+    if report.part.is_empty() {
+        ui.label("no placed design — run Place");
+        return;
+    }
+    ui.label(format!("part={}", report.part));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    let max_avail = report
+        .occupancy
+        .iter()
+        .map(|r| r.available.max(1))
+        .max()
+        .unwrap_or(1) as f32;
+    egui::Grid::new("utilization_occupancy")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Resource").strong());
+            ui.label(RichText::new("Used").strong());
+            ui.label(RichText::new("Available").strong());
+            ui.label(RichText::new("Pct").strong());
+            ui.label(RichText::new("Occupancy").strong());
+            ui.end_row();
+            for row in &report.occupancy {
+                let on = selected.as_deref() == Some(row.resource);
+                if ui.selectable_label(on, row.resource).clicked() {
+                    pick = Some(row.resource.into());
+                }
+                ui.label(row.used.to_string());
+                ui.label(row.available.to_string());
+                ui.label(format!("{}%", row.pct()));
+                let frac = if row.available == 0 {
+                    0.0
+                } else {
+                    row.used as f32 / row.available as f32
+                };
+                let bar_w = 160.0 * (row.available as f32 / max_avail).clamp(0.25, 1.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, 12.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
+                let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
+                ui.painter()
+                    .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
+                ui.end_row();
+            }
+        });
+    if let Some(res) = pick {
+        let _ = model.select_utilization(&res);
+    }
+    if !report.hierarchy.is_empty() {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Hierarchical").strong());
+        egui::Grid::new("utilization_hierarchy")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Instance").strong());
+                ui.label(RichText::new("LUT").strong());
+                ui.label(RichText::new("FF").strong());
+                ui.label(RichText::new("IOB").strong());
+                ui.label(RichText::new("BRAM").strong());
+                ui.label(RichText::new("DSP").strong());
+                ui.end_row();
+                for h in &report.hierarchy {
+                    ui.label(&h.name);
+                    ui.label(h.lut.to_string());
+                    ui.label(h.ff.to_string());
+                    ui.label(h.iob.to_string());
+                    ui.label(h.bram.to_string());
+                    ui.label(h.dsp.to_string());
+                    ui.end_row();
+                }
+            });
+    }
+    ui.add_space(8.0);
+    report_box(
+        ui,
+        "Utilization (report_utilization)",
+        &model.utilization_text(),
+    );
 }
 
 fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke) {

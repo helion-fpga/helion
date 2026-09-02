@@ -1,13 +1,13 @@
 //! Graph STA: create_clock / create_generated_clock (-divide_by / -multiply_by /
 //! -invert / -edges) / set_bus_skew / group_path / set_max_time_borrow /
 //! set_data_check / report_timing_summary / report_cdc / report_clock_networks /
-//! report_power / placed Manhattan.
+//! report_power / report_methodology / placed Manhattan.
 
 use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
 use helion_route::Routed;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
 pub struct Clock {
@@ -2097,6 +2097,318 @@ pub fn report_power(
         dsp_cap,
         f_mhz,
     }
+}
+
+/// UG949 `report_methodology` severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodologySeverity {
+    Error,
+    CriticalWarning,
+    Warning,
+    Advisory,
+}
+
+impl MethodologySeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "Error",
+            Self::CriticalWarning => "CriticalWarning",
+            Self::Warning => "Warning",
+            Self::Advisory => "Advisory",
+        }
+    }
+}
+
+/// One UG949 methodology row: TIMING/CDC/XDC check against STA + HNF + XDC.
+#[derive(Clone, Debug)]
+pub struct MethodologyViolation {
+    pub id: String,
+    pub severity: MethodologySeverity,
+    pub category: String,
+    pub objects: String,
+    pub message: String,
+}
+
+/// UG949 Methodology report: constraint completeness + unsafe CDC, not a dump.
+#[derive(Clone, Debug, Default)]
+pub struct MethodologyReport {
+    pub checks: Vec<MethodologyViolation>,
+}
+
+impl MethodologyReport {
+    pub fn check(&self, id: &str) -> Option<&MethodologyViolation> {
+        self.checks.iter().find(|c| c.id == id)
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|c| c.severity == MethodologySeverity::Error)
+            .count()
+    }
+
+    pub fn critical_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|c| c.severity == MethodologySeverity::CriticalWarning)
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|c| c.severity == MethodologySeverity::Warning)
+            .count()
+    }
+
+    pub fn advisory_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|c| c.severity == MethodologySeverity::Advisory)
+            .count()
+    }
+
+    pub fn text(&self) -> String {
+        if self.checks.is_empty() {
+            return "report_methodology checks=0 ok".into();
+        }
+        let mut lines = vec![format!(
+            "report_methodology checks={} errors={} critical={} warning={} advisory={}",
+            self.checks.len(),
+            self.error_count(),
+            self.critical_count(),
+            self.warning_count(),
+            self.advisory_count()
+        )];
+        for c in &self.checks {
+            let obj = if c.objects.is_empty() {
+                "-"
+            } else {
+                c.objects.as_str()
+            };
+            lines.push(format!(
+                "{} {} {} {} {}",
+                c.id,
+                c.severity.as_str(),
+                c.category,
+                obj,
+                c.message
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+fn methodology_push(
+    checks: &mut Vec<MethodologyViolation>,
+    id: &str,
+    severity: MethodologySeverity,
+    category: &str,
+    objects: impl Into<String>,
+    message: impl Into<String>,
+) {
+    checks.push(MethodologyViolation {
+        id: id.into(),
+        severity,
+        category: category.into(),
+        objects: objects.into(),
+        message: message.into(),
+    });
+}
+
+fn clock_pin_names(clocks: &[Clock], xdc: &Constraints) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for c in clocks.iter().chain(xdc.clocks.iter()) {
+        names.insert(c.name.clone());
+        names.insert(c.source.clone());
+        if let Some((cell, _)) = c.source.split_once('/') {
+            names.insert(cell.to_string());
+        }
+    }
+    names
+}
+
+fn lut_drives_clock(design: &Design) -> Vec<(String, String, String)> {
+    let mut hits = Vec::new();
+    for ff in design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+    {
+        let Some(clk_net) = design.net_on(&ff.name, "CLK") else {
+            continue;
+        };
+        let Some(net) = design.net(clk_net) else {
+            continue;
+        };
+        for e in &net.endpoints {
+            if e.pin != "O" {
+                continue;
+            }
+            if design
+                .cell(&e.cell)
+                .is_some_and(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            {
+                hits.push((e.cell.clone(), ff.name.clone(), clk_net.to_string()));
+            }
+        }
+    }
+    hits
+}
+
+fn q_used_as_clock(design: &Design) -> Vec<(String, String, String)> {
+    let mut hits = Vec::new();
+    for src in design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+    {
+        let Some(q_net) = design.net_on(&src.name, "Q") else {
+            continue;
+        };
+        for dst in design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+        {
+            if dst.name == src.name {
+                continue;
+            }
+            if design.net_on(&dst.name, "CLK") == Some(q_net) {
+                hits.push((src.name.clone(), dst.name.clone(), q_net.to_string()));
+            }
+        }
+    }
+    hits
+}
+
+/// UG949 `report_methodology`: STA/XDC/HNF checks (missing clocks, I/O delay,
+/// LUT-as-clock, missing generated clock, unsafe CDC). Empty design yields no
+/// rows. Does not move WNS.
+pub fn report_methodology(
+    clocks: &[Clock],
+    xdc: &Constraints,
+    timing: Option<&TimingResult>,
+    design: Option<&Design>,
+) -> MethodologyReport {
+    let Some(d) = design else {
+        return MethodologyReport::default();
+    };
+    let mut checks = Vec::new();
+    if xdc.clocks.is_empty() {
+        methodology_push(
+            &mut checks,
+            "TIMING-1",
+            MethodologySeverity::Warning,
+            "TIMING",
+            "clk",
+            "No user create_clock; implicit analysis clock used",
+        );
+    }
+    let clock_pins = clock_pin_names(clocks, xdc);
+    let implicit_clk = clock_pins.is_empty();
+    for p in &d.ports {
+        let is_clk = clock_pins.contains(&p.name)
+            || (implicit_clk && p.name == "clk")
+            || p.name == "clk";
+        match p.dir {
+            PortDir::In | PortDir::Inout if !is_clk => {
+                if !xdc.input_delay_ps.contains_key(&p.name) {
+                    methodology_push(
+                        &mut checks,
+                        "TIMING-6",
+                        MethodologySeverity::Warning,
+                        "TIMING",
+                        &p.name,
+                        format!("Missing set_input_delay on input port {}", p.name),
+                    );
+                }
+            }
+            PortDir::Out | PortDir::Inout => {
+                if !xdc.output_delay_ps.contains_key(&p.name) {
+                    methodology_push(
+                        &mut checks,
+                        "TIMING-7",
+                        MethodologySeverity::Warning,
+                        "TIMING",
+                        &p.name,
+                        format!("Missing set_output_delay on output port {}", p.name),
+                    );
+                }
+            }
+            PortDir::In => {}
+        }
+    }
+    if !xdc.clocks.is_empty() && xdc.clock_uncertainties.is_empty() {
+        let names = xdc
+            .clocks
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        methodology_push(
+            &mut checks,
+            "TIMING-24",
+            MethodologySeverity::Advisory,
+            "XDC",
+            names,
+            "No set_clock_uncertainty on user clocks",
+        );
+    }
+    for (lut, ff, net) in lut_drives_clock(d) {
+        methodology_push(
+            &mut checks,
+            "TIMING-10",
+            MethodologySeverity::Warning,
+            "TIMING",
+            format!("{lut},{ff}"),
+            format!("LUT {lut} drives clock net {net} on {ff}"),
+        );
+    }
+    for (src, dst, net) in q_used_as_clock(d) {
+        let pin = format!("{src}/Q");
+        let covered = xdc.clocks.iter().any(|c| {
+            c.generated
+                && (c.source == pin
+                    || c.source == src
+                    || c.source == net
+                    || c.source.starts_with(&format!("{src}/")))
+        });
+        if !covered {
+            methodology_push(
+                &mut checks,
+                "TIMING-18",
+                MethodologySeverity::Advisory,
+                "TIMING",
+                format!("{src},{dst}"),
+                format!("FF {src}/Q clocks {dst} without create_generated_clock"),
+            );
+        }
+    }
+    let clks = if clocks.is_empty() {
+        xdc.clocks.as_slice()
+    } else {
+        clocks
+    };
+    if clks.len() >= 2 {
+        let interaction = report_clock_interaction(clks, xdc, timing);
+        for cell in &interaction.cells {
+            if cell.relation == ClockRelation::TimedUnsafe {
+                methodology_push(
+                    &mut checks,
+                    "CDC-1",
+                    MethodologySeverity::CriticalWarning,
+                    "CDC",
+                    format!("{}->{}", cell.from, cell.to),
+                    format!(
+                        "Timed (unsafe) CDC {} → {} without a clock-group or false-path exception",
+                        cell.from, cell.to
+                    ),
+                );
+            }
+        }
+    }
+    MethodologyReport { checks }
 }
 
 fn tcl_clock_group_names(joined: &str) -> Vec<String> {
@@ -4809,5 +5121,87 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         );
         let gold2 = report_timing_placed(&d, &placed, &clks).unwrap();
         assert_eq!(gold2.wns_ps, gold.wns_ps, "report_power must not move WNS");
+    }
+
+    #[test]
+    fn report_methodology_from_sta_xdc_not_a_dump() {
+        let empty = report_methodology(&[], &Constraints::default(), None, None);
+        assert!(empty.checks.is_empty());
+        assert!(empty.text().contains("checks=0"), "{}", empty.text());
+
+        let d = Design::structural_counter();
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let t = report_timing(&d, &clks).unwrap();
+        let gold = t.wns_ps;
+        let r = report_methodology(&clks, &Constraints::default(), Some(&t), Some(&d));
+        assert!(
+            r.check("TIMING-1").is_some(),
+            "empty XDC must flag missing create_clock: {}",
+            r.text()
+        );
+        assert_eq!(
+            r.check("TIMING-1").unwrap().severity,
+            MethodologySeverity::Warning
+        );
+        let t7 = r.check("TIMING-7").expect("missing output delay");
+        assert_eq!(t7.objects, "led");
+        assert_eq!(t7.severity, MethodologySeverity::Warning);
+        assert!(
+            r.check("TIMING-6").is_none(),
+            "clk is a clock source, not a data input: {}",
+            r.text()
+        );
+        assert_eq!(t.wns_ps, gold, "methodology must not move WNS");
+
+        let mut xdc = Constraints::default();
+        xdc.clocks = clks.clone();
+        let r = report_methodology(&clks, &xdc, Some(&t), Some(&d));
+        assert!(r.check("TIMING-1").is_none(), "{}", r.text());
+        assert!(r.check("TIMING-7").is_some(), "{}", r.text());
+        assert!(r.check("TIMING-24").is_some(), "{}", r.text());
+        assert_eq!(
+            r.check("TIMING-24").unwrap().severity,
+            MethodologySeverity::Advisory
+        );
+
+        xdc.output_delay_ps.insert("led".into(), 1000);
+        xdc.clock_uncertainties.push(ClockUncertainty {
+            from: "clk".into(),
+            to: "clk".into(),
+            setup_ps: 100,
+            hold_ps: 50,
+        });
+        let r = report_methodology(&clks, &xdc, Some(&t), Some(&d));
+        assert!(r.check("TIMING-7").is_none(), "{}", r.text());
+        assert!(r.check("TIMING-24").is_none(), "{}", r.text());
+
+        create_clock(&mut clks, "virt", 8_000, "virt");
+        xdc.clocks = clks.clone();
+        let r = report_methodology(&clks, &xdc, Some(&t), Some(&d));
+        let cdc = r.check("CDC-1").expect("unsafe CDC");
+        assert_eq!(cdc.severity, MethodologySeverity::CriticalWarning);
+        assert!(cdc.objects.contains("clk"), "{}", cdc.objects);
+        assert!(r.critical_count() >= 1, "{}", r.text());
+
+        xdc.clock_groups.push(ClockGroups {
+            asynchronous: true,
+            exclusive: false,
+            groups: vec![vec!["clk".into()], vec!["virt".into()]],
+        });
+        let r = report_methodology(&clks, &xdc, Some(&t), Some(&d));
+        assert!(
+            r.check("CDC-1").is_none(),
+            "async groups must clear CDC-1: {}",
+            r.text()
+        );
+
+        let blinky = Design::structural_blinky();
+        let tb = report_timing(&blinky, &clks[..1]).unwrap();
+        assert_ne!(tb.wns_ps, gold, "methodology companion STA is per-design");
+        let rb = report_methodology(&clks[..1], &Constraints::default(), Some(&tb), Some(&blinky));
+        assert!(rb.check("TIMING-1").is_some(), "{}", rb.text());
+        assert_eq!(rb.check("TIMING-7").unwrap().objects, "led");
+        assert_eq!(tb.wns_ps, report_timing(&blinky, &clks[..1]).unwrap().wns_ps);
     }
 }

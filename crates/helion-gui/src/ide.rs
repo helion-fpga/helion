@@ -18,9 +18,10 @@ use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
-    report_cdc, report_clock_interaction, report_clock_networks, report_power,
-    report_timing_routed_xdc, report_timing_summary, CdcReport, ClockInteraction,
-    ClockNetworkReport, Constraints, PowerReport, TimingResult, TimingSummary,
+    report_cdc, report_clock_interaction, report_clock_networks, report_methodology,
+    report_power, report_timing_routed_xdc, report_timing_summary, CdcReport,
+    ClockInteraction, ClockNetworkReport, Constraints, MethodologyReport, PowerReport,
+    TimingResult, TimingSummary,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -130,6 +131,99 @@ fn primitive_of(kind: &CellKind) -> String {
     }
 }
 
+/// One HAD resource row of the UG893 Utilization occupancy pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtilOccupancy {
+    pub resource: &'static str,
+    pub used: usize,
+    pub available: usize,
+}
+
+impl UtilOccupancy {
+    pub fn pct(self) -> u32 {
+        if self.available == 0 {
+            0
+        } else {
+            ((self.used as u64 * 100) / self.available as u64) as u32
+        }
+    }
+}
+
+/// Hierarchical occupancy counted off HNF cells (not a resource-name dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HierOccupancy {
+    pub name: String,
+    pub lut: usize,
+    pub ff: usize,
+    pub iob: usize,
+    pub bram: usize,
+    pub dsp: usize,
+}
+
+/// UG893 Utilization occupancy report: HAD used/available + HNF hierarchy.
+#[derive(Clone, Debug, Default)]
+pub struct UtilizationReport {
+    pub part: String,
+    pub occupancy: Vec<UtilOccupancy>,
+    pub hierarchy: Vec<HierOccupancy>,
+}
+
+impl UtilizationReport {
+    pub fn row(&self, resource: &str) -> Option<&UtilOccupancy> {
+        self.occupancy
+            .iter()
+            .find(|r| r.resource.eq_ignore_ascii_case(resource))
+    }
+
+    pub fn hier(&self, name: &str) -> Option<&HierOccupancy> {
+        self.hierarchy.iter().find(|h| h.name == name)
+    }
+
+    pub fn text(&self) -> String {
+        if self.part.is_empty() {
+            return "no placed design — run Place".into();
+        }
+        let mut lines = Vec::new();
+        if let (Some(lut), Some(iob), Some(bram), Some(dsp)) = (
+            self.row("LUTFF"),
+            self.row("IOB"),
+            self.row("BRAM"),
+            self.row("DSP"),
+        ) {
+            lines.push(format!(
+                "report_utilization part={} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+                self.part,
+                lut.used,
+                lut.available,
+                iob.used,
+                iob.available,
+                bram.used,
+                bram.available,
+                dsp.used,
+                dsp.available
+            ));
+        } else {
+            lines.push(format!("report_utilization part={}", self.part));
+        }
+        for r in &self.occupancy {
+            lines.push(format!(
+                "resource {} used={} available={} pct={}",
+                r.resource,
+                r.used,
+                r.available,
+                r.pct()
+            ));
+        }
+        for h in &self.hierarchy {
+            lines.push(format!(
+                "hier {} lut={} ff={} iob={} bram={} dsp={}",
+                h.name, h.lut, h.ff, h.iob, h.bram, h.dsp
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
 /// Utilization pane, counted off the packed design against HAD capacity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Utilization {
@@ -156,6 +250,31 @@ impl Utilization {
             self.dsp,
             self.dsp_cap
         )
+    }
+
+    pub fn occupancy(&self) -> [UtilOccupancy; 4] {
+        [
+            UtilOccupancy {
+                resource: "LUTFF",
+                used: self.lutff,
+                available: self.lutff_cap as usize,
+            },
+            UtilOccupancy {
+                resource: "IOB",
+                used: self.iob,
+                available: self.iob_cap,
+            },
+            UtilOccupancy {
+                resource: "BRAM",
+                used: self.bram,
+                available: self.bram_cap as usize,
+            },
+            UtilOccupancy {
+                resource: "DSP",
+                used: self.dsp,
+                available: self.dsp_cap as usize,
+            },
+        ]
     }
 }
 
@@ -292,10 +411,24 @@ impl NavSection {
                     tcl: "open_elaborated_schematic",
                 },
             ],
-            NavSection::Implementation => &[NavAction {
-                label: "Run Implementation",
-                tcl: "run_implementation",
-            }],
+            NavSection::Implementation => &[
+                NavAction {
+                    label: "Run Implementation",
+                    tcl: "run_implementation",
+                },
+                NavAction {
+                    label: "Report DRC",
+                    tcl: "report_drc",
+                },
+                NavAction {
+                    label: "Report Utilization",
+                    tcl: "report_utilization",
+                },
+                NavAction {
+                    label: "Report Methodology",
+                    tcl: "report_methodology",
+                },
+            ],
             NavSection::TimingAnalysis => &[
                 NavAction {
                     label: "Report Timing",
@@ -320,6 +453,10 @@ impl NavSection {
                 NavAction {
                     label: "Report Power",
                     tcl: "report_power",
+                },
+                NavAction {
+                    label: "Report Methodology",
+                    tcl: "report_methodology",
                 },
             ],
             NavSection::ProgramDebug => &[
@@ -2020,6 +2157,9 @@ pub enum WorkspaceTab {
     Cdc,
     ClockNetworks,
     Power,
+    Methodology,
+    Drc,
+    Utilization,
     Hierarchy,
     Find,
     Package,
@@ -2476,10 +2616,7 @@ impl IdeModel {
 
     /// Utilization pane text. Empty until the design is packed/placed.
     pub fn utilization_text(&self) -> String {
-        match &self.utilization {
-            None => "no placed design — run Place".into(),
-            Some(u) => u.text(),
-        }
+        self.utilization_report().text()
     }
 
     /// Console entry point: a raw command string routed onto the real Session.
@@ -2634,6 +2771,12 @@ impl IdeModel {
             self.shell.session.insert_eco_lut(name, init)
         } else if t == "report_drc" {
             self.run_drc()
+        } else if t == "report_methodology" || t == "methodology" {
+            self.workspace = WorkspaceTab::Methodology;
+            Ok(self.methodology_text())
+        } else if t == "report_utilization" || t == "utilization" {
+            self.workspace = WorkspaceTab::Utilization;
+            Ok(self.utilization_report().text())
         } else if t == "report_clock_interaction" || t == "clock_interaction" {
             self.workspace = WorkspaceTab::ClockInteraction;
             Ok(self.clock_interaction_text())
@@ -2668,6 +2811,12 @@ impl IdeModel {
             self.select_clock_network(name.trim())
         } else if let Some(rail) = t.strip_prefix("select_power ") {
             self.select_power(rail.trim())
+        } else if let Some(id) = t.strip_prefix("select_methodology ") {
+            self.select_methodology(id.trim())
+        } else if let Some(id) = t.strip_prefix("select_drc ") {
+            self.select_drc(id.trim())
+        } else if let Some(res) = t.strip_prefix("select_utilization ") {
+            self.select_utilization(res.trim())
         } else if t == "create_clock" || t.starts_with("create_clock ") {
             self.apply_create_clock(t)
         } else if t == "create_generated_clock" || t.starts_with("create_generated_clock ") {
@@ -5478,6 +5627,204 @@ impl IdeModel {
         ))
     }
 
+    fn hierarchical_occupancy(design: &Design) -> Vec<HierOccupancy> {
+        let mut top = HierOccupancy {
+            name: design.name.clone(),
+            lut: 0,
+            ff: 0,
+            iob: 0,
+            bram: 0,
+            dsp: 0,
+        };
+        for c in &design.cells {
+            match c.kind {
+                CellKind::Lut6 { .. } => top.lut += 1,
+                CellKind::Hff => top.ff += 1,
+                CellKind::IobOut => top.iob += 1,
+                CellKind::Bram18 => top.bram += 1,
+                CellKind::Mac27 => top.dsp += 1,
+                _ => {}
+            }
+        }
+        vec![top]
+    }
+
+    /// UG893 Utilization occupancy pane: packed HAD used/available + HNF hierarchy.
+    pub fn utilization_report(&self) -> UtilizationReport {
+        let Some(u) = self.utilization else {
+            return UtilizationReport::default();
+        };
+        let part = self.part().to_string();
+        let occupancy = u.occupancy().to_vec();
+        let hierarchy = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(Self::hierarchical_occupancy)
+            .unwrap_or_default();
+        UtilizationReport {
+            part,
+            occupancy,
+            hierarchy,
+        }
+    }
+
+    /// Click a resource row: properties + Utilization workspace.
+    pub fn select_utilization(&mut self, resource: &str) -> Result<String, String> {
+        let r = self.utilization_report();
+        if r.part.is_empty() {
+            return Err("select_utilization: no placed design".into());
+        }
+        let row = r
+            .row(resource)
+            .copied()
+            .ok_or_else(|| format!("select_utilization: unknown resource {resource}"))?;
+        self.selected = Some(row.resource.into());
+        self.properties = vec![
+            ("NAME".into(), row.resource.into()),
+            ("TYPE".into(), "utilization".into()),
+            ("USED".into(), row.used.to_string()),
+            ("AVAILABLE".into(), row.available.to_string()),
+            ("PCT".into(), row.pct().to_string()),
+            ("PART".into(), r.part.clone()),
+        ];
+        self.workspace = WorkspaceTab::Utilization;
+        Ok(format!(
+            "utilization RESOURCE={} USED={} AVAILABLE={} PCT={} PART={}",
+            row.resource,
+            row.used,
+            row.available,
+            row.pct(),
+            r.part
+        ))
+    }
+
+    /// Live helion-drc result from placed/routed Session (not a cached dump).
+    pub fn drc_report(&self) -> Drc {
+        let Ok(dev) = self.device() else {
+            return Drc::default();
+        };
+        let s = &self.shell.session;
+        if let (Some(d), Some(r)) = (s.design.as_ref(), s.routed.as_ref()) {
+            check_routed(d, r, &dev)
+        } else if let (Some(d), Some(p)) = (s.design.as_ref(), s.placed.as_ref()) {
+            check_placed(d, p, &dev)
+        } else {
+            Drc::default()
+        }
+    }
+
+    pub fn drc_text(&self) -> String {
+        match (&self.drc, self.shell.session.placed.is_some() || self.shell.session.routed.is_some())
+        {
+            (Some(d), _) => d.text(),
+            (None, true) => self.drc_report().text(),
+            (None, false) => "no DRC — run Place/Route".into(),
+        }
+    }
+
+    /// Click a DRC rule: properties + DRC workspace.
+    pub fn select_drc(&mut self, id: &str) -> Result<String, String> {
+        let report = if let Some(d) = self.drc.clone() {
+            d
+        } else {
+            self.drc_report()
+        };
+        if report.ok() && report.items.is_empty() {
+            return Err("select_drc: no violations".into());
+        }
+        let v = if let Some(v) = report.item(id) {
+            v.clone()
+        } else if let Ok(i) = id.parse::<usize>() {
+            report
+                .items
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_drc: no row {id}"))?
+        } else {
+            report
+                .items
+                .iter()
+                .find(|v| v.message.contains(id) || v.objects.contains(id))
+                .cloned()
+                .ok_or_else(|| format!("select_drc: no rule {id}"))?
+        };
+        self.selected = Some(v.id.clone());
+        self.properties = vec![
+            ("NAME".into(), v.id.clone()),
+            ("TYPE".into(), "drc".into()),
+            ("SEVERITY".into(), v.severity.as_str().into()),
+            ("OBJECTS".into(), v.objects.clone()),
+            ("MESSAGE".into(), v.message.clone()),
+        ];
+        self.workspace = WorkspaceTab::Drc;
+        Ok(format!(
+            "drc ID={} SEVERITY={} OBJECTS={} {}",
+            v.id,
+            v.severity.as_str(),
+            if v.objects.is_empty() {
+                "-"
+            } else {
+                v.objects.as_str()
+            },
+            v.message
+        ))
+    }
+
+    /// UG949 Methodology pane: STA/XDC/HNF checks, not a dump. Empty XDC keeps gold WNS.
+    pub fn methodology_report(&self) -> MethodologyReport {
+        let Some(d) = self.shell.session.design.as_ref() else {
+            return MethodologyReport::default();
+        };
+        let clks = self.pane_clocks();
+        report_methodology(&clks, &self.constraints, self.timing.as_ref(), Some(d))
+    }
+
+    pub fn methodology_text(&self) -> String {
+        if self.shell.session.design.is_none() {
+            return "no design — synth / report_methodology".into();
+        }
+        self.methodology_report().text()
+    }
+
+    /// Click a methodology check: properties + Methodology workspace.
+    pub fn select_methodology(&mut self, id: &str) -> Result<String, String> {
+        let report = self.methodology_report();
+        let v = report
+            .check(id)
+            .or_else(|| {
+                report
+                    .checks
+                    .iter()
+                    .find(|c| c.id.eq_ignore_ascii_case(id) || c.objects == id)
+            })
+            .cloned()
+            .ok_or_else(|| format!("select_methodology: no check {id}"))?;
+        self.selected = Some(v.id.clone());
+        self.properties = vec![
+            ("NAME".into(), v.id.clone()),
+            ("TYPE".into(), "methodology".into()),
+            ("SEVERITY".into(), v.severity.as_str().into()),
+            ("CATEGORY".into(), v.category.clone()),
+            ("OBJECTS".into(), v.objects.clone()),
+            ("MESSAGE".into(), v.message.clone()),
+        ];
+        self.workspace = WorkspaceTab::Methodology;
+        Ok(format!(
+            "methodology ID={} SEVERITY={} CATEGORY={} OBJECTS={} {}",
+            v.id,
+            v.severity.as_str(),
+            v.category,
+            if v.objects.is_empty() {
+                "-"
+            } else {
+                v.objects.as_str()
+            },
+            v.message
+        ))
+    }
+
     /// UG893 Timing Constraints pane text. Empty until create_clock /
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
@@ -6134,13 +6481,9 @@ impl IdeModel {
         } else {
             return Err("report_drc: place or route first".into());
         };
-        let n = drc.violations.len();
-        let text = if drc.ok() {
-            format!("report_drc violations=0 ok")
-        } else {
-            format!("report_drc violations={n} {}", drc.violations.join("; "))
-        };
+        let text = drc.text();
         self.drc = Some(drc);
+        self.workspace = WorkspaceTab::Drc;
         Ok(text)
     }
 
@@ -7286,9 +7629,8 @@ impl IdeModel {
         }
         if self.workspace == WorkspaceTab::ClockNetworks {
             if let Some(n) = self.clock_networks().network(&id).cloned() {
-                if !props.iter().any(|(k, _)| k == "TYPE") {
-                    props.push(("TYPE".into(), "clock_network".into()));
-                }
+                props.retain(|(k, _)| k != "TYPE");
+                props.insert(0, ("TYPE".into(), "clock_network".into()));
                 props.push(("PERIOD_PS".into(), n.period_ps.to_string()));
                 props.push(("SOURCE".into(), n.source));
                 props.push(("NET".into(), n.net));
@@ -7327,6 +7669,38 @@ impl IdeModel {
                 props.push(("VOLTAGE_MV".into(), p.voltage_mv.to_string()));
                 props.push(("TEMP_C".into(), p.temperature_c.to_string()));
                 props.push(("F_MHZ".into(), p.f_mhz.to_string()));
+            }
+        }
+        if self.workspace == WorkspaceTab::Methodology {
+            if let Some(v) = self.methodology_report().check(&id).cloned() {
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "methodology".into()));
+                }
+                props.push(("SEVERITY".into(), v.severity.as_str().into()));
+                props.push(("CATEGORY".into(), v.category));
+                props.push(("OBJECTS".into(), v.objects));
+                props.push(("MESSAGE".into(), v.message));
+            }
+        }
+        if self.workspace == WorkspaceTab::Drc {
+            let report = self.drc.clone().unwrap_or_else(|| self.drc_report());
+            if let Some(v) = report.item(&id).cloned() {
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "drc".into()));
+                }
+                props.push(("SEVERITY".into(), v.severity.as_str().into()));
+                props.push(("OBJECTS".into(), v.objects));
+                props.push(("MESSAGE".into(), v.message));
+            }
+        }
+        if self.workspace == WorkspaceTab::Utilization {
+            if let Some(row) = self.utilization_report().row(&id).copied() {
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "utilization".into()));
+                }
+                props.push(("USED".into(), row.used.to_string()));
+                props.push(("AVAILABLE".into(), row.available.to_string()));
+                props.push(("PCT".into(), row.pct().to_string()));
             }
         }
         self.properties = props;
@@ -12701,6 +13075,7 @@ mod tests {
         assert_eq!(cdc.relation, helion_sta::ClockRelation::TimedUnsafe);
         assert_ne!(cdc.wns_ps, Some(gold), "CDC slack uses dest period");
         assert!(r.critical_count() >= 2, "{}", r.text());
+        let counter_cdc_wns = cdc.wns_ps;
         let pane = ide.exec("report_cdc").unwrap();
         assert!(pane.contains("SEVERITY=Critical"), "{pane}");
         assert!(pane.contains("FROM=clk TO=virt"), "{pane}");
@@ -12753,6 +13128,9 @@ mod tests {
         blinky.run_step(FlowStep::Place).unwrap();
         blinky.run_step(FlowStep::Route).unwrap();
         blinky
+            .exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        blinky
             .exec("create_clock -name virt -period 8.000 [get_ports virt]")
             .unwrap();
         let bwns = blinky.wns_ps().expect("blinky STA");
@@ -12761,9 +13139,9 @@ mod tests {
             blinky
                 .cdc_report()
                 .violation("clk", "virt")
-                .unwrap()
+                .expect("blinky CDC")
                 .wns_ps,
-            ide.cdc_report().violation("clk", "virt").unwrap().wns_ps,
+            counter_cdc_wns,
             "CDC WNS is per-design STA, not a canned pane"
         );
     }

@@ -6,9 +6,37 @@ use helion_place::Placed;
 use helion_route::Routed;
 use std::collections::{BTreeMap, HashSet};
 
+/// UG893 DRC violation severity (Error / Warning / Advisory).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrcSeverity {
+    Error,
+    Warning,
+    Advisory,
+}
+
+impl DrcSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "Error",
+            Self::Warning => "Warning",
+            Self::Advisory => "Advisory",
+        }
+    }
+}
+
+/// One UG893 DRC row: rule id + objects + engine message, not a joined dump.
+#[derive(Clone, Debug)]
+pub struct DrcViolation {
+    pub id: String,
+    pub severity: DrcSeverity,
+    pub objects: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Drc {
     pub violations: Vec<String>,
+    pub items: Vec<DrcViolation>,
 }
 
 impl Drc {
@@ -23,37 +51,103 @@ impl Drc {
             Err(self.violations.join("; "))
         }
     }
+
+    pub fn add(&mut self, id: &str, objects: impl Into<String>, message: impl Into<String>) {
+        let objects = objects.into();
+        let message = message.into();
+        self.violations.push(message.clone());
+        self.items.push(DrcViolation {
+            id: id.into(),
+            severity: DrcSeverity::Error,
+            objects,
+            message,
+        });
+    }
+
+    pub fn item(&self, id: &str) -> Option<&DrcViolation> {
+        self.items
+            .iter()
+            .find(|v| v.id == id)
+            .or_else(|| {
+                self.items
+                    .iter()
+                    .find(|v| v.id.eq_ignore_ascii_case(id))
+            })
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|v| v.severity == DrcSeverity::Error)
+            .count()
+    }
+
+    /// UG893 DRC pane text: rule rows from helion-drc, not a one-line dump.
+    pub fn text(&self) -> String {
+        if self.ok() {
+            return "report_drc violations=0 ok".into();
+        }
+        let n = self.violations.len();
+        let mut lines = vec![format!(
+            "report_drc violations={n} errors={}",
+            self.error_count()
+        )];
+        for v in &self.items {
+            let obj = if v.objects.is_empty() {
+                "-"
+            } else {
+                v.objects.as_str()
+            };
+            lines.push(format!(
+                "{} {} {} {}",
+                v.id,
+                v.severity.as_str(),
+                obj,
+                v.message
+            ));
+        }
+        lines.join("\n")
+    }
 }
 
 pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
     let mut d = Drc::default();
     if placed.lutff_sites.len() != placed.packed.lutffs.len() {
-        d.violations.push(format!(
-            "placed {} LUTFF sites for {} clusters",
-            placed.lutff_sites.len(),
-            placed.packed.lutffs.len()
-        ));
+        d.add(
+            "PLACE-1",
+            "",
+            format!(
+                "placed {} LUTFF sites for {} clusters",
+                placed.lutff_sites.len(),
+                placed.packed.lutffs.len()
+            ),
+        );
     }
     if placed.packed.lutffs.len() as u32 > dev.lut6_count() {
-        d.violations.push("LUT occupancy exceeds device".into());
+        d.add("PLACE-2", "", "LUT occupancy exceeds device");
     }
     let mut used = HashSet::new();
     for (site, ble) in &placed.lutff_sites {
+        let clb = format!("CLB_X{}Y{}", site.x, site.y);
         if *ble as u32 >= dev.n_ble {
-            d.violations.push(format!("BLE {ble} out of range at CLB_X{}Y{}", site.x, site.y));
+            d.add(
+                "PLACE-3",
+                &clb,
+                format!("BLE {ble} out of range at {clb}"),
+            );
         }
         if !used.insert((site.x, site.y, *ble)) {
-            d.violations.push(format!("overused CLB_X{}Y{} BLE{ble}", site.x, site.y));
+            d.add("PLACE-4", &clb, format!("overused {clb} BLE{ble}"));
         }
     }
     if placed.mac_sites.len() != placed.packed.macs.len() {
-        d.violations.push("DSP placement mismatch".into());
+        d.add("DSP-1", "", "DSP placement mismatch");
     }
     if placed.bram_sites.len() != placed.packed.brams.len() {
-        d.violations.push("BRAM placement mismatch".into());
+        d.add("BRAM-1", "", "BRAM placement mismatch");
     }
     if placed.iob_sites.len() != placed.packed.iobs.len() {
-        d.violations.push("IOB placement mismatch".into());
+        d.add("IOB-1", "", "IOB placement mismatch");
     }
     let has_clk = design.ports.iter().any(|p| p.name == "clk")
         || design
@@ -61,7 +155,7 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
             .iter()
             .any(|n| n.endpoints.iter().any(|e| e.pin == "CLK"));
     if !placed.packed.lutffs.is_empty() && !has_clk {
-        d.violations.push("no clock on registered design".into());
+        d.add("CLK-1", "", "no clock on registered design");
     }
     check_iostandard(design, placed, dev, &mut d);
     check_io_electrical(design, &mut d);
@@ -86,10 +180,11 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
             continue;
         };
         let Some(vcco) = Device::iostandard_vcco_mv(std) else {
-            d.violations.push(format!(
-                "IOSTANDARD {std} on {} is not a HAD I/O standard",
-                p.name
-            ));
+            d.add(
+                "IOSTD-1",
+                &p.name,
+                format!("IOSTANDARD {std} on {} is not a HAD I/O standard", p.name),
+            );
             continue;
         };
         let loc = p
@@ -127,9 +222,11 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
                 .map(|(n, s, v)| format!("{n}={s}/{v}mV"))
                 .collect::<Vec<_>>()
                 .join(",");
-            d.violations.push(format!(
-                "IOSTANDARD VCCO mix on BANK{bank}: {detail}"
-            ));
+            d.add(
+                "IOSTD-2",
+                format!("BANK{bank}"),
+                format!("IOSTANDARD VCCO mix on BANK{bank}: {detail}"),
+            );
         }
     }
 }
@@ -139,72 +236,95 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
     for p in &design.ports {
         if let Some(drv) = p.attrs.get("DRIVE") {
             match Device::parse_drive(drv) {
-                None => d.violations.push(format!(
-                    "DRIVE {drv} on {} is not a HAD drive strength",
-                    p.name
-                )),
+                None => d.add(
+                    "DRIVE-1",
+                    &p.name,
+                    format!("DRIVE {drv} on {} is not a HAD drive strength", p.name),
+                ),
                 Some(ma) => {
                     if !Device::drive_legal_for_iostandard(p.attrs.get("IOSTANDARD"), ma) {
                         let std = p
                             .attrs
                             .get("IOSTANDARD")
                             .unwrap_or(Device::DEFAULT_IOSTANDARD);
-                        d.violations.push(format!(
-                            "DRIVE {ma} not legal for IOSTANDARD {std} on {}",
-                            p.name
-                        ));
+                        d.add(
+                            "DRIVE-2",
+                            &p.name,
+                            format!(
+                                "DRIVE {ma} not legal for IOSTANDARD {std} on {}",
+                                p.name
+                            ),
+                        );
                     }
                 }
             }
         }
         if let Some(s) = p.attrs.get("SLEW") {
             if !Device::legal_slew(s) {
-                d.violations.push(format!(
-                    "SLEW {s} on {} is not a HAD slew (SLOW|FAST)",
-                    p.name
-                ));
+                d.add(
+                    "SLEW-1",
+                    &p.name,
+                    format!("SLEW {s} on {} is not a HAD slew (SLOW|FAST)", p.name),
+                );
             }
         }
         if let Some(pt) = p.attrs.get("PULLTYPE") {
             if !Device::legal_pulltype(pt) {
-                d.violations.push(format!(
-                    "PULLTYPE {pt} on {} is not a HAD pull (NONE|PULLUP|PULLDOWN|KEEPER)",
-                    p.name
-                ));
+                d.add(
+                    "PULL-1",
+                    &p.name,
+                    format!(
+                        "PULLTYPE {pt} on {} is not a HAD pull (NONE|PULLUP|PULLDOWN|KEEPER)",
+                        p.name
+                    ),
+                );
             }
         }
         if let Some(dt) = p.attrs.get("DIFF_TERM") {
             if !Device::legal_diff_term(dt) {
-                d.violations.push(format!(
-                    "DIFF_TERM {dt} on {} is not a HAD term (TRUE|FALSE)",
-                    p.name
-                ));
+                d.add(
+                    "DIFF-1",
+                    &p.name,
+                    format!("DIFF_TERM {dt} on {} is not a HAD term (TRUE|FALSE)", p.name),
+                );
             } else if !Device::diff_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), dt) {
                 let std = p
                     .attrs
                     .get("IOSTANDARD")
                     .unwrap_or(Device::DEFAULT_IOSTANDARD);
-                d.violations.push(format!(
-                    "DIFF_TERM {dt} not legal for IOSTANDARD {std} on {}",
-                    p.name
-                ));
+                d.add(
+                    "DIFF-2",
+                    &p.name,
+                    format!(
+                        "DIFF_TERM {dt} not legal for IOSTANDARD {std} on {}",
+                        p.name
+                    ),
+                );
             }
         }
         if let Some(it) = p.attrs.get("IN_TERM") {
             if !Device::legal_in_term(it) {
-                d.violations.push(format!(
-                    "IN_TERM {it} on {} is not a HAD term (NONE|UNTUNED_SPLIT_40|UNTUNED_SPLIT_50|UNTUNED_SPLIT_60)",
-                    p.name
-                ));
+                d.add(
+                    "INTERM-1",
+                    &p.name,
+                    format!(
+                        "IN_TERM {it} on {} is not a HAD term (NONE|UNTUNED_SPLIT_40|UNTUNED_SPLIT_50|UNTUNED_SPLIT_60)",
+                        p.name
+                    ),
+                );
             } else if !Device::in_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), it) {
                 let std = p
                     .attrs
                     .get("IOSTANDARD")
                     .unwrap_or(Device::DEFAULT_IOSTANDARD);
-                d.violations.push(format!(
-                    "IN_TERM {it} not legal for IOSTANDARD {std} on {}",
-                    p.name
-                ));
+                d.add(
+                    "INTERM-2",
+                    &p.name,
+                    format!(
+                        "IN_TERM {it} not legal for IOSTANDARD {std} on {}",
+                        p.name
+                    ),
+                );
             }
         }
     }
@@ -213,10 +333,14 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
 pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
     let mut d = check_placed(design, &routed.placed, dev);
     if !routed.placed.packed.iobs.is_empty() && routed.iob_src.is_empty() {
-        d.violations.push("unrouted IOB".into());
+        d.add("ROUTE-1", "", "unrouted IOB");
     }
     if routed.overused > 0 {
-        d.violations.push(format!("PathFinder overused {} tiles", routed.overused));
+        d.add(
+            "ROUTE-2",
+            "",
+            format!("PathFinder overused {} tiles", routed.overused),
+        );
     }
     for iob in &routed.placed.packed.iobs {
         if !routed
@@ -226,7 +350,11 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
             .iter()
             .any(|l| l.q_net == iob.from_net)
         {
-            d.violations.push(format!("IOB {} net {} has no FF driver", iob.cell, iob.from_net));
+            d.add(
+                "ROUTE-3",
+                &iob.cell,
+                format!("IOB {} net {} has no FF driver", iob.cell, iob.from_net),
+            );
         }
     }
     d
@@ -296,6 +424,10 @@ mod tests {
             "{:?}",
             drc.violations
         );
+        let row = drc.item("IOSTD-2").expect("structured DRC row");
+        assert_eq!(row.severity, DrcSeverity::Error);
+        assert!(row.objects.contains("BANK"), "{}", row.objects);
+        assert!(drc.text().contains("IOSTD-2"), "{}", drc.text());
     }
 
     #[test]
