@@ -3894,15 +3894,16 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Create Block Design").clicked() {
             let _ = model.exec("create_bd");
         }
-    });
-    ui.collapsing("IP Catalog (Helion-MM/ST)", |ui| {
-        for c in &model.ip_catalog {
-            ui.monospace(format!(
-                "{}  {}/{}  {}",
-                c.name, c.vendor, c.library, c.bus
-            ));
+        if ui.button("Generate Output Products").clicked() {
+            let spec = model.selected_ip.clone().unwrap_or_default();
+            let _ = model.exec(&format!("generate_ip {spec}"));
+        }
+        if ui.button("Add to Block Design").clicked() {
+            let spec = model.selected_ip.clone().unwrap_or_default();
+            let _ = model.exec(&format!("create_bd_cell {spec}"));
         }
     });
+    paint_ip_catalog(ui, model);
     let drawing = model
         .block_design
         .as_ref()
@@ -3911,7 +3912,7 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.weak("Create Block Design to place Helion-MM IP on the canvas.");
         return;
     };
-    ui.monospace(format!(
+    ui.label(format!(
         "BD {}  {} IP  {} nets  ok={}",
         model.block_design.as_ref().map(|b| b.name.as_str()).unwrap_or("-"),
         drawing
@@ -3925,13 +3926,20 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
     if !drawing.addresses.is_empty() {
         ui.add_space(4.0);
         ui.label(RichText::new("Address Map (Helion-MM)").strong());
-        ui.monospace("Slave            Offset      Range");
-        for a in &drawing.addresses {
-            ui.monospace(format!(
-                "{:<16} 0x{:>08x}  0x{:x}",
-                a.slave, a.base, a.range
-            ));
-        }
+        egui::Grid::new("bd_addr_map")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Slave").strong());
+                ui.label(RichText::new("Offset").strong());
+                ui.label(RichText::new("Range").strong());
+                ui.end_row();
+                for a in &drawing.addresses {
+                    ui.label(&a.slave);
+                    ui.label(format!("0x{:08x}", a.base));
+                    ui.label(format!("0x{:x}", a.range));
+                    ui.end_row();
+                }
+            });
     }
     egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -4059,10 +4067,76 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
             }
         });
-    if let Some(bd) = &model.block_design {
-        ui.collapsing("Generated SV", |ui| {
-            ui.monospace(&bd.sv);
+    paint_bd_hdl(ui, model);
+}
+
+fn paint_ip_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("IP Catalog — helion-ipxact VLNV table (Helion-MM/ST), not a collapsing dump")
+            .strong(),
+    );
+    let rows = model.ip_catalog_rows();
+    ui.label(format!("cores={}", rows.len()));
+    let selected = model.selected_ip.clone();
+    let mut pick: Option<String> = None;
+    egui::Grid::new("ip_catalog_table")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Name").strong());
+            ui.label(RichText::new("VLNV").strong());
+            ui.label(RichText::new("Bus").strong());
+            ui.label(RichText::new("Status").strong());
+            ui.end_row();
+            for r in &rows {
+                let on = selected.as_deref() == Some(r.name.as_str());
+                if ui.selectable_label(on, &r.name).clicked() {
+                    pick = Some(r.name.clone());
+                }
+                ui.label(&r.vlnv);
+                ui.label(&r.bus);
+                ui.label(&r.status);
+                ui.end_row();
+            }
         });
+    if let Some(name) = pick {
+        let _ = model.select_ip_core(&name);
+    }
+}
+
+fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
+    let rows = model.bd_hdl_rows();
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("Generated HDL — instance table from helion-bd emit_sv, not a source dump")
+            .strong(),
+    );
+    let selected = model.selected_ip.clone();
+    let mut pick: Option<String> = None;
+    egui::Grid::new("bd_hdl_table")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Instance").strong());
+            ui.label(RichText::new("Module").strong());
+            ui.label(RichText::new("Bus").strong());
+            ui.label(RichText::new("Ports").strong());
+            ui.end_row();
+            for r in &rows {
+                let on = selected.as_deref() == Some(r.module.as_str());
+                if ui.selectable_label(on, &r.instance).clicked() {
+                    pick = Some(r.module.clone());
+                }
+                ui.label(&r.module);
+                ui.label(&r.bus);
+                ui.label(&r.ports);
+                ui.end_row();
+            }
+        });
+    if let Some(name) = pick {
+        let _ = model.select_ip_core(&name);
     }
 }
 
