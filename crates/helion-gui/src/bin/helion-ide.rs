@@ -1037,6 +1037,7 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.horizontal(|ui| {
         for tab in [
+            WorkspaceTab::Summary,
             WorkspaceTab::Reports,
             WorkspaceTab::Settings,
             WorkspaceTab::Schematic,
@@ -1062,6 +1063,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Bitstream,
         ] {
             let label = match tab {
+                WorkspaceTab::Summary => "Project Summary",
                 WorkspaceTab::Reports => "Reports",
                 WorkspaceTab::Settings => "Project Settings",
                 WorkspaceTab::Schematic => "Schematic",
@@ -1096,6 +1098,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.separator();
     match model.workspace {
+        WorkspaceTab::Summary => paint_project_summary(ui, model),
         WorkspaceTab::Reports => paint_reports(ui, model),
         WorkspaceTab::Settings => paint_project_settings(ui, model),
         WorkspaceTab::Schematic => paint_schematic(ui, model),
@@ -1119,6 +1122,110 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Package => paint_package(ui, model),
         WorkspaceTab::Runs => paint_runs(ui, model),
         WorkspaceTab::Bitstream => paint_bitstream(ui, model),
+    }
+}
+
+fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Project Summary");
+    ui.weak(
+        "UG893 Project Summary — clickable Session WNS / util / run / bitstream gadgets, not a dump",
+    );
+    let rows = model.project_summary_gadgets();
+    let wns = model
+        .wns_ps()
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| "-".into());
+    let lutff = rows
+        .iter()
+        .find(|r| r.id == "utilization")
+        .map(|r| r.value.as_str())
+        .unwrap_or("-");
+    let run = rows
+        .iter()
+        .find(|r| r.id == "run")
+        .map(|r| r.status.as_str())
+        .unwrap_or("-");
+    let hash = rows
+        .iter()
+        .find(|r| r.id == "bitstream")
+        .map(|r| r.value.as_str())
+        .unwrap_or("-");
+    ui.label(format!(
+        "project_summary n={} wns_ps={wns} lutff={lutff} run={run} hash={hash}",
+        rows.len()
+    ));
+    ui.add_space(6.0);
+    let selected = model.selected_summary.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both()
+        .id_salt("ug893_project_summary")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("project_summary_gadgets")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Gadget").strong());
+                    ui.label(RichText::new("Status").strong());
+                    ui.label(RichText::new("Value").strong());
+                    ui.end_row();
+                    for (i, r) in rows.iter().enumerate() {
+                        let on = selected.as_deref() == Some(r.id.as_str());
+                        if ui.selectable_label(on, &r.name).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        let fill = run_status_color(&r.status);
+                        let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
+                            .fill(fill)
+                            .selected(on);
+                        if ui.add(btn).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        if ui.selectable_label(on, &r.value).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        ui.end_row();
+                    }
+                });
+            let report = model.utilization_report();
+            if !report.occupancy.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Occupancy").strong());
+                let max_avail = report
+                    .occupancy
+                    .iter()
+                    .map(|r| r.available.max(1))
+                    .max()
+                    .unwrap_or(1) as f32;
+                egui::Grid::new("project_summary_occupancy")
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        for row in &report.occupancy {
+                            ui.label(row.resource);
+                            ui.label(format!("{}/{}", row.used, row.available));
+                            let frac = if row.available == 0 {
+                                0.0
+                            } else {
+                                row.used as f32 / row.available as f32
+                            };
+                            let bar_w = 160.0 * (row.available as f32 / max_avail).clamp(0.25, 1.0);
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(bar_w, 12.0), Sense::hover());
+                            ui.painter().rect_filled(
+                                rect,
+                                2.0,
+                                Color32::from_rgb(0x2b, 0x32, 0x3a),
+                            );
+                            let fill =
+                                rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
+                            ui.painter()
+                                .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+    if let Some(spec) = pick {
+        let _ = model.select_project_summary(&spec);
     }
 }
 
