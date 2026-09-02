@@ -162,6 +162,10 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
                 d.set_slew(obj, val)?;
             } else if key.eq_ignore_ascii_case("PULLTYPE") {
                 d.set_pulltype(obj, val)?;
+            } else if key.eq_ignore_ascii_case("DIFF_TERM") {
+                d.set_diff_term(obj, val)?;
+            } else if key.eq_ignore_ascii_case("IN_TERM") {
+                d.set_in_term(obj, val)?;
             }
             return Ok(format!("set_property {key} {val} {obj}"));
         }

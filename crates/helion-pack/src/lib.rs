@@ -41,6 +41,10 @@ pub struct PackedIob {
     pub slew: Option<String>,
     /// UG893 I/O Ports `PULLTYPE`.
     pub pulltype: Option<String>,
+    /// UG893 I/O Ports `DIFF_TERM`.
+    pub diff_term: Option<String>,
+    /// UG893 I/O Ports `IN_TERM`.
+    pub in_term: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +108,8 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 drive: port.and_then(|p| p.attrs.get("DRIVE").map(|s| s.to_string())),
                 slew: port.and_then(|p| p.attrs.get("SLEW").map(|s| s.to_string())),
                 pulltype: port.and_then(|p| p.attrs.get("PULLTYPE").map(|s| s.to_string())),
+                diff_term: port.and_then(|p| p.attrs.get("DIFF_TERM").map(|s| s.to_string())),
+                in_term: port.and_then(|p| p.attrs.get("IN_TERM").map(|s| s.to_string())),
             });
         }
     }
@@ -143,7 +149,8 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     })
 }
 
-/// Copy HNF port DRIVE / SLEW / PULLTYPE onto packed IOBs (post-pack set_property).
+/// Copy HNF port DRIVE / SLEW / PULLTYPE / DIFF_TERM / IN_TERM onto packed IOBs
+/// (post-pack set_property).
 pub fn apply_iob_electrical(design: &Design, iobs: &mut [PackedIob]) {
     for iob in iobs.iter_mut() {
         let pad = design.net_on(&iob.cell, "PAD").unwrap_or("");
@@ -151,6 +158,8 @@ pub fn apply_iob_electrical(design: &Design, iobs: &mut [PackedIob]) {
             iob.drive = p.attrs.get("DRIVE").map(|s| s.to_string());
             iob.slew = p.attrs.get("SLEW").map(|s| s.to_string());
             iob.pulltype = p.attrs.get("PULLTYPE").map(|s| s.to_string());
+            iob.diff_term = p.attrs.get("DIFF_TERM").map(|s| s.to_string());
+            iob.in_term = p.attrs.get("IN_TERM").map(|s| s.to_string());
         }
     }
 }
@@ -183,14 +192,20 @@ mod tests {
         assert!(p.iobs[0].drive.is_none());
         assert!(p.iobs[0].slew.is_none());
         assert!(p.iobs[0].pulltype.is_none());
+        assert!(p.iobs[0].diff_term.is_none());
+        assert!(p.iobs[0].in_term.is_none());
         let mut d = Design::structural_counter();
         d.set_drive("led", "4").unwrap();
         d.set_slew("led", "FAST").unwrap();
         d.set_pulltype("led", "PULLUP").unwrap();
+        d.set_diff_term("led", "TRUE").unwrap();
+        d.set_in_term("led", "UNTUNED_SPLIT_50").unwrap();
         let p = pack(&d, &dev).unwrap();
         assert_eq!(p.iobs[0].drive.as_deref(), Some("4"));
         assert_eq!(p.iobs[0].slew.as_deref(), Some("FAST"));
         assert_eq!(p.iobs[0].pulltype.as_deref(), Some("PULLUP"));
+        assert_eq!(p.iobs[0].diff_term.as_deref(), Some("TRUE"));
+        assert_eq!(p.iobs[0].in_term.as_deref(), Some("UNTUNED_SPLIT_50"));
     }
 
     #[test]

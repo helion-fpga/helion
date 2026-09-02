@@ -17,8 +17,8 @@ use helion_ipxact::{pack_gpio, pack_uart, IpCore};
 use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
-    create_clock, iostandard_pad_ps, port_pad_ps, load_xdc, report_timing_routed_xdc, Constraints,
-    TimingResult,
+    clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
+    report_timing_routed_xdc, Constraints, TimingResult,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1502,6 +1502,10 @@ pub struct IoPortView {
     pub slew: Option<String>,
     /// `set_property PULLTYPE` — NONE | PULLUP | PULLDOWN | KEEPER.
     pub pulltype: Option<String>,
+    /// `set_property DIFF_TERM` — TRUE | FALSE (HAD SSTL/HSTL only when TRUE).
+    pub diff_term: Option<String>,
+    /// `set_property IN_TERM` — NONE | UNTUNED_SPLIT_{40,50,60}.
+    pub in_term: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2334,7 +2338,7 @@ impl IdeModel {
         match &self.timing {
             None => "no routed design — run Route".into(),
             Some(t) => format!(
-                "WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
+                "WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}",
                 t.wns_ps,
                 t.tns_ps,
                 t.setup_ps,
@@ -2343,7 +2347,8 @@ impl IdeModel {
                 t.endpoints,
                 t.r2r_ps,
                 t.iob_ps,
-                t.route_ps
+                t.route_ps,
+                t.clk_net_ps
             ),
         }
     }
@@ -2439,6 +2444,10 @@ impl IdeModel {
                 self.apply_slew(t)
             } else if key.eq_ignore_ascii_case("PULLTYPE") {
                 self.apply_pulltype(t)
+            } else if key.eq_ignore_ascii_case("DIFF_TERM") {
+                self.apply_diff_term(t)
+            } else if key.eq_ignore_ascii_case("IN_TERM") {
+                self.apply_in_term(t)
             } else {
                 tcl_eval(&mut self.shell, cmd)
             }
@@ -2491,11 +2500,28 @@ impl IdeModel {
             self.run_drc()
         } else if t == "create_clock" || t.starts_with("create_clock ") {
             self.apply_create_clock(t)
+        } else if t == "create_generated_clock" || t.starts_with("create_generated_clock ") {
+            self.apply_create_generated_clock(t)
         } else if t.starts_with("set_input_delay")
             || t.starts_with("set_output_delay")
             || t.starts_with("set_false_path")
             || t.starts_with("set_multicycle_path")
             || t.starts_with("set_max_delay")
+            || t.starts_with("set_min_delay")
+            || t.starts_with("set_clock_groups")
+            || t.starts_with("set_clock_uncertainty")
+            || t.starts_with("set_clock_latency")
+            || t.starts_with("set_disable_timing")
+            || t.starts_with("set_case_analysis")
+            || t.starts_with("set_propagated_clock")
+            || t.starts_with("set_clock_sense")
+            || t.starts_with("set_input_jitter")
+            || t.starts_with("set_system_jitter")
+            || t.starts_with("set_timing_derate")
+            || t.starts_with("set_operating_conditions")
+            || t.starts_with("set_bus_skew")
+            || t == "group_path"
+            || t.starts_with("group_path ")
         {
             self.apply_sdc_exception(t)
         } else if let Some(path) = t
@@ -3566,7 +3592,7 @@ impl IdeModel {
         s
     }
 
-    /// UG893 I/O Ports table: PACKAGE_PIN + IOSTANDARD/DRIVE/SLEW/PULLTYPE
+    /// UG893 I/O Ports table: PACKAGE_PIN + IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM
     /// hitting HAD/STA/DRC/bitgen, not a pin dump.
     pub fn io_ports_text(&self) -> String {
         let n = self.io_ports.len();
@@ -3578,7 +3604,7 @@ impl IdeModel {
         let mut s = format!("io_ports n={n} assigned={assigned}");
         for p in &self.io_ports {
             s.push_str(&format!(
-                " {} {} PACKAGE_PIN={} placed={} IOSTANDARD={} DRIVE={} SLEW={} PULLTYPE={}",
+                " {} {} PACKAGE_PIN={} placed={} IOSTANDARD={} DRIVE={} SLEW={} PULLTYPE={} DIFF_TERM={} IN_TERM={}",
                 p.name,
                 p.dir,
                 p.package_pin.as_deref().unwrap_or("-"),
@@ -3586,7 +3612,9 @@ impl IdeModel {
                 p.iostandard.as_deref().unwrap_or("-"),
                 p.drive.as_deref().unwrap_or("-"),
                 p.slew.as_deref().unwrap_or("-"),
-                p.pulltype.as_deref().unwrap_or("-")
+                p.pulltype.as_deref().unwrap_or("-"),
+                p.diff_term.as_deref().unwrap_or("-"),
+                p.in_term.as_deref().unwrap_or("-")
             ));
         }
         s
@@ -4035,6 +4063,16 @@ impl IdeModel {
         self.set_pulltype(&port, &val)
     }
 
+    fn apply_diff_term(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, val) = parse_port_prop_cmd(cmd, "DIFF_TERM")?;
+        self.set_diff_term(&port, &val)
+    }
+
+    fn apply_in_term(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, val) = parse_port_prop_cmd(cmd, "IN_TERM")?;
+        self.set_in_term(&port, &val)
+    }
+
     /// I/O Planning `set_property DRIVE`: HAD mA on the HNF port so STA / DRC / bitgen see it.
     pub fn set_drive(&mut self, port: &str, ma: &str) -> Result<String, String> {
         let port = port.trim();
@@ -4144,6 +4182,82 @@ impl IdeModel {
         ))
     }
 
+    /// I/O Planning `set_property DIFF_TERM`: TRUE | FALSE hits STA pad delay and bitgen.
+    pub fn set_diff_term(&mut self, port: &str, term: &str) -> Result<String, String> {
+        let port = port.trim();
+        let term = term.trim();
+        if port.is_empty() || term.is_empty() {
+            return Err("set_property DIFF_TERM: need <TRUE|FALSE> [get_ports <port>]".into());
+        }
+        let Some(canon) = Device::parse_diff_term(term) else {
+            return Err(format!(
+                "set_property DIFF_TERM: {term} is not a HAD term (TRUE|FALSE)"
+            ));
+        };
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property DIFF_TERM: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property DIFF_TERM: no port {port}"));
+            }
+            d.set_diff_term(port, canon)?;
+        }
+        self.constraints
+            .diff_terms
+            .insert(port.to_string(), canon.to_string());
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        let bitgen = self.maybe_rebitgen()?;
+        let pad_ps = self.port_pad_ps_now(port);
+        Ok(format!(
+            "set_property DIFF_TERM {canon} {port} pad_ps={pad_ps} bitgen={}",
+            u8::from(bitgen)
+        ))
+    }
+
+    /// I/O Planning `set_property IN_TERM`: NONE | UNTUNED_SPLIT_{40,50,60}.
+    pub fn set_in_term(&mut self, port: &str, term: &str) -> Result<String, String> {
+        let port = port.trim();
+        let term = term.trim();
+        if port.is_empty() || term.is_empty() {
+            return Err("set_property IN_TERM: need <type> [get_ports <port>]".into());
+        }
+        let Some(canon) = Device::parse_in_term(term) else {
+            return Err(format!(
+                "set_property IN_TERM: {term} is not a HAD term (NONE|UNTUNED_SPLIT_40|UNTUNED_SPLIT_50|UNTUNED_SPLIT_60)"
+            ));
+        };
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property IN_TERM: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property IN_TERM: no port {port}"));
+            }
+            d.set_in_term(port, canon)?;
+        }
+        self.constraints
+            .in_terms
+            .insert(port.to_string(), canon.to_string());
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        let bitgen = self.maybe_rebitgen()?;
+        let pad_ps = self.port_pad_ps_now(port);
+        Ok(format!(
+            "set_property IN_TERM {canon} {port} pad_ps={pad_ps} bitgen={}",
+            u8::from(bitgen)
+        ))
+    }
+
     fn port_pad_ps_now(&self, port: &str) -> i64 {
         let p = self
             .shell
@@ -4156,6 +4270,8 @@ impl IdeModel {
             p.and_then(|p| p.attrs.get("DRIVE")),
             p.and_then(|p| p.attrs.get("SLEW")),
             p.and_then(|p| p.attrs.get("PULLTYPE")),
+            p.and_then(|p| p.attrs.get("DIFF_TERM")),
+            p.and_then(|p| p.attrs.get("IN_TERM")),
         )
     }
 
@@ -4724,7 +4840,8 @@ impl IdeModel {
         s
     }
 
-    /// UG893 Timing Constraints pane text. Empty until create_clock / read_xdc.
+    /// UG893 Timing Constraints pane text. Empty until create_clock /
+    /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
         if self.constraints.clocks.is_empty()
             && self.constraints.input_delay_ps.is_empty()
@@ -4732,25 +4849,53 @@ impl IdeModel {
             && self.constraints.false_paths.is_empty()
             && self.constraints.multicycle_paths.is_empty()
             && self.constraints.max_delays.is_empty()
+            && self.constraints.min_delays.is_empty()
+            && self.constraints.clock_groups.is_empty()
+            && self.constraints.clock_uncertainties.is_empty()
+            && self.constraints.clock_latencies.is_empty()
+            && self.constraints.disable_timings.is_empty()
+            && self.constraints.case_analyses.is_empty()
+            && self.constraints.propagated_clocks.is_empty()
+            && self.constraints.clock_senses.is_empty()
+            && self.constraints.input_jitters.is_empty()
+            && self.constraints.system_jitter_ps == 0
+            && self.constraints.timing_derates.is_empty()
+            && !self.constraints.operating_conditions.is_set()
+            && self.constraints.bus_skews.is_empty()
+            && self.constraints.path_groups.is_empty()
             && self.constraints.package_pins.is_empty()
             && self.constraints.iostandards.is_empty()
             && self.constraints.drives.is_empty()
             && self.constraints.slews.is_empty()
             && self.constraints.pulltypes.is_empty()
+            && self.constraints.diff_terms.is_empty()
+            && self.constraints.in_terms.is_empty()
             && self.pblocks.is_empty()
         {
-            return "no timing constraints — create_clock / read_xdc".into();
+            return "no timing constraints — create_clock / create_generated_clock / read_xdc".into();
         }
         let mut lines = Vec::new();
         for c in &self.constraints.clocks {
-            lines.push(format!(
-                "create_clock -name {} -period {:.3} [get_ports {}] PERIOD_PS={} generated={}",
-                c.name,
-                c.period_ps as f64 / 1000.0,
-                c.source,
-                c.period_ps,
-                u8::from(c.generated)
-            ));
+            if c.generated {
+                let master = c.master.as_deref().unwrap_or("clk");
+                lines.push(format!(
+                    "create_generated_clock -name {} -source [get_ports {master}] -divide_by {} [get_pins {}] PERIOD_PS={} DIVIDE_BY={} MASTER={master} generated=1",
+                    c.name,
+                    c.divide_by,
+                    c.source,
+                    c.period_ps,
+                    c.divide_by
+                ));
+            } else {
+                lines.push(format!(
+                    "create_clock -name {} -period {:.3} [get_ports {}] PERIOD_PS={} generated={}",
+                    c.name,
+                    c.period_ps as f64 / 1000.0,
+                    c.source,
+                    c.period_ps,
+                    u8::from(c.generated)
+                ));
+            }
         }
         for (port, ps) in &self.constraints.input_delay_ps {
             lines.push(format!("set_input_delay {port} DELAY_PS={ps}"));
@@ -4773,6 +4918,107 @@ impl IdeModel {
                 m.from, m.to, m.delay_ps, u8::from(m.datapath_only)
             ));
         }
+        for m in &self.constraints.min_delays {
+            lines.push(format!(
+                "set_min_delay -from {} -to {} DELAY_PS={} datapath_only={}",
+                m.from, m.to, m.delay_ps, u8::from(m.datapath_only)
+            ));
+        }
+        for b in &self.constraints.bus_skews {
+            lines.push(format!(
+                "set_bus_skew -from {} -to {} SKEW_PS={} setup={} hold={}",
+                b.from,
+                b.to,
+                b.skew_ps,
+                u8::from(b.setup),
+                u8::from(b.hold)
+            ));
+        }
+        for g in &self.constraints.path_groups {
+            lines.push(format!(
+                "group_path -name {} -from {} -to {} WEIGHT_MILLI={} CRITICAL_RANGE_PS={}",
+                g.name, g.from, g.to, g.weight_milli, g.critical_range_ps
+            ));
+        }
+        for g in &self.constraints.clock_groups {
+            let mut flags = Vec::new();
+            if g.asynchronous {
+                flags.push("-asynchronous");
+            }
+            if g.exclusive {
+                flags.push("-exclusive");
+            }
+            let groups = g
+                .groups
+                .iter()
+                .map(|grp| format!("-group {}", grp.join(",")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!(
+                "set_clock_groups {} groups={} {groups}",
+                flags.join(" "),
+                g.groups.len()
+            ));
+        }
+        for u in &self.constraints.clock_uncertainties {
+            lines.push(format!(
+                "set_clock_uncertainty -from {} -to {} SETUP_PS={} HOLD_PS={}",
+                u.from, u.to, u.setup_ps, u.hold_ps
+            ));
+        }
+        for l in &self.constraints.clock_latencies {
+            lines.push(format!(
+                "set_clock_latency {} LATE_PS={} EARLY_PS={} source={}",
+                l.clock, l.late_ps, l.early_ps, u8::from(l.source)
+            ));
+        }
+        for d in &self.constraints.disable_timings {
+            lines.push(format!(
+                "set_disable_timing -from {} -to {} {}",
+                d.from, d.to, d.object
+            ));
+        }
+        for c in &self.constraints.case_analyses {
+            lines.push(format!("set_case_analysis {} {}", c.value, c.object));
+        }
+        for p in &self.constraints.propagated_clocks {
+            lines.push(format!("set_propagated_clock {p}"));
+        }
+        for s in &self.constraints.clock_senses {
+            lines.push(format!("set_clock_sense -{} {}", s.sense, s.object));
+        }
+        for j in &self.constraints.input_jitters {
+            lines.push(format!(
+                "set_input_jitter {} JITTER_PS={}",
+                j.clock, j.jitter_ps
+            ));
+        }
+        if self.constraints.system_jitter_ps != 0 {
+            lines.push(format!(
+                "set_system_jitter JITTER_PS={}",
+                self.constraints.system_jitter_ps
+            ));
+        }
+        for d in &self.constraints.timing_derates {
+            lines.push(format!(
+                "set_timing_derate LATE_MILLI={} EARLY_MILLI={} cell={} net={}",
+                d.late_milli,
+                d.early_milli,
+                u8::from(d.cell),
+                u8::from(d.net)
+            ));
+        }
+        if self.constraints.operating_conditions.is_set() {
+            let oc = &self.constraints.operating_conditions;
+            lines.push(format!(
+                "set_operating_conditions VOLTAGE_MV={} TEMP_C={} voltage={} temperature={} SCALE_MILLI={}",
+                oc.voltage_mv,
+                oc.temperature_c,
+                u8::from(oc.voltage_set),
+                u8::from(oc.temperature_set),
+                oc.scale_milli()
+            ));
+        }
         for (port, pin) in &self.constraints.package_pins {
             lines.push(format!("set_property PACKAGE_PIN {pin} {port}"));
         }
@@ -4787,6 +5033,12 @@ impl IdeModel {
         }
         for (port, pull) in &self.constraints.pulltypes {
             lines.push(format!("set_property PULLTYPE {pull} {port}"));
+        }
+        for (port, term) in &self.constraints.diff_terms {
+            lines.push(format!("set_property DIFF_TERM {term} {port}"));
+        }
+        for (port, term) in &self.constraints.in_terms {
+            lines.push(format!("set_property IN_TERM {term} {port}"));
         }
         for pb in &self.pblocks {
             lines.push(format!("create_pblock {}", pb.name));
@@ -4816,16 +5068,63 @@ impl IdeModel {
             .multicycle_paths
             .extend(extra.multicycle_paths);
         self.constraints.max_delays.extend(extra.max_delays);
+        self.constraints.min_delays.extend(extra.min_delays);
+        self.constraints.clock_groups.extend(extra.clock_groups);
+        self.constraints
+            .clock_uncertainties
+            .extend(extra.clock_uncertainties);
+        self.constraints.clock_latencies.extend(extra.clock_latencies);
+        self.constraints
+            .disable_timings
+            .extend(extra.disable_timings);
+        self.constraints.case_analyses.extend(extra.case_analyses);
+        for p in extra.propagated_clocks {
+            if !self.constraints.propagated_clocks.contains(&p) {
+                self.constraints.propagated_clocks.push(p);
+            }
+        }
+        self.constraints.clock_senses.extend(extra.clock_senses);
+        for j in extra.input_jitters {
+            self.constraints.input_jitters.retain(|k| k.clock != j.clock);
+            self.constraints.input_jitters.push(j);
+        }
+        if extra.system_jitter_ps != 0 {
+            self.constraints.system_jitter_ps = extra.system_jitter_ps;
+        }
+        self.constraints
+            .timing_derates
+            .extend(extra.timing_derates);
+        self.constraints.bus_skews.extend(extra.bus_skews);
+        self.constraints.path_groups.extend(extra.path_groups);
+        if extra.operating_conditions.voltage_set {
+            self.constraints.operating_conditions.voltage_mv =
+                extra.operating_conditions.voltage_mv;
+            self.constraints.operating_conditions.voltage_set = true;
+        }
+        if extra.operating_conditions.temperature_set {
+            self.constraints.operating_conditions.temperature_c =
+                extra.operating_conditions.temperature_c;
+            self.constraints.operating_conditions.temperature_set = true;
+        }
         self.constraints.package_pins.extend(extra.package_pins);
         self.constraints.iostandards.extend(extra.iostandards);
         self.constraints.drives.extend(extra.drives);
         self.constraints.slews.extend(extra.slews);
         self.constraints.pulltypes.extend(extra.pulltypes);
+        self.constraints.diff_terms.extend(extra.diff_terms);
+        self.constraints.in_terms.extend(extra.in_terms);
         if let Some(c) = self
             .constraints
             .clocks
             .iter()
-            .find(|c| c.source == "clk" || c.name == "clk")
+            .filter(|c| c.generated)
+            .max_by_key(|c| c.period_ps)
+            .or_else(|| {
+                self.constraints
+                    .clocks
+                    .iter()
+                    .find(|c| c.source == "clk" || c.name == "clk")
+            })
             .or_else(|| self.constraints.clocks.first())
         {
             self.clock_period_ps = c.period_ps;
@@ -4848,8 +5147,63 @@ impl IdeModel {
         Ok(format!("create_clock {name} PERIOD_PS={period} clocks={n}"))
     }
 
+    /// UG893 Timing Constraints Apply: `create_generated_clock -divide_by`
+    /// derives a new period from the master clock and feeds helion-sta (WNS
+    /// moves). Empty XDC / no generated clock keeps gold WNS.
+    pub fn apply_create_generated_clock(&mut self, cmd: &str) -> Result<String, String> {
+        let xdc = {
+            let mut xdc = String::new();
+            let masters: Vec<&helion_sta::Clock> = self
+                .constraints
+                .clocks
+                .iter()
+                .filter(|c| !c.generated)
+                .collect();
+            if masters.is_empty() {
+                xdc.push_str(&format!(
+                    "create_clock -name clk -period {:.3} [get_ports clk]\n",
+                    self.clock_period_ps as f64 / 1000.0
+                ));
+            } else {
+                for c in masters {
+                    xdc.push_str(&format!(
+                        "create_clock -name {} -period {:.3} [get_ports {}]\n",
+                        c.name,
+                        c.period_ps as f64 / 1000.0,
+                        c.source
+                    ));
+                }
+            }
+            xdc.push_str(cmd);
+            xdc.push('\n');
+            xdc
+        };
+        let extra = load_xdc(&xdc)?;
+        let gclk = extra
+            .clocks
+            .iter()
+            .find(|c| c.generated)
+            .ok_or_else(|| {
+                "create_generated_clock: missing -divide_by or unknown master".to_string()
+            })?;
+        let n = extra.clocks.len();
+        let period = gclk.period_ps;
+        let name = gclk.name.clone();
+        let div = gclk.divide_by;
+        let master = gclk.master.clone().unwrap_or_else(|| "clk".into());
+        self.merge_constraints(extra);
+        Ok(format!(
+            "create_generated_clock {name} PERIOD_PS={period} DIVIDE_BY={div} MASTER={master} clocks={n}"
+        ))
+    }
+
     /// UG893 Timing Constraints Apply: set_input_delay / set_output_delay /
-    /// set_false_path / set_multicycle_path / set_max_delay land in the pane
+    /// set_false_path / set_multicycle_path / set_max_delay / set_min_delay /
+    /// set_clock_groups / set_clock_uncertainty / set_clock_latency /
+    /// set_disable_timing / set_case_analysis / set_propagated_clock /
+    /// set_clock_sense / set_input_jitter / set_system_jitter /
+    /// set_timing_derate / set_operating_conditions / set_bus_skew /
+    /// group_path land in the pane
     /// and feed helion-sta (setup/hold WNS move).
     pub fn apply_sdc_exception(&mut self, cmd: &str) -> Result<String, String> {
         let extra = load_xdc(cmd)?;
@@ -4858,22 +5212,98 @@ impl IdeModel {
             && extra.false_paths.is_empty()
             && extra.multicycle_paths.is_empty()
             && extra.max_delays.is_empty()
+            && extra.min_delays.is_empty()
+            && extra.clock_groups.is_empty()
+            && extra.clock_uncertainties.is_empty()
+            && extra.clock_latencies.is_empty()
+            && extra.disable_timings.is_empty()
+            && extra.case_analyses.is_empty()
+            && extra.propagated_clocks.is_empty()
+            && extra.clock_senses.is_empty()
+            && extra.input_jitters.is_empty()
+            && extra.system_jitter_ps == 0
+            && extra.timing_derates.is_empty()
+            && !extra.operating_conditions.is_set()
+            && extra.bus_skews.is_empty()
+            && extra.path_groups.is_empty()
         {
-            return Err(format!("{cmd}: missing delay, false path, multicycle, or max_delay"));
+            return Err(format!(
+                "{cmd}: missing delay, false path, multicycle, max_delay, min_delay, clock_groups, uncertainty, latency, disable_timing, case_analysis, propagated_clock, clock_sense, input_jitter, system_jitter, timing_derate, operating_conditions, bus_skew, or group_path"
+            ));
         }
         let n_in = extra.input_delay_ps.len();
         let n_out = extra.output_delay_ps.len();
         let n_fp = extra.false_paths.len();
         let n_mcp = extra.multicycle_paths.len();
         let n_md = extra.max_delays.len();
+        let n_mind = extra.min_delays.len();
+        let n_cg = extra.clock_groups.len();
+        let n_cgg = extra
+            .clock_groups
+            .iter()
+            .map(|g| g.groups.len())
+            .max()
+            .unwrap_or(0);
+        let n_u = extra.clock_uncertainties.len();
+        let n_l = extra.clock_latencies.len();
+        let n_dt = extra.disable_timings.len();
+        let n_ca = extra.case_analyses.len();
+        let n_pc = extra.propagated_clocks.len();
+        let n_cs = extra.clock_senses.len();
+        let n_ij = extra.input_jitters.len();
+        let n_sj = u8::from(extra.system_jitter_ps != 0);
+        let n_td = extra.timing_derates.len();
+        let n_oc = u8::from(extra.operating_conditions.is_set());
+        let n_bs = extra.bus_skews.len();
+        let n_gp = extra.path_groups.len();
         let in_ps = extra.input_delay_ps.values().copied().max().unwrap_or(0);
         let out_ps = extra.output_delay_ps.values().copied().max().unwrap_or(0);
         let sm = extra.setup_mult();
         let hm = extra.hold_mult();
         let md_ps = extra.max_delay_ps().unwrap_or(0);
+        let mind_ps = extra.min_delay_ps().unwrap_or(0);
+        let us = extra.uncertainty_setup_ps();
+        let uh = extra.uncertainty_hold_ps();
+        let late = extra.latency_late_ps();
+        let early = extra.latency_early_ps();
+        let ij = extra.input_jitter_ps();
+        let sj = extra.system_jitter_ps;
+        let late_m = extra
+            .timing_derates
+            .last()
+            .map(|d| d.late_milli)
+            .unwrap_or(0);
+        let early_m = extra
+            .timing_derates
+            .last()
+            .map(|d| d.early_milli)
+            .unwrap_or(0);
+        let vmv = extra.operating_conditions.voltage_mv;
+        let tc = extra.operating_conditions.temperature_c;
+        let ocm = extra.operating_conditions.scale_milli();
+        let bs = extra.bus_skew_setup_ps().max(extra.bus_skew_hold_ps());
+        let wm = extra.group_path_weight_milli();
+        let cr = extra.group_path_critical_range_ps();
+        let case = extra
+            .case_analyses
+            .first()
+            .map(|c| c.value.clone())
+            .unwrap_or_default();
+        let sense = extra
+            .clock_senses
+            .first()
+            .map(|s| s.sense.clone())
+            .unwrap_or_default();
+        let clk_net = self
+            .shell
+            .session
+            .routed
+            .as_ref()
+            .map(|r| clock_network_delay_ps(&r.placed))
+            .unwrap_or(0);
         self.merge_constraints(extra);
         Ok(format!(
-            "apply_xdc input_delay={n_in} DELAY_PS={in_ps} output_delay={n_out} DELAY_PS={out_ps} false_path={n_fp} multicycle={n_mcp} SETUP_MULT={sm} HOLD_MULT={hm} max_delay={n_md} MAX_DELAY_PS={md_ps}"
+            "apply_xdc input_delay={n_in} DELAY_PS={in_ps} output_delay={n_out} DELAY_PS={out_ps} false_path={n_fp} multicycle={n_mcp} SETUP_MULT={sm} HOLD_MULT={hm} max_delay={n_md} MAX_DELAY_PS={md_ps} min_delay={n_mind} MIN_DELAY_PS={mind_ps} clock_groups={n_cg} GROUPS={n_cgg} uncertainty={n_u} UNCERT_SETUP_PS={us} UNCERT_HOLD_PS={uh} latency={n_l} LATE_PS={late} EARLY_PS={early} disable_timing={n_dt} case_analysis={n_ca} CASE={case} propagated_clock={n_pc} CLK_NET_PS={clk_net} clock_sense={n_cs} SENSE={sense} input_jitter={n_ij} INPUT_JITTER_PS={ij} system_jitter={n_sj} SYSTEM_JITTER_PS={sj} timing_derate={n_td} LATE_MILLI={late_m} EARLY_MILLI={early_m} operating_conditions={n_oc} VOLTAGE_MV={vmv} TEMP_C={tc} OC_SCALE_MILLI={ocm} bus_skew={n_bs} BUS_SKEW_PS={bs} group_path={n_gp} WEIGHT_MILLI={wm} CRITICAL_RANGE_PS={cr}"
         ))
     }
 
@@ -4886,11 +5316,27 @@ impl IdeModel {
             && extra.false_paths.is_empty()
             && extra.multicycle_paths.is_empty()
             && extra.max_delays.is_empty()
+            && extra.min_delays.is_empty()
+            && extra.clock_groups.is_empty()
+            && extra.clock_uncertainties.is_empty()
+            && extra.clock_latencies.is_empty()
+            && extra.disable_timings.is_empty()
+            && extra.case_analyses.is_empty()
+            && extra.propagated_clocks.is_empty()
+            && extra.clock_senses.is_empty()
+            && extra.input_jitters.is_empty()
+            && extra.system_jitter_ps == 0
+            && extra.timing_derates.is_empty()
+            && !extra.operating_conditions.is_set()
+            && extra.bus_skews.is_empty()
+            && extra.path_groups.is_empty()
             && extra.package_pins.is_empty()
             && extra.iostandards.is_empty()
             && extra.drives.is_empty()
             && extra.slews.is_empty()
             && extra.pulltypes.is_empty()
+            && extra.diff_terms.is_empty()
+            && extra.in_terms.is_empty()
         {
             return Err(format!("read_xdc {path}: no timing constraints"));
         }
@@ -4905,9 +5351,23 @@ impl IdeModel {
         let n_fp = extra.false_paths.len();
         let n_mcp = extra.multicycle_paths.len();
         let n_md = extra.max_delays.len();
+        let n_mind = extra.min_delays.len();
+        let n_cg = extra.clock_groups.len();
+        let n_u = extra.clock_uncertainties.len();
+        let n_l = extra.clock_latencies.len();
+        let n_dt = extra.disable_timings.len();
+        let n_ca = extra.case_analyses.len();
+        let n_pc = extra.propagated_clocks.len();
+        let n_cs = extra.clock_senses.len();
+        let n_ij = extra.input_jitters.len();
+        let n_sj = u8::from(extra.system_jitter_ps != 0);
+        let n_td = extra.timing_derates.len();
+        let n_oc = u8::from(extra.operating_conditions.is_set());
+        let n_bs = extra.bus_skews.len();
+        let n_gp = extra.path_groups.len();
         self.merge_constraints(extra);
         Ok(format!(
-            "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md}"
+            "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md} min_delay={n_mind} clock_groups={n_cg} uncertainty={n_u} latency={n_l} disable_timing={n_dt} case_analysis={n_ca} propagated_clock={n_pc} clock_sense={n_cs} input_jitter={n_ij} system_jitter={n_sj} timing_derate={n_td} operating_conditions={n_oc} bus_skew={n_bs} group_path={n_gp}"
         ))
     }
 
@@ -4915,14 +5375,26 @@ impl IdeModel {
         let mut clks = self.constraints.clocks.clone();
         if clks.is_empty() {
             create_clock(&mut clks, "clk", self.clock_period_ps, "clk");
+        } else if let Some((i, _)) = clks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.generated)
+            .max_by_key(|(_, c)| c.period_ps)
+        {
+            // UG903 create_generated_clock: divide_by scales the analysis period/WNS.
+            clks.swap(0, i);
         }
         clks
     }
 
-    /// Console `report_timing` uses IdeModel constraint clocks + I/O delay/false path/
-    /// multicycle/max_delay, the same vector `refresh_reports` feeds
-    /// `report_timing_routed_xdc`. Pulls place/route if needed so `read_sv` then
-    /// `report_timing` still hits STA (old Tcl path).
+    /// Console `report_timing` uses IdeModel constraint clocks (including
+    /// create_generated_clock) + I/O delay/false path/
+    /// multicycle/max_delay/min_delay/clock_groups/uncertainty/latency/disable_timing/
+    /// case_analysis/propagated_clock/clock_sense/input_jitter/system_jitter/
+    /// timing_derate/operating_conditions/bus_skew/group_path, the same
+    /// vector `refresh_reports` feeds `report_timing_routed_xdc`.
+    /// Pulls place/route if needed so `read_sv` then `report_timing` still hits STA
+    /// (old Tcl path).
     pub fn report_timing_now(&mut self) -> Result<String, String> {
         if self.shell.session.design.is_none() {
             return Err("report_timing: no design".into());
@@ -4939,8 +5411,8 @@ impl IdeModel {
         let r = self.shell.session.routed.as_ref().unwrap();
         let t = report_timing_routed_xdc(d, r, &clks, &self.constraints)?;
         Ok(format!(
-            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-            d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
+            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}",
+            d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps, t.clk_net_ps
         ))
     }
 
@@ -5779,6 +6251,8 @@ impl IdeModel {
         let drives = self.constraints.drives.clone();
         let slews = self.constraints.slews.clone();
         let pulls = self.constraints.pulltypes.clone();
+        let diffs = self.constraints.diff_terms.clone();
+        let interms = self.constraints.in_terms.clone();
         let placed_iobs = self.shell.session.placed.as_ref().map(|p| {
             p.iob_sites
                 .iter()
@@ -5820,6 +6294,16 @@ impl IdeModel {
                     .get("PULLTYPE")
                     .map(|s| s.to_string())
                     .or_else(|| pulls.get(&p.name).cloned());
+                let diff_term = p
+                    .attrs
+                    .get("DIFF_TERM")
+                    .map(|s| s.to_string())
+                    .or_else(|| diffs.get(&p.name).cloned());
+                let in_term = p
+                    .attrs
+                    .get("IN_TERM")
+                    .map(|s| s.to_string())
+                    .or_else(|| interms.get(&p.name).cloned());
                 let site = placed_iobs.as_ref().and_then(|v| {
                     // Match output port to IOB cell by net name or first IOB for `led`.
                     v.iter().find(|(cell, _)| {
@@ -5844,6 +6328,8 @@ impl IdeModel {
                     drive,
                     slew,
                     pulltype,
+                    diff_term,
+                    in_term,
                 }
             })
             .collect();
@@ -5972,6 +6458,16 @@ impl IdeModel {
             if !props.iter().any(|(k, _)| k == "PULLTYPE") {
                 if let Some(v) = p.pulltype.clone() {
                     props.push(("PULLTYPE".into(), v));
+                }
+            }
+            if !props.iter().any(|(k, _)| k == "DIFF_TERM") {
+                if let Some(v) = p.diff_term.clone() {
+                    props.push(("DIFF_TERM".into(), v));
+                }
+            }
+            if !props.iter().any(|(k, _)| k == "IN_TERM") {
+                if let Some(v) = p.in_term.clone() {
+                    props.push(("IN_TERM".into(), v));
                 }
             }
         }
@@ -6847,6 +7343,219 @@ mod tests {
         );
     }
 
+    /// UG893 Timing Constraints Apply: create_generated_clock -divide_by is a
+    /// pane command that scales the STA period/WNS — not a label. Empty XDC
+    /// keeps gold WNS.
+    #[test]
+    fn timing_constraints_generated_clock_divide_by_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns10 = ide.wns_ps().expect("STA WNS at default 10 ns");
+        assert_ne!(wns10, 0);
+        assert!(
+            ide.constraints_text().contains("no timing constraints"),
+            "{}",
+            ide.constraints_text()
+        );
+        assert!(
+            ide.constraints.clocks.iter().all(|c| !c.generated),
+            "{:?}",
+            ide.constraints.clocks
+        );
+
+        let out = ide
+            .exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(out.contains("PERIOD_PS=20000"), "{out}");
+        assert!(out.contains("DIVIDE_BY=2"), "{out}");
+        assert!(out.contains("MASTER=clk"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.clock_period_ps, 20_000);
+        assert!(
+            ide.constraints
+                .clocks
+                .iter()
+                .any(|c| c.generated && c.name == "clkdiv" && c.period_ps == 20_000 && c.divide_by == 2),
+            "{:?}",
+            ide.constraints.clocks
+        );
+        let pane = ide.constraints_text();
+        assert!(pane.contains("create_generated_clock"), "{pane}");
+        assert!(pane.contains("DIVIDE_BY=2"), "{pane}");
+        assert!(pane.contains("PERIOD_PS=20000"), "{pane}");
+        let wns20 = ide.wns_ps().expect("STA after divide_by 2");
+        assert_eq!(
+            wns20,
+            wns10 + 10_000,
+            "WNS must move with generated-clock divide_by (STA), not a canned pane: {wns10} vs {wns20}"
+        );
+        let ta = ide
+            .ultrafast_pane_engine(UltraFastStage::TimingAnalysis)
+            .unwrap();
+        assert!(ta.contains(&format!("WNS_PS={wns20}")), "{ta}");
+        assert!(ta.contains("clocks=2"), "{ta}");
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns20}")),
+            "Tcl report_timing must use generated-clock period, not Session 10 ns: {rt}"
+        );
+
+        let out4 = ide
+            .exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 4 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(out4.contains("PERIOD_PS=40000"), "{out4}");
+        assert!(out4.contains("DIVIDE_BY=4"), "{out4}");
+        assert_eq!(ide.clock_period_ps, 40_000);
+        let wns40 = ide.wns_ps().expect("STA after divide_by 4");
+        assert_eq!(
+            wns40,
+            wns10 + 30_000,
+            "divide_by 4 must scale period/WNS again: {wns10} vs {wns40}"
+        );
+        assert!(
+            ide.constraints_text().contains("DIVIDE_BY=4"),
+            "{}",
+            ide.constraints_text()
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().expect("blinky gold WNS");
+        assert_ne!(b0, wns10, "gold WNS is per-design STA");
+        blinky
+            .exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        let b1 = blinky.wns_ps().expect("blinky after divide_by 2");
+        assert_eq!(b1, b0 + 10_000);
+        assert_ne!(b1, wns20, "generated-clock WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_bus_skew / group_path -weight
+    /// move helion-sta WNS — empty XDC keeps gold.
+    #[test]
+    fn timing_constraints_bus_skew_group_path_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before bus skew");
+        let setup0 = ide.timing.as_ref().unwrap().setup_ps;
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.bus_skews.is_empty() && ide.constraints.path_groups.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let bs = ide
+            .exec("set_bus_skew -setup 0.5 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(bs.contains("bus_skew=1"), "{bs}");
+        assert!(bs.contains("BUS_SKEW_PS=500"), "{bs}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.bus_skew_setup_ps(), 500);
+        assert_eq!(ide.constraints.bus_skew_hold_ps(), 0);
+        assert!(
+            ide.constraints_text()
+                .contains("set_bus_skew -from clk -to led SKEW_PS=500 setup=1 hold=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_bs = ide.wns_ps().expect("STA after setup bus skew");
+        assert_eq!(
+            wns_bs,
+            wns0 - 500,
+            "setup bus skew 0.5 ns must worsen WNS: {wns0} vs {wns_bs}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold0,
+            "setup-only bus skew must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_bs}")),
+            "report_timing must honor bus skew: {rt}"
+        );
+
+        let bh = ide
+            .exec("set_bus_skew -hold 0.2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(bh.contains("BUS_SKEW_PS=200"), "{bh}");
+        assert_eq!(ide.constraints.bus_skew_hold_ps(), 200);
+        let hold_bs = ide.timing.as_ref().expect("STA after hold bus skew").hold_slack_ps;
+        assert_eq!(ide.wns_ps().unwrap(), wns_bs, "hold bus skew must not move setup WNS");
+        assert_eq!(
+            hold_bs,
+            hold0 - 200,
+            "hold bus skew 0.2 ns must worsen hold slack: {hold_bs} vs {hold0}"
+        );
+
+        let gp = ide
+            .exec("group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(gp.contains("group_path=1"), "{gp}");
+        assert!(gp.contains("WEIGHT_MILLI=2000"), "{gp}");
+        assert_eq!(ide.constraints.group_path_weight_milli(), 2000);
+        assert!(
+            ide.constraints_text()
+                .contains("group_path -name extra -from clk -to led WEIGHT_MILLI=2000"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_gp = ide.wns_ps().expect("STA after group_path weight");
+        assert_eq!(
+            wns_gp,
+            wns_bs - setup0,
+            "group_path -weight 2 must double setup: {wns_bs} vs {wns_gp} setup={setup0}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold_bs,
+            "group_path weight must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_gp}")),
+            "report_timing must honor group_path weight: {rt}"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        let bsetup = blinky.timing.as_ref().unwrap().setup_ps;
+        assert_ne!(b0, wns0, "gold WNS is per-design STA");
+        blinky
+            .exec("set_bus_skew -setup 0.5 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 - 500);
+        assert_ne!(b1, wns_bs, "bus-skew WNS is per-design STA, not canned");
+        blinky
+            .exec("group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        assert_eq!(b2, b1 - bsetup);
+        assert_ne!(b2, wns_gp, "group_path WNS is per-design STA, not canned");
+    }
+
     /// UG893 Timing Constraints Apply: set_input/output_delay and set_false_path
     /// are pane commands that move helion-sta WNS — not labels on a stub editor.
     #[test]
@@ -7070,6 +7779,749 @@ mod tests {
         let bsetup = blinky.timing.as_ref().unwrap().setup_ps;
         assert_eq!(b2, 5000 - bsetup);
         assert_ne!(b2, wns_md, "max_delay WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_min_delay / set_clock_groups
+    /// move helion-sta hold slack and setup WNS — not labels on a stub editor.
+    #[test]
+    fn timing_constraints_min_delay_clock_groups_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before min_delay");
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        let hold_ps0 = ide.timing.as_ref().unwrap().hold_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.min_delays.is_empty() && ide.constraints.clock_groups.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let mind = ide
+            .exec("set_min_delay 1.0 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(mind.contains("min_delay=1"), "{mind}");
+        assert!(mind.contains("MIN_DELAY_PS=1000"), "{mind}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.min_delay_ps(), Some(1000));
+        assert!(
+            ide.constraints_text()
+                .contains("set_min_delay -from clk -to led DELAY_PS=1000 datapath_only=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let t = ide.timing.as_ref().expect("STA after min_delay");
+        assert_eq!(
+            t.hold_slack_ps,
+            hold_ps0 - 1000,
+            "set_min_delay 1 ns replaces HOLD_REQ_PS: {} vs hold {}",
+            t.hold_slack_ps,
+            hold_ps0
+        );
+        assert_eq!(t.wns_ps, wns0, "min_delay must not move setup WNS");
+        assert_ne!(
+            t.hold_slack_ps, hold0,
+            "min_delay must move hold slack off the gold result"
+        );
+        let hold_min = t.hold_slack_ps;
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("HOLD_SLACK_PS={hold_min}")),
+            "report_timing must honor set_min_delay: {rt}"
+        );
+
+        let od = ide
+            .exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        assert!(od.contains("output_delay=1"), "{od}");
+        let wns_od = ide.wns_ps().expect("STA after output delay");
+        assert_eq!(
+            wns_od,
+            wns0 - 2000,
+            "output delay must still worsen WNS before clock groups: {wns0} vs {wns_od}"
+        );
+
+        let cg = ide
+            .exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
+            .unwrap();
+        assert!(cg.contains("clock_groups=1"), "{cg}");
+        assert!(cg.contains("GROUPS=2"), "{cg}");
+        assert!(
+            ide.constraints.clock_groups_false_path(),
+            "{:?}",
+            ide.constraints.clock_groups
+        );
+        assert!(
+            ide.constraints_text()
+                .contains("set_clock_groups -asynchronous groups=2 -group clk -group virt"),
+            "{}",
+            ide.constraints_text()
+        );
+        let t = ide.timing.as_ref().expect("STA after clock groups");
+        assert_eq!(t.iob_ps, 0, "clock groups must drop IOB from STA");
+        assert_eq!(t.setup_ps, t.r2r_ps, "clock groups setup is r2r only");
+        let wns_cg = t.wns_ps;
+        assert_ne!(
+            wns_cg, wns_od,
+            "clock groups must move WNS off the I/O-delay result"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_cg}")), "{rt}");
+        assert!(rt.contains("iob_ps=0"), "{rt}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let bhold0 = blinky.timing.as_ref().unwrap().hold_ps;
+        let bwns0 = blinky.wns_ps().unwrap();
+        assert_ne!(bwns0, wns0, "setup WNS is per-design STA");
+        blinky
+            .exec("set_min_delay 1.0 -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let bhold = blinky.timing.as_ref().unwrap().hold_slack_ps;
+        assert_eq!(bhold, bhold0 - 1000);
+        assert_ne!(bhold0, 0, "hold delay comes from route, not a canned 0");
+        blinky
+            .exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        let b_od = blinky.wns_ps().unwrap();
+        assert_eq!(b_od, bwns0 - 2000);
+        blinky
+            .exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
+            .unwrap();
+        let b_cg = blinky.wns_ps().unwrap();
+        assert_ne!(b_cg, b_od, "clock groups must move blinky WNS off I/O delay");
+        assert_ne!(b_cg, wns_cg, "clock groups WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_clock_uncertainty / set_clock_latency
+    /// move helion-sta setup WNS and hold slack — not labels on a stub editor.
+    #[test]
+    fn timing_constraints_uncertainty_latency_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before uncertainty");
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.clock_uncertainties.is_empty()
+                && ide.constraints.clock_latencies.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let su = ide
+            .exec("set_clock_uncertainty -setup 0.5 [get_clocks clk]")
+            .unwrap();
+        assert!(su.contains("uncertainty=1"), "{su}");
+        assert!(su.contains("UNCERT_SETUP_PS=500"), "{su}");
+        assert!(su.contains("UNCERT_HOLD_PS=0"), "{su}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.uncertainty_setup_ps(), 500);
+        assert_eq!(ide.constraints.uncertainty_hold_ps(), 0);
+        assert!(
+            ide.constraints_text()
+                .contains("set_clock_uncertainty")
+                && ide.constraints_text().contains("SETUP_PS=500"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_su = ide.wns_ps().expect("STA after setup uncertainty");
+        assert_eq!(
+            wns_su,
+            wns0 - 500,
+            "setup uncertainty 0.5 ns must worsen WNS: {wns0} vs {wns_su}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold0,
+            "setup-only uncertainty must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_su}")),
+            "report_timing must honor setup uncertainty: {rt}"
+        );
+
+        let hu = ide
+            .exec("set_clock_uncertainty -hold 0.2 [get_clocks clk]")
+            .unwrap();
+        assert!(hu.contains("UNCERT_HOLD_PS=200"), "{hu}");
+        assert_eq!(ide.constraints.uncertainty_hold_ps(), 200);
+        let hold_u = ide.timing.as_ref().expect("STA after hold uncertainty").hold_slack_ps;
+        assert_eq!(ide.wns_ps().unwrap(), wns_su, "hold uncertainty must not move setup WNS");
+        assert_eq!(
+            hold_u,
+            hold0 - 200,
+            "hold uncertainty 0.2 ns must worsen hold slack: {hold_u} vs {hold0}"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("HOLD_SLACK_PS={hold_u}")), "{rt}");
+
+        let late = ide
+            .exec("set_clock_latency -late 0.4 [get_clocks clk]")
+            .unwrap();
+        assert!(late.contains("latency=1"), "{late}");
+        assert!(late.contains("LATE_PS=400"), "{late}");
+        assert_eq!(ide.constraints.latency_late_ps(), 400);
+        assert!(
+            ide.constraints_text()
+                .contains("set_clock_latency clk LATE_PS=400 EARLY_PS=0 source=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_late = ide.wns_ps().expect("STA after late latency");
+        assert_eq!(
+            wns_late,
+            wns_su - 400,
+            "late latency 0.4 ns must worsen WNS: {wns_su} vs {wns_late}"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_late}")), "{rt}");
+
+        let early = ide
+            .exec("set_clock_latency -source -early 0.1 [get_clocks clk]")
+            .unwrap();
+        assert!(early.contains("EARLY_PS=100"), "{early}");
+        assert_eq!(ide.constraints.latency_early_ps(), 100);
+        assert!(
+            ide.constraints_text().contains("EARLY_PS=100")
+                && ide.constraints_text().contains("source=1"),
+            "{}",
+            ide.constraints_text()
+        );
+        let hold_e = ide.timing.as_ref().expect("STA after early latency").hold_slack_ps;
+        assert_eq!(ide.wns_ps().unwrap(), wns_late, "early latency must not move setup WNS");
+        assert_eq!(
+            hold_e,
+            hold_u - 100,
+            "early latency 0.1 ns must worsen hold slack: {hold_e} vs {hold_u}"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        blinky
+            .exec("set_clock_uncertainty -setup 0.5 [get_clocks clk]")
+            .unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 - 500);
+        assert_ne!(b1, wns_su, "uncertainty WNS is per-design STA, not canned");
+        blinky
+            .exec("set_clock_latency -late 0.4 [get_clocks clk]")
+            .unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        assert_eq!(b2, b1 - 400);
+        assert_ne!(b2, wns_late, "latency WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_input_jitter / set_system_jitter
+    /// move helion-sta setup WNS and hold slack like uncertainty — empty XDC keeps gold.
+    #[test]
+    fn timing_constraints_input_system_jitter_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before jitter");
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.input_jitters.is_empty() && ide.constraints.system_jitter_ps == 0,
+            "{:?}",
+            ide.constraints
+        );
+
+        let ij = ide
+            .exec("set_input_jitter [get_clocks clk] 0.2")
+            .unwrap();
+        assert!(ij.contains("input_jitter=1"), "{ij}");
+        assert!(ij.contains("INPUT_JITTER_PS=200"), "{ij}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.input_jitter_ps(), 200);
+        assert_eq!(ide.constraints.jitter_setup_ps(), 200);
+        assert!(
+            ide.constraints_text()
+                .contains("set_input_jitter clk JITTER_PS=200"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_ij = ide.wns_ps().expect("STA after input jitter");
+        assert_eq!(
+            wns_ij,
+            wns0 - 200,
+            "input jitter 0.2 ns must worsen WNS: {wns0} vs {wns_ij}"
+        );
+        let hold_ij = ide.timing.as_ref().expect("STA after input jitter").hold_slack_ps;
+        assert_eq!(
+            hold_ij,
+            hold0 - 200,
+            "input jitter 0.2 ns must worsen hold slack: {hold_ij} vs {hold0}"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_ij}")),
+            "report_timing must honor input jitter: {rt}"
+        );
+        assert!(rt.contains(&format!("HOLD_SLACK_PS={hold_ij}")), "{rt}");
+
+        let sj = ide.exec("set_system_jitter 0.1").unwrap();
+        assert!(sj.contains("system_jitter=1"), "{sj}");
+        assert!(sj.contains("SYSTEM_JITTER_PS=100"), "{sj}");
+        assert_eq!(ide.constraints.system_jitter_ps, 100);
+        assert_eq!(ide.constraints.jitter_setup_ps(), 300);
+        assert!(
+            ide.constraints_text()
+                .contains("set_system_jitter JITTER_PS=100"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_sj = ide.wns_ps().expect("STA after system jitter");
+        assert_eq!(
+            wns_sj,
+            wns_ij - 100,
+            "system jitter 0.1 ns must stack on WNS: {wns_ij} vs {wns_sj}"
+        );
+        let hold_sj = ide.timing.as_ref().expect("STA after system jitter").hold_slack_ps;
+        assert_eq!(
+            hold_sj,
+            hold_ij - 100,
+            "system jitter 0.1 ns must stack on hold: {hold_sj} vs {hold_ij}"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_sj}")), "{rt}");
+        assert!(rt.contains(&format!("HOLD_SLACK_PS={hold_sj}")), "{rt}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        let bhold0 = blinky.timing.as_ref().unwrap().hold_slack_ps;
+        blinky
+            .exec("set_input_jitter [get_clocks clk] 0.2")
+            .unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 - 200);
+        assert_ne!(b1, wns_ij, "input jitter WNS is per-design STA, not canned");
+        assert_eq!(
+            blinky.timing.as_ref().unwrap().hold_slack_ps,
+            bhold0 - 200
+        );
+        blinky.exec("set_system_jitter 0.1").unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        assert_eq!(b2, b1 - 100);
+        assert_ne!(b2, wns_sj, "system jitter WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_timing_derate / set_operating_conditions
+    /// scale helion-sta setup/hold path delay — empty XDC keeps gold.
+    #[test]
+    fn timing_constraints_derate_operating_conditions_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before derate");
+        let setup0 = ide.timing.as_ref().unwrap().setup_ps;
+        let hold0 = ide.timing.as_ref().unwrap().hold_ps;
+        let hold_slack0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.timing_derates.is_empty()
+                && !ide.constraints.operating_conditions.is_set(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let late = ide.exec("set_timing_derate -late 1.1").unwrap();
+        assert!(late.contains("timing_derate=1"), "{late}");
+        assert!(late.contains("LATE_MILLI=1100"), "{late}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert_eq!(ide.constraints.late_derate_milli(), 1100);
+        assert_eq!(ide.constraints.early_derate_milli(), 1000);
+        assert!(
+            ide.constraints_text()
+                .contains("set_timing_derate LATE_MILLI=1100 EARLY_MILLI=0"),
+            "{}",
+            ide.constraints_text()
+        );
+        let setup_late = setup0 * 1100 / 1000;
+        let wns_late = ide.wns_ps().expect("STA after late derate");
+        assert_eq!(
+            wns_late,
+            wns0 - (setup_late - setup0),
+            "late derate 1.1 must scale setup WNS: {wns0} vs {wns_late}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold_slack0,
+            "late derate must not move hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(
+            rt.contains(&format!("WNS_PS={wns_late}")),
+            "report_timing must honor late derate: {rt}"
+        );
+
+        let early = ide.exec("set_timing_derate -early 0.9").unwrap();
+        assert!(early.contains("EARLY_MILLI=900"), "{early}");
+        assert_eq!(ide.constraints.early_derate_milli(), 900);
+        assert!(
+            ide.constraints_text()
+                .contains("set_timing_derate LATE_MILLI=0 EARLY_MILLI=900"),
+            "{}",
+            ide.constraints_text()
+        );
+        let hold_early = hold0 * 900 / 1000;
+        let wns_early = ide.wns_ps().expect("STA after early derate");
+        assert_eq!(wns_early, wns_late, "early derate must not move setup WNS");
+        let hold_e = ide.timing.as_ref().expect("STA after early derate").hold_slack_ps;
+        assert_eq!(
+            hold_e,
+            hold_slack0 - (hold0 - hold_early),
+            "early derate 0.9 must scale hold slack: {hold_e} vs {hold_slack0}"
+        );
+
+        let oc = ide
+            .exec("set_operating_conditions -voltage 0.95 -temperature 85")
+            .unwrap();
+        assert!(oc.contains("operating_conditions=1"), "{oc}");
+        assert!(oc.contains("VOLTAGE_MV=950"), "{oc}");
+        assert!(oc.contains("TEMP_C=85"), "{oc}");
+        assert!(oc.contains("OC_SCALE_MILLI=1172"), "{oc}");
+        assert_eq!(ide.constraints.operating_conditions.voltage_mv, 950);
+        assert_eq!(ide.constraints.operating_conditions.temperature_c, 85);
+        assert_eq!(ide.constraints.operating_conditions.scale_milli(), 1172);
+        assert!(
+            ide.constraints_text()
+                .contains("set_operating_conditions VOLTAGE_MV=950 TEMP_C=85"),
+            "{}",
+            ide.constraints_text()
+        );
+        let late_m = 1100i64 * 1172 / 1000;
+        let early_m = 900i64 * 1172 / 1000;
+        let setup_all = setup0 * late_m / 1000;
+        let hold_all = hold0 * early_m / 1000;
+        let wns_oc = ide.wns_ps().expect("STA after operating conditions");
+        assert_eq!(
+            wns_oc,
+            wns0 - (setup_all - setup0),
+            "derate × PVT must stack on setup: {wns0} vs {wns_oc}"
+        );
+        let hold_oc = ide.timing.as_ref().expect("STA after OC").hold_slack_ps;
+        assert_eq!(
+            hold_oc,
+            hold_slack0 - (hold0 - hold_all),
+            "derate × PVT must stack on hold"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_oc}")), "{rt}");
+        assert!(rt.contains(&format!("HOLD_SLACK_PS={hold_oc}")), "{rt}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        let bsetup = blinky.timing.as_ref().unwrap().setup_ps;
+        blinky.exec("set_timing_derate -late 1.1").unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        let bsetup_d = bsetup * 1100 / 1000;
+        assert_eq!(b1, b0 - (bsetup_d - bsetup));
+        assert_ne!(b1, wns_late, "derate WNS is per-design STA, not canned");
+        blinky
+            .exec("set_operating_conditions -voltage 0.95")
+            .unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        let b_late_m = 1100i64 * 1052 / 1000;
+        let bsetup_oc = bsetup * b_late_m / 1000;
+        assert_eq!(b2, b0 - (bsetup_oc - bsetup));
+        assert_ne!(b2, wns_oc, "OC WNS is per-design STA, not canned");
+    }
+
+    /// UG893 Timing Constraints Apply: set_disable_timing / set_case_analysis
+    /// drop/force paths in helion-sta like false path — not labels on a stub editor.
+    #[test]
+    fn timing_constraints_disable_timing_case_analysis_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before disable_timing");
+        assert_ne!(wns0, 0);
+        assert!(
+            ide.constraints.disable_timings.is_empty() && ide.constraints.case_analyses.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+
+        let od = ide
+            .exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        assert!(od.contains("output_delay=1"), "{od}");
+        let wns_od = ide.wns_ps().expect("STA after output delay");
+        assert_eq!(
+            wns_od,
+            wns0 - 2000,
+            "output delay must worsen WNS before disable_timing: {wns0} vs {wns_od}"
+        );
+
+        let dt = ide
+            .exec("set_disable_timing -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        assert!(dt.contains("disable_timing=1"), "{dt}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert!(
+            ide.constraints.arcs_disabled(),
+            "{:?}",
+            ide.constraints.disable_timings
+        );
+        assert!(
+            ide.constraints_text()
+                .contains("set_disable_timing -from clk -to led"),
+            "{}",
+            ide.constraints_text()
+        );
+        let t = ide.timing.as_ref().expect("STA after disable_timing");
+        assert_eq!(t.iob_ps, 0, "disable_timing must drop IOB from STA");
+        assert_eq!(t.setup_ps, t.r2r_ps, "disable_timing setup is r2r only");
+        let wns_dt = t.wns_ps;
+        assert_ne!(
+            wns_dt, wns_od,
+            "disable_timing must move WNS off the I/O-delay result"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_dt}")), "{rt}");
+        assert!(rt.contains("iob_ps=0"), "{rt}");
+
+        let mut ca_ide = IdeModel::new();
+        ca_ide.open_source(&example("counter.sv")).unwrap();
+        ca_ide.run_step(FlowStep::Opt).unwrap();
+        ca_ide.run_step(FlowStep::Place).unwrap();
+        ca_ide.run_step(FlowStep::Route).unwrap();
+        let c0 = ca_ide.wns_ps().unwrap();
+        ca_ide
+            .exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        let c_od = ca_ide.wns_ps().unwrap();
+        assert_eq!(c_od, c0 - 2000);
+        let ca = ca_ide
+            .exec("set_case_analysis 0 [get_ports clk]")
+            .unwrap();
+        assert!(ca.contains("case_analysis=1"), "{ca}");
+        assert!(ca.contains("CASE=0"), "{ca}");
+        assert_eq!(ca_ide.constraints.case_analyses.len(), 1);
+        assert_eq!(ca_ide.constraints.case_analyses[0].value, "0");
+        assert_eq!(ca_ide.constraints.case_analyses[0].object, "clk");
+        assert!(
+            ca_ide.constraints_text().contains("set_case_analysis 0 clk"),
+            "{}",
+            ca_ide.constraints_text()
+        );
+        let t = ca_ide.timing.as_ref().expect("STA after case_analysis");
+        assert_eq!(t.iob_ps, 0, "case_analysis must drop IOB from STA");
+        assert_eq!(t.setup_ps, t.r2r_ps, "case_analysis setup is r2r only");
+        let wns_ca = t.wns_ps;
+        assert_ne!(
+            wns_ca, c_od,
+            "case_analysis must force-drop WNS off the I/O-delay result"
+        );
+        assert_eq!(wns_ca, wns_dt, "case_analysis and disable_timing drop the same IOB path");
+        let rt = ca_ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_ca}")), "{rt}");
+        assert!(rt.contains("iob_ps=0"), "{rt}");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        assert_ne!(b0, wns0, "setup WNS is per-design STA");
+        blinky
+            .exec("set_output_delay -clock clk 2.0 [get_ports led]")
+            .unwrap();
+        let b_od = blinky.wns_ps().unwrap();
+        assert_eq!(b_od, b0 - 2000);
+        blinky
+            .exec("set_disable_timing -from [get_ports clk] -to [get_ports led]")
+            .unwrap();
+        let b_dt = blinky.wns_ps().unwrap();
+        assert_ne!(b_dt, b_od, "disable_timing must move blinky WNS off I/O delay");
+        assert_ne!(b_dt, wns_dt, "disable_timing WNS is per-design STA, not canned");
+        blinky
+            .exec("set_case_analysis 1 [get_pins u_lut0/I0]")
+            .unwrap();
+        assert!(
+            blinky
+                .constraints_text()
+                .contains("set_case_analysis 1 u_lut0"),
+            "{}",
+            blinky.constraints_text()
+        );
+        assert_eq!(
+            blinky.wns_ps().unwrap(),
+            b_dt,
+            "second case_analysis still drops IOB, does not invent slack"
+        );
+    }
+
+    /// UG893 Timing Constraints Apply: set_propagated_clock / set_clock_sense
+    /// fold routed clock-network delay into helion-sta — ideal clocks keep gold WNS.
+    #[test]
+    fn timing_constraints_propagated_clock_sense_apply_moves_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns0 = ide.wns_ps().expect("STA WNS before propagated clock");
+        let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
+        let clk_net = ide.timing.as_ref().unwrap().clk_net_ps;
+        assert_ne!(wns0, 0);
+        assert!(clk_net > 0, "routed clock network must have hop delay, got {clk_net}");
+        assert!(
+            ide.constraints.propagated_clocks.is_empty() && ide.constraints.clock_senses.is_empty(),
+            "{:?}",
+            ide.constraints
+        );
+        assert!(
+            ide.timing_text().contains(&format!("CLK_NET_PS={clk_net}")),
+            "{}",
+            ide.timing_text()
+        );
+        assert_eq!(wns0, 10_000 - ide.timing.as_ref().unwrap().setup_ps);
+
+        let pos = ide
+            .exec("set_clock_sense -positive [get_pins u_ff/CLK]")
+            .unwrap();
+        assert!(pos.contains("clock_sense=1"), "{pos}");
+        assert!(pos.contains("SENSE=positive"), "{pos}");
+        assert_eq!(
+            ide.wns_ps().unwrap(),
+            wns0,
+            "positive sense is the default edge and must keep gold WNS"
+        );
+
+        let prop = ide
+            .exec("set_propagated_clock [get_clocks clk]")
+            .unwrap();
+        assert!(prop.contains("propagated_clock=1"), "{prop}");
+        assert!(prop.contains(&format!("CLK_NET_PS={clk_net}")), "{prop}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert!(ide.constraints.clocks_propagated(), "{:?}", ide.constraints.propagated_clocks);
+        assert!(
+            ide.constraints_text().contains("set_propagated_clock clk"),
+            "{}",
+            ide.constraints_text()
+        );
+        let wns_prop = ide.wns_ps().expect("STA after set_propagated_clock");
+        assert_eq!(
+            wns_prop,
+            wns0 - clk_net,
+            "propagated clocks must add routed insertion to WNS: {wns0} vs {wns_prop} net {clk_net}"
+        );
+        assert_eq!(
+            ide.timing.as_ref().unwrap().hold_slack_ps,
+            hold0 - clk_net,
+            "propagated clocks must move hold by insertion delay"
+        );
+        let rt = ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_prop}")), "{rt}");
+        assert!(rt.contains(&format!("CLK_NET_PS={clk_net}")), "{rt}");
+
+        let stop = ide
+            .exec("set_clock_sense -stop_propagation [get_pins clk_buf/O]")
+            .unwrap();
+        assert!(stop.contains("SENSE=stop"), "{stop}");
+        assert!(ide.constraints.clock_stopped());
+        assert!(
+            ide.constraints_text()
+                .contains("set_clock_sense -stop clk_buf"),
+            "{}",
+            ide.constraints_text()
+        );
+        assert_eq!(
+            ide.wns_ps().unwrap(),
+            wns0,
+            "stop_propagation must restore ideal insertion (gold WNS)"
+        );
+        assert_eq!(ide.timing.as_ref().unwrap().hold_slack_ps, hold0);
+
+        let mut neg_ide = IdeModel::new();
+        neg_ide.open_source(&example("counter.sv")).unwrap();
+        neg_ide.run_step(FlowStep::Opt).unwrap();
+        neg_ide.run_step(FlowStep::Place).unwrap();
+        neg_ide.run_step(FlowStep::Route).unwrap();
+        let n0 = neg_ide.wns_ps().unwrap();
+        let n_net = neg_ide.timing.as_ref().unwrap().clk_net_ps;
+        let neg = neg_ide
+            .exec("set_clock_sense -negative [get_pins u_lut0/I0]")
+            .unwrap();
+        assert!(neg.contains("SENSE=negative"), "{neg}");
+        assert!(
+            neg_ide
+                .constraints_text()
+                .contains("set_clock_sense -negative u_lut0"),
+            "{}",
+            neg_ide.constraints_text()
+        );
+        let wns_neg = neg_ide.wns_ps().unwrap();
+        assert_eq!(
+            wns_neg,
+            n0 - 5_000,
+            "negative sense is a half-cycle setup: {n0} vs {wns_neg}"
+        );
+        let rt = neg_ide.exec("report_timing").unwrap();
+        assert!(rt.contains(&format!("WNS_PS={wns_neg}")), "{rt}");
+
+        neg_ide
+            .exec("set_propagated_clock [get_clocks clk]")
+            .unwrap();
+        let wns_both = neg_ide.wns_ps().unwrap();
+        assert_eq!(
+            wns_both,
+            n0 - n_net - 5_000,
+            "propagated + negative must stack: {wns_both}"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let b0 = blinky.wns_ps().unwrap();
+        let b_net = blinky.timing.as_ref().unwrap().clk_net_ps;
+        assert_ne!(b0, wns0, "setup WNS is per-design STA");
+        blinky
+            .exec("set_propagated_clock [get_clocks clk]")
+            .unwrap();
+        let b1 = blinky.wns_ps().unwrap();
+        assert_eq!(b1, b0 - b_net);
+        assert_ne!(b1, wns_prop, "propagated WNS is per-design STA, not canned");
+        blinky
+            .exec("set_clock_sense -negative [get_pins u_lut0/I0]")
+            .unwrap();
+        let b2 = blinky.wns_ps().unwrap();
+        assert_eq!(b2, b1 - 5_000);
+        assert_ne!(b2, wns_both, "sense WNS is per-design STA, not canned");
     }
 
     /// UG893 Hierarchy is HNF instances, not a restyled netlist cell list.
@@ -9179,6 +10631,163 @@ mod tests {
         assert_eq!(
             hash_back, hash0,
             "default electrical bits must restore gold bitstream"
+        );
+        let clean = ide.exec("report_drc").unwrap();
+        assert!(
+            clean.contains("violations=0") || clean.contains("ok"),
+            "defaults are legal: {clean}"
+        );
+    }
+
+    /// UG893 I/O Ports: `set_property DIFF_TERM / IN_TERM` hit HNF + HAD + STA
+    /// pad delay + DRC + bitgen — not table labels.
+    #[test]
+    fn io_planning_diff_term_in_term_hit_sta_drc_bitgen() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+
+        let wns0 = ide.wns_ps().expect("STA after route");
+        let iob0 = ide.timing.as_ref().unwrap().iob_ps;
+        let hash0 = ide.bitstream_hash().expect("bitgen before termination");
+        assert_ne!(wns0, 0);
+        let dump = ide.exec("io_ports").unwrap();
+        assert!(dump.contains("DIFF_TERM=-"), "{dump}");
+        assert!(dump.contains("IN_TERM=-"), "{dump}");
+        let led0 = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led port");
+        assert!(led0.diff_term.is_none(), "{led0:?}");
+        assert!(led0.in_term.is_none(), "{led0:?}");
+
+        let out = ide
+            .exec("set_property DIFF_TERM TRUE [get_ports led]")
+            .unwrap();
+        assert!(out.contains("DIFF_TERM TRUE"), "{out}");
+        assert!(out.contains("pad_ps="), "must report STA pad delay: {out}");
+        assert!(out.contains("bitgen=1"), "must re-bitgen: {out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+        assert_eq!(
+            ide.design()
+                .unwrap()
+                .ports
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.attrs.get("DIFF_TERM")),
+            Some("TRUE"),
+            "HNF port attr"
+        );
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after DIFF_TERM");
+        assert_eq!(led.diff_term.as_deref(), Some("TRUE"), "{led:?}");
+        let ports = ide.exec("io_ports").unwrap();
+        assert!(ports.contains("DIFF_TERM=TRUE"), "{ports}");
+        assert_eq!(
+            ide.constraints.diff_terms.get("led").map(|s| s.as_str()),
+            Some("TRUE")
+        );
+        let ctext = ide.constraints_text();
+        assert!(ctext.contains("set_property DIFF_TERM TRUE led"), "{ctext}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "DIFF_TERM" && v == "TRUE"),
+            "{:?}",
+            ide.properties
+        );
+        let iob1 = ide.timing.as_ref().expect("STA after DIFF_TERM").iob_ps;
+        assert!(
+            iob1 > iob0,
+            "DIFF_TERM TRUE must add pad load ({iob1} vs {iob0})"
+        );
+        let hash1 = ide.bitstream_hash().expect("bitgen after DIFF_TERM");
+        assert_ne!(hash1, hash0, "DIFF_TERM must change the IOB bitstream");
+
+        let e = ide
+            .exec("set_property DIFF_TERM YES [get_ports led]")
+            .unwrap_err();
+        assert!(
+            e.contains("not a HAD"),
+            "illegal DIFF_TERM must fail against HAD: {e}"
+        );
+        assert_eq!(
+            ide.design()
+                .unwrap()
+                .ports
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.attrs.get("DIFF_TERM")),
+            Some("TRUE"),
+            "failed DIFF_TERM must not clobber HNF"
+        );
+
+        let interm = ide
+            .exec("set_property IN_TERM UNTUNED_SPLIT_50 [get_ports led]")
+            .unwrap();
+        assert!(interm.contains("IN_TERM UNTUNED_SPLIT_50"), "{interm}");
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after IN_TERM");
+        assert_eq!(led.in_term.as_deref(), Some("UNTUNED_SPLIT_50"), "{led:?}");
+        let iob2 = ide.timing.as_ref().expect("STA after IN_TERM").iob_ps;
+        assert!(
+            iob2 > iob1,
+            "IN_TERM UNTUNED_SPLIT_50 must add pad load ({iob2} vs {iob1})"
+        );
+        let e = ide
+            .exec("set_property IN_TERM 50 [get_ports led]")
+            .unwrap_err();
+        assert!(e.contains("HAD") || e.contains("UNTUNED"), "{e}");
+
+        let mix = ide.exec("report_drc").unwrap();
+        assert!(
+            mix.contains("DIFF_TERM") || mix.contains("IN_TERM") || mix.contains("IOSTANDARD"),
+            "TRUE / UNTUNED_SPLIT_50 vs default LVCMOS18 must fail DRC: {mix}"
+        );
+        assert!(
+            !ide.drc.as_ref().unwrap().ok(),
+            "DRC must not be clean: {:?}",
+            ide.drc.as_ref().unwrap().violations
+        );
+
+        ide.exec("set_property IOSTANDARD SSTL15 [get_ports led]")
+            .unwrap();
+        let sstl = ide.exec("report_drc").unwrap();
+        assert!(
+            sstl.contains("violations=0") || sstl.contains("ok"),
+            "SSTL15 + DIFF_TERM TRUE + IN_TERM is HAD-legal: {sstl}"
+        );
+
+        ide.exec("set_property IOSTANDARD LVCMOS18 [get_ports led]")
+            .unwrap();
+        ide.exec("set_property DIFF_TERM FALSE [get_ports led]")
+            .unwrap();
+        ide.exec("set_property IN_TERM NONE [get_ports led]")
+            .unwrap();
+        let wns_back = ide.wns_ps().expect("STA after defaults");
+        assert_eq!(
+            wns_back, wns0,
+            "FALSE / NONE / LVCMOS18 must restore gold pad ({wns_back} vs {wns0})"
+        );
+        let iob_back = ide.timing.as_ref().unwrap().iob_ps;
+        assert_eq!(iob_back, iob0, "gold IOB pad must return ({iob_back} vs {iob0})");
+        let hash_back = ide.bitstream_hash().expect("bitgen after defaults");
+        assert_eq!(
+            hash_back, hash0,
+            "default termination bits must restore gold bitstream"
         );
         let clean = ide.exec("report_drc").unwrap();
         assert!(

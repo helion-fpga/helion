@@ -134,7 +134,7 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
     }
 }
 
-/// UG893 I/O Ports DRIVE / SLEW / PULLTYPE: HAD-legal values and drive vs IOSTANDARD.
+/// UG893 I/O Ports DRIVE / SLEW / PULLTYPE / DIFF_TERM / IN_TERM: HAD-legal values and vs IOSTANDARD.
 fn check_io_electrical(design: &Design, d: &mut Drc) {
     for p in &design.ports {
         if let Some(drv) = p.attrs.get("DRIVE") {
@@ -169,6 +169,40 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
             if !Device::legal_pulltype(pt) {
                 d.violations.push(format!(
                     "PULLTYPE {pt} on {} is not a HAD pull (NONE|PULLUP|PULLDOWN|KEEPER)",
+                    p.name
+                ));
+            }
+        }
+        if let Some(dt) = p.attrs.get("DIFF_TERM") {
+            if !Device::legal_diff_term(dt) {
+                d.violations.push(format!(
+                    "DIFF_TERM {dt} on {} is not a HAD term (TRUE|FALSE)",
+                    p.name
+                ));
+            } else if !Device::diff_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), dt) {
+                let std = p
+                    .attrs
+                    .get("IOSTANDARD")
+                    .unwrap_or(Device::DEFAULT_IOSTANDARD);
+                d.violations.push(format!(
+                    "DIFF_TERM {dt} not legal for IOSTANDARD {std} on {}",
+                    p.name
+                ));
+            }
+        }
+        if let Some(it) = p.attrs.get("IN_TERM") {
+            if !Device::legal_in_term(it) {
+                d.violations.push(format!(
+                    "IN_TERM {it} on {} is not a HAD term (NONE|UNTUNED_SPLIT_40|UNTUNED_SPLIT_50|UNTUNED_SPLIT_60)",
+                    p.name
+                ));
+            } else if !Device::in_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), it) {
+                let std = p
+                    .attrs
+                    .get("IOSTANDARD")
+                    .unwrap_or(Device::DEFAULT_IOSTANDARD);
+                d.violations.push(format!(
+                    "IN_TERM {it} not legal for IOSTANDARD {std} on {}",
                     p.name
                 ));
             }
@@ -347,5 +381,78 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         check_placed(&d, &pl, &dev).fail().unwrap();
+    }
+
+    #[test]
+    fn unknown_diff_term_in_term_fail() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_diff_term("led", "YES").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "illegal DIFF_TERM must fail DRC: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("DIFF_TERM") && v.contains("HAD")),
+            "{:?}",
+            drc.violations
+        );
+
+        let mut d = Design::structural_blinky();
+        d.set_in_term("led", "50").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("IN_TERM")),
+            "{:?}",
+            drc.violations
+        );
+    }
+
+    #[test]
+    fn diff_term_in_term_vs_lvcmos_fail_and_sstl_is_clean() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVCMOS18").unwrap();
+        d.set_diff_term("led", "TRUE").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "DIFF_TERM TRUE vs LVCMOS18 must fail: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("DIFF_TERM") && v.contains("IOSTANDARD")),
+            "{:?}",
+            drc.violations
+        );
+
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "LVCMOS18").unwrap();
+        d.set_in_term("led", "UNTUNED_SPLIT_50").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let drc = check_placed(&d, &pl, &dev);
+        assert!(!drc.ok(), "IN_TERM vs LVCMOS18 must fail: {:?}", drc.violations);
+        assert!(
+            drc.violations.iter().any(|v| v.contains("IN_TERM") && v.contains("IOSTANDARD")),
+            "{:?}",
+            drc.violations
+        );
+
+        let mut d = Design::structural_blinky();
+        d.set_iostandard("led", "SSTL15").unwrap();
+        d.set_diff_term("led", "TRUE").unwrap();
+        d.set_in_term("led", "UNTUNED_SPLIT_50").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        check_placed(&d, &pl, &dev).fail().unwrap();
+
+        let mut d = Design::structural_blinky();
+        d.set_diff_term("led", "FALSE").unwrap();
+        d.set_in_term("led", "NONE").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        check_routed(&d, &r, &dev).fail().unwrap();
     }
 }
