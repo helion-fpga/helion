@@ -1037,6 +1037,14 @@ pub struct TimingPath {
 }
 
 impl TimingPath {
+    /// Clickable-grid dump row: UG893 Fig. 55 Name/From/To/Slack_ps, not `endpoint slack=`.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} FROM={} TO={} SLACK_PS={}",
+            self.name, self.startpoint, self.endpoint, self.slack_ps
+        )
+    }
+
     /// Combinational + sequential cell arcs (not nets).
     pub fn logic_ps(&self) -> i64 {
         self.pins
@@ -2117,16 +2125,57 @@ impl UltraFastStage {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeNode {
     pub name: String,
     pub kind: String,
 }
 
-#[derive(Clone, Debug)]
+impl ScopeNode {
+    pub fn type_cell(&self) -> &str {
+        self.kind.split(':').next().unwrap_or(self.kind.as_str())
+    }
+
+    /// Clickable-grid dump row: UG900 Scopes Name/Type over helion-sim, not `name (kind)`.
+    pub fn row_text(&self) -> String {
+        format!("NAME={} TYPE={}", self.name, self.type_cell())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimObject {
     pub name: String,
+    /// `port` / `net` / `reg` / `bus` / `virtual_bus` from HNF + helion-sim.
+    pub kind: String,
     pub value: String,
+}
+
+impl SimObject {
+    pub fn type_cell(&self) -> &str {
+        if self.kind.is_empty() {
+            "signal"
+        } else {
+            self.kind.as_str()
+        }
+    }
+
+    pub fn value_cell(&self) -> &str {
+        if self.value.is_empty() {
+            "-"
+        } else {
+            self.value.as_str()
+        }
+    }
+
+    /// Clickable-grid dump row: UG900 Objects Name/Type/Value, not `name = value`.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} TYPE={} VALUE={}",
+            self.name,
+            self.type_cell(),
+            self.value_cell()
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3010,6 +3059,19 @@ impl FindHit {
     }
 }
 
+/// One clickable Name/Value row in the UG893 Properties pane (not a weak-key dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyRow {
+    pub name: String,
+    pub value: String,
+}
+
+impl PropertyRow {
+    pub fn row_text(&self) -> String {
+        format!("NAME={} VALUE={}", self.name, self.value)
+    }
+}
+
 /// HAD IOB sites as package pins (Helion has no BGA; pins are IOB_XxYy).
 #[derive(Clone, Debug)]
 pub struct PackagePin {
@@ -3077,10 +3139,14 @@ pub struct IdeModel {
     pub schematic: SchematicView,
     pub device: DeviceView,
     pub properties: Vec<(String, String)>,
+    /// UG893 Properties selected Name (clickable Name/Value table).
+    pub selected_property: Option<String>,
     pub selected: Option<String>,
     pub scopes: Vec<ScopeNode>,
     pub selected_scope: Option<String>,
     pub objects: Vec<SimObject>,
+    /// UG900 Objects selected Name (clickable Name/Type/Value table).
+    pub selected_object: Option<String>,
     pub wave: Waveform,
     pub timing_paths: Vec<TimingPath>,
     pub selected_timing_path: Option<usize>,
@@ -3151,10 +3217,12 @@ impl IdeModel {
             schematic: SchematicView::default(),
             device: DeviceView::default(),
             properties: Vec::new(),
+            selected_property: None,
             selected: None,
             scopes: Vec::new(),
             selected_scope: None,
             objects: Vec::new(),
+            selected_object: None,
             wave: Waveform::default(),
             timing_paths: Vec::new(),
             selected_timing_path: None,
@@ -3380,6 +3448,11 @@ impl IdeModel {
         } else if let Some(id) = t.strip_prefix("select ") {
             self.select(id.trim());
             Ok(format!("select {}", id.trim()))
+        } else if t == "properties" {
+            Ok(self.properties_text())
+        } else if t == "select_property" || t.starts_with("select_property ") {
+            let spec = t.strip_prefix("select_property").unwrap_or("").trim();
+            self.select_property(spec)
         } else if t == "find" || t == "find_results" {
             self.open_find_results()
         } else if let Some(q) = t.strip_prefix("find ") {
@@ -3712,8 +3785,18 @@ impl IdeModel {
             self.select_timing_pin(spec.trim())
         } else if t == "select_timing_pin" {
             self.select_timing_pin("")
+        } else if t == "scopes" {
+            Ok(self.scopes_text())
+        } else if t == "objects" {
+            Ok(self.objects_text())
         } else if let Some(name) = t.strip_prefix("select_scope ") {
             self.select_scope(name.trim())
+        } else if t == "select_scope" {
+            self.select_scope("")
+        } else if let Some(spec) = t.strip_prefix("select_object ") {
+            self.select_object(spec.trim())
+        } else if t == "select_object" {
+            self.select_object("")
         } else if let Some(name) = t.strip_prefix("select_clock_region ") {
             self.select_clock_region(name.trim())
         } else if let Some(q) = t.strip_prefix("console_find ") {
@@ -4509,6 +4592,7 @@ impl IdeModel {
         let id = id.trim();
         self.selected_timing_pin = None;
         self.selected_ip = None;
+        self.selected_property = None;
         if id.is_empty() {
             self.selected = None;
             self.properties.clear();
@@ -5177,29 +5261,119 @@ impl IdeModel {
         s
     }
 
-    /// UG900: click a Scope to populate Objects from helion-sim (filtered, not static).
-    pub fn select_scope(&mut self, name: &str) -> Result<String, String> {
-        let name = name.trim();
-        if name.is_empty() {
+    pub fn scope_rows(&self) -> &[ScopeNode] {
+        &self.scopes
+    }
+
+    pub fn object_rows(&self) -> &[SimObject] {
+        &self.objects
+    }
+
+    /// UG900 Scopes table dump (Name/Type), not a `name (kind)` line.
+    pub fn scopes_text(&self) -> String {
+        let n = self.scopes.len();
+        let mut s = format!("scopes n={n}");
+        if n == 0 {
+            s.push_str(" no scopes");
+            return s;
+        }
+        for sc in &self.scopes {
+            s.push('\n');
+            s.push_str(&sc.row_text());
+        }
+        s
+    }
+
+    /// UG900 Objects table dump (Name/Type/Value), not a `name = value` line.
+    pub fn objects_text(&self) -> String {
+        let n = self.objects.len();
+        let scope = self.selected_scope.as_deref().unwrap_or("-");
+        let mut s = format!("objects n={n} scope={scope}");
+        if n == 0 {
+            s.push_str(" no objects");
+            return s;
+        }
+        for o in &self.objects {
+            s.push('\n');
+            s.push_str(&o.row_text());
+        }
+        s
+    }
+
+    /// UG900: click a Scope row (name or index) — Name/Type table, not a dump.
+    pub fn select_scope(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
             return Err("select_scope: empty".into());
         }
         if self.scopes.is_empty() {
             self.prepare_sim()?;
         }
-        if !self.scopes.iter().any(|s| s.name == name) {
-            return Err(format!("select_scope: no scope {name}"));
-        }
-        self.selected_scope = Some(name.to_string());
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= self.scopes.len() {
+                return Err(format!("select_scope: no row {spec}"));
+            }
+            i
+        } else {
+            self.scopes
+                .iter()
+                .position(|s| s.name.eq_ignore_ascii_case(spec))
+                .ok_or_else(|| format!("select_scope: no scope {spec}"))?
+        };
+        let sc = self.scopes[idx].clone();
+        self.selected_scope = Some(sc.name.clone());
+        self.selected_object = None;
         self.refresh_sim_objects();
-        Ok(format!(
-            "scope {name} objects={} {}",
-            self.objects.len(),
+        self.workspace = WorkspaceTab::Wave;
+        self.properties = vec![
+            ("NAME".into(), sc.name.clone()),
+            ("TYPE".into(), sc.type_cell().to_string()),
+            ("OBJECTS".into(), self.objects.len().to_string()),
+        ];
+        let mut s = format!("scope {} objects={}", sc.name, self.objects.len());
+        for o in &self.objects {
+            s.push('\n');
+            s.push_str(&o.row_text());
+        }
+        Ok(s)
+    }
+
+    /// UG900: click an Objects row (name or index) — add_wave + Properties, not a dump.
+    pub fn select_object(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_object: missing name".into());
+        }
+        if self.objects.is_empty() {
+            if self.scopes.is_empty() {
+                self.prepare_sim()?;
+            }
+            self.refresh_sim_objects();
+        }
+        if self.objects.is_empty() {
+            return Err("select_object: no objects".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= self.objects.len() {
+                return Err(format!("select_object: no row {spec}"));
+            }
+            i
+        } else {
             self.objects
                 .iter()
-                .map(|o| format!("{}={}", o.name, o.value))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ))
+                .position(|o| o.name.eq_ignore_ascii_case(spec))
+                .ok_or_else(|| format!("select_object: no object {spec}"))?
+        };
+        let o = self.objects[idx].clone();
+        self.selected_object = Some(o.name.clone());
+        self.workspace = WorkspaceTab::Wave;
+        self.properties = vec![
+            ("NAME".into(), o.name.clone()),
+            ("TYPE".into(), o.type_cell().to_string()),
+            ("VALUE".into(), o.value_cell().to_string()),
+        ];
+        let _ = self.add_wave(&o.name);
+        Ok(o.row_text())
     }
 
     /// Fig. 49: select a clock region; Properties show name + HAD site count.
@@ -6626,6 +6800,67 @@ impl IdeModel {
             .iter()
             .find(|(k, _)| k == "NAME")
             .map(|(_, v)| v.as_str())
+    }
+
+    /// UG893 Properties: clickable Name/Value rows over the selected HNF/HAD/STA object.
+    pub fn property_rows(&self) -> Vec<PropertyRow> {
+        self.properties
+            .iter()
+            .map(|(name, value)| PropertyRow {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// UG893 Properties pane dump (tests). Paint is a clickable grid, not this string.
+    pub fn properties_text(&self) -> String {
+        let obj = self
+            .properties_name()
+            .or(self.selected.as_deref())
+            .or(self.selected_ip.as_deref())
+            .unwrap_or("-");
+        let n = self.properties.len();
+        let mut s = format!("properties n={n} object={obj}");
+        if n == 0 {
+            s.push_str("\nno properties — select a cell, net, or port");
+            return s;
+        }
+        for row in self.property_rows() {
+            s.push('\n');
+            s.push_str(&row.row_text());
+        }
+        s
+    }
+
+    /// Click a UG893 Properties Name/Value row — highlight that property, not a dump.
+    pub fn select_property(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_property: missing name".into());
+        }
+        if self.properties.is_empty() {
+            return Err("select_property: no properties".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= self.properties.len() {
+                return Err(format!("select_property: no row {spec}"));
+            }
+            i
+        } else {
+            self.properties
+                .iter()
+                .position(|(k, v)| {
+                    k.eq_ignore_ascii_case(spec)
+                        || format!("{k}={v}").eq_ignore_ascii_case(spec)
+                        || format!("{k}:{v}").eq_ignore_ascii_case(spec)
+                        || format!("NAME={k} VALUE={v}").eq_ignore_ascii_case(spec)
+                })
+                .ok_or_else(|| format!("select_property: no row {spec}"))?
+        };
+        let (name, value) = self.properties[idx].clone();
+        self.selected_property = Some(name.clone());
+        Ok(format!("property NAME={name} VALUE={value}"))
     }
 
     pub fn refresh_ip_catalog(&mut self) {
@@ -8914,6 +9149,7 @@ impl IdeModel {
         self.fabric_sim = None;
         self.wave = Waveform::default();
         self.objects.clear();
+        self.selected_object = None;
         self.prepare_sim()?;
         Ok("sim_restart".into())
     }
@@ -9007,12 +9243,44 @@ impl IdeModel {
         Ok(())
     }
 
+    fn sim_object_kind(&self, name: &str) -> String {
+        if self.wave.virtual_bus(name).is_some() {
+            return "virtual_bus".into();
+        }
+        if let Some(t) = self.wave.trace(name) {
+            if t.width > 1 {
+                return "bus".into();
+            }
+        }
+        if let Some(d) = self.shell.session.design.as_ref() {
+            if d.ports.iter().any(|p| p.name == name) {
+                return "port".into();
+            }
+            if d.nets.iter().any(|n| n.name == name) {
+                return "net".into();
+            }
+            if let Some(c) = d.cells.iter().find(|c| c.name == name) {
+                return match &c.kind {
+                    CellKind::Hff => "reg".into(),
+                    CellKind::Lut6 { .. } => "net".into(),
+                    CellKind::IobOut => "port".into(),
+                    CellKind::Ila { .. } => "ila".into(),
+                    CellKind::Mac27 => "dsp".into(),
+                    CellKind::Bram18 => "bram".into(),
+                    CellKind::BlackBox { .. } => "instance".into(),
+                };
+            }
+        }
+        "signal".into()
+    }
+
     fn collect_sim_objects(&self) -> Vec<SimObject> {
         let mut v = Vec::new();
         let mut seen = HashSet::new();
         let push = |v: &mut Vec<SimObject>, seen: &mut HashSet<String>, name: String, value: String| {
             if seen.insert(name.clone()) {
-                v.push(SimObject { name, value });
+                let kind = self.sim_object_kind(&name);
+                v.push(SimObject { name, kind, value });
             }
         };
         if let Some(sim) = &self.event_sim {
@@ -9998,6 +10266,7 @@ impl IdeModel {
         }
         let Some(id) = self.selected.clone() else {
             self.properties.clear();
+            self.selected_property = None;
             return;
         };
         if let Some(rest) = id.strip_prefix("message:") {
@@ -15064,6 +15333,46 @@ mod tests {
         }
     }
 
+    /// UG893 Fig. 55 schematic path picker is Name/From/To/Slack_ps, not `endpoint slack=` chips.
+    #[test]
+    fn schematic_timing_paths_name_from_to_slack_table() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(!ide.timing_paths.is_empty(), "STA endpoints become timing paths");
+        let wns = ide.wns_ps().expect("STA WNS");
+        for p in &ide.timing_paths {
+            let row = p.row_text();
+            assert!(row.contains("NAME="), "{row}");
+            assert!(row.contains(&format!("FROM={}", p.startpoint)), "{row}");
+            assert!(row.contains(&format!("TO={}", p.endpoint)), "{row}");
+            assert!(row.contains(&format!("SLACK_PS={}", p.slack_ps)), "{row}");
+            assert!(
+                !row.contains(" slack="),
+                "not an endpoint slack= chip: {row}"
+            );
+            assert_eq!(p.slack_ps, wns, "Slack_ps is helion-sta WNS, not chrome");
+            assert!(
+                ide.design()
+                    .unwrap()
+                    .cells
+                    .iter()
+                    .any(|c| c.name == p.endpoint || p.cells.contains(&c.name)),
+                "To is an HNF cell: {}",
+                p.endpoint
+            );
+        }
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.exec("report_timing").unwrap();
+        assert!(!blinky.timing_paths.is_empty());
+        assert_ne!(
+            blinky.timing_paths[0].row_text(),
+            ide.timing_paths[0].row_text(),
+            "path table is per-design STA, not canned"
+        );
+    }
+
     /// UG903 report_timing is a pin-delay table (incr/path from helion-sta), not a name list.
     #[test]
     fn reports_timing_paths_is_ug903_pin_delay_table() {
@@ -15344,6 +15653,150 @@ mod tests {
             "{child_names:?} {:?}",
             ide.objects
         );
+    }
+
+    /// UG900 Scopes/Objects is a clickable Name/Type/Value table over helion-sim, not a dump.
+    #[test]
+    fn ug900_scopes_objects_name_type_value_table() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("hier.sv")).unwrap();
+        ide.sim_run(4).unwrap();
+
+        let scopes = ide.exec("scopes").unwrap();
+        assert!(scopes.contains('\n'), "Scopes must be a table: {scopes}");
+        assert!(scopes.contains("NAME=hier"), "{scopes}");
+        assert!(scopes.contains("TYPE=module"), "{scopes}");
+        assert!(scopes.contains("NAME=u0"), "{scopes}");
+        assert!(scopes.contains("TYPE=instance"), "{scopes}");
+        assert!(
+            !scopes.contains(" (module)"),
+            "not a name (kind) dump: {scopes}"
+        );
+        assert!(
+            ide.scope_rows()
+                .iter()
+                .any(|s| s.name == "hier" && s.type_cell() == "module"),
+            "{:?}",
+            ide.scope_rows()
+        );
+        assert!(
+            ide.scope_rows()
+                .iter()
+                .any(|s| s.name == "u0" && s.type_cell() == "instance"),
+            "{:?}",
+            ide.scope_rows()
+        );
+
+        let top = ide.exec("select_scope 0").unwrap();
+        assert!(top.contains("scope hier"), "{top}");
+        assert_eq!(ide.selected_scope.as_deref(), Some("hier"));
+        assert_eq!(ide.workspace, WorkspaceTab::Wave);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "module"),
+            "{:?}",
+            ide.properties
+        );
+
+        let objs = ide.exec("objects").unwrap();
+        assert!(objs.contains('\n'), "Objects must be a table: {objs}");
+        assert!(objs.contains("scope=hier"), "{objs}");
+        assert!(objs.contains("NAME=led"), "{objs}");
+        assert!(objs.contains("TYPE=port"), "{objs}");
+        assert!(objs.contains("VALUE="), "{objs}");
+        assert!(
+            !objs.contains("led = "),
+            "not a name = value dump: {objs}"
+        );
+        let led = ide
+            .object_rows()
+            .iter()
+            .find(|o| o.name == "led")
+            .cloned()
+            .expect("led object");
+        assert_eq!(led.type_cell(), "port");
+        assert!(
+            led.value == "0" || led.value == "1",
+            "Value is a helion-sim bit, not a placeholder: {led:?}"
+        );
+
+        let sel = ide.exec("select_object led").unwrap();
+        assert!(sel.contains("NAME=led"), "{sel}");
+        assert!(sel.contains("TYPE=port"), "{sel}");
+        assert!(sel.contains("VALUE="), "{sel}");
+        assert_eq!(ide.selected_object.as_deref(), Some("led"));
+        assert_eq!(ide.workspace, WorkspaceTab::Wave);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "port"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "VALUE" && (v == "0" || v == "1")),
+            "{:?}",
+            ide.properties
+        );
+        assert!(ide.wave.has_trace("led"), "click add_wave");
+
+        let by_idx = ide.exec("select_object 0").unwrap();
+        assert!(by_idx.contains("NAME="), "{by_idx}");
+        assert_eq!(ide.selected_object.as_deref(), Some(ide.objects[0].name.as_str()));
+
+        let child = ide.exec("select_scope u0").unwrap();
+        assert!(child.contains("scope u0"), "{child}");
+        assert!(child.contains("TYPE="), "{child}");
+        assert!(
+            ide.object_rows()
+                .iter()
+                .any(|o| o.type_cell() == "reg" && (o.value == "0" || o.value == "1")),
+            "instance scope Objects are helion-sim FF probes: {:?}",
+            ide.object_rows()
+        );
+        assert!(
+            ide.object_rows().iter().all(|o| o.name != "led"),
+            "LED stays in the parent scope: {:?}",
+            ide.object_rows()
+        );
+        assert!(
+            ide.exec("select_object no_such")
+                .unwrap_err()
+                .contains("no object"),
+            "unknown object must refuse"
+        );
+
+        let mut counter = IdeModel::new();
+        counter.open_source(&example("counter.sv")).unwrap();
+        counter.run_step(FlowStep::Opt).unwrap();
+        counter.run_step(FlowStep::Place).unwrap();
+        counter.run_step(FlowStep::Route).unwrap();
+        counter.run_step(FlowStep::Bitstream).unwrap();
+        counter.sim_run(16).unwrap();
+        let c_objs = counter.exec("objects").unwrap();
+        assert!(c_objs.contains("NAME=led"), "{c_objs}");
+        assert!(c_objs.contains("TYPE=port"), "{c_objs}");
+        assert!(
+            counter
+                .object_rows()
+                .iter()
+                .any(|o| o.name == "cnt" && o.type_cell() == "bus"),
+            "packed LUTFF bus is TYPE=bus: {:?}",
+            counter.object_rows()
+        );
+        let gold = counter.fabric_led_bits(16).unwrap();
+        counter.exec("add_wave_virtual_bus vb led cnt").unwrap();
+        let vb = counter
+            .object_rows()
+            .iter()
+            .find(|o| o.name == "vb")
+            .expect("virtual bus object");
+        assert_eq!(vb.type_cell(), "virtual_bus");
+        assert_ne!(vb.value_cell(), "-");
+        assert_eq!(counter.wave.bits_of("led").as_deref(), Some(gold.as_str()));
     }
 
     /// Fig. 49: click a clock region; Properties show name + HAD site count.
@@ -18237,5 +18690,172 @@ mod tests {
             "blinky cells are not counter: {:?}",
             blinky.find_rows()
         );
+    }
+
+    /// UG893 Properties is a clickable Name/Value table over the selected
+    /// HNF/HAD/STA object, not a weak-key / monospace-value dump.
+    #[test]
+    fn properties_pane_clickable_name_value_table_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.property_rows().is_empty());
+        assert!(ide.selected_property.is_none());
+        assert!(
+            ide.exec("select_property")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_property NAME")
+                .unwrap_err()
+                .contains("no properties"),
+            "idle pane must refuse a click"
+        );
+        let empty = ide.exec("properties").unwrap();
+        assert!(empty.contains("properties n=0"), "{empty}");
+        assert!(empty.contains("no properties"), "{empty}");
+        assert!(
+            !empty.contains("NAME="),
+            "idle pane has no canned rows: {empty}"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.select("u_lut0");
+        let table = ide.exec("properties").unwrap();
+        assert!(table.contains("properties n="), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("NAME=NAME VALUE=u_lut0"), "{table}");
+        assert!(table.contains("NAME=PRIMITIVE VALUE=LUT6"), "{table}");
+        assert!(table.contains("NAME=INIT"), "{table}");
+        let rows = ide.property_rows();
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "NAME" && r.value == "u_lut0"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.name == "PRIMITIVE" && r.value == "LUT6"),
+            "{rows:?}"
+        );
+        let prim = ide.exec("select_property PRIMITIVE").unwrap();
+        assert!(prim.contains("NAME=PRIMITIVE"), "{prim}");
+        assert!(prim.contains("VALUE=LUT6"), "{prim}");
+        assert_eq!(ide.selected_property.as_deref(), Some("PRIMITIVE"));
+        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
+        let by_idx = ide.exec("select_property 0").unwrap();
+        assert!(by_idx.contains("NAME=NAME"), "{by_idx}");
+        assert!(by_idx.contains("VALUE=u_lut0"), "{by_idx}");
+        assert_eq!(ide.selected_property.as_deref(), Some("NAME"));
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.select("u_lut0");
+        let placed = ide.exec("properties").unwrap();
+        assert!(
+            placed.contains("NAME=SITE VALUE=") || placed.contains("NAME=LOC VALUE="),
+            "placed HNF cell must expose HAD site: {placed}"
+        );
+        let site = ide
+            .device
+            .occupant_of("u_lut0")
+            .expect("placed u_lut0 occupies a HAD site")
+            .site_name();
+        assert!(
+            ide.property_rows()
+                .iter()
+                .any(|r| r.name == "SITE" && r.value == site),
+            "{:?}",
+            ide.property_rows()
+        );
+        let site_click = ide.exec("select_property SITE").unwrap();
+        assert!(site_click.contains("NAME=SITE"), "{site_click}");
+        assert!(site_click.contains(&format!("VALUE={site}")), "{site_click}");
+        ide.select(&site);
+        let had = ide.exec("properties").unwrap();
+        assert!(had.contains("NAME=TYPE VALUE=site"), "{had}");
+        assert!(had.contains(&format!("NAME=SITE VALUE={site}")), "{had}");
+        assert!(
+            ide.property_rows()
+                .iter()
+                .any(|r| r.name == "TYPE" && r.value == "site"),
+            "{:?}",
+            ide.property_rows()
+        );
+        let kind = ide.exec("select_property KIND").unwrap();
+        assert!(kind.contains("NAME=KIND"), "{kind}");
+        assert_eq!(ide.selected_property.as_deref(), Some("KIND"));
+
+        ide.select("u_lut0");
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        let pin = {
+            ide.ensure_timing_paths().expect("STA paths");
+            ide.timing_paths
+                .iter()
+                .flat_map(|p| p.pins.iter())
+                .find(|p| p.incr_ps > 0)
+                .cloned()
+                .expect("STA pin delay")
+        };
+        let pin_out = ide
+            .exec(&format!("select_timing_pin {}", pin.pin))
+            .unwrap();
+        assert!(pin_out.contains("incr_ps="), "{pin_out}");
+        let sta = ide.exec("properties").unwrap();
+        assert!(sta.contains("NAME=TYPE VALUE=timing_pin"), "{sta}");
+        assert!(sta.contains("NAME=INCR_PS VALUE="), "{sta}");
+        assert!(sta.contains("NAME=SLACK_PS VALUE="), "{sta}");
+        assert!(
+            ide.property_rows()
+                .iter()
+                .any(|r| r.name == "TYPE" && r.value == "timing_pin"),
+            "{:?}",
+            ide.property_rows()
+        );
+        assert!(
+            ide.property_rows()
+                .iter()
+                .any(|r| r.name == "INCR_PS" && r.value == pin.incr_ps.to_string()),
+            "{:?}",
+            ide.property_rows()
+        );
+        let slack = ide.exec("select_property SLACK_PS").unwrap();
+        assert!(slack.contains("NAME=SLACK_PS"), "{slack}");
+        assert_eq!(ide.selected_property.as_deref(), Some("SLACK_PS"));
+        assert!(
+            ide.exec("select_property no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown property must refuse"
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Properties"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.select("led");
+        let btable = blinky.exec("properties").unwrap();
+        assert!(btable.contains("NAME=NAME VALUE=led"), "{btable}");
+        assert!(btable.contains("NAME=TYPE VALUE=port"), "{btable}");
+        assert!(
+            !btable.contains("VALUE=u_lut0"),
+            "Properties are per-session, not canned: {btable}"
+        );
+        assert!(
+            blinky
+                .property_rows()
+                .iter()
+                .any(|r| r.name == "TYPE" && r.value == "port"),
+            "{:?}",
+            blinky.property_rows()
+        );
+        let bsel = blinky.exec("select_property DIR").unwrap();
+        assert!(bsel.contains("NAME=DIR"), "{bsel}");
+        assert_eq!(blinky.selected_property.as_deref(), Some("DIR"));
     }
 }

@@ -11,7 +11,7 @@ pub use ide::{
     HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, MsgSeverity, NavAction, NavSection,
     ConstraintRow, ConstraintSection,
-    Pblock, ReportCatalogRow,
+    Pblock, PropertyRow, ReportCatalogRow,
     NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
     TimingPathPin,
