@@ -6,9 +6,9 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::{
-    doctor, BottomTab, CdcSeverity, ClockRelation, DrcSeverity, FlowStep, IdeModel, IlaTrigger,
-    LayoutKind, MethodologySeverity, MsgSeverity, NavSection, PathGroupKind, StepState, WaveRadix,
-    WaveStyle, WorkspaceTab,
+    doctor, BottomTab, CdcSeverity, ClockRelation, ConstraintSection, DrcSeverity, FlowStep,
+    IdeModel, IlaTrigger, LayoutKind, MethodologySeverity, MsgSeverity, NavSection, PathGroupKind,
+    StepState, WaveRadix, WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -1221,7 +1221,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Timing Constraints");
-    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / create_generated_clock (-divide_by / -multiply_by / -invert / -edges) / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path / max_time_borrow / data_check Apply");
+    ui.weak("UG893 Timing Constraints Editor — clickable clocks / I/O-delay / exception tables from helion-sta XDC, not a dump. Empty XDC keeps gold WNS.");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Read examples/counter.sdc").clicked() {
@@ -1336,9 +1336,90 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     ui.add_space(6.0);
-    report_box(ui, "Constraints (create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path / max_time_borrow / data_check)", &model.constraints_text());
+    paint_constraints_tables(ui, model);
     ui.add_space(8.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
+}
+
+fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
+    let rows = model.constraint_rows();
+    if rows.is_empty() {
+        ui.label("no timing constraints — create_clock / create_generated_clock / read_xdc");
+        return;
+    }
+    ui.label(format!(
+        "clocks={} io_delay={} exceptions={}",
+        rows.iter()
+            .filter(|r| r.section == ConstraintSection::Clocks)
+            .count(),
+        rows.iter()
+            .filter(|r| r.section == ConstraintSection::IoDelay)
+            .count(),
+        rows.iter()
+            .filter(|r| r.section == ConstraintSection::Exception)
+            .count()
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    let sections = [
+        (
+            "Clocks (create_clock / create_generated_clock)",
+            ConstraintSection::Clocks,
+            "constraints_clocks",
+        ),
+        (
+            "I/O Delay (set_input_delay / set_output_delay)",
+            ConstraintSection::IoDelay,
+            "constraints_io_delay",
+        ),
+        (
+            "Exceptions (false path / multicycle / max_delay / min_delay / clock_groups / …)",
+            ConstraintSection::Exception,
+            "constraints_exceptions",
+        ),
+    ];
+    for (title, section, grid) in sections {
+        let sect: Vec<_> = rows.iter().filter(|r| r.section == section).collect();
+        ui.add_space(6.0);
+        ui.label(RichText::new(title).strong());
+        if sect.is_empty() {
+            ui.weak("—");
+            continue;
+        }
+        egui::Grid::new(grid)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("Kind").strong());
+                ui.label(RichText::new("From").strong());
+                ui.label(RichText::new("To").strong());
+                ui.label(RichText::new("Value").strong());
+                ui.end_row();
+                for r in sect {
+                    let on = selected.as_deref() == Some(r.id.as_str());
+                    let name = if r.name.is_empty() { "-" } else { r.name.as_str() };
+                    if ui.selectable_label(on, name).clicked() {
+                        pick = Some(r.id.clone());
+                    }
+                    ui.label(&r.kind);
+                    let from = if r.from.is_empty() { "-" } else { r.from.as_str() };
+                    let to = if r.to.is_empty() { "-" } else { r.to.as_str() };
+                    ui.label(from);
+                    ui.label(to);
+                    ui.label(&r.value);
+                    ui.end_row();
+                }
+            });
+    }
+    if let Some(id) = pick {
+        let _ = model.select_constraint(&id);
+    }
+    ui.add_space(6.0);
+    report_box(
+        ui,
+        "Constraints (timing_constraints)",
+        &model.constraints_table_text(),
+    );
 }
 
 fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
@@ -1900,7 +1981,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     ui.add_space(6.0);
-    if model.session().design.is_none() {
+    if model.tree.top.is_none() {
         ui.label("no design — synth / report_methodology");
         return;
     }
@@ -1975,7 +2056,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     ui.add_space(6.0);
-    if model.session().placed.is_none() && model.session().routed.is_none() {
+    if model.utilization.is_none() && model.drc.is_none() {
         ui.label("no DRC — run Place/Route");
         return;
     }
