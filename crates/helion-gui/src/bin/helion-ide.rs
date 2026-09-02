@@ -1202,7 +1202,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Timing Constraints");
-    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path / max_time_borrow / data_check Apply");
+    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / create_generated_clock (-divide_by / -multiply_by / -invert / -edges) / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path / max_time_borrow / data_check Apply");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Read examples/counter.sdc").clicked() {
@@ -1212,6 +1212,21 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Apply create_generated_clock ÷2").clicked() {
             let _ = model.exec(
                 "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            );
+        }
+        if ui.button("Apply create_generated_clock ×2").clicked() {
+            let _ = model.exec(
+                "create_generated_clock -name clk2x -source [get_ports clk] -multiply_by 2 [get_pins u_ff/Q]",
+            );
+        }
+        if ui.button("Apply create_generated_clock -invert").clicked() {
+            let _ = model.exec(
+                "create_generated_clock -name clkinv -source [get_ports clk] -divide_by 1 -invert [get_pins u_ff/Q]",
+            );
+        }
+        if ui.button("Apply create_generated_clock -edges {1 3 5}").clicked() {
+            let _ = model.exec(
+                "create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_pins u_ff/Q]",
             );
         }
         if ui.button("Apply set_input_delay 1.5ns clk").clicked() {
@@ -2333,16 +2348,43 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.horizontal(|ui| {
         ui.heading("Waveform");
+        let a_txt = match model.wave.cursor_a {
+            Some(s) => format!("A t={s} ({} ps)", model.wave.time_ps(s)),
+            None => "A=-".into(),
+        };
+        let b_txt = match model.wave.cursor_b {
+            Some(s) => format!("B t={s} ({} ps)", model.wave.time_ps(s)),
+            None => "B=-".into(),
+        };
+        let d_txt = match model.wave.time_delta_ps() {
+            Some(d) => format!("Δt={d} ps"),
+            None => "Δt=n/a".into(),
+        };
         ui.label(
             RichText::new(format!(
-                "timescale {} ps/cycle  cursor t={} ({} ps)",
+                "timescale {} ps/cycle  cursor t={} ({} ps)  {a_txt}  {b_txt}  {d_txt}  markers={} virtual_bus={}",
                 model.wave.timescale_ps,
                 model.wave.cursor,
-                model.wave.time_ps(model.wave.cursor)
+                model.wave.time_ps(model.wave.cursor),
+                model.wave.markers.len(),
+                model.wave.virtual_buses.len()
             ))
             .weak()
             .monospace(),
         );
+        if ui.small_button("Cursor A").clicked() {
+            let _ = model.set_wave_ab_cursor("A");
+        }
+        if ui.small_button("Cursor B").clicked() {
+            let _ = model.set_wave_ab_cursor("B");
+        }
+        if ui.small_button("Add marker").clicked() {
+            let n = model.wave.markers.len() + 1;
+            let _ = model.add_wave_marker(&format!("M{n}"));
+        }
+        if ui.small_button("Virtual bus led+cnt").clicked() {
+            let _ = model.add_wave_virtual_bus("vb led cnt");
+        }
     });
     if model.wave.traces.is_empty() {
         ui.weak("Run Simulation (sim_run 16) after Bitstream.");
@@ -2353,6 +2395,14 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.label(RichText::new("Name").strong().monospace());
         ui.add_space(80.0);
         ui.label(RichText::new("Value").strong().monospace());
+        if model.wave.cursor_a.is_some() {
+            ui.add_space(12.0);
+            ui.label(RichText::new("A").strong().monospace().color(Color32::from_rgb(0xe0, 0x6c, 0x75)));
+        }
+        if model.wave.cursor_b.is_some() {
+            ui.add_space(12.0);
+            ui.label(RichText::new("B").strong().monospace().color(Color32::from_rgb(0x56, 0xb6, 0xc2)));
+        }
         ui.add_space(40.0);
         ui.label(RichText::new("Waveform").strong().monospace());
     });
@@ -2383,12 +2433,71 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
                 );
             }
         }
+        for m in &model.wave.markers {
+            let x = wave_x0 + wave_w * (m.sample as f32 + 0.5) / (n as f32);
+            p.line_segment(
+                [egui::pos2(x, ruler.top()), egui::pos2(x, ruler.bottom())],
+                Stroke::new(1.2, Color32::from_rgb(0xc0, 0x78, 0xc8)),
+            );
+            p.text(
+                egui::pos2(x + 2.0, ruler.top()),
+                egui::Align2::LEFT_TOP,
+                &m.name,
+                egui::FontId::monospace(9.0),
+                Color32::from_rgb(0xd8, 0xa0, 0xe0),
+            );
+        }
+        if let (Some(a), Some(b)) = (model.wave.cursor_a, model.wave.cursor_b) {
+            let xa = wave_x0 + wave_w * (a as f32 + 0.5) / (n as f32);
+            let xb = wave_x0 + wave_w * (b as f32 + 0.5) / (n as f32);
+            let (l, r) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(l, ruler.top()),
+                    egui::pos2(r, ruler.bottom()),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(0x56, 0xb6, 0xc2, 40),
+            );
+        }
+        if let Some(a) = model.wave.cursor_a {
+            let x = wave_x0 + wave_w * (a as f32 + 0.5) / (n as f32);
+            p.line_segment(
+                [egui::pos2(x, ruler.top()), egui::pos2(x, ruler.bottom())],
+                Stroke::new(1.4, Color32::from_rgb(0xe0, 0x6c, 0x75)),
+            );
+            p.text(
+                egui::pos2(x + 2.0, ruler.top()),
+                egui::Align2::LEFT_TOP,
+                "A",
+                egui::FontId::monospace(9.0),
+                Color32::from_rgb(0xe0, 0x6c, 0x75),
+            );
+        }
+        if let Some(b) = model.wave.cursor_b {
+            let x = wave_x0 + wave_w * (b as f32 + 0.5) / (n as f32);
+            p.line_segment(
+                [egui::pos2(x, ruler.top()), egui::pos2(x, ruler.bottom())],
+                Stroke::new(1.4, Color32::from_rgb(0x56, 0xb6, 0xc2)),
+            );
+            p.text(
+                egui::pos2(x + 2.0, ruler.top()),
+                egui::Align2::LEFT_TOP,
+                "B",
+                egui::FontId::monospace(9.0),
+                Color32::from_rgb(0x56, 0xb6, 0xc2),
+            );
+        }
     }
 
     let mut style_cmd: Option<(String, WaveStyle)> = None;
     let mut radix_cmd: Option<(String, WaveRadix)> = None;
     let mut new_cursor: Option<usize> = None;
+    let mut place_a: Option<usize> = None;
+    let mut place_b: Option<usize> = None;
     let cursor = model.wave.cursor;
+    let cursor_a = model.wave.cursor_a;
+    let cursor_b = model.wave.cursor_b;
     let ts = model.wave.timescale_ps;
 
     for t in &model.wave.traces {
@@ -2406,6 +2515,26 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
                         .color(Color32::from_rgb(0xc8, 0xf0, 0xd8)),
                 ),
             );
+            if let Some(a) = cursor_a {
+                ui.add_sized(
+                    [56.0, 28.0],
+                    egui::Label::new(
+                        RichText::new(t.value_at(a))
+                            .monospace()
+                            .color(Color32::from_rgb(0xe0, 0x6c, 0x75)),
+                    ),
+                );
+            }
+            if let Some(b) = cursor_b {
+                ui.add_sized(
+                    [56.0, 28.0],
+                    egui::Label::new(
+                        RichText::new(t.value_at(b))
+                            .monospace()
+                            .color(Color32::from_rgb(0x56, 0xb6, 0xc2)),
+                    ),
+                );
+            }
             if ui
                 .small_button(if t.style == WaveStyle::Analog {
                     "Analog"
@@ -2445,12 +2574,30 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
                 Sense::click(),
             );
             if ui.is_rect_visible(rect) {
-                paint_trace_shape(ui, rect, t, cursor, n, ts);
+                paint_trace_shape(
+                    ui,
+                    rect,
+                    t,
+                    cursor,
+                    cursor_a,
+                    cursor_b,
+                    n,
+                    ts,
+                    &model.wave.markers,
+                );
             }
             if resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let x = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                    new_cursor = Some(((x * n as f32) as usize).min(n.saturating_sub(1)));
+                    let sample = ((x * n as f32) as usize).min(n.saturating_sub(1));
+                    let mods = ui.input(|i| i.modifiers);
+                    if mods.shift {
+                        place_a = Some(sample);
+                    } else if mods.alt {
+                        place_b = Some(sample);
+                    } else {
+                        new_cursor = Some(sample);
+                    }
                 }
             }
         });
@@ -2478,6 +2625,12 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(c) = new_cursor {
         model.wave.set_cursor(c);
     }
+    if let Some(a) = place_a {
+        let _ = model.set_wave_ab_cursor(&format!("A {a}"));
+    }
+    if let Some(b) = place_b {
+        let _ = model.set_wave_ab_cursor(&format!("B {b}"));
+    }
 }
 
 fn paint_trace_shape(
@@ -2485,8 +2638,11 @@ fn paint_trace_shape(
     rect: egui::Rect,
     t: &helion_gui::WaveTrace,
     cursor: usize,
+    cursor_a: Option<usize>,
+    cursor_b: Option<usize>,
     n: usize,
     _ts: u64,
+    markers: &[helion_gui::WaveMarker],
 ) {
     let p = ui.painter();
     p.rect_filled(rect, 0.0, Color32::from_rgb(0x0d, 0x10, 0x12));
@@ -2545,11 +2701,45 @@ fn paint_trace_shape(
             let _ = dim;
         }
     }
+    if let (Some(a), Some(b)) = (cursor_a, cursor_b) {
+        let xa = rect.left() + dx * (a as f32 + 0.5);
+        let xb = rect.left() + dx * (b as f32 + 0.5);
+        let (l, r) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(l, rect.top()),
+                egui::pos2(r, rect.bottom()),
+            ),
+            0.0,
+            Color32::from_rgba_unmultiplied(0x56, 0xb6, 0xc2, 28),
+        );
+    }
     let cx = rect.left() + dx * (cursor as f32 + 0.5);
     p.line_segment(
         [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
         Stroke::new(1.0, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
     );
+    if let Some(a) = cursor_a {
+        let ax = rect.left() + dx * (a as f32 + 0.5);
+        p.line_segment(
+            [egui::pos2(ax, rect.top()), egui::pos2(ax, rect.bottom())],
+            Stroke::new(1.2, Color32::from_rgb(0xe0, 0x6c, 0x75)),
+        );
+    }
+    if let Some(b) = cursor_b {
+        let bx = rect.left() + dx * (b as f32 + 0.5);
+        p.line_segment(
+            [egui::pos2(bx, rect.top()), egui::pos2(bx, rect.bottom())],
+            Stroke::new(1.2, Color32::from_rgb(0x56, 0xb6, 0xc2)),
+        );
+    }
+    for m in markers {
+        let mx = rect.left() + dx * (m.sample as f32 + 0.5);
+        p.line_segment(
+            [egui::pos2(mx, rect.top()), egui::pos2(mx, rect.bottom())],
+            Stroke::new(1.0, Color32::from_rgb(0xc0, 0x78, 0xc8)),
+        );
+    }
     let _ = ns;
 }
 

@@ -13,7 +13,8 @@ pub use ide::{
     Pblock,
     NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
-    UltraFastStage, Utilization, Waveform, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
+    UltraFastStage, Utilization, VirtualBus, Waveform, WaveMarker, WaveRadix, WaveStyle, WaveTrace,
+    WorkspaceTab,
 };
 pub use helion_sta::{
     ClockInteraction, ClockInteractionCell, ClockRelation, PathGroupKind, TimingSummary,

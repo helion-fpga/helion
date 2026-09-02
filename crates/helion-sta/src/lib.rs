@@ -1,5 +1,6 @@
-//! Graph STA: create_clock / create_generated_clock / set_bus_skew / group_path /
-//! set_max_time_borrow / set_data_check / report_timing_summary / placed Manhattan.
+//! Graph STA: create_clock / create_generated_clock (-divide_by / -multiply_by /
+//! -invert / -edges) / set_bus_skew / group_path / set_max_time_borrow /
+//! set_data_check / report_timing_summary / placed Manhattan.
 
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
@@ -14,6 +15,12 @@ pub struct Clock {
     pub generated: bool,
     pub master: Option<String>,
     pub divide_by: u32,
+    /// UG903 `create_generated_clock -multiply_by`. 1 when unset.
+    pub multiply_by: u32,
+    /// UG903 `create_generated_clock -invert`: half-cycle setup vs the master.
+    pub invert: bool,
+    /// UG903 `create_generated_clock -edges {rise fall next_rise}`. Empty when unset.
+    pub edges: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -350,7 +357,36 @@ pub fn create_clock(clocks: &mut Vec<Clock>, name: &str, period_ps: u64, source:
         generated: false,
         master: None,
         divide_by: 1,
+        multiply_by: 1,
+        invert: false,
+        edges: Vec::new(),
     });
+}
+
+fn generated_period_ps(
+    master_ps: u64,
+    divide_by: u32,
+    multiply_by: u32,
+    edges: &[u32],
+) -> Result<u64, String> {
+    if edges.len() >= 3 {
+        let rise = edges[0];
+        let next = edges[2];
+        if next <= rise {
+            return Err(format!(
+                "create_generated_clock -edges: next rising {next} must be after first {rise}"
+            ));
+        }
+        // Integer edge index is a half-cycle of the master (1 = first rising).
+        let half_cycles = (next - rise) as u64;
+        Ok((master_ps.saturating_mul(half_cycles) / 2).max(1))
+    } else if !edges.is_empty() {
+        Err("create_generated_clock -edges needs {rise fall next_rise}".into())
+    } else {
+        let div = divide_by.max(1) as u64;
+        let mul = multiply_by.max(1) as u64;
+        Ok((master_ps.saturating_mul(div) / mul).max(1))
+    }
 }
 
 pub fn create_generated_clock(
@@ -360,11 +396,25 @@ pub fn create_generated_clock(
     divide_by: u32,
     source: &str,
 ) -> Result<(), String> {
+    create_generated_clock_with(clocks, name, master, divide_by, 1, false, &[], source)
+}
+
+/// UG903 `create_generated_clock` with `-multiply_by` / `-invert` / `-edges`.
+pub fn create_generated_clock_with(
+    clocks: &mut Vec<Clock>,
+    name: &str,
+    master: &str,
+    divide_by: u32,
+    multiply_by: u32,
+    invert: bool,
+    edges: &[u32],
+    source: &str,
+) -> Result<(), String> {
     let m = clocks
         .iter()
         .find(|c| c.name == master)
         .ok_or_else(|| format!("unknown master clock {master}"))?;
-    let period = m.period_ps.saturating_mul(divide_by.max(1) as u64);
+    let period = generated_period_ps(m.period_ps, divide_by, multiply_by, edges)?;
     clocks.push(Clock {
         name: name.into(),
         period_ps: period,
@@ -372,6 +422,9 @@ pub fn create_generated_clock(
         generated: true,
         master: Some(master.into()),
         divide_by: divide_by.max(1),
+        multiply_by: multiply_by.max(1),
+        invert,
+        edges: edges.to_vec(),
     });
     Ok(())
 }
@@ -1125,6 +1178,22 @@ impl Constraints {
             0
         }
     }
+
+    /// UG903 `create_generated_clock -invert`: half-cycle setup on the analysis
+    /// generated clock. Unset invert keeps gold WNS.
+    pub fn invert_setup_ps(&self, period_ps: u64) -> i64 {
+        let hit = self
+            .clocks
+            .iter()
+            .filter(|c| c.generated)
+            .max_by_key(|c| c.period_ps)
+            .or_else(|| self.clocks.iter().find(|c| c.invert));
+        if hit.map(|c| c.invert).unwrap_or(false) {
+            (period_ps as i64) / 2
+        } else {
+            0
+        }
+    }
 }
 
 impl Constraints {
@@ -1490,6 +1559,40 @@ fn tcl_clock_group_names(joined: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_edge_list(toks: &[&str], start: usize) -> (Vec<u32>, usize) {
+    let mut edges = Vec::new();
+    let mut i = start;
+    while i < toks.len() {
+        let raw = toks[i];
+        if raw.starts_with('-')
+            && raw
+                .chars()
+                .nth(1)
+                .map(|c| c.is_ascii_alphabetic())
+                .unwrap_or(false)
+        {
+            break;
+        }
+        if raw.starts_with('[') {
+            break;
+        }
+        let cleaned = raw.trim_matches(|c: char| c == '{' || c == '}' || c == ',');
+        for p in cleaned.split(|c: char| !c.is_ascii_digit()) {
+            if let Ok(n) = p.parse::<u32>() {
+                if n > 0 {
+                    edges.push(n);
+                }
+            }
+        }
+        let done = raw.contains('}');
+        i += 1;
+        if done {
+            break;
+        }
+    }
+    (edges, i)
+}
+
 /// XDC/SDC: create_clock, create_generated_clock, set_input/output_delay,
 /// set_false_path, set_multicycle_path, set_max_delay, set_min_delay,
 /// set_clock_groups, set_clock_uncertainty, set_clock_latency,
@@ -1541,7 +1644,10 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
             "create_generated_clock" => {
                 let mut name = "genclk".to_string();
                 let mut master = c.clocks.first().map(|k| k.name.clone()).unwrap_or_else(|| "clk".into());
-                let mut divide_by = 2u32;
+                let mut divide_by: Option<u32> = None;
+                let mut multiply_by: Option<u32> = None;
+                let mut invert = false;
+                let mut edges: Vec<u32> = Vec::new();
                 let mut source = String::new();
                 let mut i = 1;
                 while i < toks.len() {
@@ -1551,8 +1657,24 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                         continue;
                     }
                     if toks[i] == "-divide_by" {
-                        divide_by = toks.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(2);
+                        divide_by = toks.get(i + 1).and_then(|s| s.parse().ok());
                         i += 2;
+                        continue;
+                    }
+                    if toks[i] == "-multiply_by" {
+                        multiply_by = toks.get(i + 1).and_then(|s| s.parse().ok());
+                        i += 2;
+                        continue;
+                    }
+                    if toks[i] == "-invert" {
+                        invert = true;
+                        i += 1;
+                        continue;
+                    }
+                    if toks[i] == "-edges" {
+                        let (e, ni) = parse_edge_list(&toks, i + 1);
+                        edges = e;
+                        i = ni;
                         continue;
                     }
                     if toks[i] == "-source" {
@@ -1578,7 +1700,22 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                         master = k.name.clone();
                     }
                 }
-                create_generated_clock(&mut c.clocks, &name, &master, divide_by, &source)?;
+                let divide_by = divide_by.unwrap_or(if multiply_by.is_some() || !edges.is_empty() {
+                    1
+                } else {
+                    2
+                });
+                let multiply_by = multiply_by.unwrap_or(1);
+                create_generated_clock_with(
+                    &mut c.clocks,
+                    &name,
+                    &master,
+                    divide_by,
+                    multiply_by,
+                    invert,
+                    &edges,
+                    &source,
+                )?;
             }
             "set_input_delay" | "set_output_delay" => {
                 let is_out = toks[0] == "set_output_delay";
@@ -2435,9 +2572,9 @@ pub fn apply_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
 /// setup/hold slack. Latch `set_max_time_borrow` adds to setup slack.
 /// Late derate, PVT, and `group_path -weight` scale setup delay; early derate and PVT
 /// scale hold delay.
-/// Propagated clocks add routed clock-network insertion; `-negative` sense is a
-/// half-cycle setup; `-stop_propagation` keeps ideal (0) insertion. Empty
-/// constraints keep gold WNS.
+/// Propagated clocks add routed clock-network insertion; `-negative` sense and
+/// `create_generated_clock -invert` are a half-cycle setup; `-stop_propagation`
+/// keeps ideal (0) insertion. Empty constraints keep gold WNS.
 pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64) {
     let false_out = !xdc.false_paths.is_empty()
         || xdc.clock_groups_false_path()
@@ -2465,6 +2602,7 @@ pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64)
         - sense
         - xdc.bus_skew_setup_ps()
         - xdc.data_check_setup_ps()
+        - xdc.invert_setup_ps(period_ps)
         + xdc.time_borrow_ps();
     r.tns_ps = r.wns_ps.min(0);
     let hold = scale_delay_ps(r.hold_ps, xdc.path_early_milli());
@@ -2538,6 +2676,128 @@ mod tests {
         assert_eq!(r.clocks.len(), 2);
         // non-vacuous: path delay is counted
         assert_ne!(r.wns_ps, clks[0].period_ps as i64);
+    }
+
+    #[test]
+    fn create_generated_clock_multiply_by_invert_edges() {
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        create_generated_clock_with(&mut clks, "clk2x", "clk", 1, 2, false, &[], "u_ff/Q")
+            .unwrap();
+        assert!(clks[1].generated);
+        assert_eq!(clks[1].period_ps, 5_000);
+        assert_eq!(clks[1].multiply_by, 2);
+        assert!(!clks[1].invert);
+        create_generated_clock_with(
+            &mut clks,
+            "clkinv",
+            "clk",
+            1,
+            1,
+            true,
+            &[],
+            "u_ff/Q",
+        )
+        .unwrap();
+        assert!(clks[2].invert);
+        assert_eq!(clks[2].period_ps, 10_000);
+        create_generated_clock_with(
+            &mut clks,
+            "clkedg",
+            "clk",
+            1,
+            1,
+            false,
+            &[1, 3, 5],
+            "u_ff/Q",
+        )
+        .unwrap();
+        assert_eq!(clks[3].period_ps, 20_000);
+        assert_eq!(clks[3].edges, vec![1, 3, 5]);
+        assert!(create_generated_clock_with(
+            &mut clks,
+            "bad",
+            "clk",
+            1,
+            1,
+            false,
+            &[1, 3],
+            "u_ff/Q"
+        )
+        .is_err());
+
+        let xdc = load_xdc(
+            r#"
+create_clock -period 10.000 [get_ports clk]
+create_generated_clock -name clk2x -source [get_ports clk] -multiply_by 2 [get_pins u_ff/Q]
+create_generated_clock -name clkinv -source [get_ports clk] -divide_by 1 -invert [get_pins u_ff/Q]
+create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_pins u_ff/Q]
+"#,
+        )
+        .unwrap();
+        let mul = xdc.clocks.iter().find(|c| c.name == "clk2x").unwrap();
+        assert_eq!(mul.period_ps, 5_000);
+        assert_eq!(mul.multiply_by, 2);
+        let inv = xdc.clocks.iter().find(|c| c.name == "clkinv").unwrap();
+        assert!(inv.invert);
+        assert_eq!(inv.period_ps, 10_000);
+        let edg = xdc.clocks.iter().find(|c| c.name == "clkedg").unwrap();
+        assert_eq!(edg.period_ps, 20_000);
+        assert_eq!(edg.edges, vec![1, 3, 5]);
+        assert_eq!(xdc.invert_setup_ps(20_000), 0, "max-period generated is not inverted");
+        let mut only_inv = Constraints::default();
+        only_inv.clocks.push(inv.clone());
+        assert_eq!(only_inv.invert_setup_ps(10_000), 5_000);
+        assert_eq!(
+            Constraints::default().invert_setup_ps(10_000),
+            0,
+            "empty invert must keep gold WNS"
+        );
+
+        let d = Design::structural_counter();
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let routed = helion_route::route(&pl, &dev).unwrap();
+        let mut gold_clks = Vec::new();
+        create_clock(&mut gold_clks, "clk", 10_000, "clk");
+        let gold = report_timing_routed(&d, &routed, &gold_clks).unwrap();
+        let empty = report_timing_routed_xdc(&d, &routed, &gold_clks, &Constraints::default())
+            .unwrap();
+        assert_eq!(empty.wns_ps, gold.wns_ps, "empty XDC must keep gold WNS");
+
+        let mut mul_xdc = Constraints::default();
+        mul_xdc.clocks = vec![gold_clks[0].clone(), mul.clone()];
+        let with_mul = report_timing_routed_xdc(&d, &routed, &[mul.clone()], &mul_xdc).unwrap();
+        assert_eq!(
+            with_mul.wns_ps,
+            gold.wns_ps - 5_000,
+            "multiply_by 2 halves the requirement: gold={} got={}",
+            gold.wns_ps,
+            with_mul.wns_ps
+        );
+
+        let mut inv_xdc = Constraints::default();
+        inv_xdc.clocks = vec![gold_clks[0].clone(), inv.clone()];
+        let with_inv = report_timing_routed_xdc(&d, &routed, &[inv.clone()], &inv_xdc).unwrap();
+        assert_eq!(
+            with_inv.wns_ps,
+            gold.wns_ps - 5_000,
+            "invert is a half-cycle setup: gold={} got={}",
+            gold.wns_ps,
+            with_inv.wns_ps
+        );
+
+        let mut edg_xdc = Constraints::default();
+        edg_xdc.clocks = vec![gold_clks[0].clone(), edg.clone()];
+        let with_edg = report_timing_routed_xdc(&d, &routed, &[edg.clone()], &edg_xdc).unwrap();
+        assert_eq!(
+            with_edg.wns_ps,
+            gold.wns_ps + 10_000,
+            "edges {{1 3 5}} is divide-by-2: gold={} got={}",
+            gold.wns_ps,
+            with_edg.wns_ps
+        );
     }
 
     #[test]
