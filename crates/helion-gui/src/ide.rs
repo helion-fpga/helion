@@ -247,6 +247,14 @@ impl NavSection {
         match self {
             NavSection::BoardDevice => &[
                 NavAction {
+                    label: "I/O Planning",
+                    tcl: "io_planning",
+                },
+                NavAction {
+                    label: "Floorplanning",
+                    tcl: "floorplanning",
+                },
+                NavAction {
                     label: "Open Device",
                     tcl: "device",
                 },
@@ -1142,6 +1150,54 @@ impl ClockRegion {
     }
 }
 
+/// UG893 Floorplanning: a Pblock rectangle on the Device die.
+/// `create_pblock` / `resize_pblock` hit place + `bitgen_pblock`, not a dump.
+#[derive(Clone, Debug, Default)]
+pub struct Pblock {
+    pub name: String,
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+    /// HNF cells assigned via `add_cells_to_pblock` (empty = whole design).
+    pub cells: Vec<String>,
+    /// Partial bitstream frames from `helion-bits::bitgen_pblock`.
+    pub frames: usize,
+    pub bytes: usize,
+    /// False until `resize_pblock` sets a HAD range.
+    pub ranged: bool,
+}
+
+impl Pblock {
+    pub fn cols(&self) -> u32 {
+        if !self.ranged {
+            return 0;
+        }
+        self.x1.saturating_sub(self.x0).saturating_add(1)
+    }
+    pub fn rows(&self) -> u32 {
+        if !self.ranged {
+            return 0;
+        }
+        self.y1.saturating_sub(self.y0).saturating_add(1)
+    }
+
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        self.ranged && x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
+    }
+
+    pub fn range_text(&self) -> String {
+        if !self.ranged {
+            return "-".into();
+        }
+        format!("CLB_X{}Y{}:CLB_X{}Y{}", self.x0, self.y0, self.x1, self.y1)
+    }
+
+    pub fn site_count(&self, sites: &[DeviceSiteView]) -> usize {
+        sites.iter().filter(|s| self.contains(s.x, s.y)).count()
+    }
+}
+
 /// UG893 Device routing overlay: PathFinder tiles from Session.routed, not occupancy restyle.
 #[derive(Clone, Debug)]
 pub struct DeviceRoute {
@@ -1164,6 +1220,8 @@ pub struct DeviceView {
     pub clock_regions: Vec<ClockRegion>,
     /// PathFinder IOB routes (CLB → IOB tiles) after Route.
     pub routes: Vec<DeviceRoute>,
+    /// UG893 Floorplanning Pblock rectangles (create_pblock / resize_pblock).
+    pub pblocks: Vec<Pblock>,
 }
 
 /// Fig. 49: tile the HAD die into 2×2 clock-region rectangles.
@@ -1228,6 +1286,14 @@ impl DeviceView {
         self.routes
             .iter()
             .find(|r| r.hops > 0 && r.tiles.iter().any(|t| *t == (x, y)))
+    }
+
+    pub fn pblock_named(&self, name: &str) -> Option<&Pblock> {
+        self.pblocks.iter().find(|p| p.name == name)
+    }
+
+    pub fn pblock_at(&self, x: u32, y: u32) -> Option<&Pblock> {
+        self.pblocks.iter().find(|p| p.contains(x, y))
     }
 
     pub fn site_name(kind: SiteKind, x: u32, y: u32) -> String {
@@ -1423,7 +1489,10 @@ pub struct SimObject {
 pub struct IoPortView {
     pub name: String,
     pub dir: String,
+    /// Placed IOB after `place_design` (HAD `IOB_XnYm`).
     pub site: Option<String>,
+    /// `set_property PACKAGE_PIN` / LOC constraint (may precede place).
+    pub package_pin: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2126,6 +2195,8 @@ pub struct IdeModel {
     pub find_results: Vec<FindHit>,
     pub package_pins: Vec<PackagePin>,
     pub package: PackageDrawing,
+    /// UG893 Floorplanning Pblocks (source of truth; copied onto DeviceView).
+    pub pblocks: Vec<Pblock>,
     pub workspace: WorkspaceTab,
     pub bottom_tab: BottomTab,
     event_sim: Option<Sim>,
@@ -2182,6 +2253,7 @@ impl IdeModel {
             find_results: Vec::new(),
             package_pins: Vec::new(),
             package: PackageDrawing::default(),
+            pblocks: Vec::new(),
             workspace: WorkspaceTab::Reports,
             bottom_tab: BottomTab::Tcl,
             event_sim: None,
@@ -2329,6 +2401,30 @@ impl IdeModel {
         } else if t == "device" || t == "device_drawing" {
             self.workspace = WorkspaceTab::Device;
             Ok(self.device_drawing_text())
+        } else if t == "io_planning" || t == "io_ports" {
+            self.open_io_planning()
+        } else if t == "floorplanning" || t == "pblocks" || t == "get_pblocks" {
+            self.open_floorplanning()
+        } else if t == "create_pblock" || t.starts_with("create_pblock ") {
+            self.create_pblock_cmd(t)
+        } else if t.starts_with("resize_pblock ") {
+            self.resize_pblock_cmd(t)
+        } else if t.starts_with("add_cells_to_pblock ") {
+            self.add_cells_to_pblock_cmd(t)
+        } else if let Some(name) = t.strip_prefix("select_pblock ") {
+            self.select_pblock(name.trim())
+        } else if t.starts_with("assign_package_pin ") {
+            self.apply_package_pin(t)
+        } else if t.starts_with("set_property ") {
+            let key = t
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("");
+            if key.eq_ignore_ascii_case("PACKAGE_PIN") || key.eq_ignore_ascii_case("LOC") {
+                self.apply_package_pin(t)
+            } else {
+                tcl_eval(&mut self.shell, cmd)
+            }
         } else if let Some(pin) = t.strip_prefix("select_package_pin ") {
             self.select_package_pin(pin.trim())
         } else if let Some(spec) = t.strip_prefix("select_device_site ") {
@@ -2613,7 +2709,7 @@ impl IdeModel {
                 if self.shell.session.design.is_none() {
                     return Err("place_design: run Synthesis first".into());
                 }
-                self.shell.session.place_design(&dev)?;
+                self.place_now(&dev)?;
                 self.steps[FlowStep::Route.index()] = StepState::Pending;
                 self.steps[FlowStep::Bitstream.index()] = StepState::Pending;
                 let p = self.shell.session.placed.as_ref().unwrap();
@@ -3451,6 +3547,411 @@ impl IdeModel {
         s
     }
 
+    /// UG893 I/O Ports table: PACKAGE_PIN constraint + placed HAD site, not a pin dump.
+    pub fn io_ports_text(&self) -> String {
+        let n = self.io_ports.len();
+        let assigned = self
+            .io_ports
+            .iter()
+            .filter(|p| p.package_pin.is_some() || p.site.is_some())
+            .count();
+        let mut s = format!("io_ports n={n} assigned={assigned}");
+        for p in &self.io_ports {
+            s.push_str(&format!(
+                " {} {} PACKAGE_PIN={} placed={}",
+                p.name,
+                p.dir,
+                p.package_pin.as_deref().unwrap_or("-"),
+                p.site.as_deref().unwrap_or("-")
+            ));
+        }
+        s
+    }
+
+    /// Open the I/O Planning pane (I/O Ports + Package drawing).
+    pub fn open_io_planning(&mut self) -> Result<String, String> {
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        Ok(self.io_ports_text())
+    }
+
+    /// Place using the first ranged Pblock (UG893 floorplan containment).
+    fn place_now(&mut self, dev: &helion_device::Device) -> Result<(), String> {
+        if let Some(pb) = self.pblocks.iter().find(|p| p.ranged).cloned() {
+            self.shell
+                .session
+                .place_pblock(dev, pb.x0, pb.y0, pb.x1, pb.y1)
+        } else {
+            self.shell.session.place_design(dev)
+        }
+    }
+
+    /// UG893 Floorplanning pane: Pblock rectangles on the Device die.
+    pub fn open_floorplanning(&mut self) -> Result<String, String> {
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Device;
+        Ok(self.pblocks_text())
+    }
+
+    pub fn pblocks_text(&self) -> String {
+        let n = self.pblocks.len();
+        let mut s = format!("pblocks n={n}");
+        for p in &self.pblocks {
+            s.push_str(&format!(
+                " {} range={} cells={} frames={} bytes={} sites={}",
+                p.name,
+                p.range_text(),
+                p.cells.len(),
+                p.frames,
+                p.bytes,
+                p.site_count(&self.device.sites)
+            ));
+        }
+        s
+    }
+
+    fn create_pblock_cmd(&mut self, cmd: &str) -> Result<String, String> {
+        let rest = cmd.strip_prefix("create_pblock").unwrap_or("").trim();
+        let mut name = String::new();
+        let mut add = None;
+        let mut toks = rest.split_whitespace().peekable();
+        while let Some(tok) = toks.next() {
+            if tok == "-add" {
+                let spec = toks.next().unwrap_or("");
+                add = Some(spec.to_string());
+            } else if name.is_empty() {
+                name = tok.trim_matches(|c: char| "{}[]".contains(c)).to_string();
+            } else if add.is_none() {
+                add = Some(tok.to_string());
+            }
+        }
+        if name.is_empty() {
+            name = format!("pblock_{}", self.pblocks.len());
+        }
+        if self.pblocks.iter().any(|p| p.name == name) {
+            return Err(format!("create_pblock: {name} exists"));
+        }
+        self.pblocks.push(Pblock {
+            name: name.clone(),
+            ..Pblock::default()
+        });
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Device;
+        self.selected = Some(name.clone());
+        if let Some(spec) = add {
+            let out = self.resize_pblock(&name, &spec)?;
+            return Ok(format!("create_pblock {name} {out}"));
+        }
+        self.refresh_device();
+        self.refresh_properties();
+        Ok(format!("create_pblock {name}"))
+    }
+
+    fn resize_pblock_cmd(&mut self, cmd: &str) -> Result<String, String> {
+        let rest = cmd.strip_prefix("resize_pblock").unwrap_or("").trim();
+        let mut toks = rest.split_whitespace();
+        let name = toks
+            .next()
+            .ok_or("resize_pblock: need <name> -add <range>")?
+            .trim_matches(|c: char| "{}[]".contains(c));
+        let mut spec = String::new();
+        for tok in toks {
+            if tok == "-add" {
+                continue;
+            }
+            if !spec.is_empty() {
+                spec.push(' ');
+            }
+            spec.push_str(tok);
+        }
+        if spec.is_empty() {
+            return Err("resize_pblock: need -add {CLB_X0Y0:CLB_X1Y1}".into());
+        }
+        self.resize_pblock(name, &spec)
+    }
+
+    /// `resize_pblock`: set the HAD rectangle, re-place into it, partial bitgen.
+    pub fn resize_pblock(&mut self, name: &str, spec: &str) -> Result<String, String> {
+        let (x0, y0, x1, y1) = self.resolve_pblock_range(spec)?;
+        let idx = self
+            .pblocks
+            .iter()
+            .position(|p| p.name == name)
+            .ok_or_else(|| format!("resize_pblock: no pblock {name}"))?;
+        let cells = self.pblocks[idx].cells.clone();
+        let mut placed = 0u8;
+        let mut routed = 0u8;
+        let mut frames = 0usize;
+        let mut bytes = 0usize;
+        let mut loc = format!("CLB_X{x0}Y{y0}");
+        if self.shell.session.design.is_some() {
+            let dev = self.device()?;
+            self.shell.session.place_pblock(&dev, x0, y0, x1, y1)?;
+            placed = 1;
+            if let Some(s) = self
+                .shell
+                .session
+                .placed
+                .as_ref()
+                .and_then(|p| p.lutff_sites.first())
+            {
+                loc = format!("CLB_X{}Y{}", s.0.x, s.0.y);
+            }
+            self.shell.session.route_design(&dev)?;
+            routed = 1;
+            let sites = self.pblock_engine_sites(x0, y0, x1, y1, &cells);
+            if sites.is_empty() {
+                return Err("resize_pblock: no placed sites in range".into());
+            }
+            let pb = self.shell.session.write_pblock_bitstream(&dev, &sites)?;
+            frames = pb.frames.len();
+            bytes = pb.packets.len();
+        }
+        let p = &mut self.pblocks[idx];
+        p.x0 = x0;
+        p.y0 = y0;
+        p.x1 = x1;
+        p.y1 = y1;
+        p.ranged = true;
+        p.frames = frames;
+        p.bytes = bytes;
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Device;
+        self.selected = Some(name.to_string());
+        self.refresh_device();
+        self.refresh_properties();
+        Ok(format!(
+            "resize_pblock {name} -add CLB_X{x0}Y{y0}:CLB_X{x1}Y{y1} loc={loc} placed={placed} routed={routed} frames={frames} bytes={bytes}"
+        ))
+    }
+
+    fn add_cells_to_pblock_cmd(&mut self, cmd: &str) -> Result<String, String> {
+        let rest = cmd.strip_prefix("add_cells_to_pblock").unwrap_or("").trim();
+        let mut toks = rest.split_whitespace();
+        let name = toks
+            .next()
+            .ok_or("add_cells_to_pblock: need <pblock> <cell>")?
+            .trim_matches(|c: char| "{}[]".contains(c));
+        let mut cells: Vec<String> = Vec::new();
+        for tok in toks {
+            let c = tok.trim_matches(|c: char| "{}[]".contains(c));
+            if c.eq_ignore_ascii_case("get_cells") || c.is_empty() {
+                continue;
+            }
+            cells.push(c.to_string());
+        }
+        if cells.is_empty() {
+            if let Some(d) = self.shell.session.design.as_ref() {
+                cells = d
+                    .cells
+                    .iter()
+                    .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+                    .map(|c| c.name.clone())
+                    .collect();
+            }
+        }
+        if cells.is_empty() {
+            return Err("add_cells_to_pblock: need <cell>".into());
+        }
+        let idx = self
+            .pblocks
+            .iter()
+            .position(|p| p.name == name)
+            .ok_or_else(|| format!("add_cells_to_pblock: no pblock {name}"))?;
+        for c in &cells {
+            if !self.pblocks[idx].cells.contains(c) {
+                self.pblocks[idx].cells.push(c.clone());
+            }
+        }
+        let ranged = self.pblocks[idx].ranged;
+        let out = if ranged {
+            let spec = self.pblocks[idx].range_text();
+            self.resize_pblock(name, &spec)?
+        } else {
+            String::new()
+        };
+        self.selected = Some(name.to_string());
+        self.workspace = WorkspaceTab::Device;
+        self.refresh_device();
+        self.refresh_properties();
+        Ok(format!(
+            "add_cells_to_pblock {name} cells={} {out}",
+            self.pblocks
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.cells.join(","))
+                .unwrap_or_default()
+        ))
+    }
+
+    pub fn select_pblock(&mut self, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        let pb = self
+            .pblocks
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| format!("select_pblock: no pblock {name}"))?;
+        let sites = pb.site_count(&self.device.sites);
+        self.workspace = WorkspaceTab::Device;
+        self.nav = NavSection::BoardDevice;
+        self.selected = Some(pb.name.clone());
+        self.properties = vec![
+            ("NAME".into(), pb.name.clone()),
+            ("TYPE".into(), "pblock".into()),
+            ("RANGE".into(), pb.range_text()),
+            ("SITES".into(), sites.to_string()),
+            ("CELLS".into(), pb.cells.len().to_string()),
+            ("FRAMES".into(), pb.frames.to_string()),
+            ("BYTES".into(), pb.bytes.to_string()),
+            ("X0".into(), pb.x0.to_string()),
+            ("Y0".into(), pb.y0.to_string()),
+            ("X1".into(), pb.x1.to_string()),
+            ("Y1".into(), pb.y1.to_string()),
+        ];
+        Ok(format!(
+            "pblock {} range={} sites={} frames={}",
+            pb.name,
+            pb.range_text(),
+            sites,
+            pb.frames
+        ))
+    }
+
+    fn resolve_pblock_range(&self, spec: &str) -> Result<(u32, u32, u32, u32), String> {
+        let t = spec
+            .trim()
+            .trim_matches(|c: char| "{}[]".contains(c))
+            .trim();
+        let t = t.strip_prefix("-add").unwrap_or(t).trim();
+        let t = t.trim_matches(|c: char| "{}[]".contains(c)).trim();
+        let cr_name = t
+            .strip_prefix("CLOCKREGION_")
+            .or_else(|| t.strip_prefix("clockregion_"));
+        if let Some(name) = cr_name {
+            let cr = self
+                .device
+                .clock_region_named(name)
+                .ok_or_else(|| format!("resize_pblock: no clock region {name}"))?;
+            return Ok((cr.x0, cr.y0, cr.x1, cr.y1));
+        }
+        parse_pblock_range(t)
+    }
+
+    fn pblock_engine_sites(
+        &self,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        cells: &[String],
+    ) -> Vec<(u32, u32)> {
+        let mut sites = Vec::new();
+        let Some(pl) = self.shell.session.placed.as_ref() else {
+            return sites;
+        };
+        for (i, (site, _)) in pl.lutff_sites.iter().enumerate() {
+            if site.x < x0 || site.x > x1 || site.y < y0 || site.y > y1 {
+                continue;
+            }
+            if !cells.is_empty() {
+                let Some(lf) = pl.packed.lutffs.get(i) else {
+                    continue;
+                };
+                if !cells.iter().any(|c| c == &lf.lut_cell || c == &lf.ff_cell) {
+                    continue;
+                }
+            }
+            if !sites.contains(&(site.x, site.y)) {
+                sites.push((site.x, site.y));
+            }
+        }
+        for (i, site) in pl.iob_sites.iter().enumerate() {
+            if site.x < x0 || site.x > x1 || site.y < y0 || site.y > y1 {
+                continue;
+            }
+            if !cells.is_empty() {
+                let Some(iob) = pl.packed.iobs.get(i) else {
+                    continue;
+                };
+                if !cells.iter().any(|c| c == &iob.cell) {
+                    continue;
+                }
+            }
+            if !sites.contains(&(site.x, site.y)) {
+                sites.push((site.x, site.y));
+            }
+        }
+        sites
+    }
+
+    /// Parse `set_property PACKAGE_PIN|LOC <pin> [get_ports <port>]` or
+    /// `assign_package_pin <port> <pin>`.
+    fn apply_package_pin(&mut self, cmd: &str) -> Result<String, String> {
+        let (port, pin) = parse_package_pin_cmd(cmd)?;
+        self.set_package_pin(&port, &pin)
+    }
+
+    /// I/O Planning `set_property PACKAGE_PIN`: bind LOC, re-place (and re-route
+    /// if already routed) so the loc hits place/STA rather than a pin list.
+    pub fn set_package_pin(&mut self, port: &str, pin: &str) -> Result<String, String> {
+        let port = port.trim();
+        let pin = pin.trim();
+        if port.is_empty() || pin.is_empty() {
+            return Err("set_property PACKAGE_PIN: need <pin> [get_ports <port>]".into());
+        }
+        let (x, y) = parse_site_xy(pin).map_err(|e| {
+            format!("set_property PACKAGE_PIN: bad pin {pin} ({e})")
+        })?;
+        let dev = self.device()?;
+        if dev.iob_major(x, y).is_none() {
+            return Err(format!(
+                "set_property PACKAGE_PIN: {pin} is not a HAD IOB site"
+            ));
+        }
+        {
+            let d = self
+                .shell
+                .session
+                .design
+                .as_mut()
+                .ok_or("set_property PACKAGE_PIN: no design")?;
+            if d.ports.iter().all(|p| p.name != port) {
+                return Err(format!("set_property PACKAGE_PIN: no port {port}"));
+            }
+            d.set_loc(port, pin)?;
+        }
+        self.constraints
+            .package_pins
+            .insert(port.to_string(), pin.to_string());
+        let was_routed = self.shell.session.routed.is_some();
+        let was_placed = self.shell.session.placed.is_some();
+        let mut placed = format!("IOB_X{x}Y{y}");
+        if was_placed {
+            self.shell.session.place_design(&dev)?;
+            if let Some(s) = self
+                .shell
+                .session
+                .placed
+                .as_ref()
+                .and_then(|p| p.iob_sites.first())
+            {
+                placed = format!("IOB_X{}Y{}", s.x, s.y);
+            }
+            if was_routed {
+                self.shell.session.route_design(&dev)?;
+            }
+        }
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(port);
+        Ok(format!(
+            "set_property PACKAGE_PIN {pin} {port} loc={placed} replaced={} rerouted={}",
+            u8::from(was_placed),
+            u8::from(was_routed)
+        ))
+    }
+
     /// Click a package pin: assigned pins cross-select the I/O port.
     pub fn select_package_pin(&mut self, pin: &str) -> Result<String, String> {
         let pin = pin.trim();
@@ -3760,6 +4261,7 @@ impl IdeModel {
         self.device.occupant_of(id).is_some()
             || self.device.sites.iter().any(|s| s.site_name() == id)
             || self.device.route_named(id).is_some()
+            || self.pblocks.iter().any(|p| p.name == id)
     }
 
     /// UG893 Device drawing dump: HAD die occupancy map, not an occupant-name list.
@@ -3767,7 +4269,7 @@ impl IdeModel {
         let n = self.device.sites.len();
         let occ = self.device.occupied_count();
         let mut s = format!(
-            "device drawing part={} cols={} rows={} sites={} occupied={} x0={} y0={} clock_regions={} routes={}",
+            "device drawing part={} cols={} rows={} sites={} occupied={} x0={} y0={} clock_regions={} routes={} pblocks={}",
             self.part(),
             self.device.cols,
             self.device.rows,
@@ -3776,8 +4278,22 @@ impl IdeModel {
             self.device.x0,
             self.device.y0,
             self.device.clock_regions.len(),
-            self.device.routes.len()
+            self.device.routes.len(),
+            self.pblocks.len()
         );
+        for pb in &self.pblocks {
+            s.push_str(&format!(
+                " pb={}:{},{},{},{}:cells={}:frames={}:sites={}",
+                pb.name,
+                pb.x0,
+                pb.y0,
+                pb.x1,
+                pb.y1,
+                pb.cells.len(),
+                pb.frames,
+                pb.site_count(&self.device.sites)
+            ));
+        }
         for cr in &self.device.clock_regions {
             s.push_str(&format!(
                 " cr={}:{},{},{},{}:sites={}",
@@ -3999,6 +4515,7 @@ impl IdeModel {
             && self.constraints.output_delay_ps.is_empty()
             && self.constraints.false_paths.is_empty()
             && self.constraints.package_pins.is_empty()
+            && self.pblocks.is_empty()
         {
             return "no timing constraints — create_clock / read_xdc".into();
         }
@@ -4024,6 +4541,15 @@ impl IdeModel {
         }
         for (port, pin) in &self.constraints.package_pins {
             lines.push(format!("set_property PACKAGE_PIN {pin} {port}"));
+        }
+        for pb in &self.pblocks {
+            lines.push(format!("create_pblock {}", pb.name));
+            if pb.ranged {
+                lines.push(format!("resize_pblock {} -add {{{}}}", pb.name, pb.range_text()));
+            }
+            for c in &pb.cells {
+                lines.push(format!("add_cells_to_pblock {} {c}", pb.name));
+            }
         }
         lines.join("\n")
     }
@@ -4133,7 +4659,7 @@ impl IdeModel {
         if self.shell.session.routed.is_none() {
             let dev = self.device()?;
             if self.shell.session.placed.is_none() {
-                self.shell.session.place_design(&dev)?;
+                self.place_now(&dev)?;
             }
             self.shell.session.route_design(&dev)?;
         }
@@ -4686,7 +5212,12 @@ impl IdeModel {
         let assigned: Vec<(String, String)> = self
             .io_ports
             .iter()
-            .filter_map(|p| p.site.as_ref().map(|s| (s.clone(), p.name.clone())))
+            .filter_map(|p| {
+                p.site
+                    .as_ref()
+                    .or(p.package_pin.as_ref())
+                    .map(|s| (s.clone(), p.name.clone()))
+            })
             .collect();
         self.package_pins = dev
             .iob_sites()
@@ -4924,6 +5455,7 @@ impl IdeModel {
             sites,
             clock_regions: had_clock_regions(x0, y0, cols, rows),
             routes: Vec::new(),
+            pblocks: self.pblocks.clone(),
         };
         self.refresh_device_routes();
     }
@@ -4971,6 +5503,7 @@ impl IdeModel {
             self.io_ports.clear();
             return;
         };
+        let locs = self.constraints.package_pins.clone();
         let placed_iobs = self.shell.session.placed.as_ref().map(|p| {
             p.iob_sites
                 .iter()
@@ -4987,6 +5520,11 @@ impl IdeModel {
                     PortDir::Out => "OUT",
                     PortDir::Inout => "INOUT",
                 };
+                let package_pin = p
+                    .attrs
+                    .get("LOC")
+                    .map(|s| s.to_string())
+                    .or_else(|| locs.get(&p.name).cloned());
                 let site = placed_iobs.as_ref().and_then(|v| {
                     // Match output port to IOB cell by net name or first IOB for `led`.
                     v.iter().find(|(cell, _)| {
@@ -5006,6 +5544,7 @@ impl IdeModel {
                     name: p.name.clone(),
                     dir: dir.into(),
                     site,
+                    package_pin,
                 }
             })
             .collect();
@@ -5095,6 +5634,16 @@ impl IdeModel {
                 }
             }
         }
+        if !props.iter().any(|(k, _)| k == "PACKAGE_PIN") {
+            if let Some(pin) = self
+                .io_ports
+                .iter()
+                .find(|p| p.name == id)
+                .and_then(|p| p.package_pin.clone().or(p.site.clone()))
+            {
+                props.push(("PACKAGE_PIN".into(), pin));
+            }
+        }
         if let Some(cr) = self.device.clock_region_named(&id).cloned() {
             let sites = cr.site_count(&self.device.sites);
             props.push(("TYPE".into(), "clock_region".into()));
@@ -5103,6 +5652,19 @@ impl IdeModel {
             props.push(("Y0".into(), cr.y0.to_string()));
             props.push(("X1".into(), cr.x1.to_string()));
             props.push(("Y1".into(), cr.y1.to_string()));
+        }
+        if let Some(pb) = self.pblocks.iter().find(|p| p.name == id).cloned() {
+            let sites = pb.site_count(&self.device.sites);
+            props.push(("TYPE".into(), "pblock".into()));
+            props.push(("RANGE".into(), pb.range_text()));
+            props.push(("SITES".into(), sites.to_string()));
+            props.push(("CELLS".into(), pb.cells.len().to_string()));
+            props.push(("FRAMES".into(), pb.frames.to_string()));
+            props.push(("BYTES".into(), pb.bytes.to_string()));
+            props.push(("X0".into(), pb.x0.to_string()));
+            props.push(("Y0".into(), pb.y0.to_string()));
+            props.push(("X1".into(), pb.x1.to_string()));
+            props.push(("Y1".into(), pb.y1.to_string()));
         }
         self.properties = props;
     }
@@ -5161,6 +5723,67 @@ impl IdeModel {
             r.bitstream_hash = hash;
         }
     }
+}
+
+fn tcl_ident(joined: &str, key: &str) -> Option<String> {
+    joined.split_once(key).and_then(|(_, r)| {
+        r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .find(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
+}
+
+fn parse_package_pin_cmd(cmd: &str) -> Result<(String, String), String> {
+    let t = cmd.trim();
+    if let Some(rest) = t.strip_prefix("assign_package_pin ") {
+        let mut p = rest.split_whitespace();
+        let port = p
+            .next()
+            .ok_or("assign_package_pin: need <port> <pin>")?;
+        let pin = p
+            .next()
+            .ok_or("assign_package_pin: need <port> <pin>")?;
+        return Ok((port.to_string(), pin.to_string()));
+    }
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    if toks.first().copied() != Some("set_property") {
+        return Err("set_property PACKAGE_PIN: need PACKAGE_PIN <pin> [get_ports <port>]".into());
+    }
+    let key = toks.get(1).copied().unwrap_or("");
+    if !key.eq_ignore_ascii_case("PACKAGE_PIN") && !key.eq_ignore_ascii_case("LOC") {
+        return Err(format!("set_property: not a PACKAGE_PIN ({key})"));
+    }
+    let pin = toks
+        .get(2)
+        .ok_or("set_property PACKAGE_PIN: missing pin")?
+        .to_string();
+    let joined = toks.get(3..).unwrap_or(&[]).join(" ");
+    let port = tcl_ident(&joined, "get_ports")
+        .or_else(|| {
+            toks.get(3).map(|s| {
+                s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            "set_property PACKAGE_PIN: missing [get_ports <port>]".to_string()
+        })?;
+    Ok((port, pin))
+}
+
+fn parse_pblock_range(spec: &str) -> Result<(u32, u32, u32, u32), String> {
+    let t = spec.trim().trim_matches(|c: char| "{}[]".contains(c)).trim();
+    if t.is_empty() {
+        return Err("resize_pblock: empty range".into());
+    }
+    if let Some((a, b)) = t.split_once(':') {
+        let (x0, y0) = parse_site_xy(a)?;
+        let (x1, y1) = parse_site_xy(b)?;
+        return Ok((x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)));
+    }
+    let (x, y) = parse_site_xy(t)?;
+    Ok((x, y, x, y))
 }
 
 fn parse_site_xy(spec: &str) -> Result<(u32, u32), String> {
@@ -7637,5 +8260,308 @@ mod tests {
         );
         assert_eq!(blinky.utilization.unwrap().lutff, 1);
         assert_eq!(ide.utilization.unwrap().lutff, 4);
+    }
+
+    /// UG893 I/O Planning: `set_property PACKAGE_PIN` re-places onto the HAD IOB
+    /// and re-runs STA — not a pin-name list.
+    #[test]
+    fn io_planning_package_pin_replaces_and_hits_sta() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+
+        let x0 = ide.session().placed.as_ref().unwrap().iob_sites[0].x;
+        let lut_x0 = ide.session().placed.as_ref().unwrap().lutff_sites[0].0.x;
+        let wns0 = ide.wns_ps().expect("STA after route");
+        assert_ne!(wns0, 0);
+        assert_eq!(x0, 2, "default IOB is the first HAD site IOB_X2Y0");
+        assert_eq!(lut_x0, 2, "LUTFF follows the default IOB column");
+        assert!(
+            NavSection::BoardDevice
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "io_planning"),
+            "navigator I/O Planning child: {:?}",
+            NavSection::BoardDevice.actions()
+        );
+
+        let dump = ide.exec("io_planning").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+        assert_eq!(ide.nav, NavSection::BoardDevice);
+        assert!(dump.contains("led"), "{dump}");
+        assert!(dump.contains("PACKAGE_PIN=-") || dump.contains("placed=IOB_X2Y0"), "{dump}");
+        let led0 = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led port");
+        assert_eq!(led0.site.as_deref(), Some("IOB_X2Y0"), "{:?}", ide.io_ports);
+        assert!(led0.package_pin.is_none(), "no LOC until set_property: {led0:?}");
+
+        let out = ide
+            .exec("set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]")
+            .unwrap();
+        assert!(out.contains("PACKAGE_PIN IOB_X5Y0"), "{out}");
+        assert!(out.contains("led"), "{out}");
+        assert!(out.contains("replaced=1"), "must re-place, not stash a pin: {out}");
+        assert!(out.contains("rerouted=1"), "must re-route so STA sees the loc: {out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+
+        let pl = ide.session().placed.as_ref().expect("re-placed");
+        assert_eq!(pl.iob_sites[0].x, 5, "PACKAGE_PIN must bind IOB in place");
+        assert_eq!(pl.iob_sites[0].y, 0);
+        assert_eq!(pl.lutff_sites[0].0.x, 5, "LUTFF follows LOC column");
+        assert_ne!(pl.iob_sites[0].x, x0);
+        assert_eq!(
+            pl.packed.iobs[0].loc.as_deref(),
+            Some("IOB_X5Y0"),
+            "pack must see LOC"
+        );
+
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after loc");
+        assert_eq!(led.package_pin.as_deref(), Some("IOB_X5Y0"), "{led:?}");
+        assert_eq!(led.site.as_deref(), Some("IOB_X5Y0"), "{led:?}");
+        assert!(
+            ide.package_pins
+                .iter()
+                .any(|p| p.pin == "IOB_X5Y0" && p.port.as_deref() == Some("led")),
+            "package drawing occupancy must move: {:?}",
+            ide.package_pins.iter().filter(|p| p.port.is_some()).collect::<Vec<_>>()
+        );
+        assert!(
+            !ide.package_pins
+                .iter()
+                .any(|p| p.pin == "IOB_X2Y0" && p.port.as_deref() == Some("led")),
+            "old IOB must be vacated"
+        );
+
+        let ports = ide.exec("io_ports").unwrap();
+        assert!(ports.contains("PACKAGE_PIN=IOB_X5Y0"), "{ports}");
+        assert!(ports.contains("placed=IOB_X5Y0"), "{ports}");
+        assert_eq!(
+            ide.constraints.package_pins.get("led").map(|s| s.as_str()),
+            Some("IOB_X5Y0")
+        );
+        let ctext = ide.constraints_text();
+        assert!(
+            ctext.contains("set_property PACKAGE_PIN IOB_X5Y0 led"),
+            "{ctext}"
+        );
+        let loc = ide
+            .design()
+            .unwrap()
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("LOC"));
+        assert_eq!(loc, Some("IOB_X5Y0"));
+
+        assert_eq!(ide.selected_cell(), Some("led"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "PACKAGE_PIN" && v == "IOB_X5Y0"),
+            "{:?}",
+            ide.properties
+        );
+
+        let lut = ide.device.occupant_of("u_lut0").expect("LUTFF after re-place");
+        assert_eq!(lut.x, 5, "device floorplan must follow PACKAGE_PIN column");
+        let wns1 = ide.wns_ps().expect("STA after PACKAGE_PIN re-place/route");
+        assert_ne!(wns1, 0);
+        let rt = ide.session().routed.as_ref().expect("re-routed");
+        assert!(
+            rt.iob_src[0].hops >= 1,
+            "PathFinder hops after loc: {}",
+            rt.iob_src[0].hops
+        );
+        assert_eq!(rt.placed.iob_sites[0].x, 5);
+        assert!(ide.timing.as_ref().unwrap().route_ps > 0);
+
+        let e = ide
+            .exec("set_property PACKAGE_PIN IOB_X0Y0 [get_ports led]")
+            .unwrap_err();
+        assert!(
+            e.contains("not a HAD IOB"),
+            "bogus ball must fail against HAD: {e}"
+        );
+        assert_eq!(
+            ide.session().placed.as_ref().unwrap().iob_sites[0].x,
+            5,
+            "failed loc must not move place"
+        );
+
+        let assign = ide.exec("assign_package_pin led IOB_X8Y0").unwrap();
+        assert!(assign.contains("IOB_X8Y0"), "{assign}");
+        assert_eq!(ide.session().placed.as_ref().unwrap().iob_sites[0].x, 8);
+        assert_eq!(ide.session().placed.as_ref().unwrap().lutff_sites[0].0.x, 8);
+        assert_eq!(
+            ide.io_ports
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.site.as_deref()),
+            Some("IOB_X8Y0")
+        );
+        assert!(ide.wns_ps().is_some());
+    }
+
+    /// UG893 Floorplanning: `create_pblock` / `resize_pblock` re-places into a
+    /// HAD rectangle and hits `helion-bits::bitgen_pblock` — not a site dump.
+    #[test]
+    fn pblock_floorplanning_hits_place_and_bitgen_pblock() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+
+        let x0 = ide.session().placed.as_ref().unwrap().lutff_sites[0].0.x;
+        let y0 = ide.session().placed.as_ref().unwrap().lutff_sites[0].0.y;
+        let full = ide
+            .session()
+            .bitstream
+            .as_ref()
+            .expect("full bitstream")
+            .frames
+            .len();
+        assert!(full > 0, "full bitgen must produce frames");
+        assert_eq!(x0, 2, "default LUTFF follows IOB column");
+        assert!(
+            NavSection::BoardDevice
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "floorplanning"),
+            "navigator Floorplanning child: {:?}",
+            NavSection::BoardDevice.actions()
+        );
+
+        let created = ide.exec("create_pblock pblock_0").unwrap();
+        assert!(created.contains("pblock_0"), "{created}");
+        assert_eq!(ide.workspace, WorkspaceTab::Device);
+        assert_eq!(ide.nav, NavSection::BoardDevice);
+        let pane = ide.exec("floorplanning").unwrap();
+        assert!(pane.contains("pblocks n=1"), "{pane}");
+        assert!(pane.contains("pblock_0"), "{pane}");
+
+        let out = ide
+            .exec("resize_pblock pblock_0 -add {CLB_X5Y1:CLB_X8Y8}")
+            .unwrap();
+        assert!(out.contains("resize_pblock pblock_0"), "{out}");
+        assert!(out.contains("CLB_X5Y1:CLB_X8Y8"), "{out}");
+        assert!(out.contains("placed=1"), "must re-place into the pblock: {out}");
+        assert!(out.contains("routed=1"), "must re-route so bitgen_pblock sees the loc: {out}");
+        assert!(out.contains("frames="), "must hit bitgen_pblock: {out}");
+
+        let lut_sites: Vec<(u32, u32)> = ide
+            .session()
+            .placed
+            .as_ref()
+            .expect("re-placed")
+            .lutff_sites
+            .iter()
+            .map(|(s, _)| (s.x, s.y))
+            .collect();
+        for (x, y) in &lut_sites {
+            assert!(
+                *x >= 5 && *x <= 8 && *y >= 1 && *y <= 8,
+                "LUTFF must sit in the pblock: X{x}Y{y}"
+            );
+        }
+        assert_ne!(lut_sites[0].0, x0, "pblock must move LUTFF off default column");
+        assert!(
+            lut_sites.iter().any(|&(x, y)| x != x0 || y != y0),
+            "pblock must move at least one LUTFF off the default site"
+        );
+
+        let pb = ide
+            .pblocks
+            .iter()
+            .find(|p| p.name == "pblock_0")
+            .cloned()
+            .expect("pblock_0");
+        assert!(pb.ranged);
+        assert_eq!((pb.x0, pb.y0, pb.x1, pb.y1), (5, 1, 8, 8));
+        assert!(pb.frames > 0, "partial bitstream frames: {pb:?}");
+        assert!(
+            pb.frames < full,
+            "pblock frames {} must be a subset of full {full}",
+            pb.frames
+        );
+        assert_eq!(ide.device.pblocks.len(), 1);
+        assert!(ide.device.pblock_named("pblock_0").is_some());
+
+        let dump = ide.exec("device").unwrap();
+        assert!(dump.contains("pblocks=1"), "{dump}");
+        assert!(dump.contains("pb=pblock_0:5,1,8,8:"), "{dump}");
+        let lut = ide.device.occupant_of("u_lut0").expect("LUTFF after pblock");
+        assert!(
+            pb.contains(lut.x, lut.y),
+            "device floorplan occupant must sit in the pblock: {lut:?}"
+        );
+
+        let sel = ide.exec("select_pblock pblock_0").unwrap();
+        assert!(sel.contains("pblock pblock_0"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "pblock"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "FRAMES" && v == &pb.frames.to_string()),
+            "{:?}",
+            ide.properties
+        );
+
+        let add = ide.exec("add_cells_to_pblock pblock_0 u_lut0").unwrap();
+        assert!(add.contains("u_lut0"), "{add}");
+        assert!(
+            ide.pblocks[0].cells.iter().any(|c| c == "u_lut0"),
+            "{:?}",
+            ide.pblocks[0].cells
+        );
+        let ctext = ide.constraints_text();
+        assert!(ctext.contains("create_pblock pblock_0"), "{ctext}");
+        assert!(
+            ctext.contains("resize_pblock pblock_0 -add {CLB_X5Y1:CLB_X8Y8}"),
+            "{ctext}"
+        );
+
+        let wns = ide.wns_ps().expect("STA after pblock re-place/route");
+        assert_ne!(wns, 0);
+        let rt_x = ide
+            .session()
+            .routed
+            .as_ref()
+            .expect("re-routed")
+            .placed
+            .lutff_sites[0]
+            .0
+            .x;
+        assert_eq!(rt_x, lut_sites[0].0);
+
+        let e = ide
+            .exec("resize_pblock missing -add {CLB_X5Y1:CLB_X8Y8}")
+            .unwrap_err();
+        assert!(e.contains("no pblock"), "{e}");
+        let e = ide
+            .exec("resize_pblock pblock_0 -add {CLB_X99Y99:CLB_X100Y100}")
+            .unwrap_err();
+        assert!(
+            e.contains("no HAD CLB") || e.contains("no placed sites"),
+            "bogus range must fail against HAD: {e}"
+        );
     }
 }

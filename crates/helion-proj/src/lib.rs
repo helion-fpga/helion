@@ -1,10 +1,10 @@
 //! Dual-mode Session, checkpoints `.hckp`, object query, opt, ECO.
 
-use helion_bits::{bitgen, eco_lut, Bitstream};
+use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
 use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{pack, Packed};
-use helion_place::{place_incremental, place_with, PlaceOpts, Placed};
+use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{create_clock, report_timing_routed};
 use helion_hw::prog_sim;
@@ -186,6 +186,43 @@ impl Session {
         self.routed = None;
         self.bitstream = None;
         Ok(())
+    }
+
+    /// UG893 `create_pblock`/`resize_pblock`: place into a HAD rectangle.
+    pub fn place_pblock(
+        &mut self,
+        dev: &Device,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> Result<(), String> {
+        let d = self.design.as_ref().ok_or("place_pblock: no design")?;
+        let packed = pack(d, dev)?;
+        let placed = place_in_region(
+            &packed,
+            dev,
+            ImplStrategy::Default.place_opts(),
+            x0,
+            y0,
+            x1,
+            y1,
+        )?;
+        self.packed = Some(packed);
+        self.placed = Some(placed);
+        self.routed = None;
+        self.bitstream = None;
+        Ok(())
+    }
+
+    /// Partial bitstream for Pblock sites (`helion-bits::bitgen_pblock`).
+    pub fn write_pblock_bitstream(
+        &self,
+        dev: &Device,
+        sites: &[(u32, u32)],
+    ) -> Result<Bitstream, String> {
+        let routed = self.routed.as_ref().ok_or("write_pblock: not routed")?;
+        bitgen_pblock(dev, routed, sites)
     }
 
     pub fn route_design(&mut self, dev: &Device) -> Result<(), String> {

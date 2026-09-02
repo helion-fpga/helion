@@ -130,6 +130,65 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
     })
 }
 
+/// UG893 floorplanning: place into a Pblock rectangle (CLB_XxYy:CLB_XxYy).
+/// Hits the same site picker as `place_with`, then relocates LUTFF (and IOB if
+/// the rectangle covers HAD IOB rows) into the region.
+pub fn place_in_region(
+    packed: &Packed,
+    dev: &Device,
+    opts: PlaceOpts,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> Result<Placed, String> {
+    let (x0, x1) = (x0.min(x1), x0.max(x1));
+    let (y0, y1) = (y0.min(y1), y0.max(y1));
+    let mut placed = place_with(packed, dev, opts)?;
+    let mut clbs: Vec<Site> = dev
+        .clb_sites()
+        .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
+        .collect();
+    if clbs.is_empty() {
+        return Err(format!(
+            "pblock CLB_X{x0}Y{y0}:CLB_X{x1}Y{y1} has no HAD CLB sites"
+        ));
+    }
+    clbs.sort_by_key(|s| (s.x, s.y));
+    let n_ble = dev.n_ble.max(1) as usize;
+    for i in 0..placed.lutff_sites.len() {
+        let clb_off = i / n_ble;
+        let ble = (i % n_ble) as u8;
+        let idx = clb_off.min(clbs.len() - 1);
+        placed.lutff_sites[i] = (clbs[idx], ble);
+    }
+    let mut iobs: Vec<Site> = dev
+        .iob_sites()
+        .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
+        .collect();
+    if !iobs.is_empty() {
+        iobs.sort_by_key(|s| (s.x, s.y));
+        for (i, slot) in placed.iob_sites.iter_mut().enumerate() {
+            *slot = iobs[i.min(iobs.len() - 1)];
+        }
+    }
+    placed.cost = if opts.timing_weight > 0.0 {
+        placed
+            .lutff_sites
+            .first()
+            .zip(placed.iob_sites.first())
+            .map(|(l, i)| (l.0.y as f64 - i.y as f64).abs() * opts.timing_weight)
+            .unwrap_or(0.0)
+    } else {
+        placed
+            .lutff_sites
+            .first()
+            .map(|(s, _)| s.y as f64)
+            .unwrap_or(0.0)
+    };
+    Ok(placed)
+}
+
 /// UG986 Lab 2: reuse previous LUTFF/IOB sites for cells that kept their names.
 pub fn place_incremental(
     packed: &Packed,
@@ -213,6 +272,25 @@ mod tests {
         let pl = place(&p, &dev).unwrap();
         assert_eq!(pl.mac_sites.len(), 1);
         assert_eq!(pl.mac_sites[0].kind, SiteKind::Dsp);
+    }
+
+    #[test]
+    fn pblock_region_places_lutff_inside() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let def = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pl = place_in_region(&p, &dev, PlaceOpts { timing_weight: 0.75 }, 5, 1, 8, 8).unwrap();
+        assert!(!pl.lutff_sites.is_empty());
+        for (s, _) in &pl.lutff_sites {
+            assert!(
+                s.x >= 5 && s.x <= 8 && s.y >= 1 && s.y <= 8,
+                "LUTFF must sit in the pblock: {s:?}"
+            );
+        }
+        assert_ne!(
+            def.lutff_sites[0].0.x, pl.lutff_sites[0].0.x,
+            "pblock must move LUTFF off the default IOB column"
+        );
     }
 
     #[test]
