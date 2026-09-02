@@ -828,9 +828,20 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+fn run_status_color(status: &str) -> Color32 {
+    match status {
+        "Complete" => Color32::from_rgb(0x50, 0xc0, 0x70),
+        "Running" => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        "Failed" => Color32::from_rgb(0xe0, 0x50, 0x50),
+        _ => Color32::from_rgb(0x6a, 0x70, 0x78),
+    }
+}
+
 fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Design Runs");
-    ui.weak("UG986 Labs 1–4 Helion engines — strategies, incremental checkpoint, directed route, ECO");
+    ui.weak(
+        "UG893/UG986 Design Runs — clickable name/strategy/WNS/runtime/hash grid over Helion engines, not a dump",
+    );
     ui.horizontal(|ui| {
         if ui.button("Launch synth_1").clicked() {
             let _ = model.exec("launch_runs synth_1");
@@ -840,6 +851,28 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
         if ui.button("Reset impl_1").clicked() {
             let _ = model.exec("reset_runs impl_1");
+        }
+        if ui.button("Launch selected").clicked() {
+            if let Some(name) = model
+                .selected
+                .as_deref()
+                .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string())
+            {
+                if model.runs.iter().any(|r| r.name == name) {
+                    let _ = model.exec(&format!("launch_runs {name}"));
+                }
+            }
+        }
+        if ui.button("Reset selected").clicked() {
+            if let Some(name) = model
+                .selected
+                .as_deref()
+                .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string())
+            {
+                if model.runs.iter().any(|r| r.name == name) {
+                    let _ = model.exec(&format!("reset_runs {name}"));
+                }
+            }
         }
         if ui.button("Create RuntimeOpt").clicked() {
             let _ = model.exec("create_run impl_runtime -strategy RuntimeOpt");
@@ -880,30 +913,85 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     ui.add_space(6.0);
-    ui.monospace(
-        "Name            Strategy       Status        LUTFF  WNS_PS  ms    reuse  hash",
-    );
-    for r in &model.runs {
-        ui.monospace(format!(
-            "{:<15} {:<14} {:<13} {:<6} {:<7} {:<5} {:<6} {}",
-            r.name,
-            r.strategy,
-            r.status,
-            r.lutff.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-            r.wns_ps.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-            r.runtime_ms.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-            r.reuse_pct
-                .map(|n| format!("{n}%"))
-                .unwrap_or_else(|| "-".into()),
-            r.bitstream_hash
-                .map(|h| format!("{h:#010x}"))
-                .unwrap_or_else(|| "-".into()),
-        ));
-    }
+    ui.label(format!("runs n={}", model.runs.len()));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    egui::ScrollArea::both()
+        .max_height(220.0)
+        .show(ui, |ui| {
+            egui::Grid::new("design_runs_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Strategy").strong());
+                    ui.label(RichText::new("Status").strong());
+                    ui.label(RichText::new("LUTFF").strong());
+                    ui.label(RichText::new("WNS_PS").strong());
+                    ui.label(RichText::new("Runtime").strong());
+                    ui.label(RichText::new("Reuse").strong());
+                    ui.label(RichText::new("Hash").strong());
+                    ui.end_row();
+                    for r in &model.runs {
+                        let id = format!("run:{}", r.name);
+                        let on = selected.as_deref() == Some(id.as_str())
+                            || selected.as_deref() == Some(r.name.as_str());
+                        if ui.selectable_label(on, &r.name).clicked() {
+                            pick = Some(r.name.clone());
+                        }
+                        ui.label(r.strategy_cell());
+                        let fill = run_status_color(&r.status);
+                        let btn = egui::Button::new(
+                            RichText::new(&r.status).color(Color32::BLACK),
+                        )
+                        .fill(fill)
+                        .selected(on);
+                        if ui.add(btn).clicked() {
+                            pick = Some(r.name.clone());
+                        }
+                        ui.label(r.lutff_cell());
+                        ui.label(r.wns_cell());
+                        ui.label(r.runtime_cell());
+                        ui.label(r.reuse_cell());
+                        ui.label(r.hash_cell());
+                        ui.end_row();
+                    }
+                });
+        });
     ui.add_space(8.0);
-    report_box(ui, "Compare (engine)", &model.compare_runs_text());
-    ui.add_space(6.0);
-    report_box(ui, "Runs (engine)", &model.runs_text());
+    ui.label(RichText::new("Compare Runs (name / strategy / WNS / runtime / hash)").strong());
+    {
+        let cmp: Vec<_> = model.compare_run_rows().into_iter().cloned().collect();
+        if cmp.is_empty() {
+            ui.weak("no implementation runs");
+        } else {
+            egui::Grid::new("compare_runs_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Strategy").strong());
+                    ui.label(RichText::new("WNS_PS").strong());
+                    ui.label(RichText::new("Runtime").strong());
+                    ui.label(RichText::new("Hash").strong());
+                    ui.end_row();
+                    for r in &cmp {
+                        let id = format!("run:{}", r.name);
+                        let on = selected.as_deref() == Some(id.as_str())
+                            || selected.as_deref() == Some(r.name.as_str());
+                        if ui.selectable_label(on, r.name.as_str()).clicked() {
+                            pick = Some(r.name.clone());
+                        }
+                        ui.label(r.strategy_cell());
+                        ui.label(r.wns_cell());
+                        ui.label(r.runtime_cell());
+                        ui.label(r.hash_cell());
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+    if let Some(name) = pick {
+        let _ = model.select_run(&name);
+    }
 }
 
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
