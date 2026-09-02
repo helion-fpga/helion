@@ -102,6 +102,18 @@ impl Sim {
             .copied()
             .unwrap_or(false);
     }
+
+    /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.
+    pub fn object_values(&self) -> Vec<(String, String)> {
+        let bit = |b: bool| if b { "1".to_string() } else { "0".to_string() };
+        let mut v = vec![("led".to_string(), bit(self.led))];
+        let mut ffs: Vec<_> = self.ff_q.iter().collect();
+        ffs.sort_by_key(|(n, _)| *n);
+        for (n, q) in ffs {
+            v.push((n.clone(), bit(*q)));
+        }
+        v
+    }
 }
 
 pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {

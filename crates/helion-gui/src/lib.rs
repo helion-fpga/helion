@@ -6,12 +6,13 @@ pub const GPUI_TOOLKIT: &str = "gpui";
 pub mod doctor;
 pub mod ide;
 pub use ide::{
-    BdView, BottomTab, ConsoleLine, DesignRun, DeviceView, FindHit, FlowStep, HierarchyView,
-    HwManager, IdeMessage, IdeModel, IlaDashboard, IlaTrigger, IoPortView, LayoutKind, MsgSeverity,
-    NavSection, NetlistTree,
-    PackageDrawing, PackagePin, SchematicView, ScopeNode, SimObject, StepState, UltraFastStage,
-    Utilization,
-    Waveform, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
+    BdAddrEntry, BdPin, BdView, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
+    DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
+    HwManager, IdeMessage,
+    IdeModel, IlaDashboard, IlaTrigger, IoPortView, LayoutKind, MsgSeverity, NavAction, NavSection,
+    NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
+    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
+    UltraFastStage, Utilization, Waveform, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
 };
 
 use helion_device::Device;
