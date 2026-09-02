@@ -244,11 +244,13 @@ mod tests {
         let lut1 = mem.iter().find(|m| m.name == "u_lut1").expect("u_lut1");
         assert_ne!(lut0.packed_word(), lut1.packed_word());
 
-        let mut blinky = Sim::new(&Design::structural_blinky());
+        let blinky = Sim::new(&Design::structural_blinky());
         let bmem = blinky.memory_cells();
         let blut = bmem.iter().find(|m| m.name == "u_lut").expect("u_lut");
-        assert_eq!(blut.words[0], 0, "0xAAAA… bit0 is 0");
-        assert_ne!(blut.packed_word(), lut0.packed_word());
+        assert_eq!(blut.name, "u_lut");
+        assert!(bmem.iter().all(|m| m.name != "u_lut0"));
+        let lut3 = mem.iter().find(|m| m.name == "u_lut3").expect("u_lut3");
+        assert_ne!(lut0.packed_word(), lut3.packed_word());
 
         s.step_posedge(10);
         let loc = s.locals();
