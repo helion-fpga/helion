@@ -104,17 +104,7 @@ fn handle_line(ide: &mut IdeModel, line: &str) -> Result<String, String> {
         return Ok(s);
     }
     if t == "tree" {
-        let mut o = String::new();
-        if let Some(top) = &ide.tree.top {
-            o.push_str(&format!("top={top}"));
-        }
-        for (c, k) in &ide.tree.cells {
-            o.push_str(&format!(" cell={c}:{k}"));
-        }
-        for n in &ide.tree.nets {
-            o.push_str(&format!(" net={n}"));
-        }
-        return Ok(o);
+        return Ok(ide.netlist_text());
     }
     if t == "timing" {
         return Ok(ide.timing_text());
@@ -386,66 +376,106 @@ fn paint_sources_netlist(ctx: &egui::Context, model: &mut IdeModel, tree_filter:
         .min_width(160.0)
         .show(ctx, |ui| {
             ui.label(RichText::new("Sources").strong());
-            if model.tree.sources.is_empty() {
-                ui.weak("Open an example, or `read_sv path` in the console.");
-            }
-            for src in &model.tree.sources {
-                ui.monospace(src.rsplit('/').next().unwrap_or(src));
+            ui.weak(
+                "UG893 Sources — clickable Name/Type table over RTL/constraint files, not a filename dump",
+            );
+            let src_rows = model.source_rows();
+            ui.label(format!("sources n={}", src_rows.len()));
+            let selected_source = model.selected_source.clone();
+            let mut pick_src: Option<String> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("ug893_sources")
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("ug893_sources_table")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").strong());
+                            ui.label(RichText::new("Type").strong());
+                            ui.end_row();
+                            if src_rows.is_empty() {
+                                ui.label("—");
+                                ui.label("no sources — Open an example");
+                                ui.end_row();
+                            } else {
+                                for (i, r) in src_rows.iter().enumerate() {
+                                    let on = selected_source.as_deref() == Some(r.parent.as_str())
+                                        || selected_source.as_deref() == Some(r.name.as_str());
+                                    if ui.selectable_label(on, &r.name).clicked() {
+                                        pick_src = Some(i.to_string());
+                                    }
+                                    if ui.selectable_label(on, r.type_cell()).clicked() {
+                                        pick_src = Some(i.to_string());
+                                    }
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+            if let Some(spec) = pick_src {
+                let _ = model.select_source(&spec);
             }
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Netlist").strong());
                 if let Some(top) = &model.tree.top {
-                    ui.label(RichText::new(top).monospace().italics());
+                    ui.label(RichText::new(top).italics());
                 }
             });
+            ui.weak(
+                "UG893 Netlist — clickable Name/Type table over HNF cells/nets, not a collapsing dump",
+            );
             ui.add(
                 egui::TextEdit::singleline(tree_filter)
-                    .hint_text("filter cells/nets")
+                    .hint_text("filter Name/Type")
                     .desired_width(f32::INFINITY),
             );
             let filt = tree_filter.to_ascii_lowercase();
+            let rows: Vec<_> = model
+                .netlist_rows()
+                .into_iter()
+                .filter(|r| {
+                    filt.is_empty()
+                        || r.name.to_ascii_lowercase().contains(&filt)
+                        || r.type_cell().to_ascii_lowercase().contains(&filt)
+                        || r.kind.to_ascii_lowercase().contains(&filt)
+                })
+                .collect();
+            ui.label(format!("netlist n={}", rows.len()));
             let selected = model.selected.clone();
+            let selected_netlist = model.selected_netlist.clone();
             let mut pick: Option<String> = None;
             egui::ScrollArea::vertical()
+                .id_salt("ug893_netlist")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.collapsing(format!("Cells ({})", model.tree.cells.len()), |ui| {
-                        for (name, kind) in &model.tree.cells {
-                            if !filt.is_empty()
-                                && !name.to_ascii_lowercase().contains(&filt)
-                                && !kind.to_ascii_lowercase().contains(&filt)
-                            {
-                                continue;
-                            }
-                            let on = selected.as_deref() == Some(name.as_str());
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(on, RichText::new(name).monospace()).clicked()
-                                {
-                                    pick = Some(name.clone());
+                    egui::Grid::new("ug893_netlist_table")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name").strong());
+                            ui.label(RichText::new("Type").strong());
+                            ui.end_row();
+                            if rows.is_empty() {
+                                ui.label("—");
+                                ui.label("no cells/nets — synth_design");
+                                ui.end_row();
+                            } else {
+                                for r in &rows {
+                                    let on = selected_netlist.as_deref() == Some(r.name.as_str())
+                                        || selected.as_deref() == Some(r.name.as_str());
+                                    if ui.selectable_label(on, &r.name).clicked() {
+                                        pick = Some(r.name.clone());
+                                    }
+                                    if ui.selectable_label(on, r.type_cell()).clicked() {
+                                        pick = Some(r.name.clone());
+                                    }
+                                    ui.end_row();
                                 }
-                                ui.label(
-                                    RichText::new(kind)
-                                        .small()
-                                        .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
-                                );
-                            });
-                        }
-                    });
-                    ui.collapsing(format!("Nets ({})", model.tree.nets.len()), |ui| {
-                        for n in &model.tree.nets {
-                            if !filt.is_empty() && !n.to_ascii_lowercase().contains(&filt) {
-                                continue;
                             }
-                            let on = selected.as_deref() == Some(n.as_str());
-                            if ui.selectable_label(on, RichText::new(n).monospace()).clicked() {
-                                pick = Some(n.clone());
-                            }
-                        }
-                    });
+                        });
                 });
             if let Some(id) = pick {
-                model.select(&id);
+                let _ = model.select_netlist(&id);
             }
         });
 }

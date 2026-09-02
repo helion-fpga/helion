@@ -1,10 +1,10 @@
 //! Headless IDE model — the Vivado-class application state.
 //!
-//! Sources/netlist tree, Tcl console, flow rail (Synthesis → Opt → Place → Route →
-//! Bitstream) and the timing/utilization report panes. Everything here runs the *real*
-//! [`Session`] engines: there is no canned output anywhere in this file, so the widget
-//! layer (`helion-ide`) is a thin painter over this model and can be tested without a
-//! display.
+//! Sources/netlist Name/Type table, Tcl console, flow rail (Synthesis → Opt → Place →
+//! Route → Bitstream) and the timing/utilization report panes. Everything here runs the
+//! *real* [`Session`] engines: there is no canned output anywhere in this file, so the
+//! widget layer (`helion-ide`) is a thin painter over this model and can be tested
+//! without a display.
 
 use crate::{tcl_eval, GpuiShell};
 use helion_bd::{emit_sv, validate, BlockDesign};
@@ -111,11 +111,75 @@ impl NetlistTree {
         self.cells.iter().any(|(c, _)| c == name)
     }
 
+    pub fn has_net(&self, name: &str) -> bool {
+        self.nets.iter().any(|n| n == name)
+    }
+
     pub fn kind_of(&self, name: &str) -> Option<&str> {
         self.cells
             .iter()
             .find(|(c, _)| c == name)
             .map(|(_, k)| k.as_str())
+    }
+}
+
+/// One clickable row in the UG893 Sources / Netlist pane (not a collapsing dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetlistRow {
+    /// `source` / `cell` / `net`.
+    pub kind: String,
+    pub name: String,
+    /// File language / primitive / `net`.
+    pub type_name: String,
+    /// Full source path, or HNF top for cells/nets.
+    pub parent: String,
+}
+
+impl NetlistRow {
+    pub fn type_cell(&self) -> &str {
+        if self.type_name.is_empty() {
+            self.kind.as_str()
+        } else {
+            self.type_name.as_str()
+        }
+    }
+
+    pub fn parent_cell(&self) -> &str {
+        if self.parent.is_empty() {
+            "-"
+        } else {
+            self.parent.as_str()
+        }
+    }
+
+    /// Clickable-grid dump row: UG893 Sources/Netlist Name/Type over HNF, not `name (kind)`.
+    pub fn row_text(&self) -> String {
+        format!("NAME={} TYPE={}", self.name, self.type_cell())
+    }
+}
+
+fn source_basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn source_type_of(path: &str) -> &'static str {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "sv" => "sv",
+        "v" => "verilog",
+        "vhd" | "vhdl" => "vhdl",
+        "sdc" | "xdc" => "constraint",
+        "c" => "c",
+        "prj" => "project",
+        _ => "source",
     }
 }
 
@@ -389,6 +453,14 @@ impl NavSection {
                 NavAction {
                     label: "Add Sources",
                     tcl: "project_manager",
+                },
+                NavAction {
+                    label: "Sources",
+                    tcl: "sources",
+                },
+                NavAction {
+                    label: "Netlist",
+                    tcl: "netlist",
                 },
                 NavAction {
                     label: "Reports",
@@ -3171,6 +3243,10 @@ pub struct IdeModel {
     pub find_results: Vec<FindHit>,
     /// UG893 Find Results selected row index.
     pub selected_find: Option<usize>,
+    /// UG893 Sources selected path (clickable Name/Type table).
+    pub selected_source: Option<String>,
+    /// UG893 Netlist selected Name (clickable Name/Type table).
+    pub selected_netlist: Option<String>,
     pub package_pins: Vec<PackagePin>,
     pub package: PackageDrawing,
     /// UG893 Floorplanning Pblocks (source of truth; copied onto DeviceView).
@@ -3242,6 +3318,8 @@ impl IdeModel {
             hierarchy: HierarchyView::default(),
             find_results: Vec::new(),
             selected_find: None,
+            selected_source: None,
+            selected_netlist: None,
             package_pins: Vec::new(),
             package: PackageDrawing::default(),
             pblocks: Vec::new(),
@@ -3453,6 +3531,18 @@ impl IdeModel {
         } else if t == "select_property" || t.starts_with("select_property ") {
             let spec = t.strip_prefix("select_property").unwrap_or("").trim();
             self.select_property(spec)
+        } else if t == "sources" {
+            self.layout = LayoutKind::Default;
+            Ok(self.sources_text())
+        } else if t == "select_source" || t.starts_with("select_source ") {
+            let spec = t.strip_prefix("select_source").unwrap_or("").trim();
+            self.select_source(spec)
+        } else if t == "netlist" || t == "tree" {
+            self.layout = LayoutKind::Default;
+            Ok(self.netlist_text())
+        } else if t == "select_netlist" || t.starts_with("select_netlist ") {
+            let spec = t.strip_prefix("select_netlist").unwrap_or("").trim();
+            self.select_netlist(spec)
         } else if t == "find" || t == "find_results" {
             self.open_find_results()
         } else if let Some(q) = t.strip_prefix("find ") {
@@ -4593,12 +4683,19 @@ impl IdeModel {
         self.selected_timing_pin = None;
         self.selected_ip = None;
         self.selected_property = None;
+        self.selected_source = None;
         if id.is_empty() {
             self.selected = None;
+            self.selected_netlist = None;
             self.properties.clear();
             return;
         }
         self.selected = Some(id.to_string());
+        if self.tree.has_cell(id) || self.tree.has_net(id) {
+            self.selected_netlist = Some(id.to_string());
+        } else {
+            self.selected_netlist = None;
+        }
         self.refresh_properties();
         self.highlight_device_routes();
     }
@@ -4611,7 +4708,159 @@ impl IdeModel {
         let Some(id) = self.selected.as_deref() else {
             return false;
         };
-        self.tree.has_cell(id) || self.tree.nets.iter().any(|n| n == id)
+        self.tree.has_cell(id) || self.tree.has_net(id)
+    }
+
+    /// UG893 Sources table rows (file Name/Type), not a basename dump.
+    pub fn source_rows(&self) -> Vec<NetlistRow> {
+        self.tree
+            .sources
+            .iter()
+            .map(|p| NetlistRow {
+                kind: "source".into(),
+                name: source_basename(p),
+                type_name: source_type_of(p).into(),
+                parent: p.clone(),
+            })
+            .collect()
+    }
+
+    /// UG893 Netlist table rows (HNF cell primitive / net), not a collapsing dump.
+    pub fn netlist_rows(&self) -> Vec<NetlistRow> {
+        let parent = self
+            .tree
+            .top
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into());
+        let mut rows = Vec::with_capacity(self.tree.cells.len() + self.tree.nets.len());
+        for (name, kind) in &self.tree.cells {
+            rows.push(NetlistRow {
+                kind: "cell".into(),
+                name: name.clone(),
+                type_name: kind.clone(),
+                parent: parent.clone(),
+            });
+        }
+        for n in &self.tree.nets {
+            rows.push(NetlistRow {
+                kind: "net".into(),
+                name: n.clone(),
+                type_name: "net".into(),
+                parent: parent.clone(),
+            });
+        }
+        rows
+    }
+
+    /// UG893 Sources pane dump (tests). Paint is a clickable Name/Type grid, not this string.
+    pub fn sources_text(&self) -> String {
+        let rows = self.source_rows();
+        let n = rows.len();
+        let mut s = format!("sources n={n}");
+        if n == 0 {
+            s.push_str(" no sources");
+            return s;
+        }
+        for r in &rows {
+            s.push('\n');
+            s.push_str(&r.row_text());
+        }
+        s
+    }
+
+    /// UG893 Netlist pane dump (tests). Paint is a clickable Name/Type grid, not this string.
+    pub fn netlist_text(&self) -> String {
+        let rows = self.netlist_rows();
+        let n = rows.len();
+        let top = self.tree.top.as_deref().unwrap_or("-");
+        let mut s = format!("netlist n={n} top={top}");
+        if n == 0 {
+            s.push_str(" no cells/nets");
+            return s;
+        }
+        for r in &rows {
+            s.push('\n');
+            s.push_str(&r.row_text());
+        }
+        s
+    }
+
+    /// Click a UG893 Sources row (name, path, or index) — Name/Type table, not a dump.
+    pub fn select_source(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_source: missing name".into());
+        }
+        let rows = self.source_rows();
+        if rows.is_empty() {
+            return Err("select_source: no sources".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= rows.len() {
+                return Err(format!("select_source: no row {spec}"));
+            }
+            i
+        } else {
+            rows.iter()
+                .position(|r| {
+                    r.name.eq_ignore_ascii_case(spec)
+                        || r.parent.eq_ignore_ascii_case(spec)
+                        || r.parent.ends_with(spec)
+                        || format!("{}:{}", r.kind, r.name).eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", r.type_cell(), r.name).eq_ignore_ascii_case(spec)
+                })
+                .ok_or_else(|| format!("select_source: no row {spec}"))?
+        };
+        let row = rows[idx].clone();
+        self.selected_timing_pin = None;
+        self.selected_ip = None;
+        self.selected_property = None;
+        self.selected_netlist = None;
+        self.selected_source = Some(row.parent.clone());
+        self.selected = Some(row.name.clone());
+        self.layout = LayoutKind::Default;
+        self.refresh_properties();
+        Ok(row.row_text())
+    }
+
+    /// Click a UG893 Netlist row (name or index) — Name/Type table, not a collapsing dump.
+    pub fn select_netlist(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_netlist: missing name".into());
+        }
+        let rows = self.netlist_rows();
+        if rows.is_empty() {
+            return Err("select_netlist: no cells/nets".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= rows.len() {
+                return Err(format!("select_netlist: no row {spec}"));
+            }
+            i
+        } else {
+            rows.iter()
+                .position(|r| {
+                    r.name.eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", r.kind, r.name).eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", r.type_cell(), r.name).eq_ignore_ascii_case(spec)
+                })
+                .ok_or_else(|| format!("select_netlist: no row {spec}"))?
+        };
+        let row = rows[idx].clone();
+        self.selected_source = None;
+        self.layout = LayoutKind::Default;
+        self.select(&row.name);
+        self.selected_netlist = Some(row.name.clone());
+        if !self.properties.iter().any(|(k, _)| k == "TYPE") {
+            self.properties
+                .push(("TYPE".into(), row.type_cell().to_string()));
+        }
+        if !self.properties.iter().any(|(k, _)| k == "KIND") {
+            self.properties.push(("KIND".into(), row.kind.clone()));
+        }
+        Ok(row.row_text())
     }
 
     pub fn schematic_has_selected(&self) -> bool {
@@ -10217,6 +10466,17 @@ impl IdeModel {
     }
 
     fn refresh_properties(&mut self) {
+        if let Some(path) = self.selected_source.clone() {
+            let name = source_basename(&path);
+            let ty = source_type_of(&path);
+            self.properties = vec![
+                ("NAME".into(), name),
+                ("TYPE".into(), ty.into()),
+                ("KIND".into(), "source".into()),
+                ("PATH".into(), path),
+            ];
+            return;
+        }
         if let Some(name) = self.selected_ip.clone() {
             if let Some(core) = self.ip_catalog.iter().find(|c| c.name == name).cloned() {
                 let status = self
@@ -10328,7 +10588,14 @@ impl IdeModel {
         let mut props = vec![("NAME".into(), id.clone())];
         if let Some(d) = self.shell.session.design.as_ref() {
             if let Some(c) = d.cells.iter().find(|c| c.name == id) {
-                props.push(("PRIMITIVE".into(), primitive_of(&c.kind)));
+                let prim = primitive_of(&c.kind);
+                props.push(("PRIMITIVE".into(), prim.clone()));
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), prim));
+                }
+                if !props.iter().any(|(k, _)| k == "KIND") {
+                    props.push(("KIND".into(), "cell".into()));
+                }
                 match &c.kind {
                     CellKind::Lut6 { init } => {
                         props.push(("INIT".into(), format!("{init:#018x}")));
@@ -18857,5 +19124,274 @@ mod tests {
         let bsel = blinky.exec("select_property DIR").unwrap();
         assert!(bsel.contains("NAME=DIR"), "{bsel}");
         assert_eq!(blinky.selected_property.as_deref(), Some("DIR"));
+    }
+
+    /// UG893 Sources/Netlist is a clickable Name/Type table over RTL + HNF
+    /// cells/nets, not a collapsing Cells/Nets monospace dump.
+    #[test]
+    fn sources_netlist_pane_clickable_name_type_table_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.source_rows().is_empty());
+        assert!(ide.netlist_rows().is_empty());
+        assert!(ide.selected_source.is_none());
+        assert!(ide.selected_netlist.is_none());
+        assert!(
+            ide.exec("select_source")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_source counter.sv")
+                .unwrap_err()
+                .contains("no sources"),
+            "idle pane must refuse a source click"
+        );
+        assert!(
+            ide.exec("select_netlist")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty netlist click must refuse"
+        );
+        assert!(
+            ide.exec("select_netlist u_lut0")
+                .unwrap_err()
+                .contains("no cells/nets"),
+            "idle pane must refuse a netlist click"
+        );
+        let empty_src = ide.exec("sources").unwrap();
+        assert_eq!(ide.layout, LayoutKind::Default);
+        assert!(empty_src.contains("sources n=0"), "{empty_src}");
+        assert!(empty_src.contains("no sources"), "{empty_src}");
+        assert!(
+            !empty_src.contains("NAME="),
+            "idle Sources has no canned rows: {empty_src}"
+        );
+        let empty_nl = ide.exec("netlist").unwrap();
+        assert!(empty_nl.contains("netlist n=0"), "{empty_nl}");
+        assert!(empty_nl.contains("no cells/nets"), "{empty_nl}");
+        assert!(
+            !empty_nl.contains("NAME="),
+            "idle Netlist has no canned rows: {empty_nl}"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "sources"),
+            "Flow Navigator Project Manager must offer Sources"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "netlist"),
+            "Flow Navigator Project Manager must offer Netlist"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        let sources = ide.exec("sources").unwrap();
+        assert_eq!(ide.layout, LayoutKind::Default);
+        assert!(sources.contains('\n'), "must not be a one-liner dump: {sources}");
+        assert!(sources.contains("sources n="), "{sources}");
+        assert!(sources.contains("NAME=counter.sv"), "{sources}");
+        assert!(sources.contains("TYPE=sv"), "{sources}");
+        let src_rows = ide.source_rows();
+        assert!(
+            src_rows
+                .iter()
+                .any(|r| r.name == "counter.sv" && r.type_cell() == "sv" && r.kind == "source"),
+            "{src_rows:?}"
+        );
+        assert!(
+            src_rows.iter().any(|r| r.parent.ends_with("counter.sv")),
+            "parent is the RTL path, not a dump stub: {src_rows:?}"
+        );
+
+        let ssel = ide.exec("select_source counter.sv").unwrap();
+        assert!(ssel.contains("NAME=counter.sv"), "{ssel}");
+        assert!(ssel.contains("TYPE=sv"), "{ssel}");
+        assert!(
+            ide.selected_source
+                .as_deref()
+                .map(|p| p.ends_with("counter.sv"))
+                .unwrap_or(false),
+            "{:?}",
+            ide.selected_source
+        );
+        assert_eq!(ide.selected.as_deref(), Some("counter.sv"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "sv"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "KIND" && v == "source"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "PATH" && v.ends_with("counter.sv")),
+            "{:?}",
+            ide.properties
+        );
+        let by_idx = ide.exec("select_source 0").unwrap();
+        assert!(by_idx.contains("NAME=counter.sv"), "{by_idx}");
+
+        let table = ide.exec("netlist").unwrap();
+        assert_eq!(ide.layout, LayoutKind::Default);
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("netlist n="), "{table}");
+        assert!(table.contains("top=counter"), "{table}");
+        assert!(table.contains("NAME=u_lut0"), "{table}");
+        assert!(table.contains("TYPE=LUT6"), "{table}");
+        assert!(table.contains("TYPE=net"), "{table}");
+        assert!(table.contains("NAME=cnt_3"), "{table}");
+        let rows = ide.netlist_rows();
+        assert!(
+            rows.iter()
+                .any(|h| h.name == "u_lut0" && h.type_cell() == "LUT6" && h.kind == "cell"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|h| h.name == "cnt_3" && h.type_cell() == "net" && h.kind == "net"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|h| h.parent_cell() == "counter"),
+            "parent is HNF top, not a dump stub: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|h| h.type_cell() == "IOB_OUT"),
+            "IOB primitive must show: {rows:?}"
+        );
+
+        let sel = ide.exec("select_netlist u_lut0").unwrap();
+        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        assert!(sel.contains("TYPE=LUT6"), "{sel}");
+        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
+        assert!(ide.selected_source.is_none());
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "PRIMITIVE" && v == "LUT6"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "LUT6"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "KIND" && v == "cell"),
+            "{:?}",
+            ide.properties
+        );
+        let cell0 = ide.exec("select_netlist 0").unwrap();
+        assert!(cell0.contains("NAME="), "{cell0}");
+        assert!(ide.selected_netlist.is_some());
+
+        let nsel = ide.exec("select_netlist cnt_3").unwrap();
+        assert!(nsel.contains("NAME=cnt_3"), "{nsel}");
+        assert!(nsel.contains("TYPE=net"), "{nsel}");
+        assert_eq!(ide.selected.as_deref(), Some("cnt_3"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("cnt_3"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "net"),
+            "{:?}",
+            ide.properties
+        );
+
+        assert!(
+            ide.exec("select_netlist no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown hit must refuse"
+        );
+        assert!(
+            ide.exec("select_source no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown source must refuse"
+        );
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        let after = ide.exec("netlist").unwrap();
+        assert!(after.contains("NAME=u_lut0"), "{after}");
+        assert!(after.contains("TYPE=LUT6"), "{after}");
+        let click = ide.exec("select_netlist u_lut0").unwrap();
+        assert!(click.contains("NAME=u_lut0"), "{click}");
+        let src_again = ide.exec("select_source counter.sv").unwrap();
+        assert!(src_again.contains("TYPE=sv"), "{src_again}");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Sources/Netlist"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let bsrc = blinky.exec("sources").unwrap();
+        assert!(bsrc.contains("NAME=blinky.sv"), "{bsrc}");
+        assert!(
+            !bsrc.contains("NAME=counter.sv"),
+            "Sources are per-session, not canned: {bsrc}"
+        );
+        let btable = blinky.exec("netlist").unwrap();
+        assert!(btable.contains("NAME=u_lut"), "{btable}");
+        assert!(btable.contains("top=blinky"), "{btable}");
+        assert!(
+            !btable.contains("NAME=u_lut0"),
+            "Netlist is per-session, not canned: {btable}"
+        );
+        assert!(
+            !btable.contains("PARENT=counter") && !btable.contains("top=counter"),
+            "blinky netlist is not counter: {btable}"
+        );
+        let bsel = blinky.exec("select_netlist u_lut").unwrap();
+        assert!(bsel.contains("NAME=u_lut"), "{bsel}");
+        assert_eq!(blinky.selected.as_deref(), Some("u_lut"));
+        assert!(
+            blinky
+                .netlist_rows()
+                .iter()
+                .any(|h| h.kind == "cell" && h.parent_cell() == "blinky"),
+            "{:?}",
+            blinky.netlist_rows()
+        );
+        assert!(
+            !blinky.netlist_rows().iter().any(|h| h.name == "u_lut0"),
+            "blinky cells are not counter: {:?}",
+            blinky.netlist_rows()
+        );
+        blinky.exec("select_source blinky.sv").unwrap();
+        assert!(
+            blinky
+                .selected_source
+                .as_deref()
+                .map(|p| p.ends_with("blinky.sv"))
+                .unwrap_or(false),
+            "{:?}",
+            blinky.selected_source
+        );
     }
 }
