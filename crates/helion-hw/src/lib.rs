@@ -171,6 +171,13 @@ mod tests {
         assert!(st.init && st.done && st.eos && st.gwe);
         assert!(!st.gsr && !st.gts && !st.crc_err);
         assert_eq!(tap.ir, IR_STAT);
+        assert_eq!(st.word(), helion_fabric::Stat::STARTUP_WORD);
+        let mut idle = Tap::new(&dev);
+        assert_eq!(idle.read_idcode(), 0x0001_1A1F);
+        let rst = idle.read_stat();
+        assert_eq!(rst.word(), helion_fabric::Stat::RESET_WORD);
+        assert_eq!(idle.ir, IR_STAT);
+        assert_ne!(rst.word(), st.word());
     }
 
     #[test]
