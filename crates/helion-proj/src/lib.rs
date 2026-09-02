@@ -388,8 +388,8 @@ impl Session {
         Ok(self.bitstream.as_ref().unwrap())
     }
 
-    /// Push HNF port DRIVE / SLEW / PULLTYPE onto packed IOBs so bitgen sees
-    /// post-pack `set_property` without a re-pack.
+    /// Push HNF port DRIVE / SLEW / PULLTYPE / DIFF_TERM / IN_TERM onto packed
+    /// IOBs so bitgen sees post-pack `set_property` without a re-pack.
     fn sync_iob_electrical(&mut self) {
         let Some(d) = self.design.clone() else {
             return;
@@ -482,6 +482,10 @@ impl Session {
             d.set_slew(obj, val)?;
         } else if key.eq_ignore_ascii_case("PULLTYPE") {
             d.set_pulltype(obj, val)?;
+        } else if key.eq_ignore_ascii_case("DIFF_TERM") {
+            d.set_diff_term(obj, val)?;
+        } else if key.eq_ignore_ascii_case("IN_TERM") {
+            d.set_in_term(obj, val)?;
         } else {
             d.set_cell_attr(obj, key, val)?;
         }
@@ -630,6 +634,8 @@ pub struct ProjectFile {
     pub drives: Vec<(String, String)>,
     pub slews: Vec<(String, String)>,
     pub pulltypes: Vec<(String, String)>,
+    pub diff_terms: Vec<(String, String)>,
+    pub in_terms: Vec<(String, String)>,
 }
 
 pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
@@ -728,6 +734,34 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                         .to_string();
                     if !port.is_empty() {
                         p.pulltypes.push((port, val));
+                    }
+                } else if rest.first().copied() == Some("DIFF_TERM") && rest.len() >= 2 {
+                    let val = rest[1].to_string();
+                    let joined = rest[2..].join(" ");
+                    let port = joined
+                        .split_once("get_ports")
+                        .and_then(|(_, r)| {
+                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .find(|s| !s.is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    if !port.is_empty() {
+                        p.diff_terms.push((port, val));
+                    }
+                } else if rest.first().copied() == Some("IN_TERM") && rest.len() >= 2 {
+                    let val = rest[1].to_string();
+                    let joined = rest[2..].join(" ");
+                    let port = joined
+                        .split_once("get_ports")
+                        .and_then(|(_, r)| {
+                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                .find(|s| !s.is_empty())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    if !port.is_empty() {
+                        p.in_terms.push((port, val));
                     }
                 }
             }
@@ -896,6 +930,8 @@ set_property IOSTANDARD LVCMOS18 [get_ports led]
 set_property DRIVE 12 [get_ports led]
 set_property SLEW SLOW [get_ports led]
 set_property PULLTYPE NONE [get_ports led]
+set_property DIFF_TERM FALSE [get_ports led]
+set_property IN_TERM NONE [get_ports led]
 "#,
         )
         .unwrap();
@@ -907,6 +943,8 @@ set_property PULLTYPE NONE [get_ports led]
         assert_eq!(prj.drives, vec![("led".into(), "12".into())]);
         assert_eq!(prj.slews, vec![("led".into(), "SLOW".into())]);
         assert_eq!(prj.pulltypes, vec![("led".into(), "NONE".into())]);
+        assert_eq!(prj.diff_terms, vec![("led".into(), "FALSE".into())]);
+        assert_eq!(prj.in_terms, vec![("led".into(), "NONE".into())]);
         assert!(load_prj("part X\n").is_err());
     }
 

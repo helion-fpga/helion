@@ -373,6 +373,10 @@ impl Device {
     pub const DEFAULT_SLEW: &'static str = "SLOW";
     /// Default pull. Unset / NONE keeps gold STA pad delay.
     pub const DEFAULT_PULLTYPE: &'static str = "NONE";
+    /// Default differential termination. Unset / FALSE keeps gold STA pad delay.
+    pub const DEFAULT_DIFF_TERM: &'static str = "FALSE";
+    /// Default input termination. Unset / NONE keeps gold STA pad delay.
+    pub const DEFAULT_IN_TERM: &'static str = "NONE";
 
     pub fn iob_bank(&self, x: u32, y: u32) -> Option<u32> {
         self.iob_major(x, y)
@@ -419,6 +423,65 @@ impl Device {
         )
     }
 
+    /// UG893 I/O Ports `DIFF_TERM`: TRUE | FALSE (also 1 | 0).
+    pub fn parse_diff_term(s: &str) -> Option<&'static str> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "TRUE" | "1" => Some("TRUE"),
+            "FALSE" | "0" => Some("FALSE"),
+            _ => None,
+        }
+    }
+
+    pub fn legal_diff_term(s: &str) -> bool {
+        Self::parse_diff_term(s).is_some()
+    }
+
+    /// UG893 I/O Ports `IN_TERM`: NONE | UNTUNED_SPLIT_{40,50,60}.
+    pub fn parse_in_term(s: &str) -> Option<&'static str> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "NONE" => Some("NONE"),
+            "UNTUNED_SPLIT_40" => Some("UNTUNED_SPLIT_40"),
+            "UNTUNED_SPLIT_50" => Some("UNTUNED_SPLIT_50"),
+            "UNTUNED_SPLIT_60" => Some("UNTUNED_SPLIT_60"),
+            _ => None,
+        }
+    }
+
+    pub fn legal_in_term(s: &str) -> bool {
+        Self::parse_in_term(s).is_some()
+    }
+
+    /// SSTL/HSTL banks carry on-die / differential termination. LVCMOS does not.
+    pub fn had_odt_iostandard(std: Option<&str>) -> bool {
+        let std = std
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_IOSTANDARD.to_string());
+        matches!(
+            std.as_str(),
+            "SSTL15" | "SSTL15_I" | "HSTL_I" | "HSTL_I_18"
+        )
+    }
+
+    /// `DIFF_TERM TRUE` is HAD-legal only on SSTL/HSTL; FALSE is always legal.
+    pub fn diff_term_legal_for_iostandard(std: Option<&str>, term: &str) -> bool {
+        match Self::parse_diff_term(term) {
+            None => false,
+            Some("FALSE") => true,
+            Some("TRUE") => Self::had_odt_iostandard(std),
+            _ => false,
+        }
+    }
+
+    /// `IN_TERM` other than NONE is HAD-legal only on SSTL/HSTL.
+    pub fn in_term_legal_for_iostandard(std: Option<&str>, term: &str) -> bool {
+        match Self::parse_in_term(term) {
+            None => false,
+            Some("NONE") => true,
+            Some(_) => Self::had_odt_iostandard(std),
+        }
+    }
+
     /// Drive vs IOSTANDARD (unset standard is the HAD default LVCMOS18).
     pub fn drive_legal_for_iostandard(std: Option<&str>, ma: u32) -> bool {
         if !Self::legal_drive(ma) {
@@ -439,7 +502,14 @@ impl Device {
     }
 
     /// IOB word bits above USED/BLE/Y. Defaults encode as 0 so gold bitgen holds.
-    pub fn iob_electrical_bits(drive: Option<&str>, slew: Option<&str>, pull: Option<&str>) -> u128 {
+    /// [18:16] DRIVE, [19] SLEW, [21:20] PULLTYPE, [22] DIFF_TERM, [24:23] IN_TERM.
+    pub fn iob_electrical_bits(
+        drive: Option<&str>,
+        slew: Option<&str>,
+        pull: Option<&str>,
+        diff_term: Option<&str>,
+        in_term: Option<&str>,
+    ) -> u128 {
         let mut w = 0u128;
         if let Some(ma) = drive.and_then(Self::parse_drive) {
             if ma != Self::DEFAULT_DRIVE_MA {
@@ -468,6 +538,20 @@ impl Device {
             _ => 0,
         };
         w |= pcode << 20;
+        if diff_term
+            .and_then(Self::parse_diff_term)
+            .map(|s| s == "TRUE")
+            .unwrap_or(false)
+        {
+            w |= 1u128 << 22;
+        }
+        let icode = match in_term.and_then(Self::parse_in_term) {
+            Some("UNTUNED_SPLIT_40") => 1u128,
+            Some("UNTUNED_SPLIT_50") => 2,
+            Some("UNTUNED_SPLIT_60") => 3,
+            _ => 0,
+        };
+        w |= icode << 23;
         w
     }
 
@@ -776,18 +860,46 @@ mod tests {
         assert!(Device::drive_legal_for_iostandard(Some("LVCMOS18"), 16));
         assert!(!Device::drive_legal_for_iostandard(Some("LVCMOS18"), 24));
         assert!(Device::drive_legal_for_iostandard(Some("LVCMOS25"), 24));
-        assert_eq!(Device::iob_electrical_bits(None, None, None), 0);
+        assert_eq!(Device::iob_electrical_bits(None, None, None, None, None), 0);
         assert_eq!(
-            Device::iob_electrical_bits(Some("12"), Some("SLOW"), Some("NONE")),
+            Device::iob_electrical_bits(
+                Some("12"),
+                Some("SLOW"),
+                Some("NONE"),
+                Some("FALSE"),
+                Some("NONE")
+            ),
             0,
             "defaults must not change the gold IOB word"
         );
-        assert_ne!(Device::iob_electrical_bits(Some("4"), None, None), 0);
-        assert_ne!(Device::iob_electrical_bits(None, Some("FAST"), None), 0);
-        assert_ne!(Device::iob_electrical_bits(None, None, Some("PULLUP")), 0);
+        assert_ne!(Device::iob_electrical_bits(Some("4"), None, None, None, None), 0);
+        assert_ne!(Device::iob_electrical_bits(None, Some("FAST"), None, None, None), 0);
+        assert_ne!(Device::iob_electrical_bits(None, None, Some("PULLUP"), None, None), 0);
+        assert_ne!(
+            Device::iob_electrical_bits(None, None, None, Some("TRUE"), None),
+            0
+        );
+        assert_ne!(
+            Device::iob_electrical_bits(None, None, None, None, Some("UNTUNED_SPLIT_50")),
+            0
+        );
         assert_eq!(Device::DEFAULT_DRIVE_MA, 12);
         assert_eq!(Device::DEFAULT_SLEW, "SLOW");
         assert_eq!(Device::DEFAULT_PULLTYPE, "NONE");
+        assert_eq!(Device::DEFAULT_DIFF_TERM, "FALSE");
+        assert_eq!(Device::DEFAULT_IN_TERM, "NONE");
+        assert!(Device::legal_diff_term("true"));
+        assert!(Device::legal_diff_term("0"));
+        assert!(!Device::legal_diff_term("YES"));
+        assert_eq!(Device::parse_diff_term("1"), Some("TRUE"));
+        assert!(Device::legal_in_term("UNTUNED_SPLIT_50"));
+        assert!(!Device::legal_in_term("50"));
+        assert!(Device::diff_term_legal_for_iostandard(None, "FALSE"));
+        assert!(!Device::diff_term_legal_for_iostandard(None, "TRUE"));
+        assert!(Device::diff_term_legal_for_iostandard(Some("SSTL15"), "TRUE"));
+        assert!(Device::in_term_legal_for_iostandard(None, "NONE"));
+        assert!(!Device::in_term_legal_for_iostandard(Some("LVCMOS18"), "UNTUNED_SPLIT_50"));
+        assert!(Device::in_term_legal_for_iostandard(Some("HSTL_I"), "UNTUNED_SPLIT_50"));
     }
 
     #[test]

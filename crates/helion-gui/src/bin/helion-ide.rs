@@ -907,7 +907,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("I/O Planning");
-    ui.weak("UG893 — PACKAGE_PIN re-places; IOSTANDARD/DRIVE/SLEW/PULLTYPE hit HAD / STA / DRC / bitgen");
+    ui.weak("UG893 — PACKAGE_PIN re-places; IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM hit HAD / STA / DRC / bitgen");
     let mut pick_port: Option<String> = None;
     let mut set_iostd: Option<(String, &'static str)> = None;
     let mut set_io: Option<(String, &'static str, &'static str)> = None;
@@ -926,11 +926,13 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
             let drv = p.drive.as_deref().unwrap_or("-");
             let slew = p.slew.as_deref().unwrap_or("-");
             let pull = p.pulltype.as_deref().unwrap_or("-");
+            let diff = p.diff_term.as_deref().unwrap_or("-");
+            let interm = p.in_term.as_deref().unwrap_or("-");
             if ui
                 .selectable_label(
                     on,
                     format!(
-                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}",
+                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}  DIFF_TERM={diff}  IN_TERM={interm}",
                         p.name, p.dir
                     ),
                 )
@@ -947,7 +949,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
         {
             ui.horizontal(|ui| {
                 ui.weak("IOSTANDARD");
-                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12"] {
+                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
                     if ui.small_button(std).clicked() {
                         set_iostd = Some((port.to_string(), std));
                     }
@@ -974,6 +976,22 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                 for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
                     if ui.small_button(s).clicked() {
                         set_io = Some((port.to_string(), "PULLTYPE", s));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("DIFF_TERM");
+                for s in ["FALSE", "TRUE"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "DIFF_TERM", s));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("IN_TERM");
+                for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "IN_TERM", s));
                     }
                 }
             });
@@ -1181,12 +1199,17 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Timing Constraints");
-    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / I/O delay / false path / multicycle / max_delay Apply");
+    ui.weak("UG893 SDC/XDC on helion-sta — create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path Apply");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Read examples/counter.sdc").clicked() {
             let p = helion_device::Device::examples_dir().join("counter.sdc");
             let _ = model.exec(&format!("read_xdc {}", p.display()));
+        }
+        if ui.button("Apply create_generated_clock ÷2").clicked() {
+            let _ = model.exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            );
         }
         if ui.button("Apply set_input_delay 1.5ns clk").clicked() {
             let _ = model.exec("set_input_delay -clock clk 1.5 [get_ports clk]");
@@ -1208,9 +1231,60 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Apply set_max_delay 5ns clk→led").clicked() {
             let _ = model.exec("set_max_delay 5.0 -from [get_ports clk] -to [get_ports led]");
         }
+        if ui.button("Apply set_min_delay 1ns clk→led").clicked() {
+            let _ = model.exec("set_min_delay 1.0 -from [get_ports clk] -to [get_ports led]");
+        }
+        if ui.button("Apply set_clock_groups async clk/virt").clicked() {
+            let _ = model.exec(
+                "set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]",
+            );
+        }
+        if ui.button("Apply set_clock_uncertainty 0.5ns setup").clicked() {
+            let _ = model.exec("set_clock_uncertainty -setup 0.5 [get_clocks clk]");
+        }
+        if ui.button("Apply set_clock_latency 0.4ns late").clicked() {
+            let _ = model.exec("set_clock_latency -late 0.4 [get_clocks clk]");
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Apply set_disable_timing clk→led").clicked() {
+            let _ = model.exec("set_disable_timing -from [get_ports clk] -to [get_ports led]");
+        }
+        if ui.button("Apply set_case_analysis 0 clk").clicked() {
+            let _ = model.exec("set_case_analysis 0 [get_ports clk]");
+        }
+        if ui.button("Apply set_propagated_clock clk").clicked() {
+            let _ = model.exec("set_propagated_clock [get_clocks clk]");
+        }
+        if ui.button("Apply set_clock_sense -negative").clicked() {
+            let _ = model.exec("set_clock_sense -negative [get_pins u_lut0/I0]");
+        }
+        if ui.button("Apply set_clock_sense -stop").clicked() {
+            let _ = model.exec("set_clock_sense -stop_propagation [get_pins clk_buf/O]");
+        }
+        if ui.button("Apply set_input_jitter 0.2ns clk").clicked() {
+            let _ = model.exec("set_input_jitter [get_clocks clk] 0.2");
+        }
+        if ui.button("Apply set_system_jitter 0.1ns").clicked() {
+            let _ = model.exec("set_system_jitter 0.1");
+        }
+        if ui.button("Apply set_timing_derate -late 1.1").clicked() {
+            let _ = model.exec("set_timing_derate -late 1.1");
+        }
+        if ui.button("Apply set_operating_conditions 0.95V 85C").clicked() {
+            let _ = model.exec("set_operating_conditions -voltage 0.95 -temperature 85");
+        }
+        if ui.button("Apply set_bus_skew 0.5ns clk→led").clicked() {
+            let _ = model.exec("set_bus_skew -setup 0.5 -from [get_ports clk] -to [get_ports led]");
+        }
+        if ui.button("Apply group_path -weight 2 clk→led").clicked() {
+            let _ = model.exec(
+                "group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]",
+            );
+        }
     });
     ui.add_space(6.0);
-    report_box(ui, "Constraints (create_clock / I/O delay / false path / multicycle / max_delay)", &model.constraints_text());
+    report_box(ui, "Constraints (create_clock / create_generated_clock / I/O delay / false path / multicycle / max_delay / min_delay / clock_groups / uncertainty / latency / disable_timing / case_analysis / propagated_clock / clock_sense / input_jitter / system_jitter / timing_derate / operating_conditions / bus_skew / group_path)", &model.constraints_text());
     ui.add_space(8.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
 }
@@ -1613,11 +1687,13 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
             let drv = p.drive.as_deref().unwrap_or("-");
             let slew = p.slew.as_deref().unwrap_or("-");
             let pull = p.pulltype.as_deref().unwrap_or("-");
+            let diff = p.diff_term.as_deref().unwrap_or("-");
+            let interm = p.in_term.as_deref().unwrap_or("-");
             if ui
                 .selectable_label(
                     on,
                     format!(
-                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}",
+                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}  DIFF_TERM={diff}  IN_TERM={interm}",
                         p.name, p.dir
                     ),
                 )
@@ -1633,7 +1709,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
         {
             ui.horizontal(|ui| {
                 ui.weak("IOSTANDARD");
-                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12"] {
+                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
                     if ui.small_button(std).clicked() {
                         set_iostd = Some((port.to_string(), std));
                     }
@@ -1660,6 +1736,22 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
                     if ui.small_button(s).clicked() {
                         set_io = Some((port.to_string(), "PULLTYPE", s));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("DIFF_TERM");
+                for s in ["FALSE", "TRUE"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "DIFF_TERM", s));
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak("IN_TERM");
+                for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
+                    if ui.small_button(s).clicked() {
+                        set_io = Some((port.to_string(), "IN_TERM", s));
                     }
                 }
             });

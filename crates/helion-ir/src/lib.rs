@@ -238,6 +238,14 @@ impl Design {
         self.set_port_attr(port, "PULLTYPE", pull)
     }
 
+    pub fn set_diff_term(&mut self, port: &str, term: &str) -> Result<(), String> {
+        self.set_port_attr(port, "DIFF_TERM", term)
+    }
+
+    pub fn set_in_term(&mut self, port: &str, term: &str) -> Result<(), String> {
+        self.set_port_attr(port, "IN_TERM", term)
+    }
+
     pub fn lut_inits(&self) -> Vec<u64> {
         self.cells
             .iter()
@@ -554,6 +562,8 @@ mod tests {
         d.set_drive("led", "12").unwrap();
         d.set_slew("led", "SLOW").unwrap();
         d.set_pulltype("led", "NONE").unwrap();
+        d.set_diff_term("led", "FALSE").unwrap();
+        d.set_in_term("led", "NONE").unwrap();
         d.attrs.set("top", "blinky");
         let text = d.to_hnf();
         assert!(text.starts_with("HNF 1"), "{text}");
@@ -577,6 +587,14 @@ mod tests {
         );
         assert_eq!(
             back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("PULLTYPE"),
+            Some("NONE")
+        );
+        assert_eq!(
+            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("DIFF_TERM"),
+            Some("FALSE")
+        );
+        assert_eq!(
+            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("IN_TERM"),
             Some("NONE")
         );
         assert_eq!(back.net_on("u_lut", "I0"), Some("q"));
