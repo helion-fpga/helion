@@ -394,6 +394,10 @@ impl NavSection {
                     label: "Reports",
                     tcl: "reports",
                 },
+                NavAction {
+                    label: "Find Results",
+                    tcl: "find_results",
+                },
             ],
             NavSection::IpIntegrator => &[
                 NavAction {
@@ -2957,11 +2961,53 @@ impl HierarchyView {
     }
 }
 
-/// UG893 Find Results — hits against the live HNF / HAD, not a placeholder list.
-#[derive(Clone, Debug)]
+/// One clickable row in the UG893 Find Results pane (not a `kind  name` dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FindHit {
+    /// Object type: `cell` / `net` / `port` / `pin` (HNF or HAD).
     pub kind: String,
     pub name: String,
+    /// LUT6 / HFF / IN / fanout=N / BANKn — Type is `kind`, this is the primitive.
+    pub primitive: String,
+    /// HNF top / connected port.
+    pub parent: String,
+}
+
+impl FindHit {
+    pub fn type_cell(&self) -> &str {
+        self.kind.split(':').next().unwrap_or(self.kind.as_str())
+    }
+
+    pub fn primitive_cell(&self) -> &str {
+        if !self.primitive.is_empty() {
+            return self.primitive.as_str();
+        }
+        if let Some((_, rest)) = self.kind.split_once(':') {
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+        "-"
+    }
+
+    pub fn parent_cell(&self) -> &str {
+        if self.parent.is_empty() {
+            "-"
+        } else {
+            self.parent.as_str()
+        }
+    }
+
+    /// Clickable-grid dump row: UG893 Find Results Name/Type over HNF/HAD.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} TYPE={} PRIMITIVE={} PARENT={}",
+            self.name,
+            self.type_cell(),
+            self.primitive_cell(),
+            self.parent_cell()
+        )
+    }
 }
 
 /// HAD IOB sites as package pins (Helion has no BGA; pins are IOB_XxYy).
@@ -3057,6 +3103,8 @@ pub struct IdeModel {
     pub constraints: Constraints,
     pub hierarchy: HierarchyView,
     pub find_results: Vec<FindHit>,
+    /// UG893 Find Results selected row index.
+    pub selected_find: Option<usize>,
     pub package_pins: Vec<PackagePin>,
     pub package: PackageDrawing,
     /// UG893 Floorplanning Pblocks (source of truth; copied onto DeviceView).
@@ -3125,6 +3173,7 @@ impl IdeModel {
             constraints: Constraints::default(),
             hierarchy: HierarchyView::default(),
             find_results: Vec::new(),
+            selected_find: None,
             package_pins: Vec::new(),
             package: PackageDrawing::default(),
             pblocks: Vec::new(),
@@ -3331,8 +3380,13 @@ impl IdeModel {
         } else if let Some(id) = t.strip_prefix("select ") {
             self.select(id.trim());
             Ok(format!("select {}", id.trim()))
+        } else if t == "find" || t == "find_results" {
+            self.open_find_results()
         } else if let Some(q) = t.strip_prefix("find ") {
             self.find(q.trim())
+        } else if t == "select_find" || t.starts_with("select_find ") {
+            let spec = t.strip_prefix("select_find").unwrap_or("").trim();
+            self.select_find(spec)
         } else if t == "hierarchy" {
             self.workspace = WorkspaceTab::Hierarchy;
             Ok(self.hierarchy_text())
@@ -4734,29 +4788,45 @@ impl IdeModel {
     pub fn sheet_find(&mut self, kind: &str) -> Result<String, String> {
         let k = kind.trim().to_ascii_lowercase();
         let k = if k.is_empty() { "cells".into() } else { k };
+        let parent = self.find_parent_name();
         let mut hits = Vec::new();
         match k.as_str() {
             "cells" | "cell" => {
-                for (n, kind) in &self.tree.cells {
+                for (n, prim) in &self.tree.cells {
                     hits.push(FindHit {
-                        kind: format!("cell:{kind}"),
+                        kind: "cell".into(),
                         name: n.clone(),
+                        primitive: prim.clone(),
+                        parent: parent.clone(),
                     });
                 }
             }
             "ports" | "port" | "io" | "i/o" | "io_ports" | "i/o_ports" => {
                 for p in &self.schematic.ports {
                     hits.push(FindHit {
-                        kind: format!("port:{}", p.dir),
+                        kind: "port".into(),
                         name: p.name.clone(),
+                        primitive: p.dir.clone(),
+                        parent: parent.clone(),
                     });
                 }
             }
             "nets" | "net" => {
+                let fanout = |name: &str| {
+                    self.shell
+                        .session
+                        .design
+                        .as_ref()
+                        .and_then(|d| d.nets.iter().find(|n| n.name == name))
+                        .map(|n| format!("fanout={}", n.endpoints.len()))
+                        .unwrap_or_else(|| "net".into())
+                };
                 for n in &self.tree.nets {
                     hits.push(FindHit {
                         kind: "net".into(),
                         name: n.clone(),
+                        primitive: fanout(n),
+                        parent: parent.clone(),
                     });
                 }
             }
@@ -4767,15 +4837,19 @@ impl IdeModel {
             return Err(format!("sheet_find {k}: 0 hits"));
         }
         self.find_results = hits;
+        self.selected_find = None;
         self.workspace = WorkspaceTab::Find;
-        Ok(format!(
+        let mut s = format!(
             "sheet_find {k} hits={n} {}",
             self.find_results
                 .iter()
                 .map(|h| format!("{}:{}", h.kind, h.name))
                 .collect::<Vec<_>>()
                 .join(" ")
-        ))
+        );
+        s.push('\n');
+        s.push_str(&self.find_results_text());
+        Ok(s)
     }
 
     /// RTL Analysis / Synthesis child: open the elaborated HNF schematic.
@@ -6227,12 +6301,96 @@ impl IdeModel {
         Ok(self.runs_text())
     }
 
+    fn find_parent_name(&self) -> String {
+        self.hierarchy
+            .top
+            .clone()
+            .or_else(|| self.tree.top.clone())
+            .or_else(|| {
+                self.shell
+                    .session
+                    .design
+                    .as_ref()
+                    .map(|d| d.name.clone())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn find_rows(&self) -> &[FindHit] {
+        &self.find_results
+    }
+
+    /// UG893 Find Results table dump (Name/Type/Primitive/Parent), not a kind-name line.
+    pub fn find_results_text(&self) -> String {
+        let n = self.find_results.len();
+        let mut s = format!("find_results n={n}");
+        if n == 0 {
+            s.push_str(" no hits");
+            return s;
+        }
+        for h in &self.find_results {
+            s.push('\n');
+            s.push_str(&h.row_text());
+        }
+        s
+    }
+
+    pub fn open_find_results(&mut self) -> Result<String, String> {
+        self.workspace = WorkspaceTab::Find;
+        Ok(self.find_results_text())
+    }
+
+    /// Click a UG893 Find Results row (name or index) — Find workspace, not a dump.
+    pub fn select_find(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_find: missing name".into());
+        }
+        if self.find_results.is_empty() {
+            return Err("select_find: no hits".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            if i >= self.find_results.len() {
+                return Err(format!("select_find: no row {spec}"));
+            }
+            i
+        } else {
+            self.find_results
+                .iter()
+                .position(|h| {
+                    h.name.eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", h.kind, h.name).eq_ignore_ascii_case(spec)
+                        || format!("{}:{}", h.type_cell(), h.name).eq_ignore_ascii_case(spec)
+                })
+                .ok_or_else(|| format!("select_find: no row {spec}"))?
+        };
+        let hit = self.find_results[idx].clone();
+        self.selected_find = Some(idx);
+        self.workspace = WorkspaceTab::Find;
+        self.select(&hit.name);
+        if !self.properties.iter().any(|(k, _)| k == "TYPE") {
+            self.properties
+                .push(("TYPE".into(), hit.type_cell().to_string()));
+        }
+        if !self.properties.iter().any(|(k, _)| k == "PRIMITIVE") {
+            self.properties
+                .push(("PRIMITIVE".into(), hit.primitive_cell().to_string()));
+        }
+        if !self.properties.iter().any(|(k, _)| k == "PARENT") {
+            self.properties
+                .push(("PARENT".into(), hit.parent_cell().to_string()));
+        }
+        Ok(hit.row_text())
+    }
+
     /// UG893 Find: substring match on HNF cells/nets/ports and HAD pin names.
     pub fn find(&mut self, query: &str) -> Result<String, String> {
         let q = query.trim().to_ascii_lowercase();
         if q.is_empty() {
             return Err("find: empty query".into());
         }
+        let parent = self.find_parent_name();
         let mut hits = Vec::new();
         if let Some(d) = self.shell.session.design.as_ref() {
             for c in &d.cells {
@@ -6240,6 +6398,8 @@ impl IdeModel {
                     hits.push(FindHit {
                         kind: "cell".into(),
                         name: c.name.clone(),
+                        primitive: primitive_of(&c.kind),
+                        parent: parent.clone(),
                     });
                 }
             }
@@ -6248,14 +6408,23 @@ impl IdeModel {
                     hits.push(FindHit {
                         kind: "net".into(),
                         name: n.name.clone(),
+                        primitive: format!("fanout={}", n.endpoints.len()),
+                        parent: parent.clone(),
                     });
                 }
             }
             for p in &d.ports {
                 if p.name.to_ascii_lowercase().contains(&q) {
+                    let dir = match p.dir {
+                        PortDir::In => "IN",
+                        PortDir::Out => "OUT",
+                        PortDir::Inout => "INOUT",
+                    };
                     hits.push(FindHit {
                         kind: "port".into(),
                         name: p.name.clone(),
+                        primitive: dir.into(),
+                        parent: parent.clone(),
                     });
                 }
             }
@@ -6265,31 +6434,36 @@ impl IdeModel {
                 hits.push(FindHit {
                     kind: "pin".into(),
                     name: pin.pin.clone(),
+                    primitive: format!("BANK{}", pin.bank),
+                    parent: pin.port.clone().unwrap_or_else(|| parent.clone()),
                 });
             }
         }
         let n = hits.len();
         self.find_results = hits;
+        self.selected_find = None;
         self.workspace = WorkspaceTab::Find;
         if n == 0 {
             return Err(format!("find {query}: 0 hits"));
         }
-        let cell = self
-            .find_results
-            .iter()
-            .find(|h| h.kind == "cell")
-            .map(|h| h.name.clone());
-        if let Some(name) = cell {
+        let cell = self.find_results.iter().enumerate().find_map(|(i, h)| {
+            if h.kind == "cell" || h.type_cell() == "cell" {
+                Some((i, h.name.clone()))
+            } else {
+                None
+            }
+        });
+        if let Some((i, name)) = cell {
+            self.selected_find = Some(i);
             self.select(&name);
         }
-        Ok(format!(
-            "find {query} hits={n} {}",
-            self.find_results
-                .iter()
-                .map(|h| format!("{}:{}", h.kind, h.name))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ))
+        let mut s = format!("find {query} hits={n}");
+        for h in &self.find_results {
+            s.push_str(&format!(" {}:{}", h.kind, h.name));
+        }
+        s.push('\n');
+        s.push_str(&self.find_results_text());
+        Ok(s)
     }
 
     pub fn device_has_selected(&self) -> bool {
@@ -17900,5 +18074,168 @@ mod tests {
             "Log clicks are per-session, not canned: {bsel}"
         );
         assert_eq!(blinky.workspace, WorkspaceTab::Reports);
+    }
+
+    /// UG893 Find Results is a clickable Name/Type table over HNF/HAD find,
+    /// not a `kind  name` selectable-label dump.
+    #[test]
+    fn find_results_pane_clickable_name_type_table_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.find_rows().is_empty());
+        assert!(
+            ide.exec("select_find")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_find u_lut0")
+                .unwrap_err()
+                .contains("no hits"),
+            "idle pane must refuse a click"
+        );
+        let empty = ide.exec("find_results").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Find);
+        assert!(empty.contains("find_results n=0"), "{empty}");
+        assert!(empty.contains("no hits"), "{empty}");
+        assert!(
+            !empty.contains("NAME="),
+            "idle pane has no canned rows: {empty}"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "find_results"),
+            "Flow Navigator Project Manager must offer Find Results"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        let table = ide.exec("find u_lut0").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Find);
+        assert!(table.contains("cell:u_lut0"), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("find_results n="), "{table}");
+        assert!(table.contains("NAME=u_lut0"), "{table}");
+        assert!(table.contains("TYPE=cell"), "{table}");
+        assert!(table.contains("PRIMITIVE=LUT6"), "{table}");
+        assert!(table.contains("PARENT=counter"), "{table}");
+        let rows = ide.find_rows();
+        assert!(
+            rows.iter()
+                .any(|h| h.name == "u_lut0" && h.type_cell() == "cell" && h.primitive_cell() == "LUT6"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|h| h.parent_cell() == "counter"),
+            "parent is HNF top, not a dump stub: {rows:?}"
+        );
+
+        let sel = ide.exec("select_find u_lut0").unwrap();
+        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        assert!(sel.contains("TYPE=cell"), "{sel}");
+        assert!(sel.contains("PRIMITIVE=LUT6"), "{sel}");
+        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.workspace, WorkspaceTab::Find);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "PRIMITIVE" && v == "LUT6"),
+            "{:?}",
+            ide.properties
+        );
+        let by_idx = ide.exec("select_find 0").unwrap();
+        assert!(by_idx.contains("NAME="), "{by_idx}");
+        assert_eq!(ide.selected_find, Some(0));
+
+        let ports = ide.exec("sheet_find ports").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Find);
+        assert!(ports.contains('\n'), "sheet_find must be a table: {ports}");
+        assert!(ports.contains("NAME=clk"), "{ports}");
+        assert!(ports.contains("NAME=led"), "{ports}");
+        assert!(ports.contains("TYPE=port"), "{ports}");
+        assert!(ports.contains("PRIMITIVE=IN"), "{ports}");
+        assert!(ports.contains("PRIMITIVE=OUT"), "{ports}");
+        let psel = ide.exec("select_find clk").unwrap();
+        assert!(psel.contains("NAME=clk"), "{psel}");
+        assert!(psel.contains("TYPE=port"), "{psel}");
+        assert_eq!(ide.selected.as_deref(), Some("clk"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "port"),
+            "{:?}",
+            ide.properties
+        );
+
+        let nets = ide.exec("sheet_find nets").unwrap();
+        assert!(nets.contains("TYPE=net"), "{nets}");
+        assert!(
+            ide.find_rows().iter().any(|h| h.type_cell() == "net"),
+            "{:?}",
+            ide.find_rows()
+        );
+        let cells = ide.exec("sheet_find cells").unwrap();
+        assert!(cells.contains("NAME=u_lut0"), "{cells}");
+        assert!(cells.contains("TYPE=cell"), "{cells}");
+        assert!(cells.contains("PRIMITIVE=LUT6"), "{cells}");
+
+        assert!(
+            ide.exec("select_find no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown hit must refuse"
+        );
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        let after = ide.exec("find u_lut0").unwrap();
+        assert!(after.contains("NAME=u_lut0"), "{after}");
+        let click = ide.exec("select_find u_lut0").unwrap();
+        assert!(click.contains("NAME=u_lut0"), "{click}");
+        let pin_hits = ide.exec("find IOB").unwrap();
+        assert!(
+            pin_hits.contains("TYPE=pin") || pin_hits.contains("TYPE=cell"),
+            "HAD pins are findable: {pin_hits}"
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Find Results"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let btable = blinky.exec("find led").unwrap();
+        assert!(btable.contains("NAME=led"), "{btable}");
+        assert!(btable.contains("PARENT=blinky"), "{btable}");
+        assert!(
+            !btable.contains("PARENT=counter"),
+            "Find Results are per-session, not canned: {btable}"
+        );
+        assert!(
+            blinky
+                .exec("find u_lut0")
+                .unwrap_err()
+                .contains("0 hits"),
+            "blinky has no counter LUT"
+        );
+        blinky.exec("sheet_find cells").unwrap();
+        assert!(
+            blinky
+                .find_rows()
+                .iter()
+                .any(|h| h.type_cell() == "cell" && h.parent_cell() == "blinky"),
+            "{:?}",
+            blinky.find_rows()
+        );
+        assert!(
+            !blinky.find_rows().iter().any(|h| h.name == "u_lut0"),
+            "blinky cells are not counter: {:?}",
+            blinky.find_rows()
+        );
     }
 }
