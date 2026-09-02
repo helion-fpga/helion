@@ -12,7 +12,7 @@ pub use ide::{
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, MsgSeverity, NavAction, NavSection,
     ConstraintRow, ConstraintSection,
     Pblock, PropertyRow, ReportCatalogRow,
-    NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
+    NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
     TimingPathPin,
     UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
