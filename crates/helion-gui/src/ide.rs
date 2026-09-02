@@ -18,7 +18,8 @@ use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
-    report_timing_routed_xdc, Constraints, TimingResult,
+    report_clock_interaction, report_timing_routed_xdc, ClockInteraction, Constraints,
+    TimingResult,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -294,10 +295,16 @@ impl NavSection {
                 label: "Run Implementation",
                 tcl: "run_implementation",
             }],
-            NavSection::TimingAnalysis => &[NavAction {
-                label: "Report Timing",
-                tcl: "report_timing",
-            }],
+            NavSection::TimingAnalysis => &[
+                NavAction {
+                    label: "Report Timing",
+                    tcl: "report_timing",
+                },
+                NavAction {
+                    label: "Report Clock Interaction",
+                    tcl: "report_clock_interaction",
+                },
+            ],
             NavSection::ProgramDebug => &[
                 NavAction {
                     label: "Generate Bitstream",
@@ -1899,6 +1906,7 @@ pub enum WorkspaceTab {
     Hardware,
     Ip,
     Constraints,
+    ClockInteraction,
     Hierarchy,
     Find,
     Package,
@@ -2498,6 +2506,14 @@ impl IdeModel {
             self.shell.session.insert_eco_lut(name, init)
         } else if t == "report_drc" {
             self.run_drc()
+        } else if t == "report_clock_interaction" || t == "clock_interaction" {
+            self.workspace = WorkspaceTab::ClockInteraction;
+            Ok(self.clock_interaction_text())
+        } else if let Some(rest) = t.strip_prefix("select_clock_interaction ") {
+            let mut p = rest.split_whitespace();
+            let from = p.next().unwrap_or("");
+            let to = p.next().unwrap_or(from);
+            self.select_clock_interaction(from, to)
         } else if t == "create_clock" || t.starts_with("create_clock ") {
             self.apply_create_clock(t)
         } else if t == "create_generated_clock" || t.starts_with("create_generated_clock ") {
@@ -4840,6 +4856,55 @@ impl IdeModel {
         s
     }
 
+    /// UG949 Clock Interaction pane: STA clock matrix, not a dump.
+    /// Implicit analysis clock appears after synth; user clocks come from create_clock.
+    pub fn clock_interaction(&self) -> ClockInteraction {
+        let clks = if !self.constraints.clocks.is_empty() {
+            self.constraints.clocks.clone()
+        } else if self.timing.is_some() || self.shell.session.design.is_some() {
+            self.clocks_for_sta()
+        } else {
+            return ClockInteraction::default();
+        };
+        report_clock_interaction(&clks, &self.constraints, self.timing.as_ref())
+    }
+
+    pub fn clock_interaction_text(&self) -> String {
+        self.clock_interaction().text()
+    }
+
+    /// Click a From×To cell: properties + Clock Interaction workspace.
+    pub fn select_clock_interaction(&mut self, from: &str, to: &str) -> Result<String, String> {
+        let report = self.clock_interaction();
+        let cell = report.cell(from, to).ok_or_else(|| {
+            format!("select_clock_interaction: no cell {from}->{to}")
+        })?;
+        let wns = match cell.wns_ps {
+            Some(w) => format!("{w}"),
+            None => "n/a".into(),
+        };
+        self.selected = Some(format!("{from}->{to}"));
+        self.properties = vec![
+            ("NAME".into(), format!("{from}->{to}")),
+            ("TYPE".into(), "clock_interaction".into()),
+            ("FROM".into(), cell.from.clone()),
+            ("TO".into(), cell.to.clone()),
+            ("RELATION".into(), cell.relation.as_str().into()),
+            ("COMMON_PS".into(), cell.common_period_ps.to_string()),
+            ("REQ_PS".into(), cell.requirement_ps.to_string()),
+            ("WNS_PS".into(), wns.clone()),
+            ("PATHS".into(), cell.path_count.to_string()),
+        ];
+        self.workspace = WorkspaceTab::ClockInteraction;
+        Ok(format!(
+            "clock_interaction FROM={from} TO={to} {} COMMON_PS={} REQ_PS={} WNS_PS={wns} paths={}",
+            cell.relation.as_str(),
+            cell.common_period_ps,
+            cell.requirement_ps,
+            cell.path_count
+        ))
+    }
+
     /// UG893 Timing Constraints pane text. Empty until create_clock /
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
@@ -6492,6 +6557,25 @@ impl IdeModel {
             props.push(("Y0".into(), pb.y0.to_string()));
             props.push(("X1".into(), pb.x1.to_string()));
             props.push(("Y1".into(), pb.y1.to_string()));
+        }
+        if let Some((from, to)) = id.split_once("->") {
+            if let Some(cell) = self.clock_interaction().cell(from, to).cloned() {
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "clock_interaction".into()));
+                }
+                props.push(("FROM".into(), cell.from));
+                props.push(("TO".into(), cell.to));
+                props.push(("RELATION".into(), cell.relation.as_str().into()));
+                props.push(("COMMON_PS".into(), cell.common_period_ps.to_string()));
+                props.push(("REQ_PS".into(), cell.requirement_ps.to_string()));
+                props.push((
+                    "WNS_PS".into(),
+                    cell.wns_ps
+                        .map(|w| w.to_string())
+                        .unwrap_or_else(|| "n/a".into()),
+                ));
+                props.push(("PATHS".into(), cell.path_count.to_string()));
+            }
         }
         self.properties = props;
     }
@@ -10945,6 +11029,216 @@ mod tests {
         assert!(
             e.contains("no HAD CLB") || e.contains("no placed sites"),
             "bogus range must fail against HAD: {e}"
+        );
+    }
+
+    /// UG949 Clock Interaction (`report_clock_interaction`) pane is STA clocks
+    /// + XDC CDC exceptions — not a canned matrix. Empty XDC keeps gold WNS.
+    #[test]
+    fn clock_interaction_pane_from_sta_clocks_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let empty = ide.clock_interaction_text();
+        assert!(
+            empty.contains("no clocks"),
+            "idle pane has no canned matrix: {empty}"
+        );
+        assert!(ide.clock_interaction().cells.is_empty());
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_clock_interaction"),
+            "Flow Navigator Timing Analysis must offer the pane"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+
+        let out = ide.exec("report_clock_interaction").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::ClockInteraction);
+        assert!(out.contains("FROM=clk TO=clk Timed"), "{out}");
+        assert!(out.contains(&format!("WNS_PS={gold}")), "{out}");
+        let r = ide.clock_interaction();
+        assert_eq!(r.clocks.len(), 1, "{}", r.text());
+        assert_eq!(r.cells.len(), 1);
+        let intra = r.cell("clk", "clk").expect("intra-clock cell");
+        assert_eq!(intra.relation, helion_sta::ClockRelation::Timed);
+        assert_eq!(intra.wns_ps, Some(gold));
+        assert_eq!(intra.path_count, ide.timing.as_ref().unwrap().endpoints);
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening the pane must not move gold WNS"
+        );
+
+        let sel = ide.exec("select_clock_interaction clk clk").unwrap();
+        assert!(sel.contains("TYPE") || sel.contains("FROM=clk"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "clock_interaction"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "RELATION" && v == "Timed"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WNS_PS" && v == &gold.to_string()),
+            "{:?}",
+            ide.properties
+        );
+
+        let gclk = ide
+            .exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            )
+            .unwrap();
+        assert!(gclk.contains("PERIOD_PS=20000"), "{gclk}");
+        let r = ide.clock_interaction();
+        assert_eq!(r.clocks.len(), 2, "{}", r.text());
+        assert_eq!(r.cells.len(), 4);
+        assert_eq!(
+            r.cell("clk", "clkdiv").unwrap().relation,
+            helion_sta::ClockRelation::TimedGenerated
+        );
+        assert_eq!(
+            r.cell("clkdiv", "clk").unwrap().relation,
+            helion_sta::ClockRelation::TimedGenerated
+        );
+        let wns_div = ide.wns_ps().expect("STA after generated clock");
+        assert_eq!(wns_div, gold + 10_000);
+        assert_eq!(
+            r.cell("clkdiv", "clkdiv").unwrap().wns_ps,
+            Some(wns_div),
+            "generated intra-clock WNS is STA, not a label"
+        );
+        assert_eq!(r.cell("clk", "clk").unwrap().wns_ps, Some(gold));
+
+        let virt = ide
+            .exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        assert!(virt.contains("PERIOD_PS=8000"), "{virt}");
+        let r = ide.clock_interaction();
+        assert_eq!(r.clocks.len(), 3, "{}", r.text());
+        assert_eq!(r.cells.len(), 9);
+        let cdc = r.cell("clk", "virt").expect("CDC cell");
+        assert_eq!(cdc.relation, helion_sta::ClockRelation::TimedUnsafe);
+        assert_ne!(
+            cdc.wns_ps,
+            Some(gold),
+            "unsafe CDC slack uses the destination period, not a canned copy: {:?}",
+            cdc.wns_ps
+        );
+        assert!(r.unsafe_count() >= 2, "{}", r.text());
+        assert!(r.cdc_count() >= 2, "{}", r.text());
+        let pane = ide.exec("report_clock_interaction").unwrap();
+        assert!(pane.contains("Timed (unsafe)"), "{pane}");
+        assert!(pane.contains("FROM=clk TO=virt"), "{pane}");
+
+        let cg = ide
+            .exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
+            .unwrap();
+        assert!(cg.contains("clock_groups=1"), "{cg}");
+        let r = ide.clock_interaction();
+        assert_eq!(
+            r.cell("clk", "virt").unwrap().relation,
+            helion_sta::ClockRelation::Asynchronous
+        );
+        assert!(r.cell("clk", "virt").unwrap().wns_ps.is_none());
+        assert_eq!(
+            r.cell("clk", "clk").unwrap().relation,
+            helion_sta::ClockRelation::Timed
+        );
+        let pane = ide.clock_interaction_text();
+        assert!(pane.contains("Asynchronous"), "{pane}");
+
+        let mut ex = IdeModel::new();
+        ex.open_source(&example("counter.sv")).unwrap();
+        ex.run_step(FlowStep::Place).unwrap();
+        ex.run_step(FlowStep::Route).unwrap();
+        ex.exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        ex.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        let gold2 = ex.wns_ps().expect("STA with virt clock still on clk");
+        assert_eq!(gold2, gold, "virtual clock must not steal the analysis period");
+        let fp = ex
+            .exec("set_false_path -from [get_clocks clk] -to [get_clocks virt]")
+            .unwrap();
+        assert!(fp.contains("false_path=1"), "{fp}");
+        assert_eq!(
+            ex.clock_interaction()
+                .cell("clk", "virt")
+                .unwrap()
+                .relation,
+            helion_sta::ClockRelation::FalsePath
+        );
+
+        let mut dp = IdeModel::new();
+        dp.open_source(&example("counter.sv")).unwrap();
+        dp.run_step(FlowStep::Place).unwrap();
+        dp.run_step(FlowStep::Route).unwrap();
+        dp.exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        dp.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        let md = dp
+            .exec("set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]")
+            .unwrap();
+        assert!(md.contains("max_delay=1") || md.contains("MAX_DELAY_PS=2000"), "{md}");
+        let cell = dp
+            .clock_interaction()
+            .cell("clk", "virt")
+            .unwrap()
+            .clone();
+        assert_eq!(cell.relation, helion_sta::ClockRelation::TimedDatapath);
+        assert_eq!(cell.requirement_ps, 2_000);
+
+        let mut excl = IdeModel::new();
+        excl.open_source(&example("counter.sv")).unwrap();
+        excl.run_step(FlowStep::Place).unwrap();
+        excl.run_step(FlowStep::Route).unwrap();
+        excl.exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        excl.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        let exg = excl
+            .exec(
+                "set_clock_groups -physically_exclusive -group [get_clocks clk] -group [get_clocks virt]",
+            )
+            .unwrap();
+        assert!(exg.contains("clock_groups=1"), "{exg}");
+        assert_eq!(
+            excl.clock_interaction()
+                .cell("clk", "virt")
+                .unwrap()
+                .relation,
+            helion_sta::ClockRelation::Exclusive
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let bwns = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(
+            bwns, gold,
+            "clock-interaction WNS is per-design STA, not a canned pane"
+        );
+        assert_eq!(
+            blinky.clock_interaction().cell("clk", "clk").unwrap().wns_ps,
+            Some(bwns)
         );
     }
 }
