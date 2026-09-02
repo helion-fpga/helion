@@ -1727,6 +1727,22 @@ impl Pblock {
     pub fn site_count(&self, sites: &[DeviceSiteView]) -> usize {
         sites.iter().filter(|s| self.contains(s.x, s.y)).count()
     }
+
+    /// Clickable-grid dump row: UG893 Floorplanning columns over bitgen_pblock.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} RANGE={} CELLS={} FRAMES={} BYTES={} range={} cells={} frames={} bytes={}",
+            self.name,
+            self.range_text(),
+            self.cells.len(),
+            self.frames,
+            self.bytes,
+            self.range_text(),
+            self.cells.len(),
+            self.frames,
+            self.bytes
+        )
+    }
 }
 
 /// UG893 Device routing overlay: PathFinder tiles from Session.routed, not occupancy restyle.
@@ -2129,6 +2145,50 @@ pub struct IoPortView {
     pub diff_term: Option<String>,
     /// `set_property IN_TERM` — NONE | UNTUNED_SPLIT_{40,50,60}.
     pub in_term: Option<String>,
+}
+
+impl IoPortView {
+    pub fn package_pin_cell(&self) -> &str {
+        self.package_pin.as_deref().unwrap_or("-")
+    }
+    pub fn placed_cell(&self) -> &str {
+        self.site.as_deref().unwrap_or("-")
+    }
+    pub fn iostandard_cell(&self) -> &str {
+        self.iostandard.as_deref().unwrap_or("-")
+    }
+    pub fn drive_cell(&self) -> &str {
+        self.drive.as_deref().unwrap_or("-")
+    }
+    pub fn slew_cell(&self) -> &str {
+        self.slew.as_deref().unwrap_or("-")
+    }
+    pub fn pulltype_cell(&self) -> &str {
+        self.pulltype.as_deref().unwrap_or("-")
+    }
+    pub fn diff_term_cell(&self) -> &str {
+        self.diff_term.as_deref().unwrap_or("-")
+    }
+    pub fn in_term_cell(&self) -> &str {
+        self.in_term.as_deref().unwrap_or("-")
+    }
+
+    /// Clickable-grid dump row: UG893 I/O Ports columns from HAD/STA, not a pin list.
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} DIR={} PACKAGE_PIN={} placed={} IOSTANDARD={} DRIVE={} SLEW={} PULLTYPE={} DIFF_TERM={} IN_TERM={}",
+            self.name,
+            self.dir,
+            self.package_pin_cell(),
+            self.placed_cell(),
+            self.iostandard_cell(),
+            self.drive_cell(),
+            self.slew_cell(),
+            self.pulltype_cell(),
+            self.diff_term_cell(),
+            self.in_term_cell()
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3298,6 +3358,9 @@ impl IdeModel {
             Ok(self.device_drawing_text())
         } else if t == "io_planning" || t == "io_ports" {
             self.open_io_planning()
+        } else if t == "select_io_port" || t.starts_with("select_io_port ") {
+            let name = t.strip_prefix("select_io_port").unwrap_or("").trim();
+            self.select_io_port(name)
         } else if t == "floorplanning" || t == "pblocks" || t == "get_pblocks" {
             self.open_floorplanning()
         } else if t == "create_pblock" || t.starts_with("create_pblock ") {
@@ -3306,8 +3369,9 @@ impl IdeModel {
             self.resize_pblock_cmd(t)
         } else if t.starts_with("add_cells_to_pblock ") {
             self.add_cells_to_pblock_cmd(t)
-        } else if let Some(name) = t.strip_prefix("select_pblock ") {
-            self.select_pblock(name.trim())
+        } else if t == "select_pblock" || t.starts_with("select_pblock ") {
+            let name = t.strip_prefix("select_pblock").unwrap_or("").trim();
+            self.select_pblock(name)
         } else if t.starts_with("assign_package_pin ") {
             self.apply_package_pin(t)
         } else if t.starts_with("set_property ") {
@@ -5203,6 +5267,10 @@ impl IdeModel {
 
     /// UG893 I/O Ports table: PACKAGE_PIN + IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM
     /// hitting HAD/STA/DRC/bitgen, not a pin dump.
+    pub fn io_port_rows(&self) -> &[IoPortView] {
+        &self.io_ports
+    }
+
     pub fn io_ports_text(&self) -> String {
         let n = self.io_ports.len();
         let assigned = self
@@ -5212,19 +5280,8 @@ impl IdeModel {
             .count();
         let mut s = format!("io_ports n={n} assigned={assigned}");
         for p in &self.io_ports {
-            s.push_str(&format!(
-                " {} {} PACKAGE_PIN={} placed={} IOSTANDARD={} DRIVE={} SLEW={} PULLTYPE={} DIFF_TERM={} IN_TERM={}",
-                p.name,
-                p.dir,
-                p.package_pin.as_deref().unwrap_or("-"),
-                p.site.as_deref().unwrap_or("-"),
-                p.iostandard.as_deref().unwrap_or("-"),
-                p.drive.as_deref().unwrap_or("-"),
-                p.slew.as_deref().unwrap_or("-"),
-                p.pulltype.as_deref().unwrap_or("-"),
-                p.diff_term.as_deref().unwrap_or("-"),
-                p.in_term.as_deref().unwrap_or("-")
-            ));
+            s.push('\n');
+            s.push_str(&p.row_text());
         }
         s
     }
@@ -5234,6 +5291,30 @@ impl IdeModel {
         self.nav = NavSection::BoardDevice;
         self.workspace = WorkspaceTab::Package;
         Ok(self.io_ports_text())
+    }
+
+    /// Click a UG893 I/O Ports row (name or index) — Package workspace, not a dump.
+    pub fn select_io_port(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_io_port: missing name".into());
+        }
+        let p = if let Ok(i) = spec.parse::<usize>() {
+            self.io_ports
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_io_port: no row {spec}"))?
+        } else {
+            self.io_ports
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(spec))
+                .cloned()
+                .ok_or_else(|| format!("select_io_port: no port {spec}"))?
+        };
+        self.nav = NavSection::BoardDevice;
+        self.workspace = WorkspaceTab::Package;
+        self.select(&p.name);
+        Ok(p.row_text())
     }
 
     /// Place using the first ranged Pblock (UG893 floorplan containment).
@@ -5254,17 +5335,18 @@ impl IdeModel {
         Ok(self.pblocks_text())
     }
 
+    pub fn pblock_rows(&self) -> &[Pblock] {
+        &self.pblocks
+    }
+
     pub fn pblocks_text(&self) -> String {
         let n = self.pblocks.len();
         let mut s = format!("pblocks n={n}");
         for p in &self.pblocks {
+            s.push('\n');
+            s.push_str(&p.row_text());
             s.push_str(&format!(
-                " {} range={} cells={} frames={} bytes={} sites={}",
-                p.name,
-                p.range_text(),
-                p.cells.len(),
-                p.frames,
-                p.bytes,
+                " sites={}",
                 p.site_count(&self.device.sites)
             ));
         }
@@ -5445,14 +5527,23 @@ impl IdeModel {
         ))
     }
 
-    pub fn select_pblock(&mut self, name: &str) -> Result<String, String> {
-        let name = name.trim();
-        let pb = self
-            .pblocks
-            .iter()
-            .find(|p| p.name == name)
-            .cloned()
-            .ok_or_else(|| format!("select_pblock: no pblock {name}"))?;
+    pub fn select_pblock(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_pblock: missing name".into());
+        }
+        let pb = if let Ok(i) = spec.parse::<usize>() {
+            self.pblocks
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_pblock: no row {spec}"))?
+        } else {
+            self.pblocks
+                .iter()
+                .find(|p| p.name == spec)
+                .cloned()
+                .ok_or_else(|| format!("select_pblock: no pblock {spec}"))?
+        };
         let sites = pb.site_count(&self.device.sites);
         self.workspace = WorkspaceTab::Device;
         self.nav = NavSection::BoardDevice;
@@ -5471,8 +5562,14 @@ impl IdeModel {
             ("Y1".into(), pb.y1.to_string()),
         ];
         Ok(format!(
-            "pblock {} range={} sites={} frames={}",
+            "pblock {} NAME={} RANGE={} CELLS={} FRAMES={} BYTES={} SITES={} range={} sites={} frames={}",
             pb.name,
+            pb.name,
+            pb.range_text(),
+            pb.cells.len(),
+            pb.frames,
+            pb.bytes,
+            sites,
             pb.range_text(),
             sites,
             pb.frames
@@ -14504,6 +14601,58 @@ mod tests {
         );
     }
 
+    /// UG893 Fig. 61 Hierarchy pane is nested HNF boxes (click to select),
+    /// not a `hierarchy_drawing_text` dump painted above the canvas.
+    #[test]
+    fn hierarchy_pane_nested_boxes_are_clickable_not_a_dump() {
+        let mut hier = IdeModel::new();
+        hier.open_source(&example("hier.sv")).unwrap();
+        let dump = hier.exec("hierarchy_drawing").unwrap();
+        assert_eq!(hier.workspace, WorkspaceTab::Hierarchy);
+        assert!(dump.contains("box="), "exec dump is for tests: {dump}");
+        let d = hier.hierarchy.drawing();
+        assert!(
+            d.boxes.len() >= 3,
+            "top + instance + leaf: {:?}",
+            d.boxes
+                .iter()
+                .map(|b| (&b.name, &b.kind, b.cells))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            d.boxes.iter().all(|b| b.w > 0.0 && b.h > 0.0),
+            "paint surface is rectangles, not a text list: {:?}",
+            d.boxes
+        );
+        let u0 = d.boxes.iter().find(|b| b.name == "u0").expect("u0 box");
+        let sel = hier.exec(&format!("select {}", u0.name)).unwrap();
+        assert!(sel.contains("u0"), "{sel}");
+        assert!(hier.hierarchy_has_selected());
+        assert_eq!(hier.selected.as_deref(), Some("u0"));
+        assert!(
+            hier.properties
+                .iter()
+                .any(|(k, v)| k == "NAME" && v == "u0"),
+            "{:?}",
+            hier.properties
+        );
+
+        let mut counter = IdeModel::new();
+        counter.open_source(&example("counter.sv")).unwrap();
+        let cd = counter.hierarchy.drawing();
+        assert!(
+            !cd.boxes.iter().any(|b| b.name == "u0"),
+            "counter boxes are per-design HNF, not hier's u0: {:?}",
+            cd.boxes.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        let ctop = cd.boxes.iter().find(|b| b.kind == "module").unwrap();
+        let htop = d.boxes.iter().find(|b| b.kind == "module").unwrap();
+        assert_ne!(
+            ctop.cells, htop.cells,
+            "box cells track HNF, not a canned dump"
+        );
+    }
+
     /// Fig. 49: Device clock-region outlines tile the HAD die.
     #[test]
     fn device_clock_region_outlines_tile_the_die() {
@@ -15874,6 +16023,116 @@ mod tests {
         );
     }
 
+    /// UG893 I/O Ports is a clickable Name/Dir/PACKAGE_PIN/IOSTANDARD table
+    /// from HAD/STA, not a collapsing concatenated dump.
+    #[test]
+    fn io_ports_pane_clickable_table_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.io_port_rows().is_empty());
+        assert!(
+            ide.exec("select_io_port")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_io_port led")
+                .unwrap_err()
+                .contains("no port"),
+            "unknown port must refuse"
+        );
+        let empty = ide.exec("io_ports").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+        assert_eq!(ide.nav, NavSection::BoardDevice);
+        assert!(empty.contains("io_ports n=0"), "{empty}");
+        assert!(!empty.contains("NAME="), "idle pane has no canned rows: {empty}");
+        assert!(
+            NavSection::BoardDevice
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "io_planning"),
+            "Flow Navigator Board/Device must offer I/O Planning"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        let table = ide.exec("io_ports").unwrap();
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("NAME=clk"), "{table}");
+        assert!(table.contains("NAME=led"), "{table}");
+        assert!(table.contains("DIR=IN"), "{table}");
+        assert!(table.contains("DIR=OUT"), "{table}");
+        assert!(table.contains("PACKAGE_PIN=-"), "{table}");
+        assert!(table.contains("IOSTANDARD=-"), "{table}");
+        assert!(table.contains("DRIVE=-"), "{table}");
+        assert!(table.contains("SLEW=-"), "{table}");
+        assert!(table.contains("PULLTYPE=-"), "{table}");
+        assert!(table.contains("DIFF_TERM=-"), "{table}");
+        assert!(table.contains("IN_TERM=-"), "{table}");
+        let rows = ide.io_port_rows();
+        assert_eq!(rows.len(), 2, "counter has clk+led: {rows:?}");
+        assert!(rows.iter().any(|p| p.name == "clk" && p.dir == "IN"));
+        assert!(rows.iter().any(|p| p.name == "led" && p.dir == "OUT"));
+
+        let sel = ide.exec("select_io_port led").unwrap();
+        assert!(sel.contains("NAME=led"), "{sel}");
+        assert!(sel.contains("DIR=OUT"), "{sel}");
+        assert_eq!(ide.selected.as_deref(), Some("led"));
+        assert_eq!(ide.workspace, WorkspaceTab::Package);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "port"),
+            "{:?}",
+            ide.properties
+        );
+        let by_idx = ide.exec("select_io_port 0").unwrap();
+        assert!(
+            by_idx.contains("NAME=clk") || by_idx.contains("NAME=led"),
+            "{by_idx}"
+        );
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("gold WNS");
+        assert_ne!(gold, 0);
+        let placed = ide.exec("io_ports").unwrap();
+        assert!(
+            placed.contains("placed=IOB_"),
+            "place fills the Placed column from HAD: {placed}"
+        );
+        let led = ide
+            .io_port_rows()
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led");
+        assert!(led.site.as_deref().unwrap_or("").starts_with("IOB_"), "{led:?}");
+        ide.exec("set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]")
+            .unwrap();
+        let loc = ide.exec("select_io_port led").unwrap();
+        assert!(loc.contains("PACKAGE_PIN=IOB_X5Y0"), "{loc}");
+        assert!(loc.contains("placed=IOB_X5Y0"), "{loc}");
+        assert_eq!(
+            ide.io_port_rows()
+                .iter()
+                .find(|p| p.name == "led")
+                .and_then(|p| p.package_pin.as_deref()),
+            Some("IOB_X5Y0")
+        );
+        let wns = ide.wns_ps().expect("STA after PACKAGE_PIN");
+        assert_ne!(wns, 0);
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let btable = blinky.exec("io_ports").unwrap();
+        assert!(btable.contains("NAME=led"), "{btable}");
+        assert!(btable.contains('\n'), "{btable}");
+        blinky.exec("select_io_port led").unwrap();
+        assert_eq!(blinky.selected.as_deref(), Some("led"));
+        assert_eq!(blinky.io_port_rows().len(), 2);
+    }
+
     /// UG893 Floorplanning: `create_pblock` / `resize_pblock` re-places into a
     /// HAD rectangle and hits `helion-bits::bitgen_pblock` — not a site dump.
     #[test]
@@ -16024,6 +16283,99 @@ mod tests {
             e.contains("no HAD CLB") || e.contains("no placed sites"),
             "bogus range must fail against HAD: {e}"
         );
+    }
+
+    /// UG893 Floorplanning Pblocks is a clickable Name/Range/Cells/Sites/Frames
+    /// table over create_pblock / resize_pblock / bitgen_pblock, not a collapsing dump.
+    #[test]
+    fn pblocks_pane_clickable_table_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.pblock_rows().is_empty());
+        assert!(
+            ide.exec("select_pblock")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_pblock pblock_0")
+                .unwrap_err()
+                .contains("no pblock"),
+            "unknown pblock must refuse"
+        );
+        let empty = ide.exec("pblocks").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Device);
+        assert_eq!(ide.nav, NavSection::BoardDevice);
+        assert!(empty.contains("pblocks n=0"), "{empty}");
+        assert!(!empty.contains("NAME="), "idle pane has no canned rows: {empty}");
+        assert!(
+            NavSection::BoardDevice
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "floorplanning"),
+            "Flow Navigator Board/Device must offer Floorplanning"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("gold WNS");
+        assert_ne!(gold, 0);
+
+        ide.exec("create_pblock pblock_0").unwrap();
+        let table = ide.exec("pblocks").unwrap();
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("pblocks n=1"), "{table}");
+        assert!(table.contains("NAME=pblock_0"), "{table}");
+        assert!(table.contains("RANGE=-"), "{table}");
+        assert!(table.contains("CELLS=0"), "{table}");
+        assert!(table.contains("FRAMES=0"), "{table}");
+        let rows = ide.pblock_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "pblock_0");
+        assert!(!rows[0].ranged);
+
+        let sel = ide.exec("select_pblock pblock_0").unwrap();
+        assert!(sel.contains("NAME=pblock_0"), "{sel}");
+        assert!(sel.contains("pblock pblock_0"), "{sel}");
+        assert_eq!(ide.selected.as_deref(), Some("pblock_0"));
+        assert_eq!(ide.workspace, WorkspaceTab::Device);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "pblock"),
+            "{:?}",
+            ide.properties
+        );
+        let by_idx = ide.exec("select_pblock 0").unwrap();
+        assert!(by_idx.contains("NAME=pblock_0"), "{by_idx}");
+
+        ide.exec("resize_pblock pblock_0 -add {CLB_X5Y1:CLB_X8Y8}")
+            .unwrap();
+        let ranged = ide.exec("pblocks").unwrap();
+        assert!(ranged.contains("RANGE=CLB_X5Y1:CLB_X8Y8"), "{ranged}");
+        assert!(ranged.contains("NAME=pblock_0"), "{ranged}");
+        let pb = ide.pblock_rows()[0].clone();
+        assert!(pb.ranged);
+        assert!(pb.frames > 0, "bitgen_pblock fills Frames: {pb:?}");
+        assert!(ranged.contains(&format!("FRAMES={}", pb.frames)), "{ranged}");
+        let click = ide.exec("select_pblock pblock_0").unwrap();
+        assert!(click.contains("RANGE=CLB_X5Y1:CLB_X8Y8"), "{click}");
+        assert!(
+            click.contains(&format!("FRAMES={}", pb.frames)),
+            "click must carry bitgen_pblock, not a stub: {click}"
+        );
+        let wns = ide.wns_ps().expect("STA after pblock");
+        assert_ne!(wns, 0);
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.exec("create_pblock pblock_blinky").unwrap();
+        let btable = blinky.exec("pblocks").unwrap();
+        assert!(btable.contains("NAME=pblock_blinky"), "{btable}");
+        assert!(!btable.contains("NAME=pblock_0"), "pblocks are per-session: {btable}");
+        assert!(btable.contains('\n'), "{btable}");
     }
 
     /// UG949 Clock Interaction (`report_clock_interaction`) pane is STA clocks

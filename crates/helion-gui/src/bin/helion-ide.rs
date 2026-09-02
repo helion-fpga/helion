@@ -1068,8 +1068,13 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hierarchy");
     ui.weak("UG893 Fig. 61 — nested boxes, area ∝ HNF cell/resource count (not a tree list)");
-    ui.monospace(model.hierarchy_drawing_text());
     let drawing = model.hierarchy.drawing();
+    ui.label(format!(
+        "boxes={} canvas={}×{}",
+        drawing.boxes.len(),
+        drawing.width as i32,
+        drawing.height as i32
+    ));
     let selected = model.selected.clone();
     let mut pick = None;
     egui::ScrollArea::both()
@@ -1187,98 +1192,130 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("I/O Planning");
-    ui.weak("UG893 — PACKAGE_PIN re-places; IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM hit HAD / STA / DRC / bitgen");
+fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'static str) {
+    ui.label(RichText::new("I/O Ports").strong());
+    ui.weak(
+        "UG893 I/O Ports — clickable Name/Dir/PACKAGE_PIN/IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM table from HAD/STA, not a collapsing dump",
+    );
+    let assigned = model
+        .io_ports
+        .iter()
+        .filter(|p| p.package_pin.is_some() || p.site.is_some())
+        .count();
+    ui.label(format!(
+        "io_ports n={} assigned={assigned}",
+        model.io_ports.len()
+    ));
+    let selected = model.selected.clone();
+    let rows = model.io_port_rows().to_vec();
     let mut pick_port: Option<String> = None;
     let mut set_iostd: Option<(String, &'static str)> = None;
     let mut set_io: Option<(String, &'static str, &'static str)> = None;
-    ui.collapsing("I/O Ports", |ui| {
-        if model.io_ports.is_empty() {
-            ui.weak("Synth a design to list ports.");
-        }
-        for p in &model.io_ports {
-            let on = model.selected.as_deref() == Some(p.name.as_str());
-            let pin = p
-                .package_pin
-                .as_deref()
-                .or(p.site.as_deref())
-                .unwrap_or("(unplaced)");
-            let std = p.iostandard.as_deref().unwrap_or("-");
-            let drv = p.drive.as_deref().unwrap_or("-");
-            let slew = p.slew.as_deref().unwrap_or("-");
-            let pull = p.pulltype.as_deref().unwrap_or("-");
-            let diff = p.diff_term.as_deref().unwrap_or("-");
-            let interm = p.in_term.as_deref().unwrap_or("-");
-            if ui
-                .selectable_label(
-                    on,
-                    format!(
-                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}  DIFF_TERM={diff}  IN_TERM={interm}",
-                        p.name, p.dir
-                    ),
-                )
-                .clicked()
-            {
-                pick_port = Some(p.name.clone());
+    egui::ScrollArea::horizontal()
+        .id_salt(format!("{grid_id}_scroll"))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            egui::Grid::new(grid_id)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").strong());
+                    ui.label(RichText::new("Dir").strong());
+                    ui.label(RichText::new("Package Pin").strong());
+                    ui.label(RichText::new("Placed").strong());
+                    ui.label(RichText::new("IOSTANDARD").strong());
+                    ui.label(RichText::new("Drive").strong());
+                    ui.label(RichText::new("Slew").strong());
+                    ui.label(RichText::new("Pull Type").strong());
+                    ui.label(RichText::new("Diff Term").strong());
+                    ui.label(RichText::new("In Term").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("Synth a design to list ports.");
+                        ui.end_row();
+                    } else {
+                        for p in &rows {
+                            let on = selected.as_deref() == Some(p.name.as_str());
+                            if ui.selectable_label(on, &p.name).clicked() {
+                                pick_port = Some(p.name.clone());
+                            }
+                            ui.label(&p.dir);
+                            ui.label(p.package_pin_cell());
+                            ui.label(p.placed_cell());
+                            ui.label(p.iostandard_cell());
+                            ui.label(p.drive_cell());
+                            ui.label(p.slew_cell());
+                            ui.label(p.pulltype_cell());
+                            ui.label(p.diff_term_cell());
+                            ui.label(p.in_term_cell());
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
+    if let Some(port) = model
+        .selected
+        .as_deref()
+        .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
+    {
+        ui.horizontal(|ui| {
+            ui.weak("IOSTANDARD");
+            for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
+                if ui.small_button(std).clicked() {
+                    set_iostd = Some((port.to_string(), std));
+                }
             }
-        }
-        ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
-        if let Some(port) = model
-            .selected
-            .as_deref()
-            .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
-        {
-            ui.horizontal(|ui| {
-                ui.weak("IOSTANDARD");
-                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
-                    if ui.small_button(std).clicked() {
-                        set_iostd = Some((port.to_string(), std));
-                    }
+        });
+        ui.horizontal(|ui| {
+            ui.weak("DRIVE");
+            for ma in ["4", "8", "12", "16"] {
+                if ui.small_button(ma).clicked() {
+                    set_io = Some((port.to_string(), "DRIVE", ma));
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("DRIVE");
-                for ma in ["4", "8", "12", "16"] {
-                    if ui.small_button(ma).clicked() {
-                        set_io = Some((port.to_string(), "DRIVE", ma));
-                    }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.weak("SLEW");
+            for s in ["SLOW", "FAST"] {
+                if ui.small_button(s).clicked() {
+                    set_io = Some((port.to_string(), "SLEW", s));
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("SLEW");
-                for s in ["SLOW", "FAST"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "SLEW", s));
-                    }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.weak("PULLTYPE");
+            for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
+                if ui.small_button(s).clicked() {
+                    set_io = Some((port.to_string(), "PULLTYPE", s));
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("PULLTYPE");
-                for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "PULLTYPE", s));
-                    }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.weak("DIFF_TERM");
+            for s in ["FALSE", "TRUE"] {
+                if ui.small_button(s).clicked() {
+                    set_io = Some((port.to_string(), "DIFF_TERM", s));
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("DIFF_TERM");
-                for s in ["FALSE", "TRUE"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "DIFF_TERM", s));
-                    }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.weak("IN_TERM");
+            for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
+                if ui.small_button(s).clicked() {
+                    set_io = Some((port.to_string(), "IN_TERM", s));
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("IN_TERM");
-                for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "IN_TERM", s));
-                    }
-                }
-            });
-        }
-    });
+            }
+        });
+    }
     if let Some((port, std)) = set_iostd {
         let _ = model.exec(&format!(
             "set_property IOSTANDARD {std} [get_ports {port}]"
@@ -1290,6 +1327,88 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(name) = pick_port {
         model.select(&name);
     }
+}
+
+fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.label(RichText::new("Pblocks").strong());
+    ui.weak(
+        "UG893 Floorplanning — clickable Name/Range/Cells/Sites/Frames table over create_pblock / resize_pblock / bitgen_pblock, not a collapsing dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Create pblock").clicked() {
+            let _ = model.exec("create_pblock");
+        }
+        if ui.button("Resize to CLOCKREGION_X1Y1").clicked() {
+            let name = model
+                .pblocks
+                .first()
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "pblock_0".into());
+            if model.pblocks.is_empty() {
+                let _ = model.exec("create_pblock pblock_0");
+            }
+            let _ = model.exec(&format!("resize_pblock {name} -add CLOCKREGION_X1Y1"));
+        }
+    });
+    ui.label(format!("pblocks n={}", model.pblocks.len()));
+    let selected = model.selected.clone();
+    let rows: Vec<(String, String, usize, usize, usize, usize)> = model
+        .pblock_rows()
+        .iter()
+        .map(|p| {
+            (
+                p.name.clone(),
+                p.range_text(),
+                p.cells.len(),
+                p.site_count(&model.device.sites),
+                p.frames,
+                p.bytes,
+            )
+        })
+        .collect();
+    let mut pick_pblock: Option<String> = None;
+    egui::Grid::new("pblocks_table")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Name").strong());
+            ui.label(RichText::new("Range").strong());
+            ui.label(RichText::new("Cells").strong());
+            ui.label(RichText::new("Sites").strong());
+            ui.label(RichText::new("Frames").strong());
+            ui.label(RichText::new("Bytes").strong());
+            ui.end_row();
+            if rows.is_empty() {
+                ui.label("—");
+                ui.label("—");
+                ui.label("—");
+                ui.label("—");
+                ui.label("—");
+                ui.label("No pblocks — create_pblock then resize_pblock -add {CLB_X5Y1:CLB_X8Y8}.");
+                ui.end_row();
+            } else {
+                for (name, range, cells, sites, frames, bytes) in &rows {
+                    let on = selected.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(on, name.as_str()).clicked() {
+                        pick_pblock = Some(name.clone());
+                    }
+                    ui.label(range);
+                    ui.label(cells.to_string());
+                    ui.label(sites.to_string());
+                    ui.label(frames.to_string());
+                    ui.label(bytes.to_string());
+                    ui.end_row();
+                }
+            }
+        });
+    if let Some(name) = pick_pblock {
+        let _ = model.select_pblock(&name);
+    }
+}
+
+fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("I/O Planning");
+    ui.weak("UG893 — PACKAGE_PIN re-places; IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM hit HAD / STA / DRC / bitgen");
+    paint_io_ports_table(ui, model, "io_ports_package");
     ui.separator();
     ui.label(RichText::new("Package").strong());
     ui.weak("UG893 Fig. 53 — HAD IOB pin circles on colored I/O bank regions");
@@ -2928,143 +3047,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 .color(Color32::from_rgb(0xe5, 0x9a, 0x3c)),
         );
     });
-    let mut pick_port: Option<String> = None;
-    let mut set_iostd: Option<(String, &'static str)> = None;
-    let mut set_io: Option<(String, &'static str, &'static str)> = None;
-    ui.collapsing("I/O Ports", |ui| {
-        if model.io_ports.is_empty() {
-            ui.weak("Synth a design to list ports.");
-        }
-        for p in &model.io_ports {
-            let on = model.selected.as_deref() == Some(p.name.as_str());
-            let pin = p
-                .package_pin
-                .as_deref()
-                .or(p.site.as_deref())
-                .unwrap_or("(unplaced)");
-            let std = p.iostandard.as_deref().unwrap_or("-");
-            let drv = p.drive.as_deref().unwrap_or("-");
-            let slew = p.slew.as_deref().unwrap_or("-");
-            let pull = p.pulltype.as_deref().unwrap_or("-");
-            let diff = p.diff_term.as_deref().unwrap_or("-");
-            let interm = p.in_term.as_deref().unwrap_or("-");
-            if ui
-                .selectable_label(
-                    on,
-                    format!(
-                        "{}  {}  PACKAGE_PIN={pin}  IOSTANDARD={std}  DRIVE={drv}  SLEW={slew}  PULLTYPE={pull}  DIFF_TERM={diff}  IN_TERM={interm}",
-                        p.name, p.dir
-                    ),
-                )
-                .clicked()
-            {
-                pick_port = Some(p.name.clone());
-            }
-        }
-        if let Some(port) = model
-            .selected
-            .as_deref()
-            .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
-        {
-            ui.horizontal(|ui| {
-                ui.weak("IOSTANDARD");
-                for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
-                    if ui.small_button(std).clicked() {
-                        set_iostd = Some((port.to_string(), std));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("DRIVE");
-                for ma in ["4", "8", "12", "16"] {
-                    if ui.small_button(ma).clicked() {
-                        set_io = Some((port.to_string(), "DRIVE", ma));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("SLEW");
-                for s in ["SLOW", "FAST"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "SLEW", s));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("PULLTYPE");
-                for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "PULLTYPE", s));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("DIFF_TERM");
-                for s in ["FALSE", "TRUE"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "DIFF_TERM", s));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.weak("IN_TERM");
-                for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
-                    if ui.small_button(s).clicked() {
-                        set_io = Some((port.to_string(), "IN_TERM", s));
-                    }
-                }
-            });
-        }
-    });
-    if let Some((port, std)) = set_iostd {
-        let _ = model.exec(&format!(
-            "set_property IOSTANDARD {std} [get_ports {port}]"
-        ));
-    }
-    if let Some((port, key, val)) = set_io {
-        let _ = model.exec(&format!("set_property {key} {val} [get_ports {port}]"));
-    }
-    let mut pick_pblock: Option<String> = None;
-    ui.collapsing("Pblocks", |ui| {
-        ui.weak("UG893 Floorplanning — create_pblock / resize_pblock hits place + bitgen_pblock");
-        ui.horizontal(|ui| {
-            if ui.button("Create pblock").clicked() {
-                let _ = model.exec("create_pblock");
-            }
-            if ui.button("Resize to CLOCKREGION_X1Y1").clicked() {
-                let name = model
-                    .pblocks
-                    .first()
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| "pblock_0".into());
-                if model.pblocks.is_empty() {
-                    let _ = model.exec("create_pblock pblock_0");
-                }
-                let _ = model.exec(&format!("resize_pblock {name} -add CLOCKREGION_X1Y1"));
-            }
-        });
-        if model.pblocks.is_empty() {
-            ui.weak("No pblocks — create_pblock then resize_pblock -add {CLB_X5Y1:CLB_X8Y8}.");
-        }
-        for p in &model.pblocks {
-            let on = model.selected.as_deref() == Some(p.name.as_str());
-            if ui
-                .selectable_label(
-                    on,
-                    format!(
-                        "{}  {}  cells={} frames={}",
-                        p.name,
-                        p.range_text(),
-                        p.cells.len(),
-                        p.frames
-                    ),
-                )
-                .clicked()
-            {
-                pick_pblock = Some(p.name.clone());
-            }
-        }
-    });
+    paint_io_ports_table(ui, model, "io_ports_device");
+    paint_pblocks_table(ui, model);
     ui.separator();
     let cols = model.device.cols.max(1);
     let rows = model.device.rows.max(1);
@@ -3320,12 +3304,6 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
             }
         });
-    if let Some(name) = pick_port {
-        model.select(&name);
-    }
-    if let Some(name) = pick_pblock {
-        let _ = model.select_pblock(&name);
-    }
     if let Some(name) = click_pblock {
         let _ = model.select_pblock(&name);
     }
