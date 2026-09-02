@@ -1,7 +1,8 @@
 //! Headless IDE model — the Vivado-class application state.
 //!
 //! Sources/netlist Name/Type table, Tcl Console Status/Cmd/Out table, flow rail
-//! (Synthesis → Opt → Place → Route → Bitstream) and the timing/utilization report
+//! (Synthesis → Opt → Place → Route → Bitstream), UG893 Project Summary dashboard
+//! (Session WNS / util / run / bitstream hash), and the timing/utilization report
 //! panes. Everything here runs the *real* [`Session`] engines: there is no canned
 //! output anywhere in this file, so the widget layer (`helion-ide`) is a thin painter
 //! over this model and can be tested without a display.
@@ -465,6 +466,10 @@ impl NavSection {
                 },
             ],
             NavSection::ProjectManager => &[
+                NavAction {
+                    label: "Project Summary",
+                    tcl: "project_summary",
+                },
                 NavAction {
                     label: "Add Sources",
                     tcl: "project_manager",
@@ -3007,6 +3012,7 @@ impl BdView {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceTab {
+    Summary,
     Reports,
     Settings,
     Schematic,
@@ -3049,6 +3055,25 @@ impl ReportCatalogRow {
         format!(
             "NAME={} CATEGORY={} STATUS={} SUMMARY={} TCL={}",
             self.id, self.category, self.status, self.summary, self.tcl
+        )
+    }
+}
+
+/// One clickable gadget in the UG893 Project Summary dashboard (not a dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSummaryGadget {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub value: String,
+    pub workspace: WorkspaceTab,
+}
+
+impl ProjectSummaryGadget {
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} STATUS={} VALUE={}",
+            self.id, self.status, self.value
         )
     }
 }
@@ -3452,6 +3477,8 @@ pub struct IdeModel {
     pub selected_message: Option<usize>,
     /// UG893 Reports window selected catalog row (`report_cdc`, …).
     pub selected_report: Option<String>,
+    /// UG893 Project Summary selected gadget (`timing`, `utilization`, …).
+    pub selected_summary: Option<String>,
     /// UG893 Log pane selected transcript row.
     pub selected_log: Option<usize>,
     event_sim: Option<Sim>,
@@ -3533,6 +3560,7 @@ impl IdeModel {
             message_filter: None,
             selected_message: None,
             selected_report: None,
+            selected_summary: None,
             selected_log: None,
             event_sim: None,
             fabric_sim: None,
@@ -3738,6 +3766,11 @@ impl IdeModel {
             self.select_property(spec)
         } else if t == "project_settings" || t == "settings" {
             self.open_project_settings()
+        } else if t == "project_summary" || t == "summary" {
+            self.open_project_summary()
+        } else if t == "select_project_summary" || t.starts_with("select_project_summary ") {
+            let spec = t.strip_prefix("select_project_summary").unwrap_or("").trim();
+            self.select_project_summary(spec)
         } else if t == "select_project_setting" || t.starts_with("select_project_setting ") {
             let spec = t.strip_prefix("select_project_setting").unwrap_or("").trim();
             self.select_project_setting(spec)
@@ -4595,7 +4628,7 @@ impl IdeModel {
             NavSection::Synthesis | NavSection::TimingAnalysis => {
                 self.workspace = WorkspaceTab::Reports
             }
-            NavSection::ProjectManager => self.workspace = WorkspaceTab::Reports,
+            NavSection::ProjectManager => self.workspace = WorkspaceTab::Summary,
         }
         Ok(format!("nav {}", sec.tcl()))
     }
@@ -7971,6 +8004,274 @@ impl IdeModel {
         self.nav = NavSection::ProjectManager;
         self.workspace = WorkspaceTab::Settings;
         Ok(self.project_settings_text())
+    }
+
+    /// UG893 Project Summary dashboard: Session WNS / util / run / bitstream hash.
+    pub fn project_summary_gadgets(&self) -> Vec<ProjectSummaryGadget> {
+        let sources = self.tree.sources.len();
+        let project_ready = self.shell.session.design.is_some() || sources > 0;
+        let project_val = format!(
+            "PART={} TOP={} SOURCES={}",
+            self.part(),
+            self.top_value(),
+            sources
+        );
+
+        let wns = self.wns_ps();
+        let tns = self.timing.as_ref().map(|t| t.tns_ps);
+        let timing_ready = wns.is_some();
+        let timing_val = match (wns, tns) {
+            (Some(w), Some(tns)) => format!("WNS_PS={w} TNS_PS={tns}"),
+            _ => "-".into(),
+        };
+
+        let util = self.utilization_report();
+        let util_ready = !util.part.is_empty();
+        let util_val = if let Some(lut) = util.row("LUTFF") {
+            format!(
+                "LUTFF={}/{} IOB={}/{}",
+                lut.used,
+                lut.available,
+                util.row("IOB").map(|r| r.used).unwrap_or(0),
+                util.row("IOB").map(|r| r.available).unwrap_or(0)
+            )
+        } else {
+            "-".into()
+        };
+
+        let synth_st = self
+            .runs
+            .iter()
+            .find(|r| r.name == "synth_1")
+            .map(|r| r.status.as_str())
+            .unwrap_or("Not started");
+        let impl_st = self
+            .runs
+            .iter()
+            .find(|r| r.name == "impl_1")
+            .map(|r| r.status.as_str())
+            .unwrap_or("Not started");
+        let run_status = if impl_st == "Complete" {
+            "Complete"
+        } else if impl_st == "Running" {
+            "Running"
+        } else if synth_st == "Complete" {
+            "Complete"
+        } else {
+            "Not started"
+        };
+        let run_val = format!("synth_1={synth_st} impl_1={impl_st}");
+
+        let hash = self.bitstream_hash();
+        let bits = self.bitstream_report();
+        let bits_ready = hash.is_some();
+        let bits_val = match hash {
+            Some(h) => format!(
+                "hash={h:#010x} frames={} configured={}",
+                bits.frames, bits.configured
+            ),
+            None => "-".into(),
+        };
+
+        let drc = self.drc.clone().unwrap_or_else(|| self.drc_report());
+        let drc_ready = self.drc.is_some()
+            || self.utilization.is_some()
+            || self.shell.session.placed.is_some()
+            || self.shell.session.routed.is_some();
+        let drc_val = if drc_ready {
+            format!(
+                "violations={} errors={}",
+                drc.violations.len(),
+                drc.error_count()
+            )
+        } else {
+            "-".into()
+        };
+
+        vec![
+            ProjectSummaryGadget {
+                id: "project".into(),
+                name: "Project".into(),
+                status: if project_ready {
+                    "Complete".into()
+                } else {
+                    "Not started".into()
+                },
+                value: project_val,
+                workspace: WorkspaceTab::Settings,
+            },
+            ProjectSummaryGadget {
+                id: "timing".into(),
+                name: "Timing".into(),
+                status: if timing_ready {
+                    "Complete".into()
+                } else {
+                    "Not generated".into()
+                },
+                value: if timing_ready { timing_val } else { "-".into() },
+                workspace: WorkspaceTab::Reports,
+            },
+            ProjectSummaryGadget {
+                id: "utilization".into(),
+                name: "Utilization".into(),
+                status: if util_ready {
+                    "Complete".into()
+                } else {
+                    "Not generated".into()
+                },
+                value: if util_ready { util_val } else { "-".into() },
+                workspace: WorkspaceTab::Utilization,
+            },
+            ProjectSummaryGadget {
+                id: "run".into(),
+                name: "Design Runs".into(),
+                status: run_status.into(),
+                value: run_val,
+                workspace: WorkspaceTab::Runs,
+            },
+            ProjectSummaryGadget {
+                id: "bitstream".into(),
+                name: "Bitstream".into(),
+                status: if bits_ready {
+                    "Complete".into()
+                } else {
+                    "Not generated".into()
+                },
+                value: if bits_ready { bits_val } else { "-".into() },
+                workspace: WorkspaceTab::Bitstream,
+            },
+            ProjectSummaryGadget {
+                id: "drc".into(),
+                name: "DRC".into(),
+                status: if drc_ready {
+                    "Complete".into()
+                } else {
+                    "Not generated".into()
+                },
+                value: if drc_ready { drc_val } else { "-".into() },
+                workspace: WorkspaceTab::Drc,
+            },
+        ]
+    }
+
+    /// UG893 Project Summary dump (tests). Paint is a clickable gadget grid, not this string.
+    pub fn project_summary_text(&self) -> String {
+        let rows = self.project_summary_gadgets();
+        let wns = self
+            .wns_ps()
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "-".into());
+        let lutff = self
+            .utilization_report()
+            .row("LUTFF")
+            .map(|r| format!("{}/{}", r.used, r.available))
+            .unwrap_or_else(|| "-".into());
+        let run = rows
+            .iter()
+            .find(|r| r.id == "run")
+            .map(|r| r.status.as_str())
+            .unwrap_or("Not started");
+        let hash = self
+            .bitstream_hash()
+            .map(|h| format!("{h:#010x}"))
+            .unwrap_or_else(|| "-".into());
+        let mut s = format!(
+            "project_summary n={} wns_ps={wns} lutff={lutff} run={run} hash={hash}",
+            rows.len()
+        );
+        for r in &rows {
+            s.push('\n');
+            s.push_str(&r.row_text());
+        }
+        s
+    }
+
+    pub fn open_project_summary(&mut self) -> Result<String, String> {
+        self.nav = NavSection::ProjectManager;
+        self.workspace = WorkspaceTab::Summary;
+        Ok(self.project_summary_text())
+    }
+
+    /// Click a Project Summary gadget: properties + open that engine pane.
+    pub fn select_project_summary(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_project_summary: missing name".into());
+        }
+        let rows = self.project_summary_gadgets();
+        let row = if let Ok(i) = spec.parse::<usize>() {
+            rows.get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_project_summary: no row {spec}"))?
+        } else {
+            rows.iter()
+                .find(|r| {
+                    r.id.eq_ignore_ascii_case(spec) || r.name.eq_ignore_ascii_case(spec)
+                })
+                .cloned()
+                .ok_or_else(|| format!("select_project_summary: no row {spec}"))?
+        };
+        self.selected_summary = Some(row.id.clone());
+        self.selected = Some(format!("summary:{}", row.id));
+        if row.id == "timing" {
+            self.selected_report = Some("report_timing_summary".into());
+        }
+        self.properties = self.project_summary_properties(&row);
+        self.workspace = row.workspace;
+        Ok(format!("project_summary {}", row.row_text()))
+    }
+
+    fn project_summary_properties(&self, row: &ProjectSummaryGadget) -> Vec<(String, String)> {
+        let mut props = vec![
+            ("NAME".into(), row.id.clone()),
+            ("TYPE".into(), "project_summary".into()),
+            ("TITLE".into(), row.name.clone()),
+            ("STATUS".into(), row.status.clone()),
+            ("VALUE".into(), row.value.clone()),
+        ];
+        match row.id.as_str() {
+            "timing" => {
+                if let Some(w) = self.wns_ps() {
+                    props.push(("WNS_PS".into(), w.to_string()));
+                }
+                if let Some(t) = self.timing.as_ref() {
+                    props.push(("TNS_PS".into(), t.tns_ps.to_string()));
+                }
+            }
+            "utilization" => {
+                if let Some(lut) = self.utilization_report().row("LUTFF").copied() {
+                    props.push(("LUTFF".into(), format!("{}/{}", lut.used, lut.available)));
+                    props.push(("PCT".into(), lut.pct().to_string()));
+                }
+            }
+            "bitstream" => {
+                if let Some(h) = self.bitstream_hash() {
+                    props.push(("HASH".into(), format!("{h:#010x}")));
+                }
+            }
+            "run" => {
+                if let Some(r) = self.runs.iter().find(|r| r.name == "impl_1") {
+                    props.push(("IMPL".into(), r.status.clone()));
+                    if let Some(w) = r.wns_ps {
+                        props.push(("WNS_PS".into(), w.to_string()));
+                    }
+                    if let Some(h) = r.bitstream_hash {
+                        props.push(("HASH".into(), format!("{h:#010x}")));
+                    }
+                }
+            }
+            "drc" => {
+                let drc = self.drc.clone().unwrap_or_else(|| self.drc_report());
+                props.push(("VIOLATIONS".into(), drc.violations.len().to_string()));
+                props.push(("ERRORS".into(), drc.error_count().to_string()));
+            }
+            "project" => {
+                props.push(("PART".into(), self.part().to_string()));
+                props.push(("TOP".into(), self.top_value()));
+            }
+            _ => {}
+        }
+        props
     }
 
     fn apply_project_setting(&mut self, cmd: &str) -> Result<String, String> {
@@ -11957,6 +12258,16 @@ impl IdeModel {
                     ("SUMMARY".into(), row.summary),
                     ("TCL".into(), row.tcl),
                 ];
+                return;
+            }
+        }
+        if let Some(rest) = id.strip_prefix("summary:") {
+            if let Some(row) = self
+                .project_summary_gadgets()
+                .into_iter()
+                .find(|r| r.id == rest)
+            {
+                self.properties = self.project_summary_properties(&row);
                 return;
             }
         }
@@ -21338,5 +21649,219 @@ mod tests {
             "blinky fileset is not counter: {:?}",
             blinky.properties
         );
+    }
+
+    /// UG893 Project Summary is a clickable dashboard over Session WNS / util /
+    /// run / bitstream hash, not a stacked dump of those panes.
+    #[test]
+    fn project_summary_dashboard_session_wns_util_run_bitstream_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.selected_summary.is_none());
+        assert!(
+            ide.exec("select_project_summary")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_project_summary no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown gadget must refuse"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "project_summary"),
+            "Flow Navigator Project Manager must offer Project Summary"
+        );
+
+        let idle = ide.exec("project_summary").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Summary);
+        assert_eq!(ide.nav, NavSection::ProjectManager);
+        assert!(idle.contains('\n'), "must not be a one-liner dump: {idle}");
+        assert!(idle.contains("project_summary n=6"), "{idle}");
+        assert!(idle.contains("wns_ps=-"), "{idle}");
+        assert!(idle.contains("lutff=-"), "{idle}");
+        assert!(idle.contains("run=Not started"), "{idle}");
+        assert!(idle.contains("hash=-"), "{idle}");
+        assert!(idle.contains("NAME=project"), "{idle}");
+        assert!(idle.contains("NAME=timing"), "{idle}");
+        assert!(idle.contains("NAME=utilization"), "{idle}");
+        assert!(idle.contains("NAME=run"), "{idle}");
+        assert!(idle.contains("NAME=bitstream"), "{idle}");
+        assert!(idle.contains("NAME=drc"), "{idle}");
+        assert!(idle.contains("STATUS=Not generated"), "{idle}");
+        assert!(
+            !idle.contains("WNS_PS=9640"),
+            "idle dashboard must not can gold WNS: {idle}"
+        );
+        let idle_rows = ide.project_summary_gadgets();
+        assert_eq!(idle_rows.len(), 6);
+        assert!(
+            idle_rows.iter().any(|g| g.id == "timing" && g.value == "-"),
+            "{idle_rows:?}"
+        );
+        assert!(
+            idle_rows
+                .iter()
+                .any(|g| g.id == "bitstream" && g.value == "-"),
+            "{idle_rows:?}"
+        );
+        assert!(
+            idle_rows
+                .iter()
+                .any(|g| g.id == "project" && g.value.contains("PART=HL10T-C32-1")),
+            "{idle_rows:?}"
+        );
+
+        ide.exec("nav project_manager").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Summary);
+
+        let proj = ide.exec("select_project_summary project").unwrap();
+        assert!(proj.contains("NAME=project"), "{proj}");
+        assert!(proj.contains("PART=HL10T-C32-1"), "{proj}");
+        assert_eq!(ide.selected_summary.as_deref(), Some("project"));
+        assert_eq!(ide.workspace, WorkspaceTab::Settings);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "project_summary"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        let after_src = ide.exec("project_summary").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Summary);
+        assert!(after_src.contains("TOP=counter"), "{after_src}");
+        assert!(after_src.contains("SOURCES="), "{after_src}");
+        assert!(after_src.contains("synth_1=Complete"), "{after_src}");
+        assert!(
+            !after_src.contains("WNS_PS="),
+            "open_source must not invent STA WNS: {after_src}"
+        );
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        let hash = ide.bitstream_hash().expect("hash after bitstream");
+
+        let table = ide.exec("project_summary").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Summary);
+        assert!(
+            table.contains(&format!("wns_ps={gold}")),
+            "dashboard header must carry STA, not a dump: {table}"
+        );
+        assert!(table.contains(&format!("WNS_PS={gold}")), "{table}");
+        assert!(table.contains("NAME=timing STATUS=Complete"), "{table}");
+        assert!(table.contains("NAME=utilization STATUS=Complete"), "{table}");
+        assert!(table.contains("LUTFF="), "{table}");
+        assert!(table.contains("NAME=run STATUS=Complete"), "{table}");
+        assert!(table.contains("impl_1=Complete"), "{table}");
+        assert!(table.contains(&format!("hash={hash:#010x}")), "{table}");
+        assert!(table.contains("NAME=bitstream STATUS=Complete"), "{table}");
+        assert!(table.contains("NAME=drc STATUS=Complete"), "{table}");
+        let rows = ide.project_summary_gadgets();
+        let timing = rows.iter().find(|g| g.id == "timing").unwrap();
+        assert_eq!(timing.status, "Complete");
+        assert!(
+            timing.value.contains(&format!("WNS_PS={gold}")),
+            "{}",
+            timing.value
+        );
+        let util = rows.iter().find(|g| g.id == "utilization").unwrap();
+        assert_eq!(util.status, "Complete");
+        assert!(util.value.contains("LUTFF="), "{}", util.value);
+        let run = rows.iter().find(|g| g.id == "run").unwrap();
+        assert_eq!(run.status, "Complete");
+        let bits = rows.iter().find(|g| g.id == "bitstream").unwrap();
+        assert_eq!(bits.status, "Complete");
+        assert!(
+            bits.value.contains(&format!("hash={hash:#010x}")),
+            "{}",
+            bits.value
+        );
+
+        let tsel = ide.exec("select_project_summary timing").unwrap();
+        assert!(tsel.contains(&format!("WNS_PS={gold}")), "{tsel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert_eq!(ide.selected_summary.as_deref(), Some("timing"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WNS_PS" && *v == gold.to_string()),
+            "{:?}",
+            ide.properties
+        );
+
+        let usel = ide.exec("select_project_summary utilization").unwrap();
+        assert!(usel.contains("LUTFF="), "{usel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Utilization);
+        assert_eq!(ide.selected_summary.as_deref(), Some("utilization"));
+
+        let rsel = ide.exec("select_project_summary run").unwrap();
+        assert!(rsel.contains("impl_1=Complete"), "{rsel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "WNS_PS" && *v == gold.to_string()),
+            "{:?}",
+            ide.properties
+        );
+
+        let bsel = ide.exec("select_project_summary bitstream").unwrap();
+        assert!(bsel.contains(&format!("hash={hash:#010x}")), "{bsel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Bitstream);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "HASH" && *v == format!("{hash:#010x}")),
+            "{:?}",
+            ide.properties
+        );
+
+        let dsel = ide.exec("select_project_summary drc").unwrap();
+        assert!(dsel.contains("violations="), "{dsel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Drc);
+
+        let by_idx = ide.exec("select_project_summary 1").unwrap();
+        assert!(by_idx.contains("NAME=timing"), "{by_idx}");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Project Summary"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        blinky.run_step(FlowStep::Bitstream).unwrap();
+        let bw = blinky.wns_ps().expect("blinky STA");
+        let bh = blinky.bitstream_hash().expect("blinky hash");
+        assert_ne!(bw, gold, "WNS is per-design STA");
+        assert_ne!(bh, hash, "bitstream hash is per-design");
+        let btable = blinky.exec("project_summary").unwrap();
+        assert!(btable.contains(&format!("WNS_PS={bw}")), "{btable}");
+        assert!(
+            !btable.contains(&format!("WNS_PS={gold}")),
+            "Project Summary is per-session, not canned: {btable}"
+        );
+        assert!(btable.contains(&format!("hash={bh:#010x}")), "{btable}");
+        assert!(
+            !btable.contains(&format!("hash={hash:#010x}")),
+            "blinky hash is not counter: {btable}"
+        );
+        assert!(btable.contains("TOP=blinky"), "{btable}");
+        let bsel = blinky.exec("select_project_summary timing").unwrap();
+        assert!(bsel.contains(&format!("WNS_PS={bw}")), "{bsel}");
+        assert_eq!(blinky.wns_ps(), Some(bw));
     }
 }
