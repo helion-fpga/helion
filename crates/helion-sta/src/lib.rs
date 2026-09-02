@@ -1,5 +1,5 @@
 //! Graph STA: create_clock / create_generated_clock / set_bus_skew / group_path /
-//! set_max_time_borrow / set_data_check / placed Manhattan.
+//! set_max_time_borrow / set_data_check / report_timing_summary / placed Manhattan.
 
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
@@ -168,6 +168,174 @@ impl ClockInteraction {
                 cell.common_period_ps,
                 cell.requirement_ps,
                 cell.path_count
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// UG903/UG949 `report_timing_summary` path-group class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathGroupKind {
+    /// Same launch and capture clock.
+    IntraClock,
+    /// Cross-clock (CDC) path group.
+    InterClock,
+    /// User `group_path -name` (not a clock-named default).
+    Other,
+}
+
+impl PathGroupKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IntraClock => "intra",
+            Self::InterClock => "inter",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One intra / inter / other path group of `report_timing_summary`.
+#[derive(Clone, Debug)]
+pub struct TimingSummaryGroup {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub kind: PathGroupKind,
+    pub wns_ps: Option<i64>,
+    pub tns_ps: i64,
+    pub whs_ps: Option<i64>,
+    pub ths_ps: i64,
+    pub failing_setup: usize,
+    pub failing_hold: usize,
+    pub endpoints: usize,
+}
+
+impl TimingSummaryGroup {
+    fn with_slacks(
+        name: String,
+        from: String,
+        to: String,
+        kind: PathGroupKind,
+        wns_ps: Option<i64>,
+        whs_ps: Option<i64>,
+        endpoints: usize,
+    ) -> Self {
+        let tns_ps = wns_ps.map(|w| w.min(0)).unwrap_or(0);
+        let ths_ps = whs_ps.map(|w| w.min(0)).unwrap_or(0);
+        let failing_setup = usize::from(wns_ps.map(|w| w < 0).unwrap_or(false)) * endpoints;
+        let failing_hold = usize::from(whs_ps.map(|w| w < 0).unwrap_or(false)) * endpoints;
+        Self {
+            name,
+            from,
+            to,
+            kind,
+            wns_ps,
+            tns_ps,
+            whs_ps,
+            ths_ps,
+            failing_setup,
+            failing_hold,
+            endpoints,
+        }
+    }
+
+    fn slack_token(label: &str, v: Option<i64>) -> String {
+        match v {
+            Some(w) => format!("{label}={w}"),
+            None => format!("{label}=n/a"),
+        }
+    }
+}
+
+/// UG903/UG949 Timing Summary: Design WNS/TNS/WHS/THS plus intra/inter/other groups.
+#[derive(Clone, Debug, Default)]
+pub struct TimingSummary {
+    pub clocks: Vec<Clock>,
+    pub wns_ps: Option<i64>,
+    pub tns_ps: i64,
+    pub whs_ps: Option<i64>,
+    pub ths_ps: i64,
+    pub failing_setup: usize,
+    pub failing_hold: usize,
+    pub endpoints: usize,
+    pub groups: Vec<TimingSummaryGroup>,
+}
+
+impl TimingSummary {
+    pub fn group(&self, from: &str, to: &str) -> Option<&TimingSummaryGroup> {
+        self.groups
+            .iter()
+            .find(|g| g.from == from && g.to == to && g.kind != PathGroupKind::Other)
+    }
+
+    pub fn named(&self, name: &str) -> Option<&TimingSummaryGroup> {
+        self.groups.iter().find(|g| g.name == name)
+    }
+
+    pub fn intra_count(&self) -> usize {
+        self.groups
+            .iter()
+            .filter(|g| g.kind == PathGroupKind::IntraClock)
+            .count()
+    }
+
+    pub fn inter_count(&self) -> usize {
+        self.groups
+            .iter()
+            .filter(|g| g.kind == PathGroupKind::InterClock)
+            .count()
+    }
+
+    pub fn other_count(&self) -> usize {
+        self.groups
+            .iter()
+            .filter(|g| g.kind == PathGroupKind::Other)
+            .count()
+    }
+
+    pub fn text(&self) -> String {
+        if self.clocks.is_empty() {
+            return "no clocks — create_clock / report_timing_summary".into();
+        }
+        let mut lines = vec![format!(
+            "report_timing_summary clocks={} groups={} intra={} inter={} other={} {} TNS_PS={} {} THS_PS={} FAILING_SETUP={} FAILING_HOLD={} endpoints={}",
+            self.clocks.len(),
+            self.groups.len(),
+            self.intra_count(),
+            self.inter_count(),
+            self.other_count(),
+            TimingSummaryGroup::slack_token("WNS_PS", self.wns_ps),
+            self.tns_ps,
+            TimingSummaryGroup::slack_token("WHS_PS", self.whs_ps),
+            self.ths_ps,
+            self.failing_setup,
+            self.failing_hold,
+            self.endpoints
+        )];
+        for c in &self.clocks {
+            lines.push(format!(
+                "clock {} PERIOD_PS={} generated={} MASTER={}",
+                c.name,
+                c.period_ps,
+                u8::from(c.generated),
+                c.master.as_deref().unwrap_or("-")
+            ));
+        }
+        for g in &self.groups {
+            lines.push(format!(
+                "GROUP NAME={} KIND={} FROM={} TO={} {} TNS_PS={} {} THS_PS={} FAILING_SETUP={} FAILING_HOLD={} endpoints={}",
+                g.name,
+                g.kind.as_str(),
+                g.from,
+                g.to,
+                TimingSummaryGroup::slack_token("WNS_PS", g.wns_ps),
+                g.tns_ps,
+                TimingSummaryGroup::slack_token("WHS_PS", g.whs_ps),
+                g.ths_ps,
+                g.failing_setup,
+                g.failing_hold,
+                g.endpoints
             ));
         }
         lines.join("\n")
@@ -1149,6 +1317,164 @@ pub fn report_clock_interaction(
     ClockInteraction {
         clocks: clocks.to_vec(),
         cells,
+    }
+}
+
+fn slack_from_requirement(timing: Option<&TimingResult>, analysis_req: i64, requirement_ps: i64) -> Option<i64> {
+    timing.map(|t| requirement_ps - (analysis_req - t.wns_ps))
+}
+
+fn hold_slack(timing: Option<&TimingResult>) -> Option<i64> {
+    timing.map(|t| t.hold_slack_ps)
+}
+
+fn weighted_setup_slack(
+    t: &TimingResult,
+    analysis_req: i64,
+    requirement_ps: i64,
+    weight_milli: i64,
+    current_weight: i64,
+) -> i64 {
+    let delay = analysis_req - t.wns_ps;
+    let unweighted = if current_weight <= 0 || current_weight == 1000 {
+        delay
+    } else {
+        delay.saturating_mul(1000) / current_weight
+    };
+    let group_delay = if weight_milli == 1000 {
+        unweighted
+    } else {
+        unweighted.saturating_mul(weight_milli.max(1)) / 1000
+    };
+    requirement_ps - group_delay
+}
+
+/// UG903/UG949 `report_timing_summary`: Design WNS/TNS/WHS/THS plus intra-clock,
+/// inter-clock, and user `group_path` rows from STA clocks + XDC. Empty clocks
+/// yield an empty report (not a canned table). Empty XDC keeps gold WNS.
+pub fn report_timing_summary(
+    clocks: &[Clock],
+    xdc: &Constraints,
+    timing: Option<&TimingResult>,
+) -> TimingSummary {
+    let clocks = if clocks.is_empty() {
+        xdc.clocks.as_slice()
+    } else {
+        clocks
+    };
+    if clocks.is_empty() {
+        return TimingSummary::default();
+    }
+    let analysis_clocks = timing
+        .map(|t| t.clocks.as_slice())
+        .filter(|c| !c.is_empty())
+        .unwrap_or(clocks);
+    let analysis_req = analysis_requirement_ps(analysis_clocks, xdc);
+    let endpoints = timing.map(|t| t.endpoints).unwrap_or(0);
+    let mut groups = Vec::new();
+    for from in clocks {
+        for to in clocks {
+            let relation = classify_clock_pair(from, to, clocks, xdc);
+            let excepted = matches!(
+                relation,
+                ClockRelation::FalsePath
+                    | ClockRelation::Asynchronous
+                    | ClockRelation::Exclusive
+                    | ClockRelation::NoPaths
+            );
+            let requirement_ps = xdc
+                .datapath_max_delay_covers(&from.name, &to.name)
+                .unwrap_or(to.period_ps as i64);
+            let kind = if from.name == to.name {
+                PathGroupKind::IntraClock
+            } else {
+                PathGroupKind::InterClock
+            };
+            let name = if from.name == to.name {
+                from.name.clone()
+            } else {
+                format!("{}->{}", from.name, to.name)
+            };
+            let (wns_ps, whs_ps, n_ep) = if excepted {
+                (None, None, 0)
+            } else {
+                (
+                    slack_from_requirement(timing, analysis_req, requirement_ps),
+                    hold_slack(timing),
+                    if from.name == to.name {
+                        endpoints
+                    } else {
+                        usize::from(timing.is_some())
+                    },
+                )
+            };
+            groups.push(TimingSummaryGroup::with_slacks(
+                name,
+                from.name.clone(),
+                to.name.clone(),
+                kind,
+                wns_ps,
+                whs_ps,
+                n_ep,
+            ));
+        }
+    }
+    let current_weight = xdc.group_path_weight_milli();
+    let default_req = clocks.first().map(|c| c.period_ps as i64).unwrap_or(analysis_req);
+    for g in &xdc.path_groups {
+        let req = if g.to.is_empty() {
+            default_req
+        } else {
+            clocks
+                .iter()
+                .find(|c| c.name == g.to)
+                .map(|c| c.period_ps as i64)
+                .unwrap_or(default_req)
+        };
+        let wns_ps = timing.map(|t| {
+            weighted_setup_slack(t, analysis_req, req, g.weight_milli, current_weight)
+        });
+        let from = if g.from.is_empty() {
+            clocks[0].name.clone()
+        } else {
+            g.from.clone()
+        };
+        let to = if g.to.is_empty() {
+            clocks[0].name.clone()
+        } else {
+            g.to.clone()
+        };
+        groups.push(TimingSummaryGroup::with_slacks(
+            g.name.clone(),
+            from,
+            to,
+            PathGroupKind::Other,
+            wns_ps,
+            hold_slack(timing),
+            endpoints,
+        ));
+    }
+    let (wns_ps, tns_ps, whs_ps, ths_ps, failing_setup, failing_hold) = match timing {
+        Some(t) => (
+            Some(t.wns_ps),
+            t.tns_ps,
+            Some(t.hold_slack_ps),
+            t.hold_slack_ps.min(0),
+            usize::from(t.wns_ps < 0) * t.endpoints,
+            usize::from(t.hold_slack_ps < 0) * t.endpoints,
+        ),
+        None => (None, 0, None, 0, 0, 0),
+    };
+    TimingSummary {
+        clocks: clocks.to_vec(),
+        wns_ps,
+        tns_ps,
+        whs_ps,
+        ths_ps,
+        failing_setup,
+        failing_hold,
+        endpoints,
+        groups,
     }
 }
 
@@ -3336,5 +3662,105 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         assert_eq!(cell.wns_ps, Some(t.wns_ps));
         assert_eq!(cell.path_count, t.endpoints);
         assert_ne!(t.wns_ps, 0);
+    }
+
+    #[test]
+    fn report_timing_summary_intra_inter_other_from_sta() {
+        let empty = report_timing_summary(&[], &Constraints::default(), None);
+        assert!(empty.clocks.is_empty());
+        assert!(empty.groups.is_empty());
+        assert!(empty.text().contains("no clocks"));
+
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        create_generated_clock(&mut clks, "clkdiv", "clk", 2, "u_ff/Q").unwrap();
+        create_clock(&mut clks, "virt", 8_000, "virt");
+        let r = report_timing_summary(&clks, &Constraints::default(), None);
+        assert_eq!(r.clocks.len(), 3);
+        assert_eq!(r.intra_count(), 3);
+        assert_eq!(r.inter_count(), 6);
+        assert_eq!(r.other_count(), 0);
+        assert!(r.group("clk", "clk").unwrap().wns_ps.is_none());
+        assert_eq!(r.group("clk", "clk").unwrap().kind, PathGroupKind::IntraClock);
+        assert_eq!(
+            r.group("clk", "virt").unwrap().kind,
+            PathGroupKind::InterClock
+        );
+
+        let d = Design::structural_counter();
+        let mut sta_clks = Vec::new();
+        create_clock(&mut sta_clks, "clk", 10_000, "clk");
+        let t = report_timing(&d, &sta_clks).unwrap();
+        let rs = report_timing_summary(&sta_clks, &Constraints::default(), Some(&t));
+        let intra = rs.group("clk", "clk").unwrap();
+        assert_eq!(intra.wns_ps, Some(t.wns_ps));
+        assert_eq!(intra.tns_ps, t.tns_ps);
+        assert_eq!(intra.whs_ps, Some(t.hold_slack_ps));
+        assert_eq!(intra.ths_ps, t.hold_slack_ps.min(0));
+        assert_eq!(intra.endpoints, t.endpoints);
+        assert_eq!(rs.wns_ps, Some(t.wns_ps));
+        assert_eq!(rs.whs_ps, Some(t.hold_slack_ps));
+        assert_ne!(t.wns_ps, 0);
+        assert!(rs.text().contains(&format!("WNS_PS={}", t.wns_ps)));
+
+        let mut two = sta_clks.clone();
+        create_clock(&mut two, "virt", 8_000, "virt");
+        let ri = report_timing_summary(&two, &Constraints::default(), Some(&t));
+        let inter = ri.group("clk", "virt").unwrap();
+        assert_eq!(inter.kind, PathGroupKind::InterClock);
+        assert_ne!(
+            inter.wns_ps,
+            intra.wns_ps,
+            "inter-clock WNS uses dest period, not a canned copy"
+        );
+        assert_eq!(inter.wns_ps, Some(8_000 - (10_000 - t.wns_ps)));
+
+        let mut async_xdc = Constraints::default();
+        async_xdc.clock_groups.push(ClockGroups {
+            asynchronous: true,
+            exclusive: false,
+            groups: vec![vec!["clk".into()], vec!["virt".into()]],
+        });
+        let ra = report_timing_summary(&two, &async_xdc, Some(&t));
+        assert!(ra.group("clk", "virt").unwrap().wns_ps.is_none());
+        assert_eq!(ra.group("clk", "clk").unwrap().wns_ps, Some(t.wns_ps));
+
+        let mut gp = Constraints::default();
+        gp.path_groups.push(PathGroup {
+            name: "extra".into(),
+            from: "clk".into(),
+            to: "led".into(),
+            weight_milli: 2000,
+            critical_range_ps: 0,
+        });
+        gp.path_groups.push(PathGroup {
+            name: "light".into(),
+            from: "clk".into(),
+            to: "led".into(),
+            weight_milli: 1000,
+            critical_range_ps: 0,
+        });
+        let rg = report_timing_summary(&sta_clks, &gp, Some(&t));
+        assert_eq!(rg.other_count(), 2);
+        let extra = rg.named("extra").unwrap();
+        let light = rg.named("light").unwrap();
+        assert_eq!(extra.kind, PathGroupKind::Other);
+        assert_ne!(
+            extra.wns_ps, light.wns_ps,
+            "group_path weight must move that group's WNS"
+        );
+        assert!(
+            extra.wns_ps.unwrap() < light.wns_ps.unwrap(),
+            "weight 2 must worsen WNS vs weight 1: extra={:?} light={:?}",
+            extra.wns_ps,
+            light.wns_ps
+        );
+        let blinky = report_timing(&Design::structural_blinky(), &sta_clks).unwrap();
+        let rb = report_timing_summary(&sta_clks, &Constraints::default(), Some(&blinky));
+        assert_ne!(
+            rb.wns_ps,
+            rs.wns_ps,
+            "timing summary WNS is per-design STA, not canned"
+        );
     }
 }

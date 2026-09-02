@@ -7,7 +7,7 @@
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::{
     doctor, BottomTab, ClockRelation, FlowStep, IdeModel, IlaTrigger, LayoutKind, MsgSeverity,
-    NavSection, StepState, WaveRadix, WaveStyle, WorkspaceTab,
+    NavSection, PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -1310,6 +1310,8 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Reports");
     ui.add_space(6.0);
+    paint_timing_summary(ui, model);
+    ui.add_space(8.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
     if !model.timing_paths.is_empty() {
         ui.add_space(6.0);
@@ -1361,6 +1363,126 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui,
         "Clock Interaction (report_clock_interaction)",
         &model.clock_interaction_text(),
+    );
+}
+
+fn slack_label(v: Option<i64>) -> String {
+    match v {
+        Some(w) => w.to_string(),
+        None => "n/a".into(),
+    }
+}
+
+fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.label(
+        RichText::new(
+            "Timing Summary (report_timing_summary) — UG903/UG949 intra/inter-clock WNS/TNS/WHS/THS by path group",
+        )
+        .strong(),
+    );
+    ui.weak("STA path groups, not a dump. Empty XDC keeps gold WNS.");
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report timing summary").clicked() {
+            let _ = model.exec("report_timing_summary");
+        }
+        if ui.button("Apply group_path extra weight 2").clicked() {
+            let _ = model.exec(
+                "group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]",
+            );
+        }
+    });
+    let report = model.timing_summary();
+    if report.clocks.is_empty() {
+        ui.label("no clocks — create_clock / report_timing_summary");
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Design Timing Summary").strong());
+    egui::Grid::new("timing_summary_design")
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("WNS_PS").strong());
+            ui.label(RichText::new("TNS_PS").strong());
+            ui.label(RichText::new("WHS_PS").strong());
+            ui.label(RichText::new("THS_PS").strong());
+            ui.label(RichText::new("FAILING_SETUP").strong());
+            ui.label(RichText::new("FAILING_HOLD").strong());
+            ui.label(RichText::new("ENDPOINTS").strong());
+            ui.end_row();
+            ui.label(slack_label(report.wns_ps));
+            ui.label(report.tns_ps.to_string());
+            ui.label(slack_label(report.whs_ps));
+            ui.label(report.ths_ps.to_string());
+            ui.label(report.failing_setup.to_string());
+            ui.label(report.failing_hold.to_string());
+            ui.label(report.endpoints.to_string());
+            ui.end_row();
+        });
+    let selected = model.selected.clone();
+    let mut pick: Option<(String, Option<String>)> = None;
+    let sections = [
+        ("Intra-Clock Paths", PathGroupKind::IntraClock),
+        ("Inter-Clock Paths", PathGroupKind::InterClock),
+        ("Other Path Groups", PathGroupKind::Other),
+    ];
+    for (title, kind) in sections {
+        let rows: Vec<_> = report.groups.iter().filter(|g| g.kind == kind).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new(title).strong());
+        egui::Grid::new(format!("timing_summary_{}", kind.as_str()))
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("From").strong());
+                ui.label(RichText::new("To").strong());
+                ui.label(RichText::new("WNS_PS").strong());
+                ui.label(RichText::new("TNS_PS").strong());
+                ui.label(RichText::new("WHS_PS").strong());
+                ui.label(RichText::new("THS_PS").strong());
+                ui.label(RichText::new("ENDPOINTS").strong());
+                ui.end_row();
+                for g in rows {
+                    let key = if kind == PathGroupKind::Other {
+                        g.name.clone()
+                    } else {
+                        format!("{}->{}", g.from, g.to)
+                    };
+                    let on = selected.as_deref() == Some(key.as_str());
+                    let name_lbl = if on {
+                        RichText::new(&g.name).strong()
+                    } else {
+                        RichText::new(&g.name)
+                    };
+                    if ui.selectable_label(on, name_lbl).clicked() {
+                        pick = Some(if kind == PathGroupKind::Other {
+                            (g.name.clone(), None)
+                        } else {
+                            (g.from.clone(), Some(g.to.clone()))
+                        });
+                    }
+                    ui.label(&g.from);
+                    ui.label(&g.to);
+                    ui.label(slack_label(g.wns_ps));
+                    ui.label(g.tns_ps.to_string());
+                    ui.label(slack_label(g.whs_ps));
+                    ui.label(g.ths_ps.to_string());
+                    ui.label(g.endpoints.to_string());
+                    ui.end_row();
+                }
+            });
+    }
+    if let Some((a, b)) = pick {
+        let _ = model.select_timing_summary(&a, b.as_deref());
+    }
+    ui.add_space(6.0);
+    report_box(
+        ui,
+        "Timing Summary (report_timing_summary)",
+        &model.timing_summary_text(),
     );
 }
 
