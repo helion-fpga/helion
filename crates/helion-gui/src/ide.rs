@@ -385,10 +385,16 @@ impl NavSection {
                     tcl: "package",
                 },
             ],
-            NavSection::ProjectManager => &[NavAction {
-                label: "Add Sources",
-                tcl: "project_manager",
-            }],
+            NavSection::ProjectManager => &[
+                NavAction {
+                    label: "Add Sources",
+                    tcl: "project_manager",
+                },
+                NavAction {
+                    label: "Reports",
+                    tcl: "reports",
+                },
+            ],
             NavSection::IpIntegrator => &[NavAction {
                 label: "Create Block Design",
                 tcl: "create_bd",
@@ -2596,6 +2602,27 @@ pub enum WorkspaceTab {
     Bitstream,
 }
 
+/// One clickable row in the UG893 Reports window (not a stacked dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportCatalogRow {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub tcl: String,
+    pub status: String,
+    pub summary: String,
+    pub workspace: WorkspaceTab,
+}
+
+impl ReportCatalogRow {
+    pub fn row_text(&self) -> String {
+        format!(
+            "NAME={} CATEGORY={} STATUS={} SUMMARY={} TCL={}",
+            self.id, self.category, self.status, self.summary, self.tcl
+        )
+    }
+}
+
 /// UG893 Hierarchy — top module + instances + leaf primitives from HNF.
 #[derive(Clone, Debug, Default)]
 pub struct HierarchyView {
@@ -2906,6 +2933,10 @@ pub struct IdeModel {
     /// UG893 Messages filter (None = All). Counts stay unfiltered.
     pub message_filter: Option<MsgSeverity>,
     pub selected_message: Option<usize>,
+    /// UG893 Reports window selected catalog row (`report_cdc`, …).
+    pub selected_report: Option<String>,
+    /// UG893 Log pane selected transcript row.
+    pub selected_log: Option<usize>,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
 }
@@ -2965,6 +2996,8 @@ impl IdeModel {
             bottom_tab: BottomTab::Tcl,
             message_filter: None,
             selected_message: None,
+            selected_report: None,
+            selected_log: None,
             event_sim: None,
             fabric_sim: None,
         };
@@ -3298,7 +3331,15 @@ impl IdeModel {
             Ok(self.clock_interaction_text())
         } else if t == "report_timing_summary" || t == "timing_summary" {
             self.workspace = WorkspaceTab::Reports;
+            self.selected_report = Some("report_timing_summary".into());
             Ok(self.timing_summary_text())
+        } else if t == "reports" || t == "report_catalog" {
+            self.workspace = WorkspaceTab::Reports;
+            Ok(self.reports_text())
+        } else if let Some(spec) = t.strip_prefix("select_report ") {
+            self.select_report(spec.trim())
+        } else if t == "select_report" {
+            self.select_report("")
         } else if t == "report_cdc" || t == "cdc" {
             self.workspace = WorkspaceTab::Cdc;
             Ok(self.cdc_text())
@@ -3478,6 +3519,10 @@ impl IdeModel {
         } else if t == "log" {
             self.bottom_tab = BottomTab::Log;
             Ok(self.log_text())
+        } else if let Some(spec) = t.strip_prefix("select_log ") {
+            self.select_log(spec.trim())
+        } else if t == "select_log" {
+            self.select_log("")
         } else if t == "report_timing" {
             // Same clocks as the Reports/Constraints panes — not Session's 10 ns default.
             self.report_timing_now()
@@ -3633,13 +3678,113 @@ impl IdeModel {
         ))
     }
 
-    /// UG893 Log pane: Tcl transcript of every console and rail command.
+    /// UG893 Log pane: clickable Tcl transcript (status / cmd / engine out).
     pub fn log_text(&self) -> String {
-        if self.log.is_empty() {
-            "log empty".into()
-        } else {
-            self.log.join("\n")
+        if self.console.is_empty() {
+            return "log empty".into();
         }
+        let n_err = self.console.iter().filter(|l| !l.ok).count();
+        let mut s = format!("log n={} errors={n_err}", self.console.len());
+        for (i, line) in self.console.iter().enumerate() {
+            let status = if line.ok { "ok" } else { "error" };
+            s.push_str(&format!(
+                "\n{i} STATUS={status} CMD={} OUT={}",
+                line.cmd, line.out
+            ));
+            s.push_str(&format!("\nhelion% {}\n{}", line.cmd, line.out));
+        }
+        s
+    }
+
+    /// Clickable Log rows — same journal as the Tcl console, not a restyle of `log`.
+    pub fn log_rows(&self) -> Vec<(usize, &ConsoleLine)> {
+        self.console.iter().enumerate().collect()
+    }
+
+    /// Click a Log row: properties + jump to the engine pane that produced it.
+    pub fn select_log(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_log: missing id".into());
+        }
+        if self.console.is_empty() {
+            return Err("select_log: log empty".into());
+        }
+        let spec_l = spec.to_ascii_lowercase();
+        let (idx, line) = if let Ok(i) = spec.parse::<usize>() {
+            self.console
+                .get(i)
+                .cloned()
+                .map(|l| (i, l))
+                .ok_or_else(|| format!("select_log: no row {spec}"))?
+        } else {
+            self.console
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, l)| {
+                    l.cmd.eq_ignore_ascii_case(spec)
+                        || l.cmd
+                            .split_whitespace()
+                            .next()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(spec))
+                })
+                .or_else(|| {
+                    self.console.iter().enumerate().rev().find(|(_, l)| {
+                        !l.cmd.eq_ignore_ascii_case("log")
+                            && l.out.to_ascii_lowercase().contains(&spec_l)
+                    })
+                })
+                .map(|(i, l)| (i, l.clone()))
+                .ok_or_else(|| format!("select_log: no row {spec}"))?
+        };
+        let status = if line.ok { "ok" } else { "error" };
+        let id = line
+            .cmd
+            .split_whitespace()
+            .next()
+            .unwrap_or(line.cmd.as_str())
+            .to_string();
+        self.selected_log = Some(idx);
+        self.selected = Some(format!("log:{idx}"));
+        self.bottom_tab = BottomTab::Log;
+        self.properties = vec![
+            ("NAME".into(), id.clone()),
+            ("TYPE".into(), "log".into()),
+            ("INDEX".into(), idx.to_string()),
+            ("STATUS".into(), status.into()),
+            ("CMD".into(), line.cmd.clone()),
+            ("OUT".into(), line.out.clone()),
+        ];
+        match id.as_str() {
+            "report_timing" | "report_timing_summary" | "reports" => {
+                self.workspace = WorkspaceTab::Reports;
+            }
+            "report_drc" => self.workspace = WorkspaceTab::Drc,
+            "report_methodology" => self.workspace = WorkspaceTab::Methodology,
+            "report_cdc" => self.workspace = WorkspaceTab::Cdc,
+            "report_power" => self.workspace = WorkspaceTab::Power,
+            "report_clock_interaction" => {
+                self.workspace = WorkspaceTab::ClockInteraction;
+            }
+            "report_clock_networks" => self.workspace = WorkspaceTab::ClockNetworks,
+            "report_utilization" => self.workspace = WorkspaceTab::Utilization,
+            "timing_constraints" | "report_timing_constraints" => {
+                self.workspace = WorkspaceTab::Constraints;
+            }
+            "place_design" | "route_design" | "device" => {
+                self.workspace = WorkspaceTab::Device;
+            }
+            "synth_design" | "opt_design" | "schematic" => {
+                self.workspace = WorkspaceTab::Schematic;
+            }
+            "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
+            _ => {}
+        }
+        Ok(format!(
+            "log INDEX={idx} STATUS={status} CMD={} OUT={}",
+            line.cmd, line.out
+        ))
     }
 
     fn journal(&mut self, cmd: &str, r: &Result<String, String>) {
@@ -6168,6 +6313,246 @@ impl IdeModel {
             group.ths_ps,
             group.endpoints
         ))
+    }
+
+    /// UG893 Reports window: clickable catalog of engine reports, not stacked dumps.
+    pub fn report_catalog(&self) -> Vec<ReportCatalogRow> {
+        fn row(
+            id: &str,
+            name: &str,
+            category: &str,
+            workspace: WorkspaceTab,
+            ready: bool,
+            summary: String,
+        ) -> ReportCatalogRow {
+            ReportCatalogRow {
+                id: id.into(),
+                name: name.into(),
+                category: category.into(),
+                tcl: id.into(),
+                status: if ready {
+                    "Complete".into()
+                } else {
+                    "Not generated".into()
+                },
+                summary: if ready { summary } else { "-".into() },
+                workspace,
+            }
+        }
+
+        let ts = self.timing_summary();
+        let ts_ready = !ts.clocks.is_empty();
+        let ts_sum = format!(
+            "WNS_PS={} TNS_PS={} clocks={}",
+            ts.wns_ps
+                .map(|w| w.to_string())
+                .unwrap_or_else(|| "n/a".into()),
+            ts.tns_ps,
+            ts.clocks.len()
+        );
+
+        let ci = self.clock_interaction();
+        let ci_ready = !ci.clocks.is_empty();
+        let ci_sum = format!("clocks={} cells={}", ci.clocks.len(), ci.cells.len());
+
+        let cdc = self.cdc_report();
+        let cdc_ready = !cdc.clocks.is_empty();
+        let cdc_sum = format!(
+            "critical={} warning={} info={} safe={}",
+            cdc.critical_count(),
+            cdc.warning_count(),
+            cdc.info_count(),
+            cdc.safe_count()
+        );
+
+        let cn = self.clock_networks();
+        let cn_ready = !cn.clocks.is_empty();
+        let cn_sum = format!(
+            "loads={} buffers={} INSERTION_PS={}",
+            cn.total_loads, cn.total_buffers, cn.max_insertion_ps
+        );
+
+        let pwr = self.power_report();
+        let pwr_ready = !pwr.part.is_empty();
+        let pwr_sum = format!(
+            "TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={}",
+            pwr.total_uw, pwr.static_uw, pwr.dynamic_uw, pwr.voltage_mv
+        );
+
+        let meth = self.methodology_report();
+        let meth_ready = self.shell.session.design.is_some();
+        let meth_sum = format!(
+            "checks={} errors={} warning={}",
+            meth.checks.len(),
+            meth.error_count(),
+            meth.warning_count()
+        );
+
+        let drc = self.drc.clone().unwrap_or_else(|| self.drc_report());
+        let drc_ready = self.drc.is_some()
+            || self.utilization.is_some()
+            || self.shell.session.placed.is_some()
+            || self.shell.session.routed.is_some();
+        let drc_sum = format!(
+            "violations={} errors={}",
+            drc.violations.len(),
+            drc.error_count()
+        );
+
+        let util = self.utilization_report();
+        let util_ready = !util.part.is_empty();
+        let util_sum = if let Some(lut) = util.row("LUTFF") {
+            format!(
+                "LUTFF={}/{} IOB={}/{}",
+                lut.used,
+                lut.available,
+                util.row("IOB").map(|r| r.used).unwrap_or(0),
+                util.row("IOB").map(|r| r.available).unwrap_or(0)
+            )
+        } else {
+            format!("part={}", util.part)
+        };
+
+        let bits = self.bitstream_report();
+        let bits_ready = self.shell.session.bitstream.is_some();
+        let bits_sum = format!(
+            "hash={:#010x} frames={} configured={}",
+            bits.hash, bits.frames, bits.configured
+        );
+
+        vec![
+            row(
+                "report_timing_summary",
+                "Timing Summary",
+                "Timing",
+                WorkspaceTab::Reports,
+                ts_ready,
+                ts_sum,
+            ),
+            row(
+                "report_clock_interaction",
+                "Clock Interaction",
+                "Timing",
+                WorkspaceTab::ClockInteraction,
+                ci_ready,
+                ci_sum,
+            ),
+            row(
+                "report_cdc",
+                "CDC",
+                "Timing",
+                WorkspaceTab::Cdc,
+                cdc_ready,
+                cdc_sum,
+            ),
+            row(
+                "report_clock_networks",
+                "Clock Networks",
+                "Timing",
+                WorkspaceTab::ClockNetworks,
+                cn_ready,
+                cn_sum,
+            ),
+            row(
+                "report_power",
+                "Power",
+                "Implementation",
+                WorkspaceTab::Power,
+                pwr_ready,
+                pwr_sum,
+            ),
+            row(
+                "report_methodology",
+                "Methodology",
+                "Implementation",
+                WorkspaceTab::Methodology,
+                meth_ready,
+                meth_sum,
+            ),
+            row(
+                "report_drc",
+                "DRC",
+                "Implementation",
+                WorkspaceTab::Drc,
+                drc_ready,
+                drc_sum,
+            ),
+            row(
+                "report_utilization",
+                "Utilization",
+                "Implementation",
+                WorkspaceTab::Utilization,
+                util_ready,
+                util_sum,
+            ),
+            row(
+                "report_bitstream",
+                "Bitstream",
+                "Program",
+                WorkspaceTab::Bitstream,
+                bits_ready,
+                bits_sum,
+            ),
+        ]
+    }
+
+    pub fn reports_text(&self) -> String {
+        let rows = self.report_catalog();
+        let n_done = rows.iter().filter(|r| r.status == "Complete").count();
+        let mut s = format!("reports n={} complete={n_done}", rows.len());
+        for r in &rows {
+            s.push('\n');
+            s.push_str(&r.row_text());
+        }
+        s
+    }
+
+    /// Click a Reports catalog row: properties + open that engine pane.
+    pub fn select_report(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_report: missing name".into());
+        }
+        let key = spec.strip_prefix("report:").unwrap_or(spec);
+        let spec_l = key.to_ascii_lowercase();
+        let rows = self.report_catalog();
+        let row = if let Ok(i) = key.parse::<usize>() {
+            rows.get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_report: no row {spec}"))?
+        } else {
+            rows.iter()
+                .find(|r| r.id.eq_ignore_ascii_case(key) || r.tcl.eq_ignore_ascii_case(key))
+                .cloned()
+                .or_else(|| {
+                    rows.iter()
+                        .find(|r| r.name.eq_ignore_ascii_case(key))
+                        .cloned()
+                })
+                .or_else(|| {
+                    rows.iter()
+                        .find(|r| {
+                            r.id.to_ascii_lowercase().contains(&spec_l)
+                                || r.name.to_ascii_lowercase().contains(&spec_l)
+                                || r.category.to_ascii_lowercase() == spec_l
+                        })
+                        .cloned()
+                })
+                .ok_or_else(|| format!("select_report: no row {spec}"))?
+        };
+        self.selected_report = Some(row.id.clone());
+        self.selected = Some(format!("report:{}", row.id));
+        self.properties = vec![
+            ("NAME".into(), row.id.clone()),
+            ("TYPE".into(), "report".into()),
+            ("TITLE".into(), row.name.clone()),
+            ("CATEGORY".into(), row.category.clone()),
+            ("STATUS".into(), row.status.clone()),
+            ("SUMMARY".into(), row.summary.clone()),
+            ("TCL".into(), row.tcl.clone()),
+        ];
+        self.workspace = row.workspace;
+        Ok(format!("report {}", row.row_text()))
     }
 
     fn pane_clocks(&self) -> Vec<helion_sta::Clock> {
@@ -8825,6 +9210,41 @@ impl IdeModel {
         if let Some(name) = id.strip_prefix("run:") {
             if let Some(r) = self.runs.iter().find(|r| r.name == name).cloned() {
                 self.properties = Self::design_run_properties(&r);
+                return;
+            }
+        }
+        if let Some(rest) = id.strip_prefix("log:") {
+            if let Ok(i) = rest.parse::<usize>() {
+                if let Some(line) = self.console.get(i) {
+                    let status = if line.ok { "ok" } else { "error" };
+                    let name = line
+                        .cmd
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(line.cmd.as_str());
+                    self.properties = vec![
+                        ("NAME".into(), name.into()),
+                        ("TYPE".into(), "log".into()),
+                        ("INDEX".into(), i.to_string()),
+                        ("STATUS".into(), status.into()),
+                        ("CMD".into(), line.cmd.clone()),
+                        ("OUT".into(), line.out.clone()),
+                    ];
+                    return;
+                }
+            }
+        }
+        if let Some(rest) = id.strip_prefix("report:") {
+            if let Some(row) = self.report_catalog().into_iter().find(|r| r.id == rest) {
+                self.properties = vec![
+                    ("NAME".into(), row.id),
+                    ("TYPE".into(), "report".into()),
+                    ("TITLE".into(), row.name),
+                    ("CATEGORY".into(), row.category),
+                    ("STATUS".into(), row.status),
+                    ("SUMMARY".into(), row.summary),
+                    ("TCL".into(), row.tcl),
+                ];
                 return;
             }
         }
@@ -15866,5 +16286,253 @@ mod tests {
             Some(wns_route),
             "empty XDC gold WNS must hold after Hardware Manager STAT"
         );
+    }
+
+    /// UG893 Reports window is a clickable catalog of engine reports
+    /// (Clock Interaction / CDC / Clock Networks / Power / …), not stacked dumps.
+    #[test]
+    fn reports_workspace_clickable_catalog_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(ide.report_catalog().iter().all(|r| r.status == "Not generated"));
+        assert!(
+            ide.report_catalog().iter().all(|r| r.summary == "-"),
+            "idle catalog has no canned summaries: {:?}",
+            ide.report_catalog()
+                .iter()
+                .map(|r| (r.id.as_str(), r.summary.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ide.exec("select_report")
+                .unwrap_err()
+                .contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_report no_such")
+                .unwrap_err()
+                .contains("no row"),
+            "unknown report must refuse"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "reports"),
+            "Flow Navigator Project Manager must offer Reports"
+        );
+
+        let table = ide.exec("reports").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert!(table.contains("reports n=9"), "{table}");
+        assert!(table.contains("complete=0"), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("NAME=report_timing_summary"), "{table}");
+        assert!(table.contains("NAME=report_clock_interaction"), "{table}");
+        assert!(table.contains("NAME=report_cdc"), "{table}");
+        assert!(table.contains("NAME=report_clock_networks"), "{table}");
+        assert!(table.contains("NAME=report_power"), "{table}");
+        assert!(table.contains("NAME=report_methodology"), "{table}");
+        assert!(table.contains("NAME=report_drc"), "{table}");
+        assert!(table.contains("NAME=report_utilization"), "{table}");
+        assert!(table.contains("NAME=report_bitstream"), "{table}");
+        assert!(table.contains("STATUS=Not generated"), "{table}");
+        assert!(
+            !table.contains("WNS_PS=9640") || table.contains("SUMMARY=-"),
+            "idle catalog must not can gold WNS: {table}"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+
+        let table = ide.exec("reports").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert!(table.contains("complete="), "{table}");
+        assert!(
+            table.contains(&format!("WNS_PS={gold}")),
+            "Timing Summary row must carry STA, not a dump: {table}"
+        );
+        let rows = ide.report_catalog();
+        let ts = rows
+            .iter()
+            .find(|r| r.id == "report_timing_summary")
+            .expect("timing summary row");
+        assert_eq!(ts.status, "Complete");
+        assert!(ts.summary.contains(&format!("WNS_PS={gold}")), "{}", ts.summary);
+        let ci = rows
+            .iter()
+            .find(|r| r.id == "report_clock_interaction")
+            .unwrap();
+        assert_eq!(ci.status, "Complete");
+        assert!(ci.summary.contains("clocks="), "{}", ci.summary);
+        let cdc = rows.iter().find(|r| r.id == "report_cdc").unwrap();
+        assert_eq!(cdc.status, "Complete");
+        assert!(cdc.summary.contains("critical="), "{}", cdc.summary);
+        let cn = rows
+            .iter()
+            .find(|r| r.id == "report_clock_networks")
+            .unwrap();
+        assert_eq!(cn.status, "Complete");
+        assert!(cn.summary.contains("INSERTION_PS="), "{}", cn.summary);
+        let pwr = rows.iter().find(|r| r.id == "report_power").unwrap();
+        assert_eq!(pwr.status, "Complete");
+        assert!(pwr.summary.contains("TOTAL_UW="), "{}", pwr.summary);
+        let util = rows
+            .iter()
+            .find(|r| r.id == "report_utilization")
+            .unwrap();
+        assert_eq!(util.status, "Complete");
+        assert!(util.summary.contains("LUTFF="), "{}", util.summary);
+        let bits = rows
+            .iter()
+            .find(|r| r.id == "report_bitstream")
+            .unwrap();
+        assert_eq!(bits.status, "Not generated");
+        assert_eq!(bits.summary, "-");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening the catalog must not move gold WNS"
+        );
+
+        let sel = ide.exec("select_report report_cdc").unwrap();
+        assert!(sel.contains("NAME=report_cdc"), "{sel}");
+        assert!(sel.contains("TYPE") || sel.contains("CATEGORY=Timing"), "{sel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Cdc);
+        assert_eq!(ide.selected.as_deref(), Some("report:report_cdc"));
+        assert_eq!(ide.selected_report.as_deref(), Some("report_cdc"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "report"),
+            "{:?}",
+            ide.properties
+        );
+
+        let ts_sel = ide.exec("select_report report_timing_summary").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert!(ts_sel.contains(&format!("WNS_PS={gold}")), "{ts_sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "SUMMARY" && v.contains(&format!("WNS_PS={gold}"))),
+            "{:?}",
+            ide.properties
+        );
+
+        let psel = ide.exec("select_report report_power").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Power);
+        assert!(psel.contains("TOTAL_UW="), "{psel}");
+
+        ide.exec("write_bitstream").unwrap();
+        let bits = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_bitstream")
+            .unwrap();
+        assert_eq!(bits.status, "Complete");
+        let hash = ide.bitstream_hash().expect("hash");
+        assert!(
+            bits.summary.contains(&format!("{hash:#010x}")),
+            "{}",
+            bits.summary
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "bitstream catalog row must not move gold WNS"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Opt).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let bw = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bw, gold, "WNS is per-design");
+        let btable = blinky.exec("reports").unwrap();
+        assert!(btable.contains(&format!("WNS_PS={bw}")), "{btable}");
+        assert!(
+            !btable.contains(&format!("WNS_PS={gold}")),
+            "catalog is per-session, not canned: {btable}"
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Reports catalog"
+        );
+    }
+
+    /// UG893 Log pane is a clickable command/result table, not a monospace dump.
+    #[test]
+    fn log_pane_clickable_command_result_table() {
+        let mut ide = IdeModel::new();
+        assert!(ide.log_rows().is_empty());
+        assert!(
+            ide.select_log("0").unwrap_err().contains("log empty"),
+            "empty table must refuse a click"
+        );
+        let empty = ide.exec("log").unwrap();
+        assert_eq!(ide.bottom_tab, BottomTab::Log);
+        assert!(empty.contains("log n=1") || empty.contains("log empty") || empty.contains("CMD=log"), "{empty}");
+
+        let e = ide.run_step(FlowStep::Synthesis).unwrap_err();
+        assert!(e.contains("source") || e.contains("synth"), "{e}");
+        let table = ide.exec("log").unwrap();
+        assert_eq!(ide.bottom_tab, BottomTab::Log);
+        assert!(table.contains("STATUS=error"), "{table}");
+        assert!(table.contains("CMD=synth_design"), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        let sel = ide.exec("select_log synth_design").unwrap();
+        assert!(sel.contains("STATUS=error"), "{sel}");
+        assert!(sel.contains("CMD=synth_design"), "{sel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Schematic);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "log"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("report_timing").unwrap();
+        let wns = ide.wns_ps().expect("STA WNS");
+        assert_ne!(wns, 0);
+        let table = ide.exec("log").unwrap();
+        assert!(table.contains("helion% report_timing"), "{table}");
+        assert!(table.contains(&format!("WNS_PS={wns}")), "{table}");
+        assert!(table.contains("STATUS=ok CMD=report_timing"), "{table}");
+        let tsel = ide.exec("select_log report_timing").unwrap();
+        assert!(
+            tsel.contains(&format!("WNS_PS={wns}")),
+            "click must carry STA, not a stub: {tsel}"
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert_eq!(ide.bottom_tab, BottomTab::Log);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "OUT" && v.contains(&format!("WNS_PS={wns}"))),
+            "{:?}",
+            ide.properties
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.exec("report_timing").unwrap();
+        let bw = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bw, wns, "WNS is per-design");
+        let bsel = blinky.exec("select_log report_timing").unwrap();
+        assert!(bsel.contains(&format!("WNS_PS={bw}")), "{bsel}");
+        assert!(
+            !bsel.contains(&format!("WNS_PS={wns}")),
+            "Log clicks are per-session, not canned: {bsel}"
+        );
+        assert_eq!(blinky.workspace, WorkspaceTab::Reports);
     }
 }

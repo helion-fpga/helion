@@ -620,14 +620,7 @@ fn paint_bottom(ctx: &egui::Context, model: &mut IdeModel) {
                     paint_messages(ui, model);
                 }
                 BottomTab::Log => {
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for line in &model.log {
-                                ui.monospace(line);
-                            }
-                        });
+                    paint_log(ui, model);
                 }
             }
         });
@@ -749,6 +742,84 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
         });
     if let Some(i) = pick {
         let _ = model.select_message(&i.to_string());
+    }
+}
+
+fn log_status_color(ok: bool) -> Color32 {
+    if ok {
+        Color32::from_rgb(0x50, 0xc0, 0x70)
+    } else {
+        Color32::from_rgb(0xe0, 0x50, 0x50)
+    }
+}
+
+fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.weak(
+        "UG893 Log — clickable Tcl transcript (status / cmd / engine out), not a monospace dump",
+    );
+    let n_err = model.console.iter().filter(|l| !l.ok).count();
+    ui.label(format!(
+        "log n={} errors={n_err}",
+        model.console.len()
+    ));
+    let selected = model.selected_log;
+    let rows: Vec<(usize, helion_gui::ConsoleLine)> = model
+        .log_rows()
+        .into_iter()
+        .map(|(i, l)| (i, l.clone()))
+        .collect();
+    let mut pick: Option<usize> = None;
+    egui::ScrollArea::both()
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("log_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("#").strong());
+                    ui.label(RichText::new("Status").strong());
+                    ui.label(RichText::new("Command").strong());
+                    ui.label(RichText::new("Result").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("log empty");
+                        ui.end_row();
+                    } else {
+                        for (i, line) in &rows {
+                            let on = selected == Some(*i);
+                            ui.monospace(i.to_string());
+                            let status = if line.ok { "ok" } else { "error" };
+                            let btn = egui::Button::new(
+                                RichText::new(status).color(Color32::BLACK),
+                            )
+                            .fill(log_status_color(line.ok))
+                            .selected(on);
+                            if ui.add(btn).clicked() {
+                                pick = Some(*i);
+                            }
+                            if ui.selectable_label(on, &line.cmd).clicked() {
+                                pick = Some(*i);
+                            }
+                            let out = if line.out.len() > 80 {
+                                format!("{}…", &line.out[..80])
+                            } else if line.out.is_empty() {
+                                "—".into()
+                            } else {
+                                line.out.clone()
+                            };
+                            if ui.selectable_label(on, out).clicked() {
+                                pick = Some(*i);
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(i) = pick {
+        let _ = model.select_log(&i.to_string());
     }
 }
 
@@ -1526,8 +1597,6 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     paint_constraints_tables(ui, model);
-    ui.add_space(8.0);
-    report_box(ui, "Timing (report_timing)", &model.timing_text());
 }
 
 fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
@@ -1603,20 +1672,17 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(id) = pick {
         let _ = model.select_constraint(&id);
     }
-    ui.add_space(6.0);
-    report_box(
-        ui,
-        "Constraints (timing_constraints)",
-        &model.constraints_table_text(),
-    );
 }
 
 fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Reports");
+    ui.weak(
+        "UG893 Reports — clickable catalog of Helion engine reports, not stacked dumps",
+    );
     ui.add_space(6.0);
-    paint_timing_summary(ui, model);
+    paint_report_catalog(ui, model);
     ui.add_space(8.0);
-    report_box(ui, "Timing (report_timing)", &model.timing_text());
+    paint_timing_summary(ui, model);
     if !model.timing_paths.is_empty() {
         ui.add_space(6.0);
         ui.label(RichText::new("Timing Paths (click → Schematic)").strong());
@@ -1644,30 +1710,47 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.select_timing_path(&i.to_string());
         }
     }
-    ui.add_space(8.0);
-    paint_utilization(ui, model);
-    ui.add_space(8.0);
-    paint_bitstream(ui, model);
-    ui.add_space(8.0);
-    paint_drc(ui, model);
-    ui.add_space(8.0);
-    paint_methodology(ui, model);
-    ui.add_space(8.0);
-    report_box(
-        ui,
-        "Clock Interaction (report_clock_interaction)",
-        &model.clock_interaction_text(),
-    );
-    ui.add_space(8.0);
-    report_box(ui, "CDC (report_cdc)", &model.cdc_text());
-    ui.add_space(8.0);
-    report_box(
-        ui,
-        "Clock Networks (report_clock_networks)",
-        &model.clock_networks_text(),
-    );
-    ui.add_space(8.0);
-    report_box(ui, "Power (report_power)", &model.power_text());
+}
+
+fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
+    let rows = model.report_catalog();
+    ui.label(format!(
+        "reports n={} complete={}",
+        rows.len(),
+        rows.iter().filter(|r| r.status == "Complete").count()
+    ));
+    let selected = model.selected_report.clone();
+    let mut pick: Option<String> = None;
+    egui::Grid::new("reports_catalog")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Name").strong());
+            ui.label(RichText::new("Category").strong());
+            ui.label(RichText::new("Status").strong());
+            ui.label(RichText::new("Summary").strong());
+            ui.end_row();
+            for r in &rows {
+                let on = selected.as_deref() == Some(r.id.as_str());
+                if ui.selectable_label(on, &r.name).clicked() {
+                    pick = Some(r.id.clone());
+                }
+                ui.label(&r.category);
+                let fill = run_status_color(&r.status);
+                let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
+                    .fill(fill)
+                    .selected(on);
+                if ui.add(btn).clicked() {
+                    pick = Some(r.id.clone());
+                }
+                if ui.selectable_label(on, &r.summary).clicked() {
+                    pick = Some(r.id.clone());
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(id) = pick {
+        let _ = model.select_report(&id);
+    }
 }
 
 fn slack_label(v: Option<i64>) -> String {
@@ -1782,12 +1865,6 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some((a, b)) = pick {
         let _ = model.select_timing_summary(&a, b.as_deref());
     }
-    ui.add_space(6.0);
-    report_box(
-        ui,
-        "Timing Summary (report_timing_summary)",
-        &model.timing_summary_text(),
-    );
 }
 
 fn clock_relation_color(rel: ClockRelation) -> Color32 {
@@ -1886,14 +1963,6 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some((from, to)) = pick {
         let _ = model.select_clock_interaction(&from, &to);
     }
-    ui.add_space(8.0);
-    report_box(
-        ui,
-        "Clock Interaction (report_clock_interaction)",
-        &model.clock_interaction_text(),
-    );
-    ui.add_space(8.0);
-    report_box(ui, "Timing (report_timing)", &model.timing_text());
 }
 
 fn cdc_severity_color(sev: CdcSeverity) -> Color32 {
@@ -1983,8 +2052,6 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some((from, to)) = pick {
         let _ = model.select_cdc(&from, &to);
     }
-    ui.add_space(8.0);
-    report_box(ui, "CDC (report_cdc)", &model.cdc_text());
 }
 
 fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
@@ -2048,12 +2115,6 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(name) = pick {
         let _ = model.select_clock_network(&name);
     }
-    ui.add_space(8.0);
-    report_box(
-        ui,
-        "Clock Networks (report_clock_networks)",
-        &model.clock_networks_text(),
-    );
 }
 
 fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
@@ -2132,8 +2193,6 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
         report.dsp,
         report.dsp_cap
     ));
-    ui.add_space(8.0);
-    report_box(ui, "Power (report_power)", &model.power_text());
 }
 
 fn methodology_severity_color(sev: MethodologySeverity) -> Color32 {
@@ -2212,12 +2271,6 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(id) = pick {
         let _ = model.select_methodology(&id);
     }
-    ui.add_space(8.0);
-    report_box(
-        ui,
-        "Methodology (report_methodology)",
-        &model.methodology_text(),
-    );
 }
 
 fn drc_severity_color(sev: DrcSeverity) -> Color32 {
@@ -2363,8 +2416,6 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(id) = pick {
         let _ = model.select_drc(&id);
     }
-    ui.add_space(8.0);
-    report_box(ui, "DRC (report_drc)", &model.drc_text());
 }
 
 fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
@@ -2452,12 +2503,6 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
             });
     }
-    ui.add_space(8.0);
-    report_box(
-        ui,
-        "Utilization (report_utilization)",
-        &model.utilization_text(),
-    );
 }
 
 fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke) {
@@ -3973,14 +4018,4 @@ fn flow_button(ui: &mut egui::Ui, model: &mut IdeModel, step: FlowStep) {
         let _ = model.run_step(step);
     }
     resp.on_hover_text(step.tcl());
-}
-
-fn report_box(ui: &mut egui::Ui, title: &str, body: &str) {
-    egui::Frame::group(ui.style())
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            ui.label(RichText::new(title).strong());
-            ui.add_space(4.0);
-            ui.monospace(body);
-        });
 }
