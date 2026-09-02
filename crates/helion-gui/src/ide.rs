@@ -1,10 +1,10 @@
 //! Headless IDE model — the Vivado-class application state.
 //!
-//! Sources/netlist Name/Type table, Tcl console, flow rail (Synthesis → Opt → Place →
-//! Route → Bitstream) and the timing/utilization report panes. Everything here runs the
-//! *real* [`Session`] engines: there is no canned output anywhere in this file, so the
-//! widget layer (`helion-ide`) is a thin painter over this model and can be tested
-//! without a display.
+//! Sources/netlist Name/Type table, Tcl Console Status/Cmd/Out table, flow rail
+//! (Synthesis → Opt → Place → Route → Bitstream) and the timing/utilization report
+//! panes. Everything here runs the *real* [`Session`] engines: there is no canned
+//! output anywhere in this file, so the widget layer (`helion-ide`) is a thin painter
+//! over this model and can be tested without a display.
 
 use crate::{tcl_eval, GpuiShell};
 use helion_bd::{emit_sv, validate, BlockDesign};
@@ -90,6 +90,21 @@ pub struct ConsoleLine {
     pub cmd: String,
     pub out: String,
     pub ok: bool,
+}
+
+impl ConsoleLine {
+    pub fn status(&self) -> &'static str {
+        if self.ok {
+            "ok"
+        } else {
+            "error"
+        }
+    }
+
+    /// Clickable-grid dump row: UG893 Tcl Console Status/Cmd/Out, not `helion% cmd`.
+    pub fn row_text(&self) -> String {
+        format!("STATUS={} CMD={} OUT={}", self.status(), self.cmd, self.out)
+    }
 }
 
 /// Sources + elaborated netlist, exactly as the HNF design holds it.
@@ -3893,8 +3908,13 @@ impl IdeModel {
             self.find_console(q.trim())
         } else if t == "console_find" {
             self.find_console(&self.console_find.clone())
+        } else if t == "tcl_console" || t == "console" {
+            self.bottom_tab = BottomTab::Tcl;
+            Ok(self.console_text())
         } else if let Some(idx) = t.strip_prefix("select_console ") {
             self.select_console_line(idx.trim())
+        } else if t == "select_console" {
+            self.select_console_line("")
         } else if t == "schematic" {
             self.workspace = WorkspaceTab::Schematic;
             Ok(self.schematic_text())
@@ -4082,11 +4102,7 @@ impl IdeModel {
         let n_err = self.console.iter().filter(|l| !l.ok).count();
         let mut s = format!("log n={} errors={n_err}", self.console.len());
         for (i, line) in self.console.iter().enumerate() {
-            let status = if line.ok { "ok" } else { "error" };
-            s.push_str(&format!(
-                "\n{i} STATUS={status} CMD={} OUT={}",
-                line.cmd, line.out
-            ));
+            s.push_str(&format!("\n{i} {}", line.row_text()));
             s.push_str(&format!("\nhelion% {}\n{}", line.cmd, line.out));
         }
         s
@@ -4152,35 +4168,30 @@ impl IdeModel {
             ("CMD".into(), line.cmd.clone()),
             ("OUT".into(), line.out.clone()),
         ];
-        match id.as_str() {
-            "report_timing" | "report_timing_summary" | "reports" => {
-                self.workspace = WorkspaceTab::Reports;
-            }
-            "report_drc" => self.workspace = WorkspaceTab::Drc,
-            "report_methodology" => self.workspace = WorkspaceTab::Methodology,
-            "report_cdc" => self.workspace = WorkspaceTab::Cdc,
-            "report_power" => self.workspace = WorkspaceTab::Power,
-            "report_clock_interaction" => {
-                self.workspace = WorkspaceTab::ClockInteraction;
-            }
-            "report_clock_networks" => self.workspace = WorkspaceTab::ClockNetworks,
-            "report_utilization" => self.workspace = WorkspaceTab::Utilization,
-            "timing_constraints" | "report_timing_constraints" => {
-                self.workspace = WorkspaceTab::Constraints;
-            }
-            "place_design" | "route_design" | "device" => {
-                self.workspace = WorkspaceTab::Device;
-            }
-            "synth_design" | "opt_design" | "schematic" => {
-                self.workspace = WorkspaceTab::Schematic;
-            }
-            "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
-            _ => {}
-        }
+        self.apply_cmd_workspace(&id);
         Ok(format!(
             "log INDEX={idx} STATUS={status} CMD={} OUT={}",
             line.cmd, line.out
         ))
+    }
+
+    /// UG893 Tcl Console: clickable Status/Cmd/Out table over the Session journal
+    /// (not a `helion% cmd` + monospace-out dump). Same rows as Log.
+    pub fn console_text(&self) -> String {
+        if self.console.is_empty() {
+            return "tcl_console empty".into();
+        }
+        let n_err = self.console.iter().filter(|l| !l.ok).count();
+        let mut s = format!("tcl_console n={} errors={n_err}", self.console.len());
+        for (i, line) in self.console.iter().enumerate() {
+            s.push_str(&format!("\n{i} {}", line.row_text()));
+        }
+        s
+    }
+
+    /// Clickable Tcl Console rows — Status/Cmd/Out over Session, not a restyle of `log`.
+    pub fn console_rows(&self) -> Vec<(usize, &ConsoleLine)> {
+        self.console.iter().enumerate().collect()
     }
 
     fn journal(&mut self, cmd: &str, r: &Result<String, String>) {
@@ -5651,6 +5662,34 @@ impl IdeModel {
         ))
     }
 
+    fn apply_cmd_workspace(&mut self, id: &str) {
+        match id {
+            "report_timing" | "report_timing_summary" | "reports" => {
+                self.workspace = WorkspaceTab::Reports;
+            }
+            "report_drc" => self.workspace = WorkspaceTab::Drc,
+            "report_methodology" => self.workspace = WorkspaceTab::Methodology,
+            "report_cdc" => self.workspace = WorkspaceTab::Cdc,
+            "report_power" => self.workspace = WorkspaceTab::Power,
+            "report_clock_interaction" => {
+                self.workspace = WorkspaceTab::ClockInteraction;
+            }
+            "report_clock_networks" => self.workspace = WorkspaceTab::ClockNetworks,
+            "report_utilization" => self.workspace = WorkspaceTab::Utilization,
+            "timing_constraints" | "report_timing_constraints" => {
+                self.workspace = WorkspaceTab::Constraints;
+            }
+            "place_design" | "route_design" | "device" => {
+                self.workspace = WorkspaceTab::Device;
+            }
+            "synth_design" | "opt_design" | "schematic" => {
+                self.workspace = WorkspaceTab::Schematic;
+            }
+            "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
+            _ => {}
+        }
+    }
+
     /// Fig. 64: Find in the Tcl journal (selectable console, not a dump).
     pub fn find_console(&mut self, q: &str) -> Result<String, String> {
         let q = q.trim();
@@ -5687,19 +5726,66 @@ impl IdeModel {
         ))
     }
 
+    /// Click a UG893 Tcl Console row: properties + jump to the engine pane.
     pub fn select_console_line(&mut self, spec: &str) -> Result<String, String> {
-        let idx: usize = spec
-            .parse()
-            .map_err(|_| format!("select_console: bad index {spec}"))?;
-        let line = self
-            .console
-            .get(idx)
-            .ok_or_else(|| format!("select_console: no line {idx}"))?;
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_console: missing id".into());
+        }
+        if self.console.is_empty() {
+            return Err("select_console: console empty".into());
+        }
+        let spec_l = spec.to_ascii_lowercase();
+        let (idx, line) = if let Ok(i) = spec.parse::<usize>() {
+            self.console
+                .get(i)
+                .cloned()
+                .map(|l| (i, l))
+                .ok_or_else(|| format!("select_console: no row {spec}"))?
+        } else {
+            self.console
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, l)| {
+                    l.cmd.eq_ignore_ascii_case(spec)
+                        || l.cmd
+                            .split_whitespace()
+                            .next()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(spec))
+                })
+                .or_else(|| {
+                    self.console.iter().enumerate().rev().find(|(_, l)| {
+                        !l.cmd.eq_ignore_ascii_case("tcl_console")
+                            && !l.cmd.eq_ignore_ascii_case("console")
+                            && l.out.to_ascii_lowercase().contains(&spec_l)
+                    })
+                })
+                .map(|(i, l)| (i, l.clone()))
+                .ok_or_else(|| format!("select_console: no row {spec}"))?
+        };
+        let status = line.status();
+        let id = line
+            .cmd
+            .split_whitespace()
+            .next()
+            .unwrap_or(line.cmd.as_str())
+            .to_string();
         self.console_selected = Some(idx);
+        self.selected = Some(format!("tcl:{idx}"));
         self.bottom_tab = BottomTab::Tcl;
+        self.properties = vec![
+            ("NAME".into(), id.clone()),
+            ("TYPE".into(), "tcl".into()),
+            ("INDEX".into(), idx.to_string()),
+            ("STATUS".into(), status.into()),
+            ("CMD".into(), line.cmd.clone()),
+            ("OUT".into(), line.out.clone()),
+        ];
+        self.apply_cmd_workspace(&id);
         Ok(format!(
-            "console_line {idx} ok={} cmd={} out={}",
-            line.ok as u8, line.cmd, line.out
+            "console_line {idx} ok={} cmd={} out={} STATUS={status} CMD={} OUT={}",
+            line.ok as u8, line.cmd, line.out, line.cmd, line.out
         ))
     }
 
@@ -10564,6 +10650,26 @@ impl IdeModel {
                         ("TYPE".into(), "log".into()),
                         ("INDEX".into(), i.to_string()),
                         ("STATUS".into(), status.into()),
+                        ("CMD".into(), line.cmd.clone()),
+                        ("OUT".into(), line.out.clone()),
+                    ];
+                    return;
+                }
+            }
+        }
+        if let Some(rest) = id.strip_prefix("tcl:") {
+            if let Ok(i) = rest.parse::<usize>() {
+                if let Some(line) = self.console.get(i) {
+                    let name = line
+                        .cmd
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(line.cmd.as_str());
+                    self.properties = vec![
+                        ("NAME".into(), name.into()),
+                        ("TYPE".into(), "tcl".into()),
+                        ("INDEX".into(), i.to_string()),
+                        ("STATUS".into(), line.status().into()),
                         ("CMD".into(), line.cmd.clone()),
                         ("OUT".into(), line.out.clone()),
                     ];
@@ -16151,6 +16257,114 @@ mod tests {
         assert_eq!(ide.console_selected, Some(idx));
         assert!(sel.contains("ok=1"), "{sel}");
         assert!(sel.contains("cmd=report_timing"), "{sel}");
+    }
+
+    /// UG893 Tcl Console is a clickable Status/Cmd/Out table over Session,
+    /// not a `helion% cmd` + monospace-out dump (Log already is that table).
+    #[test]
+    fn tcl_console_clickable_status_cmd_out_table() {
+        let mut ide = IdeModel::new();
+        assert!(ide.console_rows().is_empty());
+        assert!(
+            ide.select_console_line("0")
+                .unwrap_err()
+                .contains("console empty"),
+            "empty table must refuse a click"
+        );
+        assert!(
+            ide.exec("select_console")
+                .unwrap_err()
+                .contains("missing id"),
+            "empty click must refuse"
+        );
+        let empty = ide.exec("tcl_console").unwrap();
+        assert_eq!(ide.bottom_tab, BottomTab::Tcl);
+        assert!(
+            empty.contains("tcl_console empty")
+                || empty.contains("tcl_console n=")
+                || empty.contains("CMD=tcl_console"),
+            "{empty}"
+        );
+        assert!(
+            !empty.contains("helion%"),
+            "Tcl Console table must not be a helion% dump: {empty}"
+        );
+
+        let e = ide.run_step(FlowStep::Synthesis).unwrap_err();
+        assert!(e.contains("source") || e.contains("synth"), "{e}");
+        let table = ide.exec("tcl_console").unwrap();
+        assert_eq!(ide.bottom_tab, BottomTab::Tcl);
+        assert!(table.contains("STATUS=error"), "{table}");
+        assert!(table.contains("CMD=synth_design"), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            !table.contains("helion%"),
+            "must not dump helion% lines: {table}"
+        );
+        let sel = ide.exec("select_console synth_design").unwrap();
+        assert!(sel.contains("STATUS=error"), "{sel}");
+        assert!(sel.contains("CMD=synth_design"), "{sel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Schematic);
+        assert_eq!(ide.bottom_tab, BottomTab::Tcl);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "tcl"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("report_timing").unwrap();
+        let gold = ide.wns_ps().expect("STA WNS");
+        assert_ne!(gold, 0);
+        let table = ide.exec("tcl_console").unwrap();
+        assert!(table.contains("tcl_console n="), "{table}");
+        assert!(table.contains("STATUS=ok CMD=report_timing"), "{table}");
+        assert!(table.contains(&format!("WNS_PS={gold}")), "{table}");
+        assert!(
+            !table.contains("helion% report_timing"),
+            "table is Status/Cmd/Out, not a prompt dump: {table}"
+        );
+        let tsel = ide.exec("select_console report_timing").unwrap();
+        assert!(
+            tsel.contains(&format!("WNS_PS={gold}")),
+            "click must carry STA, not a stub: {tsel}"
+        );
+        assert!(tsel.contains("STATUS=ok"), "{tsel}");
+        assert_eq!(ide.workspace, WorkspaceTab::Reports);
+        assert_eq!(ide.bottom_tab, BottomTab::Tcl);
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "OUT" && v.contains(&format!("WNS_PS={gold}"))),
+            "{:?}",
+            ide.properties
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "empty XDC gold WNS must hold after Tcl Console"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.exec("report_timing").unwrap();
+        let bw = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bw, gold, "WNS is per-design");
+        let bsel = blinky.exec("select_console report_timing").unwrap();
+        assert!(bsel.contains(&format!("WNS_PS={bw}")), "{bsel}");
+        assert!(
+            !bsel.contains(&format!("WNS_PS={gold}")),
+            "Tcl Console clicks are per-session, not canned: {bsel}"
+        );
+        assert_eq!(blinky.workspace, WorkspaceTab::Reports);
+        let btable = blinky.exec("tcl_console").unwrap();
+        assert!(btable.contains(&format!("WNS_PS={bw}")), "{btable}");
+        assert!(
+            !btable.contains(&format!("WNS_PS={gold}")),
+            "table is per-session, not canned: {btable}"
+        );
     }
 
     /// UG893 Device routing overlay: PathFinder IOB tiles from Session.routed, not occupancy restyle.

@@ -662,77 +662,7 @@ fn paint_bottom(ctx: &egui::Context, model: &mut IdeModel) {
             });
             match model.bottom_tab {
                 BottomTab::Tcl => {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Find").small());
-                        let find = egui::TextEdit::singleline(&mut model.console_find)
-                            .desired_width(180.0)
-                            .hint_text("find in journal")
-                            .font(egui::TextStyle::Monospace);
-                        let resp = ui.add(find);
-                        if ui.button("Find").clicked()
-                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
-                            let q = model.console_find.clone();
-                            let _ = model.find_console(&q);
-                        }
-                        if let Some(i) = model.console_selected {
-                            ui.weak(format!("sel={i}"));
-                        }
-                    });
-                    let selected = model.console_selected;
-                    let hits = model.console_find_hits.clone();
-                    let mut pick_line = None;
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .max_height(ui.available_height() - 28.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for (i, line) in model.console.iter().enumerate() {
-                                let color = if line.ok {
-                                    Color32::from_rgb(0xc8, 0xd0, 0xd8)
-                                } else {
-                                    Color32::from_rgb(0xe0, 0x6c, 0x75)
-                                };
-                                let on = selected == Some(i);
-                                let hit = hits.contains(&i);
-                                let cmd_col = if on {
-                                    Color32::from_rgb(0xe5, 0xc0, 0x7b)
-                                } else if hit {
-                                    Color32::from_rgb(0x7e, 0xc8, 0xe3)
-                                } else {
-                                    Color32::from_rgb(0x5e, 0xa8, 0xc3)
-                                };
-                                if ui
-                                    .selectable_label(
-                                        on,
-                                        RichText::new(format!("helion% {}", line.cmd))
-                                            .monospace()
-                                            .color(cmd_col),
-                                    )
-                                    .clicked()
-                                {
-                                    pick_line = Some(i);
-                                }
-                                if !line.out.is_empty() {
-                                    ui.monospace(RichText::new(&line.out).color(color));
-                                }
-                            }
-                        });
-                    if let Some(i) = pick_line {
-                        let _ = model.select_console_line(&i.to_string());
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("helion%").monospace());
-                        let edit = egui::TextEdit::singleline(&mut model.input)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("synth_design / sim_run 16 / nav simulation / report_drc …")
-                            .font(egui::TextStyle::Monospace);
-                        let resp = ui.add(edit);
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let _ = model.submit_input();
-                            resp.request_focus();
-                        }
-                    });
+                    paint_tcl_console(ui, model);
                 }
                 BottomTab::Messages => {
                     paint_messages(ui, model);
@@ -869,6 +799,117 @@ fn log_status_color(ok: bool) -> Color32 {
     } else {
         Color32::from_rgb(0xe0, 0x50, 0x50)
     }
+}
+
+fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.weak(
+        "UG893 Tcl Console — clickable Status/Cmd/Out table over Session, not a helion% dump",
+    );
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Find").small());
+        let find = egui::TextEdit::singleline(&mut model.console_find)
+            .desired_width(180.0)
+            .hint_text("find in journal")
+            .font(egui::TextStyle::Monospace);
+        let resp = ui.add(find);
+        if ui.button("Find").clicked()
+            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
+            let q = model.console_find.clone();
+            let _ = model.find_console(&q);
+        }
+        if let Some(i) = model.console_selected {
+            ui.weak(format!("sel={i}"));
+        }
+    });
+    let n_err = model.console.iter().filter(|l| !l.ok).count();
+    ui.label(format!(
+        "tcl_console n={} errors={n_err}",
+        model.console.len()
+    ));
+    let selected = model.console_selected;
+    let hits = model.console_find_hits.clone();
+    let rows: Vec<(usize, helion_gui::ConsoleLine)> = model
+        .console_rows()
+        .into_iter()
+        .map(|(i, l)| (i, l.clone()))
+        .collect();
+    let mut pick_line = None;
+    egui::ScrollArea::both()
+        .stick_to_bottom(true)
+        .max_height(ui.available_height() - 28.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("tcl_console_table")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("#").strong());
+                    ui.label(RichText::new("Status").strong());
+                    ui.label(RichText::new("Cmd").strong());
+                    ui.label(RichText::new("Out").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("tcl_console empty");
+                        ui.end_row();
+                    } else {
+                        for (i, line) in &rows {
+                            let on = selected == Some(*i);
+                            let hit = hits.contains(i);
+                            ui.monospace(i.to_string());
+                            let btn = egui::Button::new(
+                                RichText::new(line.status()).color(Color32::BLACK),
+                            )
+                            .fill(log_status_color(line.ok))
+                            .selected(on);
+                            if ui.add(btn).clicked() {
+                                pick_line = Some(*i);
+                            }
+                            let cmd_col = if on {
+                                Color32::from_rgb(0xe5, 0xc0, 0x7b)
+                            } else if hit {
+                                Color32::from_rgb(0x7e, 0xc8, 0xe3)
+                            } else {
+                                Color32::from_rgb(0xc8, 0xd0, 0xd8)
+                            };
+                            if ui
+                                .selectable_label(on, RichText::new(&line.cmd).color(cmd_col))
+                                .clicked()
+                            {
+                                pick_line = Some(*i);
+                            }
+                            let out = if line.out.len() > 80 {
+                                format!("{}…", &line.out[..80])
+                            } else if line.out.is_empty() {
+                                "—".into()
+                            } else {
+                                line.out.clone()
+                            };
+                            if ui.selectable_label(on, out).clicked() {
+                                pick_line = Some(*i);
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(i) = pick_line {
+        let _ = model.select_console_line(&i.to_string());
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("helion%").monospace());
+        let edit = egui::TextEdit::singleline(&mut model.input)
+            .desired_width(f32::INFINITY)
+            .hint_text("synth_design / sim_run 16 / nav simulation / report_drc …")
+            .font(egui::TextStyle::Monospace);
+        let resp = ui.add(edit);
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let _ = model.submit_input();
+            resp.request_focus();
+        }
+    });
 }
 
 fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
