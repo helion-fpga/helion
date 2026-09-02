@@ -31,6 +31,29 @@ pub fn pack_gpio() -> IpCore {
     }
 }
 
+/// PicoRV32 wrap on Helion-MM (ip/h_rv32_hb1). Not a Zynq PS, not AXI.
+pub fn pack_rv32() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_rv32_hb1".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
+pub fn catalog() -> Vec<IpCore> {
+    vec![pack_uart(), pack_gpio(), pack_rv32()]
+}
+
+impl IpCore {
+    /// IEEE 1685 VLNV (`vendor:library:name:version`).
+    pub fn vlnv(&self) -> String {
+        format!("{}:{}:{}:{}", self.vendor, self.library, self.name, self.version)
+    }
+}
+
 pub fn to_xml(ip: &IpCore) -> String {
     format!(
         r#"<?xml version="1.0"?>
@@ -91,5 +114,15 @@ mod tests {
         let gpio = pack_gpio();
         assert_eq!(gpio.name, "h_gpio");
         assert_eq!(gpio.bus, "Helion-MM");
+        let rv = pack_rv32();
+        assert_eq!(rv.name, "h_rv32_hb1");
+        assert_eq!(rv.bus, "Helion-MM");
+        assert_ne!(rv.bus, "AXI");
+        let cat = catalog();
+        assert!(cat.iter().any(|c| c.name == "h_uart"));
+        assert!(cat.iter().any(|c| c.name == "h_gpio"));
+        assert!(cat.iter().any(|c| c.name == "h_rv32_hb1"));
+        assert!(cat.iter().all(|c| c.bus != "AXI"));
+        assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
     }
 }

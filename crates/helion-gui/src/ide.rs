@@ -13,7 +13,7 @@ use helion_device::{Device, Far, SiteKind};
 use helion_drc::{check_placed, check_routed, Drc};
 use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
-use helion_ipxact::{pack_gpio, pack_uart, IpCore};
+use helion_ipxact::{catalog as ipxact_catalog, to_xml, IpCore};
 use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
@@ -395,10 +395,16 @@ impl NavSection {
                     tcl: "reports",
                 },
             ],
-            NavSection::IpIntegrator => &[NavAction {
-                label: "Create Block Design",
-                tcl: "create_bd",
-            }],
+            NavSection::IpIntegrator => &[
+                NavAction {
+                    label: "IP Catalog",
+                    tcl: "ip_catalog",
+                },
+                NavAction {
+                    label: "Create Block Design",
+                    tcl: "create_bd",
+                },
+            ],
             NavSection::Simulation => &[NavAction {
                 label: "Run Simulation",
                 tcl: "run_simulation",
@@ -2335,6 +2341,27 @@ pub struct BdView {
     pub ok: bool,
 }
 
+/// One UG893 IP Catalog row (VLNV from helion-ipxact, not a collapsing dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IpCatalogRow {
+    pub name: String,
+    pub vendor: String,
+    pub library: String,
+    pub version: String,
+    pub bus: String,
+    pub vlnv: String,
+    pub status: String,
+}
+
+/// One generated-HDL instance row for the IP Integrator (not a SV dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BdHdlRow {
+    pub instance: String,
+    pub module: String,
+    pub bus: String,
+    pub ports: String,
+}
+
 /// IP Integrator symbol (UG893 BD canvas: boxes + interface pins, not a catalog dump).
 #[derive(Clone, Debug)]
 pub struct BdSymbol {
@@ -2960,6 +2987,10 @@ pub struct IdeModel {
     pub hw: HwManager,
     pub ila: IlaDashboard,
     pub ip_catalog: Vec<IpCore>,
+    /// UG893 IP Catalog selected core name.
+    pub selected_ip: Option<String>,
+    /// Last Generate Output Products XML (helion-ipxact), not painted as a dump.
+    pub generated_ip_xml: Option<String>,
     pub block_design: Option<BdView>,
     pub drc: Option<Drc>,
     /// UG893 Timing Constraints — SDC/XDC clocks that feed helion-sta.
@@ -3026,7 +3057,9 @@ impl IdeModel {
             io_ports: Vec::new(),
             hw: HwManager::default(),
             ila: IlaDashboard::default(),
-            ip_catalog: vec![pack_uart(), pack_gpio()],
+            ip_catalog: ipxact_catalog(),
+            selected_ip: None,
+            generated_ip_xml: None,
             block_design: None,
             drc: None,
             constraints: Constraints::default(),
@@ -3465,12 +3498,26 @@ impl IdeModel {
             Ok(self.bd_drawing_text())
         } else if t == "ip_catalog" {
             self.refresh_ip_catalog();
-            Ok(self
-                .ip_catalog
-                .iter()
-                .map(|c| format!("{}:{}", c.name, c.bus))
-                .collect::<Vec<_>>()
-                .join(" "))
+            self.workspace = WorkspaceTab::Ip;
+            Ok(self.ip_catalog_text())
+        } else if let Some(spec) = t.strip_prefix("select_ip ") {
+            self.select_ip_core(spec.trim())
+        } else if t == "select_ip" {
+            self.select_ip_core("")
+        } else if let Some(spec) = t.strip_prefix("generate_ip ") {
+            self.generate_ip(spec.trim())
+        } else if t == "generate_ip" {
+            self.generate_ip("")
+        } else if let Some(spec) = t.strip_prefix("create_bd_cell ") {
+            self.create_bd_cell(spec.trim())
+        } else if t == "create_bd_cell" {
+            self.create_bd_cell("")
+        } else if t == "bd_hdl" {
+            self.workspace = WorkspaceTab::Ip;
+            if self.block_design.is_none() {
+                let _ = self.create_block_design();
+            }
+            Ok(self.bd_hdl_text())
         } else if let Some(rest) = t.strip_prefix("ila_capture ") {
             let mut parts = rest.split_whitespace();
             let net = parts.next().unwrap_or("led");
@@ -4342,6 +4389,8 @@ impl IdeModel {
     /// Cross-select: one identity shared by Netlist, Schematic, Device, Properties.
     pub fn select(&mut self, id: &str) {
         let id = id.trim();
+        self.selected_timing_pin = None;
+        self.selected_ip = None;
         if id.is_empty() {
             self.selected = None;
             self.properties.clear();
@@ -6309,14 +6358,21 @@ impl IdeModel {
     }
 
     pub fn refresh_ip_catalog(&mut self) {
-        self.ip_catalog = vec![pack_uart(), pack_gpio()];
+        self.ip_catalog = ipxact_catalog();
     }
 
-    pub fn create_block_design(&mut self) -> Result<String, String> {
-        self.refresh_ip_catalog();
+    fn default_bd_cores(&self) -> Vec<IpCore> {
+        self.ip_catalog
+            .iter()
+            .filter(|c| c.name == "h_uart" || c.name == "h_gpio")
+            .cloned()
+            .collect()
+    }
+
+    fn commit_block_design(&mut self, name: String, cores: Vec<IpCore>) -> Result<String, String> {
         let bd = BlockDesign {
-            name: "system".into(),
-            cores: self.ip_catalog.clone(),
+            name,
+            cores,
         };
         let v = validate(&bd);
         let sv = if v.ok {
@@ -6324,15 +6380,15 @@ impl IdeModel {
         } else {
             String::new()
         };
-        let cores: Vec<String> = bd.cores.iter().map(|c| c.name.clone()).collect();
+        let names: Vec<String> = bd.cores.iter().map(|c| c.name.clone()).collect();
         let msg = if v.ok {
-            format!("create_bd_design {} cores={}", bd.name, cores.join(","))
+            format!("create_bd_design {} cores={}", bd.name, names.join(","))
         } else {
             format!("create_bd_design failed {}", v.errors.join("; "))
         };
         self.block_design = Some(BdView {
             name: bd.name,
-            cores,
+            cores: names,
             sv,
             ok: v.ok,
         });
@@ -6342,6 +6398,225 @@ impl IdeModel {
         } else {
             Err(msg)
         }
+    }
+
+    pub fn create_block_design(&mut self) -> Result<String, String> {
+        self.refresh_ip_catalog();
+        let cores = self.default_bd_cores();
+        self.commit_block_design("system".into(), cores)
+    }
+
+    /// UG893 IP Catalog rows: VLNV + bus from helion-ipxact.
+    pub fn ip_catalog_rows(&self) -> Vec<IpCatalogRow> {
+        let in_bd: Vec<&str> = self
+            .block_design
+            .as_ref()
+            .map(|b| b.cores.iter().map(|c| c.as_str()).collect())
+            .unwrap_or_default();
+        self.ip_catalog
+            .iter()
+            .map(|c| IpCatalogRow {
+                name: c.name.clone(),
+                vendor: c.vendor.clone(),
+                library: c.library.clone(),
+                version: c.version.clone(),
+                bus: c.bus.clone(),
+                vlnv: c.vlnv(),
+                status: if in_bd.iter().any(|n| *n == c.name) {
+                    "In BD".into()
+                } else {
+                    "Available".into()
+                },
+            })
+            .collect()
+    }
+
+    pub fn ip_catalog_text(&self) -> String {
+        let rows = self.ip_catalog_rows();
+        let mut s = format!("ip_catalog n={}", rows.len());
+        for r in &rows {
+            s.push_str(&format!(
+                "\nNAME={} VLNV={} BUS={} STATUS={} VENDOR={} LIBRARY={} VERSION={}",
+                r.name, r.vlnv, r.bus, r.status, r.vendor, r.library, r.version
+            ));
+        }
+        s
+    }
+
+    fn find_ip_core(&self, spec: &str) -> Result<IpCore, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_ip: missing name".into());
+        }
+        if let Ok(i) = spec.parse::<usize>() {
+            return self
+                .ip_catalog
+                .get(i)
+                .cloned()
+                .ok_or_else(|| format!("select_ip: no row {spec}"));
+        }
+        self.ip_catalog
+            .iter()
+            .find(|c| {
+                c.name.eq_ignore_ascii_case(spec)
+                    || c.vlnv().eq_ignore_ascii_case(spec)
+            })
+            .cloned()
+            .ok_or_else(|| format!("select_ip: no IP {spec}"))
+    }
+
+    fn ip_properties(core: &IpCore, status: &str) -> Vec<(String, String)> {
+        vec![
+            ("NAME".into(), core.name.clone()),
+            ("TYPE".into(), "ip_core".into()),
+            ("VLNV".into(), core.vlnv()),
+            ("VENDOR".into(), core.vendor.clone()),
+            ("LIBRARY".into(), core.library.clone()),
+            ("VERSION".into(), core.version.clone()),
+            ("BUS".into(), core.bus.clone()),
+            ("STATUS".into(), status.into()),
+        ]
+    }
+
+    /// UG893 IP Catalog click: Properties = VLNV / bus from helion-ipxact.
+    pub fn select_ip_core(&mut self, spec: &str) -> Result<String, String> {
+        self.refresh_ip_catalog();
+        let core = self.find_ip_core(spec)?;
+        if core.bus == "AXI" {
+            return Err(format!("select_ip: {} bus AXI is not Helion-MM/ST", core.name));
+        }
+        let status = self
+            .ip_catalog_rows()
+            .iter()
+            .find(|r| r.name == core.name)
+            .map(|r| r.status.clone())
+            .unwrap_or_else(|| "Available".into());
+        self.selected_ip = Some(core.name.clone());
+        self.selected = Some(core.name.clone());
+        self.workspace = WorkspaceTab::Ip;
+        self.properties = Self::ip_properties(&core, &status);
+        Ok(format!(
+            "ip {} VLNV={} BUS={} STATUS={}",
+            core.name,
+            core.vlnv(),
+            core.bus,
+            status
+        ))
+    }
+
+    /// UG893 Generate Output Products: helion-ipxact XML, not a canned string.
+    pub fn generate_ip(&mut self, spec: &str) -> Result<String, String> {
+        let spec = if spec.trim().is_empty() {
+            self.selected_ip.clone().unwrap_or_default()
+        } else {
+            spec.to_string()
+        };
+        if spec.trim().is_empty() {
+            return Err("generate_ip: missing name".into());
+        }
+        let core = self.find_ip_core(&spec)?;
+        if core.bus == "AXI" {
+            return Err(format!("generate_ip: {} bus AXI is not Helion-MM/ST", core.name));
+        }
+        let xml = to_xml(&core);
+        if xml.contains("AXI") {
+            return Err("generate_ip: IP-XACT must not emit AXI".into());
+        }
+        self.generated_ip_xml = Some(xml.clone());
+        self.selected_ip = Some(core.name.clone());
+        self.selected = Some(core.name.clone());
+        self.workspace = WorkspaceTab::Ip;
+        self.properties = Self::ip_properties(&core, "Generated");
+        self.properties
+            .push(("XML_BYTES".into(), xml.len().to_string()));
+        Ok(format!(
+            "generate_target {} VLNV={} BUS={} xml_bytes={} ipxact:name={}",
+            core.name,
+            core.vlnv(),
+            core.bus,
+            xml.len(),
+            core.name
+        ))
+    }
+
+    /// UG893 Add to Block Design: instantiate a catalog core on the Helion-MM canvas.
+    pub fn create_bd_cell(&mut self, spec: &str) -> Result<String, String> {
+        self.refresh_ip_catalog();
+        let spec = if spec.trim().is_empty() {
+            self.selected_ip.clone().unwrap_or_default()
+        } else {
+            spec.to_string()
+        };
+        if spec.trim().is_empty() {
+            return Err("create_bd_cell: missing name".into());
+        }
+        let core = self.find_ip_core(&spec)?;
+        if core.bus != "Helion-MM" && core.bus != "Helion-ST" {
+            return Err(format!(
+                "create_bd_cell: {} bus {} not Helion-MM/ST",
+                core.name, core.bus
+            ));
+        }
+        if self.block_design.is_none() {
+            self.create_block_design()?;
+        }
+        let mut names = self
+            .block_design
+            .as_ref()
+            .map(|b| b.cores.clone())
+            .unwrap_or_default();
+        if names.iter().any(|n| n == &core.name) {
+            self.workspace = WorkspaceTab::Ip;
+            return Ok(format!("create_bd_cell {} already on canvas", core.name));
+        }
+        names.push(core.name.clone());
+        let cores: Vec<IpCore> = names
+            .iter()
+            .filter_map(|n| self.ip_catalog.iter().find(|c| c.name == *n).cloned())
+            .collect();
+        let bd_name = self
+            .block_design
+            .as_ref()
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "system".into());
+        let out = self.commit_block_design(bd_name, cores)?;
+        Ok(format!("create_bd_cell {} {out}", core.name))
+    }
+
+    /// Generated HDL as instance rows (module / instance / bus / ports), not a SV dump.
+    pub fn bd_hdl_rows(&self) -> Vec<BdHdlRow> {
+        let Some(bd) = &self.block_design else {
+            return Vec::new();
+        };
+        bd.cores
+            .iter()
+            .map(|name| {
+                let bus = self
+                    .ip_catalog
+                    .iter()
+                    .find(|c| c.name == *name)
+                    .map(|c| c.bus.clone())
+                    .unwrap_or_else(|| "Helion-MM".into());
+                BdHdlRow {
+                    instance: format!("u_{name}"),
+                    module: name.clone(),
+                    bus,
+                    ports: "clk,resetn".into(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn bd_hdl_text(&self) -> String {
+        let rows = self.bd_hdl_rows();
+        let mut s = format!("bd_hdl n={}", rows.len());
+        for r in &rows {
+            s.push_str(&format!(
+                "\nINSTANCE={} MODULE={} BUS={} PORTS={}",
+                r.instance, r.module, r.bus, r.ports
+            ));
+        }
+        s
     }
 
     /// IP Integrator canvas dump: IP boxes + Helion-MM wires, not a catalog list.
@@ -8972,6 +9247,7 @@ impl IdeModel {
     fn refresh_analysis(&mut self) {
         self.refresh_schematic();
         self.refresh_device();
+        self.fill_timing_path_locations();
         self.refresh_io_ports();
         self.refresh_hierarchy();
         self.refresh_package();
@@ -9178,6 +9454,14 @@ impl IdeModel {
             viewport_w,
             viewport_h,
         };
+    }
+
+    fn fill_timing_path_locations(&mut self) {
+        for p in &mut self.timing_paths {
+            for pin in &mut p.pins {
+                pin.location = site_of(&self.device, &pin.cell);
+            }
+        }
     }
 
     fn refresh_device(&mut self) {
@@ -9394,6 +9678,53 @@ impl IdeModel {
     }
 
     fn refresh_properties(&mut self) {
+        if let Some(name) = self.selected_ip.clone() {
+            if let Some(core) = self.ip_catalog.iter().find(|c| c.name == name).cloned() {
+                let status = self
+                    .ip_catalog_rows()
+                    .iter()
+                    .find(|r| r.name == core.name)
+                    .map(|r| r.status.clone())
+                    .unwrap_or_else(|| "Available".into());
+                self.properties = Self::ip_properties(&core, &status);
+                if let Some(xml) = &self.generated_ip_xml {
+                    if xml.contains(&format!("<ipxact:name>{}</ipxact:name>", core.name)) {
+                        self.properties
+                            .push(("XML_BYTES".into(), xml.len().to_string()));
+                    }
+                }
+                return;
+            }
+        }
+        if let Some(pin_name) = self.selected_timing_pin.clone() {
+            if let Ok((pi, pin)) = self.find_timing_pin(&pin_name) {
+                let slack = self.timing_paths.get(pi).map(|p| p.slack_ps).unwrap_or(0);
+                let net = if pin.net.is_empty() {
+                    "-".to_string()
+                } else {
+                    pin.net.clone()
+                };
+                let loc = if pin.location.is_empty() {
+                    "-".to_string()
+                } else {
+                    pin.location.clone()
+                };
+                self.properties = vec![
+                    ("NAME".into(), pin.pin.clone()),
+                    ("TYPE".into(), "timing_pin".into()),
+                    ("CELL".into(), pin.cell.clone()),
+                    ("PIN".into(), pin.pin.clone()),
+                    ("DELAY_TYPE".into(), pin.delay_type.clone()),
+                    ("INCR_PS".into(), pin.incr_ps.to_string()),
+                    ("PATH_PS".into(), pin.path_ps.to_string()),
+                    ("NET".into(), net),
+                    ("FANOUT".into(), pin.fanout.to_string()),
+                    ("LOCATION".into(), loc),
+                    ("SLACK_PS".into(), slack.to_string()),
+                ];
+                return;
+            }
+        }
         let Some(id) = self.selected.clone() else {
             self.properties.clear();
             return;
@@ -11034,6 +11365,131 @@ mod tests {
         assert!(uart.x > hub.x + hub.w, "IP to the right of the interconnect");
         assert!((uart.y - gpio.y).abs() > 8.0, "UART and GPIO are separate boxes");
         assert!(d.wires.iter().any(|w| w.net == "Helion-MM" && w.points.len() >= 2));
+    }
+
+    /// UG893 IP Catalog is a clickable VLNV table from helion-ipxact, not a collapsing dump.
+    #[test]
+    fn ip_catalog_is_clickable_vlnv_table_not_a_dump() {
+        let mut ide = IdeModel::new();
+        assert!(
+            NavSection::IpIntegrator
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "ip_catalog"),
+            "Flow Navigator IP Integrator must offer IP Catalog"
+        );
+        let table = ide.exec("ip_catalog").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Ip);
+        assert!(table.contains("ip_catalog n="), "{table}");
+        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(table.contains("NAME=h_uart"), "{table}");
+        assert!(table.contains("NAME=h_gpio"), "{table}");
+        assert!(table.contains("NAME=h_rv32_hb1"), "{table}");
+        assert!(table.contains("VLNV=community:helion:h_uart:1.0"), "{table}");
+        assert!(table.contains("BUS=Helion-MM"), "{table}");
+        assert!(table.contains("STATUS=Available"), "{table}");
+        assert!(!table.contains("AXI"), "{table}");
+        assert!(
+            ide.ip_catalog.iter().all(|c| c.bus != "AXI"),
+            "{:?}",
+            ide.ip_catalog
+        );
+        let rows = ide.ip_catalog_rows();
+        assert!(rows.len() >= 3, "catalog is helion-ipxact pack, not two dump lines");
+        assert!(rows.iter().all(|r| r.vlnv.contains(&r.name) && r.bus == "Helion-MM"));
+
+        assert!(
+            ide.exec("select_ip").unwrap_err().contains("missing name"),
+            "empty click must refuse"
+        );
+        assert!(
+            ide.exec("select_ip no_such").unwrap_err().contains("no IP"),
+            "unknown core must refuse"
+        );
+
+        let sel = ide.exec("select_ip h_uart").unwrap();
+        assert_eq!(ide.selected_ip.as_deref(), Some("h_uart"));
+        assert_eq!(ide.selected.as_deref(), Some("h_uart"));
+        assert!(sel.contains("VLNV=community:helion:h_uart:1.0"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "ip_core"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "BUS" && v == "Helion-MM"),
+            "{:?}",
+            ide.properties
+        );
+
+        let generated = ide.exec("generate_ip h_uart").unwrap();
+        assert!(generated.contains("xml_bytes="), "{generated}");
+        assert!(generated.contains("VLNV=community:helion:h_uart:1.0"), "{generated}");
+        let xml = ide.generated_ip_xml.as_deref().expect("generate_ip stores IP-XACT");
+        assert!(xml.contains("<ipxact:name>h_uart</ipxact:name>"), "{xml}");
+        assert!(xml.contains("Helion-MM"), "{xml}");
+        assert!(!xml.contains("AXI"), "{xml}");
+        assert!(
+            ide.exec("generate_ip").unwrap().contains("h_uart"),
+            "generate_ip with selection uses selected core"
+        );
+        assert!(
+            ide.exec("generate_ip no_such").unwrap_err().contains("no IP"),
+            "unknown generate must refuse"
+        );
+
+        ide.exec("create_bd").unwrap();
+        let uart_status = ide
+            .ip_catalog_rows()
+            .into_iter()
+            .find(|r| r.name == "h_uart")
+            .unwrap();
+        assert_eq!(uart_status.status, "In BD");
+        let rv_status = ide
+            .ip_catalog_rows()
+            .into_iter()
+            .find(|r| r.name == "h_rv32_hb1")
+            .unwrap();
+        assert_eq!(rv_status.status, "Available");
+        let n0 = ide.block_design.as_ref().unwrap().cores.len();
+        let add = ide.exec("create_bd_cell h_rv32_hb1").unwrap();
+        assert!(add.contains("h_rv32_hb1"), "{add}");
+        let bd = ide.block_design.as_ref().unwrap();
+        assert_eq!(bd.cores.len(), n0 + 1);
+        assert!(bd.cores.iter().any(|c| c == "h_rv32_hb1"));
+        assert!(bd.sv.contains("h_rv32_hb1"), "{}", bd.sv);
+        assert!(!bd.sv.contains("AXI"), "{}", bd.sv);
+        let already = ide.exec("create_bd_cell h_uart").unwrap();
+        assert!(already.contains("already"), "{already}");
+
+        let hdl = ide.exec("bd_hdl").unwrap();
+        assert!(hdl.contains("bd_hdl n="), "{hdl}");
+        assert!(hdl.contains("INSTANCE=u_h_uart"), "{hdl}");
+        assert!(hdl.contains("MODULE=h_uart"), "{hdl}");
+        assert!(hdl.contains("MODULE=h_gpio"), "{hdl}");
+        assert!(hdl.contains("MODULE=h_rv32_hb1"), "{hdl}");
+        assert!(hdl.contains("BUS=Helion-MM"), "{hdl}");
+        assert!(hdl.contains("PORTS=clk,resetn"), "{hdl}");
+        assert!(!hdl.contains("module system"), "HDL pane is an instance table, not a SV dump: {hdl}");
+        assert!(
+            ide.exec("create_bd_cell no_such")
+                .unwrap_err()
+                .contains("no IP"),
+            "unknown cell must refuse"
+        );
+        let mut empty = IdeModel::new();
+        assert!(
+            empty.exec("create_bd_cell").unwrap_err().contains("missing name"),
+            "empty add must refuse"
+        );
+        assert!(
+            empty.exec("generate_ip").unwrap_err().contains("missing name"),
+            "empty generate must refuse"
+        );
     }
 
     /// UG893 Timing Constraints is an IdeModel pane fed by helion-sta, not a stub string.
@@ -14419,7 +14875,7 @@ mod tests {
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "INCR_PS" && v == pin.incr_ps.to_string()),
+                .any(|(k, v)| k == "INCR_PS" && v.as_str() == pin.incr_ps.to_string()),
             "{:?}",
             ide.properties
         );
