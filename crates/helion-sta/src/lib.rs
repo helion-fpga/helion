@@ -1,4 +1,5 @@
-//! Graph STA: create_clock / create_generated_clock / set_bus_skew / group_path / placed Manhattan.
+//! Graph STA: create_clock / create_generated_clock / set_bus_skew / group_path /
+//! set_max_time_borrow / set_data_check / placed Manhattan.
 
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
@@ -655,6 +656,25 @@ pub struct PathGroup {
     pub critical_range_ps: i64,
 }
 
+/// UG903 `set_max_time_borrow`: latch may steal this much from the next period (ps).
+/// Added to setup slack. Empty list keeps gold WNS (FF / no-borrow).
+#[derive(Clone, Debug)]
+pub struct MaxTimeBorrow {
+    pub object: String,
+    pub borrow_ps: i64,
+}
+
+/// UG903 `set_data_check`: data-to-data setup/hold between `-from` and `-to` (ps).
+/// Setup subtracts from WNS; hold subtracts from hold slack.
+#[derive(Clone, Debug)]
+pub struct DataCheck {
+    pub from: String,
+    pub to: String,
+    pub setup_ps: i64,
+    pub hold_ps: i64,
+    pub clock: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Constraints {
     pub clocks: Vec<Clock>,
@@ -678,6 +698,8 @@ pub struct Constraints {
     pub operating_conditions: OperatingConditions,
     pub bus_skews: Vec<BusSkew>,
     pub path_groups: Vec<PathGroup>,
+    pub max_time_borrows: Vec<MaxTimeBorrow>,
+    pub data_checks: Vec<DataCheck>,
     pub package_pins: BTreeMap<String, String>,
     pub iostandards: BTreeMap<String, String>,
     pub drives: BTreeMap<String, String>,
@@ -870,6 +892,33 @@ impl Constraints {
         self.path_groups
             .iter()
             .map(|g| g.critical_range_ps)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Largest UG903 `set_max_time_borrow` in ps (0 if none — gold WNS).
+    pub fn time_borrow_ps(&self) -> i64 {
+        self.max_time_borrows
+            .iter()
+            .map(|b| b.borrow_ps)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Largest setup `set_data_check` in ps (0 if none).
+    pub fn data_check_setup_ps(&self) -> i64 {
+        self.data_checks
+            .iter()
+            .map(|d| d.setup_ps)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Largest hold `set_data_check` in ps (0 if none).
+    pub fn data_check_hold_ps(&self) -> i64 {
+        self.data_checks
+            .iter()
+            .map(|d| d.hold_ps)
             .max()
             .unwrap_or(0)
     }
@@ -1120,7 +1169,7 @@ fn tcl_clock_group_names(joined: &str) -> Vec<String> {
 /// set_clock_groups, set_clock_uncertainty, set_clock_latency,
 /// set_disable_timing, set_case_analysis, set_propagated_clock, set_clock_sense,
 /// set_input_jitter, set_system_jitter, set_timing_derate, set_operating_conditions,
-/// set_bus_skew, group_path,
+/// set_bus_skew, group_path, set_max_time_borrow, set_data_check,
 /// set_property PACKAGE_PIN / IOSTANDARD / DRIVE / SLEW / PULLTYPE / DIFF_TERM / IN_TERM.
 pub fn load_xdc(text: &str) -> Result<Constraints, String> {
     let mut c = Constraints::default();
@@ -1860,6 +1909,100 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                         .unwrap_or(0),
                 });
             }
+            "set_max_time_borrow" => {
+                let mut delay_ns: Option<f64> = None;
+                let mut i = 1;
+                while i < toks.len() {
+                    match toks[i] {
+                        s if s.starts_with('-') => i += 1,
+                        other => {
+                            if delay_ns.is_none() {
+                                if let Ok(v) = other.parse::<f64>() {
+                                    delay_ns = Some(v);
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                let ns = delay_ns.ok_or_else(|| format!("{line}: missing time borrow"))?;
+                let object = tcl_object_name(&toks.join(" ")).unwrap_or_default();
+                c.max_time_borrows.push(MaxTimeBorrow {
+                    object,
+                    borrow_ps: (ns * 1000.0).round() as i64,
+                });
+            }
+            "set_data_check" => {
+                let mut want_setup = false;
+                let mut want_hold = false;
+                let mut delay_ns: Option<f64> = None;
+                let mut clock = String::new();
+                let mut i = 1;
+                while i < toks.len() {
+                    match toks[i] {
+                        "-setup" => {
+                            want_setup = true;
+                            if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                                delay_ns = Some(v);
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        "-hold" => {
+                            want_hold = true;
+                            if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                                delay_ns = Some(v);
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        "-clock" => {
+                            let joined = toks[i..].join(" ");
+                            if let Some(n) = tcl_object_name(&joined) {
+                                clock = n;
+                            } else if let Some(n) = toks.get(i + 1) {
+                                clock = n
+                                    .trim_matches(|c: char| {
+                                        !c.is_ascii_alphanumeric() && c != '_'
+                                    })
+                                    .to_string();
+                            }
+                            i += 2;
+                        }
+                        s if s.starts_with('-') => i += 1,
+                        other => {
+                            if delay_ns.is_none() {
+                                if let Ok(v) = other.parse::<f64>() {
+                                    delay_ns = Some(v);
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                let ns = delay_ns.ok_or_else(|| format!("{line}: missing data check"))?;
+                let (from, to) = tcl_from_to(&toks);
+                if from.is_empty() && to.is_empty() {
+                    return Err(format!("{line}: set_data_check needs -from/-to"));
+                }
+                let ps = (ns * 1000.0).round() as i64;
+                let (setup_ps, hold_ps) = if want_hold && !want_setup {
+                    (0, ps)
+                } else if want_setup && !want_hold {
+                    (ps, 0)
+                } else {
+                    (ps, ps)
+                };
+                c.data_checks.push(DataCheck {
+                    from,
+                    to,
+                    setup_ps,
+                    hold_ps,
+                    clock,
+                });
+            }
             "set_operating_conditions" => {
                 let mut voltage_v: Option<f64> = None;
                 let mut temp: Option<i64> = None;
@@ -1956,12 +2099,14 @@ pub fn apply_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
 /// / `set_clock_uncertainty` / `set_clock_latency` / `set_disable_timing`
 /// / `set_case_analysis` / `set_propagated_clock` / `set_clock_sense`
 /// / `set_input_jitter` / `set_system_jitter` / `set_timing_derate`
-/// / `set_operating_conditions` / `set_bus_skew` / `group_path` to an STA result.
+/// / `set_operating_conditions` / `set_bus_skew` / `group_path`
+/// / `set_max_time_borrow` / `set_data_check` to an STA result.
 /// False paths, async/exclusive clock groups, disable_timing, and case_analysis
 /// drop the IOB contribution; I/O delays add to setup and move WNS.
 /// Setup MCP N uses N×period as the requirement; `set_max_delay` replaces it.
 /// Hold MCP M subtracts M×period from hold slack; `set_min_delay` replaces HOLD_REQ_PS.
-/// Uncertainty, jitter, bus skew, and late/early latency subtract from setup/hold slack.
+/// Uncertainty, jitter, bus skew, data-check, and late/early latency subtract from
+/// setup/hold slack. Latch `set_max_time_borrow` adds to setup slack.
 /// Late derate, PVT, and `group_path -weight` scale setup delay; early derate and PVT
 /// scale hold delay.
 /// Propagated clocks add routed clock-network insertion; `-negative` sense is a
@@ -1992,7 +2137,9 @@ pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64)
         - xdc.latency_late_ps()
         - clk_net
         - sense
-        - xdc.bus_skew_setup_ps();
+        - xdc.bus_skew_setup_ps()
+        - xdc.data_check_setup_ps()
+        + xdc.time_borrow_ps();
     r.tns_ps = r.wns_ps.min(0);
     let hold = scale_delay_ps(r.hold_ps, xdc.path_early_milli());
     if let Some(min_d) = xdc.min_delay_ps() {
@@ -2008,7 +2155,8 @@ pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64)
         + xdc.jitter_hold_ps()
         + xdc.latency_early_ps()
         + clk_net
-        + xdc.bus_skew_hold_ps();
+        + xdc.bus_skew_hold_ps()
+        + xdc.data_check_hold_ps();
 }
 
 /// STA with XDC delays/false paths applied.
@@ -2031,7 +2179,7 @@ pub fn report_timing_xdc(
 /// min_delay / clock_groups / uncertainty / latency / disable_timing /
 /// case_analysis / propagated_clock / clock_sense / input_jitter /
 /// system_jitter / timing_derate / operating_conditions / bus_skew /
-/// group_path (UG893 Timing Constraints Apply).
+/// group_path / max_time_borrow / data_check (UG893 Timing Constraints Apply).
 pub fn report_timing_routed_xdc(
     design: &Design,
     routed: &Routed,
@@ -3011,6 +3159,93 @@ group_path -name holdg -critical_range 0.4 -from [get_ports clk] -to [get_ports 
             with_both.wns_ps,
             base.wns_ps - base.setup_ps - 300,
             "bus skew and group_path weight must stack"
+        );
+    }
+
+    #[test]
+    fn xdc_max_time_borrow_data_check_move_sta() {
+        let xdc = load_xdc(
+            r#"
+create_clock -period 10.000 [get_ports clk]
+set_max_time_borrow 1.0 [get_cells u_ff]
+set_data_check -setup 0.5 -from [get_ports clk] -to [get_ports led]
+set_data_check -hold 0.2 -from [get_ports clk] -to [get_ports led]
+set_data_check -from [get_pins A] -to [get_pins B] 0.3
+"#,
+        )
+        .unwrap();
+        assert_eq!(xdc.max_time_borrows.len(), 1);
+        assert_eq!(xdc.max_time_borrows[0].borrow_ps, 1000);
+        assert_eq!(xdc.max_time_borrows[0].object, "u_ff");
+        assert_eq!(xdc.time_borrow_ps(), 1000);
+        assert_eq!(xdc.data_checks.len(), 3);
+        assert_eq!(xdc.data_checks[0].setup_ps, 500);
+        assert_eq!(xdc.data_checks[0].hold_ps, 0);
+        assert_eq!(xdc.data_checks[1].setup_ps, 0);
+        assert_eq!(xdc.data_checks[1].hold_ps, 200);
+        assert_eq!(xdc.data_checks[2].setup_ps, 300);
+        assert_eq!(xdc.data_checks[2].hold_ps, 300);
+        assert_eq!(xdc.data_check_setup_ps(), 500);
+        assert_eq!(xdc.data_check_hold_ps(), 300);
+        assert!(load_xdc("set_max_time_borrow [get_cells u_ff]\n").is_err());
+        assert!(load_xdc("set_data_check -from [get_ports clk]\n").is_err());
+        assert!(load_xdc("set_data_check 0.5\n").is_err());
+
+        let d = Design::structural_counter();
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let routed = helion_route::route(&pl, &dev).unwrap();
+        let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
+        assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
+
+        let mut tb = Constraints::default();
+        tb.max_time_borrows.push(xdc.max_time_borrows[0].clone());
+        let with_tb = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &tb).unwrap();
+        assert_eq!(
+            with_tb.wns_ps,
+            base.wns_ps + 1000,
+            "latch borrow 1 ns must improve setup WNS"
+        );
+        assert_eq!(
+            with_tb.hold_slack_ps, base.hold_slack_ps,
+            "time borrow must not move hold"
+        );
+
+        let mut dc = Constraints::default();
+        dc.data_checks.push(xdc.data_checks[0].clone());
+        let with_dc = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &dc).unwrap();
+        assert_eq!(
+            with_dc.wns_ps,
+            base.wns_ps - 500,
+            "setup data check 0.5 ns must worsen WNS"
+        );
+        assert_eq!(
+            with_dc.hold_slack_ps, base.hold_slack_ps,
+            "setup-only data check must not move hold"
+        );
+
+        let mut dh = Constraints::default();
+        dh.data_checks.push(xdc.data_checks[1].clone());
+        let with_dh = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &dh).unwrap();
+        assert_eq!(with_dh.wns_ps, base.wns_ps, "hold data check must not move WNS");
+        assert_eq!(
+            with_dh.hold_slack_ps,
+            base.hold_slack_ps - 200,
+            "hold data check 0.2 ns must worsen hold slack"
+        );
+
+        let mut both = Constraints::default();
+        both.max_time_borrows.push(xdc.max_time_borrows[0].clone());
+        both.data_checks.push(xdc.data_checks[0].clone());
+        let with_both = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &both).unwrap();
+        assert_eq!(
+            with_both.wns_ps,
+            base.wns_ps + 1000 - 500,
+            "time borrow and data-check setup must stack"
         );
     }
 
