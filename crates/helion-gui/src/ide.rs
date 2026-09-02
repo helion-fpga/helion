@@ -11,7 +11,7 @@ use crate::{tcl_eval, GpuiShell};
 use helion_bd::{emit_sv, validate, BlockDesign};
 use helion_debug::{insert_arm_capture, IlaCapture};
 use helion_device::{Device, Far, SiteKind};
-use helion_drc::{check_placed, check_routed, Drc};
+use helion_drc::{check_placed, check_routed, Drc, DrcSeverity};
 use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_ipxact::{catalog as ipxact_catalog, to_xml, IpCore};
@@ -21,8 +21,8 @@ use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
     report_cdc, report_clock_interaction, report_clock_networks, report_methodology,
     report_power, report_timing_routed_xdc, report_timing_summary, CdcReport,
-    ClockInteraction, ClockNetworkReport, Constraints, MethodologyReport, PowerReport,
-    TimingResult, TimingSummary, FF_CKQ_PS, LUT_PS, PIN_PS, SETUP_PS,
+    ClockInteraction, ClockNetworkReport, Constraints, MethodologyReport, MethodologySeverity,
+    PowerReport, TimingResult, TimingSummary, FF_CKQ_PS, LUT_PS, PIN_PS, SETUP_PS,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -254,6 +254,41 @@ fn lhs_ident(t: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Port / net / module name on a declaration line (`input logic clk` → `clk`).
+fn decl_ident(t: &str) -> Option<String> {
+    let s = t.trim().trim_end_matches([';', ',', '(', ')']);
+    let skip = [
+        "input",
+        "output",
+        "inout",
+        "logic",
+        "wire",
+        "reg",
+        "signed",
+        "unsigned",
+        "module",
+        "endmodule",
+        "entity",
+        "architecture",
+        "signal",
+        "port",
+        "std_logic",
+        "std_logic_vector",
+        "parameter",
+        "localparam",
+        "genvar",
+        "integer",
+    ];
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| {
+            !tok.is_empty()
+                && !skip.iter().any(|k| tok.eq_ignore_ascii_case(k))
+                && !tok.chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+        .last()
+        .map(|s| s.to_string())
+}
+
 /// Classify RTL into UG900 Source rows. Sequential `always_ff`/`process` bodies
 /// are the helion-sim posedge PC; `assign` maps to a live probe.
 fn classify_rtl_lines(src: &str) -> Vec<SourceLine> {
@@ -331,6 +366,7 @@ fn classify_rtl_lines(src: &str) -> Vec<SourceLine> {
             || t == "("
         {
             kind = "decl".into();
+            signal = decl_ident(t);
         }
         lines.push(SourceLine {
             line,
@@ -627,6 +663,10 @@ impl NavSection {
                     tcl: "sources",
                 },
                 NavAction {
+                    label: "Text Editor",
+                    tcl: "text_editor",
+                },
+                NavAction {
                     label: "Netlist",
                     tcl: "netlist",
                 },
@@ -671,10 +711,16 @@ impl NavSection {
                     tcl: "locals",
                 },
             ],
-            NavSection::RtlAnalysis => &[NavAction {
-                label: "Open Elaborated Schematic",
-                tcl: "open_elaborated_schematic",
-            }],
+            NavSection::RtlAnalysis => &[
+                NavAction {
+                    label: "Open Elaborated Schematic",
+                    tcl: "open_elaborated_schematic",
+                },
+                NavAction {
+                    label: "Text Editor",
+                    tcl: "text_editor",
+                },
+            ],
             NavSection::Synthesis => &[
                 NavAction {
                     label: "Run Synthesis",
@@ -2629,6 +2675,58 @@ impl SourceLine {
             self.text.trim()
         )
     }
+
+    /// Clickable-grid dump row: UG893 Text Editor Line/Marker/Kind/Text, not a file dump.
+    pub fn editor_row_text(&self, marker: Option<&EditorMarker>) -> String {
+        let (mk, id) = match marker {
+            Some(m) => (m.marker_cell(), m.id.as_str()),
+            None => ("-", "-"),
+        };
+        format!(
+            "LINE={} MARKER={} KIND={} SIGNAL={} ID={} TEXT={}",
+            self.line,
+            mk,
+            self.type_cell(),
+            self.signal_cell(),
+            id,
+            self.text.trim()
+        )
+    }
+}
+
+/// One gutter marker in the UG893 Text Editor (methodology/DRC/bookmark/probe).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorMarker {
+    pub line: usize,
+    /// `error` / `warning` / `advisory` / `bookmark` / `probe`.
+    pub kind: String,
+    /// TIMING-7 / PLACE-1 / bookmark / probe.
+    pub id: String,
+    pub text: String,
+}
+
+impl EditorMarker {
+    pub fn marker_cell(&self) -> &'static str {
+        match self.kind.as_str() {
+            "error" => "E",
+            "warning" => "W",
+            "advisory" => "A",
+            "bookmark" => "B",
+            "probe" => "P",
+            _ => "-",
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self.kind.as_str() {
+            "error" => 0,
+            "warning" => 1,
+            "advisory" => 2,
+            "probe" => 3,
+            "bookmark" => 4,
+            _ => 9,
+        }
+    }
 }
 
 /// UG900 Locals window: current-scope sequential probes from helion-sim/fabric.
@@ -3263,6 +3361,7 @@ pub enum WorkspaceTab {
     Device,
     Wave,
     Source,
+    TextEditor,
     Memory,
     Breakpoints,
     Locals,
@@ -3682,6 +3781,10 @@ pub struct IdeModel {
     pub selected_source_line: Option<usize>,
     /// Sequential PC: always_ff/process body that the last `step_posedge` executed.
     pub sim_pc_line: Option<usize>,
+    /// UG893 Text Editor bookmarks (1-based RTL lines).
+    pub editor_bookmarks: Vec<usize>,
+    /// Properties follow the Text Editor line (last click), not the Sources file.
+    editor_line_focus: bool,
     bp_prev: HashMap<String, u64>,
     next_bp_id: usize,
     pub wave: Waveform,
@@ -3780,6 +3883,8 @@ impl IdeModel {
             source_lines: Vec::new(),
             selected_source_line: None,
             sim_pc_line: None,
+            editor_bookmarks: Vec::new(),
+            editor_line_focus: false,
             bp_prev: HashMap::new(),
             next_bp_id: 1,
             wave: Waveform::default(),
@@ -4035,6 +4140,17 @@ impl IdeModel {
             Ok(self.sources_text())
         } else if t == "source" || t == "source_window" {
             self.open_source_window()
+        } else if t == "text_editor" || t == "open_text_editor" {
+            self.open_text_editor()
+        } else if t == "select_editor_line" || t.starts_with("select_editor_line ") {
+            let spec = t.strip_prefix("select_editor_line").unwrap_or("").trim();
+            self.select_editor_line(spec)
+        } else if t == "toggle_bookmark" || t.starts_with("toggle_bookmark ") {
+            let spec = t.strip_prefix("toggle_bookmark").unwrap_or("").trim();
+            self.toggle_editor_bookmark(spec)
+        } else if t == "goto_editor" || t.starts_with("goto_editor ") {
+            let spec = t.strip_prefix("goto_editor").unwrap_or("").trim();
+            self.goto_editor(spec)
         } else if t == "select_source_line" || t.starts_with("select_source_line ") {
             let spec = t.strip_prefix("select_source_line").unwrap_or("").trim();
             self.select_source_line(spec)
@@ -5226,6 +5342,7 @@ impl IdeModel {
         self.selected_ip = None;
         self.selected_property = None;
         self.selected_source = None;
+        self.editor_line_focus = false;
         if id.is_empty() {
             self.selected = None;
             self.selected_netlist = None;
@@ -5240,6 +5357,7 @@ impl IdeModel {
         }
         self.refresh_properties();
         self.highlight_device_routes();
+        self.probe_editor_line(id);
     }
 
     pub fn selected_cell(&self) -> Option<&str> {
@@ -5361,9 +5479,11 @@ impl IdeModel {
         self.selected_netlist = None;
         self.selected_source = Some(row.parent.clone());
         self.selected = Some(row.name.clone());
+        self.editor_line_focus = false;
         self.layout = LayoutKind::Default;
         if is_rtl_source(&row.parent) {
             self.load_rtl_source(&row.parent);
+            self.workspace = WorkspaceTab::TextEditor;
         }
         self.refresh_properties();
         Ok(row.row_text())
@@ -6213,6 +6333,8 @@ impl IdeModel {
         self.source_lines = classify_rtl_lines(&text);
         self.selected_source_line = None;
         self.sim_pc_line = None;
+        self.editor_bookmarks.clear();
+        self.editor_line_focus = false;
     }
 
     fn ensure_rtl_source(&mut self) -> Result<String, String> {
@@ -6280,6 +6402,329 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Source;
         self.layout = LayoutKind::Simulation;
         Ok(self.source_window_text())
+    }
+
+    fn line_for_object(&self, obj: &str) -> Option<usize> {
+        let obj = obj.trim();
+        if obj.is_empty() || obj == "-" {
+            return None;
+        }
+        if let Some(l) = self
+            .source_lines
+            .iter()
+            .find(|l| l.signal.as_deref() == Some(obj))
+        {
+            return Some(l.line);
+        }
+        if let Some((base, rest)) = obj.rsplit_once('_') {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                if let Some(l) = self
+                    .source_lines
+                    .iter()
+                    .find(|l| l.signal.as_deref() == Some(base))
+                {
+                    return Some(l.line);
+                }
+            }
+        }
+        let needle = obj.to_ascii_lowercase();
+        self.source_lines.iter().find_map(|l| {
+            let t = l.text.to_ascii_lowercase();
+            if t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == needle)
+            {
+                Some(l.line)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn crossprobe_object(&self, signal: &str) -> Option<String> {
+        if self.tree.has_cell(signal) || self.tree.has_net(signal) {
+            return Some(signal.to_string());
+        }
+        let prefix = format!("{signal}_");
+        self.tree
+            .nets
+            .iter()
+            .find(|n| n.as_str() == signal || n.starts_with(&prefix))
+            .cloned()
+            .or_else(|| {
+                self.tree
+                    .cells
+                    .iter()
+                    .find(|(c, _)| c == signal || c.starts_with(&prefix))
+                    .map(|(c, _)| c.clone())
+            })
+    }
+
+    fn probe_editor_line(&mut self, id: &str) {
+        if self.source_lines.is_empty() {
+            return;
+        }
+        if let Some(line) = self.line_for_object(id) {
+            self.selected_source_line = Some(line);
+        }
+    }
+
+    fn methodology_marker_kind(sev: MethodologySeverity) -> &'static str {
+        match sev {
+            MethodologySeverity::Error => "error",
+            MethodologySeverity::CriticalWarning | MethodologySeverity::Warning => "warning",
+            MethodologySeverity::Advisory => "advisory",
+        }
+    }
+
+    fn drc_marker_kind(sev: DrcSeverity) -> &'static str {
+        match sev {
+            DrcSeverity::Error => "error",
+            DrcSeverity::Warning => "warning",
+            DrcSeverity::Advisory => "advisory",
+        }
+    }
+
+    /// UG893 Text Editor gutter: methodology/DRC objects + bookmarks + schematic probe.
+    pub fn editor_markers(&self) -> Vec<EditorMarker> {
+        let mut out = Vec::new();
+        if !self.source_lines.is_empty() {
+            for c in self.methodology_report().checks {
+                if let Some(line) = self.line_for_object(&c.objects) {
+                    out.push(EditorMarker {
+                        line,
+                        kind: Self::methodology_marker_kind(c.severity).into(),
+                        id: c.id,
+                        text: c.message,
+                    });
+                }
+            }
+            if let Some(drc) = self.drc.as_ref() {
+                for v in &drc.items {
+                    if let Some(line) = self.line_for_object(&v.objects) {
+                        out.push(EditorMarker {
+                            line,
+                            kind: Self::drc_marker_kind(v.severity).into(),
+                            id: v.id.clone(),
+                            text: v.message.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for &line in &self.editor_bookmarks {
+            out.push(EditorMarker {
+                line,
+                kind: "bookmark".into(),
+                id: "bookmark".into(),
+                text: "bookmark".into(),
+            });
+        }
+        if let Some(id) = self.selected.as_deref() {
+            if !id.starts_with("message:") {
+                if let Some(line) = self.line_for_object(id) {
+                    out.push(EditorMarker {
+                        line,
+                        kind: "probe".into(),
+                        id: "probe".into(),
+                        text: id.to_string(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn editor_marker_for_line(&self, line: usize) -> Option<EditorMarker> {
+        self.editor_markers()
+            .into_iter()
+            .filter(|m| m.line == line)
+            .min_by_key(|m| m.rank())
+    }
+
+    /// UG893 Text Editor dump (Line/Marker/Kind/Text), not a concatenated file dump.
+    pub fn editor_text(&self) -> String {
+        let n = self.source_lines.len();
+        let file = self
+            .rtl_source_path()
+            .as_deref()
+            .map(source_basename)
+            .unwrap_or_else(|| "-".into());
+        let line = self
+            .selected_source_line
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let markers = self.editor_markers();
+        let n_mark = markers.iter().filter(|m| m.kind != "probe").count();
+        let mut s = format!("text_editor n={n} file={file} line={line} markers={n_mark}");
+        if n == 0 {
+            s.push_str(" no source — add RTL");
+            return s;
+        }
+        for l in &self.source_lines {
+            s.push('\n');
+            let mk = markers
+                .iter()
+                .filter(|m| m.line == l.line)
+                .min_by_key(|m| m.rank());
+            s.push_str(&l.editor_row_text(mk));
+        }
+        s
+    }
+
+    /// UG893 Text Editor: project-mode RTL in Default layout (not UG900 Simulation Source).
+    pub fn open_text_editor(&mut self) -> Result<String, String> {
+        let path = self
+            .ensure_rtl_source()
+            .map_err(|e| e.replacen("source:", "text_editor:", 1))?;
+        if path.is_empty() && self.source_lines.is_empty() {
+            return Err("text_editor: add RTL first".into());
+        }
+        if self.selected_source.is_none() && !path.is_empty() {
+            self.selected_source = Some(path);
+        }
+        self.workspace = WorkspaceTab::TextEditor;
+        self.layout = LayoutKind::Default;
+        Ok(self.editor_text())
+    }
+
+    /// Click a UG893 Text Editor line — cross-probes the HNF net/cell, not a dump.
+    pub fn select_editor_line(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_editor_line: empty".into());
+        }
+        self.ensure_rtl_source()
+            .map_err(|e| e.replacen("source:", "text_editor:", 1))?;
+        if self.source_lines.is_empty() {
+            return Err("select_editor_line: no source".into());
+        }
+        let idx = if let Ok(i) = spec.parse::<usize>() {
+            self.source_lines
+                .iter()
+                .position(|l| l.line == i)
+                .or_else(|| (i < self.source_lines.len()).then_some(i))
+                .ok_or_else(|| format!("select_editor_line: no line {spec}"))?
+        } else {
+            self.source_lines
+                .iter()
+                .position(|l| l.signal.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(spec)))
+                .ok_or_else(|| format!("select_editor_line: no line {spec}"))?
+        };
+        let row = self.source_lines[idx].clone();
+        self.selected_source_line = Some(row.line);
+        self.editor_line_focus = true;
+        self.workspace = WorkspaceTab::TextEditor;
+        self.layout = LayoutKind::Default;
+        if let Some(sig) = row.signal.as_deref() {
+            if let Some(obj) = self.crossprobe_object(sig) {
+                self.selected = Some(obj.clone());
+                if self.tree.has_cell(&obj) || self.tree.has_net(&obj) {
+                    self.selected_netlist = Some(obj);
+                }
+            }
+        }
+        self.properties = self.editor_line_properties(&row);
+        let mk = self.editor_marker_for_line(row.line);
+        Ok(row.editor_row_text(mk.as_ref()))
+    }
+
+    fn editor_line_properties(&self, row: &SourceLine) -> Vec<(String, String)> {
+        let mk = self.editor_marker_for_line(row.line);
+        let path = self
+            .selected_source
+            .clone()
+            .or_else(|| self.rtl_source_path());
+        let file = source_basename(path.as_deref().unwrap_or(""));
+        vec![
+            ("NAME".into(), format!("{}:{}", file, row.line)),
+            ("TYPE".into(), "editor_line".into()),
+            ("FILE".into(), file),
+            ("LINE".into(), row.line.to_string()),
+            ("KIND".into(), row.type_cell().to_string()),
+            ("SIGNAL".into(), row.signal_cell().into()),
+            (
+                "MARKER".into(),
+                mk.as_ref().map(|m| m.marker_cell()).unwrap_or("-").into(),
+            ),
+            (
+                "ID".into(),
+                mk.as_ref()
+                    .map(|m| m.id.as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+            ),
+            ("TEXT".into(), row.text.trim().to_string()),
+        ]
+    }
+
+    /// UG893 Text Editor gutter bookmark (user marker, not a simulation breakpoint).
+    pub fn toggle_editor_bookmark(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("toggle_bookmark: empty".into());
+        }
+        self.ensure_rtl_source()
+            .map_err(|e| e.replacen("source:", "text_editor:", 1))?;
+        let line = spec
+            .rsplit_once(':')
+            .map(|(_, n)| n)
+            .unwrap_or(spec)
+            .parse::<usize>()
+            .map_err(|_| format!("toggle_bookmark: bad line {spec}"))?;
+        if !self.source_lines.iter().any(|l| l.line == line) {
+            return Err(format!("toggle_bookmark: no line {line}"));
+        }
+        self.workspace = WorkspaceTab::TextEditor;
+        self.layout = LayoutKind::Default;
+        self.selected_source_line = Some(line);
+        if let Some(i) = self.editor_bookmarks.iter().position(|&l| l == line) {
+            self.editor_bookmarks.remove(i);
+            return Ok(format!("toggle_bookmark {line} off"));
+        }
+        self.editor_bookmarks.push(line);
+        Ok(format!("toggle_bookmark {line} on"))
+    }
+
+    /// Cross-probe methodology/DRC/object → UG893 Text Editor line.
+    pub fn goto_editor(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        self.open_text_editor()?;
+        let target = if spec.is_empty() {
+            self.selected.clone().unwrap_or_default()
+        } else {
+            spec.to_string()
+        };
+        if target.is_empty() {
+            return Err("goto_editor: empty".into());
+        }
+        if let Ok(n) = target.parse::<usize>() {
+            if self.source_lines.iter().any(|l| l.line == n) {
+                return self.select_editor_line(&n.to_string());
+            }
+        }
+        let from_check = self.methodology_report().checks.iter().find_map(|c| {
+            if c.id.eq_ignore_ascii_case(&target) || c.objects.eq_ignore_ascii_case(&target) {
+                Some(c.objects.clone())
+            } else {
+                None
+            }
+        });
+        let from_drc = self.drc.as_ref().and_then(|d| {
+            d.items.iter().find_map(|v| {
+                if v.id.eq_ignore_ascii_case(&target) || v.objects.eq_ignore_ascii_case(&target) {
+                    Some(v.objects.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        let obj = from_check
+            .or(from_drc)
+            .unwrap_or(target);
+        let line = self
+            .line_for_object(&obj)
+            .ok_or_else(|| format!("goto_editor: no line for {obj}"))?;
+        self.select_editor_line(&line.to_string())
     }
 
     /// Click a UG900 Source line (number or index) — Line/BP/Text table, not a dump.
@@ -6819,6 +7264,8 @@ impl IdeModel {
             "source" | "source_window" | "select_source_line" | "toggle_bp_line" | "add_bp_line" => {
                 self.workspace = WorkspaceTab::Source
             }
+            "text_editor" | "open_text_editor" | "select_editor_line" | "toggle_bookmark"
+            | "goto_editor" => self.workspace = WorkspaceTab::TextEditor,
             "breakpoints" | "add_bp" | "select_breakpoint" => {
                 self.workspace = WorkspaceTab::Breakpoints
             }
@@ -12644,6 +13091,14 @@ impl IdeModel {
     }
 
     fn refresh_properties(&mut self) {
+        if self.editor_line_focus {
+            if let Some(line) = self.selected_source_line {
+                if let Some(row) = self.source_lines.iter().find(|l| l.line == line).cloned() {
+                    self.properties = self.editor_line_properties(&row);
+                    return;
+                }
+            }
+        }
         if let Some(path) = self.selected_source.clone() {
             let name = source_basename(&path);
             let ty = source_type_of(&path);
@@ -22586,5 +23041,249 @@ mod tests {
         let bsel = blinky.exec("select_project_summary timing").unwrap();
         assert!(bsel.contains(&format!("WNS_PS={bw}")), "{bsel}");
         assert_eq!(blinky.wns_ps(), Some(bw));
+    }
+
+    /// UG893 Text Editor is project-mode RTL in Default layout: methodology/DRC
+    /// gutter markers + schematic/netlist cross-probe, not a file dump or the
+    /// UG900 Simulation Source window.
+    #[test]
+    fn ug893_text_editor_rtl_markers_cross_probe_default_layout() {
+        let mut idle = IdeModel::new();
+        assert!(idle.source_line_rows().is_empty());
+        assert!(idle.editor_bookmarks.is_empty());
+        assert!(idle.editor_markers().is_empty());
+        let empty = idle.exec("text_editor").unwrap_err();
+        assert!(
+            empty.contains("RTL") || empty.contains("text_editor"),
+            "idle Text Editor must refuse: {empty}"
+        );
+        assert!(
+            idle.exec("select_editor_line")
+                .unwrap_err()
+                .contains("empty"),
+            "empty line click must refuse"
+        );
+        assert!(
+            idle.exec("toggle_bookmark")
+                .unwrap_err()
+                .contains("empty"),
+            "empty bookmark click must refuse"
+        );
+        assert!(
+            NavSection::ProjectManager
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "text_editor"),
+            "Flow Navigator Project Manager must offer Text Editor"
+        );
+        assert!(
+            NavSection::RtlAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "text_editor"),
+            "Flow Navigator RTL Analysis must offer Text Editor"
+        );
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        let table = ide.exec("text_editor").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::TextEditor);
+        assert_eq!(ide.layout, LayoutKind::Default);
+        assert!(
+            table.contains('\n'),
+            "Text Editor must be a line table: {table}"
+        );
+        assert!(table.contains("text_editor n="), "{table}");
+        assert!(table.contains("file=counter.sv"), "{table}");
+        assert!(table.contains("LINE=8"), "{table}");
+        assert!(table.contains("KIND=seq"), "{table}");
+        assert!(table.contains("cnt <= cnt + 1"), "{table}");
+        assert!(table.contains("LINE=10"), "{table}");
+        assert!(table.contains("KIND=assign"), "{table}");
+        assert!(table.contains("assign led"), "{table}");
+        assert!(
+            !table.contains("q <= ~q"),
+            "counter Text Editor is not blinky: {table}"
+        );
+        assert!(
+            !table.contains(" BP="),
+            "Text Editor is not the UG900 Source BP table: {table}"
+        );
+        let clk = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.signal.as_deref() == Some("clk") && l.kind == "decl")
+            .cloned()
+            .expect("clk port");
+        let led = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.signal.as_deref() == Some("led") && l.kind == "decl")
+            .cloned()
+            .expect("led port");
+        let seq = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.executable && l.kind == "seq")
+            .cloned()
+            .expect("always_ff body");
+        assert_eq!(seq.line, 8);
+        assert_eq!(seq.signal.as_deref(), Some("cnt"));
+        assert!(
+            table.contains(&format!("LINE={} MARKER=W", clk.line)),
+            "TIMING-1 missing create_clock marks clk: {table}"
+        );
+        assert!(
+            table.contains("ID=TIMING-1"),
+            "clk marker is methodology TIMING-1: {table}"
+        );
+        assert!(
+            table.contains(&format!("LINE={} MARKER=W", led.line)),
+            "TIMING-7 missing output delay marks led: {table}"
+        );
+        assert!(
+            table.contains("ID=TIMING-7"),
+            "led marker is methodology TIMING-7: {table}"
+        );
+        assert!(
+            ide.editor_markers()
+                .iter()
+                .any(|m| m.id == "TIMING-7" && m.line == led.line && m.kind == "warning"),
+            "{:?}",
+            ide.editor_markers()
+        );
+
+        let click = ide.exec("select_editor_line 10").unwrap();
+        assert!(click.contains("LINE=10"), "{click}");
+        assert!(click.contains("KIND=assign"), "{click}");
+        assert!(click.contains("SIGNAL=led"), "{click}");
+        assert_eq!(ide.selected_source_line, Some(10));
+        assert_eq!(ide.layout, LayoutKind::Default);
+        assert_eq!(ide.workspace, WorkspaceTab::TextEditor);
+        assert_eq!(ide.selected.as_deref(), Some("led"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("led"));
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "editor_line"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "SIGNAL" && v == "led"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.exec("select_editor_line 99")
+                .unwrap_err()
+                .contains("no line"),
+            "unknown line must refuse"
+        );
+
+        let by_sig = ide.exec("select_editor_line cnt").unwrap();
+        assert!(by_sig.contains("SIGNAL=cnt"), "{by_sig}");
+        assert!(
+            ide.selected_source_line == Some(6) || ide.selected_source_line == Some(8),
+            "cnt maps to decl or seq: {:?}",
+            ide.selected_source_line
+        );
+        assert!(
+            ide.selected.as_deref() == Some("cnt")
+                || ide
+                    .selected
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("cnt_")),
+            "cnt line cross-probes the HNF cnt net: {:?}",
+            ide.selected
+        );
+
+        let comment_ln = ide
+            .source_line_rows()
+            .iter()
+            .find(|l| l.kind == "comment")
+            .map(|l| l.line)
+            .expect("comment");
+        let bm = ide.exec(&format!("toggle_bookmark {comment_ln}")).unwrap();
+        assert!(bm.contains("on"), "{bm}");
+        assert!(ide.editor_bookmarks.contains(&comment_ln));
+        let with_bm = ide.exec("text_editor").unwrap();
+        assert!(
+            with_bm.contains(&format!("LINE={comment_ln} MARKER=B"))
+                && with_bm.contains("ID=bookmark"),
+            "bookmark is a gutter marker: {with_bm}"
+        );
+        ide.exec(&format!("toggle_bookmark {comment_ln}")).unwrap();
+        assert!(
+            !ide.editor_bookmarks.contains(&comment_ln),
+            "gutter toggle removes the bookmark: {:?}",
+            ide.editor_bookmarks
+        );
+
+        let goto = ide.exec("goto_editor TIMING-7").unwrap();
+        assert!(goto.contains("SIGNAL=led"), "{goto}");
+        assert_eq!(ide.selected_source_line, Some(led.line));
+        assert_eq!(ide.workspace, WorkspaceTab::TextEditor);
+        assert_eq!(ide.layout, LayoutKind::Default);
+
+        let src = ide.exec("select_source counter.sv").unwrap();
+        assert!(src.contains("NAME=counter.sv"), "{src}");
+        assert_eq!(ide.workspace, WorkspaceTab::TextEditor);
+        assert_eq!(ide.layout, LayoutKind::Default);
+
+        ide.exec("select_netlist led").unwrap();
+        assert_eq!(ide.selected.as_deref(), Some("led"));
+        assert_eq!(
+            ide.selected_source_line,
+            Some(led.line),
+            "schematic/netlist select must probe the RTL line"
+        );
+        let probed = ide.exec("text_editor").unwrap();
+        assert!(
+            probed.contains(&format!("LINE={} MARKER=P", led.line))
+                || probed.contains("ID=probe")
+                || probed.contains("ID=TIMING-7"),
+            "probe or methodology marker on led: {probed}"
+        );
+
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+        let after = ide.exec("text_editor").unwrap();
+        assert!(after.contains("file=counter.sv"), "{after}");
+        ide.exec("select_editor_line 10").unwrap();
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "Text Editor must not disturb gold WNS"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        let bsrc = blinky.exec("text_editor").unwrap();
+        assert!(bsrc.contains("file=blinky.sv"), "{bsrc}");
+        assert!(bsrc.contains("q <= ~q"), "{bsrc}");
+        assert!(
+            !bsrc.contains("cnt <= cnt + 1"),
+            "blinky Text Editor is not counter: {bsrc}"
+        );
+        let bseq = blinky
+            .source_line_rows()
+            .iter()
+            .find(|l| l.executable && l.kind == "seq")
+            .expect("blinky seq");
+        assert_eq!(bseq.signal.as_deref(), Some("q"));
+        blinky.exec("select_editor_line 10").unwrap();
+        assert_eq!(blinky.selected.as_deref(), Some("led"));
+        assert_eq!(blinky.layout, LayoutKind::Default);
+        assert_eq!(blinky.workspace, WorkspaceTab::TextEditor);
+        assert!(
+            !bsrc.contains(&format!("WNS_PS={gold}")),
+            "Text Editor is not a timing dump: {bsrc}"
+        );
     }
 }
