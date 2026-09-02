@@ -1047,6 +1047,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Device,
             WorkspaceTab::Wave,
             WorkspaceTab::Source,
+            WorkspaceTab::TextEditor,
             WorkspaceTab::Memory,
             WorkspaceTab::Breakpoints,
             WorkspaceTab::Locals,
@@ -1074,6 +1075,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Device => "Device",
                 WorkspaceTab::Wave => "Waveform",
                 WorkspaceTab::Source => "Source",
+                WorkspaceTab::TextEditor => "Text Editor",
                 WorkspaceTab::Memory => "Memory",
                 WorkspaceTab::Breakpoints => "Breakpoints",
                 WorkspaceTab::Locals => "Locals",
@@ -1110,6 +1112,7 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Device => paint_device(ui, model),
         WorkspaceTab::Wave => paint_wave(ui, model),
         WorkspaceTab::Source => paint_source(ui, model),
+        WorkspaceTab::TextEditor => paint_text_editor(ui, model),
         WorkspaceTab::Memory => paint_memory(ui, model),
         WorkspaceTab::Breakpoints => paint_breakpoints(ui, model),
         WorkspaceTab::Locals => paint_locals(ui, model),
@@ -3841,6 +3844,93 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     if let Some(spec) = pick_line {
         let _ = model.select_source_line(&spec);
+    }
+}
+
+fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Text Editor");
+    ui.weak(
+        "UG893 Text Editor — project-mode RTL with methodology/DRC markers and schematic cross-probe, not a file dump",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("Open").clicked() {
+            let _ = model.open_text_editor();
+        }
+        if ui.button("Goto Source").clicked() {
+            let _ = model.goto_editor("");
+        }
+    });
+    let rows = model.source_line_rows().to_vec();
+    let selected = model.selected_source_line;
+    let markers = model.editor_markers();
+    let mut pick_line: Option<String> = None;
+    let mut pick_mark: Option<String> = None;
+    egui::ScrollArea::both()
+        .id_salt("ug893_text_editor")
+        .show(ui, |ui| {
+            egui::Grid::new("ug893_text_editor_table")
+                .spacing([8.0, 2.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Marker").strong());
+                    ui.label(RichText::new("Line").strong());
+                    ui.label(RichText::new("Kind").strong());
+                    ui.label(RichText::new("Text").strong());
+                    ui.end_row();
+                    if rows.is_empty() {
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("no source — add RTL");
+                        ui.end_row();
+                    } else {
+                        for r in &rows {
+                            let on = selected == Some(r.line);
+                            let mk = markers
+                                .iter()
+                                .filter(|m| m.line == r.line)
+                                .min_by_key(|m| match m.kind.as_str() {
+                                    "error" => 0u8,
+                                    "warning" => 1,
+                                    "advisory" => 2,
+                                    "probe" => 3,
+                                    "bookmark" => 4,
+                                    _ => 9,
+                                });
+                            let mark = mk.map(|m| m.marker_cell()).unwrap_or("-");
+                            if ui.selectable_label(on && mk.is_some(), mark).clicked() {
+                                if mk.map(|m| m.kind.as_str()) == Some("bookmark")
+                                    || mk.is_none()
+                                {
+                                    pick_mark = Some(r.line.to_string());
+                                } else {
+                                    pick_line = Some(r.line.to_string());
+                                }
+                            }
+                            if ui
+                                .selectable_label(on, RichText::new(r.line.to_string()).monospace())
+                                .clicked()
+                            {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            if ui.selectable_label(on, r.type_cell()).clicked() {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            if ui
+                                .selectable_label(on, RichText::new(r.text.trim()).monospace())
+                                .clicked()
+                            {
+                                pick_line = Some(r.line.to_string());
+                            }
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    if let Some(spec) = pick_mark {
+        let _ = model.toggle_editor_bookmark(&spec);
+    }
+    if let Some(spec) = pick_line {
+        let _ = model.select_editor_line(&spec);
     }
 }
 
