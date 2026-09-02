@@ -13,13 +13,14 @@ pub use ide::{
     Pblock,
     NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
-    UltraFastStage, Utilization, VirtualBus, Waveform, WaveMarker, WaveRadix, WaveStyle, WaveTrace,
-    WorkspaceTab,
+    UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
+    Waveform, WaveMarker, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
 };
+pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{
     CdcReport, CdcSeverity, CdcViolation, ClockInteraction, ClockInteractionCell, ClockNetwork,
-    ClockNetworkReport, ClockRelation, PathGroupKind, PowerReport, TimingSummary,
-    TimingSummaryGroup,
+    ClockNetworkReport, ClockRelation, MethodologyReport, MethodologySeverity,
+    MethodologyViolation, PathGroupKind, PowerReport, TimingSummary, TimingSummaryGroup,
 };
 
 use helion_device::Device;
