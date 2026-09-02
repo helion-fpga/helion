@@ -6,8 +6,8 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::{
-    doctor, BottomTab, ClockRelation, FlowStep, IdeModel, IlaTrigger, LayoutKind, MsgSeverity,
-    NavSection, PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
+    doctor, BottomTab, CdcSeverity, ClockRelation, FlowStep, IdeModel, IlaTrigger, LayoutKind,
+    MsgSeverity, NavSection, PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -664,6 +664,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
             WorkspaceTab::Ip,
             WorkspaceTab::Constraints,
             WorkspaceTab::ClockInteraction,
+            WorkspaceTab::Cdc,
+            WorkspaceTab::ClockNetworks,
+            WorkspaceTab::Power,
             WorkspaceTab::Hierarchy,
             WorkspaceTab::Find,
             WorkspaceTab::Package,
@@ -678,6 +681,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
                 WorkspaceTab::Ip => "IP / BD",
                 WorkspaceTab::Constraints => "Timing Constraints",
                 WorkspaceTab::ClockInteraction => "Clock Interaction",
+                WorkspaceTab::Cdc => "CDC",
+                WorkspaceTab::ClockNetworks => "Clock Networks",
+                WorkspaceTab::Power => "Power",
                 WorkspaceTab::Hierarchy => "Hierarchy",
                 WorkspaceTab::Find => "Find Results",
                 WorkspaceTab::Package => "Package",
@@ -701,6 +707,9 @@ fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
         WorkspaceTab::Ip => paint_ip(ui, model),
         WorkspaceTab::Constraints => paint_constraints(ui, model),
         WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, model),
+        WorkspaceTab::Cdc => paint_cdc(ui, model),
+        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, model),
+        WorkspaceTab::Power => paint_power(ui, model),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, model),
         WorkspaceTab::Find => paint_find(ui, model),
         WorkspaceTab::Package => paint_package(ui, model),
@@ -1379,6 +1388,16 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
         "Clock Interaction (report_clock_interaction)",
         &model.clock_interaction_text(),
     );
+    ui.add_space(8.0);
+    report_box(ui, "CDC (report_cdc)", &model.cdc_text());
+    ui.add_space(8.0);
+    report_box(
+        ui,
+        "Clock Networks (report_clock_networks)",
+        &model.clock_networks_text(),
+    );
+    ui.add_space(8.0);
+    report_box(ui, "Power (report_power)", &model.power_text());
 }
 
 fn slack_label(v: Option<i64>) -> String {
@@ -1605,6 +1624,246 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
     );
     ui.add_space(8.0);
     report_box(ui, "Timing (report_timing)", &model.timing_text());
+}
+
+fn cdc_severity_color(sev: CdcSeverity) -> Color32 {
+    match sev {
+        CdcSeverity::Critical => Color32::from_rgb(0xe0, 0x50, 0x50),
+        CdcSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        CdcSeverity::Info => Color32::from_rgb(0x90, 0x60, 0xc0),
+        CdcSeverity::Safe => Color32::from_rgb(0x3c, 0xb3, 0x71),
+    }
+}
+
+fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("CDC");
+    ui.weak(
+        "UG906 report_cdc — STA inter-clock rows (Critical missing sync / Warning datapath / Info async / Safe false path), not a dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report CDC").clicked() {
+            let _ = model.exec("report_cdc");
+        }
+        if ui.button("Apply set_clock_groups async clk/virt").clicked() {
+            let _ = model.exec(
+                "set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]",
+            );
+        }
+        if ui.button("Apply set_false_path clk→virt").clicked() {
+            let _ = model.exec("set_false_path -from [get_clocks clk] -to [get_clocks virt]");
+        }
+        if ui.button("Apply set_max_delay -datapath_only 2ns").clicked() {
+            let _ = model.exec(
+                "set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]",
+            );
+        }
+    });
+    ui.add_space(6.0);
+    let report = model.cdc_report();
+    if report.clocks.is_empty() {
+        ui.label("no clocks — create_clock / report_cdc");
+        return;
+    }
+    ui.label(format!(
+        "critical={} warning={} info={} safe={}",
+        report.critical_count(),
+        report.warning_count(),
+        report.info_count(),
+        report.safe_count()
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<(String, String)> = None;
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("cdc_table")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("From").strong());
+                ui.label(RichText::new("To").strong());
+                ui.label(RichText::new("Severity").strong());
+                ui.label(RichText::new("Check").strong());
+                ui.label(RichText::new("Sync").strong());
+                ui.label(RichText::new("Endpoints").strong());
+                ui.label(RichText::new("WNS_PS").strong());
+                ui.label(RichText::new("Relation").strong());
+                ui.end_row();
+                for v in &report.violations {
+                    let key = format!("{}->{}", v.from, v.to);
+                    let on = selected.as_deref() == Some(key.as_str());
+                    let fill = cdc_severity_color(v.severity);
+                    let btn = egui::Button::new(
+                        RichText::new(&v.from).color(Color32::BLACK),
+                    )
+                    .fill(fill)
+                    .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some((v.from.clone(), v.to.clone()));
+                    }
+                    ui.label(&v.to);
+                    ui.label(v.severity.as_str());
+                    ui.label(&v.check);
+                    ui.label(if v.synchronizer { "1" } else { "0" });
+                    ui.label(v.endpoints.to_string());
+                    ui.label(slack_label(v.wns_ps));
+                    ui.label(v.relation.as_str());
+                    ui.end_row();
+                }
+            });
+    });
+    if let Some((from, to)) = pick {
+        let _ = model.select_cdc(&from, &to);
+    }
+    ui.add_space(8.0);
+    report_box(ui, "CDC (report_cdc)", &model.cdc_text());
+}
+
+fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Clock Networks");
+    ui.weak(
+        "UG903 report_clock_networks — STA clocks, HNF FF loads, HAD CLK-spine buffers, place insertion, not a dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report clock networks").clicked() {
+            let _ = model.exec("report_clock_networks");
+        }
+        if ui.button("Apply create_generated_clock ÷2").clicked() {
+            let _ = model.exec(
+                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+            );
+        }
+        if ui.button("Apply set_propagated_clock clk").clicked() {
+            let _ = model.exec("set_propagated_clock [get_clocks clk]");
+        }
+    });
+    ui.add_space(6.0);
+    let report = model.clock_networks();
+    if report.clocks.is_empty() {
+        ui.label("no clocks — create_clock / report_clock_networks");
+        return;
+    }
+    ui.label(format!(
+        "loads={} buffers={} INSERTION_PS={}",
+        report.total_loads, report.total_buffers, report.max_insertion_ps
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    egui::Grid::new("clock_networks_table")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Clock").strong());
+            ui.label(RichText::new("Period_ps").strong());
+            ui.label(RichText::new("Source").strong());
+            ui.label(RichText::new("Net").strong());
+            ui.label(RichText::new("Loads").strong());
+            ui.label(RichText::new("Buffers").strong());
+            ui.label(RichText::new("Fanout").strong());
+            ui.label(RichText::new("Insertion_ps").strong());
+            ui.end_row();
+            for c in &report.clocks {
+                let on = selected.as_deref() == Some(c.name.as_str());
+                if ui.selectable_label(on, &c.name).clicked() {
+                    pick = Some(c.name.clone());
+                }
+                ui.label(c.period_ps.to_string());
+                ui.label(&c.source);
+                ui.label(&c.net);
+                ui.label(c.n_loads.to_string());
+                ui.label(c.n_buffers.to_string());
+                ui.label(c.fanout.to_string());
+                ui.label(c.insertion_ps.to_string());
+                ui.end_row();
+            }
+        });
+    if let Some(name) = pick {
+        let _ = model.select_clock_network(&name);
+    }
+    ui.add_space(8.0);
+    report_box(
+        ui,
+        "Clock Networks (report_clock_networks)",
+        &model.clock_networks_text(),
+    );
+}
+
+fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Power");
+    ui.weak(
+        "UG907 report_power — HAD occupancy × STA clocks × set_operating_conditions PVT, not a dump",
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Report power").clicked() {
+            let _ = model.exec("report_power");
+        }
+        if ui.button("Apply set_operating_conditions 0.95V 85C").clicked() {
+            let _ = model.exec("set_operating_conditions -voltage 0.95 -temperature 85");
+        }
+    });
+    ui.add_space(6.0);
+    let report = model.power_report();
+    if report.part.is_empty() {
+        ui.label("no design — synth / report_power");
+        return;
+    }
+    ui.label(format!(
+        "part={} VOLTAGE_MV={} TEMP_C={} F_MHZ={}",
+        report.part, report.voltage_mv, report.temperature_c, report.f_mhz
+    ));
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    let rails = [
+        ("total", report.total_uw),
+        ("static", report.static_uw),
+        ("dynamic", report.dynamic_uw),
+        ("clocks", report.clocks_uw),
+        ("logic", report.logic_uw),
+        ("signals", report.signals_uw),
+        ("io", report.io_uw),
+        ("bram", report.bram_uw),
+        ("dsp", report.dsp_uw),
+    ];
+    let max_uw = report.total_uw.max(1);
+    egui::Grid::new("power_rails")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Rail").strong());
+            ui.label(RichText::new("UW").strong());
+            ui.label(RichText::new("Share").strong());
+            ui.end_row();
+            for (name, uw) in rails {
+                let on = selected.as_deref() == Some(name);
+                if ui.selectable_label(on, name).clicked() {
+                    pick = Some(name.into());
+                }
+                ui.label(uw.to_string());
+                let frac = uw as f32 / max_uw as f32;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 12.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
+                let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
+                ui.painter()
+                    .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
+                ui.end_row();
+            }
+        });
+    if let Some(rail) = pick {
+        let _ = model.select_power(&rail);
+    }
+    ui.add_space(6.0);
+    ui.label(format!(
+        "LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        report.lutff,
+        report.lutff_cap,
+        report.iob,
+        report.iob_cap,
+        report.bram,
+        report.bram_cap,
+        report.dsp,
+        report.dsp_cap
+    ));
+    ui.add_space(8.0);
+    report_box(ui, "Power (report_power)", &model.power_text());
 }
 
 fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke) {

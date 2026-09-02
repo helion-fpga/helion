@@ -17,7 +17,8 @@ pub use ide::{
     WorkspaceTab,
 };
 pub use helion_sta::{
-    ClockInteraction, ClockInteractionCell, ClockRelation, PathGroupKind, TimingSummary,
+    CdcReport, CdcSeverity, CdcViolation, ClockInteraction, ClockInteractionCell, ClockNetwork,
+    ClockNetworkReport, ClockRelation, PathGroupKind, PowerReport, TimingSummary,
     TimingSummaryGroup,
 };
 

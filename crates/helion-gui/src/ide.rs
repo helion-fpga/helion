@@ -18,8 +18,9 @@ use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, Session};
 use helion_sim::Sim;
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
-    report_clock_interaction, report_timing_routed_xdc, report_timing_summary, ClockInteraction,
-    Constraints, TimingResult, TimingSummary,
+    report_cdc, report_clock_interaction, report_clock_networks, report_power,
+    report_timing_routed_xdc, report_timing_summary, CdcReport, ClockInteraction,
+    ClockNetworkReport, Constraints, PowerReport, TimingResult, TimingSummary,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -307,6 +308,18 @@ impl NavSection {
                 NavAction {
                     label: "Report Clock Interaction",
                     tcl: "report_clock_interaction",
+                },
+                NavAction {
+                    label: "Report CDC",
+                    tcl: "report_cdc",
+                },
+                NavAction {
+                    label: "Report Clock Networks",
+                    tcl: "report_clock_networks",
+                },
+                NavAction {
+                    label: "Report Power",
+                    tcl: "report_power",
                 },
             ],
             NavSection::ProgramDebug => &[
@@ -2004,6 +2017,9 @@ pub enum WorkspaceTab {
     Ip,
     Constraints,
     ClockInteraction,
+    Cdc,
+    ClockNetworks,
+    Power,
     Hierarchy,
     Find,
     Package,
@@ -2624,6 +2640,15 @@ impl IdeModel {
         } else if t == "report_timing_summary" || t == "timing_summary" {
             self.workspace = WorkspaceTab::Reports;
             Ok(self.timing_summary_text())
+        } else if t == "report_cdc" || t == "cdc" {
+            self.workspace = WorkspaceTab::Cdc;
+            Ok(self.cdc_text())
+        } else if t == "report_clock_networks" || t == "clock_networks" {
+            self.workspace = WorkspaceTab::ClockNetworks;
+            Ok(self.clock_networks_text())
+        } else if t == "report_power" || t == "power" {
+            self.workspace = WorkspaceTab::Power;
+            Ok(self.power_text())
         } else if let Some(rest) = t.strip_prefix("select_timing_summary ") {
             let mut p = rest.split_whitespace();
             let a = p.next().unwrap_or("");
@@ -2634,6 +2659,15 @@ impl IdeModel {
             let from = p.next().unwrap_or("");
             let to = p.next().unwrap_or(from);
             self.select_clock_interaction(from, to)
+        } else if let Some(rest) = t.strip_prefix("select_cdc ") {
+            let mut p = rest.split_whitespace();
+            let from = p.next().unwrap_or("");
+            let to = p.next().unwrap_or(from);
+            self.select_cdc(from, to)
+        } else if let Some(name) = t.strip_prefix("select_clock_network ") {
+            self.select_clock_network(name.trim())
+        } else if let Some(rail) = t.strip_prefix("select_power ") {
+            self.select_power(rail.trim())
         } else if t == "create_clock" || t.starts_with("create_clock ") {
             self.apply_create_clock(t)
         } else if t == "create_generated_clock" || t.starts_with("create_generated_clock ") {
@@ -5258,6 +5292,192 @@ impl IdeModel {
         ))
     }
 
+    fn pane_clocks(&self) -> Vec<helion_sta::Clock> {
+        if !self.constraints.clocks.is_empty() {
+            self.constraints.clocks.clone()
+        } else if self.timing.is_some() || self.shell.session.design.is_some() {
+            self.clocks_for_sta()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// UG906 CDC pane: STA inter-clock rows + XDC exceptions, not a dump.
+    pub fn cdc_report(&self) -> CdcReport {
+        let clks = self.pane_clocks();
+        if clks.is_empty() {
+            return CdcReport::default();
+        }
+        report_cdc(
+            &clks,
+            &self.constraints,
+            self.timing.as_ref(),
+            self.shell.session.design.as_ref(),
+        )
+    }
+
+    pub fn cdc_text(&self) -> String {
+        self.cdc_report().text()
+    }
+
+    /// Click a CDC row: properties + CDC workspace.
+    pub fn select_cdc(&mut self, from: &str, to: &str) -> Result<String, String> {
+        let report = self.cdc_report();
+        let v = report
+            .violation(from, to)
+            .ok_or_else(|| format!("select_cdc: no row {from}->{to}"))?;
+        let wns = match v.wns_ps {
+            Some(w) => format!("{w}"),
+            None => "n/a".into(),
+        };
+        self.selected = Some(format!("{from}->{to}"));
+        self.properties = vec![
+            ("NAME".into(), format!("{from}->{to}")),
+            ("TYPE".into(), "cdc".into()),
+            ("FROM".into(), v.from.clone()),
+            ("TO".into(), v.to.clone()),
+            ("SEVERITY".into(), v.severity.as_str().into()),
+            ("CHECK".into(), v.check.clone()),
+            ("SYNC".into(), u8::from(v.synchronizer).to_string()),
+            ("ENDPOINTS".into(), v.endpoints.to_string()),
+            ("WNS_PS".into(), wns.clone()),
+            ("RELATION".into(), v.relation.as_str().into()),
+        ];
+        self.workspace = WorkspaceTab::Cdc;
+        Ok(format!(
+            "cdc FROM={from} TO={to} SEVERITY={} CHECK={} SYNC={} ENDPOINTS={} WNS_PS={wns} RELATION={}",
+            v.severity.as_str(),
+            v.check,
+            u8::from(v.synchronizer),
+            v.endpoints,
+            v.relation.as_str()
+        ))
+    }
+
+    /// UG903 Clock Networks pane: STA clocks + HNF FF loads + HAD spine insertion.
+    pub fn clock_networks(&self) -> ClockNetworkReport {
+        let clks = self.pane_clocks();
+        if clks.is_empty() {
+            return ClockNetworkReport::default();
+        }
+        let placed = self
+            .shell
+            .session
+            .routed
+            .as_ref()
+            .map(|r| &r.placed)
+            .or(self.shell.session.placed.as_ref());
+        report_clock_networks(&clks, self.shell.session.design.as_ref(), placed)
+    }
+
+    pub fn clock_networks_text(&self) -> String {
+        self.clock_networks().text()
+    }
+
+    /// Click a clock-tree row: properties + Clock Networks workspace.
+    pub fn select_clock_network(&mut self, name: &str) -> Result<String, String> {
+        let report = self.clock_networks();
+        let n = report
+            .network(name)
+            .ok_or_else(|| format!("select_clock_network: no clock {name}"))?;
+        self.selected = Some(n.name.clone());
+        self.properties = vec![
+            ("NAME".into(), n.name.clone()),
+            ("TYPE".into(), "clock_network".into()),
+            ("PERIOD_PS".into(), n.period_ps.to_string()),
+            ("SOURCE".into(), n.source.clone()),
+            ("NET".into(), n.net.clone()),
+            ("GENERATED".into(), u8::from(n.generated).to_string()),
+            (
+                "MASTER".into(),
+                n.master.clone().unwrap_or_else(|| "-".into()),
+            ),
+            ("LOADS".into(), n.n_loads.to_string()),
+            ("BUFFERS".into(), n.n_buffers.to_string()),
+            ("FANOUT".into(), n.fanout.to_string()),
+            ("INSERTION_PS".into(), n.insertion_ps.to_string()),
+        ];
+        self.workspace = WorkspaceTab::ClockNetworks;
+        Ok(format!(
+            "clock_network NAME={} PERIOD_PS={} SOURCE={} NET={} loads={} buffers={} fanout={} INSERTION_PS={}",
+            n.name,
+            n.period_ps,
+            n.source,
+            n.net,
+            n.n_loads,
+            n.n_buffers,
+            n.fanout,
+            n.insertion_ps
+        ))
+    }
+
+    /// UG907 Power pane: HAD occupancy × STA clocks × PVT, not a dump.
+    pub fn power_report(&self) -> PowerReport {
+        if self.shell.session.design.is_none() && self.shell.session.placed.is_none() {
+            return PowerReport::default();
+        }
+        let Ok(dev) = self.device() else {
+            return PowerReport::default();
+        };
+        let clks = self.pane_clocks();
+        let placed = self
+            .shell
+            .session
+            .routed
+            .as_ref()
+            .map(|r| &r.placed)
+            .or(self.shell.session.placed.as_ref());
+        report_power(
+            &dev,
+            self.shell.session.design.as_ref(),
+            placed,
+            &clks,
+            &self.constraints.operating_conditions,
+        )
+    }
+
+    pub fn power_text(&self) -> String {
+        self.power_report().text()
+    }
+
+    /// Click a power rail: properties + Power workspace.
+    pub fn select_power(&mut self, rail: &str) -> Result<String, String> {
+        let p = self.power_report();
+        if p.part.is_empty() {
+            return Err("select_power: no design".into());
+        }
+        let (name, uw) = match rail.trim().to_ascii_lowercase().as_str() {
+            "total" | "" => ("total", p.total_uw),
+            "static" => ("static", p.static_uw),
+            "dynamic" => ("dynamic", p.dynamic_uw),
+            "clocks" | "clock" => ("clocks", p.clocks_uw),
+            "logic" => ("logic", p.logic_uw),
+            "signals" | "signal" => ("signals", p.signals_uw),
+            "io" | "iob" => ("io", p.io_uw),
+            "bram" => ("bram", p.bram_uw),
+            "dsp" => ("dsp", p.dsp_uw),
+            other => return Err(format!("select_power: unknown rail {other}")),
+        };
+        self.selected = Some(name.into());
+        self.properties = vec![
+            ("NAME".into(), name.into()),
+            ("TYPE".into(), "power".into()),
+            ("UW".into(), uw.to_string()),
+            ("TOTAL_UW".into(), p.total_uw.to_string()),
+            ("STATIC_UW".into(), p.static_uw.to_string()),
+            ("DYNAMIC_UW".into(), p.dynamic_uw.to_string()),
+            ("VOLTAGE_MV".into(), p.voltage_mv.to_string()),
+            ("TEMP_C".into(), p.temperature_c.to_string()),
+            ("F_MHZ".into(), p.f_mhz.to_string()),
+            ("PART".into(), p.part.clone()),
+        ];
+        self.workspace = WorkspaceTab::Power;
+        Ok(format!(
+            "power RAIL={name} UW={uw} TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={} TEMP_C={} F_MHZ={}",
+            p.total_uw, p.static_uw, p.dynamic_uw, p.voltage_mv, p.temperature_c, p.f_mhz
+        ))
+    }
+
     /// UG893 Timing Constraints pane text. Empty until create_clock /
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
@@ -7025,7 +7245,26 @@ impl IdeModel {
             }
         }
         if let Some((from, to)) = id.split_once("->") {
-            if self.workspace != WorkspaceTab::Reports {
+            if self.workspace == WorkspaceTab::Cdc {
+                if let Some(v) = self.cdc_report().violation(from, to).cloned() {
+                    if !props.iter().any(|(k, _)| k == "TYPE") {
+                        props.push(("TYPE".into(), "cdc".into()));
+                    }
+                    props.push(("FROM".into(), v.from));
+                    props.push(("TO".into(), v.to));
+                    props.push(("SEVERITY".into(), v.severity.as_str().into()));
+                    props.push(("CHECK".into(), v.check));
+                    props.push(("SYNC".into(), u8::from(v.synchronizer).to_string()));
+                    props.push(("ENDPOINTS".into(), v.endpoints.to_string()));
+                    props.push((
+                        "WNS_PS".into(),
+                        v.wns_ps
+                            .map(|w| w.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                    ));
+                    props.push(("RELATION".into(), v.relation.as_str().into()));
+                }
+            } else if self.workspace != WorkspaceTab::Reports {
                 if let Some(cell) = self.clock_interaction().cell(from, to).cloned() {
                     if !props.iter().any(|(k, _)| k == "TYPE") {
                         props.push(("TYPE".into(), "clock_interaction".into()));
@@ -7043,6 +7282,51 @@ impl IdeModel {
                     ));
                     props.push(("PATHS".into(), cell.path_count.to_string()));
                 }
+            }
+        }
+        if self.workspace == WorkspaceTab::ClockNetworks {
+            if let Some(n) = self.clock_networks().network(&id).cloned() {
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "clock_network".into()));
+                }
+                props.push(("PERIOD_PS".into(), n.period_ps.to_string()));
+                props.push(("SOURCE".into(), n.source));
+                props.push(("NET".into(), n.net));
+                props.push(("GENERATED".into(), u8::from(n.generated).to_string()));
+                props.push((
+                    "MASTER".into(),
+                    n.master.unwrap_or_else(|| "-".into()),
+                ));
+                props.push(("LOADS".into(), n.n_loads.to_string()));
+                props.push(("BUFFERS".into(), n.n_buffers.to_string()));
+                props.push(("FANOUT".into(), n.fanout.to_string()));
+                props.push(("INSERTION_PS".into(), n.insertion_ps.to_string()));
+            }
+        }
+        if self.workspace == WorkspaceTab::Power {
+            let p = self.power_report();
+            if !p.part.is_empty() {
+                let uw = match id.as_str() {
+                    "static" => p.static_uw,
+                    "dynamic" => p.dynamic_uw,
+                    "clocks" => p.clocks_uw,
+                    "logic" => p.logic_uw,
+                    "signals" => p.signals_uw,
+                    "io" => p.io_uw,
+                    "bram" => p.bram_uw,
+                    "dsp" => p.dsp_uw,
+                    _ => p.total_uw,
+                };
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "power".into()));
+                }
+                props.push(("UW".into(), uw.to_string()));
+                props.push(("TOTAL_UW".into(), p.total_uw.to_string()));
+                props.push(("STATIC_UW".into(), p.static_uw.to_string()));
+                props.push(("DYNAMIC_UW".into(), p.dynamic_uw.to_string()));
+                props.push(("VOLTAGE_MV".into(), p.voltage_mv.to_string()));
+                props.push(("TEMP_C".into(), p.temperature_c.to_string()));
+                props.push(("F_MHZ".into(), p.f_mhz.to_string()));
             }
         }
         self.properties = props;
@@ -12360,5 +12644,313 @@ mod tests {
             blinky.timing_summary().wns_ps,
             Some(bwns)
         );
+    }
+
+    /// UG906 `report_cdc` pane is STA inter-clock rows + XDC exceptions, not a dump.
+    /// Empty XDC keeps gold WNS.
+    #[test]
+    fn cdc_pane_from_sta_clocks_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let empty = ide.cdc_text();
+        assert!(
+            empty.contains("no clocks"),
+            "idle pane has no canned CDC table: {empty}"
+        );
+        assert!(ide.cdc_report().violations.is_empty());
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_cdc"),
+            "Flow Navigator Timing Analysis must offer report_cdc"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+
+        let out = ide.exec("report_cdc").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Cdc);
+        assert!(out.contains("report_cdc"), "{out}");
+        assert!(
+            ide.cdc_report().violations.is_empty(),
+            "single clock is not CDC: {}",
+            ide.cdc_text()
+        );
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening the pane must not move gold WNS"
+        );
+
+        ide.exec(
+            "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+        )
+        .unwrap();
+        ide.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        let r = ide.cdc_report();
+        assert_eq!(r.clocks.len(), 3, "{}", r.text());
+        assert_eq!(r.violations.len(), 6);
+        let cdc = r.violation("clk", "virt").expect("CDC row");
+        assert_eq!(cdc.severity, helion_sta::CdcSeverity::Critical);
+        assert_eq!(cdc.check, "CDC-10");
+        assert_eq!(cdc.relation, helion_sta::ClockRelation::TimedUnsafe);
+        assert_ne!(cdc.wns_ps, Some(gold), "CDC slack uses dest period");
+        assert!(r.critical_count() >= 2, "{}", r.text());
+        let pane = ide.exec("report_cdc").unwrap();
+        assert!(pane.contains("SEVERITY=Critical"), "{pane}");
+        assert!(pane.contains("FROM=clk TO=virt"), "{pane}");
+        assert_eq!(ide.workspace, WorkspaceTab::Cdc);
+
+        let sel = ide.exec("select_cdc clk virt").unwrap();
+        assert!(sel.contains("SEVERITY=Critical"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "cdc"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "CHECK" && v == "CDC-10"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
+            .unwrap();
+        let r = ide.cdc_report();
+        let v = r.violation("clk", "virt").unwrap();
+        assert_eq!(v.severity, helion_sta::CdcSeverity::Info);
+        assert!(v.wns_ps.is_none());
+        assert_eq!(
+            r.violation("clk", "clkdiv").unwrap().severity,
+            helion_sta::CdcSeverity::Safe
+        );
+
+        let mut dp = IdeModel::new();
+        dp.open_source(&example("counter.sv")).unwrap();
+        dp.run_step(FlowStep::Place).unwrap();
+        dp.run_step(FlowStep::Route).unwrap();
+        dp.exec("create_clock -period 10.000 [get_ports clk]")
+            .unwrap();
+        dp.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        dp.exec("set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]")
+            .unwrap();
+        let v = dp.cdc_report().violation("clk", "virt").unwrap().clone();
+        assert_eq!(v.severity, helion_sta::CdcSeverity::Warning);
+        assert_eq!(v.check, "CDC-13");
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        blinky
+            .exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        let bwns = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bwns, gold);
+        assert_ne!(
+            blinky
+                .cdc_report()
+                .violation("clk", "virt")
+                .unwrap()
+                .wns_ps,
+            ide.cdc_report().violation("clk", "virt").unwrap().wns_ps,
+            "CDC WNS is per-design STA, not a canned pane"
+        );
+    }
+
+    /// UG903 `report_clock_networks` pane is HNF FF loads + HAD CLK-spine insertion,
+    /// not a dump. Empty XDC keeps gold WNS.
+    #[test]
+    fn clock_networks_pane_from_hnf_and_had_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let empty = ide.clock_networks_text();
+        assert!(
+            empty.contains("no clocks"),
+            "idle pane has no canned tree: {empty}"
+        );
+        assert!(ide.clock_networks().clocks.is_empty());
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_clock_networks"),
+            "Flow Navigator Timing Analysis must offer report_clock_networks"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        let clk_net = ide.timing.as_ref().unwrap().clk_net_ps;
+
+        let out = ide.exec("report_clock_networks").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::ClockNetworks);
+        assert!(out.contains("loads=4"), "{out}");
+        assert!(out.contains("buffers=1"), "{out}");
+        assert!(out.contains("INSERTION_PS="), "{out}");
+        let r = ide.clock_networks();
+        let clk = r.network("clk").expect("clk tree");
+        assert_eq!(clk.n_loads, 4, "{}", r.text());
+        assert_eq!(clk.fanout, 4);
+        assert_eq!(clk.n_buffers, 1);
+        assert_eq!(clk.net, "clk");
+        assert_eq!(clk.insertion_ps, clk_net);
+        assert!(clk.insertion_ps > 0, "{}", r.text());
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening the pane must not move gold WNS"
+        );
+
+        let sel = ide.exec("select_clock_network clk").unwrap();
+        assert!(sel.contains("loads=4"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "clock_network"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "LOADS" && v == "4"),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.exec(
+            "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff0/Q]",
+        )
+        .unwrap();
+        let r = ide.clock_networks();
+        assert_eq!(r.clocks.len(), 2, "{}", r.text());
+        let div = r.network("clkdiv").unwrap();
+        assert!(div.generated, "{}", r.text());
+        assert_eq!(div.n_buffers, 0, "generated clocks are local, not gclk");
+        assert_eq!(div.insertion_ps, 0);
+        assert_eq!(r.network("clk").unwrap().n_loads, 4);
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let br = blinky.clock_networks();
+        assert_eq!(br.network("clk").unwrap().n_loads, 1, "{}", br.text());
+        assert_ne!(
+            br.total_loads, r.total_loads,
+            "clock-network loads are per-design HNF, not a dump"
+        );
+        let b_insert = blinky.timing.as_ref().unwrap().clk_net_ps;
+        assert_eq!(
+            br.max_insertion_ps, b_insert,
+            "blinky insertion is STA CLK_NET_PS from this placement"
+        );
+    }
+
+    /// UG907 `report_power` pane is HAD occupancy × STA clocks × PVT, not a dump.
+    /// Empty XDC keeps gold WNS.
+    #[test]
+    fn power_pane_from_had_occupancy_and_sta_not_a_dump() {
+        let mut ide = IdeModel::new();
+        let empty = ide.power_text();
+        assert!(
+            empty.contains("no design"),
+            "idle pane has no canned wattage: {empty}"
+        );
+        assert!(ide.power_report().part.is_empty());
+        assert!(
+            NavSection::TimingAnalysis
+                .actions()
+                .iter()
+                .any(|a| a.tcl == "report_power"),
+            "Flow Navigator Timing Analysis must offer report_power"
+        );
+
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_ne!(gold, 0);
+
+        let out = ide.exec("report_power").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Power);
+        assert!(out.contains("part=HL10T-C32-1"), "{out}");
+        assert!(out.contains("LUTFF=4/"), "{out}");
+        assert!(out.contains("TOTAL_UW="), "{out}");
+        let p = ide.power_report();
+        assert_eq!(p.voltage_mv, 1000);
+        assert_eq!(p.temperature_c, 25);
+        assert_eq!(p.f_mhz, 100);
+        assert_eq!(p.lutff, 4);
+        assert_eq!(p.iob, 1);
+        assert!(p.total_uw > 0, "{}", p.text());
+        assert_eq!(p.total_uw, p.static_uw + p.dynamic_uw);
+        assert!(p.logic_uw > 0);
+        assert!(p.clocks_uw > 0);
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "opening the pane must not move gold WNS"
+        );
+
+        let sel = ide.exec("select_power logic").unwrap();
+        assert!(sel.contains("RAIL=logic"), "{sel}");
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "power"),
+            "{:?}",
+            ide.properties
+        );
+        assert!(
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "UW" && v == &p.logic_uw.to_string()),
+            "{:?}",
+            ide.properties
+        );
+
+        ide.exec("set_operating_conditions -voltage 0.95 -temperature 85")
+            .unwrap();
+        let pvt = ide.power_report();
+        assert_eq!(pvt.voltage_mv, 950);
+        assert_eq!(pvt.temperature_c, 85);
+        assert_ne!(
+            pvt.total_uw, p.total_uw,
+            "PVT must move power vs gold 1.00 V 25 C"
+        );
+        assert!(
+            ide.wns_ps().unwrap() < gold,
+            "OC also scales STA (already shipped); power must still be occupancy-backed"
+        );
+
+        let mut blinky = IdeModel::new();
+        blinky.open_source(&example("blinky.sv")).unwrap();
+        blinky.run_step(FlowStep::Place).unwrap();
+        blinky.run_step(FlowStep::Route).unwrap();
+        let pb = blinky.power_report();
+        assert_eq!(pb.lutff, 1, "{}", pb.text());
+        assert!(
+            p.total_uw > pb.total_uw,
+            "counter occupancy must draw more than blinky: counter={} blinky={}",
+            p.total_uw,
+            pb.total_uw
+        );
+        assert_ne!(p.logic_uw, pb.logic_uw);
+        let bwns = blinky.wns_ps().expect("blinky STA");
+        assert_ne!(bwns, gold, "power WNS companion is per-design STA");
     }
 }
