@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/brand/die-pulse.gif" width="920" alt="HL10T die: current enters the pads, runs the fabric, and leaves">
+  <img src="docs/brand/die-flow.gif" width="920" alt="HL10T die: current enters the pads, runs the fabric, and leaves">
 </p>
 
 # Helion Design Suite (1.0)
