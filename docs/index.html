@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Helion — original FPGA family and CAD</title>
   <meta name="description" content="Open-source FPGA CAD and an original device family. Synth, place, PathFinder, STA, bitstream, desktop IDE. Contributors wanted." />
-  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
@@ -13,18 +14,19 @@
   <meta property="og:title" content="Helion — original FPGA family and CAD" />
   <meta property="og:description" content="Not a vendor skin. One Session, original HAD parts, Apache-2.0 OR MIT. We need people." />
   <meta property="og:type" content="website" />
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/og.png" />
 </head>
 <body>
   <!--
-    THESIS: Helion is original FPGA CAD; the first viewport is the HL10T die and the gold WNS, not a SaaS hero.
-    OWN-WORLD: solder-mask green-black, copper IO, amber clock spine, Tektur silkscreen, Public Sans, Red Hat Mono.
-    STORY: Visitor sees a real part, believes WNS_PS=9640, and has a path to help.
-    FIRST VIEWPORT: thesis + Get involved on the left; HAD floorplan on the right.
-    FORM: die-plot / FR4 datasheet.
+    THESIS: Helion is original FPGA CAD; the first viewport is the cropped circuit mark, not a fake die grid.
+    OWN-WORLD: the brand sheet mark (copper octagon + traces), lockup, solder-mask page.
+    STORY: Visitor sees the real Helion symbol, believes WNS_PS=9640, and has a path to help.
+    FIRST VIEWPORT: thesis + Get involved on the left; full mark on the right, unclipped.
+    FORM: brand sheet / FR4 datasheet.
     FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
   -->
   <header class="bar">
-    <a class="mark" href="index.html">Helion<span>.</span></a>
+    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="361" height="361" /><span class="word">Helion</span></a>
     <nav>
       <a href="start.html">Start</a>
       <a href="architecture.html">Architecture</a>
@@ -50,14 +52,8 @@
           <a class="btn ghost" href="https://github.com/sponsors/saksham-45">Sponsor</a>
         </p>
       </div>
-      <div class="die-wrap">
-        <div class="die-meta">
-          <span>HL10T-C32-1</span>
-          <span class="gold">WNS_PS=9640</span>
-          <span class="mute">clk 10.000 ns</span>
-        </div>
-        <div id="die"></div>
-        <div class="die-read" id="die-read"></div>
+      <div class="hero-art">
+        <img src="brand/mark.png" alt="Helion mark: octagonal die with copper traces" width="361" height="361" />
       </div>
     </section>
 
