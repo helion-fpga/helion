@@ -1,18 +1,19 @@
-//! Helion IDE — Vivado-class desktop window over the real Session engines.
+//! Helion IDE — three canvases, one activity rail, one Implement.
 //!
 //! `--version` / `--doctor` never open a window (so they work headless and on CI).
 //! The GUI paints [`helion_gui::IdeModel`]; every button and the Tcl box call into
 //! that model, which is what the unit tests already prove is not a no-op.
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
-use helion_gui::chrome::{self, OverflowMode, RAIL_OPEN_SOURCES};
+use helion_gui::chrome::{self, Activity, Canvas, RAIL_OPEN_SOURCES};
 use helion_gui::{
-    doctor, BottomTab, CdcSeverity, ClockRelation, ConstraintSection, DrcSeverity, FlowStep,
-    IdeModel, IlaTrigger, LayoutKind, MethodologySeverity, MsgSeverity, NavSection, PathGroupKind,
-    StepState, WaveRadix, WaveStyle, WorkspaceTab,
+    doctor, BottomTab, CdcSeverity, ClockRelation, ConstraintSection, DrcSeverity,
+    FlowStep, IdeModel, IlaTrigger, LayoutKind, MethodologySeverity, MsgSeverity, NavSection,
+    PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -179,11 +180,11 @@ fn run_gui() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 640.0])
-            .with_title("Helion Design Suite"),
+            .with_title("Helion"),
         ..Default::default()
     };
     eframe::run_native(
-        "helion-ide",
+        "Helion",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -195,30 +196,201 @@ fn run_gui() -> eframe::Result {
 struct HelionIde {
     model: IdeModel,
     tree_filter: String,
+    sidebar_hidden: bool,
+    activity: Activity,
+    canvas: Canvas,
+    show_tcl: bool,
+    show_palette: bool,
+    show_examples: bool,
+    recent: Vec<PathBuf>,
+    tcl_focus: bool,
 }
 
 impl HelionIde {
     fn new() -> Self {
+        let mut model = IdeModel::new();
+        let has_rtl = !model.tree.sources.is_empty();
+        // Floorplan is already preloaded on IdeModel::new (HAD die, no sources).
+        let canvas = if has_rtl { Canvas::Device } else { Canvas::Editor };
+        let activity = if has_rtl { Activity::Device } else { Activity::Files };
+        model.workspace = if has_rtl {
+            WorkspaceTab::Device
+        } else {
+            WorkspaceTab::TextEditor
+        };
+        model.bottom_tab = BottomTab::Tcl;
         Self {
-            model: IdeModel::new(),
+            model,
             tree_filter: String::new(),
+            sidebar_hidden: false,
+            activity,
+            canvas,
+            show_tcl: false,
+            show_palette: false,
+            show_examples: false,
+            recent: Vec::new(),
+            tcl_focus: false,
+        }
+    }
+
+    fn set_canvas(&mut self, c: Canvas) {
+        self.canvas = c;
+        self.model.workspace = match c {
+            Canvas::Editor => WorkspaceTab::TextEditor,
+            Canvas::Device => WorkspaceTab::Device,
+            Canvas::Timing => WorkspaceTab::Reports,
+        };
+    }
+
+    fn set_activity(&mut self, a: Activity) {
+        self.activity = a;
+        match a {
+            Activity::Files => {
+                self.sidebar_hidden = false;
+                self.model.layout = LayoutKind::Default;
+                self.set_canvas(Canvas::Editor);
+            }
+            Activity::Device => {
+                self.sidebar_hidden = false;
+                self.set_canvas(Canvas::Editor);
+            }
+            Activity::Timing => {
+                self.sidebar_hidden = false;
+                self.set_canvas(Canvas::Timing);
+            }
+            Activity::Simulate => {
+                self.sidebar_hidden = false;
+                let _ = self.model.set_layout(LayoutKind::Simulation);
+                self.model.workspace = WorkspaceTab::Wave;
+            }
+            Activity::Program => {
+                self.sidebar_hidden = false;
+                let _ = self.model.set_nav(NavSection::ProgramDebug);
+            }
+            Activity::Reports => {
+                self.sidebar_hidden = false;
+                self.set_canvas(Canvas::Timing);
+                self.model.workspace = WorkspaceTab::Reports;
+            }
+        }
+    }
+
+    fn remember(&mut self, path: PathBuf) {
+        self.recent.retain(|p| p != &path);
+        self.recent.insert(0, path);
+        self.recent.truncate(8);
+    }
+
+    fn open_path(&mut self, path: &Path) {
+        match self.model.open_source(path) {
+            Ok(_) => {
+                self.remember(path.to_path_buf());
+                self.set_canvas(Canvas::Editor);
+            }
+            Err(_) => {}
         }
     }
 }
 
 impl eframe::App for HelionIde {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        paint_menu_rail(ctx, &mut self.model);
-        paint_bottom(ctx, &mut self.model);
-        paint_navigator(ctx, &mut self.model);
-        match self.model.layout {
-            LayoutKind::Simulation => paint_sim_side(ctx, &mut self.model),
-            LayoutKind::Default => paint_sources_netlist(ctx, &mut self.model, &mut self.tree_filter),
+        handle_shortcuts(ctx, self);
+        paint_toolbar(ctx, self);
+        paint_status_bar(ctx, &self.model);
+        paint_bottom(ctx, self);
+        paint_activity_rail(ctx, self);
+        if !self.sidebar_hidden {
+            paint_sidebar(ctx, self);
         }
-        paint_properties(ctx, &mut self.model);
         egui::CentralPanel::default().show(ctx, |ui| {
-            paint_workspace(ui, &mut self.model);
+            paint_workspace(ui, self);
         });
+        paint_tcl_window(ctx, self);
+        paint_palette(ctx, self);
+        paint_examples_popup(ctx, self);
+    }
+}
+
+fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
+    let cmd = egui::Modifiers::COMMAND;
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::O)) {
+        native_open(app);
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Enter)) {
+        run_implement(&mut app.model);
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Num1)) {
+        app.set_canvas(Canvas::Editor);
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Num2)) {
+        app.set_canvas(Canvas::Device);
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Num3)) {
+        app.set_canvas(Canvas::Timing);
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::J)) {
+        app.sidebar_hidden = !app.sidebar_hidden;
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Backtick)) {
+        app.show_tcl = !app.show_tcl;
+        if app.show_tcl {
+            app.tcl_focus = true;
+            app.model.bottom_tab = BottomTab::Tcl;
+        }
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::P)) {
+        app.show_palette = !app.show_palette;
+    }
+}
+
+fn native_open(app: &mut HelionIde) {
+    if let Some(path) = native_open_dialog() {
+        app.open_path(&path);
+    }
+}
+
+fn native_open_dialog() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"try
+    POSIX path of (choose file with prompt "Open HDL" of type {"sv", "v", "svh", "vhd", "sdc", "xdc"})
+on error
+    ""
+end try"#;
+        let out = Command::new("osascript").arg("-e").arg(script).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if p.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(p))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn run_implement(model: &mut IdeModel) {
+    let _ = model.implement();
+}
+
+
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.spacing().interact_size.x.max(96.0), chrome::HIT_PRIMARY],
+        egui::Button::new(RichText::new(text).size(14.0)),
+    )
+}
+
+fn tip(name: &str, shortcut: &str, tcl: &str) -> String {
+    if tcl.is_empty() {
+        format!("{name}  {shortcut}")
+    } else {
+        format!("{name}  {shortcut}\n{tcl}")
     }
 }
 
@@ -236,304 +408,621 @@ fn data_scroll(id: &'static str) -> egui::ScrollArea {
         .max_height(p.max_height)
 }
 
-fn paint_overflow_strip(
-    ui: &mut egui::Ui,
-    mode: OverflowMode,
-    id: &'static str,
-    add: impl FnOnce(&mut egui::Ui),
-) {
-    match mode {
-        OverflowMode::Scroll => {
-            ui.horizontal(|ui| {
-                let _ = ui.small_button("‹");
-                egui::ScrollArea::horizontal()
-                    .id_salt(id)
-                    .auto_shrink([false, true])
-                    .max_height(28.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(add);
-                    });
-                let _ = ui.small_button("›");
-            });
-        }
-        OverflowMode::Wrap | OverflowMode::Fit => {
-            ui.horizontal_wrapped(add);
-        }
-        OverflowMode::Clip => {
-            // Never paint Clip: wrap so trailing labels stay on screen.
-            ui.horizontal_wrapped(add);
-        }
-    }
-}
-
-fn paint_menu_rail(ctx: &egui::Context, model: &mut IdeModel) {
-    egui::TopBottomPanel::top("rail")
-        .exact_height(chrome::RAIL_MIN_HEIGHT)
+fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::TopBottomPanel::top("toolbar")
+        .exact_height(chrome::TOOLBAR_HEIGHT)
         .show(ctx, |ui| {
-            let plan = chrome::chrome_at(ui.available_width());
-            ui.add_space(4.0);
-            paint_overflow_strip(ui, plan.rail_mode, "rail_flow_strip", |ui| {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Helion Design Suite")
-                        .strong()
-                        .size(16.0)
-                        .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
-                );
-                ui.label(
-                    RichText::new(model.part())
-                        .monospace()
-                        .color(Color32::from_rgb(0xb0, 0xb8, 0xc0)),
-                );
-                ui.separator();
-                ui.label(RichText::new("Layout").weak());
-                egui::ComboBox::from_id_salt("layout")
-                    .selected_text(model.layout.label())
-                    .show_ui(ui, |ui| {
-                        for l in LayoutKind::ALL {
-                            if ui
-                                .selectable_label(model.layout == l, l.label())
-                                .clicked()
-                            {
-                                let _ = model.set_layout(l);
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                let open = ui
+                    .add_sized(
+                        [72.0, chrome::HIT_PRIMARY],
+                        egui::Button::new("Open…"),
+                    )
+                    .on_hover_text(tip("Open", "⌘O", "open_source"));
+                if open.clicked() {
+                    native_open(app);
+                }
+                ui.menu_button("Recent", |ui| {
+                    if app.recent.is_empty() {
+                        ui.label("No recent files.");
+                    } else {
+                        let paths: Vec<PathBuf> = app.recent.clone();
+                        for p in paths {
+                            let name = p
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.display().to_string());
+                            if ui.button(name).clicked() {
+                                app.open_path(&p);
+                                ui.close_menu();
                             }
                         }
-                    });
-                ui.separator();
-                ui.label(RichText::new("Flow").weak());
-                for step in FlowStep::ALL {
-                    flow_button(ui, model, step);
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(8.0);
-                for (label, file) in RAIL_OPEN_SOURCES {
-                    if ui.button(label).clicked() {
-                        let p = helion_device::Device::examples_dir().join(file);
-                        let _ = model.open_source(&p);
                     }
-                }
+                });
+                ui.separator();
+                paint_progress_strip(ui, &mut app.model);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let impl_btn = ui
+                        .add_sized(
+                            [112.0, chrome::HIT_PRIMARY],
+                            egui::Button::new(RichText::new("Implement").strong()),
+                        )
+                        .on_hover_text(tip("Implement", "⌘↩", "impl_design"));
+                    if impl_btn.clicked() {
+                        run_implement(&mut app.model);
+                    }
+                });
             });
         });
 }
 
-fn paint_nav_section(ui: &mut egui::Ui, model: &mut IdeModel, sec: NavSection) {
-    let on = model.nav == sec;
-    let fill = if on {
-        Color32::from_rgb(0x1f, 0x4a, 0x38)
-    } else {
-        Color32::from_rgb(0x2b, 0x32, 0x3a)
-    };
-    let resp = ui.add(
-        egui::Button::new(RichText::new(sec.label()).color(Color32::from_rgb(
-            0xdc, 0xe0, 0xe4,
-        )))
-        .fill(fill)
-        .min_size(egui::vec2(ui.available_width(), 22.0)),
-    );
-    if resp.clicked() {
-        let _ = model.set_nav(sec);
-    }
-    resp.on_hover_text(format!("nav {}", sec.tcl()));
-}
-
-fn paint_nav_actions(ui: &mut egui::Ui, model: &mut IdeModel, sec: NavSection) {
-    let mut run = None;
-    ui.indent(format!("nav_actions_{}", sec.tcl()), |ui| {
-        for a in sec.actions() {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(a.label)
-                            .small()
-                            .color(Color32::from_rgb(0xc8, 0xf0, 0xd8)),
-                    )
-                    .fill(Color32::from_rgb(0x1a, 0x28, 0x22))
-                    .min_size(egui::vec2(ui.available_width(), 18.0)),
-                )
-                .on_hover_text(a.tcl)
-                .clicked()
-            {
-                run = Some(a.tcl);
+fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
+    const STEPS: [FlowStep; 4] = [
+        FlowStep::Synthesis,
+        FlowStep::Opt,
+        FlowStep::Place,
+        FlowStep::Route,
+    ];
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let n = STEPS.len();
+        for (i, step) in STEPS.iter().copied().enumerate() {
+            let state = model.step_state(step);
+            let blocked = model.step_blocked(step);
+            let (fill, stroke, text) = match state {
+                StepState::Pending => (
+                    Color32::from_rgb(0x2b, 0x32, 0x3a),
+                    Color32::from_rgb(0x5a, 0x64, 0x6e),
+                    Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                ),
+                StepState::Done => (
+                    Color32::from_rgb(0x1f, 0x4a, 0x38),
+                    Color32::from_rgb(0x3d, 0xb8, 0x7a),
+                    Color32::from_rgb(0xc8, 0xf0, 0xd8),
+                ),
+                StepState::Failed => (
+                    Color32::from_rgb(0x4a, 0x22, 0x28),
+                    Color32::from_rgb(0xe0, 0x6c, 0x75),
+                    Color32::from_rgb(0xff, 0xd0, 0xd4),
+                ),
+            };
+            ui.add_enabled_ui(blocked.is_none(), |ui| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(64.0, 28.0), Sense::click());
+                if ui.is_rect_visible(rect) {
+                    ui.painter().rect(
+                        rect,
+                        2.0,
+                        fill,
+                        Stroke::new(1.0, stroke),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        step.label(),
+                        egui::FontId::proportional(11.0),
+                        text,
+                    );
+                }
+                let hover = match blocked {
+                    Some(why) => why.to_string(),
+                    None => tip(step.label(), "", step.tcl()),
+                };
+                let resp = resp.on_hover_text(hover);
+                if resp.clicked() && blocked.is_none() {
+                    let _ = model.run_step(step);
+                }
+            });
+            if i + 1 < n {
+                ui.label(RichText::new("·").weak().size(11.0));
             }
         }
     });
-    if let Some(tcl) = run {
-        let _ = model.exec(tcl);
+}
+
+fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::SidePanel::left("activity_rail")
+        .exact_width(chrome::RAIL_WIDTH)
+        .resizable(false)
+        .show_separator_line(true)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            let mut pick = None;
+            for act in Activity::ALL {
+                let on = app.activity == act;
+                let fill = if on {
+                    Color32::from_rgb(0x1f, 0x4a, 0x38)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let resp = ui.add_sized(
+                    [chrome::RAIL_WIDTH - 4.0, chrome::HIT_PRIMARY],
+                    egui::Button::new(RichText::new(act.icon()).size(11.0).strong())
+                        .fill(fill),
+                );
+                let resp = resp.on_hover_text(tip(act.label(), "", act.tcl()));
+                if resp.clicked() {
+                    pick = Some(act);
+                }
+            }
+            if let Some(a) = pick {
+                app.set_activity(a);
+            }
+        });
+}
+
+fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
+    match app.activity {
+        Activity::Simulate => paint_sim_side(ctx, &mut app.model),
+        Activity::Files => paint_files_side(ctx, app),
+        Activity::Device => paint_files_side(ctx, app),
+        Activity::Timing | Activity::Reports => paint_files_side(ctx, app),
+        Activity::Program => paint_files_side(ctx, app),
     }
 }
 
-fn paint_navigator(ctx: &egui::Context, model: &mut IdeModel) {
-    egui::SidePanel::left("navigator")
+fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::SidePanel::left("sidebar")
         .resizable(true)
-        .default_width(chrome::NAV_WIDTH)
+        .default_width(chrome::SIDEBAR_WIDTH)
         .min_width(180.0)
+        .max_width(360.0)
         .show(ctx, |ui| {
-            ui.label(RichText::new("Flow Navigator").strong().size(14.0));
-            ui.weak("UG949 UltraFast tree — stages on Helion engines");
+            let title = match app.activity {
+                Activity::Files => "Files",
+                Activity::Device => "Device",
+                Activity::Timing => "Timing",
+                Activity::Simulate => "Simulate",
+                Activity::Program => "Program",
+                Activity::Reports => "Reports",
+            };
+            ui.label(RichText::new(title).strong().size(14.0));
             ui.add_space(4.0);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.collapsing(NavSection::BoardDevice.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::BoardDevice);
-                    paint_nav_actions(ui, model, NavSection::BoardDevice);
-                });
-                ui.collapsing(NavSection::ProjectManager.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::ProjectManager);
-                    paint_nav_actions(ui, model, NavSection::ProjectManager);
-                    paint_nav_section(ui, model, NavSection::IpIntegrator);
-                    paint_nav_actions(ui, model, NavSection::IpIntegrator);
-                });
-                ui.collapsing(NavSection::Simulation.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::Simulation);
-                    paint_nav_actions(ui, model, NavSection::Simulation);
-                });
-                ui.collapsing(NavSection::RtlAnalysis.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::RtlAnalysis);
-                    paint_nav_actions(ui, model, NavSection::RtlAnalysis);
-                });
-                ui.collapsing(NavSection::Synthesis.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::Synthesis);
-                    paint_nav_actions(ui, model, NavSection::Synthesis);
-                });
-                ui.collapsing(NavSection::Implementation.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::Implementation);
-                    paint_nav_actions(ui, model, NavSection::Implementation);
-                    paint_nav_section(ui, model, NavSection::TimingAnalysis);
-                    paint_nav_actions(ui, model, NavSection::TimingAnalysis);
-                });
-                ui.collapsing(NavSection::ProgramDebug.label(), |ui| {
-                    paint_nav_section(ui, model, NavSection::ProgramDebug);
-                    paint_nav_actions(ui, model, NavSection::ProgramDebug);
-                });
+            match app.activity {
+                Activity::Files => paint_files_tree(ui, app),
+                Activity::Device => {
+                    paint_io_ports_table(ui, &mut app.model, "sidebar_io");
+                }
+                Activity::Timing | Activity::Reports => {
+                    paint_report_catalog(ui, &mut app.model);
+                }
+                Activity::Program => {
+                    ui.label("Hardware and bitstream.");
+                    if primary_button(ui, "Program").clicked() {
+                        let _ = app.model.exec("program_hw");
+                    }
+                }
+                Activity::Simulate => {}
+            }
+            if app.model.selected.is_some()
+                || app.model.selected_source.is_some()
+                || app.model.selected_io_port.is_some()
+            {
+                paint_properties(ui, &mut app.model);
+            }
+        });
+}
+
+fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let src_rows = app.model.source_rows();
+    if src_rows.is_empty() {
+        ui.label("No sources yet.");
+        if primary_button(ui, "Open HDL…")
+            .on_hover_text(tip("Open", "⌘O", "open_source"))
+            .clicked()
+        {
+            native_open(app);
+        }
+        if ui.button("Examples").clicked() {
+            app.show_examples = true;
+        }
+        return;
+    }
+    let selected_source = app.model.selected_source.clone();
+    let mut pick_src: Option<String> = None;
+    data_scroll("files_sources")
+        .max_height(200.0)
+        .show(ui, |ui| {
+            for (i, r) in src_rows.iter().enumerate() {
+                let on = selected_source.as_deref() == Some(r.parent.as_str())
+                    || selected_source.as_deref() == Some(r.name.as_str());
+                let resp = ui.add_sized(
+                    [ui.available_width(), chrome::HIT_SIDEBAR],
+                    egui::SelectableLabel::new(on, &r.name),
+                );
+                if resp.clicked() {
+                    pick_src = Some(i.to_string());
+                }
+            }
+        });
+    if let Some(spec) = pick_src {
+        let _ = app.model.select_source(&spec);
+        app.set_canvas(Canvas::Editor);
+    }
+    ui.separator();
+    ui.label(RichText::new("Netlist").strong());
+    ui.add(
+        egui::TextEdit::singleline(&mut app.tree_filter)
+            .hint_text("filter")
+            .desired_width(f32::INFINITY),
+    );
+    let filt = app.tree_filter.to_ascii_lowercase();
+    let rows: Vec<_> = app
+        .model
+        .netlist_rows()
+        .into_iter()
+        .filter(|r| {
+            filt.is_empty()
+                || r.name.to_ascii_lowercase().contains(&filt)
+                || r.type_cell().to_ascii_lowercase().contains(&filt)
+                || r.kind.to_ascii_lowercase().contains(&filt)
+        })
+        .collect();
+    if rows.is_empty() {
+        ui.label("No netlist yet.");
+        return;
+    }
+    let selected = app.model.selected.clone();
+    let selected_netlist = app.model.selected_netlist.clone();
+    let mut pick: Option<String> = None;
+    let mut pick_obj: Option<String> = None;
+    data_scroll("files_netlist").show(ui, |ui| {
+        for r in &rows {
+            let on = selected_netlist.as_deref() == Some(r.name.as_str())
+                || selected.as_deref() == Some(r.name.as_str());
+            let resp = ui.add_sized(
+                [ui.available_width(), chrome::HIT_SIDEBAR],
+                egui::SelectableLabel::new(on, format!("{}  {}", r.name, r.type_cell())),
+            );
+            if resp.clicked() {
+                pick_obj = Some(r.name.clone());
+                pick = Some(r.name.clone());
+            }
+        }
+    });
+    if let Some(id) = pick_obj {
+        let _ = app.model.select_netlist_object(&id);
+    } else if let Some(id) = pick {
+        let _ = app.model.select_netlist(&id);
+    }
+}
+
+fn paint_status_bar(ctx: &egui::Context, model: &IdeModel) {
+    egui::TopBottomPanel::bottom("status")
+        .exact_height(chrome::STATUS_HEIGHT)
+        .show_separator_line(true)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let wns = model
+                    .wns_ps()
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "—".into());
+                let lutff = model
+                    .utilization
+                    .as_ref()
+                    .map(|u| format!("{}/{}", u.lutff, u.lutff_cap))
+                    .unwrap_or_else(|| "—".into());
+                let run = model
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|r| r.status != "Not started")
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("idle");
+                ui.label(
+                    RichText::new(format!(
+                        "{} · WNS {} · LUTFF {} · {}",
+                        model.part(),
+                        wns,
+                        lutff,
+                        run
+                    ))
+                    .monospace()
+                    .size(12.0)
+                    .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
+                );
             });
         });
 }
 
-fn paint_sources_netlist(ctx: &egui::Context, model: &mut IdeModel, tree_filter: &mut String) {
-    egui::SidePanel::left("tree")
-        .resizable(true)
-        .default_width(chrome::TREE_WIDTH)
-        .min_width(160.0)
-        .show(ctx, |ui| {
-            ui.label(RichText::new("Sources").strong());
-            ui.weak(
-                "UG893 Sources — clickable Name/Type table over RTL/constraint files, not a filename dump",
-            );
-            let src_rows = model.source_rows();
-            ui.label(format!("sources n={}", src_rows.len()));
-            let selected_source = model.selected_source.clone();
-            let mut pick_src: Option<String> = None;
-            data_scroll("ug893_sources")
-                .max_height(140.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("ug893_sources_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").strong());
-                            ui.label(RichText::new("Type").strong());
-                            ui.end_row();
-                            if src_rows.is_empty() {
-                                ui.label("—");
-                                ui.label("no sources — Open an example");
-                                ui.end_row();
-                            } else {
-                                for (i, r) in src_rows.iter().enumerate() {
-                                    let on = selected_source.as_deref() == Some(r.parent.as_str())
-                                        || selected_source.as_deref() == Some(r.name.as_str());
-                                    if ui.selectable_label(on, &r.name).clicked() {
-                                        pick_src = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, r.type_cell()).clicked() {
-                                        pick_src = Some(i.to_string());
-                                    }
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                });
-            if let Some(spec) = pick_src {
-                let _ = model.select_source(&spec);
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Netlist").strong());
-                if let Some(top) = &model.tree.top {
-                    ui.label(RichText::new(top).italics());
+fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.separator();
+    ui.label(RichText::new("Properties").strong());
+    let obj = model
+        .properties_name()
+        .or(model.selected.as_deref())
+        .or(model.selected_ip.as_deref())
+        .unwrap_or("—");
+    let rows = model.property_rows();
+    let selected = model.selected_property.clone();
+    let mut pick: Option<String> = None;
+    data_scroll("properties_table_scroll").show(ui, |ui| {
+        egui::Grid::new("properties_table")
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("Value").strong());
+                ui.end_row();
+                if rows.is_empty() {
+                    ui.label("No properties.");
+                    ui.end_row();
+                } else {
+                    for (i, r) in rows.iter().enumerate() {
+                        let on = selected.as_deref() == Some(r.name.as_str());
+                        if ui.selectable_label(on, &r.name).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        if ui.selectable_label(on, &r.value).clicked() {
+                            pick = Some(i.to_string());
+                        }
+                        ui.end_row();
+                    }
                 }
             });
-            ui.weak(
-                "UG893 Netlist — clickable Name/Type table with object links that cross-probe HNF, not a collapsing dump",
-            );
-            ui.add(
-                egui::TextEdit::singleline(tree_filter)
-                    .hint_text("filter Name/Type")
-                    .desired_width(f32::INFINITY),
-            );
-            let filt = tree_filter.to_ascii_lowercase();
-            let rows: Vec<_> = model
-                .netlist_rows()
-                .into_iter()
-                .filter(|r| {
-                    filt.is_empty()
-                        || r.name.to_ascii_lowercase().contains(&filt)
-                        || r.type_cell().to_ascii_lowercase().contains(&filt)
-                        || r.kind.to_ascii_lowercase().contains(&filt)
-                })
-                .collect();
-            ui.label(format!("netlist n={}", rows.len()));
-            let selected = model.selected.clone();
-            let selected_netlist = model.selected_netlist.clone();
-            let mut pick: Option<String> = None;
-            let mut pick_obj: Option<String> = None;
-            data_scroll("ug893_netlist")
-                .show(ui, |ui| {
-                    egui::Grid::new("ug893_netlist_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").strong());
-                            ui.label(RichText::new("Type").strong());
-                            ui.label(RichText::new("Objects").strong());
-                            ui.end_row();
-                            if rows.is_empty() {
-                                ui.label("—");
-                                ui.label("no cells/nets — synth_design");
-                                ui.label("—");
-                                ui.end_row();
-                            } else {
-                                for r in &rows {
-                                    let on = selected_netlist.as_deref() == Some(r.name.as_str())
-                                        || selected.as_deref() == Some(r.name.as_str());
-                                    if ui.selectable_label(on, &r.name).clicked() {
-                                        pick_obj = Some(r.name.clone());
-                                    }
-                                    if ui.selectable_label(on, r.type_cell()).clicked() {
-                                        pick = Some(r.name.clone());
-                                    }
-                                    if ui.selectable_label(on, &r.name).clicked() {
-                                        pick_obj = Some(r.name.clone());
-                                    }
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                });
-            if let Some(id) = pick_obj {
-                let _ = model.select_netlist_object(&id);
-            } else if let Some(id) = pick {
-                let _ = model.select_netlist(&id);
+    });
+    if let Some(spec) = pick {
+        let _ = model.select_property(&spec);
+    }
+}
+
+fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::TopBottomPanel::bottom("console")
+        .resizable(true)
+        .default_height(180.0)
+        .min_height(80.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let console_on = app.model.bottom_tab == BottomTab::Tcl
+                    || app.model.bottom_tab == BottomTab::Log;
+                if ui.selectable_label(console_on, "Console").clicked() {
+                    app.model.bottom_tab = BottomTab::Tcl;
+                }
+                if ui
+                    .selectable_label(app.model.bottom_tab == BottomTab::Messages, "Messages")
+                    .clicked()
+                {
+                    app.model.bottom_tab = BottomTab::Messages;
+                }
+                if app.activity == Activity::Simulate
+                    && ui
+                        .selectable_label(app.model.bottom_tab == BottomTab::SimLog, "Sim log")
+                        .clicked()
+                {
+                    app.model.bottom_tab = BottomTab::SimLog;
+                }
+            });
+            match app.model.bottom_tab {
+                BottomTab::Tcl | BottomTab::Log => paint_tcl_console(ui, app),
+                BottomTab::Messages => paint_messages(ui, &mut app.model),
+                BottomTab::SimLog => paint_sim_log(ui, &mut app.model),
             }
         });
 }
+
+fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
+    if !app.show_tcl {
+        return;
+    }
+    egui::Window::new("Tcl")
+        .open(&mut app.show_tcl)
+        .default_width(520.0)
+        .default_height(240.0)
+        .show(ctx, |ui| {
+            paint_tcl_console(ui, app);
+        });
+}
+
+fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
+    if !app.show_palette {
+        return;
+    }
+    let mut open = app.show_palette;
+    let mut run = None;
+    egui::Window::new("Commands")
+        .open(&mut open)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label("Recipes — run from here or the console.");
+            let recipes: &[(&str, &str)] = &[
+                ("Implement", "impl_design"),
+                ("Report timing", "report_timing"),
+                ("Report utilization", "report_utilization"),
+                ("Launch selected run", "launch_runs"),
+                ("New run", "create_run impl_2 -strategy Default"),
+                ("create_clock 10ns", "create_clock -period 10 clk"),
+                ("read_xdc examples/counter.sdc", "read_xdc"),
+            ];
+            for (name, tcl) in recipes {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), chrome::HIT_SIDEBAR],
+                        egui::Button::new(*name),
+                    )
+                    .on_hover_text(*tcl)
+                    .clicked()
+                {
+                    run = Some(*tcl);
+                }
+            }
+        });
+    app.show_palette = open;
+    if let Some(tcl) = run {
+        if tcl == "impl_design" {
+            run_implement(&mut app.model);
+        } else if tcl == "launch_runs" {
+            if let Some(name) = app
+                .model
+                .selected
+                .as_deref()
+                .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string())
+            {
+                let _ = app.model.exec(&format!("launch_runs {name}"));
+            }
+        } else if tcl == "read_xdc" {
+            let p = helion_device::Device::examples_dir().join("counter.sdc");
+            let _ = app.model.exec(&format!("read_xdc {}", p.display()));
+        } else {
+            let _ = app.model.exec(tcl);
+        }
+        app.show_palette = false;
+    }
+}
+
+fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
+    if !app.show_examples {
+        return;
+    }
+    let mut open = app.show_examples;
+    let mut pick = None;
+    egui::Window::new("Examples")
+        .open(&mut open)
+        .show(ctx, |ui| {
+            for (label, file) in RAIL_OPEN_SOURCES {
+                if ui.button(label).clicked() {
+                    pick = Some(file);
+                }
+            }
+        });
+    app.show_examples = open;
+    if let Some(file) = pick {
+        let p = helion_device::Device::examples_dir().join(file);
+        app.open_path(&p);
+        app.show_examples = false;
+    }
+}
+
+fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let avail = ui.available_width();
+    let plan = {
+        let mut p = chrome::chrome_at(ui.ctx().screen_rect().width());
+        let (row, more) = chrome::fit_or_more(&chrome::workspace_tab_labels(), avail);
+        p.tab_rows = vec![row];
+        p.more_items = more;
+        p.workspace_mode = chrome::workspace_tab_overflow(avail);
+        p
+    };
+    ui.horizontal(|ui| {
+        for lab in plan.tab_rows.first().into_iter().flatten().copied() {
+            if lab == chrome::MORE || lab == chrome::MORE_LABEL {
+                ui.menu_button(chrome::MORE, |ui| {
+                    for extra in &plan.more_items {
+                        if let Some(c) = Canvas::parse_label(extra) {
+                            if ui
+                                .selectable_label(app.canvas == c, extra.to_string())
+                                .clicked()
+                            {
+                                app.set_canvas(c);
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                });
+                continue;
+            }
+            if let Some(c) = Canvas::parse_label(lab) {
+                let on = app.canvas == c;
+                if ui
+                    .selectable_label(on, format!("{}  {}", c.label(), c.shortcut()))
+                    .on_hover_text(tip(c.label(), c.shortcut(), ""))
+                    .clicked()
+                {
+                    app.set_canvas(c);
+                }
+            }
+        }
+    });
+    ui.separator();
+    if app.activity == Activity::Program {
+        paint_hw(ui, &mut app.model);
+        return;
+    }
+    if app.activity == Activity::Simulate
+        && !matches!(
+            app.model.workspace,
+            WorkspaceTab::Device | WorkspaceTab::TextEditor | WorkspaceTab::Source
+        )
+    {
+        match app.model.workspace {
+            WorkspaceTab::Wave => paint_wave(ui, &mut app.model),
+            WorkspaceTab::Memory => paint_memory(ui, &mut app.model),
+            WorkspaceTab::Breakpoints => paint_breakpoints(ui, &mut app.model),
+            WorkspaceTab::Locals => paint_locals(ui, &mut app.model),
+            WorkspaceTab::Forces => paint_forces(ui, &mut app.model),
+            WorkspaceTab::SimSettings => paint_sim_settings(ui, &mut app.model),
+            WorkspaceTab::Source => paint_source(ui, &mut app.model),
+            _ => paint_wave(ui, &mut app.model),
+        }
+        return;
+    }
+    match app.canvas {
+        Canvas::Editor => {
+            if app.model.tree.sources.is_empty() && app.model.source_line_rows().is_empty() {
+                paint_empty_editor(ui, app);
+            } else {
+                paint_text_editor(ui, &mut app.model);
+            }
+        }
+        Canvas::Device => {
+            egui::CollapsingHeader::new("I/O")
+                .default_open(false)
+                .show(ui, |ui| {
+                    paint_io_ports_table(ui, &mut app.model, "device_io_overlay");
+                });
+            paint_device(ui, &mut app.model);
+        }
+        Canvas::Timing => {
+            if app.activity == Activity::Reports {
+                paint_reports(ui, &mut app.model);
+            } else {
+                match app.model.workspace {
+                    WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
+                    WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
+                    WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model),
+                    WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
+                    WorkspaceTab::Power => paint_power(ui, &mut app.model),
+                    WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model),
+                    WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
+                    WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
+                    WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
+                    _ => {
+                        paint_timing_summary(ui, &mut app.model);
+                        paint_timing_paths(ui, &mut app.model);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(48.0);
+        ui.label(RichText::new("No sources yet.").size(16.0));
+        ui.add_space(8.0);
+        if primary_button(ui, "Open HDL…")
+            .on_hover_text(tip("Open", "⌘O", "open_source"))
+            .clicked()
+        {
+            native_open(app);
+        }
+        ui.add_space(6.0);
+        if ui.button("Examples").clicked() {
+            app.show_examples = true;
+        }
+    });
+}
+
 
 fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
     egui::SidePanel::left("scopes")
         .resizable(true)
-        .default_width(260.0)
+        .default_width(chrome::SIDEBAR_WIDTH)
         .show(ctx, |ui| {
             ui.label(RichText::new("Scopes").strong());
-            ui.weak(
-                "UG900 Scopes — clickable Name/Type table over helion-sim, not a name (kind) dump",
-            );
             ui.horizontal(|ui| {
                 let n = model.sim_runtime_cycles.max(1);
                 if ui.button(format!("Run {n}")).clicked() {
@@ -585,9 +1074,6 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
             }
             ui.separator();
             ui.label(RichText::new("Objects").strong());
-            ui.weak(
-                "UG900 Objects — clickable Name/Type/Value table over helion-sim, not a name = value dump",
-            );
             let objects = model.object_rows().to_vec();
             let selected_object = model.selected_object.clone();
             let mut pick_obj = None;
@@ -628,9 +1114,6 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
             }
             ui.separator();
             ui.label(RichText::new("Locals").strong());
-            ui.weak(
-                "UG900 Locals — clickable Name/Type/Value over helion-sim/fabric sequential probes",
-            );
             let locals = model.local_rows().to_vec();
             let selected_local = model.selected_local.clone();
             let mut pick_local = None;
@@ -687,100 +1170,6 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
         });
 }
 
-fn paint_properties(ctx: &egui::Context, model: &mut IdeModel) {
-    egui::SidePanel::right("properties")
-        .resizable(true)
-        .default_width(chrome::PROPERTIES_WIDTH)
-        .show(ctx, |ui| {
-            ui.label(RichText::new("Properties").strong());
-            ui.weak(
-                "UG893 Properties — clickable Name/Value table over the selected HNF/HAD/STA object, not a weak-key dump",
-            );
-            let obj = model
-                .properties_name()
-                .or(model.selected.as_deref())
-                .or(model.selected_ip.as_deref())
-                .unwrap_or("—");
-            ui.label(format!(
-                "properties n={} object={obj}",
-                model.properties.len()
-            ));
-            let selected = model.selected_property.clone();
-            let rows = model.property_rows();
-            let mut pick: Option<String> = None;
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("properties_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").strong());
-                            ui.label(RichText::new("Value").strong());
-                            ui.end_row();
-                            if rows.is_empty() {
-                                ui.label("—");
-                                ui.label("no properties — select a cell, net, or port");
-                                ui.end_row();
-                            } else {
-                                for (i, r) in rows.iter().enumerate() {
-                                    let on = selected.as_deref() == Some(r.name.as_str());
-                                    if ui.selectable_label(on, &r.name).clicked() {
-                                        pick = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, &r.value).clicked() {
-                                        pick = Some(i.to_string());
-                                    }
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                });
-            if let Some(spec) = pick {
-                let _ = model.select_property(&spec);
-            }
-        });
-}
-
-fn paint_bottom(ctx: &egui::Context, model: &mut IdeModel) {
-    egui::TopBottomPanel::bottom("console")
-        .resizable(true)
-        .default_height(200.0)
-        .min_height(100.0)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let plan = chrome::chrome_at(ui.available_width());
-                paint_overflow_strip(ui, plan.bottom_mode, "bottom_tabs_strip", |ui| {
-                    for tab in BottomTab::ALL {
-                        if ui
-                            .selectable_label(model.bottom_tab == tab, tab.label())
-                            .clicked()
-                        {
-                            model.bottom_tab = tab;
-                        }
-                    }
-                    ui.label(
-                        RichText::new(&model.status)
-                            .monospace()
-                            .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
-                    );
-                });
-            });
-            match model.bottom_tab {
-                BottomTab::Tcl => {
-                    paint_tcl_console(ui, model);
-                }
-                BottomTab::Messages => {
-                    paint_messages(ui, model);
-                }
-                BottomTab::Log => {
-                    paint_log(ui, model);
-                }
-                BottomTab::SimLog => {
-                    paint_sim_log(ui, model);
-                }
-            }
-        });
-}
 
 fn msg_severity_color(sev: MsgSeverity) -> Color32 {
     match sev {
@@ -791,9 +1180,6 @@ fn msg_severity_color(sev: MsgSeverity) -> Color32 {
 }
 
 fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG893 Messages — clickable severity / object links that cross-probe HNF/HAD, not a colored dump",
-    );
     let n_err = model
         .messages
         .iter()
@@ -929,10 +1315,8 @@ fn log_status_color(ok: bool) -> Color32 {
     }
 }
 
-fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG893 Tcl Console — clickable Status/Cmd/Out table over Session, not a helion% dump",
-    );
+fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let model = &mut app.model;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Find").small());
         let find = egui::TextEdit::singleline(&mut model.console_find)
@@ -950,11 +1334,6 @@ fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
             ui.weak(format!("sel={i}"));
         }
     });
-    let n_err = model.console.iter().filter(|l| !l.ok).count();
-    ui.label(format!(
-        "tcl_console n={} errors={n_err}",
-        model.console.len()
-    ));
     let selected = model.console_selected;
     let hits = model.console_find_hits.clone();
     let rows: Vec<(usize, helion_gui::ConsoleLine)> = model
@@ -963,6 +1342,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
         .map(|(i, l)| (i, l.clone()))
         .collect();
     let mut pick_line = None;
+    let mut open_hdl = false;
     egui::ScrollArea::both()
         .stick_to_bottom(true)
         .max_height(ui.available_height() - 28.0)
@@ -979,8 +1359,13 @@ fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
                     if rows.is_empty() {
                         ui.label("—");
                         ui.label("—");
-                        ui.label("—");
-                        ui.label("no Tcl — type a command or Open counter.sv");
+                        ui.label("No commands yet.");
+                        if primary_button(ui, "Open HDL…")
+                            .on_hover_text(tip("Open", "⌘O", "open_source"))
+                            .clicked()
+                        {
+                            open_hdl = true;
+                        }
                         ui.end_row();
                     } else {
                         for (i, line) in &rows {
@@ -1026,6 +1411,10 @@ fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(i) = pick_line {
         let _ = model.select_console_line(&i.to_string());
     }
+    if open_hdl {
+        native_open(app);
+        return;
+    }
     ui.horizontal(|ui| {
         ui.label(RichText::new("helion%").monospace());
         let edit = egui::TextEdit::singleline(&mut model.input)
@@ -1041,14 +1430,6 @@ fn paint_tcl_console(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG893 Log — clickable Tcl transcript (status / cmd / engine out), not a monospace dump",
-    );
-    let n_err = model.console.iter().filter(|l| !l.ok).count();
-    ui.label(format!(
-        "log n={} errors={n_err}",
-        model.console.len()
-    ));
     let selected = model.selected_log;
     let rows: Vec<(usize, helion_gui::ConsoleLine)> = model
         .log_rows()
@@ -1111,19 +1492,11 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG900 Simulation Log — clickable Time/Severity/Id/Message table over helion-sim, not a Tcl/Log dump",
-    );
-    let n_err = model
+    let _n_err = model
         .sim_log
         .iter()
         .filter(|r| r.severity == MsgSeverity::Error)
         .count();
-    ui.label(format!(
-        "sim_log n={} errors={n_err} engine=helion-sim kernel={}",
-        model.sim_log.len(),
-        model.sim_log.last().map(|r| r.kernel.as_str()).unwrap_or("idle")
-    ));
     let selected = model.selected_sim_log;
     let rows = model.sim_log.clone();
     let mut pick: Option<usize> = None;
@@ -1145,7 +1518,7 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no sim log — run_simulation");
+                        ui.label("No simulation log yet.");
                         ui.end_row();
                     } else {
                         for (i, row) in rows.iter().enumerate() {
@@ -1181,104 +1554,29 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_workspace(ui: &mut egui::Ui, model: &mut IdeModel) {
-    let avail = ui.available_width();
-    let mode = chrome::workspace_tab_overflow(avail);
-    let labels = chrome::workspace_tab_labels();
-    let rows = chrome::wrap_labels(&labels, avail);
-    match mode {
-        OverflowMode::Wrap | OverflowMode::Clip => {
-            for row in &rows {
-                ui.horizontal(|ui| {
-                    for lab in row {
-                        if let Some(tab) = WorkspaceTab::ALL.iter().copied().find(|t| t.label() == *lab)
-                        {
-                            if ui
-                                .selectable_label(model.workspace == tab, tab.label())
-                                .clicked()
-                            {
-                                model.workspace = tab;
-                            }
-                        }
-                    }
-                });
-            }
-        }
-        OverflowMode::Fit | OverflowMode::Scroll => {
-            paint_overflow_strip(ui, mode, "workspace_tabs_strip", |ui| {
-                for tab in WorkspaceTab::ALL {
-                    if ui
-                        .selectable_label(model.workspace == tab, tab.label())
-                        .clicked()
-                    {
-                        model.workspace = tab;
-                    }
-                }
-            });
-        }
-    }
-    ui.separator();
-    match model.workspace {
-        WorkspaceTab::Summary => paint_project_summary(ui, model),
-        WorkspaceTab::Reports => paint_reports(ui, model),
-        WorkspaceTab::Settings => paint_project_settings(ui, model),
-        WorkspaceTab::Schematic => paint_schematic(ui, model),
-        WorkspaceTab::Device => paint_device(ui, model),
-        WorkspaceTab::Wave => paint_wave(ui, model),
-        WorkspaceTab::Source => paint_source(ui, model),
-        WorkspaceTab::TextEditor => paint_text_editor(ui, model),
-        WorkspaceTab::Memory => paint_memory(ui, model),
-        WorkspaceTab::Breakpoints => paint_breakpoints(ui, model),
-        WorkspaceTab::Locals => paint_locals(ui, model),
-        WorkspaceTab::Forces => paint_forces(ui, model),
-        WorkspaceTab::SimSettings => paint_sim_settings(ui, model),
-        WorkspaceTab::Hardware => paint_hw(ui, model),
-        WorkspaceTab::Ip => paint_ip(ui, model),
-        WorkspaceTab::Constraints => paint_constraints(ui, model),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, model),
-        WorkspaceTab::Cdc => paint_cdc(ui, model),
-        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, model),
-        WorkspaceTab::Power => paint_power(ui, model),
-        WorkspaceTab::Methodology => paint_methodology(ui, model),
-        WorkspaceTab::Drc => paint_drc(ui, model),
-        WorkspaceTab::Utilization => paint_utilization(ui, model),
-        WorkspaceTab::Hierarchy => paint_hierarchy(ui, model),
-        WorkspaceTab::Find => paint_find(ui, model),
-        WorkspaceTab::Package => paint_package(ui, model),
-        WorkspaceTab::Runs => paint_runs(ui, model),
-        WorkspaceTab::Bitstream => paint_bitstream(ui, model),
-    }
-}
 
 fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Project Summary");
-    ui.weak(
-        "UG893 Project Summary — clickable Session WNS / util / run / bitstream gadgets, not a dump",
-    );
     let rows = model.project_summary_gadgets();
-    let wns = model
+    let _wns = model
         .wns_ps()
         .map(|w| w.to_string())
         .unwrap_or_else(|| "-".into());
-    let lutff = rows
+    let _lutff = rows
         .iter()
         .find(|r| r.id == "utilization")
         .map(|r| r.value.as_str())
         .unwrap_or("-");
-    let run = rows
+    let _run = rows
         .iter()
         .find(|r| r.id == "run")
         .map(|r| r.status.as_str())
         .unwrap_or("-");
-    let hash = rows
+    let _hash = rows
         .iter()
         .find(|r| r.id == "bitstream")
         .map(|r| r.value.as_str())
         .unwrap_or("-");
-    ui.label(format!(
-        "project_summary n={} wns_ps={wns} lutff={lutff} run={run} hash={hash}",
-        rows.len()
-    ));
     ui.add_space(6.0);
     let selected = model.selected_summary.clone();
     let mut pick: Option<String> = None;
@@ -1356,24 +1654,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Project Settings");
-    ui.weak(
-        "UG893 Project Settings — clickable part / top / fileset / strategy Name/Value table over Session, not a dump",
-    );
     let rows = model.project_setting_rows();
-    ui.label(format!(
-        "project_settings n={} part={} top={} fileset={} strategy={}",
-        rows.len(),
-        model.part(),
-        rows.iter()
-            .find(|r| r.name == "TOP")
-            .map(|r| r.value.as_str())
-            .unwrap_or("-"),
-        model.active_fileset,
-        rows.iter()
-            .find(|r| r.name == "STRATEGY")
-            .map(|r| r.value.as_str())
-            .unwrap_or("-"),
-    ));
     let selected = model.selected_setting.clone();
     let mut pick: Option<String> = None;
     egui::ScrollArea::both()
@@ -1405,9 +1686,6 @@ fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_sim_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Simulation Settings");
-    ui.weak(
-        "UG900 Simulation Settings — clickable SIMSET / SIM_TOP / compile / elaborate Name/Value table over helion-sv/helion-sim, not xvlog/xelab",
-    );
     ui.horizontal(|ui| {
         if ui.button("Compile").clicked() {
             let _ = model.exec("compile");
@@ -1417,22 +1695,6 @@ fn paint_sim_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     let rows = model.sim_setting_rows();
-    ui.label(format!(
-        "simulation_settings n={} target=helion-sim simset={} sim_top={} include={} define={} param={} elab_debug={} snapshot={} compile_n={} elab_cells={} timescale_ps={} runtime_cycles={} engine_time_ps={}",
-        rows.len(),
-        model.sim_fileset_value(),
-        model.sim_top_value(),
-        rows.iter().find(|r| r.name == "INCLUDE_PATH").map(|r| r.value.as_str()).unwrap_or("-"),
-        rows.iter().find(|r| r.name == "DEFINE").map(|r| r.value.as_str()).unwrap_or("-"),
-        rows.iter().find(|r| r.name == "PARAM").map(|r| r.value.as_str()).unwrap_or("-"),
-        rows.iter().find(|r| r.name == "ELAB_DEBUG").map(|r| r.value.as_str()).unwrap_or("-"),
-        rows.iter().find(|r| r.name == "ELAB_SNAPSHOT").map(|r| r.value.as_str()).unwrap_or("-"),
-        model.sim_compile_modules.len(),
-        model.sim_elab.as_ref().map(|r| r.cells.to_string()).unwrap_or_else(|| "-".into()),
-        model.sim_timescale_ps,
-        model.sim_runtime_cycles,
-        model.sim_engine_time_ps(),
-    ));
     let selected = model.selected_sim_setting.clone();
     let mut pick: Option<String> = None;
     egui::ScrollArea::both()
@@ -1472,21 +1734,12 @@ fn run_status_color(status: &str) -> Color32 {
 }
 
 fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Design Runs");
-    ui.weak(
-        "UG893/UG986 Design Runs — clickable name/strategy/WNS/runtime/hash grid over Helion engines, not a dump",
-    );
+    ui.heading("Runs");
     ui.horizontal(|ui| {
-        if ui.button("Launch synth_1").clicked() {
-            let _ = model.exec("launch_runs synth_1");
-        }
-        if ui.button("Launch impl_1").clicked() {
-            let _ = model.exec("launch_runs impl_1");
-        }
-        if ui.button("Reset impl_1").clicked() {
-            let _ = model.exec("reset_runs impl_1");
-        }
-        if ui.button("Launch selected").clicked() {
+        if ui
+            .add_sized([140.0, chrome::HIT_PRIMARY], egui::Button::new("Launch selected"))
+            .clicked()
+        {
             if let Some(name) = model
                 .selected
                 .as_deref()
@@ -1495,65 +1748,22 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
                 if model.runs.iter().any(|r| r.name == name) {
                     let _ = model.exec(&format!("launch_runs {name}"));
                 }
+            } else if let Some(r) = model.runs.first() {
+                let _ = model.exec(&format!("launch_runs {}", r.name));
             }
         }
-        if ui.button("Reset selected").clicked() {
-            if let Some(name) = model
-                .selected
-                .as_deref()
-                .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string())
-            {
-                if model.runs.iter().any(|r| r.name == name) {
-                    let _ = model.exec(&format!("reset_runs {name}"));
-                }
+        ui.menu_button("New run…", |ui| {
+            if ui.button("RuntimeOpt").clicked() {
+                let _ = model.exec("create_run impl_runtime -strategy RuntimeOpt");
+                ui.close();
             }
-        }
-        if ui.button("Create RuntimeOpt").clicked() {
-            let _ = model.exec("create_run impl_runtime -strategy RuntimeOpt");
-            let _ = model.exec("launch_runs impl_runtime");
-        }
-        if ui.button("Create PhysOpt").clicked() {
-            let _ = model.exec("create_run impl_phys -strategy PhysOpt");
-            let _ = model.exec("launch_runs impl_phys");
-        }
-        if ui.button("Compare Runs").clicked() {
-            let _ = model.exec("compare_runs");
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Incremental Impl").clicked() {
-            let _ = model.exec("incremental_impl");
-        }
-        if ui.button("Fix Route +8 hops").clicked() {
-            if let Some(net) = model
-                .session()
-                .placed
-                .as_ref()
-                .and_then(|p| p.packed.iobs.first())
-                .map(|i| i.from_net.clone())
-            {
-                let _ = model.exec(&format!("fix_route {net} 8"));
+            if ui.button("PhysOpt").clicked() {
+                let _ = model.exec("create_run impl_phys -strategy PhysOpt");
+                ui.close();
             }
-        }
-        if ui.button("Insert ECO_LUT3").clicked() {
-            let _ = model.exec("insert_eco_lut ECO_LUT3 0x8");
-        }
-        if ui.button("Check ECO").clicked() {
-            let _ = model.exec("check_eco");
-        }
-        if ui.button("ECO Changes").clicked() {
-            let _ = model.exec("eco_changes");
-        }
-        if ui.button("Incremental Place+Route").clicked() {
-            let _ = model.exec("incremental_place");
-            let _ = model.exec("incremental_route");
-        }
-        if ui.button("Incremental Compile").clicked() {
-            let _ = model.exec("incremental_report");
-        }
+        });
     });
     ui.add_space(6.0);
-    ui.label(format!("runs n={}", model.runs.len()));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     egui::ScrollArea::both()
@@ -1602,7 +1812,7 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
     {
         let cmp: Vec<_> = model.compare_run_rows().into_iter().cloned().collect();
         if cmp.is_empty() {
-            ui.weak("no implementation runs — launch_runs impl_1");
+            ui.label("No runs yet.");
         } else {
             egui::Grid::new("compare_runs_table")
                 .spacing([8.0, 4.0])
@@ -1649,21 +1859,11 @@ fn incremental_status_color(status: &str) -> Color32 {
 
 fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Incremental Compile").strong());
-    ui.weak(
-        "UG986 Incremental Compile — clickable Name/Kind/Status/Site table with object links that cross-probe HNF/HAD, not a reuse cells dump",
-    );
     let rows = model.incremental_rows.clone();
-    let n_new = rows
+    let _n_new = rows
         .iter()
         .filter(|r| r.kind != "resource" && r.status == "New")
         .count();
-    ui.label(format!(
-        "incremental_report n={} reused={} new={n_new}",
-        rows.len(),
-        rows.iter()
-            .filter(|r| r.kind != "resource" && r.status == "Reused")
-            .count()
-    ));
     let selected = model.selected_incremental.clone();
     let selected_obj = model.selected.clone();
     let mut pick: Option<String> = None;
@@ -1755,16 +1955,8 @@ fn eco_status_color(status: &str) -> Color32 {
 
 fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("ECO Changes").strong());
-    ui.weak(
-        "UG893/UG986 ECO Changes — clickable Name/Kind/Status/Site table with object links that cross-probe HNF/HAD, not a check_eco dump",
-    );
     let rows = model.eco_rows();
-    let n_missing = rows.iter().filter(|r| r.status == "Missing").count();
-    ui.label(format!(
-        "eco_changes n={} placed={} missing={n_missing}",
-        rows.len(),
-        rows.iter().filter(|r| r.status == "Placed").count()
-    ));
+    let _n_missing = rows.iter().filter(|r| r.status == "Missing").count();
     let selected = model.selected_eco.clone();
     let selected_obj = model.selected.clone();
     let mut pick: Option<String> = None;
@@ -1828,7 +2020,6 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hierarchy");
-    ui.weak("UG893 Fig. 61 — nested boxes, area ∝ HNF cell/resource count (not a tree list)");
     let drawing = model.hierarchy.drawing();
     ui.label(format!(
         "boxes={} canvas={}×{}",
@@ -1934,9 +2125,6 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Find Results");
-    ui.weak(
-        "UG893 Find Results — clickable Name/Type table with object links that cross-probe HNF/HAD, not a kind-name dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Find cells").clicked() {
             let _ = model.exec("sheet_find cells");
@@ -1948,7 +2136,6 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("sheet_find nets");
         }
     });
-    ui.label(format!("find_results n={}", model.find_results.len()));
     let selected = model.selected.clone();
     let selected_find = model.selected_find;
     let rows = model.find_rows().to_vec();
@@ -2002,18 +2189,11 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'static str) {
     ui.label(RichText::new("I/O Ports").strong());
-    ui.weak(
-        "UG893 I/O Ports — clickable Name/Dir/PACKAGE_PIN table with object links that cross-probe HNF/HAD, not a collapsing dump",
-    );
-    let assigned = model
+    let _assigned = model
         .io_ports
         .iter()
         .filter(|p| p.package_pin.is_some() || p.site.is_some())
         .count();
-    ui.label(format!(
-        "io_ports n={} assigned={assigned}",
-        model.io_ports.len()
-    ));
     let selected = model.selected.clone();
     let selected_io = model.selected_io_port.clone();
     let rows = model.io_port_rows().to_vec();
@@ -2166,9 +2346,6 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
 
 fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Pblocks").strong());
-    ui.weak(
-        "UG893 Floorplanning — clickable Name/Range/Cells table with object links that cross-probe HNF/HAD, not a collapsing dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Create pblock").clicked() {
             let _ = model.exec("create_pblock");
@@ -2185,7 +2362,6 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec(&format!("resize_pblock {name} -add CLOCKREGION_X1Y1"));
         }
     });
-    ui.label(format!("pblocks n={}", model.pblocks.len()));
     let selected = model.selected.clone();
     let selected_pb = model.selected_pblock.clone();
     let rows = model.pblock_rows().to_vec();
@@ -2264,7 +2440,6 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("I/O Planning");
-    ui.weak("UG893 — PACKAGE_PIN re-places; IOSTANDARD/DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM hit HAD / STA / DRC / bitgen");
     egui::ScrollArea::vertical()
         .id_salt("package_tables")
         .auto_shrink([false, true])
@@ -2274,7 +2449,6 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
         });
     ui.separator();
     ui.label(RichText::new("Package").strong());
-    ui.weak("UG893 Fig. 53 — HAD IOB pin circles on colored I/O bank regions");
     ui.monospace(format!(
         "part={}  {}×{}  pins={}  assigned={}",
         model.package.part,
@@ -2463,120 +2637,28 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Timing Constraints");
-    ui.weak("UG893 Timing Constraints Editor — clickable clocks / I/O-delay / exception tables from helion-sta XDC, not a dump. Empty XDC keeps gold WNS.");
-    ui.add_space(6.0);
+    ui.heading("Constraints");
     ui.horizontal(|ui| {
-        if ui.button("Read examples/counter.sdc").clicked() {
-            let p = helion_device::Device::examples_dir().join("counter.sdc");
-            let _ = model.exec(&format!("read_xdc {}", p.display()));
-        }
-        if ui.button("Apply create_generated_clock ÷2").clicked() {
-            let _ = model.exec(
-                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
-            );
-        }
-        if ui.button("Apply create_generated_clock ×2").clicked() {
-            let _ = model.exec(
-                "create_generated_clock -name clk2x -source [get_ports clk] -multiply_by 2 [get_pins u_ff/Q]",
-            );
-        }
-        if ui.button("Apply create_generated_clock -invert").clicked() {
-            let _ = model.exec(
-                "create_generated_clock -name clkinv -source [get_ports clk] -divide_by 1 -invert [get_pins u_ff/Q]",
-            );
-        }
-        if ui.button("Apply create_generated_clock -edges {1 3 5}").clicked() {
-            let _ = model.exec(
-                "create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_pins u_ff/Q]",
-            );
-        }
-        if ui.button("Apply set_input_delay 1.5ns clk").clicked() {
-            let _ = model.exec("set_input_delay -clock clk 1.5 [get_ports clk]");
-        }
-        if ui.button("Apply set_output_delay 2ns led").clicked() {
-            let _ = model.exec("set_output_delay -clock clk 2.0 [get_ports led]");
-        }
-        if ui.button("Apply set_false_path clk→led").clicked() {
-            let _ = model.exec("set_false_path -from [get_ports clk] -to [get_ports led]");
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Apply set_multicycle_path 2 clk→led").clicked() {
-            let _ = model.exec("set_multicycle_path 2 -from [get_ports clk] -to [get_ports led]");
-        }
-        if ui.button("Apply set_multicycle_path -hold 1").clicked() {
-            let _ = model.exec("set_multicycle_path -hold 1 -from [get_ports clk] -to [get_ports led]");
-        }
-        if ui.button("Apply set_max_delay 5ns clk→led").clicked() {
-            let _ = model.exec("set_max_delay 5.0 -from [get_ports clk] -to [get_ports led]");
-        }
-        if ui.button("Apply set_min_delay 1ns clk→led").clicked() {
-            let _ = model.exec("set_min_delay 1.0 -from [get_ports clk] -to [get_ports led]");
-        }
-        if ui.button("Apply set_clock_groups async clk/virt").clicked() {
-            let _ = model.exec(
-                "set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]",
-            );
-        }
-        if ui.button("Apply set_clock_uncertainty 0.5ns setup").clicked() {
-            let _ = model.exec("set_clock_uncertainty -setup 0.5 [get_clocks clk]");
-        }
-        if ui.button("Apply set_clock_latency 0.4ns late").clicked() {
-            let _ = model.exec("set_clock_latency -late 0.4 [get_clocks clk]");
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Apply set_disable_timing clk→led").clicked() {
-            let _ = model.exec("set_disable_timing -from [get_ports clk] -to [get_ports led]");
-        }
-        if ui.button("Apply set_case_analysis 0 clk").clicked() {
-            let _ = model.exec("set_case_analysis 0 [get_ports clk]");
-        }
-        if ui.button("Apply set_propagated_clock clk").clicked() {
-            let _ = model.exec("set_propagated_clock [get_clocks clk]");
-        }
-        if ui.button("Apply set_clock_sense -negative").clicked() {
-            let _ = model.exec("set_clock_sense -negative [get_pins u_lut0/I0]");
-        }
-        if ui.button("Apply set_clock_sense -stop").clicked() {
-            let _ = model.exec("set_clock_sense -stop_propagation [get_pins clk_buf/O]");
-        }
-        if ui.button("Apply set_input_jitter 0.2ns clk").clicked() {
-            let _ = model.exec("set_input_jitter [get_clocks clk] 0.2");
-        }
-        if ui.button("Apply set_system_jitter 0.1ns").clicked() {
-            let _ = model.exec("set_system_jitter 0.1");
-        }
-        if ui.button("Apply set_timing_derate -late 1.1").clicked() {
-            let _ = model.exec("set_timing_derate -late 1.1");
-        }
-        if ui.button("Apply set_operating_conditions 0.95V 85C").clicked() {
-            let _ = model.exec("set_operating_conditions -voltage 0.95 -temperature 85");
-        }
-        if ui.button("Apply set_bus_skew 0.5ns clk→led").clicked() {
-            let _ = model.exec("set_bus_skew -setup 0.5 -from [get_ports clk] -to [get_ports led]");
-        }
-        if ui.button("Apply group_path -weight 2 clk→led").clicked() {
-            let _ = model.exec(
-                "group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]",
-            );
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Apply set_max_time_borrow 1ns").clicked() {
-            let _ = model.exec("set_max_time_borrow 1.0 [get_cells u_ff]");
-        }
-        if ui.button("Apply set_data_check -setup 0.5ns").clicked() {
-            let _ = model.exec(
-                "set_data_check -setup 0.5 -from [get_ports clk] -to [get_ports led]",
-            );
-        }
-        if ui.button("Apply set_data_check -hold 0.2ns").clicked() {
-            let _ = model.exec(
-                "set_data_check -hold 0.2 -from [get_ports clk] -to [get_ports led]",
-            );
-        }
+        ui.menu_button("Add…", |ui| {
+            let recipes: &[(&str, &str)] = &[
+                ("Clock 10 ns", "create_clock -period 10 clk"),
+                ("Input delay 1.5 ns", "set_input_delay -clock clk 1.5 [get_ports clk]"),
+                ("Output delay 2 ns", "set_output_delay -clock clk 2.0 [get_ports led]"),
+                ("False path", "set_false_path -from [get_ports clk] -to [get_ports led]"),
+                ("Read counter.sdc", "__read_sdc__"),
+            ];
+            for (name, tcl) in recipes {
+                if ui.button(*name).clicked() {
+                    if *tcl == "__read_sdc__" {
+                        let p = helion_device::Device::examples_dir().join("counter.sdc");
+                        let _ = model.exec(&format!("read_xdc {}", p.display()));
+                    } else {
+                        let _ = model.exec(tcl);
+                    }
+                    ui.close();
+                }
+            }
+        });
     });
     ui.add_space(6.0);
     paint_constraints_tables(ui, model);
@@ -2585,7 +2667,7 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.constraint_rows();
     if rows.is_empty() {
-        ui.label("no timing constraints — create_clock / create_generated_clock / read_xdc");
+        ui.label("No constraints yet.");
         return;
     }
     ui.label(format!(
@@ -2659,9 +2741,6 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Reports");
-    ui.weak(
-        "UG893 Reports — clickable catalog of Helion engine reports, not stacked dumps",
-    );
     ui.add_space(6.0);
     paint_report_catalog(ui, model);
     ui.add_space(8.0);
@@ -2671,13 +2750,7 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.label(
-        RichText::new(
-            "Timing Paths (report_timing) — UG903 pin-delay table (Name / Type / Incr_ps / Path_ps)",
-        )
-        .strong(),
-    );
-    ui.weak("STA arcs from helion-sta, not a selectable path-name list.");
+    ui.label(RichText::new("Timing Paths").strong());
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("Report timing").clicked() {
@@ -2692,7 +2765,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     if model.timing_paths.is_empty() {
-        ui.label("no timing paths — report_timing / Route");
+        ui.label("No timing paths yet.");
         return;
     }
     ui.add_space(4.0);
@@ -2791,11 +2864,6 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.report_catalog();
-    ui.label(format!(
-        "reports n={} complete={}",
-        rows.len(),
-        rows.iter().filter(|r| r.status == "Complete").count()
-    ));
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
     egui::Grid::new("reports_catalog")
@@ -2840,11 +2908,10 @@ fn slack_label(v: Option<i64>) -> String {
 fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(
         RichText::new(
-            "Timing Summary (report_timing_summary) — UG903/UG949 intra/inter-clock WNS/TNS/WHS/THS by path group",
+            "Timing Summary",
         )
         .strong(),
     );
-    ui.weak("STA path groups with From/To object links that cross-probe HNF clocks, not a dump. Empty XDC keeps gold WNS.");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("Report timing summary").clicked() {
@@ -2970,28 +3037,10 @@ fn clock_relation_color(rel: ClockRelation) -> Color32 {
 
 fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Clock Interaction");
-    ui.weak(
-        "UG949 report_clock_interaction — STA From×To matrix with object links that cross-probe HNF clock sources, not a dump",
-    );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report clock interaction").clicked() {
             let _ = model.exec("report_clock_interaction");
-        }
-        if ui.button("Apply set_clock_groups async clk/virt").clicked() {
-            let _ = model.exec(
-                "set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]",
-            );
-        }
-        if ui.button("Apply set_false_path clk→virt").clicked() {
-            let _ = model.exec(
-                "set_false_path -from [get_clocks clk] -to [get_clocks virt]",
-            );
-        }
-        if ui.button("Apply set_max_delay -datapath_only 2ns").clicked() {
-            let _ = model.exec(
-                "set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]",
-            );
         }
     });
     ui.add_space(6.0);
@@ -3083,26 +3132,10 @@ fn cdc_severity_color(sev: CdcSeverity) -> Color32 {
 
 fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("CDC");
-    ui.weak(
-        "UG906 report_cdc — STA inter-clock rows with object links that cross-probe HNF clock sources, not a dump",
-    );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report CDC").clicked() {
             let _ = model.exec("report_cdc");
-        }
-        if ui.button("Apply set_clock_groups async clk/virt").clicked() {
-            let _ = model.exec(
-                "set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]",
-            );
-        }
-        if ui.button("Apply set_false_path clk→virt").clicked() {
-            let _ = model.exec("set_false_path -from [get_clocks clk] -to [get_clocks virt]");
-        }
-        if ui.button("Apply set_max_delay -datapath_only 2ns").clicked() {
-            let _ = model.exec(
-                "set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]",
-            );
         }
     });
     ui.add_space(6.0);
@@ -3186,21 +3219,10 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Clock Networks");
-    ui.weak(
-        "UG903 report_clock_networks — STA clock tree with source/net links that cross-probe HNF, not a dump",
-    );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report clock networks").clicked() {
             let _ = model.exec("report_clock_networks");
-        }
-        if ui.button("Apply create_generated_clock ÷2").clicked() {
-            let _ = model.exec(
-                "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
-            );
-        }
-        if ui.button("Apply set_propagated_clock clk").clicked() {
-            let _ = model.exec("set_propagated_clock [get_clocks clk]");
         }
     });
     ui.add_space(6.0);
@@ -3261,16 +3283,10 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Power");
-    ui.weak(
-        "UG907 report_power — HAD occupancy × STA clocks with Utilization Details that cross-probe HNF, not a LUTFF dump",
-    );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report power").clicked() {
             let _ = model.exec("report_power");
-        }
-        if ui.button("Apply set_operating_conditions 0.95V 85C").clicked() {
-            let _ = model.exec("set_operating_conditions -voltage 0.95 -temperature 85");
         }
     });
     ui.add_space(6.0);
@@ -3362,19 +3378,10 @@ fn methodology_severity_color(sev: MethodologySeverity) -> Color32 {
 
 fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Methodology");
-    ui.weak(
-        "UG949 report_methodology — STA/XDC/HNF checks with object links that cross-probe HNF/HAD, not a dump",
-    );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report methodology").clicked() {
             let _ = model.exec("report_methodology");
-        }
-        if ui.button("Apply create_clock 10ns").clicked() {
-            let _ = model.exec("create_clock -period 10.000 [get_ports clk]");
-        }
-        if ui.button("Apply set_output_delay 0.5ns led").clicked() {
-            let _ = model.exec("set_output_delay 0.5 -clock [get_clocks clk] [get_ports led]");
         }
     });
     ui.add_space(6.0);
@@ -3527,7 +3534,6 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("DRC");
-    ui.weak("UG893 DRC — helion-drc rule rows with object links that cross-probe HNF/HAD, not a one-line dump");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report DRC").clicked() {
@@ -3606,9 +3612,6 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Utilization");
-    ui.weak(
-        "UG893 Utilization — HAD occupancy bars + hierarchical instance links that cross-probe HNF, not a dump",
-    );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Report utilization").clicked() {
@@ -3718,7 +3721,6 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
 
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
-    ui.weak("UG893 Fig. 55/56/57 — HNF symbols, pin stubs, orthogonal nets (dotted = off-sheet, thick = bus)");
     model
         .schematic
         .set_viewport(ui.available_width(), ui.available_height().max(240.0));
@@ -3782,9 +3784,6 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     if !model.timing_paths.is_empty() {
         ui.label(RichText::new("Timing paths").small());
-        ui.weak(
-            "UG893 Fig. 55 — clickable Name/From/To/Slack_ps table from helion-sta, not endpoint slack= chips",
-        );
         let mut pick_path = None;
         let selected_path = model.selected_timing_path;
         egui::Grid::new("schematic_timing_paths")
@@ -3888,7 +3887,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                             Color32::from_rgb(0x7a, 0x84, 0x8e)
                         },
                     );
-                    // UG893 Fig. 60: ports / IOB as right-pointing triangles; LUTs and FFs as boxes.
+                    // Ports / IOB as right-pointing triangles; LUTs and FFs as boxes.
                     if port || sy.kind == "IOB_OUT" {
                         let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
                         p.add(egui::Shape::convex_polygon(pts, fill, stroke));
@@ -3917,7 +3916,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                         } else {
                             egui::pos2(r.left(), tip.y)
                         };
-                        // UG893 Fig. pin stub: a short line inside and outside the symbol.
+                        // Pin stub: a short line inside and outside the symbol.
                         let inner = if pin.output {
                             egui::pos2(r.right() - 10.0, tip.y)
                         } else {
@@ -3990,16 +3989,6 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Device");
-    ui.weak(format!(
-        "HAD {}  drawing {}×{} @ X{}Y{}  sites={} occupied={}  (UG893 floorplan, not a site list)",
-        model.part(),
-        model.device.cols,
-        model.device.rows,
-        model.device.x0,
-        model.device.y0,
-        model.device.sites.len(),
-        model.device.occupied_count()
-    ));
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("CLB")
@@ -4047,7 +4036,6 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
         .auto_shrink([false, true])
         .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
         .show(ui, |ui| {
-            paint_io_ports_table(ui, model, "io_ports_device");
             paint_pblocks_table(ui, model);
             paint_clock_regions(ui, model);
             paint_device_routes(ui, model);
@@ -4164,7 +4152,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                         if on { gold } else { purple },
                     );
                 }
-                // UG893 Floorplanning: Pblock rectangles (create_pblock / resize_pblock).
+                // Pblock rectangles (create_pblock / resize_pblock).
                 for pb in &model.pblocks {
                     if !pb.ranged {
                         continue;
@@ -4189,7 +4177,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                         if on { gold } else { amber },
                     );
                 }
-                // PathFinder IOB nets over the die (UG893 Device routing, not occupancy restyle).
+                // PathFinder IOB nets over the die.
                 let route_col = Color32::from_rgb(0x3d, 0xb8, 0x7a);
                 let unroute_col = Color32::from_rgb(0x5a, 0x64, 0x6e);
                 for rt in &model.device.routes {
@@ -4319,15 +4307,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Clock Regions").strong());
-    ui.weak(
-        "UG893 Fig. 49 Clock Regions — clickable Name/X0/Y0/X1/Y1/Sites table over HAD, not a clock_region dump",
-    );
     let regions = model.device.clock_regions.clone();
-    ui.label(format!(
-        "clock_regions n={} part={}",
-        regions.len(),
-        model.part()
-    ));
+
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     if regions.is_empty() {
@@ -4382,11 +4363,7 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Device Routing").strong());
-    ui.weak(
-        "UG893 Device Routing — clickable Net/Hops/Delay_ps table over PathFinder, not a device_route dump",
-    );
     let routes = model.device.routes.clone();
-    ui.label(format!("device_routes n={}", routes.len()));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     if routes.is_empty() {
@@ -4427,9 +4404,6 @@ fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Source");
-    ui.weak(
-        "UG900 Source — RTL + line-breakpoint gutter over helion-sim posedge PC, not a file dump",
-    );
     ui.horizontal(|ui| {
         let n = model.sim_runtime_cycles.max(1);
         if ui.button(format!("Run {n}")).clicked() {
@@ -4476,7 +4450,7 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no source — add RTL");
+                        ui.label("No sources yet.");
                         ui.end_row();
                     } else {
                         for r in &rows {
@@ -4524,9 +4498,6 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Text Editor");
-    ui.weak(
-        "UG893 Text Editor — project-mode RTL with methodology/DRC markers and schematic cross-probe, not a file dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Open").clicked() {
             let _ = model.open_text_editor();
@@ -4555,7 +4526,7 @@ fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no source — add RTL");
+                        ui.label("No sources yet.");
                         ui.end_row();
                     } else {
                         for r in &rows {
@@ -4611,9 +4582,6 @@ fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Memory");
-    ui.weak(
-        "UG900 Memory — clickable Name/Type/Addr/Data table over helion-sim LUT INIT and fabric BLE/BRAM, not a hex dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Run 16").clicked() {
             let _ = model.sim_run(16);
@@ -4707,9 +4675,6 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Breakpoints");
-    ui.weak(
-        "UG900 Breakpoints — clickable Id/Enabled/Signal/Condition/Hits over helion-sim/fabric, not a dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Add led == 1").clicked() {
             let _ = model.add_breakpoint("led 1");
@@ -4781,9 +4746,6 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Force Constants");
-    ui.weak(
-        "UG900 Force Constants — clickable Name/Kind/Value/Start/Cancel over helion-sim force/deposit, not a Tcl dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Force led 1").clicked() {
             let _ = model.add_force("led 1");
@@ -4860,9 +4822,6 @@ fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_locals(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Locals");
-    ui.weak(
-        "UG900 Locals — clickable Name/Type/Value table over current-scope helion-sim/fabric probes, not a dump",
-    );
     ui.horizontal(|ui| {
         if ui.button("Run 16").clicked() {
             let _ = model.sim_run(16);
@@ -5209,15 +5168,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG900 Wave Markers — clickable Name/Sample/Time_ps table over helion-sim, not a marker-name dump",
-    );
     let markers = model.wave.markers.clone();
-    ui.label(format!(
-        "wave_markers n={} timescale_ps={}",
-        markers.len(),
-        model.wave.timescale_ps
-    ));
     let selected = model.selected_wave_marker.clone();
     let mut pick: Option<String> = None;
     if markers.is_empty() {
@@ -5256,15 +5207,7 @@ fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_wave_cursors(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG900 Wave Cursors — clickable Name/Sample/Time_ps/Delta table over helion-sim, not an A t= dump",
-    );
     let rows = model.wave_cursor_rows();
-    ui.label(format!(
-        "wave_cursors n={} timescale_ps={}",
-        rows.len(),
-        model.wave.timescale_ps
-    ));
     let selected = model.selected_wave_cursor.clone();
     let mut pick: Option<String> = None;
     data_scroll("ug900_wave_cursors_scroll").show(ui, |ui| {
@@ -5304,11 +5247,7 @@ fn paint_wave_cursors(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_virtual_buses(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.weak(
-        "UG900 Virtual Bus — clickable Name/Members/Width/Value table over packed helion-sim traces, not a pack dump",
-    );
     let buses = model.wave.virtual_buses.clone();
-    ui.label(format!("virtual_buses n={}", buses.len()));
     let selected = model.selected_virtual_bus.clone();
     let mut pick: Option<String> = None;
     if buses.is_empty() {
@@ -5475,9 +5414,6 @@ fn hw_stat_bit_color(name: &str, value: bool) -> Color32 {
 
 fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hardware Manager");
-    ui.weak(
-        "UG893 Hardware Manager / UG900 debug — helion-hw TAP STAT bits + ILA samples, not a one-liner",
-    );
     ui.horizontal(|ui| {
         if ui.button("Open Hardware Manager").clicked() {
             let _ = model.exec("open_hw_manager");
@@ -5533,7 +5469,6 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     ui.separator();
     ui.label(RichText::new("ILA Dashboard").strong());
-    ui.weak("UG900 — trigger/window on helion-debug capture, samples on Wave");
     ui.horizontal(|ui| {
         if ui
             .selectable_label(model.ila.trigger == IlaTrigger::Rising, "Rising")
@@ -5865,52 +5800,4 @@ fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(name) = pick {
         let _ = model.select_ip_core(&name);
     }
-}
-
-fn flow_button(ui: &mut egui::Ui, model: &mut IdeModel, step: FlowStep) {
-    let state = model.step_state(step);
-    let (fill, stroke, text) = match state {
-        StepState::Pending => (
-            Color32::from_rgb(0x2b, 0x32, 0x3a),
-            Color32::from_rgb(0x5a, 0x64, 0x6e),
-            Color32::from_rgb(0xdc, 0xe0, 0xe4),
-        ),
-        StepState::Done => (
-            Color32::from_rgb(0x1f, 0x4a, 0x38),
-            Color32::from_rgb(0x3d, 0xb8, 0x7a),
-            Color32::from_rgb(0xc8, 0xf0, 0xd8),
-        ),
-        StepState::Failed => (
-            Color32::from_rgb(0x4a, 0x22, 0x28),
-            Color32::from_rgb(0xe0, 0x6c, 0x75),
-            Color32::from_rgb(0xff, 0xd0, 0xd4),
-        ),
-    };
-    let label = format!("  {}  ", step.label());
-    let galley = ui.painter().layout_no_wrap(
-        label.clone(),
-        egui::FontId::proportional(14.0),
-        text,
-    );
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(galley.size().x + 8.0, 28.0),
-        Sense::click(),
-    );
-    if ui.is_rect_visible(rect) {
-        ui.painter()
-            .rect(rect, 4.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-        let pos = egui::pos2(
-            rect.center().x - galley.size().x / 2.0,
-            rect.center().y - galley.size().y / 2.0,
-        );
-        ui.painter().galley(pos, galley, text);
-    }
-    if resp.hovered() {
-        ui.painter()
-            .rect_stroke(rect, 4.0, Stroke::new(1.5, stroke), egui::StrokeKind::Outside);
-    }
-    if resp.clicked() {
-        let _ = model.run_step(step);
-    }
-    resp.on_hover_text(step.tcl());
 }

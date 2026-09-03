@@ -4,6 +4,7 @@
 pub const GPUI_TOOLKIT: &str = "gpui";
 
 pub mod chrome;
+pub use chrome::{Activity, Canvas};
 pub mod doctor;
 pub mod ide;
 pub use ide::{

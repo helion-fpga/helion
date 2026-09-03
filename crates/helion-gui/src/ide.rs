@@ -3849,6 +3849,60 @@ impl WorkspaceTab {
         WorkspaceTab::Bitstream,
     ];
 
+    /// On-screen canvases (MUST 1). Internal ALL remains for routing.
+    pub const CANVASES: [WorkspaceTab; 3] = [
+        WorkspaceTab::TextEditor,
+        WorkspaceTab::Device,
+        WorkspaceTab::Reports,
+    ];
+
+    pub fn canvas(self) -> WorkspaceTab {
+        match self {
+            WorkspaceTab::Source | WorkspaceTab::TextEditor => WorkspaceTab::TextEditor,
+            WorkspaceTab::Device | WorkspaceTab::Package => WorkspaceTab::Device,
+            WorkspaceTab::Reports
+            | WorkspaceTab::Constraints
+            | WorkspaceTab::ClockInteraction
+            | WorkspaceTab::Cdc
+            | WorkspaceTab::ClockNetworks
+            | WorkspaceTab::Power
+            | WorkspaceTab::Methodology
+            | WorkspaceTab::Drc
+            | WorkspaceTab::Utilization
+            | WorkspaceTab::Runs => WorkspaceTab::Reports,
+            other => other,
+        }
+    }
+
+    pub fn canvas_label(self) -> &'static str {
+        match self.canvas() {
+            WorkspaceTab::TextEditor => "Editor",
+            WorkspaceTab::Device => "Device",
+            WorkspaceTab::Reports => "Timing",
+            other => other.label(),
+        }
+    }
+
+    pub fn is_canvas(self) -> bool {
+        matches!(
+            self,
+            WorkspaceTab::TextEditor | WorkspaceTab::Device | WorkspaceTab::Reports
+        )
+    }
+
+    pub fn sim_only(self) -> bool {
+        matches!(
+            self,
+            WorkspaceTab::Wave
+                | WorkspaceTab::Source
+                | WorkspaceTab::Memory
+                | WorkspaceTab::Breakpoints
+                | WorkspaceTab::Locals
+                | WorkspaceTab::Forces
+                | WorkspaceTab::SimSettings
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             WorkspaceTab::Summary => "Project Summary",
@@ -4248,6 +4302,17 @@ impl BottomTab {
         BottomTab::SimLog,
     ];
 
+    /// Painted bottom tabs (MUST 11). Log is the console; Sim log is Simulate-only.
+    pub const HOME: [BottomTab; 2] = [BottomTab::Tcl, BottomTab::Messages];
+
+    pub fn paint_label(self) -> &'static str {
+        match self {
+            BottomTab::Tcl => "Console",
+            BottomTab::Log => "Console",
+            other => other.label(),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             BottomTab::Tcl => "Tcl Console",
@@ -4531,7 +4596,7 @@ impl IdeModel {
             package_pins: Vec::new(),
             package: PackageDrawing::default(),
             pblocks: Vec::new(),
-            workspace: WorkspaceTab::Reports,
+            workspace: WorkspaceTab::Device,
             bottom_tab: BottomTab::Tcl,
             message_filter: None,
             selected_message: None,
@@ -5972,6 +6037,55 @@ impl IdeModel {
         self.run_step_from(step, None)
     }
 
+    /// Why a flow step is illegal right now (`Place first`). None = enabled.
+    pub fn step_blocked(&self, step: FlowStep) -> Option<&'static str> {
+        match step {
+            FlowStep::Synthesis => {
+                if self.tree.sources.is_empty() {
+                    Some("Open a source first")
+                } else {
+                    None
+                }
+            }
+            FlowStep::Opt | FlowStep::Place => {
+                if self.shell.session.design.is_none() {
+                    Some("Synthesize first")
+                } else {
+                    None
+                }
+            }
+            FlowStep::Route => {
+                if self.shell.session.placed.is_none() {
+                    Some("Place first")
+                } else {
+                    None
+                }
+            }
+            FlowStep::Bitstream => {
+                if self.shell.session.routed.is_none() {
+                    Some("Route first")
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Primary Implement: Synthesis → Opt → Place → Route. Bitstream is secondary.
+    pub fn implement(&mut self) -> Result<String, String> {
+        let mut last = String::new();
+        for step in [FlowStep::Synthesis, FlowStep::Opt, FlowStep::Place, FlowStep::Route] {
+            if self.step_state(step) != StepState::Done {
+                last = self.run_step(step)?;
+            }
+        }
+        if last.is_empty() {
+            Ok("implement already done".into())
+        } else {
+            Ok(last)
+        }
+    }
+
     fn run_step_from(&mut self, step: FlowStep, source: Option<PathBuf>) -> Result<String, String> {
         let r = self.run_step_inner(step, source);
         self.steps[step.index()] = match &r {
@@ -6090,7 +6204,7 @@ impl IdeModel {
         self.layout = layout;
         self.workspace = match layout {
             LayoutKind::Simulation => WorkspaceTab::Wave,
-            LayoutKind::Default => WorkspaceTab::Reports,
+            LayoutKind::Default => WorkspaceTab::Device,
         };
         Ok(format!("layout {}", layout.tcl()))
     }
@@ -31486,101 +31600,106 @@ mod tests {
         assert_eq!(ide.wns_ps(), Some(9640));
     }
 
-    /// CAD chrome at ~1440×900: naive one-row strip clips Bitstream; shipped
-    /// wrap/scroll keeps every tab and rail action selectable; tables both-axis
-    /// with a bounded height.
+
+    /// CAD chrome at ~1440×900: three canvases fit; More ⋯ if needed;
+    /// wrap must not steal canvas; examples stay off the rail; side chrome
+    /// is rail + sidebar, not 680.
     #[test]
     fn chrome_overflow_keeps_every_tab_and_rail_action_selectable_at_desktop_width() {
-        use crate::chrome::{self, OverflowMode, RAIL_OPEN_SOURCES};
+        use crate::chrome::{self, Activity, OverflowMode, RAIL_OPEN_SOURCES};
+
+        assert_ne!(
+            chrome::side_chrome_width(),
+            680.0,
+            "side chrome must not be NAV+TREE+PROPERTIES=680"
+        );
+        assert_eq!(
+            chrome::side_chrome_width(),
+            chrome::RAIL_WIDTH + chrome::SIDEBAR_WIDTH
+        );
+        assert_eq!(chrome::RAIL_WIDTH, 40.0);
+        assert_eq!(chrome::SIDEBAR_WIDTH, 240.0);
+        assert_eq!(chrome::HIT_PRIMARY, 32.0);
+        assert_eq!(chrome::HIT_SIDEBAR, 28.0);
+        assert!(chrome::workspace_matches_canvases());
+
+        let labels = chrome::workspace_tab_labels();
+        assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(WorkspaceTab::CANVASES.len(), 3);
+        assert_eq!(WorkspaceTab::ALL.len(), 28);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
-        let labels = chrome::workspace_tab_labels();
-        assert_eq!(labels.last().copied(), Some("Bitstream"));
-        let clipped = chrome::visible_if_clipped(&labels, avail);
         assert!(
-            chrome::would_clip(&labels, avail),
-            "28 tab extents must exceed the central pane ({avail})"
+            !chrome::would_clip(&labels, avail),
+            "3 canvases must fit at 1440 (avail={avail})"
         );
-        assert!(
-            !clipped.iter().any(|l| *l == "Bitstream"),
-            "naive horizontal clips Bitstream: {clipped:?}"
-        );
-        assert_eq!(
-            chrome::naive_tab_overflow(avail),
-            OverflowMode::Clip,
-            "naive paint path is Clip"
-        );
-        assert_eq!(
-            chrome::workspace_tab_overflow(avail),
-            OverflowMode::Wrap,
-            "shipped paint must Wrap instead of Clip so Bitstream stays on screen"
-        );
-        assert!(
-            !OverflowMode::Clip.keeps_trailing(),
-            "Clip drops trailing labels"
-        );
+        assert_eq!(chrome::naive_tab_overflow(avail), OverflowMode::Fit);
+        assert_eq!(chrome::workspace_tab_overflow(avail), OverflowMode::Fit);
+        assert!(OverflowMode::Wrap.steals_canvas());
+        assert!(!OverflowMode::Fit.steals_canvas());
+        assert!(!OverflowMode::More.steals_canvas());
+        assert!(!OverflowMode::Clip.keeps_trailing());
 
         let plan = chrome::chrome_at(chrome::DESKTOP_WIDTH);
         assert_eq!(plan.window_w, 1440.0);
-        assert_eq!(plan.naive_workspace_mode, OverflowMode::Clip);
-        assert_eq!(plan.workspace_mode, OverflowMode::Wrap);
-        assert_eq!(plan.workspace_tabs.len(), WorkspaceTab::ALL.len());
-        assert!(
-            plan.tab_rows.iter().any(|r| r.contains(&"Bitstream")),
-            "wrap rows must include Bitstream: {:?}",
-            plan.tab_rows
-        );
-        for tab in WorkspaceTab::ALL {
+        assert_eq!(plan.workspace_mode, OverflowMode::Fit);
+        assert_eq!(plan.tab_rows.len(), 1, "one tab row; wrap must not steal canvas");
+        assert_eq!(plan.workspace_tabs, vec!["Editor", "Device", "Timing"]);
+        for lab in ["Editor", "Device", "Timing"] {
             assert!(
-                plan.tab_is_selectable(tab.label()),
-                "tab {} must stay selectable at 1440: mode={:?} rows={:?}",
-                tab.label(),
-                plan.workspace_mode,
+                plan.tab_is_selectable(lab),
+                "canvas {lab} must stay selectable at 1440: {:?}",
                 plan.tab_rows
             );
         }
         assert_eq!(plan.dropped_workspace(), 0);
+        assert!(plan.more_items.is_empty(), "More not needed at 1440: {:?}", plan.more_items);
 
-        for (label, _) in RAIL_OPEN_SOURCES {
+        assert_eq!(
+            plan.rail_actions,
+            vec!["Files", "Device", "Timing", "Simulate", "Program", "Reports"]
+        );
+        for a in Activity::ALL {
             assert!(
-                plan.rail_is_selectable(label),
-                "rail action {label} must stay selectable: {:?}",
+                plan.rail_is_selectable(a.label()),
+                "rail {} clipped: {:?}",
+                a.label(),
                 plan.rail_rows
             );
         }
-        for step in FlowStep::ALL {
+        for (label, _) in RAIL_OPEN_SOURCES {
             assert!(
-                plan.rail_is_selectable(step.label()),
-                "flow {} clipped",
-                step.label()
+                !plan.rail_actions.iter().any(|l| *l == label),
+                "examples must not be on the rail: {label}"
+            );
+            assert!(
+                !plan.rail_is_selectable(label),
+                "examples must not be selectable on the rail: {label}"
             );
         }
-        assert!(plan.rail_is_selectable("Open hier.sv"));
+        assert!(!plan.rail_actions.iter().any(|l| l.starts_with("Open ")));
         assert_eq!(plan.dropped_rail(), 0);
         assert!(plan.rail_mode.keeps_trailing());
         assert_ne!(plan.rail_mode, OverflowMode::Clip);
 
-        assert_eq!(plan.bottom_tabs.last().copied(), Some("Simulation Log"));
-        for tab in BottomTab::ALL {
-            assert!(plan.bottom_tabs.contains(&tab.label()), "{}", tab.label());
-        }
+        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages"]);
+        assert!(!plan.bottom_tabs.contains(&"Tcl Console"));
+        assert!(!plan.bottom_tabs.contains(&"Log"));
+        assert!(!plan.bottom_tabs.contains(&"Simulation Log"));
         assert!(plan.bottom_mode.keeps_trailing());
 
-        for sec in NavSection::ALL {
-            assert!(
-                plan.nav_sections.contains(&sec.label()),
-                "navigator {}",
-                sec.label()
-            );
-        }
+        assert_eq!(
+            plan.nav_sections,
+            vec!["Files", "Device", "Timing", "Simulate", "Program", "Reports"]
+        );
+        assert_eq!(plan.nav_sections.len(), 6);
+        assert_ne!(plan.nav_sections.len(), 9);
 
         assert!(chrome::grid_clips_last_column(10, 80.0, 400.0));
         assert!(!chrome::grid_clips_last_column(2, 80.0, 400.0));
         let table = chrome::table_scroll_policy(10, 400.0);
-        assert!(
-            table.last_column_would_clip,
-            "10×80 cols clip at 400px"
-        );
+        assert!(table.last_column_would_clip, "10×80 cols clip at 400px");
         assert!(table.x && table.y, "clipped last column requires both-axis scroll");
         assert_eq!(table.max_height, chrome::TABLE_MAX_HEIGHT);
         assert!(
@@ -31592,22 +31711,32 @@ mod tests {
         assert!(plan.table.x && plan.table.y);
 
         let squeezed = chrome::chrome_at(1100.0);
-        assert_eq!(squeezed.naive_workspace_mode, OverflowMode::Clip);
-        assert_eq!(squeezed.workspace_mode, OverflowMode::Wrap);
+        assert_eq!(squeezed.workspace_mode, OverflowMode::Fit);
+        assert_eq!(squeezed.tab_rows.len(), 1);
+        assert!(!squeezed.workspace_mode.steals_canvas());
         assert_eq!(squeezed.dropped_workspace(), 0);
         assert_eq!(squeezed.dropped_rail(), 0);
-        assert!(squeezed.tab_is_selectable("Bitstream"));
-        assert!(squeezed.rail_is_selectable("Open hier.sv"));
+        assert!(squeezed.tab_is_selectable("Timing"));
+        assert!(!squeezed.rail_is_selectable("Open hier.sv"));
+
+        let tiny = chrome::chrome_at(200.0);
+        assert_eq!(tiny.workspace_mode, OverflowMode::More);
+        assert!(
+            tiny.tab_rows.iter().any(|r| r.contains(&chrome::MORE)),
+            "More ⋯ if needed: {:?}",
+            tiny.tab_rows
+        );
+        assert_eq!(tiny.tab_rows.len(), 1, "More stays on one row");
+        assert!(!tiny.workspace_mode.steals_canvas());
+        assert_eq!(tiny.dropped_workspace(), 0);
+        assert!(tiny.tab_is_selectable("Timing"));
 
         let cell = chrome::floorplan_fit_cell(32, 33, 800.0, 500.0);
         assert!(
             chrome::floorplan_fits_viewport(32, 33, cell, 800.0, 500.0),
             "fit cell {cell} must show the whole 32×33 die in 800×500"
         );
-        assert!(
-            cell >= 4.0 && cell <= 24.0,
-            "cell out of range: {cell}"
-        );
+        assert!(cell >= 4.0 && cell <= 24.0, "cell out of range: {cell}");
         assert!(
             chrome::DEVICE_TABLES_MAX_HEIGHT < chrome::DESKTOP_HEIGHT / 3.0,
             "device tables must leave room for an expanding floorplan"
