@@ -29,16 +29,13 @@
   </header>
 
   <main id="main">
-    <section class="hero">
-      <div class="hero-visual">
-        <video autoplay muted loop playsinline poster="brand/hero-die.jpg">
-          <source src="brand/die-pulse.mp4?v=flow" type="video/mp4" />
-          <img src="brand/die-flow.gif" alt="Time-stream flowing live through the die" />
-        </video>
-      </div>
-      <div>
-        <h1>Co-creating an original FPGA family.</h1>
-        <p class="lede">
+    <section class="hero" id="hero-stage">
+      <video class="hero-bg" id="hero-vid" autoplay muted loop playsinline poster="brand/hero-die.jpg" aria-hidden="true">
+        <source src="brand/die-pulse.mp4?v=flow" type="video/mp4" />
+      </video>
+      <div class="hero-copy" id="hero-copy">
+        <h1 data-punch>Co-creating an original FPGA family.</h1>
+        <p class="lede" data-punch>
           Synth, pack, PathFinder, STA, bitstream, and a desktop IDE — one Session,
           one HAD part. Empty-XDC <code>counter.sv</code> gold is <span class="gold">WNS_PS=9640</span>.
         </p>
@@ -46,6 +43,7 @@
           <a class="btn ghost" href="use.html">Use Helion →</a>
         </p>
       </div>
+      <canvas class="hero-fg" id="hero-fg" aria-hidden="true"></canvas>
     </section>
 
     <div class="marquee" aria-hidden="true">
