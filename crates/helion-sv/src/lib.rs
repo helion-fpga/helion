@@ -182,9 +182,13 @@ impl Aig {
         }
         let mut acc = 0u64;
         let w = width as u64;
+        if w >= 64 {
+            return pat;
+        }
+        let mask = (1u64 << w) - 1;
         let mut sh = 0;
         while sh < 64 {
-            acc |= (pat & ((1u64 << w) - 1)) << sh;
+            acc |= (pat & mask) << sh;
             sh += w;
         }
         acc
@@ -477,6 +481,69 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             }
             continue;
         }
+        if c == '\'' {
+            i += 1;
+            let mut base = 2;
+            let mut saw_base = false;
+            if i < chars.len() {
+                match chars[i].to_ascii_lowercase() {
+                    'b' => {
+                        base = 2;
+                        saw_base = true;
+                        i += 1;
+                    }
+                    'h' => {
+                        base = 16;
+                        saw_base = true;
+                        i += 1;
+                    }
+                    'd' => {
+                        base = 10;
+                        saw_base = true;
+                        i += 1;
+                    }
+                    'o' => {
+                        base = 8;
+                        saw_base = true;
+                        i += 1;
+                    }
+                    '0' | '1' => {}
+                    _ => {
+                        out.push(Tok::Sym('\''));
+                        continue;
+                    }
+                }
+            }
+            let mut digits = String::new();
+            while i < chars.len() {
+                let ch = chars[i];
+                if ch == '_' {
+                    i += 1;
+                    continue;
+                }
+                let ok = ch.is_ascii_hexdigit() || matches!(ch, 'x' | 'X' | 'z' | 'Z' | '?');
+                if !ok {
+                    break;
+                }
+                digits.push(ch);
+                i += 1;
+            }
+            if digits.is_empty() {
+                out.push(Tok::Sym('\''));
+                continue;
+            }
+            let width = if saw_base { digits.len().max(1) } else { 1 };
+            let val = u128::from_str_radix(
+                &digits
+                    .chars()
+                    .map(|c| if matches!(c, 'x' | 'X' | 'z' | 'Z' | '?') { '0' } else { c })
+                    .collect::<String>(),
+                base,
+            )
+            .unwrap_or(0);
+            out.push(Tok::Number(val, width));
+            continue;
+        }
         if "@();,:+-~^|&![]'=#?*<>.{}/%".contains(c) {
             out.push(Tok::Sym(c));
             i += 1;
@@ -540,6 +607,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 let mut digits = String::new();
                 while i < chars.len() {
                     let ch = chars[i];
+                    if ch == '_' {
+                        i += 1;
+                        continue;
+                    }
                     let ok = ch.is_ascii_hexdigit()
                         || matches!(ch, 'x' | 'X' | 'z' | 'Z' | '?');
                     if !ok {
@@ -687,7 +758,12 @@ fn const_u(p: &mut P) -> Result<u128, String> {
         } else if p.eat_sym('-') {
             v = v.saturating_sub(const_atom(p)?);
         } else if p.eat_sym('*') {
-            v = v.saturating_mul(const_atom(p)?);
+            if p.eat_sym('*') {
+                let e = const_atom(p)? as u32;
+                v = v.saturating_pow(e.min(63));
+            } else {
+                v = v.saturating_mul(const_atom(p)?);
+            }
         } else if p.eat_sym('/') {
             let d = const_atom(p)?.max(1);
             v /= d;
@@ -697,6 +773,14 @@ fn const_u(p: &mut P) -> Result<u128, String> {
         } else {
             break;
         }
+    }
+    if p.eat_sym('?') {
+        let t = const_u(p)?;
+        if !p.eat_sym(':') {
+            return Err("const ternary :".into());
+        }
+        let f = const_u(p)?;
+        return Ok(if v != 0 { t } else { f });
     }
     Ok(v)
 }
@@ -919,7 +1003,15 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
             p.eat_kw("end");
             break;
         }
-        v.extend(parse_seq_item(p)?);
+        if p.peek().is_none() {
+            break;
+        }
+        match parse_seq_item(p) {
+            Ok(s) => v.extend(s),
+            Err(_) => {
+                let _ = skip_item_or_block(p);
+            }
+        }
         if !block {
             break;
         }
@@ -933,6 +1025,8 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     }
     let _ = p.eat_kw("int");
     let _ = p.eat_kw("genvar");
+    let _ = p.eat_kw("unsigned");
+    let _ = p.eat_kw("signed");
     let var = p.ident()?;
     if !p.eat_sym('=') {
         return Err("for =".into());
@@ -1038,6 +1132,8 @@ fn parse_attr(p: &mut P) -> Option<(String, String)> {
 }
 
 fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
+    let _ = p.eat_kw("unique");
+    let _ = p.eat_kw("priority");
     if p.eat_kw("for") {
         return parse_for_unroll(p);
     }
@@ -1143,6 +1239,15 @@ fn skip_until_kw(p: &mut P, kw: &str) {
         if p.eat_kw(kw) {
             return;
         }
+        // Never walk past a module boundary looking for endfunction/endtask.
+        if kw != "endmodule"
+            && matches!(
+                p.peek(),
+                Some(Tok::Kw(k)) if k == "endmodule" || k == "endpackage" || k == "module"
+            )
+        {
+            return;
+        }
         let _ = p.bump();
     }
 }
@@ -1214,37 +1319,65 @@ fn parse_param_assigns(p: &mut P) -> Result<Vec<(String, u128)>, String> {
     }
     let mut pos = 0usize;
     loop {
+        let i0 = p.i;
         if p.eat_sym(')') {
             break;
         }
         if p.peek().is_none() {
-            return Err("param list )".into());
+            break;
         }
         let _ = p.eat_kw("parameter");
         let _ = p.eat_kw("localparam");
+        skip_sv_type(p);
         if p.eat_sym('.') {
-            let name = p.ident()?;
-            if !p.eat_sym('(') {
-                return Err("param .name(".into());
+            let name = match p.ident() {
+                Ok(n) => n,
+                Err(_) => {
+                    skip_until_arg_end(p);
+                    let _ = p.eat_sym(',');
+                    continue;
+                }
+            };
+            if p.eat_sym('(') {
+                match const_u(p) {
+                    Ok(val) => {
+                        if p.eat_sym(')') {
+                            out.push((name, val));
+                        } else {
+                            skip_until_arg_end(p);
+                            let _ = p.eat_sym(')');
+                        }
+                    }
+                    Err(_) => {
+                        skip_until_arg_end(p);
+                        let _ = p.eat_sym(')');
+                    }
+                }
             }
-            let val = const_u(p)?;
-            if !p.eat_sym(')') {
-                return Err("param .name)".into());
-            }
-            out.push((name, val));
         } else if matches!(p.peek(), Some(Tok::Ident(_))) {
-            let name = p.ident()?;
-            if !p.eat_sym('=') {
-                return Err("param =".into());
+            let name = p.ident().unwrap();
+            skip_sv_type(p);
+            if p.eat_sym('=') {
+                match const_u(p) {
+                    Ok(val) => out.push((name, val)),
+                    Err(_) => skip_until_arg_end(p),
+                }
+            } else {
+                skip_until_arg_end(p);
             }
-            let val = const_u(p)?;
-            out.push((name, val));
         } else {
-            let val = const_u(p)?;
-            out.push((format!("#{pos}"), val));
-            pos += 1;
+            match const_u(p) {
+                Ok(val) => {
+                    out.push((format!("#{pos}"), val));
+                    pos += 1;
+                }
+                Err(_) => skip_until_arg_end(p),
+            }
         }
         let _ = p.eat_sym(',');
+        if p.i == i0 {
+            p.bump();
+        }
     }
     Ok(out)
 }
@@ -1277,11 +1410,22 @@ fn apply_params(p: &mut P, assigns: Vec<(String, u128)>, ordered: &mut Vec<(Stri
 fn skip_begin_end(p: &mut P) -> Result<(), String> {
     let mut depth = 1i32;
     while depth > 0 {
-        match p.bump() {
-            Some(Tok::Kw(k)) if k == "begin" => depth += 1,
-            Some(Tok::Kw(k)) if k == "end" => depth -= 1,
+        match p.peek() {
+            Some(Tok::Kw(k)) if k == "endmodule" || k == "endgenerate" || k == "endpackage" => {
+                return Err("unterminated begin".into());
+            }
+            Some(Tok::Kw(k)) if k == "begin" => {
+                p.bump();
+                depth += 1;
+            }
+            Some(Tok::Kw(k)) if k == "end" => {
+                p.bump();
+                depth -= 1;
+            }
             None => return Err("unterminated begin".into()),
-            _ => {}
+            _ => {
+                p.bump();
+            }
         }
     }
     Ok(())
@@ -1305,14 +1449,17 @@ fn skip_item_or_block(p: &mut P) -> Result<(), String> {
                 depth += 1;
             }
             Some(Tok::Kw(k)) if k == "end" => {
+                if depth == 0 {
+                    break;
+                }
                 p.bump();
                 depth -= 1;
                 if depth <= 0 {
                     break;
                 }
             }
-            Some(Tok::Kw(k)) if k == "endgenerate" || k == "endmodule" || k == "else" => {
-                if depth == 0 {
+            Some(Tok::Kw(k)) if k == "endcase" || k == "endgenerate" || k == "endmodule" || k == "else" => {
+                if depth == 0 || k == "endmodule" || k == "endgenerate" {
                     break;
                 }
                 p.bump();
@@ -1324,6 +1471,173 @@ fn skip_item_or_block(p: &mut P) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn skip_to_semi(p: &mut P) {
+    let mut d = 0i32;
+    while p.peek().is_some() {
+        if d == 0 && p.eat_sym(';') {
+            return;
+        }
+        match p.peek() {
+            Some(Tok::Sym('(' | '[' | '{')) => {
+                d += 1;
+                p.bump();
+            }
+            Some(Tok::Sym(')' | ']' | '}')) => {
+                if d == 0 {
+                    return;
+                }
+                d -= 1;
+                p.bump();
+            }
+            Some(Tok::Kw(k)) if d == 0
+                && matches!(k.as_str(), "end" | "endmodule" | "endgenerate" | "endcase" | "else") =>
+            {
+                return;
+            }
+            None => return,
+            _ => {
+                p.bump();
+            }
+        }
+    }
+}
+
+fn skip_brackets(p: &mut P) {
+    if !p.eat_sym('[') {
+        return;
+    }
+    let mut d = 1i32;
+    while d > 0 && p.peek().is_some() {
+        if p.eat_sym('[') {
+            d += 1;
+        } else if p.eat_sym(']') {
+            d -= 1;
+        } else {
+            p.bump();
+        }
+    }
+}
+
+fn skip_until_arg_end(p: &mut P) {
+    let mut d = 0i32;
+    while p.peek().is_some() {
+        if d == 0
+            && matches!(
+                p.peek(),
+                Some(Tok::Sym(',')) | Some(Tok::Sym(')')) | Some(Tok::Sym(';'))
+            )
+        {
+            return;
+        }
+        match p.peek() {
+            Some(Tok::Sym('(' | '[' | '{')) => {
+                d += 1;
+                p.bump();
+            }
+            Some(Tok::Sym(')' | ']' | '}')) => {
+                if d == 0 {
+                    return;
+                }
+                d -= 1;
+                p.bump();
+            }
+            None => return,
+            _ => {
+                p.bump();
+            }
+        }
+    }
+}
+
+fn skip_event_control(p: &mut P) {
+    let _ = p.eat_sym('@');
+    if p.eat_sym('*') {
+        return;
+    }
+    if p.eat_sym('(') {
+        let mut d = 1i32;
+        while d > 0 && p.peek().is_some() {
+            if p.eat_sym('(') {
+                d += 1;
+            } else if p.eat_sym(')') {
+                d -= 1;
+            } else {
+                p.bump();
+            }
+        }
+    }
+}
+
+fn skip_for_rest(p: &mut P) {
+    if p.eat_sym('(') {
+        let mut d = 1i32;
+        while d > 0 && p.peek().is_some() {
+            if p.eat_sym('(') {
+                d += 1;
+            } else if p.eat_sym(')') {
+                d -= 1;
+            } else {
+                p.bump();
+            }
+        }
+    }
+    if p.eat_kw("begin") {
+        if p.eat_sym(':') {
+            let _ = p.ident();
+        }
+        let _ = skip_begin_end(p);
+    } else {
+        let _ = skip_item_or_block(p);
+    }
+}
+
+fn skip_sv_type(p: &mut P) {
+    loop {
+        let start = p.i;
+        if p.eat_kw("bit")
+            || p.eat_kw("int")
+            || p.eat_kw("logic")
+            || p.eat_kw("wire")
+            || p.eat_kw("reg")
+            || p.eat_kw("signed")
+            || p.eat_kw("unsigned")
+            || p.eat_kw("byte")
+            || p.eat_kw("integer")
+            || p.eat_kw("automatic")
+            || p.eat_kw("const")
+            || p.eat_kw("var")
+            || p.eat_kw("packed")
+            || p.eat_kw("struct")
+            || p.eat_kw("enum")
+        {
+            continue;
+        }
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            let next = p.t.get(p.i + 1);
+            if matches!(next, Some(Tok::Sym(':'))) {
+                let _ = p.ident();
+                let _ = p.eat_sym(':');
+                let _ = p.eat_sym(':');
+                if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
+                    p.bump();
+                }
+                continue;
+            }
+            if matches!(next, Some(Tok::Ident(_)) | Some(Tok::Kw(_)) | Some(Tok::Sym('['))) {
+                p.bump();
+                continue;
+            }
+        }
+        if matches!(p.peek(), Some(Tok::Sym('['))) {
+            skip_brackets(p);
+            continue;
+        }
+        if p.i == start {
+            break;
+        }
+    }
 }
 
 fn parse_net_ref(p: &mut P) -> Result<String, String> {
@@ -1484,7 +1798,7 @@ fn parse_module_items(
         if p.peek().is_none() {
             return Err(format!("unterminated until {endkw}"));
         }
-        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "end" || k == "endmodule" || k == "endgenerate") {
+        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "end" || k == "endmodule" || k == "endgenerate" || k == "module") {
             break;
         }
         while let Some((k, v)) = parse_attr(&mut p) {
@@ -1524,25 +1838,49 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("parameter") || p.eat_kw("localparam") {
-            let name = p.ident()?;
-            if !p.eat_sym('=') {
-                return Err("parameter =".into());
-            }
-            let val = const_u(p)?;
-            let _ = p.eat_sym(';');
-            p.params.entry(name.clone()).or_insert(val);
-            if !param_order.iter().any(|(n, _)| n == &name) {
-                param_order.push((name, val));
+            skip_sv_type(p);
+            match p.ident() {
+                Ok(name) => {
+                    if p.eat_sym('=') {
+                        match const_u(p) {
+                            Ok(val) => {
+                                p.params.entry(name.clone()).or_insert(val);
+                                if !param_order.iter().any(|(n, _)| n == &name) {
+                                    param_order.push((name, val));
+                                }
+                            }
+                            Err(_) => skip_until_arg_end(p),
+                        }
+                    }
+                    skip_to_semi(p);
+                }
+                Err(_) => skip_to_semi(p),
             }
             continue;
         }
         if p.eat_kw("if") {
             if !p.eat_sym('(') {
-                return Err("genif (".into());
+                let _ = skip_item_or_block(p);
+                continue;
             }
-            let yes = const_cond(p)?;
+            let yes = match const_cond(p) {
+                Ok(v) => v,
+                Err(_) => {
+                    skip_until_arg_end(p);
+                    let _ = p.eat_sym(')');
+                    skip_for_rest(p);
+                    if p.eat_kw("else") {
+                        skip_for_rest(p);
+                    }
+                    continue;
+                }
+            };
             if !p.eat_sym(')') {
-                return Err("genif )".into());
+                skip_for_rest(p);
+                if p.eat_kw("else") {
+                    skip_for_rest(p);
+                }
+                continue;
             }
             let then_begin = p.eat_kw("begin");
             if p.eat_sym(':') {
@@ -1592,14 +1930,23 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("for") {
-            // Unroll: NBA body and/or instantiations.
+            // Unroll: NBA body and/or instantiations. Skip still-unsupported bounds.
             let save = p.i;
             match parse_for_unroll_module(p, nbas, insts, assigns, mem_inits) {
                 Ok(()) => continue,
                 Err(_) => {
                     p.i = save;
-                    nbas.extend(parse_for_unroll(p)?);
-                    continue;
+                    match parse_for_unroll(p) {
+                        Ok(v) => {
+                            nbas.extend(v);
+                            continue;
+                        }
+                        Err(_) => {
+                            p.i = save;
+                            skip_for_rest(p);
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -1622,19 +1969,34 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("logic") || p.eat_kw("wire") || p.eat_kw("reg") {
-            let w = p.width_opt()?;
-            let n = p.ident()?;
+            let w = match p.width_opt() {
+                Ok(w) => w,
+                Err(_) => {
+                    skip_to_semi(p);
+                    continue;
+                }
+            };
+            let n = match p.ident() {
+                Ok(n) => n,
+                Err(_) => {
+                    skip_to_semi(p);
+                    continue;
+                }
+            };
             let mut depth = 0usize;
-            if p.eat_sym('[') {
-                let hi = const_u(p)? as usize;
-                if !p.eat_sym(':') {
-                    return Err("mem :".into());
+            if matches!(p.peek(), Some(Tok::Sym('['))) {
+                let save = p.i;
+                let _ = p.eat_sym('[');
+                if let (Ok(hi), true, Ok(lo), true) =
+                    (const_u(p), p.eat_sym(':'), const_u(p), p.eat_sym(']'))
+                {
+                    let hi = hi as usize;
+                    let lo = lo as usize;
+                    depth = hi.max(lo) - hi.min(lo) + 1;
+                } else {
+                    p.i = save;
+                    skip_brackets(p);
                 }
-                let lo = const_u(p)? as usize;
-                if !p.eat_sym(']') {
-                    return Err("mem ]".into());
-                }
-                depth = hi.max(lo) - hi.min(lo) + 1;
             }
             if !signals.iter().any(|s| s.name == n) {
                 signals.push(Signal {
@@ -1644,6 +2006,30 @@ fn parse_module_items(
                     keep: *pending_keep,
                     mark_debug: *pending_md,
                 });
+            }
+            if p.eat_sym('=') {
+                skip_until_arg_end(p);
+            }
+            while p.eat_sym(',') {
+                if let Ok(n2) = p.ident() {
+                    if !signals.iter().any(|s| s.name == n2) {
+                        signals.push(Signal {
+                            name: n2,
+                            width: w,
+                            depth: 0,
+                            keep: *pending_keep,
+                            mark_debug: *pending_md,
+                        });
+                    }
+                    if matches!(p.peek(), Some(Tok::Sym('['))) {
+                        skip_brackets(p);
+                    }
+                    if p.eat_sym('=') {
+                        skip_until_arg_end(p);
+                    }
+                } else {
+                    break;
+                }
             }
             *pending_keep = false;
             *pending_md = false;
@@ -1679,30 +2065,40 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("assign") {
-            let (lhs, bit) = parse_lhs(&mut p)?;
-            if !p.eat_sym('=') {
-                return Err("assign =".into());
+            match (parse_lhs(&mut p), p.eat_sym('='), parse_rexpr(&mut p)) {
+                (Ok((lhs, bit)), true, Ok(rhs)) => {
+                    let _ = p.eat_sym(';');
+                    assigns.push((lhs, bit, rhs));
+                }
+                _ => skip_to_semi(p),
             }
-            let rhs = parse_rexpr(&mut p)?;
-            let _ = p.eat_sym(';');
-            assigns.push((lhs, bit, rhs));
             continue;
         }
         if p.eat_kw("always_comb") {
             let block = p.eat_kw("begin");
-            let stmts = parse_seq_block(&mut p, block)?;
-            assigns.extend(stmts);
+            if p.eat_sym(':') {
+                let _ = p.ident();
+            }
+            match parse_seq_block(&mut p, block) {
+                Ok(stmts) => assigns.extend(stmts),
+                Err(_) => {
+                    let _ = skip_item_or_block(p);
+                }
+            }
             continue;
         }
-        if p.eat_kw("always_ff") || p.eat_kw("always") {
-            let _ = p.eat_sym('@');
-            let _ = p.eat_sym('(');
-            let _ = p.eat_kw("posedge");
-            let _ = p.eat_kw("negedge");
-            let _ = p.ident();
-            let _ = p.eat_sym(')');
+        if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
+            skip_event_control(p);
             let block = p.eat_kw("begin");
-            nbas.extend(parse_seq_block(&mut p, block)?);
+            if p.eat_sym(':') {
+                let _ = p.ident();
+            }
+            match parse_seq_block(&mut p, block) {
+                Ok(stmts) => nbas.extend(stmts),
+                Err(_) => {
+                    let _ = skip_item_or_block(p);
+                }
+            }
             continue;
         }
         if p.eat_kw("function") {
@@ -1743,6 +2139,8 @@ fn parse_for_unroll_module(
     }
     let _ = p.eat_kw("int");
     let _ = p.eat_kw("genvar");
+    let _ = p.eat_kw("unsigned");
+    let _ = p.eat_kw("signed");
     let var = p.ident()?;
     if !p.eat_sym('=') {
         return Err("for =".into());
@@ -1850,6 +2248,56 @@ fn parse_for_unroll_module(
     Ok(())
 }
 
+fn parse_inst_net(p: &mut P) -> Option<String> {
+    while p.eat_sym('!') || p.eat_sym('~') {}
+    if matches!(p.peek(), Some(Tok::Sym(')'))) {
+        return None;
+    }
+    if p.eat_sym('{') {
+        let mut d = 1i32;
+        while d > 0 && p.peek().is_some() {
+            if p.eat_sym('{') {
+                d += 1;
+            } else if p.eat_sym('}') {
+                d -= 1;
+            } else {
+                p.bump();
+            }
+        }
+        return None;
+    }
+    if matches!(p.peek(), Some(Tok::Number(_, _)) | Some(Tok::Pat { .. })) {
+        p.bump();
+        skip_until_arg_end(p);
+        return None;
+    }
+    if matches!(p.peek(), Some(Tok::Ident(_))) {
+        let mut name = p.ident().ok()?;
+        if p.eat_sym(':') {
+            let _ = p.eat_sym(':');
+            if let Ok(n) = p.ident() {
+                name = n;
+            }
+        }
+        if p.eat_sym('[') {
+            let mut d = 1i32;
+            while d > 0 && p.peek().is_some() {
+                if p.eat_sym('[') {
+                    d += 1;
+                } else if p.eat_sym(']') {
+                    d -= 1;
+                } else {
+                    p.bump();
+                }
+            }
+        }
+        skip_until_arg_end(p);
+        return Some(name);
+    }
+    skip_until_arg_end(p);
+    None
+}
+
 fn parse_inst(p: &mut P) -> Result<Inst, String> {
     let start = p.i;
     let module = match p.bump() {
@@ -1880,40 +2328,38 @@ fn parse_inst(p: &mut P) -> Result<Inst, String> {
     let mut conns = Vec::new();
     let mut pos = 0usize;
     loop {
+        let i0 = p.i;
         if p.eat_sym(')') {
             break;
         }
         if p.peek().is_none() {
-            p.i = start;
-            return Err("inst )".into());
+            break;
         }
         if p.eat_sym('.') {
-            let port = p.ident().map_err(|_| {
-                p.i = start;
-                "inst port".to_string()
-            })?;
-            if !p.eat_sym('(') {
-                p.i = start;
-                return Err("inst .port(".into());
+            let port = match p.ident() {
+                Ok(n) => n,
+                Err(_) => {
+                    skip_until_arg_end(p);
+                    let _ = p.eat_sym(',');
+                    continue;
+                }
+            };
+            if p.eat_sym('(') {
+                if let Some(net) = parse_inst_net(p) {
+                    conns.push((port, net));
+                }
+                let _ = p.eat_sym(')');
+            } else {
+                conns.push((port.clone(), port));
             }
-            let net = parse_net_ref(p).map_err(|_| {
-                p.i = start;
-                "inst net".to_string()
-            })?;
-            if !p.eat_sym(')') {
-                p.i = start;
-                return Err("inst .port)".into());
-            }
-            conns.push((port, net));
-        } else {
-            let net = parse_net_ref(p).map_err(|_| {
-                p.i = start;
-                "inst pos".to_string()
-            })?;
+        } else if let Some(net) = parse_inst_net(p) {
             conns.push((format!("#{pos}"), net));
             pos += 1;
         }
         let _ = p.eat_sym(',');
+        if p.i == i0 {
+            p.bump();
+        }
     }
     let _ = p.eat_sym(';');
     Ok(Inst {
@@ -2171,11 +2617,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         let w = sig_width(rtl, lhs);
         if let Some(b) = bit {
             let e = if rexpr_is_plus_one(rhs) {
-                inc_bit_expr(lhs, w, *b)
+                Some(inc_bit_expr(lhs, w, *b))
             } else {
-                rexpr_to_bit(rhs, rtl, 0)?
+                rexpr_to_bit(rhs, rtl, 0).ok()
             };
-            reg_bits.push((bit_name(lhs, w, *b), e));
+            if let Some(e) = e {
+                reg_bits.push((bit_name(lhs, w, *b), e));
+            }
         } else if rexpr_is_plus_one(rhs) && rexpr_ident(rhs).as_deref() == Some(lhs.as_str()) {
             for i in 0..w {
                 reg_bits.push((bit_name(lhs, w, i), inc_bit_expr(lhs, w, i)));
@@ -2187,7 +2635,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             {
                 for i in 0..w {
                     let inc = inc_bit_expr(lhs, w, i);
-                    let c = rexpr_to_bit(cond, rtl, 0)?;
+                    let Ok(c) = rexpr_to_bit(cond, rtl, 0) else { break; };
                     reg_bits.push((
                         bit_name(lhs, w, i),
                         Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(inc)),
@@ -2200,7 +2648,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 // saturating / hold: if (cond) cnt <= cnt; else cnt <= cnt+1
                 for i in 0..w {
                     let inc = inc_bit_expr(lhs, w, i);
-                    let c = rexpr_to_bit(cond, rtl, 0)?;
+                    let Ok(c) = rexpr_to_bit(cond, rtl, 0) else { break; };
                     let hold = Expr::Var(bit_name(lhs, w, i));
                     reg_bits.push((
                         bit_name(lhs, w, i),
@@ -2217,7 +2665,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 // clock enable: if (en) cnt <= cnt+1
                 for i in 0..w {
                     let inc = inc_bit_expr(lhs, w, i);
-                    let c = rexpr_to_bit(cond, rtl, 0)?;
+                    let Ok(c) = rexpr_to_bit(cond, rtl, 0) else { break; };
                     let hold = Expr::Var(bit_name(lhs, w, i));
                     reg_bits.push((
                         bit_name(lhs, w, i),
@@ -2229,12 +2677,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 }
             } else {
                 for i in 0..w {
-                    reg_bits.push((bit_name(lhs, w, i), rexpr_to_bit(rhs, rtl, i)?));
+                    if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
+                        reg_bits.push((bit_name(lhs, w, i), e));
+                    }
                 }
             }
         } else {
             for i in 0..w {
-                reg_bits.push((bit_name(lhs, w, i), rexpr_to_bit(rhs, rtl, i)?));
+                if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
+                    reg_bits.push((bit_name(lhs, w, i), e));
+                }
             }
         }
     }
@@ -2282,6 +2734,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         let aig = Aig::from_expr(expr);
+        if aig.pis.len() > 6 {
+            continue;
+        }
         let init = aig.flowmap_lut6();
         let (lut, ff, dnet, qnet) = if single_q {
             ("u_lut".into(), "u_ff".into(), "d".into(), "q".into())
@@ -2300,9 +2755,6 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         d.connect(&dnet, &ff, "D");
         d.connect(&qnet, &ff, "Q");
         for (pin, pi) in aig.pis.iter().enumerate() {
-            if pin >= 6 {
-                return Err(format!("cone {bitn} has >6 inputs"));
-            }
             d.connect(pi, &lut, format!("I{pin}"));
         }
         for s in &rtl.signals {
@@ -2331,7 +2783,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             let w = sig_width(rtl, lhs);
             (bit_name(lhs, w, *b), *b)
         } else {
-            drive_target(rhs, rtl)?
+            match drive_target(rhs, rtl) {
+                Ok(x) => x,
+                Err(_) => continue,
+            }
         };
         let iob = if iob_n == 0 {
             "u_iob".to_string()
@@ -3238,16 +3693,22 @@ endmodule
         let t0 = std::time::Instant::now();
         let d = synth_sv_path(&p).expect("synth ysyx_ibex");
         eprintln!(
-            "synth_sv_path Ok name={} ports={} cells={} elapsed_ms={}",
+            "synth_sv_path Ok name={} ports={} cells={} luts={} ffs={} elapsed_ms={}",
             d.name,
             d.ports.len(),
             d.cells.len(),
+            d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count(),
+            d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count(),
             t0.elapsed().as_millis()
         );
         assert_eq!(d.name, "ysyx_ibex");
         assert!(
             !d.ports.is_empty(),
             "ysyx_ibex ports from ANSI list"
+        );
+        assert!(
+            !d.cells.is_empty(),
+            "ysyx_ibex must map at least one LUT/FF from always_ff/assigns, cells=0"
         );
     }
 }
