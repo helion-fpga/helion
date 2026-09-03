@@ -19,4 +19,5 @@ helion-fabric = { workspace = true }
 helion-drc = { workspace = true }
 helion-bd = { workspace = true }
 helion-ipxact = { workspace = true }
+helion-place = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }

@@ -3,6 +3,21 @@
 use helion_ir::{CellKind, Design};
 use std::collections::HashMap;
 
+/// UG900 force vs deposit: hold until `release`, or one-shot poke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimForceKind {
+    Force,
+    Deposit,
+}
+
+/// One UG900 force/deposit on a helion-sim probe (LED or FF Q).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimForce {
+    pub name: String,
+    pub kind: SimForceKind,
+    pub value: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sim {
     pub time: u64,
@@ -12,6 +27,8 @@ pub struct Sim {
     iob_from_ff: Option<String>,
     ff_q: HashMap<String, bool>,
     pub led: bool,
+    /// Continuous UG900 forces (name → value). Re-applied after each posedge.
+    forces: HashMap<String, u64>,
 }
 
 impl Sim {
@@ -72,7 +89,81 @@ impl Sim {
             iob_from_ff,
             ff_q,
             led: false,
+            forces: HashMap::new(),
         }
+    }
+
+    fn resolve_signal(&self, name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("led") {
+            return Some("led".into());
+        }
+        self.ff_q
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    fn write_signal(&mut self, name: &str, value: u64) -> Result<(), String> {
+        let bit = value != 0;
+        if name == "led" {
+            self.led = bit;
+            return Ok(());
+        }
+        if let Some(q) = self.ff_q.get_mut(name) {
+            *q = bit;
+            return Ok(());
+        }
+        Err(format!("force: no signal {name}"))
+    }
+
+    fn apply_forces(&mut self) {
+        let held: Vec<(String, u64)> = self.forces.iter().map(|(n, v)| (n.clone(), *v)).collect();
+        for (name, value) in held {
+            let _ = self.write_signal(&name, value);
+        }
+    }
+
+    /// One-shot UG900 deposit: poke now, HDL drivers take the next posedge.
+    pub fn deposit(&mut self, name: &str, value: u64) -> Result<(), String> {
+        let key = self
+            .resolve_signal(name)
+            .ok_or_else(|| format!("deposit: no signal {name}"))?;
+        self.forces.remove(&key);
+        self.write_signal(&key, value)
+    }
+
+    /// UG900 force: hold `name` at `value` across posedges until `release`.
+    pub fn force(&mut self, name: &str, value: u64) -> Result<(), String> {
+        let key = self
+            .resolve_signal(name)
+            .ok_or_else(|| format!("force: no signal {name}"))?;
+        self.write_signal(&key, value)?;
+        self.forces.insert(key, value);
+        Ok(())
+    }
+
+    /// Drop a UG900 force so the LUT/FF/IOB drivers resume.
+    pub fn release(&mut self, name: &str) -> Result<(), String> {
+        let key = self
+            .resolve_signal(name)
+            .ok_or_else(|| format!("remove_force: no signal {name}"))?;
+        self.forces.remove(&key);
+        Ok(())
+    }
+
+    /// Live UG900 force table (continuous holds only; deposits do not persist).
+    pub fn force_list(&self) -> Vec<SimForce> {
+        let mut v: Vec<SimForce> = self
+            .forces
+            .iter()
+            .map(|(name, value)| SimForce {
+                name: name.clone(),
+                kind: SimForceKind::Force,
+                value: *value,
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 
     pub fn step_posedge(&mut self, delay: u64) {
@@ -101,6 +192,7 @@ impl Sim {
             .and_then(|f| self.ff_q.get(f))
             .copied()
             .unwrap_or(false);
+        self.apply_forces();
     }
 
     /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.
@@ -263,6 +355,26 @@ mod tests {
             "{loc:?}"
         );
         assert_eq!(s.signal_value("led"), Some(u64::from(s.led)));
+    }
+
+    #[test]
+    fn force_holds_led_deposit_is_oneshot() {
+        let mut s = Sim::new(&Design::structural_counter());
+        s.force("led", 1).unwrap();
+        assert_eq!(s.force_list().len(), 1);
+        for _ in 0..16 {
+            s.step_posedge(10);
+            assert!(s.led, "force must hold LED across posedges");
+        }
+        s.release("led").unwrap();
+        assert!(s.force_list().is_empty());
+        s.deposit("led", 1).unwrap();
+        assert!(s.led, "deposit pokes immediately");
+        assert!(s.force_list().is_empty(), "deposit is not a hold");
+        s.step_posedge(10);
+        assert!(!s.led, "next posedge is HDL cnt[3], still 0");
+        assert!(s.force("no_such", 1).unwrap_err().contains("no signal"));
+        assert!(s.deposit("no_such", 1).unwrap_err().contains("no signal"));
     }
 
     fn fabric_wave(d: &Design, cycles: u32) -> Vec<bool> {

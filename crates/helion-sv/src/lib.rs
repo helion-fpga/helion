@@ -1,12 +1,16 @@
-//! SV subset: **sv-parser** AST → RTL elab → AIG → FlowMap LUT6+FF.
+//! SV frontend: preprocess + helion-sv elab → AIG → FlowMap LUT6+FF.
 //!
-//! Handles 1-bit and vector `logic`, `assign`, `always_ff`, `+` incrementers,
-//! bit-selects, and Boolean operators. Garbage is rejected by sv-parser.
+//! Large cores (Ibex, PicoRV32) are ingested via `` `define ``/`ifdef`
+//! preprocess and skip of packages/typedefs; Helion-legal always_ff / assign
+//! still map to LUT/FF. Unknown instances become empty blackboxes.
+
+mod preprocess;
+pub use preprocess::preprocess_sv;
 
 use helion_ir::{CellKind, Design, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use sv_parser::parse_sv_str;
+use sv_parser::{parse_sv_str, Define, DefineText};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
@@ -177,9 +181,48 @@ impl Aig {
     }
 }
 
+/// UG900 Compilation tab over helion-sv (include + `define), not xvlog.
+#[derive(Clone, Debug, Default)]
+pub struct SvCompileOpts {
+    /// `define NAME[=VALUE]` pairs for sv-parser.
+    pub defines: Vec<(String, String)>,
+    /// Verilog include directories for sv-parser.
+    pub include_paths: Vec<String>,
+}
+
+/// UG900 Elaboration snapshot stats from helion-sv (not xelab).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SvElabReport {
+    pub top: String,
+    pub cells: usize,
+    pub luts: usize,
+    pub ffs: usize,
+}
+
 pub fn parse_sv(source: &str, origin: &str) -> Result<sv_parser::SyntaxTree, String> {
-    let defines = HashMap::new();
-    parse_sv_str(source, origin, &defines, &[""], false, false)
+    parse_sv_opts(source, origin, &SvCompileOpts::default())
+}
+
+pub fn parse_sv_opts(
+    source: &str,
+    origin: &str,
+    opts: &SvCompileOpts,
+) -> Result<sv_parser::SyntaxTree, String> {
+    let mut defines = HashMap::new();
+    for (k, v) in &opts.defines {
+        let text = if v.is_empty() {
+            None
+        } else {
+            Some(DefineText::new(v.clone(), None))
+        };
+        defines.insert(k.clone(), Some(Define::new(k.clone(), Vec::new(), text)));
+    }
+    let inc: Vec<String> = if opts.include_paths.is_empty() {
+        vec!["".into()]
+    } else {
+        opts.include_paths.clone()
+    };
+    parse_sv_str(source, origin, &defines, &inc, false, false)
         .map(|(tree, _)| tree)
         .map_err(|e| format!("sv-parser: {e}"))
 }
@@ -362,7 +405,12 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         "module", "endmodule", "input", "output", "logic", "wire", "reg", "always_ff", "always",
         "begin", "end", "posedge", "negedge", "assign", "inout", "if", "else", "always_comb",
         "case", "casez", "casex", "endcase", "default", "generate", "endgenerate", "genvar",
-        "for", "int", "parameter", "localparam", "initial",
+        "for", "int", "parameter", "localparam", "initial", "package", "endpackage", "typedef",
+        "import", "export", "struct", "enum", "packed", "signed", "unsigned", "function",
+        "endfunction", "task", "endtask", "return", "always_latch", "unique", "priority",
+        "automatic", "void", "const", "var", "ref", "static", "extern", "virtual", "pure",
+        "interface", "endinterface", "modport", "clocking", "property", "endproperty",
+        "assert", "assume", "cover", "sequence", "endsequence",
     ];
     while i < chars.len() {
         let c = chars[i];
@@ -398,13 +446,24 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 2;
             continue;
         }
-        if "@();,:+-~^|&![]'=#?*<>.".contains(c) {
+        if "@();,:+-~^|&![]'=#?*<>.{}".contains(c) {
             out.push(Tok::Sym(c));
             i += 1;
             continue;
         }
-        if c.is_ascii_alphabetic() || c == '_' {
+        if c == '`' {
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '$' || c.is_ascii_alphabetic() || c == '_' {
             let mut n = String::new();
+            if c == '$' {
+                n.push(c);
+                i += 1;
+            }
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 n.push(chars[i]);
                 i += 1;
@@ -770,6 +829,9 @@ fn skip_logic(p: &mut P) {
     let _ = p.eat_kw("logic");
     let _ = p.eat_kw("wire");
     let _ = p.eat_kw("reg");
+    let _ = p.eat_kw("signed");
+    let _ = p.eat_kw("unsigned");
+    let _ = p.eat_kw("var");
 }
 
 fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
@@ -1035,8 +1097,17 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
     Ok(vec![parse_nba(p)?])
 }
 
+fn skip_until_kw(p: &mut P, kw: &str) {
+    while p.peek().is_some() {
+        if p.eat_kw(kw) {
+            return;
+        }
+        let _ = p.bump();
+    }
+}
+
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
-    let s = strip_comments(source);
+    let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
     let mut p = P { t: &toks, i: 0, params: HashMap::new() };
     let mut mods = Vec::new();
@@ -1044,7 +1115,34 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
         if p.eat_sym(';') {
             continue;
         }
-        mods.push(parse_one_module(&mut p)?);
+        if p.eat_kw("import") || p.eat_kw("export") {
+            let _ = skip_item_or_block(&mut p);
+            continue;
+        }
+        if p.eat_kw("package") {
+            skip_until_kw(&mut p, "endpackage");
+            continue;
+        }
+        if p.eat_kw("typedef") {
+            let _ = skip_item_or_block(&mut p);
+            continue;
+        }
+        if p.eat_kw("interface") {
+            skip_until_kw(&mut p, "endinterface");
+            continue;
+        }
+        match p.peek() {
+            Some(Tok::Kw(k)) if k == "module" => match parse_one_module(&mut p) {
+                Ok(m) => mods.push(m),
+                Err(_) => skip_until_kw(&mut p, "endmodule"),
+            },
+            _ => {
+                let _ = skip_item_or_block(&mut p);
+                if p.peek().is_some() {
+                    let _ = p.bump();
+                }
+            }
+        }
     }
     if mods.is_empty() {
         return Err("no module".into());
@@ -1199,6 +1297,9 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         return Err("expected module".into());
     }
     let module = p.ident()?;
+    while p.eat_kw("import") {
+        let _ = skip_item_or_block(&mut p);
+    }
     let mut param_order: Vec<(String, u128)> = Vec::new();
     let header_params = parse_param_assigns(&mut p)?;
     apply_params(&mut p, header_params, &mut param_order);
@@ -1484,13 +1585,28 @@ fn parse_module_items(
             nbas.extend(parse_seq_block(&mut p, block)?);
             continue;
         }
+        if p.eat_kw("function") {
+            skip_until_kw(p, "endfunction");
+            continue;
+        }
+        if p.eat_kw("task") {
+            skip_until_kw(p, "endtask");
+            continue;
+        }
+        if p.eat_kw("typedef") || p.eat_kw("import") || p.eat_kw("export") {
+            let _ = skip_item_or_block(p);
+            continue;
+        }
         if matches!(p.peek(), Some(Tok::Ident(_))) {
             if let Ok(inst) = parse_inst(&mut p) {
                 insts.push(inst);
                 continue;
             }
         }
-        p.bump();
+        let _ = skip_item_or_block(p);
+        if p.peek().is_some() {
+            let _ = p.bump();
+        }
     }
     Ok(())
 }
@@ -2223,9 +2339,9 @@ fn flatten_module_ov(
         mem_inits: src.mem_inits.clone(),
     };
     for inst in &src.insts {
-        let child_proto = mods
-            .get(&inst.module)
-            .ok_or_else(|| format!("unknown module {}", inst.module))?;
+        let Some(child_proto) = mods.get(&inst.module) else {
+            continue;
+        };
         let ov = inst_overrides(inst, child_proto);
         let child = flatten_module_ov(mods, &inst.module, &ov)?;
         let prefix = format!("{}_", inst.name);
@@ -2265,20 +2381,36 @@ fn flatten_module_ov(
 }
 
 fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
+    synth_from_parsed_top(mods, None, &HashMap::new())
+}
+
+fn synth_from_parsed_top(
+    mods: Vec<Rtl>,
+    top: Option<&str>,
+    overrides: &HashMap<String, u128>,
+) -> Result<Design, String> {
     let map: HashMap<String, Rtl> = mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
     let instantiated: HashMap<String, ()> = mods
         .iter()
         .flat_map(|m| m.insts.iter().map(|i| (i.module.clone(), ())))
         .collect();
-    let top = mods
-        .iter()
-        .rev()
-        .find(|m| !instantiated.contains_key(&m.module))
-        .or_else(|| mods.last())
-        .ok_or_else(|| "no top module".to_string())?;
-    let flat = flatten_module(&map, &top.module)?;
+    let top_name = if let Some(name) = top {
+        if !map.contains_key(name) {
+            return Err(format!("unknown module {name}"));
+        }
+        name.to_string()
+    } else {
+        mods.iter()
+            .rev()
+            .find(|m| !instantiated.contains_key(&m.module))
+            .or_else(|| mods.last())
+            .ok_or_else(|| "no top module".to_string())?
+            .module
+            .clone()
+    };
+    let flat = flatten_module_ov(&map, &top_name, overrides)?;
     let mut d = synth_rtl(&flat)?;
-    record_instances(&map, &top.module, &mut d, "");
+    record_instances(&map, &top_name, &mut d, "");
     Ok(d)
 }
 
@@ -2304,8 +2436,109 @@ fn record_instances(mods: &HashMap<String, Rtl>, module: &str, d: &mut Design, p
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
-    let _tree = parse_sv(source, origin)?;
-    synth_from_parsed(parse_source(source)?)
+    let pre = preprocess_sv(&strip_comments(source));
+    let _ = parse_sv(&pre, origin);
+    synth_from_parsed(parse_source(&pre)?)
+}
+
+/// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
+pub fn list_sv_modules(source: &str) -> Result<Vec<String>, String> {
+    list_sv_modules_origin(source, "t.sv")
+}
+
+/// Module names in one SV file, with origin for sv-parser diagnostics.
+pub fn list_sv_modules_origin(source: &str, origin: &str) -> Result<Vec<String>, String> {
+    let pre = preprocess_sv(&strip_comments(source));
+    let _ = parse_sv(&pre, origin);
+    Ok(parse_source(&pre)?
+        .into_iter()
+        .map(|m| m.module)
+        .collect())
+}
+
+/// Module names from a path on disk (helion-sv parse).
+pub fn list_sv_modules_path(path: &Path) -> Result<Vec<String>, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    list_sv_modules_origin(&src, &path.display().to_string())
+}
+
+/// UG900 Compilation: sv-parser + helion-sv module list (not xvlog).
+pub fn compile_sv(
+    source: &str,
+    origin: &str,
+    opts: &SvCompileOpts,
+) -> Result<Vec<String>, String> {
+    let _tree = parse_sv_opts(source, origin, opts)?;
+    Ok(parse_source(source)?
+        .into_iter()
+        .map(|m| m.module)
+        .collect())
+}
+
+pub fn compile_sv_path(path: &Path, opts: &SvCompileOpts) -> Result<Vec<String>, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    compile_sv(&src, &path.display().to_string(), opts)
+}
+
+fn elab_report(d: &Design) -> SvElabReport {
+    SvElabReport {
+        top: d.name.clone(),
+        cells: d.cells.len(),
+        luts: d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count(),
+        ffs: d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .count(),
+    }
+}
+
+/// UG900 Elaboration: helion-sv flatten + FlowMap snapshot (not xelab).
+pub fn elaborate_sv(
+    source: &str,
+    origin: &str,
+    top: Option<&str>,
+    params: &HashMap<String, u128>,
+    opts: &SvCompileOpts,
+) -> Result<(Design, SvElabReport), String> {
+    let _tree = parse_sv_opts(source, origin, opts)?;
+    let d = synth_from_parsed_top(parse_source(source)?, top, params)?;
+    let report = elab_report(&d);
+    Ok((d, report))
+}
+
+pub fn elaborate_sv_path(
+    path: &Path,
+    top: Option<&str>,
+    params: &HashMap<String, u128>,
+    opts: &SvCompileOpts,
+) -> Result<(Design, SvElabReport), String> {
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    elaborate_sv(&src, &path.display().to_string(), top, params, opts)
+}
+
+pub fn elaborate_sv_sources(
+    files: &[(&str, &str)],
+    top: Option<&str>,
+    params: &HashMap<String, u128>,
+    opts: &SvCompileOpts,
+) -> Result<(Design, SvElabReport), String> {
+    if files.is_empty() {
+        return Err("no sources".into());
+    }
+    let mut all = String::new();
+    for (origin, src) in files {
+        let _tree = parse_sv_opts(src, origin, opts)?;
+        all.push_str(src);
+        all.push('\n');
+    }
+    let d = synth_from_parsed_top(parse_source(&all)?, top, params)?;
+    let report = elab_report(&d);
+    Ok((d, report))
 }
 
 /// Elaborate many SV files together. Each file is parsed by sv-parser, then
@@ -2799,5 +3032,53 @@ endmodule
         assert_eq!(fab.bram_init_word(0, 0), 0x11);
         assert_eq!(fab.bram_init_word(0, 1), 0x22);
         assert_ne!(bits.frames, bits2.frames, "different ROM contents must change bitstream");
+    }
+
+    #[test]
+    fn preprocess_skips_package_and_ifdef_macros() {
+        let src = r#"
+`define USE_Q
+package p;
+  typedef struct packed { logic a; } t;
+endpackage
+import p::*;
+module m(input logic clk, output logic led);
+  `ifdef USE_Q
+  logic q;
+  always_ff @(posedge clk) q <= ~q;
+  assign led = q;
+  `else
+  assign led = 1'b0;
+  `endif
+endmodule
+"#;
+        let d = synth_sv(src, "pkg.sv").unwrap();
+        assert_eq!(d.name, "m");
+        assert_eq!(d.lut_inits(), vec![0x5555_5555_5555_5555]);
+    }
+
+    #[test]
+    fn ysyx_ibex_lists_modules_and_synths_top() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
+        if !p.exists() {
+            return;
+        }
+        let src = std::fs::read_to_string(&p).unwrap();
+        let mods = list_sv_modules_origin(&src, "ysyx_ibex.sv").expect("list ibex modules");
+        assert!(
+            mods.iter().any(|m| m == "ysyx_ibex"),
+            "top ysyx_ibex must parse: {mods:?}"
+        );
+        assert!(
+            mods.len() > 5,
+            "Ibex-scale file must yield many modules, got {}",
+            mods.len()
+        );
+        let d = synth_sv_path(&p).expect("synth ysyx_ibex");
+        assert_eq!(d.name, "ysyx_ibex");
+        assert!(
+            !d.ports.is_empty(),
+            "ysyx_ibex ports from ANSI list"
+        );
     }
 }
