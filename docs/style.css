@@ -121,13 +121,26 @@ nav a[aria-current="page"] {
   background: #05070a;
 }
 
+.hero-fill {
+  position: absolute;
+  top: 0;
+  left: 46%;
+  width: 54%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 78% 50%;
+  z-index: 1;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 18%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 18%);
+}
+
 .hero::after {
   content: "";
   position: absolute;
   inset: 0;
   z-index: 1;
   pointer-events: none;
-  background: linear-gradient(90deg, transparent 46%, rgba(5, 7, 10, 0.22) 68%, rgba(5, 7, 10, 0.55) 100%);
+  background: linear-gradient(90deg, transparent 62%, rgba(5, 7, 10, 0.12) 100%);
 }
 
 .hero-copy {
@@ -485,6 +498,10 @@ pre {
     top: 38%;
     height: 95%;
     transform: translate(-50%, -50%);
+  }
+  .hero-fill {
+    left: 0;
+    object-position: 70% 50%;
   }
   .hero::after {
     background: linear-gradient(180deg, transparent 22%, rgba(5, 7, 10, 0.45) 58%, rgba(5, 7, 10, 0.82) 100%);
