@@ -101,11 +101,11 @@ nav a[aria-current="page"] {
   isolation: isolate;
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(22rem, 40rem);
-  gap: 2rem 1.4rem;
+  gap: 2rem 1.2rem;
   align-items: center;
   padding: 4.5rem 4rem 3.2rem;
-  background: var(--paper);
-  color: var(--ink);
+  background: #05070a;
+  color: var(--paper);
   overflow: hidden;
 }
 
@@ -118,6 +118,7 @@ nav a[aria-current="page"] {
   width: 100%;
   height: auto;
   background: #05070a;
+  mix-blend-mode: screen;
 }
 
 .hero-copy {
@@ -143,10 +144,26 @@ nav a[aria-current="page"] {
   line-height: 1.08;
   letter-spacing: -0.02em;
   margin: 0 0 1.1rem;
-  color: var(--ink);
+  color: #f6f1e8;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75), 0 0 18px rgba(0, 0, 0, 0.45);
 }
 
 .lede { color: var(--mute); font-size: 1.12rem; max-width: 38rem; margin: 0 0 1.5rem; }
+
+.hero .lede {
+  color: color-mix(in srgb, var(--paper) 82%, #8a9099);
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.55);
+}
+.hero .lede code { color: #fff; }
+.hero .btn.ghost {
+  color: var(--paper);
+  border-color: color-mix(in srgb, var(--paper) 70%, transparent);
+}
+.hero .btn.ghost:hover {
+  background: var(--paper);
+  color: var(--ink);
+  border-color: var(--paper);
+}
 
 .cta { display: flex; flex-wrap: wrap; gap: 0.7rem; }
 
