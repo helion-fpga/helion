@@ -4,30 +4,22 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Helion — original FPGA family and CAD</title>
-  <meta name="description" content="Open-source FPGA CAD and an original device family. Synth, place, PathFinder, STA, bitstream, desktop IDE. Contributors wanted." />
+  <meta name="description" content="Open-source FPGA CAD and an original device family. Synth, place, PathFinder, STA, bitstream, desktop IDE." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
   <meta property="og:title" content="Helion — original FPGA family and CAD" />
-  <meta property="og:description" content="Not a vendor skin. One Session, original HAD parts, Apache-2.0 OR MIT. We need people." />
-  <meta property="og:type" content="website" />
-  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/og.png" />
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/hero-die.jpg" />
 </head>
 <body>
-  <!--
-    THESIS: Helion is original FPGA CAD; the first viewport is a live HL10T floorplan you can probe.
-    OWN-WORLD: copper IO, amber clock spine, HAD CLB grid, brand mark in the chrome.
-    STORY: Visitor probes the die, believes WNS_PS=9640, and has a path to use or help.
-    FIRST VIEWPORT: thesis + Use Helion on the left; Device canvas with the full 35×34 grid on the right.
-    FORM: live Device view, not a still.
-    FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
-  -->
+  <a class="skip" href="#main">Skip to main content</a>
   <header class="bar">
-    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="361" height="361" /><span class="word">Helion</span></a>
+    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
     <nav>
+      <a href="index.html">Home</a>
       <a href="start.html">Start</a>
       <a href="use.html">Use</a>
       <a href="architecture.html">Architecture</a>
@@ -37,95 +29,110 @@
     </nav>
   </header>
 
-  <div class="page">
+  <main id="main">
     <section class="hero">
-      <div>
-        <h1>Original FPGA family, and the CAD that builds for it.</h1>
-        <p class="lede">
-          Helion is not a vendor skin. Synth, pack, PathFinder route, STA, bitstream, and a desktop IDE
-          all hit the same Session. One owner. A real device family (HAD). Apache-2.0 OR MIT.
-          If you write Rust, SystemVerilog, STA, or docs — we need you.
-        </p>
-        <p class="cta">
-          <a class="btn" href="use.html">Use Helion</a>
-          <a class="btn ghost" href="get-involved.html">Get involved</a>
-          <a class="btn ghost" href="https://github.com/helion-fpga/helion">Star / fork</a>
-        </p>
-      </div>
       <div class="device" id="device">
         <div class="device-bar">
           <span>Device · HL10T-C32-1</span>
           <span class="gold">WNS_PS=9640</span>
           <span class="mute">clk 10.000 ns</span>
         </div>
-        <div class="device-stage">
-          <div id="die"></div>
-        </div>
+        <div class="device-stage"><div id="die"></div></div>
         <div class="device-legend">
           <span><i class="sw-io"></i>IO ring</span>
-          <span><i class="sw-clk"></i>CLK spine x=1</span>
+          <span><i class="sw-clk"></i>CLK spine</span>
           <span><i class="sw-clb"></i>32×32 CLB</span>
         </div>
         <div class="device-read" id="die-read"></div>
       </div>
+      <div>
+        <h1>Co-creating an original FPGA family.</h1>
+        <p class="lede">
+          Synth, pack, PathFinder, STA, bitstream, and a desktop IDE — one Session,
+          one HAD part, no vendor skin. Gold on empty-XDC <code>counter.sv</code> is
+          <span class="gold">WNS_PS=9640</span>.
+        </p>
+        <p class="cta">
+          <a class="btn" href="use.html">Use Helion →</a>
+          <a class="btn ghost" href="get-involved.html">Get involved</a>
+        </p>
+      </div>
     </section>
 
-    <section class="section">
-      <h2>Prove it in one minute</h2>
-      <pre><code>git clone https://github.com/helion-fpga/helion.git
+    <div class="marquee" aria-hidden="true">
+      <div class="marquee-track">
+        <span>SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim · SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim ·</span>
+        <span>SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim · SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim ·</span>
+      </div>
+    </div>
+
+    <div class="page">
+      <section class="section">
+        <p class="kicker">Our work</p>
+        <h2>CAD at the edge of an original die</h2>
+        <p class="lede">Device facts come from HAD. The IDE paints that Session. Public vendor guides are a capability checklist, not source to copy.</p>
+        <div class="cards">
+          <a class="card" href="use.html">
+            <div class="card-visual"><img src="brand/hero-die.jpg" alt="" /><span>read</span></div>
+            <div class="card-body"><strong>Using Helion</strong><p>Open the IDE, run the gold, read the die.</p></div>
+          </a>
+          <a class="card" href="architecture.html">
+            <div class="card-visual" style="background:linear-gradient(135deg,#141210,#e2b43a);"><span>read</span></div>
+            <div class="card-body"><strong>Architecture</strong><p>Crates, HNF, PathFinder, HL10T-C32-1.</p></div>
+          </a>
+          <a class="card" href="wiki.html">
+            <div class="card-visual" style="background:linear-gradient(135deg,#5c4d8a,#141210);"><span>read</span></div>
+            <div class="card-body"><strong>Wiki</strong><p>Start, use, contribute, legal fence.</p></div>
+          </a>
+          <a class="card" href="get-involved.html">
+            <div class="card-visual" style="background:linear-gradient(135deg,#b85c28,#141210);"><span>read</span></div>
+            <div class="card-body"><strong>Get involved</strong><p>One owner. We need people.</p></div>
+          </a>
+        </div>
+      </section>
+
+      <p class="giant">We are<br><em>original</em><br>silicon CAD.</p>
+
+      <section class="section">
+        <p class="kicker">Facts</p>
+        <h2>Helion in numbers</h2>
+        <div class="facts">
+          <div><strong>9640</strong><span>WNS_PS on empty-XDC counter</span></div>
+          <div><strong>32×32</strong><span>CLB interior on HL10T-C32-1</span></div>
+          <div><strong>16</strong><span>cycle gold LED waveform</span></div>
+          <div><strong>1.0</strong><span>suite, Apache-2.0 OR MIT</span></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="band">
+      <div class="band-inner">
+        <p class="kicker">Knowledge</p>
+        <h2>Prove it in one minute</h2>
+        <pre><code>git clone https://github.com/helion-fpga/helion.git
 cd helion
-cargo test --workspace
 cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
-# empty-XDC counter gold: WNS_PS=9640
-# fabric LED: helion run examples/counter.sv --cycles 16</code></pre>
-      <p class="lede">macOS app: <code>./scripts/build-macos-app.sh</code> then <code>open dist/Helion.app</code>. The GUI binary is <code>Helion</code> / <code>helion-ide</code>, not the CLI.</p>
-    </section>
+# WNS_PS=9640</code></pre>
+        <p class="cta">
+          <a class="btn" href="start.html">Start →</a>
+          <a class="btn ghost" href="https://github.com/helion-fpga/helion">GitHub</a>
+        </p>
+      </div>
+    </div>
+  </main>
 
-    <section class="section">
-      <h2>Flow</h2>
-      <p class="pipeline" aria-label="CAD flow">
-        <span>helion-sv</span><i>→</i>
-        <span>pack</span><i>→</i>
-        <span>place</span><i>→</i>
-        <span>PathFinder</span><i>→</i>
-        <span>STA</span><i>→</i>
-        <span>drc</span><i>→</i>
-        <span>.hbits</span>
-      </p>
-      <p class="lede" style="margin-top:1rem">Device facts come from the Helion Architecture Database. Nothing in the CAD hardcodes a vendor die.</p>
-    </section>
-
-    <section class="section">
-      <h2>We need help with</h2>
-      <dl>
-        <div class="need">
-          <dt>SV ingest</dt>
-          <dd>Large files such as <code>examples/ysyx_ibex.sv</code> must preprocess, skip packages, and synth without hanging or aborting.</dd>
-        </div>
-        <div class="need">
-          <dt>STA / XDC</dt>
-          <dd>Clocks, I/O delay, false paths — gold counter stays <span class="gold">WNS_PS=9640</span>.</dd>
-        </div>
-        <div class="need">
-          <dt>IDE</dt>
-          <dd>Engine-backed panes and tests, not caption dumps. Floorplan, wave, timing, netlist.</dd>
-        </div>
-        <div class="need">
-          <dt>Docs / CI</dt>
-          <dd>This site, Linux + macOS CI, good first issues. If you cannot write CAD yet, you can still land here.</dd>
-        </div>
-      </dl>
-      <p class="cta">
-        <a class="btn" href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">Good first issues</a>
-        <a class="btn ghost" href="https://github.com/helion-fpga/helion/discussions">Discussions</a>
-      </p>
-    </section>
+  <div class="marquee" aria-hidden="true">
+    <div class="marquee-track">
+      <span>Use the suite / Come help / Use the suite / Come help / </span>
+      <span>Use the suite / Come help / Use the suite / Come help / </span>
+    </div>
   </div>
 
-  <footer>
-    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a> · org <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-    <span><a href="legal.html">Legal fence</a> · <a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></span>
+  <footer class="site">
+    <span>Apache-2.0 OR MIT · <a href="https://github.com/saksham-45">@saksham-45</a> · <a href="https://github.com/helion-fpga">helion-fpga</a></span>
+    <span><a href="legal.html">Legal</a> · <a href="get-involved.html">Get involved</a></span>
   </footer>
+  <button class="anim-toggle" id="anim-toggle" type="button" title="Pause animations">II</button>
   <script src="site.js"></script>
 </body>
 </html>
