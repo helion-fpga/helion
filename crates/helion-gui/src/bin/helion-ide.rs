@@ -244,32 +244,19 @@ impl HelionIde {
 
     fn set_activity(&mut self, a: Activity) {
         self.activity = a;
+        self.sidebar_hidden = false;
         match a {
             Activity::Files => {
-                self.sidebar_hidden = false;
                 self.model.layout = LayoutKind::Default;
                 self.set_canvas(Canvas::Editor);
             }
-            Activity::Device => {
-                self.sidebar_hidden = false;
-                self.set_canvas(Canvas::Editor);
-            }
-            Activity::Timing => {
-                self.sidebar_hidden = false;
-                self.set_canvas(Canvas::Timing);
-            }
-            Activity::Simulate => {
-                self.sidebar_hidden = false;
-                let _ = self.model.set_layout(LayoutKind::Simulation);
-                self.model.workspace = WorkspaceTab::Wave;
-            }
-            Activity::Program => {
-                self.sidebar_hidden = false;
-                let _ = self.model.set_nav(NavSection::ProgramDebug);
-            }
+            Activity::Device => self.set_canvas(Canvas::Device),
+            Activity::Timing => self.set_canvas(Canvas::Timing),
+            Activity::Simulate | Activity::Program => {}
             Activity::Reports => {
-                self.sidebar_hidden = false;
-                self.set_canvas(Canvas::Timing);
+                if self.canvas != Canvas::Timing {
+                    self.set_canvas(Canvas::Timing);
+                }
                 self.model.workspace = WorkspaceTab::Reports;
             }
         }
@@ -285,7 +272,7 @@ impl HelionIde {
         match self.model.open_source(path) {
             Ok(_) => {
                 self.remember(path.to_path_buf());
-                self.set_canvas(Canvas::Editor);
+                self.set_activity(Activity::Files);
             }
             Err(_) => {}
         }
@@ -317,7 +304,7 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
         native_open(app);
     }
     if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Enter)) {
-        run_implement(&mut app.model);
+        run_implement(app);
     }
     if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::Num1)) {
         app.set_canvas(Canvas::Editor);
@@ -374,8 +361,13 @@ end try"#;
     }
 }
 
-fn run_implement(model: &mut IdeModel) {
-    let _ = model.implement();
+fn run_implement(app: &mut HelionIde) {
+    if app.model.step_blocked(FlowStep::Synthesis).is_some() {
+        return;
+    }
+    if app.model.implement().is_ok() {
+        app.set_canvas(Canvas::Device);
+    }
 }
 
 
@@ -440,19 +432,53 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                         }
                     }
                 });
+                ui.menu_button("Examples", |ui| {
+                    let mut pick = None;
+                    for (label, file) in RAIL_OPEN_SOURCES {
+                        if ui.button(label).clicked() {
+                            pick = Some(file);
+                            ui.close_menu();
+                        }
+                    }
+                    if let Some(file) = pick {
+                        let p = helion_device::Device::examples_dir().join(file);
+                        app.open_path(&p);
+                    }
+                });
                 ui.separator();
                 paint_progress_strip(ui, &mut app.model);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
-                    let impl_btn = ui
-                        .add_sized(
-                            [112.0, chrome::HIT_PRIMARY],
-                            egui::Button::new(RichText::new("Implement").strong()),
-                        )
-                        .on_hover_text(tip("Implement", "⌘↩", "impl_design"));
-                    if impl_btn.clicked() {
-                        run_implement(&mut app.model);
-                    }
+                    let synth_blocked = app.model.step_blocked(FlowStep::Synthesis);
+                    ui.add_enabled_ui(synth_blocked.is_none(), |ui| {
+                        let impl_btn = ui
+                            .add_sized(
+                                [112.0, chrome::HIT_PRIMARY],
+                                egui::Button::new(RichText::new("Implement").strong()),
+                            )
+                            .on_hover_text(match synth_blocked {
+                                Some(why) => why.to_string(),
+                                None => tip("Implement", "⌘↩", "impl_design"),
+                            });
+                        if impl_btn.clicked() {
+                            run_implement(app);
+                        }
+                    });
+                    let bits_blocked = app.model.step_blocked(FlowStep::Bitstream);
+                    ui.add_enabled_ui(bits_blocked.is_none(), |ui| {
+                        let b = ui
+                            .add_sized(
+                                [88.0, chrome::HIT_PRIMARY],
+                                egui::Button::new("Bitstream"),
+                            )
+                            .on_hover_text(match bits_blocked {
+                                Some(why) => why.to_string(),
+                                None => tip("Bitstream", "", "write_bitstream"),
+                            });
+                        if b.clicked() {
+                            let _ = app.model.run_step(FlowStep::Bitstream);
+                        }
+                    });
                 });
             });
         });
@@ -490,7 +516,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(64.0, 28.0), Sense::click());
+                    ui.allocate_exact_size(egui::vec2(64.0, 22.0), Sense::click());
                 if ui.is_rect_visible(rect) {
                     ui.painter().rect(
                         rect,
@@ -543,7 +569,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                     egui::Button::new(RichText::new(act.icon()).size(11.0).strong())
                         .fill(fill),
                 );
-                let resp = resp.on_hover_text(tip(act.label(), "", act.tcl()));
+                let resp = resp.on_hover_text(act.hover());
                 if resp.clicked() {
                     pick = Some(act);
                 }
@@ -586,14 +612,30 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                 Activity::Device => {
                     paint_io_ports_table(ui, &mut app.model, "sidebar_io");
                 }
-                Activity::Timing | Activity::Reports => {
+                Activity::Timing => {
+                    paint_timing_paths(ui, &mut app.model);
+                }
+                Activity::Reports => {
                     paint_report_catalog(ui, &mut app.model);
                 }
                 Activity::Program => {
-                    ui.label("Hardware and bitstream.");
-                    if primary_button(ui, "Program").clicked() {
-                        let _ = app.model.exec("program_hw");
+                    let bits_done = app.model.step_state(FlowStep::Bitstream) == StepState::Done;
+                    if bits_done {
+                        ui.label("Sim cable ready.");
+                    } else {
+                        ui.label("No bitstream yet. Implement, then Bitstream.");
                     }
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(bits_done, |ui| {
+                        let b = primary_button(ui, "Program").on_hover_text(if bits_done {
+                            tip("Program", "", "program_hw")
+                        } else {
+                            "Write bitstream first".into()
+                        });
+                        if b.clicked() && bits_done {
+                            let _ = app.model.exec("program_hw");
+                        }
+                    });
                 }
                 Activity::Simulate => {}
             }
@@ -608,16 +650,12 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
     let src_rows = app.model.source_rows();
-    if src_rows.is_empty() {
-        ui.label("No sources yet.");
+        ui.label("No sources.");
         if primary_button(ui, "Open HDL…")
             .on_hover_text(tip("Open", "⌘O", "open_source"))
             .clicked()
         {
             native_open(app);
-        }
-        if ui.button("Examples").clicked() {
-            app.show_examples = true;
         }
         return;
     }
@@ -733,7 +771,6 @@ fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.separator();
     ui.label(RichText::new("Properties").strong());
     let rows = model.property_rows();
-    ui.label(format!("properties n={}", rows.len()));
     let selected = model.selected_property.clone();
     let mut pick: Option<String> = None;
     data_scroll("properties_table_scroll").show(ui, |ui| {
@@ -850,7 +887,7 @@ fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
     app.show_palette = open;
     if let Some(tcl) = run {
         if tcl == "impl_design" {
-            run_implement(&mut app.model);
+            run_implement(app);
         } else if tcl == "launch_runs" {
             if let Some(name) = app
                 .model
@@ -1051,7 +1088,7 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                             ui.end_row();
                             if scopes.is_empty() {
                                 ui.label("—");
-                                ui.label("no scopes — sim_run");
+                                ui.label("No scopes yet.");
                                 ui.end_row();
                             } else {
                                 for (i, s) in scopes.iter().enumerate() {
@@ -1515,8 +1552,10 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("—");
                         ui.label("No simulation log yet.");
+                        if primary_button(ui, "Run").clicked() {
+                            let _ = model.exec("run_simulation");
+                        }
                         ui.end_row();
                     } else {
                         for (i, row) in rows.iter().enumerate() {
@@ -2749,10 +2788,6 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Timing Paths").strong());
-    ui.label(format!(
-        "timing_paths n={} engine=helion-sta",
-        model.timing_paths.len()
-    ));
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("Report timing").clicked() {
@@ -2918,11 +2953,6 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.horizontal(|ui| {
         if ui.button("Report timing summary").clicked() {
             let _ = model.exec("report_timing_summary");
-        }
-        if ui.button("Apply group_path extra weight 2").clicked() {
-            let _ = model.exec(
-                "group_path -name extra -weight 2 -from [get_ports clk] -to [get_ports led]",
-            );
         }
     });
     let report = model.timing_summary();
@@ -3473,10 +3503,15 @@ fn bitstream_block_color(block: &str) -> Color32 {
 
 fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Bitstream");
-    ui.weak(
-        "helion-bits FAR table — configured frames (block / major / minor / ones), not a hash dump",
-    );
     ui.add_space(6.0);
+    let report = model.bitstream_report();
+    if report.frames == 0 && report.bytes == 0 {
+        ui.label("No bitstream yet.");
+        if primary_button(ui, "Generate Bitstream").clicked() {
+            let _ = model.exec("write_bitstream");
+        }
+        return;
+    }
     ui.horizontal(|ui| {
         if ui.button("Generate Bitstream").clicked() {
             let _ = model.exec("write_bitstream");
@@ -3486,11 +3521,6 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
     });
     ui.add_space(6.0);
-    let report = model.bitstream_report();
-    if report.frames == 0 && report.bytes == 0 {
-        ui.label("no bitstream — run Bitstream");
-        return;
-    }
     ui.label(format!(
         "idcode={:#010x} hash={:#010x} bytes={} frames={} configured={}",
         report.idcode, report.hash, report.bytes, report.frames, report.configured
@@ -3991,14 +4021,6 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Device");
-    ui.label(format!(
-        "{} engine=HAD drawing {}x{} sites={} occupied={}",
-        model.part(),
-        model.device.cols,
-        model.device.rows,
-        model.device.sites.len(),
-        model.device.occupied_count()
-    ));
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("CLB")
@@ -4320,11 +4342,6 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     let regions = model.device.clock_regions.clone();
 
     let selected = model.selected.clone();
-    ui.label(format!(
-        "clock_regions n={} engine=HAD part={}",
-        regions.len(),
-        model.part()
-    ));
     let mut pick: Option<String> = None;
     if regions.is_empty() {
         ui.weak("no clock regions — HAD die");
@@ -4380,7 +4397,6 @@ fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Device Routing").strong());
     let routes = model.device.routes.clone();
     let selected = model.selected.clone();
-    ui.label(format!("device_routes n={} engine=helion-route", routes.len()));
     let mut pick: Option<String> = None;
     if routes.is_empty() {
         ui.weak("no routes — Route / device_routes");

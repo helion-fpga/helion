@@ -49,7 +49,7 @@ impl FlowStep {
     /// Rail label as painted in the GUI.
     pub fn label(self) -> &'static str {
         match self {
-            FlowStep::Synthesis => "Synthesis",
+            FlowStep::Synthesis => "Synth",
             FlowStep::Opt => "Opt",
             FlowStep::Place => "Place",
             FlowStep::Route => "Route",
