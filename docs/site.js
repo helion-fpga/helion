@@ -22,120 +22,47 @@
   }
   syncAnim();
 
-  (function heroWrap() {
-    var stage = document.getElementById("hero-stage");
-    var video = document.getElementById("hero-vid");
-    var visual = stage && stage.querySelector(".hero-visual");
-    var copy = document.getElementById("hero-copy");
-    var canvas = document.getElementById("hero-fg");
-    if (!stage || !video || !visual || !copy || !canvas) return;
+  (function heroExtend() {
+    var main = document.getElementById("hero-vid");
+    var ext = document.getElementById("hero-extend");
+    if (!main || !ext) return;
 
-    var ctx = canvas.getContext("2d", { alpha: true });
-    var dpr = 1;
-    var running = false;
-    var visible = true;
-
-    function resize() {
-      var r = stage.getBoundingClientRect();
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
-      var w = Math.max(1, Math.round(r.width * dpr));
-      var h = Math.max(1, Math.round(r.height * dpr));
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
-      canvas.style.width = r.width + "px";
-      canvas.style.height = r.height + "px";
-      return r;
-    }
-
-    function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
-    function smooth(a, b, x) {
-      var t = clamp((x - a) / (b - a || 1), 0, 1);
-      return t * t * (3 - 2 * t);
-    }
-
-    function frame() {
-      if (!running) return;
-      var r = resize();
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, r.width, r.height);
-      if (video.readyState < 2) {
-        requestAnimationFrame(frame);
-        return;
-      }
-      var vis = visual.getBoundingClientRect();
-      var box = copy.getBoundingClientRect();
-      var vw = video.videoWidth;
-      var vh = video.videoHeight;
-      var vidX = vis.left - r.left;
-      var vidY = vis.top - r.top;
-      var vidW = vis.width;
-      var vidH = vis.height;
-      var copyL = box.left - r.left;
-      var copyR = box.right - r.left;
-      var copyT = box.top - r.top;
-      var copyB = box.bottom - r.top;
-      if (copyL < vidX + vidW * 0.45) {
-        requestAnimationFrame(frame);
-        return;
-      }
-
-      var seam = vidX + vidW - 8;
-      var endX = r.width + 8;
-      var span = Math.max(1, endX - seam);
-      var step = 2;
-
-      for (var x = seam; x < endX; x += step) {
-        var u = (x - seam) / span;
-        var srcX = clamp(vw - 2 - u * vw * 0.2, 0, vw - 2);
-        var wrap = smooth(copyL - 36, copyL + 12, x) * (1 - smooth(copyR - 4, copyR + 120, x));
-        var srcW = Math.max(1, step * (vw / vidW));
-        var dw = step + 1.25;
-        ctx.globalAlpha = 1;
-        ctx.drawImage(video, srcX, 0, srcW, vh, x, vidY, dw, vidH);
-        if (wrap > 0.04) {
-          ctx.globalAlpha = wrap * 0.55;
-          ctx.drawImage(video, srcX, 0, srcW, vh, x, vidY - wrap * 44, dw, vidH);
-          ctx.drawImage(video, srcX, 0, srcW, vh, x, vidY + wrap * 48, dw, vidH);
+    function attach() {
+      try {
+        if (typeof main.captureStream === "function") {
+          ext.srcObject = main.captureStream();
+        } else {
+          ext.removeAttribute("srcObject");
+          ext.src = main.currentSrc || "brand/die-pulse.mp4?v=wrap";
+          ext.loop = true;
         }
+      } catch (err) {
+        ext.src = "brand/die-pulse.mp4?v=wrap";
+        ext.loop = true;
       }
-      ctx.globalAlpha = 1;
-      requestAnimationFrame(frame);
+      ext.play().catch(function () {});
     }
 
-    function start() {
-      if (running || !visible || !animOn) return;
-      running = true;
-      frame();
-    }
-    function stop() { running = false; }
+    if (main.readyState >= 2) attach();
+    else main.addEventListener("loadeddata", attach, { once: true });
+    main.addEventListener("play", function () {
+      ext.play().catch(function () {});
+    });
 
     var origSync = syncAnim;
     syncAnim = function () {
       origSync();
       if (!animOn) {
-        stop();
-        canvas.style.display = "none";
-        video.pause();
+        ext.style.display = "none";
+        main.pause();
+        ext.pause();
       } else {
-        canvas.style.display = "";
-        video.play().catch(function () {});
-        start();
+        ext.style.display = "";
+        main.play().catch(function () {});
+        ext.play().catch(function () {});
       }
     };
-
-    new ResizeObserver(resize).observe(stage);
-    video.addEventListener("play", start);
-    new IntersectionObserver(function (entries) {
-      visible = !!(entries[0] && entries[0].isIntersecting);
-      if (visible) start();
-      else stop();
-    }, { threshold: 0.05 }).observe(stage);
-
-    resize();
-    if (reduce) canvas.style.display = "none";
-    else start();
+    if (reduce) ext.style.display = "none";
   })();
 
   var host = document.getElementById("die");
