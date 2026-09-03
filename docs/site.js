@@ -49,111 +49,10 @@
       return r;
     }
 
-    function catmull(pts, n) {
-      var p = [pts[0]].concat(pts, [pts[pts.length - 1]]);
-      var out = [];
-      var segs = p.length - 3;
-      var per = Math.max(2, Math.floor(n / segs));
-      for (var i = 0; i < segs; i++) {
-        var p0 = p[i], p1 = p[i + 1], p2 = p[i + 2], p3 = p[i + 3];
-        for (var k = 0; k < per; k++) {
-          var t = k / per, t2 = t * t, t3 = t2 * t;
-          out.push({
-            x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
-            y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
-          });
-        }
-      }
-      out.push(pts[pts.length - 1]);
-      return out;
-    }
-
-    function wiggle(path, t, amp, seed) {
-      var out = new Array(path.length);
-      for (var i = 0; i < path.length; i++) {
-        var s = i / (path.length - 1);
-        var ang = (s * 9 + seed) * Math.PI * 2 - t * Math.PI * 2;
-        var nx = 0, ny = 1;
-        if (i > 0 && i < path.length - 1) {
-          var dx = path[i + 1].x - path[i - 1].x;
-          var dy = path[i + 1].y - path[i - 1].y;
-          var len = Math.hypot(dx, dy) || 1;
-          nx = -dy / len;
-          ny = dx / len;
-        }
-        var a = amp * (0.35 + 0.65 * Math.sin(ang) + 0.25 * Math.sin(ang * 2.1 + seed));
-        out[i] = { x: path[i].x + nx * a, y: path[i].y + ny * a };
-      }
-      return out;
-    }
-
-    function stroke(path, width, color, alpha) {
-      if (path.length < 2) return;
-      ctx.beginPath();
-      ctx.moveTo(path[0].x, path[0].y);
-      for (var i = 1; i < path.length; i++) ctx.lineTo(path[i].x, path[i].y);
-      ctx.strokeStyle = color;
-      ctx.globalAlpha = alpha;
-      ctx.lineWidth = width;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.shadowColor = color;
-      ctx.shadowBlur = Math.max(12, width * 1.35);
-      ctx.stroke();
-    }
-
-    function pathsFor(stageR, vis, box) {
-      var ox = vis.right - stageR.left - 18;
-      var baseY = vis.top - stageR.top + vis.height * 0.47;
-      var left = box.left - stageR.left;
-      var top = box.top - stageR.top;
-      var right = box.right - stageR.left;
-      var bottom = box.bottom - stageR.top;
-      var midY = (top + bottom) / 2;
-      var endX = stageR.width + 70;
-      var gapX = (ox + left) * 0.5;
-      return [
-        catmull([
-          { x: ox, y: baseY - 22 },
-          { x: gapX, y: baseY - 28 },
-          { x: left + 36, y: top - 28 },
-          { x: (left + right) * 0.5, y: top - 34 },
-          { x: right + 24, y: top - 6 },
-          { x: endX, y: top + 16 }
-        ], 90),
-        catmull([
-          { x: ox, y: baseY - 6 },
-          { x: gapX + 8, y: top + 10 },
-          { x: left + 48, y: top + 6 },
-          { x: (left + right) * 0.52, y: top + 18 },
-          { x: right + 20, y: top + 36 },
-          { x: endX, y: midY - 36 }
-        ], 90),
-        catmull([
-          { x: ox, y: baseY + 4 },
-          { x: gapX, y: midY - 4 },
-          { x: left + 40, y: midY + 6 },
-          { x: (left + right) * 0.5, y: midY + 8 },
-          { x: right + 18, y: midY },
-          { x: endX, y: midY + 10 }
-        ], 90),
-        catmull([
-          { x: ox, y: baseY + 16 },
-          { x: gapX + 6, y: bottom - 18 },
-          { x: left + 44, y: bottom + 10 },
-          { x: (left + right) * 0.5, y: bottom + 26 },
-          { x: right + 28, y: bottom + 4 },
-          { x: endX, y: bottom - 8 }
-        ], 90),
-        catmull([
-          { x: ox, y: baseY + 30 },
-          { x: gapX, y: bottom + 8 },
-          { x: left + 60, y: bottom + 32 },
-          { x: (left + right) * 0.62, y: bottom + 44 },
-          { x: right + 36, y: bottom + 16 },
-          { x: endX, y: bottom + 10 }
-        ], 90)
-      ];
+    function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+    function smooth(a, b, x) {
+      var t = clamp((x - a) / (b - a || 1), 0, 1);
+      return t * t * (3 - 2 * t);
     }
 
     function frame() {
@@ -161,21 +60,47 @@
       var r = resize();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, r.width, r.height);
+      if (video.readyState < 2) {
+        requestAnimationFrame(frame);
+        return;
+      }
       var vis = visual.getBoundingClientRect();
       var box = copy.getBoundingClientRect();
-      var dur = video.duration || 3.5;
-      var t = ((video.currentTime || 0) / dur) % 1;
-      var bases = pathsFor(r, vis, box);
-      ctx.save();
-      ctx.globalCompositeOperation = "lighter";
-      for (var p = 0; p < bases.length; p++) {
-        var path = wiggle(bases[p], t, 11, p * 0.29);
-        var path2 = wiggle(bases[p], t + 0.17, 18, p * 0.29 + 0.4);
-        stroke(path2, 26, "rgba(186, 80, 255, 0.55)", 0.2);
-        stroke(path, 16, "rgba(90, 235, 220, 0.85)", 0.28);
-        stroke(path, 7, "rgba(180, 255, 250, 0.9)", 0.22);
+      var vw = video.videoWidth;
+      var vh = video.videoHeight;
+      var vidX = vis.left - r.left;
+      var vidY = vis.top - r.top;
+      var vidW = vis.width;
+      var vidH = vis.height;
+      var copyL = box.left - r.left;
+      var copyR = box.right - r.left;
+      var copyT = box.top - r.top;
+      var copyB = box.bottom - r.top;
+      if (copyL < vidX + vidW * 0.45) {
+        requestAnimationFrame(frame);
+        return;
       }
-      ctx.restore();
+
+      var seam = vidX + vidW - 8;
+      var endX = r.width + 8;
+      var span = Math.max(1, endX - seam);
+      var step = 2;
+
+      for (var x = seam; x < endX; x += step) {
+        var u = (x - seam) / span;
+        var srcX = clamp(vw - 2 - u * vw * 0.2, 0, vw - 2);
+        var wrap = smooth(copyL - 36, copyL + 12, x) * (1 - smooth(copyR - 4, copyR + 120, x));
+        var srcW = Math.max(1, step * (vw / vidW));
+        var dw = step + 1.25;
+        ctx.globalAlpha = 1;
+        ctx.drawImage(video, srcX, 0, srcW, vh, x, vidY, dw, vidH);
+        if (wrap > 0.04) {
+          ctx.globalAlpha = wrap * 0.55;
+          ctx.drawImage(video, srcX, 0, srcW, vh, x, vidY - wrap * 44, dw, vidH);
+          ctx.drawImage(video, srcX, 0, srcW, vh, x, vidY + wrap * 48, dw, vidH);
+        }
+      }
+      ctx.globalAlpha = 1;
       requestAnimationFrame(frame);
     }
 
