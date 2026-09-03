@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Use Helion — user guide</title>
+  <meta name="description" content="How to use Helion: open the IDE, run the gold counter, CLI flow, Device floorplan, gold WNS_PS=9640." />
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="361" height="361" /><span class="word">Helion</span></a>
+    <nav>
+      <a href="start.html">Start</a>
+      <a href="use.html">Use</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="wiki.html">Wiki</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="page">
+    <div class="prose">
+      <h1>Using Helion</h1>
+      <p class="lede">This is the user guide: open a design, run the CAD, read timing, simulate. Build steps live on <a href="start.html">Start</a>.</p>
+
+      <h2>What you get</h2>
+      <ul>
+        <li>Desktop IDE: <code>Helion.app</code> → <code>Contents/MacOS/Helion</code> (same as <code>helion-ide</code>)</li>
+        <li>CLI: <code>helion</code> (doctor, run, report_timing, project)</li>
+        <li>Part: <code>HL10T-C32-1</code> from HAD, not a vendor die</li>
+      </ul>
+
+      <h2>Open a design in the IDE</h2>
+      <ol>
+        <li><code>open dist/Helion.app</code> (or <code>cargo run -p helion-gui --bin helion-ide</code>).</li>
+        <li>Do not launch the CLI binary as the app.</li>
+        <li>Open HDL from the examples rail: <code>counter.sv</code>, <code>blinky.sv</code>, <code>hier.sv</code>, <code>complex.sv</code>, or <code>ysyx_ibex.sv</code>.</li>
+        <li>The Editor canvas shows the source. Device canvas is the floorplan of <code>HL10T-C32-1</code> (IO ring, clock spine, CLB array). Timing canvas is STA.</li>
+      </ol>
+      <p>Headless (no window) — this is the gold gate:</p>
+      <pre><code>cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+# expect: WNS_PS=9640</code></pre>
+
+      <h2>CLI flow</h2>
+      <pre><code>cargo run -p helion-cli -- doctor
+cargo run -p helion-cli -- run examples/counter.sv --cycles 16
+cargo run -p helion-cli -- report_timing examples/blinky.sv</code></pre>
+      <p>Empty-XDC counter gold: <span class="gold">WNS_PS=9640</span>. Fabric LED over 16 cycles: <code>LED[16]=0000000111111110</code> (LED = cnt[3]).</p>
+
+      <h2>Device (the die)</h2>
+      <p>HAD grid for <code>HL10T-C32-1</code>:</p>
+      <figure class="had">
+        <svg viewBox="0 0 360 340" role="img" aria-label="HL10T-C32-1: IO ring, clock spine, 32 by 32 CLB">
+          <rect x="0" y="0" width="360" height="340" fill="#050c09"/>
+          <rect x="12" y="12" width="336" height="28" fill="#c47a3a"/>
+          <rect x="12" y="300" width="336" height="28" fill="#c47a3a"/>
+          <rect x="12" y="40" width="28" height="260" fill="#c47a3a"/>
+          <rect x="320" y="40" width="28" height="260" fill="#c47a3a"/>
+          <rect x="44" y="40" width="22" height="260" fill="#e6b325"/>
+          <rect x="70" y="40" width="246" height="260" fill="#163226" stroke="#3d8f6a" stroke-width="1"/>
+          <text x="180" y="31" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO ring · 32 user IO</text>
+          <text x="180" y="319" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO</text>
+          <text x="55" y="178" text-anchor="middle" fill="#081510" font-size="11" font-family="ui-monospace, monospace" transform="rotate(-90 55 178)">CLK x=1</text>
+          <text x="193" y="165" text-anchor="middle" fill="#ebe6d4" font-size="16" font-family="ui-monospace, monospace">32 × 32 CLB</text>
+          <text x="193" y="188" text-anchor="middle" fill="#b7b09a" font-size="12" font-family="ui-monospace, monospace">HL10T-C32-1</text>
+        </svg>
+        <figcaption><span class="gold">WNS_PS=9640</span> · clk 10.000 ns · CAD reads <code>devices/helion/parts/HL10T-C32-1.toml</code></figcaption>
+      </figure>
+      <p>In the app, Device is a canvas that fits the remaining pane (not a tiny bottom scroller). Package and Bitstream sit with it.</p>
+
+      <h2>What “gold” means</h2>
+      <p>If you change CAD or GUI, <code>helion-ide --headless examples/counter.sv</code> must still print <span class="gold">WNS_PS=9640</span> unless the same commit updates the QoR table in the README <em>with a reason</em>.</p>
+
+      <h2>Large SystemVerilog</h2>
+      <p><code>examples/ysyx_ibex.sv</code> is on the Open rail. Ingest is helion-sv. Fitting a full SoC on this part is not the synth bar. Leftover Helion-legal constructs should still map; do not abort the run because sv-parser is unhappy.</p>
+
+      <p class="cta">
+        <a class="btn" href="start.html">Build from source</a>
+        <a class="btn ghost" href="wiki.html">Wiki index</a>
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a> · org <a href="https://github.com/helion-fpga">helion-fpga</a></span>
+    <span><a href="legal.html">Legal fence</a></span>
+  </footer>
+  <script src="site.js"></script>
+</body>
+</html>

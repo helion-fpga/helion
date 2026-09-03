@@ -2,6 +2,8 @@
 
 - Home: index.html
 - Getting started: start.html
+- Using Helion: use.html
+- Wiki: wiki.html
 - Architecture: architecture.html
 - Get involved: get-involved.html
 - Contributing (code): contribute.html
