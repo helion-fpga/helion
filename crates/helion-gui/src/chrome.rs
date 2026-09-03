@@ -137,12 +137,19 @@ impl Activity {
         }
     }
 
+    /// Rail is click-only. ⌘1/⌘2/⌘3 belong to the three canvases.
     pub fn shortcut(self) -> &'static str {
+        ""
+    }
+
+    pub fn hover(self) -> &'static str {
         match self {
-            Activity::Files => "⌘1",
-            Activity::Device => "⌘2",
-            Activity::Timing => "⌘3",
-            Activity::Simulate | Activity::Program | Activity::Reports => "",
+            Activity::Files => "Files\nSources",
+            Activity::Device => "Device\nFloorplan and I/O",
+            Activity::Timing => "Timing\nSlack and paths",
+            Activity::Simulate => "Simulate\nScopes and wave",
+            Activity::Program => "Program\nCable and bitstream",
+            Activity::Reports => "Reports\nTiming and utilization",
         }
     }
 }
