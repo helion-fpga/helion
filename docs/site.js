@@ -22,120 +22,161 @@
   }
   syncAnim();
 
-  (function heroThrough() {
+  (function heroWrap() {
     var stage = document.getElementById("hero-stage");
     var video = document.getElementById("hero-vid");
+    var visual = stage && stage.querySelector(".hero-visual");
+    var copy = document.getElementById("hero-copy");
     var canvas = document.getElementById("hero-fg");
-    if (!stage || !video || !canvas) return;
+    if (!stage || !video || !visual || !copy || !canvas) return;
 
     var ctx = canvas.getContext("2d", { alpha: true });
-    var mask = document.createElement("canvas");
-    var mctx = mask.getContext("2d");
     var dpr = 1;
     var running = false;
     var visible = true;
 
-    function stageRect() {
-      return stage.getBoundingClientRect();
-    }
-
-    function resizeLayer(el) {
-      var r = stageRect();
+    function resize() {
+      var r = stage.getBoundingClientRect();
       dpr = Math.min(window.devicePixelRatio || 1, 2);
       var w = Math.max(1, Math.round(r.width * dpr));
       var h = Math.max(1, Math.round(r.height * dpr));
-      if (el.width !== w || el.height !== h) {
-        el.width = w;
-        el.height = h;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
       }
-      el.style.width = r.width + "px";
-      el.style.height = r.height + "px";
+      canvas.style.width = r.width + "px";
+      canvas.style.height = r.height + "px";
       return r;
     }
 
-    function drawVideo(g, ox, oy, zoom) {
-      var r = stageRect();
-      var vw = video.videoWidth;
-      var vh = video.videoHeight;
-      if (!vw || !vh) return;
-      var elW = r.width * 1.12;
-      var elH = r.height * 1.12;
-      var elX = r.width * -0.06 + (ox || 0);
-      var elY = r.height * -0.06 + (oy || 0);
-      var s = Math.max(elW / vw, elH / vh) * (zoom || 1);
-      var dw = vw * s;
-      var dh = vh * s;
-      var dx = elX + (elW - dw) * 0.12;
-      var dy = elY + (elH - dh) * 0.48;
-      g.drawImage(video, dx, dy, dw, dh);
-    }
-
-    function punchGlyphs(g, origin) {
-      var nodes = stage.querySelectorAll("[data-punch]");
-      var range = document.createRange();
-      g.fillStyle = "#000";
-      g.strokeStyle = "#000";
-      g.lineJoin = "round";
-      g.lineWidth = 2.6;
-      g.textBaseline = "alphabetic";
-      g.letterSpacing = "0px";
-      nodes.forEach(function (el) {
-        var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-        var node;
-        while ((node = walker.nextNode())) {
-          var str = node.nodeValue;
-          var cs = window.getComputedStyle(node.parentElement);
-          g.font =
-            cs.fontStyle + " " + cs.fontWeight + " " + cs.fontSize + " " + cs.fontFamily;
-          var m0 = g.measureText("Hg");
-          var ascent = m0.fontBoundingBoxAscent || parseFloat(cs.fontSize) * 0.8;
-          var descent = m0.fontBoundingBoxDescent || parseFloat(cs.fontSize) * 0.2;
-          var em = ascent + descent;
-          for (var i = 0; i < str.length; i++) {
-            if (str[i] === "\n") continue;
-            range.setStart(node, i);
-            range.setEnd(node, i + 1);
-            var b = range.getBoundingClientRect();
-            if (b.width < 0.15 || b.height < 0.5) continue;
-            var extra = Math.max(0, b.height - em);
-            var x = b.left - origin.left;
-            var y = b.top - origin.top + extra / 2 + ascent;
-            g.strokeText(str[i], x, y);
-            g.fillText(str[i], x, y);
-          }
+    function catmull(pts, n) {
+      var p = [pts[0]].concat(pts, [pts[pts.length - 1]]);
+      var out = [];
+      var segs = p.length - 3;
+      var per = Math.max(2, Math.floor(n / segs));
+      for (var i = 0; i < segs; i++) {
+        var p0 = p[i], p1 = p[i + 1], p2 = p[i + 2], p3 = p[i + 3];
+        for (var k = 0; k < per; k++) {
+          var t = k / per, t2 = t * t, t3 = t2 * t;
+          out.push({
+            x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+            y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+          });
         }
-      });
+      }
+      out.push(pts[pts.length - 1]);
+      return out;
     }
 
-    function rebuildMask() {
-      var r = resizeLayer(mask);
-      mctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      mctx.globalCompositeOperation = "source-over";
-      mctx.fillStyle = "#fff";
-      mctx.fillRect(0, 0, r.width, r.height);
-      mctx.globalCompositeOperation = "destination-out";
-      punchGlyphs(mctx, r);
-      mctx.globalCompositeOperation = "source-over";
+    function wiggle(path, t, amp, seed) {
+      var out = new Array(path.length);
+      for (var i = 0; i < path.length; i++) {
+        var s = i / (path.length - 1);
+        var ang = (s * 9 + seed) * Math.PI * 2 - t * Math.PI * 2;
+        var nx = 0, ny = 1;
+        if (i > 0 && i < path.length - 1) {
+          var dx = path[i + 1].x - path[i - 1].x;
+          var dy = path[i + 1].y - path[i - 1].y;
+          var len = Math.hypot(dx, dy) || 1;
+          nx = -dy / len;
+          ny = dx / len;
+        }
+        var a = amp * (0.35 + 0.65 * Math.sin(ang) + 0.25 * Math.sin(ang * 2.1 + seed));
+        out[i] = { x: path[i].x + nx * a, y: path[i].y + ny * a };
+      }
+      return out;
+    }
+
+    function stroke(path, width, color, alpha) {
+      if (path.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(path[0].x, path[0].y);
+      for (var i = 1; i < path.length; i++) ctx.lineTo(path[i].x, path[i].y);
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = width;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.shadowColor = color;
+      ctx.shadowBlur = Math.max(12, width * 1.35);
+      ctx.stroke();
+    }
+
+    function pathsFor(stageR, vis, box) {
+      var ox = vis.right - stageR.left - 18;
+      var baseY = vis.top - stageR.top + vis.height * 0.47;
+      var left = box.left - stageR.left;
+      var top = box.top - stageR.top;
+      var right = box.right - stageR.left;
+      var bottom = box.bottom - stageR.top;
+      var midY = (top + bottom) / 2;
+      var endX = stageR.width + 70;
+      var gapX = (ox + left) * 0.5;
+      return [
+        catmull([
+          { x: ox, y: baseY - 22 },
+          { x: gapX, y: baseY - 28 },
+          { x: left + 36, y: top - 28 },
+          { x: (left + right) * 0.5, y: top - 34 },
+          { x: right + 24, y: top - 6 },
+          { x: endX, y: top + 16 }
+        ], 90),
+        catmull([
+          { x: ox, y: baseY - 6 },
+          { x: gapX + 8, y: top + 10 },
+          { x: left + 48, y: top + 6 },
+          { x: (left + right) * 0.52, y: top + 18 },
+          { x: right + 20, y: top + 36 },
+          { x: endX, y: midY - 36 }
+        ], 90),
+        catmull([
+          { x: ox, y: baseY + 4 },
+          { x: gapX, y: midY - 4 },
+          { x: left + 40, y: midY + 6 },
+          { x: (left + right) * 0.5, y: midY + 8 },
+          { x: right + 18, y: midY },
+          { x: endX, y: midY + 10 }
+        ], 90),
+        catmull([
+          { x: ox, y: baseY + 16 },
+          { x: gapX + 6, y: bottom - 18 },
+          { x: left + 44, y: bottom + 10 },
+          { x: (left + right) * 0.5, y: bottom + 26 },
+          { x: right + 28, y: bottom + 4 },
+          { x: endX, y: bottom - 8 }
+        ], 90),
+        catmull([
+          { x: ox, y: baseY + 30 },
+          { x: gapX, y: bottom + 8 },
+          { x: left + 60, y: bottom + 32 },
+          { x: (left + right) * 0.62, y: bottom + 44 },
+          { x: right + 36, y: bottom + 16 },
+          { x: endX, y: bottom + 10 }
+        ], 90)
+      ];
     }
 
     function frame() {
       if (!running) return;
-      var r = resizeLayer(canvas);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (video.readyState >= 2) {
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        drawVideo(ctx, 18, -10, 1.045);
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.globalCompositeOperation = "destination-in";
-        ctx.drawImage(mask, 0, 0);
-        ctx.globalCompositeOperation = "source-over";
+      var r = resize();
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, r.width, r.height);
+      var vis = visual.getBoundingClientRect();
+      var box = copy.getBoundingClientRect();
+      var dur = video.duration || 3.5;
+      var t = ((video.currentTime || 0) / dur) % 1;
+      var bases = pathsFor(r, vis, box);
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      for (var p = 0; p < bases.length; p++) {
+        var path = wiggle(bases[p], t, 11, p * 0.29);
+        var path2 = wiggle(bases[p], t + 0.17, 18, p * 0.29 + 0.4);
+        stroke(path2, 26, "rgba(186, 80, 255, 0.55)", 0.2);
+        stroke(path, 16, "rgba(90, 235, 220, 0.85)", 0.28);
+        stroke(path, 7, "rgba(180, 255, 250, 0.9)", 0.22);
       }
-      if (video.requestVideoFrameCallback) {
-        video.requestVideoFrameCallback(function () { frame(); });
-      } else {
-        requestAnimationFrame(frame);
-      }
+      ctx.restore();
+      requestAnimationFrame(frame);
     }
 
     function start() {
@@ -144,11 +185,6 @@
       frame();
     }
     function stop() { running = false; }
-
-    function layout() {
-      resizeLayer(canvas);
-      rebuildMask();
-    }
 
     var origSync = syncAnim;
     syncAnim = function () {
@@ -164,10 +200,7 @@
       }
     };
 
-    new ResizeObserver(layout).observe(stage);
-    window.addEventListener("resize", layout);
-    if (document.fonts && document.fonts.ready) document.fonts.ready.then(layout);
-    video.addEventListener("loadeddata", layout);
+    new ResizeObserver(resize).observe(stage);
     video.addEventListener("play", start);
     new IntersectionObserver(function (entries) {
       visible = !!(entries[0] && entries[0].isIntersecting);
@@ -175,7 +208,7 @@
       else stop();
     }, { threshold: 0.05 }).observe(stage);
 
-    layout();
+    resize();
     if (reduce) canvas.style.display = "none";
     else start();
   })();
