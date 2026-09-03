@@ -22,48 +22,8 @@
   }
   syncAnim();
 
-  (function heroExtend() {
-    var main = document.getElementById("hero-vid");
-    var ext = document.getElementById("hero-extend");
-    if (!main || !ext) return;
-
-    function attach() {
-      try {
-        if (typeof main.captureStream === "function") {
-          ext.srcObject = main.captureStream();
-        } else {
-          ext.removeAttribute("srcObject");
-          ext.src = main.currentSrc || "brand/die-pulse.mp4?v=wrap";
-          ext.loop = true;
-        }
-      } catch (err) {
-        ext.src = "brand/die-pulse.mp4?v=wrap";
-        ext.loop = true;
-      }
-      ext.play().catch(function () {});
-    }
-
-    if (main.readyState >= 2) attach();
-    else main.addEventListener("loadeddata", attach, { once: true });
-    main.addEventListener("play", function () {
-      ext.play().catch(function () {});
-    });
-
-    var origSync = syncAnim;
-    syncAnim = function () {
-      origSync();
-      if (!animOn) {
-        ext.style.display = "none";
-        main.pause();
-        ext.pause();
-      } else {
-        ext.style.display = "";
-        main.play().catch(function () {});
-        ext.play().catch(function () {});
-      }
-    };
-    if (reduce) ext.style.display = "none";
-  })();
+  var plate = document.getElementById("hero-vid");
+  if (reduce && plate) plate.pause();
 
   var host = document.getElementById("die");
   if (!host) return;
