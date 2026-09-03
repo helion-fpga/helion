@@ -1387,6 +1387,18 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                         keep: false,
                         mark_debug: false,
                     });
+                    while p.eat_sym('[') {
+                        let mut d = 1i32;
+                        while d > 0 && p.peek().is_some() {
+                            if p.eat_sym('[') {
+                                d += 1;
+                            } else if p.eat_sym(']') {
+                                d -= 1;
+                            } else {
+                                p.bump();
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
                     // skip this port to comma or ')'
@@ -3213,6 +3225,7 @@ endmodule
         assert!(p.exists(), "examples/ysyx_ibex.sv must ship with the crate tests");
         let src = std::fs::read_to_string(&p).unwrap();
         let mods = list_sv_modules_origin(&src, "ysyx_ibex.sv").expect("list ibex modules");
+        eprintln!("ibex_modules={} has_top={}", mods.len(), mods.iter().any(|m| m == "ysyx_ibex"));
         assert!(
             mods.iter().any(|m| m == "ysyx_ibex"),
             "top ysyx_ibex must parse: {mods:?}"
@@ -3222,7 +3235,15 @@ endmodule
             "Ibex-scale file must yield many modules, got {}",
             mods.len()
         );
+        let t0 = std::time::Instant::now();
         let d = synth_sv_path(&p).expect("synth ysyx_ibex");
+        eprintln!(
+            "synth_sv_path Ok name={} ports={} cells={} elapsed_ms={}",
+            d.name,
+            d.ports.len(),
+            d.cells.len(),
+            t0.elapsed().as_millis()
+        );
         assert_eq!(d.name, "ysyx_ibex");
         assert!(
             !d.ports.is_empty(),
