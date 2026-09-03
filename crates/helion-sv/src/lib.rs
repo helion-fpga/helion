@@ -2588,6 +2588,105 @@ fn drive_target(e: &RExpr, rtl: &Rtl) -> Result<(String, usize), String> {
     }
 }
 
+
+/// LUT6 INIT for a 2-input AND of (I0^a_inv) & (I1^b_inv), then XOR o_inv.
+/// 4-bit pattern is replicated across 64 bits (unused I2..I5).
+fn lut6_and2(a_inv: bool, b_inv: bool, o_inv: bool) -> u64 {
+    let mut pat = 0u64;
+    for addr in 0..4u32 {
+        let i0 = addr & 1 == 1;
+        let i1 = addr & 2 == 2;
+        let v = ((i0 ^ a_inv) && (i1 ^ b_inv)) ^ o_inv;
+        if v {
+            pat |= 1u64 << addr;
+        }
+    }
+    let mut acc = 0u64;
+    let mut sh = 0;
+    while sh < 64 {
+        acc |= (pat & 0xf) << sh;
+        sh += 4;
+    }
+    acc
+}
+
+fn lut6_inv() -> u64 {
+    0x5555_5555_5555_5555
+}
+
+fn lut6_const(one: bool) -> u64 {
+    if one {
+        u64::MAX
+    } else {
+        0
+    }
+}
+
+/// Map a >6-PI cone to a LUT2 tree. Output net is the function of `aig`.
+/// PI<=6 stays on the single-LUT6 path so gold INIT patterns do not move.
+fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
+    use std::collections::HashMap;
+    let mut node_net: HashMap<u32, String> = HashMap::new();
+    let mut n_lut = 0usize;
+    fn emit_lut(d: &mut Design, prefix: &str, n_lut: &mut usize, init: u64, ins: &[(&str, &str)]) -> String {
+        let cell = format!("{prefix}l{n_lut}");
+        let out = format!("{prefix}n{n_lut}");
+        *n_lut += 1;
+        d.add_cell(&cell, CellKind::Lut6 { init });
+        d.connect(&out, &cell, "O");
+        for (net, pin) in ins {
+            d.connect(*net, &cell, *pin);
+        }
+        out
+    }
+    fn lit_net(
+        d: &mut Design,
+        aig: &Aig,
+        lit: Lit,
+        prefix: &str,
+        n_lut: &mut usize,
+        node_net: &mut HashMap<u32, String>,
+    ) -> String {
+        let n = node_true(d, aig, lit.node, prefix, n_lut, node_net);
+        if !lit.inv {
+            return n;
+        }
+        emit_lut(d, prefix, n_lut, lut6_inv(), &[(&n, "I0")])
+    }
+    fn node_true(
+        d: &mut Design,
+        aig: &Aig,
+        node: u32,
+        prefix: &str,
+        n_lut: &mut usize,
+        node_net: &mut HashMap<u32, String>,
+    ) -> String {
+        if node == 0 {
+            return emit_lut(d, prefix, n_lut, lut6_const(false), &[]);
+        }
+        if (node as usize) <= aig.pis.len() {
+            return aig.pis[(node as usize) - 1].clone();
+        }
+        if let Some(n) = node_net.get(&node) {
+            return n.clone();
+        }
+        let ai = (node as usize) - 1 - aig.pis.len();
+        let (a, b) = aig.ands[ai];
+        let na = lit_net(d, aig, a, prefix, n_lut, node_net);
+        let nb = lit_net(d, aig, b, prefix, n_lut, node_net);
+        let out = emit_lut(
+            d,
+            prefix,
+            n_lut,
+            lut6_and2(false, false, false),
+            &[(&na, "I0"), (&nb, "I1")],
+        );
+        node_net.insert(node, out.clone());
+        out
+    }
+    lit_net(d, aig, aig.output, prefix, &mut n_lut, &mut node_net)
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
@@ -2735,6 +2834,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
+            let (ff, qnet) = if single_q {
+                ("u_ff".to_string(), "q".to_string())
+            } else {
+                (format!("u_ff{i}"), bitn.clone())
+            };
+            let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"));
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect(clk, &ff, "CLK");
+            d.connect(&wide, &ff, "D");
+            d.connect(&qnet, &ff, "Q");
             continue;
         }
         let init = aig.flowmap_lut6();
@@ -3692,13 +3801,15 @@ endmodule
         );
         let t0 = std::time::Instant::now();
         let d = synth_sv_path(&p).expect("synth ysyx_ibex");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
         eprintln!(
             "synth_sv_path Ok name={} ports={} cells={} luts={} ffs={} elapsed_ms={}",
             d.name,
             d.ports.len(),
             d.cells.len(),
-            d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count(),
-            d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count(),
+            luts,
+            ffs,
             t0.elapsed().as_millis()
         );
         assert_eq!(d.name, "ysyx_ibex");
