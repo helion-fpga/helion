@@ -98,12 +98,20 @@ nav a[aria-current="page"] {
 
 .hero {
   display: grid;
-  grid-template-columns: minmax(22rem, 1.15fr) minmax(0, 0.95fr);
-  gap: 2.5rem 3rem;
+  grid-template-columns: 1.15fr 0.95fr;
+  gap: 3.5rem 4.5rem;
   align-items: center;
-  padding: 2.5rem 1.6rem 2rem;
+  padding: 4.5rem 4rem 3.2rem;
   max-width: 88rem;
   margin: 0 auto;
+}
+
+.hero-visual video,
+.hero-visual img {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #05070a;
 }
 
 .hero h1 {
@@ -421,9 +429,10 @@ pre {
 .need dd { margin: 0; color: var(--mute); }
 
 @media (max-width: 960px) {
-  .hero { grid-template-columns: 1fr; }
+  .hero { grid-template-columns: 1fr; padding: 2.2rem 1.4rem 1.8rem; gap: 1.8rem; }
+  .hero-visual { order: -1; }
   .cards, .facts { grid-template-columns: 1fr 1fr; }
-  .device { min-height: 22rem; order: -1; }
+  .device { min-height: 22rem; }
 }
 @media (max-width: 640px) {
   .cards, .facts, .need { grid-template-columns: 1fr; }
