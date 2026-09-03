@@ -650,6 +650,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
     let src_rows = app.model.source_rows();
+    if src_rows.is_empty() {
         ui.label("No sources.");
         if primary_button(ui, "Open HDL…")
             .on_hover_text(tip("Open", "⌘O", "open_source"))
