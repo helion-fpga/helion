@@ -133,25 +133,57 @@ fn read_define_body(chars: &[char], i: &mut usize) -> (Vec<String>, String) {
     if *i < chars.len() && chars[*i] == '(' {
         *i += 1;
         loop {
+            let start = *i;
             skip_ws_not_nl(chars, i);
-            if *i < chars.len() && chars[*i] == ')' {
+            if *i >= chars.len() || chars[*i] == '\n' {
+                break;
+            }
+            if chars[*i] == ')' {
                 *i += 1;
                 break;
             }
             let a = read_ident(chars, i);
-            if !a.is_empty() {
-                args.push(a);
+            if a.is_empty() {
+                // Non-ident in the arg list (`define FOO(1+2)`). Consume to the
+                // matching ')' so i never stalls.
+                let mut depth = 1i32;
+                while *i < chars.len() && chars[*i] != '\n' && depth > 0 {
+                    match chars[*i] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    *i += 1;
+                }
+                break;
+            }
+            args.push(a);
+            skip_ws_not_nl(chars, i);
+            if *i < chars.len() && chars[*i] == '=' {
+                *i += 1;
+                let mut d = 0i32;
+                while *i < chars.len() && chars[*i] != '\n' {
+                    match chars[*i] {
+                        '(' => d += 1,
+                        ')' if d == 0 => break,
+                        ')' => d -= 1,
+                        ',' if d == 0 => break,
+                        _ => {}
+                    }
+                    *i += 1;
+                }
             }
             skip_ws_not_nl(chars, i);
             if *i < chars.len() && chars[*i] == ',' {
                 *i += 1;
+                continue;
             }
             if *i < chars.len() && chars[*i] == ')' {
                 *i += 1;
                 break;
             }
-            if *i >= chars.len() || chars[*i] == '\n' {
-                break;
+            if *i == start {
+                *i += 1;
             }
         }
     }
@@ -255,5 +287,19 @@ mod tests {
     fn object_like_define_expands() {
         let s = preprocess_sv("`define N 4\nlogic [`N:0] q;\n");
         assert!(s.contains("logic [4:0] q;"), "{s}");
+    }
+
+    #[test]
+    fn function_like_non_ident_args_do_not_hang() {
+        let s = preprocess_sv("`define FOO(1+2)\nlogic x;\n");
+        assert!(s.contains("logic x;"), "{s}");
+        assert!(!s.contains('`'), "{s}");
+    }
+
+    #[test]
+    fn object_like_paren_body_not_args() {
+        let s = preprocess_sv("`define BAR (4)\nlogic [3:0] q;\nassign q = `BAR;\n");
+        assert!(s.contains("assign q = (4);") || s.contains("assign q = (4)"), "{s}");
+        assert!(!s.contains('`'), "{s}");
     }
 }
