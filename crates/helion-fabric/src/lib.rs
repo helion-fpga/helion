@@ -438,11 +438,39 @@ impl Fabric {
         self.iobs.get(&(x, y)).copied().unwrap_or(false)
     }
 
+    /// UG900 force/deposit poke on an IOB pad (after `step_user`).
+    pub fn set_led_at(&mut self, x: u32, y: u32, v: bool) {
+        self.iobs.insert((x, y), v);
+    }
+
     pub fn ble_q(&self, x: u32, y: u32, ble: u32) -> bool {
         self.clbs
             .get(&(x, y))
             .map(|c| c.q[ble as usize])
             .unwrap_or(false)
+    }
+
+    /// UG900 force/deposit poke on a BLE FF Q; IOBs sourced from that BLE follow.
+    pub fn set_ble_q(&mut self, x: u32, y: u32, ble: u32, v: bool) {
+        if let Some(c) = self.clbs.get_mut(&(x, y)) {
+            if let Some(q) = c.q.get_mut(ble as usize) {
+                *q = v;
+            }
+        }
+        let srcs: Vec<(u32, u32)> = self
+            .iob_src
+            .iter()
+            .filter_map(|(&(ix, iy), &(cx, cy, b))| {
+                if cx == x && cy == y && u32::from(b) == ble {
+                    Some((ix, iy))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (ix, iy) in srcs {
+            self.iobs.insert((ix, iy), v);
+        }
     }
 
     /// Read programmed BRAM INIT word `addr` of BRAM major `idx` (not pack-only).

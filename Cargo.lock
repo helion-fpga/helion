@@ -966,6 +966,7 @@ dependencies = [
  "helion-hw",
  "helion-ipxact",
  "helion-ir",
+ "helion-place",
  "helion-proj",
  "helion-sim",
  "helion-sta",

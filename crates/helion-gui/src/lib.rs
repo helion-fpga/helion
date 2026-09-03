@@ -3,6 +3,7 @@
 
 pub const GPUI_TOOLKIT: &str = "gpui";
 
+pub mod chrome;
 pub mod doctor;
 pub mod ide;
 pub use ide::{
@@ -10,14 +11,14 @@ pub use ide::{
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
     HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
-    MemoryWordRow, BreakpointRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
+    MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection,
     Pblock, ProjectSummaryGadget, PropertyRow, ReportCatalogRow,
     NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
-    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimObject, StepState, TimingPath,
+    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
     TimingPathPin,
     UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
-    Waveform, WaveMarker, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
+    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
 };
 pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{
