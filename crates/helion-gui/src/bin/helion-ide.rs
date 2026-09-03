@@ -732,12 +732,8 @@ fn paint_status_bar(ctx: &egui::Context, model: &IdeModel) {
 fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.separator();
     ui.label(RichText::new("Properties").strong());
-    let obj = model
-        .properties_name()
-        .or(model.selected.as_deref())
-        .or(model.selected_ip.as_deref())
-        .unwrap_or("—");
     let rows = model.property_rows();
+    ui.label(format!("properties n={}", rows.len()));
     let selected = model.selected_property.clone();
     let mut pick: Option<String> = None;
     data_scroll("properties_table_scroll").show(ui, |ui| {
@@ -807,13 +803,15 @@ fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
     if !app.show_tcl {
         return;
     }
+    let mut open = app.show_tcl;
     egui::Window::new("Tcl")
-        .open(&mut app.show_tcl)
+        .open(&mut open)
         .default_width(520.0)
         .default_height(240.0)
         .show(ctx, |ui| {
             paint_tcl_console(ui, app);
         });
+    app.show_tcl = open;
 }
 
 fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
@@ -2751,6 +2749,10 @@ fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Timing Paths").strong());
+    ui.label(format!(
+        "timing_paths n={} engine=helion-sta",
+        model.timing_paths.len()
+    ));
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("Report timing").clicked() {
@@ -3989,6 +3991,14 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Device");
+    ui.label(format!(
+        "{} engine=HAD drawing {}x{} sites={} occupied={}",
+        model.part(),
+        model.device.cols,
+        model.device.rows,
+        model.device.sites.len(),
+        model.device.occupied_count()
+    ));
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("CLB")
@@ -4310,6 +4320,11 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     let regions = model.device.clock_regions.clone();
 
     let selected = model.selected.clone();
+    ui.label(format!(
+        "clock_regions n={} engine=HAD part={}",
+        regions.len(),
+        model.part()
+    ));
     let mut pick: Option<String> = None;
     if regions.is_empty() {
         ui.weak("no clock regions — HAD die");
@@ -4365,6 +4380,7 @@ fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Device Routing").strong());
     let routes = model.device.routes.clone();
     let selected = model.selected.clone();
+    ui.label(format!("device_routes n={} engine=helion-route", routes.len()));
     let mut pick: Option<String> = None;
     if routes.is_empty() {
         ui.weak("no routes — Route / device_routes");
