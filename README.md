@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/brand/hero-die.jpg" width="920" alt="Photoreal HL10T silicon die">
+</p>
+
 # Helion Design Suite (1.0)
 
 Original FPGA family + CAD. Native `aarch64-apple-darwin`. No vendor bitstream.

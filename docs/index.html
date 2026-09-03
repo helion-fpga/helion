@@ -18,21 +18,21 @@
 </head>
 <body>
   <!--
-    THESIS: Helion is original FPGA CAD; the first viewport is the cropped circuit mark, not a fake die grid.
-    OWN-WORLD: the brand sheet mark (copper octagon + traces), lockup, solder-mask page.
-    STORY: Visitor sees the real Helion symbol, believes WNS_PS=9640, and has a path to help.
-    FIRST VIEWPORT: thesis + Get involved on the left; full mark on the right, unclipped.
-    FORM: brand sheet / FR4 datasheet.
+    THESIS: Helion is original FPGA CAD; the first viewport is a live HL10T floorplan you can probe.
+    OWN-WORLD: copper IO, amber clock spine, HAD CLB grid, brand mark in the chrome.
+    STORY: Visitor probes the die, believes WNS_PS=9640, and has a path to use or help.
+    FIRST VIEWPORT: thesis + Use Helion on the left; Device canvas with the full 35×34 grid on the right.
+    FORM: live Device view, not a still.
     FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
   -->
   <header class="bar">
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="361" height="361" /><span class="word">Helion</span></a>
     <nav>
       <a href="start.html">Start</a>
+      <a href="use.html">Use</a>
       <a href="architecture.html">Architecture</a>
+      <a href="wiki.html">Wiki</a>
       <a href="get-involved.html">Get involved</a>
-      <a href="contribute.html">Contribute</a>
-      <a href="legal.html">Legal</a>
       <a href="https://github.com/helion-fpga/helion">GitHub</a>
     </nav>
   </header>
@@ -47,13 +47,26 @@
           If you write Rust, SystemVerilog, STA, or docs — we need you.
         </p>
         <p class="cta">
-          <a class="btn" href="get-involved.html">Get involved</a>
+          <a class="btn" href="use.html">Use Helion</a>
+          <a class="btn ghost" href="get-involved.html">Get involved</a>
           <a class="btn ghost" href="https://github.com/helion-fpga/helion">Star / fork</a>
-          <a class="btn ghost" href="https://github.com/sponsors/saksham-45">Sponsor</a>
         </p>
       </div>
-      <div class="hero-art">
-        <img src="brand/mark.png" alt="Helion mark: octagonal die with copper traces" width="361" height="361" />
+      <div class="device" id="device">
+        <div class="device-bar">
+          <span>Device · HL10T-C32-1</span>
+          <span class="gold">WNS_PS=9640</span>
+          <span class="mute">clk 10.000 ns</span>
+        </div>
+        <div class="device-stage">
+          <div id="die"></div>
+        </div>
+        <div class="device-legend">
+          <span><i class="sw-io"></i>IO ring</span>
+          <span><i class="sw-clk"></i>CLK spine x=1</span>
+          <span><i class="sw-clb"></i>32×32 CLB</span>
+        </div>
+        <div class="device-read" id="die-read"></div>
       </div>
     </section>
 

@@ -17,10 +17,10 @@
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="361" height="361" /><span class="word">Helion</span></a>
     <nav>
       <a href="start.html">Start</a>
+      <a href="use.html">Use</a>
       <a href="architecture.html">Architecture</a>
+      <a href="wiki.html">Wiki</a>
       <a href="get-involved.html">Get involved</a>
-      <a href="contribute.html">Contribute</a>
-      <a href="legal.html">Legal</a>
       <a href="https://github.com/helion-fpga/helion">GitHub</a>
     </nav>
   </header>
@@ -60,7 +60,24 @@ helion-gui IdeModel paints the Session</code></pre>
       </table>
 
       <h2>Part HL10T-C32-1</h2>
-      <p>32×32 interior CLB, IO on the ring, clock spine at x=1, 32 user IO, 8 BRAM18, speed 1. Grid is in <code>devices/helion/parts/HL10T-C32-1.toml</code> — CAD must query that file.</p>
+      <p>32×32 interior CLB, IO on the ring, clock spine at x=1, 32 user IO, 8 BRAM18, speed 1. Grid is in <code>devices/helion/parts/HL10T-C32-1.toml</code> — CAD must query that file. How to open it in the IDE: <a href="use.html">Use</a>.</p>
+      <figure class="had">
+        <svg viewBox="0 0 360 340" role="img" aria-label="HL10T-C32-1 labeled die: IO ring, clock spine, CLB array">
+          <rect x="0" y="0" width="360" height="340" fill="#050c09"/>
+          <rect x="12" y="12" width="336" height="28" fill="#c47a3a"/>
+          <rect x="12" y="300" width="336" height="28" fill="#c47a3a"/>
+          <rect x="12" y="40" width="28" height="260" fill="#c47a3a"/>
+          <rect x="320" y="40" width="28" height="260" fill="#c47a3a"/>
+          <rect x="44" y="40" width="22" height="260" fill="#e6b325"/>
+          <rect x="70" y="40" width="246" height="260" fill="#163226" stroke="#3d8f6a" stroke-width="1"/>
+          <text x="180" y="31" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO ring · 32 user IO</text>
+          <text x="180" y="319" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO</text>
+          <text x="55" y="178" text-anchor="middle" fill="#081510" font-size="11" font-family="ui-monospace, monospace" transform="rotate(-90 55 178)">CLK x=1</text>
+          <text x="193" y="165" text-anchor="middle" fill="#ebe6d4" font-size="16" font-family="ui-monospace, monospace">32 × 32 CLB</text>
+          <text x="193" y="188" text-anchor="middle" fill="#b7b09a" font-size="12" font-family="ui-monospace, monospace">HL10T-C32-1</text>
+        </svg>
+        <figcaption>Labeled HAD regions — not a 1×1-pixel tile dump. <span class="gold">WNS_PS=9640</span></figcaption>
+      </figure>
 
       <h2>Gold</h2>
       <p>Empty-XDC <code>examples/counter.sv</code> → <span class="gold">WNS_PS=9640</span>. QoR table in the repository README is gated; a LUT/WNS/bitstream-size change must update the table <em>in the same commit with a reason</em>.</p>
