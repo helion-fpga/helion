@@ -1,0 +1,17 @@
+title: "[Idea] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Helion-legal only. Public vendor guides are a capability checklist, not source to copy.
+  - type: textarea
+    id: idea
+    attributes:
+      label: Idea
+    validations:
+      required: true
+  - type: textarea
+    id: engine
+    attributes:
+      label: Which engine would own it
+      placeholder: helion-sv / sta / gui IdeModel / docs / …

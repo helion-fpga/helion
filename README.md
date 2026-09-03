@@ -2,6 +2,16 @@
 
 Original FPGA family + CAD. Native `aarch64-apple-darwin`. No vendor bitstream.
 
+**We need people.** One owner, a real CAD, Apache-2.0 OR MIT. If you write Rust,
+SystemVerilog, STA, IDE tests, or docs, start at
+[Get involved](https://helion-fpga.github.io/helion/get-involved.html).
+
+[Docs](https://helion-fpga.github.io/helion/)
+· [Contributing](CONTRIBUTING.md)
+· [Discussions](https://github.com/helion-fpga/helion/discussions)
+· [Good first issues](https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+· [Sponsor](https://github.com/sponsors/saksham-45)
+
 **1.0 bar:** `cargo test --workspace` (no board). SystemVerilog / VHDL / C subset through
 synth → pack → PathFinder → bitgen → cycle-accurate fabric sim. 4-bit counter LED = cnt[3].
 
@@ -94,7 +104,7 @@ and gated on Linux (`x86_64-unknown-linux-gnu` in CI).
 On an **Apple Silicon Mac** with Xcode Command Line Tools and rustup 1.85+:
 
 ```bash
-git clone https://github.com/saksham-45/helion.git
+git clone https://github.com/helion-fpga/helion.git
 cd helion
 git pull --ff-only
 

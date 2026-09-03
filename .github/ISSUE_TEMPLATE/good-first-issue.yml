@@ -1,0 +1,27 @@
+name: Good first issue
+description: Small, engine-backed task for a new contributor
+labels: ["good first issue", "help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the change small. One `cargo test -p CRATE --lib TESTNAME`. Do not regress `helion-ide --headless examples/counter.sv` → `WNS_PS=9640`.
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+    validations:
+      required: true
+  - type: input
+    id: crate
+    attributes:
+      label: Crate
+      placeholder: helion-sv, helion-gui, helion-sta, …
+    validations:
+      required: true
+  - type: input
+    id: test
+    attributes:
+      label: Test to add or run
+    validations:
+      required: true

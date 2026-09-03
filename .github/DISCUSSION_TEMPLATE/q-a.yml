@@ -1,0 +1,18 @@
+title: "[Q] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions about building, HAD, or how a crate works. Bugs still go to Issues.
+  - type: textarea
+    id: q
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: input
+    id: cmd
+    attributes:
+      label: What you already ran
+      placeholder: cargo test -p … / helion-ide --headless examples/counter.sv

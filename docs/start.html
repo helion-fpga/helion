@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Start — Helion</title>
+  <meta name="description" content="Build Helion from source. Rust 1.85+, cargo test, headless gold counter WNS_PS=9640." />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="index.html">Helion<span>.</span></a>
+    <nav>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="contribute.html">Contribute</a>
+      <a href="legal.html">Legal</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="page">
+    <div class="prose">
+      <h1>Getting started</h1>
+      <p class="lede">There is no installer. Clone the tree, run the gold, then open the IDE. Native desktop target is Apple Silicon; CI is Linux.</p>
+
+      <h2>Needs</h2>
+      <ul>
+        <li>Rust 1.85+ (<code>rustup toolchain install 1.85.0</code>)</li>
+        <li>Git</li>
+        <li>On macOS: Xcode Command Line Tools if you want <code>Helion.app</code></li>
+      </ul>
+
+      <h2>Build and gold</h2>
+      <pre><code>git clone https://github.com/helion-fpga/helion.git
+cd helion
+cargo test --workspace
+cargo run -p helion-cli -- doctor
+cargo run -p helion-cli -- run examples/counter.sv --cycles 16
+cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv</code></pre>
+      <p>Empty-XDC counter gold is <span class="gold">WNS_PS=9640</span> and LED waveform <code>LED[16]=0000000111111110</code> (LED = cnt[3]).</p>
+
+      <h2>Desktop IDE (macOS)</h2>
+      <pre><code>./scripts/build-macos-app.sh
+open dist/Helion.app</code></pre>
+      <p>The windowed binary is <code>Contents/MacOS/Helion</code> (same as <code>helion-ide</code>). Do not launch the CLI as the app. HAD and examples ship under <code>Contents/Resources/</code>.</p>
+      <p>Without the bundle:</p>
+      <pre><code>cargo run -p helion-gui --release --bin helion-ide</code></pre>
+
+      <h2>While you iterate</h2>
+      <p>Run <strong>one</strong> test name, not the world:</p>
+      <pre><code>cargo test -p helion-sv --lib TESTNAME</code></pre>
+
+      <h2>Large SystemVerilog</h2>
+      <p><code>examples/ysyx_ibex.sv</code> is in the tree (Open rail in the IDE). Ingest is helion-sv preprocess + parse. Fitting a full SoC on HL10T-C32-1 is <em>not</em> the synth bar. Do not abort the run because sv-parser is unhappy — leftover Helion-legal constructs still map.</p>
+
+      <p><a class="btn" href="get-involved.html">Next: get involved</a></p>
+    </div>
+  </div>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
+    <span><a href="architecture.html">Architecture</a></span>
+  </footer>
+  <script src="site.js"></script>
+</body>
+</html>
