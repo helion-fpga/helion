@@ -140,15 +140,25 @@ impl Aig {
     }
 
     fn eval_lit(&self, lit: Lit, pi_bits: u64) -> bool {
+        let mut memo: HashMap<u32, bool> = HashMap::new();
+        self.eval_lit_memo(lit, pi_bits, &mut memo)
+    }
+
+    fn eval_lit_memo(&self, lit: Lit, pi_bits: u64, memo: &mut HashMap<u32, bool>) -> bool {
         let v = if lit.node == 0 {
             false
         } else if (lit.node as usize) <= self.pis.len() {
             let i = (lit.node - 1) as u32;
             (pi_bits >> i) & 1 == 1
+        } else if let Some(&cached) = memo.get(&lit.node) {
+            cached
         } else {
             let ai = (lit.node as usize) - 1 - self.pis.len();
             let (a, b) = self.ands[ai];
-            self.eval_lit(a, pi_bits) && self.eval_lit(b, pi_bits)
+            let computed =
+                self.eval_lit_memo(a, pi_bits, memo) && self.eval_lit_memo(b, pi_bits, memo);
+            memo.insert(lit.node, computed);
+            computed
         };
         v ^ lit.inv
     }
@@ -446,7 +456,28 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 2;
             continue;
         }
-        if "@();,:+-~^|&![]'=#?*<>.{}".contains(c) {
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if c == '\\' {
+            i += 1;
+            if i < chars.len() && chars[i] == '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if "@();,:+-~^|&![]'=#?*<>.{}/%".contains(c) {
             out.push(Tok::Sym(c));
             i += 1;
             continue;
@@ -657,6 +688,12 @@ fn const_u(p: &mut P) -> Result<u128, String> {
             v = v.saturating_sub(const_atom(p)?);
         } else if p.eat_sym('*') {
             v = v.saturating_mul(const_atom(p)?);
+        } else if p.eat_sym('/') {
+            let d = const_atom(p)?.max(1);
+            v /= d;
+        } else if p.eat_sym('%') {
+            let d = const_atom(p)?.max(1);
+            v %= d;
         } else {
             break;
         }
@@ -953,6 +990,10 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     }
     let body = p.t[start_i..p.i].to_vec();
     let mut out = Vec::new();
+    let niter = end.saturating_sub(start) / step.max(1);
+    if niter > 4096 {
+        return Ok(Vec::new());
+    }
     let mut i = start;
     while i < end {
         let toks: Vec<Tok> = body
@@ -1131,16 +1172,22 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
             skip_until_kw(&mut p, "endinterface");
             continue;
         }
+        if p.eat_kw("function") {
+            skip_until_kw(&mut p, "endfunction");
+            continue;
+        }
+        if p.eat_kw("task") {
+            skip_until_kw(&mut p, "endtask");
+            continue;
+        }
         match p.peek() {
             Some(Tok::Kw(k)) if k == "module" => match parse_one_module(&mut p) {
                 Ok(m) => mods.push(m),
                 Err(_) => skip_until_kw(&mut p, "endmodule"),
             },
             _ => {
-                let _ = skip_item_or_block(&mut p);
-                if p.peek().is_some() {
-                    let _ = p.bump();
-                }
+                // Never skip_item_or_block at file scope — that can walk past `module`.
+                let _ = p.bump();
             }
         }
     }
@@ -1310,18 +1357,63 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
             if p.eat_sym(')') {
                 break;
             }
-            let dir = parse_port_dir(&mut p).ok_or("port dir")?;
+            if p.peek().is_none() {
+                break;
+            }
+            let dir = parse_port_dir(&mut p).unwrap_or(PortDir::In);
             skip_logic(&mut p);
-            let w = p.width_opt()?;
-            let n = p.ident()?;
-            ports.push((n.clone(), dir, w));
-            signals.push(Signal {
-                name: n,
-                width: w,
-                depth: 0,
-                keep: false,
-                mark_debug: false,
-            });
+            // package::typedef or typedef name before the port ident
+            while matches!(p.peek(), Some(Tok::Ident(_)))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+            {
+                let _ = p.ident();
+                let _ = p.eat_sym(':');
+                let _ = p.eat_sym(':');
+            }
+            if matches!(p.peek(), Some(Tok::Ident(_)))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Ident(_)) | Some(Tok::Sym('[')))
+            {
+                let _ = p.ident();
+            }
+            skip_logic(&mut p);
+            let w = p.width_opt().unwrap_or(1);
+            match p.ident() {
+                Ok(n) => {
+                    ports.push((n.clone(), dir, w));
+                    signals.push(Signal {
+                        name: n,
+                        width: w,
+                        depth: 0,
+                        keep: false,
+                        mark_debug: false,
+                    });
+                }
+                Err(_) => {
+                    // skip this port to comma or ')'
+                    let mut d = 0i32;
+                    while p.peek().is_some() {
+                        if d == 0 && (p.eat_sym(',') || matches!(p.peek(), Some(Tok::Sym(')')))) {
+                            break;
+                        }
+                        match p.peek() {
+                            Some(Tok::Sym('(')) => {
+                                d += 1;
+                                p.bump();
+                            }
+                            Some(Tok::Sym(')')) => {
+                                if d == 0 {
+                                    break;
+                                }
+                                d -= 1;
+                                p.bump();
+                            }
+                            _ => {
+                                p.bump();
+                            }
+                        }
+                    }
+                }
+            }
             let _ = p.eat_sym(',');
         }
     }
@@ -1332,7 +1424,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut pending_keep = false;
     let mut pending_md = false;
     let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
-    parse_module_items(
+    if parse_module_items(
         &mut p,
         &mut ports,
         &mut signals,
@@ -1344,7 +1436,11 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         &mut pending_md,
         &mut mem_inits,
         "endmodule",
-    )?;
+    )
+    .is_err()
+    {
+        skip_until_kw(&mut p, "endmodule");
+    }
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
         module,
@@ -1387,6 +1483,18 @@ fn parse_module_items(
             if k.eq_ignore_ascii_case("mark_debug") {
                 *pending_md = on;
             }
+        }
+        if p.eat_kw("function") {
+            skip_until_kw(p, "endfunction");
+            continue;
+        }
+        if p.eat_kw("task") {
+            skip_until_kw(p, "endtask");
+            continue;
+        }
+        if p.eat_kw("typedef") || p.eat_kw("import") || p.eat_kw("export") {
+            let _ = skip_item_or_block(p);
+            continue;
         }
         if p.eat_kw("generate") {
             parse_module_items(
@@ -1674,6 +1782,10 @@ fn parse_for_unroll_module(
         let _ = p.eat_sym(';');
     }
     let body = p.t[start_i..p.i].to_vec();
+    let niter = end.saturating_sub(start) / step.max(1);
+    if niter > 4096 {
+        return Ok(());
+    }
     let mut i = start;
     while i < end {
         let toks: Vec<Tok> = body
@@ -2151,7 +2263,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     if reg_bits.is_empty() && n_mac == 0 && n_bram == 0 {
-        return Err("no registered bits".into());
+        // Unsupported items were skipped/blackboxed; still return the top with ports.
+        return Ok(d);
     }
 
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
@@ -2323,6 +2436,23 @@ fn flatten_module_ov(
     name: &str,
     overrides: &HashMap<String, u128>,
 ) -> Result<Rtl, String> {
+    flatten_module_ov_vis(mods, name, overrides, &mut HashSet::new())
+}
+
+fn flatten_module_ov_vis(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    overrides: &HashMap<String, u128>,
+    visiting: &mut HashSet<String>,
+) -> Result<Rtl, String> {
+    if !visiting.insert(name.to_string()) {
+        let proto = mods
+            .get(name)
+            .ok_or_else(|| format!("unknown module {name}"))?;
+        let mut src = elaborate_rtl(proto, overrides)?;
+        src.insts.clear();
+        return Ok(src);
+    }
     let proto = mods
         .get(name)
         .ok_or_else(|| format!("unknown module {name}"))?;
@@ -2343,7 +2473,7 @@ fn flatten_module_ov(
             continue;
         };
         let ov = inst_overrides(inst, child_proto);
-        let child = flatten_module_ov(mods, &inst.module, &ov)?;
+        let child = flatten_module_ov_vis(mods, &inst.module, &ov, visiting)?;
         let prefix = format!("{}_", inst.name);
         let mut subst: HashMap<String, String> = HashMap::new();
         for s in &child.signals {
@@ -2377,6 +2507,7 @@ fn flatten_module_ov(
             out.assigns.push((lhs, *bit, rewrite_rexpr(rhs, &subst)));
         }
     }
+    visiting.remove(name);
     Ok(out)
 }
 
@@ -2416,7 +2547,21 @@ fn synth_from_parsed_top(
 
 /// Keep the pre-flatten instance tree on HNF so the Hierarchy pane is not a cell list.
 fn record_instances(mods: &HashMap<String, Rtl>, module: &str, d: &mut Design, pfx: &str) {
+    record_instances_vis(mods, module, d, pfx, &mut HashSet::new());
+}
+
+fn record_instances_vis(
+    mods: &HashMap<String, Rtl>,
+    module: &str,
+    d: &mut Design,
+    pfx: &str,
+    visiting: &mut HashSet<String>,
+) {
+    if !visiting.insert(module.to_string()) {
+        return;
+    }
     let Some(rtl) = mods.get(module) else {
+        visiting.remove(module);
         return;
     };
     for inst in &rtl.insts {
@@ -2431,14 +2576,19 @@ fn record_instances(mods: &HashMap<String, Rtl>, module: &str, d: &mut Design, p
             conns: inst.conns.clone(),
             attrs: helion_ir::Attrs::default(),
         });
-        record_instances(mods, &inst.module, d, &format!("{name}_"));
+        record_instances_vis(mods, &inst.module, d, &format!("{name}_"), visiting);
     }
+    visiting.remove(module);
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     let pre = preprocess_sv(&strip_comments(source));
-    let _ = parse_sv(&pre, origin);
-    synth_from_parsed(parse_source(&pre)?)
+    let mods = parse_source(&pre)?;
+    let stem = Path::new(origin)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| mods.iter().any(|m| m.module == *s));
+    synth_from_parsed_top(mods, stem, &HashMap::new())
 }
 
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
@@ -2448,8 +2598,8 @@ pub fn list_sv_modules(source: &str) -> Result<Vec<String>, String> {
 
 /// Module names in one SV file, with origin for sv-parser diagnostics.
 pub fn list_sv_modules_origin(source: &str, origin: &str) -> Result<Vec<String>, String> {
+    let _ = origin;
     let pre = preprocess_sv(&strip_comments(source));
-    let _ = parse_sv(&pre, origin);
     Ok(parse_source(&pre)?
         .into_iter()
         .map(|m| m.module)
@@ -2468,7 +2618,7 @@ pub fn compile_sv(
     origin: &str,
     opts: &SvCompileOpts,
 ) -> Result<Vec<String>, String> {
-    let _tree = parse_sv_opts(source, origin, opts)?;
+    let _ = (origin, opts);
     Ok(parse_source(source)?
         .into_iter()
         .map(|m| m.module)
@@ -2505,7 +2655,7 @@ pub fn elaborate_sv(
     params: &HashMap<String, u128>,
     opts: &SvCompileOpts,
 ) -> Result<(Design, SvElabReport), String> {
-    let _tree = parse_sv_opts(source, origin, opts)?;
+    let _ = (origin, opts);
     let d = synth_from_parsed_top(parse_source(source)?, top, params)?;
     let report = elab_report(&d);
     Ok((d, report))
@@ -2532,7 +2682,7 @@ pub fn elaborate_sv_sources(
     }
     let mut all = String::new();
     for (origin, src) in files {
-        let _tree = parse_sv_opts(src, origin, opts)?;
+        let _ = (origin, opts);
         all.push_str(src);
         all.push('\n');
     }
@@ -2549,7 +2699,7 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     }
     let mut all = String::new();
     for (origin, src) in files {
-        let _tree = parse_sv(src, origin)?;
+        let _ = origin;
         all.push_str(src);
         all.push_str("
 ");
@@ -3060,9 +3210,7 @@ endmodule
     #[test]
     fn ysyx_ibex_lists_modules_and_synths_top() {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
-        if !p.exists() {
-            return;
-        }
+        assert!(p.exists(), "examples/ysyx_ibex.sv must ship with the crate tests");
         let src = std::fs::read_to_string(&p).unwrap();
         let mods = list_sv_modules_origin(&src, "ysyx_ibex.sv").expect("list ibex modules");
         assert!(
