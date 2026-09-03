@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Legal fence — Helion</title>
+  <meta name="description" content="Helion legal fence: original ISA and CAD only. No UNISIM, vendor Tcl, or vendor bitstream backends." />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="index.html">Helion<span>.</span></a>
+    <nav>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="contribute.html">Contribute</a>
+      <a href="legal.html">Legal</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="page">
+    <div class="prose">
+      <h1>Legal fence</h1>
+      <p class="lede">Helion is an original FPGA family and CAD. Vendor user guides are a checklist of <em>capabilities</em>, not a source tree to copy.</p>
+
+      <div class="fence">
+        <p><strong>Do not add</strong> Project X-Ray, vendor Tcl, UNISIM names, or 7-series / UltraScale / Lattice / Intel bitstream backends.</p>
+        <p><strong>Do not</strong> ship AXI interconnect as Helion IP — the buses are Helion-MM and Helion-ST.</p>
+        <p><strong>Do not</strong> use vendor trademarks as product names in the UI or docs.</p>
+      </div>
+
+      <h2>What is original</h2>
+      <ul>
+        <li>HAD parts (<code>HL10T-C32-1</code> and kin) and FeatureMap frames</li>
+        <li>HNF netlist, Session Tcl, <code>.hbits</code>, <code>.hckp</code></li>
+        <li>helion-sim / helion-fabric / IEEE 1149.1 TAP in helion-hw</li>
+        <li>The desktop IDE as an eframe shell over <code>IdeModel</code></li>
+      </ul>
+
+      <h2>License</h2>
+      <p>Dual <a href="https://github.com/helion-fpga/helion/blob/master/LICENSE-APACHE">Apache-2.0</a> OR <a href="https://github.com/helion-fpga/helion/blob/master/LICENSE-MIT">MIT</a>, your choice.</p>
+
+      <h2>Security</h2>
+      <p>RCE, path traversal, secrets: private advisory or <a href="https://github.com/saksham-45">@saksham-45</a>. QoR misses and “does not fit Ibex on HL10T” are not vulnerabilities. See <a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">SECURITY.md</a>.</p>
+    </div>
+  </div>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
+    <span><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></span>
+  </footer>
+  <script src="site.js"></script>
+</body>
+</html>

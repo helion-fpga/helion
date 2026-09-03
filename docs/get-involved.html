@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Get involved — Helion</title>
+  <meta name="description" content="How to help Helion: discussions, good first issues, sponsoring, and the coding path." />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="index.html">Helion<span>.</span></a>
+    <nav>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="contribute.html">Contribute</a>
+      <a href="legal.html">Legal</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="page">
+    <div class="prose">
+      <h1>Get involved</h1>
+      <p class="lede">Helion is a 100% free, open-source, community-driven CAD project. One owner today. That only changes if people show up.</p>
+
+      <ol class="steps">
+        <li>
+          <h3>Get connected</h3>
+          <p>Ask in <a href="https://github.com/helion-fpga/helion/discussions">GitHub Discussions</a>. Bugs and features go in <a href="https://github.com/helion-fpga/helion/issues">Issues</a>. There is no Discord yet — do not wait for one.</p>
+        </li>
+        <li>
+          <h3>Decide what to work on</h3>
+          <p>Pick a <a href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">good first issue</a>, or say what you want to own (SV ingest, STA, IDE tests, docs, CI). Highest leverage is listed on the <a href="index.html">home page</a>.</p>
+        </li>
+        <li>
+          <h3>Build your own copy</h3>
+          <p>Follow <a href="start.html">Start</a>. Empty-XDC <code>examples/counter.sv</code> must print <span class="gold">WNS_PS=9640</span>. Work on <code>master</code>.</p>
+        </li>
+        <li>
+          <h3>Find the code</h3>
+          <p>See the crate map on <a href="architecture.html">Architecture</a> and the table in <a href="contribute.html">Contribute</a>. GUI paint is not the engine — <code>IdeModel</code> is.</p>
+        </li>
+        <li>
+          <h3>Ship a patch</h3>
+          <p>One crate when you can. One test name while iterating: <code>cargo test -p CRATE --lib TESTNAME</code>. Open a PR and fill the template. Read the <a href="legal.html">legal fence</a> first.</p>
+        </li>
+      </ol>
+
+      <h2>Ways to help that are not CAD</h2>
+      <ul>
+        <li>Review PRs and test them on macOS / Linux.</li>
+        <li>Improve this documentation site (<code>docs/</code>).</li>
+        <li>Triage issues; turn “it broke” into a command + log.</li>
+        <li><a href="https://github.com/sponsors/saksham-45">Sponsor</a> hosting, domain, and time until a treasurer is named.</li>
+      </ul>
+
+      <h2>Code of conduct</h2>
+      <p>Helion follows the Contributor Covenant. Disagreement about CAD is expected. Personal attacks and vendor-IP dumps are not. Enforcement: <a href="https://github.com/saksham-45">@saksham-45</a>.</p>
+
+      <p class="cta">
+        <a class="btn" href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22">Help wanted</a>
+        <a class="btn ghost" href="contribute.html">Coding guide</a>
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
+    <span><a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></span>
+  </footer>
+  <script src="site.js"></script>
+</body>
+</html>

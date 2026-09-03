@@ -1,0 +1,10 @@
+# Helion documentation
+
+- Home: index.html
+- Getting started: start.html
+- Architecture: architecture.html
+- Get involved: get-involved.html
+- Contributing (code): contribute.html
+- Legal fence: legal.html
+- Repository: https://github.com/helion-fpga/helion
+- License: Apache-2.0 OR MIT

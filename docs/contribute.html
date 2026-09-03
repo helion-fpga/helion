@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Contribute — Helion</title>
+  <meta name="description" content="Coding path for Helion: one test name, legal fence, crate map." />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="bar">
+    <a class="mark" href="index.html">Helion<span>.</span></a>
+    <nav>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="contribute.html">Contribute</a>
+      <a href="legal.html">Legal</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="page">
+    <div class="prose">
+      <h1>Start coding</h1>
+      <p class="lede">Public vendor user guides are a capability checklist, not source to copy. Full text: <a href="https://github.com/helion-fpga/helion/blob/master/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p>
+
+      <h2>First patch</h2>
+      <ol>
+        <li>Talk in <a href="https://github.com/helion-fpga/helion/discussions">Discussions</a> or pick a <strong>good first issue</strong>.</li>
+        <li>Fork, clone, branch from <code>master</code>.</li>
+        <li>Build (<a href="start.html">Start</a>). Gold: <span class="gold">WNS_PS=9640</span>.</li>
+        <li>One change, one crate when you can. Iterate with <code>cargo test -p CRATE --lib TESTNAME</code>.</li>
+        <li>Open a PR. Fill the template. Do not regress the gold counter.</li>
+      </ol>
+
+      <h2>Where to look</h2>
+      <table>
+        <thead><tr><th>Want</th><th>Path</th></tr></thead>
+        <tbody>
+          <tr><td>SV ingest</td><td><code>crates/helion-sv</code></td></tr>
+          <tr><td>STA / XDC</td><td><code>crates/helion-sta</code></td></tr>
+          <tr><td>Place / route / bits</td><td><code>helion-place</code>, <code>helion-route</code>, <code>helion-bits</code></td></tr>
+          <tr><td>IDE model + tests</td><td><code>crates/helion-gui/src/ide.rs</code></td></tr>
+          <tr><td>IDE paint</td><td><code>crates/helion-gui/src/bin/helion-ide.rs</code></td></tr>
+          <tr><td>Chrome / floorplan fit</td><td><code>crates/helion-gui/src/chrome.rs</code></td></tr>
+          <tr><td>Parts</td><td><code>devices/helion/</code></td></tr>
+          <tr><td>Examples</td><td><code>examples/</code></td></tr>
+          <tr><td>This site</td><td><code>docs/</code></td></tr>
+        </tbody>
+      </table>
+
+      <h2>Rules that fail the PR</h2>
+      <ul>
+        <li><code>unsafe</code> except documented islands (none in 0.1).</li>
+        <li>UNISIM names, vendor Tcl, Project X-Ray, 7-series / UltraScale / Lattice / Intel bitstream backends.</li>
+        <li>AXI interconnect as Helion IP (use Helion-MM/ST).</li>
+        <li>Skipping a missing <code>examples/ysyx_ibex.sv</code> in tests that claim to ingest it.</li>
+        <li>Changing gold WNS without updating the QoR table with a reason.</li>
+      </ul>
+
+      <p class="cta">
+        <a class="btn" href="https://github.com/helion-fpga/helion/issues/new/choose">Open an issue</a>
+        <a class="btn ghost" href="legal.html">Legal fence</a>
+      </p>
+    </div>
+  </div>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
+    <span><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></span>
+  </footer>
+  <script src="site.js"></script>
+</body>
+</html>

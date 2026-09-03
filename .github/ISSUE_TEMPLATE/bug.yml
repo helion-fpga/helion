@@ -1,0 +1,36 @@
+name: Bug report
+description: Something in Helion CAD or the IDE is wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Helion engines only (HAD / HNF / Session / STA / sim). Do not attach AMD/Xilinx bitstreams or UNISIM netlists.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      placeholder: Command, pane, or test that failed
+    validations:
+      required: true
+  - type: textarea
+    id: expect
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: cmd
+    attributes:
+      label: Command or path
+      placeholder: cargo test -p helion-gui --lib … / helion-ide --headless examples/counter.sv
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      render: text
+  - type: input
+    id: gold
+    attributes:
+      label: Did empty-XDC counter still print WNS_PS=9640?
+      placeholder: yes / no / did not run

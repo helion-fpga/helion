@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Helion — original FPGA family and CAD</title>
+  <meta name="description" content="Open-source FPGA CAD and an original device family. Synth, place, PathFinder, STA, bitstream, desktop IDE. Contributors wanted." />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,650;1,400&family=Red+Hat+Mono:wght@400;600&family=Tektur:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <meta property="og:title" content="Helion — original FPGA family and CAD" />
+  <meta property="og:description" content="Not a vendor skin. One Session, original HAD parts, Apache-2.0 OR MIT. We need people." />
+  <meta property="og:type" content="website" />
+</head>
+<body>
+  <!--
+    THESIS: Helion is original FPGA CAD; the first viewport is the HL10T die and the gold WNS, not a SaaS hero.
+    OWN-WORLD: solder-mask green-black, copper IO, amber clock spine, Tektur silkscreen, Public Sans, Red Hat Mono.
+    STORY: Visitor sees a real part, believes WNS_PS=9640, and has a path to help.
+    FIRST VIEWPORT: thesis + Get involved on the left; HAD floorplan on the right.
+    FORM: die-plot / FR4 datasheet.
+    FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+  -->
+  <header class="bar">
+    <a class="mark" href="index.html">Helion<span>.</span></a>
+    <nav>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="contribute.html">Contribute</a>
+      <a href="legal.html">Legal</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="page">
+    <section class="hero">
+      <div>
+        <h1>Original FPGA family, and the CAD that builds for it.</h1>
+        <p class="lede">
+          Helion is not a vendor skin. Synth, pack, PathFinder route, STA, bitstream, and a desktop IDE
+          all hit the same Session. One owner. A real device family (HAD). Apache-2.0 OR MIT.
+          If you write Rust, SystemVerilog, STA, or docs — we need you.
+        </p>
+        <p class="cta">
+          <a class="btn" href="get-involved.html">Get involved</a>
+          <a class="btn ghost" href="https://github.com/helion-fpga/helion">Star / fork</a>
+          <a class="btn ghost" href="https://github.com/sponsors/saksham-45">Sponsor</a>
+        </p>
+      </div>
+      <div class="die-wrap">
+        <div class="die-meta">
+          <span>HL10T-C32-1</span>
+          <span class="gold">WNS_PS=9640</span>
+          <span class="mute">clk 10.000 ns</span>
+        </div>
+        <div id="die"></div>
+        <div class="die-read" id="die-read"></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Prove it in one minute</h2>
+      <pre><code>git clone https://github.com/helion-fpga/helion.git
+cd helion
+cargo test --workspace
+cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+# empty-XDC counter gold: WNS_PS=9640
+# fabric LED: helion run examples/counter.sv --cycles 16</code></pre>
+      <p class="lede">macOS app: <code>./scripts/build-macos-app.sh</code> then <code>open dist/Helion.app</code>. The GUI binary is <code>Helion</code> / <code>helion-ide</code>, not the CLI.</p>
+    </section>
+
+    <section class="section">
+      <h2>Flow</h2>
+      <p class="pipeline" aria-label="CAD flow">
+        <span>helion-sv</span><i>→</i>
+        <span>pack</span><i>→</i>
+        <span>place</span><i>→</i>
+        <span>PathFinder</span><i>→</i>
+        <span>STA</span><i>→</i>
+        <span>drc</span><i>→</i>
+        <span>.hbits</span>
+      </p>
+      <p class="lede" style="margin-top:1rem">Device facts come from the Helion Architecture Database. Nothing in the CAD hardcodes a vendor die.</p>
+    </section>
+
+    <section class="section">
+      <h2>We need help with</h2>
+      <dl>
+        <div class="need">
+          <dt>SV ingest</dt>
+          <dd>Large files such as <code>examples/ysyx_ibex.sv</code> must preprocess, skip packages, and synth without hanging or aborting.</dd>
+        </div>
+        <div class="need">
+          <dt>STA / XDC</dt>
+          <dd>Clocks, I/O delay, false paths — gold counter stays <span class="gold">WNS_PS=9640</span>.</dd>
+        </div>
+        <div class="need">
+          <dt>IDE</dt>
+          <dd>Engine-backed panes and tests, not caption dumps. Floorplan, wave, timing, netlist.</dd>
+        </div>
+        <div class="need">
+          <dt>Docs / CI</dt>
+          <dd>This site, Linux + macOS CI, good first issues. If you cannot write CAD yet, you can still land here.</dd>
+        </div>
+      </dl>
+      <p class="cta">
+        <a class="btn" href="https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">Good first issues</a>
+        <a class="btn ghost" href="https://github.com/helion-fpga/helion/discussions">Discussions</a>
+      </p>
+    </section>
+  </div>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a> · org <a href="https://github.com/helion-fpga">helion-fpga</a></span>
+    <span><a href="legal.html">Legal fence</a> · <a href="https://github.com/helion-fpga/helion/blob/master/CODE_OF_CONDUCT.md">Code of conduct</a></span>
+  </footer>
+  <script src="site.js"></script>
+</body>
+</html>
