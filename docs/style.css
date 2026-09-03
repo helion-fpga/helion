@@ -222,6 +222,19 @@ html[data-anim="off"] .marquee-track { animation: none; }
   to { transform: translateX(-50%); }
 }
 
+.die-film {
+  background: #05070a;
+  border-block: 1px solid var(--line);
+}
+.die-film video,
+.die-film img {
+  display: block;
+  width: min(100%, 72rem);
+  height: auto;
+  margin: 0 auto;
+  background: #05070a;
+}
+
 .page { max-width: 88rem; margin: 0 auto; padding: 2.4rem 1.6rem 4.5rem; }
 .page.narrow, .prose-wrap { max-width: 46rem; }
 
