@@ -1629,6 +1629,13 @@ mod tests {
 
     #[test]
     fn detect_lists_sim_and_ofl_backends() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HELION_OFL");
+            std::env::remove_var("HELION_OPENFPGALOADER");
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
         let d = detect_boards();
         assert!(
             d.cables.iter().any(|c| c.backend == CableBackend::Sim),

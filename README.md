@@ -182,7 +182,7 @@ Sim path for TAP STAT without hardware:
 helion-prog --detect                    # OFL on PATH → physical_had=0 when empty
 ```
 
-`openFPGALoader` on the box is legal OSS only. Never invent Helion TAP STAT; never claim board DONE without live TDO evidence. Notes: [`docs/FM-HEL-TOP-ofl-box.md`](docs/FM-HEL-TOP-ofl-box.md), [`docs/FM-HEL-TOP-tap-ibex-smoke.md`](docs/FM-HEL-TOP-tap-ibex-smoke.md).
+`openFPGALoader` on the box is legal OSS only (Debian apt). On macOS: `brew install openfpgaloader` (Homebrew bottle; still 0 probes without FTDI). Never invent Helion TAP STAT; never claim board DONE without live TDO evidence. Notes: [`docs/FM-HEL-TOP-ofl-box.md`](docs/FM-HEL-TOP-ofl-box.md), [`docs/FM-HEL-TOP-tap-ibex-smoke.md`](docs/FM-HEL-TOP-tap-ibex-smoke.md).
 
 ## Cap holds (Ibex / pin-wrap)
 

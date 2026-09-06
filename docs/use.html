@@ -91,6 +91,7 @@ helion project examples/ip_ingest/counter_ip.prj</code></pre>
       <p>Without a USB programmer, detect stays <strong>0 probes</strong> and refuses DONE. Sim cable for TAP STAT smoke (no board claim):</p>
       <pre><code>./scripts/ibex-prog-mpsse-sim-smoke.sh
 helion-prog --detect</code></pre>
+      <p>macOS OFL prep (OSS): <code>brew install openfpgaloader</code> — install ≠ DONE; need live FTDI + Helion TAP STAT TDO.</p>
       <p>Cap holds on Ibex pin-wrap: <code>imux_skip=0</code>, <code>IOB=1</code>, gold <span class="gold">WNS_PS=9640</span>. Never invent Helion TAP STAT.</p>
 
       <h2>Large SystemVerilog</h2>

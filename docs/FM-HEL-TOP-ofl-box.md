@@ -69,3 +69,16 @@ helion report_timing examples/counter.sv --sdc examples/counter.sdc
 ## Verdict
 
 **PASS (bar moved; hardware still blocked)** — OFL installed on box; scan-usb header honesty fixed; dry-run/detect/fixture tests expanded; gold 9640; no merge.
+
+## macOS (Homebrew) — OFL prep
+
+Legal OSS only (`openfpgaloader` Apache-2.0 on homebrew-core). Do **not** claim board DONE from install alone.
+
+```bash
+brew install openfpgaloader   # bottle ~1.1.x + libftdi/libusb
+which openFPGALoader          # expect /opt/homebrew/bin/openFPGALoader
+openFPGALoader --scan-usb     # empty / No USB → 0 probes (honest)
+```
+
+Captain Mac (2026-09-06): brew install succeeded (`openfpgaloader` 1.1.1); `SPUSBDataType` empty; `--scan-usb` / `--detect` → no FTDI (`unable to open ftdi device: -3`). **No board DONE.**
+
