@@ -1,6 +1,6 @@
 # FM-HEL-UX2 — CAPTAIN intensive IDE UI/UX
 
-**Date:** 2026-09-06 ~06:57 America/New_York (EDT)  
+**Date:** 2026-09-06 ~07:15 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
 **Score tip (branch HEAD):** `fbdd9e02ce8b688aa46bb4e229b1aa56be5f0617` (`fbdd9e0`)
 **Chrome+hooks tip:** `a61ce83` (ancestor of HEAD)  
@@ -48,11 +48,21 @@ Window-id `screencapture -l` denied (Screen Recording); used `-R` window bounds.
 
 ## Remains for Helion UX HARD PASS
 
-1. Captain re-score with these shots (die fill % / splitter Δ labeled overlays if needed for cycle3).  
-2. Letter+name rail still letter-led (names present) — further iconography optional NICE.  
-3. Some More panes still soft-English without CTA.  
-4. **NO MERGE** until captain HARD PASS.
+1. **Reshot Device after die-fill fix** (width-first `floorplan_fit_cell`, cell max 64) — labeled pre-fix overlays show fill≈49% / right_gap≈710 logical FAIL on Mac shot 02; unit tests now require ≥80% / ≤80px. Captain re-score with new shots + labeled overlays under `/workspace/fm-hel-ux2/shots/20-device-fill-labeled.png`, `21-device-canvas-fill-labeled.png`, `54-splitter-grab-labeled.png`.  
+2. Splitter drag Δ≥40px: cycle2b `54`/`55` held; UX2 labeled calm `SPLITTER_GRAB_PX=6` (Mac Shell unreachable for new before/after this turn).  
+3. Letter+name rail still letter-led (names present) — further iconography optional NICE.  
+4. Some More panes still soft-English without CTA.  
+5. **NO MERGE** until captain HARD PASS.
+
+## Die-fill / splitter measurement (cycle3 evidence)
+
+| Artifact | Result |
+|----------|--------|
+| `20-device-fill-labeled.png` | pre-fix Mac 02: fill≈**49.2%**, right_gap≈**1419px** (~710 logical) **FAIL** |
+| `21-device-canvas-fill-labeled.png` | crop 13: fill≈**34.8%**, same class FAIL |
+| `54-splitter-grab-labeled.png` | calm grab **6px** labeled; Δ proof → cycle2b |
+| `chrome::floorplan_fit_cell` | width-first when letterbox &lt;80%; max cell **64**; helpers `floorplan_die_fill_ratio` / `floorplan_right_gap_px` |
 
 ## Push
 
-`helion-fpga` `fm-hel-corpus-soft-pass` tip **`a61ce83`** (no merge, no force).
+`helion-fpga` `fm-hel-corpus-soft-pass` (no merge, no force) — see tip after this commit.
