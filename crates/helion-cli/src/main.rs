@@ -12,7 +12,7 @@ use helion_sta::{
     Constraints, TimingResult,
 };
 use helion_hls::synth_c_path;
-use helion_proj::{constraints_from_project, load_prj, resolve_prj_path};
+use helion_proj::{constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path};
 use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
@@ -35,7 +35,8 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
     match ext.as_str() {
         "prj" => {
             let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
-            let prj = load_prj(&text)?;
+            let mut prj = load_prj(&text)?;
+            let _ips = expand_ip_packages(&mut prj, p)?;
             let src_paths: Vec<std::path::PathBuf> = prj
                 .sources
                 .iter()
@@ -220,6 +221,7 @@ fn main() {
         "pblock" => cmd_pblock(&args),
         "qor" => cmd_qor(&args),
         "project" => cmd_project(&args),
+        "ip" => cmd_ip(&args),
         "hnf" => cmd_hnf(&args),
         "--help" | "-h" | "help" => usage(),
         other => {
@@ -247,6 +249,7 @@ fn usage() {
   helion qor <file.sv>
   helion project <file.prj>
   helion project run <file.prj> [--cycles N]
+  helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
   helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]",
@@ -528,11 +531,15 @@ fn cmd_project(args: &[String]) {
         eprintln!("project {path}: {e}");
         std::process::exit(1);
     });
-    let prj = load_prj(&text).unwrap_or_else(|e| {
+    let mut prj = load_prj(&text).unwrap_or_else(|e| {
         eprintln!("project: {e}");
         std::process::exit(1);
     });
     let prj_path = Path::new(path);
+    let ips = expand_ip_packages(&mut prj, prj_path).unwrap_or_else(|e| {
+        eprintln!("project ip: {e}");
+        std::process::exit(1);
+    });
     let src_paths: Vec<std::path::PathBuf> = prj
         .sources
         .iter()
@@ -557,10 +564,11 @@ fn cmd_project(args: &[String]) {
         std::process::exit(1);
     });
     println!(
-        "project {} part={} sources={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
+        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
         path,
         prj.part,
         prj.sources.len(),
+        ips.len(),
         prj.top.as_deref().unwrap_or("-"),
         prj.constraint_files.len(),
         xdc.clocks.len(),
@@ -719,6 +727,76 @@ fn hw(args: Vec<String>) {
     }
 }
 
+
+fn cmd_ip(args: &[String]) {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "list" | "catalog" => {
+            for c in helion_ipxact::catalog() {
+                println!(
+                    "ip {} bus={} vlnv={}",
+                    c.name,
+                    c.bus,
+                    c.vlnv()
+                );
+            }
+        }
+        "show" => {
+            let path = positional(&args[1..]).unwrap_or("ip/h_gpio/h_gpio.helion");
+            let pkg = helion_ipxact::load_helion(Path::new(path)).unwrap_or_else(|e| {
+                eprintln!("ip show: {e}");
+                std::process::exit(1);
+            });
+            println!(
+                "ip show {} vlnv={} bus={} top={} files={} constraints={}",
+                path,
+                pkg.vlnv(),
+                pkg.bus,
+                pkg.top.as_deref().unwrap_or("-"),
+                pkg.files.len(),
+                pkg.constraints.len()
+            );
+            for f in pkg.resolve_files().unwrap_or_default() {
+                println!("  file {}", f.display());
+            }
+            for c in pkg.resolve_constraints().unwrap_or_default() {
+                println!("  xdc {}", c.display());
+            }
+        }
+        "pack" => {
+            let name = positional(&args[1..]).unwrap_or("h_gpio");
+            let ip = helion_ipxact::catalog()
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| {
+                    eprintln!("ip pack: unknown catalog core {name} (try helion ip list)");
+                    std::process::exit(2);
+                });
+            let file = format!("{name}.v");
+            let body = helion_ipxact::to_helion_manifest(&ip, Some(&ip.name), &[&file]);
+            let out = take_flag(&args[1..], "-o")
+                .or_else(|| take_flag(&args[1..], "--output"))
+                .unwrap_or_else(|| format!("ip/{name}/{name}.helion"));
+            if let Some(parent) = Path::new(&out).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&out, &body).unwrap_or_else(|e| {
+                eprintln!("ip pack write {out}: {e}");
+                std::process::exit(1);
+            });
+            println!("wrote {out} vlnv={} bus={}", ip.vlnv(), ip.bus);
+        }
+        "-h" | "--help" | "help" => {
+            eprintln!("usage: helion ip list|show <file.helion>|pack <name> [-o out.helion]");
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!("helion ip: unknown subcommand {other}");
+            eprintln!("usage: helion ip list|show <file.helion>|pack <name> [-o out.helion]");
+            std::process::exit(2);
+        }
+    }
+}
 
 fn cmd_gui() {
     let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("helion").to_path_buf());
