@@ -1,0 +1,5 @@
+# Box evidence (Debian openfpgaloader 0.13.1): binary on PATH, --scan-usb empty.
+# Helion must report ofl probes 0 / physical_had=0 — never invent Helion TAP STAT.
+# HELION_OFL_DRY_RUN=1 refuses DONE even when a probe is present.
+openFPGALoader --scan-usb → empty / No USB devices found / header only
+TAP_readback=none
