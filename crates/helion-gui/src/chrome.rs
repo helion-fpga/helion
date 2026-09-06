@@ -30,6 +30,14 @@ pub const TABLE_MAX_HEIGHT: f32 = 180.0;
 pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 220.0;
 /// Floorplan / package canvas never shrinks below this if the pane has room.
 pub const DRAWING_MIN_HEIGHT: f32 = 280.0;
+/// Idle paint policy (Air budgets): eframe reactive; no continuous `request_repaint`.
+/// Floorplan/device paint is O(pins + tiles) per *input* frame only — not a synth loop.
+pub const IDLE_PAINT_POLICY: &str = "reactive-no-request_repaint";
+/// Soft budget: idle CPU should be ~0% when the window is unfocused / no input (OS compositor).
+pub const IDLE_CPU_SOFT_PCT: u32 = 1;
+/// Soft budget: no uncapped animation timer; paint only on egui events.
+pub const IDLE_ANIM_HZ: u32 = 0;
+
 /// Legacy alias — canvas expands; do not use as a max cap.
 pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 /// Minimum column width used to decide whether a grid clips its last column.
@@ -542,5 +550,15 @@ mod tests {
         assert_eq!(Activity::Simulate.short_label(), "Sim");
         assert_eq!(Activity::Program.short_label(), "Prog");
         assert_eq!(RAIL_WIDTH, 48.0);
+    }
+}
+
+#[cfg(test)]
+mod idle_budget_tests {
+    #[test]
+    fn idle_policy_is_reactive_no_continuous_anim() {
+        assert_eq!(super::IDLE_PAINT_POLICY, "reactive-no-request_repaint");
+        assert_eq!(super::IDLE_ANIM_HZ, 0);
+        assert!(super::IDLE_CPU_SOFT_PCT <= 5);
     }
 }

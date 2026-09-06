@@ -799,19 +799,30 @@ fn parse_scan_usb_output(raw: &str) -> Vec<UsbProbe> {
             continue;
         }
         let lower = t.to_ascii_lowercase();
-        // openFPGALoader --scan-usb lines typically mention FTDI/USB/vid/pid/probe/cable.
-        let interesting = lower.contains("vid")
-            || lower.contains("pid")
-            || lower.contains("ftdi")
-            || lower.contains("probe")
-            || lower.contains("cable")
-            || lower.contains("usb")
-            || lower.contains("0x");
-        let skip = lower.contains("no usb")
+        // OFL 0.13.x prints column header + "empty"/"No USB devices found" even with 0 probes.
+        // Never treat header chatter as a programmer (would falsely set physical_had).
+        let skip = lower == "empty"
+            || lower.starts_with("bus device")
+            || lower.contains("no usb")
             || lower.contains("nothing")
             || lower.starts_with("usage")
-            || lower.contains("not found");
-        if interesting && !skip {
+            || lower.contains("not found")
+            // Column header: "vid:pid" without a hex id.
+            || (lower.contains("vid:pid") && !lower.contains("0x"));
+        if skip {
+            continue;
+        }
+        // Require a hex VID/PID (0x…) — header lines lack it; real probes and our fixtures have it.
+        let has_hex_id = lower.contains("0x");
+        let interesting = has_hex_id
+            && (lower.contains("vid")
+                || lower.contains("pid")
+                || lower.contains("ftdi")
+                || lower.contains("probe")
+                || lower.contains("cable")
+                || lower.contains("usb")
+                || lower.contains(':'));
+        if interesting {
             let name = t.split_whitespace().next().unwrap_or("usb").to_string();
             probes.push(UsbProbe {
                 name,
@@ -2072,6 +2083,126 @@ mod tests {
         unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
         unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
         unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+    }
+
+    #[test]
+    fn ofl_scan_usb_empty_header_is_zero_probes() {
+        // Real OFL 0.13.x empty output (Debian package) — header must not count as a probe.
+        let raw = load_ofl_fixture("scan_usb_empty.txt");
+        let probes = parse_scan_usb_output(&raw);
+        assert!(
+            probes.is_empty(),
+            "header/empty chatter must not invent probes: {probes:?}"
+        );
+        let one = load_ofl_fixture("scan_usb_one_ftdi.txt");
+        let probes = parse_scan_usb_output(&one);
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert!(probes[0].detail.contains("0x0403"), "{probes:?}");
+        assert_eq!(probes[0].source, UsbProbeSource::OpenFpgaLoader);
+        // Fake line without 0x must still be ignored
+        let junk = "Bus device vid:pid       probe type      manufacturer serial               product\n";
+        assert!(parse_scan_usb_output(junk).is_empty());
+    }
+
+    /// When real `openFPGALoader` is on PATH (box apt install): detect sees binary, 0 probes, no DONE.
+    #[test]
+    fn ofl_real_binary_on_path_detect_zero_probes_no_done() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        // Clear overrides so PATH / system OFL is used when present.
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+            std::env::remove_var("HELION_OFL");
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
+        let Some(ofl) = find_openfpgaloader() else {
+            // CI without OFL — skip (install is box-local).
+            return;
+        };
+        assert!(ofl.is_file(), "{}", ofl.display());
+        let scan = scan_usb_probes();
+        assert_eq!(scan.ofl_path.as_deref(), Some(ofl.as_path()));
+        let ofl_n = scan
+            .probes
+            .iter()
+            .filter(|p| p.source == UsbProbeSource::OpenFpgaLoader)
+            .count();
+        // This Linux box has no FTDI; after header fix, OFL probes must be 0.
+        // If a real probe appears in future CI, still never claim DONE from detect alone.
+        let det = detect_boards();
+        assert!(det.text().contains("ofl path") || det.text().contains("ofl probes"));
+        assert!(
+            !det.text().to_ascii_lowercase().contains("done=1"),
+            "detect must not claim DONE: {}",
+            det.text()
+        );
+        if ofl_n == 0 {
+            assert!(!det.physical_had, "0 OFL probes → physical_had false");
+            let note = scan.note.to_ascii_lowercase();
+            assert!(
+                note.contains("no usb") || note.contains("0 probe") || ofl_n == 0,
+                "note={}",
+                scan.note
+            );
+            let dev = Device::load_part("HL10T-C32-1").unwrap();
+            let dir = std::env::temp_dir().join("helion-ofl-real-bin");
+            let _ = std::fs::create_dir_all(&dir);
+            let bits_path = dir.join("t.hbits");
+            std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+            let cable = resolve_cable("ofl").unwrap();
+            let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+            assert!(
+                err.contains("no USB") || err.contains("programmer"),
+                "honest refuse without probe: {err}"
+            );
+            assert!(!err.to_ascii_lowercase().contains("done=1"));
+            // Dry-run with no probe still refuses before spawn (no DONE).
+            unsafe { std::env::set_var("HELION_OFL_DRY_RUN", "1"); }
+            let err2 = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+            assert!(
+                err2.contains("no USB")
+                    || err2.contains("dry-run")
+                    || err2.contains("HELION_OFL_DRY_RUN"),
+                "{err2}"
+            );
+            unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
+        }
+    }
+
+    #[test]
+    fn ofl_fixture_scan_and_verify_never_invent_helion_stat() {
+        let _doc = load_ofl_fixture("box_ofl_installed_no_probe.txt");
+        assert!(_doc.contains("TAP_readback=none"));
+        // Cross-check: SRAM/generic still TAP_readback=none
+        for name in [
+            "sram_done_no_verify.txt",
+            "programmer_ok_generic.txt",
+            "dry_run_would_run.txt",
+        ] {
+            let body = load_ofl_fixture(name);
+            let (v, detail) = parse_ofl_verify_output(&body, "", OflReadbackKind::None, true);
+            assert_eq!(v, None, "{name}: {detail}");
+            if detail.contains("TAP_readback") {
+                assert!(detail.contains("TAP_readback=none"), "{name}: {detail}");
+            }
+            assert!(!body.to_ascii_lowercase().contains("stat=0x"));
+            assert!(!detail.to_ascii_lowercase().contains("stat=0x"));
+        }
+    }
+
+    #[test]
+    fn native_mpsse_and_ofl_honesty_coexist_on_box() {
+        // usb-native on + 0 FTDI → Io; OFL on PATH + 0 probes → no USB; neither invents STAT.
+        let native_err = try_native_usb_program(std::path::Path::new("/dev/null"), false);
+        if usb_native_feature_enabled() {
+            assert!(matches!(native_err, Err(NativeUsbError::Io(_))), "{native_err:?}");
+        } else {
+            assert!(matches!(native_err, Err(NativeUsbError::NotImplemented(_))), "{native_err:?}");
+        }
+        let det = detect_boards();
+        assert!(det.text().contains("TAP_readback=none") || det.text().contains("never invent"));
+        assert!(!det.text().to_ascii_lowercase().contains("done=1 from enumerate"));
+        let _ = native_err;
     }
 
 

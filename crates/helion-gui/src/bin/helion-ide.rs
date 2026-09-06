@@ -286,6 +286,8 @@ impl HelionIde {
 }
 
 impl eframe::App for HelionIde {
+    /// Idle policy: reactive eframe only — never `request_repaint` / Continuous here.
+    /// Synth/implement run on click (`run_step`), not a background paint loop.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         handle_shortcuts(ctx, self);
         paint_toolbar(ctx, self);
