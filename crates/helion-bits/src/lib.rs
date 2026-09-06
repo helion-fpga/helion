@@ -31,7 +31,7 @@ impl FeatureSet {
     }
 
     pub fn set_imux(&mut self, x: u32, y: u32, mux: u32, sel: u8) {
-        // 6-bit sel: bits 0..4 gold-stable; bit5 = N-S ±2 bank.
+        // 6-bit sel: bits 0..4 gold-stable; bit5 banks N-S±2 / E-W±1.
         for b in 0..6u32 {
             if (sel >> b) & 1 == 1 {
                 self.set(format!("CLB_X{x}Y{y}.IMUX[{mux}][{b}]"), true);

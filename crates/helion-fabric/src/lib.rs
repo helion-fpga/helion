@@ -367,7 +367,8 @@ impl Fabric {
     }
 
     /// IMUX sel: 0-7 S±1 Q, 8-15 N±1 Q, 16-23 local Q, 24-31 local LUT O,
-    /// 32-39 S±2 Q, 40-47 N±2 Q (bit5 extension; gold uses sel<32).
+    /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q
+    /// (6-bit sel; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
             return self.q_at(x, y.saturating_sub(1), sel);
@@ -386,6 +387,14 @@ impl Fabric {
         }
         if sel < 48 {
             return self.q_at(x, y + 2, sel - 40);
+        }
+        if sel < 56 {
+            // west neighbor Q (driver west of sink)
+            return self.q_at(x.saturating_sub(1), y, sel - 48);
+        }
+        if sel < 64 {
+            // east neighbor Q
+            return self.q_at(x + 1, y, sel - 56);
         }
         false
     }
