@@ -4,6 +4,11 @@
 //! load a `.hbits` from the last implement, program over the sim cable
 //! (TAP CFG_W) **or** spawn `openFPGALoader` when on PATH with a USB probe,
 //! and report clear errors when nothing is attached / OFL missing.
+//!
+//! Native libusb/FTDI is scaffolded via [`HadUsbTransport`] + [`NativeFtdiStub`]
+//! (honest `NotImplemented` → OFL fallback). HAD board IDs / `HELION_OFL_BOARD`
+//! defaults live in [`HAD_KNOWN_BOARDS`]. OFL USB path does **not** provide
+//! Helion TAP STAT readback (`--verify` is SPI-flash only) — summaries say so.
 //! Never claims hardware DONE without a device. No UNISIM/AMD IP — HAD is Helion's story.
 
 use helion_bits::Bitstream;
@@ -168,8 +173,10 @@ pub fn prog_empty(dev: &Device) -> Result<Stat, String> {
 pub enum CableBackend {
     /// In-process TAP + fabric (helion-hw sim cable).
     Sim,
-    /// External `openFPGALoader` on PATH (USB/JTAG). Prefer this over fake success.
+    /// External `openFPGALoader` on PATH (USB/JTAG). Active physical path today.
     OpenFpgaLoader,
+    /// Future native libusb/FTDI path ([`HadUsbTransport`]). Stubbed → NotImplemented.
+    NativeUsb,
 }
 
 impl CableBackend {
@@ -177,6 +184,189 @@ impl CableBackend {
         match self {
             CableBackend::Sim => "sim",
             CableBackend::OpenFpgaLoader => "ofl",
+            CableBackend::NativeUsb => "native",
+        }
+    }
+}
+
+/// Error from the native USB / FTDI scaffolding (not openFPGALoader).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeUsbError {
+    /// Driver / transport not built yet — callers should fall back to OFL.
+    NotImplemented(&'static str),
+    /// Probe / IO failure once a real driver exists.
+    Io(String),
+}
+
+impl std::fmt::Display for NativeUsbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NativeUsbError::NotImplemented(msg) => write!(f, "native USB NotImplemented: {msg}"),
+            NativeUsbError::Io(msg) => write!(f, "native USB I/O: {msg}"),
+        }
+    }
+}
+
+/// Future Helion-native USB/JTAG transport (libusb + FTDI MPSSE class).
+///
+/// Full driver is intentionally out of scope for this gap; the stub returns
+/// [`NativeUsbError::NotImplemented`] so program paths fall back to OFL.
+pub trait HadUsbTransport {
+    fn name(&self) -> &'static str;
+    fn open_probe(&mut self) -> Result<(), NativeUsbError>;
+    fn program_hbits(
+        &mut self,
+        path: &std::path::Path,
+        flash: bool,
+    ) -> Result<(), NativeUsbError>;
+    /// Helion TAP STAT word readback over USB/JTAG, when implemented.
+    fn read_stat(&mut self) -> Result<Option<u32>, NativeUsbError>;
+}
+
+/// Honest stub until a real libusb/FTDI backend lands.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeFtdiStub;
+
+impl HadUsbTransport for NativeFtdiStub {
+    fn name(&self) -> &'static str {
+        "native-ftdi-stub"
+    }
+
+    fn open_probe(&mut self) -> Result<(), NativeUsbError> {
+        Err(NativeUsbError::NotImplemented(
+            "libusb/FTDI HadUsbTransport not implemented yet; use --cable ofl|usb (openFPGALoader)              or --cable auto (OFL when probes present)",
+        ))
+    }
+
+    fn program_hbits(
+        &mut self,
+        _path: &std::path::Path,
+        _flash: bool,
+    ) -> Result<(), NativeUsbError> {
+        self.open_probe()
+    }
+
+    fn read_stat(&mut self) -> Result<Option<u32>, NativeUsbError> {
+        Err(NativeUsbError::NotImplemented(
+            "TAP STAT readback over native USB not implemented; OFL path also has no Helion TAP readback",
+        ))
+    }
+}
+
+/// Try the native FTDI stub. Always `NotImplemented` today — callers fall back to OFL.
+pub fn try_native_usb_program(
+    path: &std::path::Path,
+    flash: bool,
+) -> Result<(), NativeUsbError> {
+    let mut t = NativeFtdiStub;
+    t.open_probe()?;
+    t.program_hbits(path, flash)
+}
+
+/// One known Helion HAD board / part row for OFL `-b` defaults and docs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HadBoardId {
+    pub part: &'static str,
+    pub idcode: u32,
+    /// Suggested openFPGALoader `-b` name (Helion-local until upstreamed).
+    pub ofl_board: &'static str,
+    /// Common FTDI VID used on bring-up cables (heuristic, not a Helion USB ID).
+    pub usb_vid: u16,
+    /// Common FTDI PID (FT2232H dual = 0x6010) used on bring-up cables.
+    pub usb_pid: u16,
+    pub note: &'static str,
+}
+
+/// Known Helion HAD part → IDCODE / suggested `HELION_OFL_BOARD` table.
+pub const HAD_KNOWN_BOARDS: &[HadBoardId] = &[
+    HadBoardId {
+        part: "HL10T-C32-1",
+        idcode: 0x0001_1A1F,
+        ofl_board: "helion_hl10t",
+        usb_vid: 0x0403,
+        usb_pid: 0x6010,
+        note: "Helion-T bring-up part; OFL board alias is Helion-local (not upstream openFPGALoader yet)",
+    },
+    HadBoardId {
+        part: "HL10T-DSP1",
+        idcode: 0x0001_1A1F,
+        ofl_board: "helion_hl10t",
+        usb_vid: 0x0403,
+        usb_pid: 0x6010,
+        note: "Same IDCODE as HL10T-C32-1; DSP/MAC27 site variant",
+    },
+];
+
+/// Look up a HAD board row by part name (case-insensitive).
+pub fn lookup_had_board(part: &str) -> Option<&'static HadBoardId> {
+    let p = part.trim();
+    HAD_KNOWN_BOARDS
+        .iter()
+        .find(|b| b.part.eq_ignore_ascii_case(p))
+}
+
+/// Human-readable known-id table for detect / docs.
+pub fn had_board_id_table_text() -> String {
+    let mut out = String::from(
+        "had_board_ids (HELION_OFL_BOARD defaults; Helion-local until OFL upstream)
+",
+    );
+    out.push_str(
+        "docs: set HELION_OFL_BOARD=<ofl_board> to pass -b; HELION_OFL_BOARD=none disables -b;          unset → default ofl_board for known part. HELION_OFL_CABLE / HELION_OFL_EXTRA /          HELION_OFL_VERIFY (flash --verify) / HELION_OFL_DRY_RUN also apply.
+",
+    );
+    for b in HAD_KNOWN_BOARDS {
+        out.push_str(&format!(
+            "had_board part={} idcode={:#010x} ofl_board={} usb_vid={:#06x} usb_pid={:#06x} — {}
+",
+            b.part, b.idcode, b.ofl_board, b.usb_vid, b.usb_pid, b.note
+        ));
+    }
+    out.push_str(
+        "native_usb: stub (HadUsbTransport/NativeFtdiStub) — NotImplemented; active USB path is OFL
+",
+    );
+    out
+}
+
+/// Resolve openFPGALoader `-b` board name.
+///
+/// Precedence: `HELION_OFL_BOARD` (use `none`/`-`/empty to suppress) → else known-table
+/// default for `part` → else `None` (no `-b`).
+pub fn resolve_ofl_board(part: Option<&str>) -> Option<String> {
+    if let Ok(board) = std::env::var("HELION_OFL_BOARD") {
+        let b = board.trim();
+        if b.is_empty() || b == "-" || b.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        return Some(b.to_string());
+    }
+    part.and_then(lookup_had_board)
+        .map(|b| b.ofl_board.to_string())
+}
+
+fn ofl_verify_enabled() -> bool {
+    matches!(
+        std::env::var("HELION_OFL_VERIFY").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// Whether OFL `--verify` was requested. Note: OFL verify is **SPI flash only**,
+/// not Helion TAP STAT readback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OflReadbackKind {
+    /// No bitstream/STAT readback available over USB for Helion TAP.
+    None,
+    /// `openFPGALoader --verify` requested for flash (SPI content check only).
+    FlashSpiVerify,
+}
+
+impl OflReadbackKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OflReadbackKind::None => "none",
+            OflReadbackKind::FlashSpiVerify => "flash_spi_verify",
         }
     }
 }
@@ -242,6 +432,7 @@ impl DetectReport {
                 c.detail
             ));
         }
+        out.push_str(&had_board_id_table_text());
         out
     }
 }
@@ -420,17 +611,35 @@ fn ofl_cable_info(scan: &UsbScan) -> CableInfo {
     }
 }
 
-/// List programming cables: always `sim0`; always advertise `ofl0` (USB/openFPGALoader).
+fn native_cable_info() -> CableInfo {
+    CableInfo {
+        id: "native0".into(),
+        backend: CableBackend::NativeUsb,
+        part_hint: "HL10T-C32-1".into(),
+        detail: "native libusb/FTDI stub (HadUsbTransport) — NotImplemented; OFL fallback is the active USB path"
+            .into(),
+    }
+}
+
+/// List programming cables: `sim0`, `ofl0`, and `native0` (stub).
 pub fn list_cables() -> Vec<CableInfo> {
     let scan = scan_usb_probes();
-    vec![sim_cable_info(), ofl_cable_info(&scan)]
+    vec![
+        sim_cable_info(),
+        ofl_cable_info(&scan),
+        native_cable_info(),
+    ]
 }
 
 /// Detect programming targets. Sim always present; physical only when USB probes enumerate.
 pub fn detect_boards() -> DetectReport {
     let usb = scan_usb_probes();
     let physical_had = !usb.probes.is_empty();
-    let cables = vec![sim_cable_info(), ofl_cable_info(&usb)];
+    let cables = vec![
+        sim_cable_info(),
+        ofl_cable_info(&usb),
+        native_cable_info(),
+    ];
     let note = if physical_had {
         format!(
             "Physical USB programmer present via openFPGALoader ({} probe(s)). Use --cable usb|ofl|auto.",
@@ -452,7 +661,7 @@ pub fn detect_boards() -> DetectReport {
     }
 }
 
-/// Resolve `--cable auto|sim|usb|ofl|sim0|ofl0|usb0`.
+/// Resolve `--cable auto|sim|usb|ofl|native|sim0|ofl0|usb0|native0`.
 pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
     let s = spec.trim().to_ascii_lowercase();
     let det = detect_boards();
@@ -468,9 +677,16 @@ pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
         .find(|c| c.backend == CableBackend::OpenFpgaLoader)
         .cloned()
         .unwrap_or_else(|| ofl_cable_info(&det.usb));
+    let native = det
+        .cables
+        .iter()
+        .find(|c| c.backend == CableBackend::NativeUsb)
+        .cloned()
+        .unwrap_or_else(native_cable_info);
     match s.as_str() {
         "" | "sim" | "sim0" => Ok(sim),
         "usb" | "usb0" | "ofl" | "ofl0" | "openfpgaloader" => Ok(ofl),
+        "native" | "native0" | "ftdi" | "libusb" => Ok(native),
         "auto" => {
             if det.physical_had {
                 Ok(ofl)
@@ -479,7 +695,7 @@ pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
             }
         }
         other => Err(format!(
-            "unknown cable {other:?}: use --cable auto|sim|usb|ofl"
+            "unknown cable {other:?}: use --cable auto|sim|usb|ofl|native"
         )),
     }
 }
@@ -492,6 +708,12 @@ pub struct OflProgramReport {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// Board `-b` actually passed (after [`resolve_ofl_board`]), if any.
+    pub board: Option<String>,
+    /// Helion TAP STAT readback is never available via OFL today.
+    pub tap_readback: bool,
+    /// OFL `--verify` kind (SPI flash only when enabled).
+    pub readback: OflReadbackKind,
 }
 
 fn format_command(program: &std::path::Path, args: &[String]) -> String {
@@ -509,19 +731,33 @@ fn format_command(program: &std::path::Path, args: &[String]) -> String {
     s
 }
 
-fn build_ofl_program_args(bitstream: &std::path::Path, flash: bool) -> Vec<String> {
+fn build_ofl_program_args(
+    bitstream: &std::path::Path,
+    flash: bool,
+    part: Option<&str>,
+) -> (Vec<String>, Option<String>, OflReadbackKind) {
     let mut args = Vec::new();
-    if let Ok(board) = std::env::var("HELION_OFL_BOARD") {
-        let b = board.trim();
-        if !b.is_empty() {
-            args.push("-b".into());
-            args.push(b.to_string());
-        }
+    let board = resolve_ofl_board(part);
+    if let Some(ref b) = board {
+        args.push("-b".into());
+        args.push(b.clone());
     } else if let Ok(cable) = std::env::var("HELION_OFL_CABLE") {
+        // Cable only when no board (OFL typically wants one of -b / -c).
         let c = cable.trim();
         if !c.is_empty() {
             args.push("-c".into());
             args.push(c.to_string());
+        }
+    }
+    // If board was set via default/env but user also set cable, append cable via EXTRA
+    // or when board is set and HELION_OFL_CABLE is set, pass both (OFL accepts -b and -c).
+    if board.is_some() {
+        if let Ok(cable) = std::env::var("HELION_OFL_CABLE") {
+            let c = cable.trim();
+            if !c.is_empty() {
+                args.push("-c".into());
+                args.push(c.to_string());
+            }
         }
     }
     if flash {
@@ -529,13 +765,20 @@ fn build_ofl_program_args(bitstream: &std::path::Path, flash: bool) -> Vec<Strin
     } else {
         args.push("-m".into());
     }
+    // OFL `--verify` is SPI-flash only — never Helion TAP STAT. Opt-in via HELION_OFL_VERIFY.
+    let readback = if flash && ofl_verify_enabled() {
+        args.push("--verify".into());
+        OflReadbackKind::FlashSpiVerify
+    } else {
+        OflReadbackKind::None
+    };
     if let Ok(extra) = std::env::var("HELION_OFL_EXTRA") {
         for tok in extra.split_whitespace() {
             args.push(tok.to_string());
         }
     }
     args.push(bitstream.display().to_string());
-    args
+    (args, board, readback)
 }
 
 /// Invoke openFPGALoader to program `bitstream` (`.hbits` or converted file).
@@ -545,6 +788,15 @@ fn build_ofl_program_args(bitstream: &std::path::Path, flash: bool) -> Vec<Strin
 pub fn program_via_openfpgaloader(
     bitstream: &std::path::Path,
     flash: bool,
+) -> Result<OflProgramReport, String> {
+    program_via_openfpgaloader_for_part(bitstream, flash, None)
+}
+
+/// Like [`program_via_openfpgaloader`], applying HAD board-id defaults for `part`.
+pub fn program_via_openfpgaloader_for_part(
+    bitstream: &std::path::Path,
+    flash: bool,
+    part: Option<&str>,
 ) -> Result<OflProgramReport, String> {
     let ofl = find_openfpgaloader().ok_or_else(|| {
         "program: openFPGALoader not on PATH — install it or set HELION_OPENFPGALOADER; \
@@ -571,7 +823,29 @@ pub fn program_via_openfpgaloader(
             bitstream.display()
         ));
     }
-    let args = build_ofl_program_args(bitstream, flash);
+    let (args, board, readback) = build_ofl_program_args(bitstream, flash, part);
+    if let Some(ref b) = board {
+        eprintln!(
+            "program: HELION_OFL_BOARD/default → -b {b} (Helion-local alias until OFL upstream)"
+        );
+    } else if let Some(p) = part {
+        if let Some(row) = lookup_had_board(p) {
+            eprintln!(
+                "program: tip set HELION_OFL_BOARD={} for part {} (currently no -b)",
+                row.ofl_board, p
+            );
+        }
+    }
+    if flash && readback == OflReadbackKind::None {
+        eprintln!(
+            "program: no TAP readback over USB; OFL --verify is SPI-flash only \
+             (set HELION_OFL_VERIFY=1 to request flash verify)"
+        );
+    } else if !flash {
+        eprintln!(
+            "program: no TAP STAT readback over USB (OFL SRAM path has no Helion IR_STAT)"
+        );
+    }
     let command = format_command(&ofl, &args);
     eprintln!("program: invoking {command}");
     if ofl_dry_run() {
@@ -612,6 +886,9 @@ pub fn program_via_openfpgaloader(
         exit_code: code,
         stdout,
         stderr,
+        board,
+        tap_readback: false,
+        readback,
     })
 }
 
@@ -670,6 +947,30 @@ pub fn program_hbits_with_cable(
             let (bits, st) = program_hbits_path(dev, path)?;
             Ok(ProgramOutcome::Sim { bits, stat: st })
         }
+        CableBackend::NativeUsb => {
+            // Honest stub: try native, then fall back to OFL when NotImplemented.
+            match try_native_usb_program(path, flash) {
+                Ok(()) => Err(
+                    "program: native USB stub reported success without a driver — refusing DONE"
+                        .into(),
+                ),
+                Err(NativeUsbError::NotImplemented(msg)) => {
+                    eprintln!("program: native USB stub → {msg}; falling back to openFPGALoader");
+                    program_hbits_with_cable(
+                        dev,
+                        path,
+                        &CableInfo {
+                            id: "ofl0".into(),
+                            backend: CableBackend::OpenFpgaLoader,
+                            part_hint: cable.part_hint.clone(),
+                            detail: "OFL fallback after native NotImplemented".into(),
+                        },
+                        flash,
+                    )
+                }
+                Err(NativeUsbError::Io(msg)) => Err(format!("program: native USB I/O: {msg}")),
+            }
+        }
         CableBackend::OpenFpgaLoader => {
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("program: read {}: {e}", path.display()))?;
@@ -700,7 +1001,7 @@ pub fn program_hbits_with_cable(
                 dev.part,
                 if flash { "flash" } else { "sram" }
             );
-            let ofl = program_via_openfpgaloader(path, flash)?;
+            let ofl = program_via_openfpgaloader_for_part(path, flash, Some(dev.part.as_str()))?;
             Ok(ProgramOutcome::OpenFpgaLoader {
                 bits,
                 ofl,
@@ -733,6 +1034,7 @@ impl ProgramOutcome {
     }
 
     /// Human summary line for CLI / GUI. Claims DONE only for sim TAP or OFL exit 0.
+    /// OFL path never invents Helion TAP STAT bits — reports `TAP_readback=none`.
     pub fn summary_line(&self, sub: &str, part: &str) -> String {
         match self {
             ProgramOutcome::Sim { bits, stat } => format!(
@@ -749,9 +1051,14 @@ impl ProgramOutcome {
             ),
             ProgramOutcome::OpenFpgaLoader { bits, ofl, bytes } => {
                 let frames = bits.as_ref().map(|b| b.frames.len()).unwrap_or(0);
+                let board = ofl
+                    .board
+                    .as_deref()
+                    .unwrap_or("-");
                 format!(
-                    "hw {sub} backend=ofl part={part} frames={frames} bytes={bytes} ofl_exit={} DONE=1 (programmer ok) cmd={}",
+                    "hw {sub} backend=ofl part={part} frames={frames} bytes={bytes} ofl_board={board} ofl_exit={} DONE=1 (programmer ok; no TAP readback) TAP_readback=none ofl_verify={} STAT=(no readback) cmd={}",
                     ofl.exit_code.unwrap_or(0),
+                    ofl.readback.as_str(),
                     ofl.command
                 )
             }
@@ -857,10 +1164,18 @@ mod tests {
                 .any(|c| c.backend == CableBackend::OpenFpgaLoader),
             "ofl/usb backend must be advertised"
         );
+        assert!(
+            d.cables.iter().any(|c| c.backend == CableBackend::NativeUsb),
+            "native USB stub must be advertised"
+        );
         assert!(d.text().contains("physical_had="));
+        assert!(d.text().contains("had_board_ids"));
+        assert!(d.text().contains("helion_hl10t"));
+        assert!(d.text().contains("native_usb: stub"));
         assert!(resolve_cable("sim").is_ok());
         assert!(resolve_cable("usb").is_ok());
         assert!(resolve_cable("ofl").is_ok());
+        assert!(resolve_cable("native").is_ok());
         assert!(resolve_cable("auto").is_ok());
         assert!(resolve_cable("nope").is_err());
         // Without a real USB probe (typical CI), physical_had is false.
@@ -954,6 +1269,96 @@ mod tests {
         let (bits, st) = program_packets(&dev, &empty.packets).unwrap();
         assert_eq!(bits.idcode, dev.idcode);
         assert!(st.done && st.gwe && !st.crc_err);
+    }
+
+    #[test]
+    fn had_board_id_helpers_and_ofl_board_defaults() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let t = lookup_had_board("HL10T-C32-1").expect("T part");
+        assert_eq!(t.idcode, 0x0001_1A1F);
+        assert_eq!(t.ofl_board, "helion_hl10t");
+        let dsp = lookup_had_board("HL10T-DSP1").expect("DSP part");
+        assert_eq!(dsp.idcode, t.idcode);
+        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        assert_eq!(
+            resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
+            Some("helion_hl10t")
+        );
+        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); }
+        assert_eq!(resolve_ofl_board(Some("HL10T-C32-1")), None);
+        unsafe { std::env::set_var("HELION_OFL_BOARD", "custom_had"); }
+        assert_eq!(
+            resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
+            Some("custom_had")
+        );
+        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        let table = had_board_id_table_text();
+        assert!(table.contains("HELION_OFL_BOARD"));
+        assert!(table.contains("0x00011a1f") || table.contains("0x00011A1F"));
+    }
+
+    #[test]
+    fn native_usb_stub_not_implemented_falls_back_to_ofl() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("helion-native-fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        let fake = dir.join("fake-ofl");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &fake,
+                "#!/bin/sh\nif [ \"$1\" = \"--scan-usb\" ]; then echo 'FTDI probe vid=0x0403 pid=0x6010'; exit 0; fi\necho ofl-ok; exit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
+        assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let bits_path = dir.join("t.hbits");
+        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        unsafe { std::env::set_var("HELION_OPENFPGALOADER", &fake); }
+        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); } // keep cmd simple for assert
+        let cable = resolve_cable("native").unwrap();
+        assert_eq!(cable.backend, CableBackend::NativeUsb);
+        let ok = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap();
+        match ok {
+            ProgramOutcome::OpenFpgaLoader { ofl, .. } => {
+                assert_eq!(ofl.exit_code, Some(0));
+                assert!(!ofl.tap_readback);
+                assert_eq!(ofl.readback, OflReadbackKind::None);
+                let line = ProgramOutcome::OpenFpgaLoader {
+                    bits: None,
+                    ofl: ofl.clone(),
+                    bytes: 0,
+                }
+                .summary_line("program", &dev.part);
+                assert!(line.contains("no TAP readback"), "{line}");
+                assert!(line.contains("TAP_readback=none"), "{line}");
+                assert!(line.contains("STAT=(no readback)"), "{line}");
+            }
+            ProgramOutcome::Sim { .. } => panic!("expected OFL fallback from native stub"),
+        }
+        // Flash + HELION_OFL_VERIFY should request --verify (still not TAP readback).
+        unsafe { std::env::set_var("HELION_OFL_VERIFY", "1"); }
+        let ofl_cable = resolve_cable("ofl").unwrap();
+        let flash_ok = program_hbits_with_cable(&dev, &bits_path, &ofl_cable, true).unwrap();
+        match flash_ok {
+            ProgramOutcome::OpenFpgaLoader { ofl, .. } => {
+                assert!(ofl.command.contains("--verify"), "{}", ofl.command);
+                assert_eq!(ofl.readback, OflReadbackKind::FlashSpiVerify);
+                assert!(!ofl.tap_readback);
+            }
+            ProgramOutcome::Sim { .. } => panic!("expected ofl"),
+        }
+        unsafe { std::env::remove_var("HELION_OFL_VERIFY"); }
+        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
     }
 
 }
