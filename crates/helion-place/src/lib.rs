@@ -409,7 +409,14 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             let mut swapped = 0u32;
             let mut driver_moved = 0u32;
             let mut driver_swapped = 0u32;
-            for _pass in 0..32 {
+            // Cheap early-out: if initial affinity place is already IMUX-legal,
+            // skip the 32-pass bileg legalize (reduced Ibex / small designs).
+            let already_legal = packed.lutffs.iter().enumerate().all(|(i, lf)| {
+                let (site, _) = lutff_sites[i];
+                imux_illegal_pins(lf, site, &ff_at) == 0
+            });
+            let pass_limit = if already_legal { 0 } else { 32 };
+            for _pass in 0..pass_limit {
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
                 let mut pass_drv_moved = 0u32;

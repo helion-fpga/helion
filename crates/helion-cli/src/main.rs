@@ -145,6 +145,10 @@ fn compile_design_xdc(
     }
     // Empty / clock-only XDC keeps gold WNS (9640 on counter @ 10 ns).
     let timing = report_timing_routed_xdc(&design, &routed, &clks, xdc)?;
+    eprintln!(
+        "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
+        timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+    );
     Ok(Compiled {
         dev,
         design,
