@@ -27,7 +27,8 @@ impl Default for PlaceOpts {
     }
 }
 
-/// Bring-up IMUX reach: same CLB, N-S ±1/±2, E-W ±1/±2, or diag ±1 (matches helion-route::imux_sel).
+/// Bring-up IMUX reach: same CLB, N-S ±1/±2, E-W ±1/±2, diag ±1, or knight
+/// (±2,±1)/(±1,±2) — matches helion-route::imux_sel.
 fn imux_local(from: Site, to: Site) -> bool {
     if from.x == to.x
         && (from.y == to.y
@@ -47,10 +48,10 @@ fn imux_local(from: Site, to: Site) -> bool {
     {
         return true;
     }
-    // Real diagonal (±1,±1) neighbor Q.
+    // Real diagonal (±1,±1) or knight (±2,±1)/(±1,±2) neighbor Q.
     let dx = from.x.abs_diff(to.x);
     let dy = from.y.abs_diff(to.y);
-    dx == 1 && dy == 1
+    (dx == 1 && dy == 1) || (dx == 2 && dy == 1) || (dx == 1 && dy == 2)
 }
 
 fn imux_illegal_pins(
@@ -124,7 +125,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
-        // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1).
+        // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
             let preferred_x = iob_for_net
@@ -185,7 +186,18 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             y_order.push(s.y - 2);
                         }
                     } else if dx == 1 {
-                        // Diagonal / E-W±1: prefer same Y then ±1 for diag IMUX.
+                        // Diagonal / E-W±1 / knight (±1,±2): same Y, ±1, ±2.
+                        y_order.push(s.y);
+                        y_order.push(s.y.saturating_add(1));
+                        y_order.push(s.y.saturating_add(2));
+                        if s.y > 0 {
+                            y_order.push(s.y - 1);
+                        }
+                        if s.y > 1 {
+                            y_order.push(s.y - 2);
+                        }
+                    } else if dx == 2 {
+                        // Knight (±2,±1): prefer Y±1 (and same Y for E-W±2).
                         y_order.push(s.y);
                         y_order.push(s.y.saturating_add(1));
                         if s.y > 0 {
@@ -224,8 +236,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         }
 
             // FM-HEL-TOP: stronger IMUX legalization — pull sinks onto driver
-            // same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 (real HAD reach); empty-BLE
-            // move then pairwise swap when sites are full.
+            // same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight (real HAD reach);
+            // empty-BLE move then pairwise swap when sites are full.
             let mut site_of: std::collections::HashMap<(u32, u32, u8), usize> =
                 std::collections::HashMap::new();
             for (i, (s, ble)) in lutff_sites.iter().enumerate() {
@@ -261,10 +273,31 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 if x > 0 && y > 0 {
                     xy.push((x - 1, y - 1));
                 }
+                // Knight (±2,±1) / (±1,±2) — real IMUX sel 128-191
+                xy.push((x.saturating_add(2), y.saturating_add(1)));
+                xy.push((x.saturating_add(1), y.saturating_add(2)));
+                if y > 0 {
+                    xy.push((x.saturating_add(2), y - 1));
+                }
+                if y > 1 {
+                    xy.push((x.saturating_add(1), y - 2));
+                }
+                if x > 0 {
+                    xy.push((x - 1, y.saturating_add(2)));
+                }
+                if x > 1 {
+                    xy.push((x - 2, y.saturating_add(1)));
+                }
+                if x > 0 && y > 1 {
+                    xy.push((x - 1, y - 2));
+                }
+                if x > 1 && y > 0 {
+                    xy.push((x - 2, y - 1));
+                }
             };
             let mut moved = 0u32;
             let mut swapped = 0u32;
-            for _pass in 0..14 {
+            for _pass in 0..16 {
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
                 for (i, lf) in packed.lutffs.iter().enumerate() {
@@ -428,7 +461,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
             if moved > 0 || swapped > 0 {
                 eprintln!(
-                    "hang_diag place imux_legalize moved={moved} swapped={swapped}"
+                    "hang_knight place imux_legalize moved={moved} swapped={swapped}"
                 );
             }
     }

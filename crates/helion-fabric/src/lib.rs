@@ -291,8 +291,8 @@ impl Fabric {
             let (mstr, rest) = rest.split_once("][")?;
             let m: u32 = mstr.parse().ok()?;
             let b: u32 = rest.strip_suffix(']')?.parse().ok()?;
-            // Bits 0..4 keep gold abs (m*5+b). Bit 5 / bit 6 live in
-            // extension banks after 64×5 so legacy frames stay bit-compatible.
+            // Bits 0..4 keep gold abs (m*5+b). Bit 5/6/7 live in extension
+            // banks after 64×5 so legacy frames stay bit-compatible.
             if b < 5 {
                 return Some(512 + 40 + 40 + m * 5 + b);
             }
@@ -301,6 +301,9 @@ impl Fabric {
             }
             if b == 6 {
                 return Some(512 + 40 + 40 + 64 * 5 + 64 + m);
+            }
+            if b == 7 {
+                return Some(512 + 40 + 40 + 64 * 5 + 64 + 64 + m);
             }
             return None;
         }
@@ -342,7 +345,7 @@ impl Fabric {
 
     fn imux_sel(&self, x: u32, y: u32, mux: u32) -> u8 {
         let mut s = 0u8;
-        for b in 0..7u32 {
+        for b in 0..8u32 {
             if self.clb_feature_bit(x, y, &format!("IMUX[{mux}][{b}]")) {
                 s |= 1 << b;
             }
@@ -372,8 +375,10 @@ impl Fabric {
     /// IMUX sel: 0-7 S±1 Q, 8-15 N±1 Q, 16-23 local Q, 24-31 local LUT O,
     /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q,
     /// 64-71 W±2 Q, 72-79 E±2 Q,
-    /// 80-87 SW±1 Q, 88-95 SE±1 Q, 96-103 NW±1 Q, 104-111 NE±1 Q
-    /// (7-bit sel; gold uses sel<32).
+    /// 80-87 SW±1 Q, 88-95 SE±1 Q, 96-103 NW±1 Q, 104-111 NE±1 Q,
+    /// 128-135 W2S1, 136-143 W2N1, 144-151 E2S1, 152-159 E2N1,
+    /// 160-167 W1S2, 168-175 W1N2, 176-183 E1S2, 184-191 E1N2
+    /// (8-bit sel; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
             return self.q_at(x, y.saturating_sub(1), sel);
@@ -424,6 +429,42 @@ impl Fabric {
         if sel < 112 {
             // NE diagonal: driver east+north
             return self.q_at(x + 1, y + 1, sel - 104);
+        }
+        // Knight moves (bit7 bank): (±2,±1) and (±1,±2)
+        if sel < 128 {
+            return false; // 112-127 reserved
+        }
+        if sel < 136 {
+            // W2S1: driver west±2 + south±1
+            return self.q_at(x.saturating_sub(2), y.saturating_sub(1), sel - 128);
+        }
+        if sel < 144 {
+            // W2N1
+            return self.q_at(x.saturating_sub(2), y + 1, sel - 136);
+        }
+        if sel < 152 {
+            // E2S1
+            return self.q_at(x + 2, y.saturating_sub(1), sel - 144);
+        }
+        if sel < 160 {
+            // E2N1
+            return self.q_at(x + 2, y + 1, sel - 152);
+        }
+        if sel < 168 {
+            // W1S2
+            return self.q_at(x.saturating_sub(1), y.saturating_sub(2), sel - 160);
+        }
+        if sel < 176 {
+            // W1N2
+            return self.q_at(x.saturating_sub(1), y + 2, sel - 168);
+        }
+        if sel < 184 {
+            // E1S2
+            return self.q_at(x + 1, y.saturating_sub(2), sel - 176);
+        }
+        if sel < 192 {
+            // E1N2
+            return self.q_at(x + 1, y + 2, sel - 184);
         }
         false
     }

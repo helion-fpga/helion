@@ -31,8 +31,9 @@ impl FeatureSet {
     }
 
     pub fn set_imux(&mut self, x: u32, y: u32, mux: u32, sel: u8) {
-        // 7-bit sel: bits 0..4 gold-stable; bit5 = N-S±2 / E-W±1; bit6 = E-W±2 / diag±1.
-        for b in 0..7u32 {
+        // 8-bit sel: bits 0..4 gold-stable; bit5 = N-S±2 / E-W±1; bit6 = E-W±2 / diag±1;
+        // bit7 = knight (±2,±1)/(±1,±2). Legacy abs for 0..6 unchanged (append-only bank).
+        for b in 0..8u32 {
             if (sel >> b) & 1 == 1 {
                 self.set(format!("CLB_X{x}Y{y}.IMUX[{mux}][{b}]"), true);
             }

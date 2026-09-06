@@ -14,7 +14,7 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
-    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±2 / diag±1 IMUX encoding (Ibex-scale).
+    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±2 / diag±1 / knight IMUX encoding (Ibex-scale).
     pub imux_skip: u32,
 }
 
@@ -198,8 +198,42 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
         // driver NE of sink
         return Ok(104 + dble);
     }
+    // Real knight (±2,±1)/(±1,±2): bit7 bank sel 128-191; fabric samples Q
+    // at knight-neighbor sites (same honesty class as axis/diag neighbor Q).
+    if from.x + 2 == to.x && from.y + 1 == to.y {
+        // driver W2S1 of sink
+        return Ok(128 + dble);
+    }
+    if from.x + 2 == to.x && to.y + 1 == from.y {
+        // driver W2N1 of sink
+        return Ok(136 + dble);
+    }
+    if to.x + 2 == from.x && from.y + 1 == to.y {
+        // driver E2S1 of sink
+        return Ok(144 + dble);
+    }
+    if to.x + 2 == from.x && to.y + 1 == from.y {
+        // driver E2N1 of sink
+        return Ok(152 + dble);
+    }
+    if from.x + 1 == to.x && from.y + 2 == to.y {
+        // driver W1S2 of sink
+        return Ok(160 + dble);
+    }
+    if from.x + 1 == to.x && to.y + 2 == from.y {
+        // driver W1N2 of sink
+        return Ok(168 + dble);
+    }
+    if to.x + 1 == from.x && from.y + 2 == to.y {
+        // driver E1S2 of sink
+        return Ok(176 + dble);
+    }
+    if to.x + 1 == from.x && to.y + 2 == from.y {
+        // driver E1N2 of sink
+        return Ok(184 + dble);
+    }
     Err(format!(
-        "IMUX: no local/N-S±2/E-W±2/diag±1 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
+        "IMUX: no local/N-S±2/E-W±2/diag±1/knight encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
         from.x, from.y, to.x, to.y
     ))
 }
@@ -266,7 +300,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
                     });
                 }
                 Err(_) => {
-                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±2 / diag±1. Full Ibex has
+                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±2 / diag±1 / knight. Full Ibex has
                     // longer/>±1 diagonal FF→LUT arcs; skip + count (honest, not silent).
                     imux_skip += 1;
                 }
@@ -354,7 +388,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
     }
     if imux_skip > 0 {
         eprintln!(
-            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±2/diag±1/same-CLB)",
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±2/diag±1/knight/same-CLB)",
             imux_skip,
             imux.len()
         );
