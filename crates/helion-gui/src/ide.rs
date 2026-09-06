@@ -17079,7 +17079,7 @@ impl IdeModel {
     }
 
     /// UG893 Hardware Manager STAT table from helion-hw TAP / fabric Stat.
-    /// Program with explicit cable (`auto|sim|usb|ofl`) via helion-hw backends.
+    /// Program with explicit cable (`auto|sim|usb|ofl|native`) via helion-hw backends.
     pub fn program_hw_with_cable(&mut self, cable: &str) -> Result<String, String> {
         if !self.shell.session.hw_open {
             self.shell.session.open_hw_manager();

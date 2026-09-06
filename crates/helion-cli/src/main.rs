@@ -167,7 +167,7 @@ fn usage() {
   helion project run <file.prj> [--cycles N]
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
-  helion hw program|flash --cable auto|sim|usb|ofl [--bitstream FILE.hbits] [--part P]",
+  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]",
         v = env!("CARGO_PKG_VERSION")
     );
 }
@@ -533,7 +533,7 @@ fn hw(args: Vec<String>) {
     let sub = it.next().unwrap_or_default();
     if sub.is_empty() || sub == "-h" || sub == "--help" || sub == "help" {
         eprintln!(
-            "usage:\n  helion hw list\n  helion hw detect\n  helion hw program|flash --cable auto|sim|usb|ofl [--bitstream FILE.hbits] [--part P]"
+            "usage:\n  helion hw list\n  helion hw detect\n  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]"
         );
         std::process::exit(2);
     }

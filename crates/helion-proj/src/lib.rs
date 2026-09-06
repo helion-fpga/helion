@@ -480,8 +480,8 @@ impl Session {
                     st.crc_err as u8
                 ))
             }
-            CableBackend::OpenFpgaLoader => {
-                // Persist packets to a temp .hbits so OFL (or dry-run) can consume a path.
+            CableBackend::OpenFpgaLoader | CableBackend::NativeUsb => {
+                // Persist packets to a temp .hbits so OFL (or native→OFL fallback) can consume a path.
                 let dir = std::env::temp_dir().join("helion-prog-hw");
                 std::fs::create_dir_all(&dir).map_err(|e| format!("program_hw: temp dir: {e}"))?;
                 let path = dir.join(format!("{}.hbits", dev.part));

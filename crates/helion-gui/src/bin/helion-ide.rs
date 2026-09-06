@@ -206,7 +206,7 @@ struct HelionIde {
     tcl_focus: bool,
     /// Last Program rail action: (ok, message) for honest empty/error/progress.
     program_status: Option<(bool, String)>,
-    /// Cable picker: auto|sim|usb|ofl (wired to helion-hw resolve_cable).
+    /// Cable picker: auto|sim|usb|ofl|native (wired to helion-hw resolve_cable).
     program_cable: String,
 }
 
@@ -678,6 +678,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
             ("auto", "auto"),
             ("sim", "sim"),
             ("usb", "usb/ofl"),
+            ("native", "native→ofl"),
         ] {
             let selected = app.program_cable == id;
             if ui.selectable_label(selected, label).clicked() {

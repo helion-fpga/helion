@@ -12,10 +12,10 @@ fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "helion-prog [--cable auto|sim|usb|ofl] [--part PART] [--flash] [bitstream.hbits]\n\
+            "helion-prog [--cable auto|sim|usb|ofl|native] [--part PART] [--flash] [bitstream.hbits]\n\
              \n\
              Detects cables (sim always; USB via openFPGALoader when on PATH),\n\
-             loads `.hbits`, programs via TAP CFG_W (sim) or openFPGALoader (usb/ofl).\n\
+             loads `.hbits`, programs via TAP CFG_W (sim), openFPGALoader (usb/ofl), or native stub→OFL fallback.\n\
              Never claims DONE on USB without a detected programmer. Empty args\n\
              program an empty bitstream on --cable sim only."
         );
