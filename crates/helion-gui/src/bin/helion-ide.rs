@@ -2304,7 +2304,7 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
             }
-            if resp.clicked() {
+            if resp.clicked() || resp.double_clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let lx = pos.x - rect.left();
                     let ly = pos.y - rect.top();
@@ -2321,6 +2321,9 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                     if let Some(b) = hit {
                         pick = Some(b.name.clone());
+                        if resp.double_clicked() {
+                            let _ = model.exec(&format!("open_hierarchy_sheet {}", b.name));
+                        }
                     }
                 }
             }
@@ -2328,6 +2331,12 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(id) = pick {
         model.select(&id);
     }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Show in Schematic").clicked() {
+            let _ = model.exec("open_hierarchy_sheet");
+        }
+    });
 }
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
