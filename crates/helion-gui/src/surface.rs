@@ -188,6 +188,8 @@ pub fn apply_activity(s: &mut ChromeState, a: Activity) {
             s.workspace = WorkspaceTab::Reports;
         }
         Activity::Simulate => {
+            // Do not leave Timing/Device canvas selected — Waveform is the pane.
+            s.canvas = Canvas::Editor;
             if !s.workspace.sim_only() {
                 s.workspace = WorkspaceTab::Wave;
             }
@@ -700,6 +702,21 @@ mod tests {
     }
 
     #[test]
+    fn simulate_activity_does_not_leave_timing_canvas_selected() {
+        let mut d = ChromeDriver::new();
+        d.click_canvas(Canvas::Timing);
+        assert_eq!(d.pane(), WorkspacePane::Timing);
+        d.click_activity(Activity::Simulate);
+        assert_eq!(d.pane(), WorkspacePane::Wave);
+        assert_ne!(
+            d.chrome.canvas,
+            Canvas::Timing,
+            "Sim rail must not keep Timing highlighted"
+        );
+        assert_eq!(d.chrome.workspace, WorkspaceTab::Wave);
+    }
+
+    #[test]
     fn every_more_destination_click_paints_its_own_pane_not_timing() {
         let mut d = ChromeDriver::new();
         d.click_open(&example("counter.sv")).unwrap();
@@ -849,6 +866,28 @@ mod tests {
         let fit = chrome::fit_pane(drawing.width.max(1.0), drawing.height.max(1.0), 900.0, 500.0);
         assert!(fit.right_clip <= 0.5);
         assert!(fit.fills() || fit.fill >= chrome::PANE_FILL_MIN);
+
+        d.click_more(WorkspaceTab::Hierarchy);
+        assert_eq!(d.pane(), WorkspacePane::Hierarchy);
+        let hier = d.model.hierarchy.drawing();
+        assert!(!hier.boxes.is_empty(), "hierarchy after Implement must have boxes");
+        let native = chrome::native_drawing_fill(hier.width, hier.height, 1000.0, 400.0);
+        assert!(
+            native < chrome::PANE_FILL_MIN,
+            "native hierarchy {native} cols must be a postage stamp so scale is required ({}×{})",
+            hier.width,
+            hier.height
+        );
+        let hfit = chrome::hierarchy_fit(hier.width.max(1.0), hier.height.max(1.0), 1000.0, 400.0);
+        assert!(hfit.fills(), "hierarchy scaled {hfit:?}");
+        d.click_more(WorkspaceTab::Ip);
+        assert_eq!(d.pane(), WorkspacePane::Ip);
+        let (cat_h, ip_canvas) = chrome::ip_layout(1000.0, 400.0);
+        assert!(cat_h <= chrome::IP_CATALOG_MAX_HEIGHT);
+        assert!(
+            ip_canvas.fills() || ip_canvas.fill >= chrome::PANE_FILL_MIN,
+            "IP canvas {ip_canvas:?}"
+        );
     }
 
     #[test]

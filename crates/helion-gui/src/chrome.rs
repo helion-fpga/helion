@@ -24,6 +24,10 @@ pub const STATUS_HEIGHT: f32 = 22.0;
 pub const HIT_PRIMARY: f32 = 32.0;
 /// Comfort primary (Implement / Open) — ≥44 where the toolbar has room.
 pub const HIT_COMFORT: f32 = 36.0;
+/// Every toolbar / flow chip shares this height. Width may follow the label; height may not.
+pub const TOOLBAR_CTRL_H: f32 = HIT_COMFORT;
+/// Approx glyph width at the rail's primary (word) size — letter is secondary.
+const RAIL_WORD_CHAR_PX: f32 = 8.0;
 pub const HIT_SIDEBAR: f32 = 28.0;
 pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
 /// Occupancy / util bars (NICE leftover: was 12px).
@@ -58,8 +62,27 @@ pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 pub const MIN_COL_PX: f32 = 80.0;
 pub const MORE: &str = "More ⋯";
 pub const MORE_LABEL: &str = MORE;
-const CHAR_PX: f32 = 7.0;
+const CHAR_PX: f32 = RAIL_WORD_CHAR_PX;
 const TAB_PAD_PX: f32 = 16.0;
+
+/// Toolbar control size: one height, width from the label (min 72, max 140).
+pub fn toolbar_ctrl_size(label: &str) -> [f32; 2] {
+    let w = (label.chars().count() as f32 * 8.0 + 28.0).clamp(72.0, 140.0);
+    [w, TOOLBAR_CTRL_H]
+}
+
+/// Synth/Opt/Place/Route chips — same height as Open/Implement.
+pub fn flow_chip_size() -> [f32; 2] {
+    [72.0, TOOLBAR_CTRL_H]
+}
+
+/// Waveform trace row height. One or two traces must fill the remaining pane
+/// instead of painting a 32px strip over a black slab.
+pub fn wave_trace_row_h(n_traces: usize, remaining_h: f32) -> f32 {
+    let n = n_traces.max(1) as f32;
+    let remain = remaining_h.max(36.0);
+    (remain / n).clamp(36.0, remain)
+}
 
 /// Example sources (empty state / File → Examples). Do not paint on the rail.
 pub const RAIL_OPEN_SOURCES: [(&'static str, &'static str); 5] = [
@@ -437,9 +460,11 @@ pub fn floorplan_fits_viewport(
         && cell * rows.max(1) as f32 + 16.0 <= avail_h + 1.0
 }
 
-/// Remaining-pane fill bar (Program / Package / Schematic drawings).
+/// Remaining-pane fill bar (Program / Package / Schematic / Hierarchy / IP drawings).
 pub const PANE_FILL_MIN: f32 = 0.80;
 pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
+/// Compact IP catalog strip so the BD canvas can still hit the fill bar.
+pub const IP_CATALOG_MAX_HEIGHT: f32 = 88.0;
 
 /// How a content bbox sits in the remaining central pane after chrome/tables.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -544,10 +569,35 @@ pub fn program_layout(n_tiles: usize, pane_w: f32, pane_h: f32) -> (f32, f32, u3
 /// Content bbox of the Program STAT grid + ILA rest (both are content).
 pub fn hardware_content_bbox(n_bits: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
     let (tile_band, ila_h, cols, rows, cw, ch) = program_layout(n_bits, pane_w, pane_h);
-    let drawn_w = (cw * cols as f32 + 16.0).min(pane_w.max(1.0)).max(pane_w * PANE_FILL_MIN);
+    let drawn_w = (cw * cols as f32 + 16.0).min(pane_w.max(1.0));
     let drawn_h = tile_band + ila_h;
     let _ = (rows, ch);
     DrawingFit::from_drawn(pane_w.max(1.0), pane_h.max(1.0), 1.0, 1.0, drawn_w, drawn_h)
+}
+
+/// Native Hierarchy/IP sheet as a fraction of the pane (postage stamp in the More shots).
+pub fn native_drawing_fill(sheet_w: f32, sheet_h: f32, pane_w: f32, pane_h: f32) -> f32 {
+    (sheet_w / pane_w.max(1.0)).min(sheet_h / pane_h.max(1.0)).clamp(0.0, 1.0)
+}
+
+/// Stretch a Hierarchy/IP sheet so the drawn bbox fills the remaining pane.
+pub fn hierarchy_fit(sheet_w: f32, sheet_h: f32, pane_w: f32, pane_h: f32) -> DrawingFit {
+    fill_pane(sheet_w, sheet_h, pane_w, pane_h)
+}
+
+/// IP Integrator: capped catalog strip + canvas occupying the rest of the pane.
+pub fn ip_layout(pane_w: f32, pane_h: f32) -> (f32, DrawingFit) {
+    let ph = pane_h.max(1.0);
+    let catalog_h = IP_CATALOG_MAX_HEIGHT
+        .min(ph * (1.0 - PANE_FILL_MIN))
+        .min(ph * 0.22)
+        .max(48.0);
+    let canvas_h = (ph - catalog_h).max(ph * PANE_FILL_MIN);
+    let catalog_h = (ph - canvas_h).max(0.0);
+    (
+        catalog_h,
+        DrawingFit::from_drawn(pane_w.max(1.0), ph, 1.0, 1.0, pane_w.max(1.0), canvas_h),
+    )
 }
 
 /// Auto-fit only the identity camera when the sheet would clip. User zoom/pan is kept.
@@ -854,6 +904,13 @@ mod tests {
         assert_eq!(HIT_RAIL, 56.0);
         assert!(HIT_RAIL >= 28.0);
         assert_eq!(HIT_COMFORT, 36.0);
+        assert_eq!(TOOLBAR_CTRL_H, HIT_COMFORT);
+        assert_eq!(flow_chip_size()[1], HIT_COMFORT);
+        for label in ["Open…", "Bitstream", "Implement", "Implementing…"] {
+            let s = toolbar_ctrl_size(label);
+            assert_eq!(s[1], HIT_COMFORT, "{label} height");
+            assert!(s[0] >= 72.0, "{label} width {}", s[0]);
+        }
         assert_eq!(OCCUPANCY_BAR_H, 20.0);
         assert!((4.0..=6.0).contains(&SPLITTER_GRAB_PX));
         assert_eq!(DEVICE_TABLES_MAX_HEIGHT, 140.0);
@@ -878,6 +935,29 @@ mod tests {
         }
         let table = table_scroll_policy(10, 400.0);
         assert!(table.last_column_would_clip && table.x && table.y);
+    }
+
+    #[test]
+    fn toolbar_and_wave_geometry_are_uniform_and_fill() {
+        assert_eq!(TOOLBAR_CTRL_H, 36.0);
+        assert_eq!(flow_chip_size(), [72.0, 36.0]);
+        assert_eq!(toolbar_ctrl_size("Open…")[1], toolbar_ctrl_size("Implement")[1]);
+        // One trace in a 400px remaining pane must not be a 32px strip.
+        let h1 = wave_trace_row_h(1, 400.0);
+        assert!(
+            h1 >= 400.0 * PANE_FILL_MIN,
+            "single wave trace row {h1} leaves a black slab in 400px"
+        );
+        let h2 = wave_trace_row_h(2, 400.0);
+        assert!(h2 >= 180.0, "two traces share the pane, got {h2}");
+        assert_eq!(wave_trace_row_h(20, 400.0), 36.0);
+        // Program bbox must not be padded up to 80% by the helper itself.
+        let hw = hardware_content_bbox(8, 1000.0, 500.0);
+        assert!(
+            hw.drawn_w < 1000.0 * PANE_FILL_MIN || hw.fill >= PANE_FILL_MIN,
+            "bbox must measure tiles, not clamp to 80%: {hw:?}"
+        );
+        assert!(hw.fills() || hw.fill >= PANE_FILL_MIN, "program tiles {hw:?}");
     }
 
     #[test]
@@ -954,6 +1034,34 @@ mod tests {
         assert!(schematic_should_auto_fit(
             1.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0
         ));
+    }
+
+    #[test]
+    fn hierarchy_and_ip_canvas_fill_remaining_pane_not_postage_stamps() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        // Counter hierarchy sheet from the More Hierarchy shot: 316×258.
+        let native = native_drawing_fill(316.0, 258.0, pane_w, pane_h);
+        assert!(
+            native < PANE_FILL_MIN,
+            "native hierarchy postage stamp must fail the fill bar (got {native})"
+        );
+        let fit = hierarchy_fit(316.0, 258.0, pane_w, pane_h);
+        assert!(
+            fit.fills(),
+            "hierarchy must stretch into the remaining pane, got {fit:?}"
+        );
+        assert!(fit.right_clip <= 0.5);
+        let (catalog_h, canvas) = ip_layout(pane_w, pane_h);
+        assert!(
+            catalog_h <= IP_CATALOG_MAX_HEIGHT,
+            "IP catalog strip {catalog_h} must stay compact"
+        );
+        assert!(
+            canvas.fills() || canvas.fill >= PANE_FILL_MIN,
+            "IP BD canvas {canvas:?}"
+        );
+        assert!(canvas.empty_gap <= PANE_EMPTY_GAP_MAX);
     }
 
     #[test]
