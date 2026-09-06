@@ -1,46 +1,49 @@
 # Schematic deepen vs Yosys connectivity
 
 **Date:** 2026-09-06 (America/New_York)
-**Status:** **DONE-at-57** (expand residual: no new fold-ins; IDE regen deferred)
+**Status:** **DONE-at-74** (cheap-18 EMPTY_SYNTH regen: +17; ln TIMEOUT)
 **Scope:** capped sample of phase-d PASS designs (no uncapped Ibex/sha256)
 **Gold:** `WNS_PS=9640` held
 **Phase-d score:** PASS 98 / SOFT 2 / FAIL 0 (uart, ysyx_ibex) — deepen does not flip residuals
 **Push:** doc on `fm-hel-corpus-soft-pass` (NO MERGE)
 
-## Method (gap-3 expand attempt)
+## Method (cheap-18 EMPTY_SYNTH regen)
 
-1. Prior DONE-at-57 already on branch (`docs/FM-HEL-CORPUS-schematic-deepen.md`).
-2. Re-scanned all phase-d `helion_schematic.out` not in sample:
-   - foldable non-empty leftovers: **only** `sha256`, `ysyx_ibex` → **excluded** (capped / intentional skip)
-   - **41 EMPTY_SYNTH** stale dumps (`synth cells=0`) — need fresh `helion-ide --stdin`
-3. Box has `helion-ide` at `/workspace/helion/target/debug/helion-ide`; Mac unreachable this pass.
-4. Expand steered to **ship now** (no multi-design IDE batch this turn).
+1. Listed cheap-18 ≤500-cell EMPTY_SYNTH from deepen residual map.
+2. Headless capped `helion-ide --stdin` on box (`open <rtl>` → `schematic` → `schematic_drawing` → `quit`), PG-kill ≤55s each.
+3. IDE binary: `/workspace/helion/target/debug/helion-ide`. RTL from `fm-hel-corpus/vendored/logikbench/...`.
+4. Folded non-empty dumps into `dashboard/schematic-deepen-sample.json`; copied raw outs under `dashboard/schematic-deepen-raw/`.
+5. Note: current IDE cell counts drift vs older phase-d summaries for some IDs (cam/fsm/muxhot/serv/ln); still folded when dump completed with synth>0 & sch>0.
 
 ## Sample deepen counts
 
-**PASS 57 / SOFT 0 / FAIL 0** (n=57; before=57 — no move)
+**PASS 74 / SOFT 0 / FAIL 0** (n=74; before=57 → **+17**)
 
 JSON: `dashboard/schematic-deepen-sample.json`  
-Raw: `dashboard/schematic-deepen-raw/` (58 files; `fsm.out` is TIMEOUT cells=39628 — not in sample)
+Raw: `dashboard/schematic-deepen-raw/` (74+ residual files; `ln` TIMEOUT not folded)
 
-## Remaining EMPTY_SYNTH (41) — skip / regen map
+### Newly folded (+17)
 
-### Cheap regen candidates (helion cells ≤500) — 18
+`addtree`, `bin2prio`, `bnor`, `bor`, `bxnor`, `bxor`, `cam`, `csa42`, `dec`, `div`, `fsm`, `log2`, `mod`, `muxhot`, `muxpri`, `serv`, `tmr`
 
-`addtree`(149), `bin2prio`(131), `bnor`(128), `bor`(129), `bxnor`(442), `bxor`(443), `cam`(85), `csa42`(97), `dec`(312), `div`(134), `fsm`(17), `ln`(87), `log2`(170), `mod`(118), `muxhot`(129), `muxpri`(129), `serv`(321), `tmr`(128)
+### Cheap-18 failures
+
+| id | result | detail |
+|----|--------|--------|
+| ln | TIMEOUT | synth/sch cells=17036 edges≈21M; drawing killed @55s (out≈760MB). Not folded. |
+
+## Remaining EMPTY_SYNTH after this pass
+
+### Still need regen
+
+`ln` (cheap-band on older helion; IDE now ~17k cells — drawing hang)
 
 ### Skip / defer (>500 or SOFT / hang risk) — 23
 
 `absdiff`, `add`, `addmod`, `addsub`, `clamp`, `cmp`, `crc32`, `divs`, `hamming`, `hswish`, `macc`, `max`, `maxn`, `min`, `muladdc`, `muxcase`, `rambit`, `rambyte`, `raminit`, `ramsdp`, `ramsp`, `rom`, `uart`  
 Plus intentional skip: `sha256`, `ysyx_ibex` (not EMPTY; excluded from deepen sample).
 
-## Blockers
-
-- Fresh schematic dumps require headless IDE runs; expand turn capped to ship without batch regen.
-- Mac local-tool unreachable for GUI WT push this pass.
-- Full ~98 PASS not schematic-swept until cheap-18 regenerated + folded.
-
 ## Bar move
 
-- Schematic connectivity sample: **57 → 57 PASS** / 0 SOFT / 0 FAIL (held)
-- Next lever: regenerate cheap-18 EMPTY_SYNTH with capped/headless `helion-ide`, fold into sample → target n≈75
+- Schematic connectivity sample: **57 → 74 PASS** / 0 SOFT / 0 FAIL
+- Target n≈75 essentially met (74); full ~98 still needs defer-band + ln
