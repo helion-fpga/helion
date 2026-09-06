@@ -204,6 +204,8 @@ struct HelionIde {
     show_examples: bool,
     recent: Vec<PathBuf>,
     tcl_focus: bool,
+    /// Last Program rail action: (ok, message) for honest empty/error/progress.
+    program_status: Option<(bool, String)>,
 }
 
 impl HelionIde {
@@ -230,6 +232,7 @@ impl HelionIde {
             show_examples: false,
             recent: Vec::new(),
             tcl_focus: false,
+            program_status: None,
         }
     }
 
@@ -619,23 +622,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     paint_report_catalog(ui, &mut app.model);
                 }
                 Activity::Program => {
-                    let bits_done = app.model.step_state(FlowStep::Bitstream) == StepState::Done;
-                    if bits_done {
-                        ui.label("Sim cable ready.");
-                    } else {
-                        ui.label("No bitstream yet. Implement, then Bitstream.");
-                    }
-                    ui.add_space(6.0);
-                    ui.add_enabled_ui(bits_done, |ui| {
-                        let b = primary_button(ui, "Program").on_hover_text(if bits_done {
-                            tip("Program", "", "program_hw")
-                        } else {
-                            "Write bitstream first".into()
-                        });
-                        if b.clicked() && bits_done {
-                            let _ = app.model.exec("program_hw");
-                        }
-                    });
+                    paint_program_side(ui, app);
                 }
                 Activity::Simulate => {}
             }
@@ -646,6 +633,137 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                 paint_properties(ui, &mut app.model);
             }
         });
+}
+
+
+fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let det = helion_hw::detect_boards();
+    let cable = helion_hw::list_cables()
+        .into_iter()
+        .next()
+        .expect("sim cable");
+    ui.label(RichText::new("Cable").strong());
+    ui.label(format!("{} · sim", cable.id));
+    ui.label(
+        RichText::new(if det.physical_had {
+            "Physical HAD attached."
+        } else {
+            "No USB HAD — sim cable only."
+        })
+        .color(if det.physical_had {
+            Color32::from_rgb(0x3d, 0xb8, 0x7a)
+        } else {
+            Color32::from_rgb(0xa0, 0xa8, 0xb0)
+        })
+        .small(),
+    );
+    ui.add_space(6.0);
+
+    let bits_done = app.model.step_state(FlowStep::Bitstream) == StepState::Done;
+    let frames = app
+        .model
+        .shell
+        .session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.len())
+        .unwrap_or(0);
+    let bytes = app
+        .model
+        .shell
+        .session
+        .bitstream
+        .as_ref()
+        .map(|b| b.packets.len())
+        .unwrap_or(0);
+    ui.label(RichText::new("Bitstream").strong());
+    if bits_done {
+        ui.label(format!("Last implement · {frames} frames · {bytes} B"));
+    } else {
+        ui.label(
+            RichText::new("No bitstream yet. Run Implement → Bitstream.")
+                .color(Color32::from_rgb(0xe0, 0xa0, 0x40)),
+        );
+    }
+    ui.add_space(6.0);
+
+    let hw = app.model.hw_stat_report();
+    if hw.open {
+        ui.label(format!(
+            "Target {} · {}",
+            if hw.target == "sim" {
+                "sim"
+            } else {
+                hw.target.as_str()
+            },
+            if hw.programmed {
+                "programmed"
+            } else {
+                "idle"
+            }
+        ));
+    } else {
+        ui.label(
+            RichText::new("Hardware Manager closed — Program opens sim cable.")
+                .small()
+                .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+        );
+    }
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("Detect")
+            .on_hover_text("list_cables / detect_boards")
+            .clicked()
+        {
+            app.program_status = Some((true, det.text().trim().to_string()));
+            let _ = app.model.exec("open_hw_manager");
+        }
+        let prog = primary_button(ui, "Program").on_hover_text(if bits_done {
+            tip("Program", "", "program_hw")
+        } else {
+            "No bitstream — Implement first".into()
+        });
+        if prog.clicked() {
+            if !bits_done {
+                app.program_status = Some((
+                    false,
+                    "program_hw: no bitstream — Implement, then Bitstream (or helion bitstream -o out.hbits)".into(),
+                ));
+            } else {
+                app.program_status = Some((true, "programming via sim cable…".into()));
+                match app.model.exec("program_hw") {
+                    Ok(s) => {
+                        app.program_status =
+                            Some((true, format!("{s} · frames={frames} bytes={bytes}")));
+                    }
+                    Err(e) => app.program_status = Some((false, e)),
+                }
+            }
+        }
+    });
+
+    if let Some((ok, msg)) = &app.program_status {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(
+            RichText::new(if *ok { "Result" } else { "Error" })
+                .strong()
+                .color(if *ok {
+                    Color32::from_rgb(0x3d, 0xb8, 0x7a)
+                } else {
+                    Color32::from_rgb(0xe0, 0x50, 0x50)
+                }),
+        );
+        ui.label(
+            RichText::new(msg.as_str()).color(if *ok {
+                Color32::from_rgb(0xc0, 0xc8, 0xd0)
+            } else {
+                Color32::from_rgb(0xe0, 0x80, 0x80)
+            }),
+        );
+    }
 }
 
 fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
@@ -5460,7 +5578,12 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     let report = model.hw_stat_report();
     if !report.open {
-        ui.label("no hardware — open_hw_manager");
+        ui.label("No cable yet. Open Hardware Manager to connect the sim cable.");
+        ui.label(
+            RichText::new("No physical HAD USB programmer detected — sim backend only.")
+                .small()
+                .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+        );
     } else {
         ui.label(format!(
             "target={} part={} idcode={:#010x} ir={:#04x} programmed={} word={}",

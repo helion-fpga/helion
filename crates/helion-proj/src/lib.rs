@@ -448,14 +448,27 @@ impl Session {
 
     pub fn program_hw(&mut self, dev: &Device) -> Result<String, String> {
         if !self.hw_open {
-            return Err("program_hw: open_hw_manager first".into());
+            return Err(
+                "program_hw: no cable — open_hw_manager first (sim cable; no USB HAD yet)".into(),
+            );
         }
-        let bits = self.bitstream.as_ref().ok_or("program_hw: no bitstream")?;
+        let bits = self.bitstream.as_ref().ok_or_else(|| {
+            String::from(
+                "program_hw: no bitstream — run write_bitstream / Implement, or `helion bitstream -o out.hbits`",
+            )
+        })?;
+        let frames = bits.frames.len();
+        let bytes = bits.packets.len();
         let st = prog_sim(dev, bits)?;
         self.programmed = true;
         Ok(format!(
-            "program_hw DONE={} GWE={} CRC_ERR={}",
-            st.done as u8, st.gwe as u8, st.crc_err as u8
+            "program_hw cable=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={}",
+            dev.part,
+            frames,
+            bytes,
+            st.done as u8,
+            st.gwe as u8,
+            st.crc_err as u8
         ))
     }
 

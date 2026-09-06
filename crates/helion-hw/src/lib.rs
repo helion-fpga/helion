@@ -1,4 +1,9 @@
-//! IEEE 1149.1 TAP + helion-prog + hw_server sim cable (no board).
+//! IEEE 1149.1 TAP + helion-prog + cable detect (sim backend; physical HAD TBD).
+//!
+//! openFPGALoader-class usefulness for HAD today means: list/detect a programming
+//! target, load a `.hbits` from the last implement, program over the sim cable
+//! (TAP CFG_W), and report STAT with clear empty/error states when nothing is
+//! attached. No UNISIM/AMD IP — HAD is Helion's story.
 
 use helion_bits::Bitstream;
 use helion_device::Device;
@@ -157,6 +162,127 @@ pub fn prog_empty(dev: &Device) -> Result<Stat, String> {
     prog_sim(dev, &Bitstream::empty(dev))
 }
 
+/// Programming backend. Physical USB HAD is not shipped yet — only `Sim`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CableBackend {
+    /// In-process TAP + fabric (helion-hw sim cable).
+    Sim,
+}
+
+/// One entry from `list_cables` / `detect_boards`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CableInfo {
+    pub id: String,
+    pub backend: CableBackend,
+    pub part_hint: String,
+    pub detail: String,
+}
+
+/// Result of board/cable detection (honest about missing physical HAD).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectReport {
+    pub cables: Vec<CableInfo>,
+    /// True only when a real HAD USB programmer enumerates (not implemented).
+    pub physical_had: bool,
+    pub note: String,
+}
+
+impl DetectReport {
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "detect physical_had={} cables={}\n",
+            u8::from(self.physical_had),
+            self.cables.len()
+        ));
+        out.push_str(&format!("note {}\n", self.note));
+        for c in &self.cables {
+            let be = match c.backend {
+                CableBackend::Sim => "sim",
+            };
+            out.push_str(&format!(
+                "cable {} backend={} part={} — {}\n",
+                c.id, be, c.part_hint, c.detail
+            ));
+        }
+        out
+    }
+}
+
+/// Always lists the in-process sim cable. No USB probe yet.
+pub fn list_cables() -> Vec<CableInfo> {
+    vec![CableInfo {
+        id: "sim0".into(),
+        backend: CableBackend::Sim,
+        part_hint: "HL10T-C32-1".into(),
+        detail: "helion-hw sim cable (TAP CFG_W); no USB HAD attached".into(),
+    }]
+}
+
+/// Detect programming targets. Physical HAD absent; sim is always present.
+pub fn detect_boards() -> DetectReport {
+    DetectReport {
+        cables: list_cables(),
+        physical_had: false,
+        note: "No physical HAD USB programmer found. Use --cable sim (openFPGALoader-class flow over helion-hw TAP).".into(),
+    }
+}
+
+/// Resolve a cable id from `list_cables` / detect. Only `sim` / `sim0` today.
+pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
+    let s = spec.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "sim" || s == "sim0" {
+        return Ok(list_cables()
+            .into_iter()
+            .next()
+            .expect("sim cable always present"));
+    }
+    Err(format!(
+        "unknown cable {spec:?}: no physical HAD USB backend yet; use --cable sim"
+    ))
+}
+
+/// Load `.hbits` packets and program the sim cable for `dev`.
+pub fn program_packets(dev: &Device, packets: &[u8]) -> Result<(Bitstream, Stat), String> {
+    if packets.is_empty() {
+        return Err("program: empty bitstream (0 bytes)".into());
+    }
+    let bits = Bitstream::from_packets(packets)?;
+    if bits.idcode != dev.idcode {
+        return Err(format!(
+            "program: bitstream idcode {:#010x} != device {} idcode {:#010x}",
+            bits.idcode, dev.part, dev.idcode
+        ));
+    }
+    let st = prog_sim(dev, &bits)?;
+    Ok((bits, st))
+}
+
+/// Program a path to a `.hbits` file over the sim cable.
+pub fn program_hbits_path(
+    dev: &Device,
+    path: &std::path::Path,
+) -> Result<(Bitstream, Stat), String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("program: read {}: {e}", path.display()))?;
+    eprintln!(
+        "program: loading {} ({} bytes) onto {} via sim cable…",
+        path.display(),
+        bytes.len(),
+        dev.part
+    );
+    let (bits, st) = program_packets(dev, &bytes)?;
+    eprintln!(
+        "program: progress CFG_W frames={} → STAT DONE={} GWE={} CRC_ERR={}",
+        bits.frames.len(),
+        st.done as u8,
+        st.gwe as u8,
+        st.crc_err as u8
+    );
+    Ok((bits, st))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +310,26 @@ mod tests {
     fn helion_prog_sim_empty() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let st = prog_empty(&dev).unwrap();
+        assert!(st.done && st.gwe && !st.crc_err);
+    }
+
+    #[test]
+    fn detect_lists_sim_not_physical_had() {
+        let d = detect_boards();
+        assert!(!d.physical_had);
+        assert_eq!(d.cables.len(), 1);
+        assert_eq!(d.cables[0].backend, CableBackend::Sim);
+        assert!(d.text().contains("physical_had=0"));
+        assert!(resolve_cable("sim").is_ok());
+        assert!(resolve_cable("usb0").is_err());
+    }
+
+    #[test]
+    fn program_packets_roundtrip_empty_hbits() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let empty = Bitstream::empty(&dev);
+        let (bits, st) = program_packets(&dev, &empty.packets).unwrap();
+        assert_eq!(bits.idcode, dev.idcode);
         assert!(st.done && st.gwe && !st.crc_err);
     }
 
