@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~08:15 America/New_York (EDT)  
 **Branch:** `fm-hel-top` — PR https://github.com/helion-fpga/helion/pull/8 (**NO MERGE**; grinding continues)  
-**Tip:** `a5bf9c58653bce010ddce3b78dacfd4fb0ed0b8e` (`a5bf9c5`)
+**Tip:** `d197c6bb65e4410a8085d99dcd438c6d89f81875` (`d197c6b`)
 **Master:** `46bae17` (PR #7 merge; captain leave-vs-revert)  
 **Author:** saksham-45  
 
@@ -50,3 +50,9 @@ Verified this turn (box): `report_timing counter WNS_PS=9640 TNS_PS=0 endpoints=
 ## Merge
 
 **NO MERGE** until Firstmate/captain.
+
+## Remains
+
+- Live FTDI / board DONE — soft-hold (Mac USB empty).
+- AIG/flowmap wall — STOP (no thrash).
+- Captain leave-vs-revert on merged PR #7.
