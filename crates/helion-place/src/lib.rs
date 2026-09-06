@@ -27,31 +27,22 @@ impl Default for PlaceOpts {
     }
 }
 
-/// Bring-up IMUX reach: same CLB, N-S ±1/±2, E-W ±1/±2, diag ±1, or knight
+/// Bring-up IMUX reach: same CLB, axis ±1..±4, diag ±1/±2, knight
 /// (±2,±1)/(±1,±2) — matches helion-route::imux_sel.
 fn imux_local(from: Site, to: Site) -> bool {
-    if from.x == to.x
-        && (from.y == to.y
-            || from.y + 1 == to.y
-            || to.y + 1 == from.y
-            || from.y + 2 == to.y
-            || to.y + 2 == from.y)
-    {
-        return true;
-    }
-    // Real E-W ±1/±2 same-row neighbor Q (uwilton / bit6 bank).
-    if from.y == to.y
-        && (from.x + 1 == to.x
-            || to.x + 1 == from.x
-            || from.x + 2 == to.x
-            || to.x + 2 == from.x)
-    {
-        return true;
-    }
-    // Real diagonal (±1,±1) or knight (±2,±1)/(±1,±2) neighbor Q.
     let dx = from.x.abs_diff(to.x);
     let dy = from.y.abs_diff(to.y);
-    (dx == 1 && dy == 1) || (dx == 2 && dy == 1) || (dx == 1 && dy == 2)
+    if dx == 0 && dy <= 4 {
+        return true;
+    }
+    if dy == 0 && dx <= 3 {
+        return true;
+    }
+    // Diagonal ±1 / ±2, knight (±2,±1)/(±1,±2)
+    (dx == 1 && dy == 1)
+        || (dx == 2 && dy == 2)
+        || (dx == 2 && dy == 1)
+        || (dx == 1 && dy == 2)
 }
 
 fn imux_illegal_pins(
@@ -68,6 +59,27 @@ fn imux_illegal_pins(
         }
     }
     n
+}
+
+/// Spill distance for illegal IMUX pins: sum of Manhattan over out-of-reach
+/// arcs. Enables gradient legalize (walk closer across passes) when empty
+/// sites inside direct reach are full — critical for long N-S Ibex arcs.
+fn imux_spill(
+    lf: &helion_pack::PackedLutFf,
+    site: Site,
+    ff_at: &std::collections::HashMap<&str, Site>,
+) -> u32 {
+    let mut spill = 0u32;
+    for (_, driver) in &lf.lut_pins {
+        match ff_at.get(driver.as_str()) {
+            Some(ds) if imux_local(*ds, site) => {}
+            Some(ds) => {
+                spill += ds.x.abs_diff(site.x) + ds.y.abs_diff(site.y);
+            }
+            None => {}
+        }
+    }
+    spill
 }
 
 fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
@@ -145,11 +157,15 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 // Harder cluster: keep sink in E-W±1/±2 of drivers before sprawl.
                 try_xs.push(s.x.saturating_add(1));
                 try_xs.push(s.x.saturating_add(2));
+                try_xs.push(s.x.saturating_add(3));
                 if s.x > 0 {
                     try_xs.push(s.x - 1);
                 }
                 if s.x > 1 {
                     try_xs.push(s.x - 2);
+                }
+                if s.x > 2 {
+                    try_xs.push(s.x - 3);
                 }
             }
             try_xs.push(preferred_x);
@@ -197,7 +213,18 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             y_order.push(s.y - 2);
                         }
                     } else if dx == 2 {
-                        // Knight (±2,±1): prefer Y±1 (and same Y for E-W±2).
+                        // Knight / diag±2 / E-W±2: Y, ±1, ±2.
+                        y_order.push(s.y);
+                        y_order.push(s.y.saturating_add(1));
+                        y_order.push(s.y.saturating_add(2));
+                        if s.y > 0 {
+                            y_order.push(s.y - 1);
+                        }
+                        if s.y > 1 {
+                            y_order.push(s.y - 2);
+                        }
+                    } else if dx == 3 {
+                        // E-W±3: prefer same Y (±1 slack).
                         y_order.push(s.y);
                         y_order.push(s.y.saturating_add(1));
                         if s.y > 0 {
@@ -235,45 +262,56 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             lutff_sites.push(site_ble);
         }
 
-            // FM-HEL-TOP: stronger IMUX legalization — pull sinks onto driver
-            // same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight (real HAD reach);
-            // empty-BLE move then pairwise swap when sites are full.
+            // FM-HEL-TOP: bidirectional IMUX legalization — pull sinks toward
+            // drivers AND drivers toward sinks onto real HAD reach (same-CLB /
+            // N-S±1/±2 / E-W±1/±2 / diag±1 / knight); empty-BLE move then
+            // pairwise swap when sites are full.
             let mut site_of: std::collections::HashMap<(u32, u32, u8), usize> =
                 std::collections::HashMap::new();
             for (i, (s, ble)) in lutff_sites.iter().enumerate() {
                 site_of.insert((s.x, s.y, *ble), i);
             }
+            // Reverse fanout: driver FF cell → unique sink LUTFF indices (bileg).
+            let mut sinks_of: std::collections::HashMap<&str, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, lf) in packed.lutffs.iter().enumerate() {
+                for (_, driver) in &lf.lut_pins {
+                    let v = sinks_of.entry(driver.as_str()).or_default();
+                    if !v.contains(&i) {
+                        v.push(i);
+                    }
+                }
+            }
             let push_reach = |xy: &mut Vec<(u32, u32)>, x: u32, y: u32| {
                 xy.push((x, y));
-                xy.push((x, y.saturating_add(1)));
-                xy.push((x, y.saturating_add(2)));
-                if y > 0 {
-                    xy.push((x, y - 1));
+                // N-S ±1..±4
+                for d in 1u32..=4 {
+                    xy.push((x, y.saturating_add(d)));
+                    if y >= d {
+                        xy.push((x, y - d));
+                    }
                 }
-                if y > 1 {
-                    xy.push((x, y - 2));
+                // E-W ±1..±3
+                for d in 1u32..=3 {
+                    xy.push((x.saturating_add(d), y));
+                    if x >= d {
+                        xy.push((x - d, y));
+                    }
                 }
-                // E-W ±1/±2 same row (matches IMUX reach)
-                xy.push((x.saturating_add(1), y));
-                xy.push((x.saturating_add(2), y));
-                if x > 0 {
-                    xy.push((x - 1, y));
+                // Diagonal (±1,±1) and (±2,±2)
+                for d in [1u32, 2] {
+                    xy.push((x.saturating_add(d), y.saturating_add(d)));
+                    if y >= d {
+                        xy.push((x.saturating_add(d), y - d));
+                    }
+                    if x >= d {
+                        xy.push((x - d, y.saturating_add(d)));
+                    }
+                    if x >= d && y >= d {
+                        xy.push((x - d, y - d));
+                    }
                 }
-                if x > 1 {
-                    xy.push((x - 2, y));
-                }
-                // Diagonal (±1,±1) — real IMUX sel 80-111
-                xy.push((x.saturating_add(1), y.saturating_add(1)));
-                if y > 0 {
-                    xy.push((x.saturating_add(1), y - 1));
-                }
-                if x > 0 {
-                    xy.push((x - 1, y.saturating_add(1)));
-                }
-                if x > 0 && y > 0 {
-                    xy.push((x - 1, y - 1));
-                }
-                // Knight (±2,±1) / (±1,±2) — real IMUX sel 128-191
+                // Knight (±2,±1) / (±1,±2)
                 xy.push((x.saturating_add(2), y.saturating_add(1)));
                 xy.push((x.saturating_add(1), y.saturating_add(2)));
                 if y > 0 {
@@ -295,11 +333,88 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     xy.push((x - 2, y - 1));
                 }
             };
+            // Illegal fanout arcs from driver FF at d_site onto its sinks.
+            let illegal_fanout = |d_ff: &str,
+                                  d_site: Site,
+                                  sink_idxs: &[usize],
+                                  lutff_sites: &[(Site, u8)]|
+             -> u32 {
+                let mut n = 0u32;
+                for &si in sink_idxs {
+                    let (ss, _) = lutff_sites[si];
+                    for (_, driver) in &packed.lutffs[si].lut_pins {
+                        if driver.as_str() == d_ff && !imux_local(d_site, ss) {
+                            n += 1;
+                        }
+                    }
+                }
+                n
+            };
+            // Driver move score: (fanout, own_inputs). Lex better = less fanout,
+            // then less own inputs — prefer collapsing long arcs even if inputs
+            // briefly worsen (sink-phase repairs inputs next pass).
+            let drv_score = |d_idx: usize,
+                             d_ff: &str,
+                             d_site: Site,
+                             sink_idxs: &[usize],
+                             lutff_sites: &[(Site, u8)],
+                             ff_at: &std::collections::HashMap<&str, Site>|
+             -> (u32, u32, u32) {
+                let mut fan_spill = 0u32;
+                for &si in sink_idxs {
+                    let (ss, _) = lutff_sites[si];
+                    for (_, driver) in &packed.lutffs[si].lut_pins {
+                        if driver.as_str() == d_ff && !imux_local(d_site, ss) {
+                            fan_spill += d_site.x.abs_diff(ss.x) + d_site.y.abs_diff(ss.y);
+                        }
+                    }
+                }
+                (
+                    illegal_fanout(d_ff, d_site, sink_idxs, lutff_sites),
+                    fan_spill,
+                    imux_illegal_pins(&packed.lutffs[d_idx], d_site, ff_at),
+                )
+            };
+            // Gradient sites between a and b (inclusive steps) for long-arc walk.
+            let push_gradient = |xy: &mut Vec<(u32, u32)>, ax: u32, ay: u32, bx: u32, by: u32| {
+                xy.push((ax, ay));
+                xy.push((bx, by));
+                let mx = (ax + bx) / 2;
+                let my = (ay + by) / 2;
+                xy.push((mx, my));
+                // Step ±1/±2 toward b along each axis from a.
+                let toward = |from: u32, to: u32, step: u32| -> u32 {
+                    if from < to {
+                        from.saturating_add(step).min(to)
+                    } else if from > to {
+                        from.saturating_sub(step)
+                    } else {
+                        from
+                    }
+                };
+                for step in [1u32, 2, 3, 4] {
+                    let nx = toward(ax, bx, step);
+                    let ny = toward(ay, by, step);
+                    xy.push((nx, ny));
+                    xy.push((nx, ay));
+                    xy.push((ax, ny));
+                    // also from b toward a (driver walk)
+                    let nx2 = toward(bx, ax, step);
+                    let ny2 = toward(by, ay, step);
+                    xy.push((nx2, ny2));
+                }
+                push_reach(xy, mx, my);
+            };
             let mut moved = 0u32;
             let mut swapped = 0u32;
-            for _pass in 0..16 {
+            let mut driver_moved = 0u32;
+            let mut driver_swapped = 0u32;
+            for _pass in 0..32 {
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
+                let mut pass_drv_moved = 0u32;
+                let mut pass_drv_swapped = 0u32;
+                // --- Phase A: pull sinks toward drivers (existing) ---
                 for (i, lf) in packed.lutffs.iter().enumerate() {
                     if lf.lut_pins.is_empty() {
                         continue;
@@ -309,18 +424,29 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     if before == 0 {
                         continue;
                     }
+                    let before_sp = imux_spill(lf, cur_site, &ff_at);
+                    let before_sc = (before, before_sp);
                     let mut cand_xy: Vec<(u32, u32)> = Vec::new();
                     for (_, driver) in &lf.lut_pins {
                         if let Some(ds) = ff_at.get(driver.as_str()).copied() {
                             push_reach(&mut cand_xy, ds.x, ds.y);
+                            if !imux_local(ds, cur_site) {
+                                push_gradient(
+                                    &mut cand_xy,
+                                    cur_site.x,
+                                    cur_site.y,
+                                    ds.x,
+                                    ds.y,
+                                );
+                            }
                         }
                     }
                     {
                         let mut seen = HashSet::new();
                         cand_xy.retain(|xy| seen.insert(*xy));
                     }
-                    // 1) Prefer empty BLE on a legal candidate.
-                    let mut best: Option<(Site, u8, u32)> = None;
+                    // 1) Prefer empty BLE: fewer illegal, then less spill (gradient).
+                    let mut best: Option<(Site, u8, (u32, u32))> = None;
                     for (cx, cy) in &cand_xy {
                         let Some(site) = cols
                             .get(cx)
@@ -336,15 +462,18 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             if used.contains(&key) {
                                 continue;
                             }
-                            let ill = imux_illegal_pins(lf, site, &ff_at);
-                            if ill < before && best.as_ref().map(|b| ill < b.2).unwrap_or(true) {
-                                best = Some((site, ble, ill));
-                                if ill == 0 {
+                            let sc = (
+                                imux_illegal_pins(lf, site, &ff_at),
+                                imux_spill(lf, site, &ff_at),
+                            );
+                            if sc < before_sc && best.as_ref().map(|b| sc < b.2).unwrap_or(true) {
+                                best = Some((site, ble, sc));
+                                if sc.0 == 0 {
                                     break;
                                 }
                             }
                         }
-                        if best.map(|b| b.2) == Some(0) {
+                        if best.as_ref().map(|b| b.2 .0) == Some(0) {
                             break;
                         }
                     }
@@ -361,8 +490,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         continue;
                     }
                     // 2) Pairwise swap with occupant when total illegal pins drop.
-                    // Mutate/restore ff_at (no HashMap clone — Ibex-scale).
-                    let mut best_swap: Option<(usize, Site, u8, u32)> = None;
+                    let mut best_swap: Option<(usize, Site, u8, (u32, u32))> = None;
                     for (cx, cy) in &cand_xy {
                         let Some(site) = cols
                             .get(cx)
@@ -396,8 +524,14 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             } else {
                                 None
                             };
-                            let ill_i = imux_illegal_pins(lf, site, &ff_at);
-                            let ill_j = imux_illegal_pins(other, cur_site, &ff_at);
+                            let sc_i = (
+                                imux_illegal_pins(lf, site, &ff_at),
+                                imux_spill(lf, site, &ff_at),
+                            );
+                            let sc_j = (
+                                imux_illegal_pins(other, cur_site, &ff_at),
+                                imux_spill(other, cur_site, &ff_at),
+                            );
                             // restore
                             if !i_ff.is_empty() {
                                 match i_prev {
@@ -419,19 +553,22 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                                     }
                                 }
                             }
-                            let after = ill_i + ill_j;
-                            let before_tot = before + other_before;
+                            let after = (sc_i.0 + sc_j.0, sc_i.1 + sc_j.1);
+                            let before_tot = (
+                                before + other_before,
+                                before_sp + imux_spill(other, osite, &ff_at),
+                            );
                             if after >= before_tot {
                                 continue;
                             }
                             if best_swap.as_ref().map(|b| after < b.3).unwrap_or(true) {
                                 best_swap = Some((j, site, ble, after));
-                                if after == 0 {
+                                if after.0 == 0 && after.1 == 0 {
                                     break;
                                 }
                             }
                         }
-                        if best_swap.map(|b| b.3) == Some(0) {
+                        if best_swap.as_ref().map(|b| b.3 .0) == Some(0) {
                             break;
                         }
                     }
@@ -443,7 +580,6 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         lutff_sites[j] = (cur_site, cur_ble);
                         site_of.insert((site.x, site.y, ble), i);
                         site_of.insert((cur_site.x, cur_site.y, cur_ble), j);
-                        // used keys unchanged (swap)
                         if !lf.ff_cell.is_empty() {
                             ff_at.insert(lf.ff_cell.as_str(), site);
                         }
@@ -453,15 +589,210 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         pass_swapped += 1;
                     }
                 }
+                // --- Phase B: pull drivers toward illegal sinks (bileg) ---
+                // Fanout-primary: accept move if illegal fanout drops (lex), even
+                // when driver inputs briefly worsen — sink-phase repairs next pass.
+                for (i, lf) in packed.lutffs.iter().enumerate() {
+                    if lf.ff_cell.is_empty() {
+                        continue;
+                    }
+                    let d_ff = lf.ff_cell.as_str();
+                    let Some(sink_idxs) = sinks_of.get(d_ff).map(|v| v.as_slice()) else {
+                        continue;
+                    };
+                    if sink_idxs.is_empty() {
+                        continue;
+                    }
+                    let (cur_site, cur_ble) = lutff_sites[i];
+                    let before = drv_score(i, d_ff, cur_site, sink_idxs, &lutff_sites, &ff_at);
+                    if before.0 == 0 {
+                        continue;
+                    }
+                    // Candidates: IMUX-reach of illegal sinks + gradient walk toward them.
+                    let mut cand_xy: Vec<(u32, u32)> = Vec::new();
+                    for &si in sink_idxs {
+                        let (ss, _) = lutff_sites[si];
+                        if !imux_local(cur_site, ss) {
+                            push_reach(&mut cand_xy, ss.x, ss.y);
+                            push_gradient(
+                                &mut cand_xy,
+                                cur_site.x,
+                                cur_site.y,
+                                ss.x,
+                                ss.y,
+                            );
+                        }
+                    }
+                    {
+                        let mut seen = HashSet::new();
+                        cand_xy.retain(|xy| seen.insert(*xy));
+                    }
+                    // 1) Empty BLE move for driver.
+                    let mut best: Option<(Site, u8, (u32, u32, u32))> = None;
+                    for (cx, cy) in &cand_xy {
+                        let Some(site) = cols
+                            .get(cx)
+                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
+                        else {
+                            continue;
+                        };
+                        for ble in 0..n_ble as u8 {
+                            let key = (site.x, site.y, ble);
+                            if key == (cur_site.x, cur_site.y, cur_ble) {
+                                continue;
+                            }
+                            if used.contains(&key) {
+                                continue;
+                            }
+                            let prev = ff_at.insert(d_ff, site);
+                            let sc = drv_score(i, d_ff, site, sink_idxs, &lutff_sites, &ff_at);
+                            match prev {
+                                Some(s) => {
+                                    ff_at.insert(d_ff, s);
+                                }
+                                None => {
+                                    ff_at.remove(d_ff);
+                                }
+                            }
+                            if sc < before && best.as_ref().map(|b| sc < b.2).unwrap_or(true) {
+                                best = Some((site, ble, sc));
+                                if sc.0 == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        if best.as_ref().map(|b| b.2 .0) == Some(0) {
+                            break;
+                        }
+                    }
+                    if let Some((site, ble, _)) = best {
+                        used.remove(&(cur_site.x, cur_site.y, cur_ble));
+                        used.insert((site.x, site.y, ble));
+                        site_of.remove(&(cur_site.x, cur_site.y, cur_ble));
+                        site_of.insert((site.x, site.y, ble), i);
+                        lutff_sites[i] = (site, ble);
+                        ff_at.insert(d_ff, site);
+                        pass_drv_moved += 1;
+                        continue;
+                    }
+                    // 2) Pairwise swap: driver ↔ occupant. Lex score on
+                    // (drv_fanout + other_fanout, drv_inputs + other_inputs).
+                    let mut best_swap: Option<(usize, Site, u8, (u32, u32, u32))> = None;
+                    for (cx, cy) in &cand_xy {
+                        let Some(site) = cols
+                            .get(cx)
+                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
+                        else {
+                            continue;
+                        };
+                        for ble in 0..n_ble as u8 {
+                            let key = (site.x, site.y, ble);
+                            if key == (cur_site.x, cur_site.y, cur_ble) {
+                                continue;
+                            }
+                            let Some(&j) = site_of.get(&key) else {
+                                continue;
+                            };
+                            if j == i {
+                                continue;
+                            }
+                            let other = &packed.lutffs[j];
+                            let (osite, _oble) = lutff_sites[j];
+                            let j_ff = other.ff_cell.as_str();
+                            let j_sinks: &[usize] = if !j_ff.is_empty() {
+                                sinks_of.get(j_ff).map(|v| v.as_slice()).unwrap_or(&[])
+                            } else {
+                                &[]
+                            };
+                            let before_j = if !j_ff.is_empty() {
+                                drv_score(j, j_ff, osite, j_sinks, &lutff_sites, &ff_at)
+                            } else {
+                                (0, 0, imux_illegal_pins(other, osite, &ff_at))
+                            };
+                            let before_tot = (
+                                before.0 + before_j.0,
+                                before.1 + before_j.1,
+                                before.2 + before_j.2,
+                            );
+                            let i_prev = ff_at.insert(d_ff, site);
+                            let j_prev = if !j_ff.is_empty() {
+                                ff_at.insert(j_ff, cur_site)
+                            } else {
+                                None
+                            };
+                            let after_i = drv_score(i, d_ff, site, sink_idxs, &lutff_sites, &ff_at);
+                            let after_j = if !j_ff.is_empty() {
+                                drv_score(j, j_ff, cur_site, j_sinks, &lutff_sites, &ff_at)
+                            } else {
+                                (0, 0, imux_illegal_pins(other, cur_site, &ff_at))
+                            };
+                            match i_prev {
+                                Some(s) => {
+                                    ff_at.insert(d_ff, s);
+                                }
+                                None => {
+                                    ff_at.remove(d_ff);
+                                }
+                            }
+                            if !j_ff.is_empty() {
+                                match j_prev {
+                                    Some(s) => {
+                                        ff_at.insert(j_ff, s);
+                                    }
+                                    None => {
+                                        ff_at.remove(j_ff);
+                                    }
+                                }
+                            }
+                            let after_tot = (
+                                after_i.0 + after_j.0,
+                                after_i.1 + after_j.1,
+                                after_i.2 + after_j.2,
+                            );
+                            if after_tot >= before_tot {
+                                continue;
+                            }
+                            if best_swap.as_ref().map(|b| after_tot < b.3).unwrap_or(true) {
+                                best_swap = Some((j, site, ble, after_tot));
+                                if after_tot.0 == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        if best_swap.as_ref().map(|b| b.3 .0) == Some(0) {
+                            break;
+                        }
+                    }
+                    if let Some((j, site, ble, _)) = best_swap {
+                        let (osite, oble) = lutff_sites[j];
+                        site_of.remove(&(cur_site.x, cur_site.y, cur_ble));
+                        site_of.remove(&(osite.x, osite.y, oble));
+                        lutff_sites[i] = (site, ble);
+                        lutff_sites[j] = (cur_site, cur_ble);
+                        site_of.insert((site.x, site.y, ble), i);
+                        site_of.insert((cur_site.x, cur_site.y, cur_ble), j);
+                        ff_at.insert(d_ff, site);
+                        if !packed.lutffs[j].ff_cell.is_empty() {
+                            ff_at.insert(packed.lutffs[j].ff_cell.as_str(), cur_site);
+                        }
+                        pass_drv_swapped += 1;
+                    }
+                }
                 moved += pass_moved;
                 swapped += pass_swapped;
-                if pass_moved == 0 && pass_swapped == 0 {
+                driver_moved += pass_drv_moved;
+                driver_swapped += pass_drv_swapped;
+                if pass_moved == 0
+                    && pass_swapped == 0
+                    && pass_drv_moved == 0
+                    && pass_drv_swapped == 0
+                {
                     break;
                 }
             }
-            if moved > 0 || swapped > 0 {
+            if moved > 0 || swapped > 0 || driver_moved > 0 || driver_swapped > 0 {
                 eprintln!(
-                    "hang_knight place imux_legalize moved={moved} swapped={swapped}"
+                    "hang_bileg place imux_legalize sink_moved={moved} sink_swapped={swapped} drv_moved={driver_moved} drv_swapped={driver_swapped}"
                 );
             }
     }
