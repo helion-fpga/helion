@@ -554,6 +554,7 @@ impl ChromeDriver {
     }
 }
 
+#[cfg(test)]
 fn example(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples")
