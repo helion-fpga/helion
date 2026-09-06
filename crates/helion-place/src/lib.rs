@@ -27,7 +27,7 @@ impl Default for PlaceOpts {
     }
 }
 
-/// Bring-up IMUX reach: same CLB, N-S ±1/±2, or E-W ±1/±2 (matches helion-route::imux_sel).
+/// Bring-up IMUX reach: same CLB, N-S ±1/±2, E-W ±1/±2, or diag ±1 (matches helion-route::imux_sel).
 fn imux_local(from: Site, to: Site) -> bool {
     if from.x == to.x
         && (from.y == to.y
@@ -39,11 +39,18 @@ fn imux_local(from: Site, to: Site) -> bool {
         return true;
     }
     // Real E-W ±1/±2 same-row neighbor Q (uwilton / bit6 bank).
-    from.y == to.y
+    if from.y == to.y
         && (from.x + 1 == to.x
             || to.x + 1 == from.x
             || from.x + 2 == to.x
             || to.x + 2 == from.x)
+    {
+        return true;
+    }
+    // Real diagonal (±1,±1) neighbor Q.
+    let dx = from.x.abs_diff(to.x);
+    let dy = from.y.abs_diff(to.y);
+    dx == 1 && dy == 1
 }
 
 fn imux_illegal_pins(
@@ -117,7 +124,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
-        // FF cell → site as we place (IMUX encodes same-CLB / N-S ±1/±2 / E-W ±1/±2).
+        // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
             let preferred_x = iob_for_net
@@ -166,7 +173,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 // south/mid wrap so the full 8192 BLE budget is reachable.
                 let mut y_order: Vec<u32> = Vec::with_capacity(col.len());
                 for s in &affinity {
-                    if s.x == col_x {
+                    let dx = s.x.abs_diff(col_x);
+                    if dx == 0 {
                         y_order.push(s.y);
                         y_order.push(s.y.saturating_add(1));
                         y_order.push(s.y.saturating_add(2));
@@ -175,6 +183,13 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         }
                         if s.y > 1 {
                             y_order.push(s.y - 2);
+                        }
+                    } else if dx == 1 {
+                        // Diagonal / E-W±1: prefer same Y then ±1 for diag IMUX.
+                        y_order.push(s.y);
+                        y_order.push(s.y.saturating_add(1));
+                        if s.y > 0 {
+                            y_order.push(s.y - 1);
                         }
                     }
                 }
@@ -209,8 +224,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         }
 
             // FM-HEL-TOP: stronger IMUX legalization — pull sinks onto driver
-            // same-CLB / N-S±1/±2 / E-W±1/±2 (real HAD reach); empty-BLE move then
-            // pairwise swap when sites are full.
+            // same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 (real HAD reach); empty-BLE
+            // move then pairwise swap when sites are full.
             let mut site_of: std::collections::HashMap<(u32, u32, u8), usize> =
                 std::collections::HashMap::new();
             for (i, (s, ble)) in lutff_sites.iter().enumerate() {
@@ -235,10 +250,21 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 if x > 1 {
                     xy.push((x - 2, y));
                 }
+                // Diagonal (±1,±1) — real IMUX sel 80-111
+                xy.push((x.saturating_add(1), y.saturating_add(1)));
+                if y > 0 {
+                    xy.push((x.saturating_add(1), y - 1));
+                }
+                if x > 0 {
+                    xy.push((x - 1, y.saturating_add(1)));
+                }
+                if x > 0 && y > 0 {
+                    xy.push((x - 1, y - 1));
+                }
             };
             let mut moved = 0u32;
             let mut swapped = 0u32;
-            for _pass in 0..12 {
+            for _pass in 0..14 {
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
                 for (i, lf) in packed.lutffs.iter().enumerate() {

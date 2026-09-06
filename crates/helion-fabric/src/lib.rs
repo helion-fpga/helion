@@ -371,7 +371,9 @@ impl Fabric {
 
     /// IMUX sel: 0-7 S±1 Q, 8-15 N±1 Q, 16-23 local Q, 24-31 local LUT O,
     /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q,
-    /// 64-71 W±2 Q, 72-79 E±2 Q (7-bit sel; gold uses sel<32).
+    /// 64-71 W±2 Q, 72-79 E±2 Q,
+    /// 80-87 SW±1 Q, 88-95 SE±1 Q, 96-103 NW±1 Q, 104-111 NE±1 Q
+    /// (7-bit sel; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
             return self.q_at(x, y.saturating_sub(1), sel);
@@ -406,6 +408,22 @@ impl Fabric {
         if sel < 80 {
             // east ±2 Q
             return self.q_at(x + 2, y, sel - 72);
+        }
+        if sel < 88 {
+            // SW diagonal (±1,±1): driver west+south of sink
+            return self.q_at(x.saturating_sub(1), y.saturating_sub(1), sel - 80);
+        }
+        if sel < 96 {
+            // SE diagonal: driver east+south
+            return self.q_at(x + 1, y.saturating_sub(1), sel - 88);
+        }
+        if sel < 104 {
+            // NW diagonal: driver west+north
+            return self.q_at(x.saturating_sub(1), y + 1, sel - 96);
+        }
+        if sel < 112 {
+            // NE diagonal: driver east+north
+            return self.q_at(x + 1, y + 1, sel - 104);
         }
         false
     }

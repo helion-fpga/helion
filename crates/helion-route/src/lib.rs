@@ -14,7 +14,7 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
-    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±2 IMUX encoding (Ibex-scale).
+    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±2 / diag±1 IMUX encoding (Ibex-scale).
     pub imux_skip: u32,
 }
 
@@ -180,8 +180,26 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
     if from.y == to.y && to.x + 2 == from.x {
         return Ok(72 + dble);
     }
+    // Real diagonal (±1,±1): remaining 7-bit sel 80-111; fabric samples
+    // neighbor-column × neighbor-row Q (same honesty class as axis ±1/±2).
+    if from.x + 1 == to.x && from.y + 1 == to.y {
+        // driver SW of sink
+        return Ok(80 + dble);
+    }
+    if to.x + 1 == from.x && from.y + 1 == to.y {
+        // driver SE of sink
+        return Ok(88 + dble);
+    }
+    if from.x + 1 == to.x && to.y + 1 == from.y {
+        // driver NW of sink
+        return Ok(96 + dble);
+    }
+    if to.x + 1 == from.x && to.y + 1 == from.y {
+        // driver NE of sink
+        return Ok(104 + dble);
+    }
     Err(format!(
-        "IMUX: no local/N-S±2/E-W±2 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
+        "IMUX: no local/N-S±2/E-W±2/diag±1 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
         from.x, from.y, to.x, to.y
     ))
 }
@@ -248,8 +266,8 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
                     });
                 }
                 Err(_) => {
-                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±2. Full Ibex has
-                    // longer/diagonal/>±1 FF→LUT arcs; skip + count (honest, not silent).
+                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±2 / diag±1. Full Ibex has
+                    // longer/>±1 diagonal FF→LUT arcs; skip + count (honest, not silent).
                     imux_skip += 1;
                 }
             }
@@ -336,7 +354,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
     }
     if imux_skip > 0 {
         eprintln!(
-            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±2/same-CLB)",
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±2/diag±1/same-CLB)",
             imux_skip,
             imux.len()
         );
