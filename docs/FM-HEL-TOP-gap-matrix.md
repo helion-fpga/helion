@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~08:25 America/New_York (EDT)  
 **Branch:** `fm-hel-top` — PR https://github.com/helion-fpga/helion/pull/8 (**NO MERGE**; grinding continues)  
-**Tip:** `fa91b7f31e28299958d118c30baa1fff7ff5927f` (`fa91b7f`)
+**Tip:** `66d81de60a580ec6bc5ed4dac584cd117071bc9f` (`66d81de`)
 **Master:** `46bae17` (PR #7 merge; captain leave-vs-revert)  
 **Author:** saksham-45  
 
