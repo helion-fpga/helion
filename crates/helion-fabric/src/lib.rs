@@ -376,8 +376,12 @@ impl Fabric {
     /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q,
     /// 64-71 W±2 Q, 72-79 E±2 Q,
     /// 80-87 SW±1 Q, 88-95 SE±1 Q, 96-103 NW±1 Q, 104-111 NE±1 Q,
+    /// 112-119 S±3 Q, 120-127 N±3 Q,
     /// 128-135 W2S1, 136-143 W2N1, 144-151 E2S1, 152-159 E2N1,
-    /// 160-167 W1S2, 168-175 W1N2, 176-183 E1S2, 184-191 E1N2
+    /// 160-167 W1S2, 168-175 W1N2, 176-183 E1S2, 184-191 E1N2,
+    /// 192-199 W±3 Q, 200-207 E±3 Q,
+    /// 208-215 SW2, 216-223 SE2, 224-231 NW2, 232-239 NE2,
+    /// 240-247 S±4 Q, 248-255 N±4 Q
     /// (8-bit sel; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
@@ -430,10 +434,14 @@ impl Fabric {
             // NE diagonal: driver east+north
             return self.q_at(x + 1, y + 1, sel - 104);
         }
-        // Knight moves (bit7 bank): (±2,±1) and (±1,±2)
-        if sel < 128 {
-            return false; // 112-127 reserved
+        // N-S ±3 (was reserved 112-127): fabric samples Q three rows away.
+        if sel < 120 {
+            return self.q_at(x, y.saturating_sub(3), sel - 112);
         }
+        if sel < 128 {
+            return self.q_at(x, y + 3, sel - 120);
+        }
+        // Knight moves (bit7 bank): (±2,±1) and (±1,±2)
         if sel < 136 {
             // W2S1: driver west±2 + south±1
             return self.q_at(x.saturating_sub(2), y.saturating_sub(1), sel - 128);
@@ -466,7 +474,35 @@ impl Fabric {
             // E1N2
             return self.q_at(x + 1, y + 2, sel - 184);
         }
-        false
+        // E-W ±3 (192-207)
+        if sel < 200 {
+            return self.q_at(x.saturating_sub(3), y, sel - 192);
+        }
+        if sel < 208 {
+            return self.q_at(x + 3, y, sel - 200);
+        }
+        // Diagonal ±2 (208-239)
+        if sel < 216 {
+            // SW2
+            return self.q_at(x.saturating_sub(2), y.saturating_sub(2), sel - 208);
+        }
+        if sel < 224 {
+            // SE2
+            return self.q_at(x + 2, y.saturating_sub(2), sel - 216);
+        }
+        if sel < 232 {
+            // NW2
+            return self.q_at(x.saturating_sub(2), y + 2, sel - 224);
+        }
+        if sel < 240 {
+            // NE2
+            return self.q_at(x + 2, y + 2, sel - 232);
+        }
+        // N-S ±4 (240-255); remaining u8 values are 248-255.
+        if sel < 248 {
+            return self.q_at(x, y.saturating_sub(4), sel - 240);
+        }
+        self.q_at(x, y + 4, sel.wrapping_sub(248))
     }
 
     fn eval_comb(&mut self) {
