@@ -12,7 +12,7 @@ pub const RAIL_WIDTH: f32 = 48.0;
 /// Tall enough for letter glyph + short label under it.
 pub const HIT_RAIL: f32 = 48.0;
 /// One sidebar (MUST 5).
-pub const SIDEBAR_WIDTH: f32 = 240.0;
+pub const SIDEBAR_WIDTH: f32 = 220.0;
 /// Legacy aliases — side chrome is rail + sidebar, not 680.
 pub const NAV_WIDTH: f32 = RAIL_WIDTH;
 pub const TREE_WIDTH: f32 = SIDEBAR_WIDTH;
@@ -492,7 +492,7 @@ mod tests {
         assert_ne!(side_chrome_width(), 680.0);
         assert_eq!(RAIL_WIDTH, 48.0);
         assert_eq!(HIT_RAIL, 48.0);
-        assert_eq!(SIDEBAR_WIDTH, 240.0);
+        assert_eq!(SIDEBAR_WIDTH, 220.0);
         assert_eq!(HIT_PRIMARY, 32.0);
         assert_eq!(HIT_SIDEBAR, 28.0);
 
