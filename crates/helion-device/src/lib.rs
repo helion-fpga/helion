@@ -689,7 +689,7 @@ impl FeatureMap {
         }
         // 4. IMUX 64×5 (sel[4:0]), then IMUX[m][5] / IMUX[m][6] extension
         // banks appended so legacy abs for bits 0..4 stay gold-stable.
-        // sel[5] = N-S±2 (32-47) + E-W±1 (48-63); sel[6] = E-W±2 (64-79).
+        // sel[5] = N-S±2 (32-47) + E-W±1 (48-63); sel[6] = E-W±2 (64-79) + diag±1 (80-111).
         for m in 0..64u32 {
             for b in 0..5u32 {
                 bits.insert(format!("IMUX[{m}][{b}]"), cursor + b);
