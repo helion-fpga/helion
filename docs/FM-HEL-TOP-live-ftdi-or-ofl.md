@@ -73,3 +73,24 @@ helion report_timing examples/counter.sv --sdc examples/counter.sdc
 ## Verdict
 
 **PASS (bar moved; live probe blocked)** — Mac unreachable → documented no probe. Shipped STAT TDO INOUT capture + parse + mock harness; native program Ok only on live DONE=1 TDO; gold 9640 held. No merge.
+
+
+## Mac sync note (2026-09-06 grind polish)
+
+| Item | Status |
+|------|--------|
+| Prior stale tip note | Mac had been at **`0293341`** (gap7 project honesty) while branch tip moved on |
+| Tip after sync | **`78bcf60`** on `fm-hel-corpus-soft-pass` (matches remote; do **not** hard-reset over chrome WIP) |
+| `system_profiler SPUSBDataType` | **empty** (0 bytes) — soft-block for live probe |
+| OFL | **`brew install openfpgaloader`** → 1.1.1 at `/opt/homebrew/bin/openFPGALoader` |
+| `--scan-usb` / `--detect` | empty / `unable to open ftdi device: -3` — **0 probes** |
+| Board DONE | **no** (no FTDI; never invent STAT) |
+
+Sync recipe when behind (preserve local chrome/debug WIP — **never** `git reset --hard`):
+
+```bash
+cd ~/helion
+git fetch helion-fpga fm-hel-corpus-soft-pass
+git status -sb   # stash or leave chrome unstaged
+git merge --ff-only helion-fpga/fm-hel-corpus-soft-pass   # or rebase if clean
+```
