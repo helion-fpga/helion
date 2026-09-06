@@ -85,7 +85,16 @@ cargo run -p helion-cli -- report_timing examples/blinky.sv</code></pre>
       <p>Format-1 manifests beside catalog HDL. Bus is Helion-MM / Helion-ST only. Details: <a href="https://github.com/helion-fpga/helion/blob/master/ip/README.md"><code>ip/README.md</code></a>.</p>
       <pre><code>helion ip list
 helion ip show ip/h_gpio/h_gpio.helion
-helion project examples/ip_ingest/counter_ip.prj</code></pre>
+helion ip show examples/ip/counter
+helion project examples/ip_ingest/counter_ip.prj
+helion project run examples/ip/read_ip_counter.prj --cycles 16</code></pre>
+
+      <h2>ILA (mark_debug → implement → ila_arm)</h2>
+      <p>Mark a net, (re)implement, then arm. Probe insert is idempotent after <code>mark_debug</code> (no &quot;bitstream unchanged&quot; no-op). Details: <a href="FM-HEL-TOP-ila-ip.md"><code>FM-HEL-TOP-ila-ip.md</code></a>.</p>
+      <pre><code>mark_debug cnt_3
+# Place → Route → Bitstream (or Implement)
+ila_window 8
+ila_arm cnt_3</code></pre>
 
       <h2>Program / mpsse-sim / OFL</h2>
       <p>Without a USB programmer, detect stays <strong>0 probes</strong> and refuses DONE. Sim cable for TAP STAT smoke (no board claim):</p>

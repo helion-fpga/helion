@@ -1,0 +1,8 @@
+# Tiny Helion IP package (directory form) — gold counter via read_ip
+# Legal fence: Helion-MM only (no AXI)
+format 1
+vlnv community:helion:counter_ip:1.0
+bus Helion-MM
+top counter
+file ../../counter.sv
+xdc ../../counter.sdc

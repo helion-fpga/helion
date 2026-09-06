@@ -141,3 +141,56 @@ fn helion_ip_show_gpio_catalog_package() {
     assert!(stdout.contains("h_gpio.v"), "{stdout}");
     assert!(!stdout.to_ascii_lowercase().contains("axi"), "{stdout}");
 }
+
+#[test]
+fn project_read_ip_examples_ip_dir_holds_gold() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    let prj = root.join("examples/ip/read_ip_counter.prj");
+    let out = Command::new(bin)
+        .args(["project", "run", prj.to_str().unwrap(), "--cycles", "16"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "examples/ip read_ip failed:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("ip=1"), "expected read_ip expand: {stdout}");
+    assert!(stdout.contains("sources=1"), "dir package SV expand: {stdout}");
+    assert!(stdout.contains("xdc_files=1"), "dir package xdc expand: {stdout}");
+    let wns: i64 = field(&stdout, "WNS_PS=").parse().unwrap();
+    assert_eq!(wns, 9640, "examples/ip counter WNS gold: {stdout}");
+    assert!(
+        stdout.contains("0000000111111110"),
+        "examples/ip LED gold: {stdout}"
+    );
+}
+
+#[test]
+fn helion_ip_show_rejects_axi_fence() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    let bad = root.join("target/test_axi_reject.helion");
+    std::fs::write(
+        &bad,
+        "format 1\nvlnv community:helion:bad:1.0\nbus AXI\ntop t\nfile missing.v\n",
+    )
+    .unwrap();
+    let out = Command::new(bin)
+        .args(["ip", "show", bad.to_str().unwrap()])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(!out.status.success(), "AXI package must fail: {combined}");
+    assert!(
+        combined.contains("not AXI") || combined.to_ascii_lowercase().contains("axi"),
+        "legal fence message: {combined}"
+    );
+}
+
