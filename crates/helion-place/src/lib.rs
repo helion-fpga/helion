@@ -27,6 +27,27 @@ impl Default for PlaceOpts {
     }
 }
 
+/// Bring-up IMUX reach: same CLB or N-S ±1 (matches helion-route::imux_sel).
+fn imux_local(from: Site, to: Site) -> bool {
+    from.x == to.x && (from.y == to.y || from.y + 1 == to.y || to.y + 1 == from.y)
+}
+
+fn imux_illegal_pins(
+    lf: &helion_pack::PackedLutFf,
+    site: Site,
+    ff_at: &std::collections::HashMap<&str, Site>,
+) -> u32 {
+    let mut n = 0u32;
+    for (_, driver) in &lf.lut_pins {
+        match ff_at.get(driver.as_str()) {
+            Some(ds) if imux_local(*ds, site) => {}
+            Some(_) => n += 1,
+            None => {}
+        }
+    }
+    n
+}
+
 fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
     let rest = loc.strip_prefix("IOB_X")?;
     let (xs, ys) = rest.split_once('Y')?;
@@ -159,6 +180,82 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
             lutff_sites.push(site_ble);
         }
+
+            // FM-HEL-TOP: longer-reach via legalization — pull sinks onto
+            // driver same-CLB / N-S±1 so imux_skip drops (HAD has no E-W IMUX).
+            let mut moved = 0u32;
+            for _pass in 0..3 {
+                let mut pass_moved = 0u32;
+                for (i, lf) in packed.lutffs.iter().enumerate() {
+                    if lf.lut_pins.is_empty() {
+                        continue;
+                    }
+                    let (cur_site, cur_ble) = lutff_sites[i];
+                    let before = imux_illegal_pins(lf, cur_site, &ff_at);
+                    if before == 0 {
+                        continue;
+                    }
+                    let mut cand_xy: Vec<(u32, u32)> = Vec::new();
+                    for (_, driver) in &lf.lut_pins {
+                        if let Some(ds) = ff_at.get(driver.as_str()).copied() {
+                            cand_xy.push((ds.x, ds.y));
+                            cand_xy.push((ds.x, ds.y.saturating_add(1)));
+                            if ds.y > 0 {
+                                cand_xy.push((ds.x, ds.y - 1));
+                            }
+                        }
+                    }
+                    {
+                        let mut seen = HashSet::new();
+                        cand_xy.retain(|xy| seen.insert(*xy));
+                    }
+                    let mut best: Option<(Site, u8, u32)> = None;
+                    for (cx, cy) in cand_xy {
+                        let Some(site) = cols.get(&cx).and_then(|c| c.iter().find(|s| s.y == cy).copied()) else {
+                            continue;
+                        };
+                        for ble in 0..n_ble as u8 {
+                            let key = (site.x, site.y, ble);
+                            if key == (cur_site.x, cur_site.y, cur_ble) {
+                                let ill = imux_illegal_pins(lf, site, &ff_at);
+                                if ill < before {
+                                    best = Some((site, ble, ill));
+                                }
+                                continue;
+                            }
+                            if used.contains(&key) {
+                                continue;
+                            }
+                            let ill = imux_illegal_pins(lf, site, &ff_at);
+                            if ill < before && best.as_ref().map(|b| ill < b.2).unwrap_or(true) {
+                                best = Some((site, ble, ill));
+                                if ill == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        if best.map(|b| b.2) == Some(0) {
+                            break;
+                        }
+                    }
+                    if let Some((site, ble, _)) = best {
+                        used.remove(&(cur_site.x, cur_site.y, cur_ble));
+                        used.insert((site.x, site.y, ble));
+                        lutff_sites[i] = (site, ble);
+                        if !lf.ff_cell.is_empty() {
+                            ff_at.insert(lf.ff_cell.as_str(), site);
+                        }
+                        pass_moved += 1;
+                    }
+                }
+                moved += pass_moved;
+                if pass_moved == 0 {
+                    break;
+                }
+            }
+            if moved > 0 {
+                eprintln!("hang_diag place imux_legalize moved={moved}");
+            }
     }
 
     let mut mac_sites = Vec::new();
