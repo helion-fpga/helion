@@ -1,0 +1,6 @@
+# Multi-file Helion project: sources list + external SDC
+part HL10T-C32-1
+read_sv examples/multi/tog.sv
+read_sv examples/multi/top.sv
+top top
+read_xdc examples/multi/multi.sdc

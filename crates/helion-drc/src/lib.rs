@@ -154,7 +154,8 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
             .nets
             .iter()
             .any(|n| n.endpoints.iter().any(|e| e.pin == "CLK"));
-    if !placed.packed.lutffs.is_empty() && !has_clk {
+    let has_ff = placed.packed.lutffs.iter().any(|l| !l.ff_cell.is_empty());
+    if has_ff && !has_clk {
         d.add("CLK-1", "", "no clock on registered design");
     }
     check_iostandard(design, placed, dev, &mut d);
@@ -353,7 +354,7 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
             d.add(
                 "ROUTE-3",
                 &iob.cell,
-                format!("IOB {} net {} has no FF driver", iob.cell, iob.from_net),
+                format!("IOB {} net {} has no LUT/FF driver", iob.cell, iob.from_net),
             );
         }
     }

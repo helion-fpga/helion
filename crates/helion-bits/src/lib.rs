@@ -20,18 +20,25 @@ impl FeatureSet {
     }
 
     pub fn set_init(&mut self, x: u32, y: u32, ble: u32, init: u64) {
+        // Only program 1-bits; unset INIT bits stay at reset 0 (assemble skips false).
         for i in 0..64u32 {
-            let b = (init >> i) & 1 == 1;
-            self.set(format!("CLB_X{x}Y{y}.BLE{ble}.LUT.INIT[{i}]"), b);
+            if (init >> i) & 1 == 1 {
+                self.set(format!("CLB_X{x}Y{y}.BLE{ble}.LUT.INIT[{i}]"), true);
+            }
         }
     }
 
     pub fn set_ff_used(&mut self, x: u32, y: u32, ble: u32, used: bool) {
-        self.set(format!("CLB_X{x}Y{y}.BLE{ble}.FF.USED"), used);
+        // FF.USED reset is 0; only assert when the BLE packs an FF.
+        if used {
+            self.set(format!("CLB_X{x}Y{y}.BLE{ble}.FF.USED"), true);
+        }
     }
 
     pub fn set_imux(&mut self, x: u32, y: u32, mux: u32, sel: u8) {
-        for b in 0..5u32 {
+        // 8-bit sel: bits 0..4 gold-stable; bit5 = N-S±2 / E-W±1; bit6 = E-W±2 / diag±1;
+        // bit7 = knight; sel 112-127 N-S±3; 192-255 E-W±3 / diag±2 / N-S±4. Legacy abs for 0..7 unchanged.
+        for b in 0..8u32 {
             if (sel >> b) & 1 == 1 {
                 self.set(format!("CLB_X{x}Y{y}.IMUX[{mux}][{b}]"), true);
             }
@@ -49,19 +56,25 @@ pub struct Bitstream {
 
 impl Bitstream {
     pub fn empty(dev: &Device) -> Self {
-        let mut frames = BTreeMap::new();
-        for major in 0..dev.n_clb() as u16 {
-            for minor in 0..dev.clb_minors as u8 {
-                frames.insert((Far::CLB_IO_CLK, major, minor), 0);
-            }
-        }
+        // Sparse from the start: reset frames are absent (same as encode skip of 0).
+        // Avoids O(n_clb * minors) zero inserts on every bitgen (Ibex-scale).
         let mut bs = Self {
             idcode: dev.idcode,
-            frames,
+            frames: BTreeMap::new(),
             packets: Vec::new(),
         };
         bs.packets = encode_packets(dev.idcode, &bs.frames);
         bs
+    }
+
+    /// Rebuild a bitstream from a `.hbits` packet stream (CLI flash / program).
+    pub fn from_packets(bytes: &[u8]) -> Result<Self, String> {
+        let (idcode, frames) = decode_packets(bytes)?;
+        Ok(Self {
+            idcode,
+            frames,
+            packets: bytes.to_vec(),
+        })
     }
 }
 
@@ -71,7 +84,8 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
     for (i, lutff) in routed.placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = routed.placed.lutff_sites[i];
         feats.set_init(site.x, site.y, ble as u32, lutff.init);
-        feats.set_ff_used(site.x, site.y, ble as u32, true);
+        // Comb packs leave ff_cell empty — do not assert FF.USED.
+        feats.set_ff_used(site.x, site.y, ble as u32, !lutff.ff_cell.is_empty());
     }
     for m in &routed.imux {
         feats.set_imux(m.x, m.y, m.mux, m.sel);
@@ -580,7 +594,13 @@ mod tests {
         assert_eq!(init2, 0xAAAA_AAAA_AAAA_AAAA);
         assert_ne!(bs.frames, eco.frames);
         let pb = bitgen_pblock(&dev, &r, &[(site.x, site.y)]).unwrap();
-        assert!(pb.frames.len() < bs.frames.len(), "partial must be smaller");
+        // Sparse bitgen: blinky already fits one major, so pblock may equal full.
+        // Honesty bar is subset + packets never larger than the parent stream.
         assert!(pb.frames.keys().all(|k| bs.frames.contains_key(k)));
+        assert!(
+            pb.packets.len() <= bs.packets.len(),
+            "partial packets must not exceed full"
+        );
+        assert!(!pb.frames.is_empty(), "pblock must carry the placed major");
     }
 }

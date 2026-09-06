@@ -291,7 +291,21 @@ impl Fabric {
             let (mstr, rest) = rest.split_once("][")?;
             let m: u32 = mstr.parse().ok()?;
             let b: u32 = rest.strip_suffix(']')?.parse().ok()?;
-            return Some(512 + 40 + 40 + m * 5 + b);
+            // Bits 0..4 keep gold abs (m*5+b). Bit 5/6/7 live in extension
+            // banks after 64×5 so legacy frames stay bit-compatible.
+            if b < 5 {
+                return Some(512 + 40 + 40 + m * 5 + b);
+            }
+            if b == 5 {
+                return Some(512 + 40 + 40 + 64 * 5 + m);
+            }
+            if b == 6 {
+                return Some(512 + 40 + 40 + 64 * 5 + 64 + m);
+            }
+            if b == 7 {
+                return Some(512 + 40 + 40 + 64 * 5 + 64 + 64 + m);
+            }
+            return None;
         }
         None
     }
@@ -331,7 +345,7 @@ impl Fabric {
 
     fn imux_sel(&self, x: u32, y: u32, mux: u32) -> u8 {
         let mut s = 0u8;
-        for b in 0..5u32 {
+        for b in 0..8u32 {
             if self.clb_feature_bit(x, y, &format!("IMUX[{mux}][{b}]")) {
                 s |= 1 << b;
             }
@@ -358,7 +372,17 @@ impl Fabric {
             .unwrap_or(false)
     }
 
-    /// IMUX[4:0]: 0-7 south BLE Q, 8-15 north BLE Q, 16-23 local BLE Q, 24-31 local LUT O.
+    /// IMUX sel: 0-7 S±1 Q, 8-15 N±1 Q, 16-23 local Q, 24-31 local LUT O,
+    /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q,
+    /// 64-71 W±2 Q, 72-79 E±2 Q,
+    /// 80-87 SW±1 Q, 88-95 SE±1 Q, 96-103 NW±1 Q, 104-111 NE±1 Q,
+    /// 112-119 S±3 Q, 120-127 N±3 Q,
+    /// 128-135 W2S1, 136-143 W2N1, 144-151 E2S1, 152-159 E2N1,
+    /// 160-167 W1S2, 168-175 W1N2, 176-183 E1S2, 184-191 E1N2,
+    /// 192-199 W±3 Q, 200-207 E±3 Q,
+    /// 208-215 SW2, 216-223 SE2, 224-231 NW2, 232-239 NE2,
+    /// 240-247 S±4 Q, 248-255 N±4 Q
+    /// (8-bit sel; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
             return self.q_at(x, y.saturating_sub(1), sel);
@@ -369,7 +393,116 @@ impl Fabric {
         if sel < 24 {
             return self.q_at(x, y, sel - 16);
         }
-        self.lut_o_at(x, y, sel - 24)
+        if sel < 32 {
+            return self.lut_o_at(x, y, sel - 24);
+        }
+        if sel < 40 {
+            return self.q_at(x, y.saturating_sub(2), sel - 32);
+        }
+        if sel < 48 {
+            return self.q_at(x, y + 2, sel - 40);
+        }
+        if sel < 56 {
+            // west neighbor Q (driver west of sink)
+            return self.q_at(x.saturating_sub(1), y, sel - 48);
+        }
+        if sel < 64 {
+            // east neighbor Q
+            return self.q_at(x + 1, y, sel - 56);
+        }
+        if sel < 72 {
+            // west ±2 Q (driver two columns west) — bit6 bank
+            return self.q_at(x.saturating_sub(2), y, sel - 64);
+        }
+        if sel < 80 {
+            // east ±2 Q
+            return self.q_at(x + 2, y, sel - 72);
+        }
+        if sel < 88 {
+            // SW diagonal (±1,±1): driver west+south of sink
+            return self.q_at(x.saturating_sub(1), y.saturating_sub(1), sel - 80);
+        }
+        if sel < 96 {
+            // SE diagonal: driver east+south
+            return self.q_at(x + 1, y.saturating_sub(1), sel - 88);
+        }
+        if sel < 104 {
+            // NW diagonal: driver west+north
+            return self.q_at(x.saturating_sub(1), y + 1, sel - 96);
+        }
+        if sel < 112 {
+            // NE diagonal: driver east+north
+            return self.q_at(x + 1, y + 1, sel - 104);
+        }
+        // N-S ±3 (was reserved 112-127): fabric samples Q three rows away.
+        if sel < 120 {
+            return self.q_at(x, y.saturating_sub(3), sel - 112);
+        }
+        if sel < 128 {
+            return self.q_at(x, y + 3, sel - 120);
+        }
+        // Knight moves (bit7 bank): (±2,±1) and (±1,±2)
+        if sel < 136 {
+            // W2S1: driver west±2 + south±1
+            return self.q_at(x.saturating_sub(2), y.saturating_sub(1), sel - 128);
+        }
+        if sel < 144 {
+            // W2N1
+            return self.q_at(x.saturating_sub(2), y + 1, sel - 136);
+        }
+        if sel < 152 {
+            // E2S1
+            return self.q_at(x + 2, y.saturating_sub(1), sel - 144);
+        }
+        if sel < 160 {
+            // E2N1
+            return self.q_at(x + 2, y + 1, sel - 152);
+        }
+        if sel < 168 {
+            // W1S2
+            return self.q_at(x.saturating_sub(1), y.saturating_sub(2), sel - 160);
+        }
+        if sel < 176 {
+            // W1N2
+            return self.q_at(x.saturating_sub(1), y + 2, sel - 168);
+        }
+        if sel < 184 {
+            // E1S2
+            return self.q_at(x + 1, y.saturating_sub(2), sel - 176);
+        }
+        if sel < 192 {
+            // E1N2
+            return self.q_at(x + 1, y + 2, sel - 184);
+        }
+        // E-W ±3 (192-207)
+        if sel < 200 {
+            return self.q_at(x.saturating_sub(3), y, sel - 192);
+        }
+        if sel < 208 {
+            return self.q_at(x + 3, y, sel - 200);
+        }
+        // Diagonal ±2 (208-239)
+        if sel < 216 {
+            // SW2
+            return self.q_at(x.saturating_sub(2), y.saturating_sub(2), sel - 208);
+        }
+        if sel < 224 {
+            // SE2
+            return self.q_at(x + 2, y.saturating_sub(2), sel - 216);
+        }
+        if sel < 232 {
+            // NW2
+            return self.q_at(x.saturating_sub(2), y + 2, sel - 224);
+        }
+        if sel < 240 {
+            // NE2
+            return self.q_at(x + 2, y + 2, sel - 232);
+        }
+        // N-S ±4 (240-255); remaining u8 values are 248-255.
+        if sel < 248 {
+            return self.q_at(x, y.saturating_sub(4), sel - 240);
+        }
+        self.q_at(x, y + 4, sel.wrapping_sub(248))
     }
 
     fn eval_comb(&mut self) {
@@ -418,12 +551,13 @@ impl Fabric {
         }
         let srcs = self.iob_src.clone();
         for ((ix, iy), (cx, cy, ble)) in srcs {
-            let q = self
-                .clbs
-                .get(&(cx, cy))
-                .map(|c| c.q[ble as usize])
-                .unwrap_or(false);
-            self.iobs.insert((ix, iy), q);
+            // Registered BLE: pad follows FF Q. Comb BLE (FF.USED=0): pad follows LUT O.
+            let v = if self.clb_feature_bit(cx, cy, &format!("BLE{ble}.FF.USED")) {
+                self.q_at(cx, cy, ble)
+            } else {
+                self.lut_o_at(cx, cy, ble)
+            };
+            self.iobs.insert((ix, iy), v);
         }
     }
 
