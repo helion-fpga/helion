@@ -2127,6 +2127,17 @@ impl Pblock {
         format!("CLB_X{}Y{}:CLB_X{}Y{}", self.x0, self.y0, self.x1, self.y1)
     }
 
+    /// Operator-facing range (Device table / die hover). Tcl `CLB_X…` stays in the Tcl console.
+    pub fn english_range(&self) -> String {
+        if !self.ranged {
+            return "No range yet".into();
+        }
+        format!(
+            "Tiles ({}, {}) to ({}, {})",
+            self.x0, self.y0, self.x1, self.y1
+        )
+    }
+
     pub fn site_count(&self, sites: &[DeviceSiteView]) -> usize {
         sites.iter().filter(|s| self.contains(s.x, s.y)).count()
     }
@@ -3888,6 +3899,14 @@ impl WorkspaceTab {
             self,
             WorkspaceTab::TextEditor | WorkspaceTab::Device | WorkspaceTab::Reports
         )
+    }
+
+    /// Parse a More / canvas label or Debug name (`Schematic`, `Project Summary`).
+    pub fn parse_label(s: &str) -> Option<Self> {
+        let t = s.trim();
+        Self::ALL.iter().copied().find(|tab| {
+            tab.label().eq_ignore_ascii_case(t) || format!("{tab:?}").eq_ignore_ascii_case(t)
+        })
     }
 
     pub fn sim_only(self) -> bool {
@@ -8381,7 +8400,7 @@ impl IdeModel {
         let n = self.memories.len();
         let mut s = format!("memory n={n}");
         if n == 0 {
-            s.push_str(" no memories — sim_run");
+            s.push_str(" no memories — run simulation");
             return s;
         }
         for m in &self.memories {
@@ -8434,7 +8453,7 @@ impl IdeModel {
         let scope = self.selected_scope.as_deref().unwrap_or("-");
         let mut s = format!("locals n={n} scope={scope}");
         if n == 0 {
-            s.push_str(" no locals — sim_run");
+            s.push_str(" no locals — run simulation");
             return s;
         }
         for l in &self.locals {
@@ -31753,7 +31772,7 @@ mod tests {
             chrome::side_chrome_width(),
             chrome::RAIL_WIDTH + chrome::SIDEBAR_WIDTH
         );
-        assert_eq!(chrome::RAIL_WIDTH, 48.0);
+        assert_eq!(chrome::RAIL_WIDTH, 88.0);
         assert_eq!(chrome::SIDEBAR_WIDTH, 220.0);
         assert_eq!(chrome::HIT_PRIMARY, 32.0);
         assert_eq!(chrome::HIT_SIDEBAR, 28.0);
@@ -31886,6 +31905,123 @@ mod tests {
         assert!(
             chrome::DRAWING_MIN_HEIGHT > chrome::TABLE_MAX_HEIGHT,
             "floorplan canvas must outrank a single table strip"
+        );
+        assert_eq!(chrome::RAIL_WIDTH, 88.0);
+        for a in chrome::Activity::ALL {
+            assert!(
+                chrome::rail_name_fits(a.label()),
+                "rail {} must fit at 1440 and 1100",
+                a.label()
+            );
+        }
+        assert!(chrome::splitter_can_travel(
+            chrome::SIDEBAR_MIN_WIDTH,
+            chrome::SIDEBAR_MAX_WIDTH
+        ));
+    }
+
+    #[test]
+    fn schematic_after_implement_has_cells_and_more_does_not_map_to_timing() {
+        use crate::{pane_for_workspace, WorkspacePane};
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        let drawing = ide.schematic.drawing();
+        let n_cells = drawing
+            .symbols
+            .iter()
+            .filter(|s| !s.kind.starts_with("PORT"))
+            .count();
+        assert!(
+            n_cells > 0,
+            "counter schematic after Implement must show cells, got {} symbols",
+            drawing.symbols.len()
+        );
+        assert!(
+            !drawing.wires.is_empty(),
+            "counter schematic after Implement must show wires"
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Schematic),
+            WorkspacePane::Schematic
+        );
+        assert_ne!(
+            pane_for_workspace(WorkspaceTab::Schematic),
+            WorkspacePane::Timing
+        );
+        assert_eq!(
+            WorkspaceTab::parse_label("Schematic"),
+            Some(WorkspaceTab::Schematic)
+        );
+        assert_eq!(
+            WorkspaceTab::parse_label("Project Summary"),
+            Some(WorkspaceTab::Summary)
+        );
+        for tab in WorkspaceTab::ALL {
+            if crate::chrome::is_more_destination(tab) {
+                assert_ne!(
+                    pane_for_workspace(tab),
+                    WorkspacePane::Timing,
+                    "{tab:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_sim_state_is_english_and_pblock_range_is_english() {
+        let ide = IdeModel::new();
+        let locals = ide.locals_text();
+        let mems = ide.memories_text();
+        assert!(
+            !locals.contains("sim_run"),
+            "locals empty state must not speak Tcl: {locals}"
+        );
+        assert!(
+            !mems.contains("sim_run"),
+            "memory empty state must not speak Tcl: {mems}"
+        );
+        assert!(locals.contains("run simulation"), "{locals}");
+        assert!(mems.contains("run simulation"), "{mems}");
+
+        let empty = Pblock::default();
+        assert_eq!(empty.english_range(), "No range yet");
+        assert_eq!(empty.range_text(), "-");
+        let pb = Pblock {
+            name: "pblock_0".into(),
+            x0: 0,
+            y0: 0,
+            x1: 3,
+            y1: 3,
+            ranged: true,
+            ..Default::default()
+        };
+        assert!(
+            !pb.english_range().contains("CLB_X"),
+            "Device table must not dump Tcl: {}",
+            pb.english_range()
+        );
+        assert!(
+            pb.english_range().contains("Tiles"),
+            "{}",
+            pb.english_range()
+        );
+        assert!(pb.range_text().starts_with("CLB_X"), "Tcl console keeps CLB_X");
+    }
+
+    #[test]
+    fn native_open_dialog_is_not_a_none_stub() {
+        assert_eq!(crate::dialog_backend(), "rfd");
+        assert!(crate::HDL_EXTENSIONS.contains(&"sv"));
+        let _ = crate::hdl_file_dialog();
+        let sv = example("counter.sv");
+        let mut ide = IdeModel::new();
+        ide.open_source(&sv).unwrap();
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sv")),
+            "{:?}",
+            ide.tree.sources
         );
     }
 }

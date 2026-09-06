@@ -7,14 +7,13 @@
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::chrome::{self, Activity, Canvas, RAIL_OPEN_SOURCES};
 use helion_gui::{
-    doctor, BottomTab, CdcSeverity, ClockRelation, ConstraintSection, DrcSeverity,
-    FlowStep, IdeModel, IlaTrigger, LayoutKind, MethodologySeverity, MsgSeverity,
-    PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
+    doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
+    ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
+    MethodologySeverity, MsgSeverity, PathGroupKind, StepState, WaveRadix, WaveStyle,
+    WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -177,9 +176,16 @@ fn run_stdin() {
 }
 
 fn run_gui() -> eframe::Result {
+    let (iw, ih) = std::env::var("HELION_INNER_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((1440.0, 900.0));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 900.0])
+            .with_inner_size([iw, ih])
             .with_min_inner_size([1100.0, 640.0])
             .with_title("Helion"),
         ..Default::default()
@@ -202,6 +208,8 @@ struct HelionIde {
     model: IdeModel,
     tree_filter: String,
     sidebar_hidden: bool,
+    sidebar_width: f32,
+    console_height: f32,
     activity: Activity,
     canvas: Canvas,
     show_tcl: bool,
@@ -213,6 +221,14 @@ struct HelionIde {
     program_status: Option<(bool, String)>,
     /// Cable picker: auto|sim|usb|ofl|native (wired to helion-hw resolve_cable).
     program_cable: String,
+    /// Optional framebuffer dump: HELION_SHOTDIR + HELION_SHOT (then HELION_SHOT_QUIT=1).
+    shot_dir: Option<PathBuf>,
+    shot_name: Option<String>,
+    shot_quit: bool,
+    shot_frames: u32,
+    shot_done: bool,
+    /// Cached USB/OFL scan — detect_boards shells openFPGALoader; never call it every frame.
+    board_detect: Option<helion_hw::DetectReport>,
 }
 
 impl HelionIde {
@@ -232,6 +248,8 @@ impl HelionIde {
             model,
             tree_filter: String::new(),
             sidebar_hidden: false,
+            sidebar_width: chrome::SIDEBAR_WIDTH,
+            console_height: chrome::CONSOLE_DEFAULT_HEIGHT,
             activity,
             canvas,
             show_tcl: false,
@@ -241,7 +259,23 @@ impl HelionIde {
             tcl_focus: false,
             program_status: None,
             program_cable: "auto".into(),
+            shot_dir: std::env::var("HELION_SHOTDIR").ok().map(PathBuf::from),
+            shot_name: std::env::var("HELION_SHOT").ok(),
+            shot_quit: std::env::var("HELION_SHOT_QUIT").ok().as_deref() == Some("1"),
+            shot_frames: 0,
+            shot_done: false,
+            board_detect: None,
         };
+        if let Ok(w) = std::env::var("HELION_SIDEBAR_WIDTH") {
+            if let Ok(v) = w.parse::<f32>() {
+                app.sidebar_width = v.clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
+            }
+        }
+        if let Ok(h) = std::env::var("HELION_CONSOLE_HEIGHT") {
+            if let Ok(v) = h.parse::<f32>() {
+                app.console_height = v.clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
+            }
+        }
         // Optional launch hooks for Mac shots / demos (does not remove Open…).
         if let Ok(path) = std::env::var("HELION_OPEN") {
             let pb = PathBuf::from(path.trim());
@@ -258,7 +292,21 @@ impl HelionIde {
             Ok("synth") => {
                 let _ = app.model.run_step(FlowStep::Synthesis);
             }
+            Ok("sim") => {
+                let _ = app.model.exec("sim_run");
+                app.set_activity(Activity::Simulate);
+            }
             _ => {}
+        }
+        if let Ok(name) = std::env::var("HELION_WORKSPACE") {
+            if let Some(tab) = WorkspaceTab::parse_label(&name) {
+                open_more_workspace(&mut app, tab);
+            }
+        }
+        if let Ok(name) = std::env::var("HELION_ACTIVITY") {
+            if let Some(act) = Activity::ALL.iter().copied().find(|a| a.label().eq_ignore_ascii_case(name.trim())) {
+                app.set_activity(act);
+            }
         }
         app
     }
@@ -269,21 +317,12 @@ impl HelionIde {
             Canvas::Editor => self.model.workspace = WorkspaceTab::TextEditor,
             Canvas::Device => self.model.workspace = WorkspaceTab::Device,
             Canvas::Timing => {
-                // Keep a report-detail workspace if already on one; else default Timing Summary pane.
-                // Never open the Reports *catalog* in the Timing canvas (catalog is SidePanel-only).
-                if !matches!(
-                    self.model.workspace,
-                    WorkspaceTab::Reports
-                        | WorkspaceTab::Constraints
-                        | WorkspaceTab::ClockInteraction
-                        | WorkspaceTab::Cdc
-                        | WorkspaceTab::ClockNetworks
-                        | WorkspaceTab::Power
-                        | WorkspaceTab::Methodology
-                        | WorkspaceTab::Drc
-                        | WorkspaceTab::Utilization
-                        | WorkspaceTab::Runs
-                ) {
+                // Timing canvas is WNS + paths. Never open the Reports catalog here.
+                if self.activity == Activity::Reports
+                    && chrome::is_report_detail(self.model.workspace)
+                {
+                    // Keep the selected report-detail More view under Reports.
+                } else {
                     self.model.workspace = WorkspaceTab::Reports;
                 }
             }
@@ -292,27 +331,39 @@ impl HelionIde {
 
     fn set_activity(&mut self, a: Activity) {
         self.activity = a;
-        self.sidebar_hidden = false;
+        self.sidebar_hidden = matches!(a, Activity::Timing | Activity::Simulate);
         match a {
             Activity::Files => {
                 self.model.layout = LayoutKind::Default;
                 self.set_canvas(Canvas::Editor);
             }
             Activity::Device => self.set_canvas(Canvas::Device),
-            Activity::Timing => self.set_canvas(Canvas::Timing),
+            Activity::Timing => {
+                self.canvas = Canvas::Timing;
+                self.model.workspace = WorkspaceTab::Reports;
+            }
             Activity::Simulate => {
-                self.model.workspace = WorkspaceTab::Wave;
+                if !self.model.workspace.sim_only() {
+                    self.model.workspace = WorkspaceTab::Wave;
+                }
             }
             Activity::Program => {}
             Activity::Reports => {
-                if self.canvas != Canvas::Timing {
-                    self.set_canvas(Canvas::Timing);
+                self.canvas = Canvas::Timing;
+                if !chrome::is_report_detail(self.model.workspace) {
+                    self.model.workspace = WorkspaceTab::Reports;
                 }
-                self.model.workspace = WorkspaceTab::Reports;
                 // Catalog-first: don't auto-open Timing Summary under Reports (void + twin).
                 self.model.selected_report = None;
             }
         }
+    }
+
+    fn boards(&mut self, refresh: bool) -> &helion_hw::DetectReport {
+        if refresh || self.board_detect.is_none() {
+            self.board_detect = Some(helion_hw::detect_boards());
+        }
+        self.board_detect.as_ref().expect("board detect cached")
     }
 
     fn remember(&mut self, path: PathBuf) {
@@ -338,7 +389,13 @@ impl eframe::App for HelionIde {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         handle_shortcuts(ctx, self);
         paint_toolbar(ctx, self);
-        paint_status_bar(ctx, self.activity, self.canvas, &self.model);
+        let board_soft_hold = self.activity == Activity::Program
+            && self
+                .board_detect
+                .as_ref()
+                .map(|d| !d.physical_had)
+                .unwrap_or(true);
+        paint_status_bar(ctx, self.activity, self.canvas, &self.model, board_soft_hold);
         paint_bottom(ctx, self);
         paint_activity_rail(ctx, self);
         if !self.sidebar_hidden {
@@ -350,7 +407,64 @@ impl eframe::App for HelionIde {
         paint_tcl_window(ctx, self);
         paint_palette(ctx, self);
         paint_examples_popup(ctx, self);
+        capture_shot(ctx, self);
     }
+}
+
+fn capture_shot(ctx: &egui::Context, app: &mut HelionIde) {
+    let Some(dir) = app.shot_dir.clone() else {
+        return;
+    };
+    if app.shot_done {
+        return;
+    }
+    ctx.request_repaint();
+    app.shot_frames = app.shot_frames.saturating_add(1);
+    if app.shot_frames == 4 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+    }
+    let mut image: Option<std::sync::Arc<egui::ColorImage>> = None;
+    ctx.input(|i| {
+        for ev in &i.raw.events {
+            if let egui::Event::Screenshot { image: img, .. } = ev {
+                image = Some(img.clone());
+            }
+        }
+    });
+    let Some(image) = image else {
+        if app.shot_frames > 90 {
+            eprintln!("helion-ide: screenshot timed out");
+            if app.shot_quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            app.shot_done = true;
+        }
+        return;
+    };
+    let name = app
+        .shot_name
+        .clone()
+        .unwrap_or_else(|| "helion".into());
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{name}.ppm"));
+    if let Err(e) = write_ppm(&path, &image) {
+        eprintln!("helion-ide: shot {}: {e}", path.display());
+    } else {
+        eprintln!("helion-ide: wrote {}", path.display());
+    }
+    app.shot_done = true;
+    if app.shot_quit {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+fn write_ppm(path: &Path, image: &egui::ColorImage) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    write!(f, "P6\n{} {}\n255\n", image.size[0], image.size[1])?;
+    for px in &image.pixels {
+        f.write_all(&[px.r(), px.g(), px.b()])?;
+    }
+    Ok(())
 }
 
 fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
@@ -392,28 +506,7 @@ fn native_open(app: &mut HelionIde) {
 }
 
 fn native_open_dialog() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let script = r#"try
-    POSIX path of (choose file with prompt "Open HDL" of type {"sv", "v", "svh", "vhd", "sdc", "xdc"})
-on error
-    ""
-end try"#;
-        let out = Command::new("osascript").arg("-e").arg(script).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if p.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(p))
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    open_hdl_dialog()
 }
 
 fn run_implement(app: &mut HelionIde) {
@@ -680,20 +773,23 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
 fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
     match app.activity {
         Activity::Simulate => {} // scopes live in-canvas (SidePanel left a thick void beside Wave)
-        Activity::Files => paint_files_side(ctx, app),
-        Activity::Device => paint_files_side(ctx, app),
-        // Timing/Reports: catalog/paths stack inside the canvas (SidePanel was leaving a black void).
-        Activity::Timing | Activity::Reports => {}
-        Activity::Program => paint_files_side(ctx, app),
+        Activity::Timing => {} // WNS + paths live in the Timing canvas; no catalog twin
+        Activity::Files | Activity::Device | Activity::Program | Activity::Reports => {
+            paint_files_side(ctx, app);
+        }
     }
 }
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
-    // Exact width — resizable SidePanels previously left a ~500px black void beside Timing/Reports.
-    egui::SidePanel::left("sidebar_v3")
-        .resizable(false)
-        .exact_width(chrome::SIDEBAR_WIDTH)
+    let mut width = app.sidebar_width.clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
+    let inner = egui::SidePanel::left("sidebar_v3")
+        .resizable(true)
+        .default_width(width)
+        .width_range(chrome::SIDEBAR_MIN_WIDTH..=chrome::SIDEBAR_MAX_WIDTH)
+        .show_separator_line(true)
         .show(ctx, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_max_width(ui.available_width());
             let title = match app.activity {
                 Activity::Files => "Files",
                 Activity::Device => "Device",
@@ -726,12 +822,15 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
             {
                 paint_properties(ui, &mut app.model);
             }
+            width = ui.max_rect().width();
         });
+    app.sidebar_width = inner.response.rect.width().clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
+    let _ = width;
 }
 
 
 fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
-    let det = helion_hw::detect_boards();
+    let det = app.boards(false).clone();
     ui.label(RichText::new("Cable").strong());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -845,7 +944,8 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
             .on_hover_text("Detect cables — honest USB/OFL scan; never fakes a probe")
             .clicked()
         {
-            let ofl = det
+            let fresh = app.boards(true).clone();
+            let ofl = fresh
                 .usb
                 .ofl_path
                 .as_ref()
@@ -853,12 +953,12 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
                 .unwrap_or_else(|| "(not on PATH)".into());
             let summary = format!(
                 "scan USB={} · OFL={} · physical_had={}",
-                det.usb.probes.len(),
+                fresh.usb.probes.len(),
                 ofl,
-                u8::from(det.physical_had),
+                u8::from(fresh.physical_had),
             );
             // Honest scan summary only — never invent a probe / board DONE.
-            app.program_status = Some((det.physical_had, summary));
+            app.program_status = Some((fresh.physical_had, summary));
             let _ = app.model.exec("open_hw_manager");
         }
         let prog_hover = if phys_blocked {
@@ -926,12 +1026,11 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
     let src_rows = app.model.source_rows();
     if src_rows.is_empty() {
         ui.label("No sources.");
-        if primary_button(ui, "Open HDL…")
-            .on_hover_text(tip("Open", "⌘O", "open_source"))
-            .clicked()
-        {
-            native_open(app);
-        }
+        ui.label(
+            RichText::new("Use Open… in the toolbar.")
+                .small()
+                .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+        );
         return;
     }
     let selected_source = app.model.selected_source.clone();
@@ -1011,6 +1110,7 @@ fn paint_status_bar(
     activity: Activity,
     canvas: Canvas,
     model: &IdeModel,
+    board_soft_hold: bool,
 ) {
     egui::TopBottomPanel::bottom("status")
         .exact_height(chrome::STATUS_HEIGHT)
@@ -1044,9 +1144,7 @@ fn paint_status_bar(
                 let crumb = format!("{} › {}", activity.label(), where_label);
                 // Soft-hold crumb on Program rail — visible without opening Program side.
                 // Detect only; never claims board DONE. Sim Program path unchanged.
-                let board_crumb = if activity == Activity::Program
-                    && !helion_hw::detect_boards().physical_had
-                {
+                let board_crumb = if board_soft_hold {
                     " · board:soft-hold"
                 } else {
                     ""
@@ -1105,10 +1203,12 @@ fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
-    egui::TopBottomPanel::bottom("console")
+    let inner = egui::TopBottomPanel::bottom("console")
         .resizable(true)
-        .default_height(180.0)
-        .min_height(80.0)
+        .default_height(app.console_height)
+        .min_height(chrome::CONSOLE_MIN_HEIGHT)
+        .max_height(chrome::CONSOLE_MAX_HEIGHT)
+        .show_separator_line(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -1131,6 +1231,15 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
                 if m.clicked() {
                     app.model.bottom_tab = BottomTab::Messages;
                 }
+                let tcl = ui.add_sized(
+                    [56.0, chrome::HIT_SIDEBAR],
+                    egui::Button::selectable(app.show_tcl, "Tcl"),
+                );
+                if tcl.clicked() {
+                    app.show_tcl = true;
+                    app.tcl_focus = true;
+                    app.model.bottom_tab = BottomTab::Tcl;
+                }
                 if app.activity == Activity::Simulate {
                     let s = ui.add_sized(
                         [88.0, chrome::HIT_SIDEBAR],
@@ -1150,6 +1259,11 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
                 BottomTab::SimLog => paint_sim_log(ui, &mut app.model),
             }
         });
+    app.console_height = inner
+        .response
+        .rect
+        .height()
+        .clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
 }
 
 fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
@@ -1251,21 +1365,26 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.horizontal(|ui| {
         for c in Canvas::ALL {
             // Reports rail owns the catalog view — don't paint it as "Timing" selected (Timing ≠ Reports).
-            let on = app.canvas == c && !(app.activity == Activity::Reports && c == Canvas::Timing);
+            let on = app.canvas == c
+                && !chrome::is_more_destination(app.model.workspace)
+                && !(app.activity == Activity::Reports && c == Canvas::Timing);
             if ui
                 .selectable_label(on, format!("{}  {}", c.label(), c.shortcut()))
                 .on_hover_text(tip(c.label(), c.shortcut(), ""))
                 .clicked()
             {
-                app.set_activity(Activity::Files);
-                app.set_canvas(c);
-                if c == Canvas::Timing {
-                    app.set_activity(Activity::Timing);
+                match c {
+                    Canvas::Editor => app.set_activity(Activity::Files),
+                    Canvas::Device => app.set_activity(Activity::Device),
+                    Canvas::Timing => app.set_activity(Activity::Timing),
                 }
             }
         }
         if app.activity == Activity::Reports {
             let _ = ui.selectable_label(true, "Reports");
+        }
+        if chrome::is_more_destination(app.model.workspace) {
+            let _ = ui.selectable_label(true, app.model.workspace.label());
         }
         ui.menu_button(chrome::MORE, |ui| {
             ui.label(RichText::new("More views").strong().small());
@@ -1283,54 +1402,16 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
         });
     });
     ui.separator();
-    if app.activity == Activity::Program {
-        paint_hw(ui, &mut app.model);
+    if app.model.workspace.sim_only() || app.activity == Activity::Simulate {
+        paint_sim_workspace(ui, app);
         return;
     }
-    if app.activity == Activity::Simulate
-        && !matches!(
-            app.model.workspace,
-            WorkspaceTab::Device | WorkspaceTab::TextEditor | WorkspaceTab::Source
-        )
-    {
-        // Absolute rect split — no horizontal wrap void between Scopes and Wave.
-        let full = ui.available_rect_before_wrap();
-        let h = full.height().max(200.0);
-        let nav_w = 220.0_f32;
-        let rule = chrome::SPLITTER_GRAB_PX; // 6px calm abut
-        let _ = ui.allocate_rect(full, Sense::hover());
-        let nav_rect = egui::Rect::from_min_size(full.min, egui::vec2(nav_w, h));
-        let sep_rect = egui::Rect::from_min_size(
-            egui::pos2(full.min.x + nav_w, full.min.y),
-            egui::vec2(rule, h),
-        );
-        let wave_rect = egui::Rect::from_min_max(
-            egui::pos2(full.min.x + nav_w + rule, full.min.y),
-            egui::pos2(full.max.x, full.min.y + h),
-        );
-        ui.painter().rect_filled(nav_rect, 0.0, Color32::from_rgb(0x22, 0x28, 0x30));
-        ui.painter().rect_filled(sep_rect, 0.0, Color32::from_rgb(0x3a, 0x42, 0x4a));
-        ui.painter().rect_filled(wave_rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("sim_nav_canvas_v3")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    paint_sim_nav_body(ui, &mut app.model);
-                });
-        });
-        ui.scope_builder(egui::UiBuilder::new().max_rect(wave_rect), |ui| {
-            match app.model.workspace {
-                WorkspaceTab::Wave => paint_wave(ui, &mut app.model),
-                WorkspaceTab::Memory => paint_memory(ui, &mut app.model),
-                WorkspaceTab::Breakpoints => paint_breakpoints(ui, &mut app.model),
-                WorkspaceTab::Locals => paint_locals(ui, &mut app.model),
-                WorkspaceTab::Forces => paint_forces(ui, &mut app.model),
-                WorkspaceTab::SimSettings => paint_sim_settings(ui, &mut app.model),
-                WorkspaceTab::Source => paint_source(ui, &mut app.model),
-                _ => paint_wave(ui, &mut app.model),
-            }
-        });
+    if chrome::is_more_destination(app.model.workspace) {
+        paint_more_pane(ui, app);
+        return;
+    }
+    if app.activity == Activity::Program {
+        paint_hw(ui, app);
         return;
     }
     match app.canvas {
@@ -1342,40 +1423,29 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             }
         }
         Canvas::Device => {
-            egui::CollapsingHeader::new("I/O")
-                .default_open(false)
-                .show(ui, |ui| {
-                    paint_io_ports_table(ui, &mut app.model, "device_io_overlay");
-                });
             paint_device(ui, &mut app.model);
         }
         Canvas::Timing => {
             // Full-width vertical stack. No SidePanel twin, no set_min_size (that created a tall black hole).
             egui::ScrollArea::vertical()
-                .id_salt("timing_canvas_v5")
+                .id_salt("timing_canvas_v6")
                 .auto_shrink([false, true])
                 .hscroll(false)
                 .show(ui, |ui| {
                     match app.activity {
                         Activity::Reports => {
-                            ui.heading("Reports");
-                            ui.add_space(4.0);
-                            paint_report_catalog(ui, &mut app.model);
-                            ui.add_space(6.0);
-                            // Collapsed by default — open only when user expands (no tall void band).
-                            let open = false;
-                            egui::CollapsingHeader::new("Report detail")
-                                .default_open(open)
-                                .show(ui, |ui| {
-                                    if app.model.selected_report.is_some() {
-                                        paint_reports_detail(ui, app);
-                                    } else {
-                                        ui.label(
-                                            RichText::new("Select a report above.")
-                                                .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
-                                        );
-                                    }
-                                });
+                            if app.model.selected_report.is_some()
+                                || chrome::is_report_detail(app.model.workspace)
+                            {
+                                paint_reports_detail(ui, app);
+                            } else {
+                                ui.heading("Reports");
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("Select a report in the sidebar.")
+                                        .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                                );
+                            }
                         }
                         _ => paint_timing_only(ui, &mut app.model),
                     }
@@ -1384,40 +1454,120 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     }
 }
 
+fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
+    // Absolute rect split — no horizontal wrap void between Scopes and Wave.
+    let full = ui.available_rect_before_wrap();
+    let h = full.height().max(200.0);
+    let nav_w = 220.0_f32;
+    let rule = chrome::SPLITTER_GRAB_PX; // 6px calm abut
+    let _ = ui.allocate_rect(full, Sense::hover());
+    let nav_rect = egui::Rect::from_min_size(full.min, egui::vec2(nav_w, h));
+    let sep_rect = egui::Rect::from_min_size(
+        egui::pos2(full.min.x + nav_w, full.min.y),
+        egui::vec2(rule, h),
+    );
+    let wave_rect = egui::Rect::from_min_max(
+        egui::pos2(full.min.x + nav_w + rule, full.min.y),
+        egui::pos2(full.max.x, full.min.y + h),
+    );
+    ui.painter().rect_filled(nav_rect, 0.0, Color32::from_rgb(0x22, 0x28, 0x30));
+    ui.painter().rect_filled(sep_rect, 0.0, Color32::from_rgb(0x3a, 0x42, 0x4a));
+    ui.painter().rect_filled(wave_rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("sim_nav_canvas_v3")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                paint_sim_nav_body(ui, &mut app.model);
+            });
+    });
+    ui.scope_builder(egui::UiBuilder::new().max_rect(wave_rect), |ui| {
+        match pane_for_workspace(app.model.workspace) {
+            WorkspacePane::Wave => paint_wave(ui, &mut app.model),
+            WorkspacePane::Memory => paint_memory(ui, &mut app.model),
+            WorkspacePane::Breakpoints => paint_breakpoints(ui, &mut app.model),
+            WorkspacePane::Locals => paint_locals(ui, &mut app.model),
+            WorkspacePane::Forces => paint_forces(ui, &mut app.model),
+            WorkspacePane::SimSettings => paint_sim_settings(ui, &mut app.model),
+            WorkspacePane::Source => paint_source(ui, &mut app.model),
+            _ => paint_wave(ui, &mut app.model),
+        }
+    });
+}
+
 fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
     app.model.workspace = tab;
+    app.sidebar_hidden = tab.sim_only() || matches!(tab, WorkspaceTab::Wave);
     if tab.sim_only() {
-        app.set_activity(Activity::Simulate);
+        app.activity = Activity::Simulate;
         return;
     }
-    match tab.canvas() {
-        WorkspaceTab::TextEditor => app.set_canvas(Canvas::Editor),
-        WorkspaceTab::Device => {
-            app.set_activity(Activity::Device);
-            app.set_canvas(Canvas::Device);
+    if chrome::is_report_detail(tab) {
+        app.activity = Activity::Reports;
+        app.canvas = Canvas::Timing;
+        app.sidebar_hidden = false;
+        return;
+    }
+    match pane_for_workspace(tab) {
+        WorkspacePane::Package => {
+            app.activity = Activity::Device;
+            app.canvas = Canvas::Device;
+            app.sidebar_hidden = false;
         }
-        WorkspaceTab::Reports => {
-            if matches!(
-                tab,
-                WorkspaceTab::Runs
-                    | WorkspaceTab::Constraints
-                    | WorkspaceTab::Utilization
-                    | WorkspaceTab::Drc
-                    | WorkspaceTab::Power
-                    | WorkspaceTab::Methodology
-                    | WorkspaceTab::ClockInteraction
-                    | WorkspaceTab::Cdc
-                    | WorkspaceTab::ClockNetworks
-            ) {
-                app.set_activity(Activity::Reports);
-            } else {
-                app.set_activity(Activity::Timing);
-            }
-            app.set_canvas(Canvas::Timing);
+        WorkspacePane::Hardware | WorkspacePane::Bitstream => {
+            app.activity = Activity::Program;
+            app.sidebar_hidden = false;
+        }
+        WorkspacePane::ReportsCatalog => {
+            app.activity = Activity::Reports;
+            app.canvas = Canvas::Timing;
+            app.sidebar_hidden = false;
         }
         _ => {
-            app.set_canvas(Canvas::Timing);
+            app.activity = Activity::Files;
+            app.sidebar_hidden = false;
         }
+    }
+}
+
+/// More ⋯ destinations fill the central pane with their real UI — never Timing-only, never a stub heading.
+fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
+    match pane_for_workspace(app.model.workspace) {
+        WorkspacePane::Schematic => paint_schematic(ui, &mut app.model),
+        WorkspacePane::Package => paint_package(ui, &mut app.model),
+        WorkspacePane::Hierarchy => paint_hierarchy(ui, &mut app.model),
+        WorkspacePane::Bitstream => paint_bitstream(ui, &mut app.model),
+        WorkspacePane::Hardware => paint_hw(ui, app),
+        WorkspacePane::Ip => paint_ip(ui, &mut app.model),
+        WorkspacePane::Find => paint_find(ui, &mut app.model),
+        WorkspacePane::Settings => paint_project_settings(ui, &mut app.model),
+        WorkspacePane::Summary => paint_project_summary(ui, &mut app.model),
+        WorkspacePane::Constraints => paint_constraints(ui, &mut app.model),
+        WorkspacePane::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
+        WorkspacePane::Cdc => paint_cdc(ui, &mut app.model),
+        WorkspacePane::ClockNetworks => paint_clock_networks(ui, &mut app.model),
+        WorkspacePane::Power => paint_power(ui, &mut app.model),
+        WorkspacePane::Methodology => paint_methodology(ui, &mut app.model),
+        WorkspacePane::Drc => paint_drc(ui, &mut app.model),
+        WorkspacePane::Utilization => paint_utilization(ui, &mut app.model),
+        WorkspacePane::Runs => paint_runs(ui, &mut app.model),
+        WorkspacePane::Wave
+        | WorkspacePane::Source
+        | WorkspacePane::Memory
+        | WorkspacePane::Breakpoints
+        | WorkspacePane::Locals
+        | WorkspacePane::Forces
+        | WorkspacePane::SimSettings => paint_sim_workspace(ui, app),
+        WorkspacePane::ReportsCatalog => {
+            ui.heading("Reports");
+            ui.label(
+                RichText::new("Select a report in the sidebar.")
+                    .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+            );
+        }
+        WorkspacePane::Editor => paint_text_editor(ui, &mut app.model),
+        WorkspacePane::Device => paint_device(ui, &mut app.model),
+        WorkspacePane::Timing => paint_timing_only(ui, &mut app.model),
     }
 }
 
@@ -1469,18 +1619,11 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Package => paint_package(ui, &mut app.model),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model),
         WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model),
-        WorkspaceTab::Hardware => paint_hw(ui, &mut app.model),
+        WorkspaceTab::Hardware => paint_hw(ui, app),
         WorkspaceTab::Ip => paint_ip(ui, &mut app.model),
         WorkspaceTab::Find => paint_find(ui, &mut app.model),
-        WorkspaceTab::Settings | WorkspaceTab::Summary => {
-            ui.heading(app.model.workspace.label());
-            ui.add_space(6.0);
-            ui.label("Open a report from the Reports rail, or pick another view in More ⋯.");
-            if primary_button(ui, "Open Timing Summary").clicked() {
-                app.model.workspace = WorkspaceTab::Reports;
-                let _ = app.model.exec("report_timing_summary");
-            }
-        }
+        WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model),
+        WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model),
         _ => {
             paint_timing_summary(ui, &mut app.model);
             ui.add_space(8.0);
@@ -1641,7 +1784,12 @@ fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel) {
             if let Some(spec) = pick_local {
                 let _ = model.select_local(&spec);
             }
-            ui.horizontal(|ui| {
+            ui.separator();
+            ui.label(RichText::new("Panes").strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Wave").clicked() {
+                    model.workspace = WorkspaceTab::Wave;
+                }
                 if ui.button("Source").clicked() {
                     let _ = model.open_source_window();
                 }
@@ -1651,8 +1799,14 @@ fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel) {
                 if ui.button("Breakpoints").clicked() {
                     let _ = model.open_breakpoints();
                 }
+                if ui.button("Locals").clicked() {
+                    model.workspace = WorkspaceTab::Locals;
+                }
                 if ui.button("Force").clicked() {
                     let _ = model.open_forces();
+                }
+                if ui.button("Settings").clicked() {
+                    model.workspace = WorkspaceTab::SimSettings;
                 }
             });
 }
@@ -1827,7 +1981,6 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
         .map(|(i, l)| (i, l.clone()))
         .collect();
     let mut pick_line = None;
-    let mut open_hdl = false;
     egui::ScrollArea::both()
         .stick_to_bottom(true)
         .max_height(ui.available_height() - 28.0)
@@ -1845,12 +1998,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("No commands yet.");
-                        if primary_button(ui, "Open HDL…")
-                            .on_hover_text(tip("Open", "⌘O", "open_source"))
-                            .clicked()
-                        {
-                            open_hdl = true;
-                        }
+                        ui.label("—");
                         ui.end_row();
                     } else {
                         for (i, line) in &rows {
@@ -1895,10 +2043,6 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
         });
     if let Some(i) = pick_line {
         let _ = model.select_console_line(&i.to_string());
-    }
-    if open_hdl {
-        native_open(app);
-        return;
     }
     ui.horizontal(|ui| {
         ui.label(RichText::new("helion%").monospace());
@@ -2043,7 +2187,6 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Project Summary");
     let rows = model.project_summary_gadgets();
@@ -2141,7 +2284,6 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Project Settings");
     let rows = model.project_setting_rows();
@@ -2633,7 +2775,6 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Find Results");
     ui.horizontal(|ui| {
@@ -2861,7 +3002,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Create pblock").clicked() {
             let _ = model.exec("create_pblock");
         }
-        if ui.button("Resize to CLOCKREGION_X1Y1").clicked() {
+        if ui.button("Resize to clock region X1Y1").clicked() {
             let name = model
                 .pblocks
                 .first()
@@ -2914,7 +3055,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
                             pick_obj = Some(p.name.clone());
                         }
                     }
-                    if ui.selectable_label(on, p.range_text().as_str()).clicked() {
+                    if ui.selectable_label(on, p.english_range().as_str()).clicked() {
                         if p.ranged {
                             pick_obj = Some(format!("CLB_X{}Y{}", p.x0, p.y0));
                         } else {
@@ -2949,7 +3090,6 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("I/O Planning");
     egui::ScrollArea::vertical()
@@ -3000,11 +3140,18 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
     let view_w = avail.x.max(80.0);
     let cell = chrome::floorplan_fit_cell(cols, rows, view_w, view_h);
+    let die_w = chrome::floorplan_die_width(cols, cell);
+    let die_h = cell * rows as f32 + 16.0;
+    let draw_w = view_w.max(die_w);
+    let draw_h = die_h.max(chrome::DRAWING_MIN_HEIGHT);
     let mut pick: Option<String> = None;
     let selected = model.selected.clone();
-    {
+    egui::ScrollArea::both()
+        .id_salt("package_die_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(view_w, view_h),
+                egui::vec2(draw_w, draw_h),
                 Sense::click(),
             );
             if ui.is_rect_visible(rect) {
@@ -3128,7 +3275,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
             }
-    }
+        });
     if let Some(pin) = pick {
         let selected_port = model.selected.clone().filter(|s| {
             model.io_ports.iter().any(|p| p.name == *s)
@@ -3359,8 +3506,14 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
+    egui::ScrollArea::both()
+        .id_salt("reports_catalog_scroll")
+        .auto_shrink([false, true])
+        .max_height(ui.available_height().max(120.0))
+        .show(ui, |ui| {
     egui::Grid::new("reports_catalog")
         .spacing([8.0, 4.0])
+        .min_col_width(48.0)
         .show(ui, |ui| {
             ui.label(RichText::new("Name").strong());
             ui.label(RichText::new("Category").strong());
@@ -3380,11 +3533,17 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
                 if ui.add(btn).clicked() {
                     pick = Some(r.id.clone());
                 }
-                if ui.selectable_label(on, &r.summary).clicked() {
+                let summary = if r.summary.len() > 28 {
+                    format!("{}…", r.summary.chars().take(28).collect::<String>())
+                } else {
+                    r.summary.clone()
+                };
+                if ui.selectable_label(on, summary).clicked() {
                     pick = Some(r.id.clone());
                 }
                 ui.end_row();
             }
+        });
         });
     if let Some(id) = pick {
         let _ = model.select_report(&id);
@@ -4236,7 +4395,6 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
     }
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
     model
@@ -4567,12 +4725,19 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
     let view_w = avail.x.max(80.0);
     let cell = chrome::floorplan_fit_cell(cols, rows, view_w, view_h);
+    let die_w = chrome::floorplan_die_width(cols, cell);
+    let die_h = cell * rows as f32 + 16.0;
+    let draw_w = view_w.max(die_w);
+    let draw_h = die_h.max(chrome::DRAWING_MIN_HEIGHT);
     let mut pick_site: Option<(u32, u32)> = None;
     let mut pick_region: Option<String> = None;
     let mut click_pblock: Option<String> = None;
-    {
+    egui::ScrollArea::both()
+        .id_salt("device_die_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(view_w, view_h),
+                egui::vec2(draw_w, draw_h),
                 Sense::click(),
             );
             if ui.is_rect_visible(rect) {
@@ -4741,7 +4906,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                             tip.push_str(&format!(
                                 "{}  {}  frames={}",
                                 pb.name,
-                                pb.range_text(),
+                                pb.english_range(),
                                 pb.frames
                             ));
                         }
@@ -4811,7 +4976,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
             }
-    }
+        });
     if let Some(name) = click_pblock {
         let _ = model.select_pblock(&name);
     }
@@ -5732,7 +5897,7 @@ fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_wave_marker.clone();
     let mut pick: Option<String> = None;
     if markers.is_empty() {
-        ui.label("No markers yet.");
+        ui.label("No markers yet. Run simulation, then add a marker.");
         if primary_button(ui, "Add marker").clicked() {
             let n = model.wave.markers.len() + 1;
             let _ = model.add_wave_marker(&format!("M{n}"));
@@ -5979,9 +6144,10 @@ fn hw_stat_bit_color(name: &str, value: bool) -> Color32 {
     }
 }
 
-fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.heading("Hardware Manager");
-    let det = helion_hw::detect_boards();
+    let det = app.boards(false).clone();
+    let model = &mut app.model;
     if !det.physical_had {
         ui.label(
             RichText::new(
