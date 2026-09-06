@@ -3,6 +3,7 @@
 **Date:** 2026-09-06 ~08:19 America/New_York (EDT)  
 **Branch:** `fm-hel-top` — PR https://github.com/helion-fpga/helion/pull/8 (**NO MERGE**)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
+**Tip:** `a5bf9c58653bce010ddce3b78dacfd4fb0ed0b8e` (`a5bf9c5`)  
 **Remote:** push **only** `helion-fpga HEAD:fm-hel-top` (never `fm-hel-corpus-soft-pass`, never merge, never force-push master)
 
 ## Problem
