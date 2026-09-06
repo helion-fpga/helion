@@ -4,7 +4,7 @@
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
 **Prior TAP:** SHA `b13b3f3` — counter.hbits CFG_W + STAT DONE via `--cable mpsse-sim`  
 **Prior place:** SHA `fc95562` — imux_skip→0, IOB=1, gold 9640  
-**Shipped:** *(this commit)*  
+**Shipped:** SHA `9ef8bdc`  
 **Gold:** `WNS_PS=9640` **held** (`helion report_timing examples/counter.sv --sdc examples/counter.sdc`)
 
 ## Goal
