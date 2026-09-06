@@ -300,7 +300,10 @@ impl HelionIde {
             }
             Activity::Device => self.set_canvas(Canvas::Device),
             Activity::Timing => self.set_canvas(Canvas::Timing),
-            Activity::Simulate | Activity::Program => {}
+            Activity::Simulate => {
+                self.model.workspace = WorkspaceTab::Wave;
+            }
+            Activity::Program => {}
             Activity::Reports => {
                 if self.canvas != Canvas::Timing {
                     self.set_canvas(Canvas::Timing);
@@ -676,7 +679,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
     match app.activity {
-        Activity::Simulate => paint_sim_side(ctx, &mut app.model),
+        Activity::Simulate => {} // scopes live in-canvas (SidePanel left a thick void beside Wave)
         Activity::Files => paint_files_side(ctx, app),
         Activity::Device => paint_files_side(ctx, app),
         // Timing/Reports: catalog/paths stack inside the canvas (SidePanel was leaving a black void).
@@ -1230,16 +1233,44 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             WorkspaceTab::Device | WorkspaceTab::TextEditor | WorkspaceTab::Source
         )
     {
-        match app.model.workspace {
-            WorkspaceTab::Wave => paint_wave(ui, &mut app.model),
-            WorkspaceTab::Memory => paint_memory(ui, &mut app.model),
-            WorkspaceTab::Breakpoints => paint_breakpoints(ui, &mut app.model),
-            WorkspaceTab::Locals => paint_locals(ui, &mut app.model),
-            WorkspaceTab::Forces => paint_forces(ui, &mut app.model),
-            WorkspaceTab::SimSettings => paint_sim_settings(ui, &mut app.model),
-            WorkspaceTab::Source => paint_source(ui, &mut app.model),
-            _ => paint_wave(ui, &mut app.model),
-        }
+        // Absolute rect split — no horizontal wrap void between Scopes and Wave.
+        let full = ui.available_rect_before_wrap();
+        let h = full.height().max(200.0);
+        let nav_w = 220.0_f32;
+        let rule = chrome::SPLITTER_GRAB_PX; // 6px calm abut
+        let _ = ui.allocate_rect(full, Sense::hover());
+        let nav_rect = egui::Rect::from_min_size(full.min, egui::vec2(nav_w, h));
+        let sep_rect = egui::Rect::from_min_size(
+            egui::pos2(full.min.x + nav_w, full.min.y),
+            egui::vec2(rule, h),
+        );
+        let wave_rect = egui::Rect::from_min_max(
+            egui::pos2(full.min.x + nav_w + rule, full.min.y),
+            egui::pos2(full.max.x, full.min.y + h),
+        );
+        ui.painter().rect_filled(nav_rect, 0.0, Color32::from_rgb(0x22, 0x28, 0x30));
+        ui.painter().rect_filled(sep_rect, 0.0, Color32::from_rgb(0x3a, 0x42, 0x4a));
+        ui.painter().rect_filled(wave_rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("sim_nav_canvas_v3")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    paint_sim_nav_body(ui, &mut app.model);
+                });
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(wave_rect), |ui| {
+            match app.model.workspace {
+                WorkspaceTab::Wave => paint_wave(ui, &mut app.model),
+                WorkspaceTab::Memory => paint_memory(ui, &mut app.model),
+                WorkspaceTab::Breakpoints => paint_breakpoints(ui, &mut app.model),
+                WorkspaceTab::Locals => paint_locals(ui, &mut app.model),
+                WorkspaceTab::Forces => paint_forces(ui, &mut app.model),
+                WorkspaceTab::SimSettings => paint_sim_settings(ui, &mut app.model),
+                WorkspaceTab::Source => paint_source(ui, &mut app.model),
+                _ => paint_wave(ui, &mut app.model),
+            }
+        });
         return;
     }
     match app.canvas {
@@ -1418,14 +1449,7 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 
-fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
-    // Calm narrow scopes rail — resizable but hard-capped so Wave is not pushed behind a black void.
-    egui::SidePanel::left("scopes_v3")
-        .resizable(true)
-        .default_width(chrome::SIDEBAR_WIDTH)
-        .min_width(180.0)
-        .max_width(260.0)
-        .show(ctx, |ui| {
+fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel) {
             ui.label(RichText::new("Scopes").strong());
             ui.horizontal(|ui| {
                 let n = model.sim_runtime_cycles.max(1);
@@ -1571,7 +1595,6 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                     let _ = model.open_forces();
                 }
             });
-        });
 }
 
 
@@ -5372,6 +5395,27 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
         if primary_button(ui, "Run Simulation").clicked() {
             let _ = model.exec("sim_run");
         }
+        // Own the Wave pane — no thick empty black slab beside scopes.
+        let fill = ui.available_size().max(egui::vec2(120.0, 160.0));
+        let (rect, _) = ui.allocate_exact_size(fill, Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            4.0,
+            Color32::from_rgb(0x1a, 0x1e, 0x24),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(0x3a, 0x42, 0x4a)),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Wave · run simulation to fill",
+            egui::FontId::proportional(14.0),
+            Color32::from_rgb(0xa0, 0xa8, 0xb0),
+        );
         return;
     }
     let n = model.wave.sample_len().max(1);
