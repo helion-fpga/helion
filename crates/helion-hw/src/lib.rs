@@ -7,8 +7,10 @@
 //!
 //! Optional **`usb-native`** feature enables [`rusb`] FTDI (VID 0x0403) enumeration
 //! via [`native_usb`] — listed in [`detect_boards`] as physical probes **without**
-//! claiming program DONE. Programming / MPSSE remains OFL (or sim); [`NativeFtdiStub`]
-//! still returns `NotImplemented` for CFG_W. Without the feature, OFL path is unchanged.
+//! claiming program DONE. Programming / real MPSSE remains OFL (or sim); [`NativeFtdiStub`]
+//! still returns `NotImplemented` for CFG_W. [`mpsse_sim`] adds an in-process FTDI
+//! bitbang harness (open + one JTAG IR/DR shift) for tests — **not** hardware DONE.
+//! Without the feature, OFL path is unchanged.
 //! HAD board IDs / `HELION_OFL_BOARD` defaults live in [`HAD_KNOWN_BOARDS`].
 //! OFL summaries parse verify output honestly and never invent Helion TAP STAT.
 //! No UNISIM/AMD IP — HAD is Helion's story.
@@ -18,7 +20,9 @@ use helion_device::Device;
 use helion_fabric::{Fabric, Stat};
 
 pub mod native_usb;
+pub mod mpsse_sim;
 pub use native_usb::{enumerate_ftdi, feature_enabled as usb_native_feature_enabled, FtdiDeviceInfo, NativeUsbScan, FTDI_VID};
+pub use mpsse_sim::{FtdiBitbangSim, MpsseSimError};
 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +51,8 @@ pub struct Tap {
     pub ir: u8,
     fabric: Fabric,
     ir_shift: u8,
+    /// DR shift register (IDCODE/STAT words use low 32 bits).
+    dr_shift: u64,
     shlen: u8,
 }
 
@@ -57,8 +63,59 @@ impl Tap {
             ir: IR_IDCODE,
             fabric: Fabric::new(dev),
             ir_shift: 0,
+            dr_shift: 0,
             shlen: 0,
         }
+    }
+
+    /// IEEE 1149.1 IR length for Helion TAP (matches `IR_*` 6-bit opcodes).
+    pub const IR_LEN: u8 = 6;
+
+    /// One simulated TCK: sample TDO, shift TDI if in Shift-*, then apply TMS.
+    ///
+    /// Bit-accurate path used by [`mpsse_sim`] — independent of the high-level
+    /// [`Self::shift_ir`] shortcut used by the sim cable program path.
+    pub fn tick(&mut self, tms: bool, tdi: bool) -> bool {
+        let tdo = match self.state {
+            TapState::ShiftIr | TapState::CaptureIr => (self.ir_shift & 1) != 0,
+            TapState::ShiftDr | TapState::CaptureDr => (self.dr_shift & 1) != 0,
+            _ => false,
+        };
+
+        match self.state {
+            TapState::ShiftIr => {
+                // 6-bit IR, LSB-first: shift right, insert TDI at bit 5.
+                self.ir_shift =
+                    ((self.ir_shift >> 1) & 0x1f) | (u8::from(tdi) << (Self::IR_LEN - 1));
+                self.shlen = self.shlen.saturating_add(1);
+            }
+            TapState::ShiftDr => {
+                // 32-bit DR window for IDCODE/STAT.
+                self.dr_shift = (self.dr_shift >> 1) | ((u64::from(tdi)) << 31);
+                self.shlen = self.shlen.saturating_add(1);
+            }
+            _ => {}
+        }
+
+        let prev = self.state;
+        self.tms(tms);
+
+        if self.state == TapState::CaptureIr && prev != TapState::CaptureIr {
+            self.ir_shift = self.ir & 0x3f;
+            self.shlen = 0;
+        }
+        if self.state == TapState::CaptureDr && prev != TapState::CaptureDr {
+            self.dr_shift = match self.ir {
+                IR_IDCODE => u64::from(self.fabric.idcode),
+                IR_STAT => u64::from(self.fabric.stat.word()),
+                _ => 0,
+            };
+            self.shlen = 0;
+        }
+        if self.state == TapState::UpdateIr && prev != TapState::UpdateIr {
+            self.ir = self.ir_shift & 0x3f;
+        }
+        tdo
     }
 
     /// 5× TMS=1 → Test-Logic-Reset.
@@ -330,7 +387,7 @@ pub fn had_board_id_table_text() -> String {
         ));
     }
     out.push_str(&format!(
-        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL\n",
+        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL; mpsse_sim=bitbang-harness (tests only, not hardware DONE)\n",
         if native_usb::feature_enabled() {
             "usb-native"
         } else {
