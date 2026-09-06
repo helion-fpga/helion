@@ -11,7 +11,7 @@ pub mod open_dialog;
 pub mod surface;
 pub use surface::{
     central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
-    JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, spawn_job,
+    JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
 };
 pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
 pub use ide::{

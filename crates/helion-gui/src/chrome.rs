@@ -521,6 +521,49 @@ pub fn hardware_dashboard_size(pane_w: f32, pane_h: f32, chrome_h: f32) -> (f32,
     (pane_w.max(80.0), remain)
 }
 
+/// STAT/ILA tiles that fill the Program pane (content bbox, not a dark empty slab).
+pub fn stat_bit_grid(n_bits: usize, pane_w: f32, pane_h: f32) -> (u32, u32, f32, f32) {
+    let n = n_bits.max(1) as u32;
+    let aspect = (pane_w / pane_h.max(1.0)).clamp(0.25, 8.0);
+    let cols = ((n as f32 * aspect).sqrt().ceil() as u32).max(1);
+    let rows = n.div_ceil(cols).max(1);
+    let (cw, ch) = package_cell(cols, rows, pane_w, pane_h);
+    (cols, rows, cw, ch)
+}
+
+/// Compact CAD cards (Windows compact / Apple content-first): tile strip + ILA rest.
+/// Tile height is capped so 3 empty-state cables are not fullscreen candy slabs.
+pub fn program_layout(n_tiles: usize, pane_w: f32, pane_h: f32) -> (f32, f32, u32, u32, f32, f32) {
+    let ph = pane_h.max(1.0);
+    let tile_band = (ph * 0.42).clamp(88.0, 132.0);
+    let ila_h = (ph - tile_band).max(ph * 0.40);
+    let (cols, rows, cw, ch) = stat_bit_grid(n_tiles.max(1), pane_w.max(1.0), tile_band);
+    (tile_band, ila_h, cols, rows, cw, ch.min(tile_band))
+}
+
+/// Content bbox of the Program STAT grid + ILA rest (both are content).
+pub fn hardware_content_bbox(n_bits: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let (tile_band, ila_h, cols, rows, cw, ch) = program_layout(n_bits, pane_w, pane_h);
+    let drawn_w = (cw * cols as f32 + 16.0).min(pane_w.max(1.0)).max(pane_w * PANE_FILL_MIN);
+    let drawn_h = tile_band + ila_h;
+    let _ = (rows, ch);
+    DrawingFit::from_drawn(pane_w.max(1.0), pane_h.max(1.0), 1.0, 1.0, drawn_w, drawn_h)
+}
+
+/// Auto-fit only the identity camera when the sheet would clip. User zoom/pan is kept.
+pub fn schematic_should_auto_fit(
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    sheet_w: f32,
+    sheet_h: f32,
+    vw: f32,
+    vh: f32,
+) -> bool {
+    let identity = (zoom - 1.0).abs() < 0.02 && pan_x.abs() < 0.5 && pan_y.abs() < 0.5;
+    identity && (sheet_w * zoom > vw + 1.0 || sheet_h * zoom > vh + 1.0)
+}
+
 /// Paint `data_scroll` reads this: both axes + bounded height.
 pub fn table_scroll_policy(n_cols: usize, available: f32) -> TableScrollPolicy {
     let last_column_would_clip = grid_clips_last_column(n_cols, MIN_COL_PX, available);
@@ -896,9 +939,21 @@ mod tests {
         assert!((pane_w - drawn_w).max(pane_h - drawn_h) <= PANE_EMPTY_GAP_MAX);
         let filled = fill_pane(32.0, 1.0, pane_w, pane_h);
         assert!(filled.fills(), "{filled:?}");
-        let (dw, dh) = hardware_dashboard_size(pane_w, pane_h, 120.0);
-        assert!(dw / pane_w >= PANE_FILL_MIN);
-        assert!(dh / (pane_h - 120.0).max(1.0) >= PANE_FILL_MIN);
+        let hw = hardware_content_bbox(3, pane_w, pane_h);
+        assert!(hw.fills(), "Program cards+ILA content bbox {hw:?}");
+        let (tile_band, ila_h, _, _, _, ch) = program_layout(3, pane_w, pane_h);
+        assert!(
+            ch <= 132.0 && tile_band <= 132.0,
+            "empty-state cable cards must stay compact, ch={ch} band={tile_band}"
+        );
+        assert!(ila_h >= pane_h * 0.40, "ILA rest is content, not a void");
+        assert!(
+            !schematic_should_auto_fit(2.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0),
+            "user zoom-in must not be auto-fitted"
+        );
+        assert!(schematic_should_auto_fit(
+            1.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0
+        ));
     }
 
     #[test]

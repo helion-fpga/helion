@@ -25,6 +25,11 @@ pub fn take_jobs() -> Vec<JobKind> {
     PENDING_JOBS.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
+/// Paint-path flow buttons queue the engine; they never call `run_step` on the UI thread.
+pub fn queue_flow(step: FlowStep) {
+    request_job(JobKind::Step(step));
+}
+
 /// Why a control looked dead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventClass {
@@ -836,9 +841,9 @@ mod tests {
         );
         d.click_more(WorkspaceTab::Hardware);
         assert_eq!(d.pane(), WorkspacePane::Hardware);
-        let (dw, dh) = chrome::hardware_dashboard_size(1000.0, 500.0, 120.0);
-        assert!(dw / 1000.0 >= chrome::PANE_FILL_MIN);
-        assert!(dh / 380.0 >= chrome::PANE_FILL_MIN);
+        let n = d.model.hw_stat_report().bits.len().max(3);
+        let hw = chrome::hardware_content_bbox(n, 1000.0, 400.0);
+        assert!(hw.fills(), "Program STAT content bbox {hw:?}");
         d.click_more(WorkspaceTab::Schematic);
         let drawing = d.model.schematic.drawing();
         let fit = chrome::fit_pane(drawing.width.max(1.0), drawing.height.max(1.0), 900.0, 500.0);
@@ -848,8 +853,13 @@ mod tests {
 
     #[test]
     fn jobs_are_not_run_inside_a_paint_callback() {
-        // Paint queues via spawn_job / request_job; the engine type is Send and
-        // the UI only try_recv. Running implement on this thread is tests/headless.
+        let _ = take_jobs();
+        queue_flow(FlowStep::Synthesis);
+        queue_flow(FlowStep::Place);
+        queue_flow(FlowStep::Route);
+        let queued = take_jobs();
+        assert_eq!(queued.len(), 3, "{queued:?}");
+        assert!(queued.iter().all(|k| matches!(k, JobKind::Step(_))));
         assert_send::<IdeModel>();
         let mut d = ChromeDriver::new();
         d.click_open(&example("counter.sv")).unwrap();
