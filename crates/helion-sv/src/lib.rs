@@ -3973,49 +3973,68 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
 
-    // Output IOBs from assigns
+    // Output IOBs from assigns.
+    // FM-HEL-TOP: under skip_comb_assigns, AXI/out continuous assigns have no
+    // mapped LUT/FF drivers. Emitting them fills the pack then iob_trim → 0,
+    // blocking the FF→PAD fallback (bare ysyx_ibex IOB=0). Prefer NBA-
+    // registered top outs; else last FF → first Out.
     let mut iob_n = 0usize;
-    for (lhs, bit, rhs) in &rtl.assigns {
-        let is_out = rtl
-            .ports
-            .iter()
-            .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
-        if !is_out {
-            continue;
-        }
-        let w = sig_width(rtl, lhs);
-        if bit.is_none() && w > 1 {
-            for i in 0..w.min(256) {
-                let qnet = bit_name(lhs, w, i);
-                let iob = if iob_n == 0 {
-                    "u_iob".to_string()
-                } else {
-                    format!("u_iob{iob_n}")
-                };
-                iob_n += 1;
-                d.add_cell(&iob, CellKind::IobOut);
-                d.connect(&qnet, &iob, "I");
-                d.connect(lhs, &iob, "PAD");
-            }
-            continue;
-        }
-        let (qnet, _) = if let Some(b) = bit {
-            (bit_name(lhs, w, *b), *b)
-        } else {
-            match drive_target(rhs, rtl) {
-                Ok(x) => x,
-                Err(_) => continue,
-            }
-        };
-        let iob = if iob_n == 0 {
+    let emit_iob = |d: &mut Design, iob_n: &mut usize, qnet: &str, pad: &str| {
+        let iob = if *iob_n == 0 {
             "u_iob".to_string()
         } else {
             format!("u_iob{iob_n}")
         };
-        iob_n += 1;
+        *iob_n += 1;
         d.add_cell(&iob, CellKind::IobOut);
-        d.connect(&qnet, &iob, "I");
-        d.connect(lhs, &iob, "PAD");
+        d.connect(qnet, &iob, "I");
+        d.connect(pad, &iob, "PAD");
+    };
+    if skip_comb_assigns {
+        eprintln!("hang_diag skip_undriven_iob_assigns (FF→PAD fallback path)");
+        let reg_q: HashSet<&str> = reg_bits.iter().map(|(n, _)| n.as_str()).collect();
+        for (n, dir, w) in &rtl.ports {
+            if *dir != PortDir::Out {
+                continue;
+            }
+            let w = *w;
+            // Cap so PathFinder stays under ≤120s (cli also caps driven IOBs).
+            let lim = if w > 1 { w.min(4) } else { 1 };
+            for i in 0..lim {
+                let qnet = bit_name(n, w, i);
+                if !reg_q.contains(qnet.as_str()) {
+                    continue;
+                }
+                emit_iob(&mut d, &mut iob_n, &qnet, n);
+            }
+        }
+    } else {
+        for (lhs, bit, rhs) in &rtl.assigns {
+            let is_out = rtl
+                .ports
+                .iter()
+                .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
+            if !is_out {
+                continue;
+            }
+            let w = sig_width(rtl, lhs);
+            if bit.is_none() && w > 1 {
+                for i in 0..w.min(256) {
+                    let qnet = bit_name(lhs, w, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                }
+                continue;
+            }
+            let (qnet, _) = if let Some(b) = bit {
+                (bit_name(lhs, w, *b), *b)
+            } else {
+                match drive_target(rhs, rtl) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                }
+            };
+            emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+        }
     }
     if iob_n == 0 {
         // default: last register bit to first output

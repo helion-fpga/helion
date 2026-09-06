@@ -14,7 +14,7 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
-    /// LUT-pin drivers outside same-CLB / N-S±2 IMUX encoding (Ibex-scale).
+    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±1 IMUX encoding (Ibex-scale).
     pub imux_skip: u32,
 }
 
@@ -163,8 +163,18 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
         // driver is north of sink (±2)
         return Ok(40 + dble);
     }
+    // Real E-W ±1 (same row): uwilton SB left/right track + IMUX neighbor Q.
+    // Not a fake encoding — fabric decode samples adjacent-column Q.
+    if from.y == to.y && from.x + 1 == to.x {
+        // driver is west of sink
+        return Ok(48 + dble);
+    }
+    if from.y == to.y && to.x + 1 == from.x {
+        // driver is east of sink
+        return Ok(56 + dble);
+    }
     Err(format!(
-        "IMUX: no local/N-S±2 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
+        "IMUX: no local/N-S±2/E-W±1 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
         from.x, from.y, to.x, to.y
     ))
 }
@@ -231,8 +241,8 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
                     });
                 }
                 Err(_) => {
-                    // Bring-up IMUX is same-CLB / N-S±2 only. Full Ibex has
-                    // longer/diagonal/E-W FF→LUT arcs; skip + count (honest, not silent).
+                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±1. Full Ibex has
+                    // longer/diagonal/>±1 FF→LUT arcs; skip + count (honest, not silent).
                     imux_skip += 1;
                 }
             }
@@ -319,7 +329,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
     }
     if imux_skip > 0 {
         eprintln!(
-            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/same-CLB only)",
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±1/same-CLB)",
             imux_skip,
             imux.len()
         );

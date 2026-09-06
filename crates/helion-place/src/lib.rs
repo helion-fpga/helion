@@ -27,14 +27,19 @@ impl Default for PlaceOpts {
     }
 }
 
-/// Bring-up IMUX reach: same CLB or N-S ±1/±2 (matches helion-route::imux_sel).
+/// Bring-up IMUX reach: same CLB, N-S ±1/±2, or E-W ±1 (matches helion-route::imux_sel).
 fn imux_local(from: Site, to: Site) -> bool {
-    from.x == to.x
+    if from.x == to.x
         && (from.y == to.y
             || from.y + 1 == to.y
             || to.y + 1 == from.y
             || from.y + 2 == to.y
             || to.y + 2 == from.y)
+    {
+        return true;
+    }
+    // Real E-W ±1 same-row neighbor Q (uwilton left/right).
+    from.y == to.y && (from.x + 1 == to.x || to.x + 1 == from.x)
 }
 
 fn imux_illegal_pins(
@@ -108,7 +113,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
-        // FF cell → site as we place (IMUX encodes same-CLB / N-S ±1/±2).
+        // FF cell → site as we place (IMUX encodes same-CLB / N-S ±1/±2 / E-W ±1).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
             let preferred_x = iob_for_net
@@ -191,14 +196,14 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         }
 
             // FM-HEL-TOP: stronger IMUX legalization — pull sinks onto driver
-            // same-CLB / N-S±1/±2 (real HAD reach); empty-BLE move then pairwise
-            // swap when sites are full. No fake E-W encoding.
+            // same-CLB / N-S±1/±2 / E-W±1 (real HAD reach); empty-BLE move then
+            // pairwise swap when sites are full.
             let mut site_of: std::collections::HashMap<(u32, u32, u8), usize> =
                 std::collections::HashMap::new();
             for (i, (s, ble)) in lutff_sites.iter().enumerate() {
                 site_of.insert((s.x, s.y, *ble), i);
             }
-            let push_ns = |xy: &mut Vec<(u32, u32)>, x: u32, y: u32| {
+            let push_reach = |xy: &mut Vec<(u32, u32)>, x: u32, y: u32| {
                 xy.push((x, y));
                 xy.push((x, y.saturating_add(1)));
                 xy.push((x, y.saturating_add(2)));
@@ -207,6 +212,11 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 }
                 if y > 1 {
                     xy.push((x, y - 2));
+                }
+                // E-W ±1 same row
+                xy.push((x.saturating_add(1), y));
+                if x > 0 {
+                    xy.push((x - 1, y));
                 }
             };
             let mut moved = 0u32;
@@ -226,7 +236,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     let mut cand_xy: Vec<(u32, u32)> = Vec::new();
                     for (_, driver) in &lf.lut_pins {
                         if let Some(ds) = ff_at.get(driver.as_str()).copied() {
-                            push_ns(&mut cand_xy, ds.x, ds.y);
+                            push_reach(&mut cand_xy, ds.x, ds.y);
                         }
                     }
                     {
