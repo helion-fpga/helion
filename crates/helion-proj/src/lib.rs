@@ -6,7 +6,7 @@ use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
-use helion_sta::{create_clock, report_timing_routed};
+use helion_sta::{create_clock, load_xdc, report_timing_routed, Constraints};
 use helion_hw::prog_sim;
 use helion_debug::insert_ila;
 
@@ -636,11 +636,16 @@ pub fn get_pins(d: &Design, cell: &str) -> Vec<String> {
 }
 
 /// Drop const-0 LUT+FF pairs that do not drive an IOB.
-/// Vivado-like project file: `part`, `read_sv`, `read_vhdl`, `read_c`, `create_clock`, `set_property PACKAGE_PIN`.
+/// Vivado-like project file: `part`, `read_sv` (multi), `read_xdc`/`read_sdc`,
+/// `create_clock`, `set_property PACKAGE_PIN` / `TOP`.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectFile {
     pub part: String,
     pub sources: Vec<String>,
+    /// External XDC/SDC paths from `read_xdc` / `read_sdc`.
+    pub constraint_files: Vec<String>,
+    /// Optional elaborator top (`top <mod>` / `set_property TOP <mod>`).
+    pub top: Option<String>,
     pub sdc: Vec<String>,
     pub package_pins: Vec<(String, String)>,
     pub iostandards: Vec<(String, String)>,
@@ -674,11 +679,30 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     p.sources.push(v.to_string());
                 }
             }
+            "read_xdc" | "read_sdc" | "xdc" | "sdc" => {
+                if let Some(v) = toks.next() {
+                    p.constraint_files.push(v.to_string());
+                }
+            }
+            "top" => {
+                if let Some(v) = toks.next() {
+                    p.top = Some(v.to_string());
+                }
+            }
             "create_clock" => p.sdc.push(line.to_string()),
             "set_property" => {
                 let rest: Vec<&str> = toks.collect();
-                // set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]
-                if rest.first().copied() == Some("PACKAGE_PIN") && rest.len() >= 2 {
+                if rest.first().copied() == Some("TOP") && rest.len() >= 2 {
+                    let name = rest[1]
+                        .trim_matches(|c: char| c == '[' || c == ']')
+                        .to_string();
+                    if !name.is_empty()
+                        && !name.eq_ignore_ascii_case("current_fileset")
+                        && !name.starts_with("get_")
+                    {
+                        p.top = Some(name);
+                    }
+                } else if rest.first().copied() == Some("PACKAGE_PIN") && rest.len() >= 2 {
                     let site = rest[1].to_string();
                     let joined = rest[2..].join(" ");
                     let port = joined
@@ -785,6 +809,84 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
         return Err("project has no sources".into());
     }
     Ok(p)
+}
+
+/// Resolve a project-relative path against the `.prj` location, then CWD.
+pub fn resolve_prj_path(prj_path: &std::path::Path, given: &str) -> std::path::PathBuf {
+    let given = std::path::Path::new(given);
+    if given.exists() {
+        return given.to_path_buf();
+    }
+    for anc in prj_path.ancestors() {
+        let cand = anc.join(given);
+        if cand.exists() {
+            return cand;
+        }
+        if let Some(name) = given.file_name() {
+            let cand = anc.join(name);
+            if cand.exists() {
+                return cand;
+            }
+        }
+    }
+    given.to_path_buf()
+}
+
+/// Flatten inline SDC + `read_xdc` files + `set_property` IO into one XDC blob, then `load_xdc`.
+/// Empty constraints keep the CLI gold WNS path (default 10 ns clk applied by the runner).
+pub fn constraints_from_project(
+    prj: &ProjectFile,
+    prj_path: &std::path::Path,
+) -> Result<Constraints, String> {
+    let mut blob = String::new();
+    for line in &prj.sdc {
+        blob.push_str(line);
+        blob.push('\n');
+    }
+    for cf in &prj.constraint_files {
+        let path = resolve_prj_path(prj_path, cf);
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read_xdc {}: {e}", path.display()))?;
+        blob.push_str(&body);
+        if !body.ends_with('\n') {
+            blob.push('\n');
+        }
+    }
+    for (port, site) in &prj.package_pins {
+        blob.push_str(&format!(
+            "set_property PACKAGE_PIN {site} [get_ports {port}]\n"
+        ));
+    }
+    for (port, std) in &prj.iostandards {
+        blob.push_str(&format!(
+            "set_property IOSTANDARD {std} [get_ports {port}]\n"
+        ));
+    }
+    for (port, val) in &prj.drives {
+        blob.push_str(&format!("set_property DRIVE {val} [get_ports {port}]\n"));
+    }
+    for (port, val) in &prj.slews {
+        blob.push_str(&format!("set_property SLEW {val} [get_ports {port}]\n"));
+    }
+    for (port, val) in &prj.pulltypes {
+        blob.push_str(&format!(
+            "set_property PULLTYPE {val} [get_ports {port}]\n"
+        ));
+    }
+    for (port, val) in &prj.diff_terms {
+        blob.push_str(&format!(
+            "set_property DIFF_TERM {val} [get_ports {port}]\n"
+        ));
+    }
+    for (port, val) in &prj.in_terms {
+        blob.push_str(&format!(
+            "set_property IN_TERM {val} [get_ports {port}]\n"
+        ));
+    }
+    if blob.trim().is_empty() {
+        return Ok(Constraints::default());
+    }
+    load_xdc(&blob)
 }
 
 pub fn opt_design(d: &mut Design) -> usize {
@@ -950,6 +1052,8 @@ set_property IN_TERM NONE [get_ports led]
         .unwrap();
         assert_eq!(prj.part, "HL10T-C32-1");
         assert_eq!(prj.sources, vec!["examples/blinky.sv"]);
+        assert!(prj.constraint_files.is_empty());
+        assert!(prj.top.is_none());
         assert_eq!(prj.sdc.len(), 1);
         assert_eq!(prj.package_pins, vec![("led".into(), "IOB_X2Y0".into())]);
         assert_eq!(prj.iostandards, vec![("led".into(), "LVCMOS18".into())]);
@@ -959,6 +1063,26 @@ set_property IN_TERM NONE [get_ports led]
         assert_eq!(prj.diff_terms, vec![("led".into(), "FALSE".into())]);
         assert_eq!(prj.in_terms, vec![("led".into(), "NONE".into())]);
         assert!(load_prj("part X\n").is_err());
+    }
+
+    #[test]
+    fn project_file_read_xdc_multi_source_and_top() {
+        let prj = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/multi/tog.sv
+read_sv examples/multi/top.sv
+read_xdc examples/multi/multi.sdc
+top top
+set_property TOP top
+create_clock -period 10.000 [get_ports clk]
+"#,
+        )
+        .unwrap();
+        assert_eq!(prj.sources.len(), 2);
+        assert_eq!(prj.constraint_files, vec!["examples/multi/multi.sdc"]);
+        assert_eq!(prj.top.as_deref(), Some("top"));
+        assert_eq!(prj.sdc.len(), 1);
     }
 
     #[test]
