@@ -1,8 +1,8 @@
 # FM-HEL-TOP — gap matrix (post-#7)
 
-**Date:** 2026-09-06 ~08:15 America/New_York (EDT)  
+**Date:** 2026-09-06 ~08:25 America/New_York (EDT)  
 **Branch:** `fm-hel-top` — PR https://github.com/helion-fpga/helion/pull/8 (**NO MERGE**; grinding continues)  
-**Tip:** `d197c6bb65e4410a8085d99dcd438c6d89f81875` (`d197c6b`)
+**Tip:** `fa91b7f31e28299958d118c30baa1fff7ff5927f` (`fa91b7f`)
 **Master:** `46bae17` (PR #7 merge; captain leave-vs-revert)  
 **Author:** saksham-45  
 
@@ -31,11 +31,11 @@ Helion did **not** merge #7. MergeBy on GitHub: `saksham-45` at 2026-09-06 06:54
 | Schematic deepen | **99 PASS** | `2714c61` (+sha256 wrap); skip ibex uncapped |
 | 3 SOFTs | **100/0/0** | verified |
 | CLI breadcrumb | shipped | `9ef40e9` |
-| Board flash UX | soft-hold physical | this branch `c769aeb` — no DONE claim |
+| Board flash UX | soft-hold + status crumb | `fa91b7f` — `board:soft-hold` on Program; no DONE claim |
 | ILA | **mark→impl→arm fixed** | `strip_ila` baseline; see FM-HEL-TOP-ila-ip |
 | IP/project | `examples/ip/` + read_ip smoke | dir-form package; AXI fence |
-| Air perf | idle-clean | `c5f02b6`; no request_repaint calls; Mac reconfirmed |
-| Implement QoR | bars moved; AIG STOP | no thrash |
+| Air perf | idle-clean | `c5f02b6` + tip reconfirm; `IDLE_PAINT_POLICY=reactive-no-request_repaint`; no request_repaint calls |
+| Implement QoR | verified; AIG STOP | gold 9640; reduced cells=2137 imux_skip=0 wall=0.40s — FM-HEL-TOP-impl-quality |
 | Live FTDI | soft-hold | Mac USB empty / OFL -3 |
 
 ## Gold
@@ -53,6 +53,6 @@ Verified this turn (box): `report_timing counter WNS_PS=9640 TNS_PS=0 endpoints=
 
 ## Remains
 
-- Live FTDI / board DONE — soft-hold (Mac USB empty).
+- Live FTDI / board DONE — soft-hold (Mac USB empty); status crumb `board:soft-hold` visible on Program.
 - AIG/flowmap wall — STOP (no thrash).
 - Captain leave-vs-revert on merged PR #7.
