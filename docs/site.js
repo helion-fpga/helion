@@ -1,18 +1,50 @@
-/* Nav, anim toggle, live HL10T die with current on the fabric. */
+/* Nav drawer, tape pause, live HL10T die. */
 (function () {
   var path = location.pathname.split("/").pop() || "index.html";
-  if (path === "") path = "index.html";
-  document.querySelectorAll("nav a").forEach(function (a) {
-    if ((a.getAttribute("href") || "") === path) a.setAttribute("aria-current", "page");
+  if (path === "" || path === "/") path = "index.html";
+  document.querySelectorAll("#site-nav a").forEach(function (a) {
+    var href = a.getAttribute("href") || "";
+    if (href === path) a.setAttribute("aria-current", "page");
   });
 
+  var bar = document.querySelector(".bar");
+  var toggleNav = document.querySelector(".nav-toggle");
+  if (toggleNav && bar) {
+    toggleNav.addEventListener("click", function () {
+      var open = bar.classList.toggle("is-open");
+      toggleNav.setAttribute("aria-expanded", open ? "true" : "false");
+      toggleNav.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && bar.classList.contains("is-open")) {
+        bar.classList.remove("is-open");
+        toggleNav.setAttribute("aria-expanded", "false");
+        toggleNav.setAttribute("aria-label", "Open menu");
+        toggleNav.focus();
+      }
+    });
+  }
+
   var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var animOn = !reduce;
+  var animOn = true;
   var toggle = document.getElementById("anim-toggle");
   function syncAnim() {
     document.documentElement.setAttribute("data-anim", animOn ? "on" : "off");
-    if (toggle) toggle.textContent = animOn ? "II" : "▶";
-    if (toggle) toggle.title = animOn ? "Pause animations" : "Play animations";
+    if (toggle) {
+      toggle.hidden = false;
+      toggle.textContent = animOn ? "II" : "▶";
+      toggle.title = animOn ? "Pause the tape" : "Play the tape";
+      toggle.setAttribute("aria-pressed", animOn ? "true" : "false");
+    }
+    var plate = document.getElementById("hero-vid");
+    if (plate) {
+      if (animOn) {
+        var p = plate.play();
+        if (p && p.catch) p.catch(function () {});
+      } else {
+        plate.pause();
+      }
+    }
   }
   if (toggle) {
     toggle.addEventListener("click", function () {
@@ -22,8 +54,35 @@
   }
   syncAnim();
 
-  var plate = document.getElementById("hero-vid");
-  if (reduce && plate) plate.pause();
+  var track = document.querySelector(".marquee-track");
+  var seq = track && track.querySelector(".marquee-seq");
+  if (track && seq) {
+    track.style.animation = "none";
+    var tapeX = 0;
+    var tapeLast = performance.now();
+    var tapePx = reduce ? 28 : 64;
+    var tapeVisible = true;
+    if ("IntersectionObserver" in window) {
+      var io = new IntersectionObserver(function (entries) {
+        tapeVisible = !!(entries[0] && entries[0].isIntersecting);
+      }, { threshold: 0 });
+      io.observe(track);
+    }
+    function tapeTick(now) {
+      var dt = Math.min(0.05, (now - tapeLast) / 1000);
+      tapeLast = now;
+      if (animOn && tapeVisible) {
+        var w = seq.offsetWidth;
+        if (w > 0) {
+          tapeX -= tapePx * dt;
+          if (tapeX <= -w) tapeX += w;
+          track.style.transform = "translate3d(" + tapeX.toFixed(2) + "px,0,0)";
+        }
+      }
+      requestAnimationFrame(tapeTick);
+    }
+    requestAnimationFrame(tapeTick);
+  }
 
   var host = document.getElementById("die");
   if (!host) return;
@@ -113,7 +172,6 @@
   var rows = [];
   for (var ry = 2; ry <= 31; ry += 3) rows.push(rowPath(ry));
 
-  var dots = [];
   function addDot() {
     var c = document.createElementNS(NS, "circle");
     c.setAttribute("r", "0.42");
@@ -236,7 +294,6 @@
         if (kind(cx, cy) === "CLK" && Math.random() < 0.04) {
           var row = rows[cy % rows.length];
           if (row) {
-            /* inject a short burst into a CLB row */
             var burst = Math.min(row.length - 1, Math.floor(Math.random() * 8) + 2);
             for (var k = 0; k < burst; k++) {
               var t = row[k];
@@ -251,6 +308,7 @@
         }
       }
     }
+    var _ = dt;
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
