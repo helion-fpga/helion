@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~07:58 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
-**Score tip (branch HEAD):** `e5ff2b0ef3e20dc77e1d8f91058416220ab247f0` (`e5ff2b0`)  
+**Score tip (branch HEAD):**  ()  
 **Sim abut chrome:** `e521e45` (parent of tip stamp)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
 
