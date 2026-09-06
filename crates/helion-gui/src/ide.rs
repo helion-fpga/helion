@@ -4927,6 +4927,8 @@ impl IdeModel {
             self.sim_run(self.sim_runtime_cycles.max(1))
         } else if t == "open_elaborated_schematic" {
             self.open_elaborated_schematic()
+        } else if t == "open_hierarchy_sheet" || t.starts_with("open_hierarchy_sheet ") {
+            self.open_hierarchy_sheet(t.strip_prefix("open_hierarchy_sheet").unwrap_or("").trim())
         } else if t == "sheet_find" || t.starts_with("sheet_find ") {
             let kind = t.strip_prefix("sheet_find").unwrap_or("").trim();
             self.sheet_find(kind)
@@ -7362,6 +7364,33 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Schematic;
         self.nav = NavSection::RtlAnalysis;
         Ok(self.schematic_drawing_text())
+    }
+
+    /// Fig. 61→55/56: open the schematic sheet for a hierarchy instance (or selection).
+    pub fn open_hierarchy_sheet(&mut self, spec: &str) -> Result<String, String> {
+        if self.schematic.nodes.is_empty() {
+            return Err("open_hierarchy_sheet: no HNF — Run Synthesis first".into());
+        }
+        let name = {
+            let s = spec.trim();
+            if !s.is_empty() {
+                s.to_string()
+            } else {
+                self.selected
+                    .clone()
+                    .ok_or_else(|| "open_hierarchy_sheet: select a hierarchy instance first".to_string())?
+            }
+        };
+        self.workspace = WorkspaceTab::Schematic;
+        self.nav = NavSection::RtlAnalysis;
+        if self.schematic.is_instance(&name) {
+            let _ = self.expand_inside(&name);
+        } else if self.hierarchy.has(&name) || self.schematic.has_cell(&name) {
+            self.select(&name);
+        } else {
+            return Err(format!("open_hierarchy_sheet: unknown instance {name}"));
+        }
+        Ok(format!("open_hierarchy_sheet {name} {}", self.schematic_drawing_text()))
     }
 
     /// Expand the schematic cone from a cell along HNF nets (UG893 Expand Cone).
@@ -23860,7 +23889,22 @@ mod tests {
 
     /// Fig. 56 Expand Inside regenerates nested instance contents; primitives refuse.
     #[test]
-    fn schematic_expand_inside_instance_primitives_refuse() {
+
+    #[test]
+    fn hierarchy_open_sheet_navigates_instance_to_schematic() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("hier.sv")).unwrap();
+        assert!(ide.schematic.is_instance("u0"));
+        let out = ide.exec("open_hierarchy_sheet u0").unwrap();
+        assert!(out.contains("open_hierarchy_sheet u0"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Schematic);
+        assert_eq!(ide.schematic.expand_inside.as_deref(), Some("u0"));
+        ide.selected = None;
+        let e = ide.exec("open_hierarchy_sheet").unwrap_err();
+        assert!(e.contains("select"), "{e}");
+    }
+
+        fn schematic_expand_inside_instance_primitives_refuse() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("hier.sv")).unwrap();
         assert!(
