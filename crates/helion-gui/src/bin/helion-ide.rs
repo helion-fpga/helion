@@ -640,7 +640,7 @@ fn run_implement(app: &mut HelionIde) {
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add_sized(
-        [ui.spacing().interact_size.x.max(96.0), chrome::HIT_COMFORT],
+        chrome::toolbar_ctrl_size(text),
         egui::Button::new(RichText::new(text).size(14.0)),
     )
 }
@@ -682,7 +682,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                 ui.add_space(6.0);
                 let open = ui
                     .add_sized(
-                        [80.0, chrome::HIT_COMFORT],
+                        chrome::toolbar_ctrl_size("Open…"),
                         egui::Button::new("Open…"),
                     )
                     .on_hover_text(tip("Open", "⌘O", "open_source"));
@@ -729,7 +729,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                         let impl_label = if busy { "Implementing…" } else { "Implement" };
                         let impl_btn = ui
                             .add_sized(
-                                [120.0, chrome::HIT_COMFORT],
+                                chrome::toolbar_ctrl_size(impl_label),
                                 egui::Button::new(RichText::new(impl_label).strong()),
                             )
                             .on_hover_text(match synth_blocked {
@@ -745,7 +745,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.add_enabled_ui(bits_blocked.is_none(), |ui| {
                         let b = ui
                             .add_sized(
-                                [84.0, chrome::HIT_COMFORT],
+                                chrome::toolbar_ctrl_size("Bitstream"),
                                 egui::Button::new("Bitstream"),
                             )
                             .on_hover_text(match bits_blocked {
@@ -792,8 +792,9 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ),
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
+                let chip = chrome::flow_chip_size();
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(68.0, 32.0), Sense::click());
+                    ui.allocate_exact_size(egui::vec2(chip[0], chip[1]), Sense::click());
                 if ui.is_rect_visible(rect) {
                     ui.painter().rect(
                         rect,
@@ -858,22 +859,23 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                         egui::StrokeKind::Inside,
                     );
                     let c = rect.center();
+                    // Word is the primary label (MUST 3). Letter is a small index, not the name.
                     ui.painter().text(
-                        egui::pos2(c.x, c.y - 9.0),
+                        egui::pos2(c.x, c.y - 12.0),
                         egui::Align2::CENTER_CENTER,
                         act.icon(),
-                        egui::FontId::proportional(13.0),
+                        egui::FontId::proportional(10.0),
                         if on {
-                            Color32::from_rgb(0xc8, 0xf0, 0xd8)
+                            Color32::from_rgb(0x8a, 0xc4, 0xa4)
                         } else {
-                            Color32::from_rgb(0xb0, 0xb8, 0xc0)
+                            Color32::from_rgb(0x7a, 0x84, 0x8c)
                         },
                     );
                     ui.painter().text(
-                        egui::pos2(c.x, c.y + 11.0),
+                        egui::pos2(c.x, c.y + 8.0),
                         egui::Align2::CENTER_CENTER,
                         act.short_label(),
-                        egui::FontId::proportional(10.0),
+                        egui::FontId::proportional(12.0),
                         if on {
                             Color32::from_rgb(0xc8, 0xf0, 0xd8)
                         } else {
@@ -1753,7 +1755,10 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
             native_open(app);
         }
         ui.add_space(6.0);
-        if ui.button("Examples").clicked() {
+        if primary_button(ui, "Examples")
+            .on_hover_text("Open an example HDL file")
+            .clicked()
+        {
             app.show_examples = true;
         }
     });
@@ -2766,7 +2771,13 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Hierarchy");
+    ui.horizontal(|ui| {
+        ui.heading("Hierarchy");
+        ui.add_space(12.0);
+        if ui.button("Show in Schematic").clicked() {
+            let _ = model.exec("open_hierarchy_sheet");
+        }
+    });
     let drawing = model.hierarchy.drawing();
     ui.label(
         RichText::new(format!(
@@ -2780,25 +2791,29 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     );
     let selected = model.selected.clone();
     let mut pick = None;
+    let avail = ui.available_size();
+    let view_w = avail.x.max(80.0);
+    let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
+    let fit = chrome::hierarchy_fit(drawing.width, drawing.height, view_w, view_h);
     egui::ScrollArea::both()
+        .id_salt("hierarchy_die_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let size = egui::vec2(
-                drawing.width.max(ui.available_width()).max(280.0),
-                drawing.height.max(180.0),
-            );
+            let size = egui::vec2(fit.drawn_w.max(view_w), fit.drawn_h.max(view_h));
             let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
             if ui.is_rect_visible(rect) {
                 let p = ui.painter();
                 p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
                 let o = rect.min;
+                let sx = fit.scale_x;
+                let sy = fit.scale_y;
                 // Outer boxes first so nested leaves paint on top.
                 let mut ordered: Vec<_> = drawing.boxes.iter().collect();
                 ordered.sort_by(|a, b| (b.w * b.h).partial_cmp(&(a.w * a.h)).unwrap());
                 for b in ordered {
                     let r = egui::Rect::from_min_size(
-                        egui::pos2(o.x + b.x, o.y + b.y),
-                        egui::vec2(b.w, b.h),
+                        egui::pos2(o.x + b.x * sx, o.y + b.y * sy),
+                        egui::vec2((b.w * sx).max(8.0), (b.h * sy).max(8.0)),
                     );
                     let on = selected.as_deref() == Some(b.name.as_str());
                     let fill = if b.kind == "module" {
@@ -2850,8 +2865,8 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
             }
             if resp.clicked() || resp.double_clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    let lx = pos.x - rect.left();
-                    let ly = pos.y - rect.top();
+                    let lx = (pos.x - rect.left()) / fit.scale_x.max(0.01);
+                    let ly = (pos.y - rect.top()) / fit.scale_y.max(0.01);
                     // Prefer the smallest containing box (leaf over parent).
                     let mut hit: Option<&helion_gui::HierBox> = None;
                     for b in &drawing.boxes {
@@ -2875,12 +2890,6 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     if let Some(id) = pick {
         model.select(&id);
     }
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        if ui.button("Show in Schematic").clicked() {
-            let _ = model.exec("open_hierarchy_sheet");
-        }
-    });
 }
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
@@ -5830,10 +5839,12 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
     let cursor_a = model.wave.cursor_a;
     let cursor_b = model.wave.cursor_b;
     let ts = model.wave.timescale_ps;
+    let row_h = chrome::wave_trace_row_h(model.wave.traces.len(), ui.available_height() - 8.0);
 
     for t in &model.wave.traces {
         ui.horizontal(|ui| {
-            ui.set_min_height(36.0);
+            ui.set_min_height(row_h);
+            ui.set_max_height(row_h);
             ui.add_sized(
                 [110.0, 28.0],
                 egui::Label::new(RichText::new(&t.name).monospace().strong()),
@@ -5907,7 +5918,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ));
             }
             let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 32.0),
+                egui::vec2(ui.available_width(), (row_h - 4.0).max(28.0)),
                 Sense::click(),
             );
             if ui.is_rect_visible(rect) {
@@ -6401,6 +6412,33 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
     if samples.is_empty() {
         ui.label("No ILA capture yet.");
         ui.weak("Open Hardware Manager, program the sim cable, then Arm / Capture a net.");
+        let rest = ui.available_size().max(egui::vec2(120.0, 80.0));
+        let (cap, _) = ui.allocate_exact_size(rest, Sense::hover());
+        if ui.is_rect_visible(cap) {
+            let p = ui.painter();
+            p.rect_filled(cap, 4.0, Color32::from_rgb(0x16, 0x1c, 0x22));
+            p.rect_stroke(
+                cap,
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_rgb(0x3a, 0x42, 0x4a)),
+                egui::StrokeKind::Inside,
+            );
+            let lanes = 6;
+            for i in 0..lanes {
+                let y = cap.top() + cap.height() * (i as f32 + 0.5) / lanes as f32;
+                p.line_segment(
+                    [egui::pos2(cap.left() + 12.0, y), egui::pos2(cap.right() - 12.0, y)],
+                    Stroke::new(1.0_f32, Color32::from_rgb(0x2a, 0x32, 0x3a)),
+                );
+            }
+            p.text(
+                cap.center(),
+                egui::Align2::CENTER_CENTER,
+                "ILA capture · arm a probe to fill",
+                egui::FontId::proportional(14.0),
+                Color32::from_rgb(0xa0, 0xa8, 0xb0),
+            );
+        }
     } else {
         ui.label(format!(
             "probe={} window={} trigger={} trigger_at={} bits={}",
@@ -6472,171 +6510,184 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec(&format!("create_bd_cell {spec}"));
         }
     });
-    paint_ip_catalog(ui, model);
     let drawing = model
         .block_design
         .as_ref()
         .map(|bd| bd.drawing(&model.ip_catalog));
+    let remain = ui.available_size();
+    let (catalog_h, canvas) = chrome::ip_layout(remain.x.max(80.0), remain.y.max(200.0));
+    egui::ScrollArea::vertical()
+        .id_salt("ip_catalog_strip")
+        .auto_shrink([false, true])
+        .max_height(catalog_h)
+        .show(ui, |ui| {
+            paint_ip_catalog(ui, model);
+            if let Some(drawing) = drawing.as_ref() {
+                ui.label(format!(
+                    "BD {}  {} IP  {} nets  ok={}",
+                    model.block_design.as_ref().map(|b| b.name.as_str()).unwrap_or("-"),
+                    drawing
+                        .symbols
+                        .iter()
+                        .filter(|s| s.kind != "PORT_IN" && s.kind != "INTERCONNECT")
+                        .count(),
+                    drawing.wires.len(),
+                    model.block_design.as_ref().map(|b| b.ok).unwrap_or(false)
+                ));
+                if !drawing.addresses.is_empty() {
+                    ui.label(RichText::new("Address Map (Helion-MM)").strong());
+                    egui::Grid::new("bd_addr_map")
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Slave").strong());
+                            ui.label(RichText::new("Offset").strong());
+                            ui.label(RichText::new("Range").strong());
+                            ui.end_row();
+                            for a in &drawing.addresses {
+                                ui.label(&a.slave);
+                                ui.label(format!("0x{:08x}", a.base));
+                                ui.label(format!("0x{:x}", a.range));
+                                ui.end_row();
+                            }
+                        });
+                }
+            }
+            paint_bd_hdl(ui, model);
+        });
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(canvas.drawn_w.max(remain.x), canvas.drawn_h.max(chrome::DRAWING_MIN_HEIGHT * 0.5)),
+        Sense::hover(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
     let Some(drawing) = drawing else {
-        ui.weak("Create Block Design to place Helion-MM IP on the canvas.");
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Create Block Design to place Helion-MM IP on the canvas.",
+            egui::FontId::proportional(14.0),
+            Color32::from_rgb(0x9a, 0xa4, 0xae),
+        );
         return;
     };
-    ui.label(format!(
-        "BD {}  {} IP  {} nets  ok={}",
-        model.block_design.as_ref().map(|b| b.name.as_str()).unwrap_or("-"),
-        drawing
-            .symbols
+    let fit = chrome::hierarchy_fit(drawing.width, drawing.height, rect.width(), rect.height());
+    let o = rect.min;
+    let sx = fit.scale_x;
+    let sy = fit.scale_y;
+    let net = Color32::from_rgb(0x3d, 0xb8, 0x7a);
+    let mm = Color32::from_rgb(0x7e, 0xc8, 0xe3);
+    for w in &drawing.wires {
+        let col = if w.net == "Helion-MM" { mm } else { net };
+        let thick = if w.net == "Helion-MM" { 3.4_f32 } else { 1.6_f32 };
+        let pts: Vec<egui::Pos2> = w
+            .points
             .iter()
-            .filter(|s| s.kind != "PORT_IN" && s.kind != "INTERCONNECT")
-            .count(),
-        drawing.wires.len(),
-        model.block_design.as_ref().map(|b| b.ok).unwrap_or(false)
-    ));
-    if !drawing.addresses.is_empty() {
-        ui.add_space(4.0);
-        ui.label(RichText::new("Address Map (Helion-MM)").strong());
-        egui::Grid::new("bd_addr_map")
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Slave").strong());
-                ui.label(RichText::new("Offset").strong());
-                ui.label(RichText::new("Range").strong());
-                ui.end_row();
-                for a in &drawing.addresses {
-                    ui.label(&a.slave);
-                    ui.label(format!("0x{:08x}", a.base));
-                    ui.label(format!("0x{:x}", a.range));
-                    ui.end_row();
-                }
-            });
-    }
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let size = egui::vec2(
-                drawing.width.max(ui.available_width()),
-                drawing.height.max(ui.available_height().max(200.0)),
+            .map(|(x, y)| egui::pos2(o.x + *x * sx, o.y + *y * sy))
+            .collect();
+        for pair in pts.windows(2) {
+            p.line_segment([pair[0], pair[1]], Stroke::new(thick, col));
+        }
+        if let Some(&a) = pts.first() {
+            p.text(
+                a + egui::vec2(4.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                &w.net,
+                egui::FontId::monospace(9.0),
+                col,
             );
-            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-            if !ui.is_rect_visible(rect) {
-                return;
-            }
-            let p = ui.painter();
-            p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
-            let o = rect.min;
-            let net = Color32::from_rgb(0x3d, 0xb8, 0x7a);
-            let mm = Color32::from_rgb(0x7e, 0xc8, 0xe3);
-            for w in &drawing.wires {
-                let col = if w.net == "Helion-MM" { mm } else { net };
-                let thick = if w.net == "Helion-MM" { 3.4_f32 } else { 1.6_f32 };
-                let pts: Vec<egui::Pos2> = w
-                    .points
-                    .iter()
-                    .map(|(x, y)| egui::pos2(o.x + *x, o.y + *y))
-                    .collect();
-                for pair in pts.windows(2) {
-                    p.line_segment([pair[0], pair[1]], Stroke::new(thick, col));
-                }
-                if let Some(&a) = pts.first() {
-                    p.text(
-                        a + egui::vec2(4.0, -8.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        &w.net,
-                        egui::FontId::monospace(9.0),
-                        col,
-                    );
-                }
-            }
-            for sy in &drawing.symbols {
-                let r = egui::Rect::from_min_size(
-                    egui::pos2(o.x + sy.x, o.y + sy.y),
-                    egui::vec2(sy.w, sy.h),
+        }
+    }
+    for syb in &drawing.symbols {
+        let r = egui::Rect::from_min_size(
+            egui::pos2(o.x + syb.x * sx, o.y + syb.y * sy),
+            egui::vec2((syb.w * sx).max(8.0), (syb.h * sy).max(8.0)),
+        );
+        if syb.kind == "PORT_IN" {
+            let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
+            p.add(egui::Shape::convex_polygon(
+                pts,
+                Color32::from_rgb(0x1e, 0x3a, 0x55),
+                Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0x84, 0x8e)),
+            ));
+        } else {
+            let fill = if syb.kind == "INTERCONNECT" {
+                Color32::from_rgb(0x24, 0x2e, 0x3a)
+            } else {
+                Color32::from_rgb(0x2a, 0x32, 0x24)
+            };
+            p.rect_filled(r, 3.0, fill);
+            p.rect_stroke(
+                r,
+                3.0,
+                Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0x84, 0x8e)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        p.text(
+            egui::pos2(r.center().x, r.top() + 4.0),
+            egui::Align2::CENTER_TOP,
+            &syb.kind,
+            egui::FontId::monospace(10.0),
+            Color32::from_rgb(0x7e, 0xc8, 0xe3),
+        );
+        p.text(
+            egui::pos2(r.center().x, r.bottom() - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            &syb.name,
+            egui::FontId::monospace(10.0),
+            Color32::from_rgb(0xdc, 0xe0, 0xe4),
+        );
+        if !syb.bus.is_empty() {
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                &syb.bus,
+                egui::FontId::monospace(9.0),
+                Color32::from_rgb(0x9a, 0xa4, 0xae),
+            );
+        }
+        for pin in &syb.pins {
+            let tip = egui::pos2(o.x + pin.x * sx, o.y + pin.y * sy);
+            let edge = if pin.output {
+                egui::pos2(r.right(), tip.y)
+            } else {
+                egui::pos2(r.left(), tip.y)
+            };
+            if pin.iface {
+                let bar = egui::Rect::from_center_size(edge, egui::vec2(10.0, 16.0));
+                p.rect_filled(bar, 1.0, mm);
+                p.rect_stroke(
+                    bar,
+                    1.0,
+                    Stroke::new(1.0_f32, Color32::from_rgb(0xdc, 0xe0, 0xe4)),
+                    egui::StrokeKind::Outside,
                 );
-                if sy.kind == "PORT_IN" {
-                    let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
-                    p.add(egui::Shape::convex_polygon(
-                        pts,
-                        Color32::from_rgb(0x1e, 0x3a, 0x55),
-                        Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0x84, 0x8e)),
-                    ));
+                p.line_segment([edge, tip], Stroke::new(3.4_f32, mm));
+            } else {
+                p.line_segment([edge, tip], Stroke::new(1.6_f32, net));
+                p.circle_filled(tip, 2.0, Color32::from_rgb(0xdc, 0xe0, 0xe4));
+            }
+            let label_pos = if pin.output {
+                egui::pos2(r.right() - 4.0, tip.y)
+            } else {
+                egui::pos2(r.left() + 4.0, tip.y)
+            };
+            p.text(
+                label_pos,
+                if pin.output {
+                    egui::Align2::RIGHT_CENTER
                 } else {
-                    let fill = if sy.kind == "INTERCONNECT" {
-                        Color32::from_rgb(0x24, 0x2e, 0x3a)
-                    } else {
-                        Color32::from_rgb(0x2a, 0x32, 0x24)
-                    };
-                    p.rect_filled(r, 3.0, fill);
-                    p.rect_stroke(
-                        r,
-                        3.0,
-                        Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0x84, 0x8e)),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                p.text(
-                    egui::pos2(r.center().x, r.top() + 4.0),
-                    egui::Align2::CENTER_TOP,
-                    &sy.kind,
-                    egui::FontId::monospace(10.0),
-                    Color32::from_rgb(0x7e, 0xc8, 0xe3),
-                );
-                p.text(
-                    egui::pos2(r.center().x, r.bottom() - 4.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    &sy.name,
-                    egui::FontId::monospace(10.0),
-                    Color32::from_rgb(0xdc, 0xe0, 0xe4),
-                );
-                if !sy.bus.is_empty() {
-                    p.text(
-                        r.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &sy.bus,
-                        egui::FontId::monospace(9.0),
-                        Color32::from_rgb(0x9a, 0xa4, 0xae),
-                    );
-                }
-                for pin in &sy.pins {
-                    let tip = egui::pos2(o.x + pin.x, o.y + pin.y);
-                    let edge = if pin.output {
-                        egui::pos2(r.right(), tip.y)
-                    } else {
-                        egui::pos2(r.left(), tip.y)
-                    };
-                    if pin.iface {
-                        let bar = egui::Rect::from_center_size(edge, egui::vec2(10.0, 16.0));
-                        p.rect_filled(bar, 1.0, mm);
-                        p.rect_stroke(
-                            bar,
-                            1.0,
-                            Stroke::new(1.0_f32, Color32::from_rgb(0xdc, 0xe0, 0xe4)),
-                            egui::StrokeKind::Outside,
-                        );
-                        p.line_segment([edge, tip], Stroke::new(3.4_f32, mm));
-                    } else {
-                        p.line_segment([edge, tip], Stroke::new(1.6_f32, net));
-                        p.circle_filled(tip, 2.0, Color32::from_rgb(0xdc, 0xe0, 0xe4));
-                    }
-                    let label_pos = if pin.output {
-                        egui::pos2(r.right() - 4.0, tip.y)
-                    } else {
-                        egui::pos2(r.left() + 4.0, tip.y)
-                    };
-                    p.text(
-                        label_pos,
-                        if pin.output {
-                            egui::Align2::RIGHT_CENTER
-                        } else {
-                            egui::Align2::LEFT_CENTER
-                        },
-                        &pin.name,
-                        egui::FontId::monospace(8.0),
-                        Color32::from_rgb(0x9a, 0xa4, 0xae),
-                    );
-                }
-            }
-        });
-    paint_bd_hdl(ui, model);
+                    egui::Align2::LEFT_CENTER
+                },
+                &pin.name,
+                egui::FontId::monospace(8.0),
+                Color32::from_rgb(0x9a, 0xa4, 0xae),
+            );
+        }
+    }
 }
 
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
