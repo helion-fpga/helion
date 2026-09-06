@@ -65,4 +65,4 @@ Window-id `screencapture -l` denied (Screen Recording); used `-R` window bounds.
 
 ## Push
 
-`helion-fpga` `fm-hel-corpus-soft-pass` (no merge, no force) — see tip after this commit.
+`helion-fpga` `fm-hel-corpus-soft-pass` tip **`ecc3706`** (no merge, no force).
