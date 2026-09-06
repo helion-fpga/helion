@@ -2205,5 +2205,69 @@ mod tests {
         let _ = native_err;
     }
 
+    #[test]
+    fn had_board_lookup_and_ofl_board_resolve() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        let row = lookup_had_board("hl10t-c32-1").expect("case-insensitive HAD lookup");
+        assert_eq!(row.part, "HL10T-C32-1");
+        assert_eq!(row.idcode, 0x0001_1A1F);
+        assert_eq!(row.ofl_board, "helion_hl10t");
+        assert_eq!(row.usb_vid, 0x0403);
+        assert_eq!(row.usb_pid, 0x6010);
+        assert!(lookup_had_board("no-such-part").is_none());
+        assert_eq!(
+            resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
+            Some("helion_hl10t")
+        );
+        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); }
+        assert_eq!(resolve_ofl_board(Some("HL10T-C32-1")), None);
+        unsafe { std::env::set_var("HELION_OFL_BOARD", "custom_board"); }
+        assert_eq!(
+            resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
+            Some("custom_board")
+        );
+        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        let table = had_board_id_table_text();
+        assert!(table.contains("helion_hl10t"));
+        assert!(table.contains("TAP_readback=none"));
+        assert!(!table.to_ascii_lowercase().contains("done=1 from table"));
+    }
+
+    #[test]
+    fn tap_ir_len_and_tick_reset_path() {
+        assert_eq!(Tap::IR_LEN, 6);
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        assert_eq!(tap.state, TapState::TestLogicReset);
+        for _ in 0..5 {
+            let _ = tap.tick(true, false);
+        }
+        assert_eq!(tap.state, TapState::TestLogicReset);
+        let _ = tap.tick(false, false);
+        assert_eq!(tap.state, TapState::RunTestIdle);
+        tap.reset();
+        assert_eq!(tap.state, TapState::TestLogicReset);
+        assert_eq!(tap.ir, IR_IDCODE);
+        assert!(tap.cfg_last_err().is_none());
+    }
+
+    #[test]
+    fn parse_scan_usb_dedups_and_skips_header_chatter() {
+        let raw = concat!(
+            "empty\n",
+            "No USB devices found\n",
+            "Bus device vid:pid       probe type      manufacturer serial               product\n",
+            "FTDI 0x0403:0x6010 probe type FTDI\n",
+            "FTDI 0x0403:0x6010 probe type FTDI\n",
+            "noise without hex id probe\n",
+        );
+        let probes = parse_scan_usb_output(raw);
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert!(probes[0].detail.contains("0x0403"));
+        assert_eq!(probes[0].source, UsbProbeSource::OpenFpgaLoader);
+        assert!(parse_scan_usb_output("Usage: openFPGALoader [options]\n").is_empty());
+    }
+
 
 }
