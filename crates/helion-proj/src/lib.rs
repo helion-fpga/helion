@@ -7,7 +7,7 @@ use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{create_clock, load_xdc, report_timing_routed, Constraints};
-use helion_hw::prog_sim;
+use helion_hw::{prog_sim, resolve_cable, CableBackend, program_hbits_with_cable};
 use helion_debug::insert_ila;
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
@@ -446,10 +446,15 @@ impl Session {
         self.hw_open = true;
     }
 
+    /// Program last bitstream. `cable` is `auto|sim|usb|ofl` (default `auto`).
     pub fn program_hw(&mut self, dev: &Device) -> Result<String, String> {
+        self.program_hw_cable(dev, "auto")
+    }
+
+    pub fn program_hw_cable(&mut self, dev: &Device, cable: &str) -> Result<String, String> {
         if !self.hw_open {
             return Err(
-                "program_hw: no cable — open_hw_manager first (sim cable; no USB HAD yet)".into(),
+                "program_hw: no cable — open_hw_manager first (sim or openFPGALoader USB)".into(),
             );
         }
         let bits = self.bitstream.as_ref().ok_or_else(|| {
@@ -457,19 +462,40 @@ impl Session {
                 "program_hw: no bitstream — run write_bitstream / Implement, or `helion bitstream -o out.hbits`",
             )
         })?;
-        let frames = bits.frames.len();
-        let bytes = bits.packets.len();
-        let st = prog_sim(dev, bits)?;
-        self.programmed = true;
-        Ok(format!(
-            "program_hw cable=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={}",
-            dev.part,
-            frames,
-            bytes,
-            st.done as u8,
-            st.gwe as u8,
-            st.crc_err as u8
-        ))
+        let info = resolve_cable(cable)?;
+        match info.backend {
+            CableBackend::Sim => {
+                let frames = bits.frames.len();
+                let bytes = bits.packets.len();
+                let st = prog_sim(dev, bits)?;
+                self.programmed = true;
+                Ok(format!(
+                    "program_hw cable={} backend=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={}",
+                    info.id,
+                    dev.part,
+                    frames,
+                    bytes,
+                    st.done as u8,
+                    st.gwe as u8,
+                    st.crc_err as u8
+                ))
+            }
+            CableBackend::OpenFpgaLoader => {
+                // Persist packets to a temp .hbits so OFL (or dry-run) can consume a path.
+                let dir = std::env::temp_dir().join("helion-prog-hw");
+                std::fs::create_dir_all(&dir).map_err(|e| format!("program_hw: temp dir: {e}"))?;
+                let path = dir.join(format!("{}.hbits", dev.part));
+                std::fs::write(&path, &bits.packets)
+                    .map_err(|e| format!("program_hw: write {}: {e}", path.display()))?;
+                let outcome = program_hbits_with_cable(dev, &path, &info, false)?;
+                self.programmed = true;
+                Ok(format!(
+                    "program_hw cable={} {}",
+                    info.id,
+                    outcome.summary_line("program", &dev.part)
+                ))
+            }
+        }
     }
 
     pub fn mark_debug(&mut self, net: &str) -> Result<(), String> {
