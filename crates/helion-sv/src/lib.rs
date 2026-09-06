@@ -3899,6 +3899,31 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         n_mac,
         n_bram
     );
+    // FM-HEL-TOP: O(1) keep/mark_debug lookup. Prior per-bit scan of all
+    // signals*width allocated bit_name strings (Ibex: ~2.3k regs x 1.2k sigs)
+    // and dominated synth_rtl (~4.6s of ~5.3s under debug caps path).
+    let mut keep_bits: HashSet<String> = HashSet::new();
+    let mut md_bits: HashSet<String> = HashSet::new();
+    for s in &rtl.signals {
+        if !(s.keep || s.mark_debug) {
+            continue;
+        }
+        if s.keep {
+            keep_bits.insert(s.name.clone());
+        }
+        if s.mark_debug {
+            md_bits.insert(s.name.clone());
+        }
+        for b in 0..s.width {
+            let bn = bit_name(&s.name, s.width, b);
+            if s.keep {
+                keep_bits.insert(bn.clone());
+            }
+            if s.mark_debug {
+                md_bits.insert(bn);
+            }
+        }
+    }
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
@@ -3939,15 +3964,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         for (pin, pi) in aig.pis.iter().enumerate() {
             d.connect(pi, &lut, format!("I{pin}"));
         }
-        for s in &rtl.signals {
-            let matches_sig = (0..s.width).any(|b| bit_name(&s.name, s.width, b) == *bitn)
-                || s.name == *bitn;
-            if matches_sig && s.keep {
-                let _ = d.dont_touch(&ff);
-            }
-            if matches_sig && s.mark_debug {
-                let _ = d.mark_debug(&qnet);
-            }
+        if keep_bits.contains(bitn) {
+            let _ = d.dont_touch(&ff);
+        }
+        if md_bits.contains(bitn) {
+            let _ = d.mark_debug(&qnet);
         }
     }
 
@@ -4331,8 +4352,15 @@ fn record_instances_vis(
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
+    let t_parse = std::time::Instant::now();
     let pre = preprocess_sv(&strip_comments(source));
     let mods = parse_source(&pre)?;
+    eprintln!(
+        "hang_diag parse mods={} bytes={} ms={}",
+        mods.len(),
+        source.len(),
+        t_parse.elapsed().as_millis()
+    );
     let stem = Path::new(origin)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -4429,13 +4457,22 @@ pub fn elaborate_sv_sources(
     if files.is_empty() {
         return Err("no sources".into());
     }
+    let t_parse = std::time::Instant::now();
     let mut all = String::new();
     for (origin, src) in files {
         let _ = (origin, opts);
         all.push_str(src);
         all.push('\n');
     }
-    let d = synth_from_parsed_top(parse_source(&all)?, top, params)?;
+    let mods = parse_source(&all)?;
+    eprintln!(
+        "hang_diag parse mods={} bytes={} files={} ms={}",
+        mods.len(),
+        all.len(),
+        files.len(),
+        t_parse.elapsed().as_millis()
+    );
+    let d = synth_from_parsed_top(mods, top, params)?;
     let report = elab_report(&d);
     Ok((d, report))
 }
@@ -4446,6 +4483,7 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     if files.is_empty() {
         return Err("no sources".into());
     }
+    let t_parse = std::time::Instant::now();
     let mut all = String::new();
     for (origin, src) in files {
         let _ = origin;
@@ -4453,7 +4491,15 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
         all.push_str("
 ");
     }
-    synth_from_parsed(parse_source(&all)?)
+    let mods = parse_source(&all)?;
+    eprintln!(
+        "hang_diag parse mods={} bytes={} files={} ms={}",
+        mods.len(),
+        all.len(),
+        files.len(),
+        t_parse.elapsed().as_millis()
+    );
+    synth_from_parsed(mods)
 }
 
 pub fn synth_sv_files(paths: &[&Path]) -> Result<Design, String> {

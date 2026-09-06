@@ -74,7 +74,9 @@ fn compile_design_xdc(
     xdc: &Constraints,
 ) -> Result<Compiled, String> {
     apply_xdc(&mut design, xdc)?;
+    let t_dev = std::time::Instant::now();
     let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
+    eprintln!("hang_diag device part={} ms={}", part, t_dev.elapsed().as_millis());
     let t0 = std::time::Instant::now();
     let mut packed = pack(&design, &dev)?;
     let iob_budget = dev.iob_sites().count();
@@ -145,10 +147,12 @@ fn compile_design_xdc(
         create_clock(&mut clks, "clk", 10_000, "clk");
     }
     // Empty / clock-only XDC keeps gold WNS (9640 on counter @ 10 ns).
+    let t4 = std::time::Instant::now();
     let timing = report_timing_routed_xdc(&design, &routed, &clks, xdc)?;
     eprintln!(
-        "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+        "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
+        timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps,
+        t4.elapsed().as_millis()
     );
     Ok(Compiled {
         dev,
