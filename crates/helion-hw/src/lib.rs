@@ -7,7 +7,8 @@
 //!
 //! Optional **`usb-native`** feature enables [`rusb`] FTDI (VID 0x0403) enumeration
 //! via [`native_usb`] and a real **MPSSE opcode path** via [`native_mpsse`]
-//! ([`NativeFtdiMpsse`]: open device when present, encode IR/DR for CFG_W/STAT).
+//! ([`NativeFtdiMpsse`]: open device when present, encode IR/DR for CFG_W/STAT,
+//! INOUT STAT TDO capture + [`parse_stat_tdo_mpsse`]; mock roundtrip tested).
 //! Without a device, native returns honest `Io` (never invents STAT). Without the
 //! feature, [`NativeFtdiMpsse`] / stub return `NotImplemented` → OFL fallback.
 //! [`mpsse_sim`] remains the in-process bitbang CFG_W+STAT harness (sim fabric DONE

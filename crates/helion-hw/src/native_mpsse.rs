@@ -254,8 +254,31 @@ impl MpsseOpcodeBuilder {
         self
     }
 
-    /// Encode Helion `IR_STAT` then 32-bit DR scan (STAT readback request).
+    /// Encode a 32-bit DR shift with TDO capture (INOUT opcodes).
+    ///
+    /// Layout matches [`parse_stat_tdo_mpsse`]: 3 byte-INOUT + 7-bit INOUT +
+    /// 1-bit TMS-INOUT → [`STAT_CAPTURE_TDO_LEN`] USB read bytes. Out-only
+    /// Update→Idle follows (no extra TDO).
+    pub fn helion_shift_dr_u32_capture(&mut self, val: u32) -> &mut Self {
+        self.tms_out(0x01, 3, false); // → Shift-DR
+        self.set_low_byte(0x00, JTAG_DIR_LOW); // TMS=0
+        let bytes = val.to_le_bytes();
+        self.tdi_bytes_inout(&bytes[..3]); // 24 bits → 3 TDO bytes
+        self.tdi_bits_inout(bytes[3] & 0x7f, 7); // bits 24..30 → 1 TDO byte
+        let tdi_last = (bytes[3] & 0x80) != 0;
+        self.tms_inout(0x01, 1, tdi_last); // bit 31 + Exit1-DR → 1 TDO byte
+        self.tms_out(0x01, 2, false); // Update → Idle (out-only)
+        self
+    }
+
+    /// Encode Helion `IR_STAT` then 32-bit DR scan **with TDO capture**.
     pub fn helion_read_stat(&mut self) -> &mut Self {
+        self.helion_shift_ir(IR_STAT);
+        self.helion_shift_dr_u32_capture(0)
+    }
+
+    /// Out-only STAT request (no TDO expected) — for encode/smoke without capture.
+    pub fn helion_read_stat_out_only(&mut self) -> &mut Self {
         self.helion_shift_ir(IR_STAT);
         self.helion_shift_dr_u32(0)
     }
@@ -301,6 +324,65 @@ impl MpsseOpcodeBuilder {
     }
 }
 
+/// Expected bulk-IN byte count for [`MpsseOpcodeBuilder::helion_shift_dr_u32_capture`].
+pub const STAT_CAPTURE_TDO_LEN: usize = 5; // 3 bytes + 7-bit + 1-bit TMS
+
+/// Pack a Helion STAT word into the MPSSE TDO response layout (mock / unit tests).
+///
+/// Mirrors FTDI AN_108 bit-mode packing: clocked bits land MSB-first in each
+/// returned byte (first TDO bit → bit7). Byte clocks are LSB-first LE bytes.
+pub fn pack_mock_stat_tdo(word: u32) -> [u8; STAT_CAPTURE_TDO_LEN] {
+    let le = word.to_le_bytes();
+    let mut out = [0u8; STAT_CAPTURE_TDO_LEN];
+    out[0] = le[0];
+    out[1] = le[1];
+    out[2] = le[2];
+    // bits 24..30 → one response byte, first bit in bit7
+    let mut b7 = 0u8;
+    for i in 0..7 {
+        if (word >> (24 + i)) & 1 != 0 {
+            b7 |= 1 << (7 - i);
+        }
+    }
+    out[3] = b7;
+    // bit 31 → TMS-INOUT response, first (only) bit in bit7
+    out[4] = if (word >> 31) & 1 != 0 { 0x80 } else { 0x00 };
+    out
+}
+
+/// Parse Helion STAT `u32` from MPSSE bulk-IN bytes produced by a capture DR.
+///
+/// Returns `Err` on short/empty buffers — **never** invents STARTUP_WORD / DONE.
+pub fn parse_stat_tdo_mpsse(tdo: &[u8]) -> Result<u32, String> {
+    if tdo.len() < STAT_CAPTURE_TDO_LEN {
+        return Err(format!(
+            "STAT TDO short: got {} byte(s), need {STAT_CAPTURE_TDO_LEN} (refusing invented STAT)",
+            tdo.len()
+        ));
+    }
+    let b0 = tdo[0];
+    let b1 = tdo[1];
+    let b2 = tdo[2];
+    let mut word = u32::from(b0) | (u32::from(b1) << 8) | (u32::from(b2) << 16);
+    // 7-bit response: bit7 = TDO bit24 … bit1 = TDO bit30
+    let bits7 = tdo[3];
+    for i in 0..7 {
+        if (bits7 >> (7 - i)) & 1 != 0 {
+            word |= 1u32 << (24 + i);
+        }
+    }
+    // 1-bit TMS response: bit7 = TDO bit31
+    if (tdo[4] >> 7) & 1 != 0 {
+        word |= 1u32 << 31;
+    }
+    Ok(word)
+}
+
+/// True when Helion STAT bit5 (DONE) is set — does not invent the word.
+pub fn stat_word_done(word: u32) -> bool {
+    (word >> helion_fabric::Stat::BIT_DONE) & 1 != 0
+}
+
 /// Native FTDI MPSSE transport (real USB when `usb-native` + device present).
 #[derive(Debug, Default)]
 pub struct NativeFtdiMpsse {
@@ -331,7 +413,9 @@ impl NativeFtdiMpsse {
         b.init_clock(0x0002);
         b.jtag_reset_to_idle();
         b.helion_cfg_w_packets(packets);
-        b.helion_read_stat();
+        // Trailing STAT in the bulk-OUT stream stays out-only; live DONE needs a
+        // separate INOUT capture via encode_read_stat + parse_stat_tdo_mpsse.
+        b.helion_read_stat_out_only();
         b.send_immediate();
         b.into_bytes()
     }
@@ -387,19 +471,33 @@ impl HadUsbTransport for NativeFtdiMpsse {
         let opcodes = Self::encode_cfg_w_and_stat(&bytes);
         #[cfg(feature = "usb-native")]
         {
+            // CFG_W+STAT encode still includes out-oriented CFG; follow with a
+            // dedicated capture STAT INOUT xfer and only Ok(()) on DONE=1 TDO.
+            let stat_ops = Self::encode_read_stat();
             xfer_mpsse_out_only(&opcodes)?;
-            // Honest refusal: we shifted CFG_W opcodes but cannot claim Helion
-            // STAT DONE without a validated TDO capture path against a live TAP.
-            return Err(NativeUsbError::Io(format!(
-                "native MPSSE: wrote {} opcode bytes to FTDI vid={:#06x} pid={:#06x} ({}); \
-                 Helion TAP STAT readback not yet validated on this probe — refusing DONE \
-                 (no invented STAT). Use --cable mpsse-sim for sim fabric STAT, or OFL for \
-                 programmer-ok without TAP_readback",
-                opcodes.len(),
-                self.opened_vid.unwrap_or(0),
-                self.opened_pid.unwrap_or(0),
-                self.opened_detail
-            )));
+            match xfer_mpsse_inout(&stat_ops, STAT_CAPTURE_TDO_LEN) {
+                Ok(tdo) => match parse_stat_tdo_mpsse(&tdo) {
+                    Ok(word) if stat_word_done(word) => Ok(()),
+                    Ok(word) => Err(NativeUsbError::Io(format!(
+                        "native MPSSE: STAT TDO parsed {word:#010x} but DONE=0                          (vid={:#06x} pid={:#06x} {}); refusing DONE",
+                        self.opened_vid.unwrap_or(0),
+                        self.opened_pid.unwrap_or(0),
+                        self.opened_detail
+                    ))),
+                    Err(e) => Err(NativeUsbError::Io(format!(
+                        "native MPSSE: CFG_W opcodes sent; STAT TDO parse failed: {e}                          (vid={:#06x} pid={:#06x}) — refusing invented DONE",
+                        self.opened_vid.unwrap_or(0),
+                        self.opened_pid.unwrap_or(0)
+                    ))),
+                },
+                Err(e) => Err(NativeUsbError::Io(format!(
+                    "native MPSSE: wrote {} opcode bytes to FTDI vid={:#06x} pid={:#06x} ({});                      STAT TDO bulk-IN failed ({e}) — refusing DONE (no invented STAT).                      Use --cable mpsse-sim for sim fabric STAT, or OFL for programmer-ok                      without TAP_readback",
+                    opcodes.len(),
+                    self.opened_vid.unwrap_or(0),
+                    self.opened_pid.unwrap_or(0),
+                    self.opened_detail
+                ))),
+            }
         }
         #[cfg(not(feature = "usb-native"))]
         {
@@ -415,15 +513,20 @@ impl HadUsbTransport for NativeFtdiMpsse {
         let opcodes = Self::encode_read_stat();
         #[cfg(feature = "usb-native")]
         {
-            xfer_mpsse_out_only(&opcodes)?;
-            // Do not invent a STAT word from empty/partial TDO.
-            return Err(NativeUsbError::Io(format!(
-                "native MPSSE: STAT opcode stream ({} bytes) issued to FTDI, but Helion \
-                 TAP TDO capture/parse is not validated — returning no STAT (refusing \
-                 invented DONE). Probe: {}",
-                opcodes.len(),
-                self.opened_detail
-            )));
+            match xfer_mpsse_inout(&opcodes, STAT_CAPTURE_TDO_LEN) {
+                Ok(tdo) => match parse_stat_tdo_mpsse(&tdo) {
+                    Ok(word) => Ok(Some(word)),
+                    Err(e) => Err(NativeUsbError::Io(format!(
+                        "native MPSSE: STAT TDO parse failed after IN ({e}); probe: {}                          — no invented STAT",
+                        self.opened_detail
+                    ))),
+                },
+                Err(e) => Err(NativeUsbError::Io(format!(
+                    "native MPSSE: STAT capture stream ({} bytes) issued but TDO bulk-IN                      failed ({e}); probe: {} — returning no STAT (refusing invented DONE)",
+                    opcodes.len(),
+                    self.opened_detail
+                ))),
+            }
         }
         #[cfg(not(feature = "usb-native"))]
         {
@@ -587,6 +690,51 @@ fn xfer_mpsse_out_only(opcodes: &[u8]) -> Result<(), NativeUsbError> {
     ))
 }
 
+/// MPSSE bulk OUT then bulk IN of `read_len` bytes (STAT TDO capture).
+/// Never synthesizes TDO — short/failed reads are Io errors.
+#[cfg(feature = "usb-native")]
+fn xfer_mpsse_inout(opcodes: &[u8], read_len: usize) -> Result<Vec<u8>, NativeUsbError> {
+    if read_len == 0 {
+        return Err(NativeUsbError::Io(
+            "xfer_mpsse_inout: read_len=0 (refusing empty TDO as STAT)".into(),
+        ));
+    }
+    let scan = enumerate_ftdi();
+    let target = scan.probes.first().ok_or_else(|| {
+        NativeUsbError::Io("FTDI disappeared before MPSSE INOUT xfer".into())
+    })?;
+    let devices = rusb::devices().map_err(|e| NativeUsbError::Io(format!("rusb: {e}")))?;
+    for dev in devices.iter() {
+        if dev.bus_number() != target.bus || dev.address() != target.address {
+            continue;
+        }
+        let mut handle = dev
+            .open()
+            .map_err(|e| NativeUsbError::Io(format!("open for INOUT: {e}")))?;
+        let _ = handle.claim_interface(0);
+        let _ = ftdi_set_bitmode(&mut handle, 0x0b, BITMODE_MPSSE);
+        let timeout = std::time::Duration::from_millis(1000);
+        handle
+            .write_bulk(0x02, opcodes, timeout)
+            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk OUT: {e}")))?;
+        let mut buf = vec![0u8; read_len];
+        // FT2232H channel A bulk IN is typically 0x81.
+        let n = handle
+            .read_bulk(0x81, &mut buf, timeout)
+            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk IN: {e}")))?;
+        if n < read_len {
+            return Err(NativeUsbError::Io(format!(
+                "MPSSE bulk IN short read: {n}/{read_len} (no invented STAT)"
+            )));
+        }
+        buf.truncate(read_len);
+        return Ok(buf);
+    }
+    Err(NativeUsbError::Io(
+        "FTDI device not found for MPSSE bulk INOUT".into(),
+    ))
+}
+
 /// Try native FTDI MPSSE program. Feature-off → NotImplemented; no device → Io.
 pub fn try_native_mpsse_program(path: &Path, flash: bool) -> Result<(), NativeUsbError> {
     let mut t = NativeFtdiMpsse::new();
@@ -600,12 +748,12 @@ pub fn native_mpsse_status_note() -> String {
         let scan = enumerate_ftdi();
         if scan.probes.is_empty() {
             format!(
-                "native_mpsse: usb-native ON; 0 FTDI devices — open/program → Io (no invented STAT); OFL TAP_readback=none; mpsse-sim=sim fabric only. {}",
+                "native_mpsse: usb-native ON; 0 FTDI devices — open/program → Io (no invented STAT); STAT TDO decode mock-tested; OFL TAP_readback=none; mpsse-sim=sim fabric only. {}",
                 scan.note
             )
         } else {
             format!(
-                "native_mpsse: usb-native ON; {} FTDI probe(s) listed — MPSSE open path available; STAT DONE only after validated TDO readback (not yet claimed). {}",
+                "native_mpsse: usb-native ON; {} FTDI probe(s) listed — MPSSE open+INOUT STAT TDO parse wired; DONE only if live TDO parses with bit5=1. {}",
                 scan.probes.len(),
                 scan.note
             )
@@ -708,5 +856,47 @@ mod tests {
         b.helion_shift_ir(IR_CFG_W);
         let ops = b.into_bytes();
         assert!(ops.contains(&MPSSE_CLK_TMS_OUT_NEG_LSB));
+    }
+
+    #[test]
+    fn encode_read_stat_uses_inout_capture_opcodes() {
+        let ops = NativeFtdiMpsse::encode_read_stat();
+        assert!(
+            ops.contains(&MPSSE_CLK_BYTES_INOUT_LSB) || ops.contains(&MPSSE_CLK_BITS_INOUT_LSB),
+            "STAT capture must request TDO via INOUT"
+        );
+        assert!(ops.contains(&MPSSE_CLK_TMS_INOUT_LSB), "last DR bit via TMS INOUT");
+        assert_eq!(STAT_CAPTURE_TDO_LEN, 5);
+    }
+
+    #[test]
+    fn mock_stat_tdo_roundtrip_startup_and_reset() {
+        for word in [
+            helion_fabric::Stat::STARTUP_WORD,
+            helion_fabric::Stat::RESET_WORD,
+            0u32,
+            0xA5A5_5A5A,
+            0xFFFF_FFFF,
+        ] {
+            let packed = pack_mock_stat_tdo(word);
+            let parsed = parse_stat_tdo_mpsse(&packed).expect("parse");
+            assert_eq!(parsed, word, "roundtrip {word:#010x}");
+        }
+        let startup = pack_mock_stat_tdo(helion_fabric::Stat::STARTUP_WORD);
+        let w = parse_stat_tdo_mpsse(&startup).unwrap();
+        assert!(stat_word_done(w), "STARTUP_WORD must set DONE bit5");
+        assert_eq!(w, helion_fabric::Stat::STARTUP_WORD);
+
+        let reset = pack_mock_stat_tdo(helion_fabric::Stat::RESET_WORD);
+        let r = parse_stat_tdo_mpsse(&reset).unwrap();
+        assert!(!stat_word_done(r), "RESET_WORD must not set DONE");
+    }
+
+    #[test]
+    fn parse_stat_tdo_refuses_short_buffer() {
+        let err = parse_stat_tdo_mpsse(&[0, 1, 2]).unwrap_err();
+        assert!(err.contains("short") || err.contains("refusing"), "{err}");
+        let err0 = parse_stat_tdo_mpsse(&[]).unwrap_err();
+        assert!(err0.contains("refusing") || err0.contains("short"), "{err0}");
     }
 }
