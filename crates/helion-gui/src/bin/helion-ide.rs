@@ -6,6 +6,10 @@
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::chrome::{self, Activity, Canvas, RAIL_OPEN_SOURCES};
+use helion_gui::surface::{
+    self, apply_activity, apply_canvas, apply_more, central_pane, spawn_job, ChromeState,
+    EventClass, JobHandle, JobKind, UiEvent, UiTrace,
+};
 use helion_gui::{
     doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
@@ -229,6 +233,10 @@ struct HelionIde {
     shot_done: bool,
     /// Cached USB/OFL scan — detect_boards shells openFPGALoader; never call it every frame.
     board_detect: Option<helion_hw::DetectReport>,
+    trace: UiTrace,
+    job: Option<JobHandle>,
+    busy: bool,
+    progress: String,
 }
 
 impl HelionIde {
@@ -265,6 +273,10 @@ impl HelionIde {
             shot_frames: 0,
             shot_done: false,
             board_detect: None,
+            trace: UiTrace::from_env(),
+            job: None,
+            busy: false,
+            progress: String::new(),
         };
         if let Ok(w) = std::env::var("HELION_SIDEBAR_WIDTH") {
             if let Ok(v) = w.parse::<f32>() {
@@ -311,50 +323,117 @@ impl HelionIde {
         app
     }
 
-    fn set_canvas(&mut self, c: Canvas) {
-        self.canvas = c;
-        match c {
-            Canvas::Editor => self.model.workspace = WorkspaceTab::TextEditor,
-            Canvas::Device => self.model.workspace = WorkspaceTab::Device,
-            Canvas::Timing => {
-                // Timing canvas is WNS + paths. Never open the Reports catalog here.
-                if self.activity == Activity::Reports
-                    && chrome::is_report_detail(self.model.workspace)
-                {
-                    // Keep the selected report-detail More view under Reports.
-                } else {
-                    self.model.workspace = WorkspaceTab::Reports;
-                }
-            }
+    fn snapshot(&self) -> ChromeState {
+        ChromeState {
+            activity: self.activity,
+            canvas: self.canvas,
+            workspace: self.model.workspace,
+            sidebar_hidden: self.sidebar_hidden,
+            sidebar_width: self.sidebar_width,
+            console_height: self.console_height,
         }
     }
 
+    fn restore(&mut self, s: ChromeState) {
+        self.activity = s.activity;
+        self.canvas = s.canvas;
+        self.model.workspace = s.workspace;
+        self.sidebar_hidden = s.sidebar_hidden;
+        self.sidebar_width = s.sidebar_width;
+        self.console_height = s.console_height;
+    }
+
+    fn log_click(&mut self, widget: &str, expected: &str) {
+        let actual = format!("{:?}", central_pane(&self.snapshot()));
+        let class = if actual == expected || actual.contains(expected) {
+            EventClass::Ok
+        } else {
+            EventClass::StatePaint
+        };
+        self.trace.push(UiEvent {
+            at_ms: 0,
+            kind: "click",
+            widget: widget.into(),
+            expected: expected.into(),
+            actual,
+            class,
+        });
+    }
+
+    fn set_canvas(&mut self, c: Canvas) {
+        let mut s = self.snapshot();
+        apply_canvas(&mut s, c);
+        self.restore(s);
+        self.log_click(c.label(), &format!("{:?}", match c {
+            Canvas::Editor => WorkspacePane::Editor,
+            Canvas::Device => WorkspacePane::Device,
+            Canvas::Timing => WorkspacePane::Timing,
+        }));
+    }
+
     fn set_activity(&mut self, a: Activity) {
-        self.activity = a;
-        self.sidebar_hidden = matches!(a, Activity::Timing | Activity::Simulate);
-        match a {
-            Activity::Files => {
-                self.model.layout = LayoutKind::Default;
-                self.set_canvas(Canvas::Editor);
-            }
-            Activity::Device => self.set_canvas(Canvas::Device),
-            Activity::Timing => {
-                self.canvas = Canvas::Timing;
-                self.model.workspace = WorkspaceTab::Reports;
-            }
-            Activity::Simulate => {
-                if !self.model.workspace.sim_only() {
-                    self.model.workspace = WorkspaceTab::Wave;
+        let mut s = self.snapshot();
+        apply_activity(&mut s, a);
+        self.restore(s);
+        if a == Activity::Files {
+            self.model.layout = LayoutKind::Default;
+        }
+        if a == Activity::Reports {
+            self.model.selected_report = None;
+        }
+        self.log_click(a.label(), a.label());
+    }
+
+    fn submit_job(&mut self, kind: JobKind) {
+        if self.job.is_some() {
+            self.progress = "Busy — wait for the current run to finish.".into();
+            return;
+        }
+        self.busy = true;
+        self.progress = kind.progress_english();
+        self.trace.push(UiEvent {
+            at_ms: 0,
+            kind: "job",
+            widget: kind.widget().into(),
+            expected: "engine-thread".into(),
+            actual: "queued".into(),
+            class: EventClass::Ok,
+        });
+        let model = self.model.clone();
+        self.job = Some(spawn_job(model, kind));
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.job.as_ref() else {
+            return;
+        };
+        match job.try_recv() {
+            Ok(out) => {
+                self.model = out.model;
+                self.busy = false;
+                self.progress = match &out.result {
+                    Ok(s) if s.is_empty() => format!("{} finished.", out.kind.widget()),
+                    Ok(s) => s.clone(),
+                    Err(e) => e.clone(),
+                };
+                if matches!(out.kind, JobKind::Implement) && out.result.is_ok() {
+                    self.set_canvas(Canvas::Device);
                 }
-            }
-            Activity::Program => {}
-            Activity::Reports => {
-                self.canvas = Canvas::Timing;
-                if !chrome::is_report_detail(self.model.workspace) {
-                    self.model.workspace = WorkspaceTab::Reports;
+                if matches!(out.kind, JobKind::Open(_)) && out.result.is_ok() {
+                    self.set_activity(Activity::Files);
                 }
-                // Catalog-first: don't auto-open Timing Summary under Reports (void + twin).
-                self.model.selected_report = None;
+                if matches!(out.kind, JobKind::SimRun(_)) && out.result.is_ok() {
+                    self.set_activity(Activity::Simulate);
+                }
+                self.job = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.busy = false;
+                self.progress = "Engine thread stopped.".into();
+                self.job = None;
             }
         }
     }
@@ -373,13 +452,16 @@ impl HelionIde {
     }
 
     fn open_path(&mut self, path: &Path) {
+        self.remember(path.to_path_buf());
         match self.model.open_source(path) {
-            Ok(_) => {
-                self.remember(path.to_path_buf());
-                self.set_activity(Activity::Files);
-            }
+            Ok(_) => self.set_activity(Activity::Files),
             Err(_) => {}
         }
+    }
+
+    fn open_path_async(&mut self, path: &Path) {
+        self.remember(path.to_path_buf());
+        self.submit_job(JobKind::Open(path.to_path_buf()));
     }
 }
 
@@ -388,6 +470,10 @@ impl eframe::App for HelionIde {
     /// Synth/implement run on click (`run_step`), not a background paint loop.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         handle_shortcuts(ctx, self);
+        for kind in surface::take_jobs() {
+            self.submit_job(kind);
+        }
+        self.poll_job(ctx);
         paint_toolbar(ctx, self);
         let board_soft_hold = self.activity == Activity::Program
             && self
@@ -395,7 +481,14 @@ impl eframe::App for HelionIde {
                 .as_ref()
                 .map(|d| !d.physical_had)
                 .unwrap_or(true);
-        paint_status_bar(ctx, self.activity, self.canvas, &self.model, board_soft_hold);
+        paint_status_bar(
+            ctx,
+            self.activity,
+            self.canvas,
+            &self.model,
+            board_soft_hold,
+            &self.progress,
+        );
         paint_bottom(ctx, self);
         paint_activity_rail(ctx, self);
         if !self.sidebar_hidden {
@@ -408,7 +501,35 @@ impl eframe::App for HelionIde {
         paint_palette(ctx, self);
         paint_examples_popup(ctx, self);
         capture_shot(ctx, self);
+        paint_debug_overlay(ctx, self);
     }
+}
+
+fn paint_debug_overlay(ctx: &egui::Context, app: &HelionIde) {
+    if std::env::var("HELION_DEBUG_OVERLAY").ok().as_deref() != Some("1") {
+        return;
+    }
+    ctx.set_debug_on_hover(true);
+    let s = app.snapshot();
+    let pane = central_pane(&s);
+    egui::Window::new("surface debug")
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, 48.0])
+        .resizable(false)
+        .collapsible(true)
+        .show(ctx, |ui| {
+            ui.monospace(format!(
+                "rail={} sidebar={:.0} console={:.0}\nactivity={:?}\ncanvas={:?}\nworkspace={:?}\npane={:?}\nbusy={} {}",
+                chrome::RAIL_WIDTH,
+                s.sidebar_width,
+                s.console_height,
+                s.activity,
+                s.canvas,
+                s.workspace,
+                pane,
+                app.busy,
+                app.progress
+            ));
+        });
 }
 
 fn capture_shot(ctx: &egui::Context, app: &mut HelionIde) {
@@ -501,7 +622,7 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn native_open(app: &mut HelionIde) {
     if let Some(path) = native_open_dialog() {
-        app.open_path(&path);
+        app.open_path_async(&path);
     }
 }
 
@@ -513,9 +634,7 @@ fn run_implement(app: &mut HelionIde) {
     if app.model.step_blocked(FlowStep::Synthesis).is_some() {
         return;
     }
-    if app.model.implement().is_ok() {
-        app.set_canvas(Canvas::Device);
-    }
+    app.submit_job(JobKind::Implement);
 }
 
 
@@ -581,7 +700,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                                 .map(|s| s.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| p.display().to_string());
                             if ui.button(name).clicked() {
-                                app.open_path(&p);
+                                app.open_path_async(&p);
                                 ui.close();
                             }
                         }
@@ -597,22 +716,25 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     }
                     if let Some(file) = pick {
                         let p = helion_device::Device::examples_dir().join(file);
-                        app.open_path(&p);
+                        app.open_path_async(&p);
                     }
                 });
                 ui.separator();
-                paint_progress_strip(ui, &mut app.model);
+                paint_progress_strip(ui, app);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     let synth_blocked = app.model.step_blocked(FlowStep::Synthesis);
+                    let busy = app.busy;
                     ui.add_enabled_ui(synth_blocked.is_none(), |ui| {
+                        let impl_label = if busy { "Implementing…" } else { "Implement" };
                         let impl_btn = ui
                             .add_sized(
                                 [120.0, chrome::HIT_COMFORT],
-                                egui::Button::new(RichText::new("Implement").strong()),
+                                egui::Button::new(RichText::new(impl_label).strong()),
                             )
                             .on_hover_text(match synth_blocked {
                                 Some(why) => why.to_string(),
+                                None if busy => "Busy — wait for the current run.".into(),
                                 None => tip("Implement", "⌘↩", "impl_design"),
                             });
                         if impl_btn.clicked() {
@@ -631,7 +753,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                                 None => tip("Bitstream", "", "write_bitstream"),
                             });
                         if b.clicked() {
-                            let _ = app.model.run_step(FlowStep::Bitstream);
+                            app.submit_job(JobKind::Step(FlowStep::Bitstream));
                         }
                     });
                 });
@@ -639,7 +761,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
         });
 }
 
-fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
     const STEPS: [FlowStep; 4] = [
         FlowStep::Synthesis,
         FlowStep::Opt,
@@ -650,8 +772,8 @@ fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.spacing_mut().item_spacing.x = 4.0;
         let n = STEPS.len();
         for (i, step) in STEPS.iter().copied().enumerate() {
-            let state = model.step_state(step);
-            let blocked = model.step_blocked(step);
+            let state = app.model.step_state(step);
+            let blocked = app.model.step_blocked(step);
             let (fill, stroke, text) = match state {
                 StepState::Pending => (
                     Color32::from_rgb(0x2b, 0x32, 0x3a),
@@ -694,7 +816,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
                 };
                 let resp = resp.on_hover_text(hover);
                 if resp.clicked() && blocked.is_none() {
-                    let _ = model.run_step(step);
+                    app.submit_job(JobKind::Step(step));
                 }
             });
             if i + 1 < n {
@@ -902,7 +1024,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
             .on_hover_text(tip("Bitstream", "", "write_bitstream"))
             .clicked()
         {
-            let _ = app.model.run_step(FlowStep::Bitstream);
+            app.submit_job(JobKind::Step(FlowStep::Bitstream));
         }
     }
     ui.add_space(6.0);
@@ -1076,7 +1198,7 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
     if rows.is_empty() {
         ui.label("No netlist yet.");
         if primary_button(ui, "Implement").clicked() {
-            let _ = app.model.implement();
+            app.submit_job(JobKind::Implement);
         }
         return;
     }
@@ -1111,6 +1233,7 @@ fn paint_status_bar(
     canvas: Canvas,
     model: &IdeModel,
     board_soft_hold: bool,
+    progress: &str,
 ) {
     egui::TopBottomPanel::bottom("status")
         .exact_height(chrome::STATUS_HEIGHT)
@@ -1149,15 +1272,21 @@ fn paint_status_bar(
                 } else {
                     ""
                 };
+                let progress_bit = if progress.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {progress}")
+                };
                 ui.label(
                     RichText::new(format!(
-                        "{} · {} · WNS {} · LUTFF {} · {}{}",
+                        "{} · {} · WNS {} · LUTFF {} · {}{}{}",
                         crumb,
                         model.part(),
                         wns,
                         lutff,
                         run,
-                        board_crumb
+                        board_crumb,
+                        progress_bit
                     ))
                     .monospace()
                     .size(12.0)
@@ -1355,7 +1484,7 @@ fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
     app.show_examples = open;
     if let Some(file) = pick {
         let p = helion_device::Device::examples_dir().join(file);
-        app.open_path(&p);
+        app.open_path_async(&p);
         app.show_examples = false;
     }
 }
@@ -1496,38 +1625,17 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
-    app.model.workspace = tab;
-    app.sidebar_hidden = tab.sim_only() || matches!(tab, WorkspaceTab::Wave);
-    if tab.sim_only() {
-        app.activity = Activity::Simulate;
-        return;
-    }
-    if chrome::is_report_detail(tab) {
-        app.activity = Activity::Reports;
-        app.canvas = Canvas::Timing;
-        app.sidebar_hidden = false;
-        return;
-    }
-    match pane_for_workspace(tab) {
-        WorkspacePane::Package => {
-            app.activity = Activity::Device;
-            app.canvas = Canvas::Device;
-            app.sidebar_hidden = false;
-        }
-        WorkspacePane::Hardware | WorkspacePane::Bitstream => {
-            app.activity = Activity::Program;
-            app.sidebar_hidden = false;
-        }
-        WorkspacePane::ReportsCatalog => {
-            app.activity = Activity::Reports;
-            app.canvas = Canvas::Timing;
-            app.sidebar_hidden = false;
-        }
-        _ => {
-            app.activity = Activity::Files;
-            app.sidebar_hidden = false;
-        }
-    }
+    let mut s = app.snapshot();
+    apply_more(&mut s, tab);
+    app.restore(s);
+    let pane = central_pane(&app.snapshot());
+    let expected = pane_for_workspace(tab);
+    app.log_click(tab.label(), &format!("{expected:?}"));
+    debug_assert_eq!(
+        pane, expected,
+        "More {} updated workspace but painted {pane:?}",
+        tab.label()
+    );
 }
 
 /// More ⋯ destinations fill the central pane with their real UI — never Timing-only, never a stub heading.
@@ -1657,7 +1765,7 @@ fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel) {
             ui.horizontal(|ui| {
                 let n = model.sim_runtime_cycles.max(1);
                 if ui.button(format!("Run {n}")).clicked() {
-                    let _ = model.exec("run_simulation");
+                    surface::request_job(JobKind::SimRun(n));
                 }
                 if ui.button("Step").clicked() {
                     let _ = model.sim_step();
@@ -5270,7 +5378,7 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Memory");
     ui.horizontal(|ui| {
         if ui.button("Run 16").clicked() {
-            let _ = model.sim_run(16);
+            surface::request_job(JobKind::SimRun(16));
         }
         if ui.button("Step").clicked() {
             let _ = model.sim_step();
@@ -5370,7 +5478,7 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.add_breakpoint("led");
         }
         if ui.button("Run 16").clicked() {
-            let _ = model.sim_run(16);
+            surface::request_job(JobKind::SimRun(16));
         }
         if ui.button("Disable").clicked() {
             let _ = model.set_breakpoint_enabled("", false);
@@ -5511,7 +5619,7 @@ fn paint_locals(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Locals");
     ui.horizontal(|ui| {
         if ui.button("Run 16").clicked() {
-            let _ = model.sim_run(16);
+            surface::request_job(JobKind::SimRun(16));
         }
         if ui.button("Step").clicked() {
             let _ = model.sim_step();
@@ -5618,7 +5726,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
     if model.wave.traces.is_empty() {
         ui.label("No waveform yet.");
         if primary_button(ui, "Run Simulation").clicked() {
-            let _ = model.exec("sim_run");
+            surface::request_job(JobKind::SimRun(model.sim_runtime_cycles.max(1)));
         }
         // Own the Wave pane — no thick empty black slab beside scopes.
         let fill = ui.available_size().max(egui::vec2(120.0, 160.0));
