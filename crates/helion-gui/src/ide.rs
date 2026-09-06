@@ -17226,6 +17226,36 @@ impl IdeModel {
         }
     }
 
+    /// Status-bar / Messages crumb: mark_debug nets + last ILA capture (no layout).
+    pub fn ila_status_crumb(&self) -> String {
+        let md = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.marked_debug_nets())
+            .unwrap_or_default();
+        let md_part = if md.is_empty() {
+            String::new()
+        } else if md.len() <= 2 {
+            format!("md:{} ", md.join(","))
+        } else {
+            format!("md:{}(+{}) ", md[0], md.len() - 1)
+        };
+        if self.ila.armed {
+            let net = if self.ila.net.is_empty() {
+                "…"
+            } else {
+                self.ila.net.as_str()
+            };
+            return format!("{md_part}ILA arming {net}");
+        }
+        if !self.ila.bits.is_empty() {
+            return format!("{md_part}ILA {}×{}", self.ila.net, self.ila.bits.len());
+        }
+        format!("{md_part}ILA —")
+    }
+
     pub fn ila_arm(&mut self, spec: &str) -> Result<String, String> {
         let mut parts = spec.split_whitespace();
         let net = parts
@@ -22991,6 +23021,40 @@ mod tests {
             "cone drawing is a subset of the sheet ({}/{})",
             cone_cells.len(),
             cells.len()
+        );
+    }
+
+    /// Real flow: mark_debug → (re)implement → ila_arm on counter.sv (no bitstream-unchanged no-op).
+    #[test]
+    fn ila_status_crumb_surfaces_mark_debug_and_capture() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        let idle = ide.ila_status_crumb();
+        assert!(idle.contains("ILA"), "{idle}");
+        assert!(!idle.contains("×"), "no capture yet: {idle}");
+        ide.exec("mark_debug cnt_3").unwrap();
+        let md = ide.ila_status_crumb();
+        assert!(md.contains("md:cnt_3"), "{md}");
+        assert!(md.contains("ILA"), "{md}");
+        // Session::mark_debug already inserted the probe; (re)implement with it present.
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        ide.exec("ila_window 8").unwrap();
+        let arm = ide.exec("ila_arm cnt_3").unwrap();
+        assert!(arm.contains("net=cnt_3"), "{arm}");
+        assert!(arm.contains("samples=8"), "{arm}");
+        assert!(
+            ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
+            "fabric capture after mark→impl→arm: {}",
+            ide.ila.bits
+        );
+        let cap = ide.ila_status_crumb();
+        assert!(cap.contains("md:cnt_3"), "{cap}");
+        assert!(
+            cap.contains("ILA cnt_3×8") || cap.contains("ILA cnt_3×"),
+            "{cap}"
         );
     }
 
@@ -31690,7 +31754,7 @@ mod tests {
             chrome::RAIL_WIDTH + chrome::SIDEBAR_WIDTH
         );
         assert_eq!(chrome::RAIL_WIDTH, 48.0);
-        assert_eq!(chrome::SIDEBAR_WIDTH, 240.0);
+        assert_eq!(chrome::SIDEBAR_WIDTH, 220.0);
         assert_eq!(chrome::HIT_PRIMARY, 32.0);
         assert_eq!(chrome::HIT_SIDEBAR, 28.0);
         assert!(chrome::workspace_matches_canvases());
@@ -31804,11 +31868,17 @@ mod tests {
         assert!(tiny.tab_is_selectable("Timing"));
 
         let cell = chrome::floorplan_fit_cell(32, 33, 800.0, 500.0);
+        assert!(cell >= 4.0 && cell <= 64.0, "cell out of range: {cell}");
         assert!(
-            chrome::floorplan_fits_viewport(32, 33, cell, 800.0, 500.0),
-            "fit cell {cell} must show the whole 32×33 die in 800×500"
+            chrome::floorplan_die_fill_ratio(32, cell, 800.0) >= 0.80,
+            "die fill ≥80% at 800px, got {:.3} cell={cell}",
+            chrome::floorplan_die_fill_ratio(32, cell, 800.0)
         );
-        assert!(cell >= 4.0 && cell <= 24.0, "cell out of range: {cell}");
+        assert!(
+            chrome::floorplan_right_gap_px(32, cell, 800.0) <= 80.0,
+            "right gap ≤80px, got {:.1}",
+            chrome::floorplan_right_gap_px(32, cell, 800.0)
+        );
         assert!(
             chrome::DEVICE_TABLES_MAX_HEIGHT < chrome::DESKTOP_HEIGHT / 3.0,
             "device tables must leave room for an expanding floorplan"
