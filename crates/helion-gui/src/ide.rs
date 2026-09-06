@@ -17163,19 +17163,36 @@ impl IdeModel {
         Ok(self.ila_dashboard_text())
     }
 
+    /// Prefer mark_debug nets, then last armed, then cnt_3/q3/led if present in the design.
+    pub fn default_ila_probe(&self) -> String {
+        if let Some(d) = self.shell.session.design.as_ref() {
+            let marked = d.marked_debug_nets();
+            if let Some(n) = marked.first() {
+                return n.clone();
+            }
+            if !self.ila.net.is_empty() && d.nets.iter().any(|n| n.name == self.ila.net) {
+                return self.ila.net.clone();
+            }
+            for cand in ["cnt_3", "q3", "led", "q", "cnt_0", "q0"] {
+                if d.nets.iter().any(|n| n.name == cand) {
+                    return cand.to_string();
+                }
+            }
+        }
+        if self.ila.net.is_empty() {
+            "led".into()
+        } else {
+            self.ila.net.clone()
+        }
+    }
+
     pub fn ila_arm(&mut self, spec: &str) -> Result<String, String> {
         let mut parts = spec.split_whitespace();
         let net = parts
             .next()
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if self.ila.net.is_empty() {
-                    "led".into()
-                } else {
-                    self.ila.net.clone()
-                }
-            });
+            .unwrap_or_else(|| self.default_ila_probe());
         let n = parts
             .next()
             .and_then(|s| s.parse().ok())

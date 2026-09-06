@@ -5650,16 +5650,27 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Window 16").clicked() {
             let _ = model.exec("ila_window 16");
         }
-        if ui.button("Arm / Capture cnt_3").clicked() {
+        // Default arm uses IdeModel::ila_arm probe resolution (session net / led),
+        // not a hardcoded cnt_3 dump — capture is fabric-backed via helion-debug.
+        let probe = model.default_ila_probe();
+        if ui
+            .button(format!("Arm / Capture {probe}"))
+            .on_hover_text("insert_arm_capture → fabric ble_q readback")
+            .clicked()
+        {
+            let _ = model.exec(&format!("ila_arm {probe}"));
+        }
+        if ui.button("Capture cnt_3").on_hover_text("counter MSB probe").clicked() {
             let _ = model.exec("ila_arm cnt_3");
         }
     });
     let samples = model.ila_sample_rows();
     if samples.is_empty() {
-        ui.weak("no capture — Arm / Capture a marked net");
+        ui.label("No ILA capture yet.");
+        ui.weak("Open Hardware Manager, program the sim cable, then Arm / Capture a net.");
     } else {
         ui.label(format!(
-            "probe={} window={} trigger={} trigger_at={}",
+            "probe={} window={} trigger={} trigger_at={} bits={}",
             if model.ila.net.is_empty() {
                 "-"
             } else {
@@ -5671,7 +5682,12 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
                 .ila
                 .trigger_at
                 .map(|i| i.to_string())
-                .unwrap_or_else(|| "-".into())
+                .unwrap_or_else(|| "-".into()),
+            if model.ila.bits.is_empty() {
+                "-"
+            } else {
+                model.ila.bits.as_str()
+            }
         ));
         let cursor = model.wave.cursor;
         let mut pick_s: Option<usize> = None;
