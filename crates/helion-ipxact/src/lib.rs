@@ -126,3 +126,286 @@ mod tests {
         assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
     }
 }
+
+/// On-disk Helion IP package (`.helion` manifest + relative HDL/XDC files).
+/// Smallest honest CovertEDA-class package: text manifest, not a zip redesign.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelionPackage {
+    pub format: u32,
+    pub vendor: String,
+    pub library: String,
+    pub name: String,
+    pub version: String,
+    pub bus: String,
+    pub top: Option<String>,
+    /// HDL sources relative to the `.helion` file (or absolute).
+    pub files: Vec<String>,
+    /// Optional constraint files relative to the `.helion` file.
+    pub constraints: Vec<String>,
+    /// Absolute path of the loaded manifest (empty when parsed from a string).
+    pub manifest_path: std::path::PathBuf,
+}
+
+impl HelionPackage {
+    pub fn vlnv(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.vendor, self.library, self.name, self.version
+        )
+    }
+
+    pub fn to_ip_core(&self) -> Result<IpCore, String> {
+        if self.bus.eq_ignore_ascii_case("AXI") || self.bus.to_ascii_lowercase().contains("axi") {
+            return Err(format!(
+                ".helion {}: bus must be Helion-MM/Helion-ST (not AXI)",
+                self.name
+            ));
+        }
+        Ok(IpCore {
+            vendor: self.vendor.clone(),
+            library: self.library.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            bus: self.bus.clone(),
+        })
+    }
+
+    /// Resolve HDL paths against the manifest directory.
+    pub fn resolve_files(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        self.resolve_listed(&self.files)
+    }
+
+    pub fn resolve_constraints(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        self.resolve_listed(&self.constraints)
+    }
+
+    fn resolve_listed(&self, listed: &[String]) -> Result<Vec<std::path::PathBuf>, String> {
+        let base = self
+            .manifest_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut out = Vec::new();
+        for f in listed {
+            let p = std::path::Path::new(f);
+            let cand = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            };
+            if !cand.exists() {
+                return Err(format!(
+                    ".helion {}: file not found: {} (tried {})",
+                    self.name,
+                    f,
+                    cand.display()
+                ));
+            }
+            out.push(cand);
+        }
+        Ok(out)
+    }
+}
+
+/// Parse a `.helion` IP package manifest (text, format 1).
+///
+/// ```text
+/// format 1
+/// vendor community
+/// library helion
+/// name h_gpio
+/// version 1.0
+/// bus Helion-MM
+/// top h_gpio
+/// file h_gpio.v
+/// xdc pins.xdc          # optional
+/// ```
+pub fn parse_helion(text: &str) -> Result<HelionPackage, String> {
+    let mut pkg = HelionPackage {
+        format: 1,
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: String::new(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+        top: None,
+        files: Vec::new(),
+        constraints: Vec::new(),
+        manifest_path: std::path::PathBuf::new(),
+    };
+    let mut saw_format = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut toks = line.split_whitespace();
+        let Some(cmd) = toks.next() else { continue };
+        match cmd {
+            "format" => {
+                let v = toks
+                    .next()
+                    .ok_or_else(|| "format: missing version".to_string())?;
+                pkg.format = v
+                    .parse()
+                    .map_err(|_| format!("format: bad version {v}"))?;
+                if pkg.format != 1 {
+                    return Err(format!("unsupported .helion format {}", pkg.format));
+                }
+                saw_format = true;
+            }
+            "vendor" => {
+                if let Some(v) = toks.next() {
+                    pkg.vendor = v.to_string();
+                }
+            }
+            "library" => {
+                if let Some(v) = toks.next() {
+                    pkg.library = v.to_string();
+                }
+            }
+            "name" => {
+                if let Some(v) = toks.next() {
+                    pkg.name = v.to_string();
+                }
+            }
+            "version" => {
+                if let Some(v) = toks.next() {
+                    pkg.version = v.to_string();
+                }
+            }
+            "bus" => {
+                if let Some(v) = toks.next() {
+                    pkg.bus = v.to_string();
+                }
+            }
+            "vlnv" => {
+                let v = toks
+                    .next()
+                    .ok_or_else(|| "vlnv: missing value".to_string())?;
+                let parts: Vec<&str> = v.split(':').collect();
+                if parts.len() != 4 {
+                    return Err(format!("vlnv: expected vendor:library:name:version, got {v}"));
+                }
+                pkg.vendor = parts[0].to_string();
+                pkg.library = parts[1].to_string();
+                pkg.name = parts[2].to_string();
+                pkg.version = parts[3].to_string();
+            }
+            "top" => {
+                if let Some(v) = toks.next() {
+                    pkg.top = Some(v.to_string());
+                }
+            }
+            "file" | "read_sv" | "read_verilog" | "sv" | "verilog" => {
+                if let Some(v) = toks.next() {
+                    pkg.files.push(v.to_string());
+                }
+            }
+            "xdc" | "sdc" | "read_xdc" | "read_sdc" | "constraint" => {
+                if let Some(v) = toks.next() {
+                    pkg.constraints.push(v.to_string());
+                }
+            }
+            other => {
+                return Err(format!(".helion: unknown directive {other}"));
+            }
+        }
+    }
+    if !saw_format {
+        return Err(".helion: missing `format 1`".into());
+    }
+    if pkg.name.is_empty() {
+        return Err(".helion: missing `name` (or `vlnv`)".into());
+    }
+    if pkg.files.is_empty() {
+        return Err(format!(".helion {}: no `file` entries", pkg.name));
+    }
+    if pkg.bus.eq_ignore_ascii_case("AXI") || pkg.bus.to_ascii_lowercase().contains("axi") {
+        return Err(format!(
+            ".helion {}: bus must be Helion-MM/Helion-ST (not AXI as Helion product)",
+            pkg.name
+        ));
+    }
+    Ok(pkg)
+}
+
+/// Load a `.helion` package from disk (file or directory containing `package.helion`).
+pub fn load_helion(path: &Path) -> Result<HelionPackage, String> {
+    let manifest = if path.is_dir() {
+        let cand = path.join("package.helion");
+        if cand.is_file() {
+            cand
+        } else {
+            return Err(format!(
+                ".helion dir {}: expected package.helion",
+                path.display()
+            ));
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("read {}: {e}", manifest.display()))?;
+    let mut pkg = parse_helion(&text)?;
+    pkg.manifest_path = manifest;
+    // Existence check early so project ingest fails loud.
+    let _ = pkg.resolve_files()?;
+    let _ = pkg.resolve_constraints()?;
+    Ok(pkg)
+}
+
+/// Emit a format-1 `.helion` manifest body for an IpCore + file list.
+pub fn to_helion_manifest(ip: &IpCore, top: Option<&str>, files: &[&str]) -> String {
+    let mut s = String::from("# Helion IP package (format 1)\nformat 1\n");
+    s.push_str(&format!("vlnv {}\n", ip.vlnv()));
+    s.push_str(&format!("bus {}\n", ip.bus));
+    if let Some(t) = top {
+        s.push_str(&format!("top {t}\n"));
+    }
+    for f in files {
+        s.push_str(&format!("file {f}\n"));
+    }
+    s
+}
+
+#[cfg(test)]
+mod helion_pkg_tests {
+    use super::*;
+
+    #[test]
+    fn parses_helion_manifest_and_rejects_axi() {
+        let pkg = parse_helion(
+            r#"
+format 1
+vlnv community:helion:h_gpio:1.0
+bus Helion-MM
+top h_gpio
+file h_gpio.v
+"#,
+        )
+        .unwrap();
+        assert_eq!(pkg.name, "h_gpio");
+        assert_eq!(pkg.vlnv(), "community:helion:h_gpio:1.0");
+        assert_eq!(pkg.files, vec!["h_gpio.v"]);
+        assert_eq!(pkg.to_ip_core().unwrap().bus, "Helion-MM");
+        assert!(parse_helion(
+            r#"
+format 1
+name bad
+bus AXI
+file a.v
+"#
+        )
+        .unwrap_err()
+        .contains("not AXI"));
+    }
+
+    #[test]
+    fn catalog_cores_roundtrip_helion_text() {
+        for ip in catalog() {
+            let body = to_helion_manifest(&ip, Some(&ip.name), &[&format!("{}.v", ip.name)]);
+            let pkg = parse_helion(&body).unwrap();
+            assert_eq!(pkg.to_ip_core().unwrap(), ip);
+        }
+    }
+}

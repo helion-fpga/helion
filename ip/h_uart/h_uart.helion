@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM UART catalog core
+format 1
+vlnv community:helion:h_uart:1.0
+bus Helion-MM
+top h_uart
+file h_uart.v

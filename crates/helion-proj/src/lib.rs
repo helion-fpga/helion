@@ -686,6 +686,8 @@ pub struct ProjectFile {
     pub sources: Vec<String>,
     /// External XDC/SDC paths from `read_xdc` / `read_sdc`.
     pub constraint_files: Vec<String>,
+    /// `.helion` IP package paths from `read_ip` (expanded by `expand_ip_packages`).
+    pub ip_packages: Vec<String>,
     /// Optional elaborator top (`top <mod>` / `set_property TOP <mod>`).
     pub top: Option<String>,
     pub sdc: Vec<String>,
@@ -724,6 +726,11 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
             "read_xdc" | "read_sdc" | "xdc" | "sdc" => {
                 if let Some(v) = toks.next() {
                     p.constraint_files.push(v.to_string());
+                }
+            }
+            "read_ip" | "ip" => {
+                if let Some(v) = toks.next() {
+                    p.ip_packages.push(v.to_string());
                 }
             }
             "top" => {
@@ -847,7 +854,7 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
             _ => {}
         }
     }
-    if p.sources.is_empty() {
+    if p.sources.is_empty() && p.ip_packages.is_empty() {
         return Err("project has no sources".into());
     }
     Ok(p)
@@ -872,6 +879,45 @@ pub fn resolve_prj_path(prj_path: &std::path::Path, given: &str) -> std::path::P
         }
     }
     given.to_path_buf()
+}
+
+/// Expand `read_ip` `.helion` packages into `sources` / `constraint_files`.
+/// Paths are resolved against the `.prj`, then against each package manifest.
+/// Does not override an explicit project `top`; if unset, takes the first package top.
+pub fn expand_ip_packages(
+    prj: &mut ProjectFile,
+    prj_path: &std::path::Path,
+) -> Result<Vec<helion_ipxact::HelionPackage>, String> {
+    let mut loaded = Vec::new();
+    let ips = prj.ip_packages.clone();
+    for ip_ref in ips {
+        let path = resolve_prj_path(prj_path, &ip_ref);
+        let pkg = helion_ipxact::load_helion(&path).map_err(|e| {
+            format!("read_ip {ip_ref}: {e}")
+        })?;
+        for f in pkg.resolve_files()? {
+            let s = f.display().to_string();
+            if !prj.sources.iter().any(|x| x == &s) {
+                prj.sources.push(s);
+            }
+        }
+        for c in pkg.resolve_constraints()? {
+            let s = c.display().to_string();
+            if !prj.constraint_files.iter().any(|x| x == &s) {
+                prj.constraint_files.push(s);
+            }
+        }
+        if prj.top.is_none() {
+            if let Some(t) = &pkg.top {
+                prj.top = Some(t.clone());
+            }
+        }
+        loaded.push(pkg);
+    }
+    if prj.sources.is_empty() {
+        return Err("project has no sources after read_ip expand".into());
+    }
+    Ok(loaded)
 }
 
 /// Flatten inline SDC + `read_xdc` files + `set_property` IO into one XDC blob, then `load_xdc`.
@@ -1125,6 +1171,21 @@ create_clock -period 10.000 [get_ports clk]
         assert_eq!(prj.constraint_files, vec!["examples/multi/multi.sdc"]);
         assert_eq!(prj.top.as_deref(), Some("top"));
         assert_eq!(prj.sdc.len(), 1);
+    }
+
+    #[test]
+    fn project_file_read_ip_parses() {
+        let prj = load_prj(
+            r#"
+part HL10T-C32-1
+read_ip ip/h_gpio/h_gpio.helion
+top h_gpio
+"#,
+        )
+        .unwrap();
+        assert!(prj.sources.is_empty());
+        assert_eq!(prj.ip_packages, vec!["ip/h_gpio/h_gpio.helion"]);
+        assert_eq!(prj.top.as_deref(), Some("h_gpio"));
     }
 
     #[test]
