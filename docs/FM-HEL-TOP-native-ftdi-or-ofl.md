@@ -4,7 +4,7 @@
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
 **Prior:** SHA `9ef8bdc` (+ stamp `cef8954`) — Ibex/pin-wrap/bare mpsse-sim STAT DONE=1; OFL honesty  
 **Prior place:** SHA `fc95562` — imux_skip→0, IOB=1, gold 9640  
-**Shipped:** *(see git SHA after push)*  
+**Shipped:** SHA `c907adb`  
 **Gold:** `WNS_PS=9640` **held** (`helion report_timing examples/counter.sv --sdc examples/counter.sdc`)
 
 ## Goal
