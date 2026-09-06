@@ -601,6 +601,8 @@ impl Device {
             "BLE0.FF.INIT",
             "IMUX[0][0]",
             "IMUX[63][4]",
+            "IMUX[0][5]",
+            "IMUX[63][5]",
         ] {
             match fm.minor_bit(feature) {
                 Some((minor, bit)) => {
@@ -683,12 +685,18 @@ impl FeatureMap {
             bits.insert(format!("BLE{n}.FF.CLKINV"), cursor + 4);
             cursor += 5;
         }
-        // 4. IMUX 64×5, then pad to n_minors * frame_bits
+        // 4. IMUX 64×5 (sel[4:0]), then IMUX[m][5] extension bit appended so
+        // legacy abs positions for bits 0..4 stay gold-stable. sel[5] enables
+        // N-S ±2 (32-39 south±2, 40-47 north±2) without reclaiming LUT-O.
         for m in 0..64u32 {
             for b in 0..5u32 {
                 bits.insert(format!("IMUX[{m}][{b}]"), cursor + b);
             }
             cursor += 5;
+        }
+        for m in 0..64u32 {
+            bits.insert(format!("IMUX[{m}][5]"), cursor);
+            cursor += 1;
         }
         let _ = cursor;
         Self {

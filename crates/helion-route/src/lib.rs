@@ -14,7 +14,7 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
-    /// LUT-pin drivers outside same-CLB / N-S±1 IMUX encoding (Ibex-scale).
+    /// LUT-pin drivers outside same-CLB / N-S±2 IMUX encoding (Ibex-scale).
     pub imux_skip: u32,
 }
 
@@ -148,15 +148,23 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
         return Ok(16 + dble);
     }
     if from.x == to.x && from.y + 1 == to.y {
-        // driver is south of sink
+        // driver is south of sink (±1)
         return Ok(dble);
     }
     if from.x == to.x && to.y + 1 == from.y {
-        // driver is north of sink
+        // driver is north of sink (±1)
         return Ok(8 + dble);
     }
+    if from.x == to.x && from.y + 2 == to.y {
+        // driver is south of sink (±2) — HAD IMUX bit5 bank
+        return Ok(32 + dble);
+    }
+    if from.x == to.x && to.y + 2 == from.y {
+        // driver is north of sink (±2)
+        return Ok(40 + dble);
+    }
     Err(format!(
-        "IMUX: no local/N-S encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
+        "IMUX: no local/N-S±2 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
         from.x, from.y, to.x, to.y
     ))
 }
@@ -223,8 +231,8 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
                     });
                 }
                 Err(_) => {
-                    // Bring-up IMUX is same-CLB / N-S±1 only. Full Ibex has
-                    // longer/diagonal FF→LUT arcs; skip + count (honest, not silent).
+                    // Bring-up IMUX is same-CLB / N-S±2 only. Full Ibex has
+                    // longer/diagonal/E-W FF→LUT arcs; skip + count (honest, not silent).
                     imux_skip += 1;
                 }
             }
@@ -311,7 +319,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
     }
     if imux_skip > 0 {
         eprintln!(
-            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S/same-CLB only)",
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/same-CLB only)",
             imux_skip,
             imux.len()
         );

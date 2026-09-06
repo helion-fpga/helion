@@ -291,7 +291,15 @@ impl Fabric {
             let (mstr, rest) = rest.split_once("][")?;
             let m: u32 = mstr.parse().ok()?;
             let b: u32 = rest.strip_suffix(']')?.parse().ok()?;
-            return Some(512 + 40 + 40 + m * 5 + b);
+            // Bits 0..4 keep gold abs (m*5+b). Bit 5 lives in the extension
+            // bank after 64×5 so legacy frames stay bit-compatible.
+            if b < 5 {
+                return Some(512 + 40 + 40 + m * 5 + b);
+            }
+            if b == 5 {
+                return Some(512 + 40 + 40 + 64 * 5 + m);
+            }
+            return None;
         }
         None
     }
@@ -331,7 +339,7 @@ impl Fabric {
 
     fn imux_sel(&self, x: u32, y: u32, mux: u32) -> u8 {
         let mut s = 0u8;
-        for b in 0..5u32 {
+        for b in 0..6u32 {
             if self.clb_feature_bit(x, y, &format!("IMUX[{mux}][{b}]")) {
                 s |= 1 << b;
             }
@@ -358,7 +366,8 @@ impl Fabric {
             .unwrap_or(false)
     }
 
-    /// IMUX[4:0]: 0-7 south BLE Q, 8-15 north BLE Q, 16-23 local BLE Q, 24-31 local LUT O.
+    /// IMUX sel: 0-7 S±1 Q, 8-15 N±1 Q, 16-23 local Q, 24-31 local LUT O,
+    /// 32-39 S±2 Q, 40-47 N±2 Q (bit5 extension; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
             return self.q_at(x, y.saturating_sub(1), sel);
@@ -369,7 +378,16 @@ impl Fabric {
         if sel < 24 {
             return self.q_at(x, y, sel - 16);
         }
-        self.lut_o_at(x, y, sel - 24)
+        if sel < 32 {
+            return self.lut_o_at(x, y, sel - 24);
+        }
+        if sel < 40 {
+            return self.q_at(x, y.saturating_sub(2), sel - 32);
+        }
+        if sel < 48 {
+            return self.q_at(x, y + 2, sel - 40);
+        }
+        false
     }
 
     fn eval_comb(&mut self) {
