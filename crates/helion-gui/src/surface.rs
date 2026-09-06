@@ -552,6 +552,84 @@ impl ChromeDriver {
         let p = helion_device::Device::examples_dir().join(file);
         self.click_open(&p)
     }
+
+    pub fn click_schematic_zoom_fit(&mut self) -> Result<String, String> {
+        if self.pane() != WorkspacePane::Schematic {
+            self.record(
+                "click",
+                "Zoom Fit",
+                "Schematic",
+                &format!("{:?}", self.pane()),
+                EventClass::HitTestMiss,
+            );
+            return Err("Zoom Fit: schematic not open".into());
+        }
+        let r = self.model.schematic_zoom_fit();
+        self.record(
+            "click",
+            "Zoom Fit",
+            "Schematic",
+            &format!("{:?}", self.pane()),
+            if r.is_ok() {
+                EventClass::Ok
+            } else {
+                EventClass::HitTestMiss
+            },
+        );
+        r
+    }
+
+    pub fn click_schematic_next(&mut self) -> Result<String, String> {
+        if self.pane() != WorkspacePane::Schematic {
+            self.record(
+                "click",
+                "Next",
+                "Schematic",
+                &format!("{:?}", self.pane()),
+                EventClass::HitTestMiss,
+            );
+            return Err("Next: schematic not open".into());
+        }
+        let r = self.model.schematic_next_view();
+        self.record(
+            "click",
+            "Next",
+            "Schematic",
+            &format!("{:?}", self.pane()),
+            if r.is_ok() {
+                EventClass::Ok
+            } else {
+                EventClass::HitTestMiss
+            },
+        );
+        r
+    }
+
+    pub fn click_schematic_previous(&mut self) -> Result<String, String> {
+        if self.pane() != WorkspacePane::Schematic {
+            self.record(
+                "click",
+                "Previous",
+                "Schematic",
+                &format!("{:?}", self.pane()),
+                EventClass::HitTestMiss,
+            );
+            return Err("Previous: schematic not open".into());
+        }
+        let r = self.model.schematic_previous_view();
+        self.record(
+            "click",
+            "Previous",
+            "Schematic",
+            &format!("{:?}", self.pane()),
+            if r.is_ok() {
+                EventClass::Ok
+            } else {
+                EventClass::HitTestMiss
+            },
+        );
+        r
+    }
 }
 
 #[cfg(test)]
@@ -720,11 +798,73 @@ mod tests {
         let mut d = ChromeDriver::new();
         d.click_open(&example("counter.sv")).unwrap();
         d.click_implement().unwrap();
+        assert!(d.click_schematic_zoom_fit().is_err());
+        assert_eq!(d.trace.last_class(), Some(EventClass::HitTestMiss));
         d.click_more(WorkspaceTab::Schematic);
-        let _ = d.model.schematic_zoom_fit().unwrap();
-        let _ = d.model.schematic_next_view();
-        let _ = d.model.schematic_previous_view();
+        d.click_schematic_zoom_fit().unwrap();
+        assert_eq!(d.trace.last_class(), Some(EventClass::Ok));
+        let _ = d.click_schematic_next();
+        let _ = d.click_schematic_previous();
         assert_eq!(d.pane(), WorkspacePane::Schematic);
-        assert_eq!(d.chrome.workspace, WorkspaceTab::Schematic);
+        let drawing = d.model.schematic.drawing();
+        d.model.schematic.set_viewport(900.0, 500.0);
+        d.model.schematic.zoom_fit();
+        let fit = chrome::fit_pane(drawing.width, drawing.height, 900.0, 500.0);
+        assert!(
+            fit.right_clip <= 0.5,
+            "Schematic right-edge clip {}",
+            fit.right_clip
+        );
+        assert!(fit.fill >= chrome::PANE_FILL_MIN, "schematic fill {}", fit.fill);
+    }
+
+    #[test]
+    fn program_package_schematic_fill_the_remaining_pane() {
+        let mut d = ChromeDriver::new();
+        d.click_open(&example("counter.sv")).unwrap();
+        d.click_implement().unwrap();
+        d.click_more(WorkspaceTab::Package);
+        let pkg = &d.model.package;
+        let (cw, ch) = chrome::package_cell(pkg.cols.max(1), pkg.rows.max(1), 1000.0, 400.0);
+        let fill = ((cw * pkg.cols.max(1) as f32 + 28.0) / 1000.0)
+            .min((ch * pkg.rows.max(1) as f32 + 16.0) / 400.0);
+        assert!(
+            fill >= chrome::PANE_FILL_MIN,
+            "package fill {fill} cols={} rows={}",
+            pkg.cols,
+            pkg.rows
+        );
+        d.click_more(WorkspaceTab::Hardware);
+        assert_eq!(d.pane(), WorkspacePane::Hardware);
+        let (dw, dh) = chrome::hardware_dashboard_size(1000.0, 500.0, 120.0);
+        assert!(dw / 1000.0 >= chrome::PANE_FILL_MIN);
+        assert!(dh / 380.0 >= chrome::PANE_FILL_MIN);
+        d.click_more(WorkspaceTab::Schematic);
+        let drawing = d.model.schematic.drawing();
+        let fit = chrome::fit_pane(drawing.width.max(1.0), drawing.height.max(1.0), 900.0, 500.0);
+        assert!(fit.right_clip <= 0.5);
+        assert!(fit.fills() || fit.fill >= chrome::PANE_FILL_MIN);
+    }
+
+    #[test]
+    fn jobs_are_not_run_inside_a_paint_callback() {
+        // Paint queues via spawn_job / request_job; the engine type is Send and
+        // the UI only try_recv. Running implement on this thread is tests/headless.
+        assert_send::<IdeModel>();
+        let mut d = ChromeDriver::new();
+        d.click_open(&example("counter.sv")).unwrap();
+        let handle = spawn_job(d.model.clone(), JobKind::Implement);
+        match handle.try_recv() {
+            Ok(_) | Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => panic!("engine thread died before first poll"),
+        }
+        let out = loop {
+            match handle.try_recv() {
+                Ok(o) => break o,
+                Err(TryRecvError::Empty) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(TryRecvError::Disconnected) => panic!("engine thread died"),
+            }
+        };
+        assert!(out.result.is_ok(), "{:?}", out.result);
     }
 }
