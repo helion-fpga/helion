@@ -2,7 +2,8 @@
 
 **Date:** 2026-09-06 ~06:57 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
-**Tip SHA:** `a61ce835…` → **`a61ce83`**  
+**Score tip (branch HEAD):** `fbdd9e02ce8b688aa46bb4e229b1aa56be5f0617` (`fbdd9e0`)
+**Chrome+hooks tip:** `a61ce83` (ancestor of HEAD)  
 **Chrome commit:** `5d20f16` (intensive betterment); follow-ups `5193ff4` report, `2e1ec6a`/`81adc9c` macOS `Command` import, `a61ce83` HELION_OPEN/FLOW hooks  
 **Remote:** `helion-fpga` PR #7 branch `fm-hel-corpus-soft-pass`  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
