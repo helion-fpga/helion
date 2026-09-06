@@ -1,8 +1,8 @@
-# FM-HEL-UX2 — void-class fix + 60-series after-shots
+# FM-HEL-UX2 — Sim void fix (62) + tip reconcile
 
-**Date:** 2026-09-06 ~07:46 America/New_York (EDT)  
-**Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
-**Score tip (branch HEAD):** `63ec405d0dc09e7ac1114830912e22264032cca1` (`63ec405`)  
+**Date:** 2026-09-06 ~07:57 America/New_York (EDT)  
+**Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
+**Score tip (branch HEAD):** `TIP_SHA` (`TIP_SHORT`)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
 
 ## Gold
@@ -11,27 +11,26 @@
 → WNS_PS=9640  TNS_PS=0  imux_skip=0
 ```
 
-## Void-class fix
+## Status (void class)
 
-- Timing/Reports: **no SidePanel** (SidePanel left a black hole beside the canvas).
-- Timing rail / ⌘3: **Timing Summary + paths only** — never Reports catalog twin.
-- Reports rail: **Reports tab** + catalog; Report detail **collapsed** by default (no Timing Summary stacked under a void).
-- Sim: scopes panel capped (max 260) — calm splitter.
-- More ⋯ overflow list **held** (Schematic/Wave/Package/Runs/…).
+| Shot | Intent | Notes |
+|------|--------|-------|
+| 60 | Timing-only | Prior PASS (Firstmate / Helion UX) |
+| 61 | Reports rail | Prior PASS |
+| **62** | Sim scopes\|Wave ≤6px abut | **Re-shot** after absolute-rect split (no SidePanel, no horizontal wrap). Proof: `/workspace/fm-hel-ux2/shots/62-sim-calm.png` |
+| 63 | More ⋯ overflow | Re-shot if strip shifted: `63-more-overflow.png` |
 
-## After-shots (proof)
+## Sim fix (62)
 
-| Shot | Path | Intent |
-|------|------|--------|
-| 60 | `/workspace/fm-hel-ux2/shots/60-timing-only.png` | Timing only — no Reports catalog, no pane void |
-| 61 | `61-reports-rail.png` | Reports rail/catalog — no Timing twin, detail collapsed |
-| 62 | `62-sim-calm.png` | Sim scopes\|Wave calm splitter |
-| 63 | `63-more-overflow.png` | More ⋯ overflow list present |
+- `Activity::Simulate` sets `WorkspaceTab::Wave`
+- No `SidePanel` for Sim (was leaving a thick void beside Wave)
+- Canvas uses **absolute rects**: 220px scopes nav | `SPLITTER_GRAB_PX` (6) rule | Wave fills remainder via `scope_builder`/`UiBuilder::max_rect`
+- Empty Wave paints a filled pane (no sparse header + black slab)
 
-## Note
+## Tip reconcile
 
-Unused right margin on left-aligned tables may remain (compact grids) — that is not the pane-gap / Reports\|void\|Timing auto-fail class.
+Single tip SHA is branch HEAD `TIP_SHORT` (full `TIP_SHA`). Do not cite `63ec405` as tip — that was the prior chrome commit; HEAD moved.
 
 ## Merge
 
-**NO MERGE** until Firstmate / Helion UX HARD PASS void class.
+**NO MERGE** until Firstmate / Helion UX HARD PASS on 62.
