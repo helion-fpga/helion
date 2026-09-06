@@ -56,27 +56,60 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
 
     let mut lutff_sites = Vec::new();
     if !packed.lutffs.is_empty() {
-        let iob = iob_sites
+        // Prefer the IOB column that each cluster drives (multi-IOB comb mux).
+        // Single-IOB designs (counter/blinky gold) still pack into one column.
+        let fallback_iob = iob_sites
             .first()
             .copied()
             .or_else(|| iob_all.first().copied())
             .ok_or_else(|| "need IOB column for LUTFF".to_string())?;
-        let mut col: Vec<Site> = dev.clb_sites().filter(|s| s.x == iob.x).collect();
-        if col.is_empty() {
-            col = dev.clb_sites().collect();
-        }
-        col.sort_by_key(|s| s.y);
         let n_ble = dev.n_ble.max(1) as usize;
-        let base = if opts.timing_weight > 0.0 {
-            0usize
-        } else {
-            col.len() / 2
-        };
-        for i in 0..packed.lutffs.len() {
-            let clb_off = i / n_ble;
-            let ble = (i % n_ble) as u8;
-            let idx = (base + clb_off).min(col.len() - 1);
-            lutff_sites.push((col[idx], ble));
+        let prefer_south = opts.timing_weight > 0.0;
+        let mut cols: std::collections::HashMap<u32, Vec<Site>> = std::collections::HashMap::new();
+        for s in dev.clb_sites() {
+            cols.entry(s.x).or_default().push(s);
+        }
+        for v in cols.values_mut() {
+            v.sort_by_key(|s| s.y);
+        }
+        let mut iob_for_net: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
+        for (ii, iob) in packed.iobs.iter().enumerate() {
+            if let Some(site) = iob_sites.get(ii) {
+                iob_for_net.insert(iob.from_net.as_str(), *site);
+            }
+        }
+        let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
+        for lf in &packed.lutffs {
+            let preferred_x = iob_for_net
+                .get(lf.q_net.as_str())
+                .map(|s| s.x)
+                .unwrap_or(fallback_iob.x);
+            let mut try_xs: Vec<u32> = vec![preferred_x, fallback_iob.x];
+            let mut others: Vec<u32> = cols.keys().copied().collect();
+            others.sort_unstable();
+            try_xs.extend(others);
+            try_xs.dedup();
+            let mut placed = None;
+            'cols: for col_x in try_xs {
+                let Some(col) = cols.get(&col_x) else { continue };
+                if col.is_empty() {
+                    continue;
+                }
+                let base = if prefer_south { 0usize } else { col.len() / 2 };
+                for clb_off in 0..col.len() {
+                    let idx = (base + clb_off).min(col.len() - 1);
+                    let site = col[idx];
+                    for ble in 0..n_ble as u8 {
+                        if used.insert((site.x, site.y, ble)) {
+                            placed = Some((site, ble));
+                            break 'cols;
+                        }
+                    }
+                }
+            }
+            lutff_sites.push(
+                placed.ok_or_else(|| "no CLB/BLE site left for LUTFF".to_string())?,
+            );
         }
     }
 

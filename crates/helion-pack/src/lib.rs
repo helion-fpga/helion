@@ -62,14 +62,16 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         let Some(o_net) = design.net_on(&c.name, "O") else {
             continue;
         };
-        let Some(ff) = design.cells.iter().find(|f| {
+        // Comb LUTs (no FF on O) pack as LUT-only: empty ff_cell, q_net = O so
+        // IOB/route match the LUT output. Registered LUTs keep the FF cluster.
+        let ff = design.cells.iter().find(|f| {
             matches!(f.kind, CellKind::Hff)
                 && !used_ff.contains(&f.name)
                 && design.net_on(&f.name, "D") == Some(o_net)
-        }) else {
-            return Err(format!("LUT {} has no FF on D", c.name));
-        };
-        used_ff.insert(ff.name.clone());
+        });
+        if let Some(ff) = ff {
+            used_ff.insert(ff.name.clone());
+        }
         let mut lut_pins = Vec::new();
         for pin in 0u8..6 {
             if let Some(net) = design.net_on(&c.name, &format!("I{pin}")) {
@@ -80,13 +82,17 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 }
             }
         }
-        let q_net = design
-            .net_on(&ff.name, "Q")
-            .unwrap_or("")
-            .to_string();
+        let (ff_cell, q_net) = if let Some(ff) = ff {
+            (
+                ff.name.clone(),
+                design.net_on(&ff.name, "Q").unwrap_or("").to_string(),
+            )
+        } else {
+            (String::new(), o_net.to_string())
+        };
         lutffs.push(PackedLutFf {
             lut_cell: c.name.clone(),
-            ff_cell: ff.name.clone(),
+            ff_cell,
             init,
             lut_pins,
             q_net,
@@ -206,6 +212,25 @@ mod tests {
         assert_eq!(p.iobs[0].pulltype.as_deref(), Some("PULLUP"));
         assert_eq!(p.iobs[0].diff_term.as_deref(), Some("TRUE"));
         assert_eq!(p.iobs[0].in_term.as_deref(), Some("UNTUNED_SPLIT_50"));
+    }
+
+    #[test]
+    fn packs_comb_lut_without_ff() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::new("comb");
+        d.add_port("a", helion_ir::PortDir::In);
+        d.add_port("y", helion_ir::PortDir::Out);
+        d.add_cell("u_lut", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("a", "u_lut", "I0");
+        d.connect("n", "u_lut", "O");
+        d.connect("n", "u_iob", "I");
+        d.connect("y", "u_iob", "PAD");
+        let p = pack(&d, &dev).unwrap();
+        assert_eq!(p.lutffs.len(), 1);
+        assert!(p.lutffs[0].ff_cell.is_empty(), "comb LUT must not invent an FF");
+        assert_eq!(p.lutffs[0].q_net, "n");
+        assert_eq!(p.iobs[0].from_net, "n");
     }
 
     #[test]

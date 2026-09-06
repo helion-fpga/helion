@@ -71,7 +71,8 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
     for (i, lutff) in routed.placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = routed.placed.lutff_sites[i];
         feats.set_init(site.x, site.y, ble as u32, lutff.init);
-        feats.set_ff_used(site.x, site.y, ble as u32, true);
+        // Comb packs leave ff_cell empty — do not assert FF.USED.
+        feats.set_ff_used(site.x, site.y, ble as u32, !lutff.ff_cell.is_empty());
     }
     for m in &routed.imux {
         feats.set_imux(m.x, m.y, m.mux, m.sel);
