@@ -14,7 +14,7 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
-    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±1 IMUX encoding (Ibex-scale).
+    /// LUT-pin drivers outside same-CLB / N-S±2 / E-W±2 IMUX encoding (Ibex-scale).
     pub imux_skip: u32,
 }
 
@@ -173,8 +173,15 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
         // driver is east of sink
         return Ok(56 + dble);
     }
+    // Real E-W ±2 (same row): bit6 bank; fabric samples Q two columns away.
+    if from.y == to.y && from.x + 2 == to.x {
+        return Ok(64 + dble);
+    }
+    if from.y == to.y && to.x + 2 == from.x {
+        return Ok(72 + dble);
+    }
     Err(format!(
-        "IMUX: no local/N-S±2/E-W±1 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
+        "IMUX: no local/N-S±2/E-W±2 encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
         from.x, from.y, to.x, to.y
     ))
 }
@@ -241,7 +248,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
                     });
                 }
                 Err(_) => {
-                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±1. Full Ibex has
+                    // Bring-up IMUX is same-CLB / N-S±2 / E-W±2. Full Ibex has
                     // longer/diagonal/>±1 FF→LUT arcs; skip + count (honest, not silent).
                     imux_skip += 1;
                 }
@@ -329,7 +336,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
     }
     if imux_skip > 0 {
         eprintln!(
-            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±1/same-CLB)",
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S±2/E-W±2/same-CLB)",
             imux_skip,
             imux.len()
         );

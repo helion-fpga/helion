@@ -27,7 +27,7 @@ impl Default for PlaceOpts {
     }
 }
 
-/// Bring-up IMUX reach: same CLB, N-S ±1/±2, or E-W ±1 (matches helion-route::imux_sel).
+/// Bring-up IMUX reach: same CLB, N-S ±1/±2, or E-W ±1/±2 (matches helion-route::imux_sel).
 fn imux_local(from: Site, to: Site) -> bool {
     if from.x == to.x
         && (from.y == to.y
@@ -38,8 +38,12 @@ fn imux_local(from: Site, to: Site) -> bool {
     {
         return true;
     }
-    // Real E-W ±1 same-row neighbor Q (uwilton left/right).
-    from.y == to.y && (from.x + 1 == to.x || to.x + 1 == from.x)
+    // Real E-W ±1/±2 same-row neighbor Q (uwilton / bit6 bank).
+    from.y == to.y
+        && (from.x + 1 == to.x
+            || to.x + 1 == from.x
+            || from.x + 2 == to.x
+            || to.x + 2 == from.x)
 }
 
 fn imux_illegal_pins(
@@ -113,7 +117,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
-        // FF cell → site as we place (IMUX encodes same-CLB / N-S ±1/±2 / E-W ±1).
+        // FF cell → site as we place (IMUX encodes same-CLB / N-S ±1/±2 / E-W ±1/±2).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
             let preferred_x = iob_for_net
@@ -127,9 +131,18 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     affinity.push(*s);
                 }
             }
-            let mut try_xs: Vec<u32> = Vec::with_capacity(2 + affinity.len() + all_xs.len());
+            let mut try_xs: Vec<u32> = Vec::with_capacity(8 + affinity.len() * 5 + all_xs.len());
             for s in &affinity {
                 try_xs.push(s.x);
+                // Harder cluster: keep sink in E-W±1/±2 of drivers before sprawl.
+                try_xs.push(s.x.saturating_add(1));
+                try_xs.push(s.x.saturating_add(2));
+                if s.x > 0 {
+                    try_xs.push(s.x - 1);
+                }
+                if s.x > 1 {
+                    try_xs.push(s.x - 2);
+                }
             }
             try_xs.push(preferred_x);
             if fallback_iob.x != preferred_x {
@@ -196,7 +209,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         }
 
             // FM-HEL-TOP: stronger IMUX legalization — pull sinks onto driver
-            // same-CLB / N-S±1/±2 / E-W±1 (real HAD reach); empty-BLE move then
+            // same-CLB / N-S±1/±2 / E-W±1/±2 (real HAD reach); empty-BLE move then
             // pairwise swap when sites are full.
             let mut site_of: std::collections::HashMap<(u32, u32, u8), usize> =
                 std::collections::HashMap::new();
@@ -213,15 +226,19 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 if y > 1 {
                     xy.push((x, y - 2));
                 }
-                // E-W ±1 same row
+                // E-W ±1/±2 same row (matches IMUX reach)
                 xy.push((x.saturating_add(1), y));
+                xy.push((x.saturating_add(2), y));
                 if x > 0 {
                     xy.push((x - 1, y));
+                }
+                if x > 1 {
+                    xy.push((x - 2, y));
                 }
             };
             let mut moved = 0u32;
             let mut swapped = 0u32;
-            for _pass in 0..8 {
+            for _pass in 0..12 {
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
                 for (i, lf) in packed.lutffs.iter().enumerate() {

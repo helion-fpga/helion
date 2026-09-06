@@ -1,6 +1,6 @@
 had_version = 1
 family = "helion"
-arch_gen = 12
+arch_gen = 13
 k = 6
 n_ble = 8
 ff_per_ble = 1

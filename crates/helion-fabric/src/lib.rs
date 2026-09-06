@@ -291,13 +291,16 @@ impl Fabric {
             let (mstr, rest) = rest.split_once("][")?;
             let m: u32 = mstr.parse().ok()?;
             let b: u32 = rest.strip_suffix(']')?.parse().ok()?;
-            // Bits 0..4 keep gold abs (m*5+b). Bit 5 lives in the extension
-            // bank after 64×5 so legacy frames stay bit-compatible.
+            // Bits 0..4 keep gold abs (m*5+b). Bit 5 / bit 6 live in
+            // extension banks after 64×5 so legacy frames stay bit-compatible.
             if b < 5 {
                 return Some(512 + 40 + 40 + m * 5 + b);
             }
             if b == 5 {
                 return Some(512 + 40 + 40 + 64 * 5 + m);
+            }
+            if b == 6 {
+                return Some(512 + 40 + 40 + 64 * 5 + 64 + m);
             }
             return None;
         }
@@ -339,7 +342,7 @@ impl Fabric {
 
     fn imux_sel(&self, x: u32, y: u32, mux: u32) -> u8 {
         let mut s = 0u8;
-        for b in 0..6u32 {
+        for b in 0..7u32 {
             if self.clb_feature_bit(x, y, &format!("IMUX[{mux}][{b}]")) {
                 s |= 1 << b;
             }
@@ -367,8 +370,8 @@ impl Fabric {
     }
 
     /// IMUX sel: 0-7 S±1 Q, 8-15 N±1 Q, 16-23 local Q, 24-31 local LUT O,
-    /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q
-    /// (6-bit sel; gold uses sel<32).
+    /// 32-39 S±2 Q, 40-47 N±2 Q, 48-55 W±1 Q, 56-63 E±1 Q,
+    /// 64-71 W±2 Q, 72-79 E±2 Q (7-bit sel; gold uses sel<32).
     fn decode_imux(&self, x: u32, y: u32, sel: u8) -> bool {
         if sel < 8 {
             return self.q_at(x, y.saturating_sub(1), sel);
@@ -395,6 +398,14 @@ impl Fabric {
         if sel < 64 {
             // east neighbor Q
             return self.q_at(x + 1, y, sel - 56);
+        }
+        if sel < 72 {
+            // west ±2 Q (driver two columns west) — bit6 bank
+            return self.q_at(x.saturating_sub(2), y, sel - 64);
+        }
+        if sel < 80 {
+            // east ±2 Q
+            return self.q_at(x + 2, y, sel - 72);
         }
         false
     }
