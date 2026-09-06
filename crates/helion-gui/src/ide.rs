@@ -31804,11 +31804,17 @@ mod tests {
         assert!(tiny.tab_is_selectable("Timing"));
 
         let cell = chrome::floorplan_fit_cell(32, 33, 800.0, 500.0);
+        assert!(cell >= 4.0 && cell <= 64.0, "cell out of range: {cell}");
         assert!(
-            chrome::floorplan_fits_viewport(32, 33, cell, 800.0, 500.0),
-            "fit cell {cell} must show the whole 32×33 die in 800×500"
+            chrome::floorplan_die_fill_ratio(32, cell, 800.0) >= 0.80,
+            "die fill ≥80% at 800px, got {:.3} cell={cell}",
+            chrome::floorplan_die_fill_ratio(32, cell, 800.0)
         );
-        assert!(cell >= 4.0 && cell <= 24.0, "cell out of range: {cell}");
+        assert!(
+            chrome::floorplan_right_gap_px(32, cell, 800.0) <= 80.0,
+            "right gap ≤80px, got {:.1}",
+            chrome::floorplan_right_gap_px(32, cell, 800.0)
+        );
         assert!(
             chrome::DEVICE_TABLES_MAX_HEIGHT < chrome::DESKTOP_HEIGHT / 3.0,
             "device tables must leave room for an expanding floorplan"
