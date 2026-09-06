@@ -4,27 +4,35 @@
 //! - [`FtdiBitbangSim::open`] — sim "open FTDI" (always succeeds; no libusb)
 //! - [`FtdiBitbangSim::shift_ir`] / [`FtdiBitbangSim::shift_dr_u32`] — one JTAG
 //!   shift via [`crate::Tap::tick`] (TMS/TDI bitbang)
-//! - [`FtdiBitbangSim::read_idcode`] — IR_IDCODE + 32-bit DR scan
+//! - [`FtdiBitbangSim::read_idcode`] / [`FtdiBitbangSim::read_stat_word`] — IR + DR
+//! - [`FtdiBitbangSim::program_bitstream`] — **CFG_W**: bitbang `IR_CFG_W`, shift
+//!   full `.hbits` packets as DR, Update-DR commits into sim fabric, then STAT
+//!   readback (sim fabric DONE only)
 //!
 //! This is **not** native MPSSE over real USB and must never be reported as
-//! hardware program DONE. [`crate::NativeFtdiStub`] remains `NotImplemented`
-//! for physical CFG_W / STAT over USB (OFL or sim cable still own program).
+//! hardware / board program DONE. [`crate::NativeFtdiStub`] remains `NotImplemented`
+//! for physical CFG_W / STAT over USB (OFL owns hardware program).
 
+use helion_bits::Bitstream;
 use helion_device::Device;
+use helion_fabric::Stat;
 
-use crate::{Tap, TapState, IR_IDCODE, IR_STAT};
+use crate::{Tap, TapState, IR_CFG_W, IR_IDCODE, IR_STAT};
 
 /// Error from the sim bitbang harness (never pretends to be USB I/O failure).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MpsseSimError {
     /// [`FtdiBitbangSim::open`] not called yet.
     NotOpen(&'static str),
+    /// CFG_W packet decode / fabric program failed after Update-DR.
+    CfgW(String),
 }
 
 impl std::fmt::Display for MpsseSimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MpsseSimError::NotOpen(msg) => write!(f, "mpsse-sim not open: {msg}"),
+            MpsseSimError::CfgW(msg) => write!(f, "mpsse-sim CFG_W: {msg}"),
         }
     }
 }
@@ -180,6 +188,79 @@ impl FtdiBitbangSim {
         let _ = self.shift_ir(IR_STAT)?;
         self.shift_dr_u32(0)
     }
+
+    /// Functional **CFG_W** program path (sim only): bitbang `IR_CFG_W`, shift the
+    /// full `.hbits` packet stream as one DR, Update-DR commits into the in-process
+    /// fabric + startup SM, then bitbang STAT readback.
+    ///
+    /// Returns sim fabric [`Stat`] with DONE after a successful commit. This is
+    /// **not** board DONE — no USB, no FTDI MPSSE, no openFPGALoader.
+    pub fn program_bitstream(&mut self, bits: &Bitstream) -> Result<Stat, MpsseSimError> {
+        self.require_open()?;
+        let packets = &bits.packets;
+        if packets.is_empty() {
+            return Err(MpsseSimError::CfgW(
+                "empty .hbits packet stream (nothing to shift on CFG_W DR)".into(),
+            ));
+        }
+
+        // Pre-condition: unconfigured fabric reports RESET_WORD via bitbang STAT.
+        let pre = self.read_stat_word()?;
+        if pre != Stat::RESET_WORD {
+            return Err(MpsseSimError::CfgW(format!(
+                "expected RESET_WORD {reset:#010x} before CFG_W, got {pre:#010x}",
+                reset = Stat::RESET_WORD
+            )));
+        }
+
+        let _ = self.shift_ir(IR_CFG_W)?;
+        if self.tap.ir != IR_CFG_W {
+            return Err(MpsseSimError::CfgW(format!(
+                "IR not latched to CFG_W (got {:#04x})",
+                self.tap.ir
+            )));
+        }
+
+        // Shift entire packet stream LSB-first per byte (Capture-DR clears cfg_buf).
+        self.enter_shift_dr();
+        let nbits = packets.len() * 8;
+        for i in 0..nbits {
+            let byte = packets[i / 8];
+            let tdi = ((byte >> (i % 8)) & 1) != 0;
+            let last = i + 1 == nbits;
+            let _ = self.tap.tick(last, tdi);
+        }
+        debug_assert_eq!(self.tap.state, TapState::Exit1Dr);
+        self.exit_update_idle(); // Update-DR → from_packets + fabric.program + finish_startup
+
+        if let Some(err) = self.tap.cfg_last_err() {
+            return Err(MpsseSimError::CfgW(err.to_string()));
+        }
+        if !self.tap.fabric().stat.done {
+            return Err(MpsseSimError::CfgW(
+                "CFG_W Update-DR did not assert sim fabric DONE".into(),
+            ));
+        }
+
+        // Honest STAT via bitbang DR (not a fabricated OFL summary).
+        let word = self.read_stat_word()?;
+        if word != Stat::STARTUP_WORD {
+            return Err(MpsseSimError::CfgW(format!(
+                "STAT readback {word:#010x} != STARTUP_WORD {expect:#010x}",
+                expect = Stat::STARTUP_WORD
+            )));
+        }
+        Ok(self.tap.fabric().stat.clone())
+    }
+
+    /// Load `.hbits` from disk and [`Self::program_bitstream`].
+    pub fn program_hbits_path(&mut self, path: &std::path::Path) -> Result<Stat, MpsseSimError> {
+        let bytes = std::fs::read(path).map_err(|e| {
+            MpsseSimError::CfgW(format!("read {}: {e}", path.display()))
+        })?;
+        let bits = Bitstream::from_packets(&bytes).map_err(MpsseSimError::CfgW)?;
+        self.program_bitstream(&bits)
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +307,73 @@ mod tests {
         let scanned2 = bb.shift_ir(IR_IDCODE).unwrap();
         assert_eq!(scanned2, IR_STAT);
         assert_eq!(bb.tap().ir, IR_IDCODE);
+    }
+
+    #[test]
+    fn cfg_w_empty_bitstream_stat_done_via_bitbang() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut bb = FtdiBitbangSim::new(&dev);
+        bb.open().unwrap();
+
+        let bits = Bitstream::empty(&dev);
+        assert!(!bits.packets.is_empty(), "empty design still emits .hbits header/body");
+
+        let st = bb.program_bitstream(&bits).unwrap();
+        assert!(st.done, "sim fabric DONE after CFG_W");
+        assert!(st.gwe && st.init && st.eos);
+        assert!(!st.gts && !st.gsr && !st.crc_err);
+        assert_eq!(st.word(), Stat::STARTUP_WORD);
+
+        // Second STAT scan still reports STARTUP (fabric stays configured).
+        let word = bb.read_stat_word().unwrap();
+        assert_eq!(word, Stat::STARTUP_WORD);
+        assert_eq!(bb.tap().ir, IR_STAT);
+    }
+
+    #[test]
+    fn cfg_w_counter_hbits_stat_done_via_bitbang() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut bb = FtdiBitbangSim::new(&dev);
+        bb.open().unwrap();
+
+        // Prefer freshly bitgen'd counter under /tmp; fall back to in-tree project output path.
+        let candidates = [
+            std::path::Path::new("/tmp/counter.hbits"),
+            std::path::Path::new("examples/counter.hbits"),
+            std::path::Path::new("/workspace/helion/examples/counter.hbits"),
+        ];
+        let path = candidates.iter().find(|p| p.is_file()).copied();
+        let path = match path {
+            Some(p) => p,
+            None => {
+                // Build empty+minimal from Bitstream::empty if no counter file — still proves CFG_W.
+                // Prefer failing loudly if neither exists so CI keeps a counter artifact.
+                panic!("no counter.hbits found in {:?} — run `helion project examples/counter.prj`", candidates);
+            }
+        };
+
+        let st = bb.program_hbits_path(path).unwrap();
+        assert!(st.done);
+        assert_eq!(st.word(), Stat::STARTUP_WORD);
+        assert_eq!(bb.read_idcode().unwrap(), 0x0001_1A1F);
+        // Honesty: NativeFtdiStub still NotImplemented (this path ≠ USB DONE).
+        let err = crate::try_native_usb_program(path, false).unwrap_err();
+        assert!(matches!(err, crate::NativeUsbError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn cfg_w_garbage_packets_do_not_claim_done() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut bb = FtdiBitbangSim::new(&dev);
+        bb.open().unwrap();
+
+        let mut bits = Bitstream::empty(&dev);
+        bits.packets = b"not-a-valid-hbits-stream!!!!".to_vec();
+        let err = bb.program_bitstream(&bits).unwrap_err();
+        assert!(matches!(err, MpsseSimError::CfgW(_)), "{err}");
+        // Fabric must remain unconfigured (RESET) — no fake DONE.
+        assert!(!bb.tap().fabric().stat.done);
+        assert_eq!(bb.read_stat_word().unwrap(), Stat::RESET_WORD);
     }
 
     #[test]

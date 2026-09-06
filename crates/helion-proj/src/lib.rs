@@ -480,6 +480,22 @@ impl Session {
                     st.crc_err as u8
                 ))
             }
+            CableBackend::MpsseSim => {
+                let frames = bits.frames.len();
+                let bytes = bits.packets.len();
+                let st = helion_hw::prog_mpsse_sim(dev, bits)?;
+                self.programmed = true;
+                Ok(format!(
+                    "program_hw cable={} backend=mpsse-sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={} (sim fabric bitbang; not board DONE)",
+                    info.id,
+                    dev.part,
+                    frames,
+                    bytes,
+                    st.done as u8,
+                    st.gwe as u8,
+                    st.crc_err as u8
+                ))
+            }
             CableBackend::OpenFpgaLoader | CableBackend::NativeUsb => {
                 // Persist packets to a temp .hbits so OFL (or native→OFL fallback) can consume a path.
                 let dir = std::env::temp_dir().join("helion-prog-hw");

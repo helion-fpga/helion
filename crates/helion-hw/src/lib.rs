@@ -9,8 +9,8 @@
 //! via [`native_usb`] — listed in [`detect_boards`] as physical probes **without**
 //! claiming program DONE. Programming / real MPSSE remains OFL (or sim); [`NativeFtdiStub`]
 //! still returns `NotImplemented` for CFG_W. [`mpsse_sim`] adds an in-process FTDI
-//! bitbang harness (open + one JTAG IR/DR shift) for tests — **not** hardware DONE.
-//! Without the feature, OFL path is unchanged.
+//! bitbang harness: open, IR/DR, and **CFG_W `.hbits` load + STAT readback** (sim fabric
+//! DONE only — **not** board/hardware DONE). Without the feature, OFL path is unchanged.
 //! HAD board IDs / `HELION_OFL_BOARD` defaults live in [`HAD_KNOWN_BOARDS`].
 //! OFL summaries parse verify output honestly and never invent Helion TAP STAT.
 //! No UNISIM/AMD IP — HAD is Helion's story.
@@ -54,6 +54,12 @@ pub struct Tap {
     /// DR shift register (IDCODE/STAT words use low 32 bits).
     dr_shift: u64,
     shlen: u8,
+    /// CFG_W payload accumulating during Shift-DR (`IR_CFG_W`), LSB-first per byte.
+    cfg_buf: Vec<u8>,
+    /// Bit count written into [`Self::cfg_buf`] for the current CFG_W DR scan.
+    cfg_bit_count: u32,
+    /// Last CFG_W Update-DR decode/program error (cleared on successful commit).
+    cfg_last_err: Option<String>,
 }
 
 impl Tap {
@@ -65,16 +71,33 @@ impl Tap {
             ir_shift: 0,
             dr_shift: 0,
             shlen: 0,
+            cfg_buf: Vec::new(),
+            cfg_bit_count: 0,
+            cfg_last_err: None,
         }
     }
 
     /// IEEE 1149.1 IR length for Helion TAP (matches `IR_*` 6-bit opcodes).
     pub const IR_LEN: u8 = 6;
 
+    /// In-process fabric (sim / bitbang harness). Not a board probe.
+    pub fn fabric(&self) -> &Fabric {
+        &self.fabric
+    }
+
+    /// Last CFG_W Update-DR error, if any.
+    pub fn cfg_last_err(&self) -> Option<&str> {
+        self.cfg_last_err.as_deref()
+    }
+
     /// One simulated TCK: sample TDO, shift TDI if in Shift-*, then apply TMS.
     ///
     /// Bit-accurate path used by [`mpsse_sim`] — independent of the high-level
     /// [`Self::shift_ir`] shortcut used by the sim cable program path.
+    ///
+    /// When `IR_CFG_W` is active, Shift-DR appends TDI bits into [`Self::cfg_buf`]
+    /// and Update-DR commits via [`Bitstream::from_packets`] + fabric program/startup
+    /// (sim fabric DONE only).
     pub fn tick(&mut self, tms: bool, tdi: bool) -> bool {
         let tdo = match self.state {
             TapState::ShiftIr | TapState::CaptureIr => (self.ir_shift & 1) != 0,
@@ -90,9 +113,22 @@ impl Tap {
                 self.shlen = self.shlen.saturating_add(1);
             }
             TapState::ShiftDr => {
-                // 32-bit DR window for IDCODE/STAT.
-                self.dr_shift = (self.dr_shift >> 1) | ((u64::from(tdi)) << 31);
-                self.shlen = self.shlen.saturating_add(1);
+                if self.ir == IR_CFG_W {
+                    // Variable-length CFG_W stream (full `.hbits` packets).
+                    let byte_i = (self.cfg_bit_count / 8) as usize;
+                    let bit_i = (self.cfg_bit_count % 8) as u8;
+                    if self.cfg_buf.len() <= byte_i {
+                        self.cfg_buf.resize(byte_i + 1, 0);
+                    }
+                    if tdi {
+                        self.cfg_buf[byte_i] |= 1 << bit_i;
+                    }
+                    self.cfg_bit_count = self.cfg_bit_count.saturating_add(1);
+                } else {
+                    // 32-bit DR window for IDCODE/STAT.
+                    self.dr_shift = (self.dr_shift >> 1) | ((u64::from(tdi)) << 31);
+                    self.shlen = self.shlen.saturating_add(1);
+                }
             }
             _ => {}
         }
@@ -108,12 +144,36 @@ impl Tap {
             self.dr_shift = match self.ir {
                 IR_IDCODE => u64::from(self.fabric.idcode),
                 IR_STAT => u64::from(self.fabric.stat.word()),
+                IR_CFG_W => {
+                    self.cfg_buf.clear();
+                    self.cfg_bit_count = 0;
+                    self.cfg_last_err = None;
+                    0
+                }
                 _ => 0,
             };
             self.shlen = 0;
         }
         if self.state == TapState::UpdateIr && prev != TapState::UpdateIr {
             self.ir = self.ir_shift & 0x3f;
+        }
+        if self.state == TapState::UpdateDr && prev != TapState::UpdateDr {
+            if self.ir == IR_CFG_W && !self.cfg_buf.is_empty() {
+                match Bitstream::from_packets(&self.cfg_buf) {
+                    Ok(bits) => match self.fabric.program(&bits) {
+                        Ok(()) => {
+                            self.fabric.finish_startup();
+                            self.cfg_last_err = None;
+                        }
+                        Err(e) => {
+                            self.cfg_last_err = Some(e);
+                        }
+                    },
+                    Err(e) => {
+                        self.cfg_last_err = Some(e);
+                    }
+                }
+            }
         }
         tdo
     }
@@ -231,11 +291,21 @@ pub fn prog_empty(dev: &Device) -> Result<Stat, String> {
     prog_sim(dev, &Bitstream::empty(dev))
 }
 
+/// Program via [`FtdiBitbangSim`] CFG_W bitbang path (sim fabric STAT/DONE only).
+pub fn prog_mpsse_sim(dev: &Device, bits: &Bitstream) -> Result<Stat, String> {
+    let mut bb = FtdiBitbangSim::new(dev);
+    bb.open().map_err(|e| e.to_string())?;
+    bb.program_bitstream(bits).map_err(|e| e.to_string())
+}
+
 /// Programming backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CableBackend {
-    /// In-process TAP + fabric (helion-hw sim cable).
+    /// In-process TAP + fabric (helion-hw sim cable; high-level CFG_W).
     Sim,
+    /// In-process FTDI bitbang harness ([`mpsse_sim`]): IR/DR + CFG_W packet shift + STAT.
+    /// Sim fabric DONE only — never board/hardware DONE.
+    MpsseSim,
     /// External `openFPGALoader` on PATH (USB/JTAG). Active physical path today.
     OpenFpgaLoader,
     /// Native USB path ([`HadUsbTransport`]). Detect may use rusb (`usb-native`); program still NotImplemented → OFL.
@@ -246,6 +316,7 @@ impl CableBackend {
     pub fn as_str(self) -> &'static str {
         match self {
             CableBackend::Sim => "sim",
+            CableBackend::MpsseSim => "mpsse-sim",
             CableBackend::OpenFpgaLoader => "ofl",
             CableBackend::NativeUsb => "native",
         }
@@ -387,7 +458,7 @@ pub fn had_board_id_table_text() -> String {
         ));
     }
     out.push_str(&format!(
-        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL; mpsse_sim=bitbang-harness (tests only, not hardware DONE)\n",
+        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL; mpsse_sim=bitbang+CFG_W+STAT (sim fabric DONE only; not hardware DONE)\n",
         if native_usb::feature_enabled() {
             "usb-native"
         } else {
@@ -750,6 +821,15 @@ fn sim_cable_info() -> CableInfo {
     }
 }
 
+fn mpsse_sim_cable_info() -> CableInfo {
+    CableInfo {
+        id: "mpsse-sim0".into(),
+        backend: CableBackend::MpsseSim,
+        part_hint: "HL10T-C32-1".into(),
+        detail: "FTDI bitbang harness (Tap::tick): CFG_W .hbits DR + STAT; sim fabric DONE only — not board DONE".into(),
+    }
+}
+
 fn ofl_cable_info(scan: &UsbScan) -> CableInfo {
     let ofl_probes: Vec<_> = scan
         .probes
@@ -806,6 +886,7 @@ pub fn list_cables() -> Vec<CableInfo> {
     let scan = scan_usb_probes();
     vec![
         sim_cable_info(),
+        mpsse_sim_cable_info(),
         ofl_cable_info(&scan),
         native_cable_info(&scan),
     ]
@@ -818,6 +899,7 @@ pub fn detect_boards() -> DetectReport {
     let physical_had = !usb.probes.is_empty();
     let cables = vec![
         sim_cable_info(),
+        mpsse_sim_cable_info(),
         ofl_cable_info(&usb),
         native_cable_info(&usb),
     ];
@@ -847,7 +929,7 @@ pub fn detect_boards() -> DetectReport {
     }
 }
 
-/// Resolve `--cable auto|sim|usb|ofl|native|sim0|ofl0|usb0|native0`.
+/// Resolve `--cable auto|sim|mpsse-sim|usb|ofl|native|sim0|mpsse-sim0|ofl0|usb0|native0`.
 pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
     let s = spec.trim().to_ascii_lowercase();
     let det = detect_boards();
@@ -869,8 +951,15 @@ pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
         .find(|c| c.backend == CableBackend::NativeUsb)
         .cloned()
         .unwrap_or_else(|| native_cable_info(&det.usb));
+    let mpsse = det
+        .cables
+        .iter()
+        .find(|c| c.backend == CableBackend::MpsseSim)
+        .cloned()
+        .unwrap_or_else(mpsse_sim_cable_info);
     match s.as_str() {
         "" | "sim" | "sim0" => Ok(sim),
+        "mpsse-sim" | "mpsse_sim" | "mpsse-sim0" | "bitbang" => Ok(mpsse),
         "usb" | "usb0" | "ofl" | "ofl0" | "openfpgaloader" => Ok(ofl),
         "native" | "native0" | "ftdi" | "libusb" => Ok(native),
         "auto" => {
@@ -881,7 +970,7 @@ pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
             }
         }
         other => Err(format!(
-            "unknown cable {other:?}: use --cable auto|sim|usb|ofl|native"
+            "unknown cable {other:?}: use --cable auto|sim|mpsse-sim|usb|ofl|native"
         )),
     }
 }
@@ -1219,6 +1308,24 @@ pub fn program_hbits_with_cable(
             let (bits, st) = program_hbits_path(dev, path)?;
             Ok(ProgramOutcome::Sim { bits, stat: st })
         }
+        CableBackend::MpsseSim => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("program: read {}: {e}", path.display()))?;
+            let bits = Bitstream::from_packets(&bytes)?;
+            if bits.idcode != dev.idcode {
+                return Err(format!(
+                    "program: bitstream idcode {:#010x} != device {} idcode {:#010x}",
+                    bits.idcode, dev.part, dev.idcode
+                ));
+            }
+            eprintln!(
+                "program: mpsse-sim CFG_W bitbang {} ({} bytes) → STAT readback (sim fabric only)…",
+                path.display(),
+                bytes.len()
+            );
+            let st = prog_mpsse_sim(dev, &bits)?;
+            Ok(ProgramOutcome::MpsseSim { bits, stat: st })
+        }
         CableBackend::NativeUsb => {
             // Honest stub: try native, then fall back to OFL when NotImplemented.
             match try_native_usb_program(path, flash) {
@@ -1290,6 +1397,11 @@ pub enum ProgramOutcome {
         bits: Bitstream,
         stat: Stat,
     },
+    /// Bitbang CFG_W + STAT via [`FtdiBitbangSim`] (sim fabric DONE — not board DONE).
+    MpsseSim {
+        bits: Bitstream,
+        stat: Stat,
+    },
     OpenFpgaLoader {
         bits: Option<Bitstream>,
         ofl: OflProgramReport,
@@ -1301,16 +1413,30 @@ impl ProgramOutcome {
     pub fn backend(&self) -> CableBackend {
         match self {
             ProgramOutcome::Sim { .. } => CableBackend::Sim,
+            ProgramOutcome::MpsseSim { .. } => CableBackend::MpsseSim,
             ProgramOutcome::OpenFpgaLoader { .. } => CableBackend::OpenFpgaLoader,
         }
     }
 
     /// Human summary line for CLI / GUI. Claims DONE only for sim TAP or OFL exit 0.
     /// OFL path never invents Helion TAP STAT bits — reports `TAP_readback=none`.
+    /// `mpsse-sim` reports real sim-fabric STAT from bitbang readback (still not board DONE).
     pub fn summary_line(&self, sub: &str, part: &str) -> String {
         match self {
             ProgramOutcome::Sim { bits, stat } => format!(
                 "hw {sub} backend=sim part={part} frames={} bytes={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
+                bits.frames.len(),
+                bits.packets.len(),
+                stat.init as u8,
+                stat.done as u8,
+                stat.eos as u8,
+                stat.gwe as u8,
+                stat.gsr as u8,
+                stat.gts as u8,
+                stat.crc_err as u8
+            ),
+            ProgramOutcome::MpsseSim { bits, stat } => format!(
+                "hw {sub} backend=mpsse-sim part={part} frames={} bytes={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={} (sim fabric via bitbang CFG_W; not board DONE)",
                 bits.frames.len(),
                 bits.packets.len(),
                 stat.init as u8,
@@ -1369,6 +1495,28 @@ mod tests {
         assert_eq!(rst.word(), helion_fabric::Stat::RESET_WORD);
         assert_eq!(idle.ir, IR_STAT);
         assert_ne!(rst.word(), st.word());
+    }
+
+    #[test]
+    fn helion_prog_mpsse_sim_counter_cfg_w() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let cable = resolve_cable("mpsse-sim").unwrap();
+        assert_eq!(cable.backend, CableBackend::MpsseSim);
+        let path = std::path::Path::new("/tmp/counter.hbits");
+        if !path.is_file() {
+            let bits = Bitstream::empty(&dev);
+            let st = prog_mpsse_sim(&dev, &bits).unwrap();
+            assert!(st.done);
+            return;
+        }
+        let ok = program_hbits_with_cable(&dev, path, &cable, false).unwrap();
+        match ok {
+            ProgramOutcome::MpsseSim { stat, .. } => {
+                assert!(stat.done);
+                assert_eq!(stat.word(), helion_fabric::Stat::STARTUP_WORD);
+            }
+            other => panic!("expected MpsseSim outcome, got {:?}", other.backend()),
+        }
     }
 
     #[test]
@@ -1445,6 +1593,10 @@ mod tests {
         assert!(
             d.cables.iter().any(|c| c.backend == CableBackend::NativeUsb),
             "native USB stub must be advertised"
+        );
+        assert!(
+            d.cables.iter().any(|c| c.backend == CableBackend::MpsseSim),
+            "mpsse-sim CFG_W bitbang cable must be advertised"
         );
         assert!(d.text().contains("physical_had="));
         assert!(d.text().contains("had_board_ids"));
@@ -1536,7 +1688,7 @@ mod tests {
                 assert_eq!(ofl.exit_code, Some(0));
                 assert!(ofl.command.contains("fake-ofl") || ofl.command.contains("-m"));
             }
-            ProgramOutcome::Sim { .. } => panic!("expected ofl backend"),
+            ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } => panic!("expected ofl backend"),
         }
         unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
     }
@@ -1621,7 +1773,7 @@ mod tests {
                 assert!(line.contains("TAP_readback=none"), "{line}");
                 assert!(line.contains("STAT=(no readback)"), "{line}");
             }
-            ProgramOutcome::Sim { .. } => panic!("expected OFL fallback from native stub"),
+            ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } => panic!("expected OFL fallback from native stub"),
         }
         // Flash + HELION_OFL_VERIFY should request --verify (still not TAP readback).
         unsafe { std::env::set_var("HELION_OFL_VERIFY", "1"); }
@@ -1633,7 +1785,7 @@ mod tests {
                 assert_eq!(ofl.readback, OflReadbackKind::FlashSpiVerify);
                 assert!(!ofl.tap_readback);
             }
-            ProgramOutcome::Sim { .. } => panic!("expected ofl"),
+            ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } => panic!("expected ofl"),
         }
         unsafe { std::env::remove_var("HELION_OFL_VERIFY"); }
         unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
