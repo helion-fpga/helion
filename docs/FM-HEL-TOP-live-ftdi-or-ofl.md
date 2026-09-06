@@ -3,7 +3,7 @@
 **Date:** 2026-09-06 ~02:20 America/New_York  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
 **Prior:** SHA `c907adb` / tip `ebbae5d` — Native FTDI MPSSE opcodes; no-device Io; refuse DONE until STAT TDO validated  
-**Shipped:** *(fill after commit)*  
+**Shipped:** SHA `dc98afa`  
 **Gold:** `WNS_PS=9640` **held** (`helion report_timing examples/counter.sv --sdc examples/counter.sdc`)
 
 ## Goal
