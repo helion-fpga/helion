@@ -27,9 +27,14 @@ impl Default for PlaceOpts {
     }
 }
 
-/// Bring-up IMUX reach: same CLB or N-S ±1 (matches helion-route::imux_sel).
+/// Bring-up IMUX reach: same CLB or N-S ±1/±2 (matches helion-route::imux_sel).
 fn imux_local(from: Site, to: Site) -> bool {
-    from.x == to.x && (from.y == to.y || from.y + 1 == to.y || to.y + 1 == from.y)
+    from.x == to.x
+        && (from.y == to.y
+            || from.y + 1 == to.y
+            || to.y + 1 == from.y
+            || from.y + 2 == to.y
+            || to.y + 2 == from.y)
 }
 
 fn imux_illegal_pins(
@@ -103,7 +108,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
-        // FF cell → site as we place (IMUX only encodes same-CLB / N-S ±1).
+        // FF cell → site as we place (IMUX encodes same-CLB / N-S ±1/±2).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
             let preferred_x = iob_for_net
@@ -146,8 +151,12 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     if s.x == col_x {
                         y_order.push(s.y);
                         y_order.push(s.y.saturating_add(1));
+                        y_order.push(s.y.saturating_add(2));
                         if s.y > 0 {
                             y_order.push(s.y - 1);
+                        }
+                        if s.y > 1 {
+                            y_order.push(s.y - 2);
                         }
                     }
                 }
@@ -181,11 +190,30 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             lutff_sites.push(site_ble);
         }
 
-            // FM-HEL-TOP: longer-reach via legalization — pull sinks onto
-            // driver same-CLB / N-S±1 so imux_skip drops (HAD has no E-W IMUX).
+            // FM-HEL-TOP: stronger IMUX legalization — pull sinks onto driver
+            // same-CLB / N-S±1/±2 (real HAD reach); empty-BLE move then pairwise
+            // swap when sites are full. No fake E-W encoding.
+            let mut site_of: std::collections::HashMap<(u32, u32, u8), usize> =
+                std::collections::HashMap::new();
+            for (i, (s, ble)) in lutff_sites.iter().enumerate() {
+                site_of.insert((s.x, s.y, *ble), i);
+            }
+            let push_ns = |xy: &mut Vec<(u32, u32)>, x: u32, y: u32| {
+                xy.push((x, y));
+                xy.push((x, y.saturating_add(1)));
+                xy.push((x, y.saturating_add(2)));
+                if y > 0 {
+                    xy.push((x, y - 1));
+                }
+                if y > 1 {
+                    xy.push((x, y - 2));
+                }
+            };
             let mut moved = 0u32;
-            for _pass in 0..3 {
+            let mut swapped = 0u32;
+            for _pass in 0..8 {
                 let mut pass_moved = 0u32;
+                let mut pass_swapped = 0u32;
                 for (i, lf) in packed.lutffs.iter().enumerate() {
                     if lf.lut_pins.is_empty() {
                         continue;
@@ -198,29 +226,25 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     let mut cand_xy: Vec<(u32, u32)> = Vec::new();
                     for (_, driver) in &lf.lut_pins {
                         if let Some(ds) = ff_at.get(driver.as_str()).copied() {
-                            cand_xy.push((ds.x, ds.y));
-                            cand_xy.push((ds.x, ds.y.saturating_add(1)));
-                            if ds.y > 0 {
-                                cand_xy.push((ds.x, ds.y - 1));
-                            }
+                            push_ns(&mut cand_xy, ds.x, ds.y);
                         }
                     }
                     {
                         let mut seen = HashSet::new();
                         cand_xy.retain(|xy| seen.insert(*xy));
                     }
+                    // 1) Prefer empty BLE on a legal candidate.
                     let mut best: Option<(Site, u8, u32)> = None;
-                    for (cx, cy) in cand_xy {
-                        let Some(site) = cols.get(&cx).and_then(|c| c.iter().find(|s| s.y == cy).copied()) else {
+                    for (cx, cy) in &cand_xy {
+                        let Some(site) = cols
+                            .get(cx)
+                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
+                        else {
                             continue;
                         };
                         for ble in 0..n_ble as u8 {
                             let key = (site.x, site.y, ble);
                             if key == (cur_site.x, cur_site.y, cur_ble) {
-                                let ill = imux_illegal_pins(lf, site, &ff_at);
-                                if ill < before {
-                                    best = Some((site, ble, ill));
-                                }
                                 continue;
                             }
                             if used.contains(&key) {
@@ -241,20 +265,118 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     if let Some((site, ble, _)) = best {
                         used.remove(&(cur_site.x, cur_site.y, cur_ble));
                         used.insert((site.x, site.y, ble));
+                        site_of.remove(&(cur_site.x, cur_site.y, cur_ble));
+                        site_of.insert((site.x, site.y, ble), i);
                         lutff_sites[i] = (site, ble);
                         if !lf.ff_cell.is_empty() {
                             ff_at.insert(lf.ff_cell.as_str(), site);
                         }
                         pass_moved += 1;
+                        continue;
+                    }
+                    // 2) Pairwise swap with occupant when total illegal pins drop.
+                    // Mutate/restore ff_at (no HashMap clone — Ibex-scale).
+                    let mut best_swap: Option<(usize, Site, u8, u32)> = None;
+                    for (cx, cy) in &cand_xy {
+                        let Some(site) = cols
+                            .get(cx)
+                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
+                        else {
+                            continue;
+                        };
+                        for ble in 0..n_ble as u8 {
+                            let key = (site.x, site.y, ble);
+                            if key == (cur_site.x, cur_site.y, cur_ble) {
+                                continue;
+                            }
+                            let Some(&j) = site_of.get(&key) else {
+                                continue;
+                            };
+                            if j == i {
+                                continue;
+                            }
+                            let other = &packed.lutffs[j];
+                            let (osite, _oble) = lutff_sites[j];
+                            let other_before = imux_illegal_pins(other, osite, &ff_at);
+                            let i_ff = lf.ff_cell.as_str();
+                            let j_ff = other.ff_cell.as_str();
+                            let i_prev = if !i_ff.is_empty() {
+                                ff_at.insert(i_ff, site)
+                            } else {
+                                None
+                            };
+                            let j_prev = if !j_ff.is_empty() {
+                                ff_at.insert(j_ff, cur_site)
+                            } else {
+                                None
+                            };
+                            let ill_i = imux_illegal_pins(lf, site, &ff_at);
+                            let ill_j = imux_illegal_pins(other, cur_site, &ff_at);
+                            // restore
+                            if !i_ff.is_empty() {
+                                match i_prev {
+                                    Some(s) => {
+                                        ff_at.insert(i_ff, s);
+                                    }
+                                    None => {
+                                        ff_at.remove(i_ff);
+                                    }
+                                }
+                            }
+                            if !j_ff.is_empty() {
+                                match j_prev {
+                                    Some(s) => {
+                                        ff_at.insert(j_ff, s);
+                                    }
+                                    None => {
+                                        ff_at.remove(j_ff);
+                                    }
+                                }
+                            }
+                            let after = ill_i + ill_j;
+                            let before_tot = before + other_before;
+                            if after >= before_tot {
+                                continue;
+                            }
+                            if best_swap.as_ref().map(|b| after < b.3).unwrap_or(true) {
+                                best_swap = Some((j, site, ble, after));
+                                if after == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        if best_swap.map(|b| b.3) == Some(0) {
+                            break;
+                        }
+                    }
+                    if let Some((j, site, ble, _)) = best_swap {
+                        let (osite, oble) = lutff_sites[j];
+                        site_of.remove(&(cur_site.x, cur_site.y, cur_ble));
+                        site_of.remove(&(osite.x, osite.y, oble));
+                        lutff_sites[i] = (site, ble);
+                        lutff_sites[j] = (cur_site, cur_ble);
+                        site_of.insert((site.x, site.y, ble), i);
+                        site_of.insert((cur_site.x, cur_site.y, cur_ble), j);
+                        // used keys unchanged (swap)
+                        if !lf.ff_cell.is_empty() {
+                            ff_at.insert(lf.ff_cell.as_str(), site);
+                        }
+                        if !packed.lutffs[j].ff_cell.is_empty() {
+                            ff_at.insert(packed.lutffs[j].ff_cell.as_str(), cur_site);
+                        }
+                        pass_swapped += 1;
                     }
                 }
                 moved += pass_moved;
-                if pass_moved == 0 {
+                swapped += pass_swapped;
+                if pass_moved == 0 && pass_swapped == 0 {
                     break;
                 }
             }
-            if moved > 0 {
-                eprintln!("hang_diag place imux_legalize moved={moved}");
+            if moved > 0 || swapped > 0 {
+                eprintln!(
+                    "hang_diag place imux_legalize moved={moved} swapped={swapped}"
+                );
             }
     }
 
