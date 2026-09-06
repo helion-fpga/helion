@@ -31690,7 +31690,7 @@ mod tests {
             chrome::RAIL_WIDTH + chrome::SIDEBAR_WIDTH
         );
         assert_eq!(chrome::RAIL_WIDTH, 48.0);
-        assert_eq!(chrome::SIDEBAR_WIDTH, 240.0);
+        assert_eq!(chrome::SIDEBAR_WIDTH, 220.0);
         assert_eq!(chrome::HIT_PRIMARY, 32.0);
         assert_eq!(chrome::HIT_SIDEBAR, 28.0);
         assert!(chrome::workspace_matches_canvases());
