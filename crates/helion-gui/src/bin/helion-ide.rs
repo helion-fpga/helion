@@ -1042,14 +1042,24 @@ fn paint_status_bar(
                     _ => model.workspace.canvas_label(),
                 };
                 let crumb = format!("{} › {}", activity.label(), where_label);
+                // Soft-hold crumb on Program rail — visible without opening Program side.
+                // Detect only; never claims board DONE. Sim Program path unchanged.
+                let board_crumb = if activity == Activity::Program
+                    && !helion_hw::detect_boards().physical_had
+                {
+                    " · board:soft-hold"
+                } else {
+                    ""
+                };
                 ui.label(
                     RichText::new(format!(
-                        "{} · {} · WNS {} · LUTFF {} · {}",
+                        "{} · {} · WNS {} · LUTFF {} · {}{}",
                         crumb,
                         model.part(),
                         wns,
                         lutff,
-                        run
+                        run,
+                        board_crumb
                     ))
                     .monospace()
                     .size(12.0)
