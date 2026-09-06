@@ -2,7 +2,7 @@ use helion_bits::{bitgen, bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
 use helion_device::Device;
 use helion_drc::check_routed;
 use helion_fabric::Fabric;
-use helion_hw::{detect_boards, list_cables, program_hbits_path, prog_sim, resolve_cable, Tap};
+use helion_hw::{detect_boards, list_cables, program_hbits_with_cable, prog_sim, resolve_cable, CableBackend, ProgramOutcome, Tap};
 use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
@@ -167,7 +167,7 @@ fn usage() {
   helion project run <file.prj> [--cycles N]
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
-  helion hw program|flash --cable sim [--bitstream FILE.hbits] [--part P]",
+  helion hw program|flash --cable auto|sim|usb|ofl [--bitstream FILE.hbits] [--part P]",
         v = env!("CARGO_PKG_VERSION")
     );
 }
@@ -533,18 +533,18 @@ fn hw(args: Vec<String>) {
     let sub = it.next().unwrap_or_default();
     if sub.is_empty() || sub == "-h" || sub == "--help" || sub == "help" {
         eprintln!(
-            "usage:\n  helion hw list\n  helion hw detect\n  helion hw program|flash --cable sim [--bitstream FILE.hbits] [--part P]"
+            "usage:\n  helion hw list\n  helion hw detect\n  helion hw program|flash --cable auto|sim|usb|ofl [--bitstream FILE.hbits] [--part P]"
         );
         std::process::exit(2);
     }
     if sub == "list" {
         for c in list_cables() {
-            let be = match c.backend {
-                helion_hw::CableBackend::Sim => "sim",
-            };
             println!(
                 "cable {} backend={} part={} — {}",
-                c.id, be, c.part_hint, c.detail
+                c.id,
+                c.backend.as_str(),
+                c.part_hint,
+                c.detail
             );
         }
         return;
@@ -559,7 +559,7 @@ fn hw(args: Vec<String>) {
         );
         std::process::exit(2);
     }
-    let mut cable = String::from("sim");
+    let mut cable = String::from("auto");
     let mut part = String::from("HL10T-C32-1");
     let mut bitstream: Option<String> = None;
     while let Some(a) = it.next() {
@@ -582,19 +582,19 @@ fn hw(args: Vec<String>) {
     });
     let det = detect_boards();
     println!(
-        "hw detect physical_had={} cable={} — {}",
+        "hw detect physical_had={} cable={} backend={} — {}",
         u8::from(det.physical_had),
         info.id,
+        info.backend.as_str(),
         info.detail
     );
-    if !det.physical_had {
-        println!("hw note {}", det.note);
-    }
+    println!("hw note {}", det.note);
+    let flash = sub == "flash";
     let dev = Device::load_part(&part).unwrap_or_else(|e| {
         eprintln!("helion hw {sub}: HAD {part}: {e}");
         std::process::exit(1);
     });
-    let (frames, bytes, st) = if let Some(path) = bitstream {
+    if let Some(path) = bitstream {
         let path = std::path::PathBuf::from(&path);
         if !path.exists() {
             eprintln!(
@@ -603,12 +603,19 @@ fn hw(args: Vec<String>) {
             );
             std::process::exit(1);
         }
-        let (bits, st) = program_hbits_path(&dev, &path).unwrap_or_else(|e| {
+        let outcome = program_hbits_with_cable(&dev, &path, &info, flash).unwrap_or_else(|e| {
             eprintln!("helion hw {sub}: {e}");
             std::process::exit(1);
         });
-        (bits.frames.len(), bits.packets.len(), st)
+        println!("{}", outcome.summary_line(&sub, &dev.part));
     } else {
+        if info.backend != CableBackend::Sim {
+            eprintln!(
+                "helion hw {sub}: no --bitstream given; empty smoke only supported on --cable sim\n                   tip: helion bitstream examples/blinky.sv -o out.hbits && helion hw program --cable {} -b out.hbits",
+                info.backend.as_str()
+            );
+            std::process::exit(2);
+        }
         eprintln!(
             "helion hw {sub}: no --bitstream given\n  tip: helion bitstream examples/blinky.sv -o out.hbits && helion hw program --cable sim -b out.hbits\n  programming empty bitstream (smoke only)"
         );
@@ -617,21 +624,9 @@ fn hw(args: Vec<String>) {
             eprintln!("helion hw {sub}: {e}");
             std::process::exit(1);
         });
-        (bits.frames.len(), bits.packets.len(), st)
-    };
-    println!(
-        "hw {sub} part={} frames={} bytes={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-        dev.part,
-        frames,
-        bytes,
-        st.init as u8,
-        st.done as u8,
-        st.eos as u8,
-        st.gwe as u8,
-        st.gsr as u8,
-        st.gts as u8,
-        st.crc_err as u8
-    );
+        let outcome = ProgramOutcome::Sim { bits, stat: st };
+        println!("{}", outcome.summary_line(&sub, &dev.part));
+    }
 }
 
 

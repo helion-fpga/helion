@@ -206,6 +206,8 @@ struct HelionIde {
     tcl_focus: bool,
     /// Last Program rail action: (ok, message) for honest empty/error/progress.
     program_status: Option<(bool, String)>,
+    /// Cable picker: auto|sim|usb|ofl (wired to helion-hw resolve_cable).
+    program_cable: String,
 }
 
 impl HelionIde {
@@ -233,6 +235,7 @@ impl HelionIde {
             recent: Vec::new(),
             tcl_focus: false,
             program_status: None,
+            program_cable: "auto".into(),
         }
     }
 
@@ -638,17 +641,31 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     let det = helion_hw::detect_boards();
-    let cable = helion_hw::list_cables()
-        .into_iter()
-        .next()
-        .expect("sim cable");
     ui.label(RichText::new("Cable").strong());
-    ui.label(format!("{} · sim", cable.id));
+    ui.horizontal(|ui| {
+        for (id, label) in [
+            ("auto", "auto"),
+            ("sim", "sim"),
+            ("usb", "usb/ofl"),
+        ] {
+            let selected = app.program_cable == id;
+            if ui.selectable_label(selected, label).clicked() {
+                app.program_cable = id.to_string();
+            }
+        }
+    });
+    let resolved = helion_hw::resolve_cable(&app.program_cable).ok();
+    if let Some(c) = &resolved {
+        ui.label(format!("{} · {}", c.id, c.backend.as_str()));
+        ui.label(RichText::new(c.detail.as_str()).small().color(Color32::from_rgb(0xa0, 0xa8, 0xb0)));
+    }
     ui.label(
         RichText::new(if det.physical_had {
-            "Physical HAD attached."
+            "Physical USB programmer detected (openFPGALoader)."
+        } else if det.usb.ofl_path.is_some() {
+            "No USB programmer — openFPGALoader on PATH; use sim or attach HAD."
         } else {
-            "No USB HAD — sim cable only."
+            "openFPGALoader not on PATH — sim cable available."
         })
         .color(if det.physical_had {
             Color32::from_rgb(0x3d, 0xb8, 0x7a)
@@ -732,8 +749,11 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
                     "program_hw: no bitstream — Implement, then Bitstream (or helion bitstream -o out.hbits)".into(),
                 ));
             } else {
-                app.program_status = Some((true, "programming via sim cable…".into()));
-                match app.model.exec("program_hw") {
+                let cable = app.program_cable.clone();
+                app.program_status = Some((true, format!("programming via cable={cable}…")));
+                // Ensure HW manager open, then program with selected cable backend.
+                let _ = app.model.exec("open_hw_manager");
+                match app.model.program_hw_with_cable(&cable) {
                     Ok(s) => {
                         app.program_status =
                             Some((true, format!("{s} · frames={frames} bytes={bytes}")));
@@ -5578,9 +5598,9 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     let report = model.hw_stat_report();
     if !report.open {
-        ui.label("No cable yet. Open Hardware Manager to connect the sim cable.");
+        ui.label("No cable yet. Open Hardware Manager (sim or openFPGALoader USB).");
         ui.label(
-            RichText::new("No physical HAD USB programmer detected — sim backend only.")
+            RichText::new("No USB programmer detected — sim backend available; usb/ofl needs openFPGALoader + device.")
                 .small()
                 .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
         );

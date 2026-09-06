@@ -17050,6 +17050,17 @@ impl IdeModel {
     }
 
     /// UG893 Hardware Manager STAT table from helion-hw TAP / fabric Stat.
+    /// Program with explicit cable (`auto|sim|usb|ofl`) via helion-hw backends.
+    pub fn program_hw_with_cable(&mut self, cable: &str) -> Result<String, String> {
+        if !self.shell.session.hw_open {
+            self.shell.session.open_hw_manager();
+        }
+        let part = "HL10T-C32-1";
+        let dev = helion_device::Device::load_part(part)
+            .map_err(|e| format!("program_hw: HAD {part}: {e}"))?;
+        self.shell.session.program_hw_cable(&dev, cable)
+    }
+
     pub fn hw_stat_report(&self) -> HwStatReport {
         let open = self.hw.open || self.shell.session.hw_open;
         if !open {
