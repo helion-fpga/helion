@@ -186,12 +186,16 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
     for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = placed.lutff_sites[i];
         if lutff.lut_pins.is_empty() {
-            imux.push(ImuxRoute {
-                x: site.x,
-                y: site.y,
-                mux: ble as u32 * 8,
-                sel: 16 + ble,
-            });
+            // Registered empty-pin cluster: keep local FF Q loop (gold blinky/counter).
+            // Comb LUT: primary/port inputs — no IMUX programming needed.
+            if !lutff.ff_cell.is_empty() {
+                imux.push(ImuxRoute {
+                    x: site.x,
+                    y: site.y,
+                    mux: ble as u32 * 8,
+                    sel: 16 + ble,
+                });
+            }
             continue;
         }
         for (pin, driver) in &lutff.lut_pins {

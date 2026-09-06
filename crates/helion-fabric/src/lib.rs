@@ -418,12 +418,13 @@ impl Fabric {
         }
         let srcs = self.iob_src.clone();
         for ((ix, iy), (cx, cy, ble)) in srcs {
-            let q = self
-                .clbs
-                .get(&(cx, cy))
-                .map(|c| c.q[ble as usize])
-                .unwrap_or(false);
-            self.iobs.insert((ix, iy), q);
+            // Registered BLE: pad follows FF Q. Comb BLE (FF.USED=0): pad follows LUT O.
+            let v = if self.clb_feature_bit(cx, cy, &format!("BLE{ble}.FF.USED")) {
+                self.q_at(cx, cy, ble)
+            } else {
+                self.lut_o_at(cx, cy, ble)
+            };
+            self.iobs.insert((ix, iy), v);
         }
     }
 
