@@ -33,6 +33,24 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         .unwrap_or("sv")
         .to_ascii_lowercase();
     match ext.as_str() {
+        "prj" => {
+            let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+            let prj = load_prj(&text)?;
+            let src_paths: Vec<std::path::PathBuf> = prj
+                .sources
+                .iter()
+                .map(|s| resolve_prj_path(p, s))
+                .collect();
+            for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+                if !resolved.exists() {
+                    return Err(format!(
+                        "project source {src}: not found (tried {})",
+                        resolved.display()
+                    ));
+                }
+            }
+            synth_project_sources(&src_paths, prj.top.as_deref())
+        }
         "vhd" | "vhdl" => synth_vhdl_path(p),
         "c" | "cc" | "cpp" => synth_c_path(p),
         _ => synth_sv_path(p),
@@ -219,7 +237,7 @@ fn usage() {
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv> [--sdc f.sdc]
   helion report_utilization <file.sv>
-  helion bitstream <file.sv|.vhd|.c> -o out.hbits
+  helion bitstream <file.sv|.vhd|.c|.prj> -o out.hbits
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
   helion qor <file.sv>
