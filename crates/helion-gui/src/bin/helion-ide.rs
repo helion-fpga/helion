@@ -269,8 +269,8 @@ impl HelionIde {
             Canvas::Editor => self.model.workspace = WorkspaceTab::TextEditor,
             Canvas::Device => self.model.workspace = WorkspaceTab::Device,
             Canvas::Timing => {
-                // Keep a report-detail workspace if already on one; else default Timing Summary pane.
-                // Never open the Reports *catalog* in the Timing canvas (catalog is SidePanel-only).
+                // Keep report-detail / More destinations (Schematic etc.). Do not clobber them
+                // back to Reports — that made Schematic unreachable after More → Schematic.
                 if !matches!(
                     self.model.workspace,
                     WorkspaceTab::Reports
@@ -283,8 +283,17 @@ impl HelionIde {
                         | WorkspaceTab::Drc
                         | WorkspaceTab::Utilization
                         | WorkspaceTab::Runs
+                        | WorkspaceTab::Schematic
+                        | WorkspaceTab::Package
+                        | WorkspaceTab::Hierarchy
+                        | WorkspaceTab::Find
+                        | WorkspaceTab::Ip
+                        | WorkspaceTab::Bitstream
+                        | WorkspaceTab::Hardware
+                        | WorkspaceTab::Settings
+                        | WorkspaceTab::Summary
                 ) {
-                    self.model.workspace = WorkspaceTab::Reports;
+                    self.model.workspace = WorkspaceTab::Summary;
                 }
             }
         }
@@ -666,7 +675,19 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                         },
                     );
                 }
-                let resp = resp.on_hover_text(act.hover());
+                // Anchor tooltip to the right of the rail icon — never float in the rail→content gap.
+                {
+                    let mut tip = egui::Tooltip::for_enabled(&resp);
+                    tip.popup = tip
+                        .popup
+                        .align(egui::RectAlign::RIGHT)
+                        .align_alternatives(&[])
+                        .gap(6.0);
+                    tip.show(|ui| {
+                        ui.set_max_width(220.0);
+                        ui.label(act.hover());
+                    });
+                }
                 if resp.clicked() {
                     pick = Some(act);
                 }
@@ -680,12 +701,36 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
 fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
     match app.activity {
         Activity::Simulate => {} // scopes live in-canvas (SidePanel left a thick void beside Wave)
-        Activity::Files => paint_files_side(ctx, app),
-        Activity::Device => paint_files_side(ctx, app),
-        // Timing/Reports: catalog/paths stack inside the canvas (SidePanel was leaving a black void).
-        Activity::Timing | Activity::Reports => {}
-        Activity::Program => paint_files_side(ctx, app),
+        Activity::Files | Activity::Device | Activity::Program => paint_files_side(ctx, app),
+        // Exact non-resizable SidePanel abuts the rail — fills the captain black gap with real chrome
+        // (catalog/paths). Canvas shows detail only (no Timing↔Reports twin void).
+        Activity::Timing => paint_timing_side(ctx, app),
+        Activity::Reports => paint_reports_side(ctx, app),
     }
+}
+
+fn paint_reports_side(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::SidePanel::left("sidebar_v4_reports")
+        .resizable(false)
+        .exact_width(chrome::SIDEBAR_WIDTH)
+        .show_separator_line(false)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("Reports").strong().size(14.0));
+            ui.add_space(4.0);
+            paint_report_catalog(ui, &mut app.model);
+        });
+}
+
+fn paint_timing_side(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::SidePanel::left("sidebar_v4_timing")
+        .resizable(false)
+        .exact_width(chrome::SIDEBAR_WIDTH)
+        .show_separator_line(false)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("Timing").strong().size(14.0));
+            ui.add_space(4.0);
+            paint_timing_paths(ui, &mut app.model);
+        });
 }
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
@@ -1247,41 +1292,52 @@ fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
 }
 
 fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
-    // Always: Editor | Device | Timing | More ⋯ (overflow keeps prior WorkspaceTab destinations).
-    ui.horizontal(|ui| {
-        for c in Canvas::ALL {
-            // Reports rail owns the catalog view — don't paint it as "Timing" selected (Timing ≠ Reports).
-            let on = app.canvas == c && !(app.activity == Activity::Reports && c == Canvas::Timing);
-            if ui
-                .selectable_label(on, format!("{}  {}", c.label(), c.shortcut()))
-                .on_hover_text(tip(c.label(), c.shortcut(), ""))
-                .clicked()
-            {
-                app.set_activity(Activity::Files);
-                app.set_canvas(c);
-                if c == Canvas::Timing {
-                    app.set_activity(Activity::Timing);
+    // Always: Editor | Device | Timing | (Reports|Schematic when open) | More ⋯
+    // Labels only in the strip (shortcuts on hover) so full names never clip.
+    egui::ScrollArea::horizontal()
+        .id_salt("canvas_tab_strip_v1")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for c in Canvas::ALL {
+                    // Reports rail owns the catalog view — don't paint it as "Timing" selected.
+                    let on = app.canvas == c
+                        && !(app.activity == Activity::Reports && c == Canvas::Timing)
+                        && !(app.model.workspace == WorkspaceTab::Schematic && c == Canvas::Timing);
+                    if ui
+                        .selectable_label(on, c.label())
+                        .on_hover_text(tip(c.label(), c.shortcut(), ""))
+                        .clicked()
+                    {
+                        app.set_activity(Activity::Files);
+                        app.set_canvas(c);
+                        if c == Canvas::Timing {
+                            app.set_activity(Activity::Timing);
+                        }
+                    }
                 }
-            }
-        }
-        if app.activity == Activity::Reports {
-            let _ = ui.selectable_label(true, "Reports");
-        }
-        ui.menu_button(chrome::MORE, |ui| {
-            ui.label(RichText::new("More views").strong().small());
-            ui.separator();
-            for tab in WorkspaceTab::ALL {
-                if tab.is_canvas() {
-                    continue;
+                if app.activity == Activity::Reports {
+                    let _ = ui.selectable_label(true, "Reports");
                 }
-                let on = app.model.workspace == tab;
-                if ui.selectable_label(on, tab.label()).clicked() {
-                    open_more_workspace(app, tab);
-                    ui.close();
+                if app.model.workspace == WorkspaceTab::Schematic {
+                    let _ = ui.selectable_label(true, "Schematic");
                 }
-            }
+                ui.menu_button(chrome::MORE, |ui| {
+                    ui.label(RichText::new("More views").strong().small());
+                    ui.separator();
+                    for tab in WorkspaceTab::ALL {
+                        if tab.is_canvas() {
+                            continue;
+                        }
+                        let on = app.model.workspace == tab;
+                        if ui.selectable_label(on, tab.label()).clicked() {
+                            open_more_workspace(app, tab);
+                            ui.close();
+                        }
+                    }
+                });
+            });
         });
-    });
     ui.separator();
     if app.activity == Activity::Program {
         paint_hw(ui, &mut app.model);
@@ -1350,34 +1406,53 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             paint_device(ui, &mut app.model);
         }
         Canvas::Timing => {
-            // Full-width vertical stack. No SidePanel twin, no set_min_size (that created a tall black hole).
+            // Catalog/paths live in SidePanel. Canvas = detail / Schematic / Timing summary only.
+            // No catalog twin beside Timing (void-class regress). Schematic must paint here.
             egui::ScrollArea::vertical()
-                .id_salt("timing_canvas_v5")
+                .id_salt("timing_canvas_v6")
                 .auto_shrink([false, true])
                 .hscroll(false)
                 .show(ui, |ui| {
                     match app.activity {
                         Activity::Reports => {
-                            ui.heading("Reports");
+                            ui.heading("Report detail");
                             ui.add_space(4.0);
-                            paint_report_catalog(ui, &mut app.model);
-                            ui.add_space(6.0);
-                            // Collapsed by default — open only when user expands (no tall void band).
-                            let open = false;
-                            egui::CollapsingHeader::new("Report detail")
-                                .default_open(open)
-                                .show(ui, |ui| {
-                                    if app.model.selected_report.is_some() {
-                                        paint_reports_detail(ui, app);
-                                    } else {
-                                        ui.label(
-                                            RichText::new("Select a report above.")
-                                                .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
-                                        );
-                                    }
-                                });
+                            if app.model.selected_report.is_some() {
+                                paint_reports_detail(ui, app);
+                            } else {
+                                ui.label(
+                                    RichText::new("Select a report in the sidebar.")
+                                        .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                                );
+                            }
                         }
-                        _ => paint_timing_only(ui, &mut app.model),
+                        _ => {
+                            // More → Schematic / Hierarchy / … must reach paint_timing_canvas_body.
+                            if matches!(
+                                app.model.workspace,
+                                WorkspaceTab::Schematic
+                                    | WorkspaceTab::Package
+                                    | WorkspaceTab::Hierarchy
+                                    | WorkspaceTab::Find
+                                    | WorkspaceTab::Ip
+                                    | WorkspaceTab::Bitstream
+                                    | WorkspaceTab::Hardware
+                                    | WorkspaceTab::Settings
+                                    | WorkspaceTab::Constraints
+                                    | WorkspaceTab::ClockInteraction
+                                    | WorkspaceTab::Cdc
+                                    | WorkspaceTab::ClockNetworks
+                                    | WorkspaceTab::Power
+                                    | WorkspaceTab::Methodology
+                                    | WorkspaceTab::Drc
+                                    | WorkspaceTab::Utilization
+                                    | WorkspaceTab::Runs
+                            ) {
+                                paint_timing_canvas_body(ui, app);
+                            } else {
+                                paint_timing_only(ui, &mut app.model);
+                            }
+                        }
                     }
                 });
         }
@@ -1388,6 +1463,14 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
     app.model.workspace = tab;
     if tab.sim_only() {
         app.set_activity(Activity::Simulate);
+        return;
+    }
+    if tab == WorkspaceTab::Schematic {
+        // ≤2 clicks: More → Schematic. Keep workspace=Schematic through set_canvas.
+        app.set_activity(Activity::Timing);
+        app.set_canvas(Canvas::Timing);
+        app.model.workspace = WorkspaceTab::Schematic;
+        let _ = app.model.schematic_zoom_fit();
         return;
     }
     match tab.canvas() {
@@ -1414,9 +1497,12 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
                 app.set_activity(Activity::Timing);
             }
             app.set_canvas(Canvas::Timing);
+            app.model.workspace = tab;
         }
         _ => {
+            app.set_activity(Activity::Timing);
             app.set_canvas(Canvas::Timing);
+            app.model.workspace = tab;
         }
     }
 }
@@ -3359,31 +3445,35 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
-    egui::Grid::new("reports_catalog")
-        .spacing([8.0, 4.0])
+    // Name-first list: full report titles always readable in the 220px SidePanel (no mid-word clip).
+    egui::ScrollArea::vertical()
+        .id_salt("reports_catalog_v2")
+        .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.label(RichText::new("Name").strong());
-            ui.label(RichText::new("Category").strong());
-            ui.label(RichText::new("Status").strong());
-            ui.label(RichText::new("Summary").strong());
-            ui.end_row();
             for r in &rows {
                 let on = selected.as_deref() == Some(r.id.as_str());
-                if ui.selectable_label(on, &r.name).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                ui.label(&r.category);
-                let fill = run_status_color(&r.status);
-                let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
-                    .fill(fill)
-                    .selected(on);
-                if ui.add(btn).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                if ui.selectable_label(on, &r.summary).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                ui.end_row();
+                ui.horizontal(|ui| {
+                    let name = ui.add_sized(
+                        [ui.available_width().max(120.0) - 52.0, chrome::HIT_SIDEBAR],
+                        egui::Button::selectable(on, &r.name),
+                    );
+                    if name.clicked() {
+                        pick = Some(r.id.clone());
+                    }
+                    let fill = run_status_color(&r.status);
+                    let btn = egui::Button::new(RichText::new(&r.status).small().color(Color32::BLACK))
+                        .fill(fill)
+                        .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some(r.id.clone());
+                    }
+                });
+                ui.label(
+                    RichText::new(format!("{} — {}", r.category, r.summary))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(2.0);
             }
         });
     if let Some(id) = pick {
@@ -4239,9 +4329,11 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
+    // Fill the canvas — diagram must be visible, not a clipped stub.
+    let avail_h = ui.available_height().max(420.0);
     model
         .schematic
-        .set_viewport(ui.available_width(), ui.available_height().max(240.0));
+        .set_viewport(ui.available_width().max(320.0), avail_h);
     let drawing = model.schematic.drawing();
     let n_cells = drawing
         .symbols
