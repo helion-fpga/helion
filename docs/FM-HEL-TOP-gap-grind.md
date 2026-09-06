@@ -1,18 +1,21 @@
-# FM-HEL-TOP — gap grind (die-fill/splitter overlays + width-first floorplan)
+# FM-HEL-TOP — gap grind (resume)
 
-**Date:** 2026-09-06 ~07:15 America/New_York (EDT)  
+**Date:** 2026-09-06 ~08:03 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
-**Pick:** **D** (labeled die-fill/splitter overlays; paint fix so bar can clear) — A deferred (Mac USB still empty / Shell unreachable)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
-**Shipped SHA (bar):** `ecc3706fec9df638d479603ea148aca97df4526a` (`ecc3706`)  
-**Docs tip:** `cbe358e1377397381edf3cbee9fdddc46b1b4dff` (`cbe358e`) — stamp only; author slip on stamp (saksham@), bar commit AUTHOR LOCK OK
+**CLI breadcrumb SHA:** `9ef40e9d21aabe2d5f0597c45b132e3617b560d8` (`9ef40e9`)  
+**Tip HEAD:** _(docs stamp commit; see post-push)_  
 
-## Why D over A
+## Resume status
 
-- UX2 remains asked for die-fill % / splitter Δ **labeled overlays** for captain cycle3.
-- Measuring Mac shot `02-counter-device.png` showed honest **FAIL**: fill≈49.2%, right_gap≈710 logical px (cell max 24 letterboxed large panes).
-- Labels alone would not help the UX score — shipped the **width-first** `floorplan_fit_cell` fix + unit tests (≥80% fill / ≤80px gap) so a Mac reshot can PASS.
-- Live board / FTDI still soft-blocked (Mac listed connected, Shell temporarily unreachable; prior USB empty). No fake DONE.
+| Track | Status |
+|-------|--------|
+| **FM-HEL-UX2** | **HARD PASS** at tip `a5a3b4a` (prior); void/Sim absolute split / `SPLITTER_GRAB_PX=6` / void-class layouts **untouched** this turn |
+| **Board A** | **soft-hold** — Mac USB empty / no FTDI (`0x0403`); OFL **-3**; reconfirmed 2026-09-06 ~08:03 EDT (Shell connected; `system_profiler` / `/dev/tty.usb*` / `ioreg` show no Lattice/FTDI) |
+| **Letter-led rail** | **already shipped** (48px rail + short labels); chrome assert aligned `side_chrome_width()==268` (48+220) |
+| **CLI breadcrumb** | **shipped** this turn — status bar shows `Activity › Canvas` monospace before `part · WNS · LUTFF · run` |
+| **Gold** | **WNS_PS=9640** held |
+| **Merge** | **NO MERGE** |
 
 ## Gold
 
@@ -21,42 +24,44 @@ cargo run -q -p helion-cli -- report_timing examples/counter.sv --sdc examples/c
 → WNS_PS=9640  TNS_PS=0  imux_skip=0
 ```
 
-## What shipped
+Verified this turn: `report_timing counter WNS_PS=9640 TNS_PS=0 endpoints=4 r2r_ps=360 iob_ps=220`
+
+## What shipped (this turn)
 
 | Change | Where |
 |--------|--------|
-| `floorplan_fit_cell` width-first when letterbox &lt;80%; cell clamp 4..**64** | `crates/helion-gui/src/chrome.rs` |
-| `floorplan_die_width` / `floorplan_die_fill_ratio` / `floorplan_right_gap_px` | same |
-| Unit tests: ≥80% fill / ≤80px gap at 800×500 and Mac-like 1152×628 | `chrome.rs` + `ide.rs` |
-| Labeled overlays (pre-fix evidence) | `/workspace/fm-hel-ux2/shots/20-device-fill-labeled.png`, `21-…`, `54-splitter-grab-labeled.png` |
-| UX2 report remains / measurement table | `docs/FM-HEL-UX2.md` |
+| Status-bar CLI breadcrumb `Files › Editor` (etc.) via `Activity::label` + `Canvas::label` / workspace `canvas_label` | `crates/helion-gui/src/bin/helion-ide.rs` `paint_status_bar` |
+| Chrome side-width assert 288→268 (letter-rail math) so floorplan ≥80% fill checks run | `crates/helion-gui/src/chrome.rs` |
 
-## Labeled overlay results (pre-fix Mac shots)
+## Tests
 
-| Shot | fill | right_gap (retina / logical) | Verdict |
-|------|------|------------------------------|---------|
-| `20-device-fill-labeled.png` (from 02) | ≈49.2% | 1419 / ~710 | **FAIL** (documented) |
-| `21-device-canvas-fill-labeled.png` (from 13) | ≈34.8% | 1419 / ~710 | **FAIL** (documented) |
-| `54-splitter-grab-labeled.png` | grab=6px calm | — | labeled; Δ≥40 → cycle2b 54/55 held |
+- `cargo test -p helion-gui --lib -- chrome::` → **3 passed** (overflow+floorplan, letter rail, idle)
+- Floorplan fill/gap asserts in chrome overflow test: ≥80% / ≤80px at 800×500 and Mac-like 1152×628
+- Do **not** touch Sim absolute split / `SPLITTER_GRAB_PX=6` / void-class layouts
 
-Post-fix math (unit-tested): 800×500 and 1152×628 → fill **100%**, gap **0**.
+## Breadcrumb (UI)
 
-## Board / corpus / Air
+Status line (monospace, `·`-separated):
 
-| Item | Status |
-|------|--------|
-| Live FTDI / board DONE | **no** (Mac Shell unreachable this turn; USB previously empty) |
-| Corpus | PASS 100 / SOFT 0 (unchanged) |
-| Air idle | held (no `request_repaint`; calm splitter 6px) |
-| Merge / force-push | **none** |
+```
+{Activity} › {Canvas} · {part} · WNS {wns} · LUTFF {lutff} · {run}
+```
+
+Example at Files/Editor: `Files › Editor · … · WNS … · LUTFF … · idle`  
+Simulate/Wave uses workspace canvas label: `Simulate › Waveform · …`
+
+## Board A (Mac)
+
+- Machine: `sakshams-MacBook-Pro-517.local` connected  
+- USB: **empty** for FTDI/Lattice — no `/dev/tty.usb*`, no `0x0403` in tree  
+- Live OFL / `--cable native` / STAT TDO: **blocked** (soft-hold, no fake DONE)
 
 ## Remains
 
-1. Mac rebuild + Device reshot → captain re-score with new fill overlays.  
-2. Optional: UX2 before/after splitter drag pairs when Mac local-exec works.  
-3. Real FTDI/HAD for live OFL/`--cable native` STAT TDO (A track).  
-4. **NO MERGE** until captain HARD PASS.
+1. Board A: plug FTDI/HAD → OFL/`--cable native` live path  
+2. Optional Mac Device reshot only if captain asks (UX2 already HARD PASS)  
+3. **NO MERGE** until captain says otherwise  
 
 ## Verdict
 
-**PASS (bar moved).** Bar tip **`ecc3706`** (AUTHOR LOCK OK); docs tip **`cbe358e`** pushed to `helion-fpga/fm-hel-corpus-soft-pass`. Die-fill root cause fixed + labeled measurement overlays for UX2; gold 9640 / skip=0 held; no board DONE claimed; no merge.
+**PASS (bar moved).** Breadcrumb tip **`9ef40e9`** (AUTHOR LOCK OK); gold **9640**; UX2 PASS held; board A soft-hold (OFL -3 / no 0x0403); letter rail already done; **NO MERGE**.
