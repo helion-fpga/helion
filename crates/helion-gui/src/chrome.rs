@@ -388,11 +388,41 @@ pub fn grid_clips_last_column(n_cols: usize, col_w: f32, available: f32) -> bool
     n_cols as f32 * col_w.max(1.0) > available.max(1.0)
 }
 
-/// Scale HAD die / package cells so the whole drawing fits `avail` (view at once).
+/// Scale HAD die / package cells for the Device canvas.
+///
+/// Fit both axes when that still clears the die-fill bar (≥80% of `avail_w`).
+/// Otherwise prefer **width** so the right gap stays ≤80px on large Mac windows
+/// (cell was previously capped at 24px → postage-stamp letterboxing). Vertical
+/// overflow is acceptable; the parent canvas/scroll can absorb it. Max cell 64.
 pub fn floorplan_fit_cell(cols: u32, rows: u32, avail_w: f32, avail_h: f32) -> f32 {
-    let cw = (avail_w - 28.0).max(8.0) / cols.max(1) as f32;
-    let ch = (avail_h - 16.0).max(8.0) / rows.max(1) as f32;
-    cw.min(ch).clamp(4.0, 24.0)
+    let cols_f = cols.max(1) as f32;
+    let rows_f = rows.max(1) as f32;
+    let cw = (avail_w - 28.0).max(8.0) / cols_f;
+    let ch = (avail_h - 16.0).max(8.0) / rows_f;
+    let fit_both = cw.min(ch);
+    let die_w_both = fit_both * cols_f + 28.0;
+    let cell = if die_w_both < 0.80 * avail_w.max(1.0) {
+        cw
+    } else {
+        fit_both
+    };
+    cell.clamp(4.0, 64.0)
+}
+
+/// Die drawn width (axis gutter included) for a chosen cell size.
+pub fn floorplan_die_width(cols: u32, cell: f32) -> f32 {
+    cell * cols.max(1) as f32 + 28.0
+}
+
+/// Horizontal fill ratio of the die inside `avail_w` (1.0 = full width).
+pub fn floorplan_die_fill_ratio(cols: u32, cell: f32, avail_w: f32) -> f32 {
+    let w = avail_w.max(1.0);
+    (floorplan_die_width(cols, cell) / w).clamp(0.0, 1.0)
+}
+
+/// Empty pixels to the right of the die inside `avail_w` (left-aligned paint).
+pub fn floorplan_right_gap_px(cols: u32, cell: f32, avail_w: f32) -> f32 {
+    (avail_w - floorplan_die_width(cols, cell)).max(0.0)
 }
 
 pub fn floorplan_fits_viewport(
@@ -535,8 +565,32 @@ mod tests {
         assert!(tiny.tab_is_selectable("Timing"));
 
         let cell = floorplan_fit_cell(32, 33, 800.0, 500.0);
-        assert!(floorplan_fits_viewport(32, 33, cell, 800.0, 500.0));
-        assert!(cell >= 4.0 && cell <= 24.0);
+        assert!(cell >= 4.0 && cell <= 64.0);
+        // Width-first when letterboxing would miss the ≥80% die-fill bar.
+        assert!(
+            floorplan_die_fill_ratio(32, cell, 800.0) >= 0.80,
+            "die fill must be ≥80% at 800px canvas, got {:.3}",
+            floorplan_die_fill_ratio(32, cell, 800.0)
+        );
+        assert!(
+            floorplan_right_gap_px(32, cell, 800.0) <= 80.0,
+            "right gap must be ≤80px, got {:.1}",
+            floorplan_right_gap_px(32, cell, 800.0)
+        );
+        // Large Mac-like Device pane (rail+sidebar already subtracted).
+        let mac_w = 1152.0;
+        let mac_h = 628.0;
+        let mac_cell = floorplan_fit_cell(32, 33, mac_w, mac_h);
+        assert!(
+            floorplan_die_fill_ratio(32, mac_cell, mac_w) >= 0.80,
+            "Mac die fill {:.3}",
+            floorplan_die_fill_ratio(32, mac_cell, mac_w)
+        );
+        assert!(
+            floorplan_right_gap_px(32, mac_cell, mac_w) <= 80.0,
+            "Mac right gap {:.1}",
+            floorplan_right_gap_px(32, mac_cell, mac_w)
+        );
         assert!(DEVICE_TABLES_MAX_HEIGHT < DESKTOP_HEIGHT / 3.0);
         assert!(DRAWING_MIN_HEIGHT > TABLE_MAX_HEIGHT);
         assert!(workspace_matches_canvases());
