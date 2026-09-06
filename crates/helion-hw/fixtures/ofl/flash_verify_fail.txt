@@ -1,0 +1,5 @@
+openFPGALoader 0.12.0
+Parse file done
+Erase flash done
+Write flash done
+Verify failed: mismatch at 0x00001000
