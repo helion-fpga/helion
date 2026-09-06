@@ -522,7 +522,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(64.0, 22.0), Sense::click());
+                    ui.allocate_exact_size(egui::vec2(64.0, 28.0), Sense::click());
                 if ui.is_rect_visible(rect) {
                     ui.painter().rect(
                         rect,
@@ -562,6 +562,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
         .show_separator_line(true)
         .show(ctx, |ui| {
             ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
             let mut pick = None;
             for act in Activity::ALL {
                 let on = app.activity == act;
@@ -570,11 +571,41 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                 } else {
                     Color32::TRANSPARENT
                 };
-                let resp = ui.add_sized(
-                    [chrome::RAIL_WIDTH - 4.0, chrome::HIT_PRIMARY],
-                    egui::Button::new(RichText::new(act.icon()).size(11.0).strong())
-                        .fill(fill),
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(chrome::RAIL_WIDTH - 4.0, chrome::HIT_RAIL),
+                    Sense::click(),
                 );
+                if ui.is_rect_visible(rect) {
+                    ui.painter().rect(
+                        rect,
+                        3.0,
+                        fill,
+                        Stroke::new(
+                            if on { 1.0 } else { 0.0 },
+                            Color32::from_rgb(0x3d, 0xb8, 0x7a),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    let c = rect.center();
+                    ui.painter().text(
+                        egui::pos2(c.x, c.y - 8.0),
+                        egui::Align2::CENTER_CENTER,
+                        act.icon(),
+                        egui::FontId::proportional(15.0),
+                        if on {
+                            Color32::from_rgb(0xc8, 0xf0, 0xd8)
+                        } else {
+                            Color32::from_rgb(0xdc, 0xe0, 0xe4)
+                        },
+                    );
+                    ui.painter().text(
+                        egui::pos2(c.x, c.y + 12.0),
+                        egui::Align2::CENTER_CENTER,
+                        act.short_label(),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_rgb(0x9a, 0xa4, 0xae),
+                    );
+                }
                 let resp = resp.on_hover_text(act.hover());
                 if resp.clicked() {
                     pick = Some(act);
@@ -1264,7 +1295,7 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                             if objects.is_empty() {
                                 ui.label("—");
                                 ui.label("—");
-                                ui.label("no objects — select a Scope");
+                                ui.label("No objects — select a scope.");
                                 ui.end_row();
                             } else {
                                 for (i, o) in objects.iter().enumerate() {
@@ -1305,7 +1336,7 @@ fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
                             if locals.is_empty() {
                                 ui.label("—");
                                 ui.label("—");
-                                ui.label("no locals — sim_run");
+                                ui.label("No locals until you run simulation.");
                                 ui.end_row();
                             } else {
                                 for (i, l) in locals.iter().enumerate() {
@@ -1441,7 +1472,7 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no messages");
+                        ui.label("No messages.");
                         ui.end_row();
                     } else {
                         for (i, m, obj) in &rows {
@@ -1627,7 +1658,7 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no log — run a flow step or Tcl command");
+                        ui.label("No log yet — run a flow step or a console command.");
                         ui.end_row();
                     } else {
                         for (i, line) in &rows {
@@ -2045,7 +2076,7 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
     if rows.is_empty() {
-        ui.weak("no incremental report — incremental_impl / incremental_place");
+        ui.label("No incremental report yet.");
         return;
     }
     egui::ScrollArea::both()
@@ -2138,7 +2169,7 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
     if rows.is_empty() {
-        ui.weak("no ECO cells — synth / insert_eco_lut");
+        ui.label("No ECO cells yet.");
         return;
     }
     egui::ScrollArea::both()
@@ -2333,7 +2364,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no hits — `find u_lut0` in Tcl");
+                        ui.label("No hits — try Find, or `find` in the console.");
                         ui.label("—");
                         ui.end_row();
                     } else {
@@ -2561,7 +2592,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.label("—");
                 ui.label("—");
                 ui.label("—");
-                ui.label("No pblocks — create_pblock then resize_pblock -add {CLB_X5Y1:CLB_X8Y8}.");
+                ui.label("No pblocks yet. Create one, then resize it on the die.");
                 ui.label("—");
                 ui.end_row();
             } else {
@@ -3096,7 +3127,7 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     let report = model.timing_summary();
     if report.clocks.is_empty() {
-        ui.label("no clocks — create_clock / report_timing_summary");
+        ui.label("No clocks yet. Add a clock constraint, then report timing.");
         return;
     }
     ui.add_space(4.0);
@@ -3217,7 +3248,7 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.clock_interaction();
     if report.clocks.is_empty() {
-        ui.label("no clocks — create_clock / report_clock_interaction");
+        ui.label("No clocks yet. Add a clock constraint first.");
         return;
     }
     let selected_ci = model.selected_clock_interaction.clone();
@@ -3312,7 +3343,7 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.cdc_report();
     if report.clocks.is_empty() {
-        ui.label("no clocks — create_clock / report_cdc");
+        ui.label("No clocks yet. Add a clock constraint first.");
         return;
     }
     ui.label(format!(
@@ -3399,7 +3430,7 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.clock_networks();
     if report.clocks.is_empty() {
-        ui.label("no clocks — create_clock / report_clock_networks");
+        ui.label("No clocks yet. Add a clock constraint first.");
         return;
     }
     ui.label(format!(
@@ -3463,7 +3494,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.power_report();
     if report.part.is_empty() {
-        ui.label("no design — synth / report_power");
+        ui.label("No design yet. Run Synthesis first.");
         return;
     }
     ui.label(format!(
@@ -3557,7 +3588,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     if model.tree.top.is_none() {
-        ui.label("no design — synth / report_methodology");
+        ui.label("No design yet. Run Synthesis first.");
         return;
     }
     let report = model.methodology_report();
@@ -3713,7 +3744,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     if model.utilization.is_none() && model.drc.is_none() {
-        ui.label("no DRC — run Place/Route");
+        ui.label("No DRC results yet. Run Place or Route.");
         return;
     }
     let report = model.drc.clone().unwrap_or_else(|| model.drc_report());
@@ -3739,7 +3770,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
                     ui.label("—");
                     ui.label("ok");
                     ui.label("-");
-                    ui.label("no violations");
+                    ui.label("No violations.");
                     ui.end_row();
                 } else {
                     for v in &report.items {
@@ -3792,7 +3823,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.utilization_report();
     if report.part.is_empty() {
-        ui.label("no placed design — run Place");
+        ui.label("No placed design yet. Run Place.");
         return;
     }
     ui.label(format!("part={}", report.part));
@@ -4483,7 +4514,7 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     if regions.is_empty() {
-        ui.weak("no clock regions — HAD die");
+        ui.label("No clock regions on this die.");
         return;
     }
     data_scroll("ug893_clock_regions_scroll").show(ui, |ui| {
@@ -4538,7 +4569,7 @@ fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     if routes.is_empty() {
-        ui.weak("no routes — Route / device_routes");
+        ui.label("No routes yet. Run Route after Place.");
         return;
     }
     data_scroll("ug893_device_routes_scroll").show(ui, |ui| {
@@ -4783,7 +4814,7 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no memories — sim_run");
+                        ui.label("No memories until you run simulation.");
                         ui.end_row();
                     } else {
                         for (i, m) in blocks.iter().enumerate() {
@@ -4884,7 +4915,7 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no breakpoints — add_bp");
+                        ui.label("No breakpoints yet.");
                         ui.end_row();
                     } else {
                         for b in &rows {
@@ -4954,7 +4985,7 @@ fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no forces — add_force");
+                        ui.label("No force constants yet.");
                         ui.end_row();
                     } else {
                         for (i, r) in rows.iter().enumerate() {
@@ -5020,7 +5051,7 @@ fn paint_locals(ui: &mut egui::Ui, model: &mut IdeModel) {
                     if rows.is_empty() {
                         ui.label("—");
                         ui.label("—");
-                        ui.label("no locals — sim_run");
+                        ui.label("No locals until you run simulation.");
                         ui.end_row();
                     } else {
                         for (i, l) in rows.iter().enumerate() {
@@ -5062,17 +5093,18 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
             Some(d) => format!("Δt={d} ps"),
             None => "Δt=n/a".into(),
         };
+        let ns = model.wave.timescale_ps as f64 / 1000.0;
+        let period = if ns >= 1.0 && (ns - ns.round()).abs() < 1e-9 {
+            format!("{} ns per cycle", ns.round() as i64)
+        } else {
+            format!("{} ps per cycle", model.wave.timescale_ps)
+        };
         ui.label(
             RichText::new(format!(
-                "timescale {} ps/cycle  cursor t={} ({} ps)  {a_txt}  {b_txt}  {d_txt}  markers={} virtual_bus={}",
-                model.wave.timescale_ps,
+                "Waveform {period}  cursor t={}  {a_txt}  {b_txt}  {d_txt}",
                 model.wave.cursor,
-                model.wave.time_ps(model.wave.cursor),
-                model.wave.markers.len(),
-                model.wave.virtual_buses.len()
             ))
-            .weak()
-            .monospace(),
+            .weak(),
         );
         if ui.small_button("Cursor A").clicked() {
             let _ = model.set_wave_ab_cursor("A");
@@ -5092,7 +5124,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
     paint_wave_cursors(ui, model);
     paint_virtual_buses(ui, model);
     if model.wave.traces.is_empty() {
-        ui.weak("Run Simulation (simulation_settings runtime) after Bitstream.");
+        ui.label("No waveform yet. Run Simulation after Bitstream.");
         return;
     }
     let n = model.wave.sample_len().max(1);
@@ -5343,7 +5375,11 @@ fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_wave_marker.clone();
     let mut pick: Option<String> = None;
     if markers.is_empty() {
-        ui.weak("no markers — add_wave_marker after sim_run");
+        ui.label("No markers yet.");
+        if ui.button("Add marker").clicked() {
+            let n = model.wave.markers.len() + 1;
+            let _ = model.add_wave_marker(&format!("M{n}"));
+        }
         return;
     }
     data_scroll("ug900_wave_markers_scroll").show(ui, |ui| {
@@ -5422,7 +5458,10 @@ fn paint_virtual_buses(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_virtual_bus.clone();
     let mut pick: Option<String> = None;
     if buses.is_empty() {
-        ui.weak("no virtual bus — add_wave_virtual_bus after sim_run");
+        ui.label("No virtual bus yet.");
+        if ui.button("Add virtual bus").clicked() {
+            let _ = model.add_wave_virtual_bus("vb led cnt");
+        }
         return;
     }
     data_scroll("ug900_virtual_buses_scroll").show(ui, |ui| {
