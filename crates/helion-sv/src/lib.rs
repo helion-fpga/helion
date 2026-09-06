@@ -1766,6 +1766,7 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     Ok(mods)
 }
 
+#[allow(dead_code)] // intentional: kept as direct RTL entry for future callers / tests
 fn parse_rtl(source: &str) -> Result<Rtl, String> {
     parse_source(source)?
         .into_iter()
@@ -2127,6 +2128,7 @@ fn skip_sv_type(p: &mut P) {
     }
 }
 
+#[allow(dead_code)] // intentional: parser helper retained for richer net-ref forms
 fn parse_net_ref(p: &mut P) -> Result<String, String> {
     let name = p.ident()?;
     if p.eat_sym('[') {
@@ -4183,6 +4185,7 @@ fn inst_overrides(inst: &Inst, child: &Rtl) -> HashMap<String, u128> {
     ov
 }
 
+#[allow(dead_code)] // intentional: thin wrapper over flatten_module_ov
 fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String> {
     flatten_module_ov(mods, name, &HashMap::new())
 }
