@@ -228,7 +228,7 @@ impl HelionIde {
             WorkspaceTab::TextEditor
         };
         model.bottom_tab = BottomTab::Tcl;
-        Self {
+        let mut app = Self {
             model,
             tree_filter: String::new(),
             sidebar_hidden: false,
@@ -241,7 +241,26 @@ impl HelionIde {
             tcl_focus: false,
             program_status: None,
             program_cable: "auto".into(),
+        };
+        // Optional launch hooks for Mac shots / demos (does not remove Open…).
+        if let Ok(path) = std::env::var("HELION_OPEN") {
+            let pb = PathBuf::from(path.trim());
+            if pb.is_file() {
+                app.open_path(&pb);
+            }
         }
+        match std::env::var("HELION_FLOW").as_deref() {
+            Ok("implement") => {
+                let _ = app.model.implement();
+                app.set_canvas(Canvas::Device);
+                app.set_activity(Activity::Device);
+            }
+            Ok("synth") => {
+                let _ = app.model.run_step(FlowStep::Synthesis);
+            }
+            _ => {}
+        }
+        app
     }
 
     fn set_canvas(&mut self, c: Canvas) {
