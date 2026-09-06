@@ -6,9 +6,11 @@ license.workspace = true
 
 [features]
 default = []
-# Optional rusb FTDI (VID 0x0403) enumeration for detect_boards.
-# Requires libusb-1.0 at build time. Program/DONE still goes through OFL (or sim);
-# native enumeration never claims hardware program DONE.
+# Optional rusb FTDI (VID 0x0403) enumeration + native MPSSE opcode path
+# (NativeFtdiMpsse: open when present, encode CFG_W/STAT IR/DR). Requires
+# libusb-1.0 at build time. Without a device → honest Io (no invented STAT).
+# Without this feature → NotImplemented → OFL fallback. Enumeration alone
+# never claims hardware program DONE.
 usb-native = ["dep:rusb"]
 
 [dependencies]

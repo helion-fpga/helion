@@ -16,7 +16,7 @@ fn main() {
              \n\
              Detects cables (sim always; USB via openFPGALoader when on PATH),\n\
              loads `.hbits`, programs via TAP CFG_W (sim), FTDI bitbang CFG_W+STAT (mpsse-sim),
-             openFPGALoader (usb/ofl), or native stub→OFL fallback.\n\
+             openFPGALoader (usb/ofl), or native FTDI MPSSE (usb-native; else NotImplemented→OFL).\n\
              Never claims DONE on USB without a detected programmer. Empty args\n\
              program an empty bitstream on --cable sim|mpsse-sim only."
         );

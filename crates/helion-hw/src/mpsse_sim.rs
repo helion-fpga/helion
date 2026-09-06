@@ -10,8 +10,9 @@
 //!   readback (sim fabric DONE only)
 //!
 //! This is **not** native MPSSE over real USB and must never be reported as
-//! hardware / board program DONE. [`crate::NativeFtdiStub`] remains `NotImplemented`
-//! for physical CFG_W / STAT over USB (OFL owns hardware program).
+//! hardware / board program DONE. Real USB MPSSE lives in [`crate::native_mpsse`]
+//! ([`crate::NativeFtdiMpsse`]): feature off → NotImplemented→OFL; no device → Io;
+//! never invents STAT. OFL still owns generic programmer path (`TAP_readback=none`).
 
 use helion_bits::Bitstream;
 use helion_device::Device;
@@ -356,9 +357,16 @@ mod tests {
         assert!(st.done);
         assert_eq!(st.word(), Stat::STARTUP_WORD);
         assert_eq!(bb.read_idcode().unwrap(), 0x0001_1A1F);
-        // Honesty: NativeFtdiStub still NotImplemented (this path ≠ USB DONE).
+        // Honesty: sim CFG_W ≠ board/USB DONE. Native is NotImplemented (no feature)
+        // or Io (usb-native, no FTDI) — never Ok with invented STAT.
         let err = crate::try_native_usb_program(path, false).unwrap_err();
-        assert!(matches!(err, crate::NativeUsbError::NotImplemented(_)));
+        assert!(
+            matches!(
+                err,
+                crate::NativeUsbError::NotImplemented(_) | crate::NativeUsbError::Io(_)
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -377,10 +385,14 @@ mod tests {
     }
 
     #[test]
-    fn native_stub_still_not_implemented_for_real_usb() {
-        // Honesty: sim harness ≠ native USB MPSSE DONE.
+    fn native_path_does_not_claim_done_without_probe() {
+        // Honesty: sim harness ≠ native USB MPSSE board DONE.
         let err = crate::try_native_usb_program(std::path::Path::new("/dev/null"), false)
             .unwrap_err();
-        assert!(matches!(err, crate::NativeUsbError::NotImplemented(_)));
+        if cfg!(feature = "usb-native") {
+            assert!(matches!(err, crate::NativeUsbError::Io(_)), "{err:?}");
+        } else {
+            assert!(matches!(err, crate::NativeUsbError::NotImplemented(_)), "{err:?}");
+        }
     }
 }

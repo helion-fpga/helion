@@ -6,13 +6,13 @@
 //! and report clear errors when nothing is attached / OFL missing.
 //!
 //! Optional **`usb-native`** feature enables [`rusb`] FTDI (VID 0x0403) enumeration
-//! via [`native_usb`] — listed in [`detect_boards`] as physical probes **without**
-//! claiming program DONE. Programming / real MPSSE remains OFL (or sim); [`NativeFtdiStub`]
-//! still returns `NotImplemented` for CFG_W. [`mpsse_sim`] adds an in-process FTDI
-//! bitbang harness: open, IR/DR, and **CFG_W `.hbits` load + STAT readback** (sim fabric
-//! DONE only — **not** board/hardware DONE). Without the feature, OFL path is unchanged.
-//! HAD board IDs / `HELION_OFL_BOARD` defaults live in [`HAD_KNOWN_BOARDS`].
-//! OFL summaries parse verify output honestly and never invent Helion TAP STAT.
+//! via [`native_usb`] and a real **MPSSE opcode path** via [`native_mpsse`]
+//! ([`NativeFtdiMpsse`]: open device when present, encode IR/DR for CFG_W/STAT).
+//! Without a device, native returns honest `Io` (never invents STAT). Without the
+//! feature, [`NativeFtdiMpsse`] / stub return `NotImplemented` → OFL fallback.
+//! [`mpsse_sim`] remains the in-process bitbang CFG_W+STAT harness (sim fabric DONE
+//! only — **not** board DONE). HAD board IDs / `HELION_OFL_BOARD` live in
+//! [`HAD_KNOWN_BOARDS`]. OFL verify parse stays honest (`TAP_readback=none`).
 //! No UNISIM/AMD IP — HAD is Helion's story.
 
 use helion_bits::Bitstream;
@@ -20,8 +20,13 @@ use helion_device::Device;
 use helion_fabric::{Fabric, Stat};
 
 pub mod native_usb;
+pub mod native_mpsse;
 pub mod mpsse_sim;
 pub use native_usb::{enumerate_ftdi, feature_enabled as usb_native_feature_enabled, FtdiDeviceInfo, NativeUsbScan, FTDI_VID};
+pub use native_mpsse::{
+    native_mpsse_status_note, try_native_mpsse_program, MpsseOpcodeBuilder, NativeFtdiMpsse,
+    MPSSE_CLK_TMS_OUT_NEG_LSB, MPSSE_SET_CLK_DIVISOR,
+};
 pub use mpsse_sim::{FtdiBitbangSim, MpsseSimError};
 
 
@@ -344,8 +349,10 @@ impl std::fmt::Display for NativeUsbError {
 /// Helion-native USB/JTAG transport (libusb/rusb + FTDI MPSSE class).
 ///
 /// Probe **enumeration** is available with feature `usb-native` (see [`native_usb`]).
-/// Full MPSSE JTAG program/read_stat remains out of scope; [`NativeFtdiStub`] returns
-/// [`NativeUsbError::NotImplemented`] so program paths fall back to OFL.
+/// [`NativeFtdiMpsse`] encodes real MPSSE opcodes for CFG_W/STAT and opens FTDI when
+/// present; without `usb-native` it returns [`NativeUsbError::NotImplemented`] (OFL
+/// fallback). Without a device (feature on) it returns [`NativeUsbError::Io`] — never
+/// invents Helion TAP STAT / DONE.
 pub trait HadUsbTransport {
     fn name(&self) -> &'static str;
     fn open_probe(&mut self) -> Result<(), NativeUsbError>;
@@ -358,7 +365,10 @@ pub trait HadUsbTransport {
     fn read_stat(&mut self) -> Result<Option<u32>, NativeUsbError>;
 }
 
-/// Honest stub until a real libusb/FTDI backend lands.
+/// Compatibility alias: prefers [`NativeFtdiMpsse`] (real opcode path when `usb-native`).
+///
+/// Kept so older call sites / docs mentioning the stub still compile. Behavior:
+/// feature off → `NotImplemented` → OFL; feature on + no device → `Io` (no STAT).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeFtdiStub;
 
@@ -368,34 +378,34 @@ impl HadUsbTransport for NativeFtdiStub {
     }
 
     fn open_probe(&mut self) -> Result<(), NativeUsbError> {
-        Err(NativeUsbError::NotImplemented(
-            "FTDI MPSSE program/read_stat not implemented yet (rusb enumerate is detect-only via usb-native); use --cable ofl|usb (openFPGALoader) or --cable auto",
-        ))
+        NativeFtdiMpsse::new().open_probe()
     }
 
     fn program_hbits(
         &mut self,
-        _path: &std::path::Path,
-        _flash: bool,
+        path: &std::path::Path,
+        flash: bool,
     ) -> Result<(), NativeUsbError> {
-        self.open_probe()
+        let mut t = NativeFtdiMpsse::new();
+        t.open_probe()?;
+        t.program_hbits(path, flash)
     }
 
     fn read_stat(&mut self) -> Result<Option<u32>, NativeUsbError> {
-        Err(NativeUsbError::NotImplemented(
-            "TAP STAT readback over native USB not implemented; OFL path also has no Helion TAP readback",
-        ))
+        NativeFtdiMpsse::new().read_stat()
     }
 }
 
-/// Try the native FTDI stub. Always `NotImplemented` today — callers fall back to OFL.
+/// Try native FTDI MPSSE program ([`NativeFtdiMpsse`]).
+///
+/// - `usb-native` **off**: `NotImplemented` (callers fall back to OFL).
+/// - `usb-native` **on**, no FTDI: `Io` (honest — never invents STAT).
+/// - device present: MPSSE open/opcode path; still refuses DONE until STAT TDO validated.
 pub fn try_native_usb_program(
     path: &std::path::Path,
     flash: bool,
 ) -> Result<(), NativeUsbError> {
-    let mut t = NativeFtdiStub;
-    t.open_probe()?;
-    t.program_hbits(path, flash)
+    try_native_mpsse_program(path, flash)
 }
 
 /// One known Helion HAD board / part row for OFL `-b` defaults and docs.
@@ -420,7 +430,7 @@ pub const HAD_KNOWN_BOARDS: &[HadBoardId] = &[
         ofl_board: "helion_hl10t",
         usb_vid: 0x0403,
         usb_pid: 0x6010,
-        note: "Helion-T bring-up part; OFL board alias Helion-local (not upstream yet); OFL TAP_readback=none (never invent Helion STAT); mpsse-sim=sim fabric STAT only",
+        note: "Helion-T bring-up part; OFL board alias Helion-local (not upstream yet); OFL TAP_readback=none (never invent Helion STAT); native MPSSE=usb-native open/opcodes (Io if no FTDI; no invented STAT); mpsse-sim=sim fabric STAT only",
     },
     HadBoardId {
         part: "HL10T-DSP1",
@@ -428,7 +438,7 @@ pub const HAD_KNOWN_BOARDS: &[HadBoardId] = &[
         ofl_board: "helion_hl10t",
         usb_vid: 0x0403,
         usb_pid: 0x6010,
-        note: "Same IDCODE as HL10T-C32-1; DSP/MAC27 site variant; OFL TAP_readback=none; native program=NotImplemented→OFL",
+        note: "Same IDCODE as HL10T-C32-1; DSP/MAC27 site variant; OFL TAP_readback=none; native MPSSE=usb-native or NotImplemented→OFL",
     },
 ];
 
@@ -447,7 +457,7 @@ pub fn had_board_id_table_text() -> String {
 ",
     );
     out.push_str(
-        "docs: set HELION_OFL_BOARD=<ofl_board> to pass -b; HELION_OFL_BOARD=none disables -b; unset → default ofl_board for known part. HELION_OFL_CABLE / HELION_OFL_EXTRA / HELION_OFL_VERIFY (flash --verify) / HELION_OFL_DRY_RUN also apply. OFL never invents Helion TAP STAT (TAP_readback=none); use --cable mpsse-sim for sim fabric CFG_W+STAT (not board DONE).
+        "docs: set HELION_OFL_BOARD=<ofl_board> to pass -b; HELION_OFL_BOARD=none disables -b; unset → default ofl_board for known part. HELION_OFL_CABLE / HELION_OFL_EXTRA / HELION_OFL_VERIFY (flash --verify) / HELION_OFL_DRY_RUN also apply. OFL never invents Helion TAP STAT (TAP_readback=none). Native FTDI MPSSE (--cable native, feature usb-native): open when probe present; Io if none; refuses DONE without validated STAT TDO. Use --cable mpsse-sim for sim fabric CFG_W+STAT (not board DONE).
 ",
     );
     for b in HAD_KNOWN_BOARDS {
@@ -458,13 +468,15 @@ pub fn had_board_id_table_text() -> String {
         ));
     }
     out.push_str(&format!(
-        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL; OFL TAP_readback=none (never invent Helion STAT); mpsse_sim=bitbang+CFG_W+STAT (sim fabric DONE only; not hardware DONE)\n",
+        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiMpsse (opcodes+open; NotImplemented→OFL if feature off; Io if no device); OFL TAP_readback=none (never invent Helion STAT); mpsse_sim=bitbang+CFG_W+STAT (sim fabric DONE only; not hardware DONE)\n",
         if native_usb::feature_enabled() {
             "usb-native"
         } else {
             "off (OFL path)"
         }
     ));
+    out.push_str(&native_mpsse_status_note());
+    out.push('\n');
     out
 }
 
@@ -876,7 +888,7 @@ fn native_cable_info(scan: &UsbScan) -> CableInfo {
         backend: CableBackend::NativeUsb,
         part_hint: "HL10T-C32-1".into(),
         detail: format!(
-            "native USB ({enum_bit}); MPSSE program=NotImplemented → OFL fallback; never claims DONE from enumerate alone"
+            "native USB ({enum_bit}); MPSSE opcodes via NativeFtdiMpsse (feature off→NotImplemented→OFL; no device→Io; never invents STAT / never DONE from enumerate alone)"
         ),
     }
 }
@@ -911,7 +923,7 @@ pub fn detect_boards() -> DetectReport {
     let native_n = usb.native_probes.len();
     let note = if physical_had {
         format!(
-            "Physical USB probe(s) listed: ofl={ofl_n} native_ftdi={native_n} (detect only — program DONE requires OFL/sim/mpsse-sim success, not enumerate). OFL TAP_readback=none; native MPSSE=NotImplemented→OFL. Use --cable usb|ofl|auto|native|mpsse-sim|sim."
+            "Physical USB probe(s) listed: ofl={ofl_n} native_ftdi={native_n} (detect only — program DONE requires OFL/sim/mpsse-sim success or validated native STAT TDO, not enumerate). OFL TAP_readback=none; native MPSSE=opcodes+open when usb-native (Io if open fails; NotImplemented→OFL if feature off). Use --cable usb|ofl|auto|native|mpsse-sim|sim."
         )
     } else if usb.ofl_path.is_some() || native_usb::feature_enabled() {
         format!(
@@ -919,7 +931,7 @@ pub fn detect_boards() -> DetectReport {
             usb.note
         )
     } else {
-        "openFPGALoader not on PATH and usb-native off — cannot probe USB. Install openFPGALoader (or set HELION_OPENFPGALOADER) or build helion-hw with --features usb-native. Sim/mpsse-sim cables remain available (--cable sim|mpsse-sim); native program stays NotImplemented until real FTDI MPSSE.".into()
+        "openFPGALoader not on PATH and usb-native off — cannot probe USB. Install openFPGALoader (or set HELION_OPENFPGALOADER) or build helion-hw with --features usb-native for FTDI enumerate + MPSSE opcode open path. Sim/mpsse-sim cables remain available (--cable sim|mpsse-sim); native without feature stays NotImplemented→OFL; with feature and no FTDI → honest Io (no invented STAT).".into()
     };
     DetectReport {
         cables,
@@ -1327,14 +1339,17 @@ pub fn program_hbits_with_cable(
             Ok(ProgramOutcome::MpsseSim { bits, stat: st })
         }
         CableBackend::NativeUsb => {
-            // Honest stub: try native, then fall back to OFL when NotImplemented.
+            // NativeFtdiMpsse: NotImplemented (feature off) → OFL; Io (no device /
+            // unvalidated STAT) → hard error — never invent Helion TAP STAT.
             match try_native_usb_program(path, flash) {
                 Ok(()) => Err(
-                    "program: native USB stub reported success without a driver — refusing DONE"
+                    "program: native USB reported success without validated STAT readback — refusing DONE"
                         .into(),
                 ),
                 Err(NativeUsbError::NotImplemented(msg)) => {
-                    eprintln!("program: native USB stub → {msg}; falling back to openFPGALoader");
+                    eprintln!(
+                        "program: native MPSSE NotImplemented → {msg}; falling back to openFPGALoader"
+                    );
                     program_hbits_with_cable(
                         dev,
                         path,
@@ -1347,7 +1362,9 @@ pub fn program_hbits_with_cable(
                         flash,
                     )
                 }
-                Err(NativeUsbError::Io(msg)) => Err(format!("program: native USB I/O: {msg}")),
+                Err(NativeUsbError::Io(msg)) => Err(format!(
+                    "program: native MPSSE I/O (no invented STAT): {msg}"
+                )),
             }
         }
         CableBackend::OpenFpgaLoader => {
@@ -1749,7 +1766,6 @@ mod tests {
             return;
         }
         let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
-        assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let bits_path = dir.join("t.hbits");
         std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
@@ -1757,23 +1773,36 @@ mod tests {
         unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); } // keep cmd simple for assert
         let cable = resolve_cable("native").unwrap();
         assert_eq!(cable.backend, CableBackend::NativeUsb);
-        let ok = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap();
-        match ok {
-            ProgramOutcome::OpenFpgaLoader { ofl, .. } => {
-                assert_eq!(ofl.exit_code, Some(0));
-                assert!(!ofl.tap_readback);
-                assert_eq!(ofl.readback, OflReadbackKind::None);
-                let line = ProgramOutcome::OpenFpgaLoader {
-                    bits: None,
-                    ofl: ofl.clone(),
-                    bytes: 0,
+        if usb_native_feature_enabled() {
+            // Feature on + no FTDI → honest Io (no OFL fallback, no invented STAT).
+            assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+            let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+            assert!(
+                e.contains("native MPSSE") || e.contains("I/O") || e.contains("no FTDI"),
+                "{e}"
+            );
+        } else {
+            assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+            let ok = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap();
+            match ok {
+                ProgramOutcome::OpenFpgaLoader { ofl, .. } => {
+                    assert_eq!(ofl.exit_code, Some(0));
+                    assert!(!ofl.tap_readback);
+                    assert_eq!(ofl.readback, OflReadbackKind::None);
+                    let line = ProgramOutcome::OpenFpgaLoader {
+                        bits: None,
+                        ofl: ofl.clone(),
+                        bytes: 0,
+                    }
+                    .summary_line("program", &dev.part);
+                    assert!(line.contains("no TAP readback"), "{line}");
+                    assert!(line.contains("TAP_readback=none"), "{line}");
+                    assert!(line.contains("STAT=(no readback)"), "{line}");
                 }
-                .summary_line("program", &dev.part);
-                assert!(line.contains("no TAP readback"), "{line}");
-                assert!(line.contains("TAP_readback=none"), "{line}");
-                assert!(line.contains("STAT=(no readback)"), "{line}");
+                ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } => {
+                    panic!("expected OFL fallback from native NotImplemented")
+                }
             }
-            ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } => panic!("expected OFL fallback from native stub"),
         }
         // Flash + HELION_OFL_VERIFY should request --verify (still not TAP readback).
         unsafe { std::env::set_var("HELION_OFL_VERIFY", "1"); }
@@ -1844,7 +1873,67 @@ mod tests {
             );
         }
         let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
-        assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                NativeUsbError::NotImplemented(_) | NativeUsbError::Io(_)
+            ),
+            "{err:?}"
+        );
+        if usb_native_feature_enabled() {
+            assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+        } else {
+            assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn native_mpsse_opcode_path_and_honesty_gate() {
+        // Opcode encoder exists without hardware.
+        let ops = NativeFtdiMpsse::encode_read_stat();
+        assert!(ops.contains(&MPSSE_SET_CLK_DIVISOR));
+        assert!(ops.contains(&MPSSE_CLK_TMS_OUT_NEG_LSB));
+        assert!(native_mpsse_status_note().contains("native_mpsse"));
+
+        let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
+        if usb_native_feature_enabled() {
+            assert!(
+                matches!(err, NativeUsbError::Io(_)),
+                "usb-native + no FTDI → Io, got {err:?}"
+            );
+            // Explicit --cable native must not invent STAT / soft-succeed.
+            let dev = Device::load_part("HL10T-C32-1").unwrap();
+            let dir = std::env::temp_dir().join("helion-native-mpsse-io");
+            let _ = std::fs::create_dir_all(&dir);
+            let bits_path = dir.join("t.hbits");
+            std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+            let cable = resolve_cable("native").unwrap();
+            let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+            assert!(
+                e.contains("native MPSSE") || e.contains("I/O") || e.contains("no FTDI"),
+                "{e}"
+            );
+            assert!(!e.to_ascii_lowercase().contains("done=1"));
+        } else {
+            assert!(
+                matches!(err, NativeUsbError::NotImplemented(_)),
+                "feature off → NotImplemented→OFL, got {err:?}"
+            );
+        }
+        let table = had_board_id_table_text();
+        assert!(table.contains("NativeFtdiMpsse") || table.contains("native_mpsse"));
+        assert!(table.contains("TAP_readback=none"));
+    }
+
+    #[test]
+    fn ofl_had_cable_notes_surface_board_alias() {
+        let table = had_board_id_table_text();
+        assert!(table.contains("helion_hl10t"));
+        assert!(table.contains("HELION_OFL_BOARD"));
+        assert!(table.contains("HELION_OFL_VERIFY") || table.contains("TAP_readback=none"));
+        let det = detect_boards();
+        assert!(det.text().contains("helion_hl10t"));
+        assert!(det.text().contains("native_mpsse") || det.text().contains("NativeFtdiMpsse") || det.text().contains("native_usb"));
     }
 
     #[test]
