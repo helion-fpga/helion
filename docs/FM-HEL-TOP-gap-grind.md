@@ -4,7 +4,8 @@
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
 **Pick:** **D** (labeled die-fill/splitter overlays; paint fix so bar can clear) — A deferred (Mac USB still empty / Shell unreachable)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
-**Shipped SHA:** `ecc3706fec9df638d479603ea148aca97df4526a` (`ecc3706`)
+**Shipped SHA (bar):** `ecc3706fec9df638d479603ea148aca97df4526a` (`ecc3706`)  
+**Docs tip:** `cbe358e1377397381edf3cbee9fdddc46b1b4dff` (`cbe358e`) — stamp only; author slip on stamp (saksham@), bar commit AUTHOR LOCK OK
 
 ## Why D over A
 
@@ -58,4 +59,4 @@ Post-fix math (unit-tested): 800×500 and 1152×628 → fill **100%**, gap **0**
 
 ## Verdict
 
-**PASS (bar moved).** Tip **`ecc3706`** pushed to `helion-fpga/fm-hel-corpus-soft-pass`. Die-fill root cause fixed + labeled measurement overlays for UX2; gold 9640 / skip=0 held; no board DONE claimed; no merge.
+**PASS (bar moved).** Bar tip **`ecc3706`** (AUTHOR LOCK OK); docs tip **`cbe358e`** pushed to `helion-fpga/fm-hel-corpus-soft-pass`. Die-fill root cause fixed + labeled measurement overlays for UX2; gold 9640 / skip=0 held; no board DONE claimed; no merge.
