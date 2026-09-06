@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~07:27 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
-**Score tip (branch HEAD):** `5b21b3c3257b9bf1f3f6b8d3926c7237acff16a3` (`5b21b3c`)
+**Score tip (branch HEAD):** `1d7efe3369494e8fa730c30b2de2d083925fd41e` (`1d7efe3`)
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
 
 ## Gold
