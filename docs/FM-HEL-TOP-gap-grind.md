@@ -4,7 +4,7 @@
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
 **CLI breadcrumb SHA:** `9ef40e9d21aabe2d5f0597c45b132e3617b560d8` (`9ef40e9`)  
-**Tip HEAD:** _(docs stamp commit; see post-push)_  
+**Tip HEAD:** `637c28811cf742be711f0c990eb6a685fec879b9` (`637c288`)  
 
 ## Resume status
 
