@@ -4,9 +4,11 @@
 pub const GPUI_TOOLKIT: &str = "gpui";
 
 pub mod chrome;
-pub use chrome::{Activity, Canvas};
+pub use chrome::{Activity, Canvas, WorkspacePane, pane_for_workspace};
 pub mod doctor;
 pub mod ide;
+pub mod open_dialog;
+pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
 pub use ide::{
     BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,

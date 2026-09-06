@@ -7,10 +7,10 @@ use crate::{BottomTab, WorkspaceTab};
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
-/// 48px Helion activity rail — letter + short name (MUST 3 / UXQA leftover).
-pub const RAIL_WIDTH: f32 = 48.0;
-/// Tall enough for letter glyph + short label under it.
-pub const HIT_RAIL: f32 = 48.0;
+/// Activity rail — letter above the full name. 48px clipped "Device"/"Program"/"Reports".
+pub const RAIL_WIDTH: f32 = 88.0;
+/// Tall enough for letter glyph + full name under it (hit ≥28px).
+pub const HIT_RAIL: f32 = 56.0;
 /// One sidebar (MUST 5).
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 /// Legacy aliases — side chrome is rail + sidebar, not 680.
@@ -30,6 +30,14 @@ pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
 pub const OCCUPANCY_BAR_H: f32 = 20.0;
 /// Calm splitter grab radius (4–6px ship; not neon QA slab).
 pub const SPLITTER_GRAB_PX: f32 = 6.0;
+/// Sidebar may shrink/grow; the drag must be able to move ≥40px and keep the size.
+pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;
+pub const CONSOLE_MIN_HEIGHT: f32 = 80.0;
+pub const CONSOLE_DEFAULT_HEIGHT: f32 = 180.0;
+pub const CONSOLE_MAX_HEIGHT: f32 = 420.0;
+/// Proof bar: a splitter that cannot travel this far is a dead grip.
+pub const SPLITTER_MIN_DELTA_PX: f32 = 40.0;
 /// Bounded height for in-pane Name/Value grids so they cannot eat the CentralPanel.
 pub const TABLE_MAX_HEIGHT: f32 = 180.0;
 /// Device/Package tables stack above the canvas; keep them compact so the die expands.
@@ -142,16 +150,9 @@ impl Activity {
         }
     }
 
-    /// Compact name under the letter on the 48px rail (fits without truncation spin).
+    /// Name under the letter. Full words — the rail is wide enough to paint them.
     pub fn short_label(self) -> &'static str {
-        match self {
-            Activity::Files => "Files",
-            Activity::Device => "Device",
-            Activity::Timing => "Timing",
-            Activity::Simulate => "Sim",
-            Activity::Program => "Program",
-            Activity::Reports => "Reports",
-        }
+        self.label()
     }
 
     pub fn tcl(self) -> &'static str {
@@ -481,6 +482,110 @@ pub fn workspace_matches_canvases() -> bool {
     WorkspaceTab::CANVASES.len() == Canvas::ALL.len()
 }
 
+/// Horizontal pixels the rail name occupies (letter sits above; this is the word).
+pub fn rail_name_extent(label: &str) -> f32 {
+    label.chars().count() as f32 * CHAR_PX
+}
+
+/// True when `label` paints fully inside the rail (padding 8px). Hover is not a substitute.
+pub fn rail_name_fits(label: &str) -> bool {
+    rail_name_extent(label) + 8.0 <= RAIL_WIDTH
+}
+
+/// Central pane a `WorkspaceTab` must fill. More ⋯ destinations never collapse to Timing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspacePane {
+    Editor,
+    Device,
+    Timing,
+    ReportsCatalog,
+    Schematic,
+    Package,
+    Hierarchy,
+    Bitstream,
+    Hardware,
+    Ip,
+    Find,
+    Settings,
+    Summary,
+    Wave,
+    Source,
+    Memory,
+    Breakpoints,
+    Locals,
+    Forces,
+    SimSettings,
+    Constraints,
+    ClockInteraction,
+    Cdc,
+    ClockNetworks,
+    Power,
+    Methodology,
+    Drc,
+    Utilization,
+    Runs,
+}
+
+/// Map every WorkspaceTab onto a real pane. None of these is a stub / popup / Timing dump.
+pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
+    match tab {
+        WorkspaceTab::TextEditor => WorkspacePane::Editor,
+        WorkspaceTab::Device => WorkspacePane::Device,
+        WorkspaceTab::Reports => WorkspacePane::ReportsCatalog,
+        WorkspaceTab::Schematic => WorkspacePane::Schematic,
+        WorkspaceTab::Package => WorkspacePane::Package,
+        WorkspaceTab::Hierarchy => WorkspacePane::Hierarchy,
+        WorkspaceTab::Bitstream => WorkspacePane::Bitstream,
+        WorkspaceTab::Hardware => WorkspacePane::Hardware,
+        WorkspaceTab::Ip => WorkspacePane::Ip,
+        WorkspaceTab::Find => WorkspacePane::Find,
+        WorkspaceTab::Settings => WorkspacePane::Settings,
+        WorkspaceTab::Summary => WorkspacePane::Summary,
+        WorkspaceTab::Wave => WorkspacePane::Wave,
+        WorkspaceTab::Source => WorkspacePane::Source,
+        WorkspaceTab::Memory => WorkspacePane::Memory,
+        WorkspaceTab::Breakpoints => WorkspacePane::Breakpoints,
+        WorkspaceTab::Locals => WorkspacePane::Locals,
+        WorkspaceTab::Forces => WorkspacePane::Forces,
+        WorkspaceTab::SimSettings => WorkspacePane::SimSettings,
+        WorkspaceTab::Constraints => WorkspacePane::Constraints,
+        WorkspaceTab::ClockInteraction => WorkspacePane::ClockInteraction,
+        WorkspaceTab::Cdc => WorkspacePane::Cdc,
+        WorkspaceTab::ClockNetworks => WorkspacePane::ClockNetworks,
+        WorkspaceTab::Power => WorkspacePane::Power,
+        WorkspaceTab::Methodology => WorkspacePane::Methodology,
+        WorkspaceTab::Drc => WorkspacePane::Drc,
+        WorkspaceTab::Utilization => WorkspacePane::Utilization,
+        WorkspaceTab::Runs => WorkspacePane::Runs,
+    }
+}
+
+/// Non-canvas WorkspaceTabs live in More ⋯ and must paint `pane_for_workspace` in the center.
+pub fn is_more_destination(tab: WorkspaceTab) -> bool {
+    !tab.is_canvas()
+}
+
+/// Report-detail tabs that belong under the Reports rail (catalog stays in the sidebar).
+pub fn is_report_detail(tab: WorkspaceTab) -> bool {
+    matches!(
+        tab,
+        WorkspaceTab::Constraints
+            | WorkspaceTab::ClockInteraction
+            | WorkspaceTab::Cdc
+            | WorkspaceTab::ClockNetworks
+            | WorkspaceTab::Power
+            | WorkspaceTab::Methodology
+            | WorkspaceTab::Drc
+            | WorkspaceTab::Utilization
+            | WorkspaceTab::Runs
+    )
+}
+
+/// Splitters must travel at least this far inside their min/max range.
+pub fn splitter_can_travel(min: f32, max: f32) -> bool {
+    max - min >= SPLITTER_MIN_DELTA_PX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,10 +593,10 @@ mod tests {
     #[test]
     fn chrome_overflow_keeps_every_tab_and_rail_action_selectable_at_desktop_width() {
         assert_eq!(side_chrome_width(), RAIL_WIDTH + SIDEBAR_WIDTH);
-        assert_eq!(side_chrome_width(), 268.0);  // RAIL 48 + SIDEBAR 220 (letter rail)
+        assert_eq!(side_chrome_width(), 308.0); // RAIL 88 + SIDEBAR 220 (full names)
         assert_ne!(side_chrome_width(), 680.0);
-        assert_eq!(RAIL_WIDTH, 48.0);
-        assert_eq!(HIT_RAIL, 48.0);
+        assert_eq!(RAIL_WIDTH, 88.0);
+        assert_eq!(HIT_RAIL, 56.0);
         assert_eq!(SIDEBAR_WIDTH, 220.0);
         assert_eq!(HIT_PRIMARY, 32.0);
         assert_eq!(HIT_SIDEBAR, 28.0);
@@ -597,24 +702,97 @@ mod tests {
     }
 
     #[test]
-    fn activity_rail_letter_and_short_label_are_visible() {
+    fn activity_rail_letter_and_full_name_are_visible() {
         for a in Activity::ALL {
             assert_eq!(a.icon().chars().count(), 1, "{a:?} letter");
-            assert!(!a.short_label().is_empty(), "{a:?} short");
+            assert!(!a.short_label().is_empty(), "{a:?} name");
+            assert_eq!(a.short_label(), a.label(), "{a:?} must paint the full name");
             assert!(
-                a.short_label().chars().count() <= 7,
-                "{a:?} short too long for 48px rail: {}",
+                rail_name_fits(a.label()),
+                "{a:?} name {:?} clips on {RAIL_WIDTH}px rail (extent {})",
+                a.label(),
+                rail_name_extent(a.label())
+            );
+            assert!(
+                rail_name_fits(a.short_label()),
+                "{a:?} short {:?} clips",
                 a.short_label()
             );
         }
-        assert_eq!(Activity::Simulate.short_label(), "Sim");
+        assert_eq!(Activity::Simulate.short_label(), "Simulate");
         assert_eq!(Activity::Program.short_label(), "Program");
-        assert_eq!(Activity::Program.short_label().chars().count(), 7);
-        assert_eq!(RAIL_WIDTH, 48.0);
+        assert_eq!(Activity::Device.short_label(), "Device");
+        assert_eq!(Activity::Reports.short_label(), "Reports");
+        assert_eq!(RAIL_WIDTH, 88.0);
+        assert_eq!(HIT_RAIL, 56.0);
+        assert!(HIT_RAIL >= 28.0);
         assert_eq!(HIT_COMFORT, 36.0);
         assert_eq!(OCCUPANCY_BAR_H, 20.0);
         assert!((4.0..=6.0).contains(&SPLITTER_GRAB_PX));
         assert_eq!(DEVICE_TABLES_MAX_HEIGHT, 140.0);
+        assert!(splitter_can_travel(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
+        assert!(splitter_can_travel(CONSOLE_MIN_HEIGHT, CONSOLE_MAX_HEIGHT));
+        assert!(SIDEBAR_WIDTH >= SIDEBAR_MIN_WIDTH && SIDEBAR_WIDTH <= SIDEBAR_MAX_WIDTH);
+
+        let desktop = chrome_at(DESKTOP_WIDTH);
+        assert_eq!(desktop.workspace_mode, OverflowMode::Fit);
+        for lab in ["Editor", "Device", "Timing"] {
+            assert!(desktop.tab_is_selectable(lab), "desktop {lab}");
+        }
+        let narrow = chrome_at(1100.0);
+        assert_eq!(narrow.dropped_workspace(), 0);
+        assert!(
+            narrow.workspace_mode == OverflowMode::Fit || narrow.tab_rows.iter().any(|r| r.contains(&MORE)),
+            "narrow window keeps canvases or More: {:?}",
+            narrow.tab_rows
+        );
+        for lab in ["Editor", "Device", "Timing"] {
+            assert!(narrow.tab_is_selectable(lab), "narrow {lab}");
+        }
+        let table = table_scroll_policy(10, 400.0);
+        assert!(table.last_column_would_clip && table.x && table.y);
+    }
+
+    #[test]
+    fn more_destinations_never_fall_through_to_timing_pane() {
+        use crate::WorkspaceTab;
+        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Schematic), WorkspacePane::Schematic);
+        assert_ne!(pane_for_workspace(WorkspaceTab::Schematic), WorkspacePane::Timing);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Package), WorkspacePane::Package);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Hierarchy), WorkspacePane::Hierarchy);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Summary), WorkspacePane::Summary);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Settings), WorkspacePane::Settings);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Bitstream), WorkspacePane::Bitstream);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Hardware), WorkspacePane::Hardware);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Ip), WorkspacePane::Ip);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Find), WorkspacePane::Find);
+        let mut more = 0usize;
+        for tab in WorkspaceTab::ALL {
+            let pane = pane_for_workspace(tab);
+            if is_more_destination(tab) {
+                more += 1;
+                assert_ne!(
+                    pane,
+                    WorkspacePane::Timing,
+                    "{tab:?} More destination must not paint Timing"
+                );
+                assert_ne!(
+                    pane,
+                    WorkspacePane::ReportsCatalog,
+                    "{tab:?} More destination is not the Reports catalog"
+                );
+            }
+        }
+        assert_eq!(more, 25, "28 tabs − 3 canvases");
+        assert!(is_report_detail(WorkspaceTab::Utilization));
+        assert!(!is_report_detail(WorkspaceTab::Schematic));
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Reports),
+            WorkspacePane::ReportsCatalog
+        );
+        assert_eq!(pane_for_workspace(WorkspaceTab::TextEditor), WorkspacePane::Editor);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Device), WorkspacePane::Device);
     }
 }
 
