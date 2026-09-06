@@ -265,11 +265,29 @@ impl HelionIde {
 
     fn set_canvas(&mut self, c: Canvas) {
         self.canvas = c;
-        self.model.workspace = match c {
-            Canvas::Editor => WorkspaceTab::TextEditor,
-            Canvas::Device => WorkspaceTab::Device,
-            Canvas::Timing => WorkspaceTab::Reports,
-        };
+        match c {
+            Canvas::Editor => self.model.workspace = WorkspaceTab::TextEditor,
+            Canvas::Device => self.model.workspace = WorkspaceTab::Device,
+            Canvas::Timing => {
+                // Keep a report-detail workspace if already on one; else default Timing Summary pane.
+                // Never open the Reports *catalog* in the Timing canvas (catalog is SidePanel-only).
+                if !matches!(
+                    self.model.workspace,
+                    WorkspaceTab::Reports
+                        | WorkspaceTab::Constraints
+                        | WorkspaceTab::ClockInteraction
+                        | WorkspaceTab::Cdc
+                        | WorkspaceTab::ClockNetworks
+                        | WorkspaceTab::Power
+                        | WorkspaceTab::Methodology
+                        | WorkspaceTab::Drc
+                        | WorkspaceTab::Utilization
+                        | WorkspaceTab::Runs
+                ) {
+                    self.model.workspace = WorkspaceTab::Reports;
+                }
+            }
+        }
     }
 
     fn set_activity(&mut self, a: Activity) {
@@ -288,6 +306,8 @@ impl HelionIde {
                     self.set_canvas(Canvas::Timing);
                 }
                 self.model.workspace = WorkspaceTab::Reports;
+                // Catalog-first: don't auto-open Timing Summary under Reports (void + twin).
+                self.model.selected_report = None;
             }
         }
     }
@@ -659,18 +679,17 @@ fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
         Activity::Simulate => paint_sim_side(ctx, &mut app.model),
         Activity::Files => paint_files_side(ctx, app),
         Activity::Device => paint_files_side(ctx, app),
-        // Timing/Reports: no SidePanel — catalog/paths live in the canvas (kills the black void).
+        // Timing/Reports: catalog/paths stack inside the canvas (SidePanel was leaving a black void).
         Activity::Timing | Activity::Reports => {}
         Activity::Program => paint_files_side(ctx, app),
     }
 }
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
-    egui::SidePanel::left("sidebar_v2")
-        .resizable(true)
-        .default_width(chrome::SIDEBAR_WIDTH)
-        .min_width(180.0)
-        .max_width(280.0)
+    // Exact width — resizable SidePanels previously left a ~500px black void beside Timing/Reports.
+    egui::SidePanel::left("sidebar_v3")
+        .resizable(false)
+        .exact_width(chrome::SIDEBAR_WIDTH)
         .show(ctx, |ui| {
             let title = match app.activity {
                 Activity::Files => "Files",
@@ -1168,14 +1187,22 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     // Always: Editor | Device | Timing | More ⋯ (overflow keeps prior WorkspaceTab destinations).
     ui.horizontal(|ui| {
         for c in Canvas::ALL {
-            let on = app.canvas == c;
+            // Reports rail owns the catalog view — don't paint it as "Timing" selected (Timing ≠ Reports).
+            let on = app.canvas == c && !(app.activity == Activity::Reports && c == Canvas::Timing);
             if ui
                 .selectable_label(on, format!("{}  {}", c.label(), c.shortcut()))
                 .on_hover_text(tip(c.label(), c.shortcut(), ""))
                 .clicked()
             {
+                app.set_activity(Activity::Files);
                 app.set_canvas(c);
+                if c == Canvas::Timing {
+                    app.set_activity(Activity::Timing);
+                }
             }
+        }
+        if app.activity == Activity::Reports {
+            let _ = ui.selectable_label(true, "Reports");
         }
         ui.menu_button(chrome::MORE, |ui| {
             ui.label(RichText::new("More views").strong().small());
@@ -1232,50 +1259,36 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             paint_device(ui, &mut app.model);
         }
         Canvas::Timing => {
-            // Explicit split inside the canvas: navigator | detail. No SidePanel gap.
-            let full = ui.available_size();
-            let nav_w = 280.0_f32.min(full.x * 0.34).max(200.0);
-            ui.horizontal(|ui| {
-                ui.set_min_height(full.y);
-                ui.vertical(|ui| {
-                    ui.set_width(nav_w);
-                    ui.set_min_height(full.y - 8.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("timing_nav_v1")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_min_width(nav_w - 8.0);
-                            match app.activity {
-                                Activity::Reports => {
-                                    ui.label(RichText::new("Reports").strong().size(14.0));
-                                    ui.add_space(4.0);
-                                    paint_report_catalog(ui, &mut app.model);
-                                }
-                                Activity::Timing => {
-                                    ui.label(RichText::new("Timing").strong().size(14.0));
-                                    ui.add_space(4.0);
-                                    paint_timing_paths(ui, &mut app.model);
-                                }
-                                _ => {
-                                    ui.label(RichText::new("Reports").strong().size(14.0));
-                                    ui.add_space(4.0);
-                                    paint_report_catalog(ui, &mut app.model);
-                                }
-                            }
-                        });
+            // Full-width vertical stack. No SidePanel twin, no set_min_size (that created a tall black hole).
+            egui::ScrollArea::vertical()
+                .id_salt("timing_canvas_v5")
+                .auto_shrink([false, true])
+                .hscroll(false)
+                .show(ui, |ui| {
+                    match app.activity {
+                        Activity::Reports => {
+                            ui.heading("Reports");
+                            ui.add_space(4.0);
+                            paint_report_catalog(ui, &mut app.model);
+                            ui.add_space(6.0);
+                            // Collapsed by default — open only when user expands (no tall void band).
+                            let open = false;
+                            egui::CollapsingHeader::new("Report detail")
+                                .default_open(open)
+                                .show(ui, |ui| {
+                                    if app.model.selected_report.is_some() {
+                                        paint_reports_detail(ui, app);
+                                    } else {
+                                        ui.label(
+                                            RichText::new("Select a report above.")
+                                                .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                                        );
+                                    }
+                                });
+                        }
+                        _ => paint_timing_only(ui, &mut app.model),
+                    }
                 });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.set_min_size(egui::vec2((full.x - nav_w - 12.0).max(320.0), full.y - 8.0));
-                    egui::ScrollArea::vertical()
-                        .id_salt("timing_detail_v1")
-                        .auto_shrink([false, false])
-                        .hscroll(false)
-                        .show(ui, |ui| {
-                            paint_timing_canvas_body(ui, app);
-                        });
-                });
-            });
         }
     }
 }
@@ -1313,6 +1326,39 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
         }
         _ => {
             app.set_canvas(Canvas::Timing);
+        }
+    }
+}
+
+
+/// Timing ⌘3 / Timing rail: WNS + paths only — never Reports catalog.
+fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel) {
+    paint_timing_summary(ui, model);
+    ui.add_space(8.0);
+    paint_timing_paths(ui, model);
+}
+
+/// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
+fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
+    match app.model.workspace {
+        WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
+        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model),
+        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
+        WorkspaceTab::Power => paint_power(ui, &mut app.model),
+        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model),
+        WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
+        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
+        WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
+        WorkspaceTab::Reports | WorkspaceTab::Summary => {
+            ui.heading("Timing Summary");
+            ui.add_space(4.0);
+            paint_timing_summary(ui, &mut app.model);
+        }
+        other => {
+            // Fall through to known panes / timing-only for overflow More picks.
+            let _ = other;
+            paint_timing_canvas_body(ui, app);
         }
     }
 }
@@ -1373,9 +1419,12 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 
 fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
-    egui::SidePanel::left("scopes_v2")
+    // Calm narrow scopes rail — resizable but hard-capped so Wave is not pushed behind a black void.
+    egui::SidePanel::left("scopes_v3")
         .resizable(true)
         .default_width(chrome::SIDEBAR_WIDTH)
+        .min_width(180.0)
+        .max_width(260.0)
         .show(ctx, |ui| {
             ui.label(RichText::new("Scopes").strong());
             ui.horizontal(|ui| {
