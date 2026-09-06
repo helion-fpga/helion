@@ -2,7 +2,7 @@
 
 **When:** 2026-09-06 08:09 EDT  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
-**Repo tip (pre-commit):** `a5e27f4ca3b82490a90b45a297846055f0e89cb6`  
+**Repo tip (commit):** `2714c61f7b4f734c184228d7b2798852b81526af`  
 **Author lock:** saksham-45 / 72103486+saksham-45@users.noreply.github.com
 
 ## Goals
@@ -49,3 +49,9 @@ Honest residual: **1** intentional skip — `ysyx_ibex` (never uncapped cargo / 
 
 - Deepen bar advanced **98 → 99**; residual documented honestly (Ibex skip).
 - Softs remain closed; gold held; **NO MERGE**.
+
+## SHAs
+
+- Commit: `2714c61f7b4f734c184228d7b2798852b81526af` (`2714c61`)
+- Pushed: `helion-fpga/fm-hel-corpus-soft-pass` (NO MERGE to master)
+- Gold: WNS_PS=9640
