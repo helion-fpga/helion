@@ -20,14 +20,19 @@ impl FeatureSet {
     }
 
     pub fn set_init(&mut self, x: u32, y: u32, ble: u32, init: u64) {
+        // Only program 1-bits; unset INIT bits stay at reset 0 (assemble skips false).
         for i in 0..64u32 {
-            let b = (init >> i) & 1 == 1;
-            self.set(format!("CLB_X{x}Y{y}.BLE{ble}.LUT.INIT[{i}]"), b);
+            if (init >> i) & 1 == 1 {
+                self.set(format!("CLB_X{x}Y{y}.BLE{ble}.LUT.INIT[{i}]"), true);
+            }
         }
     }
 
     pub fn set_ff_used(&mut self, x: u32, y: u32, ble: u32, used: bool) {
-        self.set(format!("CLB_X{x}Y{y}.BLE{ble}.FF.USED"), used);
+        // FF.USED reset is 0; only assert when the BLE packs an FF.
+        if used {
+            self.set(format!("CLB_X{x}Y{y}.BLE{ble}.FF.USED"), true);
+        }
     }
 
     pub fn set_imux(&mut self, x: u32, y: u32, mux: u32, sel: u8) {
@@ -51,15 +56,11 @@ pub struct Bitstream {
 
 impl Bitstream {
     pub fn empty(dev: &Device) -> Self {
-        let mut frames = BTreeMap::new();
-        for major in 0..dev.n_clb() as u16 {
-            for minor in 0..dev.clb_minors as u8 {
-                frames.insert((Far::CLB_IO_CLK, major, minor), 0);
-            }
-        }
+        // Sparse from the start: reset frames are absent (same as encode skip of 0).
+        // Avoids O(n_clb * minors) zero inserts on every bitgen (Ibex-scale).
         let mut bs = Self {
             idcode: dev.idcode,
-            frames,
+            frames: BTreeMap::new(),
             packets: Vec::new(),
         };
         bs.packets = encode_packets(dev.idcode, &bs.frames);
@@ -593,7 +594,13 @@ mod tests {
         assert_eq!(init2, 0xAAAA_AAAA_AAAA_AAAA);
         assert_ne!(bs.frames, eco.frames);
         let pb = bitgen_pblock(&dev, &r, &[(site.x, site.y)]).unwrap();
-        assert!(pb.frames.len() < bs.frames.len(), "partial must be smaller");
+        // Sparse bitgen: blinky already fits one major, so pblock may equal full.
+        // Honesty bar is subset + packets never larger than the parent stream.
         assert!(pb.frames.keys().all(|k| bs.frames.contains_key(k)));
+        assert!(
+            pb.packets.len() <= bs.packets.len(),
+            "partial packets must not exceed full"
+        );
+        assert!(!pb.frames.is_empty(), "pblock must carry the placed major");
     }
 }
