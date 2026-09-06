@@ -756,21 +756,22 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.label(format!("{} · {}", c.id, c.backend.as_str()));
         ui.label(RichText::new(c.detail.as_str()).small().color(Color32::from_rgb(0xa0, 0xa8, 0xb0)));
     }
-    ui.label(
-        RichText::new(if det.physical_had {
-            "Physical USB programmer detected (openFPGALoader)."
-        } else if det.usb.ofl_path.is_some() {
-            "No USB programmer — openFPGALoader on PATH; use sim or attach HAD."
-        } else {
-            "openFPGALoader not on PATH — sim cable available."
-        })
-        .color(if det.physical_had {
-            Color32::from_rgb(0x3d, 0xb8, 0x7a)
-        } else {
-            Color32::from_rgb(0xa0, 0xa8, 0xb0)
-        })
-        .small(),
-    );
+    // Soft-hold banner while no physical FTDI/HAD — never claim board DONE from detect alone.
+    if det.physical_had {
+        ui.label(
+            RichText::new("Physical USB programmer detected (openFPGALoader / native FTDI).")
+                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a))
+                .small(),
+        );
+    } else {
+        ui.label(
+            RichText::new(
+                "Physical board soft-hold — no USB programmer detected. Use sim cable or attach FTDI/HAD.",
+            )
+            .color(Color32::from_rgb(0xe0, 0xa0, 0x40))
+            .small(),
+        );
+    }
     ui.add_space(6.0);
 
     let bits_done = app.model.step_state(FlowStep::Bitstream) == StepState::Done;
@@ -831,53 +832,88 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     }
     ui.add_space(8.0);
 
+    let cable_needs_phys = matches!(
+        app.program_cable.as_str(),
+        "usb" | "ofl" | "native" | "ftdi" | "libusb" | "openfpgaloader"
+    );
+    let phys_blocked = cable_needs_phys && !det.physical_had;
+    let phys_block_msg =
+        "No USB programmer detected (physical soft-hold). Switch cable to sim, or attach FTDI/HAD and Detect.";
+
     ui.horizontal(|ui| {
         if sidebar_button(ui, "Detect")
-            .on_hover_text("Detect cables")
+            .on_hover_text("Detect cables — honest USB/OFL scan; never fakes a probe")
             .clicked()
         {
-            app.program_status = Some((true, det.text().trim().to_string()));
+            let ofl = det
+                .usb
+                .ofl_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(not on PATH)".into());
+            let summary = format!(
+                "scan USB={} · OFL={} · physical_had={}",
+                det.usb.probes.len(),
+                ofl,
+                u8::from(det.physical_had),
+            );
+            // Honest scan summary only — never invent a probe / board DONE.
+            app.program_status = Some((det.physical_had, summary));
             let _ = app.model.exec("open_hw_manager");
         }
-        let prog = primary_button(ui, "Program").on_hover_text(if bits_done {
+        let prog_hover = if phys_blocked {
+            phys_block_msg.to_string()
+        } else if bits_done {
             tip("Program", "", "program_hw")
         } else {
             "No bitstream yet — Generate Bitstream first".into()
-        });
-        if prog.clicked() {
-            if !bits_done {
-                app.program_status = Some((
-                    false,
-                    "No bitstream yet. Run Implement, then Generate Bitstream.".into(),
-                ));
-            } else {
-                let cable = app.program_cable.clone();
-                let _ = app.model.exec("open_hw_manager");
-                match app.model.program_hw_with_cable(&cable) {
-                    Ok(s) => {
-                        app.program_status =
-                            Some((true, format!("{s} · {frames} frames · {bytes} B")));
+        };
+        ui.add_enabled_ui(!phys_blocked, |ui| {
+            let prog = primary_button(ui, "Program").on_hover_text(prog_hover);
+            if prog.clicked() {
+                if phys_blocked {
+                    app.program_status = Some((false, phys_block_msg.to_string()));
+                } else if !bits_done {
+                    app.program_status = Some((
+                        false,
+                        "No bitstream yet. Run Implement, then Generate Bitstream.".into(),
+                    ));
+                } else {
+                    let cable = app.program_cable.clone();
+                    let _ = app.model.exec("open_hw_manager");
+                    match app.model.program_hw_with_cable(&cable) {
+                        Ok(s) => {
+                            app.program_status =
+                                Some((true, format!("{s} · {frames} frames · {bytes} B")));
+                        }
+                        Err(e) => app.program_status = Some((false, e)),
                     }
-                    Err(e) => app.program_status = Some((false, e)),
                 }
             }
-        }
+        });
     });
 
     if let Some((ok, msg)) = &app.program_status {
         ui.add_space(8.0);
         ui.separator();
+        let is_scan = msg.starts_with("scan USB=");
+        let heading = if is_scan {
+            "Scan"
+        } else if *ok {
+            "Result"
+        } else {
+            "Error"
+        };
+        let heading_color = if is_scan {
+            Color32::from_rgb(0xa0, 0xa8, 0xb0)
+        } else if *ok {
+            Color32::from_rgb(0x3d, 0xb8, 0x7a)
+        } else {
+            Color32::from_rgb(0xe0, 0x50, 0x50)
+        };
+        ui.label(RichText::new(heading).strong().color(heading_color));
         ui.label(
-            RichText::new(if *ok { "Result" } else { "Error" })
-                .strong()
-                .color(if *ok {
-                    Color32::from_rgb(0x3d, 0xb8, 0x7a)
-                } else {
-                    Color32::from_rgb(0xe0, 0x50, 0x50)
-                }),
-        );
-        ui.label(
-            RichText::new(msg.as_str()).color(if *ok {
+            RichText::new(msg.as_str()).color(if is_scan || *ok {
                 Color32::from_rgb(0xc0, 0xc8, 0xd0)
             } else {
                 Color32::from_rgb(0xe0, 0x80, 0x80)
@@ -5935,6 +5971,38 @@ fn hw_stat_bit_color(name: &str, value: bool) -> Color32 {
 
 fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hardware Manager");
+    let det = helion_hw::detect_boards();
+    if !det.physical_had {
+        ui.label(
+            RichText::new(
+                "Physical board soft-hold — no USB programmer detected. Use sim cable or attach FTDI/HAD.",
+            )
+            .color(Color32::from_rgb(0xe0, 0xa0, 0x40))
+            .small(),
+        );
+        let ofl = det
+            .usb
+            .ofl_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(not on PATH)".into());
+        ui.label(
+            RichText::new(format!(
+                "Last scan · USB={} · OFL={} · physical_had={}",
+                det.usb.probes.len(),
+                ofl,
+                u8::from(det.physical_had),
+            ))
+            .small()
+            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+        );
+    } else {
+        ui.label(
+            RichText::new("Physical USB programmer detected (detect only — not board DONE).")
+                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a))
+                .small(),
+        );
+    }
     ui.horizontal(|ui| {
         if ui.button("Open Hardware Manager").clicked() {
             let _ = model.exec("open_hw_manager");
@@ -5949,11 +6017,15 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     let report = model.hw_stat_report();
     if !report.open {
         ui.label("No cable yet. Open Hardware Manager (sim or openFPGALoader USB).");
-        ui.label(
-            RichText::new("No USB programmer detected — sim backend available; usb/ofl needs openFPGALoader + device.")
+        if !det.physical_had {
+            ui.label(
+                RichText::new(
+                    "usb/ofl / native Program needs a real FTDI/HAD probe — sim Program Device still works.",
+                )
                 .small()
                 .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
-        );
+            );
+        }
     } else {
         ui.label(format!(
             "target={} part={} idcode={:#010x} ir={:#04x} programmed={} word={}",

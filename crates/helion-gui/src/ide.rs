@@ -17226,6 +17226,36 @@ impl IdeModel {
         }
     }
 
+    /// Status-bar / Messages crumb: mark_debug nets + last ILA capture (no layout).
+    pub fn ila_status_crumb(&self) -> String {
+        let md = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.marked_debug_nets())
+            .unwrap_or_default();
+        let md_part = if md.is_empty() {
+            String::new()
+        } else if md.len() <= 2 {
+            format!("md:{} ", md.join(","))
+        } else {
+            format!("md:{}(+{}) ", md[0], md.len() - 1)
+        };
+        if self.ila.armed {
+            let net = if self.ila.net.is_empty() {
+                "…"
+            } else {
+                self.ila.net.as_str()
+            };
+            return format!("{md_part}ILA arming {net}");
+        }
+        if !self.ila.bits.is_empty() {
+            return format!("{md_part}ILA {}×{}", self.ila.net, self.ila.bits.len());
+        }
+        format!("{md_part}ILA —")
+    }
+
     pub fn ila_arm(&mut self, spec: &str) -> Result<String, String> {
         let mut parts = spec.split_whitespace();
         let net = parts
@@ -22991,6 +23021,33 @@ mod tests {
             "cone drawing is a subset of the sheet ({}/{})",
             cone_cells.len(),
             cells.len()
+        );
+    }
+
+    /// Cheap ILA GUI affordance: status crumb shows mark_debug + capture size.
+    #[test]
+    fn ila_status_crumb_surfaces_mark_debug_and_capture() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        let idle = ide.ila_status_crumb();
+        assert!(idle.contains("ILA"), "{idle}");
+        assert!(!idle.contains("×"), "no capture yet: {idle}");
+        ide.exec("mark_debug cnt_3").unwrap();
+        let md = ide.ila_status_crumb();
+        assert!(md.contains("md:cnt_3"), "{md}");
+        ide.exec("open_hw_manager").unwrap();
+        ide.exec("program_hw").unwrap();
+        ide.exec("ila_window 8").unwrap();
+        ide.exec("ila_arm cnt_3").unwrap();
+        let cap = ide.ila_status_crumb();
+        assert!(cap.contains("md:cnt_3"), "{cap}");
+        assert!(
+            cap.contains("ILA cnt_3×8") || cap.contains("ILA cnt_3×"),
+            "{cap}"
         );
     }
 
