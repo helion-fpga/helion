@@ -49,8 +49,9 @@ Ids: ['ysyx_ibex', 'uart', 'sha256']
 - Cheap sha256/uart alt golden only if free  
 - Sync dirty `helion-sv` to Mac; no push unless asked
 
-## Schematic deepen (post-FINAL)
+## Schematic deepen (post-FINAL) — DONE-at-48
 
-Sample n=16 PASS designs → deepen PASS 16 / SOFT 0 / FAIL 0. Phase-d score unchanged 97/3/0.
+Sample closed at **PASS 48 / SOFT 0 / FAIL 0** (n=16 → 41 → 48). Phase-d score unchanged 97/3/0.
 Fixes: rebuild helion-ide; emit_mac27 A/B/C/P wiring; IndexPart no false Mac27; harness empty-drawing SOFT.
-Details: `schematic-deepen.md`.
+Closeout: folded 7 leftover raw dumps; stopped — remaining PASS need fresh IDE runs / large cells; residuals capped.
+Details: `docs/FM-HEL-CORPUS-schematic-deepen.md`.
