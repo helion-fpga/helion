@@ -420,7 +420,7 @@ pub const HAD_KNOWN_BOARDS: &[HadBoardId] = &[
         ofl_board: "helion_hl10t",
         usb_vid: 0x0403,
         usb_pid: 0x6010,
-        note: "Helion-T bring-up part; OFL board alias is Helion-local (not upstream openFPGALoader yet)",
+        note: "Helion-T bring-up part; OFL board alias Helion-local (not upstream yet); OFL TAP_readback=none (never invent Helion STAT); mpsse-sim=sim fabric STAT only",
     },
     HadBoardId {
         part: "HL10T-DSP1",
@@ -428,7 +428,7 @@ pub const HAD_KNOWN_BOARDS: &[HadBoardId] = &[
         ofl_board: "helion_hl10t",
         usb_vid: 0x0403,
         usb_pid: 0x6010,
-        note: "Same IDCODE as HL10T-C32-1; DSP/MAC27 site variant",
+        note: "Same IDCODE as HL10T-C32-1; DSP/MAC27 site variant; OFL TAP_readback=none; native program=NotImplemented→OFL",
     },
 ];
 
@@ -447,7 +447,7 @@ pub fn had_board_id_table_text() -> String {
 ",
     );
     out.push_str(
-        "docs: set HELION_OFL_BOARD=<ofl_board> to pass -b; HELION_OFL_BOARD=none disables -b;          unset → default ofl_board for known part. HELION_OFL_CABLE / HELION_OFL_EXTRA /          HELION_OFL_VERIFY (flash --verify) / HELION_OFL_DRY_RUN also apply.
+        "docs: set HELION_OFL_BOARD=<ofl_board> to pass -b; HELION_OFL_BOARD=none disables -b; unset → default ofl_board for known part. HELION_OFL_CABLE / HELION_OFL_EXTRA / HELION_OFL_VERIFY (flash --verify) / HELION_OFL_DRY_RUN also apply. OFL never invents Helion TAP STAT (TAP_readback=none); use --cable mpsse-sim for sim fabric CFG_W+STAT (not board DONE).
 ",
     );
     for b in HAD_KNOWN_BOARDS {
@@ -458,7 +458,7 @@ pub fn had_board_id_table_text() -> String {
         ));
     }
     out.push_str(&format!(
-        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL; mpsse_sim=bitbang+CFG_W+STAT (sim fabric DONE only; not hardware DONE)\n",
+        "native_usb: feature={} enumerate=FTDI_VID_0x0403 detect-only; program=NativeFtdiStub NotImplemented→OFL; OFL TAP_readback=none (never invent Helion STAT); mpsse_sim=bitbang+CFG_W+STAT (sim fabric DONE only; not hardware DONE)\n",
         if native_usb::feature_enabled() {
             "usb-native"
         } else {
@@ -911,7 +911,7 @@ pub fn detect_boards() -> DetectReport {
     let native_n = usb.native_probes.len();
     let note = if physical_had {
         format!(
-            "Physical USB probe(s) listed: ofl={ofl_n} native_ftdi={native_n} (detect only — program DONE requires OFL/sim success, not enumerate). Use --cable usb|ofl|auto|native."
+            "Physical USB probe(s) listed: ofl={ofl_n} native_ftdi={native_n} (detect only — program DONE requires OFL/sim/mpsse-sim success, not enumerate). OFL TAP_readback=none; native MPSSE=NotImplemented→OFL. Use --cable usb|ofl|auto|native|mpsse-sim|sim."
         )
     } else if usb.ofl_path.is_some() || native_usb::feature_enabled() {
         format!(
@@ -919,7 +919,7 @@ pub fn detect_boards() -> DetectReport {
             usb.note
         )
     } else {
-        "openFPGALoader not on PATH and usb-native off — cannot probe USB. Install openFPGALoader (or set HELION_OPENFPGALOADER) or build helion-hw with --features usb-native. Sim cable remains available (--cable sim).".into()
+        "openFPGALoader not on PATH and usb-native off — cannot probe USB. Install openFPGALoader (or set HELION_OPENFPGALOADER) or build helion-hw with --features usb-native. Sim/mpsse-sim cables remain available (--cable sim|mpsse-sim); native program stays NotImplemented until real FTDI MPSSE.".into()
     };
     DetectReport {
         cables,
