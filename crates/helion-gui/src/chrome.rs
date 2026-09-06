@@ -437,6 +437,90 @@ pub fn floorplan_fits_viewport(
         && cell * rows.max(1) as f32 + 16.0 <= avail_h + 1.0
 }
 
+/// Remaining-pane fill bar (Program / Package / Schematic drawings).
+pub const PANE_FILL_MIN: f32 = 0.80;
+pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
+
+/// How a content bbox sits in the remaining central pane after chrome/tables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawingFit {
+    pub pane_w: f32,
+    pub pane_h: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub drawn_w: f32,
+    pub drawn_h: f32,
+    pub fill: f32,
+    pub empty_gap: f32,
+    pub right_clip: f32,
+}
+
+impl DrawingFit {
+    fn from_drawn(pane_w: f32, pane_h: f32, scale_x: f32, scale_y: f32, drawn_w: f32, drawn_h: f32) -> Self {
+        let pw = pane_w.max(1.0);
+        let ph = pane_h.max(1.0);
+        Self {
+            pane_w: pw,
+            pane_h: ph,
+            scale_x,
+            scale_y,
+            drawn_w,
+            drawn_h,
+            fill: (drawn_w / pw).min(drawn_h / ph).clamp(0.0, 1.0),
+            empty_gap: (pw - drawn_w).max(ph - drawn_h).max(0.0),
+            right_clip: (drawn_w - pw).max(0.0),
+        }
+    }
+
+    pub fn fills(&self) -> bool {
+        self.fill + 0.000_5 >= PANE_FILL_MIN && self.empty_gap <= PANE_EMPTY_GAP_MAX && self.right_clip <= 0.5
+    }
+}
+
+/// Stretch content so the drawn bbox fills the pane (package pins, hardware dashboard).
+pub fn fill_pane(content_w: f32, content_h: f32, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let cw = content_w.max(1.0);
+    let ch = content_h.max(1.0);
+    let pw = pane_w.max(1.0);
+    let ph = pane_h.max(1.0);
+    let sx = pw / cw;
+    let sy = ph / ch;
+    DrawingFit::from_drawn(pw, ph, sx, sy, pw, ph)
+}
+
+/// Isotropic fit: content stays inside the pane (schematic sheet). Right clip is 0.
+pub fn fit_pane(content_w: f32, content_h: f32, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let cw = content_w.max(1.0);
+    let ch = content_h.max(1.0);
+    let pw = pane_w.max(1.0);
+    let ph = pane_h.max(1.0);
+    let scale = (pw / cw).min(ph / ch).clamp(0.05, 16.0);
+    let dw = cw * scale;
+    let dh = ch * scale;
+    DrawingFit::from_drawn(pw, ph, scale, scale, dw, dh)
+}
+
+/// Old Package paint: square cell + DRAWING_MIN_HEIGHT pad. Leaves a black slab
+/// when the package is a 1-row pin strip.
+pub fn legacy_package_content_fill(cols: u32, rows: u32, pane_w: f32, pane_h: f32) -> f32 {
+    let cell = floorplan_fit_cell(cols, rows, pane_w, pane_h);
+    let content_h = cell * rows.max(1) as f32 + 16.0;
+    content_h / pane_h.max(1.0)
+}
+
+/// Anisotropic pin cells so the package grid fills remaining pane width and height.
+pub fn package_cell(cols: u32, rows: u32, pane_w: f32, pane_h: f32) -> (f32, f32) {
+    let cw = (pane_w - 28.0).max(8.0) / cols.max(1) as f32;
+    let ch = (pane_h - 16.0).max(8.0) / rows.max(1) as f32;
+    (cw.max(4.0), ch.max(4.0))
+}
+
+/// Remaining dashboard after Hardware Manager chrome (buttons/status).
+pub fn hardware_dashboard_size(pane_w: f32, pane_h: f32, chrome_h: f32) -> (f32, f32) {
+    let remain = (pane_h - chrome_h).max(pane_h * PANE_FILL_MIN);
+    (pane_w.max(80.0), remain)
+}
+
 /// Paint `data_scroll` reads this: both axes + bounded height.
 pub fn table_scroll_policy(n_cols: usize, available: f32) -> TableScrollPolicy {
     let last_column_would_clip = grid_clips_last_column(n_cols, MIN_COL_PX, available);
@@ -793,6 +877,44 @@ mod tests {
         );
         assert_eq!(pane_for_workspace(WorkspaceTab::TextEditor), WorkspacePane::Editor);
         assert_eq!(pane_for_workspace(WorkspaceTab::Device), WorkspacePane::Device);
+    }
+
+    #[test]
+    fn package_and_hardware_fill_remaining_pane_not_a_black_slab() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        // The 1-row pin strip + DRAWING_MIN_HEIGHT pad is the shot black-hole.
+        assert!(
+            legacy_package_content_fill(32, 1, pane_w, pane_h) < PANE_FILL_MIN,
+            "legacy letterbox must fail the fill bar so the new cell path is required"
+        );
+        let (cw, ch) = package_cell(32, 1, pane_w, pane_h);
+        let drawn_w = cw * 32.0 + 28.0;
+        let drawn_h = ch * 1.0 + 16.0;
+        let fill = (drawn_w / pane_w).min(drawn_h / pane_h);
+        assert!(fill >= PANE_FILL_MIN, "package fill {fill}");
+        assert!((pane_w - drawn_w).max(pane_h - drawn_h) <= PANE_EMPTY_GAP_MAX);
+        let filled = fill_pane(32.0, 1.0, pane_w, pane_h);
+        assert!(filled.fills(), "{filled:?}");
+        let (dw, dh) = hardware_dashboard_size(pane_w, pane_h, 120.0);
+        assert!(dw / pane_w >= PANE_FILL_MIN);
+        assert!(dh / (pane_h - 120.0).max(1.0) >= PANE_FILL_MIN);
+    }
+
+    #[test]
+    fn schematic_fit_does_not_clip_rightmost_iob() {
+        // Counter sheet is wider than a 900px pane at zoom=1.
+        let sheet_w = 1400.0;
+        let sheet_h = 720.0;
+        let pane_w = 900.0;
+        let pane_h = 500.0;
+        let raw_clip = sheet_w - pane_w;
+        assert!(raw_clip > 80.0, "unfitted sheet must clip (got {raw_clip})");
+        let fit = fit_pane(sheet_w, sheet_h, pane_w, pane_h);
+        assert!(fit.right_clip <= 0.5, "right clip {}", fit.right_clip);
+        assert!(fit.drawn_w <= pane_w + 0.5);
+        assert!(fit.drawn_h <= pane_h + 0.5);
+        assert!(fit.fill >= PANE_FILL_MIN, "fit fill {}", fit.fill);
     }
 }
 

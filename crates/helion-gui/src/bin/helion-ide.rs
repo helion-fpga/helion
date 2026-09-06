@@ -3247,11 +3247,11 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     let avail = ui.available_size();
     let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
     let view_w = avail.x.max(80.0);
-    let cell = chrome::floorplan_fit_cell(cols, rows, view_w, view_h);
-    let die_w = chrome::floorplan_die_width(cols, cell);
-    let die_h = cell * rows as f32 + 16.0;
+    let (cell_w, cell_h) = chrome::package_cell(cols, rows, view_w, view_h);
+    let die_w = cell_w * cols as f32 + 28.0;
+    let die_h = cell_h * rows as f32 + 16.0;
     let draw_w = view_w.max(die_w);
-    let draw_h = die_h.max(chrome::DRAWING_MIN_HEIGHT);
+    let draw_h = view_h.max(die_h);
     let mut pick: Option<String> = None;
     let selected = model.selected.clone();
     egui::ScrollArea::both()
@@ -3283,10 +3283,10 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                     e.3 = e.3.max(pin.y);
                 }
                 for (bank, (bx0, bx1, by0, by1, (br, bg, bb))) in &banks {
-                    let px = origin.x + (*bx0 - x0) as f32 * cell;
-                    let py = origin.y + (rows - 1 - (*by1 - y0)) as f32 * cell;
-                    let pw = (*bx1 - *bx0 + 1) as f32 * cell;
-                    let ph = (*by1 - *by0 + 1) as f32 * cell;
+                    let px = origin.x + (*bx0 - x0) as f32 * cell_w;
+                    let py = origin.y + (rows - 1 - (*by1 - y0)) as f32 * cell_h;
+                    let pw = (*bx1 - *bx0 + 1) as f32 * cell_w;
+                    let ph = (*by1 - *by0 + 1) as f32 * cell_h;
                     let brct = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
                     p.rect_filled(
                         brct.shrink(1.0),
@@ -3309,10 +3309,10 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
                 for dx in 0..cols {
                     let x = x0 + dx;
-                    let px = origin.x + dx as f32 * cell;
+                    let px = origin.x + dx as f32 * cell_w;
                     if dx % 2 == 0 {
                         p.text(
-                            egui::pos2(px + cell * 0.5, rect.bottom() - 2.0),
+                            egui::pos2(px + cell_w * 0.5, rect.bottom() - 2.0),
                             egui::Align2::CENTER_BOTTOM,
                             format!("{x}"),
                             egui::FontId::monospace(8.0),
@@ -3322,9 +3322,9 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
                 for dy in 0..rows {
                     let y = y0 + (rows - 1 - dy);
-                    let py = origin.y + dy as f32 * cell;
+                    let py = origin.y + dy as f32 * cell_h;
                     p.text(
-                        egui::pos2(rect.left() + 4.0, py + cell * 0.5),
+                        egui::pos2(rect.left() + 4.0, py + cell_h * 0.5),
                         egui::Align2::LEFT_CENTER,
                         format!("Y{y}"),
                         egui::FontId::monospace(8.0),
@@ -3332,8 +3332,8 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                     );
                     for dx in 0..cols {
                         let x = x0 + dx;
-                        let px = origin.x + dx as f32 * cell;
-                        let c = egui::pos2(px + cell * 0.5, py + cell * 0.5);
+                        let px = origin.x + dx as f32 * cell_w;
+                        let c = egui::pos2(px + cell_w * 0.5, py + cell_h * 0.5);
                         if let Some(pin) = model.package.pin_at(&model.package_pins, x, y) {
                             let on = selected.as_deref() == Some(pin.pin.as_str())
                                 || pin.port.as_deref() == selected.as_deref();
@@ -3342,11 +3342,12 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                             } else {
                                 Color32::from_rgb(0x3a, 0x44, 0x4e)
                             };
-                            p.circle_filled(c, cell * 0.32, fill);
+                            let rad = cell_w.min(cell_h);
+                            p.circle_filled(c, rad * 0.32, fill);
                             if on {
                                 p.circle_stroke(
                                     c,
-                                    cell * 0.38,
+                                    rad * 0.38,
                                     Stroke::new(1.6_f32, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
                                 );
                             }
@@ -3354,8 +3355,8 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
                 if let Some(pos) = resp.hover_pos() {
-                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
-                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell_h).floor() as i32;
                     if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
                         let x = x0 + dx as u32;
                         let y = y0 + (rows - 1 - dy as u32);
@@ -3372,8 +3373,8 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
             if resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let origin = egui::pos2(rect.left() + 28.0, rect.top() + 4.0);
-                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
-                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell_h).floor() as i32;
                     if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
                         let x = x0 + dx as u32;
                         let y = y0 + (rows - 1 - dy as u32);
@@ -4505,9 +4506,14 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
 
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
-    model
-        .schematic
-        .set_viewport(ui.available_width(), ui.available_height().max(240.0));
+    let vw = ui.available_width();
+    let vh = ui.available_height().max(240.0);
+    model.schematic.set_viewport(vw, vh);
+    let drawing = model.schematic.drawing();
+    let cam = model.schematic.camera;
+    if drawing.width * cam.zoom > vw + 1.0 || drawing.height * cam.zoom > vh + 1.0 {
+        model.schematic.zoom_fit();
+    }
     let drawing = model.schematic.drawing();
     let n_cells = drawing
         .symbols
@@ -6298,6 +6304,11 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = model.exec("report_hw_stat");
         }
     });
+    let remain = ui.available_size();
+    let (dw, dh) = chrome::hardware_dashboard_size(remain.x, remain.y, 0.0);
+    let (dash, _) = ui.allocate_exact_size(egui::vec2(dw, dh.max(remain.y)), Sense::hover());
+    ui.painter().rect_filled(dash, 0.0, Color32::from_rgb(0x16, 0x1c, 0x22));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(dash.shrink(8.0)), |ui| {
     let report = model.hw_stat_report();
     if !report.open {
         ui.label("No cable yet. Open Hardware Manager (sim or openFPGALoader USB).");
@@ -6442,6 +6453,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = model.select_ila_sample(&i.to_string());
         }
     }
+    });
 }
 
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
