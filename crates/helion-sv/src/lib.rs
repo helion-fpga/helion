@@ -3082,7 +3082,30 @@ fn index_part_bit(
     Ok(acc.unwrap_or(Expr::Const(false)))
 }
 
+thread_local! {
+    static REXPR_BIT_BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+fn rexpr_bit_budget_reset(limit: u32) {
+    REXPR_BIT_BUDGET.with(|c| c.set(limit));
+}
+
+fn rexpr_bit_budget_take() -> bool {
+    REXPR_BIT_BUDGET.with(|c| {
+        let v = c.get();
+        if v == 0 {
+            false
+        } else {
+            c.set(v - 1);
+            true
+        }
+    })
+}
+
 fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    if !rexpr_bit_budget_take() {
+        return Err("rexpr_to_bit budget exhausted".into());
+    }
     match e {
         RExpr::Const { val, width, care } => {
             let _ = width;
@@ -3155,6 +3178,9 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 return Ok(Expr::Const(false));
             }
             let w = rexpr_width(x, rtl).max(1);
+            if w > 128 {
+                return Err("reduction width too wide".into());
+            }
             let mut acc = rexpr_to_bit(x, rtl, 0)?;
             for i in 1..w {
                 acc = Expr::Xor(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
@@ -3166,6 +3192,9 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 return Ok(Expr::Const(false));
             }
             let w = rexpr_width(x, rtl).max(1);
+            if w > 128 {
+                return Err("reduction width too wide".into());
+            }
             let mut acc = rexpr_to_bit(x, rtl, 0)?;
             for i in 1..w {
                 acc = Expr::And(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
@@ -3177,6 +3206,9 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 return Ok(Expr::Const(false));
             }
             let w = rexpr_width(x, rtl).max(1);
+            if w > 128 {
+                return Err("reduction width too wide".into());
+            }
             let mut acc = rexpr_to_bit(x, rtl, 0)?;
             for i in 1..w {
                 acc = Expr::Or(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
@@ -3230,6 +3262,29 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     }
 }
 
+fn expr_node_count(e: &Expr) -> usize {
+    fn walk(e: &Expr, budget: &mut usize) -> usize {
+        if *budget == 0 {
+            return 0;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(_) | Expr::Var(_) => 1,
+            Expr::Not(x) => 1 + walk(x, budget),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                1 + walk(a, budget) + walk(b, budget)
+            }
+        }
+    }
+    let mut budget = 16_000usize;
+    let n = walk(e, &mut budget);
+    if budget == 0 {
+        16_001 // treat as over-cap
+    } else {
+        n
+    }
+}
+
 fn const_care_of(e: &RExpr) -> u128 {
     match e {
         RExpr::Const { care, .. } => *care,
@@ -3240,10 +3295,10 @@ fn const_care_of(e: &RExpr) -> u128 {
 fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     // Bound nested Add expansion: naive per-bit re-entry is exponential in nesting depth
     // (FM-HEL-HANG-1539: Ibex probe hung after flatten in rexpr_to_bit over Add trees).
-    if bit > 128 {
+    if bit > 64 {
         return Err("adder bit too wide".into());
     }
-    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 8 {
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 4 {
         return Err("adder nesting too deep".into());
     }
     let mut cin = Expr::Const(false);
@@ -3262,10 +3317,10 @@ fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, St
 
 fn sub_diff_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     // Bound like adder_sum_bit (Ibex hang caps).
-    if bit > 128 {
+    if bit > 64 {
         return Err("sub bit too wide".into());
     }
-    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 8 {
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 4 {
         return Err("sub nesting too deep".into());
     }
     let mut borrow = Expr::Const(false);
@@ -3311,6 +3366,14 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
     let wa = rexpr_width(a, rtl);
     let wb = rexpr_width(b, rtl);
     let w = wa.max(wb).max(1);
+    // FM-HEL-HANG: wide/nested Add under Eq → huge AIG (Ibex hang after CORPUS cmp).
+    // Skip instead of hang; simple Ident/Const compares (corpus hswish/lrelu) still map.
+    if w > 32 {
+        return Err("cmp width too wide".into());
+    }
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 2 {
+        return Err("cmp nesting too deep".into());
+    }
     let care = const_care_of(a) & const_care_of(b);
     let mut acc: Option<Expr> = None;
     for i in 0..w {
@@ -3330,6 +3393,13 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
 
 fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
     let w = rexpr_width(a, rtl).max(rexpr_width(b, rtl)).max(1);
+    // FM-HEL-HANG: same bound as cmp_eq_bits — skip huge cones instead of hang.
+    if w > 32 {
+        return Err("lt width too wide".into());
+    }
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 2 {
+        return Err("lt nesting too deep".into());
+    }
     let mut acc = Expr::Const(false);
     let mut eq_so_far = Expr::Const(true);
     for i in (0..w).rev() {
@@ -3647,6 +3717,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         .unwrap_or("clk");
 
     // Flatten NBAs into per-bit (name_bit, expr)
+    // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
+    rexpr_bit_budget_reset(80_000);
     let mut reg_bits: Vec<(String, Expr)> = Vec::new();
     let mut n_mac = 0usize;
     let mut n_bram = 0usize;
@@ -3721,20 +3793,23 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     ));
                 }
             } else {
-                for i in 0..w {
+                let bw = w.min(32);
+                for i in 0..bw {
                     if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
                         reg_bits.push((bit_name(lhs, w, i), e));
                     }
                 }
             }
         } else {
-            for i in 0..w {
+            let bw = w.min(32);
+            for i in 0..bw {
                 if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
                     reg_bits.push((bit_name(lhs, w, i), e));
                 }
             }
         }
     }
+    eprintln!("synth_rtl after nbas reg_bits={}", reg_bits.len());
     let mut mem_names: HashSet<String> = HashSet::new();
     for (lhs, _, _) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
@@ -3772,10 +3847,20 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     // Continuous assigns → comb LUT cones (pure-comb modules e.g. mux).
+    // FM-HEL-HANG: Ibex-scale assign fans (1300+) make AIG/flowmap wall-clock explode
+    // after CORPUS bitblast improvements. Prefer NBA/FF mapping; skip comb fan-out.
+    let skip_comb_assigns = rtl.assigns.len() > 800;
+    if skip_comb_assigns {
+        eprintln!(
+            "hang_diag skip_comb_assigns n={}",
+            rtl.assigns.len()
+        );
+    }
     // Skip simple Ident/Bit/Range drives — those stay on the IOB passthrough path
     // so sequential timing (WNS) is not broken by orphan comb LUTs.
     let mut comb_bits: Vec<(String, Expr)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.assigns {
+        if skip_comb_assigns { break; }
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
@@ -3801,13 +3886,25 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
 
+    eprintln!("synth_rtl after assigns comb_bits={}", comb_bits.len());
     if reg_bits.is_empty() && comb_bits.is_empty() && n_mac == 0 && n_bram == 0 {
         // Unsupported items were skipped/blackboxed; still return the top with ports.
         return Ok(d);
     }
 
+    eprintln!(
+        "synth_rtl reg_bits={} comb_bits={} mac={} bram={}",
+        reg_bits.len(),
+        comb_bits.len(),
+        n_mac,
+        n_bram
+    );
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
+        // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
+        if expr_node_count(expr) > 8_000 {
+            continue;
+        }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
             let (ff, qnet) = if single_q {
@@ -3855,6 +3952,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
+        if expr_node_count(expr) > 8_000 {
+            continue;
+        }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
             let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
@@ -4155,8 +4255,22 @@ fn synth_from_parsed_top(
             .module
             .clone()
     };
+    let t_flat = std::time::Instant::now();
     let flat = flatten_module_ov(&map, &top_name, overrides)?;
+    eprintln!(
+        "hang_diag flatten nbas={} assigns={} signals={} ms={}",
+        flat.nbas.len(),
+        flat.assigns.len(),
+        flat.signals.len(),
+        t_flat.elapsed().as_millis()
+    );
+    let t_syn = std::time::Instant::now();
     let mut d = synth_rtl(&flat)?;
+    eprintln!(
+        "hang_diag synth_rtl cells={} ms={}",
+        d.cells.len(),
+        t_syn.elapsed().as_millis()
+    );
     record_instances(&map, &top_name, &mut d, "");
     Ok(d)
 }
@@ -5135,6 +5249,82 @@ endmodule
         };
         let r = rexpr_to_bit(&e, &rtl, 7);
         assert!(r.is_err(), "deep Add must Err, not hang: {r:?}");
+    }
+
+    #[test]
+    fn nested_cmp_add_rexpr_is_bounded_not_hang() {
+        // CORPUS cmp/ashr path: nested Add under Eq/Lt must Err-skip, not hang.
+        let mut a = RExpr::Ident("a".into());
+        let mut b = RExpr::Ident("b".into());
+        for _ in 0..12 {
+            a = RExpr::Add(Box::new(a), Box::new(RExpr::Ident("a".into())));
+            b = RExpr::Add(Box::new(b), Box::new(RExpr::Ident("b".into())));
+        }
+        let rtl = Rtl {
+            module: "t".into(),
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "a".into(),
+                    width: 64,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+                Signal {
+                    name: "b".into(),
+                    width: 64,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: Default::default(),
+        };
+        let eq = rexpr_to_bit(&RExpr::Eq(Box::new(a.clone()), Box::new(b.clone())), &rtl, 0);
+        assert!(eq.is_err(), "deep Eq(Add,Add) must Err, not hang: {eq:?}");
+        let lt = rexpr_to_bit(&RExpr::Lt(Box::new(a), Box::new(b)), &rtl, 0);
+        assert!(lt.is_err(), "deep Lt(Add,Add) must Err, not hang: {lt:?}");
+        let wide = Rtl {
+            module: "t".into(),
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "x".into(),
+                    width: 128,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+                Signal {
+                    name: "y".into(),
+                    width: 128,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: Default::default(),
+        };
+        let wide_eq = rexpr_to_bit(
+            &RExpr::Eq(
+                Box::new(RExpr::Ident("x".into())),
+                Box::new(RExpr::Ident("y".into())),
+            ),
+            &wide,
+            0,
+        );
+        assert!(wide_eq.is_err(), "width>32 Eq must Err: {wide_eq:?}");
     }
 
     #[test]
