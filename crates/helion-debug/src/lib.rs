@@ -14,6 +14,31 @@ pub struct IlaCapture {
     pub samples: Vec<bool>,
 }
 
+fn ila_cell_names(net: &str) -> [String; 3] {
+    [
+        format!("ila_{net}"),
+        format!("ila_{net}_lut"),
+        format!("ila_{net}_ff"),
+    ]
+}
+
+fn ila_aux_nets(net: &str) -> [String; 2] {
+    [format!("ila_{net}_d"), format!("ila_{net}_q")]
+}
+
+/// Drop a prior `insert_ila` for `net` so baseline vs probe bitstreams can differ.
+/// `Session::mark_debug` / `insert_marked` already inject the probe; arm must still work.
+pub fn strip_ila(design: &mut Design, net: &str) {
+    let cells = ila_cell_names(net);
+    let aux = ila_aux_nets(net);
+    design.cells.retain(|c| !cells.iter().any(|n| n == &c.name));
+    design.nets.retain(|n| !aux.iter().any(|a| a == &n.name));
+    for n in &mut design.nets {
+        n.endpoints
+            .retain(|e| !cells.iter().any(|c| c == &e.cell));
+    }
+}
+
 /// Insert an ILA probe on `net`: identity LUT+FF so the bitstream gains BLE1 INIT.
 pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
     if !design.nets.iter().any(|n| n.name == net) {
@@ -69,14 +94,21 @@ pub fn insert_arm_capture(
     net: &str,
     n: usize,
 ) -> Result<IlaCapture, String> {
+    // Baseline without this probe — even if mark_debug / (re)implement already inserted it.
+    let mut baseline = design.clone();
+    strip_ila(&mut baseline, net);
+    let (_, bits0) = compile(dev, &baseline)?;
+    let packed0 = pack(&baseline, dev)?;
+
     let mut d = design.clone();
-    let (_, bits0) = compile(dev, &d)?;
+    // Rebuild probe cleanly (idempotent with a prior Session::mark_debug insert).
+    strip_ila(&mut d, net);
     insert_ila(&mut d, net)?;
     let (routed, bits1) = compile(dev, &d)?;
     if bits0.frames == bits1.frames {
         return Err("ILA insert was a no-op (bitstream unchanged)".into());
     }
-    if routed.placed.packed.lutffs.len() < 2 {
+    if routed.placed.packed.lutffs.len() <= packed0.lutffs.len() {
         return Err("ILA did not pack an extra LUTFF".into());
     }
     let mut fab = Fabric::new(dev);
@@ -190,5 +222,37 @@ mod tests {
         assert_eq!(b3, "0000000111111110", "MSB matches gold LED stream: {b3}");
         assert_eq!(bl, b3, "PAD led follows q3 driver");
         assert_ne!(b0, b3, "must not stub every probe as site[0]");
+    }
+
+    /// Real flow: mark_debug / insert_marked then arm must NOT hit "bitstream unchanged".
+    #[test]
+    fn mark_debug_then_arm_inserts_probe_not_noop() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::structural_counter();
+        d.mark_debug("q3").unwrap();
+        assert_eq!(insert_marked(&mut d).unwrap(), 1);
+        assert!(
+            d.cells
+                .iter()
+                .any(|c| matches!(&c.kind, CellKind::Ila { net } if net == "q3"))
+        );
+        let cap = insert_arm_capture(&dev, &d, "q3", 16).expect(
+            "mark_debug → arm must capture; must not Err(bitstream unchanged)",
+        );
+        let bits: String = cap.samples.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        assert_eq!(bits, "0000000111111110", "MSB gold after pre-insert: {bits}");
+    }
+
+    #[test]
+    fn strip_ila_removes_probe_cells() {
+        let mut d = Design::structural_blinky();
+        insert_ila(&mut d, "q").unwrap();
+        assert!(d.cells.iter().any(|c| c.name.starts_with("ila_q")));
+        strip_ila(&mut d, "q");
+        assert!(!d.cells.iter().any(|c| c.name.starts_with("ila_q")));
+        assert!(!d.nets.iter().any(|n| n.name.starts_with("ila_q")));
+        // Marked net keeps user endpoints (FF Q), not ILA sink.
+        let q = d.net("q").unwrap();
+        assert!(!q.endpoints.iter().any(|e| e.cell.starts_with("ila_")));
     }
 }
