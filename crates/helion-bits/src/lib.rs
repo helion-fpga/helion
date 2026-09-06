@@ -63,6 +63,16 @@ impl Bitstream {
         bs.packets = encode_packets(dev.idcode, &bs.frames);
         bs
     }
+
+    /// Rebuild a bitstream from a `.hbits` packet stream (CLI flash / program).
+    pub fn from_packets(bytes: &[u8]) -> Result<Self, String> {
+        let (idcode, frames) = decode_packets(bytes)?;
+        Ok(Self {
+            idcode,
+            frames,
+            packets: bytes.to_vec(),
+        })
+    }
 }
 
 /// Bitgen a routed design: every LUTFF INIT/FF, IMUX from PathFinder, IOB src, DSP/BRAM USED.
