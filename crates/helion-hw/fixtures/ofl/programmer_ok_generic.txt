@@ -1,0 +1,4 @@
+Found cable: ftdi
+board: helion_hl10t
+DONE
+finished writing bitstream successfully

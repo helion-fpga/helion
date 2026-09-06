@@ -1,0 +1,2 @@
+Bus device vid:pid       probe type      manufacturer serial               product
+1-2       0x0403:0x6010  ft2232          Digilent     SN123456             Digilent Adept USB Device

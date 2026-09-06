@@ -1,0 +1,3 @@
+# Helion HELION_OFL_DRY_RUN=1 — command logged, not executed
+# would run: openFPGALoader -b helion_hl10t -m counter.hbits
+# TAP_readback=none STAT=(no readback)

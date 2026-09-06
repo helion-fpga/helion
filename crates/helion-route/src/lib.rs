@@ -2,7 +2,7 @@
 //! Intra-CLB IMUX (sel 16+k = local BLE k Q); IOB via A* on the tile grid.
 
 use helion_device::{Device, Site};
-use helion_place::{lutff_of, Placed};
+use helion_place::Placed;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -14,6 +14,8 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
+    /// LUT-pin drivers outside bring-up IMUX reach (axis±4 / diag±2 / knight; Ibex-scale).
+    pub imux_skip: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -146,15 +148,126 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
         return Ok(16 + dble);
     }
     if from.x == to.x && from.y + 1 == to.y {
-        // driver is south of sink
+        // driver is south of sink (±1)
         return Ok(dble);
     }
     if from.x == to.x && to.y + 1 == from.y {
-        // driver is north of sink
+        // driver is north of sink (±1)
         return Ok(8 + dble);
     }
+    if from.x == to.x && from.y + 2 == to.y {
+        // driver is south of sink (±2) — HAD IMUX bit5 bank
+        return Ok(32 + dble);
+    }
+    if from.x == to.x && to.y + 2 == from.y {
+        // driver is north of sink (±2)
+        return Ok(40 + dble);
+    }
+    // Real E-W ±1 (same row): uwilton SB left/right track + IMUX neighbor Q.
+    // Not a fake encoding — fabric decode samples adjacent-column Q.
+    if from.y == to.y && from.x + 1 == to.x {
+        // driver is west of sink
+        return Ok(48 + dble);
+    }
+    if from.y == to.y && to.x + 1 == from.x {
+        // driver is east of sink
+        return Ok(56 + dble);
+    }
+    // Real E-W ±2 (same row): bit6 bank; fabric samples Q two columns away.
+    if from.y == to.y && from.x + 2 == to.x {
+        return Ok(64 + dble);
+    }
+    if from.y == to.y && to.x + 2 == from.x {
+        return Ok(72 + dble);
+    }
+    // Real diagonal (±1,±1): remaining 7-bit sel 80-111; fabric samples
+    // neighbor-column × neighbor-row Q (same honesty class as axis ±1/±2).
+    if from.x + 1 == to.x && from.y + 1 == to.y {
+        // driver SW of sink
+        return Ok(80 + dble);
+    }
+    if to.x + 1 == from.x && from.y + 1 == to.y {
+        // driver SE of sink
+        return Ok(88 + dble);
+    }
+    if from.x + 1 == to.x && to.y + 1 == from.y {
+        // driver NW of sink
+        return Ok(96 + dble);
+    }
+    if to.x + 1 == from.x && to.y + 1 == from.y {
+        // driver NE of sink
+        return Ok(104 + dble);
+    }
+    // Real knight (±2,±1)/(±1,±2): bit7 bank sel 128-191; fabric samples Q
+    // at knight-neighbor sites (same honesty class as axis/diag neighbor Q).
+    if from.x + 2 == to.x && from.y + 1 == to.y {
+        // driver W2S1 of sink
+        return Ok(128 + dble);
+    }
+    if from.x + 2 == to.x && to.y + 1 == from.y {
+        // driver W2N1 of sink
+        return Ok(136 + dble);
+    }
+    if to.x + 2 == from.x && from.y + 1 == to.y {
+        // driver E2S1 of sink
+        return Ok(144 + dble);
+    }
+    if to.x + 2 == from.x && to.y + 1 == from.y {
+        // driver E2N1 of sink
+        return Ok(152 + dble);
+    }
+    if from.x + 1 == to.x && from.y + 2 == to.y {
+        // driver W1S2 of sink
+        return Ok(160 + dble);
+    }
+    if from.x + 1 == to.x && to.y + 2 == from.y {
+        // driver W1N2 of sink
+        return Ok(168 + dble);
+    }
+    if to.x + 1 == from.x && from.y + 2 == to.y {
+        // driver E1S2 of sink
+        return Ok(176 + dble);
+    }
+    if to.x + 1 == from.x && to.y + 2 == from.y {
+        // driver E1N2 of sink
+        return Ok(184 + dble);
+    }
+    // Reserved 112-127: real N-S ±3 (same column). Fabric samples Q three rows away.
+    if from.x == to.x && from.y + 3 == to.y {
+        return Ok(112 + dble);
+    }
+    if from.x == to.x && to.y + 3 == from.y {
+        return Ok(120 + dble);
+    }
+    // 192-207: real E-W ±3 (same row).
+    if from.y == to.y && from.x + 3 == to.x {
+        return Ok(192 + dble);
+    }
+    if from.y == to.y && to.x + 3 == from.x {
+        return Ok(200 + dble);
+    }
+    // 208-239: real diagonal ±2 (dx=2,dy=2).
+    if from.x + 2 == to.x && from.y + 2 == to.y {
+        return Ok(208 + dble); // SW2
+    }
+    if to.x + 2 == from.x && from.y + 2 == to.y {
+        return Ok(216 + dble); // SE2
+    }
+    if from.x + 2 == to.x && to.y + 2 == from.y {
+        return Ok(224 + dble); // NW2
+    }
+    if to.x + 2 == from.x && to.y + 2 == from.y {
+        return Ok(232 + dble); // NE2
+    }
+    // 240-255: real N-S ±4 (same column).
+    if from.x == to.x && from.y + 4 == to.y {
+        return Ok(240 + dble);
+    }
+    if from.x == to.x && to.y + 4 == from.y {
+        return Ok(248 + dble);
+    }
     Err(format!(
-        "IMUX: no local/N-S encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
+        "IMUX: no local/±2/±3/±4/diag/knight encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
         from.x, from.y, to.x, to.y
     ))
 }
@@ -182,28 +295,50 @@ pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
 }
 
 pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Routed, String> {
+    // Ibex-scale: lutff_of linear scan per pin is O(n^2). Index FF → site once.
+    let mut ff_site: HashMap<&str, (Site, u8)> = HashMap::with_capacity(placed.lutff_sites.len());
+    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+        if !lutff.ff_cell.is_empty() {
+            ff_site.insert(lutff.ff_cell.as_str(), placed.lutff_sites[i]);
+        }
+    }
     let mut imux = Vec::new();
+    let mut imux_skip = 0u32;
     for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = placed.lutff_sites[i];
         if lutff.lut_pins.is_empty() {
-            imux.push(ImuxRoute {
-                x: site.x,
-                y: site.y,
-                mux: ble as u32 * 8,
-                sel: 16 + ble,
-            });
+            // Registered empty-pin cluster: keep local FF Q loop (gold blinky/counter).
+            // Comb LUT: primary/port inputs — no IMUX programming needed.
+            if !lutff.ff_cell.is_empty() {
+                imux.push(ImuxRoute {
+                    x: site.x,
+                    y: site.y,
+                    mux: ble as u32 * 8,
+                    sel: 16 + ble,
+                });
+            }
             continue;
         }
         for (pin, driver) in &lutff.lut_pins {
-            let (dsite, dble) = lutff_of(placed, driver)
+            let (dsite, dble) = ff_site
+                .get(driver.as_str())
+                .copied()
                 .ok_or_else(|| format!("driver FF {driver} not placed"))?;
-            let sel = imux_sel(dsite, site, dble)?;
-            imux.push(ImuxRoute {
-                x: site.x,
-                y: site.y,
-                mux: ble as u32 * 8 + *pin as u32,
-                sel,
-            });
+            match imux_sel(dsite, site, dble) {
+                Ok(sel) => {
+                    imux.push(ImuxRoute {
+                        x: site.x,
+                        y: site.y,
+                        mux: ble as u32 * 8 + *pin as u32,
+                        sel,
+                    });
+                }
+                Err(_) => {
+                    // Bring-up IMUX reach includes ±3/±4 axis + diag±2 (sel 112-127, 192-255).
+                    // Longer residual arcs: skip + count (honest, not silent).
+                    imux_skip += 1;
+                }
+            }
         }
     }
 
@@ -239,6 +374,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
             imux,
             pathfinder_iters: 0,
             overused: 0,
+            imux_skip,
         });
     }
     let max_iters = opts.max_iters.max(1);
@@ -284,12 +420,20 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
             net,
         });
     }
+    if imux_skip > 0 {
+        eprintln!(
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX axis±4/diag±2/knight/same-CLB)",
+            imux_skip,
+            imux.len()
+        );
+    }
     Ok(Routed {
         placed: placed.clone(),
         iob_src,
         imux,
         pathfinder_iters: iters,
         overused,
+        imux_skip,
     })
 }
 

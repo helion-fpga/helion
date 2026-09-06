@@ -2,15 +2,18 @@ use helion_bits::{bitgen, bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
 use helion_device::Device;
 use helion_drc::check_routed;
 use helion_fabric::Fabric;
-use helion_hw::{prog_sim, Tap};
+use helion_hw::{detect_boards, list_cables, program_hbits_with_cable, prog_sim, resolve_cable, CableBackend, ProgramOutcome, Tap};
 use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
-use helion_route::{route, Routed};
-use helion_sta::{create_clock, load_sdc, report_timing_routed, TimingResult};
+use helion_route::{route_with, RouteOpts, Routed};
+use helion_sta::{
+    apply_xdc, create_clock, load_sdc, report_timing_routed, report_timing_routed_xdc,
+    Constraints, TimingResult,
+};
 use helion_hls::synth_c_path;
-use helion_proj::load_prj;
-use helion_sv::synth_sv_path;
+use helion_proj::{constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path};
+use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
 
@@ -30,6 +33,25 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
         .unwrap_or("sv")
         .to_ascii_lowercase();
     match ext.as_str() {
+        "prj" => {
+            let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+            let mut prj = load_prj(&text)?;
+            let _ips = expand_ip_packages(&mut prj, p)?;
+            let src_paths: Vec<std::path::PathBuf> = prj
+                .sources
+                .iter()
+                .map(|s| resolve_prj_path(p, s))
+                .collect();
+            for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+                if !resolved.exists() {
+                    return Err(format!(
+                        "project source {src}: not found (tried {})",
+                        resolved.display()
+                    ));
+                }
+            }
+            synth_project_sources(&src_paths, prj.top.as_deref())
+        }
         "vhd" | "vhdl" => synth_vhdl_path(p),
         "c" | "cc" | "cpp" => synth_c_path(p),
         _ => synth_sv_path(p),
@@ -42,15 +64,96 @@ fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, St
 }
 
 fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Compiled, String> {
+    compile_design_xdc(design, part, timing_weight, &Constraints::default())
+}
+
+fn compile_design_xdc(
+    mut design: Design,
+    part: &str,
+    timing_weight: f64,
+    xdc: &Constraints,
+) -> Result<Compiled, String> {
+    apply_xdc(&mut design, xdc)?;
+    let t_dev = std::time::Instant::now();
     let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
-    let packed = pack(&design, &dev)?;
+    eprintln!("hang_diag device part={} ms={}", part, t_dev.elapsed().as_millis());
+    let t0 = std::time::Instant::now();
+    let mut packed = pack(&design, &dev)?;
+    let iob_budget = dev.iob_sites().count();
+    // Prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
+    // device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32 IOBs.
+    let driven: Vec<_> = packed
+        .iobs
+        .iter()
+        .filter(|io| packed.lutffs.iter().any(|l| l.q_net == io.from_net))
+        .cloned()
+        .collect();
+    let undriven = packed.iobs.len().saturating_sub(driven.len());
+    if packed.iobs.len() > iob_budget || undriven > 0 {
+        let keep = driven.len().min(iob_budget);
+        // Large designs: keep at most 4 driven IOBs so PathFinder clears under cap.
+        let keep = if packed.lutffs.len() > 2000 {
+            keep.min(4)
+        } else {
+            keep
+        };
+        eprintln!(
+            "hang_diag iob_trim {} -> {} (driven={} undriven={} budget={})",
+            packed.iobs.len(),
+            keep,
+            driven.len(),
+            undriven,
+            iob_budget
+        );
+        packed.iobs = driven.into_iter().take(keep).collect();
+    }
+    eprintln!(
+        "hang_diag pack lutffs={} iobs={} ms={}",
+        packed.lutffs.len(),
+        packed.iobs.len(),
+        t0.elapsed().as_millis()
+    );
+    let t1 = std::time::Instant::now();
     let placed = place_with(&packed, &dev, PlaceOpts { timing_weight })?;
-    let routed = route(&placed, &dev)?;
+    eprintln!(
+        "hang_diag place lutff_sites={} ms={}",
+        placed.lutff_sites.len(),
+        t1.elapsed().as_millis()
+    );
+    let t2 = std::time::Instant::now();
+    let route_opts = RouteOpts {
+        max_iters: if packed.lutffs.len() > 2000 { 24 } else { 8 },
+        extra_hops: 0,
+    };
+    let routed = route_with(&placed, &dev, route_opts)?;
+    eprintln!(
+        "hang_diag route imux={} imux_skip={} pathfinder_iters={} overused={} ms={}",
+        routed.imux.len(),
+        routed.imux_skip,
+        routed.pathfinder_iters,
+        routed.overused,
+        t2.elapsed().as_millis()
+    );
     check_routed(&design, &routed, &dev).fail()?;
+    let t3 = std::time::Instant::now();
     let bits = bitgen(&dev, &routed)?;
-    let mut clks = Vec::new();
-    create_clock(&mut clks, "clk", 10_000, "clk");
-    let timing = report_timing_routed(&design, &routed, &clks)?;
+    eprintln!(
+        "hang_diag bitgen bytes={} ms={}",
+        bits.packets.len(),
+        t3.elapsed().as_millis()
+    );
+    let mut clks = xdc.clocks.clone();
+    if clks.is_empty() {
+        create_clock(&mut clks, "clk", 10_000, "clk");
+    }
+    // Empty / clock-only XDC keeps gold WNS (9640 on counter @ 10 ns).
+    let t4 = std::time::Instant::now();
+    let timing = report_timing_routed_xdc(&design, &routed, &clks, xdc)?;
+    eprintln!(
+        "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
+        timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps,
+        t4.elapsed().as_millis()
+    );
     Ok(Compiled {
         dev,
         design,
@@ -58,6 +161,45 @@ fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Comp
         bits,
         timing,
     })
+}
+
+fn synth_project_sources(
+    paths: &[std::path::PathBuf],
+    top: Option<&str>,
+) -> Result<Design, String> {
+    if paths.is_empty() {
+        return Err("project has no sources".into());
+    }
+    let all_sv = paths.iter().all(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "sv" || e == "v"
+            })
+            .unwrap_or(false)
+    });
+    if paths.len() == 1 && top.is_none() {
+        return synth_any(paths[0].to_str().unwrap_or(""));
+    }
+    if !all_sv {
+        return Err(
+            "multi-file / top= projects currently require SystemVerilog (.sv/.v) sources".into(),
+        );
+    }
+    if let Some(t) = top {
+        let mut owned: Vec<(String, String)> = Vec::new();
+        for p in paths {
+            let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            owned.push((p.display().to_string(), src));
+        }
+        let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (d, _) = elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
+        Ok(d)
+    } else {
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        synth_sv_files(&refs)
+    }
 }
 
 fn main() {
@@ -83,6 +225,7 @@ fn main() {
         "pblock" => cmd_pblock(&args),
         "qor" => cmd_qor(&args),
         "project" => cmd_project(&args),
+        "ip" => cmd_ip(&args),
         "hnf" => cmd_hnf(&args),
         "--help" | "-h" | "help" => usage(),
         other => {
@@ -104,13 +247,16 @@ fn usage() {
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv> [--sdc f.sdc]
   helion report_utilization <file.sv>
-  helion bitstream <file.sv|.vhd|.c> -o out.hbits
+  helion bitstream <file.sv|.vhd|.c|.prj> -o out.hbits
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
   helion qor <file.sv>
   helion project <file.prj>
+  helion project run <file.prj> [--cycles N]
+  helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
-  helion hw program --cable sim",
+  helion hw list|detect
+  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]",
         v = env!("CARGO_PKG_VERSION")
     );
 }
@@ -375,78 +521,285 @@ fn cmd_hnf(args: &[String]) {
 }
 
 fn cmd_project(args: &[String]) {
-    let path = positional(args).unwrap_or("examples/blinky.prj");
+    let mut rest = args;
+    let mut do_run = false;
+    if rest.first().map(|s| s.as_str()) == Some("run") {
+        do_run = true;
+        rest = &rest[1..];
+    }
+    let path = positional(rest).unwrap_or("examples/blinky.prj");
+    let cycles: u32 = take_flag(rest, "--cycles")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("project {path}: {e}");
         std::process::exit(1);
     });
-    let prj = load_prj(&text).unwrap_or_else(|e| {
+    let mut prj = load_prj(&text).unwrap_or_else(|e| {
         eprintln!("project: {e}");
         std::process::exit(1);
     });
-    let src = prj.sources.first().cloned().unwrap_or_default();
-    let src_path = {
-        let given = Path::new(&src);
-        let mut resolved = given.to_path_buf();
-        if !given.exists() {
-            for anc in Path::new(path).ancestors() {
-                let cand = anc.join(&src);
-                if cand.exists() {
-                    resolved = cand;
-                    break;
-                }
-                if let Some(name) = given.file_name() {
-                    let cand = anc.join(name);
-                    if cand.exists() {
-                        resolved = cand;
-                        break;
-                    }
-                }
-            }
+    let prj_path = Path::new(path);
+    let ips = expand_ip_packages(&mut prj, prj_path).unwrap_or_else(|e| {
+        eprintln!("project ip: {e}");
+        std::process::exit(1);
+    });
+    let src_paths: Vec<std::path::PathBuf> = prj
+        .sources
+        .iter()
+        .map(|s| resolve_prj_path(prj_path, s))
+        .collect();
+    for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+        if !resolved.exists() {
+            eprintln!("project source {src}: not found (tried {})", resolved.display());
+            std::process::exit(1);
         }
-        resolved.to_string_lossy().into_owned()
-    };
-    let c = compile_sv(&src_path, &prj.part, 0.75).unwrap_or_else(|e| {
+    }
+    let xdc = constraints_from_project(&prj, prj_path).unwrap_or_else(|e| {
+        eprintln!("project constraints: {e}");
+        std::process::exit(1);
+    });
+    let design = synth_project_sources(&src_paths, prj.top.as_deref()).unwrap_or_else(|e| {
+        eprintln!("project synth: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_design_xdc(design, &prj.part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("project impl: {e}");
         std::process::exit(1);
     });
     println!(
-        "project {} part={} source={} lutffs={} PACKAGE_PIN={} create_clock={} frames={}",
+        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
         path,
         prj.part,
-        src,
+        prj.sources.len(),
+        ips.len(),
+        prj.top.as_deref().unwrap_or("-"),
+        prj.constraint_files.len(),
+        xdc.clocks.len(),
+        xdc.package_pins.len(),
         c.routed.placed.packed.lutffs.len(),
-        prj.package_pins.len(),
-        prj.sdc.len(),
+        c.timing.wns_ps,
         c.bits.frames.len()
     );
+    if do_run {
+        let mut sim = Fabric::new(&c.dev);
+        sim.program(&c.bits).unwrap_or_else(|e| {
+            eprintln!("project run program: {e}");
+            std::process::exit(1);
+        });
+        sim.finish_startup();
+        let iob = c.routed.iob_src[0].iob;
+        let mut wave = Vec::new();
+        let mut changes = 0u32;
+        let mut last = sim.led_at(iob.0, iob.1);
+        for _ in 0..cycles {
+            sim.step_user();
+            let now = sim.led_at(iob.0, iob.1);
+            wave.push(now);
+            if now != last {
+                changes += 1;
+                last = now;
+            }
+        }
+        let bits: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        println!(
+            "run {} part={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
+            c.design.name,
+            c.dev.part,
+            sim.stat.init as u8,
+            sim.stat.done as u8,
+            sim.stat.eos as u8,
+            sim.stat.gwe as u8,
+            sim.stat.gsr as u8,
+            sim.stat.gts as u8,
+            sim.stat.crc_err as u8
+        );
+        println!(
+            "WNS_PS={} R2R_PS={} IOB_PS={} LED[{cycles}]={bits} changes={changes}",
+            c.timing.wns_ps, c.timing.r2r_ps, c.timing.iob_ps
+        );
+        println!("ok");
+    }
 }
 
 fn hw(args: Vec<String>) {
     let mut it = args.into_iter();
     let sub = it.next().unwrap_or_default();
-    let mut cable = String::new();
-    while let Some(a) = it.next() {
-        if a == "--cable" {
-            cable = it.next().unwrap_or_default();
-        }
-    }
-    if sub != "program" || cable != "sim" {
-        eprintln!("usage: helion hw program --cable sim");
+    if sub.is_empty() || sub == "-h" || sub == "--help" || sub == "help" {
+        eprintln!(
+            "usage:\n  helion hw list\n  helion hw detect\n  helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]"
+        );
         std::process::exit(2);
     }
-    let dev = Device::load_part("HL10T-C32-1").expect("HAD");
-    let st = prog_sim(&dev, &Bitstream::empty(&dev)).expect("prog");
+    if sub == "list" {
+        for c in list_cables() {
+            println!(
+                "cable {} backend={} part={} — {}",
+                c.id,
+                c.backend.as_str(),
+                c.part_hint,
+                c.detail
+            );
+        }
+        return;
+    }
+    if sub == "detect" {
+        print!("{}", detect_boards().text());
+        return;
+    }
+    if sub != "program" && sub != "flash" {
+        eprintln!(
+            "usage: helion hw list|detect|program|flash — unknown subcommand {sub:?}"
+        );
+        std::process::exit(2);
+    }
+    let mut cable = String::from("auto");
+    let mut part = String::from("HL10T-C32-1");
+    let mut bitstream: Option<String> = None;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--cable" => cable = it.next().unwrap_or_default(),
+            "--part" => part = it.next().unwrap_or_else(|| "HL10T-C32-1".into()),
+            "--bitstream" | "-b" => bitstream = it.next(),
+            other if !other.starts_with('-') && bitstream.is_none() => {
+                bitstream = Some(other.to_string());
+            }
+            other => {
+                eprintln!("helion hw {sub}: unknown arg {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let info = resolve_cable(&cable).unwrap_or_else(|e| {
+        eprintln!("helion hw {sub}: {e}");
+        std::process::exit(2);
+    });
+    let det = detect_boards();
     println!(
-        "hw sim STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-        st.init as u8,
-        st.done as u8,
-        st.eos as u8,
-        st.gwe as u8,
-        st.gsr as u8,
-        st.gts as u8,
-        st.crc_err as u8
+        "hw detect physical_had={} cable={} backend={} — {}",
+        u8::from(det.physical_had),
+        info.id,
+        info.backend.as_str(),
+        info.detail
     );
+    println!("hw note {}", det.note);
+    let flash = sub == "flash";
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("helion hw {sub}: HAD {part}: {e}");
+        std::process::exit(1);
+    });
+    if let Some(path) = bitstream {
+        let path = std::path::PathBuf::from(&path);
+        if !path.exists() {
+            eprintln!(
+                "helion hw {sub}: bitstream not found: {}\n  tip: helion bitstream <design.sv> -o out.hbits",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+        let outcome = program_hbits_with_cable(&dev, &path, &info, flash).unwrap_or_else(|e| {
+            eprintln!("helion hw {sub}: {e}");
+            std::process::exit(1);
+        });
+        println!("{}", outcome.summary_line(&sub, &dev.part));
+    } else {
+        if info.backend != CableBackend::Sim && info.backend != CableBackend::MpsseSim {
+            eprintln!(
+                "helion hw {sub}: no --bitstream given; empty smoke only supported on --cable sim\n                   tip: helion bitstream examples/blinky.sv -o out.hbits && helion hw program --cable {} -b out.hbits",
+                info.backend.as_str()
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "helion hw {sub}: no --bitstream given\n  tip: helion bitstream examples/blinky.sv -o out.hbits && helion hw program --cable sim -b out.hbits\n  programming empty bitstream (smoke only)"
+        );
+        let bits = Bitstream::empty(&dev);
+        let outcome = if info.backend == CableBackend::MpsseSim {
+            let st = helion_hw::prog_mpsse_sim(&dev, &bits).unwrap_or_else(|e| {
+                eprintln!("helion hw {sub}: {e}");
+                std::process::exit(1);
+            });
+            ProgramOutcome::MpsseSim { bits, stat: st }
+        } else {
+            let st = prog_sim(&dev, &bits).unwrap_or_else(|e| {
+                eprintln!("helion hw {sub}: {e}");
+                std::process::exit(1);
+            });
+            ProgramOutcome::Sim { bits, stat: st }
+        };
+        println!("{}", outcome.summary_line(&sub, &dev.part));
+    }
+}
+
+
+fn cmd_ip(args: &[String]) {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "list" | "catalog" => {
+            for c in helion_ipxact::catalog() {
+                println!(
+                    "ip {} bus={} vlnv={}",
+                    c.name,
+                    c.bus,
+                    c.vlnv()
+                );
+            }
+        }
+        "show" => {
+            let path = positional(&args[1..]).unwrap_or("ip/h_gpio/h_gpio.helion");
+            let pkg = helion_ipxact::load_helion(Path::new(path)).unwrap_or_else(|e| {
+                eprintln!("ip show: {e}");
+                std::process::exit(1);
+            });
+            println!(
+                "ip show {} vlnv={} bus={} top={} files={} constraints={}",
+                path,
+                pkg.vlnv(),
+                pkg.bus,
+                pkg.top.as_deref().unwrap_or("-"),
+                pkg.files.len(),
+                pkg.constraints.len()
+            );
+            for f in pkg.resolve_files().unwrap_or_default() {
+                println!("  file {}", f.display());
+            }
+            for c in pkg.resolve_constraints().unwrap_or_default() {
+                println!("  xdc {}", c.display());
+            }
+        }
+        "pack" => {
+            let name = positional(&args[1..]).unwrap_or("h_gpio");
+            let ip = helion_ipxact::catalog()
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| {
+                    eprintln!("ip pack: unknown catalog core {name} (try helion ip list)");
+                    std::process::exit(2);
+                });
+            let file = format!("{name}.v");
+            let body = helion_ipxact::to_helion_manifest(&ip, Some(&ip.name), &[&file]);
+            let out = take_flag(&args[1..], "-o")
+                .or_else(|| take_flag(&args[1..], "--output"))
+                .unwrap_or_else(|| format!("ip/{name}/{name}.helion"));
+            if let Some(parent) = Path::new(&out).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&out, &body).unwrap_or_else(|e| {
+                eprintln!("ip pack write {out}: {e}");
+                std::process::exit(1);
+            });
+            println!("wrote {out} vlnv={} bus={}", ip.vlnv(), ip.bus);
+        }
+        "-h" | "--help" | "help" => {
+            eprintln!("usage: helion ip list|show <file.helion>|pack <name> [-o out.helion]");
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!("helion ip: unknown subcommand {other}");
+            eprintln!("usage: helion ip list|show <file.helion>|pack <name> [-o out.helion]");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn cmd_gui() {

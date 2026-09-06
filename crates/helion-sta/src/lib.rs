@@ -783,19 +783,22 @@ fn iob_pad_ps(design: &Design) -> i64 {
         .unwrap_or(IOB_PS)
 }
 
-fn lut_fanin(design: &Design, lut: &str) -> i64 {
-    (0..6)
-        .filter(|p| design.net_on(lut, &format!("I{p}")).is_some())
-        .count() as i64
+fn lut_fanin_idx(idx: &helion_ir::PinIndex<'_>, lut: &str) -> i64 {
+    // Static pin names avoid per-call format! in the r2r hot loop.
+    const PINS: [&str; 6] = ["I0", "I1", "I2", "I3", "I4", "I5"];
+    PINS.iter().filter(|p| idx.net_on(lut, p).is_some()).count() as i64
 }
 
 fn r2r_ps(design: &Design) -> i64 {
+    // FM-HEL-TOP: Design::net_on is O(nets); Ibex-scale r2r walked every LUT×6
+    // pins that way (~6.8s under debug). PinIndex is O(1) after one build.
+    let idx = design.pin_index();
     let mut max_ps = 0i64;
     for c in &design.cells {
         if !matches!(c.kind, CellKind::Lut6 { .. }) {
             continue;
         }
-        let pins = lut_fanin(design, &c.name);
+        let pins = lut_fanin_idx(&idx, &c.name);
         max_ps = max_ps.max(FF_CKQ_PS + LUT_PS + pins * PIN_PS + SETUP_PS);
     }
     max_ps.max(FF_CKQ_PS + LUT_PS + SETUP_PS)

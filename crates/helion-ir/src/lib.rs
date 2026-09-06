@@ -1,6 +1,6 @@
 //! Helion netlist IR (HNF). Structural cells, attributes, hierarchy, round-trip.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, Default)]
 pub struct Attrs {
@@ -101,6 +101,18 @@ pub const INC4_INIT: [u64; 4] = [
     0x7F80_7F80_7F80_7F80,
 ];
 
+
+/// Fast (cell, pin) → net lookup built by [`Design::pin_index`].
+pub struct PinIndex<'a> {
+    pin_to_net: HashMap<(&'a str, &'a str), &'a str>,
+}
+
+impl<'a> PinIndex<'a> {
+    pub fn net_on(&self, cell: &str, pin: &str) -> Option<&'a str> {
+        self.pin_to_net.get(&(cell, pin)).copied()
+    }
+}
+
 impl Design {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -164,6 +176,17 @@ impl Design {
                 .any(|e| e.cell == cell && e.pin == pin)
                 .then_some(n.name.as_str())
         })
+    }
+
+    /// O(|endpoints|) index for repeated `net_on` (Ibex-scale pack).
+    pub fn pin_index(&self) -> PinIndex<'_> {
+        let mut pin_to_net = HashMap::with_capacity(self.nets.iter().map(|n| n.endpoints.len()).sum());
+        for n in &self.nets {
+            for e in &n.endpoints {
+                pin_to_net.insert((e.cell.as_str(), e.pin.as_str()), n.name.as_str());
+            }
+        }
+        PinIndex { pin_to_net }
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {

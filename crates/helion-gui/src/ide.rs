@@ -4927,6 +4927,8 @@ impl IdeModel {
             self.sim_run(self.sim_runtime_cycles.max(1))
         } else if t == "open_elaborated_schematic" {
             self.open_elaborated_schematic()
+        } else if t == "open_hierarchy_sheet" || t.starts_with("open_hierarchy_sheet ") {
+            self.open_hierarchy_sheet(t.strip_prefix("open_hierarchy_sheet").unwrap_or("").trim())
         } else if t == "sheet_find" || t.starts_with("sheet_find ") {
             let kind = t.strip_prefix("sheet_find").unwrap_or("").trim();
             self.sheet_find(kind)
@@ -7362,6 +7364,33 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Schematic;
         self.nav = NavSection::RtlAnalysis;
         Ok(self.schematic_drawing_text())
+    }
+
+    /// Fig. 61→55/56: open the schematic sheet for a hierarchy instance (or selection).
+    pub fn open_hierarchy_sheet(&mut self, spec: &str) -> Result<String, String> {
+        if self.schematic.nodes.is_empty() {
+            return Err("open_hierarchy_sheet: no HNF — Run Synthesis first".into());
+        }
+        let name = {
+            let s = spec.trim();
+            if !s.is_empty() {
+                s.to_string()
+            } else {
+                self.selected
+                    .clone()
+                    .ok_or_else(|| "open_hierarchy_sheet: select a hierarchy instance first".to_string())?
+            }
+        };
+        self.workspace = WorkspaceTab::Schematic;
+        self.nav = NavSection::RtlAnalysis;
+        if self.schematic.is_instance(&name) {
+            let _ = self.expand_inside(&name);
+        } else if self.hierarchy.has(&name) || self.schematic.has_cell(&name) {
+            self.select(&name);
+        } else {
+            return Err(format!("open_hierarchy_sheet: unknown instance {name}"));
+        }
+        Ok(format!("open_hierarchy_sheet {name} {}", self.schematic_drawing_text()))
     }
 
     /// Expand the schematic cone from a cell along HNF nets (UG893 Expand Cone).
@@ -17050,6 +17079,17 @@ impl IdeModel {
     }
 
     /// UG893 Hardware Manager STAT table from helion-hw TAP / fabric Stat.
+    /// Program with explicit cable (`auto|sim|usb|ofl|native`) via helion-hw backends.
+    pub fn program_hw_with_cable(&mut self, cable: &str) -> Result<String, String> {
+        if !self.shell.session.hw_open {
+            self.shell.session.open_hw_manager();
+        }
+        let part = "HL10T-C32-1";
+        let dev = helion_device::Device::load_part(part)
+            .map_err(|e| format!("program_hw: HAD {part}: {e}"))?;
+        self.shell.session.program_hw_cable(&dev, cable)
+    }
+
     pub fn hw_stat_report(&self) -> HwStatReport {
         let open = self.hw.open || self.shell.session.hw_open;
         if !open {
@@ -17163,19 +17203,36 @@ impl IdeModel {
         Ok(self.ila_dashboard_text())
     }
 
+    /// Prefer mark_debug nets, then last armed, then cnt_3/q3/led if present in the design.
+    pub fn default_ila_probe(&self) -> String {
+        if let Some(d) = self.shell.session.design.as_ref() {
+            let marked = d.marked_debug_nets();
+            if let Some(n) = marked.first() {
+                return n.clone();
+            }
+            if !self.ila.net.is_empty() && d.nets.iter().any(|n| n.name == self.ila.net) {
+                return self.ila.net.clone();
+            }
+            for cand in ["cnt_3", "q3", "led", "q", "cnt_0", "q0"] {
+                if d.nets.iter().any(|n| n.name == cand) {
+                    return cand.to_string();
+                }
+            }
+        }
+        if self.ila.net.is_empty() {
+            "led".into()
+        } else {
+            self.ila.net.clone()
+        }
+    }
+
     pub fn ila_arm(&mut self, spec: &str) -> Result<String, String> {
         let mut parts = spec.split_whitespace();
         let net = parts
             .next()
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if self.ila.net.is_empty() {
-                    "led".into()
-                } else {
-                    self.ila.net.clone()
-                }
-            });
+            .unwrap_or_else(|| self.default_ila_probe());
         let n = parts
             .next()
             .and_then(|s| s.parse().ok())
@@ -23832,7 +23889,22 @@ mod tests {
 
     /// Fig. 56 Expand Inside regenerates nested instance contents; primitives refuse.
     #[test]
-    fn schematic_expand_inside_instance_primitives_refuse() {
+
+    #[test]
+    fn hierarchy_open_sheet_navigates_instance_to_schematic() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("hier.sv")).unwrap();
+        assert!(ide.schematic.is_instance("u0"));
+        let out = ide.exec("open_hierarchy_sheet u0").unwrap();
+        assert!(out.contains("open_hierarchy_sheet u0"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Schematic);
+        assert_eq!(ide.schematic.expand_inside.as_deref(), Some("u0"));
+        ide.selected = None;
+        let e = ide.exec("open_hierarchy_sheet").unwrap_err();
+        assert!(e.contains("select"), "{e}");
+    }
+
+        fn schematic_expand_inside_instance_primitives_refuse() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("hier.sv")).unwrap();
         assert!(
@@ -31617,7 +31689,7 @@ mod tests {
             chrome::side_chrome_width(),
             chrome::RAIL_WIDTH + chrome::SIDEBAR_WIDTH
         );
-        assert_eq!(chrome::RAIL_WIDTH, 40.0);
+        assert_eq!(chrome::RAIL_WIDTH, 48.0);
         assert_eq!(chrome::SIDEBAR_WIDTH, 240.0);
         assert_eq!(chrome::HIT_PRIMARY, 32.0);
         assert_eq!(chrome::HIT_SIDEBAR, 28.0);

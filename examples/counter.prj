@@ -1,0 +1,4 @@
+# Helion project — counter + SDC (gold WNS path: 9640 ps @ 10 ns)
+part HL10T-C32-1
+read_sv examples/counter.sv
+read_xdc examples/counter.sdc

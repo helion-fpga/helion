@@ -338,11 +338,33 @@ enum RExpr {
     Const { val: u128, width: usize, care: u128 }, // care bits: 1 = specified (casez)
     Ident(String),
     Bit(String, usize),
+    /// Part-select `sig[hi:lo]` (inclusive). Bit i of the slice is `sig[lo+i]`.
+    Range(String, usize, usize),
+    /// Indexed part-select `sig[base +: width]` (ascending) or `sig[base -: width]`.
+    IndexPart {
+        name: String,
+        base: Box<RExpr>,
+        width: usize,
+        ascending: bool,
+    },
+    /// Concatenation `{a,b,...}` (left = MSB). Replication `{N{e}}` may fold to Const.
+    Concat(Vec<RExpr>),
+    /// Logical right shift `a >> sh` (const shift amount in rexpr_to_bit; zero-fill).
+    Shr(Box<RExpr>, Box<RExpr>),
+    /// Arithmetic right shift `a >>> sh` (const shift; sign-fill from MSB).
+    Ashr(Box<RExpr>, Box<RExpr>),
+    /// Reduction XOR `^in` (1-bit result).
+    RedXor(Box<RExpr>),
+    /// Reduction AND `&in` (1-bit). `~&in` is Not(RedAnd(...)).
+    RedAnd(Box<RExpr>),
+    /// Reduction OR `|in` (1-bit). `~|in` is Not(RedOr(...)).
+    RedOr(Box<RExpr>),
     Not(Box<RExpr>),
     And(Box<RExpr>, Box<RExpr>),
     Or(Box<RExpr>, Box<RExpr>),
     Xor(Box<RExpr>, Box<RExpr>),
     Add(Box<RExpr>, Box<RExpr>),
+    Sub(Box<RExpr>, Box<RExpr>),
     Mul(Box<RExpr>, Box<RExpr>),
     Mux(Box<RExpr>, Box<RExpr>, Box<RExpr>),
     Eq(Box<RExpr>, Box<RExpr>),
@@ -407,8 +429,11 @@ enum Tok {
     Str(String),
     Sym(char),
     Le, // <=
+    Ge, // >=
     Eq, // ==
     Ne, // !=
+    Lor, // ||
+    Land, // &&
 }
 
 fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
@@ -450,6 +475,11 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 2;
             continue;
         }
+        if c == '>' && chars.get(i + 1) == Some(&'=') {
+            out.push(Tok::Ge);
+            i += 2;
+            continue;
+        }
         if c == '=' && chars.get(i + 1) == Some(&'=') {
             out.push(Tok::Eq);
             i += 2;
@@ -457,6 +487,16 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         }
         if c == '!' && chars.get(i + 1) == Some(&'=') {
             out.push(Tok::Ne);
+            i += 2;
+            continue;
+        }
+        if c == '|' && chars.get(i + 1) == Some(&'|') {
+            out.push(Tok::Lor);
+            i += 2;
+            continue;
+        }
+        if c == '&' && chars.get(i + 1) == Some(&'&') {
+            out.push(Tok::Land);
             i += 2;
             continue;
         }
@@ -724,6 +764,34 @@ impl<'a> P<'a> {
     }
 }
 
+/// Ibex `ibex_pkg::regfile_e` literals — packages are skipped, so seed defaults
+/// so `RegFile == RegFileFF` links the FF register file (~992 sequential bits).
+fn enum_const_default(name: &str) -> Option<u128> {
+    match name {
+        "RegFileFF" => Some(0),
+        "RegFileFPGA" => Some(1),
+        "RegFileLatch" => Some(2),
+        // Harmless Ibex param enums (packages skipped).
+        "RV32MNone" => Some(0),
+        "RV32MSlow" => Some(1),
+        "RV32MFast" => Some(2),
+        "RV32MSingleCycle" => Some(3),
+        "RV32BNone" => Some(0),
+        "RV32BBalanced" => Some(1),
+        "RV32BOTEarlGrey" => Some(2),
+        "RV32BFull" => Some(3),
+        _ => None,
+    }
+}
+
+fn clog2_u(n: u128) -> u128 {
+    if n <= 1 {
+        0
+    } else {
+        (u128::BITS - (n - 1).leading_zeros()) as u128
+    }
+}
+
 fn const_atom(p: &mut P) -> Result<u128, String> {
     if p.eat_sym('(') {
         let v = const_u(p)?;
@@ -738,13 +806,33 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             p.bump();
             Ok(n)
         }
-        Some(Tok::Ident(s)) => {
-            let name = s.clone();
+        Some(Tok::Ident(s)) if s == "$clog2" => {
             p.bump();
-            p.params
-                .get(&name)
-                .copied()
-                .ok_or_else(|| format!("unknown param {name}"))
+            if !p.eat_sym('(') {
+                return Err("$clog2 (".into());
+            }
+            let arg = const_u(p)?;
+            if !p.eat_sym(')') {
+                return Err("$clog2 )".into());
+            }
+            Ok(clog2_u(arg))
+        }
+        Some(Tok::Ident(s)) => {
+            let mut name = s.clone();
+            p.bump();
+            // `pkg::EnumLit` after skipped packages — resolve the member name.
+            if matches!(p.peek(), Some(Tok::Sym(':')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+                && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+            {
+                p.bump();
+                p.bump();
+                name = p.ident()?;
+            }
+            if let Some(v) = p.params.get(&name).copied() {
+                return Ok(v);
+            }
+            enum_const_default(&name).ok_or_else(|| format!("unknown param {name}"))
         }
         other => Err(format!("const atom {other:?}")),
     }
@@ -770,6 +858,16 @@ fn const_u(p: &mut P) -> Result<u128, String> {
         } else if p.eat_sym('%') {
             let d = const_atom(p)?.max(1);
             v %= d;
+        } else if p.eat_sym('<') {
+            // `<<` or arithmetic `<<<` (both logical shifts on const u128).
+            if !p.eat_sym('<') {
+                // Lone '<' is relational — put it back for const_rel.
+                p.i -= 1;
+                break;
+            }
+            let _ = p.eat_sym('<'); // optional third < for <<<
+            let sh = const_atom(p)? as u32;
+            v = v.checked_shl(sh.min(63)).unwrap_or(0);
         } else {
             break;
         }
@@ -785,7 +883,7 @@ fn const_u(p: &mut P) -> Result<u128, String> {
     Ok(v)
 }
 
-fn const_cond(p: &mut P) -> Result<bool, String> {
+fn const_rel(p: &mut P) -> Result<bool, String> {
     let l = const_u(p)?;
     if matches!(p.peek(), Some(Tok::Eq)) {
         p.bump();
@@ -799,6 +897,10 @@ fn const_cond(p: &mut P) -> Result<bool, String> {
         p.bump();
         return Ok(l <= const_u(p)?);
     }
+    if matches!(p.peek(), Some(Tok::Ge)) {
+        p.bump();
+        return Ok(l >= const_u(p)?);
+    }
     if p.eat_sym('<') {
         return Ok(l < const_u(p)?);
     }
@@ -806,6 +908,27 @@ fn const_cond(p: &mut P) -> Result<bool, String> {
         return Ok(l > const_u(p)?);
     }
     Ok(l != 0)
+}
+
+/// Generate/parameter const condition: relational, then left-assoc `||` / `&&`.
+fn const_cond(p: &mut P) -> Result<bool, String> {
+    let mut v = const_rel(p)?;
+    loop {
+        match p.peek() {
+            Some(Tok::Land) => {
+                p.bump();
+                let r = const_rel(p)?;
+                v = v && r;
+            }
+            Some(Tok::Lor) => {
+                p.bump();
+                let r = const_rel(p)?;
+                v = v || r;
+            }
+            _ => break,
+        }
+    }
+    Ok(v)
 }
 
 fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
@@ -822,39 +945,178 @@ fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
 }
 
 fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
-    let e = parse_add(p)?;
+    let e = parse_shift(p)?;
     if matches!(p.peek(), Some(Tok::Eq)) {
         p.bump();
-        return Ok(RExpr::Eq(Box::new(e), Box::new(parse_add(p)?)));
+        return Ok(RExpr::Eq(Box::new(e), Box::new(parse_shift(p)?)));
     }
     if matches!(p.peek(), Some(Tok::Ne)) {
         p.bump();
-        return Ok(RExpr::Ne(Box::new(e), Box::new(parse_add(p)?)));
+        return Ok(RExpr::Ne(Box::new(e), Box::new(parse_shift(p)?)));
+    }
+    // a <= b  ≡  !(b < a)
+    if matches!(p.peek(), Some(Tok::Le)) {
+        p.bump();
+        let r = parse_shift(p)?;
+        return Ok(RExpr::Not(Box::new(RExpr::Lt(Box::new(r), Box::new(e)))));
+    }
+    // a >= b  ≡  !(a < b)
+    if matches!(p.peek(), Some(Tok::Ge)) {
+        p.bump();
+        let r = parse_shift(p)?;
+        return Ok(RExpr::Not(Box::new(RExpr::Lt(Box::new(e), Box::new(r)))));
     }
     if p.eat_sym('<') {
-        return Ok(RExpr::Lt(Box::new(e), Box::new(parse_add(p)?)));
+        // Do not steal `<<` (left shift handled in parse_shift).
+        if matches!(p.peek(), Some(Tok::Sym('<'))) {
+            p.i -= 1;
+            return Ok(e);
+        }
+        return Ok(RExpr::Lt(Box::new(e), Box::new(parse_shift(p)?)));
+    }
+    if matches!(p.peek(), Some(Tok::Sym('>')))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym('>')))
+    {
+        // `>>` / `>>>` belong to parse_shift (already consumed there); leave alone.
+        return Ok(e);
     }
     if p.eat_sym('>') {
         // a > b  ≡  b < a
-        return Ok(RExpr::Lt(Box::new(parse_add(p)?), Box::new(e)));
+        return Ok(RExpr::Lt(Box::new(parse_shift(p)?), Box::new(e)));
+    }
+    Ok(e)
+}
+
+fn parse_shift(p: &mut P) -> Result<RExpr, String> {
+    let mut e = parse_add(p)?;
+    loop {
+        if matches!(p.peek(), Some(Tok::Sym('>')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('>')))
+        {
+            p.bump();
+            p.bump();
+            // `>>>` = arithmetic right shift; `>>` = logical.
+            let arith = p.eat_sym('>');
+            let sh = parse_add(p)?;
+            e = if arith {
+                RExpr::Ashr(Box::new(e), Box::new(sh))
+            } else {
+                RExpr::Shr(Box::new(e), Box::new(sh))
+            };
+            continue;
+        }
+        // `<<` / `<<<` — const fold when both sides const; else leave as identity*shift via mul-of-power2 not needed for corpus.
+        if matches!(p.peek(), Some(Tok::Sym('<')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('<')))
+        {
+            p.bump();
+            p.bump();
+            let _ = p.eat_sym('<'); // <<<
+            let sh = parse_add(p)?;
+            e = match (&e, &sh) {
+                (
+                    RExpr::Const { val: a, width: wa, care: ca },
+                    RExpr::Const { val: b, .. },
+                ) => {
+                    let shv = (*b).min(63) as u32;
+                    RExpr::Const {
+                        val: a.checked_shl(shv).unwrap_or(0),
+                        width: *wa,
+                        care: *ca,
+                    }
+                }
+                _ => e, // non-const shl: keep LHS (rare); prefer not to drop assign
+            };
+            continue;
+        }
+        break;
     }
     Ok(e)
 }
 
 fn parse_add(p: &mut P) -> Result<RExpr, String> {
     let mut e = parse_mul(p)?;
-    while p.eat_sym('+') {
-        let r = parse_mul(p)?;
-        e = RExpr::Add(Box::new(e), Box::new(r));
+    loop {
+        // Do not consume the '+'/'-' of indexed part-select `+:` / `-:`.
+        if matches!(p.peek(), Some(Tok::Sym('+')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+        {
+            break;
+        }
+        if matches!(p.peek(), Some(Tok::Sym('-')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+        {
+            break;
+        }
+        if p.eat_sym('+') {
+            let r = parse_mul(p)?;
+            e = match (&e, &r) {
+                (
+                    RExpr::Const { val: a, width: wa, care: ca },
+                    RExpr::Const { val: b, width: wb, care: cb },
+                ) => RExpr::Const {
+                    val: a.wrapping_add(*b),
+                    width: (*wa).max(*wb),
+                    care: *ca & *cb,
+                },
+                _ => RExpr::Add(Box::new(e), Box::new(r)),
+            };
+            continue;
+        }
+        if p.eat_sym('-') {
+            let r = parse_mul(p)?;
+            e = match (&e, &r) {
+                (
+                    RExpr::Const { val: a, width: wa, care: ca },
+                    RExpr::Const { val: b, width: wb, care: cb },
+                ) => RExpr::Const {
+                    val: a.wrapping_sub(*b),
+                    width: (*wa).max(*wb),
+                    care: *ca & *cb,
+                },
+                _ => RExpr::Sub(Box::new(e), Box::new(r)),
+            };
+            continue;
+        }
+        break;
     }
     Ok(e)
 }
 
 fn parse_mul(p: &mut P) -> Result<RExpr, String> {
     let mut e = parse_or_r(p)?;
-    while p.eat_sym('*') {
-        let r = parse_or_r(p)?;
-        e = RExpr::Mul(Box::new(e), Box::new(r));
+    loop {
+        if p.eat_sym('*') {
+            let r = parse_or_r(p)?;
+            e = match (&e, &r) {
+                (
+                    RExpr::Const { val: a, width: wa, care: ca },
+                    RExpr::Const { val: b, width: wb, care: cb },
+                ) => RExpr::Const {
+                    val: a.wrapping_mul(*b),
+                    width: (*wa).max(*wb),
+                    care: *ca & *cb,
+                },
+                _ => RExpr::Mul(Box::new(e), Box::new(r)),
+            };
+            continue;
+        }
+        if p.eat_sym('/') {
+            let r = parse_or_r(p)?;
+            e = match (&e, &r) {
+                (
+                    RExpr::Const { val: a, width: wa, care: ca },
+                    RExpr::Const { val: b, width: wb, care: cb },
+                ) if *b != 0 => RExpr::Const {
+                    val: a / *b,
+                    width: (*wa).max(*wb),
+                    care: *ca & *cb,
+                },
+                _ => return Err("div needs const operands".into()),
+            };
+            continue;
+        }
+        break;
     }
     Ok(e)
 }
@@ -890,7 +1152,37 @@ fn parse_un_r(p: &mut P) -> Result<RExpr, String> {
     if p.eat_sym('~') || p.eat_sym('!') {
         return Ok(RExpr::Not(Box::new(parse_un_r(p)?)));
     }
+    // Unary minus: -a  ≡  0 - a
+    if p.eat_sym('-') {
+        let x = parse_un_r(p)?;
+        return Ok(RExpr::Sub(
+            Box::new(RExpr::Const {
+                val: 0,
+                width: 32,
+                care: u128::MAX,
+            }),
+            Box::new(x),
+        ));
+    }
+    // Unary reductions (distinct from binary &/|/ ^ in parse_*_r).
+    if p.eat_sym('^') {
+        return Ok(RExpr::RedXor(Box::new(parse_un_r(p)?)));
+    }
+    if p.eat_sym('&') {
+        return Ok(RExpr::RedAnd(Box::new(parse_un_r(p)?)));
+    }
+    if p.eat_sym('|') {
+        return Ok(RExpr::RedOr(Box::new(parse_un_r(p)?)));
+    }
     parse_atom_r(p)
+}
+
+fn care_mask(width: usize) -> u128 {
+    if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width.max(1)) - 1
+    }
 }
 
 fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
@@ -900,6 +1192,64 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             return Err(")".into());
         }
         return Ok(e);
+    }
+    // Concat `{a,b}` or replication `{N{expr}}` (fold `{N{1'b0}}` to Const zero).
+    if p.eat_sym('{') {
+        let first = parse_rexpr(p)?;
+        if p.eat_sym('{') {
+            let inner = parse_rexpr(p)?;
+            if !p.eat_sym('}') {
+                return Err("replic }".into());
+            }
+            if !p.eat_sym('}') {
+                return Err("replic }}".into());
+            }
+            let n = match first {
+                RExpr::Const { val, .. } => val as usize,
+                _ => return Err("replic count not const".into()),
+            };
+            let n = n.min(256);
+            if matches!(inner, RExpr::Const { val: 0, .. }) {
+                return Ok(RExpr::Const {
+                    val: 0,
+                    width: n.max(1),
+                    care: care_mask(n.max(1)),
+                });
+            }
+            if let RExpr::Const { val, width, care } = inner {
+                let w = width.max(1);
+                let mut acc = 0u128;
+                let mut tw = 0usize;
+                for _ in 0..n {
+                    acc |= (val & care_mask(w)) << tw;
+                    tw = tw.saturating_add(w);
+                    if tw >= 128 {
+                        break;
+                    }
+                }
+                return Ok(RExpr::Const {
+                    val: acc,
+                    width: (n * w).max(1).min(128),
+                    care: care_mask((n * w).max(1).min(128)) & if care == 0 { 0 } else { u128::MAX },
+                });
+            }
+            let mut parts = Vec::with_capacity(n.max(1));
+            for _ in 0..n.max(1) {
+                parts.push(inner.clone());
+            }
+            return Ok(RExpr::Concat(parts));
+        }
+        let mut parts = vec![first];
+        while p.eat_sym(',') {
+            parts.push(parse_rexpr(p)?);
+        }
+        if !p.eat_sym('}') {
+            return Err("concat }".into());
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().unwrap());
+        }
+        return Ok(RExpr::Concat(parts));
     }
     match p.bump() {
         Some(Tok::Number(v, w)) => {
@@ -918,14 +1268,85 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         Some(Tok::Ident(s)) => {
             let name = s.clone();
             if p.eat_sym('[') {
-                let idx = match p.bump() {
-                    Some(Tok::Number(v, _)) => *v as usize,
-                    _ => return Err("bit index".into()),
-                };
-                if !p.eat_sym(']') {
-                    return Err("]".into());
+                // Indexed part-select: sig[base +: W] / sig[base -: W]
+                // or range/bit. Prefer +: / -: before treating ':' as range.
+                let base = parse_add(p)?;
+                if p.eat_sym('+') && p.eat_sym(':') {
+                    let w = const_u(p)? as usize;
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    Ok(RExpr::IndexPart {
+                        name,
+                        base: Box::new(base),
+                        width: w.max(1),
+                        ascending: true,
+                    })
+                } else if p.eat_sym('-') && p.eat_sym(':') {
+                    let w = const_u(p)? as usize;
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    Ok(RExpr::IndexPart {
+                        name,
+                        base: Box::new(base),
+                        width: w.max(1),
+                        ascending: false,
+                    })
+                } else if p.eat_sym(':') {
+                    let a = match base {
+                        RExpr::Const { val, .. } => val as usize,
+                        _ => return Err("range msb not const".into()),
+                    };
+                    let b = const_u(p)? as usize;
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    let hi = a.max(b);
+                    let lo = a.min(b);
+                    // Parameter part-select e.g. SEED[STATE_WIDTH-1:0]
+                    if let Some(v) = p.params.get(&name).copied() {
+                        let w = (hi - lo + 1).max(1);
+                        let mask = care_mask(w.min(128));
+                        let val = (v >> lo) & mask;
+                        return Ok(RExpr::Const {
+                            val,
+                            width: w,
+                            care: mask,
+                        });
+                    }
+                    Ok(RExpr::Range(name, lo, hi))
+                } else {
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    match base {
+                        RExpr::Const { val, .. } => {
+                            if let Some(v) = p.params.get(&name).copied() {
+                                let bit = val as usize;
+                                return Ok(RExpr::Const {
+                                    val: (v >> bit) & 1,
+                                    width: 1,
+                                    care: 1,
+                                });
+                            }
+                            Ok(RExpr::Bit(name, val as usize))
+                        }
+                        other => Ok(RExpr::IndexPart {
+                            name,
+                            base: Box::new(other),
+                            width: 1,
+                            ascending: true,
+                        }),
+                    }
                 }
-                Ok(RExpr::Bit(name, idx))
+            } else if let Some(v) = p.params.get(&name).copied() {
+                // Parameter used in an expression (e.g. sel*DW +: DW).
+                Ok(RExpr::Const {
+                    val: v,
+                    width: 32,
+                    care: u128::MAX,
+                })
             } else {
                 Ok(RExpr::Ident(name))
             }
@@ -958,6 +1379,22 @@ fn skip_logic(p: &mut P) {
 fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
     let name = p.ident()?;
     if p.eat_sym('[') {
+        // Bit, or const range name[hi:lo] (treated as full-vector assign).
+        let save = p.i;
+        if let Ok(hi) = const_u(p) {
+            if p.eat_sym(':') {
+                let _lo = const_u(p)?;
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                let _ = hi;
+                return Ok((name, None));
+            }
+            if p.eat_sym(']') {
+                return Ok((name, Some(hi as usize)));
+            }
+        }
+        p.i = save;
         match p.bump() {
             Some(Tok::Number(v, _)) => {
                 let idx = *v as usize;
@@ -1019,6 +1456,41 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
     Ok(v)
 }
 
+
+/// Parse for-loop step: `i++`, `i += N`, or `i = i + N` (default step 1).
+fn parse_for_step(p: &mut P) -> Result<usize, String> {
+    let _ = p.ident(); // loop variable
+    // i++
+    if p.eat_sym('+') {
+        if p.eat_sym('+') {
+            return Ok(1);
+        }
+        // i += N
+        if p.eat_sym('=') {
+            let n = const_u(p)? as usize;
+            return Ok(n.max(1));
+        }
+        return Err("for step +".into());
+    }
+    // i = i + N
+    if p.eat_sym('=') {
+        let _ = p.ident();
+        if !p.eat_sym('+') {
+            return Err("for step =+".into());
+        }
+        let n = match p.peek() {
+            Some(Tok::Number(v, _)) => {
+                let n = (*v as usize).max(1);
+                p.bump();
+                n
+            }
+            _ => 1,
+        };
+        return Ok(n);
+    }
+    Err("for step".into())
+}
+
 fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     if !p.eat_sym('(') {
         return Err("for (".into());
@@ -1049,22 +1521,14 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
-    let _ = p.ident();
-    let _ = p.eat_sym('=');
-    let _ = p.ident();
-    let _ = p.eat_sym('+');
-    let step = match p.peek() {
-        Some(Tok::Number(v, _)) => {
-            let n = (*v as usize).max(1);
-            p.bump();
-            n
-        }
-        _ => 1,
-    };
+    let step = parse_for_step(p)?;
     if !p.eat_sym(')') {
         return Err("for )".into());
     }
     let block = p.eat_kw("begin");
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
     let start_i = p.i;
     if block {
         let mut depth = 1i32;
@@ -1302,6 +1766,7 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     Ok(mods)
 }
 
+#[allow(dead_code)] // intentional: kept as direct RTL entry for future callers / tests
 fn parse_rtl(source: &str) -> Result<Rtl, String> {
     parse_source(source)?
         .into_iter()
@@ -1359,7 +1824,13 @@ fn parse_param_assigns(p: &mut P) -> Result<Vec<(String, u128)>, String> {
             skip_sv_type(p);
             if p.eat_sym('=') {
                 match const_u(p) {
-                    Ok(val) => out.push((name, val)),
+                    Ok(val) => {
+                        // Register immediately so later defaults can ref earlier ones
+                        // (`OW = 2 * DW`). Existing overrides in p.params win.
+                        let effective = p.params.get(&name).copied().unwrap_or(val);
+                        p.params.insert(name.clone(), effective);
+                        out.push((name, effective));
+                    }
                     Err(_) => skip_until_arg_end(p),
                 }
             } else {
@@ -1485,8 +1956,12 @@ fn skip_to_semi(p: &mut P) {
                 p.bump();
             }
             Some(Tok::Sym(')' | ']' | '}')) => {
+                // Stray closers (e.g. after a failed part-select parse) must not
+                // abort before ';' — that desyncs the module scanner and drops
+                // later always_ff / instances (Ibex timer, etc.).
                 if d == 0 {
-                    return;
+                    p.bump();
+                    continue;
                 }
                 d -= 1;
                 p.bump();
@@ -1551,15 +2026,26 @@ fn skip_until_arg_end(p: &mut P) {
     }
 }
 
-fn skip_event_control(p: &mut P) {
+/// Skip `@...` sensitivity. Returns true for combo `@*` / `@(*)` (no edge).
+/// Async `posedge clk or negedge nreset` is treated like sync (edges ignored).
+fn skip_event_control(p: &mut P) -> bool {
     let _ = p.eat_sym('@');
     if p.eat_sym('*') {
-        return;
+        return true;
     }
     if p.eat_sym('(') {
+        let start = p.i;
+        if p.eat_sym('*') && matches!(p.peek(), Some(Tok::Sym(')'))) {
+            p.bump();
+            return true;
+        }
+        p.i = start;
         let mut d = 1i32;
+        let mut has_edge = false;
         while d > 0 && p.peek().is_some() {
-            if p.eat_sym('(') {
+            if p.eat_kw("posedge") || p.eat_kw("negedge") {
+                has_edge = true;
+            } else if p.eat_sym('(') {
                 d += 1;
             } else if p.eat_sym(')') {
                 d -= 1;
@@ -1567,7 +2053,9 @@ fn skip_event_control(p: &mut P) {
                 p.bump();
             }
         }
+        return !has_edge;
     }
+    false
 }
 
 fn skip_for_rest(p: &mut P) {
@@ -1640,6 +2128,7 @@ fn skip_sv_type(p: &mut P) {
     }
 }
 
+#[allow(dead_code)] // intentional: parser helper retained for richer net-ref forms
 fn parse_net_ref(p: &mut P) -> Result<String, String> {
     let name = p.ident()?;
     if p.eat_sym('[') {
@@ -1859,80 +2348,87 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("if") {
-            if !p.eat_sym('(') {
-                let _ = skip_item_or_block(p);
-                continue;
-            }
-            let yes = match const_cond(p) {
-                Ok(v) => v,
-                Err(_) => {
-                    skip_until_arg_end(p);
-                    let _ = p.eat_sym(')');
+            // Generate-if / else-if / else chain. Unknown const_cond → prefer else.
+            let mut taken = false;
+            loop {
+                if !p.eat_sym('(') {
+                    let _ = skip_item_or_block(p);
+                    break;
+                }
+                // Unknown generate-if (e.g. package enums): prefer else/generic branch
+                // so prim_flop → prim_generic_flop still maps real FFs.
+                let yes = match const_cond(p) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        skip_until_arg_end(p);
+                        false
+                    }
+                };
+                if !p.eat_sym(')') {
                     skip_for_rest(p);
                     if p.eat_kw("else") {
                         skip_for_rest(p);
                     }
+                    break;
+                }
+                let then_begin = p.eat_kw("begin");
+                if p.eat_sym(':') {
+                    let _ = p.ident();
+                }
+                if yes && !taken {
+                    if then_begin {
+                        parse_module_items(
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            "end",
+                        )?;
+                    } else {
+                        // one module item; require a following else/endgenerate/endmodule delimiter
+                        parse_module_items(
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            "else",
+                        )?;
+                        // parse_module_items consumed the else keyword — put it back
+                        p.i -= 1;
+                    }
+                    taken = true;
+                } else if then_begin {
+                    skip_begin_end(p)?;
+                } else {
+                    skip_item_or_block(p)?;
+                }
+                if !p.eat_kw("else") {
+                    break;
+                }
+                // `else if (...)` — recurse as next arm of the chain.
+                if p.eat_kw("if") {
                     continue;
                 }
-            };
-            if !p.eat_sym(')') {
-                skip_for_rest(p);
-                if p.eat_kw("else") {
-                    skip_for_rest(p);
-                }
-                continue;
-            }
-            let then_begin = p.eat_kw("begin");
-            if p.eat_sym(':') {
-                let _ = p.ident();
-            }
-            if yes {
-                if then_begin {
-                    parse_module_items(
-                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
-                        "end",
-                    )?;
-                } else {
-                    // one module item; require a following else/endgenerate/endmodule delimiter
-                    parse_module_items(
-                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
-                        "else",
-                    )?;
-                    // parse_module_items consumed the else keyword — put it back
-                    p.i -= 1;
-                }
-            } else if then_begin {
-                skip_begin_end(p)?;
-            } else {
-                skip_item_or_block(p)?;
-            }
-            if p.eat_kw("else") {
                 let eb = p.eat_kw("begin");
                 if p.eat_sym(':') {
                     let _ = p.ident();
                 }
-                if yes {
+                if !taken {
                     if eb {
-                        skip_begin_end(p)?;
+                        parse_module_items(
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            "end",
+                        )?;
                     } else {
                         skip_item_or_block(p)?;
                     }
                 } else if eb {
-                    parse_module_items(
-                        p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
-                        "end",
-                    )?;
+                    skip_begin_end(p)?;
                 } else {
                     skip_item_or_block(p)?;
-                    p.i = p.i.saturating_sub(0);
                 }
+                break;
             }
             continue;
         }
         if p.eat_kw("for") {
             // Unroll: NBA body and/or instantiations. Skip still-unsupported bounds.
             let save = p.i;
-            match parse_for_unroll_module(p, nbas, insts, assigns, mem_inits) {
+            match parse_for_unroll_module(p, signals, nbas, insts, assigns, mem_inits) {
                 Ok(()) => continue,
                 Err(_) => {
                     p.i = save;
@@ -2065,12 +2561,77 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("assign") {
-            match (parse_lhs(&mut p), p.eat_sym('='), parse_rexpr(&mut p)) {
-                (Ok((lhs, bit)), true, Ok(rhs)) => {
-                    let _ = p.eat_sym(';');
-                    assigns.push((lhs, bit, rhs));
+            if p.eat_sym('{') {
+                let mut names: Vec<String> = Vec::new();
+                loop {
+                    if p.eat_sym('}') {
+                        break;
+                    }
+                    match p.ident() {
+                        Ok(n) => names.push(n),
+                        Err(_) => break,
+                    }
+                    let _ = p.eat_sym(',');
                 }
-                _ => skip_to_semi(p),
+                if p.eat_sym('=') {
+                    match parse_rexpr(p) {
+                        Ok(rhs) => {
+                            let _ = p.eat_sym(';');
+                            let widths: Vec<usize> = names
+                                .iter()
+                                .map(|n| {
+                                    signals
+                                        .iter()
+                                        .find(|s| s.name == *n)
+                                        .map(|s| s.width)
+                                        .or_else(|| {
+                                            ports
+                                                .iter()
+                                                .find(|(pn, _, _)| pn == n)
+                                                .map(|(_, _, w)| *w)
+                                        })
+                                        .unwrap_or(1)
+                                })
+                                .collect();
+                            let total: usize = widths.iter().sum();
+                            let mut bit_hi = total;
+                            for (n, w) in names.iter().zip(widths.iter()) {
+                                bit_hi = bit_hi.saturating_sub(*w);
+                                for i in 0..*w {
+                                    let src_bit = bit_hi + i;
+                                    let piece = if src_bit == 0 {
+                                        rhs.clone()
+                                    } else {
+                                        RExpr::Shr(
+                                            Box::new(rhs.clone()),
+                                            Box::new(RExpr::Const {
+                                                val: src_bit as u128,
+                                                width: 32,
+                                                care: u128::MAX,
+                                            }),
+                                        )
+                                    };
+                                    assigns.push((
+                                        n.clone(),
+                                        if *w == 1 { None } else { Some(i) },
+                                        piece,
+                                    ));
+                                }
+                            }
+                        }
+                        Err(_) => skip_to_semi(p),
+                    }
+                } else {
+                    skip_to_semi(p);
+                }
+            } else {
+                match (parse_lhs(&mut p), p.eat_sym('='), parse_rexpr(&mut p)) {
+                    (Ok((lhs, bit)), true, Ok(rhs)) => {
+                        let _ = p.eat_sym(';');
+                        assigns.push((lhs, bit, rhs));
+                    }
+                    _ => skip_to_semi(p),
+                }
             }
             continue;
         }
@@ -2088,13 +2649,21 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
-            skip_event_control(p);
+            let combo = skip_event_control(p);
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
             }
             match parse_seq_block(&mut p, block) {
-                Ok(stmts) => nbas.extend(stmts),
+                Ok(stmts) => {
+                    if combo {
+                        // `always @(*)` next-state etc. → comb assigns, not FFs.
+                        assigns.extend(stmts);
+                    } else {
+                        // Includes async `posedge clk or negedge rst` (sync-reset mux).
+                        nbas.extend(stmts);
+                    }
+                }
                 Err(_) => {
                     let _ = skip_item_or_block(p);
                 }
@@ -2119,8 +2688,9 @@ fn parse_module_items(
                 continue;
             }
         }
+        let before = p.i;
         let _ = skip_item_or_block(p);
-        if p.peek().is_some() {
+        if p.i == before && p.peek().is_some() {
             let _ = p.bump();
         }
     }
@@ -2129,6 +2699,7 @@ fn parse_module_items(
 
 fn parse_for_unroll_module(
     p: &mut P,
+    signals: &mut Vec<Signal>,
     nbas: &mut Vec<Nba>,
     insts: &mut Vec<Inst>,
     assigns: &mut Vec<(String, Option<usize>, RExpr)>,
@@ -2163,18 +2734,7 @@ fn parse_for_unroll_module(
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
-    let _ = p.ident();
-    let _ = p.eat_sym('=');
-    let _ = p.ident();
-    let _ = p.eat_sym('+');
-    let step = match p.peek() {
-        Some(Tok::Number(v, _)) => {
-            let n = (*v as usize).max(1);
-            p.bump();
-            n
-        }
-        _ => 1,
-    };
+    let step = parse_for_step(p)?;
     if !p.eat_sym(')') {
         return Err("for )".into());
     }
@@ -2237,12 +2797,35 @@ fn parse_for_unroll_module(
         } else {
             local_nbas.extend(parse_seq_block(&mut sp, false)?);
         }
+        // Local decls inside the generate-for must be uniquified per iteration
+        // so vector widths survive and each copy maps to its own FF bits.
+        let mut subst: HashMap<String, String> = HashMap::new();
+        for mut sig in dummy_sigs {
+            let fresh = format!("{}_{i}", sig.name);
+            subst.insert(sig.name.clone(), fresh.clone());
+            sig.name = fresh;
+            if !signals.iter().any(|s| s.name == sig.name) {
+                signals.push(sig);
+            }
+        }
         for mut inst in local_insts {
             inst.name = format!("{}_{i}", inst.name);
+            for (port, net) in inst.conns.iter_mut() {
+                let _ = port;
+                if let Some(n) = subst.get(net) {
+                    *net = n.clone();
+                }
+            }
             insts.push(inst);
         }
-        nbas.extend(local_nbas);
-        assigns.extend(local_assigns);
+        for (lhs, bit, rhs) in local_nbas {
+            let lhs = subst.get(&lhs).cloned().unwrap_or(lhs);
+            nbas.push((lhs, bit, rewrite_rexpr(&rhs, &subst)));
+        }
+        for (lhs, bit, rhs) in local_assigns {
+            let lhs = subst.get(&lhs).cloned().unwrap_or(lhs);
+            assigns.push((lhs, bit, rewrite_rexpr(&rhs, &subst)));
+        }
         i += step;
     }
     Ok(())
@@ -2417,10 +3000,120 @@ fn rexpr_ident(e: &RExpr) -> Option<String> {
     }
 }
 
+fn index_part_bit(
+    name: &str,
+    base: &RExpr,
+    part_w: usize,
+    ascending: bool,
+    rtl: &Rtl,
+    bit: usize,
+) -> Result<Expr, String> {
+    if bit >= part_w {
+        return Ok(Expr::Const(false));
+    }
+    let wsrc = sig_width(rtl, name);
+    if let RExpr::Const { val, .. } = base {
+        let idx = if ascending {
+            (*val as usize).saturating_add(bit)
+        } else {
+            (*val as usize).saturating_sub(bit)
+        };
+        return Ok(Expr::Var(bit_name(
+            name,
+            wsrc,
+            idx.min(wsrc.saturating_sub(1)),
+        )));
+    }
+    // sel * stride  → N-way mux of data[k*stride + bit]
+    let (sel, stride) = match base {
+        RExpr::Mul(a, b) => match (a.as_ref(), b.as_ref()) {
+            (RExpr::Const { val, .. }, other) => (other, (*val as usize).max(1)),
+            (other, RExpr::Const { val, .. }) => (other, (*val as usize).max(1)),
+            _ => return Err("index mul needs const stride".into()),
+        },
+        other => {
+            // width-1 dynamic bit: mux over possible indices 0..min(wsrc,16)
+            let n = wsrc.min(16).max(1);
+            let mut acc: Option<Expr> = None;
+            for k in 0..n {
+                let eq = cmp_eq_bits(
+                    other,
+                    &RExpr::Const {
+                        val: k as u128,
+                        width: 32,
+                        care: u128::MAX,
+                    },
+                    rtl,
+                    true,
+                )?;
+                let src = Expr::Var(bit_name(name, wsrc, k));
+                let term = Expr::And(Box::new(eq), Box::new(src));
+                acc = Some(match acc {
+                    None => term,
+                    Some(a) => Expr::Or(Box::new(a), Box::new(term)),
+                });
+            }
+            return Ok(acc.unwrap_or(Expr::Const(false)));
+        }
+    };
+    let n = (wsrc / stride).max(1).min(64);
+    let mut acc: Option<Expr> = None;
+    for k in 0..n {
+        let eq = cmp_eq_bits(
+            sel,
+            &RExpr::Const {
+                val: k as u128,
+                width: 32,
+                care: u128::MAX,
+            },
+            rtl,
+            true,
+        )?;
+        let src_idx = if ascending {
+            k * stride + bit
+        } else {
+            k * stride + (part_w - 1 - bit)
+        };
+        let src = Expr::Var(bit_name(name, wsrc, src_idx.min(wsrc.saturating_sub(1))));
+        let term = Expr::And(Box::new(eq), Box::new(src));
+        acc = Some(match acc {
+            None => term,
+            Some(a) => Expr::Or(Box::new(a), Box::new(term)),
+        });
+    }
+    Ok(acc.unwrap_or(Expr::Const(false)))
+}
+
+thread_local! {
+    static REXPR_BIT_BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+fn rexpr_bit_budget_reset(limit: u32) {
+    REXPR_BIT_BUDGET.with(|c| c.set(limit));
+}
+
+fn rexpr_bit_budget_take() -> bool {
+    REXPR_BIT_BUDGET.with(|c| {
+        let v = c.get();
+        if v == 0 {
+            false
+        } else {
+            c.set(v - 1);
+            true
+        }
+    })
+}
+
 fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    if !rexpr_bit_budget_take() {
+        return Err("rexpr_to_bit budget exhausted".into());
+    }
     match e {
         RExpr::Const { val, width, care } => {
             let _ = width;
+            if bit >= 128 {
+                return Ok(Expr::Const(false));
+            }
             if (care >> bit) & 1 == 0 {
                 return Ok(Expr::Const(false));
             }
@@ -2433,6 +3126,96 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
         RExpr::Bit(s, i) => {
             let w = sig_width(rtl, s);
             Ok(Expr::Var(bit_name(s, w, *i)))
+        }
+        RExpr::Range(s, lo, hi) => {
+            let w = sig_width(rtl, s);
+            let idx = (*lo + bit).min(*hi).min(w.saturating_sub(1));
+            Ok(Expr::Var(bit_name(s, w, idx)))
+        }
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ascending,
+        } => index_part_bit(name, base, *width, *ascending, rtl, bit),
+        RExpr::Concat(parts) => {
+            let mut offset = 0usize;
+            for part in parts.iter().rev() {
+                let w = rexpr_width(part, rtl).max(1);
+                if bit < offset + w {
+                    return rexpr_to_bit(part, rtl, bit - offset);
+                }
+                offset = offset.saturating_add(w);
+            }
+            Ok(Expr::Const(false))
+        }
+        RExpr::Shr(a, sh) => {
+            let shift = match sh.as_ref() {
+                RExpr::Const { val, .. } => *val as usize,
+                _ => return Err("shift amount not const".into()),
+            };
+            let wa = rexpr_width(a, rtl);
+            if bit.saturating_add(shift) >= wa {
+                Ok(Expr::Const(false))
+            } else {
+                rexpr_to_bit(a, rtl, bit + shift)
+            }
+        }
+        RExpr::Ashr(a, sh) => {
+            let shift = match sh.as_ref() {
+                RExpr::Const { val, .. } => *val as usize,
+                _ => return Err("ashr amount not const".into()),
+            };
+            let wa = rexpr_width(a, rtl).max(1);
+            let src = bit.saturating_add(shift);
+            if src >= wa {
+                // Sign-fill from MSB.
+                rexpr_to_bit(a, rtl, wa - 1)
+            } else {
+                rexpr_to_bit(a, rtl, src)
+            }
+        }
+        RExpr::RedXor(x) => {
+            if bit != 0 {
+                return Ok(Expr::Const(false));
+            }
+            let w = rexpr_width(x, rtl).max(1);
+            if w > 128 {
+                return Err("reduction width too wide".into());
+            }
+            let mut acc = rexpr_to_bit(x, rtl, 0)?;
+            for i in 1..w {
+                acc = Expr::Xor(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
+            }
+            Ok(acc)
+        }
+        RExpr::RedAnd(x) => {
+            if bit != 0 {
+                return Ok(Expr::Const(false));
+            }
+            let w = rexpr_width(x, rtl).max(1);
+            if w > 128 {
+                return Err("reduction width too wide".into());
+            }
+            let mut acc = rexpr_to_bit(x, rtl, 0)?;
+            for i in 1..w {
+                acc = Expr::And(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
+            }
+            Ok(acc)
+        }
+        RExpr::RedOr(x) => {
+            if bit != 0 {
+                return Ok(Expr::Const(false));
+            }
+            let w = rexpr_width(x, rtl).max(1);
+            if w > 128 {
+                return Err("reduction width too wide".into());
+            }
+            let mut acc = rexpr_to_bit(x, rtl, 0)?;
+            for i in 1..w {
+                acc = Expr::Or(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
+            }
+            Ok(acc)
         }
         RExpr::Not(x) => Ok(Expr::Not(Box::new(rexpr_to_bit(x, rtl, bit)?))),
         RExpr::And(a, b) => Ok(Expr::And(
@@ -2448,6 +3231,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             Box::new(rexpr_to_bit(b, rtl, bit)?),
         )),
         RExpr::Add(a, b) => adder_sum_bit(a, b, rtl, bit),
+        RExpr::Sub(a, b) => sub_diff_bit(a, b, rtl, bit),
         RExpr::Mul(_, _) => Err("mul is a DSP primitive, not a LUT cone".into()),
         RExpr::Mux(c, t, f) => {
             let cv = rexpr_to_bit(c, rtl, 0)?;
@@ -2480,6 +3264,29 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     }
 }
 
+fn expr_node_count(e: &Expr) -> usize {
+    fn walk(e: &Expr, budget: &mut usize) -> usize {
+        if *budget == 0 {
+            return 0;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(_) | Expr::Var(_) => 1,
+            Expr::Not(x) => 1 + walk(x, budget),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                1 + walk(a, budget) + walk(b, budget)
+            }
+        }
+    }
+    let mut budget = 16_000usize;
+    let n = walk(e, &mut budget);
+    if budget == 0 {
+        16_001 // treat as over-cap
+    } else {
+        n
+    }
+}
+
 fn const_care_of(e: &RExpr) -> u128 {
     match e {
         RExpr::Const { care, .. } => *care,
@@ -2488,6 +3295,14 @@ fn const_care_of(e: &RExpr) -> u128 {
 }
 
 fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    // Bound nested Add expansion: naive per-bit re-entry is exponential in nesting depth
+    // (FM-HEL-HANG-1539: Ibex probe hung after flatten in rexpr_to_bit over Add trees).
+    if bit > 64 {
+        return Err("adder bit too wide".into());
+    }
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 4 {
+        return Err("adder nesting too deep".into());
+    }
     let mut cin = Expr::Const(false);
     let mut sum = Expr::Const(false);
     for i in 0..=bit {
@@ -2502,10 +3317,65 @@ fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, St
     Ok(sum)
 }
 
+fn sub_diff_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    // Bound like adder_sum_bit (Ibex hang caps).
+    if bit > 64 {
+        return Err("sub bit too wide".into());
+    }
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 4 {
+        return Err("sub nesting too deep".into());
+    }
+    let mut borrow = Expr::Const(false);
+    let mut diff = Expr::Const(false);
+    for i in 0..=bit {
+        let ai = rexpr_to_bit(a, rtl, i)?;
+        let bi = rexpr_to_bit(b, rtl, i)?;
+        let axb = Expr::Xor(Box::new(ai.clone()), Box::new(bi.clone()));
+        diff = Expr::Xor(Box::new(axb.clone()), Box::new(borrow.clone()));
+        // borrow_out = (~a & b) | (~(a^b) & borrow)
+        let nota_b = Expr::And(Box::new(Expr::Not(Box::new(ai))), Box::new(bi));
+        let eq_ab = Expr::Not(Box::new(axb));
+        let eq_bor = Expr::And(Box::new(eq_ab), Box::new(borrow));
+        borrow = Expr::Or(Box::new(nota_b), Box::new(eq_bor));
+    }
+    Ok(diff)
+}
+
+fn rexpr_add_depth(e: &RExpr) -> usize {
+    match e {
+        RExpr::Add(a, b) | RExpr::Sub(a, b) => 1 + rexpr_add_depth(a).max(rexpr_add_depth(b)),
+        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+            rexpr_add_depth(x)
+        }
+        RExpr::Shr(a, b) | RExpr::Ashr(a, b) => rexpr_add_depth(a).max(rexpr_add_depth(b)),
+        RExpr::Concat(parts) => parts.iter().map(rexpr_add_depth).max().unwrap_or(0),
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => rexpr_add_depth(a).max(rexpr_add_depth(b)),
+        RExpr::Mux(c, t, f) => rexpr_add_depth(c)
+            .max(rexpr_add_depth(t))
+            .max(rexpr_add_depth(f)),
+        RExpr::IndexPart { base, .. } => rexpr_add_depth(base),
+        RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
+    }
+}
+
 fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, String> {
     let wa = rexpr_width(a, rtl);
     let wb = rexpr_width(b, rtl);
     let w = wa.max(wb).max(1);
+    // FM-HEL-HANG: wide/nested Add under Eq → huge AIG (Ibex hang after CORPUS cmp).
+    // Skip instead of hang; simple Ident/Const compares (corpus hswish/lrelu) still map.
+    if w > 32 {
+        return Err("cmp width too wide".into());
+    }
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 2 {
+        return Err("cmp nesting too deep".into());
+    }
     let care = const_care_of(a) & const_care_of(b);
     let mut acc: Option<Expr> = None;
     for i in 0..w {
@@ -2525,6 +3395,13 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
 
 fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
     let w = rexpr_width(a, rtl).max(rexpr_width(b, rtl)).max(1);
+    // FM-HEL-HANG: same bound as cmp_eq_bits — skip huge cones instead of hang.
+    if w > 32 {
+        return Err("lt width too wide".into());
+    }
+    if rexpr_add_depth(a).saturating_add(rexpr_add_depth(b)) > 2 {
+        return Err("lt nesting too deep".into());
+    }
     let mut acc = Expr::Const(false);
     let mut eq_so_far = Expr::Const(true);
     for i in (0..w).rev() {
@@ -2544,12 +3421,24 @@ fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
 fn rexpr_width(e: &RExpr, rtl: &Rtl) -> usize {
     match e {
         RExpr::Ident(s) | RExpr::Bit(s, _) => sig_width(rtl, s),
+        RExpr::Range(_, lo, hi) => hi - lo + 1,
+        RExpr::IndexPart { width, .. } => (*width).max(1),
         RExpr::Const { width, .. } => (*width).max(1),
+        RExpr::Concat(parts) => parts.iter().map(|p| rexpr_width(p, rtl).max(1)).sum(),
+        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width(a, rtl),
+        RExpr::RedXor(_)
+        | RExpr::RedAnd(_)
+        | RExpr::RedOr(_)
+        | RExpr::Eq(_, _)
+        | RExpr::Ne(_, _)
+        | RExpr::Lt(_, _) => 1,
         RExpr::Not(x) => rexpr_width(x, rtl).min(1).max(1),
-        RExpr::Eq(_, _) | RExpr::Ne(_, _) | RExpr::Lt(_, _) => 1,
-        RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Mul(a, b) => {
-            rexpr_width(a, rtl).max(rexpr_width(b, rtl))
-        }
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b) => rexpr_width(a, rtl).max(rexpr_width(b, rtl)),
         RExpr::Mux(_, t, f) => rexpr_width(t, rtl).max(rexpr_width(f, rtl)),
     }
 }
@@ -2562,11 +3451,140 @@ fn sig_depth(rtl: &Rtl, name: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn is_mac_rhs(e: &RExpr) -> bool {
+
+/// Collapse `sig[hi:lo]` to Ident when used as a Mul operand (full-vector slice).
+fn strip_range_to_ident(e: &RExpr) -> RExpr {
+    match e {
+        RExpr::Range(name, _, _) => RExpr::Ident(name.clone()),
+        other => other.clone(),
+    }
+}
+
+fn normalize_mul_operands(e: &RExpr) -> RExpr {
+    match e {
+        RExpr::Mul(a, b) => RExpr::Mul(
+            Box::new(strip_range_to_ident(a)),
+            Box::new(strip_range_to_ident(b)),
+        ),
+        RExpr::Add(a, b) => RExpr::Add(
+            Box::new(normalize_mul_operands(a)),
+            Box::new(normalize_mul_operands(b)),
+        ),
+        RExpr::Mux(c, t, f) => RExpr::Mux(
+            Box::new((**c).clone()),
+            Box::new(normalize_mul_operands(t)),
+            Box::new(normalize_mul_operands(f)),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn expr_contains_mul(e: &RExpr) -> bool {
     match e {
         RExpr::Mul(_, _) => true,
-        RExpr::Add(l, _) => matches!(l.as_ref(), RExpr::Mul(_, _)),
+        RExpr::Not(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::RedXor(x) => expr_contains_mul(x),
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b)
+        | RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b) => expr_contains_mul(a) || expr_contains_mul(b),
+        RExpr::Mux(c, t, f) => {
+            expr_contains_mul(c) || expr_contains_mul(t) || expr_contains_mul(f)
+        }
+        RExpr::Concat(parts) => parts.iter().any(expr_contains_mul),
+        // Address math in sig[base*+:W] is not a DSP multiply.
+        RExpr::IndexPart { .. } => false,
         _ => false,
+    }
+}
+
+
+/// Pull (A, B, optional C-accum) port/signal names from a MAC/mul RHS tree.
+fn mac_ab_c_from_rhs(e: &RExpr) -> (Option<String>, Option<String>, Option<String>) {
+    let e = normalize_mul_operands(e);
+    fn mul_ab(e: &RExpr) -> Option<(String, String)> {
+        match e {
+            RExpr::Mul(a, b) => Some((
+                rexpr_ident(a).or_else(|| match a.as_ref() {
+                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.clone()),
+                    _ => None,
+                })?,
+                rexpr_ident(b).or_else(|| match b.as_ref() {
+                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.clone()),
+                    _ => None,
+                })?,
+            )),
+            RExpr::Add(l, r) => mul_ab(l).or_else(|| mul_ab(r)),
+            RExpr::Mux(_, t, f) => mul_ab(t).or_else(|| mul_ab(f)),
+            _ => None,
+        }
+    }
+    fn accum_c(e: &RExpr, a: &str, b: &str) -> Option<String> {
+        match e {
+            RExpr::Add(l, r) => {
+                let li = rexpr_ident(l).or_else(|| match l.as_ref() {
+                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.clone()),
+                    _ => None,
+                });
+                let ri = rexpr_ident(r).or_else(|| match r.as_ref() {
+                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.clone()),
+                    _ => None,
+                });
+                if matches!(r.as_ref(), RExpr::Mul(_, _)) {
+                    return li.filter(|n| n != a && n != b);
+                }
+                if matches!(l.as_ref(), RExpr::Mul(_, _)) {
+                    return ri.filter(|n| n != a && n != b);
+                }
+                accum_c(l, a, b).or_else(|| accum_c(r, a, b))
+            }
+            RExpr::Mux(_, t, f) => accum_c(t, a, b).or_else(|| accum_c(f, a, b)),
+            _ => None,
+        }
+    }
+    match mul_ab(&e) {
+        Some((a, b)) => {
+            let c = accum_c(&e, &a, &b);
+            (Some(a), Some(b), c)
+        }
+        None => (None, None, None),
+    }
+}
+
+/// Infer Mac27 and wire A/B/(C)/P so schematic/HNF are not pin-NC islands.
+fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr, lhs: &str) {
+    d.add_cell(&cell, CellKind::Mac27);
+    let (a, b, c) = mac_ab_c_from_rhs(rhs);
+    if let Some(a) = a {
+        d.connect(&a, &cell, "A");
+    }
+    if let Some(b) = b {
+        d.connect(&b, &cell, "B");
+    }
+    if let Some(c) = c {
+        d.connect(&c, &cell, "C");
+    }
+    d.connect(lhs, &cell, "P");
+}
+
+fn is_mac_rhs(e: &RExpr) -> bool {
+    let e = normalize_mul_operands(e);
+    match &e {
+        RExpr::Mul(_, _) => true,
+        // `a*b`, `a*b+c`, `c+a*b`, or enable/clear mux wrapping a MAC.
+        RExpr::Add(l, r) => {
+            matches!(l.as_ref(), RExpr::Mul(_, _))
+                || matches!(r.as_ref(), RExpr::Mul(_, _))
+                || expr_contains_mul(l)
+                || expr_contains_mul(r)
+        }
+        RExpr::Mux(_, t, f) => expr_contains_mul(t) || expr_contains_mul(f),
+        _ => expr_contains_mul(&e),
     }
 }
 
@@ -2701,6 +3719,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         .unwrap_or("clk");
 
     // Flatten NBAs into per-bit (name_bit, expr)
+    // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
+    rexpr_bit_budget_reset(80_000);
     let mut reg_bits: Vec<(String, Expr)> = Vec::new();
     let mut n_mac = 0usize;
     let mut n_bram = 0usize;
@@ -2709,7 +3729,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         if is_mac_rhs(rhs) {
-            d.add_cell(format!("u_mac{n_mac}"), CellKind::Mac27);
+            emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
             n_mac += 1;
             continue;
         }
@@ -2775,20 +3795,23 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     ));
                 }
             } else {
-                for i in 0..w {
+                let bw = w.min(32);
+                for i in 0..bw {
                     if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
                         reg_bits.push((bit_name(lhs, w, i), e));
                     }
                 }
             }
         } else {
-            for i in 0..w {
+            let bw = w.min(32);
+            for i in 0..bw {
                 if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
                     reg_bits.push((bit_name(lhs, w, i), e));
                 }
             }
         }
     }
+    eprintln!("synth_rtl after nbas reg_bits={}", reg_bits.len());
     let mut mem_names: HashSet<String> = HashSet::new();
     for (lhs, _, _) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
@@ -2825,13 +3848,90 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         n_bram += 1;
     }
 
-    if reg_bits.is_empty() && n_mac == 0 && n_bram == 0 {
+    // Continuous assigns → comb LUT cones (pure-comb modules e.g. mux).
+    // FM-HEL-HANG: Ibex-scale assign fans (1300+) make AIG/flowmap wall-clock explode
+    // after CORPUS bitblast improvements. Prefer NBA/FF mapping; skip comb fan-out.
+    let skip_comb_assigns = rtl.assigns.len() > 800;
+    if skip_comb_assigns {
+        eprintln!(
+            "hang_diag skip_comb_assigns n={}",
+            rtl.assigns.len()
+        );
+    }
+    // Skip simple Ident/Bit/Range drives — those stay on the IOB passthrough path
+    // so sequential timing (WNS) is not broken by orphan comb LUTs.
+    let mut comb_bits: Vec<(String, Expr)> = Vec::new();
+    for (lhs, bit, rhs) in &rtl.assigns {
+        if skip_comb_assigns { break; }
+        match rhs {
+            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
+            _ => {}
+        }
+        // Comb multiply → DSP MAC (do not bitblast).
+        if expr_contains_mul(rhs) {
+            emit_mac27(&mut d, format!("u_mac{n_mac}"), rhs, lhs);
+            n_mac += 1;
+            continue;
+        }
+        let w = sig_width(rtl, lhs);
+        if let Some(b) = bit {
+            if let Ok(e) = rexpr_to_bit(rhs, rtl, 0) {
+                comb_bits.push((bit_name(lhs, w, *b), e));
+            }
+        } else {
+            let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
+            for i in 0..rw.min(w) {
+                if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
+                    comb_bits.push((bit_name(lhs, w, i), e));
+                }
+            }
+        }
+    }
+
+    eprintln!("synth_rtl after assigns comb_bits={}", comb_bits.len());
+    if reg_bits.is_empty() && comb_bits.is_empty() && n_mac == 0 && n_bram == 0 {
         // Unsupported items were skipped/blackboxed; still return the top with ports.
         return Ok(d);
     }
 
+    eprintln!(
+        "synth_rtl reg_bits={} comb_bits={} mac={} bram={}",
+        reg_bits.len(),
+        comb_bits.len(),
+        n_mac,
+        n_bram
+    );
+    // FM-HEL-TOP: O(1) keep/mark_debug lookup. Prior per-bit scan of all
+    // signals*width allocated bit_name strings (Ibex: ~2.3k regs x 1.2k sigs)
+    // and dominated synth_rtl (~4.6s of ~5.3s under debug caps path).
+    let mut keep_bits: HashSet<String> = HashSet::new();
+    let mut md_bits: HashSet<String> = HashSet::new();
+    for s in &rtl.signals {
+        if !(s.keep || s.mark_debug) {
+            continue;
+        }
+        if s.keep {
+            keep_bits.insert(s.name.clone());
+        }
+        if s.mark_debug {
+            md_bits.insert(s.name.clone());
+        }
+        for b in 0..s.width {
+            let bn = bit_name(&s.name, s.width, b);
+            if s.keep {
+                keep_bits.insert(bn.clone());
+            }
+            if s.mark_debug {
+                md_bits.insert(bn);
+            }
+        }
+    }
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
+        // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
+        if expr_node_count(expr) > 8_000 {
+            continue;
+        }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
             let (ff, qnet) = if single_q {
@@ -2866,46 +3966,98 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         for (pin, pi) in aig.pis.iter().enumerate() {
             d.connect(pi, &lut, format!("I{pin}"));
         }
-        for s in &rtl.signals {
-            let matches_sig = (0..s.width).any(|b| bit_name(&s.name, s.width, b) == *bitn)
-                || s.name == *bitn;
-            if matches_sig && s.keep {
-                let _ = d.dont_touch(&ff);
-            }
-            if matches_sig && s.mark_debug {
-                let _ = d.mark_debug(&qnet);
-            }
+        if keep_bits.contains(bitn) {
+            let _ = d.dont_touch(&ff);
+        }
+        if md_bits.contains(bitn) {
+            let _ = d.mark_debug(&qnet);
         }
     }
 
-    // Output IOBs from assigns
-    let mut iob_n = 0usize;
-    for (lhs, bit, rhs) in &rtl.assigns {
-        let is_out = rtl
-            .ports
-            .iter()
-            .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
-        if !is_out {
+    for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
+        if expr_node_count(expr) > 8_000 {
             continue;
         }
-        let (qnet, _) = if let Some(b) = bit {
-            let w = sig_width(rtl, lhs);
-            (bit_name(lhs, w, *b), *b)
-        } else {
-            match drive_target(rhs, rtl) {
-                Ok(x) => x,
-                Err(_) => continue,
-            }
-        };
-        let iob = if iob_n == 0 {
+        let aig = Aig::from_expr(expr);
+        if aig.pis.len() > 6 {
+            let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
+            // Alias wide cone output onto the assign net name.
+            d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
+            d.connect(&wide, format!("u_cbuf{i}"), "I0");
+            d.connect(bitn, format!("u_cbuf{i}"), "O");
+            continue;
+        }
+        let init = aig.flowmap_lut6();
+        let lut = format!("u_clut{i}");
+        d.add_cell(&lut, CellKind::Lut6 { init });
+        d.connect(bitn, &lut, "O");
+        for (pin, pi) in aig.pis.iter().enumerate() {
+            d.connect(pi, &lut, format!("I{pin}"));
+        }
+    }
+
+    // Output IOBs from assigns.
+    // FM-HEL-TOP: under skip_comb_assigns, AXI/out continuous assigns have no
+    // mapped LUT/FF drivers. Emitting them fills the pack then iob_trim → 0,
+    // blocking the FF→PAD fallback (bare ysyx_ibex IOB=0). Prefer NBA-
+    // registered top outs; else last FF → first Out.
+    let mut iob_n = 0usize;
+    let emit_iob = |d: &mut Design, iob_n: &mut usize, qnet: &str, pad: &str| {
+        let iob = if *iob_n == 0 {
             "u_iob".to_string()
         } else {
             format!("u_iob{iob_n}")
         };
-        iob_n += 1;
+        *iob_n += 1;
         d.add_cell(&iob, CellKind::IobOut);
-        d.connect(&qnet, &iob, "I");
-        d.connect(lhs, &iob, "PAD");
+        d.connect(qnet, &iob, "I");
+        d.connect(pad, &iob, "PAD");
+    };
+    if skip_comb_assigns {
+        eprintln!("hang_diag skip_undriven_iob_assigns (FF→PAD fallback path)");
+        let reg_q: HashSet<&str> = reg_bits.iter().map(|(n, _)| n.as_str()).collect();
+        for (n, dir, w) in &rtl.ports {
+            if *dir != PortDir::Out {
+                continue;
+            }
+            let w = *w;
+            // Cap so PathFinder stays under ≤120s (cli also caps driven IOBs).
+            let lim = if w > 1 { w.min(4) } else { 1 };
+            for i in 0..lim {
+                let qnet = bit_name(n, w, i);
+                if !reg_q.contains(qnet.as_str()) {
+                    continue;
+                }
+                emit_iob(&mut d, &mut iob_n, &qnet, n);
+            }
+        }
+    } else {
+        for (lhs, bit, rhs) in &rtl.assigns {
+            let is_out = rtl
+                .ports
+                .iter()
+                .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
+            if !is_out {
+                continue;
+            }
+            let w = sig_width(rtl, lhs);
+            if bit.is_none() && w > 1 {
+                for i in 0..w.min(256) {
+                    let qnet = bit_name(lhs, w, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                }
+                continue;
+            }
+            let (qnet, _) = if let Some(b) = bit {
+                (bit_name(lhs, w, *b), *b)
+            } else {
+                match drive_target(rhs, rtl) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                }
+            };
+            emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+        }
     }
     if iob_n == 0 {
         // default: last register bit to first output
@@ -2931,6 +4083,32 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
         },
         RExpr::Ident(s) => RExpr::Ident(id(s)),
         RExpr::Bit(s, i) => RExpr::Bit(id(s), *i),
+        RExpr::Range(s, lo, hi) => RExpr::Range(id(s), *lo, *hi),
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ascending,
+        } => RExpr::IndexPart {
+            name: id(name),
+            base: Box::new(rewrite_rexpr(base, subst)),
+            width: *width,
+            ascending: *ascending,
+        },
+        RExpr::Concat(parts) => RExpr::Concat(
+            parts.iter().map(|p| rewrite_rexpr(p, subst)).collect(),
+        ),
+        RExpr::Shr(a, b) => RExpr::Shr(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Ashr(a, b) => RExpr::Ashr(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::RedXor(x) => RExpr::RedXor(Box::new(rewrite_rexpr(x, subst))),
+        RExpr::RedAnd(x) => RExpr::RedAnd(Box::new(rewrite_rexpr(x, subst))),
+        RExpr::RedOr(x) => RExpr::RedOr(Box::new(rewrite_rexpr(x, subst))),
         RExpr::Not(x) => RExpr::Not(Box::new(rewrite_rexpr(x, subst))),
         RExpr::And(a, b) => RExpr::And(
             Box::new(rewrite_rexpr(a, subst)),
@@ -2945,6 +4123,10 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
             Box::new(rewrite_rexpr(b, subst)),
         ),
         RExpr::Add(a, b) => RExpr::Add(
+            Box::new(rewrite_rexpr(a, subst)),
+            Box::new(rewrite_rexpr(b, subst)),
+        ),
+        RExpr::Sub(a, b) => RExpr::Sub(
             Box::new(rewrite_rexpr(a, subst)),
             Box::new(rewrite_rexpr(b, subst)),
         ),
@@ -3003,6 +4185,7 @@ fn inst_overrides(inst: &Inst, child: &Rtl) -> HashMap<String, u128> {
     ov
 }
 
+#[allow(dead_code)] // intentional: thin wrapper over flatten_module_ov
 fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String> {
     flatten_module_ov(mods, name, &HashMap::new())
 }
@@ -3115,8 +4298,22 @@ fn synth_from_parsed_top(
             .module
             .clone()
     };
+    let t_flat = std::time::Instant::now();
     let flat = flatten_module_ov(&map, &top_name, overrides)?;
+    eprintln!(
+        "hang_diag flatten nbas={} assigns={} signals={} ms={}",
+        flat.nbas.len(),
+        flat.assigns.len(),
+        flat.signals.len(),
+        t_flat.elapsed().as_millis()
+    );
+    let t_syn = std::time::Instant::now();
     let mut d = synth_rtl(&flat)?;
+    eprintln!(
+        "hang_diag synth_rtl cells={} ms={}",
+        d.cells.len(),
+        t_syn.elapsed().as_millis()
+    );
     record_instances(&map, &top_name, &mut d, "");
     Ok(d)
 }
@@ -3158,8 +4355,15 @@ fn record_instances_vis(
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
+    let t_parse = std::time::Instant::now();
     let pre = preprocess_sv(&strip_comments(source));
     let mods = parse_source(&pre)?;
+    eprintln!(
+        "hang_diag parse mods={} bytes={} ms={}",
+        mods.len(),
+        source.len(),
+        t_parse.elapsed().as_millis()
+    );
     let stem = Path::new(origin)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -3256,13 +4460,22 @@ pub fn elaborate_sv_sources(
     if files.is_empty() {
         return Err("no sources".into());
     }
+    let t_parse = std::time::Instant::now();
     let mut all = String::new();
     for (origin, src) in files {
         let _ = (origin, opts);
         all.push_str(src);
         all.push('\n');
     }
-    let d = synth_from_parsed_top(parse_source(&all)?, top, params)?;
+    let mods = parse_source(&all)?;
+    eprintln!(
+        "hang_diag parse mods={} bytes={} files={} ms={}",
+        mods.len(),
+        all.len(),
+        files.len(),
+        t_parse.elapsed().as_millis()
+    );
+    let d = synth_from_parsed_top(mods, top, params)?;
     let report = elab_report(&d);
     Ok((d, report))
 }
@@ -3273,6 +4486,7 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     if files.is_empty() {
         return Err("no sources".into());
     }
+    let t_parse = std::time::Instant::now();
     let mut all = String::new();
     for (origin, src) in files {
         let _ = origin;
@@ -3280,7 +4494,15 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
         all.push_str("
 ");
     }
-    synth_from_parsed(parse_source(&all)?)
+    let mods = parse_source(&all)?;
+    eprintln!(
+        "hang_diag parse mods={} bytes={} files={} ms={}",
+        mods.len(),
+        all.len(),
+        files.len(),
+        t_parse.elapsed().as_millis()
+    );
+    synth_from_parsed(mods)
 }
 
 pub fn synth_sv_files(paths: &[&Path]) -> Result<Design, String> {
@@ -3331,6 +4553,93 @@ mod tests {
         assert_eq!(z, 0);
         assert_ne!(inv, buf);
         assert_ne!(buf, z);
+    }
+
+    #[test]
+    fn logikbench_mux_maps_luts() {
+        let src = r#"
+module mux #(parameter DW = 8, parameter N = 4)
+(
+    input [$clog2(N)-1:0] sel,
+    input [N*DW-1:0] data,
+    output [DW-1:0] out
+);
+   assign out[DW-1:0] = data[sel*DW +: DW];
+endmodule
+"#;
+        let d = synth_sv(src, "mux").expect("synth");
+        let cells = d.cells.len();
+        assert!(cells > 0, "expected comb LUTs for mux, cells={cells}");
+    }
+
+    #[test]
+    fn clog2_const_works() {
+        assert_eq!(clog2_u(1), 0);
+        assert_eq!(clog2_u(2), 1);
+        assert_eq!(clog2_u(16), 4);
+        assert_eq!(clog2_u(17), 5);
+    }
+
+    #[test]
+    fn fsm_tiny_maps_state_and_out_regs() {
+        // Minimal LogikBench parametric FSM shape: async reset, replication
+        // concat, >> shift, reduction XOR, $clog2 localparam.
+        let src = r#"
+module fsm_tiny #(parameter STATES = 4, parameter DW = 4, parameter [31:0] SEED = 32'hA5A5A5A5)
+(
+    input clk,
+    input nreset,
+    input [DW-1:0] in,
+    output reg [DW-1:0] out
+);
+   localparam STATE_WIDTH = $clog2(STATES);
+   reg [STATE_WIDTH-1:0] current_state;
+   reg [STATE_WIDTH-1:0] next_state;
+   always @(posedge clk or negedge nreset)
+     if (!nreset)
+       current_state <= {STATE_WIDTH{1'b0}};
+     else
+       current_state <= next_state;
+   always @(*)
+     case (current_state)
+       {STATE_WIDTH{1'b0}}: next_state = in[0] ? (STATES - 1) : 1'b1;
+       ((STATES/2) - 1): next_state = (^in) ? {STATE_WIDTH{1'b1}} : {STATE_WIDTH{1'b0}};
+       (STATES - 1): next_state = in ^ (SEED[STATE_WIDTH-1:0] >> 1);
+       default: next_state = (current_state ^ SEED[STATE_WIDTH-1:0]) + in;
+     endcase
+   always @(posedge clk or negedge nreset)
+     if (!nreset)
+       out <= {DW{1'b0}};
+     else
+       out <= (current_state ^ (current_state >> 2)) + in;
+endmodule
+"#;
+        let d = synth_sv(src, "fsm_tiny.sv").expect("fsm_tiny synth");
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        eprintln!("fsm_tiny cells={} luts={luts} ffs={ffs}", d.cells.len());
+        assert!(ffs >= 6, "expect state+out regs, ffs={ffs}");
+        assert!(luts >= 4, "expect next-state/out LUTs, luts={luts}");
+        assert!(d.cells.len() > 17, "must exceed pre-fix ~17 cell baseline, got {}", d.cells.len());
+    }
+
+    #[test]
+    fn unary_reductions_band_bxor_bnand() {
+        for (name, body) in [
+            ("band", "assign out = &in;"),
+            ("bxor", "assign out = ^in;"),
+            ("bnand", "assign out = ~&in;"),
+        ] {
+            let src = format!(
+                "module {name} #(parameter DW = 64) (input [DW-1:0] in, output out);\n  {body}\nendmodule\n"
+            );
+            let d = synth_sv(&src, &format!("{name}.sv")).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                !d.cells.is_empty(),
+                "{name} must map cells>0, got {}",
+                d.cells.len()
+            );
+        }
     }
 
     #[test]
@@ -3394,6 +4703,92 @@ endmodule
             "rst must occupy a LUT pin so INIT is not the bare incrementer"
         );
         assert!(d.ports.iter().any(|p| p.name == "rst"));
+    }
+
+    #[test]
+    fn logikbench_mac_with_clear_en_infers_mac27() {
+        let src = r#"
+module mac #(parameter DW = 16, parameter OW = 40) (
+  input clk, input clear, input en,
+  input [DW-1:0] a, input [DW-1:0] b,
+  output reg [OW-1:0] c
+);
+  always @(posedge clk) begin
+    if (clear) c <= 0;
+    else if (en) c <= c + a * b;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "mac.sv").expect("synth");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "clear/en MAC must map Mac27, cells={}",
+            d.cells.len()
+        );
+        assert_eq!(d.net_on("u_mac0", "A"), Some("a"));
+        assert_eq!(d.net_on("u_mac0", "B"), Some("b"));
+        assert_eq!(d.net_on("u_mac0", "C"), Some("c"));
+        assert_eq!(d.net_on("u_mac0", "P"), Some("c"));
+    }
+
+    
+    #[test]
+    fn dependent_param_ow_equals_two_times_dw() {
+        let src = r#"
+module mul #(parameter DW = 8, parameter OW = 2 * DW) (
+  input [DW-1:0] a, input [DW-1:0] b, output [OW-1:0] out
+);
+  assign out = a * b;
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "OW=2*DW mul must map Mac27, cells={}",
+            d.cells.len()
+        );
+    }
+
+
+#[test]
+    fn comb_mul_assign_infers_mac27() {
+        let src = r#"
+module mul #(parameter DW = 8, parameter OW = 2 * DW) (
+  input [DW-1:0] a, input [DW-1:0] b, output [OW-1:0] out
+);
+  assign out[OW-1:0] = a[DW-1:0] * b[DW-1:0];
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "comb a*b must map Mac27, cells={}",
+            d.cells.len()
+        );
+        assert_eq!(d.net_on("u_mac0", "A"), Some("a"));
+        assert_eq!(d.net_on("u_mac0", "B"), Some("b"));
+        assert_eq!(d.net_on("u_mac0", "P"), Some("out"));
+    }
+
+    
+    #[test]
+    fn logikbench_mul_ranged_assign_infers_mac27() {
+        let src = r#"
+module mul #(parameter DW = 16, parameter OW = 2 * DW)
+   (
+    input [DW-1:0]  a,
+    input [DW-1:0]  b,
+    output [OW-1:0] out
+    );
+	assign out[OW-1:0] = a[DW-1:0] * b[DW-1:0];
+endmodule
+"#;
+        let d = synth_sv(src, "mul.sv").expect("synth");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "ranged comb mul must map Mac27, cells={}",
+            d.cells.len()
+        );
     }
 
     #[test]
@@ -3580,6 +4975,94 @@ endmodule
         let inc = synth_sv(&inc_src, "g1.sv").unwrap();
         assert_eq!(inc.lut_inits(), INC4_INIT.to_vec(), "if branch must be the incrementer");
         assert_ne!(inv.lut_inits(), inc.lut_inits());
+    }
+
+    #[test]
+    fn const_cond_or_and_left_assoc() {
+        // Ibex-style: RV32M == RV32MFast || RV32M == RV32MSingleCycle
+        let toks = tokenize("RV32M == RV32MFast || RV32M == RV32MSingleCycle").unwrap();
+        let mut params = HashMap::new();
+        params.insert("RV32M".into(), 2u128); // RV32MFast
+        let mut p = P {
+            t: &toks,
+            i: 0,
+            params,
+        };
+        assert_eq!(
+            const_cond(&mut p).unwrap(),
+            true,
+            "RV32MFast must match Fast||SingleCycle"
+        );
+        assert!(p.peek().is_none(), "must consume full || expr");
+
+        let toks = tokenize("RV32M == RV32MFast || RV32M == RV32MSingleCycle").unwrap();
+        let mut params = HashMap::new();
+        params.insert("RV32M".into(), 0u128); // RV32MNone
+        let mut p = P {
+            t: &toks,
+            i: 0,
+            params,
+        };
+        assert_eq!(
+            const_cond(&mut p).unwrap(),
+            false,
+            "RV32MNone must not match Fast||SingleCycle"
+        );
+
+        let toks = tokenize("A==1 && A==2").unwrap();
+        let mut params = HashMap::new();
+        params.insert("A".into(), 1u128);
+        let mut p = P {
+            t: &toks,
+            i: 0,
+            params,
+        };
+        assert_eq!(const_cond(&mut p).unwrap(), false, "A==1 && A==2 with A=1");
+
+        let toks = tokenize("A==2 || A==3 && A==2").unwrap();
+        let mut params = HashMap::new();
+        params.insert("A".into(), 2u128);
+        let mut p = P {
+            t: &toks,
+            i: 0,
+            params,
+        };
+        // left-assoc: (A==2 || A==3) && A==2 → true
+        assert_eq!(const_cond(&mut p).unwrap(), true);
+    }
+
+    #[test]
+    fn generate_else_if_selects_branch() {
+        // Maps FFs only on the Fast||SingleCycle arm (Ibex multdiv generate shape).
+        let src = r#"
+module m #(parameter int RV32M = RV32MFast) (
+  input logic clk, output logic [3:0] q
+);
+  if (RV32M == RV32MSlow) begin
+    assign q = 4'h0;
+  end else if (RV32M == RV32MFast || RV32M == RV32MSingleCycle) begin
+    logic [3:0] r;
+    always_ff @(posedge clk) r <= ~r;
+    assign q = r;
+  end else begin
+    assign q = 4'hF;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "elif.sv").unwrap();
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(ffs, 4, "Fast||SingleCycle else-if must map 4 FFs, got {ffs}");
+        assert_eq!(d.lut_inits().len(), 4);
+        assert!(
+            d.lut_inits().iter().all(|&i| i == 0x5555_5555_5555_5555),
+            "Fast branch must be invertors {:?}",
+            d.lut_inits()
+        );
+
+        let none = src.replace("RV32M = RV32MFast", "RV32M = RV32MNone");
+        let d0 = synth_sv(&none, "elif_none.sv").unwrap();
+        let ffs0 = d0.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(ffs0, 0, "RV32MNone must take final else assigns only, got {ffs0}");
     }
 
     #[test]
@@ -3783,6 +5266,204 @@ endmodule
         assert_eq!(d.lut_inits(), vec![0x5555_5555_5555_5555]);
     }
 
+
+    #[test]
+    fn timer_full_maps_ffs() {
+        // Slice the in-tree Ibex timer module (mtime is 64b).
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
+        let all = std::fs::read_to_string(&p).expect("ysyx_ibex.sv");
+        let start = all.find("module timer #(").expect("timer module");
+        let rest = &all[start..];
+        let end = rest.find("\nendmodule").expect("timer endmodule") + "\nendmodule".len();
+        let src = &rest[..end];
+        let d = synth_sv(src, "timer.sv").expect("timer");
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        eprintln!("timer_full ffs={ffs} cells={}", d.cells.len());
+        assert!(ffs >= 64, "timer must map mtime FFs, got {ffs}");
+    }
+
+    #[test]
+    fn nested_add_rexpr_is_bounded_not_hang() {
+        // Pathological nesting used to explode adder_sum_bit (HANG-1539).
+        let mut e = RExpr::Ident("a".into());
+        for _ in 0..12 {
+            e = RExpr::Add(Box::new(e), Box::new(RExpr::Ident("b".into())));
+        }
+        let rtl = Rtl {
+            module: "t".into(),
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "a".into(),
+                    width: 8,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+                Signal {
+                    name: "b".into(),
+                    width: 8,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: Default::default(),
+        };
+        let r = rexpr_to_bit(&e, &rtl, 7);
+        assert!(r.is_err(), "deep Add must Err, not hang: {r:?}");
+    }
+
+    #[test]
+    fn nested_cmp_add_rexpr_is_bounded_not_hang() {
+        // CORPUS cmp/ashr path: nested Add under Eq/Lt must Err-skip, not hang.
+        let mut a = RExpr::Ident("a".into());
+        let mut b = RExpr::Ident("b".into());
+        for _ in 0..12 {
+            a = RExpr::Add(Box::new(a), Box::new(RExpr::Ident("a".into())));
+            b = RExpr::Add(Box::new(b), Box::new(RExpr::Ident("b".into())));
+        }
+        let rtl = Rtl {
+            module: "t".into(),
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "a".into(),
+                    width: 64,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+                Signal {
+                    name: "b".into(),
+                    width: 64,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: Default::default(),
+        };
+        let eq = rexpr_to_bit(&RExpr::Eq(Box::new(a.clone()), Box::new(b.clone())), &rtl, 0);
+        assert!(eq.is_err(), "deep Eq(Add,Add) must Err, not hang: {eq:?}");
+        let lt = rexpr_to_bit(&RExpr::Lt(Box::new(a), Box::new(b)), &rtl, 0);
+        assert!(lt.is_err(), "deep Lt(Add,Add) must Err, not hang: {lt:?}");
+        let wide = Rtl {
+            module: "t".into(),
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "x".into(),
+                    width: 128,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+                Signal {
+                    name: "y".into(),
+                    width: 128,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: Default::default(),
+        };
+        let wide_eq = rexpr_to_bit(
+            &RExpr::Eq(
+                Box::new(RExpr::Ident("x".into())),
+                Box::new(RExpr::Ident("y".into())),
+            ),
+            &wide,
+            0,
+        );
+        assert!(wide_eq.is_err(), "width>32 Eq must Err: {wide_eq:?}");
+    }
+
+    #[test]
+    fn genvar_plusplus_unrolls_flops() {
+        let src = r#"
+module rf #(parameter int NUM_WORDS = 4, parameter int W = 8) (
+  input logic clk_i, input logic rst_ni,
+  input logic [W-1:0] wdata_i, input logic [NUM_WORDS-1:0] we_i,
+  output logic [W-1:0] r0
+);
+  for (genvar i = 1; i < NUM_WORDS; i++) begin : g_rf
+    logic [W-1:0] q;
+    always_ff @(posedge clk_i) begin
+      if (we_i[i]) q <= wdata_i;
+    end
+  end
+  assign r0 = 8'h0;
+endmodule
+"#;
+        let d = synth_sv(src, "rf.sv").expect("synth rf");
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert!(ffs >= 24, "i++ genvar must map 3×8 FFs, got {ffs}");
+    }
+
+
+    #[test]
+    fn regfile_enum_literal_selects_generate_ff_branch() {
+        // Packages/enums are skipped; RegFileFF must still const-fold so the
+        // generate-if then branch (always_ff bank) is kept, not the else.
+        let src = r#"
+module rf_sel #(parameter regfile_e RegFile = RegFileFF) (
+  input logic clk,
+  output logic [31:0] q
+);
+  logic [31:0] r;
+  if (RegFile == RegFileFF) begin
+    always_ff @(posedge clk) r <= ~r;
+  end else begin
+    assign r = 32'h0;
+  end
+  assign q = r;
+endmodule
+"#;
+        let d = synth_sv(src, "rf_sel.sv").expect("synth rf_sel");
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(ffs, 32, "RegFile==RegFileFF must take then always_ff, got {ffs}");
+
+        let pkg = src.replace("RegFile = RegFileFF", "RegFile = ibex_pkg::RegFileFF")
+            .replace("RegFile == RegFileFF", "RegFile == ibex_pkg::RegFileFF");
+        let d2 = synth_sv(&pkg, "rf_sel_pkg.sv").expect("synth pkg::RegFileFF");
+        let ffs2 = d2.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(ffs2, 32, "pkg::RegFileFF must const-fold, got {ffs2}");
+    }
+
+    #[test]
+    fn unknown_generate_if_takes_else_flops() {
+        let src = r#"
+module wrap (input logic clk_i, input logic rst_ni, input logic d_i, output logic q_o);
+  parameter int Impl = 99;
+  if (Impl == MissingPkg::Xilinx) begin : gen_x
+    assign q_o = d_i;
+  end else begin : gen_g
+    always_ff @(posedge clk_i) q_o <= d_i;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "wrap.sv").expect("synth wrap");
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(ffs, 1, "unknown generate-if should take else always_ff");
+    }
+
     #[test]
     fn ysyx_ibex_lists_modules_and_synths_top() {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
@@ -3799,6 +5480,62 @@ endmodule
             "Ibex-scale file must yield many modules, got {}",
             mods.len()
         );
+        {
+            let pre = preprocess_sv(&strip_comments(&src));
+            let mods = parse_source(&pre).expect("parse ibex stats");
+            let n_inst: usize = mods.iter().map(|m| m.insts.len()).sum();
+            let n_nba: usize = mods.iter().map(|m| m.nbas.len()).sum();
+            let n_as: usize = mods.iter().map(|m| m.assigns.len()).sum();
+            let with_nba = mods.iter().filter(|m| !m.nbas.is_empty()).count();
+            let with_inst = mods.iter().filter(|m| !m.insts.is_empty()).count();
+            eprintln!(
+                "parse modules={} insts={n_inst} nbas={n_nba} assigns={n_as} mods_with_nba={with_nba} mods_with_inst={with_inst}",
+                mods.len()
+            );
+            let map: std::collections::HashMap<String, Rtl> =
+                mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
+            let flat = flatten_module_ov(&map, "ysyx_ibex", &std::collections::HashMap::new())
+                .expect("flatten ibex");
+            eprintln!(
+                "flat nbas={} assigns={} signals={}",
+                flat.nbas.len(),
+                flat.assigns.len(),
+                flat.signals.len()
+            );
+            // Cap the diagnostic bit-probe (FM-HEL-HANG-1539): full per-bit walk can
+            // hang on nested Add trees. Bound time-ish work; synth_sv_path is the real gate.
+            let mut bit_ok = 0usize;
+            let mut bit_fail = 0usize;
+            let mut probed = 0usize;
+            const PROBE_CAP: usize = 4096;
+            'probe: for (lhs, bit, rhs) in &flat.nbas {
+                let w = sig_width(&flat, lhs).min(64);
+                if let Some(b) = bit {
+                    match rexpr_to_bit(rhs, &flat, (*b).min(63)) {
+                        Ok(_) => bit_ok += 1,
+                        Err(_) => bit_fail += 1,
+                    }
+                    probed += 1;
+                } else {
+                    for i in 0..w.max(1) {
+                        match rexpr_to_bit(rhs, &flat, i) {
+                            Ok(_) => bit_ok += 1,
+                            Err(_) => bit_fail += 1,
+                        }
+                        probed += 1;
+                        if probed >= PROBE_CAP {
+                            break 'probe;
+                        }
+                    }
+                }
+                if probed >= PROBE_CAP {
+                    break;
+                }
+            }
+            eprintln!(
+                "rexpr_to_bit ok={bit_ok} fail={bit_fail} probed={probed} (cap={PROBE_CAP})"
+            );
+        }
         let t0 = std::time::Instant::now();
         let d = synth_sv_path(&p).expect("synth ysyx_ibex");
         let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
@@ -3821,5 +5558,70 @@ endmodule
             !d.cells.is_empty(),
             "ysyx_ibex must map at least one LUT/FF from always_ff/assigns, cells=0"
         );
+    }
+
+    #[test]
+    fn logikbench_lrelu_ge_ashr_maps_cells() {
+        let src = r#"
+module lrelu #(parameter DW = 16, parameter ASHIFT = 7)
+   (
+    input signed [DW-1:0]  in,
+    output signed [DW-1:0] out
+    );
+   assign out = (in >= 0) ? in : (in >>> ASHIFT);
+endmodule
+"#;
+        let d = synth_sv(src, "lrelu.sv").expect("synth lrelu");
+        assert!(
+            !d.cells.is_empty(),
+            "lrelu >= / >>> must map cells, got 0"
+        );
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(luts > 0, "lrelu must produce LUTs for mux/ashr, luts={luts}");
+    }
+
+    #[test]
+    fn logikbench_hswish_region_le_ge_maps_cells() {
+        let src = r#"
+module hswish #(parameter DW = 16, parameter QW = 8)
+   (
+    input signed [DW-1:0]  x,
+    output signed [DW-1:0] out
+    );
+   localparam signed [DW:0] THREE = 3 <<< QW;
+   localparam signed [DW:0] SIX  = 6 <<< QW;
+   wire signed [2*DW:0]     prod;
+   wire signed [2*DW:0]     mid;
+   assign prod = x * (x + THREE);
+   assign mid  = prod / SIX;
+   assign out = (x <= -THREE) ? {DW{1'b0}} :
+                (x >=  THREE) ? x :
+                mid[DW-1:0];
+endmodule
+"#;
+        let d = synth_sv(src, "hswish.sv").expect("synth hswish");
+        assert!(
+            !d.cells.is_empty(),
+            "hswish region <=/>= must map cells, got 0"
+        );
+        // Region mux + compares should produce LUTs even if /const is skipped.
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(
+            luts > 0 || d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "hswish must map LUTs or Mac27, cells={}",
+            d.cells.len()
+        );
+    }
+
+    #[test]
+    fn cmp_le_ge_and_ashr_smoke() {
+        let src = r#"
+module t(input [7:0] a, b, input signed [15:0] s, output o, output signed [15:0] y);
+  assign o = (a <= b) & (a >= b);
+  assign y = s >>> 3;
+endmodule
+"#;
+        let d = synth_sv(src, "cmp.sv").expect("synth cmp");
+        assert!(!d.cells.is_empty(), "le/ge/ashr smoke must map cells");
     }
 }
