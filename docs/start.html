@@ -32,7 +32,18 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Getting started</h1>
-      <p class="lede">There is no installer. Clone the tree, run the gold, then open the IDE. Native desktop target is Apple Silicon; CI is Linux.</p>
+      <p class="lede">Install from a GitHub Release, or clone and run the gold. Native desktop target is Apple Silicon; CI is Linux.</p>
+
+      <h2>Download</h2>
+      <p>
+        Each tagged version publishes <code>Helion.app</code> (unsigned Apple Silicon),
+        a darwin-arm64 tarball, and a Linux x86_64 tarball, plus <code>SHA256SUMS.txt</code>.
+      </p>
+      <p class="cta">
+        <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 1.0 →</a>
+        <a class="btn ghost" href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a>
+      </p>
+      <p>macOS will warn that the app is unsigned. That is expected until notarization exists.</p>
 
       <h2>Needs</h2>
       <ul>

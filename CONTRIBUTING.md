@@ -26,6 +26,9 @@ Site (LMMS-style on-ramp): [docs](https://helion-fpga.github.io/helion/) · [get
 4. One change, one crate when you can. While iterating: **`cargo test -p CRATE --lib TESTNAME`** (one test name).
 5. Open a PR. Fill the template. Fix CI.
 
+Releases (tags, notes, binaries) are cut from `master` per [`RELEASING.md`](RELEASING.md).
+Do not attach vendor bitstreams to a GitHub Release.
+
 ## Where to look
 
 | Want | Path |
