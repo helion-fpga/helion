@@ -159,3 +159,32 @@ cargo run -p helion-cli --release --target aarch64-apple-darwin -- project examp
 `HELION_HAD` overrides the part database (otherwise the binary searches
 `Helion.app/Contents/Resources/devices/helion`, then cwd, then the compile-time tree).
 Native arm64 only — no Rosetta, no vendor bitstream, no Docker.
+
+## IP packages (`.helion`)
+
+Format-1 text manifests next to catalog HDL (`ip/h_gpio`, `ip/h_uart`, `ip/h_rv32_hb1`).
+Bus is **Helion-MM** / **Helion-ST** only (never AXI as a Helion product). See [`ip/README.md`](ip/README.md).
+
+```bash
+helion ip list
+helion ip show ip/h_gpio/h_gpio.helion
+helion project examples/ip_ingest/counter_ip.prj
+# .prj: read_ip ip/h_gpio/h_gpio.helion
+```
+
+## Program / mpsse-sim / OFL (honesty)
+
+No live FTDI on the Linux box → detect must stay **0 probes** / refuse DONE.
+Sim path for TAP STAT without hardware:
+
+```bash
+./scripts/ibex-prog-mpsse-sim-smoke.sh   # pin-wrap / reduced / bare under ≤120s
+helion-prog --detect                    # OFL on PATH → physical_had=0 when empty
+```
+
+`openFPGALoader` on the box is legal OSS only. Never invent Helion TAP STAT; never claim board DONE without live TDO evidence. Notes: [`docs/FM-HEL-TOP-ofl-box.md`](docs/FM-HEL-TOP-ofl-box.md), [`docs/FM-HEL-TOP-tap-ibex-smoke.md`](docs/FM-HEL-TOP-tap-ibex-smoke.md).
+
+## Cap holds (Ibex / pin-wrap)
+
+Under `IBEX_IMPL_CAP_SEC=120` (never uncapped): **imux_skip=0**, **IOB=1**, counter gold **WNS_PS=9640**.
+Pin-wrap wall after keep/md + STA index (`4b14490`): **~1.40s**; residual AIG/flowmap **STOP** (no cheap cut) — [`docs/FM-HEL-TOP-aig-flowmap-residual.md`](docs/FM-HEL-TOP-aig-flowmap-residual.md). Place affinity cut: [`docs/FM-HEL-TOP-place-legalize-speed.md`](docs/FM-HEL-TOP-place-legalize-speed.md).

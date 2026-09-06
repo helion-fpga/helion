@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~03:10 America/New_York  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
-**Tip:** `4b14490` (unchanged — **not shipped**)  
+**Code tip:** `4b14490` (wall cut not shipped) · **Stamp:** `a03f3f2`  
 **Gold:** `WNS_PS=9640` **held**
 
 ## Goal
@@ -77,7 +77,7 @@ Inspected `Aig::{from_expr,flowmap_lut6,eval_lit_memo}` and `synth_rtl` map loop
 ## What was not done
 
 - No AIG/flowmap algorithm rewrite
-- No commit/push on `helion` (bar did not move)
+- No wall-cut commit (bar did not move); STOP stamp only
 - No merge / no force-push / no uncapped Ibex
 - No invented STAT / fake DONE
 
