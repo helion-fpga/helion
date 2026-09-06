@@ -1,52 +1,46 @@
 # Schematic deepen vs Yosys connectivity
 
-**Date:** 2026-09-05/06 (America/New_York)
-**Status:** **DONE-at-57** (sample deepen; GUI hierarchy sheet nav patched on Mac working tree — push pending if Mac offline)
+**Date:** 2026-09-06 (America/New_York)
+**Status:** **DONE-at-57** (expand residual: no new fold-ins; IDE regen deferred)
 **Scope:** capped sample of phase-d PASS designs (no uncapped Ibex/sha256)
 **Gold:** `WNS_PS=9640` held
 **Phase-d score:** PASS 98 / SOFT 2 / FAIL 0 (uart, ysyx_ibex) — deepen does not flip residuals
-**Push:** doc/code on `fm-hel-corpus-soft-pass` (NO MERGE)
+**Push:** doc on `fm-hel-corpus-soft-pass` (NO MERGE)
 
-## Method (gap-3 continuation)
+## Method (gap-3 expand attempt)
 
-1. Prior DONE-at-48 already on PR #7 (`f21e4f9`).
-2. Fold leftover phase-d `helion_schematic.out` dumps with non-empty synth+schematic+drawing into sample (no new IDE runs).
-3. Exclude `sha256` / `ysyx_ibex` (capped residuals) and 41 EMPTY_SYNTH dumps (stale ide cells=0).
-4. GUI: wire Hierarchy pane → schematic sheet (`open_hierarchy_sheet`); timing-path highlight already present (`select_timing_path`).
+1. Prior DONE-at-57 already on branch (`docs/FM-HEL-CORPUS-schematic-deepen.md`).
+2. Re-scanned all phase-d `helion_schematic.out` not in sample:
+   - foldable non-empty leftovers: **only** `sha256`, `ysyx_ibex` → **excluded** (capped / intentional skip)
+   - **41 EMPTY_SYNTH** stale dumps (`synth cells=0`) — need fresh `helion-ide --stdin`
+3. Box has `helion-ide` at `/workspace/helion/target/debug/helion-ide`; Mac unreachable this pass.
+4. Expand steered to **ship now** (no multi-design IDE batch this turn).
 
-## Sample table (n=+9 leftover phase-d fold-in)
+## Sample deepen counts
 
-| id | deepen | Helion synth | sch cells/edges | draw sym/wires | Yosys cells | notes |
-|----|--------|--------------|-----------------|----------------|-------------|-------|
-| pipeline | PASS | 1 | 1/0 | 8/0 | 1056 | no_wires |
-| ramasync | PASS | 1 | 1/0 | 6/0 | 8768 | no_wires |
-| ramspnc | PASS | 1 | 1/0 | 7/0 | 35014 | no_wires |
-| cache | PASS | 7 | 7/8 | 15/12 | 62260 | - |
-| complex | PASS | 129 | 22/0 | 24/34 | 34 | hierarchical; sch visible < flat synth |
-| dffasync | PASS | 129 | 129/4097 | 133/194 | 64 | - |
-| dffsync | PASS | 129 | 129/4097 | 133/194 | 64 | - |
-| icg | PASS | 131 | 2/0 | 6/8 | 68 | hierarchical; sch visible < flat synth |
-| fifoasync | PASS | 145 | 145/4039 | 155/290 | 2383 | - |
+**PASS 57 / SOFT 0 / FAIL 0** (n=57; before=57 — no move)
 
-**Sample deepen counts:** PASS 57 / SOFT 0 / FAIL 0 (n=57; before=48)
+JSON: `dashboard/schematic-deepen-sample.json`  
+Raw: `dashboard/schematic-deepen-raw/` (58 files; `fsm.out` is TIMEOUT cells=39628 — not in sample)
 
-## GUI depth features
+## Remaining EMPTY_SYNTH (41) — skip / regen map
 
-| feature | status | hook |
-|---------|--------|------|
-| Timing-path highlight (Fig. 59) | working (pre-existing) | `select_timing_path` → highlight_cells/nets + path_only |
-| Hierarchy sheet navigation (Fig. 61→55/56) | patched in Mac WT | `open_hierarchy_sheet` + Hierarchy double-click / Show in Schematic |
-| Sheet find / Expand Inside | working | `sheet_find`, schematic double-click instance |
+### Cheap regen candidates (helion cells ≤500) — 18
 
-## Still missing
+`addtree`(149), `bin2prio`(131), `bnor`(128), `bor`(129), `bxnor`(442), `bxor`(443), `cam`(85), `csa42`(97), `dec`(312), `div`(134), `fsm`(17), `ln`(87), `log2`(170), `mod`(118), `muxhot`(129), `muxpri`(129), `serv`(321), `tmr`(128)
 
-- ~41 EMPTY_SYNTH leftovers need fresh rebuilt `helion-ide` dumps
-- Large/timeout: fsm schematic timeout; big cells (muladdc/hamming/…)
-- Full ~98 PASS not schematic-swept; sha256/Ibex intentionally skipped
-- Mac commit+push of GUI patch + docs may still be pending if machine offline
+### Skip / defer (>500 or SOFT / hang risk) — 23
+
+`absdiff`, `add`, `addmod`, `addsub`, `clamp`, `cmp`, `crc32`, `divs`, `hamming`, `hswish`, `macc`, `max`, `maxn`, `min`, `muladdc`, `muxcase`, `rambit`, `rambyte`, `raminit`, `ramsdp`, `ramsp`, `rom`, `uart`  
+Plus intentional skip: `sha256`, `ysyx_ibex` (not EMPTY; excluded from deepen sample).
+
+## Blockers
+
+- Fresh schematic dumps require headless IDE runs; expand turn capped to ship without batch regen.
+- Mac local-tool unreachable for GUI WT push this pass.
+- Full ~98 PASS not schematic-swept until cheap-18 regenerated + folded.
 
 ## Bar move
 
-- Schematic connectivity sample: **48 → 57 PASS** / 0 SOFT / 0 FAIL
-- Raw dumps: `dashboard/schematic-deepen-raw/` (+9 copies)
-- JSON: `dashboard/schematic-deepen-sample.json`
+- Schematic connectivity sample: **57 → 57 PASS** / 0 SOFT / 0 FAIL (held)
+- Next lever: regenerate cheap-18 EMPTY_SYNTH with capped/headless `helion-ide`, fold into sample → target n≈75
