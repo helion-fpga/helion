@@ -18,16 +18,22 @@ pub const NAV_WIDTH: f32 = RAIL_WIDTH;
 pub const TREE_WIDTH: f32 = SIDEBAR_WIDTH;
 /// Properties dock — shown on selection, not always-on.
 pub const PROPERTIES_WIDTH: f32 = 220.0;
-pub const TOOLBAR_HEIGHT: f32 = 40.0;
+pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const RAIL_MIN_HEIGHT: f32 = TOOLBAR_HEIGHT;
 pub const STATUS_HEIGHT: f32 = 22.0;
 pub const HIT_PRIMARY: f32 = 32.0;
+/// Comfort primary (Implement / Open) — ≥44 where the toolbar has room.
+pub const HIT_COMFORT: f32 = 36.0;
 pub const HIT_SIDEBAR: f32 = 28.0;
 pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
+/// Occupancy / util bars (NICE leftover: was 12px).
+pub const OCCUPANCY_BAR_H: f32 = 20.0;
+/// Calm splitter grab radius (4–6px ship; not neon QA slab).
+pub const SPLITTER_GRAB_PX: f32 = 6.0;
 /// Bounded height for in-pane Name/Value grids so they cannot eat the CentralPanel.
 pub const TABLE_MAX_HEIGHT: f32 = 180.0;
 /// Device/Package tables stack above the canvas; keep them compact so the die expands.
-pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 220.0;
+pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 140.0;
 /// Floorplan / package canvas never shrinks below this if the pane has room.
 pub const DRAWING_MIN_HEIGHT: f32 = 280.0;
 /// Idle paint policy (Air budgets): eframe reactive; no continuous `request_repaint`.
@@ -143,7 +149,7 @@ impl Activity {
             Activity::Device => "Device",
             Activity::Timing => "Timing",
             Activity::Simulate => "Sim",
-            Activity::Program => "Prog",
+            Activity::Program => "Program",
             Activity::Reports => "Reports",
         }
     }
@@ -548,8 +554,13 @@ mod tests {
             );
         }
         assert_eq!(Activity::Simulate.short_label(), "Sim");
-        assert_eq!(Activity::Program.short_label(), "Prog");
+        assert_eq!(Activity::Program.short_label(), "Program");
+        assert_eq!(Activity::Program.short_label().chars().count(), 7);
         assert_eq!(RAIL_WIDTH, 48.0);
+        assert_eq!(HIT_COMFORT, 36.0);
+        assert_eq!(OCCUPANCY_BAR_H, 20.0);
+        assert!((4.0..=6.0).contains(&SPLITTER_GRAB_PX));
+        assert_eq!(DEVICE_TABLES_MAX_HEIGHT, 140.0);
     }
 }
 
