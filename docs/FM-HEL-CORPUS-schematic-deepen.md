@@ -1,10 +1,11 @@
 # Schematic deepen vs Yosys connectivity
 
-**Date:** 2026-09-05 (America/New_York evening); expand same evening
+**Date:** 2026-09-05 (America/New_York evening); expand + closeout same evening / early 2026-09-06
+**Status:** **DONE-at-48** (sample closed; not full phase-d PASS sweep)
 **Scope:** capped sample of phase-d PASS designs (no uncapped Ibex/sha256)
 **Gold:** `WNS_PS=9640` held (`helion report_timing examples/counter.sv`)
 **Phase-d score:** unchanged PASS 97 / SOFT 3 / FAIL 0 (no residual flipped)
-**Push:** none
+**Push:** doc-only on `fm-hel-corpus-soft-pass` (no chrome, no hang reverts, no merge)
 
 ## Method
 
@@ -13,6 +14,7 @@
 3. Coarse grade: empty cone/drawing when synth cells>0 → SOFT; synth 0 vs Yosys cells>0 → FAIL; else PASS. Also note Mac27 `:nc` pins and wire counts.
 4. Fix cheap bugs found; smoke with unit tests + sample re-dump.
 5. **Expand:** prior n=16 → add ~24 more small/medium PASS (helion cells≤500); exclude hang-prone / uncapped residuals.
+6. **Closeout expand:** fold 7 already-dumped PASS leftovers in `schematic-deepen-raw/` (no new IDE runs) → n=48. Stop.
 
 ## Issues found
 
@@ -24,6 +26,8 @@
 | Harness ignored empty cones | False PASS when dump keywords present but cells=0 | SOFT if `synth_design cells>0` but schematic/drawing empty |
 
 **Expand round:** no new cheap FAIL bugs. `fsm` IDE synth → 39628 cells then schematic timeout (75s) → SOFT; not fixed (not cheap). Replaced in PASS sample by `gray2bin` + `binv`.
+
+**Closeout round:** no new IDE runs / no code changes. Graded leftover raw dumps; 7 PASS folded in; `fsm` remains SOFT/excluded.
 
 ## Sample table (n=16 prior)
 
@@ -76,14 +80,41 @@
 | gray2bin | PASS | 65 | 65/2016 | 67/64 | 63 | fsm-timeout swap-in |
 | binv | PASS | 65 | 65/2017 | 67/65 | 64 | fsm-timeout swap-in |
 
-**Sample deepen counts:** PASS 41 / SOFT 0 / FAIL 0 (n=41; fsm attempted → SOFT timeout, excluded)
+## Sample table (n=+7 closeout fold-in)
+
+Already-present raw dumps under `dashboard/schematic-deepen-raw/` that were graded but not yet in the JSON sample:
+
+| id | deepen | Helion synth | sch cells/edges | draw sym/wires | Yosys cells | notes |
+|----|--------|--------------|-----------------|----------------|-------------|-------|
+| atan | PASS | 54 | 54/1194 | 56/436 | 4306 | - |
+| bnand | PASS | 65 | 65/64 | 67/65 | 64 | - |
+| cos | PASS | 54 | 54/1194 | 56/436 | 5804 | - |
+| dotprod | PASS | 75 | 75/623 | 78/35 | 14175 | mac_nc=24 |
+| firfix | PASS | 70 | 70/2345 | 75/204 | 8531 | - |
+| fmadd32 | PASS | 79 | 33/496 | 37/99 | 4056 | hierarchical; sch visible < flat synth |
+| mulc | PASS | 66 | 66/1056 | 72/68 | 7477 | mac_nc=4 |
+
+**Sample deepen counts:** PASS 48 / SOFT 0 / FAIL 0 (n=48; fsm attempted → SOFT timeout, excluded)
+
+## DONE-at-48 — why stop here
+
+**What 48 covers:** small/medium phase-d PASS designs across counters, mux/arbiter, FIFO, DSP/Mac27 (mul/mac/fmadd*), bit-twiddles, activations (gelu/lrelu/exp), trig approx (atan/cos), FIR, and hierarchical FMADD — all with non-empty schematic cone + drawing vs Yosys cell counts. Cheap connectivity bugs already fixed (Mac27 nets, IndexPart mul false-positive, empty-cone harness SOFT).
+
+**Why not expand now (remaining ~49 PASS + 3 SOFT):**
+- No more free raw dumps; further expand needs fresh `helion-ide` stdin runs (minutes each; fsm already 75s timeout at 39k cells).
+- Many remainders are large (muxcase/add/hamming/clamp/max/min/macc/muladdc 10k–65k Helion cells) or RAM-heavy — outside the ≤500-cell cheap band used for expand.
+- Capped-only policy: sha256 / ysyx_ibex / uart residuals untouched; hang fix already pushed — do not re-touch.
+- Chrome WIP stays unstaged; deepen is doc/sample closeout only.
+- Phase-d bar already 97P/3S/0F; schematic deepen is a connectivity sample, not a second full corpus.
+
+**Residual gaps:** unused Mac27 `:nc` pins on some DSP maps (noted, not FAIL); hierarchical designs show sch cells < flat synth; `crossbar` drawing wires=0; `fsm` schematic timeout; full 97 PASS not schematic-swept.
 
 ## Code fixes
 
 - `crates/helion-sv/src/lib.rs`: `emit_mac27` + `mac_ab_c_from_rhs`; IndexPart excluded from `expr_contains_mul`; Mac unit tests assert net_on A/B/C/P. *(prior round)*
 - `harness/corpus_one.py`: empty-cone SOFT when open synth cells>0. *(prior round)*
 - Rebuilt `target/debug/helion` + `helion-ide`. *(prior round)*
-- **Expand round:** no new code changes.
+- **Expand / closeout rounds:** no new code changes.
 
 ## Residuals / alt golden (cheap only)
 
@@ -97,5 +128,5 @@
 ## Bar move
 
 - **Phase-d dashboard score:** no change (97/3/0). Residuals sha256/uart/ysyx_ibex still SOFT.
-- **Schematic connectivity (sample):** n=16 → n=41 PASS / 0 SOFT / 0 FAIL (FAIL=0 held).
+- **Schematic connectivity (sample):** n=16 → n=41 → **n=48 PASS** / 0 SOFT / 0 FAIL (FAIL=0 held).
 - Raw dumps: `dashboard/schematic-deepen-raw/`; JSON: `dashboard/schematic-deepen-sample.json`.
