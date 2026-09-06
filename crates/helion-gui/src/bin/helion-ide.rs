@@ -187,6 +187,10 @@ fn run_gui() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            cc.egui_ctx.style_mut(|s| {
+                s.interaction.resize_grab_radius_side = chrome::SPLITTER_GRAB_PX;
+                s.interaction.resize_grab_radius_corner = chrome::SPLITTER_GRAB_PX + 4.0;
+            });
             Ok(Box::new(HelionIde::new()))
         }),
     )
@@ -380,8 +384,15 @@ fn run_implement(app: &mut HelionIde) {
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add_sized(
-        [ui.spacing().interact_size.x.max(96.0), chrome::HIT_PRIMARY],
+        [ui.spacing().interact_size.x.max(96.0), chrome::HIT_COMFORT],
         egui::Button::new(RichText::new(text).size(14.0)),
+    )
+}
+
+fn sidebar_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.spacing().interact_size.x.max(72.0), chrome::HIT_SIDEBAR],
+        egui::Button::new(text),
     )
 }
 
@@ -415,7 +426,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                 ui.add_space(6.0);
                 let open = ui
                     .add_sized(
-                        [72.0, chrome::HIT_PRIMARY],
+                        [80.0, chrome::HIT_COMFORT],
                         egui::Button::new("Open…"),
                     )
                     .on_hover_text(tip("Open", "⌘O", "open_source"));
@@ -460,7 +471,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.add_enabled_ui(synth_blocked.is_none(), |ui| {
                         let impl_btn = ui
                             .add_sized(
-                                [112.0, chrome::HIT_PRIMARY],
+                                [120.0, chrome::HIT_COMFORT],
                                 egui::Button::new(RichText::new("Implement").strong()),
                             )
                             .on_hover_text(match synth_blocked {
@@ -475,7 +486,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.add_enabled_ui(bits_blocked.is_none(), |ui| {
                         let b = ui
                             .add_sized(
-                                [88.0, chrome::HIT_PRIMARY],
+                                [84.0, chrome::HIT_PRIMARY],
                                 egui::Button::new("Bitstream"),
                             )
                             .on_hover_text(match bits_blocked {
@@ -523,7 +534,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(64.0, 28.0), Sense::click());
+                    ui.allocate_exact_size(egui::vec2(68.0, 32.0), Sense::click());
                 if ui.is_rect_visible(rect) {
                     ui.painter().rect(
                         rect,
@@ -589,22 +600,26 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                     );
                     let c = rect.center();
                     ui.painter().text(
-                        egui::pos2(c.x, c.y - 8.0),
+                        egui::pos2(c.x, c.y - 9.0),
                         egui::Align2::CENTER_CENTER,
                         act.icon(),
-                        egui::FontId::proportional(15.0),
+                        egui::FontId::proportional(13.0),
+                        if on {
+                            Color32::from_rgb(0xc8, 0xf0, 0xd8)
+                        } else {
+                            Color32::from_rgb(0xb0, 0xb8, 0xc0)
+                        },
+                    );
+                    ui.painter().text(
+                        egui::pos2(c.x, c.y + 11.0),
+                        egui::Align2::CENTER_CENTER,
+                        act.short_label(),
+                        egui::FontId::proportional(10.0),
                         if on {
                             Color32::from_rgb(0xc8, 0xf0, 0xd8)
                         } else {
                             Color32::from_rgb(0xdc, 0xe0, 0xe4)
                         },
-                    );
-                    ui.painter().text(
-                        egui::pos2(c.x, c.y + 12.0),
-                        egui::Align2::CENTER_CENTER,
-                        act.short_label(),
-                        egui::FontId::proportional(9.0),
-                        Color32::from_rgb(0x9a, 0xa4, 0xae),
                     );
                 }
                 let resp = resp.on_hover_text(act.hover());
@@ -675,6 +690,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     let det = helion_hw::detect_boards();
     ui.label(RichText::new("Cable").strong());
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         for (id, label) in [
             ("auto", "auto"),
             ("sim", "sim"),
@@ -682,7 +698,11 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
             ("native", "native→ofl"),
         ] {
             let selected = app.program_cable == id;
-            if ui.selectable_label(selected, label).clicked() {
+            let resp = ui.add_sized(
+                [72.0, chrome::HIT_SIDEBAR],
+                egui::Button::selectable(selected, label),
+            );
+            if resp.clicked() {
                 app.program_cable = id.to_string();
             }
         }
@@ -731,9 +751,15 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.label(format!("Last implement · {frames} frames · {bytes} B"));
     } else {
         ui.label(
-            RichText::new("No bitstream yet. Run Implement → Bitstream.")
+            RichText::new("No bitstream yet.")
                 .color(Color32::from_rgb(0xe0, 0xa0, 0x40)),
         );
+        if primary_button(ui, "Generate Bitstream")
+            .on_hover_text(tip("Bitstream", "", "write_bitstream"))
+            .clicked()
+        {
+            let _ = app.model.run_step(FlowStep::Bitstream);
+        }
     }
     ui.add_space(6.0);
 
@@ -762,9 +788,8 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.add_space(8.0);
 
     ui.horizontal(|ui| {
-        if ui
-            .small_button("Detect")
-            .on_hover_text("list_cables / detect_boards")
+        if sidebar_button(ui, "Detect")
+            .on_hover_text("Detect cables")
             .clicked()
         {
             app.program_status = Some((true, det.text().trim().to_string()));
@@ -773,23 +798,21 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
         let prog = primary_button(ui, "Program").on_hover_text(if bits_done {
             tip("Program", "", "program_hw")
         } else {
-            "No bitstream — Implement first".into()
+            "No bitstream yet — Generate Bitstream first".into()
         });
         if prog.clicked() {
             if !bits_done {
                 app.program_status = Some((
                     false,
-                    "program_hw: no bitstream — Implement, then Bitstream (or helion bitstream -o out.hbits)".into(),
+                    "No bitstream yet. Run Implement, then Generate Bitstream.".into(),
                 ));
             } else {
                 let cable = app.program_cable.clone();
-                // Sync program path overwrites status before the next paint; skip interim text.
-                // Ensure HW manager open, then program with selected cable backend.
                 let _ = app.model.exec("open_hw_manager");
                 match app.model.program_hw_with_cable(&cable) {
                     Ok(s) => {
                         app.program_status =
-                            Some((true, format!("{s} · frames={frames} bytes={bytes}")));
+                            Some((true, format!("{s} · {frames} frames · {bytes} B")));
                     }
                     Err(e) => app.program_status = Some((false, e)),
                 }
@@ -873,6 +896,9 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
         .collect();
     if rows.is_empty() {
         ui.label("No netlist yet.");
+        if primary_button(ui, "Implement").clicked() {
+            let _ = app.model.implement();
+        }
         return;
     }
     let selected = app.model.selected.clone();
@@ -981,23 +1007,37 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         .min_height(80.0)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 let console_on = app.model.bottom_tab == BottomTab::Tcl
                     || app.model.bottom_tab == BottomTab::Log;
-                if ui.selectable_label(console_on, "Console").clicked() {
+                let c = ui.add_sized(
+                    [88.0, chrome::HIT_SIDEBAR],
+                    egui::Button::selectable(console_on, "Console"),
+                );
+                if c.clicked() {
                     app.model.bottom_tab = BottomTab::Tcl;
                 }
-                if ui
-                    .selectable_label(app.model.bottom_tab == BottomTab::Messages, "Messages")
-                    .clicked()
-                {
+                let m = ui.add_sized(
+                    [96.0, chrome::HIT_SIDEBAR],
+                    egui::Button::selectable(
+                        app.model.bottom_tab == BottomTab::Messages,
+                        "Messages",
+                    ),
+                );
+                if m.clicked() {
                     app.model.bottom_tab = BottomTab::Messages;
                 }
-                if app.activity == Activity::Simulate
-                    && ui
-                        .selectable_label(app.model.bottom_tab == BottomTab::SimLog, "Sim log")
-                        .clicked()
-                {
-                    app.model.bottom_tab = BottomTab::SimLog;
+                if app.activity == Activity::Simulate {
+                    let s = ui.add_sized(
+                        [88.0, chrome::HIT_SIDEBAR],
+                        egui::Button::selectable(
+                            app.model.bottom_tab == BottomTab::SimLog,
+                            "Sim log",
+                        ),
+                    );
+                    if s.clicked() {
+                        app.model.bottom_tab = BottomTab::SimLog;
+                    }
                 }
             });
             match app.model.bottom_tab {
@@ -1537,9 +1577,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
             let q = model.console_find.clone();
             let _ = model.find_console(&q);
         }
-        if let Some(i) = model.console_selected {
-            ui.weak(format!("sel={i}"));
-        }
+        // selection highlighted in the journal grid — no sel= dump crumb
     });
     let selected = model.console_selected;
     let hits = model.console_find_hits.clone();
@@ -1843,7 +1881,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                             };
                             let bar_w = 160.0 * (row.available as f32 / max_avail).clamp(0.25, 1.0);
                             let (rect, _) =
-                                ui.allocate_exact_size(egui::vec2(bar_w, 12.0), Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
                             ui.painter().rect_filled(
                                 rect,
                                 2.0,
@@ -1949,7 +1987,7 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Runs");
     ui.horizontal(|ui| {
         if ui
-            .add_sized([140.0, chrome::HIT_PRIMARY], egui::Button::new("Launch selected"))
+            .add_sized([148.0, chrome::HIT_COMFORT], egui::Button::new("Launch selected"))
             .clicked()
         {
             if let Some(name) = model
@@ -2024,7 +2062,7 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
     {
         let cmp: Vec<_> = model.compare_run_rows().into_iter().cloned().collect();
         if cmp.is_empty() {
-            ui.label("No runs yet.");
+            ui.label("No runs yet. Use New run… or Launch selected.");
         } else {
             egui::Grid::new("compare_runs_table")
                 .spacing([8.0, 4.0])
@@ -2082,6 +2120,9 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick_obj: Option<String> = None;
     if rows.is_empty() {
         ui.label("No incremental report yet.");
+        if primary_button(ui, "Run incremental").clicked() {
+            let _ = model.exec("incremental_impl");
+        }
         return;
     }
     egui::ScrollArea::both()
@@ -2175,6 +2216,9 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick_obj: Option<String> = None;
     if rows.is_empty() {
         ui.label("No ECO cells yet.");
+        if primary_button(ui, "Insert ECO LUT").clicked() {
+            let _ = model.exec("insert_eco_lut");
+        }
         return;
     }
     egui::ScrollArea::both()
@@ -2234,12 +2278,16 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hierarchy");
     let drawing = model.hierarchy.drawing();
-    ui.label(format!(
-        "boxes={} canvas={}×{}",
-        drawing.boxes.len(),
-        drawing.width as i32,
-        drawing.height as i32
-    ));
+    ui.label(
+        RichText::new(format!(
+            "{} blocks · {}×{}",
+            drawing.boxes.len(),
+            drawing.width as i32,
+            drawing.height as i32
+        ))
+        .small()
+        .weak(),
+    );
     let selected = model.selected.clone();
     let mut pick = None;
     egui::ScrollArea::both()
@@ -2380,7 +2428,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("No hits — try Find, or `find` in the console.");
+                        ui.label("No hits yet. Try Find above.");
                         ui.label("—");
                         ui.end_row();
                     } else {
@@ -2506,7 +2554,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("IOSTANDARD");
             for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
-                if ui.small_button(std).clicked() {
+                if ui.add_sized([64.0, chrome::HIT_SIDEBAR], egui::Button::new(std)).clicked() {
                     set_iostd = Some((port.to_string(), std));
                 }
             }
@@ -2514,7 +2562,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("DRIVE");
             for ma in ["4", "8", "12", "16"] {
-                if ui.small_button(ma).clicked() {
+                if ui.add_sized([40.0, chrome::HIT_SIDEBAR], egui::Button::new(ma)).clicked() {
                     set_io = Some((port.to_string(), "DRIVE", ma));
                 }
             }
@@ -2522,7 +2570,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("SLEW");
             for s in ["SLOW", "FAST"] {
-                if ui.small_button(s).clicked() {
+                if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
                     set_io = Some((port.to_string(), "SLEW", s));
                 }
             }
@@ -2530,7 +2578,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("PULLTYPE");
             for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
-                if ui.small_button(s).clicked() {
+                if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
                     set_io = Some((port.to_string(), "PULLTYPE", s));
                 }
             }
@@ -2538,7 +2586,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("DIFF_TERM");
             for s in ["FALSE", "TRUE"] {
-                if ui.small_button(s).clicked() {
+                if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
                     set_io = Some((port.to_string(), "DIFF_TERM", s));
                 }
             }
@@ -2546,7 +2594,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("IN_TERM");
             for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
-                if ui.small_button(s).clicked() {
+                if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
                     set_io = Some((port.to_string(), "IN_TERM", s));
                 }
             }
@@ -2891,21 +2939,9 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.constraint_rows();
     if rows.is_empty() {
-        ui.label("No constraints yet.");
+        ui.label("No constraints yet. Use Add… above to create a clock.");
         return;
     }
-    ui.label(format!(
-        "clocks={} io_delay={} exceptions={}",
-        rows.iter()
-            .filter(|r| r.section == ConstraintSection::Clocks)
-            .count(),
-        rows.iter()
-            .filter(|r| r.section == ConstraintSection::IoDelay)
-            .count(),
-        rows.iter()
-            .filter(|r| r.section == ConstraintSection::Exception)
-            .count()
-    ));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let sections = [
@@ -2990,6 +3026,9 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     if model.timing_paths.is_empty() {
         ui.label("No timing paths yet.");
+        if primary_button(ui, "Report timing").clicked() {
+            let _ = model.exec("report_timing");
+        }
         return;
     }
     ui.add_space(4.0);
@@ -3144,7 +3183,10 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     let report = model.timing_summary();
     if report.clocks.is_empty() {
-        ui.label("No clocks yet. Add a clock constraint, then report timing.");
+        ui.label("No clocks yet.");
+        if primary_button(ui, "Add clock 10 ns").clicked() {
+            let _ = model.exec("create_clock -period 10 clk");
+        }
         return;
     }
     ui.add_space(4.0);
@@ -3265,7 +3307,10 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.clock_interaction();
     if report.clocks.is_empty() {
-        ui.label("No clocks yet. Add a clock constraint first.");
+        ui.label("No clocks yet.");
+        if primary_button(ui, "Add clock 10 ns").clicked() {
+            let _ = model.exec("create_clock -period 10 clk");
+        }
         return;
     }
     let selected_ci = model.selected_clock_interaction.clone();
@@ -3360,7 +3405,10 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.cdc_report();
     if report.clocks.is_empty() {
-        ui.label("No clocks yet. Add a clock constraint first.");
+        ui.label("No clocks yet.");
+        if primary_button(ui, "Add clock 10 ns").clicked() {
+            let _ = model.exec("create_clock -period 10 clk");
+        }
         return;
     }
     ui.label(format!(
@@ -3447,7 +3495,10 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.clock_networks();
     if report.clocks.is_empty() {
-        ui.label("No clocks yet. Add a clock constraint first.");
+        ui.label("No clocks yet.");
+        if primary_button(ui, "Add clock 10 ns").clicked() {
+            let _ = model.exec("create_clock -period 10 clk");
+        }
         return;
     }
     ui.label(format!(
@@ -3511,7 +3562,10 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.power_report();
     if report.part.is_empty() {
-        ui.label("No design yet. Run Synthesis first.");
+        ui.label("No design yet.");
+        if primary_button(ui, "Run Synthesis").clicked() {
+            let _ = model.run_step(FlowStep::Synthesis);
+        }
         return;
     }
     ui.label(format!(
@@ -3547,7 +3601,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
                 ui.label(uw.to_string());
                 let frac = uw as f32 / max_uw as f32;
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 12.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, chrome::OCCUPANCY_BAR_H), Sense::hover());
                 ui.painter()
                     .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
                 let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
@@ -3605,7 +3659,10 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     if model.tree.top.is_none() {
-        ui.label("No design yet. Run Synthesis first.");
+        ui.label("No design yet.");
+        if primary_button(ui, "Run Synthesis").clicked() {
+            let _ = model.run_step(FlowStep::Synthesis);
+        }
         return;
     }
     let report = model.methodology_report();
@@ -3711,8 +3768,11 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     ui.label(format!(
-        "idcode={:#010x} hash={:#010x} bytes={} frames={} configured={}",
-        report.idcode, report.hash, report.bytes, report.frames, report.configured
+        "{} · {} frames · {} B · id {:#010x}",
+        if report.configured != 0 { "Configured" } else { "Not configured" },
+        report.frames,
+        report.bytes,
+        report.idcode
     ));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
@@ -3763,12 +3823,15 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     if model.utilization.is_none() && model.drc.is_none() {
-        ui.label("No DRC results yet. Run Place or Route.");
+        ui.label("No DRC results yet.");
+        if primary_button(ui, "Report DRC").clicked() {
+            let _ = model.exec("report_drc");
+        }
         return;
     }
     let report = model.drc.clone().unwrap_or_else(|| model.drc_report());
     ui.label(format!(
-        "violations={} errors={}",
+        "{} violations · {} errors",
         report.violations.len(),
         report.error_count()
     ));
@@ -3842,7 +3905,10 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.utilization_report();
     if report.part.is_empty() {
-        ui.label("No placed design yet. Run Place.");
+        ui.label("No placed design yet.");
+        if primary_button(ui, "Place").clicked() {
+            let _ = model.run_step(FlowStep::Place);
+        }
         return;
     }
     ui.label(format!("part={}", report.part));
@@ -3878,7 +3944,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
                     row.used as f32 / row.available as f32
                 };
                 let bar_w = 160.0 * (row.available as f32 / max_avail).clamp(0.25, 1.0);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, 12.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
                 ui.painter()
                     .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
                 let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
@@ -3997,12 +4063,12 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("sheet_find nets");
         }
         if let Some(root) = &model.schematic.cone_root {
-            ui.weak(format!("cone={root}"));
+            ui.label(RichText::new(format!("Cone {root}")).small().weak());
         }
         if let Some(inst) = &model.schematic.expand_inside {
-            ui.weak(format!("inside={inst}"));
+            ui.label(RichText::new(format!("Inside {inst}")).small().weak());
         }
-        ui.weak(format!("zoom={:.2}", model.schematic.camera.zoom));
+        ui.label(RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0)).small().weak());
     });
     if !model.timing_paths.is_empty() {
         ui.label(RichText::new("Timing paths").small());
@@ -4589,7 +4655,10 @@ fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     if routes.is_empty() {
-        ui.label("No routes yet. Run Route after Place.");
+        ui.label("No routes yet.");
+        if primary_button(ui, "Route").clicked() {
+            let _ = model.run_step(FlowStep::Route);
+        }
         return;
     }
     data_scroll("ug893_device_routes_scroll").show(ui, |ui| {
@@ -4836,6 +4905,7 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("No memories until you run simulation.");
                         ui.end_row();
+                        // CTA painted below grid
                     } else {
                         for (i, m) in blocks.iter().enumerate() {
                             let on = selected.as_deref() == Some(m.name.as_str());
@@ -4867,7 +4937,7 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
     let sel_addr = model.selected_memory_addr;
     let mut pick_addr: Option<usize> = None;
     if words.is_empty() {
-        ui.weak("select a memory to view Addr/Data");
+        ui.label("Select a memory to view address and data.");
     } else {
         data_scroll("ug900_memory_words")
             .show(ui, |ui| {
@@ -4935,7 +5005,7 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("—");
                         ui.label("—");
                         ui.label("—");
-                        ui.label("No breakpoints yet.");
+                        ui.label("No breakpoints yet. Set one from the Source view.");
                         ui.end_row();
                     } else {
                         for b in &rows {
@@ -5126,25 +5196,35 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
             ))
             .weak(),
         );
-        if ui.small_button("Cursor A").clicked() {
+        if sidebar_button(ui, "Cursor A")
+            .on_hover_text("Place cursor A (Shift-click on wave)")
+            .clicked()
+        {
             let _ = model.set_wave_ab_cursor("A");
         }
-        if ui.small_button("Cursor B").clicked() {
+        if sidebar_button(ui, "Cursor B")
+            .on_hover_text("Place cursor B (Alt-click on wave)")
+            .clicked()
+        {
             let _ = model.set_wave_ab_cursor("B");
         }
-        if ui.small_button("Add marker").clicked() {
+        if sidebar_button(ui, "Add marker").clicked() {
             let n = model.wave.markers.len() + 1;
             let _ = model.add_wave_marker(&format!("M{n}"));
         }
-        if ui.small_button("Virtual bus led+cnt").clicked() {
+        if sidebar_button(ui, "Virtual bus").clicked() {
             let _ = model.add_wave_virtual_bus("vb led cnt");
         }
     });
+    ui.label(RichText::new("click cursor · Shift A · Alt B").small().weak());
     paint_wave_markers(ui, model);
     paint_wave_cursors(ui, model);
     paint_virtual_buses(ui, model);
     if model.wave.traces.is_empty() {
-        ui.label("No waveform yet. Run Simulation after Bitstream.");
+        ui.label("No waveform yet.");
+        if primary_button(ui, "Run Simulation").clicked() {
+            let _ = model.exec("sim_run");
+        }
         return;
     }
     let n = model.wave.sample_len().max(1);
@@ -5293,11 +5373,14 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
                 );
             }
             if ui
-                .small_button(if t.style == WaveStyle::Analog {
-                    "Analog"
-                } else {
-                    "Digital"
-                })
+                .add_sized(
+                    [64.0, chrome::HIT_SIDEBAR],
+                    egui::Button::new(if t.style == WaveStyle::Analog {
+                        "Analog"
+                    } else {
+                        "Digital"
+                    }),
+                )
                 .clicked()
             {
                 style_cmd = Some((
@@ -5310,11 +5393,14 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ));
             }
             if ui
-                .small_button(if t.radix == WaveRadix::Hexadecimal {
-                    "Hex"
-                } else {
-                    "Bin"
-                })
+                .add_sized(
+                    [48.0, chrome::HIT_SIDEBAR],
+                    egui::Button::new(if t.radix == WaveRadix::Hexadecimal {
+                        "Hex"
+                    } else {
+                        "Bin"
+                    }),
+                )
                 .clicked()
             {
                 radix_cmd = Some((
@@ -5396,7 +5482,7 @@ fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     if markers.is_empty() {
         ui.label("No markers yet.");
-        if ui.button("Add marker").clicked() {
+        if primary_button(ui, "Add marker").clicked() {
             let n = model.wave.markers.len() + 1;
             let _ = model.add_wave_marker(&format!("M{n}"));
         }
