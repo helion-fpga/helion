@@ -7,8 +7,10 @@ use crate::{BottomTab, WorkspaceTab};
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
-/// 40px Helion activity rail (MUST 3).
-pub const RAIL_WIDTH: f32 = 40.0;
+/// 48px Helion activity rail — letter + short name (MUST 3 / UXQA leftover).
+pub const RAIL_WIDTH: f32 = 48.0;
+/// Tall enough for letter glyph + short label under it.
+pub const HIT_RAIL: f32 = 48.0;
 /// One sidebar (MUST 5).
 pub const SIDEBAR_WIDTH: f32 = 240.0;
 /// Legacy aliases — side chrome is rail + sidebar, not 680.
@@ -123,6 +125,18 @@ impl Activity {
             Activity::Simulate => "S",
             Activity::Program => "P",
             Activity::Reports => "R",
+        }
+    }
+
+    /// Compact name under the letter on the 48px rail (fits without truncation spin).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Activity::Files => "Files",
+            Activity::Device => "Device",
+            Activity::Timing => "Timing",
+            Activity::Simulate => "Sim",
+            Activity::Program => "Prog",
+            Activity::Reports => "Reports",
         }
     }
 
@@ -430,9 +444,10 @@ mod tests {
     #[test]
     fn chrome_overflow_keeps_every_tab_and_rail_action_selectable_at_desktop_width() {
         assert_eq!(side_chrome_width(), RAIL_WIDTH + SIDEBAR_WIDTH);
-        assert_eq!(side_chrome_width(), 280.0);
+        assert_eq!(side_chrome_width(), 288.0);
         assert_ne!(side_chrome_width(), 680.0);
-        assert_eq!(RAIL_WIDTH, 40.0);
+        assert_eq!(RAIL_WIDTH, 48.0);
+        assert_eq!(HIT_RAIL, 48.0);
         assert_eq!(SIDEBAR_WIDTH, 240.0);
         assert_eq!(HIT_PRIMARY, 32.0);
         assert_eq!(HIT_SIDEBAR, 28.0);
@@ -511,5 +526,21 @@ mod tests {
         assert!(DEVICE_TABLES_MAX_HEIGHT < DESKTOP_HEIGHT / 3.0);
         assert!(DRAWING_MIN_HEIGHT > TABLE_MAX_HEIGHT);
         assert!(workspace_matches_canvases());
+    }
+
+    #[test]
+    fn activity_rail_letter_and_short_label_are_visible() {
+        for a in Activity::ALL {
+            assert_eq!(a.icon().chars().count(), 1, "{a:?} letter");
+            assert!(!a.short_label().is_empty(), "{a:?} short");
+            assert!(
+                a.short_label().chars().count() <= 7,
+                "{a:?} short too long for 48px rail: {}",
+                a.short_label()
+            );
+        }
+        assert_eq!(Activity::Simulate.short_label(), "Sim");
+        assert_eq!(Activity::Program.short_label(), "Prog");
+        assert_eq!(RAIL_WIDTH, 48.0);
     }
 }

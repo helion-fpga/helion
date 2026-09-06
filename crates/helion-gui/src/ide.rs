@@ -31645,7 +31645,7 @@ mod tests {
             chrome::side_chrome_width(),
             chrome::RAIL_WIDTH + chrome::SIDEBAR_WIDTH
         );
-        assert_eq!(chrome::RAIL_WIDTH, 40.0);
+        assert_eq!(chrome::RAIL_WIDTH, 48.0);
         assert_eq!(chrome::SIDEBAR_WIDTH, 240.0);
         assert_eq!(chrome::HIT_PRIMARY, 32.0);
         assert_eq!(chrome::HIT_SIDEBAR, 28.0);
