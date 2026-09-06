@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM GPIO catalog core
+format 1
+vlnv community:helion:h_gpio:1.0
+bus Helion-MM
+top h_gpio
+file h_gpio.v

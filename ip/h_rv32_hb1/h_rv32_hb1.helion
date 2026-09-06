@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM PicoRV32 wrap (not Zynq PS / not AXI)
+format 1
+vlnv community:helion:h_rv32_hb1:1.0
+bus Helion-MM
+top h_rv32_hb1
+file h_rv32_hb1.v

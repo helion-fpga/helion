@@ -37,6 +37,8 @@ Site (LMMS-style on-ramp): [docs](https://helion-fpga.github.io/helion/) · [get
 | IDE paint | `crates/helion-gui/src/bin/helion-ide.rs` |
 | Parts | `devices/helion/` |
 | Examples | `examples/` |
+| IP packages (`.helion`) | `ip/`, `crates/helion-ipxact` |
+| HAD program / OFL / mpsse-sim | `crates/helion-hw`, `scripts/ibex-prog-mpsse-sim-smoke.sh` |
 
 ## What we need help with
 

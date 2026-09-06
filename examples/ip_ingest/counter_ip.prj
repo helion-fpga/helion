@@ -1,0 +1,4 @@
+# Project honesty: ingest counter via read_ip (.helion), keep gold WNS
+part HL10T-C32-1
+read_ip examples/counter.helion
+top counter

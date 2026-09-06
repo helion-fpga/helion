@@ -1,0 +1,5 @@
+# FM-HEL-TOP: pin-reduced full Ibex fabric (clk+led board pins).
+part HL10T-C32-1
+read_sv examples/ysyx_ibex.sv
+read_sv examples/ibex_pin_wrap.sv
+top ibex_pin_wrap

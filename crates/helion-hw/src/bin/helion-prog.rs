@@ -1,20 +1,103 @@
-//! helion-prog — program via sim cable (M14). No board.
+//! helion-prog — program HAD via sim cable or openFPGALoader USB backend.
 use helion_bits::Bitstream;
 use helion_device::Device;
-use helion_hw::prog_sim;
+use helion_hw::{
+    detect_boards, program_hbits_with_cable, prog_sim, resolve_cable, CableBackend, ProgramOutcome,
+};
+use std::env;
+use std::path::PathBuf;
+use std::process;
 
 fn main() {
-    let dev = Device::load_part("HL10T-C32-1").expect("HAD");
-    let bits = Bitstream::empty(&dev);
-    let st = prog_sim(&dev, &bits).expect("prog");
-    println!(
-        "helion-prog sim STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-        st.init as u8,
-        st.done as u8,
-        st.eos as u8,
-        st.gwe as u8,
-        st.gsr as u8,
-        st.gts as u8,
-        st.crc_err as u8
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        eprintln!(
+            "helion-prog [--cable auto|sim|mpsse-sim|usb|ofl|native] [--part PART] [--flash] [bitstream.hbits]\n\
+             \n\
+             Detects cables (sim always; USB via openFPGALoader when on PATH),\n\
+             loads `.hbits`, programs via TAP CFG_W (sim), FTDI bitbang CFG_W+STAT (mpsse-sim),
+             openFPGALoader (usb/ofl), or native FTDI MPSSE (usb-native; else NotImplemented→OFL).\n\
+             Never claims DONE on USB without a detected programmer. Empty args\n\
+             program an empty bitstream on --cable sim|mpsse-sim only."
+        );
+        process::exit(0);
+    }
+    let mut cable = "auto".to_string();
+    let mut part = "HL10T-C32-1".to_string();
+    let mut bits_path: Option<PathBuf> = None;
+    let mut flash = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cable" => {
+                i += 1;
+                cable = args.get(i).cloned().unwrap_or_default();
+            }
+            "--part" => {
+                i += 1;
+                part = args.get(i).cloned().unwrap_or_else(|| "HL10T-C32-1".into());
+            }
+            "--flash" => flash = true,
+            "--detect" | "detect" => {
+                print!("{}", detect_boards().text());
+                return;
+            }
+            other if !other.starts_with('-') => {
+                bits_path = Some(PathBuf::from(other));
+            }
+            other => {
+                eprintln!("helion-prog: unknown arg {other}");
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let info = resolve_cable(&cable).unwrap_or_else(|e| {
+        eprintln!("helion-prog: {e}");
+        process::exit(2);
+    });
+    eprintln!(
+        "helion-prog: cable {} backend={} — {}",
+        info.id,
+        info.backend.as_str(),
+        info.detail
     );
+    let det = detect_boards();
+    eprintln!("helion-prog: {}", det.note);
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("helion-prog: HAD {part}: {e}");
+        process::exit(1);
+    });
+    if let Some(path) = bits_path {
+        let outcome = program_hbits_with_cable(&dev, &path, &info, flash).unwrap_or_else(|e| {
+            eprintln!("helion-prog: {e}");
+            process::exit(1);
+        });
+        println!("{}", outcome.summary_line("program", &dev.part));
+    } else {
+        if info.backend != CableBackend::Sim && info.backend != CableBackend::MpsseSim {
+            eprintln!(
+                "helion-prog: no .hbits given; empty smoke only on --cable sim|mpsse-sim (got {})",
+                info.backend.as_str()
+            );
+            process::exit(2);
+        }
+        eprintln!("helion-prog: no .hbits given — programming empty bitstream (smoke)");
+        let bits = Bitstream::empty(&dev);
+        let (st, outcome) = if info.backend == CableBackend::MpsseSim {
+            let st = helion_hw::prog_mpsse_sim(&dev, &bits).unwrap_or_else(|e| {
+                eprintln!("helion-prog: {e}");
+                process::exit(1);
+            });
+            (st.clone(), ProgramOutcome::MpsseSim { bits, stat: st })
+        } else {
+            let st = prog_sim(&dev, &bits).unwrap_or_else(|e| {
+                eprintln!("helion-prog: {e}");
+                process::exit(1);
+            });
+            (st.clone(), ProgramOutcome::Sim { bits, stat: st })
+        };
+        let _ = st;
+        println!("{}", outcome.summary_line("program", &dev.part));
+    }
 }

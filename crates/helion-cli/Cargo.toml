@@ -24,3 +24,4 @@ helion-drc = { workspace = true }
 helion-vhdl = { workspace = true }
 helion-hls = { workspace = true }
 helion-proj = { workspace = true }
+helion-ipxact = { workspace = true }

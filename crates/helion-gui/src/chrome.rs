@@ -7,8 +7,10 @@ use crate::{BottomTab, WorkspaceTab};
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
-/// 40px Helion activity rail (MUST 3).
-pub const RAIL_WIDTH: f32 = 40.0;
+/// 48px Helion activity rail — letter + short name (MUST 3 / UXQA leftover).
+pub const RAIL_WIDTH: f32 = 48.0;
+/// Tall enough for letter glyph + short label under it.
+pub const HIT_RAIL: f32 = 48.0;
 /// One sidebar (MUST 5).
 pub const SIDEBAR_WIDTH: f32 = 240.0;
 /// Legacy aliases — side chrome is rail + sidebar, not 680.
@@ -16,18 +18,32 @@ pub const NAV_WIDTH: f32 = RAIL_WIDTH;
 pub const TREE_WIDTH: f32 = SIDEBAR_WIDTH;
 /// Properties dock — shown on selection, not always-on.
 pub const PROPERTIES_WIDTH: f32 = 220.0;
-pub const TOOLBAR_HEIGHT: f32 = 40.0;
+pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const RAIL_MIN_HEIGHT: f32 = TOOLBAR_HEIGHT;
 pub const STATUS_HEIGHT: f32 = 22.0;
 pub const HIT_PRIMARY: f32 = 32.0;
+/// Comfort primary (Implement / Open) — ≥44 where the toolbar has room.
+pub const HIT_COMFORT: f32 = 36.0;
 pub const HIT_SIDEBAR: f32 = 28.0;
 pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
+/// Occupancy / util bars (NICE leftover: was 12px).
+pub const OCCUPANCY_BAR_H: f32 = 20.0;
+/// Calm splitter grab radius (4–6px ship; not neon QA slab).
+pub const SPLITTER_GRAB_PX: f32 = 6.0;
 /// Bounded height for in-pane Name/Value grids so they cannot eat the CentralPanel.
 pub const TABLE_MAX_HEIGHT: f32 = 180.0;
 /// Device/Package tables stack above the canvas; keep them compact so the die expands.
-pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 220.0;
+pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 140.0;
 /// Floorplan / package canvas never shrinks below this if the pane has room.
 pub const DRAWING_MIN_HEIGHT: f32 = 280.0;
+/// Idle paint policy (Air budgets): eframe reactive; no continuous `request_repaint`.
+/// Floorplan/device paint is O(pins + tiles) per *input* frame only — not a synth loop.
+pub const IDLE_PAINT_POLICY: &str = "reactive-no-request_repaint";
+/// Soft budget: idle CPU should be ~0% when the window is unfocused / no input (OS compositor).
+pub const IDLE_CPU_SOFT_PCT: u32 = 1;
+/// Soft budget: no uncapped animation timer; paint only on egui events.
+pub const IDLE_ANIM_HZ: u32 = 0;
+
 /// Legacy alias — canvas expands; do not use as a max cap.
 pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 /// Minimum column width used to decide whether a grid clips its last column.
@@ -123,6 +139,18 @@ impl Activity {
             Activity::Simulate => "S",
             Activity::Program => "P",
             Activity::Reports => "R",
+        }
+    }
+
+    /// Compact name under the letter on the 48px rail (fits without truncation spin).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Activity::Files => "Files",
+            Activity::Device => "Device",
+            Activity::Timing => "Timing",
+            Activity::Simulate => "Sim",
+            Activity::Program => "Program",
+            Activity::Reports => "Reports",
         }
     }
 
@@ -430,9 +458,10 @@ mod tests {
     #[test]
     fn chrome_overflow_keeps_every_tab_and_rail_action_selectable_at_desktop_width() {
         assert_eq!(side_chrome_width(), RAIL_WIDTH + SIDEBAR_WIDTH);
-        assert_eq!(side_chrome_width(), 280.0);
+        assert_eq!(side_chrome_width(), 288.0);
         assert_ne!(side_chrome_width(), 680.0);
-        assert_eq!(RAIL_WIDTH, 40.0);
+        assert_eq!(RAIL_WIDTH, 48.0);
+        assert_eq!(HIT_RAIL, 48.0);
         assert_eq!(SIDEBAR_WIDTH, 240.0);
         assert_eq!(HIT_PRIMARY, 32.0);
         assert_eq!(HIT_SIDEBAR, 28.0);
@@ -511,5 +540,36 @@ mod tests {
         assert!(DEVICE_TABLES_MAX_HEIGHT < DESKTOP_HEIGHT / 3.0);
         assert!(DRAWING_MIN_HEIGHT > TABLE_MAX_HEIGHT);
         assert!(workspace_matches_canvases());
+    }
+
+    #[test]
+    fn activity_rail_letter_and_short_label_are_visible() {
+        for a in Activity::ALL {
+            assert_eq!(a.icon().chars().count(), 1, "{a:?} letter");
+            assert!(!a.short_label().is_empty(), "{a:?} short");
+            assert!(
+                a.short_label().chars().count() <= 7,
+                "{a:?} short too long for 48px rail: {}",
+                a.short_label()
+            );
+        }
+        assert_eq!(Activity::Simulate.short_label(), "Sim");
+        assert_eq!(Activity::Program.short_label(), "Program");
+        assert_eq!(Activity::Program.short_label().chars().count(), 7);
+        assert_eq!(RAIL_WIDTH, 48.0);
+        assert_eq!(HIT_COMFORT, 36.0);
+        assert_eq!(OCCUPANCY_BAR_H, 20.0);
+        assert!((4.0..=6.0).contains(&SPLITTER_GRAB_PX));
+        assert_eq!(DEVICE_TABLES_MAX_HEIGHT, 140.0);
+    }
+}
+
+#[cfg(test)]
+mod idle_budget_tests {
+    #[test]
+    fn idle_policy_is_reactive_no_continuous_anim() {
+        assert_eq!(super::IDLE_PAINT_POLICY, "reactive-no-request_repaint");
+        assert_eq!(super::IDLE_ANIM_HZ, 0);
+        assert!(super::IDLE_CPU_SOFT_PCT <= 5);
     }
 }

@@ -1,0 +1,3 @@
+empty
+No USB devices found
+Bus device vid:pid       probe type      manufacturer serial               product

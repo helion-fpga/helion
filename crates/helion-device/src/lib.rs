@@ -601,6 +601,12 @@ impl Device {
             "BLE0.FF.INIT",
             "IMUX[0][0]",
             "IMUX[63][4]",
+            "IMUX[0][5]",
+            "IMUX[63][5]",
+            "IMUX[0][6]",
+            "IMUX[63][6]",
+            "IMUX[0][7]",
+            "IMUX[63][7]",
         ] {
             match fm.minor_bit(feature) {
                 Some((minor, bit)) => {
@@ -683,12 +689,28 @@ impl FeatureMap {
             bits.insert(format!("BLE{n}.FF.CLKINV"), cursor + 4);
             cursor += 5;
         }
-        // 4. IMUX 64×5, then pad to n_minors * frame_bits
+        // 4. IMUX 64×5 (sel[4:0]), then IMUX[m][5]/[6]/[7] extension
+        // banks appended so legacy abs for bits 0..6 stay gold-stable.
+        // sel[5] = N-S±2 (32-47) + E-W±1 (48-63);
+        // sel[6] = E-W±2 (64-79) + diag±1 (80-111);
+        // sel[7] = knight (±2,±1)/(±1,±2) (128-191).
         for m in 0..64u32 {
             for b in 0..5u32 {
                 bits.insert(format!("IMUX[{m}][{b}]"), cursor + b);
             }
             cursor += 5;
+        }
+        for m in 0..64u32 {
+            bits.insert(format!("IMUX[{m}][5]"), cursor);
+            cursor += 1;
+        }
+        for m in 0..64u32 {
+            bits.insert(format!("IMUX[{m}][6]"), cursor);
+            cursor += 1;
+        }
+        for m in 0..64u32 {
+            bits.insert(format!("IMUX[{m}][7]"), cursor);
+            cursor += 1;
         }
         let _ = cursor;
         Self {
@@ -911,6 +933,21 @@ mod tests {
         assert!(r.contains("LUT6=8192"), "{r}");
         assert!(r.contains("0x00011a1f") || r.contains("0x00011A1F"), "{r}");
         assert!(r.contains("BRAM18=8"), "{r}");
+    }
+
+    #[test]
+    fn imux_extension_banks_keep_legacy_abs_gold_stable() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        let fm = d.featuremap();
+        // Absolute offsets frozen through arch_gen that appended bit5/bit6/bit7.
+        assert_eq!(fm.abs_bit("IMUX[0][0]"), Some(592));
+        assert_eq!(fm.abs_bit("IMUX[63][4]"), Some(911));
+        assert_eq!(fm.abs_bit("IMUX[0][5]"), Some(912));
+        assert_eq!(fm.abs_bit("IMUX[63][5]"), Some(975));
+        assert_eq!(fm.abs_bit("IMUX[0][6]"), Some(976));
+        assert_eq!(fm.abs_bit("IMUX[63][6]"), Some(1039));
+        assert_eq!(fm.abs_bit("IMUX[0][7]"), Some(1040));
+        assert_eq!(fm.abs_bit("IMUX[63][7]"), Some(1103));
     }
 
     #[test]
