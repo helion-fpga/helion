@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~07:57 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (PR #7, **NO MERGE**)  
-**Score tip (branch HEAD):** `TIP_SHA` (`TIP_SHORT`)  
+**Score tip (branch HEAD):** `e521e452ec38cf2f13f3d3e7058d99468d540bf6` (`e521e45`)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
 
 ## Gold
@@ -29,7 +29,7 @@
 
 ## Tip reconcile
 
-Single tip SHA is branch HEAD `TIP_SHORT` (full `TIP_SHA`). Do not cite `63ec405` as tip — that was the prior chrome commit; HEAD moved.
+Single tip SHA is branch HEAD `e521e45` (full `e521e452ec38cf2f13f3d3e7058d99468d540bf6`). Do not cite `63ec405` as tip — that was the prior chrome commit; HEAD moved.
 
 ## Merge
 
