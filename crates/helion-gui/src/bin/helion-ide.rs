@@ -659,17 +659,18 @@ fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
         Activity::Simulate => paint_sim_side(ctx, &mut app.model),
         Activity::Files => paint_files_side(ctx, app),
         Activity::Device => paint_files_side(ctx, app),
-        Activity::Timing | Activity::Reports => paint_files_side(ctx, app),
+        // Timing/Reports: no SidePanel — catalog/paths live in the canvas (kills the black void).
+        Activity::Timing | Activity::Reports => {}
         Activity::Program => paint_files_side(ctx, app),
     }
 }
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
-    egui::SidePanel::left("sidebar")
+    egui::SidePanel::left("sidebar_v2")
         .resizable(true)
         .default_width(chrome::SIDEBAR_WIDTH)
         .min_width(180.0)
-        .max_width(360.0)
+        .max_width(280.0)
         .show(ctx, |ui| {
             let title = match app.activity {
                 Activity::Files => "Files",
@@ -1164,44 +1165,32 @@ fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
 }
 
 fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
-    let avail = ui.available_width();
-    let plan = {
-        let mut p = chrome::chrome_at(ui.ctx().screen_rect().width());
-        let (row, more) = chrome::fit_or_more(&chrome::workspace_tab_labels(), avail);
-        p.tab_rows = vec![row];
-        p.more_items = more;
-        p.workspace_mode = chrome::workspace_tab_overflow(avail);
-        p
-    };
+    // Always: Editor | Device | Timing | More ⋯ (overflow keeps prior WorkspaceTab destinations).
     ui.horizontal(|ui| {
-        for lab in plan.tab_rows.first().into_iter().flatten().copied() {
-            if lab == chrome::MORE || lab == chrome::MORE_LABEL {
-                ui.menu_button(chrome::MORE, |ui| {
-                    for extra in &plan.more_items {
-                        if let Some(c) = Canvas::parse_label(extra) {
-                            if ui
-                                .selectable_label(app.canvas == c, extra.to_string())
-                                .clicked()
-                            {
-                                app.set_canvas(c);
-                                ui.close();
-                            }
-                        }
-                    }
-                });
-                continue;
-            }
-            if let Some(c) = Canvas::parse_label(lab) {
-                let on = app.canvas == c;
-                if ui
-                    .selectable_label(on, format!("{}  {}", c.label(), c.shortcut()))
-                    .on_hover_text(tip(c.label(), c.shortcut(), ""))
-                    .clicked()
-                {
-                    app.set_canvas(c);
-                }
+        for c in Canvas::ALL {
+            let on = app.canvas == c;
+            if ui
+                .selectable_label(on, format!("{}  {}", c.label(), c.shortcut()))
+                .on_hover_text(tip(c.label(), c.shortcut(), ""))
+                .clicked()
+            {
+                app.set_canvas(c);
             }
         }
+        ui.menu_button(chrome::MORE, |ui| {
+            ui.label(RichText::new("More views").strong().small());
+            ui.separator();
+            for tab in WorkspaceTab::ALL {
+                if tab.is_canvas() {
+                    continue;
+                }
+                let on = app.model.workspace == tab;
+                if ui.selectable_label(on, tab.label()).clicked() {
+                    open_more_workspace(app, tab);
+                    ui.close();
+                }
+            }
+        });
     });
     ui.separator();
     if app.activity == Activity::Program {
@@ -1243,25 +1232,123 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             paint_device(ui, &mut app.model);
         }
         Canvas::Timing => {
-            if app.activity == Activity::Reports {
-                paint_reports(ui, &mut app.model);
+            // Explicit split inside the canvas: navigator | detail. No SidePanel gap.
+            let full = ui.available_size();
+            let nav_w = 280.0_f32.min(full.x * 0.34).max(200.0);
+            ui.horizontal(|ui| {
+                ui.set_min_height(full.y);
+                ui.vertical(|ui| {
+                    ui.set_width(nav_w);
+                    ui.set_min_height(full.y - 8.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("timing_nav_v1")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(nav_w - 8.0);
+                            match app.activity {
+                                Activity::Reports => {
+                                    ui.label(RichText::new("Reports").strong().size(14.0));
+                                    ui.add_space(4.0);
+                                    paint_report_catalog(ui, &mut app.model);
+                                }
+                                Activity::Timing => {
+                                    ui.label(RichText::new("Timing").strong().size(14.0));
+                                    ui.add_space(4.0);
+                                    paint_timing_paths(ui, &mut app.model);
+                                }
+                                _ => {
+                                    ui.label(RichText::new("Reports").strong().size(14.0));
+                                    ui.add_space(4.0);
+                                    paint_report_catalog(ui, &mut app.model);
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_min_size(egui::vec2((full.x - nav_w - 12.0).max(320.0), full.y - 8.0));
+                    egui::ScrollArea::vertical()
+                        .id_salt("timing_detail_v1")
+                        .auto_shrink([false, false])
+                        .hscroll(false)
+                        .show(ui, |ui| {
+                            paint_timing_canvas_body(ui, app);
+                        });
+                });
+            });
+        }
+    }
+}
+
+fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
+    app.model.workspace = tab;
+    if tab.sim_only() {
+        app.set_activity(Activity::Simulate);
+        return;
+    }
+    match tab.canvas() {
+        WorkspaceTab::TextEditor => app.set_canvas(Canvas::Editor),
+        WorkspaceTab::Device => {
+            app.set_activity(Activity::Device);
+            app.set_canvas(Canvas::Device);
+        }
+        WorkspaceTab::Reports => {
+            if matches!(
+                tab,
+                WorkspaceTab::Runs
+                    | WorkspaceTab::Constraints
+                    | WorkspaceTab::Utilization
+                    | WorkspaceTab::Drc
+                    | WorkspaceTab::Power
+                    | WorkspaceTab::Methodology
+                    | WorkspaceTab::ClockInteraction
+                    | WorkspaceTab::Cdc
+                    | WorkspaceTab::ClockNetworks
+            ) {
+                app.set_activity(Activity::Reports);
             } else {
-                match app.model.workspace {
-                    WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
-                    WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
-                    WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model),
-                    WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
-                    WorkspaceTab::Power => paint_power(ui, &mut app.model),
-                    WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model),
-                    WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
-                    WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
-                    WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
-                    _ => {
-                        paint_timing_summary(ui, &mut app.model);
-                        paint_timing_paths(ui, &mut app.model);
-                    }
-                }
+                app.set_activity(Activity::Timing);
             }
+            app.set_canvas(Canvas::Timing);
+        }
+        _ => {
+            app.set_canvas(Canvas::Timing);
+        }
+    }
+}
+
+fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
+    match app.model.workspace {
+        WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
+        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model),
+        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
+        WorkspaceTab::Power => paint_power(ui, &mut app.model),
+        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model),
+        WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
+        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
+        WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
+        WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model),
+        WorkspaceTab::Package => paint_package(ui, &mut app.model),
+        WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model),
+        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model),
+        WorkspaceTab::Hardware => paint_hw(ui, &mut app.model),
+        WorkspaceTab::Ip => paint_ip(ui, &mut app.model),
+        WorkspaceTab::Find => paint_find(ui, &mut app.model),
+        WorkspaceTab::Settings | WorkspaceTab::Summary => {
+            ui.heading(app.model.workspace.label());
+            ui.add_space(6.0);
+            ui.label("Open a report from the Reports rail, or pick another view in More ⋯.");
+            if primary_button(ui, "Open Timing Summary").clicked() {
+                app.model.workspace = WorkspaceTab::Reports;
+                let _ = app.model.exec("report_timing_summary");
+            }
+        }
+        _ => {
+            paint_timing_summary(ui, &mut app.model);
+            ui.add_space(8.0);
+            // Paths stay reachable: Timing nav lists them; detail still shows pin delay table.
+            paint_timing_paths(ui, &mut app.model);
         }
     }
 }
@@ -1286,7 +1373,7 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 
 fn paint_sim_side(ctx: &egui::Context, model: &mut IdeModel) {
-    egui::SidePanel::left("scopes")
+    egui::SidePanel::left("scopes_v2")
         .resizable(true)
         .default_width(chrome::SIDEBAR_WIDTH)
         .show(ctx, |ui| {
@@ -3020,16 +3107,6 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_reports(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Reports");
-    ui.add_space(6.0);
-    paint_report_catalog(ui, model);
-    ui.add_space(8.0);
-    paint_timing_summary(ui, model);
-    ui.add_space(8.0);
-    paint_timing_paths(ui, model);
-}
-
 fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Timing Paths").strong());
     ui.add_space(4.0);
@@ -3106,7 +3183,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     ));
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
-    egui::ScrollArea::both().max_height(280.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(280.0).hscroll(true).show(ui, |ui| {
         egui::Grid::new("timing_pin_delay")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
