@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Helion — original FPGA family and CAD</title>
   <meta name="description" content="Open-source FPGA CAD and an original device family. Synth, place, PathFinder, STA, bitstream, desktop IDE." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=tape3" />
   <meta property="og:title" content="Helion — original FPGA family and CAD" />
   <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/hero-die.jpg" />
 </head>
@@ -18,10 +18,12 @@
   <a class="skip" href="#main">Skip to main content</a>
   <header class="bar">
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
-    <nav>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
+    <nav id="site-nav">
       <a href="index.html">Home</a>
       <a href="use.html">Use</a>
       <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
       <a href="wiki.html">Wiki</a>
       <a href="get-involved.html">Get involved</a>
       <a href="https://github.com/helion-fpga/helion">GitHub</a>
@@ -30,10 +32,12 @@
 
   <main id="main">
     <section class="hero" id="hero-stage">
-      <img class="hero-fill" src="brand/hero-wave.jpg" alt="" />
-      <video class="hero-plate" id="hero-vid" autoplay muted loop playsinline poster="brand/hero-die.jpg" aria-hidden="true">
-        <source src="brand/die-pulse.mp4?v=wrap" type="video/mp4" />
-      </video>
+      <div class="hero-media">
+        <img src="brand/hero-wave.jpg" alt="" />
+        <video id="hero-vid" autoplay muted loop playsinline poster="brand/hero-die.jpg" aria-hidden="true">
+          <source src="brand/die-pulse.mp4?v=wrap" type="video/mp4" />
+        </video>
+      </div>
       <div class="hero-copy">
         <h1>Co-creating an original FPGA family.</h1>
         <p class="lede">
@@ -46,16 +50,15 @@
       </div>
     </section>
 
-    <div class="marquee" aria-hidden="true">
+    <div class="marquee" role="marquee" aria-label="Helion flow">
       <div class="marquee-track">
-        <span>SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim · </span>
-        <span>SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim · </span>
+        <div class="marquee-seq">SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim · </div>
+        <div class="marquee-seq" aria-hidden="true">SystemVerilog · Pack · Place · PathFinder · STA · DRC · .hbits · Fabric sim · </div>
       </div>
     </div>
 
     <div class="page">
       <section class="section">
-        <p class="kicker">Our work</p>
         <h2>CAD on an original die</h2>
         <p class="lede">Device facts come from HAD. The IDE paints that Session.</p>
         <div class="cards">
@@ -79,7 +82,6 @@
       </section>
 
       <section class="section">
-        <p class="kicker">Facts</p>
         <h2>Helion in numbers</h2>
         <div class="facts">
           <div><strong>9640</strong><span>WNS_PS on empty-XDC counter</span></div>
@@ -95,6 +97,7 @@
     <span>Apache-2.0 OR MIT · <a href="https://github.com/saksham-45">@saksham-45</a> · <a href="https://github.com/helion-fpga">helion-fpga</a></span>
     <span><a href="legal.html">Legal</a> · <a href="start.html">Start</a></span>
   </footer>
-  <script src="site.js"></script>
+  <button type="button" class="anim-toggle" id="anim-toggle" aria-pressed="true" title="Pause the tape">II</button>
+  <script src="site.js?v=tape3"></script>
 </body>
 </html>
