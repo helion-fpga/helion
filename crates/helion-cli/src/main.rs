@@ -687,7 +687,7 @@ fn hw(args: Vec<String>) {
         });
         println!("{}", outcome.summary_line(&sub, &dev.part));
     } else {
-        if info.backend != CableBackend::Sim {
+        if info.backend != CableBackend::Sim && info.backend != CableBackend::MpsseSim {
             eprintln!(
                 "helion hw {sub}: no --bitstream given; empty smoke only supported on --cable sim\n                   tip: helion bitstream examples/blinky.sv -o out.hbits && helion hw program --cable {} -b out.hbits",
                 info.backend.as_str()
@@ -698,11 +698,19 @@ fn hw(args: Vec<String>) {
             "helion hw {sub}: no --bitstream given\n  tip: helion bitstream examples/blinky.sv -o out.hbits && helion hw program --cable sim -b out.hbits\n  programming empty bitstream (smoke only)"
         );
         let bits = Bitstream::empty(&dev);
-        let st = prog_sim(&dev, &bits).unwrap_or_else(|e| {
-            eprintln!("helion hw {sub}: {e}");
-            std::process::exit(1);
-        });
-        let outcome = ProgramOutcome::Sim { bits, stat: st };
+        let outcome = if info.backend == CableBackend::MpsseSim {
+            let st = helion_hw::prog_mpsse_sim(&dev, &bits).unwrap_or_else(|e| {
+                eprintln!("helion hw {sub}: {e}");
+                std::process::exit(1);
+            });
+            ProgramOutcome::MpsseSim { bits, stat: st }
+        } else {
+            let st = prog_sim(&dev, &bits).unwrap_or_else(|e| {
+                eprintln!("helion hw {sub}: {e}");
+                std::process::exit(1);
+            });
+            ProgramOutcome::Sim { bits, stat: st }
+        };
         println!("{}", outcome.summary_line(&sub, &dev.part));
     }
 }
