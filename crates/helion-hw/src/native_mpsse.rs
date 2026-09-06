@@ -3,7 +3,8 @@
 //! Builds FTDI MPSSE command streams (AN_108-class opcodes) for IEEE 1149.1
 //! IR/DR shifts used by Helion `IR_CFG_W` / `IR_STAT`. With feature
 //! `usb-native`, [`NativeFtdiMpsse`] opens a real FTDI (VID 0x0403) via rusb
-//! when present and drives MPSSE bulk OUT/IN. Without a device it returns an
+//! **once** into a persistent session handle and drives MPSSE bulk OUT/IN
+//! without reopen thrash on each CFG_W / STAT. Without a device it returns an
 //! honest [`crate::NativeUsbError::Io`] — **never** invents Helion TAP STAT.
 //!
 //! Without `usb-native` (or when rusb is unavailable at build time), open /
@@ -12,8 +13,8 @@
 //! [`crate::NativeFtdiStub`].
 //!
 //! This module must **never** claim board DONE without a successful STAT
-//! readback from a real probe. Opcode builders are fully unit-tested without
-//! hardware.
+//! readback from a real probe. Opcode builders + session lifecycle are
+//! unit-tested without hardware.
 
 use std::path::Path;
 
@@ -383,14 +384,73 @@ pub fn stat_word_done(word: u32) -> bool {
     (word >> helion_fabric::Stat::BIT_DONE) & 1 != 0
 }
 
+/// Persistent FTDI MPSSE USB session: one open, many CFG_W/STAT xfers.
+///
+/// Holding the [`rusb::DeviceHandle`] avoids reopen thrash (claim/bitmode on
+/// every bulk transfer). Drop closes the handle.
+#[cfg(feature = "usb-native")]
+struct FtdiMpsseSession {
+    handle: rusb::DeviceHandle<rusb::GlobalContext>,
+    bus: u8,
+    address: u8,
+    _iface: u8,
+    /// Successful bulk xfers on this handle (OUT or INOUT).
+    xfer_count: u32,
+}
+
 /// Native FTDI MPSSE transport (real USB when `usb-native` + device present).
-#[derive(Debug, Default)]
+///
+/// When open, the rusb handle stays in [`Self`] so CFG_W + STAT share one
+/// session (no re-enumerate / re-open between steps).
 pub struct NativeFtdiMpsse {
     open: bool,
+    #[cfg(feature = "usb-native")]
+    session: Option<FtdiMpsseSession>,
     /// Selected VID/PID after successful open (detect honesty).
     pub opened_vid: Option<u16>,
     pub opened_pid: Option<u16>,
     pub opened_detail: String,
+    /// How many times USB open+bitmode actually ran (idempotent `open_probe` hits do not increment).
+    pub usb_open_count: u32,
+    /// Last Helion STAT word from a successful live TDO parse (never invented).
+    pub last_stat: Option<u32>,
+}
+
+impl std::fmt::Debug for NativeFtdiMpsse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("NativeFtdiMpsse");
+        d.field("open", &self.open)
+            .field("opened_vid", &self.opened_vid)
+            .field("opened_pid", &self.opened_pid)
+            .field("opened_detail", &self.opened_detail)
+            .field("usb_open_count", &self.usb_open_count)
+            .field("last_stat", &self.last_stat);
+        #[cfg(feature = "usb-native")]
+        {
+            d.field("session_live", &self.session.is_some());
+            if let Some(ref s) = self.session {
+                d.field("session_xfer_count", &s.xfer_count)
+                    .field("session_bus", &s.bus)
+                    .field("session_addr", &s.address);
+            }
+        }
+        d.finish()
+    }
+}
+
+impl Default for NativeFtdiMpsse {
+    fn default() -> Self {
+        Self {
+            open: false,
+            #[cfg(feature = "usb-native")]
+            session: None,
+            opened_vid: None,
+            opened_pid: None,
+            opened_detail: String::new(),
+            usb_open_count: 0,
+            last_stat: None,
+        }
+    }
 }
 
 impl NativeFtdiMpsse {
@@ -400,6 +460,28 @@ impl NativeFtdiMpsse {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Bulk xfers completed on the live session handle (0 if no session).
+    pub fn session_xfer_count(&self) -> u32 {
+        #[cfg(feature = "usb-native")]
+        {
+            self.session.as_ref().map(|s| s.xfer_count).unwrap_or(0)
+        }
+        #[cfg(not(feature = "usb-native"))]
+        {
+            0
+        }
+    }
+
+    /// Drop the persistent USB handle (next `open_probe` will re-open).
+    pub fn close_session(&mut self) {
+        #[cfg(feature = "usb-native")]
+        {
+            self.session = None;
+        }
+        self.open = false;
+        // Keep opened_* / last_stat for diagnostics; clear open flag only.
     }
 
     /// Whether this build includes the rusb MPSSE open path.
@@ -456,10 +538,8 @@ impl HadUsbTransport for NativeFtdiMpsse {
         path: &Path,
         _flash: bool,
     ) -> Result<(), NativeUsbError> {
+        // Open once (persistent session); CFG_W + STAT reuse the same handle.
         self.open_probe()?;
-        // Device is open: build opcode stream from .hbits. Real TDO/STAT readback
-        // requires a Helion TAP on the cable — without a successful STAT word we
-        // refuse DONE (never invent).
         let bytes = std::fs::read(path).map_err(|e| {
             NativeUsbError::Io(format!("read {}: {e}", path.display()))
         })?;
@@ -471,31 +551,59 @@ impl HadUsbTransport for NativeFtdiMpsse {
         let opcodes = Self::encode_cfg_w_and_stat(&bytes);
         #[cfg(feature = "usb-native")]
         {
-            // CFG_W+STAT encode still includes out-oriented CFG; follow with a
-            // dedicated capture STAT INOUT xfer and only Ok(()) on DONE=1 TDO.
+            let open_before = self.usb_open_count;
+            let xfer_before = self.session_xfer_count();
             let stat_ops = Self::encode_read_stat();
-            xfer_mpsse_out_only(&opcodes)?;
-            match xfer_mpsse_inout(&stat_ops, STAT_CAPTURE_TDO_LEN) {
+            self.xfer_out_only(&opcodes)?;
+            match self.xfer_inout(&stat_ops, STAT_CAPTURE_TDO_LEN) {
                 Ok(tdo) => match parse_stat_tdo_mpsse(&tdo) {
-                    Ok(word) if stat_word_done(word) => Ok(()),
-                    Ok(word) => Err(NativeUsbError::Io(format!(
-                        "native MPSSE: STAT TDO parsed {word:#010x} but DONE=0                          (vid={:#06x} pid={:#06x} {}); refusing DONE",
-                        self.opened_vid.unwrap_or(0),
-                        self.opened_pid.unwrap_or(0),
-                        self.opened_detail
-                    ))),
+                    Ok(word) if stat_word_done(word) => {
+                        // Session must not have re-opened between CFG_W and STAT.
+                        if self.usb_open_count != open_before {
+                            return Err(NativeUsbError::Io(
+                                "native MPSSE: session re-opened mid program (handle thrash) — refusing DONE"
+                                    .into(),
+                            ));
+                        }
+                        if self.session_xfer_count() < xfer_before + 2 {
+                            return Err(NativeUsbError::Io(
+                                "native MPSSE: expected ≥2 session xfers (CFG_W+STAT) on persistent handle"
+                                    .into(),
+                            ));
+                        }
+                        self.last_stat = Some(word);
+                        Ok(())
+                    }
+                    Ok(word) => {
+                        self.last_stat = Some(word);
+                        Err(NativeUsbError::Io(format!(
+                            "native MPSSE: STAT TDO parsed {word:#010x} but DONE=0 \
+                             (vid={:#06x} pid={:#06x} {}; session_xfers={}); refusing DONE",
+                            self.opened_vid.unwrap_or(0),
+                            self.opened_pid.unwrap_or(0),
+                            self.opened_detail,
+                            self.session_xfer_count()
+                        )))
+                    }
                     Err(e) => Err(NativeUsbError::Io(format!(
-                        "native MPSSE: CFG_W opcodes sent; STAT TDO parse failed: {e}                          (vid={:#06x} pid={:#06x}) — refusing invented DONE",
+                        "native MPSSE: CFG_W opcodes sent on persistent session; STAT TDO parse failed: {e} \
+                         (vid={:#06x} pid={:#06x}) — refusing invented DONE",
                         self.opened_vid.unwrap_or(0),
                         self.opened_pid.unwrap_or(0)
                     ))),
                 },
                 Err(e) => Err(NativeUsbError::Io(format!(
-                    "native MPSSE: wrote {} opcode bytes to FTDI vid={:#06x} pid={:#06x} ({});                      STAT TDO bulk-IN failed ({e}) — refusing DONE (no invented STAT).                      Use --cable mpsse-sim for sim fabric STAT, or OFL for programmer-ok                      without TAP_readback",
+                    "native MPSSE: wrote {} opcode bytes on persistent FTDI session \
+                     vid={:#06x} pid={:#06x} ({}; open_count={} xfers={}); \
+                     STAT TDO bulk-IN failed ({e}) — refusing DONE (no invented STAT). \
+                     Use --cable mpsse-sim for sim fabric STAT, or OFL for programmer-ok \
+                     without TAP_readback",
                     opcodes.len(),
                     self.opened_vid.unwrap_or(0),
                     self.opened_pid.unwrap_or(0),
-                    self.opened_detail
+                    self.opened_detail,
+                    self.usb_open_count,
+                    self.session_xfer_count()
                 ))),
             }
         }
@@ -513,16 +621,21 @@ impl HadUsbTransport for NativeFtdiMpsse {
         let opcodes = Self::encode_read_stat();
         #[cfg(feature = "usb-native")]
         {
-            match xfer_mpsse_inout(&opcodes, STAT_CAPTURE_TDO_LEN) {
+            match self.xfer_inout(&opcodes, STAT_CAPTURE_TDO_LEN) {
                 Ok(tdo) => match parse_stat_tdo_mpsse(&tdo) {
-                    Ok(word) => Ok(Some(word)),
+                    Ok(word) => {
+                        self.last_stat = Some(word);
+                        Ok(Some(word))
+                    }
                     Err(e) => Err(NativeUsbError::Io(format!(
-                        "native MPSSE: STAT TDO parse failed after IN ({e}); probe: {}                          — no invented STAT",
+                        "native MPSSE: STAT TDO parse failed after IN ({e}); probe: {} \
+                         — no invented STAT",
                         self.opened_detail
                     ))),
                 },
                 Err(e) => Err(NativeUsbError::Io(format!(
-                    "native MPSSE: STAT capture stream ({} bytes) issued but TDO bulk-IN                      failed ({e}); probe: {} — returning no STAT (refusing invented DONE)",
+                    "native MPSSE: STAT capture stream ({} bytes) on persistent session but TDO bulk-IN \
+                     failed ({e}); probe: {} — returning no STAT (refusing invented DONE)",
                     opcodes.len(),
                     self.opened_detail
                 ))),
@@ -539,9 +652,66 @@ impl HadUsbTransport for NativeFtdiMpsse {
 }
 
 #[cfg(feature = "usb-native")]
+impl NativeFtdiMpsse {
+    /// Bulk OUT on the persistent session handle (no re-open).
+    fn xfer_out_only(&mut self, opcodes: &[u8]) -> Result<(), NativeUsbError> {
+        let session = self.session.as_mut().ok_or_else(|| {
+            NativeUsbError::Io(
+                "native MPSSE: no persistent session for bulk OUT (open_probe first)".into(),
+            )
+        })?;
+        let timeout = std::time::Duration::from_millis(1000);
+        session
+            .handle
+            .write_bulk(0x02, opcodes, timeout)
+            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk OUT (session): {e}")))?;
+        session.xfer_count = session.xfer_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Bulk OUT then IN on the persistent session handle (no re-open).
+    fn xfer_inout(&mut self, opcodes: &[u8], read_len: usize) -> Result<Vec<u8>, NativeUsbError> {
+        if read_len == 0 {
+            return Err(NativeUsbError::Io(
+                "xfer_inout: read_len=0 (refusing empty TDO as STAT)".into(),
+            ));
+        }
+        let session = self.session.as_mut().ok_or_else(|| {
+            NativeUsbError::Io(
+                "native MPSSE: no persistent session for bulk INOUT (open_probe first)".into(),
+            )
+        })?;
+        let timeout = std::time::Duration::from_millis(1000);
+        session
+            .handle
+            .write_bulk(0x02, opcodes, timeout)
+            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk OUT (session): {e}")))?;
+        let mut buf = vec![0u8; read_len];
+        // FT2232H channel A bulk IN is typically 0x81.
+        let n = session
+            .handle
+            .read_bulk(0x81, &mut buf, timeout)
+            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk IN (session): {e}")))?;
+        if n < read_len {
+            return Err(NativeUsbError::Io(format!(
+                "MPSSE bulk IN short read: {n}/{read_len} (no invented STAT)"
+            )));
+        }
+        buf.truncate(read_len);
+        session.xfer_count = session.xfer_count.saturating_add(1);
+        Ok(buf)
+    }
+}
+
+#[cfg(feature = "usb-native")]
 fn open_probe_rusb(this: &mut NativeFtdiMpsse) -> Result<(), NativeUsbError> {
-    if this.open {
+    // Idempotent: keep the live handle (no reopen thrash).
+    if this.open && this.session.is_some() {
         return Ok(());
+    }
+    // Stale open flag without handle — recover by clearing.
+    if this.open && this.session.is_none() {
+        this.open = false;
     }
     let scan = enumerate_ftdi();
     if scan.probes.is_empty() {
@@ -558,12 +728,14 @@ fn open_probe_rusb(this: &mut NativeFtdiMpsse) -> Result<(), NativeUsbError> {
         .find(|p| p.pid == FTDI_PID_FT2232H)
         .unwrap_or(&scan.probes[0]);
     let detail = target.detail();
-    match open_ftdi_mpsse_device(target.bus, target.address, target.vid, target.pid) {
-        Ok(()) => {
+    match open_ftdi_mpsse_session(target.bus, target.address, target.vid, target.pid) {
+        Ok(session) => {
             this.open = true;
+            this.session = Some(session);
             this.opened_vid = Some(target.vid);
             this.opened_pid = Some(target.pid);
             this.opened_detail = detail;
+            this.usb_open_count = this.usb_open_count.saturating_add(1);
             Ok(())
         }
         Err(e) => Err(NativeUsbError::Io(format!(
@@ -574,12 +746,12 @@ fn open_probe_rusb(this: &mut NativeFtdiMpsse) -> Result<(), NativeUsbError> {
 }
 
 #[cfg(feature = "usb-native")]
-fn open_ftdi_mpsse_device(
+fn open_ftdi_mpsse_session(
     bus: u8,
     address: u8,
     vid: u16,
     pid: u16,
-) -> Result<(), String> {
+) -> Result<FtdiMpsseSession, String> {
     let devices = rusb::devices().map_err(|e| format!("rusb devices(): {e}"))?;
     let mut found = None;
     for dev in devices.iter() {
@@ -610,10 +782,13 @@ fn open_ftdi_mpsse_device(
     ftdi_reset(&mut handle)?;
     ftdi_set_bitmode(&mut handle, 0x00, BITMODE_RESET)?;
     ftdi_set_bitmode(&mut handle, 0x0b, BITMODE_MPSSE)?;
-    // Store nothing global — handle drops; subsequent xfer re-opens. For a
-    // first ship we prove open+bitmode; persistent handle can land later.
-    let _ = handle;
-    Ok(())
+    Ok(FtdiMpsseSession {
+        handle,
+        bus,
+        address,
+        _iface: iface,
+        xfer_count: 0,
+    })
 }
 
 #[cfg(feature = "usb-native")]
@@ -660,86 +835,23 @@ fn ftdi_set_bitmode(
     Ok(())
 }
 
-/// Best-effort MPSSE bulk OUT when a device is open. Re-opens first FTDI.
-/// On failure returns Io — never synthesizes STAT.
-#[cfg(feature = "usb-native")]
-fn xfer_mpsse_out_only(opcodes: &[u8]) -> Result<(), NativeUsbError> {
-    let scan = enumerate_ftdi();
-    let target = scan.probes.first().ok_or_else(|| {
-        NativeUsbError::Io("FTDI disappeared before MPSSE xfer".into())
-    })?;
-    let devices = rusb::devices().map_err(|e| NativeUsbError::Io(format!("rusb: {e}")))?;
-    for dev in devices.iter() {
-        if dev.bus_number() != target.bus || dev.address() != target.address {
-            continue;
-        }
-        let mut handle = dev
-            .open()
-            .map_err(|e| NativeUsbError::Io(format!("open for xfer: {e}")))?;
-        let _ = handle.claim_interface(0);
-        let _ = ftdi_set_bitmode(&mut handle, 0x0b, BITMODE_MPSSE);
-        // Bulk OUT endpoint 0x02 is standard for FT2232H channel A.
-        let timeout = std::time::Duration::from_millis(1000);
-        handle
-            .write_bulk(0x02, opcodes, timeout)
-            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk OUT: {e}")))?;
-        return Ok(());
-    }
-    Err(NativeUsbError::Io(
-        "FTDI device not found for MPSSE bulk OUT".into(),
-    ))
-}
-
-/// MPSSE bulk OUT then bulk IN of `read_len` bytes (STAT TDO capture).
-/// Never synthesizes TDO — short/failed reads are Io errors.
-#[cfg(feature = "usb-native")]
-fn xfer_mpsse_inout(opcodes: &[u8], read_len: usize) -> Result<Vec<u8>, NativeUsbError> {
-    if read_len == 0 {
-        return Err(NativeUsbError::Io(
-            "xfer_mpsse_inout: read_len=0 (refusing empty TDO as STAT)".into(),
-        ));
-    }
-    let scan = enumerate_ftdi();
-    let target = scan.probes.first().ok_or_else(|| {
-        NativeUsbError::Io("FTDI disappeared before MPSSE INOUT xfer".into())
-    })?;
-    let devices = rusb::devices().map_err(|e| NativeUsbError::Io(format!("rusb: {e}")))?;
-    for dev in devices.iter() {
-        if dev.bus_number() != target.bus || dev.address() != target.address {
-            continue;
-        }
-        let mut handle = dev
-            .open()
-            .map_err(|e| NativeUsbError::Io(format!("open for INOUT: {e}")))?;
-        let _ = handle.claim_interface(0);
-        let _ = ftdi_set_bitmode(&mut handle, 0x0b, BITMODE_MPSSE);
-        let timeout = std::time::Duration::from_millis(1000);
-        handle
-            .write_bulk(0x02, opcodes, timeout)
-            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk OUT: {e}")))?;
-        let mut buf = vec![0u8; read_len];
-        // FT2232H channel A bulk IN is typically 0x81.
-        let n = handle
-            .read_bulk(0x81, &mut buf, timeout)
-            .map_err(|e| NativeUsbError::Io(format!("MPSSE bulk IN: {e}")))?;
-        if n < read_len {
-            return Err(NativeUsbError::Io(format!(
-                "MPSSE bulk IN short read: {n}/{read_len} (no invented STAT)"
-            )));
-        }
-        buf.truncate(read_len);
-        return Ok(buf);
-    }
-    Err(NativeUsbError::Io(
-        "FTDI device not found for MPSSE bulk INOUT".into(),
-    ))
-}
-
 /// Try native FTDI MPSSE program. Feature-off → NotImplemented; no device → Io.
+///
+/// On success, Helion STAT DONE=1 was parsed from live TDO on a persistent session.
 pub fn try_native_mpsse_program(path: &Path, flash: bool) -> Result<(), NativeUsbError> {
+    try_native_mpsse_program_stat(path, flash).map(|_| ())
+}
+
+/// Like [`try_native_mpsse_program`], returning the validated STAT word (DONE=1).
+pub fn try_native_mpsse_program_stat(path: &Path, flash: bool) -> Result<u32, NativeUsbError> {
     let mut t = NativeFtdiMpsse::new();
     t.open_probe()?;
-    t.program_hbits(path, flash)
+    t.program_hbits(path, flash)?;
+    t.last_stat.ok_or_else(|| {
+        NativeUsbError::Io(
+            "native MPSSE: program Ok but last_stat missing — refusing invented STAT".into(),
+        )
+    })
 }
 
 /// Human note for detect / HAD docs about native MPSSE vs OFL.
@@ -748,18 +860,18 @@ pub fn native_mpsse_status_note() -> String {
         let scan = enumerate_ftdi();
         if scan.probes.is_empty() {
             format!(
-                "native_mpsse: usb-native ON; 0 FTDI devices — open/program → Io (no invented STAT); STAT TDO decode mock-tested; OFL TAP_readback=none; mpsse-sim=sim fabric only. {}",
+                "native_mpsse: usb-native ON; persistent FTDI session (open-once); 0 FTDI devices — open/program → Io (no invented STAT); STAT TDO decode mock-tested; OFL TAP_readback=none; mpsse-sim=sim fabric only. {}",
                 scan.note
             )
         } else {
             format!(
-                "native_mpsse: usb-native ON; {} FTDI probe(s) listed — MPSSE open+INOUT STAT TDO parse wired; DONE only if live TDO parses with bit5=1. {}",
+                "native_mpsse: usb-native ON; {} FTDI probe(s) listed — persistent MPSSE session + INOUT STAT TDO parse; DONE only if live TDO parses with bit5=1. {}",
                 scan.probes.len(),
                 scan.note
             )
         }
     } else {
-        "native_mpsse: usb-native OFF — NativeFtdiMpsse NotImplemented → OFL fallback; build with --features usb-native for real FTDI MPSSE open/opcode path".into()
+        "native_mpsse: usb-native OFF — NativeFtdiMpsse NotImplemented → OFL fallback; build with --features usb-native for persistent FTDI MPSSE session/opcode path".into()
     }
 }
 
@@ -898,5 +1010,49 @@ mod tests {
         assert!(err.contains("short") || err.contains("refusing"), "{err}");
         let err0 = parse_stat_tdo_mpsse(&[]).unwrap_err();
         assert!(err0.contains("refusing") || err0.contains("short"), "{err0}");
+    }
+
+    #[test]
+    fn persistent_session_lifecycle_without_device() {
+        let mut t = NativeFtdiMpsse::new();
+        assert!(!t.is_open());
+        assert_eq!(t.usb_open_count, 0);
+        assert_eq!(t.session_xfer_count(), 0);
+        assert!(t.last_stat.is_none());
+        let err = t.open_probe().unwrap_err();
+        if cfg!(feature = "usb-native") {
+            assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+            assert!(!t.is_open());
+            assert_eq!(t.usb_open_count, 0, "failed open must not count as session open");
+            assert_eq!(t.session_xfer_count(), 0);
+        } else {
+            assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+        }
+        // close_session is safe when never opened
+        t.close_session();
+        assert!(!t.is_open());
+        assert_eq!(t.session_xfer_count(), 0);
+        // Idempotent close
+        t.close_session();
+        assert!(!t.is_open());
+    }
+
+    #[test]
+    fn status_note_mentions_persistent_session() {
+        let n = native_mpsse_status_note();
+        assert!(
+            n.contains("persistent") || n.contains("session") || n.contains("NotImplemented"),
+            "{n}"
+        );
+    }
+
+    #[test]
+    fn try_native_mpsse_program_stat_no_device_honesty() {
+        let err = try_native_mpsse_program_stat(Path::new("/dev/null"), false).unwrap_err();
+        if cfg!(feature = "usb-native") {
+            assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+        } else {
+            assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+        }
     }
 }

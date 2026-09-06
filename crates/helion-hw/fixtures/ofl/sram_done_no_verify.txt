@@ -1,0 +1,5 @@
+openFPGALoader 0.12.0
+Jtag frequency: 6MHz
+Parse file done
+Load SRAM done
+Done

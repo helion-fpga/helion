@@ -1,0 +1,7 @@
+openFPGALoader 0.12.0
+Jtag frequency: 6MHz
+Parse file done
+Erase flash done
+Write flash: [=======================] 100%
+Verify: OK
+Done
