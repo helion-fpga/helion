@@ -3,7 +3,7 @@
 **Date:** 2026-09-06 ~01:55 America/New_York  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
 **Prior:** SHA `ea70415` (+ report `ac3caa3`) — pin-wrap imux_skip=**223**, full=**181**, IOB=1, gold 9640  
-**Shipped:** see commit on this branch  
+**Shipped:** SHA `de70989`  
 **Gold:** `WNS_PS=9640` **held**
 
 ## Goal
