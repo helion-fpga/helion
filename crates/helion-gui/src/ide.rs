@@ -23024,7 +23024,7 @@ mod tests {
         );
     }
 
-    /// Cheap ILA GUI affordance: status crumb shows mark_debug (capture optional).
+    /// Real flow: mark_debug → (re)implement → ila_arm on counter.sv (no bitstream-unchanged no-op).
     #[test]
     fn ila_status_crumb_surfaces_mark_debug_and_capture() {
         let mut ide = IdeModel::new();
@@ -23037,8 +23037,25 @@ mod tests {
         let md = ide.ila_status_crumb();
         assert!(md.contains("md:cnt_3"), "{md}");
         assert!(md.contains("ILA"), "{md}");
-        // Full insert_arm_capture needs place/route/bitstream with probe net;
-        // crumb must stay honest even when arm is a no-op on a tiny pre-built bit.
+        // Session::mark_debug already inserted the probe; (re)implement with it present.
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        ide.exec("ila_window 8").unwrap();
+        let arm = ide.exec("ila_arm cnt_3").unwrap();
+        assert!(arm.contains("net=cnt_3"), "{arm}");
+        assert!(arm.contains("samples=8"), "{arm}");
+        assert!(
+            ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
+            "fabric capture after mark→impl→arm: {}",
+            ide.ila.bits
+        );
+        let cap = ide.ila_status_crumb();
+        assert!(cap.contains("md:cnt_3"), "{cap}");
+        assert!(
+            cap.contains("ILA cnt_3×8") || cap.contains("ILA cnt_3×"),
+            "{cap}"
+        );
     }
 
     /// UG900 ILA dashboard: trigger/window from fabric samples on the wave, not a lamp.

@@ -32,8 +32,8 @@ Helion did **not** merge #7. MergeBy on GitHub: `saksham-45` at 2026-09-06 06:54
 | 3 SOFTs | **100/0/0** | verified |
 | CLI breadcrumb | shipped | `9ef40e9` |
 | Board flash UX | soft-hold physical | this branch `c769aeb` — no DONE claim |
-| ILA | crumb + prior `d6f8280` | status crumb on this branch |
-| IP/project | `.helion` | `a3da831` (on master via #7) |
+| ILA | **mark→impl→arm fixed** | `strip_ila` baseline; see FM-HEL-TOP-ila-ip |
+| IP/project | `examples/ip/` + read_ip smoke | dir-form package; AXI fence |
 | Air perf | idle-clean | `c5f02b6`; no request_repaint calls; Mac reconfirmed |
 | Implement QoR | bars moved; AIG STOP | no thrash |
 | Live FTDI | soft-hold | Mac USB empty / OFL -3 |
