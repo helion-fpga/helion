@@ -50,36 +50,29 @@ fn imux_illegal_pins(
     site: Site,
     ff_at: &std::collections::HashMap<&str, Site>,
 ) -> u32 {
-    let mut n = 0u32;
-    for (_, driver) in &lf.lut_pins {
-        match ff_at.get(driver.as_str()) {
-            Some(ds) if imux_local(*ds, site) => {}
-            Some(_) => n += 1,
-            None => {}
-        }
-    }
-    n
+    imux_score(lf, site, ff_at).0
 }
 
-/// Spill distance for illegal IMUX pins: sum of Manhattan over out-of-reach
-/// arcs. Enables gradient legalize (walk closer across passes) when empty
-/// sites inside direct reach are full — critical for long N-S Ibex arcs.
-fn imux_spill(
+/// Single pin walk: (illegal_count, manhattan_spill). Spill is Manhattan over
+/// out-of-reach arcs for gradient legalize. Hot path — one walk not two.
+fn imux_score(
     lf: &helion_pack::PackedLutFf,
     site: Site,
     ff_at: &std::collections::HashMap<&str, Site>,
-) -> u32 {
+) -> (u32, u32) {
+    let mut n = 0u32;
     let mut spill = 0u32;
     for (_, driver) in &lf.lut_pins {
         match ff_at.get(driver.as_str()) {
             Some(ds) if imux_local(*ds, site) => {}
             Some(ds) => {
+                n += 1;
                 spill += ds.x.abs_diff(site.x) + ds.y.abs_diff(site.y);
             }
             None => {}
         }
     }
-    spill
+    (n, spill)
 }
 
 fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
@@ -111,6 +104,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
 
     let mut lutff_sites = Vec::new();
     if !packed.lutffs.is_empty() {
+        let t_aff = std::time::Instant::now();
         // Prefer the IOB column that each cluster drives (multi-IOB comb mux).
         // Single-IOB designs (counter/blinky gold) still pack into one column.
         let fallback_iob = iob_sites
@@ -137,6 +131,15 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
+        // Free BLE counts: skip exhausted columns/sites without HashSet probes.
+        let mut col_free: std::collections::HashMap<u32, usize> = cols
+            .iter()
+            .map(|(&x, col)| (x, col.len() * n_ble))
+            .collect();
+        let mut site_used_n: std::collections::HashMap<(u32, u32), u8> =
+            std::collections::HashMap::new();
+        let mut xs_seen: HashSet<u32> = HashSet::new();
+        let mut y_seen: HashSet<u32> = HashSet::new();
         // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
@@ -151,7 +154,9 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     affinity.push(*s);
                 }
             }
-            let mut try_xs: Vec<u32> = Vec::with_capacity(8 + affinity.len() * 5 + all_xs.len());
+            // Primary xs: affinity ±E-W then preferred IOB — same order as before,
+            // but defer full-die all_xs until primary fails (equiv. via dedup).
+            let mut try_xs: Vec<u32> = Vec::with_capacity(8 + affinity.len() * 5);
             for s in &affinity {
                 try_xs.push(s.x);
                 // Harder cluster: keep sink in E-W±1/±2 of drivers before sprawl.
@@ -172,24 +177,40 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             if fallback_iob.x != preferred_x {
                 try_xs.push(fallback_iob.x);
             }
+            xs_seen.clear();
+            try_xs.retain(|x| xs_seen.insert(*x));
+            let primary_xs = try_xs.len();
             for &x in &all_xs {
-                try_xs.push(x);
+                if xs_seen.insert(x) {
+                    try_xs.push(x);
+                }
             }
-            // dedup preserving order
-            {
-                let mut seen = HashSet::new();
-                try_xs.retain(|x| seen.insert(*x));
-            }
-            let mut placed = None;
-            'cols: for col_x in try_xs {
-                let Some(col) = cols.get(&col_x) else { continue };
+            let try_slot = |col_x: u32,
+                                affinity: &[Site],
+                                cols: &std::collections::HashMap<u32, Vec<Site>>,
+                                col_free: &std::collections::HashMap<u32, usize>,
+                                site_used_n: &std::collections::HashMap<(u32, u32), u8>,
+                                used: &mut HashSet<(u32, u32, u8)>,
+                                y_seen: &mut HashSet<u32>,
+                                full_y: bool|
+             -> Option<(Site, u8)> {
+                if col_free.get(&col_x).copied().unwrap_or(0) == 0 {
+                    return None;
+                }
+                let Some(col) = cols.get(&col_x) else {
+                    return None;
+                };
                 if col.is_empty() {
-                    continue;
+                    return None;
                 }
                 // Preferred Y order: affinity sites in this column, then ±1, then
                 // south/mid wrap so the full 8192 BLE budget is reachable.
-                let mut y_order: Vec<u32> = Vec::with_capacity(col.len());
-                for s in &affinity {
+                let mut y_order: Vec<u32> = Vec::with_capacity(if full_y {
+                    col.len() + 8
+                } else {
+                    16
+                });
+                for s in affinity {
                     let dx = s.x.abs_diff(col_x);
                     if dx == 0 {
                         y_order.push(s.y);
@@ -238,30 +259,97 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     col[col.len() / 2].y
                 };
                 y_order.push(base_y);
-                for s in col {
-                    y_order.push(s.y);
-                }
-                {
-                    let mut seen = HashSet::new();
-                    y_order.retain(|y| seen.insert(*y));
-                }
-                for y in y_order {
-                    let Some(&site) = col.iter().find(|s| s.y == y) else { continue };
+                y_seen.clear();
+                y_order.retain(|y| y_seen.insert(*y));
+                let try_y = |y: u32,
+                             col: &[Site],
+                             site_used_n: &std::collections::HashMap<(u32, u32), u8>,
+                             used: &mut HashSet<(u32, u32, u8)>|
+                 -> Option<(Site, u8)> {
+                    let Ok(idx) = col.binary_search_by_key(&y, |s| s.y) else {
+                        return None;
+                    };
+                    let site = col[idx];
+                    if site_used_n.get(&(site.x, site.y)).copied().unwrap_or(0) as usize >= n_ble {
+                        return None;
+                    }
                     for ble in 0..n_ble as u8 {
                         if used.insert((site.x, site.y, ble)) {
-                            placed = Some((site, ble));
-                            break 'cols;
+                            return Some((site, ble));
+                        }
+                    }
+                    None
+                };
+                for y in y_order {
+                    if let Some(hit) = try_y(y, col, site_used_n, used) {
+                        return Some(hit);
+                    }
+                }
+                if full_y {
+                    for s in col {
+                        if y_seen.contains(&s.y) {
+                            continue;
+                        }
+                        if let Some(hit) = try_y(s.y, col, site_used_n, used) {
+                            return Some(hit);
                         }
                     }
                 }
+                None
+            };
+            // Per column: affinity+base Y first, then remaining column Ys — never
+            // advance to the next column before exhausting the current (legacy order).
+            // Primary xs first; die-wide all_xs tail only if primary misses.
+            let mut place_xs = |xs: &[u32]| -> Option<(Site, u8)> {
+                for &col_x in xs {
+                    if let Some(hit) = try_slot(
+                        col_x,
+                        &affinity,
+                        &cols,
+                        &col_free,
+                        &site_used_n,
+                        &mut used,
+                        &mut y_seen,
+                        false,
+                    ) {
+                        return Some(hit);
+                    }
+                    if let Some(hit) = try_slot(
+                        col_x,
+                        &affinity,
+                        &cols,
+                        &col_free,
+                        &site_used_n,
+                        &mut used,
+                        &mut y_seen,
+                        true,
+                    ) {
+                        return Some(hit);
+                    }
+                }
+                None
+            };
+            let mut placed = place_xs(&try_xs[..primary_xs]);
+            if placed.is_none() {
+                placed = place_xs(&try_xs[primary_xs..]);
             }
             let site_ble = placed.ok_or_else(|| "no CLB/BLE site left for LUTFF".to_string())?;
+            if let Some(c) = col_free.get_mut(&site_ble.0.x) {
+                *c = c.saturating_sub(1);
+            }
+            *site_used_n.entry((site_ble.0.x, site_ble.0.y)).or_insert(0) += 1;
             if !lf.ff_cell.is_empty() {
                 ff_at.insert(lf.ff_cell.as_str(), site_ble.0);
             }
             lutff_sites.push(site_ble);
         }
 
+            eprintln!(
+                "hang_diag place affinity lutffs={} ms={}",
+                lutff_sites.len(),
+                t_aff.elapsed().as_millis()
+            );
+            let t_leg = std::time::Instant::now();
             // FM-HEL-TOP: bidirectional IMUX legalization — pull sinks toward
             // drivers AND drivers toward sinks onto real HAD reach (same-CLB /
             // N-S±1/±2 / E-W±1/±2 / diag±1 / knight); empty-BLE move then
@@ -271,6 +359,16 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             for (i, (s, ble)) in lutff_sites.iter().enumerate() {
                 site_of.insert((s.x, s.y, *ble), i);
             }
+            // O(1) (x,y)→Site for legalize candidate resolution (vs linear col scan).
+            let mut site_xy: std::collections::HashMap<(u32, u32), Site> =
+                std::collections::HashMap::new();
+            for col in cols.values() {
+                for &s in col {
+                    site_xy.insert((s.x, s.y), s);
+                }
+            }
+            // Reused across cells/passes to cut HashSet alloc churn on cand_xy dedup.
+            let mut cand_seen: HashSet<(u32, u32)> = HashSet::new();
             // Reverse fanout: driver FF cell → unique sink LUTFF indices (bileg).
             let mut sinks_of: std::collections::HashMap<&str, Vec<usize>> =
                 std::collections::HashMap::new();
@@ -333,25 +431,9 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     xy.push((x - 2, y - 1));
                 }
             };
-            // Illegal fanout arcs from driver FF at d_site onto its sinks.
-            let illegal_fanout = |d_ff: &str,
-                                  d_site: Site,
-                                  sink_idxs: &[usize],
-                                  lutff_sites: &[(Site, u8)]|
-             -> u32 {
-                let mut n = 0u32;
-                for &si in sink_idxs {
-                    let (ss, _) = lutff_sites[si];
-                    for (_, driver) in &packed.lutffs[si].lut_pins {
-                        if driver.as_str() == d_ff && !imux_local(d_site, ss) {
-                            n += 1;
-                        }
-                    }
-                }
-                n
-            };
-            // Driver move score: (fanout, own_inputs). Lex better = less fanout,
-            // then less own inputs — prefer collapsing long arcs even if inputs
+            // Driver move score: (fanout, fan_spill, own_inputs). One sink walk
+            // (was illegal_fanout + spill). Lex better = less fanout, then spill,
+            // then own inputs — prefer collapsing long arcs even if inputs
             // briefly worsen (sink-phase repairs inputs next pass).
             let drv_score = |d_idx: usize,
                              d_ff: &str,
@@ -360,17 +442,19 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                              lutff_sites: &[(Site, u8)],
                              ff_at: &std::collections::HashMap<&str, Site>|
              -> (u32, u32, u32) {
+                let mut fan_illegal = 0u32;
                 let mut fan_spill = 0u32;
                 for &si in sink_idxs {
                     let (ss, _) = lutff_sites[si];
                     for (_, driver) in &packed.lutffs[si].lut_pins {
                         if driver.as_str() == d_ff && !imux_local(d_site, ss) {
+                            fan_illegal += 1;
                             fan_spill += d_site.x.abs_diff(ss.x) + d_site.y.abs_diff(ss.y);
                         }
                     }
                 }
                 (
-                    illegal_fanout(d_ff, d_site, sink_idxs, lutff_sites),
+                    fan_illegal,
                     fan_spill,
                     imux_illegal_pins(&packed.lutffs[d_idx], d_site, ff_at),
                 )
@@ -427,12 +511,12 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         continue;
                     }
                     let (cur_site, cur_ble) = lutff_sites[i];
-                    let before = imux_illegal_pins(lf, cur_site, &ff_at);
+                    let before_sc = imux_score(lf, cur_site, &ff_at);
+                    let before = before_sc.0;
+                    let before_sp = before_sc.1;
                     if before == 0 {
                         continue;
                     }
-                    let before_sp = imux_spill(lf, cur_site, &ff_at);
-                    let before_sc = (before, before_sp);
                     let mut cand_xy: Vec<(u32, u32)> = Vec::new();
                     for (_, driver) in &lf.lut_pins {
                         if let Some(ds) = ff_at.get(driver.as_str()).copied() {
@@ -448,19 +532,19 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             }
                         }
                     }
-                    {
-                        let mut seen = HashSet::new();
-                        cand_xy.retain(|xy| seen.insert(*xy));
-                    }
-                    // 1) Prefer empty BLE: fewer illegal, then less spill (gradient).
+                    cand_seen.clear();
+                    cand_xy.retain(|xy| cand_seen.insert(*xy));
+                    // 1) Prefer empty BLE: score is site-only (BLE-independent) — once/site.
                     let mut best: Option<(Site, u8, (u32, u32))> = None;
                     for (cx, cy) in &cand_xy {
-                        let Some(site) = cols
-                            .get(cx)
-                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
-                        else {
+                        let Some(&site) = site_xy.get(&(*cx, *cy)) else {
                             continue;
                         };
+                        let sc = imux_score(lf, site, &ff_at);
+                        if sc >= before_sc || best.as_ref().map(|b| sc >= b.2).unwrap_or(false) {
+                            continue;
+                        }
+                        let mut found_ble: Option<u8> = None;
                         for ble in 0..n_ble as u8 {
                             let key = (site.x, site.y, ble);
                             if key == (cur_site.x, cur_site.y, cur_ble) {
@@ -469,19 +553,14 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             if used.contains(&key) {
                                 continue;
                             }
-                            let sc = (
-                                imux_illegal_pins(lf, site, &ff_at),
-                                imux_spill(lf, site, &ff_at),
-                            );
-                            if sc < before_sc && best.as_ref().map(|b| sc < b.2).unwrap_or(true) {
-                                best = Some((site, ble, sc));
-                                if sc.0 == 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        if best.as_ref().map(|b| b.2 .0) == Some(0) {
+                            found_ble = Some(ble);
                             break;
+                        }
+                        if let Some(ble) = found_ble {
+                            best = Some((site, ble, sc));
+                            if sc.0 == 0 {
+                                break;
+                            }
                         }
                     }
                     if let Some((site, ble, _)) = best {
@@ -499,10 +578,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     // 2) Pairwise swap with occupant when total illegal pins drop.
                     let mut best_swap: Option<(usize, Site, u8, (u32, u32))> = None;
                     for (cx, cy) in &cand_xy {
-                        let Some(site) = cols
-                            .get(cx)
-                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
-                        else {
+                        let Some(&site) = site_xy.get(&(*cx, *cy)) else {
                             continue;
                         };
                         for ble in 0..n_ble as u8 {
@@ -518,7 +594,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             }
                             let other = &packed.lutffs[j];
                             let (osite, _oble) = lutff_sites[j];
-                            let other_before = imux_illegal_pins(other, osite, &ff_at);
+                            let other_before_sc = imux_score(other, osite, &ff_at);
+                            let other_before = other_before_sc.0;
                             let i_ff = lf.ff_cell.as_str();
                             let j_ff = other.ff_cell.as_str();
                             let i_prev = if !i_ff.is_empty() {
@@ -531,14 +608,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             } else {
                                 None
                             };
-                            let sc_i = (
-                                imux_illegal_pins(lf, site, &ff_at),
-                                imux_spill(lf, site, &ff_at),
-                            );
-                            let sc_j = (
-                                imux_illegal_pins(other, cur_site, &ff_at),
-                                imux_spill(other, cur_site, &ff_at),
-                            );
+                            let sc_i = imux_score(lf, site, &ff_at);
+                            let sc_j = imux_score(other, cur_site, &ff_at);
                             // restore
                             if !i_ff.is_empty() {
                                 match i_prev {
@@ -563,7 +634,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             let after = (sc_i.0 + sc_j.0, sc_i.1 + sc_j.1);
                             let before_tot = (
                                 before + other_before,
-                                before_sp + imux_spill(other, osite, &ff_at),
+                                before_sp + other_before_sc.1,
                             );
                             if after >= before_tot {
                                 continue;
@@ -630,19 +701,28 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             );
                         }
                     }
-                    {
-                        let mut seen = HashSet::new();
-                        cand_xy.retain(|xy| seen.insert(*xy));
-                    }
-                    // 1) Empty BLE move for driver.
+                    cand_seen.clear();
+                    cand_xy.retain(|xy| cand_seen.insert(*xy));
+                    // 1) Empty BLE move for driver — score site-only once (BLE-independent).
                     let mut best: Option<(Site, u8, (u32, u32, u32))> = None;
                     for (cx, cy) in &cand_xy {
-                        let Some(site) = cols
-                            .get(cx)
-                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
-                        else {
+                        let Some(&site) = site_xy.get(&(*cx, *cy)) else {
                             continue;
                         };
+                        let prev = ff_at.insert(d_ff, site);
+                        let sc = drv_score(i, d_ff, site, sink_idxs, &lutff_sites, &ff_at);
+                        match prev {
+                            Some(s) => {
+                                ff_at.insert(d_ff, s);
+                            }
+                            None => {
+                                ff_at.remove(d_ff);
+                            }
+                        }
+                        if sc >= before || best.as_ref().map(|b| sc >= b.2).unwrap_or(false) {
+                            continue;
+                        }
+                        let mut found_ble: Option<u8> = None;
                         for ble in 0..n_ble as u8 {
                             let key = (site.x, site.y, ble);
                             if key == (cur_site.x, cur_site.y, cur_ble) {
@@ -651,25 +731,14 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                             if used.contains(&key) {
                                 continue;
                             }
-                            let prev = ff_at.insert(d_ff, site);
-                            let sc = drv_score(i, d_ff, site, sink_idxs, &lutff_sites, &ff_at);
-                            match prev {
-                                Some(s) => {
-                                    ff_at.insert(d_ff, s);
-                                }
-                                None => {
-                                    ff_at.remove(d_ff);
-                                }
-                            }
-                            if sc < before && best.as_ref().map(|b| sc < b.2).unwrap_or(true) {
-                                best = Some((site, ble, sc));
-                                if sc.0 == 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        if best.as_ref().map(|b| b.2 .0) == Some(0) {
+                            found_ble = Some(ble);
                             break;
+                        }
+                        if let Some(ble) = found_ble {
+                            best = Some((site, ble, sc));
+                            if sc.0 == 0 {
+                                break;
+                            }
                         }
                     }
                     if let Some((site, ble, _)) = best {
@@ -686,10 +755,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     // (drv_fanout + other_fanout, drv_inputs + other_inputs).
                     let mut best_swap: Option<(usize, Site, u8, (u32, u32, u32))> = None;
                     for (cx, cy) in &cand_xy {
-                        let Some(site) = cols
-                            .get(cx)
-                            .and_then(|c| c.iter().find(|s| s.y == *cy).copied())
-                        else {
+                        let Some(&site) = site_xy.get(&(*cx, *cy)) else {
                             continue;
                         };
                         for ble in 0..n_ble as u8 {
@@ -802,6 +868,10 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     "hang_bileg place imux_legalize sink_moved={moved} sink_swapped={swapped} drv_moved={driver_moved} drv_swapped={driver_swapped}"
                 );
             }
+            eprintln!(
+                "hang_diag place legalize ms={}",
+                t_leg.elapsed().as_millis()
+            );
     }
 
     let mut mac_sites = Vec::new();
