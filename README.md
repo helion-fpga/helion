@@ -6,11 +6,15 @@
 
 Original FPGA family + CAD. Native `aarch64-apple-darwin`. No vendor bitstream.
 
+[![Release](https://img.shields.io/github/v/release/helion-fpga/helion)](https://github.com/helion-fpga/helion/releases/latest)
+
 **We need people.** One owner, a real CAD, Apache-2.0 OR MIT. If you write Rust,
 SystemVerilog, STA, IDE tests, or docs, start at
 [Get involved](https://helion-fpga.github.io/helion/get-involved.html).
 
-[Docs](https://helion-fpga.github.io/helion/)
+[Download](https://github.com/helion-fpga/helion/releases/latest)
+· [Changelog](CHANGELOG.md)
+· [Docs](https://helion-fpga.github.io/helion/)
 · [Contributing](CONTRIBUTING.md)
 · [Discussions](https://github.com/helion-fpga/helion/discussions)
 · [Good first issues](https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
@@ -85,6 +89,20 @@ Gold waveform: `helion run examples/counter.sv --cycles 16` → `LED[16]=0000000
 Wall time: `helion qor` reports `ELAPSED_MS` for the whole synth → pack → place →
 route → STA → bitgen flow (~30 ms per example here); the gate fails above
 2000 ms, so a flow that gets slower by an order of magnitude cannot land quietly.
+
+## Download
+
+[GitHub Releases](https://github.com/helion-fpga/helion/releases/latest) publish
+versioned builds for each `vX.Y.Z` tag:
+
+| File | What |
+|---|---|
+| `Helion-*-macos-arm64.zip` | `Helion.app` (Apple Silicon). Unsigned — Gatekeeper will warn. |
+| `helion-*-aarch64-apple-darwin.tar.gz` | CLI + IDE + HAD + examples |
+| `helion-*-x86_64-unknown-linux-gnu.tar.gz` | Linux CLI + headless IDE |
+| `SHA256SUMS.txt` | hashes |
+
+How we cut a tag: [`RELEASING.md`](RELEASING.md). Notes: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Run on macOS (Apple Silicon)
 

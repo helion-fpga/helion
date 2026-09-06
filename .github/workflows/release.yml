@@ -1,0 +1,136 @@
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild (vX.Y.Z). Empty = this SHA, no publish."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  darwin:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: aarch64-apple-darwin
+      - name: version
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$TAG" in v*.*.*) ;; *) TAG="v0.0.0-dev" ;; esac
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          CARGO_VER=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          echo "cargo=$CARGO_VER" >> "$GITHUB_OUTPUT"
+          if [ "$TAG" != "v0.0.0-dev" ] && [ "$CARGO_VER" != "$VER" ]; then
+            echo "Cargo.toml version $CARGO_VER does not match tag $TAG" >&2
+            exit 1
+          fi
+      - name: Helion.app
+        run: ./scripts/build-macos-app.sh
+      - name: helion-prog
+        run: cargo build --release --target aarch64-apple-darwin -p helion-hw
+      - name: zip app
+        run: |
+          mkdir -p dist/upload
+          ditto -c -k --keepParent dist/Helion.app \
+            "dist/upload/Helion-${{ steps.meta.outputs.ver }}-macos-arm64.zip"
+      - name: unix tarball
+        run: |
+          ./scripts/pack-unix-release.sh \
+            "${{ steps.meta.outputs.ver }}" \
+            aarch64-apple-darwin \
+            target/aarch64-apple-darwin/release \
+            dist/upload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64
+          path: dist/upload/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: version
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$TAG" in v*.*.*) ;; *) TAG="v0.0.0-dev" ;; esac
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: build
+        run: cargo build --release -p helion-cli -p helion-gui -p helion-hw
+      - name: unix tarball
+        run: |
+          mkdir -p dist/upload
+          ./scripts/pack-unix-release.sh \
+            "${{ steps.meta.outputs.ver }}" \
+            x86_64-unknown-linux-gnu \
+            target/release \
+            dist/upload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/upload/*
+          if-no-files-found: error
+
+  publish:
+    needs: [darwin, linux]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/upload
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist/upload
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sha256sum Helion-*.zip helion-*.tar.gz > SHA256SUMS.txt
+          else
+            shasum -a 256 Helion-*.zip helion-*.tar.gz > SHA256SUMS.txt
+          fi
+          cat SHA256SUMS.txt
+      - name: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          {
+            echo "Helion ${TAG#v}"
+            echo
+            echo "Original FPGA family + CAD. Native Apple Silicon app; Linux CLI tarball."
+            echo "Unsigned macOS build — Gatekeeper will warn. Apache-2.0 OR MIT."
+            echo
+            sh scripts/changelog-excerpt.sh "$TAG"
+            echo
+            echo "Gold: empty-XDC \`counter.sv\` WNS_PS=9640, LED[16]=0000000111111110."
+          } > dist/RELEASE_NOTES.md
+          cat dist/RELEASE_NOTES.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Helion ${{ github.ref_name }}
+          body_path: dist/RELEASE_NOTES.md
+          files: dist/upload/*
+          fail_on_unmatched_files: true
+          draft: false
+          make_latest: true
