@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Optional rusb FTDI (VID 0x0403) enumeration for detect_boards.
+# Requires libusb-1.0 at build time. Program/DONE still goes through OFL (or sim);
+# native enumeration never claims hardware program DONE.
+usb-native = ["dep:rusb"]
+
 [dependencies]
 helion-device = { workspace = true }
 helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
+rusb = { version = "0.9", optional = true }
 
 [dev-dependencies]
 helion-ir = { workspace = true }
