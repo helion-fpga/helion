@@ -1,28 +1,33 @@
 # Schematic deepen vs Yosys connectivity
 
 **Date:** 2026-09-06 (America/New_York)
-**Status:** **DONE-at-98** (monster-band DW-wraps: ln/muladdc/max/min/absdiff/clamp → +6)
-**Scope:** capped sample of phase-d PASS designs (no uncapped Ibex/sha256)
+**Status:** **DONE-at-99** (sha256 phase_d wrap folded → +1; residual intentional skip: ysyx_ibex only)
+**Scope:** capped sample of phase-d PASS designs (no uncapped Ibex)
 **Gold:** `WNS_PS=9640` held
-**Phase-d score:** PASS 98 / SOFT 2 / FAIL 0 (uart, ysyx_ibex) — deepen does not flip residuals
+**Phase-d score:** PASS 100 / SOFT 0 / FAIL 0 (uart, ysyx_ibex, sha256 SOFTs closed) — deepen does not flip residuals
 **Push:** doc on `fm-hel-corpus-soft-pass` (NO MERGE)
 
-## Method (monster-band DW-reduced wraps)
+## Method (this pass)
 
-1. Remaining EMPTY after batch2: `ln`, `muladdc`, `max`, `min`, `absdiff`, `clamp` (plus intentional sha256/ibex skip).
-2. Full-width / DW=16 exploded schematic edges (muladdc/max TIMEOUT @55s; ln prior ~21M edges).
-3. Added light wrappers `*_phase_d.v` under `vendored/logikbench/*/rtl/` with **DW=8** (muladdc OW=20; ln QW=4 + Q4.4-scaled coeffs).
-4. Headless capped `helion-ide --stdin` (`open <wrap>` → `schematic` → `schematic_drawing` → `quit`), PG-kill ≤55s each.
-5. IDE binary: `/workspace/helion/target/debug/helion-ide`. Folded all 6 PASS dumps into sample JSON.
+1. Prior bar: DONE-at-98 (monster-band DW-wraps: ln/muladdc/max/min/absdiff/clamp).
+2. Leftover intentional skips: `sha256`, `ysyx_ibex`.
+3. Cheap fold: headless capped `helion-ide --stdin` on `sha256_phase_d.v` (w_mem top), PG-kill ≤55s — completed in **~2.4s**.
+4. `ysyx_ibex` still excluded (never uncapped cargo / schematic hang).
 
 ## Sample deepen counts
 
-**PASS 98 / SOFT 0 / FAIL 0** (n=98; before=92 → **+6**)
+**PASS 99 / SOFT 0 / FAIL 0** (n=99; before=98 → **+1**)
 
 JSON: `dashboard/schematic-deepen-sample.json`  
 Raw: `dashboard/schematic-deepen-raw/` (truncated stubs for monster drawing bodies)
 
-### Newly folded (+6, DW-wrap)
+### Newly folded (+1)
+
+| id | wrap | synth | sch | edges | sym | wires | wall |
+|----|------|-------|-----|-------|-----|-------|------|
+| `sha256` | `sha256_phase_d.v` (w_mem) | 2860 | 2860 | 484954 | 2867 | 2827 | 2.40s |
+
+### Prior monster-band DW-wraps (+6, still held)
 
 | id | wrap | synth | sch | edges | wall |
 |----|------|-------|-----|-------|------|
@@ -33,23 +38,26 @@ Raw: `dashboard/schematic-deepen-raw/` (truncated stubs for monster drawing bodi
 | `clamp` | DW=8 | 8288 | 8288 | 532596 | 8.95s |
 | `ln` | DW=8/QW=4 | 8515 | 8515 | 8011457 | 30.94s |
 
-### Prior full-width failures (now covered via wraps)
-
-| id | prior | detail |
-|----|-------|--------|
-| muladdc | TIMEOUT | DW=16 synth/sch=21792 edges≈5.56M @55s |
-| max | TIMEOUT | DW=16 synth/sch=32880 edges≈5.63M @55s |
-| ln | TIMEOUT | DW=16 synth/sch=17036 edges≈21.5M @55s |
-
-## Remaining EMPTY_SYNTH after this pass
-
-**None** in deepen sample targets.
+## Remaining residual (honest)
 
 ### Intentional skip (not EMPTY; excluded from deepen)
 
-`sha256`, `ysyx_ibex`
+| id | reason |
+|----|--------|
+| `ysyx_ibex` | Never uncapped cargo / schematic; Helion-primary PASS via capped synth (cells=52742). Deepen sample residual **1**. |
+
+EMPTY_SYNTH leftovers in deepen sample targets: **none**.
+
+## Soft verify (same session)
+
+| check | result |
+|-------|--------|
+| phase-d score | **PASS 100 / SOFT 0 / FAIL 0** |
+| uart / ysyx_ibex / sha256 | all **overall PASS** (cells 5704 / 52742 / 2860) |
+| harness Helion-primary | present (`yosys_gap` / `helion_ahead`) |
+| gold | `helion report_timing examples/counter.sv` → **WNS_PS=9640** |
 
 ## Bar move
 
-- Schematic connectivity sample: **92 → 98 PASS** / 0 SOFT / 0 FAIL
-- Full deepen sample bar (~98 phase-d PASS excl. intentional skips) **met**
+- Schematic connectivity sample: **98 → 99 PASS** / 0 SOFT / 0 FAIL
+- Honest residual deepen skip: **1** (`ysyx_ibex`)
