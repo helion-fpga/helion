@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06 ~07:27 America/New_York (EDT)  
 **Branch:** `fm-hel-corpus-soft-pass` (NO MERGE)  
-**Score tip (branch HEAD):** *(filled after push)*  
+**Score tip (branch HEAD):**  ()  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`
 
 ## Gold
@@ -39,4 +39,4 @@ Helion UX HARD rescore on this tip + full pack. **NO MERGE** until captain/First
 
 ## Push
 
-`helion-fpga` `fm-hel-corpus-soft-pass` tip *(after push)* — no merge, no force.
+`helion-fpga` `fm-hel-corpus-soft-pass` tip  — no merge, no force.
