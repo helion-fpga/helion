@@ -53,39 +53,48 @@ pub struct PackedMac {
 }
 
 pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
+    // Ibex-scale: linear scans via Design::net_on are O(n^3). Index once.
+    let pins = design.pin_index();
+    let mut d_driver: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut q_driver: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for c in &design.cells {
+        if matches!(c.kind, CellKind::Hff) {
+            if let Some(d) = pins.net_on(&c.name, "D") {
+                d_driver.entry(d).or_insert(c.name.as_str());
+            }
+            if let Some(q) = pins.net_on(&c.name, "Q") {
+                q_driver.insert(q, c.name.as_str());
+            }
+        }
+    }
     let mut lutffs = Vec::new();
     let mut used_ff = std::collections::HashSet::new();
     for c in &design.cells {
         let CellKind::Lut6 { init } = c.kind else {
             continue;
         };
-        let Some(o_net) = design.net_on(&c.name, "O") else {
+        let Some(o_net) = pins.net_on(&c.name, "O") else {
             continue;
         };
         // Comb LUTs (no FF on O) pack as LUT-only: empty ff_cell, q_net = O so
         // IOB/route match the LUT output. Registered LUTs keep the FF cluster.
-        let ff = design.cells.iter().find(|f| {
-            matches!(f.kind, CellKind::Hff)
-                && !used_ff.contains(&f.name)
-                && design.net_on(&f.name, "D") == Some(o_net)
-        });
-        if let Some(ff) = ff {
-            used_ff.insert(ff.name.clone());
+        let ff_name = d_driver.get(o_net).copied().filter(|n| !used_ff.contains(*n));
+        if let Some(n) = ff_name {
+            used_ff.insert(n.to_string());
         }
         let mut lut_pins = Vec::new();
         for pin in 0u8..6 {
-            if let Some(net) = design.net_on(&c.name, &format!("I{pin}")) {
-                if let Some(src) = design.cells.iter().find(|f| {
-                    matches!(f.kind, CellKind::Hff) && design.net_on(&f.name, "Q") == Some(net)
-                }) {
-                    lut_pins.push((pin, src.name.clone()));
+            let key = format!("I{pin}");
+            if let Some(net) = pins.net_on(&c.name, &key) {
+                if let Some(src) = q_driver.get(net) {
+                    lut_pins.push((pin, (*src).to_string()));
                 }
             }
         }
-        let (ff_cell, q_net) = if let Some(ff) = ff {
+        let (ff_cell, q_net) = if let Some(n) = ff_name {
             (
-                ff.name.clone(),
-                design.net_on(&ff.name, "Q").unwrap_or("").to_string(),
+                n.to_string(),
+                pins.net_on(n, "Q").unwrap_or("").to_string(),
             )
         } else {
             (String::new(), o_net.to_string())
@@ -101,10 +110,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     let mut iobs = Vec::new();
     for c in &design.cells {
         if matches!(c.kind, CellKind::IobOut) {
-            let net = design
+            let net = pins
                 .net_on(&c.name, "I")
                 .ok_or_else(|| format!("IOB {} has no I net", c.name))?;
-            let pad = design.net_on(&c.name, "PAD").unwrap_or("");
+            let pad = pins.net_on(&c.name, "PAD").unwrap_or("");
             let port = design.ports.iter().find(|p| p.name == pad);
             let loc = port.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
             iobs.push(PackedIob {

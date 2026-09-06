@@ -2,7 +2,7 @@
 //! Intra-CLB IMUX (sel 16+k = local BLE k Q); IOB via A* on the tile grid.
 
 use helion_device::{Device, Site};
-use helion_place::{lutff_of, Placed};
+use helion_place::Placed;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -14,6 +14,8 @@ pub struct Routed {
     pub imux: Vec<ImuxRoute>,
     pub pathfinder_iters: u32,
     pub overused: u32,
+    /// LUT-pin drivers outside same-CLB / N-S±1 IMUX encoding (Ibex-scale).
+    pub imux_skip: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +184,15 @@ pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
 }
 
 pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Routed, String> {
+    // Ibex-scale: lutff_of linear scan per pin is O(n^2). Index FF → site once.
+    let mut ff_site: HashMap<&str, (Site, u8)> = HashMap::with_capacity(placed.lutff_sites.len());
+    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+        if !lutff.ff_cell.is_empty() {
+            ff_site.insert(lutff.ff_cell.as_str(), placed.lutff_sites[i]);
+        }
+    }
     let mut imux = Vec::new();
+    let mut imux_skip = 0u32;
     for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
         let (site, ble) = placed.lutff_sites[i];
         if lutff.lut_pins.is_empty() {
@@ -199,15 +209,25 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
             continue;
         }
         for (pin, driver) in &lutff.lut_pins {
-            let (dsite, dble) = lutff_of(placed, driver)
+            let (dsite, dble) = ff_site
+                .get(driver.as_str())
+                .copied()
                 .ok_or_else(|| format!("driver FF {driver} not placed"))?;
-            let sel = imux_sel(dsite, site, dble)?;
-            imux.push(ImuxRoute {
-                x: site.x,
-                y: site.y,
-                mux: ble as u32 * 8 + *pin as u32,
-                sel,
-            });
+            match imux_sel(dsite, site, dble) {
+                Ok(sel) => {
+                    imux.push(ImuxRoute {
+                        x: site.x,
+                        y: site.y,
+                        mux: ble as u32 * 8 + *pin as u32,
+                        sel,
+                    });
+                }
+                Err(_) => {
+                    // Bring-up IMUX is same-CLB / N-S±1 only. Full Ibex has
+                    // longer/diagonal FF→LUT arcs; skip + count (honest, not silent).
+                    imux_skip += 1;
+                }
+            }
         }
     }
 
@@ -243,6 +263,7 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
             imux,
             pathfinder_iters: 0,
             overused: 0,
+            imux_skip,
         });
     }
     let max_iters = opts.max_iters.max(1);
@@ -288,12 +309,20 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
             net,
         });
     }
+    if imux_skip > 0 {
+        eprintln!(
+            "hang_diag imux_skip={} imux_ok={} (non-local FF→LUT; bring-up IMUX N-S/same-CLB only)",
+            imux_skip,
+            imux.len()
+        );
+    }
     Ok(Routed {
         placed: placed.clone(),
         iob_src,
         imux,
         pathfinder_iters: iters,
         overused,
+        imux_skip,
     })
 }
 

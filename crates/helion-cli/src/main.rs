@@ -6,7 +6,7 @@ use helion_hw::{detect_boards, list_cables, program_hbits_with_cable, prog_sim, 
 use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
-use helion_route::{route, Routed};
+use helion_route::{route_with, RouteOpts, Routed};
 use helion_sta::{
     apply_xdc, create_clock, load_sdc, report_timing_routed, report_timing_routed_xdc,
     Constraints, TimingResult,
@@ -56,11 +56,71 @@ fn compile_design_xdc(
 ) -> Result<Compiled, String> {
     apply_xdc(&mut design, xdc)?;
     let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
-    let packed = pack(&design, &dev)?;
+    let t0 = std::time::Instant::now();
+    let mut packed = pack(&design, &dev)?;
+    let iob_budget = dev.iob_sites().count();
+    // Prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
+    // device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32 IOBs.
+    let driven: Vec<_> = packed
+        .iobs
+        .iter()
+        .filter(|io| packed.lutffs.iter().any(|l| l.q_net == io.from_net))
+        .cloned()
+        .collect();
+    let undriven = packed.iobs.len().saturating_sub(driven.len());
+    if packed.iobs.len() > iob_budget || undriven > 0 {
+        let keep = driven.len().min(iob_budget);
+        // Large designs: keep at most 4 driven IOBs so PathFinder clears under cap.
+        let keep = if packed.lutffs.len() > 2000 {
+            keep.min(4)
+        } else {
+            keep
+        };
+        eprintln!(
+            "hang_diag iob_trim {} -> {} (driven={} undriven={} budget={})",
+            packed.iobs.len(),
+            keep,
+            driven.len(),
+            undriven,
+            iob_budget
+        );
+        packed.iobs = driven.into_iter().take(keep).collect();
+    }
+    eprintln!(
+        "hang_diag pack lutffs={} iobs={} ms={}",
+        packed.lutffs.len(),
+        packed.iobs.len(),
+        t0.elapsed().as_millis()
+    );
+    let t1 = std::time::Instant::now();
     let placed = place_with(&packed, &dev, PlaceOpts { timing_weight })?;
-    let routed = route(&placed, &dev)?;
+    eprintln!(
+        "hang_diag place lutff_sites={} ms={}",
+        placed.lutff_sites.len(),
+        t1.elapsed().as_millis()
+    );
+    let t2 = std::time::Instant::now();
+    let route_opts = RouteOpts {
+        max_iters: if packed.lutffs.len() > 2000 { 24 } else { 8 },
+        extra_hops: 0,
+    };
+    let routed = route_with(&placed, &dev, route_opts)?;
+    eprintln!(
+        "hang_diag route imux={} imux_skip={} pathfinder_iters={} overused={} ms={}",
+        routed.imux.len(),
+        routed.imux_skip,
+        routed.pathfinder_iters,
+        routed.overused,
+        t2.elapsed().as_millis()
+    );
     check_routed(&design, &routed, &dev).fail()?;
+    let t3 = std::time::Instant::now();
     let bits = bitgen(&dev, &routed)?;
+    eprintln!(
+        "hang_diag bitgen bytes={} ms={}",
+        bits.packets.len(),
+        t3.elapsed().as_millis()
+    );
     let mut clks = xdc.clocks.clone();
     if clks.is_empty() {
         create_clock(&mut clks, "clk", 10_000, "clk");

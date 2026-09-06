@@ -72,6 +72,9 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         for v in cols.values_mut() {
             v.sort_by_key(|s| s.y);
         }
+        // Precompute global column order once (Ibex-scale: avoid re-sort per LUTFF).
+        let mut all_xs: Vec<u32> = cols.keys().copied().collect();
+        all_xs.sort_unstable();
         let mut iob_for_net: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for (ii, iob) in packed.iobs.iter().enumerate() {
             if let Some(site) = iob_sites.get(ii) {
@@ -79,26 +82,69 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             }
         }
         let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
+        // FF cell → site as we place (IMUX only encodes same-CLB / N-S ±1).
+        let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         for lf in &packed.lutffs {
             let preferred_x = iob_for_net
                 .get(lf.q_net.as_str())
                 .map(|s| s.x)
                 .unwrap_or(fallback_iob.x);
-            let mut try_xs: Vec<u32> = vec![preferred_x, fallback_iob.x];
-            let mut others: Vec<u32> = cols.keys().copied().collect();
-            others.sort_unstable();
-            try_xs.extend(others);
-            try_xs.dedup();
+            // Affinity: already-placed LUT-pin drivers (same CLB, then Y±1).
+            let mut affinity: Vec<Site> = Vec::new();
+            for (_, driver) in &lf.lut_pins {
+                if let Some(s) = ff_at.get(driver.as_str()) {
+                    affinity.push(*s);
+                }
+            }
+            let mut try_xs: Vec<u32> = Vec::with_capacity(2 + affinity.len() + all_xs.len());
+            for s in &affinity {
+                try_xs.push(s.x);
+            }
+            try_xs.push(preferred_x);
+            if fallback_iob.x != preferred_x {
+                try_xs.push(fallback_iob.x);
+            }
+            for &x in &all_xs {
+                try_xs.push(x);
+            }
+            // dedup preserving order
+            {
+                let mut seen = HashSet::new();
+                try_xs.retain(|x| seen.insert(*x));
+            }
             let mut placed = None;
             'cols: for col_x in try_xs {
                 let Some(col) = cols.get(&col_x) else { continue };
                 if col.is_empty() {
                     continue;
                 }
-                let base = if prefer_south { 0usize } else { col.len() / 2 };
-                for clb_off in 0..col.len() {
-                    let idx = (base + clb_off).min(col.len() - 1);
-                    let site = col[idx];
+                // Preferred Y order: affinity sites in this column, then ±1, then
+                // south/mid wrap so the full 8192 BLE budget is reachable.
+                let mut y_order: Vec<u32> = Vec::with_capacity(col.len());
+                for s in &affinity {
+                    if s.x == col_x {
+                        y_order.push(s.y);
+                        y_order.push(s.y.saturating_add(1));
+                        if s.y > 0 {
+                            y_order.push(s.y - 1);
+                        }
+                    }
+                }
+                let base_y = if prefer_south {
+                    col.first().map(|s| s.y).unwrap_or(0)
+                } else {
+                    col[col.len() / 2].y
+                };
+                y_order.push(base_y);
+                for s in col {
+                    y_order.push(s.y);
+                }
+                {
+                    let mut seen = HashSet::new();
+                    y_order.retain(|y| seen.insert(*y));
+                }
+                for y in y_order {
+                    let Some(&site) = col.iter().find(|s| s.y == y) else { continue };
                     for ble in 0..n_ble as u8 {
                         if used.insert((site.x, site.y, ble)) {
                             placed = Some((site, ble));
@@ -107,9 +153,11 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                     }
                 }
             }
-            lutff_sites.push(
-                placed.ok_or_else(|| "no CLB/BLE site left for LUTFF".to_string())?,
-            );
+            let site_ble = placed.ok_or_else(|| "no CLB/BLE site left for LUTFF".to_string())?;
+            if !lf.ff_cell.is_empty() {
+                ff_at.insert(lf.ff_cell.as_str(), site_ble.0);
+            }
+            lutff_sites.push(site_ble);
         }
     }
 
