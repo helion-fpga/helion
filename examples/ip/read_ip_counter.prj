@@ -1,0 +1,4 @@
+# Smoke: directory-form .helion via read_ip (examples/ip/counter/package.helion)
+part HL10T-C32-1
+read_ip examples/ip/counter
+top counter
