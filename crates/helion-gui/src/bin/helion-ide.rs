@@ -8,12 +8,11 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use helion_gui::chrome::{self, Activity, Canvas, RAIL_OPEN_SOURCES};
 use helion_gui::{
     doctor, BottomTab, CdcSeverity, ClockRelation, ConstraintSection, DrcSeverity,
-    FlowStep, IdeModel, IlaTrigger, LayoutKind, MethodologySeverity, MsgSeverity, NavSection,
+    FlowStep, IdeModel, IlaTrigger, LayoutKind, MethodologySeverity, MsgSeverity,
     PathGroupKind, StepState, WaveRadix, WaveStyle, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -435,7 +434,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                                 .unwrap_or_else(|| p.display().to_string());
                             if ui.button(name).clicked() {
                                 app.open_path(&p);
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     }
@@ -445,7 +444,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     for (label, file) in RAIL_OPEN_SOURCES {
                         if ui.button(label).clicked() {
                             pick = Some(file);
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     if let Some(file) = pick {
@@ -530,7 +529,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, model: &mut IdeModel) {
                         rect,
                         2.0,
                         fill,
-                        Stroke::new(1.0, stroke),
+                        Stroke::new(1.0_f32, stroke),
                         egui::StrokeKind::Inside,
                     );
                     ui.painter().text(
@@ -583,7 +582,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                         3.0,
                         fill,
                         Stroke::new(
-                            if on { 1.0 } else { 0.0 },
+                            if on { 1.0_f32 } else { 0.0_f32 },
                             Color32::from_rgb(0x3d, 0xb8, 0x7a),
                         ),
                         egui::StrokeKind::Inside,
@@ -784,7 +783,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ));
             } else {
                 let cable = app.program_cable.clone();
-                app.program_status = Some((true, format!("programming via cable={cable}…")));
+                // Sync program path overwrites status before the next paint; skip interim text.
                 // Ensure HW manager open, then program with selected cable backend.
                 let _ = app.model.exec("open_hw_manager");
                 match app.model.program_hw_with_cable(&cable) {
@@ -842,7 +841,7 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
                     || selected_source.as_deref() == Some(r.name.as_str());
                 let resp = ui.add_sized(
                     [ui.available_width(), chrome::HIT_SIDEBAR],
-                    egui::SelectableLabel::new(on, &r.name),
+                    egui::Button::selectable(on, &r.name),
                 );
                 if resp.clicked() {
                     pick_src = Some(i.to_string());
@@ -886,7 +885,7 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
                 || selected.as_deref() == Some(r.name.as_str());
             let resp = ui.add_sized(
                 [ui.available_width(), chrome::HIT_SIDEBAR],
-                egui::SelectableLabel::new(on, format!("{}  {}", r.name, r.type_cell())),
+                egui::Button::selectable(on, format!("{}  {}", r.name, r.type_cell())),
             );
             if resp.clicked() {
                 pick_obj = Some(r.name.clone());
@@ -1124,7 +1123,7 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
                                 .clicked()
                             {
                                 app.set_canvas(c);
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     }
@@ -1637,6 +1636,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
     });
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_log;
     let rows: Vec<(usize, helion_gui::ConsoleLine)> = model
@@ -1765,6 +1765,7 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Project Summary");
     let rows = model.project_summary_gadgets();
@@ -1862,6 +1863,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Project Settings");
     let rows = model.project_setting_rows();
@@ -2228,6 +2230,7 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Hierarchy");
     let drawing = model.hierarchy.drawing();
@@ -2272,7 +2275,7 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
                         r,
                         2.0,
                         Stroke::new(
-                            if on { 2.0 } else { 1.0 },
+                            if on { 2.0_f32 } else { 1.0_f32 },
                             if on {
                                 Color32::from_rgb(0xe5, 0xc0, 0x7b)
                             } else {
@@ -2342,6 +2345,7 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Find Results");
     ui.horizontal(|ui| {
@@ -2657,6 +2661,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("I/O Planning");
     egui::ScrollArea::vertical()
@@ -2748,7 +2753,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                     p.rect_stroke(
                         brct.shrink(1.0),
                         2.0,
-                        Stroke::new(1.2, Color32::from_rgb(*br, *bg, *bb)),
+                        Stroke::new(1.2_f32, Color32::from_rgb(*br, *bg, *bb)),
                         egui::StrokeKind::Inside,
                     );
                     p.text(
@@ -2799,7 +2804,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                                 p.circle_stroke(
                                     c,
                                     cell * 0.38,
-                                    Stroke::new(1.6, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+                                    Stroke::new(1.6_f32, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
                                 );
                             }
                         }
@@ -3673,6 +3678,7 @@ fn drc_severity_color(sev: DrcSeverity) -> Color32 {
     }
 }
 
+#[allow(dead_code)] // intentional: helper for WIP bitstream panel
 fn bitstream_block_color(block: &str) -> Color32 {
     match block {
         "CLB_IO_CLK" => Color32::from_rgb(0x3d, 0xb8, 0x7a),
@@ -3683,6 +3689,7 @@ fn bitstream_block_color(block: &str) -> Color32 {
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Bitstream");
     ui.add_space(6.0);
@@ -3933,6 +3940,7 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
     model
@@ -4050,11 +4058,11 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                         .map(|(x, y)| egui::pos2(o.x + *x * z, o.y + *y * z))
                         .collect();
                     let thick = if w.highlighted {
-                        4.2
+                        4.2_f32
                     } else if w.width > 1 {
-                        3.6
+                        3.6_f32
                     } else {
-                        1.4
+                        1.4_f32
                     };
                     let col = if w.highlighted { path_col } else { net_col };
                     for pair in pts.windows(2) {
@@ -4092,7 +4100,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                         Color32::from_rgb(0x2a, 0x32, 0x24)
                     };
                     let stroke = Stroke::new(
-                        if on || sy.highlighted { 2.0 } else { 1.0 },
+                        if on || sy.highlighted { 2.0_f32 } else { 1.0_f32 },
                         if sy.highlighted {
                             path_col
                         } else if on {
@@ -4137,8 +4145,8 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                             egui::pos2(r.left() + 10.0, tip.y)
                         };
                         let stub = Color32::from_rgb(0xdc, 0xe0, 0xe4);
-                        p.line_segment([inner, edge], Stroke::new(2.0, stub));
-                        p.line_segment([edge, tip], Stroke::new(2.0, stub));
+                        p.line_segment([inner, edge], Stroke::new(2.0_f32, stub));
+                        p.line_segment([edge, tip], Stroke::new(2.0_f32, stub));
                         p.circle_filled(tip, 2.2, stub);
                         let nc = pin.net.is_empty();
                         let label = if nc {
@@ -4335,7 +4343,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                             p.rect_stroke(
                                 tile,
                                 1.0,
-                                Stroke::new(1.5, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+                                Stroke::new(1.5_f32, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
                                 egui::StrokeKind::Outside,
                             );
                         }
@@ -4355,7 +4363,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     p.rect_stroke(
                         rr,
                         0.0,
-                        Stroke::new(if on { 3.0 } else { 2.0 }, if on { gold } else { purple }),
+                        Stroke::new(if on { 3.0_f32 } else { 2.0_f32 }, if on { gold } else { purple }),
                         egui::StrokeKind::Inside,
                     );
                     p.text(
@@ -4380,7 +4388,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     p.rect_stroke(
                         rr,
                         0.0,
-                        Stroke::new(if on { 3.0 } else { 2.0 }, if on { gold } else { amber }),
+                        Stroke::new(if on { 3.0_f32 } else { 2.0_f32 }, if on { gold } else { amber }),
                         egui::StrokeKind::Inside,
                     );
                     p.text(
@@ -4405,7 +4413,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     } else {
                         route_col
                     };
-                    let thick = if rt.highlighted { 2.6 } else { 1.7 };
+                    let thick = if rt.highlighted { 2.6_f32 } else { 1.7_f32 };
                     let mut pts = Vec::new();
                     for &(x, y) in &rt.tiles {
                         let dx = x.saturating_sub(x0);
@@ -5170,7 +5178,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
             let x = wave_x0 + wave_w * (i as f32) / (n as f32);
             p.line_segment(
                 [egui::pos2(x, ruler.top() + 10.0), egui::pos2(x, ruler.bottom())],
-                Stroke::new(1.0, Color32::from_rgb(0x5a, 0x64, 0x6e)),
+                Stroke::new(1.0_f32, Color32::from_rgb(0x5a, 0x64, 0x6e)),
             );
             if i % 2 == 0 {
                 p.text(
@@ -5186,7 +5194,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
             let x = wave_x0 + wave_w * (m.sample as f32 + 0.5) / (n as f32);
             p.line_segment(
                 [egui::pos2(x, ruler.top()), egui::pos2(x, ruler.bottom())],
-                Stroke::new(1.2, Color32::from_rgb(0xc0, 0x78, 0xc8)),
+                Stroke::new(1.2_f32, Color32::from_rgb(0xc0, 0x78, 0xc8)),
             );
             p.text(
                 egui::pos2(x + 2.0, ruler.top()),
@@ -5213,7 +5221,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
             let x = wave_x0 + wave_w * (a as f32 + 0.5) / (n as f32);
             p.line_segment(
                 [egui::pos2(x, ruler.top()), egui::pos2(x, ruler.bottom())],
-                Stroke::new(1.4, Color32::from_rgb(0xe0, 0x6c, 0x75)),
+                Stroke::new(1.4_f32, Color32::from_rgb(0xe0, 0x6c, 0x75)),
             );
             p.text(
                 egui::pos2(x + 2.0, ruler.top()),
@@ -5227,7 +5235,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel) {
             let x = wave_x0 + wave_w * (b as f32 + 0.5) / (n as f32);
             p.line_segment(
                 [egui::pos2(x, ruler.top()), egui::pos2(x, ruler.bottom())],
-                Stroke::new(1.4, Color32::from_rgb(0x56, 0xb6, 0xc2)),
+                Stroke::new(1.4_f32, Color32::from_rgb(0x56, 0xb6, 0xc2)),
             );
             p.text(
                 egui::pos2(x + 2.0, ruler.top()),
@@ -5544,12 +5552,12 @@ fn paint_trace_shape(
                     let yp = if prev == 1 { y1 } else { y0 };
                     p.line_segment(
                         [egui::pos2(x0, yp), egui::pos2(x0, y)],
-                        Stroke::new(1.5, green),
+                        Stroke::new(1.5_f32, green),
                     );
                 }
                 p.line_segment(
                     [egui::pos2(x0, y), egui::pos2(x1, y)],
-                    Stroke::new(1.5, green),
+                    Stroke::new(1.5_f32, green),
                 );
                 if bit == 1 {
                     p.rect_filled(
@@ -5576,7 +5584,7 @@ fn paint_trace_shape(
                 pts.push(egui::pos2(x, py));
             }
             for w in pts.windows(2) {
-                p.line_segment([w[0], w[1]], Stroke::new(1.6, green));
+                p.line_segment([w[0], w[1]], Stroke::new(1.6_f32, green));
             }
             let _ = dim;
         }
@@ -5597,27 +5605,27 @@ fn paint_trace_shape(
     let cx = rect.left() + dx * (cursor as f32 + 0.5);
     p.line_segment(
         [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
-        Stroke::new(1.0, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+        Stroke::new(1.0_f32, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
     );
     if let Some(a) = cursor_a {
         let ax = rect.left() + dx * (a as f32 + 0.5);
         p.line_segment(
             [egui::pos2(ax, rect.top()), egui::pos2(ax, rect.bottom())],
-            Stroke::new(1.2, Color32::from_rgb(0xe0, 0x6c, 0x75)),
+            Stroke::new(1.2_f32, Color32::from_rgb(0xe0, 0x6c, 0x75)),
         );
     }
     if let Some(b) = cursor_b {
         let bx = rect.left() + dx * (b as f32 + 0.5);
         p.line_segment(
             [egui::pos2(bx, rect.top()), egui::pos2(bx, rect.bottom())],
-            Stroke::new(1.2, Color32::from_rgb(0x56, 0xb6, 0xc2)),
+            Stroke::new(1.2_f32, Color32::from_rgb(0x56, 0xb6, 0xc2)),
         );
     }
     for m in markers {
         let mx = rect.left() + dx * (m.sample as f32 + 0.5);
         p.line_segment(
             [egui::pos2(mx, rect.top()), egui::pos2(mx, rect.bottom())],
-            Stroke::new(1.0, Color32::from_rgb(0xc0, 0x78, 0xc8)),
+            Stroke::new(1.0_f32, Color32::from_rgb(0xc0, 0x78, 0xc8)),
         );
     }
     let _ = ns;
@@ -5789,6 +5797,7 @@ fn paint_hw(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("IP Integrator");
     ui.weak("Helion-MM block design canvas — IP boxes and interface wires (not AXI, not a catalog dump)");
@@ -5864,7 +5873,7 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
             let mm = Color32::from_rgb(0x7e, 0xc8, 0xe3);
             for w in &drawing.wires {
                 let col = if w.net == "Helion-MM" { mm } else { net };
-                let thick = if w.net == "Helion-MM" { 3.4 } else { 1.6 };
+                let thick = if w.net == "Helion-MM" { 3.4_f32 } else { 1.6_f32 };
                 let pts: Vec<egui::Pos2> = w
                     .points
                     .iter()
@@ -5893,7 +5902,7 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
                     p.add(egui::Shape::convex_polygon(
                         pts,
                         Color32::from_rgb(0x1e, 0x3a, 0x55),
-                        Stroke::new(1.0, Color32::from_rgb(0x7a, 0x84, 0x8e)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0x84, 0x8e)),
                     ));
                 } else {
                     let fill = if sy.kind == "INTERCONNECT" {
@@ -5905,7 +5914,7 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
                     p.rect_stroke(
                         r,
                         3.0,
-                        Stroke::new(1.0, Color32::from_rgb(0x7a, 0x84, 0x8e)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(0x7a, 0x84, 0x8e)),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -5945,12 +5954,12 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
                         p.rect_stroke(
                             bar,
                             1.0,
-                            Stroke::new(1.0, Color32::from_rgb(0xdc, 0xe0, 0xe4)),
+                            Stroke::new(1.0_f32, Color32::from_rgb(0xdc, 0xe0, 0xe4)),
                             egui::StrokeKind::Outside,
                         );
-                        p.line_segment([edge, tip], Stroke::new(3.4, mm));
+                        p.line_segment([edge, tip], Stroke::new(3.4_f32, mm));
                     } else {
-                        p.line_segment([edge, tip], Stroke::new(1.6, net));
+                        p.line_segment([edge, tip], Stroke::new(1.6_f32, net));
                         p.circle_filled(tip, 2.0, Color32::from_rgb(0xdc, 0xe0, 0xe4));
                     }
                     let label_pos = if pin.output {
@@ -5975,6 +5984,7 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
     paint_bd_hdl(ui, model);
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_ip_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(4.0);
     ui.label(
@@ -6009,6 +6019,7 @@ fn paint_ip_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.bd_hdl_rows();
     if rows.is_empty() {
