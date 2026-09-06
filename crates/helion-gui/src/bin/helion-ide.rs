@@ -13,6 +13,7 @@ use helion_gui::{
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     let mut args = std::env::args().skip(1);
