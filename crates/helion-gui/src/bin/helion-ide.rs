@@ -338,7 +338,7 @@ impl eframe::App for HelionIde {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         handle_shortcuts(ctx, self);
         paint_toolbar(ctx, self);
-        paint_status_bar(ctx, &self.model);
+        paint_status_bar(ctx, self.activity, self.canvas, &self.model);
         paint_bottom(ctx, self);
         paint_activity_rail(ctx, self);
         if !self.sidebar_hidden {
@@ -970,7 +970,12 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
     }
 }
 
-fn paint_status_bar(ctx: &egui::Context, model: &IdeModel) {
+fn paint_status_bar(
+    ctx: &egui::Context,
+    activity: Activity,
+    canvas: Canvas,
+    model: &IdeModel,
+) {
     egui::TopBottomPanel::bottom("status")
         .exact_height(chrome::STATUS_HEIGHT)
         .show_separator_line(true)
@@ -993,9 +998,18 @@ fn paint_status_bar(ctx: &egui::Context, model: &IdeModel) {
                     .find(|r| r.status != "Not started")
                     .map(|r| r.name.as_str())
                     .unwrap_or("idle");
+                // Cheap CLI breadcrumb: Activity › Canvas (or workspace canvas label).
+                let where_label = match model.workspace.canvas() {
+                    WorkspaceTab::TextEditor | WorkspaceTab::Device | WorkspaceTab::Reports => {
+                        canvas.label()
+                    }
+                    _ => model.workspace.canvas_label(),
+                };
+                let crumb = format!("{} › {}", activity.label(), where_label);
                 ui.label(
                     RichText::new(format!(
-                        "{} · WNS {} · LUTFF {} · {}",
+                        "{} · {} · WNS {} · LUTFF {} · {}",
+                        crumb,
                         model.part(),
                         wns,
                         lutff,

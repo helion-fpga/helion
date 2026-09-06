@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn chrome_overflow_keeps_every_tab_and_rail_action_selectable_at_desktop_width() {
         assert_eq!(side_chrome_width(), RAIL_WIDTH + SIDEBAR_WIDTH);
-        assert_eq!(side_chrome_width(), 288.0);
+        assert_eq!(side_chrome_width(), 268.0);  // RAIL 48 + SIDEBAR 220 (letter rail)
         assert_ne!(side_chrome_width(), 680.0);
         assert_eq!(RAIL_WIDTH, 48.0);
         assert_eq!(HIT_RAIL, 48.0);
