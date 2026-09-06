@@ -7,10 +7,13 @@ use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
 use helion_route::{route, Routed};
-use helion_sta::{create_clock, load_sdc, report_timing_routed, TimingResult};
+use helion_sta::{
+    apply_xdc, create_clock, load_sdc, report_timing_routed, report_timing_routed_xdc,
+    Constraints, TimingResult,
+};
 use helion_hls::synth_c_path;
-use helion_proj::load_prj;
-use helion_sv::synth_sv_path;
+use helion_proj::{constraints_from_project, load_prj, resolve_prj_path};
+use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
 
@@ -42,15 +45,28 @@ fn compile_sv(path: &str, part: &str, timing_weight: f64) -> Result<Compiled, St
 }
 
 fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Compiled, String> {
+    compile_design_xdc(design, part, timing_weight, &Constraints::default())
+}
+
+fn compile_design_xdc(
+    mut design: Design,
+    part: &str,
+    timing_weight: f64,
+    xdc: &Constraints,
+) -> Result<Compiled, String> {
+    apply_xdc(&mut design, xdc)?;
     let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
     let packed = pack(&design, &dev)?;
     let placed = place_with(&packed, &dev, PlaceOpts { timing_weight })?;
     let routed = route(&placed, &dev)?;
     check_routed(&design, &routed, &dev).fail()?;
     let bits = bitgen(&dev, &routed)?;
-    let mut clks = Vec::new();
-    create_clock(&mut clks, "clk", 10_000, "clk");
-    let timing = report_timing_routed(&design, &routed, &clks)?;
+    let mut clks = xdc.clocks.clone();
+    if clks.is_empty() {
+        create_clock(&mut clks, "clk", 10_000, "clk");
+    }
+    // Empty / clock-only XDC keeps gold WNS (9640 on counter @ 10 ns).
+    let timing = report_timing_routed_xdc(&design, &routed, &clks, xdc)?;
     Ok(Compiled {
         dev,
         design,
@@ -58,6 +74,45 @@ fn compile_design(design: Design, part: &str, timing_weight: f64) -> Result<Comp
         bits,
         timing,
     })
+}
+
+fn synth_project_sources(
+    paths: &[std::path::PathBuf],
+    top: Option<&str>,
+) -> Result<Design, String> {
+    if paths.is_empty() {
+        return Err("project has no sources".into());
+    }
+    let all_sv = paths.iter().all(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "sv" || e == "v"
+            })
+            .unwrap_or(false)
+    });
+    if paths.len() == 1 && top.is_none() {
+        return synth_any(paths[0].to_str().unwrap_or(""));
+    }
+    if !all_sv {
+        return Err(
+            "multi-file / top= projects currently require SystemVerilog (.sv/.v) sources".into(),
+        );
+    }
+    if let Some(t) = top {
+        let mut owned: Vec<(String, String)> = Vec::new();
+        for p in paths {
+            let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            owned.push((p.display().to_string(), src));
+        }
+        let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (d, _) = elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
+        Ok(d)
+    } else {
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        synth_sv_files(&refs)
+    }
 }
 
 fn main() {
@@ -109,6 +164,7 @@ fn usage() {
   helion pblock <file.sv>
   helion qor <file.sv>
   helion project <file.prj>
+  helion project run <file.prj> [--cycles N]
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
   helion hw program|flash --cable sim [--bitstream FILE.hbits] [--part P]",
@@ -376,7 +432,16 @@ fn cmd_hnf(args: &[String]) {
 }
 
 fn cmd_project(args: &[String]) {
-    let path = positional(args).unwrap_or("examples/blinky.prj");
+    let mut rest = args;
+    let mut do_run = false;
+    if rest.first().map(|s| s.as_str()) == Some("run") {
+        do_run = true;
+        rest = &rest[1..];
+    }
+    let path = positional(rest).unwrap_or("examples/blinky.prj");
+    let cycles: u32 = take_flag(rest, "--cycles")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("project {path}: {e}");
         std::process::exit(1);
@@ -385,44 +450,83 @@ fn cmd_project(args: &[String]) {
         eprintln!("project: {e}");
         std::process::exit(1);
     });
-    let src = prj.sources.first().cloned().unwrap_or_default();
-    let src_path = {
-        let given = Path::new(&src);
-        let mut resolved = given.to_path_buf();
-        if !given.exists() {
-            for anc in Path::new(path).ancestors() {
-                let cand = anc.join(&src);
-                if cand.exists() {
-                    resolved = cand;
-                    break;
-                }
-                if let Some(name) = given.file_name() {
-                    let cand = anc.join(name);
-                    if cand.exists() {
-                        resolved = cand;
-                        break;
-                    }
-                }
-            }
+    let prj_path = Path::new(path);
+    let src_paths: Vec<std::path::PathBuf> = prj
+        .sources
+        .iter()
+        .map(|s| resolve_prj_path(prj_path, s))
+        .collect();
+    for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+        if !resolved.exists() {
+            eprintln!("project source {src}: not found (tried {})", resolved.display());
+            std::process::exit(1);
         }
-        resolved.to_string_lossy().into_owned()
-    };
-    let c = compile_sv(&src_path, &prj.part, 0.75).unwrap_or_else(|e| {
+    }
+    let xdc = constraints_from_project(&prj, prj_path).unwrap_or_else(|e| {
+        eprintln!("project constraints: {e}");
+        std::process::exit(1);
+    });
+    let design = synth_project_sources(&src_paths, prj.top.as_deref()).unwrap_or_else(|e| {
+        eprintln!("project synth: {e}");
+        std::process::exit(1);
+    });
+    let c = compile_design_xdc(design, &prj.part, 0.75, &xdc).unwrap_or_else(|e| {
         eprintln!("project impl: {e}");
         std::process::exit(1);
     });
     println!(
-        "project {} part={} source={} lutffs={} PACKAGE_PIN={} create_clock={} frames={}",
+        "project {} part={} sources={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
         path,
         prj.part,
-        src,
+        prj.sources.len(),
+        prj.top.as_deref().unwrap_or("-"),
+        prj.constraint_files.len(),
+        xdc.clocks.len(),
+        xdc.package_pins.len(),
         c.routed.placed.packed.lutffs.len(),
-        prj.package_pins.len(),
-        prj.sdc.len(),
+        c.timing.wns_ps,
         c.bits.frames.len()
     );
+    if do_run {
+        let mut sim = Fabric::new(&c.dev);
+        sim.program(&c.bits).unwrap_or_else(|e| {
+            eprintln!("project run program: {e}");
+            std::process::exit(1);
+        });
+        sim.finish_startup();
+        let iob = c.routed.iob_src[0].iob;
+        let mut wave = Vec::new();
+        let mut changes = 0u32;
+        let mut last = sim.led_at(iob.0, iob.1);
+        for _ in 0..cycles {
+            sim.step_user();
+            let now = sim.led_at(iob.0, iob.1);
+            wave.push(now);
+            if now != last {
+                changes += 1;
+                last = now;
+            }
+        }
+        let bits: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        println!(
+            "run {} part={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
+            c.design.name,
+            c.dev.part,
+            sim.stat.init as u8,
+            sim.stat.done as u8,
+            sim.stat.eos as u8,
+            sim.stat.gwe as u8,
+            sim.stat.gsr as u8,
+            sim.stat.gts as u8,
+            sim.stat.crc_err as u8
+        );
+        println!(
+            "WNS_PS={} R2R_PS={} IOB_PS={} LED[{cycles}]={bits} changes={changes}",
+            c.timing.wns_ps, c.timing.r2r_ps, c.timing.iob_ps
+        );
+        println!("ok");
+    }
 }
-
 
 fn hw(args: Vec<String>) {
     let mut it = args.into_iter();
