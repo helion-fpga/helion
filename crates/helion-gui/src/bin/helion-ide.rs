@@ -2405,6 +2405,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                     .map(|r| r.available.max(1))
                     .max()
                     .unwrap_or(1) as f32;
+                let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
                 egui::Grid::new("project_summary_occupancy")
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
@@ -2416,8 +2417,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                             } else {
                                 row.used as f32 / row.available as f32
                             };
-                            let span = chrome::occupancy_bar_w(ui.available_width().max(80.0));
-                            let bar_w = span * (row.available as f32 / max_avail).clamp(0.25, 1.0);
+                            let bar_w = bar_span * (row.available as f32 / max_avail).clamp(0.25, 1.0);
                             let (rect, _) =
                                 ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
                             ui.painter().rect_filled(
@@ -4455,6 +4455,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
         .map(|r| r.available.max(1))
         .max()
         .unwrap_or(1) as f32;
+    let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
     egui::Grid::new("utilization_occupancy")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -4477,7 +4478,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
                 } else {
                     row.used as f32 / row.available as f32
                 };
-                let bar_w = 160.0 * (row.available as f32 / max_avail).clamp(0.25, 1.0);
+                let bar_w = bar_span * (row.available as f32 / max_avail).clamp(0.25, 1.0);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
                 ui.painter()
                     .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
