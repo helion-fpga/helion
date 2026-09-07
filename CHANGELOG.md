@@ -4,6 +4,27 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [1.0.1] — 2026-09-07
+
+Patch after 1.0.0: IDE chrome and empty-state fill. Same CAD engines and
+`counter.sv` gold (**WNS_PS=9640**). No family or bitstream format change.
+
+### Fixed
+
+- Activity rail shows full names (Files / Device / Timing / Simulate / Program / Reports).
+- Schematic opens in the main pane; unconnected pins autohide unless the cell is selected.
+- Device die, Package pins, Wave traces, Program ILA, and occupancy tables fill the pane instead of leaving dead gaps.
+- Toolbar Open / flow / Bitstream / Implement share one control height.
+- Simulate no longer leaves the Timing tab selected; Reports catalog stays in the sidebar.
+- Native Open HDL stays real on macOS and Linux (rfd pinned for rustc 1.85).
+- Program no longer shells `openFPGALoader` on every paint frame.
+
+### Changed
+
+- Empty Bitstream / Find / DRC / Power / Utilization / Methodology canvases use a remaining-pane next action.
+
+[1.0.1]: https://github.com/helion-fpga/helion/releases/tag/v1.0.1
+
 ## [1.0.0] — 2026-09-06
 
 First public suite: original Helion family + in-repo CAD on native
