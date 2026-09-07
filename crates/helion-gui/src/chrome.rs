@@ -102,6 +102,14 @@ pub fn schematic_pin_visible(net_empty: bool, symbol_selected: bool) -> bool {
     !net_empty || symbol_selected
 }
 
+/// Empty Find/Bitstream/Settings canvases: the CTA occupies remaining pane height
+/// (Win32 unused-region fail; Apple empty state with a next action).
+pub fn empty_cta_occupies_pane(chrome_h: f32, pane_h: f32) -> DrawingFit {
+    let ph = pane_h.max(1.0);
+    let remain = (ph - chrome_h).max(ph * PANE_FILL_MIN);
+    DrawingFit::from_drawn(1.0, ph, 1.0, 1.0, 1.0, remain)
+}
+
 /// Example sources (empty state / File → Examples). Do not paint on the rail.
 pub const RAIL_OPEN_SOURCES: [(&'static str, &'static str); 5] = [
     ("Open counter.sv", "counter.sv"),
@@ -1014,6 +1022,12 @@ mod tests {
             "bbox must measure tiles, not clamp to 80%: {hw:?}"
         );
         assert!(hw.fills() || hw.fill >= PANE_FILL_MIN, "program tiles {hw:?}");
+        let empty = empty_cta_occupies_pane(80.0, 400.0);
+        assert!(
+            empty.fills() || empty.fill >= PANE_FILL_MIN,
+            "empty CTA must occupy remaining pane, got {empty:?}"
+        );
+        assert!(empty.drawn_h >= 400.0 * PANE_FILL_MIN);
     }
 
     #[test]
