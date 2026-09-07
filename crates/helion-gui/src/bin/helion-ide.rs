@@ -2400,6 +2400,10 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Occupancy").strong());
                 let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
+                let bar_h = chrome::occupancy_bar_h(
+                    report.occupancy.len().max(1),
+                    (ui.available_height() - 8.0).max(chrome::OCCUPANCY_BAR_H),
+                );
                 egui::Grid::new("project_summary_occupancy")
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
@@ -2412,7 +2416,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                                 row.used as f32 / row.available as f32
                             };
                             let (rect, _) =
-                                ui.allocate_exact_size(egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H), Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(bar_span, bar_h), Sense::hover());
                             ui.painter().rect_filled(
                                 rect,
                                 2.0,
@@ -4126,8 +4130,9 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.painter()
         .rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
-        let n = n_rows.max(1) as f32;
-        let row_gap = ((ui.available_height() - 40.0) / n - chrome::OCCUPANCY_BAR_H).clamp(4.0, 22.0);
+        let remain_h = (ui.available_height() - 40.0).max(chrome::OCCUPANCY_BAR_H);
+        let bar_h = chrome::occupancy_bar_h(n_rows.max(1), remain_h);
+        let row_gap = 4.0;
         let max_uw = report.total_uw.max(1);
         let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
         egui::ScrollArea::both()
@@ -4149,7 +4154,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
                             ui.label(uw.to_string());
                             let frac = uw as f32 / max_uw as f32;
                             let (bar, _) = ui.allocate_exact_size(
-                                egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H),
+                                egui::vec2(bar_span, bar_h),
                                 Sense::hover(),
                             );
                             ui.painter()
@@ -4186,7 +4191,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
                                 *used as f32 / *avail as f32
                             };
                             let (bar, _) = ui.allocate_exact_size(
-                                egui::vec2(details_bar, chrome::OCCUPANCY_BAR_H),
+                                egui::vec2(details_bar, bar_h),
                                 Sense::hover(),
                             );
                             ui.painter()
@@ -4521,8 +4526,9 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.painter()
         .rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
-        let n = n_rows.max(1) as f32;
-        let row_gap = ((ui.available_height() - 40.0) / n - chrome::OCCUPANCY_BAR_H).clamp(4.0, 22.0);
+        let remain_h = (ui.available_height() - 40.0).max(chrome::OCCUPANCY_BAR_H);
+        let bar_h = chrome::occupancy_bar_h(n_rows.max(1), remain_h);
+        let row_gap = 4.0;
         let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
         egui::ScrollArea::both()
             .id_salt("ug893_utilization")
@@ -4551,7 +4557,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
                                 row.used as f32 / row.available as f32
                             };
                             let (bar, _) = ui.allocate_exact_size(
-                                egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H),
+                                egui::vec2(bar_span, bar_h),
                                 Sense::hover(),
                             );
                             ui.painter()

@@ -999,6 +999,16 @@ mod tests {
             hier_span >= 1000.0 * chrome::PANE_FILL_MIN,
             "Hierarchical columns must span remaining width, span={hier_span}"
         );
+        let compact_bars = chrome::OCCUPANCY_BAR_H * n_occ as f32;
+        assert!(
+            compact_bars / 400.0 < chrome::PANE_FILL_MIN,
+            "20px occupancy bars must fail so stretch is required"
+        );
+        let bh = chrome::occupancy_bar_h(n_occ, 400.0);
+        assert!(
+            bh * n_occ as f32 >= 400.0 * chrome::PANE_FILL_MIN,
+            "occupancy bar height {bh} leaves a void"
+        );
     }
 
     #[test]

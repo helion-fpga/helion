@@ -118,6 +118,14 @@ pub fn occupancy_bar_w(avail: f32) -> f32 {
     avail.max(80.0)
 }
 
+/// Occupancy bar height. A 20px strip in remaining pane is a >80px void.
+pub fn occupancy_bar_h(n_rows: usize, remaining_h: f32) -> f32 {
+    let n = n_rows.max(1) as f32;
+    let remain = remaining_h.max(OCCUPANCY_BAR_H);
+    let gaps = 4.0 * n;
+    ((remain - gaps) / n).clamp(OCCUPANCY_BAR_H, remain)
+}
+
 /// Compact occupancy / utilization / power-share stack before remaining-pane stretch.
 pub fn occupancy_table_compact_h(n_rows: usize) -> f32 {
     n_rows.max(1) as f32 * (OCCUPANCY_BAR_H + 4.0) + 28.0
@@ -1138,6 +1146,16 @@ mod tests {
             "Hierarchical columns must span remaining width, span={hier_span}"
         );
         assert!(pane_w - hier_span <= PANE_EMPTY_GAP_MAX);
+        let compact_bars = OCCUPANCY_BAR_H * 5.0;
+        assert!(
+            compact_bars / pane_h < PANE_FILL_MIN,
+            "20px occupancy bars must fail so stretch is required"
+        );
+        let bh = occupancy_bar_h(5, pane_h);
+        assert!(
+            bh * 5.0 >= pane_h * PANE_FILL_MIN,
+            "occupancy bar height {bh} leaves a void in {pane_h}"
+        );
     }
 
     #[test]
