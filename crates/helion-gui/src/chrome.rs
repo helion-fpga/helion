@@ -484,6 +484,16 @@ pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
 /// Compact IP catalog strip so the BD canvas can still hit the fill bar.
 pub const IP_CATALOG_MAX_HEIGHT: f32 = 88.0;
 
+/// Chip width so catalog names like `h_rv32_hb1` are not clipped in the strip.
+pub fn ip_catalog_chip_w(name: &str) -> f32 {
+    (name.chars().count() as f32 * CHAR_PX + 20.0).clamp(96.0, 240.0)
+}
+
+pub fn ip_catalog_name_fits(name: &str) -> bool {
+    let w = ip_catalog_chip_w(name);
+    w + 0.5 >= name.chars().count() as f32 * CHAR_PX + 16.0
+}
+
 /// How a content bbox sits in the remaining central pane after chrome/tables.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawingFit {
@@ -994,6 +1004,9 @@ mod tests {
         assert!(!schematic_pin_visible(true, false), "n/c hidden unless selected");
         assert!(schematic_pin_visible(true, true), "n/c shown on selected cell");
         assert!(schematic_pin_visible(false, false), "connected pins always shown");
+        assert!(ip_catalog_name_fits("h_rv32_hb1"));
+        assert!(ip_catalog_name_fits("h_uart"));
+        assert!(ip_catalog_chip_w("h_rv32_hb1") >= 96.0);
         // Program bbox must not be padded up to 80% by the helper itself.
         let hw = hardware_content_bbox(8, 1000.0, 500.0);
         assert!(
