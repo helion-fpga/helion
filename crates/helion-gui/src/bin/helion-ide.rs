@@ -4202,8 +4202,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     if model.tree.top.is_none() {
-        ui.label("No design yet.");
-        if primary_button(ui, "Run Synthesis").clicked() {
+        if paint_remaining_cta(ui, "No design yet.", "Run Synthesis") {
             queue_flow(FlowStep::Synthesis);
         }
         return;
@@ -4446,8 +4445,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.utilization_report();
     if report.part.is_empty() {
-        ui.label("No placed design yet.");
-        if primary_button(ui, "Place").clicked() {
+        if paint_remaining_cta(ui, "No placed design yet.", "Place") {
             queue_flow(FlowStep::Place);
         }
         return;
