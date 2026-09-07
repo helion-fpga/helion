@@ -1697,18 +1697,8 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
         WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model),
         WorkspaceTab::Reports => {
-            ui.heading("Reports");
-            let remain = ui.available_size();
-            let n = app.model.report_catalog().len();
-            let bbox = chrome::reports_catalog_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
-                Sense::hover(),
-            );
-            ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
-                paint_report_catalog(ui, &mut app.model, "reports_landing_catalog");
-            });
+            // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
+            paint_timing_summary(ui, &mut app.model);
         }
         other => {
             // Fall through to known panes / timing-only for overflow More picks.
