@@ -4527,7 +4527,8 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
         .rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
         let remain_h = (ui.available_height() - 40.0).max(chrome::OCCUPANCY_BAR_H);
-        let bar_h = chrome::occupancy_bar_h(n_rows.max(1), remain_h);
+        let n_bars = report.occupancy.len().max(1);
+        let bar_h = chrome::occupancy_bars_h_after_footer(n_bars, n_hier, remain_h);
         let row_gap = 4.0;
         let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
         egui::ScrollArea::both()
