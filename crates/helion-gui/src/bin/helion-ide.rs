@@ -4146,12 +4146,14 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Utilization Details").strong());
     let blocks = model.power_block_rows();
     let mut pick_blk: Option<String> = None;
+    let details_bar = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
     egui::Grid::new("power_blocks")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
             ui.label(RichText::new("Block").strong());
             ui.label(RichText::new("Used").strong());
             ui.label(RichText::new("Available").strong());
+            ui.label(RichText::new("Occupancy").strong());
             ui.end_row();
             for (name, used, avail, rail) in &blocks {
                 let on = selected_pwr.as_deref() == Some(*rail)
@@ -4161,6 +4163,18 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
                 ui.label(used.to_string());
                 ui.label(avail.to_string());
+                let frac = if *avail == 0 {
+                    0.0
+                } else {
+                    *used as f32 / *avail as f32
+                };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(details_bar, chrome::OCCUPANCY_BAR_H), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
+                let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
+                ui.painter()
+                    .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
                 ui.end_row();
             }
         });

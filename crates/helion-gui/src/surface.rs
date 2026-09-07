@@ -947,6 +947,20 @@ mod tests {
             pwr_bar >= 820.0 * chrome::PANE_FILL_MIN,
             "power share bars must span remaining width, got {pwr_bar}"
         );
+        let blocks = d.model.power_block_rows();
+        assert!(
+            !blocks.is_empty(),
+            "Power Utilization Details after implement"
+        );
+        assert!(
+            blocks.iter().any(|(n, _, _, _)| n == "LUTFF"),
+            "Utilization Details occupancy rows: {blocks:?}"
+        );
+        let details_bar = chrome::occupancy_bar_w(820.0);
+        assert!(
+            details_bar > 180.0,
+            "Utilization Details without occupancy bars must fail, got {details_bar}"
+        );
         d.click_more(WorkspaceTab::Utilization);
         assert_eq!(d.pane(), WorkspacePane::Utilization);
         assert!(
