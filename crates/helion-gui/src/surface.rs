@@ -774,8 +774,11 @@ mod tests {
             chrome::reports_stub_fill(400.0) < chrome::PANE_FILL_MIN,
             "heading-only stub must fail fill"
         );
-        // Sidebar owns the catalog; center is the selected report body (no dual tables).
-        assert!(d.model.timing_summary().wns_ps.is_some() || !rows.is_empty());
+        let bbox = chrome::reports_catalog_bbox(rows.len(), 1000.0, 400.0);
+        assert!(
+            bbox.fills() || bbox.fill >= chrome::PANE_FILL_MIN,
+            "Reports landing catalog {bbox:?}"
+        );
     }
 
     #[test]
