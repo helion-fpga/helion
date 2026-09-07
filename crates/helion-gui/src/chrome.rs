@@ -113,7 +113,7 @@ pub fn nv_table_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
     fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
 }
 
-/// Occupancy bars were a 160px strip with a >80px right gap.
+/// Occupancy / power-share bars were 120–160px strips with a >80px right gap.
 pub fn occupancy_bar_w(avail: f32) -> f32 {
     avail.max(80.0)
 }
@@ -1061,14 +1061,32 @@ mod tests {
             "Settings/Summary table must fill the pane, got {bbox:?}"
         );
         assert!(bbox.empty_gap <= PANE_EMPTY_GAP_MAX);
-        let bar = occupancy_bar_w(pane_w - 180.0);
+        let remain = pane_w - 180.0;
+        assert!(
+            120.0 < remain * PANE_FILL_MIN,
+            "legacy 120px power share bar must fail the fill bar"
+        );
+        assert!(
+            160.0 < remain * PANE_FILL_MIN,
+            "legacy 160px occupancy bar must fail the fill bar"
+        );
+        let bar = occupancy_bar_w(remain);
         assert!(
             bar > 160.0,
             "legacy 160px occupancy bar must fail the fill bar, got {bar}"
         );
         assert!(
-            bar >= (pane_w - 180.0) * PANE_FILL_MIN,
-            "occupancy bars must span remaining width, got {bar}"
+            bar >= remain * PANE_FILL_MIN,
+            "occupancy/share bars must span remaining width, got {bar}"
+        );
+        assert!(
+            remain - bar <= PANE_EMPTY_GAP_MAX,
+            "right gap after occupancy/share bar {bar} in {remain}"
+        );
+        let shrunk = bar * 0.25;
+        assert!(
+            remain - shrunk > PANE_EMPTY_GAP_MAX,
+            "0.25× occupancy bars reintroduce a >80px void (shrunk={shrunk})"
         );
     }
 

@@ -2399,12 +2399,6 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
             if !report.occupancy.is_empty() {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Occupancy").strong());
-                let max_avail = report
-                    .occupancy
-                    .iter()
-                    .map(|r| r.available.max(1))
-                    .max()
-                    .unwrap_or(1) as f32;
                 let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
                 egui::Grid::new("project_summary_occupancy")
                     .spacing([8.0, 4.0])
@@ -2417,9 +2411,8 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                             } else {
                                 row.used as f32 / row.available as f32
                             };
-                            let bar_w = bar_span * (row.available as f32 / max_avail).clamp(0.25, 1.0);
                             let (rect, _) =
-                                ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
+                                ui.allocate_exact_size(egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H), Sense::hover());
                             ui.painter().rect_filled(
                                 rect,
                                 2.0,
@@ -4123,6 +4116,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
         ("dsp", report.dsp_uw),
     ];
     let max_uw = report.total_uw.max(1);
+    let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
     egui::Grid::new("power_rails")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -4137,7 +4131,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
                 ui.label(uw.to_string());
                 let frac = uw as f32 / max_uw as f32;
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, chrome::OCCUPANCY_BAR_H), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H), Sense::hover());
                 ui.painter()
                     .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
                 let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
@@ -4449,12 +4443,6 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected_util = model.selected_utilization.clone();
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
-    let max_avail = report
-        .occupancy
-        .iter()
-        .map(|r| r.available.max(1))
-        .max()
-        .unwrap_or(1) as f32;
     let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
     egui::Grid::new("utilization_occupancy")
         .spacing([8.0, 4.0])
@@ -4478,8 +4466,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
                 } else {
                     row.used as f32 / row.available as f32
                 };
-                let bar_w = bar_span * (row.available as f32 / max_avail).clamp(0.25, 1.0);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H), Sense::hover());
                 ui.painter()
                     .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
                 let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
