@@ -7,10 +7,10 @@ use crate::{BottomTab, WorkspaceTab};
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
-/// 48px Helion activity rail — letter + short name (MUST 3 / UXQA leftover).
-pub const RAIL_WIDTH: f32 = 48.0;
-/// Tall enough for letter glyph + short label under it.
-pub const HIT_RAIL: f32 = 48.0;
+/// Activity rail — letter above the full name. 48px clipped "Device"/"Program"/"Reports".
+pub const RAIL_WIDTH: f32 = 88.0;
+/// Tall enough for letter glyph + full name under it (hit ≥28px).
+pub const HIT_RAIL: f32 = 56.0;
 /// One sidebar (MUST 5).
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 /// Legacy aliases — side chrome is rail + sidebar, not 680.
@@ -24,12 +24,24 @@ pub const STATUS_HEIGHT: f32 = 22.0;
 pub const HIT_PRIMARY: f32 = 32.0;
 /// Comfort primary (Implement / Open) — ≥44 where the toolbar has room.
 pub const HIT_COMFORT: f32 = 36.0;
+/// Every toolbar / flow chip shares this height. Width may follow the label; height may not.
+pub const TOOLBAR_CTRL_H: f32 = HIT_COMFORT;
+/// Approx glyph width at the rail's primary (word) size — letter is secondary.
+const RAIL_WORD_CHAR_PX: f32 = 8.0;
 pub const HIT_SIDEBAR: f32 = 28.0;
 pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
 /// Occupancy / util bars (NICE leftover: was 12px).
 pub const OCCUPANCY_BAR_H: f32 = 20.0;
 /// Calm splitter grab radius (4–6px ship; not neon QA slab).
 pub const SPLITTER_GRAB_PX: f32 = 6.0;
+/// Sidebar may shrink/grow; the drag must be able to move ≥40px and keep the size.
+pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;
+pub const CONSOLE_MIN_HEIGHT: f32 = 80.0;
+pub const CONSOLE_DEFAULT_HEIGHT: f32 = 180.0;
+pub const CONSOLE_MAX_HEIGHT: f32 = 420.0;
+/// Proof bar: a splitter that cannot travel this far is a dead grip.
+pub const SPLITTER_MIN_DELTA_PX: f32 = 40.0;
 /// Bounded height for in-pane Name/Value grids so they cannot eat the CentralPanel.
 pub const TABLE_MAX_HEIGHT: f32 = 180.0;
 /// Device/Package tables stack above the canvas; keep them compact so the die expands.
@@ -50,8 +62,105 @@ pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 pub const MIN_COL_PX: f32 = 80.0;
 pub const MORE: &str = "More ⋯";
 pub const MORE_LABEL: &str = MORE;
-const CHAR_PX: f32 = 7.0;
+const CHAR_PX: f32 = RAIL_WORD_CHAR_PX;
 const TAB_PAD_PX: f32 = 16.0;
+
+/// Toolbar control size: one height, width from the label (min 72, max 140).
+pub fn toolbar_ctrl_size(label: &str) -> [f32; 2] {
+    let w = (label.chars().count() as f32 * 8.0 + 28.0).clamp(72.0, 140.0);
+    [w, TOOLBAR_CTRL_H]
+}
+
+/// Synth/Opt/Place/Route chips — same height as Open/Implement.
+pub fn flow_chip_size() -> [f32; 2] {
+    [72.0, TOOLBAR_CTRL_H]
+}
+
+/// Waveform trace row height. One or two traces must fill the remaining pane
+/// instead of painting a 32px strip over a black slab.
+pub fn wave_trace_row_h(n_traces: usize, remaining_h: f32) -> f32 {
+    let n = n_traces.max(1) as f32;
+    let remain = remaining_h.max(36.0);
+    (remain / n).clamp(36.0, remain)
+}
+
+/// Stretch a table across the remaining pane (Win32: leftover empty regions are incorrect).
+/// Subtracts `gap` between columns so the last header is not clipped.
+pub fn stretched_col_w(n_cols: usize, avail: f32) -> f32 {
+    stretched_col_w_gap(n_cols, avail, 12.0)
+}
+
+pub fn stretched_col_w_gap(n_cols: usize, avail: f32, gap: f32) -> f32 {
+    let n = n_cols.max(1) as f32;
+    let gaps = gap * (n - 1.0).max(0.0);
+    ((avail - gaps).max(48.0) / n).max(48.0)
+}
+
+/// Vivado Autohide Pins / Quartus hide instance pins: unconnected pins stay
+/// in the model but are not painted unless the symbol is selected.
+pub fn schematic_pin_visible(net_empty: bool, symbol_selected: bool) -> bool {
+    !net_empty || symbol_selected
+}
+
+/// Compact Name/Value stack (Settings 7 rows, Summary gadgets) before stretch.
+pub fn nv_table_compact_h(n_rows: usize) -> f32 {
+    n_rows.max(1) as f32 * 22.0 + 28.0
+}
+
+/// Settings/Summary landing: table occupies the remaining pane, not a postage stamp.
+pub fn nv_table_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let compact_h = nv_table_compact_h(n_rows);
+    fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
+}
+
+/// Occupancy / power-share bars were 120–160px strips with a >80px right gap.
+pub fn occupancy_bar_w(avail: f32) -> f32 {
+    avail.max(80.0)
+}
+
+/// Compact label columns left of occupancy bars (Resource/Used/Available/Pct).
+/// A 280px reserve for 4 cols left a right inset vs Hierarchical.
+pub fn occupancy_label_reserve(n_cols: usize) -> f32 {
+    n_cols.max(1) as f32 * 50.0 + 12.0
+}
+
+/// Occupancy bar height. A 20px strip in remaining pane is a >80px void.
+pub fn occupancy_bar_h(n_rows: usize, remaining_h: f32) -> f32 {
+    let n = n_rows.max(1) as f32;
+    let remain = remaining_h.max(OCCUPANCY_BAR_H);
+    let gaps = 4.0 * n;
+    ((remain - gaps) / n).clamp(OCCUPANCY_BAR_H, remain)
+}
+
+/// Occupancy bars share leftover height after a compact Hierarchical footer.
+/// Counting footer rows as occupancy bars leaves a >80px hole under Hierarchical.
+pub fn occupancy_bars_h_after_footer(n_bars: usize, footer_rows: usize, remaining_h: f32) -> f32 {
+    let footer = if footer_rows == 0 {
+        0.0
+    } else {
+        occupancy_table_compact_h(footer_rows)
+    };
+    occupancy_bar_h(n_bars.max(1), (remaining_h - footer).max(OCCUPANCY_BAR_H))
+}
+
+/// Compact occupancy / utilization / power-share stack before remaining-pane stretch.
+pub fn occupancy_table_compact_h(n_rows: usize) -> f32 {
+    n_rows.max(1) as f32 * (OCCUPANCY_BAR_H + 4.0) + 28.0
+}
+
+/// Occupancy landing: table occupies remaining pane, not a postage stamp over a void.
+pub fn occupancy_table_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let compact_h = occupancy_table_compact_h(n_rows);
+    fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
+}
+
+/// Empty Find/Bitstream/Settings canvases: the CTA occupies remaining pane height
+/// (Win32 unused-region fail; Apple empty state with a next action).
+pub fn empty_cta_occupies_pane(chrome_h: f32, pane_h: f32) -> DrawingFit {
+    let ph = pane_h.max(1.0);
+    let remain = (ph - chrome_h).max(ph * PANE_FILL_MIN);
+    DrawingFit::from_drawn(1.0, ph, 1.0, 1.0, 1.0, remain)
+}
 
 /// Example sources (empty state / File → Examples). Do not paint on the rail.
 pub const RAIL_OPEN_SOURCES: [(&'static str, &'static str); 5] = [
@@ -142,16 +251,9 @@ impl Activity {
         }
     }
 
-    /// Compact name under the letter on the 48px rail (fits without truncation spin).
+    /// Name under the letter. Full words — the rail is wide enough to paint them.
     pub fn short_label(self) -> &'static str {
-        match self {
-            Activity::Files => "Files",
-            Activity::Device => "Device",
-            Activity::Timing => "Timing",
-            Activity::Simulate => "Sim",
-            Activity::Program => "Program",
-            Activity::Reports => "Reports",
-        }
+        self.label()
     }
 
     pub fn tcl(self) -> &'static str {
@@ -436,6 +538,186 @@ pub fn floorplan_fits_viewport(
         && cell * rows.max(1) as f32 + 16.0 <= avail_h + 1.0
 }
 
+/// Remaining-pane fill bar (Program / Package / Schematic / Hierarchy / IP drawings).
+pub const PANE_FILL_MIN: f32 = 0.80;
+pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
+/// Compact IP catalog strip so the BD canvas can still hit the fill bar.
+pub const IP_CATALOG_MAX_HEIGHT: f32 = 88.0;
+
+/// Chip width so catalog names like `h_rv32_hb1` are not clipped in the strip.
+pub fn ip_catalog_chip_w(name: &str) -> f32 {
+    (name.chars().count() as f32 * CHAR_PX + 20.0).clamp(96.0, 240.0)
+}
+
+pub fn ip_catalog_name_fits(name: &str) -> bool {
+    let w = ip_catalog_chip_w(name);
+    w + 0.5 >= name.chars().count() as f32 * CHAR_PX + 16.0
+}
+
+/// How a content bbox sits in the remaining central pane after chrome/tables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawingFit {
+    pub pane_w: f32,
+    pub pane_h: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub drawn_w: f32,
+    pub drawn_h: f32,
+    pub fill: f32,
+    pub empty_gap: f32,
+    pub right_clip: f32,
+}
+
+impl DrawingFit {
+    fn from_drawn(pane_w: f32, pane_h: f32, scale_x: f32, scale_y: f32, drawn_w: f32, drawn_h: f32) -> Self {
+        let pw = pane_w.max(1.0);
+        let ph = pane_h.max(1.0);
+        Self {
+            pane_w: pw,
+            pane_h: ph,
+            scale_x,
+            scale_y,
+            drawn_w,
+            drawn_h,
+            fill: (drawn_w / pw).min(drawn_h / ph).clamp(0.0, 1.0),
+            empty_gap: (pw - drawn_w).max(ph - drawn_h).max(0.0),
+            right_clip: (drawn_w - pw).max(0.0),
+        }
+    }
+
+    pub fn fills(&self) -> bool {
+        self.fill + 0.000_5 >= PANE_FILL_MIN && self.empty_gap <= PANE_EMPTY_GAP_MAX && self.right_clip <= 0.5
+    }
+}
+
+/// Stretch content so the drawn bbox fills the pane (package pins, hardware dashboard).
+pub fn fill_pane(content_w: f32, content_h: f32, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let cw = content_w.max(1.0);
+    let ch = content_h.max(1.0);
+    let pw = pane_w.max(1.0);
+    let ph = pane_h.max(1.0);
+    let sx = pw / cw;
+    let sy = ph / ch;
+    DrawingFit::from_drawn(pw, ph, sx, sy, pw, ph)
+}
+
+/// Isotropic fit: content stays inside the pane (schematic sheet). Right clip is 0.
+pub fn fit_pane(content_w: f32, content_h: f32, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let cw = content_w.max(1.0);
+    let ch = content_h.max(1.0);
+    let pw = pane_w.max(1.0);
+    let ph = pane_h.max(1.0);
+    let scale = (pw / cw).min(ph / ch).clamp(0.05, 16.0);
+    let dw = cw * scale;
+    let dh = ch * scale;
+    DrawingFit::from_drawn(pw, ph, scale, scale, dw, dh)
+}
+
+/// Old Package paint: square cell + DRAWING_MIN_HEIGHT pad. Leaves a black slab
+/// when the package is a 1-row pin strip.
+pub fn legacy_package_content_fill(cols: u32, rows: u32, pane_w: f32, pane_h: f32) -> f32 {
+    let cell = floorplan_fit_cell(cols, rows, pane_w, pane_h);
+    let content_h = cell * rows.max(1) as f32 + 16.0;
+    content_h / pane_h.max(1.0)
+}
+
+/// Anisotropic pin cells so the package grid fills remaining pane width and height.
+pub fn package_cell(cols: u32, rows: u32, pane_w: f32, pane_h: f32) -> (f32, f32) {
+    let cw = (pane_w - 28.0).max(8.0) / cols.max(1) as f32;
+    let ch = (pane_h - 16.0).max(8.0) / rows.max(1) as f32;
+    (cw.max(4.0), ch.max(4.0))
+}
+
+/// Remaining dashboard after Hardware Manager chrome (buttons/status).
+pub fn hardware_dashboard_size(pane_w: f32, pane_h: f32, chrome_h: f32) -> (f32, f32) {
+    let remain = (pane_h - chrome_h).max(pane_h * PANE_FILL_MIN);
+    (pane_w.max(80.0), remain)
+}
+
+/// STAT/ILA tiles that fill the Program pane (content bbox, not a dark empty slab).
+pub fn stat_bit_grid(n_bits: usize, pane_w: f32, pane_h: f32) -> (u32, u32, f32, f32) {
+    let n = n_bits.max(1) as u32;
+    let aspect = (pane_w / pane_h.max(1.0)).clamp(0.25, 8.0);
+    let cols = ((n as f32 * aspect).sqrt().ceil() as u32).max(1);
+    let rows = n.div_ceil(cols).max(1);
+    let (cw, ch) = package_cell(cols, rows, pane_w, pane_h);
+    (cols, rows, cw, ch)
+}
+
+/// Compact CAD cards (Windows compact / Apple content-first): tile strip + ILA rest.
+/// Tile height is capped so 3 empty-state cables are not fullscreen candy slabs.
+pub fn program_layout(n_tiles: usize, pane_w: f32, pane_h: f32) -> (f32, f32, u32, u32, f32, f32) {
+    let ph = pane_h.max(1.0);
+    let tile_band = (ph * 0.42).clamp(88.0, 132.0);
+    let ila_h = (ph - tile_band).max(ph * 0.40);
+    let (cols, rows, cw, ch) = stat_bit_grid(n_tiles.max(1), pane_w.max(1.0), tile_band);
+    (tile_band, ila_h, cols, rows, cw, ch.min(tile_band))
+}
+
+/// Content bbox of the Program STAT grid + ILA rest (both are content).
+pub fn hardware_content_bbox(n_bits: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let (tile_band, ila_h, cols, rows, cw, ch) = program_layout(n_bits, pane_w, pane_h);
+    let drawn_w = (cw * cols as f32 + 16.0).min(pane_w.max(1.0));
+    let drawn_h = tile_band + ila_h;
+    let _ = (rows, ch);
+    DrawingFit::from_drawn(pane_w.max(1.0), pane_h.max(1.0), 1.0, 1.0, drawn_w, drawn_h)
+}
+
+/// Native Hierarchy/IP sheet as a fraction of the pane (postage stamp in the More shots).
+pub fn native_drawing_fill(sheet_w: f32, sheet_h: f32, pane_w: f32, pane_h: f32) -> f32 {
+    (sheet_w / pane_w.max(1.0)).min(sheet_h / pane_h.max(1.0)).clamp(0.0, 1.0)
+}
+
+/// Stretch a Hierarchy/IP sheet so the drawn bbox fills the remaining pane.
+pub fn hierarchy_fit(sheet_w: f32, sheet_h: f32, pane_w: f32, pane_h: f32) -> DrawingFit {
+    fill_pane(sheet_w, sheet_h, pane_w, pane_h)
+}
+
+/// Shot leftover: "Select a report in the sidebar" is a ~48px stub.
+pub fn reports_stub_fill(pane_h: f32) -> f32 {
+    48.0 / pane_h.max(1.0)
+}
+
+/// Compact catalog row stack (name/category/status/summary) before it is stretched.
+pub fn reports_catalog_compact_h(n_rows: usize) -> f32 {
+    n_rows.max(1) as f32 * 22.0 + 28.0
+}
+
+/// Reports landing: catalog table occupies the remaining pane, not Timing and not a stub.
+pub fn reports_catalog_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let compact_h = reports_catalog_compact_h(n_rows);
+    fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
+}
+
+/// IP Integrator: capped catalog strip + canvas occupying the rest of the pane.
+pub fn ip_layout(pane_w: f32, pane_h: f32) -> (f32, DrawingFit) {
+    let ph = pane_h.max(1.0);
+    let catalog_h = IP_CATALOG_MAX_HEIGHT
+        .min(ph * (1.0 - PANE_FILL_MIN))
+        .min(ph * 0.22)
+        .max(48.0);
+    let canvas_h = (ph - catalog_h).max(ph * PANE_FILL_MIN);
+    let catalog_h = (ph - canvas_h).max(0.0);
+    (
+        catalog_h,
+        DrawingFit::from_drawn(pane_w.max(1.0), ph, 1.0, 1.0, pane_w.max(1.0), canvas_h),
+    )
+}
+
+/// Auto-fit only the identity camera when the sheet would clip. User zoom/pan is kept.
+pub fn schematic_should_auto_fit(
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    sheet_w: f32,
+    sheet_h: f32,
+    vw: f32,
+    vh: f32,
+) -> bool {
+    let identity = (zoom - 1.0).abs() < 0.02 && pan_x.abs() < 0.5 && pan_y.abs() < 0.5;
+    identity && (sheet_w * zoom > vw + 1.0 || sheet_h * zoom > vh + 1.0)
+}
+
 /// Paint `data_scroll` reads this: both axes + bounded height.
 pub fn table_scroll_policy(n_cols: usize, available: f32) -> TableScrollPolicy {
     let last_column_would_clip = grid_clips_last_column(n_cols, MIN_COL_PX, available);
@@ -481,6 +763,110 @@ pub fn workspace_matches_canvases() -> bool {
     WorkspaceTab::CANVASES.len() == Canvas::ALL.len()
 }
 
+/// Horizontal pixels the rail name occupies (letter sits above; this is the word).
+pub fn rail_name_extent(label: &str) -> f32 {
+    label.chars().count() as f32 * CHAR_PX
+}
+
+/// True when `label` paints fully inside the rail (padding 8px). Hover is not a substitute.
+pub fn rail_name_fits(label: &str) -> bool {
+    rail_name_extent(label) + 8.0 <= RAIL_WIDTH
+}
+
+/// Central pane a `WorkspaceTab` must fill. More ⋯ destinations never collapse to Timing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspacePane {
+    Editor,
+    Device,
+    Timing,
+    ReportsCatalog,
+    Schematic,
+    Package,
+    Hierarchy,
+    Bitstream,
+    Hardware,
+    Ip,
+    Find,
+    Settings,
+    Summary,
+    Wave,
+    Source,
+    Memory,
+    Breakpoints,
+    Locals,
+    Forces,
+    SimSettings,
+    Constraints,
+    ClockInteraction,
+    Cdc,
+    ClockNetworks,
+    Power,
+    Methodology,
+    Drc,
+    Utilization,
+    Runs,
+}
+
+/// Map every WorkspaceTab onto a real pane. None of these is a stub / popup / Timing dump.
+pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
+    match tab {
+        WorkspaceTab::TextEditor => WorkspacePane::Editor,
+        WorkspaceTab::Device => WorkspacePane::Device,
+        WorkspaceTab::Reports => WorkspacePane::ReportsCatalog,
+        WorkspaceTab::Schematic => WorkspacePane::Schematic,
+        WorkspaceTab::Package => WorkspacePane::Package,
+        WorkspaceTab::Hierarchy => WorkspacePane::Hierarchy,
+        WorkspaceTab::Bitstream => WorkspacePane::Bitstream,
+        WorkspaceTab::Hardware => WorkspacePane::Hardware,
+        WorkspaceTab::Ip => WorkspacePane::Ip,
+        WorkspaceTab::Find => WorkspacePane::Find,
+        WorkspaceTab::Settings => WorkspacePane::Settings,
+        WorkspaceTab::Summary => WorkspacePane::Summary,
+        WorkspaceTab::Wave => WorkspacePane::Wave,
+        WorkspaceTab::Source => WorkspacePane::Source,
+        WorkspaceTab::Memory => WorkspacePane::Memory,
+        WorkspaceTab::Breakpoints => WorkspacePane::Breakpoints,
+        WorkspaceTab::Locals => WorkspacePane::Locals,
+        WorkspaceTab::Forces => WorkspacePane::Forces,
+        WorkspaceTab::SimSettings => WorkspacePane::SimSettings,
+        WorkspaceTab::Constraints => WorkspacePane::Constraints,
+        WorkspaceTab::ClockInteraction => WorkspacePane::ClockInteraction,
+        WorkspaceTab::Cdc => WorkspacePane::Cdc,
+        WorkspaceTab::ClockNetworks => WorkspacePane::ClockNetworks,
+        WorkspaceTab::Power => WorkspacePane::Power,
+        WorkspaceTab::Methodology => WorkspacePane::Methodology,
+        WorkspaceTab::Drc => WorkspacePane::Drc,
+        WorkspaceTab::Utilization => WorkspacePane::Utilization,
+        WorkspaceTab::Runs => WorkspacePane::Runs,
+    }
+}
+
+/// Non-canvas WorkspaceTabs live in More ⋯ and must paint `pane_for_workspace` in the center.
+pub fn is_more_destination(tab: WorkspaceTab) -> bool {
+    !tab.is_canvas()
+}
+
+/// Report-detail tabs that belong under the Reports rail (catalog stays in the sidebar).
+pub fn is_report_detail(tab: WorkspaceTab) -> bool {
+    matches!(
+        tab,
+        WorkspaceTab::Constraints
+            | WorkspaceTab::ClockInteraction
+            | WorkspaceTab::Cdc
+            | WorkspaceTab::ClockNetworks
+            | WorkspaceTab::Power
+            | WorkspaceTab::Methodology
+            | WorkspaceTab::Drc
+            | WorkspaceTab::Utilization
+            | WorkspaceTab::Runs
+    )
+}
+
+/// Splitters must travel at least this far inside their min/max range.
+pub fn splitter_can_travel(min: f32, max: f32) -> bool {
+    max - min >= SPLITTER_MIN_DELTA_PX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,10 +874,10 @@ mod tests {
     #[test]
     fn chrome_overflow_keeps_every_tab_and_rail_action_selectable_at_desktop_width() {
         assert_eq!(side_chrome_width(), RAIL_WIDTH + SIDEBAR_WIDTH);
-        assert_eq!(side_chrome_width(), 268.0);  // RAIL 48 + SIDEBAR 220 (letter rail)
+        assert_eq!(side_chrome_width(), 308.0); // RAIL 88 + SIDEBAR 220 (full names)
         assert_ne!(side_chrome_width(), 680.0);
-        assert_eq!(RAIL_WIDTH, 48.0);
-        assert_eq!(HIT_RAIL, 48.0);
+        assert_eq!(RAIL_WIDTH, 88.0);
+        assert_eq!(HIT_RAIL, 56.0);
         assert_eq!(SIDEBAR_WIDTH, 220.0);
         assert_eq!(HIT_PRIMARY, 32.0);
         assert_eq!(HIT_SIDEBAR, 28.0);
@@ -597,24 +983,372 @@ mod tests {
     }
 
     #[test]
-    fn activity_rail_letter_and_short_label_are_visible() {
+    fn activity_rail_letter_and_full_name_are_visible() {
         for a in Activity::ALL {
             assert_eq!(a.icon().chars().count(), 1, "{a:?} letter");
-            assert!(!a.short_label().is_empty(), "{a:?} short");
+            assert!(!a.short_label().is_empty(), "{a:?} name");
+            assert_eq!(a.short_label(), a.label(), "{a:?} must paint the full name");
             assert!(
-                a.short_label().chars().count() <= 7,
-                "{a:?} short too long for 48px rail: {}",
+                rail_name_fits(a.label()),
+                "{a:?} name {:?} clips on {RAIL_WIDTH}px rail (extent {})",
+                a.label(),
+                rail_name_extent(a.label())
+            );
+            assert!(
+                rail_name_fits(a.short_label()),
+                "{a:?} short {:?} clips",
                 a.short_label()
             );
         }
-        assert_eq!(Activity::Simulate.short_label(), "Sim");
+        assert_eq!(Activity::Simulate.short_label(), "Simulate");
         assert_eq!(Activity::Program.short_label(), "Program");
-        assert_eq!(Activity::Program.short_label().chars().count(), 7);
-        assert_eq!(RAIL_WIDTH, 48.0);
+        assert_eq!(Activity::Device.short_label(), "Device");
+        assert_eq!(Activity::Reports.short_label(), "Reports");
+        assert_eq!(RAIL_WIDTH, 88.0);
+        assert_eq!(HIT_RAIL, 56.0);
+        assert!(HIT_RAIL >= 28.0);
         assert_eq!(HIT_COMFORT, 36.0);
+        assert_eq!(TOOLBAR_CTRL_H, HIT_COMFORT);
+        assert_eq!(flow_chip_size()[1], HIT_COMFORT);
+        for label in ["Open…", "Bitstream", "Implement", "Implementing…"] {
+            let s = toolbar_ctrl_size(label);
+            assert_eq!(s[1], HIT_COMFORT, "{label} height");
+            assert!(s[0] >= 72.0, "{label} width {}", s[0]);
+        }
         assert_eq!(OCCUPANCY_BAR_H, 20.0);
         assert!((4.0..=6.0).contains(&SPLITTER_GRAB_PX));
         assert_eq!(DEVICE_TABLES_MAX_HEIGHT, 140.0);
+        assert!(splitter_can_travel(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
+        assert!(splitter_can_travel(CONSOLE_MIN_HEIGHT, CONSOLE_MAX_HEIGHT));
+        assert!(SIDEBAR_WIDTH >= SIDEBAR_MIN_WIDTH && SIDEBAR_WIDTH <= SIDEBAR_MAX_WIDTH);
+
+        let desktop = chrome_at(DESKTOP_WIDTH);
+        assert_eq!(desktop.workspace_mode, OverflowMode::Fit);
+        for lab in ["Editor", "Device", "Timing"] {
+            assert!(desktop.tab_is_selectable(lab), "desktop {lab}");
+        }
+        let narrow = chrome_at(1100.0);
+        assert_eq!(narrow.dropped_workspace(), 0);
+        assert!(
+            narrow.workspace_mode == OverflowMode::Fit || narrow.tab_rows.iter().any(|r| r.contains(&MORE)),
+            "narrow window keeps canvases or More: {:?}",
+            narrow.tab_rows
+        );
+        for lab in ["Editor", "Device", "Timing"] {
+            assert!(narrow.tab_is_selectable(lab), "narrow {lab}");
+        }
+        let table = table_scroll_policy(10, 400.0);
+        assert!(table.last_column_would_clip && table.x && table.y);
+    }
+
+    #[test]
+    fn toolbar_and_wave_geometry_are_uniform_and_fill() {
+        assert_eq!(TOOLBAR_CTRL_H, 36.0);
+        assert_eq!(flow_chip_size(), [72.0, 36.0]);
+        assert_eq!(toolbar_ctrl_size("Open…")[1], toolbar_ctrl_size("Implement")[1]);
+        // One trace in a 400px remaining pane must not be a 32px strip.
+        let h1 = wave_trace_row_h(1, 400.0);
+        assert!(
+            h1 >= 400.0 * PANE_FILL_MIN,
+            "single wave trace row {h1} leaves a black slab in 400px"
+        );
+        let h2 = wave_trace_row_h(2, 400.0);
+        assert!(h2 >= 180.0, "two traces share the pane, got {h2}");
+        assert_eq!(wave_trace_row_h(20, 400.0), 36.0);
+        let w = stretched_col_w(7, 700.0);
+        assert!(w >= 48.0, "{w}");
+        assert!(
+            w * 7.0 + 12.0 * 6.0 <= 700.0 + 1.0,
+            "stretched columns plus gaps must fit the pane ({w})"
+        );
+        assert!(!schematic_pin_visible(true, false), "n/c hidden unless selected");
+        assert!(schematic_pin_visible(true, true), "n/c shown on selected cell");
+        assert!(schematic_pin_visible(false, false), "connected pins always shown");
+        assert!(ip_catalog_name_fits("h_rv32_hb1"));
+        assert!(ip_catalog_name_fits("h_uart"));
+        assert!(ip_catalog_chip_w("h_rv32_hb1") >= 96.0);
+        // Program bbox must not be padded up to 80% by the helper itself.
+        let hw = hardware_content_bbox(8, 1000.0, 500.0);
+        assert!(
+            hw.drawn_w < 1000.0 * PANE_FILL_MIN || hw.fill >= PANE_FILL_MIN,
+            "bbox must measure tiles, not clamp to 80%: {hw:?}"
+        );
+        assert!(hw.fills() || hw.fill >= PANE_FILL_MIN, "program tiles {hw:?}");
+        let empty = empty_cta_occupies_pane(80.0, 400.0);
+        assert!(
+            empty.fills() || empty.fill >= PANE_FILL_MIN,
+            "empty CTA must occupy remaining pane, got {empty:?}"
+        );
+        assert!(empty.drawn_h >= 400.0 * PANE_FILL_MIN);
+    }
+
+    #[test]
+    fn settings_and_summary_tables_fill_remaining_pane() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        let compact = nv_table_compact_h(7);
+        assert!(
+            compact / pane_h < PANE_FILL_MIN,
+            "unstretched 7-row Name/Value {compact} must fail so stretch is required"
+        );
+        let bbox = nv_table_bbox(7, pane_w, pane_h);
+        assert!(
+            bbox.fills() || bbox.fill >= PANE_FILL_MIN,
+            "Settings/Summary table must fill the pane, got {bbox:?}"
+        );
+        assert!(bbox.empty_gap <= PANE_EMPTY_GAP_MAX);
+        let remain = pane_w - 180.0;
+        assert!(
+            120.0 < remain * PANE_FILL_MIN,
+            "legacy 120px power share bar must fail the fill bar"
+        );
+        assert!(
+            160.0 < remain * PANE_FILL_MIN,
+            "legacy 160px occupancy bar must fail the fill bar"
+        );
+        let bar = occupancy_bar_w(remain);
+        assert!(
+            bar > 160.0,
+            "legacy 160px occupancy bar must fail the fill bar, got {bar}"
+        );
+        assert!(
+            bar >= remain * PANE_FILL_MIN,
+            "occupancy/share bars must span remaining width, got {bar}"
+        );
+        assert!(
+            remain - bar <= PANE_EMPTY_GAP_MAX,
+            "right gap after occupancy/share bar {bar} in {remain}"
+        );
+        let shrunk = bar * 0.25;
+        assert!(
+            remain - shrunk > PANE_EMPTY_GAP_MAX,
+            "0.25× occupancy bars reintroduce a >80px void (shrunk={shrunk})"
+        );
+        // Power Utilization Details was Block/Used/Available (~180px) with no bar.
+        let details_labels = 180.0;
+        assert!(
+            details_labels < pane_w * PANE_FILL_MIN,
+            "Utilization Details without occupancy bars must fail the fill bar"
+        );
+        let details_bar = occupancy_bar_w(pane_w - details_labels);
+        assert!(
+            details_bar >= (pane_w - details_labels) * PANE_FILL_MIN,
+            "Utilization Details occupancy bars must span remaining width, got {details_bar}"
+        );
+        assert!(
+            pane_w - details_labels - details_bar <= PANE_EMPTY_GAP_MAX,
+            "right gap after Utilization Details occupancy bar"
+        );
+        let compact_occ = occupancy_table_compact_h(5);
+        assert!(
+            compact_occ / pane_h < PANE_FILL_MIN,
+            "unstretched 5-row occupancy table {compact_occ} must fail so stretch is required"
+        );
+        let occ = occupancy_table_bbox(5, pane_w, pane_h);
+        assert!(
+            occ.fills() || occ.fill >= PANE_FILL_MIN,
+            "occupancy/utilization table must fill remaining pane, got {occ:?}"
+        );
+        assert!(occ.empty_gap <= PANE_EMPTY_GAP_MAX);
+        // Utilization Hierarchical was 6 compact columns with a >80px right gap.
+        let compact_hier = 6.0 * 64.0;
+        assert!(
+            compact_hier < pane_w * PANE_FILL_MIN,
+            "compact Hierarchical columns must fail the fill bar"
+        );
+        let hier = stretched_col_w_gap(6, pane_w, 8.0);
+        let hier_span = hier * 6.0 + 8.0 * 5.0;
+        assert!(
+            hier_span >= pane_w * PANE_FILL_MIN,
+            "Hierarchical columns must span remaining width, span={hier_span}"
+        );
+        assert!(pane_w - hier_span <= PANE_EMPTY_GAP_MAX);
+        let compact_bars = OCCUPANCY_BAR_H * 5.0;
+        assert!(
+            compact_bars / pane_h < PANE_FILL_MIN,
+            "20px occupancy bars must fail so stretch is required"
+        );
+        let bh = occupancy_bar_h(5, pane_h);
+        assert!(
+            bh * 5.0 >= pane_h * PANE_FILL_MIN,
+            "occupancy bar height {bh} leaves a void in {pane_h}"
+        );
+        let n_bars = 4usize;
+        let footer = 2usize;
+        let wrong = occupancy_bar_h(n_bars + 1 + footer, pane_h);
+        let wrong_drawn = wrong * n_bars as f32 + occupancy_table_compact_h(footer);
+        assert!(
+            pane_h - wrong_drawn > PANE_EMPTY_GAP_MAX,
+            "counting Hierarchical rows as occupancy bars must leave a void ({wrong_drawn})"
+        );
+        let bh_footer = occupancy_bars_h_after_footer(n_bars, footer, pane_h);
+        let drawn = bh_footer * n_bars as f32 + occupancy_table_compact_h(footer);
+        assert!(
+            drawn >= pane_h * PANE_FILL_MIN || pane_h - drawn <= PANE_EMPTY_GAP_MAX,
+            "occupancy bars after Hierarchical footer {drawn} in {pane_h}"
+        );
+        let labels4 = occupancy_label_reserve(4);
+        assert!(
+            280.0 - labels4 > 40.0,
+            "legacy 280px occupancy label reserve over-subtracts ({labels4})"
+        );
+        let tight = occupancy_bar_w(pane_w - labels4);
+        let legacy = occupancy_bar_w(pane_w - 280.0);
+        assert!(tight > legacy, "tight occupancy bars {tight} vs legacy {legacy}");
+        assert!(
+            pane_w - labels4 - tight <= PANE_EMPTY_GAP_MAX,
+            "occupancy bars must meet Hierarchical right edge"
+        );
+    }
+
+    #[test]
+    fn more_destinations_never_fall_through_to_timing_pane() {
+        use crate::WorkspaceTab;
+        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Schematic), WorkspacePane::Schematic);
+        assert_ne!(pane_for_workspace(WorkspaceTab::Schematic), WorkspacePane::Timing);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Package), WorkspacePane::Package);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Hierarchy), WorkspacePane::Hierarchy);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Summary), WorkspacePane::Summary);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Settings), WorkspacePane::Settings);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Bitstream), WorkspacePane::Bitstream);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Hardware), WorkspacePane::Hardware);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Ip), WorkspacePane::Ip);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Find), WorkspacePane::Find);
+        let mut more = 0usize;
+        for tab in WorkspaceTab::ALL {
+            let pane = pane_for_workspace(tab);
+            if is_more_destination(tab) {
+                more += 1;
+                assert_ne!(
+                    pane,
+                    WorkspacePane::Timing,
+                    "{tab:?} More destination must not paint Timing"
+                );
+                assert_ne!(
+                    pane,
+                    WorkspacePane::ReportsCatalog,
+                    "{tab:?} More destination is not the Reports catalog"
+                );
+            }
+        }
+        assert_eq!(more, 25, "28 tabs − 3 canvases");
+        assert!(is_report_detail(WorkspaceTab::Utilization));
+        assert!(!is_report_detail(WorkspaceTab::Schematic));
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Reports),
+            WorkspacePane::ReportsCatalog
+        );
+        assert_eq!(pane_for_workspace(WorkspaceTab::TextEditor), WorkspacePane::Editor);
+        assert_eq!(pane_for_workspace(WorkspaceTab::Device), WorkspacePane::Device);
+    }
+
+    #[test]
+    fn reports_landing_catalog_fills_pane_and_is_not_timing() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Reports),
+            WorkspacePane::ReportsCatalog
+        );
+        assert_ne!(
+            pane_for_workspace(WorkspaceTab::Reports),
+            WorkspacePane::Timing
+        );
+        assert!(
+            reports_stub_fill(pane_h) < PANE_FILL_MIN,
+            "Select-a-report stub must fail the fill bar"
+        );
+        let compact = reports_catalog_compact_h(8);
+        assert!(
+            compact / pane_h < PANE_FILL_MIN,
+            "unstretched 8-row catalog {compact} must fail so stretch is required"
+        );
+        let bbox = reports_catalog_bbox(8, pane_w, pane_h);
+        assert!(
+            bbox.fills() || bbox.fill >= PANE_FILL_MIN,
+            "Reports catalog must fill the landing pane, got {bbox:?}"
+        );
+        assert!(bbox.empty_gap <= PANE_EMPTY_GAP_MAX);
+        assert!(bbox.right_clip <= 0.5);
+    }
+
+    #[test]
+    fn package_and_hardware_fill_remaining_pane_not_a_black_slab() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        // The 1-row pin strip + DRAWING_MIN_HEIGHT pad is the shot black-hole.
+        assert!(
+            legacy_package_content_fill(32, 1, pane_w, pane_h) < PANE_FILL_MIN,
+            "legacy letterbox must fail the fill bar so the new cell path is required"
+        );
+        let (cw, ch) = package_cell(32, 1, pane_w, pane_h);
+        let drawn_w = cw * 32.0 + 28.0;
+        let drawn_h = ch * 1.0 + 16.0;
+        let fill = (drawn_w / pane_w).min(drawn_h / pane_h);
+        assert!(fill >= PANE_FILL_MIN, "package fill {fill}");
+        assert!((pane_w - drawn_w).max(pane_h - drawn_h) <= PANE_EMPTY_GAP_MAX);
+        let filled = fill_pane(32.0, 1.0, pane_w, pane_h);
+        assert!(filled.fills(), "{filled:?}");
+        let hw = hardware_content_bbox(3, pane_w, pane_h);
+        assert!(hw.fills(), "Program cards+ILA content bbox {hw:?}");
+        let (tile_band, ila_h, _, _, _, ch) = program_layout(3, pane_w, pane_h);
+        assert!(
+            ch <= 132.0 && tile_band <= 132.0,
+            "empty-state cable cards must stay compact, ch={ch} band={tile_band}"
+        );
+        assert!(ila_h >= pane_h * 0.40, "ILA rest is content, not a void");
+        assert!(
+            !schematic_should_auto_fit(2.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0),
+            "user zoom-in must not be auto-fitted"
+        );
+        assert!(schematic_should_auto_fit(
+            1.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0
+        ));
+    }
+
+    #[test]
+    fn hierarchy_and_ip_canvas_fill_remaining_pane_not_postage_stamps() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        // Counter hierarchy sheet from the More Hierarchy shot: 316×258.
+        let native = native_drawing_fill(316.0, 258.0, pane_w, pane_h);
+        assert!(
+            native < PANE_FILL_MIN,
+            "native hierarchy postage stamp must fail the fill bar (got {native})"
+        );
+        let fit = hierarchy_fit(316.0, 258.0, pane_w, pane_h);
+        assert!(
+            fit.fills(),
+            "hierarchy must stretch into the remaining pane, got {fit:?}"
+        );
+        assert!(fit.right_clip <= 0.5);
+        let (catalog_h, canvas) = ip_layout(pane_w, pane_h);
+        assert!(
+            catalog_h <= IP_CATALOG_MAX_HEIGHT,
+            "IP catalog strip {catalog_h} must stay compact"
+        );
+        assert!(
+            canvas.fills() || canvas.fill >= PANE_FILL_MIN,
+            "IP BD canvas {canvas:?}"
+        );
+        assert!(canvas.empty_gap <= PANE_EMPTY_GAP_MAX);
+    }
+
+    #[test]
+    fn schematic_fit_does_not_clip_rightmost_iob() {
+        // Counter sheet is wider than a 900px pane at zoom=1.
+        let sheet_w = 1400.0;
+        let sheet_h = 720.0;
+        let pane_w = 900.0;
+        let pane_h = 500.0;
+        let raw_clip = sheet_w - pane_w;
+        assert!(raw_clip > 80.0, "unfitted sheet must clip (got {raw_clip})");
+        let fit = fit_pane(sheet_w, sheet_h, pane_w, pane_h);
+        assert!(fit.right_clip <= 0.5, "right clip {}", fit.right_clip);
+        assert!(fit.drawn_w <= pane_w + 0.5);
+        assert!(fit.drawn_h <= pane_h + 0.5);
+        assert!(fit.fill >= PANE_FILL_MIN, "fit fill {}", fit.fill);
     }
 }
 
