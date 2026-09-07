@@ -2354,12 +2354,24 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let selected = model.selected_summary.clone();
     let mut pick: Option<String> = None;
+    let remain = ui.available_size();
+    let bbox = chrome::nv_table_bbox(rows.len().max(1), remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+    let n = rows.len().max(1) as f32;
+    let row_gap = ((ui.available_height() - 80.0) / n - 18.0).clamp(4.0, 22.0);
+    let col_w = chrome::stretched_col_w(3, ui.available_width());
     egui::ScrollArea::both()
         .id_salt("ug893_project_summary")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("project_summary_gadgets")
-                .spacing([8.0, 4.0])
+                .spacing([12.0, row_gap])
+                .min_col_width(col_w)
                 .show(ui, |ui| {
                     ui.label(RichText::new("Gadget").strong());
                     ui.label(RichText::new("Status").strong());
@@ -2404,7 +2416,8 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                             } else {
                                 row.used as f32 / row.available as f32
                             };
-                            let bar_w = 160.0 * (row.available as f32 / max_avail).clamp(0.25, 1.0);
+                            let span = chrome::occupancy_bar_w(ui.available_width().max(80.0));
+                            let bar_w = span * (row.available as f32 / max_avail).clamp(0.25, 1.0);
                             let (rect, _) =
                                 ui.allocate_exact_size(egui::vec2(bar_w, chrome::OCCUPANCY_BAR_H), Sense::hover());
                             ui.painter().rect_filled(
@@ -2421,6 +2434,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                     });
             }
         });
+    });
     if let Some(spec) = pick {
         let _ = model.select_project_summary(&spec);
     }
@@ -2431,12 +2445,24 @@ fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.project_setting_rows();
     let selected = model.selected_setting.clone();
     let mut pick: Option<String> = None;
+    let remain = ui.available_size();
+    let bbox = chrome::nv_table_bbox(rows.len().max(1), remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+    let n = rows.len().max(1) as f32;
+    let row_gap = ((ui.available_height() - 28.0) / n - 18.0).clamp(4.0, 28.0);
+    let col_w = chrome::stretched_col_w(2, ui.available_width());
     egui::ScrollArea::both()
         .id_salt("ug893_project_settings")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("project_settings_table")
-                .spacing([8.0, 4.0])
+                .spacing([12.0, row_gap])
+                .min_col_width(col_w)
                 .show(ui, |ui| {
                     ui.label(RichText::new("Name").strong());
                     ui.label(RichText::new("Value").strong());
@@ -2453,6 +2479,7 @@ fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 });
         });
+    });
     if let Some(spec) = pick {
         let _ = model.select_project_setting(&spec);
     }

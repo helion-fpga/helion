@@ -916,6 +916,28 @@ mod tests {
     }
 
     #[test]
+    fn settings_and_summary_fill_after_implement() {
+        let mut d = ChromeDriver::new();
+        d.click_open(&example("counter.sv")).unwrap();
+        d.click_implement().unwrap();
+        d.click_more(WorkspaceTab::Settings);
+        assert_eq!(d.pane(), WorkspacePane::Settings);
+        let n = d.model.project_setting_rows().len();
+        assert!(n >= 4, "settings rows {n}");
+        let bbox = chrome::nv_table_bbox(n, 1000.0, 400.0);
+        assert!(
+            bbox.fills() || bbox.fill >= chrome::PANE_FILL_MIN,
+            "settings {bbox:?}"
+        );
+        d.click_more(WorkspaceTab::Summary);
+        assert_eq!(d.pane(), WorkspacePane::Summary);
+        let g = d.model.project_summary_gadgets().len();
+        let sb = chrome::nv_table_bbox(g.max(1), 1000.0, 400.0);
+        assert!(sb.fills() || sb.fill >= chrome::PANE_FILL_MIN, "summary {sb:?}");
+        assert!(chrome::occupancy_bar_w(820.0) > 160.0);
+    }
+
+    #[test]
     fn program_paint_path_does_not_reshell_ofl() {
         let n0 = helion_hw::usb_scan_invocations();
         let det = helion_hw::detect_boards();

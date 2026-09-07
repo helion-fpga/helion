@@ -102,6 +102,22 @@ pub fn schematic_pin_visible(net_empty: bool, symbol_selected: bool) -> bool {
     !net_empty || symbol_selected
 }
 
+/// Compact Name/Value stack (Settings 7 rows, Summary gadgets) before stretch.
+pub fn nv_table_compact_h(n_rows: usize) -> f32 {
+    n_rows.max(1) as f32 * 22.0 + 28.0
+}
+
+/// Settings/Summary landing: table occupies the remaining pane, not a postage stamp.
+pub fn nv_table_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let compact_h = nv_table_compact_h(n_rows);
+    fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
+}
+
+/// Occupancy bars were a 160px strip with a >80px right gap.
+pub fn occupancy_bar_w(avail: f32) -> f32 {
+    avail.max(80.0)
+}
+
 /// Empty Find/Bitstream/Settings canvases: the CTA occupies remaining pane height
 /// (Win32 unused-region fail; Apple empty state with a next action).
 pub fn empty_cta_occupies_pane(chrome_h: f32, pane_h: f32) -> DrawingFit {
@@ -1028,6 +1044,32 @@ mod tests {
             "empty CTA must occupy remaining pane, got {empty:?}"
         );
         assert!(empty.drawn_h >= 400.0 * PANE_FILL_MIN);
+    }
+
+    #[test]
+    fn settings_and_summary_tables_fill_remaining_pane() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        let compact = nv_table_compact_h(7);
+        assert!(
+            compact / pane_h < PANE_FILL_MIN,
+            "unstretched 7-row Name/Value {compact} must fail so stretch is required"
+        );
+        let bbox = nv_table_bbox(7, pane_w, pane_h);
+        assert!(
+            bbox.fills() || bbox.fill >= PANE_FILL_MIN,
+            "Settings/Summary table must fill the pane, got {bbox:?}"
+        );
+        assert!(bbox.empty_gap <= PANE_EMPTY_GAP_MAX);
+        let bar = occupancy_bar_w(pane_w - 180.0);
+        assert!(
+            bar > 160.0,
+            "legacy 160px occupancy bar must fail the fill bar, got {bar}"
+        );
+        assert!(
+            bar >= (pane_w - 180.0) * PANE_FILL_MIN,
+            "occupancy bars must span remaining width, got {bar}"
+        );
     }
 
     #[test]
