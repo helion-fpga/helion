@@ -1023,6 +1023,16 @@ mod tests {
             drawn >= 400.0 * chrome::PANE_FILL_MIN || 400.0 - drawn <= chrome::PANE_EMPTY_GAP_MAX,
             "occupancy bars after Hierarchical footer {drawn}"
         );
+        let labels4 = chrome::occupancy_label_reserve(4);
+        assert!(
+            280.0 - labels4 > 40.0,
+            "legacy 280px occupancy label reserve over-subtracts ({labels4})"
+        );
+        let tight = chrome::occupancy_bar_w(1000.0 - labels4);
+        assert!(
+            tight > chrome::occupancy_bar_w(1000.0 - 280.0),
+            "tight occupancy bars {tight} must beat 280px reserve"
+        );
     }
 
     #[test]

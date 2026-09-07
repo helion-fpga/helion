@@ -2399,7 +2399,9 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
             if !report.occupancy.is_empty() {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Occupancy").strong());
-                let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
+                let bar_span = chrome::occupancy_bar_w(
+                    (ui.available_width() - chrome::occupancy_label_reserve(2)).max(80.0),
+                );
                 let bar_h = chrome::occupancy_bar_h(
                     report.occupancy.len().max(1),
                     (ui.available_height() - 8.0).max(chrome::OCCUPANCY_BAR_H),
@@ -4134,7 +4136,9 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
         let bar_h = chrome::occupancy_bar_h(n_rows.max(1), remain_h);
         let row_gap = 4.0;
         let max_uw = report.total_uw.max(1);
-        let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
+        let bar_span = chrome::occupancy_bar_w(
+            (ui.available_width() - chrome::occupancy_label_reserve(2)).max(80.0),
+        );
         egui::ScrollArea::both()
             .id_salt("ug907_power")
             .auto_shrink([false, false])
@@ -4168,7 +4172,9 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
                     });
                 ui.add_space(8.0);
                 ui.label(RichText::new("Utilization Details").strong());
-                let details_bar = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
+                let details_bar = chrome::occupancy_bar_w(
+                    (ui.available_width() - chrome::occupancy_label_reserve(3)).max(80.0),
+                );
                 egui::Grid::new("power_blocks")
                     .spacing([8.0, row_gap])
                     .show(ui, |ui| {
@@ -4530,7 +4536,9 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
         let n_bars = report.occupancy.len().max(1);
         let bar_h = chrome::occupancy_bars_h_after_footer(n_bars, n_hier, remain_h);
         let row_gap = 4.0;
-        let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
+        let bar_span = chrome::occupancy_bar_w(
+            (ui.available_width() - chrome::occupancy_label_reserve(4)).max(80.0),
+        );
         egui::ScrollArea::both()
             .id_salt("ug893_utilization")
             .auto_shrink([false, false])

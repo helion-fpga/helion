@@ -118,6 +118,12 @@ pub fn occupancy_bar_w(avail: f32) -> f32 {
     avail.max(80.0)
 }
 
+/// Compact label columns left of occupancy bars (Resource/Used/Available/Pct).
+/// A 280px reserve for 4 cols left a right inset vs Hierarchical.
+pub fn occupancy_label_reserve(n_cols: usize) -> f32 {
+    n_cols.max(1) as f32 * 50.0 + 12.0
+}
+
 /// Occupancy bar height. A 20px strip in remaining pane is a >80px void.
 pub fn occupancy_bar_h(n_rows: usize, remaining_h: f32) -> f32 {
     let n = n_rows.max(1) as f32;
@@ -1180,6 +1186,18 @@ mod tests {
         assert!(
             drawn >= pane_h * PANE_FILL_MIN || pane_h - drawn <= PANE_EMPTY_GAP_MAX,
             "occupancy bars after Hierarchical footer {drawn} in {pane_h}"
+        );
+        let labels4 = occupancy_label_reserve(4);
+        assert!(
+            280.0 - labels4 > 40.0,
+            "legacy 280px occupancy label reserve over-subtracts ({labels4})"
+        );
+        let tight = occupancy_bar_w(pane_w - labels4);
+        let legacy = occupancy_bar_w(pane_w - 280.0);
+        assert!(tight > legacy, "tight occupancy bars {tight} vs legacy {legacy}");
+        assert!(
+            pane_w - labels4 - tight <= PANE_EMPTY_GAP_MAX,
+            "occupancy bars must meet Hierarchical right edge"
         );
     }
 
