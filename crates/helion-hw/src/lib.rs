@@ -19,6 +19,7 @@
 use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_fabric::{Fabric, Stat};
+use std::cell::Cell;
 
 pub mod native_usb;
 pub mod native_mpsse;
@@ -680,10 +681,21 @@ fn ofl_dry_run() -> bool {
     )
 }
 
+thread_local! {
+    static USB_SCAN_INVOCATIONS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// How many times this thread shelled `openFPGALoader --scan-usb` / native enumerate.
+/// IDE paint must not bump this every frame.
+pub fn usb_scan_invocations() -> u32 {
+    USB_SCAN_INVOCATIONS.with(|c| c.get())
+}
+
 /// Run `openFPGALoader --scan-usb` when available, then merge optional rusb FTDI
 /// (VID 0x0403) probes from [`enumerate_ftdi`]. Never fabricates probes. Native
 /// listings are detect-only and must not be treated as program DONE.
 pub fn scan_usb_probes() -> UsbScan {
+    USB_SCAN_INVOCATIONS.with(|c| c.set(c.get().saturating_add(1)));
     let native = enumerate_ftdi();
     let native_probes: Vec<UsbProbe> = native
         .probes
@@ -955,8 +967,12 @@ pub fn detect_boards() -> DetectReport {
 
 /// Resolve `--cable auto|sim|mpsse-sim|usb|ofl|native|sim0|mpsse-sim0|ofl0|usb0|native0`.
 pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
+    resolve_cable_from(spec, &detect_boards())
+}
+
+/// Paint-path resolve: uses a cached [`DetectReport`]. Must not shell OFL.
+pub fn resolve_cable_from(spec: &str, det: &DetectReport) -> Result<CableInfo, String> {
     let s = spec.trim().to_ascii_lowercase();
-    let det = detect_boards();
     let sim = det
         .cables
         .iter()
@@ -1672,6 +1688,23 @@ mod tests {
             let auto = resolve_cable("auto").unwrap();
             assert_eq!(auto.backend, CableBackend::Sim);
         }
+    }
+
+    #[test]
+    fn cached_cable_resolve_does_not_reshell_ofl() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let n0 = usb_scan_invocations();
+        let det = detect_boards();
+        let n1 = usb_scan_invocations();
+        assert!(n1 > n0, "detect_boards must scan USB/OFL once");
+        let cable = resolve_cable_from("auto", &det).expect("auto cable");
+        assert_eq!(
+            usb_scan_invocations(),
+            n1,
+            "IDE paint path must not shell openFPGALoader again (got {})",
+            usb_scan_invocations()
+        );
+        assert_eq!(cable.backend, CableBackend::Sim);
     }
 
     #[test]
