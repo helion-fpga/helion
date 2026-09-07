@@ -378,8 +378,9 @@ impl HelionIde {
         if a == Activity::Files {
             self.model.layout = LayoutKind::Default;
         }
-        if a == Activity::Reports {
-            self.model.selected_report = None;
+        if a == Activity::Reports && self.model.selected_report.is_none() {
+            // Windows layout: unused empty pane is incorrect. Open Timing Summary.
+            self.model.selected_report = Some("report_timing_summary".into());
         }
         self.log_click(a.label(), a.label());
     }
@@ -689,35 +690,45 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                 if open.clicked() {
                     native_open(app);
                 }
-                ui.menu_button("Recent", |ui| {
-                    if app.recent.is_empty() {
-                        ui.label("No recent files.");
-                    } else {
-                        let paths: Vec<PathBuf> = app.recent.clone();
-                        for p in paths {
-                            let name = p
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.display().to_string());
-                            if ui.button(name).clicked() {
-                                app.open_path_async(&p);
-                                ui.close();
+                let recent_sz = chrome::toolbar_ctrl_size("Recent");
+                ui.allocate_ui(egui::vec2(recent_sz[0], recent_sz[1]), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.menu_button("Recent", |ui| {
+                            if app.recent.is_empty() {
+                                ui.label("No recent files.");
+                            } else {
+                                let paths: Vec<PathBuf> = app.recent.clone();
+                                for p in paths {
+                                    let name = p
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| p.display().to_string());
+                                    if ui.button(name).clicked() {
+                                        app.open_path_async(&p);
+                                        ui.close();
+                                    }
+                                }
                             }
-                        }
-                    }
+                        });
+                    });
                 });
-                ui.menu_button("Examples", |ui| {
-                    let mut pick = None;
-                    for (label, file) in RAIL_OPEN_SOURCES {
-                        if ui.button(label).clicked() {
-                            pick = Some(file);
-                            ui.close();
-                        }
-                    }
-                    if let Some(file) = pick {
-                        let p = helion_device::Device::examples_dir().join(file);
-                        app.open_path_async(&p);
-                    }
+                let ex_sz = chrome::toolbar_ctrl_size("Examples");
+                ui.allocate_ui(egui::vec2(ex_sz[0], ex_sz[1]), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.menu_button("Examples", |ui| {
+                            let mut pick = None;
+                            for (label, file) in RAIL_OPEN_SOURCES {
+                                if ui.button(label).clicked() {
+                                    pick = Some(file);
+                                    ui.close();
+                                }
+                            }
+                            if let Some(file) = pick {
+                                let p = helion_device::Device::examples_dir().join(file);
+                                app.open_path_async(&p);
+                            }
+                        });
+                    });
                 });
                 ui.separator();
                 paint_progress_strip(ui, app);
@@ -933,7 +944,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     paint_timing_paths(ui, &mut app.model);
                 }
                 Activity::Reports => {
-                    paint_report_catalog(ui, &mut app.model);
+                    paint_report_catalog(ui, &mut app.model, "sidebar_reports_catalog");
                 }
                 Activity::Program => {
                     paint_program_side(ui, app);
@@ -1565,18 +1576,7 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
                 .show(ui, |ui| {
                     match app.activity {
                         Activity::Reports => {
-                            if app.model.selected_report.is_some()
-                                || chrome::is_report_detail(app.model.workspace)
-                            {
-                                paint_reports_detail(ui, app);
-                            } else {
-                                ui.heading("Reports");
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("Select a report in the sidebar.")
-                                        .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
-                                );
-                            }
+                            paint_reports_detail(ui, app);
                         }
                         _ => paint_timing_only(ui, &mut app.model),
                     }
@@ -1668,13 +1668,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         | WorkspacePane::Locals
         | WorkspacePane::Forces
         | WorkspacePane::SimSettings => paint_sim_workspace(ui, app),
-        WorkspacePane::ReportsCatalog => {
-            ui.heading("Reports");
-            ui.label(
-                RichText::new("Select a report in the sidebar.")
-                    .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
-            );
-        }
+        WorkspacePane::ReportsCatalog => paint_reports_detail(ui, app),
         WorkspacePane::Editor => paint_text_editor(ui, &mut app.model),
         WorkspacePane::Device => paint_device(ui, &mut app.model),
         WorkspacePane::Timing => paint_timing_only(ui, &mut app.model),
@@ -1701,10 +1695,19 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
-        WorkspaceTab::Reports | WorkspaceTab::Summary => {
-            ui.heading("Timing Summary");
-            ui.add_space(4.0);
-            paint_timing_summary(ui, &mut app.model);
+        WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model),
+        WorkspaceTab::Reports => {
+            ui.heading("Reports");
+            let remain = ui.available_size();
+            let n = app.model.report_catalog().len();
+            let bbox = chrome::reports_catalog_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+                Sense::hover(),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                paint_report_catalog(ui, &mut app.model, "reports_landing_catalog");
+            });
         }
         other => {
             // Fall through to known panes / timing-only for overflow More picks.
@@ -3486,8 +3489,10 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Path Summary").strong());
     let mut pick_path = None;
     let selected_path = model.selected_timing_path;
+    let path_sum_col = chrome::stretched_col_w_gap(8, ui.available_width(), 8.0);
     egui::Grid::new("timing_path_summary")
         .spacing([8.0, 4.0])
+        .min_col_width(path_sum_col)
         .show(ui, |ui| {
             ui.label(RichText::new("Name").strong());
             ui.label(RichText::new("From").strong());
@@ -3537,8 +3542,10 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
     egui::ScrollArea::vertical().max_height(280.0).hscroll(true).show(ui, |ui| {
+        let pin_col = chrome::stretched_col_w_gap(7, ui.available_width(), 8.0);
         egui::Grid::new("timing_pin_delay")
             .spacing([8.0, 4.0])
+            .min_col_width(pin_col)
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Type").strong());
@@ -3576,16 +3583,18 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static str) {
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
     egui::ScrollArea::both()
-        .id_salt("reports_catalog_scroll")
-        .auto_shrink([false, true])
+        .id_salt(salt)
+        .auto_shrink([false, false])
         .max_height(ui.available_height().max(120.0))
         .show(ui, |ui| {
-    egui::Grid::new("reports_catalog")
+    egui::Grid::new(salt)
+        .min_col_width(80.0)
+        .max_col_width((ui.available_width() / 4.0).max(80.0))
         .spacing([8.0, 4.0])
         .min_col_width(48.0)
         .show(ui, |ui| {
@@ -3654,8 +3663,10 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     ui.add_space(4.0);
     ui.label(RichText::new("Design Timing Summary").strong());
+    let col_w = chrome::stretched_col_w(7, ui.available_width());
     egui::Grid::new("timing_summary_design")
         .spacing([12.0, 4.0])
+        .min_col_width(col_w)
         .show(ui, |ui| {
             ui.label(RichText::new("WNS_PS").strong());
             ui.label(RichText::new("TNS_PS").strong());
@@ -3690,8 +3701,10 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
         ui.add_space(6.0);
         ui.label(RichText::new(title).strong());
+        let path_col = chrome::stretched_col_w_gap(8, ui.available_width(), 8.0);
         egui::Grid::new(format!("timing_summary_{}", kind.as_str()))
             .spacing([8.0, 4.0])
+            .min_col_width(path_col)
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("From").strong());
@@ -5986,11 +5999,7 @@ fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_wave_marker.clone();
     let mut pick: Option<String> = None;
     if markers.is_empty() {
-        ui.label("No markers yet. Run simulation, then add a marker.");
-        if primary_button(ui, "Add marker").clicked() {
-            let n = model.wave.markers.len() + 1;
-            let _ = model.add_wave_marker(&format!("M{n}"));
-        }
+        // Toolbar already has Add marker — don't steal pane height for an empty table.
         return;
     }
     data_scroll("ug900_wave_markers_scroll").show(ui, |ui| {
@@ -6069,10 +6078,6 @@ fn paint_virtual_buses(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_virtual_bus.clone();
     let mut pick: Option<String> = None;
     if buses.is_empty() {
-        ui.label("No virtual bus yet.");
-        if ui.button("Add virtual bus").clicked() {
-            let _ = model.add_wave_virtual_bus("vb led cnt");
-        }
         return;
     }
     data_scroll("ug900_virtual_buses_scroll").show(ui, |ui| {

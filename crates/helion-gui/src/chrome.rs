@@ -84,6 +84,18 @@ pub fn wave_trace_row_h(n_traces: usize, remaining_h: f32) -> f32 {
     (remain / n).clamp(36.0, remain)
 }
 
+/// Stretch a table across the remaining pane (Win32: leftover empty regions are incorrect).
+/// Subtracts `gap` between columns so the last header is not clipped.
+pub fn stretched_col_w(n_cols: usize, avail: f32) -> f32 {
+    stretched_col_w_gap(n_cols, avail, 12.0)
+}
+
+pub fn stretched_col_w_gap(n_cols: usize, avail: f32, gap: f32) -> f32 {
+    let n = n_cols.max(1) as f32;
+    let gaps = gap * (n - 1.0).max(0.0);
+    ((avail - gaps).max(48.0) / n).max(48.0)
+}
+
 /// Example sources (empty state / File → Examples). Do not paint on the rail.
 pub const RAIL_OPEN_SOURCES: [(&'static str, &'static str); 5] = [
     ("Open counter.sv", "counter.sv"),
@@ -585,6 +597,22 @@ pub fn hierarchy_fit(sheet_w: f32, sheet_h: f32, pane_w: f32, pane_h: f32) -> Dr
     fill_pane(sheet_w, sheet_h, pane_w, pane_h)
 }
 
+/// Shot leftover: "Select a report in the sidebar" is a ~48px stub.
+pub fn reports_stub_fill(pane_h: f32) -> f32 {
+    48.0 / pane_h.max(1.0)
+}
+
+/// Compact catalog row stack (name/category/status/summary) before it is stretched.
+pub fn reports_catalog_compact_h(n_rows: usize) -> f32 {
+    n_rows.max(1) as f32 * 22.0 + 28.0
+}
+
+/// Reports landing: catalog table occupies the remaining pane, not Timing and not a stub.
+pub fn reports_catalog_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let compact_h = reports_catalog_compact_h(n_rows);
+    fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
+}
+
 /// IP Integrator: capped catalog strip + canvas occupying the rest of the pane.
 pub fn ip_layout(pane_w: f32, pane_h: f32) -> (f32, DrawingFit) {
     let ph = pane_h.max(1.0);
@@ -951,6 +979,12 @@ mod tests {
         let h2 = wave_trace_row_h(2, 400.0);
         assert!(h2 >= 180.0, "two traces share the pane, got {h2}");
         assert_eq!(wave_trace_row_h(20, 400.0), 36.0);
+        let w = stretched_col_w(7, 700.0);
+        assert!(w >= 48.0, "{w}");
+        assert!(
+            w * 7.0 + 12.0 * 6.0 <= 700.0 + 1.0,
+            "stretched columns plus gaps must fit the pane ({w})"
+        );
         // Program bbox must not be padded up to 80% by the helper itself.
         let hw = hardware_content_bbox(8, 1000.0, 500.0);
         assert!(
@@ -1000,6 +1034,36 @@ mod tests {
         );
         assert_eq!(pane_for_workspace(WorkspaceTab::TextEditor), WorkspacePane::Editor);
         assert_eq!(pane_for_workspace(WorkspaceTab::Device), WorkspacePane::Device);
+    }
+
+    #[test]
+    fn reports_landing_catalog_fills_pane_and_is_not_timing() {
+        let pane_w = 1000.0;
+        let pane_h = 400.0;
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Reports),
+            WorkspacePane::ReportsCatalog
+        );
+        assert_ne!(
+            pane_for_workspace(WorkspaceTab::Reports),
+            WorkspacePane::Timing
+        );
+        assert!(
+            reports_stub_fill(pane_h) < PANE_FILL_MIN,
+            "Select-a-report stub must fail the fill bar"
+        );
+        let compact = reports_catalog_compact_h(8);
+        assert!(
+            compact / pane_h < PANE_FILL_MIN,
+            "unstretched 8-row catalog {compact} must fail so stretch is required"
+        );
+        let bbox = reports_catalog_bbox(8, pane_w, pane_h);
+        assert!(
+            bbox.fills() || bbox.fill >= PANE_FILL_MIN,
+            "Reports catalog must fill the landing pane, got {bbox:?}"
+        );
+        assert!(bbox.empty_gap <= PANE_EMPTY_GAP_MAX);
+        assert!(bbox.right_clip <= 0.5);
     }
 
     #[test]
