@@ -4245,9 +4245,21 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    let n = report.checks.len().max(1);
+    let remain = ui.available_size();
+    let bbox = chrome::nv_table_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+    let n_f = n as f32;
+    let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
+    let col_w = chrome::stretched_col_w_gap(5, ui.available_width(), 8.0);
     egui::ScrollArea::both().show(ui, |ui| {
         egui::Grid::new("methodology_table")
-            .spacing([8.0, 4.0])
+            .spacing([8.0, row_gap])
+            .min_col_width(col_w)
             .show(ui, |ui| {
                 ui.label(RichText::new("ID").strong());
                 ui.label(RichText::new("Severity").strong());
@@ -4285,6 +4297,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
                     ui.end_row();
                 }
             });
+    });
     });
     if let Some(id) = pick_obj {
         let _ = model.select_methodology(&id);
@@ -4404,9 +4417,21 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    let n = report.items.len().max(1);
+    let remain = ui.available_size();
+    let bbox = chrome::nv_table_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+    let n_f = n as f32;
+    let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
+    let col_w = chrome::stretched_col_w_gap(4, ui.available_width(), 8.0);
     egui::ScrollArea::both().show(ui, |ui| {
         egui::Grid::new("drc_table")
-            .spacing([8.0, 4.0])
+            .spacing([8.0, row_gap])
+            .min_col_width(col_w)
             .show(ui, |ui| {
                 ui.label(RichText::new("ID").strong());
                 ui.label(RichText::new("Severity").strong());
@@ -4450,6 +4475,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
             });
+    });
     });
     if let Some(id) = pick_obj {
         let _ = model.select_drc(&id);
