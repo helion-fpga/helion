@@ -118,6 +118,17 @@ pub fn occupancy_bar_w(avail: f32) -> f32 {
     avail.max(80.0)
 }
 
+/// Compact occupancy / utilization / power-share stack before remaining-pane stretch.
+pub fn occupancy_table_compact_h(n_rows: usize) -> f32 {
+    n_rows.max(1) as f32 * (OCCUPANCY_BAR_H + 4.0) + 28.0
+}
+
+/// Occupancy landing: table occupies remaining pane, not a postage stamp over a void.
+pub fn occupancy_table_bbox(n_rows: usize, pane_w: f32, pane_h: f32) -> DrawingFit {
+    let compact_h = occupancy_table_compact_h(n_rows);
+    fill_pane(pane_w.max(1.0), compact_h, pane_w, pane_h)
+}
+
 /// Empty Find/Bitstream/Settings canvases: the CTA occupies remaining pane height
 /// (Win32 unused-region fail; Apple empty state with a next action).
 pub fn empty_cta_occupies_pane(chrome_h: f32, pane_h: f32) -> DrawingFit {
@@ -1103,6 +1114,17 @@ mod tests {
             pane_w - details_labels - details_bar <= PANE_EMPTY_GAP_MAX,
             "right gap after Utilization Details occupancy bar"
         );
+        let compact_occ = occupancy_table_compact_h(5);
+        assert!(
+            compact_occ / pane_h < PANE_FILL_MIN,
+            "unstretched 5-row occupancy table {compact_occ} must fail so stretch is required"
+        );
+        let occ = occupancy_table_bbox(5, pane_w, pane_h);
+        assert!(
+            occ.fills() || occ.fill >= PANE_FILL_MIN,
+            "occupancy/utilization table must fill remaining pane, got {occ:?}"
+        );
+        assert!(occ.empty_gap <= PANE_EMPTY_GAP_MAX);
     }
 
     #[test]

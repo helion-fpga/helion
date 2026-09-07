@@ -967,6 +967,23 @@ mod tests {
             !d.model.utilization_report().occupancy.is_empty(),
             "Utilization occupancy after implement"
         );
+        let n_occ = d.model.utilization_report().occupancy.len() + 1;
+        let compact_occ = chrome::occupancy_table_compact_h(n_occ);
+        assert!(
+            compact_occ / 400.0 < chrome::PANE_FILL_MIN,
+            "unstretched occupancy table {compact_occ} must fail so stretch is required"
+        );
+        let occ_bbox = chrome::occupancy_table_bbox(n_occ, 1000.0, 400.0);
+        assert!(
+            occ_bbox.fills() || occ_bbox.fill >= chrome::PANE_FILL_MIN,
+            "utilization occupancy table {occ_bbox:?}"
+        );
+        let n_pwr = 9 + d.model.power_block_rows().len();
+        let pwr_bbox = chrome::occupancy_table_bbox(n_pwr.max(1), 1000.0, 400.0);
+        assert!(
+            pwr_bbox.fills() || pwr_bbox.fill >= chrome::PANE_FILL_MIN,
+            "power occupancy table {pwr_bbox:?}"
+        );
     }
 
     #[test]

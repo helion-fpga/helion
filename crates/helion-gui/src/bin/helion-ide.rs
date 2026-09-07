@@ -4103,6 +4103,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected_pwr = model.selected_power.clone();
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
+    let mut pick_blk: Option<String> = None;
     let rails = [
         ("total", report.total_uw),
         ("static", report.static_uw),
@@ -4114,70 +4115,94 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
         ("bram", report.bram_uw),
         ("dsp", report.dsp_uw),
     ];
-    let max_uw = report.total_uw.max(1);
-    let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
-    egui::Grid::new("power_rails")
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Rail").strong());
-            ui.label(RichText::new("UW").strong());
-            ui.label(RichText::new("Share").strong());
-            ui.end_row();
-            for (name, uw) in rails {
-                let on = selected_pwr.as_deref() == Some(name);
-                if ui.selectable_label(on, name).clicked() {
-                    pick = Some(name.into());
-                }
-                ui.label(uw.to_string());
-                let frac = uw as f32 / max_uw as f32;
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H), Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
-                let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
-                ui.painter()
-                    .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
-                ui.end_row();
-            }
-        });
+    let blocks = model.power_block_rows();
+    let n_rows = rails.len() + 1 + blocks.len() + 1;
+    let remain = ui.available_size();
+    let bbox = chrome::occupancy_table_bbox(n_rows.max(1), remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+        let n = n_rows.max(1) as f32;
+        let row_gap = ((ui.available_height() - 40.0) / n - chrome::OCCUPANCY_BAR_H).clamp(4.0, 22.0);
+        let max_uw = report.total_uw.max(1);
+        let bar_span = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
+        egui::ScrollArea::both()
+            .id_salt("ug907_power")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("power_rails")
+                    .spacing([8.0, row_gap])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Rail").strong());
+                        ui.label(RichText::new("UW").strong());
+                        ui.label(RichText::new("Share").strong());
+                        ui.end_row();
+                        for (name, uw) in rails {
+                            let on = selected_pwr.as_deref() == Some(name);
+                            if ui.selectable_label(on, name).clicked() {
+                                pick = Some(name.into());
+                            }
+                            ui.label(uw.to_string());
+                            let frac = uw as f32 / max_uw as f32;
+                            let (bar, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H),
+                                Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(bar, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
+                            let fill =
+                                bar.with_max_x(bar.left() + bar.width() * frac.clamp(0.0, 1.0));
+                            ui.painter()
+                                .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Utilization Details").strong());
+                let details_bar = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
+                egui::Grid::new("power_blocks")
+                    .spacing([8.0, row_gap])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Block").strong());
+                        ui.label(RichText::new("Used").strong());
+                        ui.label(RichText::new("Available").strong());
+                        ui.label(RichText::new("Occupancy").strong());
+                        ui.end_row();
+                        for (name, used, avail, rail) in &blocks {
+                            let on = selected_pwr.as_deref() == Some(*rail)
+                                || selected.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(on, name).clicked() {
+                                pick_blk = Some((*rail).into());
+                            }
+                            ui.label(used.to_string());
+                            ui.label(avail.to_string());
+                            let frac = if *avail == 0 {
+                                0.0
+                            } else {
+                                *used as f32 / *avail as f32
+                            };
+                            let (bar, _) = ui.allocate_exact_size(
+                                egui::vec2(details_bar, chrome::OCCUPANCY_BAR_H),
+                                Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(bar, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
+                            let fill =
+                                bar.with_max_x(bar.left() + bar.width() * frac.clamp(0.0, 1.0));
+                            ui.painter()
+                                .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
+                            ui.end_row();
+                        }
+                    });
+            });
+    });
     if let Some(rail) = pick {
         let _ = model.select_power(&rail);
     }
-    ui.add_space(6.0);
-    ui.label(RichText::new("Utilization Details").strong());
-    let blocks = model.power_block_rows();
-    let mut pick_blk: Option<String> = None;
-    let details_bar = chrome::occupancy_bar_w((ui.available_width() - 180.0).max(80.0));
-    egui::Grid::new("power_blocks")
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Block").strong());
-            ui.label(RichText::new("Used").strong());
-            ui.label(RichText::new("Available").strong());
-            ui.label(RichText::new("Occupancy").strong());
-            ui.end_row();
-            for (name, used, avail, rail) in &blocks {
-                let on = selected_pwr.as_deref() == Some(*rail)
-                    || selected.as_deref() == Some(name.as_str());
-                if ui.selectable_label(on, name).clicked() {
-                    pick_blk = Some((*rail).into());
-                }
-                ui.label(used.to_string());
-                ui.label(avail.to_string());
-                let frac = if *avail == 0 {
-                    0.0
-                } else {
-                    *used as f32 / *avail as f32
-                };
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(details_bar, chrome::OCCUPANCY_BAR_H), Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
-                let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
-                ui.painter()
-                    .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
-                ui.end_row();
-            }
-        });
     if let Some(rail) = pick_blk {
         let _ = model.select_power(&rail);
     }
@@ -4454,73 +4479,100 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected_util = model.selected_utilization.clone();
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
-    let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
-    egui::Grid::new("utilization_occupancy")
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Resource").strong());
-            ui.label(RichText::new("Used").strong());
-            ui.label(RichText::new("Available").strong());
-            ui.label(RichText::new("Pct").strong());
-            ui.label(RichText::new("Occupancy").strong());
-            ui.end_row();
-            for row in &report.occupancy {
-                let on = selected_util.as_deref() == Some(row.resource);
-                if ui.selectable_label(on, row.resource).clicked() {
-                    pick = Some(row.resource.into());
+    let mut pick_hier: Option<String> = None;
+    let n_hier = if report.hierarchy.is_empty() {
+        0
+    } else {
+        report.hierarchy.len() + 1
+    };
+    let n_rows = report.occupancy.len() + 1 + n_hier;
+    let remain = ui.available_size();
+    let bbox = chrome::occupancy_table_bbox(n_rows.max(1), remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+        let n = n_rows.max(1) as f32;
+        let row_gap = ((ui.available_height() - 40.0) / n - chrome::OCCUPANCY_BAR_H).clamp(4.0, 22.0);
+        let bar_span = chrome::occupancy_bar_w((ui.available_width() - 280.0).max(80.0));
+        egui::ScrollArea::both()
+            .id_salt("ug893_utilization")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("utilization_occupancy")
+                    .spacing([8.0, row_gap])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Resource").strong());
+                        ui.label(RichText::new("Used").strong());
+                        ui.label(RichText::new("Available").strong());
+                        ui.label(RichText::new("Pct").strong());
+                        ui.label(RichText::new("Occupancy").strong());
+                        ui.end_row();
+                        for row in &report.occupancy {
+                            let on = selected_util.as_deref() == Some(row.resource);
+                            if ui.selectable_label(on, row.resource).clicked() {
+                                pick = Some(row.resource.into());
+                            }
+                            ui.label(row.used.to_string());
+                            ui.label(row.available.to_string());
+                            ui.label(format!("{}%", row.pct()));
+                            let frac = if row.available == 0 {
+                                0.0
+                            } else {
+                                row.used as f32 / row.available as f32
+                            };
+                            let (bar, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H),
+                                Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(bar, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
+                            let fill =
+                                bar.with_max_x(bar.left() + bar.width() * frac.clamp(0.0, 1.0));
+                            ui.painter()
+                                .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
+                            ui.end_row();
+                        }
+                    });
+                if !report.hierarchy.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Hierarchical").strong());
+                    egui::Grid::new("utilization_hierarchy")
+                        .spacing([8.0, row_gap])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Instance").strong());
+                            ui.label(RichText::new("LUT").strong());
+                            ui.label(RichText::new("FF").strong());
+                            ui.label(RichText::new("IOB").strong());
+                            ui.label(RichText::new("BRAM").strong());
+                            ui.label(RichText::new("DSP").strong());
+                            ui.end_row();
+                            for h in &report.hierarchy {
+                                let key = format!("hier:{}", h.name);
+                                let on = selected_util.as_deref() == Some(key.as_str())
+                                    || selected.as_deref() == Some(h.name.as_str());
+                                if ui.selectable_label(on, &h.name).clicked() {
+                                    pick_hier = Some(h.name.clone());
+                                }
+                                ui.label(h.lut.to_string());
+                                ui.label(h.ff.to_string());
+                                ui.label(h.iob.to_string());
+                                ui.label(h.bram.to_string());
+                                ui.label(h.dsp.to_string());
+                                ui.end_row();
+                            }
+                        });
                 }
-                ui.label(row.used.to_string());
-                ui.label(row.available.to_string());
-                ui.label(format!("{}%", row.pct()));
-                let frac = if row.available == 0 {
-                    0.0
-                } else {
-                    row.used as f32 / row.available as f32
-                };
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_span, chrome::OCCUPANCY_BAR_H), Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, 2.0, Color32::from_rgb(0x2b, 0x32, 0x3a));
-                let fill = rect.with_max_x(rect.left() + rect.width() * frac.clamp(0.0, 1.0));
-                ui.painter()
-                    .rect_filled(fill, 2.0, Color32::from_rgb(0x7e, 0xc8, 0xe3));
-                ui.end_row();
-            }
-        });
+            });
+    });
     if let Some(res) = pick {
         let _ = model.select_utilization(&res);
     }
-    if !report.hierarchy.is_empty() {
-        ui.add_space(8.0);
-        ui.label(RichText::new("Hierarchical").strong());
-        let mut pick_hier: Option<String> = None;
-        egui::Grid::new("utilization_hierarchy")
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Instance").strong());
-                ui.label(RichText::new("LUT").strong());
-                ui.label(RichText::new("FF").strong());
-                ui.label(RichText::new("IOB").strong());
-                ui.label(RichText::new("BRAM").strong());
-                ui.label(RichText::new("DSP").strong());
-                ui.end_row();
-                for h in &report.hierarchy {
-                    let key = format!("hier:{}", h.name);
-                    let on = selected_util.as_deref() == Some(key.as_str())
-                        || selected.as_deref() == Some(h.name.as_str());
-                    if ui.selectable_label(on, &h.name).clicked() {
-                        pick_hier = Some(h.name.clone());
-                    }
-                    ui.label(h.lut.to_string());
-                    ui.label(h.ff.to_string());
-                    ui.label(h.iob.to_string());
-                    ui.label(h.bram.to_string());
-                    ui.label(h.dsp.to_string());
-                    ui.end_row();
-                }
-            });
-        if let Some(name) = pick_hier {
-            let _ = model.select_utilization_hier(&name);
-        }
+    if let Some(name) = pick_hier {
+        let _ = model.select_utilization_hier(&name);
     }
 }
 
