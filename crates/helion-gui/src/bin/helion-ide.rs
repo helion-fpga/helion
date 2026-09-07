@@ -4540,8 +4540,10 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
                 if !report.hierarchy.is_empty() {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Hierarchical").strong());
+                    let hier_col = chrome::stretched_col_w_gap(6, ui.available_width(), 8.0);
                     egui::Grid::new("utilization_hierarchy")
                         .spacing([8.0, row_gap])
+                        .min_col_width(hier_col)
                         .show(ui, |ui| {
                             ui.label(RichText::new("Instance").strong());
                             ui.label(RichText::new("LUT").strong());
