@@ -6541,44 +6541,43 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
         .map(|bd| bd.drawing(&model.ip_catalog));
     let remain = ui.available_size();
     let (catalog_h, canvas) = chrome::ip_layout(remain.x.max(80.0), remain.y.max(200.0));
-    egui::ScrollArea::vertical()
-        .id_salt("ip_catalog_strip")
-        .auto_shrink([false, true])
-        .max_height(catalog_h)
+    // Catalog is a wrapping chip strip so names like h_rv32_hb1 are not clipped in 88px.
+    ui.allocate_ui(egui::vec2(remain.x.max(80.0), catalog_h), |ui| {
+        paint_ip_catalog(ui, model);
+    });
+    if let Some(drawing) = drawing.as_ref() {
+        egui::CollapsingHeader::new(format!(
+            "BD {} · {} IP · {} nets",
+            model.block_design.as_ref().map(|b| b.name.as_str()).unwrap_or("-"),
+            drawing
+                .symbols
+                .iter()
+                .filter(|s| s.kind != "PORT_IN" && s.kind != "INTERCONNECT")
+                .count(),
+            drawing.wires.len(),
+        ))
+        .default_open(false)
         .show(ui, |ui| {
-            paint_ip_catalog(ui, model);
-            if let Some(drawing) = drawing.as_ref() {
-                ui.label(format!(
-                    "BD {}  {} IP  {} nets  ok={}",
-                    model.block_design.as_ref().map(|b| b.name.as_str()).unwrap_or("-"),
-                    drawing
-                        .symbols
-                        .iter()
-                        .filter(|s| s.kind != "PORT_IN" && s.kind != "INTERCONNECT")
-                        .count(),
-                    drawing.wires.len(),
-                    model.block_design.as_ref().map(|b| b.ok).unwrap_or(false)
-                ));
-                if !drawing.addresses.is_empty() {
-                    ui.label(RichText::new("Address Map (Helion-MM)").strong());
-                    egui::Grid::new("bd_addr_map")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Slave").strong());
-                            ui.label(RichText::new("Offset").strong());
-                            ui.label(RichText::new("Range").strong());
+            if !drawing.addresses.is_empty() {
+                ui.label(RichText::new("Address Map (Helion-MM)").strong());
+                egui::Grid::new("bd_addr_map")
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Slave").strong());
+                        ui.label(RichText::new("Offset").strong());
+                        ui.label(RichText::new("Range").strong());
+                        ui.end_row();
+                        for a in &drawing.addresses {
+                            ui.label(&a.slave);
+                            ui.label(format!("0x{:08x}", a.base));
+                            ui.label(format!("0x{:x}", a.range));
                             ui.end_row();
-                            for a in &drawing.addresses {
-                                ui.label(&a.slave);
-                                ui.label(format!("0x{:08x}", a.base));
-                                ui.label(format!("0x{:x}", a.range));
-                                ui.end_row();
-                            }
-                        });
-                }
+                        }
+                    });
             }
             paint_bd_hdl(ui, model);
         });
+    }
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(canvas.drawn_w.max(remain.x), canvas.drawn_h.max(chrome::DRAWING_MIN_HEIGHT * 0.5)),
         Sense::hover(),
@@ -6717,34 +6716,30 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_ip_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new("IP Catalog — helion-ipxact VLNV table (Helion-MM/ST), not a collapsing dump")
-            .strong(),
-    );
     let rows = model.ip_catalog_rows();
-    ui.label(format!("cores={}", rows.len()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("IP Catalog").strong());
+        ui.label(RichText::new(format!("cores={}", rows.len())).small().weak());
+    });
     let selected = model.selected_ip.clone();
     let mut pick: Option<String> = None;
-    egui::Grid::new("ip_catalog_table")
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Name").strong());
-            ui.label(RichText::new("VLNV").strong());
-            ui.label(RichText::new("Bus").strong());
-            ui.label(RichText::new("Status").strong());
-            ui.end_row();
-            for r in &rows {
-                let on = selected.as_deref() == Some(r.name.as_str());
-                if ui.selectable_label(on, &r.name).clicked() {
-                    pick = Some(r.name.clone());
-                }
-                ui.label(&r.vlnv);
-                ui.label(&r.bus);
-                ui.label(&r.status);
-                ui.end_row();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for r in &rows {
+            let on = selected.as_deref() == Some(r.name.as_str());
+            let w = chrome::ip_catalog_chip_w(&r.name);
+            let resp = ui
+                .add_sized(
+                    [w, chrome::HIT_SIDEBAR],
+                    egui::SelectableLabel::new(on, &r.name),
+                )
+                .on_hover_text(format!("{}\n{}\n{}", r.vlnv, r.bus, r.status));
+            if resp.clicked() {
+                pick = Some(r.name.clone());
             }
-        });
+        }
+    });
     if let Some(name) = pick {
         let _ = model.select_ip_core(&name);
     }
