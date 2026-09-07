@@ -4,10 +4,10 @@ Static pages for GitHub Pages (`docs/` → https://helion-fpga.github.io/helion/
 
 | Page | Job |
 |---|---|
-| `index.html` | Landing: Helion mark, gold WNS, call for help |
-| `start.html` | Build / gold / macOS app |
-| `use.html` | User guide (IDE, CLI, Device die, `.helion` IP, program honesty) |
-| `wiki.html` | Wiki index |
+| `index.html` | Goal: original FPGA family + in-repo CAD + IDE, not a vendor wrapper |
+| `start.html` | Download 1.0.1, build, gold, Helion.app layout |
+| `use.html` | User guide (rail, CLI, Device die, Tcl, IP, program honesty) |
+| `wiki.html` | Documentation index with summaries |
 | `architecture.html` | Crate map and labeled HAD |
 | `get-involved.html` | LMMS-style on-ramp |
 | `contribute.html` | Coding path |

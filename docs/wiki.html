@@ -3,18 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Wiki — Helion</title>
-  <meta name="description" content="Helion wiki: getting started, using the CAD, architecture, contributing, legal fence." />
+  <title>Wiki: Helion documentation index</title>
+  <meta name="description" content="Helion documentation index: what the project is, how to run helion-ide and helion, HAD part HL10T-C32-1, gold WNS_PS=9640, legal fence." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=tape3" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
-  
   <header class="bar">
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
     <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
@@ -32,45 +31,69 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Wiki</h1>
-      <p class="lede">Getting started, using the CAD, then coding — same job as an LMMS wiki. This site is the living copy.</p>
+      <p class="lede">
+        Helion is an original FPGA family plus the CAD and desktop IDE that target
+        it. This site is the documentation. The pages below carry commands, part
+        facts, and gold numbers. They are not a slogan index.
+      </p>
 
-      <h2>Getting started</h2>
-      <ul>
-        <li><a href="start.html">Build from source</a> — clone, gold, macOS app</li>
-        <li><a href="use.html">Using Helion</a> — IDE, CLI, Device die, gold WNS</li>
-      </ul>
+      <h2>What Helion is</h2>
+      <p>
+        Original device family <code>HL10T-C32-1</code> (HAD: 32&times;32 CLB, 32 user IO,
+        idcode <code>0x00011A1F</code>) and in-repo CAD: synth, pack, place, PathFinder
+        route, STA, DRC, sparse <code>.hbits</code>, fabric sim. Desktop IDE is
+        <code>helion-ide</code>. CLI is <code>helion</code>. Not a wrapper around a
+        vendor tool. Gold: empty-XDC <code>counter.sv</code>
+        <span class="gold">WNS_PS=9640</span>, LED
+        <code>0000000111111110</code>. License Apache-2.0 OR MIT. Full statement:
+        <a href="index.html">home</a>.
+      </p>
 
-      <h2>Getting involved</h2>
-      <ul>
-        <li><a href="get-involved.html">Get involved</a> — discussions, first issues, sponsor</li>
-        <li><a href="contribute.html">Start coding</a> — crate map, PR rules</li>
-        <li><a href="https://github.com/helion-fpga/helion/discussions/6">Welcome thread</a></li>
-      </ul>
+      <h2>Run the app</h2>
+      <p>
+        <a href="start.html">Start</a> is download and build: v1.0.1 zip and tarballs,
+        rustc 1.85, <code>Helion.app</code> layout, <code>HELION_HAD</code>, and the
+        gold commands. <a href="use.html">Use</a> is the user guide: activity rail
+        (Files / Device / Timing / Simulate / Program / Reports), More overflow,
+        full <code>helion</code> command list, Tcl Session, IP, ILA, program honesty.
+      </p>
 
-      <h2>Start coding</h2>
-      <ul>
-        <li><a href="architecture.html">Architecture</a> — crates, HAD, HNF, Session</li>
-        <li><a href="legal.html">Legal fence</a> — original CAD only</li>
-        <li><a href="https://github.com/helion-fpga/helion/blob/master/CONTRIBUTING.md">CONTRIBUTING.md</a></li>
-        <li><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">GOVERNANCE.md</a></li>
-      </ul>
+      <h2>How it is built</h2>
+      <p>
+        <a href="architecture.html">Architecture</a> is the crate map, HAD table,
+        HNF IR, FeatureMap bitstream, and Tcl engines. <a href="legal.html">Legal fence</a>
+        is the no-vendor rule: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD /
+        Intel / Lattice backends, HAD-only device facts, Helion-MM / Helion-ST buses.
+      </p>
+
+      <h2>Contribute</h2>
+      <p>
+        <a href="get-involved.html">Get involved</a> is the on-ramp (Discussions,
+        good first issues, sponsor). <a href="contribute.html">Start coding</a> is
+        crate paths and PR rules. Gold must stay <span class="gold">WNS_PS=9640</span>
+        unless the QoR table moves in the same commit with a reason.
+        Repo files: <a href="https://github.com/helion-fpga/helion/blob/master/CONTRIBUTING.md">CONTRIBUTING.md</a>,
+        <a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">GOVERNANCE.md</a>.
+      </p>
 
       <h2>Support</h2>
       <ul>
         <li><a href="https://github.com/helion-fpga/helion/issues">Issues</a></li>
         <li><a href="https://github.com/helion-fpga/helion/discussions">Discussions</a></li>
-        <li><a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">Security</a></li>
+        <li><a href="https://github.com/helion-fpga/helion/blob/master/SECURITY.md">Security</a> (QoR misses are not vulnerabilities)</li>
         <li><a href="https://github.com/sponsors/saksham-45">Sponsor</a></li>
       </ul>
-
-      <p>Markdown sources for a GitHub Wiki import live in the repo under <code>wiki/</code>.</p>
+      <p>
+        Markdown stubs for a GitHub Wiki import live in the repo under <code>wiki/</code>.
+        Branch grind notes (<code>FM-HEL-TOP-*.md</code>) are not the public guide.
+      </p>
     </div>
   </main>
 
   <footer>
     <span>Apache-2.0 OR MIT · org <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-    <span><a href="https://github.com/helion-fpga/helion/wiki">GitHub Wiki tab</a></span>
+    <span><a href="https://github.com/helion-fpga/helion">Repository</a></span>
   </footer>
-  <script src="site.js?v=tape3"></script>
+  <script src="site.js?v=docs1"></script>
 </body>
 </html>

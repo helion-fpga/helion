@@ -1,12 +1,16 @@
 # Helion documentation
 
+Helion is an original FPGA device family plus the in-repo CAD (synth, pack, place, PathFinder route, STA, bitstream) and desktop IDE that target that family. Not a vendor-tool wrapper.
+
 - Home: index.html
-- Getting started: start.html
-- Using Helion: use.html
-- Wiki: wiki.html
-- Architecture: architecture.html
+- Using Helion (IDE + CLI): use.html
+- Getting started (download / build): start.html
+- Architecture (crates, HAD, HNF): architecture.html
+- Wiki index: wiki.html
 - Get involved: get-involved.html
 - Contributing (code): contribute.html
 - Legal fence: legal.html
 - Repository: https://github.com/helion-fpga/helion
 - License: Apache-2.0 OR MIT
+- Gold: empty-XDC examples/counter.sv WNS_PS=9640, LED[16]=0000000111111110
+- Part: HL10T-C32-1 (HAD)

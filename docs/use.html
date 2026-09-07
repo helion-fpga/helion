@@ -3,18 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Use Helion — user guide</title>
-  <meta name="description" content="How to use Helion: open the IDE, run the gold counter, CLI flow, Device floorplan, gold WNS_PS=9640." />
+  <title>Use Helion: IDE, CLI, gold</title>
+  <meta name="description" content="How to use Helion: helion-ide chrome, CLI commands, HL10T-C32-1 die, gold WNS_PS=9640 and LED 0000000111111110." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=tape3" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
-  
   <header class="bar">
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
     <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
@@ -32,33 +31,125 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Using Helion</h1>
-      <p class="lede">This is the user guide: open a design, run the CAD, read timing, simulate. Build steps live on <a href="start.html">Start</a>.</p>
-
-      <h2>What you get</h2>
-      <ul>
-        <li>Desktop IDE: <code>Helion.app</code> → <code>Contents/MacOS/Helion</code> (same as <code>helion-ide</code>)</li>
-        <li>CLI: <code>helion</code> (doctor, run, report_timing, project, ip) — <code>read_ip</code> loads <code>.helion</code> IP packages</li>
-        <li>Part: <code>HL10T-C32-1</code> from HAD, not a vendor die</li>
+      <p class="lede">
+        This is the user guide for the desktop IDE (<code>helion-ide</code> /
+        <code>Helion.app</code>) and the CLI (<code>helion</code>). Build and
+        download steps live on <a href="start.html">Start</a>. The part is
+        <code>HL10T-C32-1</code> from HAD, not a vendor die.
+      </p>
+      <ul class="toc">
+        <li><a href="#binaries">Binaries</a></li>
+        <li><a href="#ide">Desktop IDE</a></li>
+        <li><a href="#cli">CLI</a></li>
+        <li><a href="#gold">Gold</a></li>
+        <li><a href="#device-die">Device die</a></li>
+        <li><a href="#tcl">Tcl Session</a></li>
+        <li><a href="#ip">IP packages</a></li>
+        <li><a href="#ila">ILA</a></li>
+        <li><a href="#program">Program / OFL</a></li>
+        <li><a href="#large">Large SystemVerilog</a></li>
       </ul>
 
-      <h2>Open a design in the IDE</h2>
+      <h2 id="binaries">What you get</h2>
+      <ul>
+        <li>Desktop IDE: <code>Helion.app/Contents/MacOS/Helion</code> (same binary as <code>helion-ide</code>). Do not launch the CLI as the app.</li>
+        <li>CLI: <code>helion</code> for doctor, synth, impl, run, timing, utilization, bitstream, project, ip, hnf, hw.</li>
+        <li>Programmer helper: <code>helion-prog</code> (<code>helion hw</code> / OFL / sim cable).</li>
+        <li>Part database: HAD under <code>devices/helion/</code>, or <code>Contents/Resources/devices/helion</code> in the app. Override with <code>HELION_HAD</code>.</li>
+      </ul>
+      <p>
+        Flags that never open a window: <code>helion-ide --version</code>,
+        <code>--doctor</code>, <code>--headless [file.sv]</code>, <code>--stdin</code>,
+        <code>--help</code>.
+      </p>
+
+      <h2 id="ide">Desktop IDE</h2>
       <ol>
-        <li><code>open dist/Helion.app</code> (or <code>cargo run -p helion-gui --bin helion-ide</code>).</li>
-        <li>Do not launch the CLI binary as the app.</li>
-        <li>Open HDL from the examples rail: <code>counter.sv</code>, <code>blinky.sv</code>, <code>hier.sv</code>, <code>complex.sv</code>, or <code>ysyx_ibex.sv</code>.</li>
-        <li>The Editor canvas shows the source. Device canvas is the floorplan of <code>HL10T-C32-1</code> (IO ring, clock spine, CLB array). Timing canvas is STA.</li>
+        <li><code>open dist/Helion.app</code>, or <code>cargo run -p helion-gui --bin helion-ide</code>.</li>
+        <li>Open HDL with the toolbar Open control (native file dialog via rfd) or the examples rail: <code>counter.sv</code>, <code>blinky.sv</code>, <code>hier.sv</code>, <code>complex.sv</code>, <code>ysyx_ibex.sv</code>.</li>
+        <li>Run Implement (or the Synth / Opt / Place / Route / Bitstream chips). CAD jobs run on a <code>helion-engine</code> thread, not inside an egui frame.</li>
       </ol>
-      <p>Headless (no window) — this is the gold gate:</p>
+      <p>Chrome is three canvases plus a 88 px activity rail. Rail items show a letter above the full name:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Rail</th><th>Opens</th></tr></thead>
+        <tbody>
+          <tr><td>Files</td><td>Editor canvas: source in the main pane</td></tr>
+          <tr><td>Device</td><td>Die floorplan of <code>HL10T-C32-1</code> (IO ring, clock spine, CLB array). Package and Bitstream sit with it.</td></tr>
+          <tr><td>Timing</td><td>STA / Timing Summary in the center. Reports catalog stays in the sidebar.</td></tr>
+          <tr><td>Simulate</td><td>Wave traces. Does not leave the Timing tab selected.</td></tr>
+          <tr><td>Program</td><td>Hardware / ILA. Empty ILA fills the remaining pane. openFPGALoader is not shelled on every paint frame.</td></tr>
+          <tr><td>Reports</td><td>Catalog in the sidebar; the selected report in the center.</td></tr>
+        </tbody>
+      </table></div>
+      <p>
+        More (⋯) is overflow, at most two clicks away. Destinations include Schematic,
+        Package, Bitstream, IP, Constraints, Summary, Settings, Find, DRC, Power,
+        Utilization, Methodology, Hierarchy, Clock networks, CDC, Hardware, Wave,
+        Memory, Breakpoints. More destinations never fall through to Timing.
+        Schematic unconnected pins autohide unless the cell is selected.
+      </p>
+      <p>
+        Toolbar Open, flow chips, Bitstream, and Implement share one control height
+        (36 px). The bottom console is Tcl. Splitters for sidebar and console are
+        real grips.
+      </p>
+      <p>Headless (no window). This is the gold gate:</p>
       <pre><code>cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
 # expect: WNS_PS=9640</code></pre>
 
-      <h2>CLI flow</h2>
+      <h2 id="cli">CLI</h2>
+      <pre><code>helion --version
+helion doctor
+helion gui
+helion synth &lt;file.sv&gt; [--part P]
+helion impl &lt;file.sv&gt; [--part P]
+helion run &lt;file.sv&gt; [--cycles N] [--part P]
+helion report_timing &lt;file.sv&gt; [--sdc f.sdc]
+helion report_utilization &lt;file.sv&gt;
+helion bitstream &lt;file.sv|.vhd|.c|.prj&gt; -o out.hbits
+helion eco &lt;file.sv&gt; --cell u_lut --init 0xAAAAAAAAAAAAAAAA
+helion pblock &lt;file.sv&gt;
+helion qor &lt;file.sv&gt;
+helion project &lt;file.prj&gt;
+helion project run &lt;file.prj&gt; [--cycles N]
+helion ip list|show &lt;file.helion&gt;|pack &lt;name&gt;
+helion hnf &lt;file.sv&gt; [-o out.hnf]
+helion hw list|detect
+helion hw program|flash --cable auto|sim|usb|ofl|native [--bitstream FILE.hbits] [--part P]</code></pre>
+      <p>Default part is <code>HL10T-C32-1</code>. From a checkout:</p>
       <pre><code>cargo run -p helion-cli -- doctor
 cargo run -p helion-cli -- run examples/counter.sv --cycles 16
-cargo run -p helion-cli -- report_timing examples/blinky.sv</code></pre>
-      <p>Empty-XDC counter gold: <span class="gold">WNS_PS=9640</span>. Fabric LED over 16 cycles: <code>LED[16]=0000000111111110</code> (LED = cnt[3]).</p>
+cargo run -p helion-cli -- report_timing examples/blinky.sv
+cargo run -p helion-cli -- qor examples/counter.sv</code></pre>
+      <p>
+        <code>helion gui</code> execs the sibling <code>helion-ide</code> / <code>Helion</code>
+        binary. <code>helion doctor</code> prints the compile-time target triple, rustc,
+        runtime HAD path, CLB/IOB site counts, and FeatureMap text.
+      </p>
 
-      <h2>Device (the die)</h2>
+      <h2 id="gold">What gold means</h2>
+      <p>
+        Empty-XDC <code>examples/counter.sv</code> on a 10.000 ns clock:
+        4 LUTFF, 1 IOB, <span class="gold">WNS_PS=9640</span>, 185-byte sparse
+        <code>.hbits</code>. The other gold designs also use 1 IOB. Fabric LED over 16 cycles:
+        <code>LED[16]=0000000111111110</code> (LED = cnt[3]).
+      </p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Design</th><th>LUTFF</th><th>WNS_PS</th><th>.hbits B</th></tr></thead>
+        <tbody>
+          <tr><td><code>blinky.sv</code></td><td>1</td><td>9700</td><td>153</td></tr>
+          <tr><td><code>counter.sv</code></td><td>4</td><td>9640</td><td>185</td></tr>
+          <tr><td><code>hier.sv</code></td><td>1</td><td>9700</td><td>153</td></tr>
+        </tbody>
+      </table></div>
+      <p>
+        If you change CAD or GUI, <code>helion-ide --headless examples/counter.sv</code>
+        must still print <span class="gold">WNS_PS=9640</span> unless the same commit
+        updates the QoR table in the repository README with a reason.
+        <code>helion qor</code> fails above 2000 ms wall time for these examples.
+      </p>
+
+      <h2 id="device-die">Device (the die)</h2>
       <p>HAD grid for <code>HL10T-C32-1</code>:</p>
       <figure class="had">
         <svg viewBox="0 0 360 340" role="img" aria-label="HL10T-C32-1: IO ring, clock spine, 32 by 32 CLB">
@@ -67,7 +158,7 @@ cargo run -p helion-cli -- report_timing examples/blinky.sv</code></pre>
           <rect x="12" y="300" width="336" height="28" fill="#c47a3a"/>
           <rect x="12" y="40" width="28" height="260" fill="#c47a3a"/>
           <rect x="320" y="40" width="28" height="260" fill="#c47a3a"/>
-          <rect x="44" y="40" width="22" height="260" fill="#e6b325"/>
+          <rect x="44" y="40" width="22" height="260" fill="#e2b43a"/>
           <rect x="70" y="40" width="246" height="260" fill="#163226" stroke="#3d8f6a" stroke-width="1"/>
           <text x="180" y="31" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO ring · 32 user IO</text>
           <text x="180" y="319" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO</text>
@@ -77,39 +168,72 @@ cargo run -p helion-cli -- report_timing examples/blinky.sv</code></pre>
         </svg>
         <figcaption><span class="gold">WNS_PS=9640</span> · clk 10.000 ns · CAD reads <code>devices/helion/parts/HL10T-C32-1.toml</code></figcaption>
       </figure>
-      <p>In the app, Device is a canvas that fits the remaining pane (not a tiny bottom scroller). Package and Bitstream sit with it.</p>
+      <p>
+        Grid: x=0 IO, x=1 CLK spine, x=2..33 CLB, x=34 IO; y=0 IO, y=1..32 interior,
+        y=33 IO. 8 BLE per CLB, 8 global clocks, 8 BRAM18, speed 1, idcode
+        <code>0x00011A1F</code>. In the app, Device is a canvas that fills the remaining
+        pane, not a tiny bottom scroller.
+      </p>
 
-      <h2>What “gold” means</h2>
-      <p>If you change CAD or GUI, <code>helion-ide --headless examples/counter.sv</code> must still print <span class="gold">WNS_PS=9640</span> unless the same commit updates the QoR table in the README <em>with a reason</em>.</p>
+      <h2 id="tcl">Tcl Session</h2>
+      <p>
+        The console in <code>helion-ide</code> and <code>helion-proj</code> run the
+        real engines. Commands: <code>synth_design</code>, <code>opt_design</code>,
+        <code>place_design</code>, <code>route_design</code>, <code>write_bitstream</code>,
+        <code>write_hnf</code>, <code>get_cells</code> / <code>get_nets</code> /
+        <code>get_pins</code>, <code>set_property</code>, <code>report_timing</code>,
+        <code>report_utilization</code>, <code>open_hw_manager</code>,
+        <code>program_hw</code>, <code>mark_debug</code>, <code>eco</code>,
+        <code>write_checkpoint</code>, <code>report_die</code>.
+        <code>.hckp</code> restore must reproduce the same bitstream hash.
+      </p>
 
-      <h2>IP packages (<code>.helion</code>)</h2>
-      <p>Format-1 manifests beside catalog HDL. Bus is Helion-MM / Helion-ST only. Details: <a href="https://github.com/helion-fpga/helion/blob/master/ip/README.md"><code>ip/README.md</code></a>.</p>
+      <h2 id="ip">IP packages (<code>.helion</code>)</h2>
+      <p>
+        Format-1 text manifests beside catalog HDL (<code>ip/h_gpio</code>,
+        <code>ip/h_uart</code>, <code>ip/h_rv32_hb1</code>). Bus is Helion-MM /
+        Helion-ST only. In the IDE, IP chips wrap; <code>read_ip</code> in a
+        <code>.prj</code> loads a package.
+      </p>
       <pre><code>helion ip list
 helion ip show ip/h_gpio/h_gpio.helion
 helion ip show examples/ip/counter
 helion project examples/ip_ingest/counter_ip.prj
 helion project run examples/ip/read_ip_counter.prj --cycles 16</code></pre>
 
-      <h2>ILA (mark_debug → implement → ila_arm)</h2>
-      <p>Mark a net, (re)implement, then arm. Probe insert is idempotent after <code>mark_debug</code> (no &quot;bitstream unchanged&quot; no-op). Details: <a href="FM-HEL-TOP-ila-ip.md"><code>FM-HEL-TOP-ila-ip.md</code></a>.</p>
+      <h2 id="ila">ILA (<code>mark_debug</code> to implement to <code>ila_arm</code>)</h2>
+      <p>Mark a net, re-implement, then arm. Probe insert is idempotent after <code>mark_debug</code>.</p>
       <pre><code>mark_debug cnt_3
-# Place → Route → Bitstream (or Implement)
+# Place, Route, Bitstream (or Implement)
 ila_window 8
 ila_arm cnt_3</code></pre>
 
-      <h2>Program / mpsse-sim / OFL</h2>
-      <p>Without a USB programmer, detect stays <strong>0 probes</strong> and refuses DONE. Sim cable for TAP STAT smoke (no board claim):</p>
+      <h2 id="program">Program / mpsse-sim / OFL</h2>
+      <p>
+        Without a USB programmer, detect stays <strong>0 probes</strong> and refuses DONE.
+        Never invent Helion TAP STAT. Never claim board DONE without live TDO evidence.
+      </p>
       <pre><code>./scripts/ibex-prog-mpsse-sim-smoke.sh
-helion-prog --detect</code></pre>
-      <p>macOS OFL prep (OSS): <code>brew install openfpgaloader</code> — install ≠ DONE; need live FTDI + Helion TAP STAT TDO.</p>
-      <p>Cap holds on Ibex pin-wrap: <code>imux_skip=0</code>, <code>IOB=1</code>, gold <span class="gold">WNS_PS=9640</span>. Never invent Helion TAP STAT.</p>
+helion-prog --detect
+helion hw detect
+helion hw program --cable sim --bitstream out.hbits</code></pre>
+      <p>
+        macOS OFL (OSS): <code>brew install openfpgaloader</code>. Install is not DONE;
+        you still need live FTDI plus Helion TAP STAT TDO. Cap holds on Ibex pin-wrap:
+        <code>imux_skip=0</code>, <code>IOB=1</code>, gold <span class="gold">WNS_PS=9640</span>.
+      </p>
 
-      <h2>Large SystemVerilog</h2>
-      <p><code>examples/ysyx_ibex.sv</code> is on the Open rail. Ingest is helion-sv. Fitting a full SoC on this part is not the synth bar. Leftover Helion-legal constructs should still map; do not abort the run because sv-parser is unhappy.</p>
+      <h2 id="large">Large SystemVerilog</h2>
+      <p>
+        <code>examples/ysyx_ibex.sv</code> is on the Open rail. Ingest is helion-sv
+        preprocess + parse. Fitting a full SoC on this part is not the synth bar.
+        Leftover Helion-legal constructs should still map; do not abort the run because
+        sv-parser is unhappy.
+      </p>
 
       <p class="cta">
         <a class="btn" href="start.html">Build from source</a>
-        <a class="btn ghost" href="wiki.html">Wiki index</a>
+        <a class="btn ghost" href="architecture.html">Architecture</a>
       </p>
     </div>
   </main>
@@ -118,6 +242,6 @@ helion-prog --detect</code></pre>
     <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a> · org <a href="https://github.com/helion-fpga">helion-fpga</a></span>
     <span><a href="legal.html">Legal fence</a></span>
   </footer>
-  <script src="site.js?v=tape3"></script>
+  <script src="site.js?v=docs1"></script>
 </body>
 </html>

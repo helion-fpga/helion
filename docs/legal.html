@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Legal fence — Helion</title>
+  <title>Legal fence: original CAD only</title>
   <meta name="description" content="Helion legal fence: original ISA and CAD only. No UNISIM, vendor Tcl, or vendor bitstream backends." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=tape3" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
@@ -32,11 +32,11 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Legal fence</h1>
-      <p class="lede">Helion is an original FPGA family and CAD. Vendor user guides are a checklist of <em>capabilities</em>, not a source tree to copy.</p>
+      <p class="lede">Helion is an original FPGA family and CAD, not a wrapper around a vendor tool. Vendor user guides are a checklist of <em>capabilities</em>, not a source tree to copy. Device facts come from HAD, never hardcoded in the CAD. No vendor bitstream.</p>
 
       <div class="fence">
         <p><strong>Do not add</strong> Project X-Ray, vendor Tcl, UNISIM names, or 7-series / UltraScale / Lattice / Intel bitstream backends.</p>
-        <p><strong>Do not</strong> ship AXI interconnect as Helion IP — the buses are Helion-MM and Helion-ST.</p>
+        <p><strong>Do not</strong> ship AXI interconnect as Helion IP. The buses are Helion-MM and Helion-ST.</p>
         <p><strong>Do not</strong> use vendor trademarks as product names in the UI or docs.</p>
       </div>
 
@@ -60,6 +60,6 @@
     <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
     <span><a href="https://github.com/helion-fpga/helion/blob/master/GOVERNANCE.md">Governance</a></span>
   </footer>
-  <script src="site.js?v=tape3"></script>
+  <script src="site.js?v=docs1"></script>
 </body>
 </html>

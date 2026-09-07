@@ -3,18 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Architecture — Helion</title>
-  <meta name="description" content="Helion crate map: HAD, HNF, Session engines, IDE model." />
+  <title>Architecture: crates, HAD, HNF, Session</title>
+  <meta name="description" content="Helion crate map, HL10T-C32-1 HAD facts, HNF IR, Tcl Session, FeatureMap .hbits. Gold WNS_PS=9640." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=tape3" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
-  
   <header class="bar">
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
     <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
@@ -32,7 +31,10 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Architecture</h1>
-      <p class="lede">One Session, many crates. Device facts live in HAD TOML. The IDE paints that Session; it does not reimplement CAD.</p>
+      <p class="lede">
+        One Session, many crates. Device facts live in HAD TOML. The IDE paints
+        that Session; it does not reimplement CAD. This is not a vendor-tool wrapper.
+      </p>
 
       <h2>Pipeline</h2>
       <pre><code>helion-sv / vhdl / hls  →  HNF
@@ -45,26 +47,44 @@ helion-gui IdeModel paints the Session</code></pre>
       <div class="table-wrap"><table>
         <thead><tr><th>Crate</th><th>Job</th></tr></thead>
         <tbody>
-          <tr><td><code>helion-sv</code></td><td>SystemVerilog subset, preprocess, synth to LUT6/FF</td></tr>
-          <tr><td><code>helion-vhdl</code></td><td>VHDL-2008 subset → same elaborator</td></tr>
+          <tr><td><code>helion-sv</code></td><td>SystemVerilog subset, preprocess, synth to LUT6/FF (sv-parser + AIG + FlowMap)</td></tr>
+          <tr><td><code>helion-vhdl</code></td><td>VHDL-2008 subset, same elaborator</td></tr>
           <tr><td><code>helion-hls</code></td><td>C subset onto LUT/FF/DSP</td></tr>
           <tr><td><code>helion-ir</code></td><td>HNF cells/nets/ports (<code>DONT_TOUCH</code>, <code>mark_debug</code>, <code>LOC</code>)</td></tr>
           <tr><td><code>helion-pack</code></td><td>LUTFF, IOB, MAC27, BRAM18</td></tr>
-          <tr><td><code>helion-place</code></td><td>Timing-driven place (timing_weight 0.75)</td></tr>
+          <tr><td><code>helion-place</code></td><td>Timing-driven place (timing_weight 0.75 on gold run)</td></tr>
           <tr><td><code>helion-route</code></td><td>PathFinder A* with hop delay in the cost</td></tr>
           <tr><td><code>helion-sta</code></td><td>XDC clocks / I-O delay / false path, WNS + hold</td></tr>
           <tr><td><code>helion-drc</code></td><td>Occupancy, unrouted IO, clocks</td></tr>
-          <tr><td><code>helion-bits</code></td><td>FeatureMap frames, sparse <code>.hbits</code></td></tr>
-          <tr><td><code>helion-fabric</code> / <code>helion-sim</code></td><td>Cycle fabric and event kernel</td></tr>
-          <tr><td><code>helion-hw</code></td><td>IEEE 1149.1 TAP, sim cable</td></tr>
+          <tr><td><code>helion-bits</code></td><td>FeatureMap frames, sparse <code>.hbits</code>, partial (DFX)</td></tr>
+          <tr><td><code>helion-fabric</code> / <code>helion-sim</code></td><td>Cycle fabric (6-input IMUX LUT + FF + IOB + STAT) and event kernel</td></tr>
+          <tr><td><code>helion-hw</code></td><td>IEEE 1149.1 TAP, sim cable, OFL / native MPSSE</td></tr>
           <tr><td><code>helion-gui</code></td><td><code>IdeModel</code> + eframe shell (<code>helion-ide</code>)</td></tr>
-          <tr><td><code>helion-proj</code></td><td>Tcl Session commands</td></tr>
+          <tr><td><code>helion-proj</code></td><td>Tcl Session commands and <code>.prj</code> / <code>read_ip</code></td></tr>
           <tr><td><code>helion-device</code></td><td>HAD load</td></tr>
+          <tr><td><code>helion-cli</code></td><td><code>helion</code> binary</td></tr>
         </tbody>
       </table></div>
 
       <h2>Part HL10T-C32-1</h2>
-      <p>32×32 interior CLB, IO on the ring, clock spine at x=1, 32 user IO, 8 BRAM18, speed 1. Grid is in <code>devices/helion/parts/HL10T-C32-1.toml</code> — CAD must query that file. How to open it in the IDE: <a href="use.html">Use</a>.</p>
+      <p>
+        CAD must query <code>devices/helion/parts/HL10T-C32-1.toml</code>. How to
+        open it in the IDE: <a href="use.html">Use</a>.
+      </p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Field</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>part</td><td><code>HL10T-C32-1</code></td></tr>
+          <tr><td>idcode</td><td><code>0x00011A1F</code></td></tr>
+          <tr><td>interior CLB</td><td>32&times;32 (1024 CLB sites, 8 BLE each)</td></tr>
+          <tr><td>user IO</td><td>32 (IO ring)</td></tr>
+          <tr><td>clock spine</td><td>x=1, 8 gclk</td></tr>
+          <tr><td>BRAM18</td><td>8</td></tr>
+          <tr><td>MAC27</td><td>0 on this SKU</td></tr>
+          <tr><td>speed</td><td>1</td></tr>
+          <tr><td>grid</td><td>x=0 IO, x=1 CLK, x=2..33 CLB, x=34 IO; y=0 IO, y=1..32 interior, y=33 IO</td></tr>
+        </tbody>
+      </table></div>
       <figure class="had">
         <svg viewBox="0 0 360 340" role="img" aria-label="HL10T-C32-1 labeled die: IO ring, clock spine, CLB array">
           <rect x="0" y="0" width="360" height="340" fill="#050c09"/>
@@ -72,7 +92,7 @@ helion-gui IdeModel paints the Session</code></pre>
           <rect x="12" y="300" width="336" height="28" fill="#c47a3a"/>
           <rect x="12" y="40" width="28" height="260" fill="#c47a3a"/>
           <rect x="320" y="40" width="28" height="260" fill="#c47a3a"/>
-          <rect x="44" y="40" width="22" height="260" fill="#e6b325"/>
+          <rect x="44" y="40" width="22" height="260" fill="#e2b43a"/>
           <rect x="70" y="40" width="246" height="260" fill="#163226" stroke="#3d8f6a" stroke-width="1"/>
           <text x="180" y="31" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO ring · 32 user IO</text>
           <text x="180" y="319" text-anchor="middle" fill="#081510" font-size="13" font-family="ui-monospace, monospace">IO</text>
@@ -80,14 +100,46 @@ helion-gui IdeModel paints the Session</code></pre>
           <text x="193" y="165" text-anchor="middle" fill="#ebe6d4" font-size="16" font-family="ui-monospace, monospace">32 × 32 CLB</text>
           <text x="193" y="188" text-anchor="middle" fill="#b7b09a" font-size="12" font-family="ui-monospace, monospace">HL10T-C32-1</text>
         </svg>
-        <figcaption>Labeled HAD regions — not a 1×1-pixel tile dump. <span class="gold">WNS_PS=9640</span></figcaption>
+        <figcaption>Labeled HAD regions. Empty-XDC counter gold <span class="gold">WNS_PS=9640</span>.</figcaption>
       </figure>
 
-      <h2>Gold</h2>
-      <p>Empty-XDC <code>examples/counter.sv</code> → <span class="gold">WNS_PS=9640</span>. QoR table in the repository README is gated; a LUT/WNS/bitstream-size change must update the table <em>in the same commit with a reason</em>.</p>
+      <h2>IR (HNF)</h2>
+      <p>
+        Cells, nets, and ports carry <code>DONT_TOUCH</code>, <code>mark_debug</code>,
+        and <code>LOC</code>. <code>helion hnf file.sv</code> writes a round-trippable
+        netlist. Checkpoints embed HNF. Restore must reproduce the same bitstream hash.
+        <code>(* keep *)</code> / <code>(* mark_debug *)</code> and <code>for</code>
+        generate unroll into that IR.
+      </p>
 
-      <h2>IR</h2>
-      <p>Checkpoints embed HNF. Restore must reproduce the same bitstream hash. <code>(* keep *)</code> / <code>(* mark_debug *)</code> and <code>for</code> generate unroll into that IR.</p>
+      <h2>Tcl Session</h2>
+      <p>
+        <code>synth_design</code>, <code>opt_design</code>, <code>place_design</code>,
+        <code>route_design</code>, <code>write_bitstream</code>, <code>write_hnf</code>,
+        <code>get_cells</code> / <code>get_nets</code> / <code>get_pins</code>,
+        <code>set_property</code>, <code>report_timing</code>,
+        <code>report_utilization</code>, <code>open_hw_manager</code>,
+        <code>program_hw</code>, <code>mark_debug</code>, <code>eco</code>,
+        <code>write_checkpoint</code>, <code>report_die</code>.
+        Each command drives the real engine.
+      </p>
+
+      <h2>Bitstream</h2>
+      <p>
+        FeatureMap frames, sparse <code>.hbits</code> (encode/decode), partial program
+        (DFX). Gold counter is 185 bytes because only configured frames are written.
+        HELIONLIB primitives: LUT6, HFF, MAC27, BRAM18. Device facts live in HAD, not
+        hardcoded in the CAD.
+      </p>
+
+      <h2>Gold</h2>
+      <p>
+        Empty-XDC <code>examples/counter.sv</code> at 10.000 ns:
+        4 LUTFF, 1 IOB, <span class="gold">WNS_PS=9640</span>,
+        <code>LED[16]=0000000111111110</code>. QoR is gated in
+        <code>crates/helion-cli/tests/qor.rs</code>. A LUT / WNS / bitstream-size
+        change must update the table in the same commit with a reason.
+      </p>
     </div>
   </main>
 
@@ -95,6 +147,6 @@ helion-gui IdeModel paints the Session</code></pre>
     <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
     <span><a href="legal.html">Legal fence</a></span>
   </footer>
-  <script src="site.js?v=tape3"></script>
+  <script src="site.js?v=docs1"></script>
 </body>
 </html>

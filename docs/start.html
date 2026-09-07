@@ -3,18 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Start — Helion</title>
-  <meta name="description" content="Build Helion from source. Rust 1.85+, cargo test, headless gold counter WNS_PS=9640." />
+  <title>Start: download and build Helion</title>
+  <meta name="description" content="Install Helion 1.0.1 from GitHub Releases or build from source. Rust 1.85, cargo test, headless gold counter WNS_PS=9640." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=tape3" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
-  
   <header class="bar">
     <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
     <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
@@ -32,25 +31,39 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Getting started</h1>
-      <p class="lede">Install from a GitHub Release, or clone and run the gold. Native desktop target is Apple Silicon; CI is Linux.</p>
-
-      <h2>Download</h2>
-      <p>
-        Each tagged version publishes <code>Helion.app</code> (unsigned Apple Silicon),
-        a darwin-arm64 tarball, and a Linux x86_64 tarball, plus <code>SHA256SUMS.txt</code>.
+      <p class="lede">
+        Install from a GitHub Release, or clone and run the gold. Native desktop
+        target is Apple Silicon (<code>aarch64-apple-darwin</code>). CI is Linux
+        (<code>x86_64-unknown-linux-gnu</code>). rustc 1.85.0.
       </p>
+
+      <h2>Download (v1.0.1)</h2>
+      <p>
+        Each <code>vX.Y.Z</code> tag publishes these files. Current patch is
+        <a href="https://github.com/helion-fpga/helion/releases/tag/v1.0.1">v1.0.1</a>
+        (IDE chrome after 1.0.0; same CAD engines and counter gold).
+      </p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>File</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td><code>Helion-1.0.1-macos-arm64.zip</code></td><td><code>Helion.app</code> for Apple Silicon. Unsigned. Gatekeeper will warn.</td></tr>
+          <tr><td><code>helion-1.0.1-aarch64-apple-darwin.tar.gz</code></td><td>CLI + IDE + HAD + examples</td></tr>
+          <tr><td><code>helion-1.0.1-x86_64-unknown-linux-gnu.tar.gz</code></td><td>Linux CLI + headless IDE</td></tr>
+          <tr><td><code>SHA256SUMS.txt</code></td><td>hashes</td></tr>
+        </tbody>
+      </table></div>
       <p class="cta">
-        <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 1.0 →</a>
+        <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Latest release</a>
         <a class="btn ghost" href="https://github.com/helion-fpga/helion/blob/master/CHANGELOG.md">Changelog</a>
       </p>
-      <p>macOS will warn that the app is unsigned. That is expected until notarization exists.</p>
 
       <h2>Needs</h2>
       <ul>
-        <li>Rust 1.85+ (<code>rustup toolchain install 1.85.0</code>)</li>
+        <li>Rust 1.85+ (<code>rustup toolchain install 1.85.0</code> then <code>rustup default 1.85.0</code>)</li>
         <li>Git</li>
-        <li>On macOS: Xcode Command Line Tools if you want <code>Helion.app</code></li>
+        <li>On macOS: Xcode Command Line Tools for <code>Helion.app</code>, and <code>rustup target add aarch64-apple-darwin</code></li>
       </ul>
+      <p>Native arm64 only. No Rosetta, no vendor bitstream, no Docker.</p>
 
       <h2>Build and gold</h2>
       <pre><code>git clone https://github.com/helion-fpga/helion.git
@@ -59,23 +72,61 @@ cargo test --workspace
 cargo run -p helion-cli -- doctor
 cargo run -p helion-cli -- run examples/counter.sv --cycles 16
 cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv</code></pre>
-      <p>Empty-XDC counter gold is <span class="gold">WNS_PS=9640</span> and LED waveform <code>LED[16]=0000000111111110</code> (LED = cnt[3]).</p>
+      <p>
+        Empty-XDC counter gold is <span class="gold">WNS_PS=9640</span> and LED waveform
+        <code>LED[16]=0000000111111110</code> (LED = cnt[3]).
+        <code>helion doctor</code> must print the HAD path, <code>sites_clb=1024</code>,
+        <code>sites_iob=32</code>, and FeatureMap lines for <code>HL10T-C32-1</code>.
+      </p>
 
       <h2>Desktop IDE (macOS)</h2>
       <pre><code>./scripts/build-macos-app.sh
-open dist/Helion.app</code></pre>
-      <p>The windowed binary is <code>Contents/MacOS/Helion</code> (same as <code>helion-ide</code>). Do not launch the CLI as the app. HAD and examples ship under <code>Contents/Resources/</code>.</p>
-      <p>Without the bundle:</p>
-      <pre><code>cargo run -p helion-gui --release --bin helion-ide</code></pre>
+open dist/Helion.app
+dist/Helion.app/Contents/MacOS/Helion --version
+dist/Helion.app/Contents/MacOS/Helion --doctor
+dist/Helion.app/Contents/MacOS/helion doctor
+dist/Helion.app/Contents/MacOS/helion run \
+    dist/Helion.app/Contents/Resources/examples/counter.sv --cycles 16</code></pre>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Path in Helion.app</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td><code>Contents/MacOS/Helion</code></td><td>windowed IDE (<code>helion-ide</code>)</td></tr>
+          <tr><td><code>Contents/MacOS/helion</code></td><td>CLI</td></tr>
+          <tr><td><code>Contents/Resources/devices/helion</code></td><td>HAD (FeatureMap / parts)</td></tr>
+          <tr><td><code>Contents/Resources/examples</code></td><td><code>counter.sv</code>, <code>blinky.sv</code>, …</td></tr>
+          <tr><td><code>Contents/Info.plist</code></td><td><code>fpga.helion.ide</code>, arm64-only</td></tr>
+        </tbody>
+      </table></div>
+      <p>
+        The windowed binary is <code>Contents/MacOS/Helion</code>. Do not launch the CLI
+        as the app. Without the bundle:
+      </p>
+      <pre><code>cargo run -p helion-gui --release --target aarch64-apple-darwin --bin helion-ide
+cargo run -p helion-cli --release --target aarch64-apple-darwin -- doctor
+cargo run -p helion-cli --release --target aarch64-apple-darwin -- run examples/counter.sv --cycles 16</code></pre>
+      <p>
+        <code>HELION_HAD</code> overrides the part database. Otherwise the binary searches
+        <code>Helion.app/Contents/Resources/devices/helion</code>, then cwd, then the
+        compile-time tree.
+      </p>
+
+      <h2>Linux CI vs a Mac</h2>
+      <p>Verified on Linux CI: workspace tests, headless <code>IdeModel</code>, <code>helion-ide --headless</code>, <code>helion doctor</code>, app layout assembly with <code>scripts/build-macos-app.sh --layout-only</code>.</p>
+      <p>Not verified on Linux: <code>cargo build --release --target aarch64-apple-darwin</code>, launching <code>dist/Helion.app</code>, codesign / notarization.</p>
 
       <h2>While you iterate</h2>
-      <p>Run <strong>one</strong> test name, not the world:</p>
+      <p>Run one test name, not the world:</p>
       <pre><code>cargo test -p helion-sv --lib TESTNAME</code></pre>
 
       <h2>Large SystemVerilog</h2>
-      <p><code>examples/ysyx_ibex.sv</code> is in the tree (Open rail in the IDE). Ingest is helion-sv preprocess + parse. Fitting a full SoC on HL10T-C32-1 is <em>not</em> the synth bar. Do not abort the run because sv-parser is unhappy — leftover Helion-legal constructs still map.</p>
+      <p>
+        <code>examples/ysyx_ibex.sv</code> is in the tree (Open rail in the IDE). Ingest
+        is helion-sv preprocess + parse. Fitting a full SoC on HL10T-C32-1 is not the
+        synth bar. Do not abort the run because sv-parser is unhappy. Leftover
+        Helion-legal constructs still map.
+      </p>
 
-      <p><a class="btn" href="get-involved.html">Next: get involved</a></p>
+      <p><a class="btn" href="use.html">Next: use the IDE and CLI</a></p>
     </div>
   </main>
 
@@ -83,6 +134,6 @@ open dist/Helion.app</code></pre>
     <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
     <span><a href="architecture.html">Architecture</a></span>
   </footer>
-  <script src="site.js?v=tape3"></script>
+  <script src="site.js?v=docs1"></script>
 </body>
 </html>
