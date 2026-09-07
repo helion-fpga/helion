@@ -21,3 +21,14 @@ helion-bd = { workspace = true }
 helion-ipxact = { workspace = true }
 helion-place = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+rfd = "0.15"
+# rfd's Linux xdg-portal path pulls ashpd → zbus. zbus ≥5.14 / zvariant ≥5.10
+# need rustc 1.87; Helion CI and rust-version are 1.85.0. Pin the last 1.85
+# MSRV line so Open HDL stays a native picker on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "=5.13.2"
+zbus_macros = "=5.13.2"
+zbus_names = "=4.3.1"
+zvariant = "=5.9.2"
+zvariant_derive = "=5.9.2"
+zvariant_utils = "=3.3.0"
