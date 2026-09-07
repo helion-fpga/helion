@@ -984,6 +984,21 @@ mod tests {
             pwr_bbox.fills() || pwr_bbox.fill >= chrome::PANE_FILL_MIN,
             "power occupancy table {pwr_bbox:?}"
         );
+        assert!(
+            !d.model.utilization_report().hierarchy.is_empty(),
+            "Utilization Hierarchical after implement"
+        );
+        let compact_hier = 6.0 * 64.0;
+        assert!(
+            compact_hier < 1000.0 * chrome::PANE_FILL_MIN,
+            "compact Hierarchical columns must fail the fill bar"
+        );
+        let hier = chrome::stretched_col_w_gap(6, 1000.0, 8.0);
+        let hier_span = hier * 6.0 + 8.0 * 5.0;
+        assert!(
+            hier_span >= 1000.0 * chrome::PANE_FILL_MIN,
+            "Hierarchical columns must span remaining width, span={hier_span}"
+        );
     }
 
     #[test]
