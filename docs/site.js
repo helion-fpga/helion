@@ -1,4 +1,4 @@
-/* Nav drawer, tape pause, live HL10T die. */
+/* Nav drawer, die-video pause, live HL10T die. */
 (function () {
   var path = location.pathname.split("/").pop() || "index.html";
   if (path === "" || path === "/") path = "index.html";
@@ -26,14 +26,14 @@
   }
 
   var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var animOn = true;
+  var animOn = !reduce;
   var toggle = document.getElementById("anim-toggle");
   function syncAnim() {
     document.documentElement.setAttribute("data-anim", animOn ? "on" : "off");
     if (toggle) {
       toggle.hidden = false;
       toggle.textContent = animOn ? "II" : "▶";
-      toggle.title = animOn ? "Pause the tape" : "Play the tape";
+      toggle.title = animOn ? "Pause die video" : "Play die video";
       toggle.setAttribute("aria-pressed", animOn ? "true" : "false");
     }
     var plate = document.getElementById("hero-vid");
@@ -47,45 +47,19 @@
     }
   }
   if (toggle) {
-    toggle.addEventListener("click", function () {
-      animOn = !animOn;
-      syncAnim();
-    });
+    if (!document.getElementById("hero-vid")) {
+      toggle.hidden = true;
+    } else {
+      toggle.addEventListener("click", function () {
+        animOn = !animOn;
+        syncAnim();
+      });
+    }
   }
   syncAnim();
 
-  var track = document.querySelector(".marquee-track");
-  var seq = track && track.querySelector(".marquee-seq");
-  if (track && seq) {
-    track.style.animation = "none";
-    var tapeX = 0;
-    var tapeLast = performance.now();
-    var tapePx = reduce ? 28 : 64;
-    var tapeVisible = true;
-    if ("IntersectionObserver" in window) {
-      var io = new IntersectionObserver(function (entries) {
-        tapeVisible = !!(entries[0] && entries[0].isIntersecting);
-      }, { threshold: 0 });
-      io.observe(track);
-    }
-    function tapeTick(now) {
-      var dt = Math.min(0.05, (now - tapeLast) / 1000);
-      tapeLast = now;
-      if (animOn && tapeVisible) {
-        var w = seq.offsetWidth;
-        if (w > 0) {
-          tapeX -= tapePx * dt;
-          if (tapeX <= -w) tapeX += w;
-          track.style.transform = "translate3d(" + tapeX.toFixed(2) + "px,0,0)";
-        }
-      }
-      requestAnimationFrame(tapeTick);
-    }
-    requestAnimationFrame(tapeTick);
-  }
-
   var host = document.getElementById("die");
-  if (!host) return;
+  if (!host || /^(H1|H2|H3|A)$/.test(host.tagName)) return;
 
   var COLS = 35, ROWS = 34;
   var NS = "http://www.w3.org/2000/svg";
