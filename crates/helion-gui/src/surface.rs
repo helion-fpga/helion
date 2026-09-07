@@ -935,6 +935,24 @@ mod tests {
         let sb = chrome::nv_table_bbox(g.max(1), 1000.0, 400.0);
         assert!(sb.fills() || sb.fill >= chrome::PANE_FILL_MIN, "summary {sb:?}");
         assert!(chrome::occupancy_bar_w(820.0) > 160.0);
+        d.click_more(WorkspaceTab::Power);
+        assert_eq!(d.pane(), WorkspacePane::Power);
+        assert!(
+            !d.model.power_report().part.is_empty(),
+            "Power after implement must have a report"
+        );
+        let pwr_bar = chrome::occupancy_bar_w(820.0);
+        assert!(pwr_bar > 120.0, "legacy 120px power share bar {pwr_bar}");
+        assert!(
+            pwr_bar >= 820.0 * chrome::PANE_FILL_MIN,
+            "power share bars must span remaining width, got {pwr_bar}"
+        );
+        d.click_more(WorkspaceTab::Utilization);
+        assert_eq!(d.pane(), WorkspacePane::Utilization);
+        assert!(
+            !d.model.utilization_report().occupancy.is_empty(),
+            "Utilization occupancy after implement"
+        );
     }
 
     #[test]
