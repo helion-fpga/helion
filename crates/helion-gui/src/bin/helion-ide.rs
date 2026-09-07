@@ -510,6 +510,8 @@ fn paint_debug_overlay(ctx: &egui::Context, app: &HelionIde) {
     if std::env::var("HELION_DEBUG_OVERLAY").ok().as_deref() != Some("1") {
         return;
     }
+    // egui 0.32: Context::set_debug_on_hover is #[cfg(debug_assertions)] only.
+    #[cfg(debug_assertions)]
     ctx.set_debug_on_hover(true);
     let s = app.snapshot();
     let pane = central_pane(&s);
