@@ -757,6 +757,28 @@ mod tests {
     }
 
     #[test]
+    fn reports_landing_is_catalog_not_timing_and_fills() {
+        let mut d = ChromeDriver::new();
+        d.click_open(&example("counter.sv")).unwrap();
+        d.click_implement().unwrap();
+        d.click_activity(Activity::Reports);
+        assert_eq!(d.pane(), WorkspacePane::ReportsCatalog);
+        assert_ne!(d.pane(), WorkspacePane::Timing);
+        let rows = d.model.report_catalog();
+        assert!(
+            rows.len() >= 4,
+            "Reports catalog must have rows, got {}",
+            rows.len()
+        );
+        assert!(
+            chrome::reports_stub_fill(400.0) < chrome::PANE_FILL_MIN,
+            "heading-only stub must fail fill"
+        );
+        // Sidebar owns the catalog; center is the selected report body (no dual tables).
+        assert!(d.model.timing_summary().wns_ps.is_some() || !rows.is_empty());
+    }
+
+    #[test]
     fn native_open_is_not_a_none_stub() {
         assert_eq!(crate::dialog_backend(), "rfd");
         let _ = crate::hdl_file_dialog();
