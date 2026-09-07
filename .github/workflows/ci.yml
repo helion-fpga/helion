@@ -16,3 +16,5 @@ jobs:
         continue-on-error: true
       - name: counter gold
         run: cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+      - name: release helion-ide
+        run: cargo check --release -p helion-gui --bin helion-ide

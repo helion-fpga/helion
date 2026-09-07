@@ -18,6 +18,7 @@ Patch after 1.0.0: IDE chrome and empty-state fill. Same CAD engines and
 - Simulate no longer leaves the Timing tab selected; Reports catalog stays in the sidebar.
 - Native Open HDL stays real on macOS and Linux (rfd pinned for rustc 1.85).
 - Program no longer shells `openFPGALoader` on every paint frame.
+- Release `helion-ide` compiles: hover-debug is debug-only (`egui` `set_debug_on_hover`).
 
 ### Changed
 
