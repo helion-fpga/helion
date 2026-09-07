@@ -1125,6 +1125,19 @@ mod tests {
             "occupancy/utilization table must fill remaining pane, got {occ:?}"
         );
         assert!(occ.empty_gap <= PANE_EMPTY_GAP_MAX);
+        // Utilization Hierarchical was 6 compact columns with a >80px right gap.
+        let compact_hier = 6.0 * 64.0;
+        assert!(
+            compact_hier < pane_w * PANE_FILL_MIN,
+            "compact Hierarchical columns must fail the fill bar"
+        );
+        let hier = stretched_col_w_gap(6, pane_w, 8.0);
+        let hier_span = hier * 6.0 + 8.0 * 5.0;
+        assert!(
+            hier_span >= pane_w * PANE_FILL_MIN,
+            "Hierarchical columns must span remaining width, span={hier_span}"
+        );
+        assert!(pane_w - hier_span <= PANE_EMPTY_GAP_MAX);
     }
 
     #[test]
