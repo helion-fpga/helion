@@ -646,6 +646,41 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+/// Fill leftover pane with an empty-state CTA (not a heading plus a dark hole).
+fn paint_remaining_cta(ui: &mut egui::Ui, message: &str, action: &str) -> bool {
+    let avail = ui.available_size().max(egui::vec2(160.0, 120.0));
+    let fit = chrome::empty_cta_occupies_pane(48.0, avail.y);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(avail.x, fit.drawn_h.max(avail.y)),
+        Sense::hover(),
+    );
+    let mut clicked = false;
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(0x16, 0x1c, 0x22));
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(0x3a, 0x42, 0x4a)),
+            egui::StrokeKind::Inside,
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((rect.height() * 0.38).max(24.0));
+                ui.label(
+                    RichText::new(message)
+                        .size(14.0)
+                        .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                );
+                ui.add_space(10.0);
+                if primary_button(ui, action).clicked() {
+                    clicked = true;
+                }
+            });
+        });
+    }
+    clicked
+}
+
 fn sidebar_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add_sized(
         [ui.spacing().interact_size.x.max(72.0), chrome::HIT_SIDEBAR],
@@ -2904,6 +2939,12 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.find_rows().to_vec();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    if rows.is_empty() {
+        if paint_remaining_cta(ui, "No hits yet.", "Find cells") {
+            let _ = model.exec("sheet_find cells");
+        }
+        return;
+    }
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -2916,14 +2957,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel) {
                     ui.label(RichText::new("Parent").strong());
                     ui.label(RichText::new("Objects").strong());
                     ui.end_row();
-                    if rows.is_empty() {
-                        ui.label("—");
-                        ui.label("—");
-                        ui.label("—");
-                        ui.label("No hits yet. Try Find above.");
-                        ui.label("—");
-                        ui.end_row();
-                    } else {
+                    {
                         for (i, h) in rows.iter().enumerate() {
                             let on = selected_find == Some(i)
                                 || selected.as_deref() == Some(h.name.as_str());
@@ -4227,8 +4261,7 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.add_space(6.0);
     let report = model.bitstream_report();
     if report.frames == 0 && report.bytes == 0 {
-        ui.label("No bitstream yet.");
-        if primary_button(ui, "Generate Bitstream").clicked() {
+        if paint_remaining_cta(ui, "No bitstream yet.", "Generate Bitstream") {
             let _ = model.exec("write_bitstream");
         }
         return;
@@ -4298,8 +4331,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
     });
     ui.add_space(6.0);
     if model.utilization.is_none() && model.drc.is_none() {
-        ui.label("No DRC results yet.");
-        if primary_button(ui, "Report DRC").clicked() {
+        if paint_remaining_cta(ui, "No DRC results yet.", "Report DRC") {
             let _ = model.exec("report_drc");
         }
         return;
