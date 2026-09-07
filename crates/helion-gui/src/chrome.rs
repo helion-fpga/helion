@@ -126,6 +126,17 @@ pub fn occupancy_bar_h(n_rows: usize, remaining_h: f32) -> f32 {
     ((remain - gaps) / n).clamp(OCCUPANCY_BAR_H, remain)
 }
 
+/// Occupancy bars share leftover height after a compact Hierarchical footer.
+/// Counting footer rows as occupancy bars leaves a >80px hole under Hierarchical.
+pub fn occupancy_bars_h_after_footer(n_bars: usize, footer_rows: usize, remaining_h: f32) -> f32 {
+    let footer = if footer_rows == 0 {
+        0.0
+    } else {
+        occupancy_table_compact_h(footer_rows)
+    };
+    occupancy_bar_h(n_bars.max(1), (remaining_h - footer).max(OCCUPANCY_BAR_H))
+}
+
 /// Compact occupancy / utilization / power-share stack before remaining-pane stretch.
 pub fn occupancy_table_compact_h(n_rows: usize) -> f32 {
     n_rows.max(1) as f32 * (OCCUPANCY_BAR_H + 4.0) + 28.0
@@ -1155,6 +1166,20 @@ mod tests {
         assert!(
             bh * 5.0 >= pane_h * PANE_FILL_MIN,
             "occupancy bar height {bh} leaves a void in {pane_h}"
+        );
+        let n_bars = 4usize;
+        let footer = 2usize;
+        let wrong = occupancy_bar_h(n_bars + 1 + footer, pane_h);
+        let wrong_drawn = wrong * n_bars as f32 + occupancy_table_compact_h(footer);
+        assert!(
+            pane_h - wrong_drawn > PANE_EMPTY_GAP_MAX,
+            "counting Hierarchical rows as occupancy bars must leave a void ({wrong_drawn})"
+        );
+        let bh_footer = occupancy_bars_h_after_footer(n_bars, footer, pane_h);
+        let drawn = bh_footer * n_bars as f32 + occupancy_table_compact_h(footer);
+        assert!(
+            drawn >= pane_h * PANE_FILL_MIN || pane_h - drawn <= PANE_EMPTY_GAP_MAX,
+            "occupancy bars after Hierarchical footer {drawn} in {pane_h}"
         );
     }
 

@@ -1009,6 +1009,20 @@ mod tests {
             bh * n_occ as f32 >= 400.0 * chrome::PANE_FILL_MIN,
             "occupancy bar height {bh} leaves a void"
         );
+        let n_bars = d.model.utilization_report().occupancy.len().max(1);
+        let n_footer = d.model.utilization_report().hierarchy.len() + 1;
+        let wrong = chrome::occupancy_bar_h(n_bars + 1 + n_footer, 400.0);
+        let wrong_drawn = wrong * n_bars as f32 + chrome::occupancy_table_compact_h(n_footer);
+        assert!(
+            400.0 - wrong_drawn > chrome::PANE_EMPTY_GAP_MAX,
+            "counting Hierarchical rows as occupancy bars must leave a void ({wrong_drawn})"
+        );
+        let bh_footer = chrome::occupancy_bars_h_after_footer(n_bars, n_footer, 400.0);
+        let drawn = bh_footer * n_bars as f32 + chrome::occupancy_table_compact_h(n_footer);
+        assert!(
+            drawn >= 400.0 * chrome::PANE_FILL_MIN || 400.0 - drawn <= chrome::PANE_EMPTY_GAP_MAX,
+            "occupancy bars after Hierarchical footer {drawn}"
+        );
     }
 
     #[test]
