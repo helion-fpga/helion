@@ -1088,6 +1088,21 @@ mod tests {
             remain - shrunk > PANE_EMPTY_GAP_MAX,
             "0.25× occupancy bars reintroduce a >80px void (shrunk={shrunk})"
         );
+        // Power Utilization Details was Block/Used/Available (~180px) with no bar.
+        let details_labels = 180.0;
+        assert!(
+            details_labels < pane_w * PANE_FILL_MIN,
+            "Utilization Details without occupancy bars must fail the fill bar"
+        );
+        let details_bar = occupancy_bar_w(pane_w - details_labels);
+        assert!(
+            details_bar >= (pane_w - details_labels) * PANE_FILL_MIN,
+            "Utilization Details occupancy bars must span remaining width, got {details_bar}"
+        );
+        assert!(
+            pane_w - details_labels - details_bar <= PANE_EMPTY_GAP_MAX,
+            "right gap after Utilization Details occupancy bar"
+        );
     }
 
     #[test]
