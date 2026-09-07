@@ -1697,8 +1697,18 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
         WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model),
         WorkspaceTab::Reports => {
-            // Catalog stays in the sidebar (MUST: no dual full tables). Center is the first report.
-            paint_timing_summary(ui, &mut app.model);
+            ui.heading("Reports");
+            let remain = ui.available_size();
+            let n = app.model.report_catalog().len();
+            let bbox = chrome::reports_catalog_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+                Sense::hover(),
+            );
+            ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+                paint_report_catalog(ui, &mut app.model, "reports_landing_catalog");
+            });
         }
         other => {
             // Fall through to known panes / timing-only for overflow More picks.
@@ -3578,17 +3588,25 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static 
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
+    let fill = salt == "reports_landing_catalog";
+    let n = rows.len().max(1) as f32;
+    let row_gap = if fill {
+        ((ui.available_height() - 28.0) / n - 18.0).clamp(4.0, 28.0)
+    } else {
+        4.0
+    };
     egui::ScrollArea::both()
         .id_salt(salt)
-        .auto_shrink([false, false])
+        .auto_shrink([false, !fill])
         .max_height(ui.available_height().max(120.0))
         .show(ui, |ui| {
-    egui::Grid::new(salt)
-        .min_col_width(80.0)
-        .max_col_width((ui.available_width() / 4.0).max(80.0))
-        .spacing([8.0, 4.0])
-        .min_col_width(48.0)
-        .show(ui, |ui| {
+    let mut grid = egui::Grid::new(salt).spacing([8.0, row_gap]);
+    grid = if fill {
+        grid.min_col_width(80.0)
+    } else {
+        grid.min_col_width(48.0)
+    };
+    grid.show(ui, |ui| {
             ui.label(RichText::new("Name").strong());
             ui.label(RichText::new("Category").strong());
             ui.label(RichText::new("Status").strong());
@@ -4550,31 +4568,39 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.label(RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0)).small().weak());
     });
     if !model.timing_paths.is_empty() {
-        ui.label(RichText::new("Timing paths").small());
-        let mut pick_path = None;
-        let selected_path = model.selected_timing_path;
-        egui::Grid::new("schematic_timing_paths")
-            .spacing([8.0, 4.0])
+        // Results strip belongs under the drawing (UG893). Keep it collapsed so Zoom Fit owns the pane.
+        egui::CollapsingHeader::new("Timing paths")
+            .default_open(false)
             .show(ui, |ui| {
-                ui.label(RichText::new("Name").strong());
-                ui.label(RichText::new("From").strong());
-                ui.label(RichText::new("To").strong());
-                ui.label(RichText::new("Slack_ps").strong());
-                ui.end_row();
-                for (i, p) in model.timing_paths.iter().enumerate() {
-                    let on = selected_path == Some(i);
-                    if ui.selectable_label(on, &p.name).clicked() {
-                        pick_path = Some(i);
-                    }
-                    ui.label(&p.startpoint);
-                    ui.label(&p.endpoint);
-                    ui.label(p.slack_ps.to_string());
-                    ui.end_row();
+                let mut pick_path = None;
+                let selected_path = model.selected_timing_path;
+                egui::ScrollArea::vertical()
+                    .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
+                    .show(ui, |ui| {
+                        egui::Grid::new("schematic_timing_paths")
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Name").strong());
+                                ui.label(RichText::new("From").strong());
+                                ui.label(RichText::new("To").strong());
+                                ui.label(RichText::new("Slack_ps").strong());
+                                ui.end_row();
+                                for (i, p) in model.timing_paths.iter().enumerate() {
+                                    let on = selected_path == Some(i);
+                                    if ui.selectable_label(on, &p.name).clicked() {
+                                        pick_path = Some(i);
+                                    }
+                                    ui.label(&p.startpoint);
+                                    ui.label(&p.endpoint);
+                                    ui.label(p.slack_ps.to_string());
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                if let Some(i) = pick_path {
+                    let _ = model.select_timing_path(&i.to_string());
                 }
             });
-        if let Some(i) = pick_path {
-            let _ = model.select_timing_path(&i.to_string());
-        }
     }
     let mut pick = None;
     let mut expand = None;
@@ -4677,6 +4703,10 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                         Color32::from_rgb(0xdc, 0xe0, 0xe4),
                     );
                     for pin in &sy.pins {
+                        let nc = pin.net.is_empty();
+                        if !chrome::schematic_pin_visible(nc, on) {
+                            continue;
+                        }
                         let tip = egui::pos2(o.x + pin.x * z, o.y + pin.y * z);
                         let edge = if pin.output {
                             egui::pos2(r.right(), tip.y)
@@ -4693,7 +4723,6 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                         p.line_segment([inner, edge], Stroke::new(2.0_f32, stub));
                         p.line_segment([edge, tip], Stroke::new(2.0_f32, stub));
                         p.circle_filled(tip, 2.2, stub);
-                        let nc = pin.net.is_empty();
                         let label = if nc {
                             format!("{} n/c", pin.name)
                         } else {

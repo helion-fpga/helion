@@ -96,6 +96,12 @@ pub fn stretched_col_w_gap(n_cols: usize, avail: f32, gap: f32) -> f32 {
     ((avail - gaps).max(48.0) / n).max(48.0)
 }
 
+/// Vivado Autohide Pins / Quartus hide instance pins: unconnected pins stay
+/// in the model but are not painted unless the symbol is selected.
+pub fn schematic_pin_visible(net_empty: bool, symbol_selected: bool) -> bool {
+    !net_empty || symbol_selected
+}
+
 /// Example sources (empty state / File → Examples). Do not paint on the rail.
 pub const RAIL_OPEN_SOURCES: [(&'static str, &'static str); 5] = [
     ("Open counter.sv", "counter.sv"),
@@ -985,6 +991,9 @@ mod tests {
             w * 7.0 + 12.0 * 6.0 <= 700.0 + 1.0,
             "stretched columns plus gaps must fit the pane ({w})"
         );
+        assert!(!schematic_pin_visible(true, false), "n/c hidden unless selected");
+        assert!(schematic_pin_visible(true, true), "n/c shown on selected cell");
+        assert!(schematic_pin_visible(false, false), "connected pins always shown");
         // Program bbox must not be padded up to 80% by the helper itself.
         let hw = hardware_content_bbox(8, 1000.0, 500.0);
         assert!(
