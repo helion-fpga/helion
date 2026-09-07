@@ -985,7 +985,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
             }
         }
     });
-    let resolved = helion_hw::resolve_cable(&app.program_cable).ok();
+    let resolved = helion_hw::resolve_cable_from(&app.program_cable, &det).ok();
     if let Some(c) = &resolved {
         ui.label(format!("{} · {}", c.id, c.backend.as_str()));
         ui.label(RichText::new(c.detail.as_str()).small().color(Color32::from_rgb(0xa0, 0xa8, 0xb0)));

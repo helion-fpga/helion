@@ -916,6 +916,22 @@ mod tests {
     }
 
     #[test]
+    fn program_paint_path_does_not_reshell_ofl() {
+        let n0 = helion_hw::usb_scan_invocations();
+        let det = helion_hw::detect_boards();
+        let n1 = helion_hw::usb_scan_invocations();
+        assert!(n1 > n0);
+        let _ = helion_hw::resolve_cable_from("auto", &det);
+        let _ = helion_hw::resolve_cable_from("sim", &det);
+        let _ = helion_hw::resolve_cable_from("usb", &det);
+        assert_eq!(
+            helion_hw::usb_scan_invocations(),
+            n1,
+            "Program sidebar must use cached DetectReport, not resolve_cable every frame"
+        );
+    }
+
+    #[test]
     fn jobs_are_not_run_inside_a_paint_callback() {
         let _ = take_jobs();
         queue_flow(FlowStep::Synthesis);
