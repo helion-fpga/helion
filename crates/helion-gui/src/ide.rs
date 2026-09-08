@@ -1765,11 +1765,17 @@ impl SchematicView {
     pub fn apply_zoom_fit(&mut self, width: f32, height: f32) {
         let vw = self.viewport_w.max(1.0);
         let vh = self.viewport_h.max(1.0);
-        let zx = vw / width.max(1.0);
-        let zy = vh / height.max(1.0);
-        let zoom = zx.min(zy).clamp(0.05, 16.0);
-        let pan_x = (vw - width * zoom) * 0.5;
-        let pan_y = (vh - height * zoom) * 0.5;
+        let zoom = crate::chrome::schematic_fit_zoom(width, height, vw, vh);
+        let (pan_x, pan_y) = crate::chrome::schematic_frame_pan(width, height, vw, vh, zoom);
+        self.commit_camera(SchematicCamera { zoom, pan_x, pan_y });
+    }
+
+    /// Zoom Out and reset pan so PORT_OUT and the rest of the sheet stay in the canvas.
+    pub fn zoom_out_framed(&mut self, width: f32, height: f32) {
+        let vw = self.viewport_w.max(1.0);
+        let vh = self.viewport_h.max(1.0);
+        let zoom = crate::chrome::schematic_zoom_out_zoom(width, height, vw, vh, self.camera.zoom);
+        let (pan_x, pan_y) = crate::chrome::schematic_frame_pan(width, height, vw, vh, zoom);
         self.commit_camera(SchematicCamera { zoom, pan_x, pan_y });
     }
 
@@ -7654,7 +7660,8 @@ impl IdeModel {
 
     pub fn schematic_zoom_out(&mut self) -> Result<String, String> {
         self.workspace = WorkspaceTab::Schematic;
-        self.schematic.zoom_by(0.8);
+        let d = self.schematic.drawing_arc();
+        self.schematic.zoom_out_framed(d.width, d.height);
         Ok(self.schematic_camera_text())
     }
 

@@ -538,28 +538,152 @@ pub fn floorplan_fits_viewport(
         && cell * rows.max(1) as f32 + 16.0 <= avail_h + 1.0
 }
 
-/// Both-axis fit cell for Device Zoom Fit. Never larger than either axis.
-/// `zoom` 1.0 fits the viewport; >1 is zoom-in (parent ScrollArea scrolls);
-/// <1 is zoom-out but stays a readable die, not a single pixel.
-pub fn floorplan_zoom_cell(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> f32 {
+/// Left gutter for Y index labels. Right chrome is a few px, not a letterbox slab.
+pub const FLOORPLAN_LEFT: f32 = 26.0;
+pub const FLOORPLAN_RIGHT: f32 = 6.0;
+pub const FLOORPLAN_TOP: f32 = 4.0;
+pub const FLOORPLAN_BOT: f32 = 18.0;
+
+fn floorplan_zoom_clamped(zoom: f32) -> f32 {
+    if zoom.is_finite() {
+        zoom.clamp(0.40, 6.0)
+    } else {
+        1.0
+    }
+}
+
+/// Anisotropic die cells. Zoom Fit fills leftover width and height (right gap is
+/// `FLOORPLAN_RIGHT`, not a void). Zoom-out shrinks both axes. Zoom-in grows both
+/// so the parent ScrollArea can scroll to the die bottom.
+pub fn floorplan_zoom_cells(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> (f32, f32) {
     let cols_f = cols.max(1) as f32;
     let rows_f = rows.max(1) as f32;
-    let cw = (avail_w - 28.0).max(8.0) / cols_f;
-    let ch = (avail_h - 16.0).max(8.0) / rows_f;
-    let fit = cw.min(ch).max(0.5);
-    let z = if zoom.is_finite() { zoom.clamp(0.40, 6.0) } else { 1.0 };
-    if z <= 1.001 {
-        // Zoom Fit / zoom-out: both axes inside the viewport.
-        (fit * z).min(fit)
-    } else {
-        fit * z
-    }
+    let fit_w = (avail_w - FLOORPLAN_LEFT - FLOORPLAN_RIGHT).max(8.0) / cols_f;
+    let fit_h = (avail_h - FLOORPLAN_TOP - FLOORPLAN_BOT).max(8.0) / rows_f;
+    let z = floorplan_zoom_clamped(zoom);
+    ((fit_w * z).max(0.5), (fit_h * z).max(0.5))
+}
+
+/// Smaller cell, for tests that still speak a single scale.
+/// Zoom Fit fills both axes; this is `min(cell_w, cell_h)`, not a width cap that letterboxes.
+pub fn floorplan_zoom_cell(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> f32 {
+    let (cw, ch) = floorplan_zoom_cells(cols, rows, avail_w, avail_h, zoom);
+    cw.min(ch)
+}
+
+/// Content size of the die including axis chrome.
+pub fn floorplan_zoom_content(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> (f32, f32) {
+    let (cw, ch) = floorplan_zoom_cells(cols, rows, avail_w, avail_h, zoom);
+    (
+        FLOORPLAN_LEFT + cw * cols.max(1) as f32 + FLOORPLAN_RIGHT,
+        FLOORPLAN_TOP + ch * rows.max(1) as f32 + FLOORPLAN_BOT,
+    )
+}
+
+/// Empty pixels to the right of a Zoom Fit die (left-aligned paint).
+pub fn floorplan_zoom_right_gap(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> f32 {
+    let (w, _) = floorplan_zoom_content(cols, rows, avail_w, avail_h, zoom);
+    (avail_w - w).max(0.0)
 }
 
 /// True when a zoomed die still fits both axes (Zoom Fit and zoom-out).
 pub fn floorplan_zoom_fits(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> bool {
-    let cell = floorplan_zoom_cell(cols, rows, avail_w, avail_h, zoom);
-    floorplan_fits_viewport(cols, rows, cell, avail_w, avail_h)
+    let (w, h) = floorplan_zoom_content(cols, rows, avail_w, avail_h, zoom);
+    w <= avail_w + 1.0 && h <= avail_h + 1.0
+}
+
+/// Fit zoom that keeps the whole schematic sheet, including PORT_OUT, inside the pane.
+pub fn schematic_fit_zoom(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32) -> f32 {
+    let pad = 28.0;
+    let zx = (vw - 8.0).max(1.0) / (sheet_w.max(1.0) + pad);
+    let zy = (vh - 8.0).max(1.0) / (sheet_h.max(1.0) + pad);
+    zx.min(zy).clamp(0.05, 16.0)
+}
+
+/// One Zoom Out step, never larger than the pane. Pan is reset by `schematic_frame_pan`.
+pub fn schematic_zoom_out_zoom(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32, current: f32) -> f32 {
+    let fit = schematic_fit_zoom(sheet_w, sheet_h, vw, vh);
+    let cur = if current.is_finite() { current.max(0.05) } else { 1.0 };
+    (cur / 1.35).clamp(0.05, 16.0).min(fit)
+}
+
+/// Center the sheet so left and right symbols (PORT_IN / PORT_OUT) stay in the canvas.
+pub fn schematic_frame_pan(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32, zoom: f32) -> (f32, f32) {
+    let z = if zoom.is_finite() { zoom.max(0.05) } else { 1.0 };
+    ((vw - sheet_w.max(1.0) * z) * 0.5, (vh - sheet_h.max(1.0) * z) * 0.5)
+}
+
+/// Device sidebar port line. Site is the full HAD name (`IOB_X17Y0`), never ellipsized.
+pub fn device_io_site_line(name: &str, dir: &str, site: &str) -> String {
+    let site = if site.is_empty() || site == "-" {
+        "unplaced"
+    } else {
+        site
+    };
+    format!("{name}  {dir}  {site}")
+}
+
+pub fn device_io_site_line_fits(name: &str, dir: &str, site: &str, avail: f32) -> bool {
+    let line = device_io_site_line(name, dir, site);
+    line.chars().count() as f32 * 7.0 + 8.0 <= avail + 0.5
+}
+
+/// Shared chrome for the current window. Floors, then scroll — never a fixed letterbox
+/// and never a pane taller than the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SharedChrome {
+    pub sidebar_w: f32,
+    pub sidebar_floor: f32,
+    pub sidebar_cap: f32,
+    pub console_h: f32,
+    pub console_floor: f32,
+    pub console_cap: f32,
+    pub tables_max_h: f32,
+    pub canvas_floor_h: f32,
+}
+
+/// Device, schematic, reports, and console share the available rect.
+/// Wide windows leave spare for the die/sheet. Narrow or short windows shrink to a floor, then scroll.
+pub fn share_available(window_w: f32, window_h: f32) -> SharedChrome {
+    let w = window_w.max(1.0);
+    let h = window_h.max(1.0);
+    let chrome_y = TOOLBAR_HEIGHT + STATUS_HEIGHT + 6.0;
+    let body_h = (h - chrome_y).max(1.0);
+    let side_budget = (w - RAIL_WIDTH).max(1.0);
+
+    let sidebar_floor = 128.0_f32.min(side_budget * 0.46).max(88.0);
+    let sidebar_cap = (side_budget * 0.30)
+        .clamp(sidebar_floor, SIDEBAR_MAX_WIDTH)
+        .max(sidebar_floor);
+    // Hold the usual 220 when the pane can spare it; shrink before the canvas letterboxes.
+    let sidebar_w = SIDEBAR_WIDTH.clamp(sidebar_floor, sidebar_cap);
+
+    let console_floor = 52.0_f32.min(body_h * 0.28).max(36.0);
+    let console_cap = (body_h * 0.26)
+        .clamp(console_floor, CONSOLE_MAX_HEIGHT)
+        .max(console_floor);
+    let console_h = (body_h * 0.16).clamp(console_floor, console_cap);
+
+    let remain_h = (body_h - console_h).max(1.0);
+    let tables_max_h = (remain_h * 0.24).clamp(44.0, DEVICE_TABLES_MAX_HEIGHT);
+    // Canvas claims the rest. Floor is a scroll threshold, not a min painted slab.
+    let canvas_floor_h = (remain_h * 0.40).clamp(64.0, 240.0);
+
+    SharedChrome {
+        sidebar_w,
+        sidebar_floor,
+        sidebar_cap,
+        console_h,
+        console_floor,
+        console_cap,
+        tables_max_h,
+        canvas_floor_h,
+    }
+}
+
+/// Drawing height that fills leftover height and never exceeds it.
+pub fn pane_view_h(avail_h: f32) -> f32 {
+    avail_h.max(1.0)
 }
 
 /// Remaining-pane fill bar (Program / Package / Schematic / Hierarchy / IP drawings).
@@ -988,6 +1112,29 @@ mod tests {
         );
         let zout = floorplan_zoom_cell(32, 33, 800.0, 360.0, 0.5);
         assert!(zout < fit && zout > 2.0, "zoom-out stays readable, cell={zout}");
+        // Zoom Fit fills leftover width: right gap is chrome, not a letterbox void.
+        let gap = floorplan_zoom_right_gap(32, 33, 800.0, 360.0, 1.0);
+        assert!(gap <= 8.0, "Zoom Fit right gap must be a few px, got {gap}");
+        let (cw, ch) = floorplan_zoom_content(32, 33, 800.0, 360.0, 1.82);
+        assert!(ch > 360.0, "zoom-in must grow past the pane so the die bottom scrolls, h={ch}");
+        assert!(cw > 800.0 || ch > 360.0);
+        let z = schematic_zoom_out_zoom(1400.0, 400.0, 900.0, 500.0, 1.0);
+        let (px, _py) = schematic_frame_pan(1400.0, 400.0, 900.0, 500.0, z);
+        let right = px + 1400.0 * z;
+        assert!(right <= 900.0 + 0.5, "PORT_OUT must stay inside after zoom-out, right={right}");
+        assert!(px + 0.5 >= 0.0, "PORT_IN must stay inside, pan={px}");
+        assert!(device_io_site_line_fits("led", "OUT", "IOB_X31Y16", SIDEBAR_WIDTH - 16.0));
+        assert!(!device_io_site_line("led", "OUT", "IOB_X31Y16").contains('…'));
+        let wide = share_available(1600.0, 900.0);
+        let narrow = share_available(780.0, 700.0);
+        let short = share_available(1200.0, 420.0);
+        assert!(wide.sidebar_w + 8.0 < 1600.0 - RAIL_WIDTH, "wide spare stays for the die");
+        assert!(narrow.sidebar_w <= wide.sidebar_w);
+        assert!(narrow.sidebar_w >= narrow.sidebar_floor - 0.5);
+        assert!(short.console_h < CONSOLE_DEFAULT_HEIGHT, "short window shrinks console, got {}", short.console_h);
+        assert!(short.tables_max_h <= DEVICE_TABLES_MAX_HEIGHT);
+        assert!(short.console_h + short.canvas_floor_h < 420.0);
+        assert_eq!(pane_view_h(90.0), 90.0);
         // Width-first when letterboxing would miss the ≥80% die-fill bar.
         assert!(
             floorplan_die_fill_ratio(32, cell, 800.0) >= 0.80,
