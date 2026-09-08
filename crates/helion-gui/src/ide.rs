@@ -4538,6 +4538,8 @@ pub struct IdeModel {
     pub runs: Vec<DesignRun>,
     pub schematic: SchematicView,
     pub device: DeviceView,
+    /// Device canvas zoom. 1.0 = Zoom Fit (both axes). >1 scrolls the die.
+    pub device_zoom: f32,
     pub properties: Vec<(String, String)>,
     /// UG893 Properties selected Name (clickable Name/Value table).
     pub selected_property: Option<String>,
@@ -4727,6 +4729,7 @@ impl IdeModel {
             ],
             schematic: SchematicView::default(),
             device: DeviceView::default(),
+            device_zoom: 1.0,
             properties: Vec::new(),
             selected_property: None,
             selected: None,
@@ -5511,6 +5514,12 @@ impl IdeModel {
             self.collapse_inside()
         } else if t == "zoom_fit" || t == "schematic_zoom_fit" {
             self.schematic_zoom_fit()
+        } else if t == "device_zoom_fit" {
+            self.device_zoom_fit()
+        } else if t == "device_zoom_in" {
+            self.device_zoom_in()
+        } else if t == "device_zoom_out" {
+            self.device_zoom_out()
         } else if t == "schematic_previous" || t == "previous_view" {
             self.schematic_previous_view()
         } else if t == "schematic_next" || t == "next_view" {
@@ -7647,6 +7656,81 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Schematic;
         self.schematic.zoom_by(0.8);
         Ok(self.schematic_camera_text())
+    }
+
+    /// Device Zoom Fit: cell scale 1.0 fits both axes of the die viewport.
+    pub fn device_zoom_fit(&mut self) -> Result<String, String> {
+        self.device_zoom = 1.0;
+        self.workspace = WorkspaceTab::Device;
+        Ok(format!("device_zoom fit zoom={:.3}", self.device_zoom))
+    }
+
+    /// Device zoom in. Paint uses a larger cell and the die ScrollArea scrolls.
+    pub fn device_zoom_in(&mut self) -> Result<String, String> {
+        self.device_zoom = (self.device_zoom * 1.35).clamp(0.40, 6.0);
+        self.workspace = WorkspaceTab::Device;
+        Ok(format!("device_zoom in zoom={:.3}", self.device_zoom))
+    }
+
+    /// Device zoom out. Stays above 0.40 so the die is not a single pixel.
+    pub fn device_zoom_out(&mut self) -> Result<String, String> {
+        self.device_zoom = (self.device_zoom / 1.35).clamp(0.40, 6.0);
+        self.workspace = WorkspaceTab::Device;
+        Ok(format!("device_zoom out zoom={:.3}", self.device_zoom))
+    }
+
+    /// On-screen timing line. Closed `WNS_PS=` only with cells>0 and an Hff clock path.
+    /// Otherwise `no_body` / `no_clock_path`. Built-in period says `default period, not user SDC`.
+    pub fn timing_honesty_label(&self) -> String {
+        let Some(d) = self.shell.session.design.as_ref() else {
+            return "no_body cells=0 (no timing: empty shell or no logic; not a closed WNS)".into();
+        };
+        let cells = d.cells.len();
+        let n_logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    helion_ir::CellKind::Lut6 { .. }
+                        | helion_ir::CellKind::Hff
+                        | helion_ir::CellKind::Mac27
+                        | helion_ir::CellKind::Bram18
+                )
+            })
+            .count();
+        if d.attrs.get("NO_BODY") == Some("1") || n_logic == 0 {
+            return format!(
+                "no_body cells={cells} (no timing: empty shell or no logic; not a closed WNS)"
+            );
+        }
+        let clock_path = d
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, helion_ir::CellKind::Hff));
+        if !clock_path {
+            return format!(
+                "no_clock_path cells={cells} (no timing: no clock path; not a closed WNS)"
+            );
+        }
+        match self.timing.as_ref() {
+            Some(t) => {
+                let note = if self.user_sdc {
+                    String::new()
+                } else {
+                    " default period, not user SDC".into()
+                };
+                format!("WNS_PS={} TNS_PS={}{note}", t.wns_ps, t.tns_ps)
+            }
+            None => format!(
+                "not routed cells={cells} (no timing: clock path present but not routed; not a closed WNS)"
+            ),
+        }
+    }
+
+    /// Closed WNS is legal only when the honesty label starts with WNS_PS=.
+    pub fn timing_closed_wns(&self) -> bool {
+        self.timing_honesty_label().starts_with("WNS_PS=")
     }
 
     pub fn schematic_previous_view(&mut self) -> Result<String, String> {
@@ -13942,15 +14026,9 @@ impl IdeModel {
         }
 
         let ts = self.timing_summary();
-        let ts_ready = !ts.clocks.is_empty();
-        let ts_sum = format!(
-            "WNS_PS={} TNS_PS={} clocks={}",
-            ts.wns_ps
-                .map(|w| w.to_string())
-                .unwrap_or_else(|| "n/a".into()),
-            ts.tns_ps,
-            ts.clocks.len()
-        );
+        let honest = self.timing_honesty_label();
+        let ts_ready = honest.starts_with("WNS_PS=") || !ts.clocks.is_empty();
+        let ts_sum = honest;
 
         let ci = self.clock_interaction();
         let ci_ready = !ci.clocks.is_empty();

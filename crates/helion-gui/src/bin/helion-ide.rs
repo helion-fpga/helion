@@ -320,6 +320,11 @@ impl HelionIde {
                 app.set_activity(act);
             }
         }
+        if let Ok(z) = std::env::var("HELION_DEVICE_ZOOM") {
+            if let Ok(v) = z.parse::<f32>() {
+                app.model.device_zoom = v.clamp(0.40, 6.0);
+            }
+        }
         app
     }
 
@@ -1291,10 +1296,18 @@ fn paint_status_bar(
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let wns = model
-                    .wns_ps()
-                    .map(|w| w.to_string())
-                    .unwrap_or_else(|| "—".into());
+                let honest = model.timing_honesty_label();
+                let wns = if model.timing_closed_wns() {
+                    honest
+                } else if honest.starts_with("no_body") {
+                    "no_body".into()
+                } else if honest.starts_with("no_clock_path") {
+                    "no_clock_path".into()
+                } else if honest.contains("default period") {
+                    honest
+                } else {
+                    honest
+                };
                 let lutff = model
                     .utilization
                     .as_ref()
@@ -1329,7 +1342,7 @@ fn paint_status_bar(
                 };
                 ui.label(
                     RichText::new(format!(
-                        "{} · {} · WNS {} · LUTFF {} · {}{}{}",
+                        "{} · {} · {} · LUTFF {} · {}{}{}",
                         crumb,
                         model.part(),
                         wns,
@@ -3608,54 +3621,37 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static 
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
-    let fill = salt == "reports_landing_catalog";
-    let n = rows.len().max(1) as f32;
-    let row_gap = if fill {
-        ((ui.available_height() - 28.0) / n - 18.0).clamp(4.0, 28.0)
-    } else {
-        4.0
-    };
-    egui::ScrollArea::both()
+    egui::ScrollArea::vertical()
         .id_salt(salt)
-        .auto_shrink([false, !fill])
+        .auto_shrink([false, false])
         .max_height(ui.available_height().max(120.0))
         .show(ui, |ui| {
-    let mut grid = egui::Grid::new(salt).spacing([8.0, row_gap]);
-    grid = if fill {
-        grid.min_col_width(80.0)
-    } else {
-        grid.min_col_width(48.0)
-    };
-    grid.show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.label(RichText::new("Name").strong());
-            ui.label(RichText::new("Category").strong());
-            ui.label(RichText::new("Status").strong());
-            ui.label(RichText::new("Summary").strong());
-            ui.end_row();
             for r in &rows {
                 let on = selected.as_deref() == Some(r.id.as_str());
-                if ui.selectable_label(on, &r.name).clicked() {
+                // Full name, wrapped to the sidebar — never "Timing Summ…".
+                let name = egui::Button::selectable(on, RichText::new(&r.name).strong())
+                    .wrap()
+                    .min_size(egui::vec2(ui.available_width(), 22.0));
+                if ui.add(name).clicked() {
                     pick = Some(r.id.clone());
                 }
-                ui.label(&r.category);
-                let fill = run_status_color(&r.status);
-                let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
-                    .fill(fill)
-                    .selected(on);
-                if ui.add(btn).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                let summary = if r.summary.len() > 28 {
-                    format!("{}…", r.summary.chars().take(28).collect::<String>())
-                } else {
-                    r.summary.clone()
-                };
-                if ui.selectable_label(on, summary).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                ui.end_row();
+                let status_fill = run_status_color(&r.status);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&r.category).small());
+                    let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
+                        .fill(status_fill)
+                        .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some(r.id.clone());
+                    }
+                });
+                ui.add(
+                    egui::Label::new(RichText::new(&r.summary).small().weak()).wrap(),
+                );
+                ui.add_space(6.0);
             }
-        });
         });
     if let Some(id) = pick {
         let _ = model.select_report(&id);
@@ -3682,7 +3678,26 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("report_timing_summary");
         }
     });
+    // CLI-honest label. Closed WNS_PS= only with cells>0 and an Hff clock path.
+    let honest = model.timing_honesty_label();
+    let closed = model.timing_closed_wns();
+    ui.label(
+        RichText::new(honest.clone())
+            .monospace()
+            .size(16.0)
+            .color(if closed {
+                Color32::from_rgb(0xc8, 0xf0, 0xd8)
+            } else {
+                Color32::from_rgb(0xe5, 0xc0, 0x7b)
+            }),
+    );
+    if !closed {
+        ui.label("Not a closed WNS.");
+    }
     let report = model.timing_summary();
+    if !closed {
+        return;
+    }
     if report.clocks.is_empty() {
         ui.label("No clocks yet.");
         if primary_button(ui, "Add clock 10 ns").clicked() {
@@ -4606,35 +4621,25 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
 
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
-    let vw = ui.available_width();
-    let vh = ui.available_height().max(240.0);
-    model.schematic.set_viewport(vw, vh);
-    let drawing = model.schematic.drawing_arc();
-    let cam = model.schematic.camera;
-    if chrome::schematic_should_auto_fit(
-        cam.zoom,
-        cam.pan_x,
-        cam.pan_y,
-        drawing.width,
-        drawing.height,
-        vw,
-        vh,
-    ) {
-        model.schematic.apply_zoom_fit(drawing.width, drawing.height);
-    }
-    let n_cells = drawing
+    // Stay on the schematic pane — do not fall back to Reports after More / Zoom.
+    model.workspace = WorkspaceTab::Schematic;
+    let mut zoom_fit = false;
+    let mut zoom_in = false;
+    let mut zoom_out = false;
+    let drawing_for_counts = model.schematic.drawing_arc();
+    let n_cells = drawing_for_counts
         .symbols
         .iter()
         .filter(|s| !s.kind.starts_with("PORT"))
         .count();
-    let n_ports = drawing
+    let n_ports = drawing_for_counts
         .symbols
         .iter()
         .filter(|s| s.kind.starts_with("PORT"))
         .count();
     let n_nets = {
         let mut s = std::collections::HashSet::new();
-        for w in &drawing.wires {
+        for w in &drawing_for_counts.wires {
             s.insert(w.net.as_str());
         }
         s.len()
@@ -4646,8 +4651,14 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Next").clicked() {
             let _ = model.schematic_next_view();
         }
+        if ui.button("Zoom In").clicked() {
+            zoom_in = true;
+        }
+        if ui.button("Zoom Out").clicked() {
+            zoom_out = true;
+        }
         if ui.button("Zoom Fit").clicked() {
-            let _ = model.schematic_zoom_fit();
+            zoom_fit = true;
         }
         if ui.button("Expand Cone").clicked() {
             let _ = model.exec("expand_cone");
@@ -4719,7 +4730,36 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut expand = None;
     let selected = model.selected.clone();
     let avail = ui.available_size();
-    let (rect, resp) = ui.allocate_exact_size(avail.max(egui::vec2(240.0, 240.0)), Sense::click_and_drag());
+    // Canvas is the leftover pane — Zoom Fit fills this, not the heading/toolbar above.
+    let canvas = egui::vec2(avail.x.max(1.0), avail.y.max(1.0));
+    model.schematic.set_viewport(canvas.x, canvas.y);
+    let sheet = model.schematic.drawing_arc();
+    let cam0 = model.schematic.camera;
+    if zoom_fit
+        || chrome::schematic_should_auto_fit(
+            cam0.zoom,
+            cam0.pan_x,
+            cam0.pan_y,
+            sheet.width,
+            sheet.height,
+            canvas.x,
+            canvas.y,
+        )
+    {
+        model.workspace = WorkspaceTab::Schematic;
+        model.schematic.apply_zoom_fit(sheet.width, sheet.height);
+    } else if zoom_in {
+        model.workspace = WorkspaceTab::Schematic;
+        model.schematic.zoom_at(1.35, canvas.x * 0.5, canvas.y * 0.5);
+    } else if zoom_out {
+        model.workspace = WorkspaceTab::Schematic;
+        let fit = (canvas.x / sheet.width.max(1.0)).min(canvas.y / sheet.height.max(1.0));
+        let floor = (fit * 0.45).max(0.12);
+        let z1 = (model.schematic.camera.zoom / 1.35).max(floor);
+        let factor = z1 / model.schematic.camera.zoom.max(0.05);
+        model.schematic.zoom_at(factor, canvas.x * 0.5, canvas.y * 0.5);
+    }
+    let (rect, resp) = ui.allocate_exact_size(canvas, Sense::click_and_drag());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         let (zoom_delta, scroll, mods, pointer) = ui.input(|i| {
@@ -4748,6 +4788,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         let d = resp.drag_delta();
         model.schematic.pan_by(d.x, d.y);
     }
+    let drawing = model.schematic.drawing_arc();
     let cam = model.schematic.camera;
     let z = cam.zoom.max(0.05);
     if ui.is_rect_visible(rect) {
@@ -4950,6 +4991,20 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Device");
     ui.horizontal(|ui| {
+        if ui.button("Zoom In").clicked() {
+            let _ = model.device_zoom_in();
+        }
+        if ui.button("Zoom Out").clicked() {
+            let _ = model.device_zoom_out();
+        }
+        if ui.button("Zoom Fit").clicked() {
+            let _ = model.device_zoom_fit();
+        }
+        ui.label(
+            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
+                .small()
+                .weak(),
+        );
         ui.label(
             RichText::new("CLB")
                 .small()
@@ -5006,20 +5061,25 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     let x0 = model.device.x0;
     let y0 = model.device.y0;
     let avail = ui.available_size();
-    let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
-    let view_w = avail.x.max(80.0);
-    let cell = chrome::floorplan_fit_cell(cols, rows, view_w, view_h);
+    // Real leftover pane only — do not inflate past it (that jammed an oversized die).
+    let view_h = avail.y.max(1.0);
+    let view_w = avail.x.max(1.0);
+    let cell = chrome::floorplan_zoom_cell(cols, rows, view_w, view_h, model.device_zoom);
     let die_w = chrome::floorplan_die_width(cols, cell);
     let die_h = cell * rows as f32 + 16.0;
-    let draw_w = view_w.max(die_w);
-    let draw_h = die_h.max(chrome::DRAWING_MIN_HEIGHT);
+    // Fit / zoom-out stay inside the viewport. Zoom-in grows; the ScrollArea scrolls.
+    let draw_w = if model.device_zoom <= 1.001 { view_w } else { die_w.max(view_w) };
+    let draw_h = if model.device_zoom <= 1.001 { view_h } else { die_h.max(view_h) };
     let mut pick_site: Option<(u32, u32)> = None;
     let mut pick_region: Option<String> = None;
     let mut click_pblock: Option<String> = None;
-    egui::ScrollArea::both()
-        .id_salt("device_die_scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
+    let (viewport, _) = ui.allocate_exact_size(egui::vec2(view_w, view_h), Sense::hover());
+    ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |ui| {
+        ui.set_clip_rect(viewport);
+        egui::ScrollArea::both()
+            .id_salt("device_die_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(
                 egui::vec2(draw_w, draw_h),
                 Sense::click(),
@@ -5260,6 +5320,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
             }
+            });
         });
     if let Some(name) = click_pblock {
         let _ = model.select_pblock(&name);

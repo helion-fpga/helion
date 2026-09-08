@@ -538,6 +538,30 @@ pub fn floorplan_fits_viewport(
         && cell * rows.max(1) as f32 + 16.0 <= avail_h + 1.0
 }
 
+/// Both-axis fit cell for Device Zoom Fit. Never larger than either axis.
+/// `zoom` 1.0 fits the viewport; >1 is zoom-in (parent ScrollArea scrolls);
+/// <1 is zoom-out but stays a readable die, not a single pixel.
+pub fn floorplan_zoom_cell(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> f32 {
+    let cols_f = cols.max(1) as f32;
+    let rows_f = rows.max(1) as f32;
+    let cw = (avail_w - 28.0).max(8.0) / cols_f;
+    let ch = (avail_h - 16.0).max(8.0) / rows_f;
+    let fit = cw.min(ch).max(0.5);
+    let z = if zoom.is_finite() { zoom.clamp(0.40, 6.0) } else { 1.0 };
+    if z <= 1.001 {
+        // Zoom Fit / zoom-out: both axes inside the viewport.
+        (fit * z).min(fit)
+    } else {
+        fit * z
+    }
+}
+
+/// True when a zoomed die still fits both axes (Zoom Fit and zoom-out).
+pub fn floorplan_zoom_fits(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> bool {
+    let cell = floorplan_zoom_cell(cols, rows, avail_w, avail_h, zoom);
+    floorplan_fits_viewport(cols, rows, cell, avail_w, avail_h)
+}
+
 /// Remaining-pane fill bar (Program / Package / Schematic / Hierarchy / IP drawings).
 pub const PANE_FILL_MIN: f32 = 0.80;
 pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
@@ -953,6 +977,17 @@ mod tests {
 
         let cell = floorplan_fit_cell(32, 33, 800.0, 500.0);
         assert!(cell >= 4.0 && cell <= 64.0);
+        let fit = floorplan_zoom_cell(32, 33, 800.0, 360.0, 1.0);
+        assert!(
+            floorplan_zoom_fits(32, 33, 800.0, 360.0, 1.0),
+            "Zoom Fit must fit both axes, cell={fit}"
+        );
+        assert!(
+            !floorplan_zoom_fits(32, 33, 800.0, 360.0, 2.0),
+            "zoom-in must overflow so the die ScrollArea can scroll"
+        );
+        let zout = floorplan_zoom_cell(32, 33, 800.0, 360.0, 0.5);
+        assert!(zout < fit && zout > 2.0, "zoom-out stays readable, cell={zout}");
         // Width-first when letterboxing would miss the ≥80% die-fill bar.
         assert!(
             floorplan_die_fill_ratio(32, cell, 800.0) >= 0.80,
