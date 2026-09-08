@@ -8,8 +8,8 @@ use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
 use helion_route::{route_with, RouteOpts, Routed};
 use helion_sta::{
-    apply_xdc, create_clock, load_sdc, report_timing_routed, report_timing_routed_xdc,
-    Constraints, TimingResult,
+    apply_xdc, create_clock, load_sdc, report_power, report_timing_routed, report_timing_routed_xdc,
+    Constraints, OperatingConditions, PowerReport, TimingResult,
 };
 use helion_hls::synth_c_path;
 use helion_proj::{constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path};
@@ -91,7 +91,6 @@ fn compile_design_xdc(
     let undriven = packed.iobs.len().saturating_sub(driven.len());
     if packed.iobs.len() > iob_budget || undriven > 0 {
         let keep = driven.len().min(iob_budget);
-        // Large designs: keep at most 4 driven IOBs so PathFinder clears under cap.
         let keep = if packed.lutffs.len() > 2000 {
             keep.min(4)
         } else {
@@ -134,7 +133,11 @@ fn compile_design_xdc(
         routed.overused,
         t2.elapsed().as_millis()
     );
-    check_routed(&design, &routed, &dev).fail()?;
+    let drc = check_routed(&design, &routed, &dev);
+    if !drc.ok() {
+        eprintln!("hang_diag drc {}", drc.text().replace('\n', " | "));
+    }
+    drc.fail()?;
     let t3 = std::time::Instant::now();
     let bits = bitgen(&dev, &routed)?;
     eprintln!(
@@ -220,6 +223,8 @@ fn main() {
         "run" => cmd_run(&args),
         "report_timing" => cmd_timing(&args),
         "report_utilization" => cmd_util(&args),
+        "report_power" => cmd_power(&args),
+        "reports" => cmd_reports(&args),
         "bitstream" => cmd_bits(&args),
         "eco" => cmd_eco(&args),
         "pblock" => cmd_pblock(&args),
@@ -245,8 +250,10 @@ fn usage() {
   helion synth <file.sv> [--part P]
   helion impl <file.sv> [--part P]
   helion run <file.sv> [--cycles N] [--part P]
-  helion report_timing <file.sv> [--sdc f.sdc]
-  helion report_utilization <file.sv>
+  helion report_timing <file.sv|.vhd> [--sdc f.sdc]
+  helion report_utilization <file.sv|.vhd>
+  helion report_power <file.sv|.vhd>
+  helion reports <file.sv|.vhd>
   helion bitstream <file.sv|.vhd|.c|.prj> -o out.hbits
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
@@ -412,6 +419,86 @@ fn cmd_util(args: &[String]) {
         c.dev.n_bram,
         p.macs.len(),
         c.dev.n_dsp
+    );
+}
+
+fn power_of(c: &Compiled) -> PowerReport {
+    let mut clks = Vec::new();
+    create_clock(&mut clks, "clk", 10_000, "clk");
+    report_power(
+        &c.dev,
+        Some(&c.design),
+        Some(&c.routed.placed),
+        &clks,
+        &OperatingConditions::default(),
+    )
+}
+
+fn cmd_power(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let c = compile_sv(path, &part, 0.0).unwrap_or_else(|e| {
+        eprintln!("report_power: {e}");
+        std::process::exit(1);
+    });
+    println!("{}", power_of(&c).text());
+}
+
+/// One compile: bitstream + timing + util + power, and they must agree.
+fn cmd_reports(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/counter.sv");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let c = compile_sv(path, &part, 0.75).unwrap_or_else(|e| {
+        eprintln!("reports: {e}");
+        std::process::exit(1);
+    });
+    let p = &c.routed.placed.packed;
+    let pwr = power_of(&c);
+    let lutff = p.lutffs.len();
+    let iob = p.iobs.len();
+    let bram = p.brams.len();
+    let dsp = p.macs.len();
+    if pwr.lutff != lutff || pwr.iob != iob || pwr.bram != bram || pwr.dsp != dsp {
+        eprintln!(
+            "reports: power occupancy LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{} mismatches util",
+            pwr.lutff, lutff, pwr.iob, iob, pwr.bram, bram, pwr.dsp, dsp
+        );
+        std::process::exit(1);
+    }
+    if pwr.total_uw != pwr.static_uw.saturating_add(pwr.dynamic_uw) {
+        eprintln!(
+            "reports: TOTAL_UW={} != STATIC+DYNAMIC {}",
+            pwr.total_uw,
+            pwr.static_uw.saturating_add(pwr.dynamic_uw)
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
+        c.design.name,
+        c.timing.wns_ps,
+        c.timing.tns_ps,
+        c.timing.endpoints,
+        c.timing.r2r_ps,
+        c.timing.iob_ps
+    );
+    println!(
+        "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
+        c.design.name,
+        lutff,
+        c.dev.lut6_count(),
+        iob,
+        c.dev.iob_sites().count(),
+        bram,
+        c.dev.n_bram,
+        dsp,
+        c.dev.n_dsp
+    );
+    println!("{}", pwr.text());
+    println!(
+        "bitstream {} bytes={} match=LUTFF,IOB,BRAM,DSP,TOTAL_UW",
+        c.design.name,
+        c.bits.packets.len()
     );
 }
 

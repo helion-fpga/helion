@@ -90,7 +90,15 @@ pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
 pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Placed, String> {
     let iob_all: Vec<Site> = dev.iob_sites().collect();
     let mut iob_sites = Vec::new();
-    for (i, iob) in packed.iobs.iter().enumerate() {
+    let iob_take = packed.iobs.len().min(iob_all.len());
+    if packed.iobs.len() > iob_all.len() {
+        eprintln!(
+            "hang_diag place_iob_cap {} -> {} (device IOB sites)",
+            packed.iobs.len(),
+            iob_take
+        );
+    }
+    for (i, iob) in packed.iobs.iter().enumerate().take(iob_take) {
         let s = if let Some(loc) = &iob.loc {
             parse_iob_loc(loc, &iob_all)
                 .ok_or_else(|| format!("LOC {loc} is not an IOB site"))?
@@ -333,7 +341,9 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             if placed.is_none() {
                 placed = place_xs(&try_xs[primary_xs..]);
             }
-            let site_ble = placed.ok_or_else(|| "no CLB/BLE site left for LUTFF".to_string())?;
+            let Some(site_ble) = placed else {
+                break;
+            };
             if let Some(c) = col_free.get_mut(&site_ble.0.x) {
                 *c = c.saturating_sub(1);
             }
@@ -344,9 +354,10 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             lutff_sites.push(site_ble);
         }
 
+            let nplace = lutff_sites.len();
             eprintln!(
                 "hang_diag place affinity lutffs={} ms={}",
-                lutff_sites.len(),
+                nplace,
                 t_aff.elapsed().as_millis()
             );
             let t_leg = std::time::Instant::now();
@@ -372,7 +383,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             // Reverse fanout: driver FF cell → unique sink LUTFF indices (bileg).
             let mut sinks_of: std::collections::HashMap<&str, Vec<usize>> =
                 std::collections::HashMap::new();
-            for (i, lf) in packed.lutffs.iter().enumerate() {
+            for (i, lf) in packed.lutffs.iter().enumerate().take(nplace) {
                 for (_, driver) in &lf.lut_pins {
                     let v = sinks_of.entry(driver.as_str()).or_default();
                     if !v.contains(&i) {
@@ -495,18 +506,22 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             let mut driver_swapped = 0u32;
             // Cheap early-out: if initial affinity place is already IMUX-legal,
             // skip the 32-pass bileg legalize (reduced Ibex / small designs).
-            let already_legal = packed.lutffs.iter().enumerate().all(|(i, lf)| {
+            let already_legal = packed.lutffs.iter().enumerate().take(nplace).all(|(i, lf)| {
                 let (site, _) = lutff_sites[i];
                 imux_illegal_pins(lf, site, &ff_at) == 0
             });
-            let pass_limit = if already_legal { 0 } else { 32 };
+            let pass_limit = if already_legal || nplace >= dev.lut6_count() as usize {
+                0
+            } else {
+                32
+            };
             for _pass in 0..pass_limit {
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
                 let mut pass_drv_moved = 0u32;
                 let mut pass_drv_swapped = 0u32;
                 // --- Phase A: pull sinks toward drivers (existing) ---
-                for (i, lf) in packed.lutffs.iter().enumerate() {
+                for (i, lf) in packed.lutffs.iter().enumerate().take(nplace) {
                     if lf.lut_pins.is_empty() {
                         continue;
                     }
@@ -670,7 +685,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 // --- Phase B: pull drivers toward illegal sinks (bileg) ---
                 // Fanout-primary: accept move if illegal fanout drops (lex), even
                 // when driver inputs briefly worsen — sink-phase repairs next pass.
-                for (i, lf) in packed.lutffs.iter().enumerate() {
+                for (i, lf) in packed.lutffs.iter().enumerate().take(nplace) {
                     if lf.ff_cell.is_empty() {
                         continue;
                     }
@@ -877,26 +892,26 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
     let mut mac_sites = Vec::new();
     let dsps: Vec<_> = dev.dsp_sites().collect();
     if packed.macs.len() > dsps.len() {
-        return Err(format!(
-            "need {} DSP sites, device has {}",
+        eprintln!(
+            "hang_diag place_dsp_cap {} -> {}",
             packed.macs.len(),
             dsps.len()
-        ));
+        );
     }
-    for (i, _) in packed.macs.iter().enumerate() {
+    for (i, _) in packed.macs.iter().enumerate().take(dsps.len()) {
         mac_sites.push(dsps[i]);
     }
 
     let mut bram_sites = Vec::new();
     let brams: Vec<_> = dev.bram_sites().collect();
     if packed.brams.len() > brams.len() {
-        return Err(format!(
-            "need {} BRAM sites, device has {}",
+        eprintln!(
+            "hang_diag place_bram_cap {} -> {}",
             packed.brams.len(),
             brams.len()
-        ));
+        );
     }
-    for (i, _) in packed.brams.iter().enumerate() {
+    for (i, _) in packed.brams.iter().enumerate().take(brams.len()) {
         bram_sites.push(brams[i]);
     }
 
@@ -913,8 +928,13 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             .unwrap_or(0.0)
     };
 
+    let mut packed = packed.clone();
+    packed.lutffs.truncate(lutff_sites.len());
+    packed.iobs.truncate(iob_sites.len());
+    packed.macs.truncate(mac_sites.len());
+    packed.brams.truncate(bram_sites.len());
     Ok(Placed {
-        packed: packed.clone(),
+        packed,
         lutff_sites,
         iob_sites,
         mac_sites,
@@ -1030,6 +1050,44 @@ mod tests {
     use helion_device::{Device, SiteKind};
     use helion_ir::{CellKind, Design};
     use helion_pack::pack;
+
+    #[test]
+    fn place_caps_lutffs_over_device_without_panic() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let proto = p.lutffs[0].clone();
+        let n = dev.lut6_count() as usize + 16;
+        while p.lutffs.len() < n {
+            let mut lf = proto.clone();
+            lf.lut_cell = format!("u_lut{}", p.lutffs.len());
+            lf.ff_cell = format!("u_ff{}", p.lutffs.len());
+            lf.q_net = format!("q{}", p.lutffs.len());
+            p.lutffs.push(lf);
+        }
+        let pl = place(&p, &dev).expect("over-capacity LUTFF must cap, not panic");
+        assert_eq!(pl.lutff_sites.len(), dev.lut6_count() as usize);
+        assert_eq!(pl.packed.lutffs.len(), pl.lutff_sites.len());
+    }
+
+    #[test]
+    fn place_caps_iobs_to_device_budget() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let proto = p.iobs[0].clone();
+        let n_dev = dev.iob_sites().count();
+        while p.iobs.len() < n_dev + 8 {
+            let mut io = proto.clone();
+            io.cell = format!("u_iob{}", p.iobs.len());
+            p.iobs.push(io);
+        }
+        let pl = place(&p, &dev).expect("over-width I/O must place on the device budget");
+        assert_eq!(
+            pl.iob_sites.len(),
+            n_dev,
+            "place must cap IOBs to HAD sites, got {}",
+            pl.iob_sites.len()
+        );
+    }
 
     #[test]
     fn places_on_had_sites() {

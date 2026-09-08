@@ -153,9 +153,6 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             });
         }
     }
-    if lutffs.is_empty() && macs.is_empty() && brams.is_empty() {
-        return Err("nothing to pack".into());
-    }
     Ok(Packed {
         lutffs,
         iobs,

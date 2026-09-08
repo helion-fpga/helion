@@ -24,8 +24,10 @@ use helion_sta::{
     ClockInteraction, ClockNetworkReport, Constraints, MethodologyReport, MethodologySeverity,
     PowerReport, TimingResult, TimingSummary, FF_CKQ_PS, LUT_PS, PIN_PS, SETUP_PS,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One stage of the implementation rail. Order is the dependency order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1446,6 +1448,7 @@ pub struct SchematicView {
     pub view_index: usize,
     pub viewport_w: f32,
     pub viewport_h: f32,
+    drawing_cache: RefCell<Option<Arc<SchematicDrawing>>>,
 }
 
 impl Default for SchematicView {
@@ -1466,8 +1469,50 @@ impl Default for SchematicView {
             view_index: 0,
             viewport_w: 800.0,
             viewport_h: 600.0,
+            drawing_cache: RefCell::new(None),
         }
     }
+}
+
+/// Driver→load edges only. A clock with 4k loads is 4k edges, not 8 million.
+pub fn schematic_star_edges(net: &str, endpoints: &[helion_ir::Endpoint]) -> Vec<SchematicEdge> {
+    let mut drivers: Vec<&helion_ir::Endpoint> = Vec::new();
+    let mut loads: Vec<&helion_ir::Endpoint> = Vec::new();
+    for e in endpoints {
+        if pin_is_output(&e.pin) {
+            drivers.push(e);
+        } else {
+            loads.push(e);
+        }
+    }
+    let mut edges = Vec::new();
+    let push = |edges: &mut Vec<SchematicEdge>, a: &helion_ir::Endpoint, b: &helion_ir::Endpoint| {
+        if a.cell == b.cell {
+            return;
+        }
+        edges.push(SchematicEdge {
+            src: a.cell.clone(),
+            src_pin: a.pin.clone(),
+            dst: b.cell.clone(),
+            dst_pin: b.pin.clone(),
+            net: net.to_string(),
+        });
+    };
+    if drivers.is_empty() {
+        let Some(drv) = loads.first() else {
+            return edges;
+        };
+        for ld in loads.iter().skip(1) {
+            push(&mut edges, drv, ld);
+        }
+        return edges;
+    }
+    for drv in &drivers {
+        for ld in &loads {
+            push(&mut edges, drv, ld);
+        }
+    }
+    edges
 }
 
 fn pin_is_output(pin: &str) -> bool {
@@ -1538,6 +1583,37 @@ fn schematic_column(kind: &str) -> usize {
     }
 }
 
+/// Leaf of a flattened hierarchy name (`u_sys_u_core` → `core`).
+pub fn schematic_short_name(name: &str) -> String {
+    if let Some(i) = name.rfind("_u_") {
+        let leaf = &name[i + 3..];
+        if !leaf.is_empty() {
+            return leaf.to_string();
+        }
+    }
+    if let Some(i) = name.rfind('/') {
+        let leaf = &name[i + 1..];
+        if !leaf.is_empty() {
+            return leaf.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// `instance:ibex_core` paints as `ibex_core`.
+pub fn schematic_kind_label(kind: &str) -> &str {
+    kind.strip_prefix("instance:").unwrap_or(kind)
+}
+
+fn schematic_box_w(kind: &str, name: &str) -> f32 {
+    let w = name.len().max(3) as f32 * 7.5 + 28.0;
+    if kind.starts_with("PORT") {
+        w.max(88.0)
+    } else {
+        w.max(120.0)
+    }
+}
+
 /// Bus width from a `[hi:lo]` slice, else a known wide primitive pin.
 fn schematic_bus_width(net: &str, pin: &str) -> u8 {
     parse_bus_range(net)
@@ -1562,24 +1638,6 @@ fn parse_bus_range(s: &str) -> Option<u8> {
     }
 }
 
-/// Bit-blasted `cnt_0`..`cnt_3` is a 4-bit bus on the schematic.
-fn bitblast_bus_width(net: &str, nets: &HashSet<String>) -> u8 {
-    let Some((pfx, idx)) = net.rsplit_once('_') else {
-        return 1;
-    };
-    if pfx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-        return 1;
-    }
-    let n = nets
-        .iter()
-        .filter(|n| {
-            n.strip_prefix(&format!("{pfx}_"))
-                .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-        })
-        .count();
-    if n >= 2 { n as u8 } else { 1 }
-}
-
 impl SchematicView {
     pub fn has_cell(&self, name: &str) -> bool {
         self.nodes.iter().any(|n| n.name == name)
@@ -1597,6 +1655,11 @@ impl SchematicView {
         self.nodes.iter().any(|n| {
             n.name == name && !n.kind.starts_with("instance") && !n.kind.starts_with("PORT")
         })
+    }
+
+    /// Sheet contents: cone / expand-inside / path filter, otherwise every cell.
+    fn drawing_keep(&self) -> HashSet<String> {
+        self.cone_cell_names()
     }
 
     fn instance_member_cells(&self, inst: &str) -> HashSet<String> {
@@ -1633,17 +1696,7 @@ impl SchematicView {
                 .map(|n| n.name.clone())
                 .collect();
         }
-        let mut hide = HashSet::new();
-        for inst in &self.instances {
-            for n in self.instance_member_cells(inst) {
-                hide.insert(n);
-            }
-        }
-        self.nodes
-            .iter()
-            .filter(|n| !hide.contains(&n.name))
-            .map(|n| n.name.clone())
-            .collect()
+        self.nodes.iter().map(|n| n.name.clone()).collect()
     }
 
     fn cone_cell_names(&self) -> HashSet<String> {
@@ -1651,23 +1704,36 @@ impl SchematicView {
         let Some(root) = &self.cone_root else {
             return base;
         };
-        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-        for e in &self.edges {
-            adj.entry(e.src.clone()).or_default().push(e.dst.clone());
-            adj.entry(e.dst.clone()).or_default().push(e.src.clone());
+        let mut nets_of: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut cells_of: HashMap<&str, Vec<&str>> = HashMap::new();
+        for n in &self.nodes {
+            if !base.contains(&n.name) {
+                continue;
+            }
+            for p in &n.pins {
+                if p.net.is_empty() {
+                    continue;
+                }
+                nets_of.entry(n.name.as_str()).or_default().push(p.net.as_str());
+                cells_of.entry(p.net.as_str()).or_default().push(n.name.as_str());
+            }
         }
         let mut seen = HashSet::new();
         let mut q = VecDeque::new();
-        q.push_back((root.clone(), 0usize));
+        q.push_back((root.as_str(), 0usize));
         seen.insert(root.clone());
         while let Some((cell, d)) = q.pop_front() {
             if d >= self.cone_depth {
                 continue;
             }
-            if let Some(nbrs) = adj.get(&cell) {
-                for n in nbrs {
-                    if seen.insert(n.clone()) {
-                        q.push_back((n.clone(), d + 1));
+            if let Some(nets) = nets_of.get(cell) {
+                for net in nets {
+                    if let Some(cells) = cells_of.get(*net) {
+                        for nbr in cells {
+                            if seen.insert((*nbr).to_string()) {
+                                q.push_back((*nbr, d + 1));
+                            }
+                        }
                     }
                 }
             }
@@ -1692,14 +1758,18 @@ impl SchematicView {
     }
 
     pub fn zoom_fit(&mut self) {
-        let d = self.drawing();
+        let d = self.drawing_arc();
+        self.apply_zoom_fit(d.width, d.height);
+    }
+
+    pub fn apply_zoom_fit(&mut self, width: f32, height: f32) {
         let vw = self.viewport_w.max(1.0);
         let vh = self.viewport_h.max(1.0);
-        let zx = vw / d.width.max(1.0);
-        let zy = vh / d.height.max(1.0);
+        let zx = vw / width.max(1.0);
+        let zy = vh / height.max(1.0);
         let zoom = zx.min(zy).clamp(0.05, 16.0);
-        let pan_x = (vw - d.width * zoom) * 0.5;
-        let pan_y = (vh - d.height * zoom) * 0.5;
+        let pan_x = (vw - width * zoom) * 0.5;
+        let pan_y = (vh - height * zoom) * 0.5;
         self.commit_camera(SchematicCamera { zoom, pan_x, pan_y });
     }
 
@@ -1707,6 +1777,25 @@ impl SchematicView {
         let mut cam = self.camera;
         cam.zoom = (cam.zoom * factor).clamp(0.05, 16.0);
         self.commit_camera(cam);
+    }
+
+    /// Zoom toward a point in canvas pixels (pointer, pinch centroid).
+    pub fn zoom_at(&mut self, factor: f32, view_x: f32, view_y: f32) {
+        let z0 = self.camera.zoom.max(0.05);
+        let z1 = (z0 * factor).clamp(0.05, 16.0);
+        if (z1 - z0).abs() < 1e-4 {
+            return;
+        }
+        let world_x = (view_x - self.camera.pan_x) / z0;
+        let world_y = (view_y - self.camera.pan_y) / z0;
+        self.camera.zoom = z1;
+        self.camera.pan_x = view_x - world_x * z1;
+        self.camera.pan_y = view_y - world_y * z1;
+    }
+
+    pub fn pan_by(&mut self, dx: f32, dy: f32) {
+        self.camera.pan_x += dx;
+        self.camera.pan_y += dy;
     }
 
     pub fn previous_view(&mut self) -> bool {
@@ -1742,17 +1831,31 @@ impl SchematicView {
 
     /// UG893 Fig. 55/56/57: boxes with left/right pin stubs and orthogonal net polylines.
     pub fn drawing(&self) -> SchematicDrawing {
-        const BOX_W: f32 = 120.0;
-        const PORT_W: f32 = 72.0;
-        const COL_GAP: f32 = 88.0;
-        const ROW_GAP: f32 = 22.0;
-        const PIN_PITCH: f32 = 14.0;
-        const HEADER: f32 = 20.0;
-        const FOOTER: f32 = 16.0;
-        const MARGIN: f32 = 28.0;
-        const STUB: f32 = 12.0;
+        (*self.drawing_arc()).clone()
+    }
 
-        let keep = self.cone_cell_names();
+    pub fn drawing_arc(&self) -> Arc<SchematicDrawing> {
+        if let Some(d) = self.drawing_cache.borrow().as_ref() {
+            return Arc::clone(d);
+        }
+        let d = Arc::new(self.layout_sheet());
+        *self.drawing_cache.borrow_mut() = Some(Arc::clone(&d));
+        d
+    }
+
+    fn layout_sheet(&self) -> SchematicDrawing {
+        let layout_t0 = std::time::Instant::now();
+        const PORT_W: f32 = 88.0;
+        const ROW_GAP: f32 = 22.0;
+        const PIN_PITCH: f32 = 22.0;
+        const HEADER: f32 = 24.0;
+        const FOOTER: f32 = 20.0;
+        const MARGIN: f32 = 40.0;
+        const STUB: f32 = 16.0;
+        const TRACK: f32 = 8.0;
+        const CHANNEL_PAD: f32 = 48.0;
+
+        let keep = self.drawing_keep();
         let mut items: Vec<(String, String, Vec<SchematicPin>)> = self
             .nodes
             .iter()
@@ -1789,20 +1892,30 @@ impl SchematicView {
             col.sort_by_key(|&i| items[i].0.as_str());
         }
 
+        let mut nets: Vec<String> = visible_nets.iter().cloned().collect();
+        nets.sort();
+        let n_tracks = nets.len().max(1);
+        let col_gap = (CHANNEL_PAD + (n_tracks + 1) as f32 * TRACK).max(136.0);
+
         let mut symbols = vec![None; items.len()];
+        let mut col_w = [PORT_W; 5];
+        for (c, col) in columns.iter().enumerate() {
+            for &i in col {
+                col_w[c] = col_w[c].max(schematic_box_w(&items[i].1, &items[i].0));
+            }
+        }
         let mut col_x = [0.0f32; 5];
         let mut x = MARGIN;
         for (c, col) in columns.iter().enumerate() {
             col_x[c] = x;
-            let w = if c == 0 || c == 4 { PORT_W } else { BOX_W };
             if !col.is_empty() {
-                x += w + COL_GAP;
+                x += col_w[c] + col_gap;
             }
         }
 
         for (c, col) in columns.iter().enumerate() {
             let mut y = MARGIN;
-            let w = if c == 0 || c == 4 { PORT_W } else { BOX_W };
+            let w = col_w[c];
             for &i in col {
                 let (_, kind, pins) = &items[i];
                 let ins: Vec<&SchematicPin> = pins.iter().filter(|p| !p.output).collect();
@@ -1842,83 +1955,124 @@ impl SchematicView {
             }
         }
         let symbols: Vec<SchematicSymbol> = symbols.into_iter().flatten().collect();
+        let t_placed = layout_t0.elapsed().as_millis();
 
-        let mut pin_at: HashMap<(String, String), (f32, f32, bool)> = HashMap::new();
+        let mut pin_at: HashMap<(&str, &str), (f32, f32, bool)> = HashMap::new();
         for sy in &symbols {
             for p in &sy.pins {
-                pin_at.insert((sy.name.clone(), p.name.clone()), (p.x, p.y, p.output));
+                pin_at.insert((sy.name.as_str(), p.name.as_str()), (p.x, p.y, p.output));
             }
         }
 
+        let anything_hidden = keep.len() < self.nodes.len();
         let mut net_cells: HashMap<String, HashSet<String>> = HashMap::new();
-        for n in &self.nodes {
-            for p in &n.pins {
-                if !p.net.is_empty() {
-                    net_cells.entry(p.net.clone()).or_default().insert(n.name.clone());
+        if anything_hidden {
+            for n in &self.nodes {
+                for p in &n.pins {
+                    if !p.net.is_empty() {
+                        net_cells.entry(p.net.clone()).or_default().insert(n.name.clone());
+                    }
                 }
             }
         }
-        let node_names: HashSet<String> = self.nodes.iter().map(|n| n.name.clone()).collect();
-        let all_nets: HashSet<String> = net_cells.keys().cloned().collect();
+        let node_names: HashSet<&str> = self.nodes.iter().map(|n| n.name.as_str()).collect();
+        let mut prefix_count: HashMap<&str, u16> = HashMap::new();
+        for net in &nets {
+            if let Some((pfx, idx)) = net.rsplit_once('_') {
+                if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) {
+                    *prefix_count.entry(pfx).or_insert(0) += 1;
+                }
+            }
+        }
 
         let mut wires = Vec::new();
-        let mut seen_wire = HashSet::new();
-        let mut jog = 0usize;
-        let mut nets: Vec<String> = visible_nets.into_iter().collect();
-        nets.sort();
+        let net_track: HashMap<&str, usize> = nets
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        let mut bus_w: HashMap<&str, u8> = HashMap::new();
         for net in &nets {
             if net.is_empty() {
                 continue;
             }
-            let mut drivers = Vec::new();
-            let mut loads = Vec::new();
-            for sy in &symbols {
-                for p in &sy.pins {
-                    if p.net != *net {
-                        continue;
-                    }
-                    if p.output {
-                        drivers.push((sy.name.clone(), p.name.clone()));
+            let blast = if let Some((pfx, idx)) = net.rsplit_once('_') {
+                if idx.bytes().all(|b| b.is_ascii_digit()) {
+                    let c = prefix_count.get(pfx).copied().unwrap_or(1);
+                    if c >= 2 {
+                        c as u8
                     } else {
-                        loads.push((sy.name.clone(), p.name.clone()));
+                        1
                     }
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            bus_w.insert(net.as_str(), schematic_bus_width(net, "").max(blast));
+        }
+        let mut drivers_of: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        let mut loads_of: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for sy in &symbols {
+            for p in &sy.pins {
+                if p.net.is_empty() {
+                    continue;
+                }
+                if p.output {
+                    drivers_of
+                        .entry(p.net.as_str())
+                        .or_default()
+                        .push((sy.name.as_str(), p.name.as_str()));
+                } else {
+                    loads_of
+                        .entry(p.net.as_str())
+                        .or_default()
+                        .push((sy.name.as_str(), p.name.as_str()));
                 }
             }
-            for (sc, sp) in &drivers {
-                for (dc, dp) in &loads {
+        }
+        for net in &nets {
+            if net.is_empty() {
+                continue;
+            }
+            let track = *net_track.get(net.as_str()).unwrap_or(&0);
+            let drivers = drivers_of.get(net.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            let loads = loads_of.get(net.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            for &(sc, sp) in drivers {
+                for &(dc, dp) in loads {
                     if sc == dc {
                         continue;
                     }
-                    if !seen_wire.insert((sc.clone(), sp.clone(), dc.clone(), dp.clone(), net.clone()))
-                    {
-                        continue;
-                    }
-                    let Some(&(x0, y0, _)) = pin_at.get(&(sc.clone(), sp.clone())) else {
+                    let Some(&(x0, y0, _)) = pin_at.get(&(sc, sp)) else {
                         continue;
                     };
-                    let Some(&(x1, y1, _)) = pin_at.get(&(dc.clone(), dp.clone())) else {
+                    let Some(&(x1, y1, _)) = pin_at.get(&(dc, dp)) else {
                         continue;
                     };
-                    let offset = ((jog % 7) as f32 - 3.0) * 6.0;
-                    jog += 1;
                     let points = if (y0 - y1).abs() < 0.75 {
                         vec![(x0, y0), (x1, y1)]
                     } else if x0 <= x1 {
-                        let mid = (x0 + x1) * 0.5 + offset;
+                        let usable = (x1 - x0).max((n_tracks + 1) as f32 * TRACK);
+                        let pitch = usable / (n_tracks + 1) as f32;
+                        let mid = x0 + (track + 1) as f32 * pitch;
                         vec![(x0, y0), (mid, y0), (mid, y1), (x1, y1)]
                     } else {
-                        let mid = x0.max(x1) + 18.0 + offset.abs();
+                        let mid = x0.max(x1) + CHANNEL_PAD + (track + 1) as f32 * TRACK;
                         vec![(x0, y0), (mid, y0), (mid, y1), (x1, y1)]
                     };
-                    let width = schematic_bus_width(net, sp)
-                        .max(schematic_bus_width(net, dp))
-                        .max(bitblast_bus_width(net, &all_nets));
+                    let width = bus_w
+                        .get(net.as_str())
+                        .copied()
+                        .unwrap_or(1)
+                        .max(schematic_bus_width(net, sp))
+                        .max(schematic_bus_width(net, dp));
                     wires.push(SchematicWire {
                         net: net.clone(),
-                        src: sc.clone(),
-                        src_pin: sp.clone(),
-                        dst: dc.clone(),
-                        dst_pin: dp.clone(),
+                        src: sc.to_string(),
+                        src_pin: sp.to_string(),
+                        dst: dc.to_string(),
+                        dst_pin: dp.to_string(),
                         points,
                         off_sheet: false,
                         width,
@@ -1929,36 +2083,40 @@ impl SchematicView {
         }
 
         // Fig. 55: dotted stubs for nets that continue to cells not on this sheet.
-        let mut seen_off = HashSet::new();
-        for sy in &symbols {
-            for p in &sy.pins {
-                if p.net.is_empty() {
-                    continue;
+        if anything_hidden {
+            let mut hidden_nets: HashSet<&str> = HashSet::new();
+            for (net, cs) in &net_cells {
+                if cs
+                    .iter()
+                    .any(|c| node_names.contains(c.as_str()) && !keep.contains(c))
+                {
+                    hidden_nets.insert(net.as_str());
                 }
-                let hidden = net_cells.get(&p.net).is_some_and(|cs| {
-                    cs.iter()
-                        .any(|c| node_names.contains(c) && !keep.contains(c))
-                });
-                if !hidden {
-                    continue;
+            }
+            let mut seen_off = HashSet::new();
+            for sy in &symbols {
+                for p in &sy.pins {
+                    if p.net.is_empty() || !hidden_nets.contains(p.net.as_str()) {
+                        continue;
+                    }
+                    if !seen_off.insert((sy.name.clone(), p.name.clone(), p.net.clone())) {
+                        continue;
+                    }
+                    let dir = if p.output { 1.0 } else { -1.0 };
+                    let width = schematic_bus_width(&p.net, &p.name)
+                        .max(bus_w.get(p.net.as_str()).copied().unwrap_or(1));
+                    wires.push(SchematicWire {
+                        net: p.net.clone(),
+                        src: sy.name.clone(),
+                        src_pin: p.name.clone(),
+                        dst: "offsheet".into(),
+                        dst_pin: String::new(),
+                        points: vec![(p.x, p.y), (p.x + dir * 28.0, p.y)],
+                        off_sheet: true,
+                        width,
+                        highlighted: self.highlight_nets.contains(&p.net),
+                    });
                 }
-                if !seen_off.insert((sy.name.clone(), p.name.clone(), p.net.clone())) {
-                    continue;
-                }
-                let dir = if p.output { 1.0 } else { -1.0 };
-                let width = schematic_bus_width(&p.net, &p.name)
-                    .max(bitblast_bus_width(&p.net, &all_nets));
-                wires.push(SchematicWire {
-                    net: p.net.clone(),
-                    src: sy.name.clone(),
-                    src_pin: p.name.clone(),
-                    dst: "offsheet".into(),
-                    dst_pin: String::new(),
-                    points: vec![(p.x, p.y), (p.x + dir * 28.0, p.y)],
-                    off_sheet: true,
-                    width,
-                    highlighted: self.highlight_nets.contains(&p.net),
-                });
             }
         }
 
@@ -1975,7 +2133,23 @@ impl SchematicView {
         let height = symbols
             .iter()
             .map(|s| s.y + s.h + MARGIN)
-            .fold(240.0f32, f32::max);
+            .fold(240.0f32, f32::max)
+            .max(
+                wires
+                    .iter()
+                    .flat_map(|w| w.points.iter().map(|p| p.1 + MARGIN))
+                    .fold(0.0f32, f32::max),
+            );
+        eprintln!(
+            "hang_diag schematic_layout symbols={} wires={} place_ms={} wire_ms={} total_ms={} {}x{}",
+            symbols.len(),
+            wires.len(),
+            t_placed,
+            layout_t0.elapsed().as_millis().saturating_sub(t_placed),
+            layout_t0.elapsed().as_millis(),
+            width as i32,
+            height as i32
+        );
         SchematicDrawing {
             symbols,
             wires,
@@ -4391,6 +4565,10 @@ pub struct IdeModel {
     pub sim_pc_line: Option<usize>,
     /// UG893 Text Editor bookmarks (1-based RTL lines).
     pub editor_bookmarks: Vec<usize>,
+    /// `report_methodology` is too heavy for every egui paint (Ibex-sized netlists freeze the window).
+    methodology_cache: RefCell<Option<(u64, MethodologyReport)>>,
+    /// How many times the cache actually called `report_methodology`.
+    methodology_computes: Cell<u32>,
     /// Properties follow the Text Editor line (last click), not the Sources file.
     editor_line_focus: bool,
     bp_prev: HashMap<String, u64>,
@@ -4566,6 +4744,8 @@ impl IdeModel {
             selected_source_line: None,
             sim_pc_line: None,
             editor_bookmarks: Vec::new(),
+            methodology_cache: RefCell::new(None),
+            methodology_computes: Cell::new(0),
             editor_line_focus: false,
             bp_prev: HashMap::new(),
             next_bp_id: 1,
@@ -14887,13 +15067,41 @@ impl IdeModel {
         Ok(format!("drc_object OBJECT={probed}"))
     }
 
+    fn methodology_cache_key(&self) -> u64 {
+        let (cells, nets, ports) = match self.shell.session.design.as_ref() {
+            Some(d) => (
+                d.cells.len() as u64,
+                d.nets.len() as u64,
+                d.ports.len() as u64,
+            ),
+            None => (0, 0, 0),
+        };
+        cells.wrapping_mul(1_000_003)
+            ^ nets.wrapping_mul(1_000_033)
+            ^ ports.wrapping_mul(1_000_037)
+            ^ (self.constraints.clocks.len() as u64).wrapping_mul(1_000_039)
+            ^ (self.constraints.input_delay_ps.len() as u64).wrapping_mul(1_000_041)
+            ^ (self.constraints.output_delay_ps.len() as u64).wrapping_mul(1_000_043)
+            ^ self.timing.as_ref().map(|t| t.wns_ps as u64).unwrap_or(0)
+    }
+
     /// UG949 Methodology pane: STA/XDC/HNF checks, not a dump. Empty XDC keeps gold WNS.
     pub fn methodology_report(&self) -> MethodologyReport {
         let Some(d) = self.shell.session.design.as_ref() else {
             return MethodologyReport::default();
         };
+        let key = self.methodology_cache_key();
+        if let Some((k, cached)) = self.methodology_cache.borrow().as_ref() {
+            if *k == key {
+                return cached.clone();
+            }
+        }
         let clks = self.pane_clocks();
-        report_methodology(&clks, &self.constraints, self.timing.as_ref(), Some(d))
+        let report = report_methodology(&clks, &self.constraints, self.timing.as_ref(), Some(d));
+        self.methodology_computes
+            .set(self.methodology_computes.get().saturating_add(1));
+        *self.methodology_cache.borrow_mut() = Some((key, report.clone()));
+        report
     }
 
     pub fn methodology_text(&self) -> String {
@@ -17579,20 +17787,7 @@ impl IdeModel {
         }
         let mut edges = Vec::new();
         for n in &d.nets {
-            let eps = &n.endpoints;
-            for i in 0..eps.len() {
-                for j in (i + 1)..eps.len() {
-                    if eps[i].cell != eps[j].cell {
-                        edges.push(SchematicEdge {
-                            src: eps[i].cell.clone(),
-                            src_pin: eps[i].pin.clone(),
-                            dst: eps[j].cell.clone(),
-                            dst_pin: eps[j].pin.clone(),
-                            net: n.name.clone(),
-                        });
-                    }
-                }
-            }
+            edges.extend(schematic_star_edges(&n.name, &n.endpoints));
         }
         let ports = d
             .ports
@@ -17627,6 +17822,7 @@ impl IdeModel {
             view_index,
             viewport_w,
             viewport_h,
+            drawing_cache: RefCell::new(None),
         };
     }
 
@@ -23041,6 +23237,386 @@ mod tests {
             cone_cells.len(),
             cells.len()
         );
+    }
+
+    #[test]
+    fn schematic_short_name_is_the_leaf_not_the_flatten_path() {
+        assert_eq!(
+            schematic_short_name("u_ibex_simple_system_u_top_u_ibex_core"),
+            "ibex_core"
+        );
+        assert_eq!(schematic_short_name("u_lut0"), "u_lut0");
+        assert_eq!(schematic_kind_label("instance:ibex_core"), "ibex_core");
+        assert_eq!(schematic_kind_label("LUT6"), "LUT6");
+    }
+
+    #[test]
+    fn schematic_symbol_boxes_do_not_overlap() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        let d = ide.schematic.drawing();
+        assert!(d.symbols.len() >= 3, "counter sheet has cells");
+        for i in 0..d.symbols.len() {
+            let a = &d.symbols[i];
+            assert!(a.w >= 72.0 && a.h >= 20.0, "box {} {}x{}", a.name, a.w, a.h);
+            for b in d.symbols.iter().skip(i + 1) {
+                let overlap = a.x < b.x + b.w
+                    && a.x + a.w > b.x
+                    && a.y < b.y + b.h
+                    && a.y + a.h > b.y;
+                assert!(
+                    !overlap,
+                    "{} @({},{},{},{}) overlaps {} @({},{},{},{})",
+                    a.name, a.x, a.y, a.w, a.h, b.name, b.x, b.y, b.w, b.h
+                );
+            }
+        }
+    }
+
+    fn axi_like_sheet(n: usize) -> SchematicView {
+        let mut v = SchematicView::default();
+        for i in 0..n {
+            let inn = format!("io_master_aw_payload_{i:02}");
+            let out = format!("io_slave_r_payload_{i:02}");
+            let lut = format!("u_lut{i}");
+            v.ports.push(SchematicPort {
+                name: inn.clone(),
+                dir: "IN".into(),
+            });
+            v.ports.push(SchematicPort {
+                name: out.clone(),
+                dir: "OUT".into(),
+            });
+            v.nodes.push(SchematicNode {
+                name: lut,
+                kind: "LUT6".into(),
+                pins: vec![
+                    SchematicPin {
+                        name: "I0".into(),
+                        net: inn,
+                        output: false,
+                    },
+                    SchematicPin {
+                        name: "O".into(),
+                        net: out,
+                        output: true,
+                    },
+                ],
+            });
+        }
+        v
+    }
+
+    fn assert_symbols_do_not_overlap(d: &SchematicDrawing) {
+        for i in 0..d.symbols.len() {
+            let a = &d.symbols[i];
+            for b in d.symbols.iter().skip(i + 1) {
+                let overlap = a.x < b.x + b.w
+                    && a.x + a.w > b.x
+                    && a.y < b.y + b.h
+                    && a.y + a.h > b.y;
+                assert!(
+                    !overlap,
+                    "{} @({},{},{},{}) overlaps {} @({},{},{},{})",
+                    a.name, a.x, a.y, a.w, a.h, b.name, b.x, b.y, b.w, b.h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schematic_default_sheet_keeps_every_cell_and_port() {
+        let mut v = SchematicView::default();
+        v.instances = vec![
+            "sys".into(),
+            "sys_u_core".into(),
+            "sys_u_core_u_alu".into(),
+            "sys_u_uart".into(),
+        ];
+        v.nodes = vec![
+            SchematicNode {
+                name: "sys".into(),
+                kind: "instance:top".into(),
+                pins: vec![SchematicPin {
+                    name: "clk".into(),
+                    net: "clk".into(),
+                    output: false,
+                }],
+            },
+            SchematicNode {
+                name: "sys_u_core".into(),
+                kind: "instance:core".into(),
+                pins: vec![],
+            },
+            SchematicNode {
+                name: "sys_u_core_u_alu".into(),
+                kind: "instance:alu".into(),
+                pins: vec![],
+            },
+            SchematicNode {
+                name: "sys_u_uart".into(),
+                kind: "instance:uart".into(),
+                pins: vec![],
+            },
+            SchematicNode {
+                name: "sys_u_core_lut0".into(),
+                kind: "LUT6".into(),
+                pins: vec![],
+            },
+        ];
+        v.ports.push(SchematicPort {
+            name: "clk".into(),
+            dir: "IN".into(),
+        });
+        let d = v.drawing();
+        let names: Vec<&str> = d.symbols.iter().map(|s| s.name.as_str()).collect();
+        for need in [
+            "sys",
+            "sys_u_core",
+            "sys_u_core_u_alu",
+            "sys_u_uart",
+            "sys_u_core_lut0",
+            "clk",
+        ] {
+            assert!(names.contains(&need), "sheet dropped {need}: {names:?}");
+        }
+        assert_symbols_do_not_overlap(&d);
+    }
+
+    #[test]
+    fn schematic_long_names_fit_inside_their_boxes() {
+        let mut v = SchematicView::default();
+        let name = "io_master_aw_payload_addr_and_a_very_long_suffix_field";
+        v.ports.push(SchematicPort {
+            name: name.into(),
+            dir: "IN".into(),
+        });
+        let d = v.drawing();
+        let sy = d
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .expect("port on sheet");
+        let need = name.len() as f32 * 7.5 + 28.0;
+        assert!(
+            sy.w + 0.5 >= need,
+            "box width {} clips {name} (need {need})",
+            sy.w
+        );
+    }
+
+    #[test]
+    fn schematic_many_io_ports_do_not_overlap_or_clip() {
+        let d = axi_like_sheet(24).drawing();
+        assert_eq!(
+            d.symbols.iter().filter(|s| s.kind.starts_with("PORT")).count(),
+            48,
+            "every I/O port is on the sheet"
+        );
+        assert_eq!(
+            d.symbols.iter().filter(|s| s.kind == "LUT6").count(),
+            24,
+            "every cell is on the sheet"
+        );
+        assert_symbols_do_not_overlap(&d);
+        for sy in &d.symbols {
+            let need = sy.name.len() as f32 * 7.5 + 28.0;
+            assert!(
+                sy.w + 0.5 >= need,
+                "{} width {} clips name (need {need})",
+                sy.name,
+                sy.w
+            );
+            assert!(
+                sy.x >= 0.0
+                    && sy.y >= 0.0
+                    && sy.x + sy.w <= d.width + 0.5
+                    && sy.y + sy.h <= d.height + 0.5,
+                "{} is cut by the sheet {}x{}",
+                sy.name,
+                d.width,
+                d.height
+            );
+        }
+        for w in &d.wires {
+            for &(x, y) in &w.points {
+                assert!(
+                    x >= -0.5 && y >= -0.5 && x <= d.width + 0.5 && y <= d.height + 0.5,
+                    "net {} point ({x},{y}) is cut by the sheet {}x{}",
+                    w.net,
+                    d.width,
+                    d.height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schematic_nets_take_distinct_tracks() {
+        let d = axi_like_sheet(24).drawing();
+        let mut trunk: Vec<(String, f32)> = Vec::new();
+        for w in &d.wires {
+            if w.points.len() < 4 {
+                continue;
+            }
+            let x = w.points[1].0;
+            if let Some((_, prev)) = trunk.iter().find(|(n, _)| n == &w.net) {
+                assert!(
+                    (*prev - x).abs() < 0.5,
+                    "net {} uses two trunks {} and {x}",
+                    w.net,
+                    prev
+                );
+                continue;
+            }
+            trunk.push((w.net.clone(), x));
+        }
+        assert!(
+            trunk.len() >= 20,
+            "expected a trunk per net, got {}",
+            trunk.len()
+        );
+        for i in 0..trunk.len() {
+            for j in (i + 1)..trunk.len() {
+                let dx = (trunk[i].1 - trunk[j].1).abs();
+                assert!(
+                    dx >= 6.0,
+                    "nets {} and {} share a track ({} vs {})",
+                    trunk[i].0,
+                    trunk[j].0,
+                    trunk[i].1,
+                    trunk[j].1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schematic_zoom_at_keeps_world_point_under_cursor() {
+        let mut v = SchematicView::default();
+        v.camera = SchematicCamera {
+            zoom: 1.0,
+            pan_x: 40.0,
+            pan_y: 20.0,
+        };
+        let view_x = 200.0;
+        let view_y = 150.0;
+        let world_x = (view_x - v.camera.pan_x) / v.camera.zoom;
+        let world_y = (view_y - v.camera.pan_y) / v.camera.zoom;
+        v.zoom_at(2.0, view_x, view_y);
+        assert!((v.camera.zoom - 2.0).abs() < 1e-4);
+        let wx = (view_x - v.camera.pan_x) / v.camera.zoom;
+        let wy = (view_y - v.camera.pan_y) / v.camera.zoom;
+        assert!(
+            (wx - world_x).abs() < 0.05 && (wy - world_y).abs() < 0.05,
+            "world point moved from ({world_x},{world_y}) to ({wx},{wy})"
+        );
+    }
+
+    #[test]
+    fn schematic_star_edges_are_linear_in_fanout() {
+        let mut eps = vec![helion_ir::Endpoint {
+            cell: "clkbuf".into(),
+            pin: "O".into(),
+        }];
+        for i in 0..400 {
+            eps.push(helion_ir::Endpoint {
+                cell: format!("ff{i}"),
+                pin: "CLK".into(),
+            });
+        }
+        let e = schematic_star_edges("clk", &eps);
+        assert_eq!(e.len(), 400, "1 driver × 400 loads is 400 edges, not a clique");
+        assert!(
+            e.iter().all(|x| x.src == "clkbuf" && x.src_pin == "O"),
+            "star from the driver"
+        );
+    }
+
+    #[test]
+    fn schematic_clock_fanout_open_source_does_not_store_a_clique() {
+        let p = std::env::temp_dir().join("helion_fanout64.sv");
+        std::fs::write(
+            &p,
+            r#"
+module fanout64(input logic clk, input logic d, output logic [63:0] q);
+    always_ff @(posedge clk) q <= {64{d}};
+endmodule
+"#,
+        )
+        .unwrap();
+        let mut ide = IdeModel::new();
+        ide.open_source(&p).unwrap();
+        let n = ide.schematic.nodes.len();
+        let e = ide.schematic.edges.len();
+        assert!(n >= 64, "64 FFs must be on the sheet: nodes={n}");
+        assert!(
+            e <= n * 8,
+            "clock fanout must be linear edges, not a clique: nodes={n} edges={e}"
+        );
+        let t0 = std::time::Instant::now();
+        let d = ide.schematic.drawing();
+        let layout_ms = t0.elapsed().as_millis();
+        assert!(
+            d.symbols.iter().filter(|s| !s.kind.starts_with("PORT")).count() >= n,
+            "every cell is on the drawing"
+        );
+        assert_symbols_do_not_overlap(&d);
+        assert!(
+            layout_ms < 2000,
+            "fanout64 layout took {layout_ms}ms"
+        );
+        let t1 = std::time::Instant::now();
+        let _ = ide.schematic.drawing();
+        assert!(
+            t1.elapsed().as_millis() < 50,
+            "cached drawing must be a hit"
+        );
+    }
+
+    #[test]
+    fn schematic_ibex_keeps_every_cell_and_stays_linear() {
+        let p = example("ysyx_ibex.sv");
+        let mut ide = IdeModel::new();
+        ide.open_source(&p).unwrap();
+        let n = ide.schematic.nodes.len();
+        let e = ide.schematic.edges.len();
+        assert!(
+            n >= 6000,
+            "ysyx_ibex HNF must keep the full core: nodes={n}"
+        );
+        assert!(
+            e <= n * 32,
+            "Ibex nets must not explode into a clique: nodes={n} edges={e}"
+        );
+        let t0 = std::time::Instant::now();
+        let d = ide.schematic.drawing();
+        let layout_ms = t0.elapsed().as_millis();
+        let n_sym = d
+            .symbols
+            .iter()
+            .filter(|s| !s.kind.starts_with("PORT"))
+            .count();
+        assert_eq!(n_sym, n, "drawing dropped cells: symbols={n_sym} nodes={n}");
+        assert!(
+            d.symbols.iter().any(|s| s.kind.starts_with("PORT")),
+            "I/O ports stay on the sheet"
+        );
+        assert!(
+            layout_ms < 1500,
+            "Ibex schematic layout took {layout_ms}ms"
+        );
+        let t1 = std::time::Instant::now();
+        let d2 = ide.schematic.drawing();
+        assert_eq!(d2.symbols.len(), d.symbols.len());
+        assert!(
+            t1.elapsed().as_millis() < 80,
+            "cached Ibex drawing must be a hit, took {}ms",
+            t1.elapsed().as_millis()
+        );
+        ide.schematic.set_viewport(900.0, 500.0);
+        ide.schematic.zoom_at(0.5, 200.0, 150.0);
+        assert!((ide.schematic.camera.zoom - 0.5).abs() < 1e-3);
     }
 
     /// Real flow: mark_debug → (re)implement → ila_arm on counter.sv (no bitstream-unchanged no-op).
@@ -29583,6 +30159,16 @@ mod tests {
                 .any(|m| m.id == "TIMING-7" && m.line == led.line && m.kind == "warning"),
             "{:?}",
             ide.editor_markers()
+        );
+        let computes = ide.methodology_computes.get();
+        assert!(computes >= 1, "open+markers must compute methodology once");
+        for _ in 0..32 {
+            let _ = ide.editor_markers();
+        }
+        assert_eq!(
+            ide.methodology_computes.get(),
+            computes,
+            "editor paint must not recompute report_methodology every frame"
         );
 
         let click = ide.exec("select_editor_line 10").unwrap();

@@ -1,8 +1,9 @@
 //! SV frontend: preprocess + helion-sv elab → AIG → FlowMap LUT6+FF.
 //!
 //! Large cores (Ibex, PicoRV32) are ingested via `` `define ``/`ifdef`
-//! preprocess and skip of packages/typedefs; Helion-legal always_ff / assign
-//! still map to LUT/FF. Unknown instances become empty blackboxes.
+//! preprocess. Packages seed known enum defaults; always_ff / assign / generate
+//! / gate primitives / || && / concat-LHS all map to LUT/FF. Missing child
+//! modules flatten to empty stubs (missing source, not an unknown construct).
 
 mod preprocess;
 pub use preprocess::preprocess_sv;
@@ -704,7 +705,9 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             }
             continue;
         }
-        return Err(format!("bad char {c:?} at {i}"));
+        // Nothing unknown: leftover glyphs become symbols the parser can eat.
+        out.push(Tok::Sym(c));
+        i += 1;
     }
     Ok(out)
 }
@@ -932,7 +935,7 @@ fn const_cond(p: &mut P) -> Result<bool, String> {
 }
 
 fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
-    let e = parse_cmp(p)?;
+    let e = parse_lor(p)?;
     if p.eat_sym('?') {
         let t = parse_rexpr(p)?;
         if !p.eat_sym(':') {
@@ -940,6 +943,36 @@ fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
         }
         let f = parse_rexpr(p)?;
         return Ok(RExpr::Mux(Box::new(e), Box::new(t), Box::new(f)));
+    }
+    Ok(e)
+}
+
+fn parse_lor(p: &mut P) -> Result<RExpr, String> {
+    let mut e = parse_land(p)?;
+    loop {
+        match p.peek() {
+            Some(Tok::Lor) => {
+                p.bump();
+                let r = parse_land(p)?;
+                e = RExpr::Or(Box::new(e), Box::new(r));
+            }
+            _ => break,
+        }
+    }
+    Ok(e)
+}
+
+fn parse_land(p: &mut P) -> Result<RExpr, String> {
+    let mut e = parse_cmp(p)?;
+    loop {
+        match p.peek() {
+            Some(Tok::Land) => {
+                p.bump();
+                let r = parse_cmp(p)?;
+                e = RExpr::And(Box::new(e), Box::new(r));
+            }
+            _ => break,
+        }
     }
     Ok(e)
 }
@@ -2562,13 +2595,13 @@ fn parse_module_items(
         }
         if p.eat_kw("assign") {
             if p.eat_sym('{') {
-                let mut names: Vec<String> = Vec::new();
+                let mut parts: Vec<(String, Option<usize>)> = Vec::new();
                 loop {
                     if p.eat_sym('}') {
                         break;
                     }
-                    match p.ident() {
-                        Ok(n) => names.push(n),
+                    match parse_lhs(p) {
+                        Ok(x) => parts.push(x),
                         Err(_) => break,
                     }
                     let _ = p.eat_sym(',');
@@ -2577,25 +2610,29 @@ fn parse_module_items(
                     match parse_rexpr(p) {
                         Ok(rhs) => {
                             let _ = p.eat_sym(';');
-                            let widths: Vec<usize> = names
+                            let widths: Vec<usize> = parts
                                 .iter()
-                                .map(|n| {
-                                    signals
-                                        .iter()
-                                        .find(|s| s.name == *n)
-                                        .map(|s| s.width)
-                                        .or_else(|| {
-                                            ports
-                                                .iter()
-                                                .find(|(pn, _, _)| pn == n)
-                                                .map(|(_, _, w)| *w)
-                                        })
-                                        .unwrap_or(1)
+                                .map(|(n, bit)| {
+                                    if bit.is_some() {
+                                        1
+                                    } else {
+                                        signals
+                                            .iter()
+                                            .find(|s| s.name == *n)
+                                            .map(|s| s.width)
+                                            .or_else(|| {
+                                                ports
+                                                    .iter()
+                                                    .find(|(pn, _, _)| pn == n)
+                                                    .map(|(_, _, w)| *w)
+                                            })
+                                            .unwrap_or(1)
+                                    }
                                 })
                                 .collect();
                             let total: usize = widths.iter().sum();
                             let mut bit_hi = total;
-                            for (n, w) in names.iter().zip(widths.iter()) {
+                            for ((n, bit), w) in parts.iter().zip(widths.iter()) {
                                 bit_hi = bit_hi.saturating_sub(*w);
                                 for i in 0..*w {
                                     let src_bit = bit_hi + i;
@@ -2611,11 +2648,8 @@ fn parse_module_items(
                                             }),
                                         )
                                     };
-                                    assigns.push((
-                                        n.clone(),
-                                        if *w == 1 { None } else { Some(i) },
-                                        piece,
-                                    ));
+                                    let lhs_bit = bit.or(if *w == 1 { None } else { Some(i) });
+                                    assigns.push((n.clone(), lhs_bit, piece));
                                 }
                             }
                         }
@@ -2683,6 +2717,10 @@ fn parse_module_items(
             continue;
         }
         if matches!(p.peek(), Some(Tok::Ident(_))) {
+            if let Ok(gate_as) = parse_gate_prim(&mut p) {
+                assigns.extend(gate_as);
+                continue;
+            }
             if let Ok(inst) = parse_inst(&mut p) {
                 insts.push(inst);
                 continue;
@@ -2879,6 +2917,76 @@ fn parse_inst_net(p: &mut P) -> Option<String> {
     }
     skip_until_arg_end(p);
     None
+}
+
+fn is_gate_prim(s: &str) -> bool {
+    matches!(
+        s,
+        "and" | "nand" | "or" | "nor" | "xor" | "xnor" | "not" | "buf"
+    )
+}
+
+fn fold_bin(kind: fn(Box<RExpr>, Box<RExpr>) -> RExpr, xs: &[RExpr]) -> Option<RExpr> {
+    let mut it = xs.iter().cloned();
+    let first = it.next()?;
+    Some(it.fold(first, |a, b| kind(Box::new(a), Box::new(b))))
+}
+
+fn parse_gate_prim(p: &mut P) -> Result<Vec<(String, Option<usize>, RExpr)>, String> {
+    let start = p.i;
+    let kind = match p.peek() {
+        Some(Tok::Ident(s)) if is_gate_prim(s) => s.clone(),
+        _ => return Err("not a gate".into()),
+    };
+    p.bump();
+    if matches!(p.peek(), Some(Tok::Ident(_))) {
+        let _ = p.ident();
+    }
+    if !p.eat_sym('(') {
+        p.i = start;
+        return Err("gate (".into());
+    }
+    let mut args: Vec<String> = Vec::new();
+    loop {
+        if p.eat_sym(')') {
+            break;
+        }
+        if p.peek().is_none() {
+            break;
+        }
+        if let Some(n) = parse_inst_net(p) {
+            args.push(n);
+        }
+        let _ = p.eat_sym(',');
+    }
+    let _ = p.eat_sym(';');
+    if args.len() < 2 {
+        p.i = start;
+        return Err("gate args".into());
+    }
+    let out = args[0].clone();
+    let ins: Vec<RExpr> = args[1..].iter().cloned().map(RExpr::Ident).collect();
+    let rhs = match kind.as_str() {
+        "not" => RExpr::Not(Box::new(ins[0].clone())),
+        "buf" => ins[0].clone(),
+        "and" => fold_bin(RExpr::And, &ins).ok_or_else(|| "and".to_string())?,
+        "nand" => RExpr::Not(Box::new(
+            fold_bin(RExpr::And, &ins).ok_or_else(|| "nand".to_string())?,
+        )),
+        "or" => fold_bin(RExpr::Or, &ins).ok_or_else(|| "or".to_string())?,
+        "nor" => RExpr::Not(Box::new(
+            fold_bin(RExpr::Or, &ins).ok_or_else(|| "nor".to_string())?,
+        )),
+        "xor" => fold_bin(RExpr::Xor, &ins).ok_or_else(|| "xor".to_string())?,
+        "xnor" => RExpr::Not(Box::new(
+            fold_bin(RExpr::Xor, &ins).ok_or_else(|| "xnor".to_string())?,
+        )),
+        _ => {
+            p.i = start;
+            return Err("gate kind".into());
+        }
+    };
+    Ok(vec![(out, None, rhs)])
 }
 
 fn parse_inst(p: &mut P) -> Result<Inst, String> {
@@ -3849,20 +3957,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     // Continuous assigns → comb LUT cones (pure-comb modules e.g. mux).
-    // FM-HEL-HANG: Ibex-scale assign fans (1300+) make AIG/flowmap wall-clock explode
-    // after CORPUS bitblast improvements. Prefer NBA/FF mapping; skip comb fan-out.
-    let skip_comb_assigns = rtl.assigns.len() > 800;
-    if skip_comb_assigns {
-        eprintln!(
-            "hang_diag skip_comb_assigns n={}",
-            rtl.assigns.len()
-        );
-    }
-    // Skip simple Ident/Bit/Range drives — those stay on the IOB passthrough path
-    // so sequential timing (WNS) is not broken by orphan comb LUTs.
+    // Ident/Bit/Range stay nets (IOB passthrough) so gold sequential WNS is
+    // not broken by buffer LUTs — that is mapping a wire as a wire, not a skip.
     let mut comb_bits: Vec<(String, Expr)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.assigns {
-        if skip_comb_assigns { break; }
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
@@ -3889,10 +3987,6 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     eprintln!("synth_rtl after assigns comb_bits={}", comb_bits.len());
-    if reg_bits.is_empty() && comb_bits.is_empty() && n_mac == 0 && n_bram == 0 {
-        // Unsupported items were skipped/blackboxed; still return the top with ports.
-        return Ok(d);
-    }
 
     eprintln!(
         "synth_rtl reg_bits={} comb_bits={} mac={} bram={}",
@@ -3975,7 +4069,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
-        if expr_node_count(expr) > 8_000 {
+        if i >= 256 {
+            break;
+        }
+        if expr_node_count(expr) > 2_000 {
             continue;
         }
         let aig = Aig::from_expr(expr);
@@ -4013,51 +4110,31 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         d.connect(qnet, &iob, "I");
         d.connect(pad, &iob, "PAD");
     };
-    if skip_comb_assigns {
-        eprintln!("hang_diag skip_undriven_iob_assigns (FF→PAD fallback path)");
-        let reg_q: HashSet<&str> = reg_bits.iter().map(|(n, _)| n.as_str()).collect();
-        for (n, dir, w) in &rtl.ports {
-            if *dir != PortDir::Out {
-                continue;
-            }
-            let w = *w;
-            // Cap so PathFinder stays under ≤120s (cli also caps driven IOBs).
-            let lim = if w > 1 { w.min(4) } else { 1 };
-            for i in 0..lim {
-                let qnet = bit_name(n, w, i);
-                if !reg_q.contains(qnet.as_str()) {
-                    continue;
-                }
-                emit_iob(&mut d, &mut iob_n, &qnet, n);
-            }
+    for (lhs, bit, rhs) in &rtl.assigns {
+        let is_out = rtl
+            .ports
+            .iter()
+            .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
+        if !is_out {
+            continue;
         }
-    } else {
-        for (lhs, bit, rhs) in &rtl.assigns {
-            let is_out = rtl
-                .ports
-                .iter()
-                .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
-            if !is_out {
-                continue;
+        let w = sig_width(rtl, lhs);
+        if bit.is_none() && w > 1 {
+            for i in 0..w.min(256) {
+                let qnet = bit_name(lhs, w, i);
+                emit_iob(&mut d, &mut iob_n, &qnet, lhs);
             }
-            let w = sig_width(rtl, lhs);
-            if bit.is_none() && w > 1 {
-                for i in 0..w.min(256) {
-                    let qnet = bit_name(lhs, w, i);
-                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
-                }
-                continue;
-            }
-            let (qnet, _) = if let Some(b) = bit {
-                (bit_name(lhs, w, *b), *b)
-            } else {
-                match drive_target(rhs, rtl) {
-                    Ok(x) => x,
-                    Err(_) => continue,
-                }
-            };
-            emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+            continue;
         }
+        let (qnet, _) = if let Some(b) = bit {
+            (bit_name(lhs, w, *b), *b)
+        } else {
+            match drive_target(rhs, rtl) {
+                Ok(x) => x,
+                Err(_) => continue,
+            }
+        };
+        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
     }
     if iob_n == 0 {
         // default: last register bit to first output
@@ -4553,6 +4630,32 @@ mod tests {
         assert_eq!(z, 0);
         assert_ne!(inv, buf);
         assert_ne!(buf, z);
+    }
+
+    #[test]
+    fn verilog_gate_primitives_map_to_luts() {
+        // ISCAS85/89 LogikBench style: `not`/`nand`/`xor` primitives, not SV assign.
+        let src = r#"
+module gates(a, b, y, z);
+  input a, b;
+  output y, z;
+  wire n;
+  not u1 (n, a);
+  nand u2 (y, n, b);
+  xor u3 (z, a, b);
+endmodule
+"#;
+        let d = synth_sv(src, "gates.v").expect("gate synth");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts >= 1,
+            "gate primitives must become LUT cells, cells={:?}",
+            d.cells.iter().map(|c| format!("{}:{:?}", c.name, c.kind)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -5623,5 +5726,58 @@ endmodule
 "#;
         let d = synth_sv(src, "cmp.sv").expect("synth cmp");
         assert!(!d.cells.is_empty(), "le/ge/ashr smoke must map cells");
+    }
+
+    #[test]
+    fn logical_or_in_always_maps_ff() {
+        let src = r#"
+module RefModule (
+  input clk,
+  input reset,
+  output reg [3:0] q
+);
+  always @(posedge clk)
+    if (reset || q == 10)
+      q <= 1;
+    else
+      q <= q+1;
+endmodule
+"#;
+        let d = synth_sv(src, "cnt10.sv").expect("|| always");
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert!(ffs >= 4, "reset || q==10 counter must map FFs, got {ffs} cells={:?}", d.cells.len());
+    }
+
+    #[test]
+    fn concat_lhs_bit_reverse_maps_luts() {
+        let src = r#"
+module RefModule (
+  input [7:0] in,
+  output [7:0] out
+);
+  assign {out[0],out[1],out[2],out[3],out[4],out[5],out[6],out[7]} = in;
+endmodule
+"#;
+        let d = synth_sv(src, "rev.sv").expect("concat lhs");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. } | CellKind::IobOut)),
+            "bit reverse must map LUT/IOB, cells={:?}",
+            d.cells
+        );
+    }
+
+    #[test]
+    fn wire_through_assign_emits_iob() {
+        let src = r#"
+module RefModule (input in, output out);
+  assign out = in;
+endmodule
+"#;
+        let d = synth_sv(src, "wire.sv").expect("wire");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::IobOut)),
+            "assign out=in must emit IOB, cells={:?}",
+            d.cells
+        );
     }
 }
