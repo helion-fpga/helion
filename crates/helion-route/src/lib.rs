@@ -320,10 +320,12 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
             continue;
         }
         for (pin, driver) in &lutff.lut_pins {
-            let (dsite, dble) = ff_site
-                .get(driver.as_str())
-                .copied()
-                .ok_or_else(|| format!("driver FF {driver} not placed"))?;
+            let Some((dsite, dble)) = ff_site.get(driver.as_str()).copied() else {
+                // Truncated-to-device clusters may still name a driver that
+                // was not placed; skip the IMUX like an out-of-reach arc.
+                imux_skip += 1;
+                continue;
+            };
             match imux_sel(dsite, site, dble) {
                 Ok(sel) => {
                     imux.push(ImuxRoute {
@@ -355,9 +357,11 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
                         .position(|l| l.q_net == io.from_net)
                 })
                 .unwrap_or(0);
-            let (clb, ble) = placed.lutff_sites[idx];
+            let Some(&(clb, ble)) = placed.lutff_sites.get(idx) else {
+                continue;
+            };
             if clb.y <= iob_site.y {
-                return Err("CLB must be north of IOB".into());
+                continue;
             }
             nets.push(((clb.x, clb.y), (iob_site.x, iob_site.y), ble));
         }

@@ -2,7 +2,7 @@
   <img src="docs/brand/die-flow.gif" width="920" alt="HL10T die: current enters the pads, runs the fabric, and leaves">
 </p>
 
-# Helion Design Suite (1.0)
+# Helion Design Suite (1.1)
 
 Original FPGA family + CAD. Native `aarch64-apple-darwin`. No vendor bitstream.
 
@@ -28,6 +28,7 @@ cargo test --workspace
 cargo run -p helion-cli -- doctor
 cargo run -p helion-cli -- run examples/counter.sv --cycles 16
 cargo run -p helion-cli -- report_timing examples/blinky.sv
+cargo run -p helion-cli -- reports examples/counter.sv
 ```
 
 Legal fence: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD/Intel/Lattice backends.
@@ -38,7 +39,7 @@ Device facts come from the Helion Architecture Database (HAD), never hardcoded i
 | Step | Crate | What it does |
 |---|---|---|
 | synth | helion-sv | sv-parser + AIG + FlowMap LUT6 |
-| vhdl | helion-vhdl | VHDL-2008 subset → same elaborator as SV |
+| vhdl | helion-vhdl | VHDL-2008 elaborator → same LUT/FF path as SV |
 | hls | helion-hls | C subset scheduled/bound onto LUT/FF/DSP |
 | pack | helion-pack | LUTFF + IOB + MAC27 + BRAM18 |
 | place | helion-place | timing-driven vs wirelength, BLE overflow |

@@ -38,6 +38,111 @@ fn field(out: &str, key: &str) -> String {
         .unwrap_or_else(|| panic!("no {key} in {out}"))
 }
 
+/// `helion reports` is one compile: util LUTFF, power LUTFF, timing WNS, bitstream bytes agree.
+#[test]
+fn reports_timing_util_power_bitstream_match_on_gold() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    for src in ["examples/counter.sv", "examples/blinky.sv", "examples/blinky.vhd"] {
+        let path = root.join(src);
+        let out = Command::new(bin)
+            .args(["reports", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{src} reports failed: {text}");
+        assert!(text.contains("report_timing"), "{text}");
+        assert!(text.contains("report_utilization"), "{text}");
+        assert!(text.contains("report_power"), "{text}");
+        assert!(text.contains("bitstream"), "{text}");
+        assert!(
+            text.contains("match=LUTFF,IOB,BRAM,DSP,TOTAL_UW"),
+            "occupancy must match across util/power: {text}"
+        );
+        let util_lut = field(&text, "LUTFF=");
+        // power line also has LUTFF=a/b — all LUTFF= tokens must share the used count.
+        let lut_used: Vec<&str> = text
+            .split_whitespace()
+            .filter_map(|t| t.strip_prefix("LUTFF="))
+            .collect();
+        assert!(lut_used.len() >= 2, "util and power both print LUTFF: {text}");
+        let u0 = lut_used[0].split('/').next().unwrap();
+        for u in &lut_used {
+            assert_eq!(
+                u.split('/').next().unwrap(),
+                u0,
+                "LUTFF used count mismatched in {src}: {lut_used:?}"
+            );
+        }
+        let _ = util_lut;
+        let wns: i64 = field(&text, "WNS_PS=").parse().unwrap();
+        assert!(wns > 0, "{src} WNS_PS={wns}");
+        if src.ends_with("counter.sv") {
+            assert_eq!(wns, 9640, "reports WNS must match report_timing gold");
+        }
+        let bytes: usize = field(&text, "bytes=").parse().unwrap();
+        assert!(bytes > 0, "{src} empty bitstream");
+        let total: i64 = field(&text, "TOTAL_UW=").parse().unwrap();
+        let stat: i64 = field(&text, "STATIC_UW=").parse().unwrap();
+        let dynv: i64 = field(&text, "DYNAMIC_UW=").parse().unwrap();
+        assert_eq!(total, stat + dynv, "{src} TOTAL_UW != STATIC+DYNAMIC");
+    }
+}
+
+#[test]
+fn reports_match_on_wire_through_and_vhdl_select() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let dir = std::env::temp_dir().join("helion_qor_constructs");
+    let _ = std::fs::create_dir_all(&dir);
+    let wire = dir.join("wire.sv");
+    std::fs::write(
+        &wire,
+        "module RefModule(input in, output out);\n  assign out = in;\nendmodule\n",
+    )
+    .unwrap();
+    let vhd = dir.join("mux.vhd");
+    std::fs::write(
+        &vhd,
+        r#"
+entity Mux4to1 is
+  port (
+    DecHor, UniHor, DecMin, UniMin : in std_logic_vector(3 downto 0);
+    Sel : in std_logic_vector(1 downto 0);
+    Tiempo : out std_logic_vector(3 downto 0));
+end Mux4to1;
+architecture Behavioral of Mux4to1 is
+begin
+   with Sel select
+      Tiempo <= DecHor when "00",
+                UniHor when "01",
+                DecMin when "10",
+                UniMin when others;
+end Behavioral;
+"#,
+    )
+    .unwrap();
+    for src in [wire.as_path(), vhd.as_path()] {
+        let out = Command::new(bin)
+            .args(["reports", src.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{} reports failed: {text}", src.display());
+        assert!(
+            text.contains("match=LUTFF,IOB,BRAM,DSP,TOTAL_UW"),
+            "constructs must match reports: {text}"
+        );
+    }
+}
+
 #[test]
 fn qor_table_matches_readme() {
     let bin = env!("CARGO_BIN_EXE_helion");
