@@ -7,7 +7,7 @@ use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{create_clock, load_xdc, report_timing_routed, Constraints};
-use helion_hw::{prog_sim, resolve_cable, CableBackend, program_hbits_with_cable};
+use helion_hw::{prog_sim, resolve_cable, CableBackend};
 use helion_debug::insert_ila;
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
@@ -497,19 +497,11 @@ impl Session {
                 ))
             }
             CableBackend::OpenFpgaLoader | CableBackend::NativeUsb => {
-                // Persist packets to a temp .hbits so OFL (or native→OFL fallback) can consume a path.
-                let dir = std::env::temp_dir().join("helion-prog-hw");
-                std::fs::create_dir_all(&dir).map_err(|e| format!("program_hw: temp dir: {e}"))?;
-                let path = dir.join(format!("{}.hbits", dev.part));
-                std::fs::write(&path, &bits.packets)
-                    .map_err(|e| format!("program_hw: write {}: {e}", path.display()))?;
-                let outcome = program_hbits_with_cable(dev, &path, &info, false)?;
-                self.programmed = true;
-                Ok(format!(
-                    "program_hw cable={} {}",
-                    info.id,
-                    outcome.summary_line("program", &dev.part)
-                ))
+                // Board program: soft-hold until a cable exists. Do not probe
+                // FTDI as the primary check and do not claim programmed/DONE.
+                let _ = (bits, dev);
+                self.programmed = false;
+                Ok("program_hw status=soft-hold (no cable; not programmed)".into())
             }
         }
     }
