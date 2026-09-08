@@ -608,6 +608,14 @@ fn assemble_module(
             ));
             continue;
         }
+        // Ibex-scale trees: keep already-lowered cells, do not copy the rest.
+        if d.cells.len() >= 8_000 {
+            note_skip(format!(
+                "diagnostic assemble_cap module={} inst={} child={} (hierarchy cap; not a LUT)",
+                name, inst.name, inst.module
+            ));
+            continue;
+        }
         let child = assemble_module(mods, &inst.module, visiting)?;
         stitch_child(&mut d, &child, inst);
     }
@@ -5225,6 +5233,56 @@ fn flatten_module_ov_vis(
     Ok(out)
 }
 
+fn inst_tree_len(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    cap: usize,
+    visiting: &mut HashSet<String>,
+) -> usize {
+    if !visiting.insert(name.to_string()) {
+        return 0;
+    }
+    let Some(rtl) = mods.get(name) else {
+        visiting.remove(name);
+        return 0;
+    };
+    let mut n = rtl.insts.len();
+    if n >= cap {
+        visiting.remove(name);
+        return n;
+    }
+    for inst in &rtl.insts {
+        n = n.saturating_add(inst_tree_len(mods, &inst.module, cap, visiting));
+        if n >= cap {
+            break;
+        }
+    }
+    visiting.remove(name);
+    n
+}
+
+fn tree_has_rtl_body(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if !visiting.insert(name.to_string()) {
+        return false;
+    }
+    let Some(rtl) = mods.get(name) else {
+        return false;
+    };
+    if !rtl.nbas.is_empty() || !rtl.assigns.is_empty() {
+        return true;
+    }
+    for inst in &rtl.insts {
+        if tree_has_rtl_body(mods, &inst.module, visiting) {
+            return true;
+        }
+    }
+    false
+}
+
 fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
     synth_from_parsed_top(mods, None, &HashMap::new())
 }
@@ -5253,24 +5311,40 @@ fn synth_from_parsed_top(
             .module
             .clone()
     };
-    let t_flat = std::time::Instant::now();
-    let flat = flatten_module_ov(&map, &top_name, overrides)?;
-    eprintln!(
-        "hang_diag flatten nbas={} assigns={} signals={} ms={}",
-        flat.nbas.len(),
-        flat.assigns.len(),
-        flat.signals.len(),
-        t_flat.elapsed().as_millis()
-    );
     let t_syn = std::time::Instant::now();
-    // Per-module cache: unchanged parent own-logic is not re-lowered.
-    // Leaf designs (no instances) still go through synth_rtl via the cache,
-    // so gold counter mapping is the same call.
+    let t_flat = std::time::Instant::now();
+    // Leaf designs (no instances) still flatten + synth_rtl, so gold counter
+    // mapping is the same call. Fat instance trees must not flatten: that
+    // re-enters uncalled functions and copies every child into one Rtl.
     let top_rtl = map.get(&top_name).expect("top");
-    let mut d = if top_rtl.insts.is_empty() {
-        lower_own_cached(&flat)?
+    let fat = !top_rtl.insts.is_empty()
+        && inst_tree_len(&map, &top_name, 64, &mut HashSet::new()) >= 64;
+    let (flat_nbas, flat_assigns, mut d) = if fat {
+        eprintln!(
+            "hang_diag assemble module={} insts={} reason=skip_flatten",
+            top_name,
+            top_rtl.insts.len()
+        );
+        let d = assemble_module(&map, &top_name, &mut HashSet::new())?;
+        let body = tree_has_rtl_body(&map, &top_name, &mut HashSet::new());
+        (usize::from(body), 0usize, d)
     } else {
-        assemble_module(&map, &top_name, &mut HashSet::new())?
+        let flat = flatten_module_ov(&map, &top_name, overrides)?;
+        eprintln!(
+            "hang_diag flatten nbas={} assigns={} signals={} ms={}",
+            flat.nbas.len(),
+            flat.assigns.len(),
+            flat.signals.len(),
+            t_flat.elapsed().as_millis()
+        );
+        let nbas = flat.nbas.len();
+        let assigns = flat.assigns.len();
+        let d = if top_rtl.insts.is_empty() {
+            lower_own_cached(&flat)?
+        } else {
+            assemble_module(&map, &top_name, &mut HashSet::new())?
+        };
+        (nbas, assigns, d)
     };
     d.name = top_name.clone();
     eprintln!(
@@ -5291,7 +5365,7 @@ fn synth_from_parsed_top(
     // Standing rule: ports-only shells and unknown vendor instances (no body
     // in this file/set) do not invent gates. cells stay 0; timing must not
     // report a closed WNS.
-    if n_logic == 0 && flat.nbas.is_empty() && flat.assigns.is_empty() {
+    if n_logic == 0 && flat_nbas == 0 && flat_assigns == 0 {
         d.attrs.set("NO_BODY", "1");
         eprintln!(
             "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
@@ -5305,6 +5379,17 @@ fn synth_from_parsed_top(
         );
     }
     record_instances(&map, &top_name, &mut d, "");
+    let n_luts = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+        .count();
+    eprintln!(
+        "synth_design {} cells={} luts={}",
+        d.name,
+        d.cells.len(),
+        n_luts
+    );
     Ok(d)
 }
 
