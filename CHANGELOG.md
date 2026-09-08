@@ -4,6 +4,21 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [1.1.1] — 2026-09-08
+
+Patch: the IDE Open / Synth rail actually elaborates `.vhd` / `.vhdl`.
+1.1.0 CLI already used `helion-vhdl`; the desktop app still called
+`synth_sv_path`, so `examples/blinky.vhd` failed in Helion.app. Gold
+empty-XDC `counter.sv` is unchanged (**WNS_PS=9640**).
+
+### Fixed
+
+- IDE `open_source` / `synth_design` / incremental impl dispatch `.vhd` and
+  `.vhdl` through `helion-vhdl` (`synth_hdl_path`). `blinky.vhd` maps LUT+FF
+  and paints the schematic.
+
+[1.1.1]: https://github.com/helion-fpga/helion/releases/tag/v1.1.1
+
 ## [1.1.0] — 2026-09-07
 
 Language coverage and schematic camera. Same family, same empty-XDC

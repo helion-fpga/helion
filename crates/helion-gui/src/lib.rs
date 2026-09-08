@@ -37,7 +37,22 @@ pub use helion_sta::{
 };
 
 use helion_device::Device;
+use helion_ir::Design;
 use helion_proj::{get_cells, get_nets, get_pins, opt_design, Mode, Session};
+use std::path::Path;
+
+/// Elaborate RTL by extension: `.vhd`/`.vhdl` through helion-vhdl, else SV.
+pub fn synth_hdl_path(path: &Path) -> Result<Design, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "vhd" | "vhdl" => helion_vhdl::synth_vhdl_path(path),
+        _ => helion_sv::synth_sv_path(path),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Tree {
@@ -112,7 +127,7 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         .or_else(|| t.strip_prefix("synth_design "))
         .or_else(|| t.strip_prefix("read_sv "))
     {
-        let d = helion_sv::synth_sv_path(std::path::Path::new(path.trim()))?;
+        let d = synth_hdl_path(std::path::Path::new(path.trim()))?;
         shell.tree.nodes.push(d.name.clone());
         let msg = format!("synth {} cells {} luts {}", d.name, d.cells.len(), d.lut_inits().len());
         shell.session.synth_design(d);
