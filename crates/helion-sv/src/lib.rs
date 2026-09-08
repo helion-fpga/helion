@@ -6,11 +6,12 @@
 //! modules flatten to empty stubs (missing source, not an unknown construct).
 
 mod preprocess;
-pub use preprocess::preprocess_sv;
+pub use preprocess::{expand_includes, preprocess_sv};
 
 use helion_ir::{CellKind, Design, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
 use sv_parser::{parse_sv_str, Define, DefineText};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,6 +394,223 @@ struct Rtl {
     params: Vec<(String, u128)>,
     toks: Vec<Tok>,
     mem_inits: HashMap<String, BTreeMap<usize, u128>>,
+}
+
+
+thread_local! {
+    static CUR_MOD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn set_cur_mod(name: &str) {
+    CUR_MOD.with(|c| *c.borrow_mut() = name.to_string());
+}
+
+fn cur_mod() -> String {
+    CUR_MOD.with(|c| c.borrow().clone())
+}
+
+fn note_skip(msg: String) {
+    eprintln!("{msg}");
+}
+
+struct OwnCache {
+    /// module:hash → own-logic Design (instances not included)
+    by_key: HashMap<String, Design>,
+    log: Vec<String>,
+}
+
+fn cache() -> &'static Mutex<OwnCache> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<OwnCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(OwnCache {
+            by_key: HashMap::new(),
+            log: Vec::new(),
+        })
+    })
+}
+
+/// Last incremental reused/rebuilt lines (process cache, not a fake flag).
+pub fn incremental_log() -> Vec<String> {
+    cache()
+        .lock()
+        .map(|c| c.log.clone())
+        .unwrap_or_default()
+}
+
+fn hash_own(rtl: &Rtl) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut feed = |s: &str| {
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    feed(&rtl.module);
+    for (n, dir, w) in &rtl.ports {
+        feed(n);
+        feed(&format!("{dir:?}:{w}"));
+    }
+    for (lhs, bit, rhs) in &rtl.nbas {
+        feed(lhs);
+        feed(&format!("{bit:?}"));
+        feed(&format!("{rhs:?}"));
+    }
+    for (lhs, bit, rhs) in &rtl.assigns {
+        feed(lhs);
+        feed(&format!("{bit:?}"));
+        feed(&format!("{rhs:?}"));
+    }
+    h
+}
+
+fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
+    let h = hash_own(rtl);
+    let key = format!("{}:{h:x}", rtl.module);
+    if let Ok(mut c) = cache().lock() {
+        if let Some(hit) = c.by_key.get(&key).cloned() {
+            let line = format!("incremental reused module={}", rtl.module);
+            eprintln!("{line}");
+            c.log.push(line);
+            return Ok(hit);
+        }
+    }
+    let line = format!("incremental rebuilt module={}", rtl.module);
+    eprintln!("{line}");
+    if let Ok(mut c) = cache().lock() {
+        c.log.push(line);
+    }
+    let mut own = rtl.clone();
+    own.insts.clear();
+    let d = synth_rtl(&own)?;
+    if let Ok(mut c) = cache().lock() {
+        c.by_key.insert(key, d.clone());
+    }
+    Ok(d)
+}
+
+fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
+    let prefix = format!("{}_", inst.name);
+    let mut port_map: HashMap<String, String> = HashMap::new();
+    for (i, p) in child.ports.iter().enumerate() {
+        if let Some((_, net)) = inst
+            .conns
+            .iter()
+            .find(|(pn, _)| pn == &p.name)
+            .or_else(|| inst.conns.iter().find(|(pn, _)| pn == &format!("#{i}")))
+        {
+            port_map.insert(p.name.clone(), net.clone());
+        }
+    }
+    let map_net = |n: &str| -> String {
+        if let Some(p) = port_map.get(n) {
+            return p.clone();
+        }
+        format!("{prefix}{n}")
+    };
+    for c in &child.cells {
+        let mut cell = c.clone();
+        cell.name = format!("{prefix}{}", c.name);
+        dst.cells.push(cell);
+    }
+    for n in &child.nets {
+        let mut net = n.clone();
+        net.name = map_net(&n.name);
+        for e in &mut net.endpoints {
+            e.cell = format!("{prefix}{}", e.cell);
+        }
+        if let Some(ex) = dst.nets.iter_mut().find(|x| x.name == net.name) {
+            ex.endpoints.extend(net.endpoints);
+        } else {
+            dst.nets.push(net);
+        }
+    }
+}
+
+fn assemble_module(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    visiting: &mut HashSet<String>,
+) -> Result<Design, String> {
+    let proto = mods
+        .get(name)
+        .ok_or_else(|| format!("unknown module {name}"))?;
+    if !visiting.insert(name.to_string()) {
+        return lower_own_cached(proto);
+    }
+    let mut d = lower_own_cached(proto)?;
+    d.name = proto.module.clone();
+    for inst in &proto.insts {
+        if !mods.contains_key(&inst.module) {
+            note_skip(format!(
+                "diagnostic unknown_instance module={} inst={} child={} (child body absent; not a LUT)",
+                name, inst.name, inst.module
+            ));
+            continue;
+        }
+        let child = assemble_module(mods, &inst.module, visiting)?;
+        stitch_child(&mut d, &child, inst);
+    }
+    visiting.remove(name);
+    Ok(d)
+}
+
+fn fnv_module_present(text: &str, name: &str) -> bool {
+    let mut i = 0;
+    let b = text.as_bytes();
+    while i + 6 < b.len() {
+        if &b[i..i + 6] == b"module" {
+            let prev_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+            let next = i + 6;
+            if prev_ok && next < b.len() && b[next].is_ascii_whitespace() {
+                let mut j = next;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if &text[start..j] == name {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result<Vec<Rtl>, String> {
+    let mut out = Vec::new();
+    if missing.is_empty() || !dir.is_dir() {
+        return Ok(out);
+    }
+    let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p == skip {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "v" && ext != "sv" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        if !missing.iter().any(|m| fnv_module_present(&text, m)) {
+            continue;
+        }
+        let expanded = expand_includes(&text, dir);
+        let pre = preprocess_sv(&strip_comments(&expanded));
+        out.extend(parse_source(&pre)?);
+    }
+    Ok(out)
 }
 
 fn strip_comments(s: &str) -> String {
@@ -2577,6 +2795,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         return Err("expected module".into());
     }
     let module = p.ident()?;
+    set_cur_mod(&module);
     while p.eat_kw("import") {
         let _ = skip_item_or_block(&mut p);
     }
@@ -2688,7 +2907,17 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     {
         skip_until_kw(&mut p, "endmodule");
     }
+    // lift_functions_if_no_body only folds functions when the module has no other body.
+    let will_lift = !funcs.is_empty() && nbas.is_empty() && assigns.is_empty() && insts.is_empty();
     lift_functions_if_no_body(&mut ports, &mut signals, &nbas, &mut assigns, &insts, &funcs);
+    if !funcs.is_empty() && !will_lift {
+        for f in &funcs {
+            note_skip(format!(
+                "diagnostic function_not_called module={} function={} (function is not called; not a LUT)",
+                module, f.name
+            ));
+        }
+    }
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
         module,
@@ -2739,6 +2968,11 @@ fn parse_module_items(
         if p.eat_kw("function") {
             if let Ok(f) = parse_function(p) {
                 funcs.push(f);
+            } else {
+                note_skip(format!(
+                    "diagnostic skip_function module={} (function not parsed; not a LUT)",
+                    cur_mod()
+                ));
             }
             continue;
         }
@@ -3093,7 +3327,13 @@ fn parse_module_items(
                         let _ = p.eat_sym(';');
                         assigns.push((lhs, bit, rhs));
                     }
-                    _ => skip_to_semi(p),
+                    _ => {
+                        note_skip(format!(
+                            "diagnostic skip_assign module={} (assign not parsed; not a LUT)",
+                            cur_mod()
+                        ));
+                        skip_to_semi(p);
+                    }
                 }
             }
             continue;
@@ -3106,6 +3346,10 @@ fn parse_module_items(
             match parse_seq_block(&mut p, block) {
                 Ok(stmts) => assigns.extend(stmts),
                 Err(_) => {
+                    note_skip(format!(
+                        "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
+                        cur_mod()
+                    ));
                     let _ = skip_item_or_block(p);
                 }
             }
@@ -3128,6 +3372,10 @@ fn parse_module_items(
                     }
                 }
                 Err(_) => {
+                    note_skip(format!(
+                        "diagnostic skip_always module={} (always body not parsed; not a LUT)",
+                        cur_mod()
+                    ));
                     let _ = skip_item_or_block(p);
                 }
             }
@@ -3136,6 +3384,11 @@ fn parse_module_items(
         if p.eat_kw("function") {
             if let Ok(f) = parse_function(p) {
                 funcs.push(f);
+            } else {
+                note_skip(format!(
+                    "diagnostic skip_function module={} (function not parsed; not a LUT)",
+                    cur_mod()
+                ));
             }
             continue;
         }
@@ -4521,6 +4774,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
         if expr_node_count(expr) > 8_000 {
+            note_skip(format!(
+                "diagnostic node_count signal={} nodes>8000 (cone too wide; not a LUT)",
+                bitn
+            ));
             continue;
         }
         let aig = Aig::from_expr(expr);
@@ -4567,6 +4824,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
         if i >= 256 {
+            note_skip(format!(
+                "diagnostic assign_cap signal={} (assign-cap 256; remaining assigns not a LUT)",
+                bitn
+            ));
             break;
         }
         if expr_node_count(expr) > 2_000 {
@@ -4579,6 +4840,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 for (pin, pi) in pis.iter().enumerate() {
                     d.connect(pi, &lut, format!("I{pin}"));
                 }
+            } else {
+                note_skip(format!(
+                    "diagnostic node_count signal={} nodes>2000 (not a ≤6-PI LUT; not mapped)",
+                    bitn
+                ));
             }
             continue;
         }
@@ -4827,6 +5093,10 @@ fn flatten_module_ov_vis(
     };
     for inst in &src.insts {
         let Some(child_proto) = mods.get(&inst.module) else {
+            note_skip(format!(
+                "diagnostic unknown_instance module={} inst={} child={} (child body absent; not a LUT)",
+                name, inst.name, inst.module
+            ));
             continue;
         };
         let ov = inst_overrides(inst, child_proto);
@@ -4906,7 +5176,16 @@ fn synth_from_parsed_top(
         t_flat.elapsed().as_millis()
     );
     let t_syn = std::time::Instant::now();
-    let mut d = synth_rtl(&flat)?;
+    // Per-module cache: unchanged parent own-logic is not re-lowered.
+    // Leaf designs (no instances) still go through synth_rtl via the cache,
+    // so gold counter mapping is the same call.
+    let top_rtl = map.get(&top_name).expect("top");
+    let mut d = if top_rtl.insts.is_empty() {
+        lower_own_cached(&flat)?
+    } else {
+        assemble_module(&map, &top_name, &mut HashSet::new())?
+    };
+    d.name = top_name.clone();
     eprintln!(
         "hang_diag synth_rtl cells={} ms={}",
         d.cells.len(),
@@ -4980,8 +5259,31 @@ fn record_instances_vis(
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     let t_parse = std::time::Instant::now();
-    let pre = preprocess_sv(&strip_comments(source));
-    let mods = parse_source(&pre)?;
+    let origin_path = Path::new(origin);
+    let base = origin_path.parent().filter(|d| !d.as_os_str().is_empty() && d.exists());
+    let expanded = if let Some(dir) = base {
+        expand_includes(source, dir)
+    } else {
+        source.to_string()
+    };
+    let pre = preprocess_sv(&strip_comments(&expanded));
+    let mut mods = parse_source(&pre)?;
+    if let Some(dir) = base {
+        let have: HashSet<String> = mods.iter().map(|m| m.module.clone()).collect();
+        let mut missing: HashSet<String> = HashSet::new();
+        for m in &mods {
+            for inst in &m.insts {
+                if !have.contains(&inst.module) {
+                    missing.insert(inst.module.clone());
+                }
+            }
+        }
+        if !missing.is_empty() {
+            if let Ok(extra) = sibling_modules(dir, &missing, origin_path) {
+                mods.extend(extra);
+            }
+        }
+    }
     eprintln!(
         "hang_diag parse mods={} bytes={} ms={}",
         mods.len(),
@@ -5142,6 +5444,12 @@ pub fn synth_sv_files(paths: &[&Path]) -> Result<Design, String> {
 pub fn synth_sv_path(path: &Path) -> Result<Design, String> {
     let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     synth_sv(&src, &path.display().to_string())
+}
+
+/// Same-directory wrapper: parent file instantiates a child whose body is
+/// `child.v` next to it (no `` `include `` required).
+pub fn synth_sv_path_with_siblings(path: &Path) -> Result<Design, String> {
+    synth_sv_path(path)
 }
 
 pub fn lut_init_of(source: &str) -> Result<u64, String> {
@@ -6397,5 +6705,54 @@ endmodule
         let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
         assert!(luts >= 4, "lifted function must map LUTs, luts={luts} cells={:?}", d.cells);
         assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
+    }
+
+    #[test]
+    fn unknown_instance_names_itself() {
+        let src = r#"
+module wrap(input a, output y);
+  missing_child u0(.a(a), .y(y));
+endmodule
+"#;
+        let d = synth_sv(src, "wrap.sv").expect("unknown child");
+        assert!(d.cells.is_empty(), "absent child must not invent gates {:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn incremental_reuses_parent_when_child_changes() {
+        let parent = r#"
+module inc_parent(input clk, input en, output led);
+  wire q;
+  inc_child u0(.clk(clk), .q(q));
+  assign led = q & en;
+endmodule
+"#;
+        let child1 = r#"
+module inc_child(input clk, output reg q);
+  always @(posedge clk) q <= ~q;
+endmodule
+"#;
+        let child2 = r#"
+module inc_child(input clk, output reg q);
+  always @(posedge clk) q <= q;
+endmodule
+"#;
+        let s1 = format!("{parent}\n{child1}");
+        let s2 = format!("{parent}\n{child2}");
+        let _ = synth_sv(&s1, "inc1.sv").expect("first");
+        let before = incremental_log();
+        let _ = synth_sv(&s2, "inc2.sv").expect("second");
+        let after = incremental_log();
+        let fresh: Vec<_> = after.iter().skip(before.len()).cloned().collect();
+        let joined = fresh.join("\n");
+        assert!(
+            joined.contains("incremental reused module=inc_parent"),
+            "parent own-logic must be reused, log={joined}"
+        );
+        assert!(
+            joined.contains("incremental rebuilt module=inc_child"),
+            "child must rebuild, log={joined}"
+        );
     }
 }

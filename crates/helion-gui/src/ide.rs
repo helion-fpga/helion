@@ -4529,6 +4529,8 @@ pub struct IdeModel {
     pub utilization: Option<Utilization>,
     pub status: String,
     pub clock_period_ps: u64,
+    /// True after a user SDC/XDC with a clock is loaded (not the built-in 10 ns).
+    pub user_sdc: bool,
     pub nav: NavSection,
     pub layout: LayoutKind,
     pub messages: Vec<IdeMessage>,
@@ -4714,6 +4716,7 @@ impl IdeModel {
             utilization: None,
             status: "idle".into(),
             clock_period_ps: 10_000,
+            user_sdc: false,
             nav: NavSection::ProjectManager,
             layout: LayoutKind::Default,
             messages: Vec::new(),
@@ -6320,6 +6323,11 @@ impl IdeModel {
                     msg.push_str(" no_body");
                 }
                 self.shell.session.synth_design(d);
+                self.load_sibling_sdc(&path);
+                let rtl_s = path.to_string_lossy().into_owned();
+                if self.tree.sources.last().map(|s| s.as_str()) != Some(rtl_s.as_str()) {
+                    self.tree.sources.push(rtl_s);
+                }
                 self.steps[FlowStep::Opt.index()] = StepState::Pending;
                 self.steps[FlowStep::Place.index()] = StepState::Pending;
                 self.steps[FlowStep::Route.index()] = StepState::Pending;
@@ -16325,6 +16333,9 @@ impl IdeModel {
         let n_tb = extra.max_time_borrows.len();
         let n_dc = extra.data_checks.len();
         self.merge_constraints(extra);
+        if n > 0 {
+            self.user_sdc = true;
+        }
         let p = path.to_string();
         if !self.tree.sources.contains(&p) {
             self.tree.sources.push(p);
@@ -16332,6 +16343,41 @@ impl IdeModel {
         Ok(format!(
             "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md} min_delay={n_mind} clock_groups={n_cg} uncertainty={n_u} latency={n_l} disable_timing={n_dt} case_analysis={n_ca} propagated_clock={n_pc} clock_sense={n_cs} input_jitter={n_ij} system_jitter={n_sj} timing_derate={n_td} operating_conditions={n_oc} bus_skew={n_bs} group_path={n_gp} time_borrow={n_tb} data_check={n_dc}"
         ))
+    }
+
+    fn load_sibling_sdc(&mut self, rtl: &std::path::Path) {
+        if self.user_sdc {
+            return;
+        }
+        for ext in ["sdc", "xdc"] {
+            let cand = rtl.with_extension(ext);
+            if cand.is_file() {
+                if self.read_xdc_path(&cand.to_string_lossy()).is_ok() && self.user_sdc {
+                    eprintln!("loaded user SDC {}", cand.display());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn design_closed_timing(d: &helion_ir::Design) -> bool {
+        if d.attrs.get("NO_BODY") == Some("1") {
+            return false;
+        }
+        let n_logic = d.cells.iter().filter(|c| {
+            matches!(
+                c.kind,
+                helion_ir::CellKind::Lut6 { .. }
+                    | helion_ir::CellKind::Hff
+                    | helion_ir::CellKind::Mac27
+                    | helion_ir::CellKind::Bram18
+            )
+        }).count();
+        let clock_path = d
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, helion_ir::CellKind::Hff));
+        n_logic > 0 && clock_path
     }
 
     fn clocks_for_sta(&self) -> Vec<helion_sta::Clock> {
@@ -16387,6 +16433,17 @@ impl IdeModel {
                     d.cells.len()
                 ));
             }
+            let clock_path = d
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, helion_ir::CellKind::Hff));
+            if !clock_path {
+                return Ok(format!(
+                    "report_timing {} no_clock_path cells={} (no timing: no clock path; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
         }
         if self.shell.session.routed.is_none() {
             let dev = self.device()?;
@@ -16399,8 +16456,33 @@ impl IdeModel {
         let d = self.shell.session.design.as_ref().unwrap();
         let r = self.shell.session.routed.as_ref().unwrap();
         let t = report_timing_routed_xdc(d, r, &clks, &self.constraints)?;
+        let clk = clks.first();
+        let clk_name = clk.map(|c| c.name.as_str()).unwrap_or("clk");
+        let period = clk.map(|c| c.period_ps).unwrap_or(self.clock_period_ps);
+        let src = clk.map(|c| c.source.as_str()).unwrap_or("clk");
+        let path = if t.wns_ps < 0 {
+            let need_ns = (t.setup_ps.max(1) as f64) / 1000.0;
+            format!(
+                " failing path: setup slack {wns} ps on clock {clk_name} (requirement {period} ps, data delay {setup} ps, r2r={r2r} iob={iob} route={route}). next constraint: create_clock -period {need_ns:.3} [get_ports {src}]",
+                wns = t.wns_ps,
+                setup = t.setup_ps,
+                r2r = t.r2r_ps,
+                iob = t.iob_ps,
+                route = t.route_ps,
+            )
+        } else {
+            format!(
+                " no failing path (setup slack {} ps on clock {clk_name})",
+                t.wns_ps
+            )
+        };
+        let period_note = if self.user_sdc {
+            String::new()
+        } else {
+            " default period, not user SDC".to_string()
+        };
         Ok(format!(
-            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}",
+            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}{period_note}{path}",
             d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps, t.clk_net_ps
         ))
     }
@@ -17616,7 +17698,9 @@ impl IdeModel {
             self.shell.session.design.as_ref(),
             self.shell.session.routed.as_ref(),
         ) {
-            (Some(d), Some(r)) => report_timing_routed_xdc(d, r, &clks, &self.constraints).ok(),
+            (Some(d), Some(r)) if Self::design_closed_timing(d) => {
+                report_timing_routed_xdc(d, r, &clks, &self.constraints).ok()
+            }
             _ => None,
         };
         self.timing_paths = match (self.shell.session.design.as_ref(), self.timing.as_ref()) {
