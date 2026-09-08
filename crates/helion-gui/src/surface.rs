@@ -856,13 +856,17 @@ mod tests {
         let drawing = d.model.schematic.drawing();
         d.model.schematic.set_viewport(900.0, 500.0);
         d.model.schematic.zoom_fit();
-        let fit = chrome::fit_pane(drawing.width, drawing.height, 900.0, 500.0);
+        let cam = d.model.schematic.camera;
+        let drawn_w = drawing.width * cam.zoom;
+        let drawn_h = drawing.height * cam.zoom;
         assert!(
-            fit.right_clip <= 0.5,
-            "Schematic right-edge clip {}",
-            fit.right_clip
+            drawn_w <= 900.5 && drawn_h <= 500.5,
+            "Zoom Fit must not clip the sheet {drawn_w}x{drawn_h} in 900x500"
         );
-        assert!(fit.fill >= chrome::PANE_FILL_MIN, "schematic fill {}", fit.fill);
+        assert!(
+            (drawn_w - 900.0).abs() < 1.5 || (drawn_h - 500.0).abs() < 1.5,
+            "Zoom Fit touches a pane edge ({drawn_w}x{drawn_h})"
+        );
     }
 
     #[test]
@@ -888,9 +892,19 @@ mod tests {
         assert!(hw.fills(), "Program STAT content bbox {hw:?}");
         d.click_more(WorkspaceTab::Schematic);
         let drawing = d.model.schematic.drawing();
-        let fit = chrome::fit_pane(drawing.width.max(1.0), drawing.height.max(1.0), 900.0, 500.0);
-        assert!(fit.right_clip <= 0.5);
-        assert!(fit.fills() || fit.fill >= chrome::PANE_FILL_MIN);
+        d.model.schematic.set_viewport(900.0, 500.0);
+        d.model.schematic.zoom_fit();
+        let cam = d.model.schematic.camera;
+        let drawn_w = drawing.width * cam.zoom;
+        let drawn_h = drawing.height * cam.zoom;
+        assert!(
+            drawn_w <= 900.5 && drawn_h <= 500.5,
+            "Zoom Fit must not clip the sheet {drawn_w}x{drawn_h}"
+        );
+        assert!(
+            (drawn_w - 900.0).abs() < 1.5 || (drawn_h - 500.0).abs() < 1.5,
+            "Zoom Fit touches a pane edge ({drawn_w}x{drawn_h})"
+        );
 
         d.click_more(WorkspaceTab::Hierarchy);
         assert_eq!(d.pane(), WorkspacePane::Hierarchy);

@@ -704,7 +704,8 @@ pub fn ip_layout(pane_w: f32, pane_h: f32) -> (f32, DrawingFit) {
     )
 }
 
-/// Auto-fit only the identity camera when the sheet would clip. User zoom/pan is kept.
+/// Grow a tiny identity sheet to fill the pane. Never shrink a large sheet:
+/// the user pans and pinches. Zoom Fit is explicit.
 pub fn schematic_should_auto_fit(
     zoom: f32,
     pan_x: f32,
@@ -715,7 +716,7 @@ pub fn schematic_should_auto_fit(
     vh: f32,
 ) -> bool {
     let identity = (zoom - 1.0).abs() < 0.02 && pan_x.abs() < 0.5 && pan_y.abs() < 0.5;
-    identity && (sheet_w * zoom > vw + 1.0 || sheet_h * zoom > vh + 1.0)
+    identity && sheet_w * zoom < vw * 0.80 && sheet_h * zoom < vh * 0.80
 }
 
 /// Paint `data_scroll` reads this: both axes + bounded height.
@@ -1302,9 +1303,14 @@ mod tests {
             !schematic_should_auto_fit(2.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0),
             "user zoom-in must not be auto-fitted"
         );
-        assert!(schematic_should_auto_fit(
-            1.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0
-        ));
+        assert!(
+            !schematic_should_auto_fit(1.0, 0.0, 0.0, 1400.0, 720.0, 900.0, 500.0),
+            "a large sheet is panned/zoomed, not auto-shrunk"
+        );
+        assert!(
+            schematic_should_auto_fit(1.0, 0.0, 0.0, 200.0, 150.0, 900.0, 500.0),
+            "a tiny sheet may grow to fill empty pane"
+        );
     }
 
     #[test]

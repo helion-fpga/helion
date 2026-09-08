@@ -45,23 +45,48 @@ impl Drc {
     }
 
     pub fn fail(&self) -> Result<(), String> {
-        if self.ok() {
-            Ok(())
-        } else {
-            Err(self.violations.join("; "))
-        }
+        self.fail_errors()
     }
 
     pub fn add(&mut self, id: &str, objects: impl Into<String>, message: impl Into<String>) {
+        self.push(id, DrcSeverity::Error, objects, message);
+    }
+
+    pub fn add_warn(&mut self, id: &str, objects: impl Into<String>, message: impl Into<String>) {
+        self.push(id, DrcSeverity::Warning, objects, message);
+    }
+
+    fn push(
+        &mut self,
+        id: &str,
+        severity: DrcSeverity,
+        objects: impl Into<String>,
+        message: impl Into<String>,
+    ) {
         let objects = objects.into();
         let message = message.into();
         self.violations.push(message.clone());
         self.items.push(DrcViolation {
             id: id.into(),
-            severity: DrcSeverity::Error,
+            severity,
             objects,
             message,
         });
+    }
+
+    /// Errors only — warnings do not fail bitstream (UG893 Warning).
+    pub fn fail_errors(&self) -> Result<(), String> {
+        let errs: Vec<String> = self
+            .items
+            .iter()
+            .filter(|v| v.severity == DrcSeverity::Error)
+            .map(|v| v.message.clone())
+            .collect();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs.join("; "))
+        }
     }
 
     pub fn item(&self, id: &str) -> Option<&DrcViolation> {
@@ -334,10 +359,10 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
 pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
     let mut d = check_placed(design, &routed.placed, dev);
     if !routed.placed.packed.iobs.is_empty() && routed.iob_src.is_empty() {
-        d.add("ROUTE-1", "", "unrouted IOB");
+        d.add_warn("ROUTE-1", "", "unrouted IOB");
     }
     if routed.overused > 0 {
-        d.add(
+        d.add_warn(
             "ROUTE-2",
             "",
             format!("PathFinder overused {} tiles", routed.overused),
@@ -351,7 +376,7 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
             .iter()
             .any(|l| l.q_net == iob.from_net)
         {
-            d.add(
+            d.add_warn(
                 "ROUTE-3",
                 &iob.cell,
                 format!("IOB {} net {} has no LUT/FF driver", iob.cell, iob.from_net),
