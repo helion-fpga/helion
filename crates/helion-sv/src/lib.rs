@@ -413,6 +413,64 @@ fn note_skip(msg: String) {
     eprintln!("{msg}");
 }
 
+thread_local! {
+    /// Function names skipped in the current module parse (not re-entered).
+    static SKIPPED_FUNCS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Once per module+function for the process. Re-elaboration must not loop the line.
+    static FUNC_NOT_CALLED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn skipped_funcs_clear() {
+    SKIPPED_FUNCS.with(|s| s.borrow_mut().clear());
+}
+
+fn skipped_funcs_push(name: String) {
+    SKIPPED_FUNCS.with(|s| s.borrow_mut().push(name));
+}
+
+fn skipped_funcs_take() -> Vec<String> {
+    SKIPPED_FUNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Emit `function_not_called` once per function. A second entry (flatten
+/// re-parse, generate copy) is not another LUT and must not loop.
+fn note_function_not_called(module: &str, function: &str) {
+    let key = format!("{module}\0{function}");
+    let fresh = FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic function_not_called module={module} function={function} (function is not called; not a LUT)"
+    ));
+}
+
+/// Name after `function` has been eaten. Does not parse statements.
+fn function_name_after_kw(p: &mut P) -> String {
+    let save = p.i;
+    skip_sv_type(p);
+    let _ = p.width_opt();
+    match p.ident() {
+        Ok(n) => n,
+        Err(_) => {
+            p.i = save;
+            String::new()
+        }
+    }
+}
+
+/// Skip a function body without entering for/if/case/assign. Uncalled.
+fn skip_function_without_reentry(p: &mut P) -> String {
+    let name = function_name_after_kw(p);
+    skip_until_kw(p, "endfunction");
+    if name.is_empty() {
+        "unknown".into()
+    } else {
+        name
+    }
+}
+
 struct OwnCache {
     /// module:hash → own-logic Design (instances not included)
     by_key: HashMap<String, Design>,
@@ -2629,6 +2687,9 @@ fn parse_function(p: &mut P) -> Result<FuncDef, String> {
                 let _ = skip_item_or_block(p);
             }
         }
+        if p.i == save {
+            let _ = p.bump();
+        }
     }
     Ok(FuncDef {
         name,
@@ -2680,6 +2741,33 @@ fn rexpr_names(e: &RExpr, out: &mut HashSet<String>) {
 /// Empty module whose only Verilog is function(s): lift each function into
 /// module ports + comb assigns. Not used when the module already has a body
 /// (calls are inlined at the assign). Never invents a vendor architecture.
+
+/// One-shot parse of functions in a function-only module (lift path).
+fn parse_functions_in_slice(toks: &[Tok]) -> Vec<FuncDef> {
+    let mut p = P {
+        t: toks,
+        i: 0,
+        params: HashMap::new(),
+        widths: HashMap::new(),
+    };
+    let mut funcs = Vec::new();
+    while p.peek().is_some() {
+        if p.eat_kw("function") {
+            match parse_function(&mut p) {
+                Ok(f) => funcs.push(f),
+                Err(_) => skip_until_kw(&mut p, "endfunction"),
+            }
+        } else {
+            let before = p.i;
+            p.bump();
+            if p.i == before {
+                break;
+            }
+        }
+    }
+    funcs
+}
+
 fn lift_functions_if_no_body(
     ports: &mut Vec<(String, PortDir, usize)>,
     signals: &mut Vec<Signal>,
@@ -2889,6 +2977,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut pending_md = false;
     let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
     let mut funcs: Vec<FuncDef> = Vec::new();
+    skipped_funcs_clear();
     if parse_module_items(
         &mut p,
         &mut ports,
@@ -2907,15 +2996,19 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     {
         skip_until_kw(&mut p, "endmodule");
     }
-    // lift_functions_if_no_body only folds functions when the module has no other body.
-    let will_lift = !funcs.is_empty() && nbas.is_empty() && assigns.is_empty() && insts.is_empty();
-    lift_functions_if_no_body(&mut ports, &mut signals, &nbas, &mut assigns, &insts, &funcs);
-    if !funcs.is_empty() && !will_lift {
-        for f in &funcs {
-            note_skip(format!(
-                "diagnostic function_not_called module={} function={} (function is not called; not a LUT)",
-                module, f.name
-            ));
+    // Uncalled functions are skipped without re-entering the body.
+    // Lift only a function-only module, and parse those functions once.
+    let skipped = skipped_funcs_take();
+    let will_lift = !skipped.is_empty() && nbas.is_empty() && assigns.is_empty() && insts.is_empty();
+    if will_lift {
+        funcs = parse_functions_in_slice(&p.t[tok_start..p.i]);
+        lift_functions_if_no_body(&mut ports, &mut signals, &nbas, &mut assigns, &insts, &funcs);
+    } else {
+        let mut seen_fn = HashSet::new();
+        for name in skipped {
+            if seen_fn.insert(name.clone()) {
+                note_function_not_called(&module, &name);
+            }
         }
     }
     let toks = p.t[tok_start..p.i].to_vec();
@@ -2966,14 +3059,11 @@ fn parse_module_items(
             }
         }
         if p.eat_kw("function") {
-            if let Ok(f) = parse_function(p) {
-                funcs.push(f);
-            } else {
-                note_skip(format!(
-                    "diagnostic skip_function module={} (function not parsed; not a LUT)",
-                    cur_mod()
-                ));
-            }
+            // Do not parse the body. Uncalled functions are not LUTs; re-entering
+            // for/if/case inside them loops (Ibex mhpmcounter_get / PMP).
+            let name = skip_function_without_reentry(p);
+            skipped_funcs_push(name);
+            let _ = funcs;
             continue;
         }
         if p.eat_kw("task") {
@@ -3382,14 +3472,11 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("function") {
-            if let Ok(f) = parse_function(p) {
-                funcs.push(f);
-            } else {
-                note_skip(format!(
-                    "diagnostic skip_function module={} (function not parsed; not a LUT)",
-                    cur_mod()
-                ));
-            }
+            // Do not parse the body. Uncalled functions are not LUTs; re-entering
+            // for/if/case inside them loops (Ibex mhpmcounter_get / PMP).
+            let name = skip_function_without_reentry(p);
+            skipped_funcs_push(name);
+            let _ = funcs;
             continue;
         }
         if p.eat_kw("task") {

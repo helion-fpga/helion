@@ -1431,8 +1431,8 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         .default_height(app.console_height)
         .min_height(share.console_floor)
         .max_height(share.console_cap);
-    if app.force_share {
-        console = console.exact_height(app.console_height);
+    if app.force_share || ctx.screen_rect().height() < 540.0 {
+        console = console.exact_height(app.console_height.min(share.console_h));
     }
     let inner = console
         .show_separator_line(true)
@@ -3260,6 +3260,15 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.pblock_rows().to_vec();
     let mut pick_pblock: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    if rows.is_empty() {
+        ui.add(
+            egui::Label::new("No pblocks yet. Create one, then resize it on the die.").wrap(),
+        );
+        // Short leftover belongs to the die, not a dashed placeholder grid.
+        if ui.ctx().screen_rect().height() < 540.0 {
+            return;
+        }
+    }
     data_scroll("pblocks_table_scroll").show(ui, |ui| {
     egui::Grid::new("pblocks_table")
         .spacing([8.0, 4.0])
@@ -3278,7 +3287,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.label("—");
                 ui.label("—");
                 ui.label("—");
-                ui.label("No pblocks yet. Create one, then resize it on the die.");
+                ui.label("—");
                 ui.label("—");
                 ui.end_row();
             } else {
@@ -4777,8 +4786,12 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         }
         ui.label(RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0)).small().weak());
     });
-    // Own line so the hint is never clipped as "pinch or s…".
-    ui.label(RichText::new("pinch or ⌘-scroll to zoom · drag to pan").small().weak());
+    // Full hint on hover. Visible words are complete — never "pinch or …".
+    let pinch_hint = "pinch or ⌘-scroll to zoom · drag to pan";
+    ui.add(
+        egui::Label::new(RichText::new("pinch to zoom · drag to pan").small().weak()).wrap(),
+    )
+    .on_hover_text(pinch_hint);
     if !model.timing_paths.is_empty() {
         // Results strip belongs under the drawing (UG893). Keep it collapsed so Zoom Fit owns the pane.
         egui::CollapsingHeader::new("Timing paths")
@@ -5099,9 +5112,9 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.heading("Device");
-    ui.horizontal_wrapped(|ui| {
+
+fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.horizontal(|ui| {
         if ui.button("Zoom In").clicked() {
             let _ = model.device_zoom_in();
         }
@@ -5116,56 +5129,93 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 .small()
                 .weak(),
         );
-        ui.label(
-            RichText::new("CLB")
-                .small()
-                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
-        );
-        ui.label(
-            RichText::new("IOB")
-                .small()
-                .color(Color32::from_rgb(0x5b, 0x9b, 0xd5)),
-        );
-        ui.label(
-            RichText::new("BRAM")
-                .small()
-                .color(Color32::from_rgb(0xb0, 0x7c, 0xe8)),
-        );
-        ui.label(
-            RichText::new("placed LUT")
-                .small()
-                .color(Color32::from_rgb(0xc8, 0xf0, 0xd8)),
-        );
-        ui.label(
-            RichText::new("placed I/O")
-                .small()
-                .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
-        );
-        ui.label(
-            RichText::new("clock region")
-                .small()
-                .color(Color32::from_rgb(0xb0, 0x7c, 0xe8)),
-        );
-        ui.label(
-            RichText::new("route")
-                .small()
-                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
-        );
-        ui.label(
-            RichText::new("pblock")
-                .small()
-                .color(Color32::from_rgb(0xe5, 0x9a, 0x3c)),
-        );
     });
+    // Complete chips only. Budget is the visible pane minus a margin so the last
+    // word cannot be cut as "clock region r".
+    let chips: [(&str, Color32); 8] = [
+        ("CLB", Color32::from_rgb(0x3d, 0xb8, 0x7a)),
+        ("IOB", Color32::from_rgb(0x5b, 0x9b, 0xd5)),
+        ("BRAM", Color32::from_rgb(0xb0, 0x7c, 0xe8)),
+        ("placed LUT", Color32::from_rgb(0xc8, 0xf0, 0xd8)),
+        ("placed I/O", Color32::from_rgb(0x7e, 0xc8, 0xe3)),
+        ("clock region", Color32::from_rgb(0xb0, 0x7c, 0xe8)),
+        ("route", Color32::from_rgb(0x3d, 0xb8, 0x7a)),
+        ("pblock", Color32::from_rgb(0xe5, 0x9a, 0x3c)),
+    ];
+    let budget = ui
+        .available_width()
+        .min(ui.clip_rect().width())
+        .max(96.0)
+        - 12.0;
+    let mut rows: Vec<Vec<(&str, Color32)>> = vec![Vec::new()];
+    let mut used = 0.0_f32;
+    for chip in chips {
+        let w = chip.0.chars().count() as f32 * 7.2 + 14.0;
+        if !rows.last().unwrap().is_empty() && used + w > budget {
+            rows.push(Vec::new());
+            used = 0.0;
+        }
+        rows.last_mut().unwrap().push(chip);
+        used += w;
+    }
+    for row in rows {
+        ui.horizontal(|ui| {
+            for (text, col) in row {
+                ui.label(RichText::new(text).small().color(col));
+            }
+        });
+    }
+}
+
+fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
+    ui.heading("Device");
+    paint_device_legend(ui, model);
     let share = chrome::share_available(ui.ctx().screen_rect().width(), ui.ctx().screen_rect().height());
-    egui::ScrollArea::vertical()
+    // Floor, then scroll. Reserve leftover height so a short window can Zoom Fit the die.
+    let after_legend = ui.available_height().max(1.0);
+    let screen_h = ui.ctx().screen_rect().height();
+    let short = screen_h < 540.0;
+    let die_reserve = if short {
+        (after_legend * 0.55).max(140.0)
+    } else {
+        share.canvas_floor_h.min(after_legend * 0.62).max(56.0)
+    };
+    let tables_h = if short {
+        56.0
+    } else {
+        share.tables_max_h.min((after_legend - die_reserve).max(40.0))
+    };
+    let pane_w = ui.available_width().max(48.0);
+    // Pblock grid scrolls. Clock-region names stay outside that cap so Occupied
+    // is not the row that gets sliced off.
+    egui::ScrollArea::both()
         .id_salt("device_tables")
         .auto_shrink([false, true])
-        .max_height(share.tables_max_h)
+        .max_height(if short { 56.0 } else { tables_h.min(pane_w * 0.28).max(52.0) })
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .show(ui, |ui| {
+            ui.set_max_width(pane_w);
+            ui.set_width(pane_w);
             paint_pblocks_table(ui, model);
+        });
+    // Cap the region list so a short window still has leftover height for Zoom Fit.
+    let remain = ui.available_height().max(1.0);
+    // Short window: one readable region line, then the die owns the leftover.
+    let cr_h = if short {
+        48.0
+    } else {
+        let die_need = share.canvas_floor_h.min(remain * 0.38).min(remain * 0.55);
+        (remain - die_need).clamp(28.0, 168.0)
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("device_clock_regions_block")
+        .auto_shrink([false, true])
+        .max_height(cr_h)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+        .show(ui, |ui| {
+            ui.set_max_width(pane_w);
+            ui.set_width(pane_w);
             paint_clock_regions(ui, model);
-            paint_device_routes(ui, model);
         });
     ui.separator();
     let cols = model.device.cols.max(1);
@@ -5176,13 +5226,27 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     // Real leftover pane only — do not inflate past it (that jammed an oversized die).
     let view_h = avail.y.max(1.0);
     let view_w = avail.x.max(1.0);
-    let (cell_w, cell_h) = chrome::floorplan_zoom_cells(cols, rows, view_w, view_h, model.device_zoom);
-    let (die_w, die_h) = chrome::floorplan_zoom_content(cols, rows, view_w, view_h, model.device_zoom);
-    // Zoom Fit fills leftover width and height. Zoom-in grows past the pane; ScrollArea
-    // must be able to reach the die bottom (Y=0), not clip it.
-    let zoomed_in = model.device_zoom > 1.001;
-    let draw_w = if zoomed_in { die_w.max(view_w + 8.0) } else { view_w };
-    let draw_h = if zoomed_in { die_h.max(view_h + 8.0) } else { view_h };
+    // Short leftover: Zoom Fit into this rect (zoom 1.0) so Y=0 is not a clipped 100% band.
+    if model.device_zoom <= 1.001 {
+        model.device_zoom = 1.0;
+    }
+    let (mut cell_w, mut cell_h) = chrome::floorplan_zoom_cells(cols, rows, view_w, view_h, model.device_zoom);
+    let mut die_w = chrome::FLOORPLAN_LEFT + cell_w * cols as f32 + chrome::FLOORPLAN_RIGHT;
+    let mut die_h = chrome::FLOORPLAN_TOP + cell_h * rows as f32 + chrome::FLOORPLAN_BOT;
+    // Fit must occupy the leftover, never paint a taller band and hide the bottom.
+    if model.device_zoom <= 1.001 && (die_w > view_w + 0.5 || die_h > view_h + 0.5) {
+        let sx = (view_w - 1.0).max(1.0) / die_w.max(1.0);
+        let sy = (view_h - 1.0).max(1.0) / die_h.max(1.0);
+        let s = sx.min(sy);
+        cell_w *= s;
+        cell_h *= s;
+        die_w *= s;
+        die_h *= s;
+    }
+    let overflow = model.device_zoom > 1.001 && (die_w > view_w + 1.0 || die_h > view_h + 1.0);
+    let zoomed_in = overflow;
+    let draw_w = if overflow { die_w.max(view_w + 8.0) } else { view_w.max(die_w) };
+    let draw_h = if overflow { die_h.max(view_h + 8.0) } else { view_h.max(die_h) };
     let origin_dx = if model.device_zoom < 0.999 {
         (view_w - die_w).max(0.0) * 0.5
     } else {
@@ -5473,6 +5537,29 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     if regions.is_empty() {
         ui.label("No clock regions on this die.");
+        return;
+    }
+    // Narrow or short pane: two complete lines. Never one overflowing "Occupied…" clip.
+    let pane_w = ui.clip_rect().width().min(ui.max_rect().width()).min(ui.available_width());
+    let short_window = ui.ctx().screen_rect().height() < 540.0;
+    if pane_w < 720.0 || short_window {
+        let shown = if short_window { 1 } else { regions.len() };
+        for (i, cr) in regions.iter().enumerate().take(shown) {
+            let sites = cr.site_count(&model.device.sites);
+            let occ = cr.occupied_count(&model.device.sites);
+            let on = selected.as_deref() == Some(cr.name.as_str());
+            let line1 = format!("{}   X0={}  Y0={}  X1={}  Y1={}", cr.name, cr.x0, cr.y0, cr.x1, cr.y1);
+            let line2 = format!("Sites={}  Occupied={}", sites, occ);
+            if ui.selectable_label(on, line1).clicked() {
+                pick = Some(i.to_string());
+            }
+            if ui.selectable_label(on, line2).clicked() {
+                pick = Some(i.to_string());
+            }
+        }
+        if let Some(spec) = pick {
+            let _ = model.select_clock_region(&spec);
+        }
         return;
     }
     data_scroll("ug893_clock_regions_scroll").show(ui, |ui| {

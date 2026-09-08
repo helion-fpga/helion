@@ -555,13 +555,38 @@ fn floorplan_zoom_clamped(zoom: f32) -> f32 {
 /// Anisotropic die cells. Zoom Fit fills leftover width and height (right gap is
 /// `FLOORPLAN_RIGHT`, not a void). Zoom-out shrinks both axes. Zoom-in grows both
 /// so the parent ScrollArea can scroll to the die bottom.
+///
+/// At Zoom Fit (`zoom` ≤ 1) the painted extent must not exceed the leftover rect.
+/// A short window shrinks the die into that rect; it must not clip Y=0.
 pub fn floorplan_zoom_cells(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> (f32, f32) {
     let cols_f = cols.max(1) as f32;
     let rows_f = rows.max(1) as f32;
-    let fit_w = (avail_w - FLOORPLAN_LEFT - FLOORPLAN_RIGHT).max(8.0) / cols_f;
-    let fit_h = (avail_h - FLOORPLAN_TOP - FLOORPLAN_BOT).max(8.0) / rows_f;
+    let aw = avail_w.max(1.0);
+    let ah = avail_h.max(1.0);
     let z = floorplan_zoom_clamped(zoom);
-    ((fit_w * z).max(0.5), (fit_h * z).max(0.5))
+    let inner_w = (aw - FLOORPLAN_LEFT - FLOORPLAN_RIGHT).max(1.0);
+    let inner_h = (ah - FLOORPLAN_TOP - FLOORPLAN_BOT).max(1.0);
+    let mut cw = inner_w / cols_f * z;
+    let mut ch = inner_h / rows_f * z;
+    if z <= 1.001 {
+        // Chrome floors must not invent height past a short leftover.
+        let inner_w_fit = (aw - FLOORPLAN_LEFT - FLOORPLAN_RIGHT).max(0.0);
+        let inner_h_fit = (ah - FLOORPLAN_TOP - FLOORPLAN_BOT).max(0.0);
+        cw = (inner_w_fit / cols_f) * z;
+        ch = (inner_h_fit / rows_f) * z;
+        if inner_w_fit < 1.0 {
+            cw = (aw * 0.82 / cols_f).max(0.05);
+        }
+        if inner_h_fit > 0.0 {
+            ch = ch.min(inner_h_fit / rows_f);
+        } else {
+            ch = (ah * 0.55 / rows_f).max(0.05);
+        }
+    } else {
+        cw = cw.max(0.5);
+        ch = ch.max(0.5);
+    }
+    (cw.max(0.05), ch.max(0.05))
 }
 
 /// Smaller cell, for tests that still speak a single scale.
@@ -1106,6 +1131,16 @@ mod tests {
             floorplan_zoom_fits(32, 33, 800.0, 360.0, 1.0),
             "Zoom Fit must fit both axes, cell={fit}"
         );
+        assert!(
+            floorplan_zoom_fits(32, 33, 520.0, 72.0, 1.0),
+            "short leftover must Zoom Fit, not clip Y=0"
+        );
+        let (short_w, short_h) = floorplan_zoom_content(32, 33, 520.0, 72.0, 1.0);
+        assert!(short_h <= 72.0 + 1.0, "short die height {short_h}");
+        assert!(short_w <= 520.0 + 1.0, "short die width {short_w}");
+        let (wide_w, _) = floorplan_zoom_content(32, 33, 1100.0, 360.0, 1.0);
+        let (fit_w, _) = floorplan_zoom_content(32, 33, 800.0, 360.0, 1.0);
+        assert!(wide_w > fit_w + 40.0, "wide window must grow the die, {wide_w} vs {fit_w}");
         assert!(
             !floorplan_zoom_fits(32, 33, 800.0, 360.0, 2.0),
             "zoom-in must overflow so the die ScrollArea can scroll"
