@@ -6309,7 +6309,7 @@ impl IdeModel {
                 let path = source
                     .or_else(|| self.tree.sources.last().map(PathBuf::from))
                     .ok_or("synth_design: add a source first")?;
-                let d = helion_sv::synth_sv_path(&path)?;
+                let d = crate::synth_hdl_path(&path)?;
                 let msg = format!(
                     "synth_design {} cells={} luts={}",
                     d.name,
@@ -10713,7 +10713,7 @@ impl IdeModel {
             .last()
             .cloned()
             .ok_or("incremental_impl: no source")?;
-        let d = helion_sv::synth_sv_path(std::path::Path::new(&path))?;
+        let d = crate::synth_hdl_path(std::path::Path::new(&path))?;
         self.shell.session.synth_design(d);
         let dev = self.device()?;
         let prev_names = Self::placed_cell_names(&prev);
@@ -19719,6 +19719,26 @@ mod tests {
             ide.console.iter().any(|l| l.cmd == "report_timing"),
             "console keeps the Tcl journal"
         );
+    }
+
+    #[test]
+    fn open_source_vhdl_blinky_synths() {
+        let mut ide = IdeModel::new();
+        let out = ide
+            .open_source(&example("blinky.vhd"))
+            .expect("IDE must synth VHDL through helion-vhdl, not the SV parser");
+        assert!(
+            out.contains("synth_design blinky"),
+            "vhdl blinky synth: {out}"
+        );
+        let d = ide.design().expect("design after vhdl synth");
+        assert_eq!(d.name, "blinky");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "rising_edge blinky must map an FF: {:?}",
+            d.cells
+        );
+        assert_eq!(ide.step_state(FlowStep::Synthesis), StepState::Done);
     }
 
     /// The rail is a state machine over the real Session, not a row of lamps.
