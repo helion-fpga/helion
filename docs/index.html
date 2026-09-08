@@ -50,7 +50,7 @@
           Empty-XDC <code>counter.sv</code> gold is <span class="gold">WNS_PS=9640</span>.
         </p>
         <p class="cta">
-          <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 1.0.1</a>
+          <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 1.1.0</a>
           <a class="btn ghost" href="use.html">Use Helion</a>
         </p>
       </div>
@@ -70,7 +70,7 @@
           </p>
           <p>
             Front ends: SystemVerilog (<code>helion-sv</code>: sv-parser, AIG, FlowMap LUT6),
-            VHDL-2008 subset (<code>helion-vhdl</code>), C subset HLS (<code>helion-hls</code>).
+            VHDL-2008 elaborator (<code>helion-vhdl</code>), C subset HLS (<code>helion-hls</code>).
             Then pack, timing-driven place, PathFinder A* route, graph STA, DRC,
             sparse <code>.hbits</code>, and cycle-accurate fabric sim. The desktop IDE
             is an eframe shell over <code>IdeModel</code>. Native desktop target is
@@ -101,7 +101,7 @@
           <thead><tr><th>Step</th><th>Crate</th><th>What it does</th></tr></thead>
           <tbody>
             <tr><td>synth</td><td><code>helion-sv</code></td><td>sv-parser + AIG + FlowMap LUT6</td></tr>
-            <tr><td>vhdl</td><td><code>helion-vhdl</code></td><td>VHDL-2008 subset, same elaborator as SV</td></tr>
+            <tr><td>vhdl</td><td><code>helion-vhdl</code></td><td>VHDL-2008 elaborator, same LUT/FF path as SV</td></tr>
             <tr><td>hls</td><td><code>helion-hls</code></td><td>C subset scheduled onto LUT / FF / DSP</td></tr>
             <tr><td>pack</td><td><code>helion-pack</code></td><td>LUTFF + IOB + MAC27 + BRAM18</td></tr>
             <tr><td>place</td><td><code>helion-place</code></td><td>timing-driven vs wirelength, BLE overflow</td></tr>

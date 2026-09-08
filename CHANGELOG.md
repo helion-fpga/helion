@@ -4,6 +4,48 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [1.1.0] — 2026-09-07
+
+Language coverage and schematic camera. Same family, same empty-XDC
+`examples/counter.sv` gold (**WNS_PS=9640**, LUTFF=4, LED `0000000111111110`).
+`helion reports` is one compile: timing, utilization, power, and bitstream
+occupancy agree (`match=LUTFF,IOB,BRAM,DSP,TOTAL_UW`).
+
+### Added
+
+- VHDL-2008 elaborator maps concurrent and sequential constructs to the SV
+  LUT/FF path: `with`/`select`, `when`/`else`, generate, process
+  if/elsif/case/for, generics, multi-name ports, `clk'event`, concatenations,
+  IEEE casts, component port maps. Tokenize never fails on a leftover glyph.
+- SystemVerilog `||` / `&&`, concat LHS bit-selects
+  (`{out[0],out[1],...}=in`), and wire-through `assign out = in` (IOB, not a
+  dropped net).
+- `helion reports <src>`: one compile prints timing + util + power + bitstream
+  and exits 0 only when occupancy and `TOTAL_UW = STATIC+DYNAMIC` match.
+- Schematic camera: pinch / ⌘-scroll zoom-at-cursor, drag pan, Zoom Fit.
+  Large sheets are not auto-shrunk. Star net edges, `Arc<SchematicDrawing>`
+  cache so Ibex-scale sheets stay idle.
+
+### Fixed
+
+- Place caps LUTFF/IOB/DSP/BRAM to HAD site counts without panicking at the
+  8192 BLE budget.
+- PathFinder overused tiles and undriven IOBs are DRC warnings; bitstream
+  still builds. Route skips an IMUX whose driver FF was truncated to the die.
+- Identity and empty-architecture designs produce matched reports (honest
+  0-LUT wrappers), not `nothing to pack`.
+
+### Changed
+
+- `helion-vhdl` is an elaborator, not a keyword skip-list. Missing child
+  architectures become empty stubs (missing source), not unknown syntax.
+
+1.1.0 was measured on a 1000-file Verilog+VHDL corpus (NVlabs/verilog-eval,
+SJTU CORE, YosysHQ/yosys tests, hdl2v/vhdl-dataset): **1000/1000** `helion
+reports` match on HL10T-C32-1.
+
+[1.1.0]: https://github.com/helion-fpga/helion/releases/tag/v1.1.0
+
 ## [1.0.1] — 2026-09-07
 
 Patch after 1.0.0: IDE chrome and empty-state fill. Same CAD engines and

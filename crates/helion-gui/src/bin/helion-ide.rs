@@ -1623,11 +1623,11 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
-    // Absolute rect split — no horizontal wrap void between Scopes and Wave.
+    // Absolute rect split — clip both sides so long HNF names cannot paint over Memory.
     let full = ui.available_rect_before_wrap();
     let h = full.height().max(200.0);
-    let nav_w = 220.0_f32;
-    let rule = chrome::SPLITTER_GRAB_PX; // 6px calm abut
+    let nav_w = chrome::SIDEBAR_WIDTH;
+    let rule = chrome::SPLITTER_GRAB_PX;
     let _ = ui.allocate_rect(full, Sense::hover());
     let nav_rect = egui::Rect::from_min_size(full.min, egui::vec2(nav_w, h));
     let sep_rect = egui::Rect::from_min_size(
@@ -1642,14 +1642,14 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.painter().rect_filled(sep_rect, 0.0, Color32::from_rgb(0x3a, 0x42, 0x4a));
     ui.painter().rect_filled(wave_rect, 0.0, Color32::from_rgb(0x1a, 0x1e, 0x24));
     ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("sim_nav_canvas_v3")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                paint_sim_nav_body(ui, &mut app.model);
-            });
+        ui.set_clip_rect(nav_rect);
+        ui.set_min_size(nav_rect.size());
+        ui.set_max_width(nav_rect.width());
+        paint_sim_nav_body(ui, &mut app.model);
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(wave_rect), |ui| {
+        ui.set_clip_rect(wave_rect);
+        ui.set_min_size(wave_rect.size());
         match pane_for_workspace(app.model.workspace) {
             WorkspacePane::Wave => paint_wave(ui, &mut app.model),
             WorkspacePane::Memory => paint_memory(ui, &mut app.model),
@@ -1796,163 +1796,131 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 
+fn paint_clipped_select(ui: &mut egui::Ui, on: bool, shown: &str, tip: &str) -> bool {
+    let w = ui.available_width().max(16.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 20.0), Sense::click());
+    let resp = resp.on_hover_text(tip);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter().with_clip_rect(rect);
+        if on {
+            p.rect_filled(rect, 2.0, Color32::from_rgb(0x2a, 0x4a, 0x6a));
+        }
+        p.text(
+            egui::pos2(rect.left() + 4.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            shown,
+            egui::FontId::monospace(12.0),
+            Color32::from_rgb(0xdc, 0xe0, 0xe4),
+        );
+    }
+    resp.clicked()
+}
+
 fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel) {
-            ui.label(RichText::new("Scopes").strong());
-            ui.horizontal(|ui| {
-                let n = model.sim_runtime_cycles.max(1);
-                if ui.button(format!("Run {n}")).clicked() {
-                    surface::request_job(JobKind::SimRun(n));
-                }
-                if ui.button("Step").clicked() {
-                    let _ = model.sim_step();
-                }
-                if ui.button("Restart").clicked() {
-                    let _ = model.sim_restart();
-                }
-                if ui.button("Settings").clicked() {
-                    let _ = model.exec("simulation_settings");
-                }
-            });
-            let scopes = model.scope_rows().to_vec();
-            let selected_scope = model.selected_scope.clone();
-            let mut pick_scope = None;
-            egui::ScrollArea::vertical()
-                .id_salt("ug900_scopes")
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("ug900_scopes_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").strong());
-                            ui.label(RichText::new("Type").strong());
-                            ui.end_row();
-                            if scopes.is_empty() {
-                                ui.label("—");
-                                ui.label("No scopes yet.");
-                                ui.end_row();
-                            } else {
-                                for (i, s) in scopes.iter().enumerate() {
-                                    let on = selected_scope.as_deref() == Some(s.name.as_str());
-                                    if ui.selectable_label(on, &s.name).clicked() {
-                                        pick_scope = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, s.type_cell()).clicked() {
-                                        pick_scope = Some(i.to_string());
-                                    }
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                });
-            if let Some(spec) = pick_scope {
-                let _ = model.select_scope(&spec);
+    ui.add_space(4.0);
+    ui.label(RichText::new("Scopes").strong());
+    ui.horizontal_wrapped(|ui| {
+        let n = model.sim_runtime_cycles.max(1);
+        if ui.button(format!("Run {n}")).clicked() {
+            surface::request_job(JobKind::SimRun(n));
+        }
+        if ui.button("Step").clicked() {
+            let _ = model.sim_step();
+        }
+        if ui.button("Restart").clicked() {
+            let _ = model.sim_restart();
+        }
+        if ui.button("Settings").clicked() {
+            let _ = model.exec("simulation_settings");
+        }
+    });
+    let scopes = model.scope_rows().to_vec();
+    let selected_scope = model.selected_scope.clone();
+    let mut pick_scope = None;
+    let row_h = 22.0;
+    ui.label(RichText::new("Name").small().weak());
+    egui::ScrollArea::vertical()
+        .id_salt("ug900_scopes")
+        .max_height(160.0)
+        .show_rows(ui, row_h, scopes.len().max(1), |ui, range| {
+            if scopes.is_empty() {
+                ui.label("No scopes yet.");
+                return;
             }
-            ui.separator();
-            ui.label(RichText::new("Objects").strong());
-            let objects = model.object_rows().to_vec();
-            let selected_object = model.selected_object.clone();
-            let mut pick_obj = None;
-            egui::ScrollArea::vertical()
-                .id_salt("ug900_objects")
-                .show(ui, |ui| {
-                    egui::Grid::new("ug900_objects_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").strong());
-                            ui.label(RichText::new("Type").strong());
-                            ui.label(RichText::new("Value").strong());
-                            ui.end_row();
-                            if objects.is_empty() {
-                                ui.label("—");
-                                ui.label("—");
-                                ui.label("No objects — select a scope.");
-                                ui.end_row();
-                            } else {
-                                for (i, o) in objects.iter().enumerate() {
-                                    let on = selected_object.as_deref() == Some(o.name.as_str());
-                                    if ui.selectable_label(on, &o.name).clicked() {
-                                        pick_obj = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, o.type_cell()).clicked() {
-                                        pick_obj = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, o.value_cell()).clicked() {
-                                        pick_obj = Some(i.to_string());
-                                    }
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                });
-            if let Some(spec) = pick_obj {
-                let _ = model.select_object(&spec);
+            let end = range.end.min(scopes.len());
+            for (i, s) in scopes[range.start..end].iter().enumerate() {
+                let i = range.start + i;
+                let on = selected_scope.as_deref() == Some(s.name.as_str());
+                let shown = format!(
+                    "{}  {}",
+                    helion_gui::schematic_short_name(&s.name),
+                    s.type_cell()
+                );
+                if paint_clipped_select(ui, on, &shown, &s.name) {
+                    pick_scope = Some(i.to_string());
+                }
             }
-            ui.separator();
-            ui.label(RichText::new("Locals").strong());
-            let locals = model.local_rows().to_vec();
-            let selected_local = model.selected_local.clone();
-            let mut pick_local = None;
-            egui::ScrollArea::vertical()
-                .id_salt("ug900_locals")
-                .max_height(160.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("ug900_locals_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Name").strong());
-                            ui.label(RichText::new("Type").strong());
-                            ui.label(RichText::new("Value").strong());
-                            ui.end_row();
-                            if locals.is_empty() {
-                                ui.label("—");
-                                ui.label("—");
-                                ui.label("No locals until you run simulation.");
-                                ui.end_row();
-                            } else {
-                                for (i, l) in locals.iter().enumerate() {
-                                    let on = selected_local.as_deref() == Some(l.name.as_str());
-                                    if ui.selectable_label(on, &l.name).clicked() {
-                                        pick_local = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, l.type_cell()).clicked() {
-                                        pick_local = Some(i.to_string());
-                                    }
-                                    if ui.selectable_label(on, l.value_cell()).clicked() {
-                                        pick_local = Some(i.to_string());
-                                    }
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                });
-            if let Some(spec) = pick_local {
-                let _ = model.select_local(&spec);
+        });
+    if let Some(spec) = pick_scope {
+        let _ = model.select_scope(&spec);
+    }
+    ui.separator();
+    ui.label(RichText::new("Objects").strong());
+    let objects = model.object_rows().to_vec();
+    let selected_object = model.selected_object.clone();
+    let mut pick_obj = None;
+    let obj_h = ui.available_height().max(80.0) - 72.0;
+    egui::ScrollArea::vertical()
+        .id_salt("ug900_objects")
+        .max_height(obj_h.max(80.0))
+        .show_rows(ui, row_h, objects.len().max(1), |ui, range| {
+            if objects.is_empty() {
+                ui.label("No objects. Select a scope.");
+                return;
             }
-            ui.separator();
-            ui.label(RichText::new("Panes").strong());
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Wave").clicked() {
-                    model.workspace = WorkspaceTab::Wave;
+            let end = range.end.min(objects.len());
+            for (i, o) in objects[range.start..end].iter().enumerate() {
+                let i = range.start + i;
+                let on = selected_object.as_deref() == Some(o.name.as_str());
+                let shown = format!(
+                    "{}  {}  {}",
+                    helion_gui::schematic_short_name(&o.name),
+                    o.type_cell(),
+                    o.value_cell()
+                );
+                if paint_clipped_select(ui, on, &shown, &o.name) {
+                    pick_obj = Some(i.to_string());
                 }
-                if ui.button("Source").clicked() {
-                    let _ = model.open_source_window();
-                }
-                if ui.button("Memory").clicked() {
-                    let _ = model.open_memory();
-                }
-                if ui.button("Breakpoints").clicked() {
-                    let _ = model.open_breakpoints();
-                }
-                if ui.button("Locals").clicked() {
-                    model.workspace = WorkspaceTab::Locals;
-                }
-                if ui.button("Force").clicked() {
-                    let _ = model.open_forces();
-                }
-                if ui.button("Settings").clicked() {
-                    model.workspace = WorkspaceTab::SimSettings;
-                }
-            });
+            }
+        });
+    if let Some(spec) = pick_obj {
+        let _ = model.select_object(&spec);
+    }
+    ui.separator();
+    ui.label(RichText::new("Panes").strong());
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Wave").clicked() {
+            model.workspace = WorkspaceTab::Wave;
+        }
+        if ui.button("Source").clicked() {
+            let _ = model.open_source_window();
+        }
+        if ui.button("Memory").clicked() {
+            let _ = model.open_memory();
+        }
+        if ui.button("Breakpoints").clicked() {
+            let _ = model.open_breakpoints();
+        }
+        if ui.button("Locals").clicked() {
+            model.workspace = WorkspaceTab::Locals;
+        }
+        if ui.button("Force").clicked() {
+            let _ = model.open_forces();
+        }
+        if ui.button("Settings").clicked() {
+            model.workspace = WorkspaceTab::SimSettings;
+        }
+    });
 }
 
 
@@ -4641,7 +4609,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     let vw = ui.available_width();
     let vh = ui.available_height().max(240.0);
     model.schematic.set_viewport(vw, vh);
-    let drawing = model.schematic.drawing();
+    let drawing = model.schematic.drawing_arc();
     let cam = model.schematic.camera;
     if chrome::schematic_should_auto_fit(
         cam.zoom,
@@ -4652,9 +4620,8 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         vw,
         vh,
     ) {
-        model.schematic.zoom_fit();
+        model.schematic.apply_zoom_fit(drawing.width, drawing.height);
     }
-    let drawing = model.schematic.drawing();
     let n_cells = drawing
         .symbols
         .iter()
@@ -4711,6 +4678,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
             ui.label(RichText::new(format!("Inside {inst}")).small().weak());
         }
         ui.label(RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0)).small().weak());
+        ui.label(RichText::new("pinch or ⌘-scroll to zoom · drag to pan").small().weak());
     });
     if !model.timing_paths.is_empty() {
         // Results strip belongs under the drawing (UG893). Keep it collapsed so Zoom Fit owns the pane.
@@ -4750,172 +4718,223 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick = None;
     let mut expand = None;
     let selected = model.selected.clone();
+    let avail = ui.available_size();
+    let (rect, resp) = ui.allocate_exact_size(avail.max(egui::vec2(240.0, 240.0)), Sense::click_and_drag());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        let (zoom_delta, scroll, mods, pointer) = ui.input(|i| {
+            (
+                i.zoom_delta(),
+                i.smooth_scroll_delta,
+                i.modifiers,
+                i.pointer.hover_pos(),
+            )
+        });
+        if let Some(pos) = pointer {
+            let vx = pos.x - rect.left();
+            let vy = pos.y - rect.top();
+            if (zoom_delta - 1.0).abs() > 0.001 {
+                model.schematic.zoom_at(zoom_delta, vx, vy);
+            } else if (mods.command || mods.ctrl) && scroll.y.abs() > 0.1 {
+                let f = (1.0 + scroll.y * 0.004).clamp(0.5, 1.8);
+                model.schematic.zoom_at(f, vx, vy);
+            } else if scroll.length_sq() > 0.1 {
+                model.schematic.pan_by(scroll.x, scroll.y);
+            }
+        }
+    }
+    if resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let d = resp.drag_delta();
+        model.schematic.pan_by(d.x, d.y);
+    }
     let cam = model.schematic.camera;
     let z = cam.zoom.max(0.05);
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let size = egui::vec2(
-                (drawing.width * z + cam.pan_x.abs() + 8.0).max(ui.available_width()),
-                (drawing.height * z + cam.pan_y.abs() + 8.0).max(ui.available_height().max(240.0)),
-            );
-            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-            if ui.is_rect_visible(rect) {
-                let p = ui.painter();
-                p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
-                let o = egui::pos2(rect.min.x + cam.pan_x, rect.min.y + cam.pan_y);
-                let net_col = Color32::from_rgb(0x3d, 0xb8, 0x7a);
-                let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
-                let path_col = Color32::from_rgb(0xe0, 0x6c, 0x75);
-                for w in &drawing.wires {
-                    let pts: Vec<egui::Pos2> = w
-                        .points
-                        .iter()
-                        .map(|(x, y)| egui::pos2(o.x + *x * z, o.y + *y * z))
-                        .collect();
-                    let thick = if w.highlighted {
-                        4.2_f32
-                    } else if w.width > 1 {
-                        3.6_f32
-                    } else {
-                        1.4_f32
-                    };
-                    let col = if w.highlighted { path_col } else { net_col };
-                    for pair in pts.windows(2) {
-                        if w.off_sheet {
-                            paint_dotted(p, pair[0], pair[1], Stroke::new(thick, col));
-                        } else {
-                            p.line_segment([pair[0], pair[1]], Stroke::new(thick, col));
-                        }
-                    }
-                    if let (Some(&a), Some(&b)) = (pts.first(), pts.get(1).or(pts.last())) {
-                        let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5 - 8.0);
-                        p.text(
-                            mid,
-                            egui::Align2::CENTER_BOTTOM,
-                            &w.net,
-                            egui::FontId::monospace(9.0),
-                            Color32::from_rgb(0x7e, 0xc8, 0xe3),
-                        );
-                    }
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter().with_clip_rect(rect);
+        p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
+        let o = egui::pos2(rect.min.x + cam.pan_x, rect.min.y + cam.pan_y);
+        let net_col = Color32::from_rgb(0x3d, 0xb8, 0x7a);
+        let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
+        let path_col = Color32::from_rgb(0xe0, 0x6c, 0x75);
+        let name_fs = 10.0 * z;
+        let pin_fs = 9.0 * z;
+        let show_names = name_fs >= 6.0;
+        let show_pins = pin_fs >= 6.5;
+        for w in &drawing.wires {
+            if w.points.len() < 2 {
+                continue;
+            }
+            let mut minx = f32::MAX;
+            let mut miny = f32::MAX;
+            let mut maxx = f32::MIN;
+            let mut maxy = f32::MIN;
+            for &(x, y) in &w.points {
+                let px = o.x + x * z;
+                let py = o.y + y * z;
+                minx = minx.min(px);
+                miny = miny.min(py);
+                maxx = maxx.max(px);
+                maxy = maxy.max(py);
+            }
+            let bb = egui::Rect::from_min_max(egui::pos2(minx, miny), egui::pos2(maxx, maxy));
+            if !bb.expand(8.0).intersects(rect) {
+                continue;
+            }
+            let thick = if w.highlighted {
+                4.2_f32
+            } else if w.width > 1 {
+                3.6_f32
+            } else {
+                1.4_f32
+            };
+            let col = if w.highlighted { path_col } else { net_col };
+            for pair in w.points.windows(2) {
+                let a = egui::pos2(o.x + pair[0].0 * z, o.y + pair[0].1 * z);
+                let b = egui::pos2(o.x + pair[1].0 * z, o.y + pair[1].1 * z);
+                if w.off_sheet {
+                    paint_dotted(&p, a, b, Stroke::new(thick, col));
+                } else {
+                    p.line_segment([a, b], Stroke::new(thick, col));
                 }
-                for sy in &drawing.symbols {
-                    let r = egui::Rect::from_min_size(
-                        egui::pos2(o.x + sy.x * z, o.y + sy.y * z),
-                        egui::vec2(sy.w * z, sy.h * z),
-                    );
-                    let on = selected.as_deref() == Some(sy.name.as_str());
-                    let port = sy.kind.starts_with("PORT");
-                    let fill = if sy.highlighted {
-                        Color32::from_rgb(0x5c, 0x2e, 0x1e)
-                    } else if on {
-                        Color32::from_rgb(0x3d, 0x4a, 0x28)
-                    } else if port || sy.kind == "IOB_OUT" {
-                        Color32::from_rgb(0x1e, 0x3a, 0x55)
-                    } else {
-                        Color32::from_rgb(0x2a, 0x32, 0x24)
-                    };
-                    let stroke = Stroke::new(
-                        if on || sy.highlighted { 2.0_f32 } else { 1.0_f32 },
-                        if sy.highlighted {
-                            path_col
-                        } else if on {
-                            gold
-                        } else {
-                            Color32::from_rgb(0x7a, 0x84, 0x8e)
-                        },
-                    );
-                    // Ports / IOB as right-pointing triangles; LUTs and FFs as boxes.
-                    if port || sy.kind == "IOB_OUT" {
-                        let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
-                        p.add(egui::Shape::convex_polygon(pts, fill, stroke));
-                    } else {
-                        p.rect_filled(r, 3.0, fill);
-                        p.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
-                    }
+            }
+            if show_names {
+                let a = w.points[0];
+                let b = w.points.get(1).copied().unwrap_or(a);
+                let pa = egui::pos2(o.x + a.0 * z, o.y + a.1 * z);
+                let pb = egui::pos2(o.x + b.0 * z, o.y + b.1 * z);
+                let span = (pa.x - pb.x).abs().max((pa.y - pb.y).abs());
+                if span > 48.0 && z >= 0.55 {
+                    let mid = egui::pos2((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5 - 8.0 * z);
                     p.text(
-                        egui::pos2(r.center().x, r.top() + 3.0),
-                        egui::Align2::CENTER_TOP,
-                        &sy.kind,
-                        egui::FontId::monospace(10.0),
+                        mid,
+                        egui::Align2::CENTER_BOTTOM,
+                        &w.net,
+                        egui::FontId::monospace(pin_fs.clamp(6.5, 11.0)),
                         Color32::from_rgb(0x7e, 0xc8, 0xe3),
                     );
+                }
+            }
+        }
+        for sy in &drawing.symbols {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(o.x + sy.x * z, o.y + sy.y * z),
+                egui::vec2(sy.w * z, sy.h * z),
+            );
+            if !r.expand(24.0).intersects(rect) {
+                continue;
+            }
+            let on = selected.as_deref() == Some(sy.name.as_str());
+            let port = sy.kind.starts_with("PORT");
+            let fill = if sy.highlighted {
+                Color32::from_rgb(0x5c, 0x2e, 0x1e)
+            } else if on {
+                Color32::from_rgb(0x3d, 0x4a, 0x28)
+            } else if port || sy.kind == "IOB_OUT" {
+                Color32::from_rgb(0x1e, 0x3a, 0x55)
+            } else {
+                Color32::from_rgb(0x2a, 0x32, 0x24)
+            };
+            let stroke = Stroke::new(
+                if on || sy.highlighted { 2.0_f32 } else { 1.0_f32 },
+                if sy.highlighted {
+                    path_col
+                } else if on {
+                    gold
+                } else {
+                    Color32::from_rgb(0x7a, 0x84, 0x8e)
+                },
+            );
+            if port || sy.kind == "IOB_OUT" {
+                let pts = vec![r.left_top(), r.left_bottom(), r.right_center()];
+                p.add(egui::Shape::convex_polygon(pts, fill, stroke));
+            } else {
+                p.rect_filled(r, 3.0, fill);
+                p.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
+            }
+            if show_names && r.width() >= 28.0 && r.height() >= 16.0 {
+                let clip = p.with_clip_rect(r.shrink(2.0).intersect(rect));
+                let fs = name_fs.clamp(6.0, 13.0);
+                clip.text(
+                    egui::pos2(r.center().x, r.top() + 3.0 * z),
+                    egui::Align2::CENTER_TOP,
+                    helion_gui::schematic_kind_label(&sy.kind),
+                    egui::FontId::monospace(fs * 0.9),
+                    Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                );
+                clip.text(
+                    egui::pos2(r.center().x, r.bottom() - 3.0 * z),
+                    egui::Align2::CENTER_BOTTOM,
+                    &sy.name,
+                    egui::FontId::monospace(fs),
+                    Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                );
+            }
+            for pin in &sy.pins {
+                let nc = pin.net.is_empty();
+                if !chrome::schematic_pin_visible(nc, on) {
+                    continue;
+                }
+                let tip = egui::pos2(o.x + pin.x * z, o.y + pin.y * z);
+                let edge = if pin.output {
+                    egui::pos2(r.right(), tip.y)
+                } else {
+                    egui::pos2(r.left(), tip.y)
+                };
+                let inner = if pin.output {
+                    egui::pos2(r.right() - 10.0 * z, tip.y)
+                } else {
+                    egui::pos2(r.left() + 10.0 * z, tip.y)
+                };
+                let stub = Color32::from_rgb(0xdc, 0xe0, 0xe4);
+                p.line_segment([inner, edge], Stroke::new(2.0_f32, stub));
+                p.line_segment([edge, tip], Stroke::new(2.0_f32, stub));
+                p.circle_filled(tip, (2.2 * z).clamp(1.2, 3.0), stub);
+                if show_pins {
+                    let label = if nc {
+                        format!("{} n/c", pin.name)
+                    } else {
+                        pin.name.clone()
+                    };
+                    let label_pos = if pin.output {
+                        egui::pos2(r.right() - 4.0 * z, tip.y)
+                    } else {
+                        egui::pos2(r.left() + 4.0 * z, tip.y)
+                    };
                     p.text(
-                        egui::pos2(r.center().x, r.bottom() - 3.0),
-                        egui::Align2::CENTER_BOTTOM,
-                        &sy.name,
-                        egui::FontId::monospace(10.0),
-                        Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                        label_pos,
+                        if pin.output {
+                            egui::Align2::RIGHT_CENTER
+                        } else {
+                            egui::Align2::LEFT_CENTER
+                        },
+                        label,
+                        egui::FontId::monospace(pin_fs.clamp(6.5, 11.0)),
+                        if nc {
+                            Color32::from_rgb(0x6a, 0x72, 0x78)
+                        } else {
+                            Color32::from_rgb(0x9a, 0xa4, 0xae)
+                        },
                     );
-                    for pin in &sy.pins {
-                        let nc = pin.net.is_empty();
-                        if !chrome::schematic_pin_visible(nc, on) {
-                            continue;
+                }
+            }
+        }
+        if resp.clicked() || resp.double_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let lx = (pos.x - rect.left() - cam.pan_x) / z;
+                let ly = (pos.y - rect.top() - cam.pan_y) / z;
+                for sy in drawing.symbols.iter().rev() {
+                    if lx >= sy.x && lx <= sy.x + sy.w && ly >= sy.y && ly <= sy.y + sy.h {
+                        pick = Some(sy.name.clone());
+                        if resp.double_clicked() && !sy.kind.starts_with("PORT") {
+                            expand = Some(sy.name.clone());
                         }
-                        let tip = egui::pos2(o.x + pin.x * z, o.y + pin.y * z);
-                        let edge = if pin.output {
-                            egui::pos2(r.right(), tip.y)
-                        } else {
-                            egui::pos2(r.left(), tip.y)
-                        };
-                        // Pin stub: a short line inside and outside the symbol.
-                        let inner = if pin.output {
-                            egui::pos2(r.right() - 10.0, tip.y)
-                        } else {
-                            egui::pos2(r.left() + 10.0, tip.y)
-                        };
-                        let stub = Color32::from_rgb(0xdc, 0xe0, 0xe4);
-                        p.line_segment([inner, edge], Stroke::new(2.0_f32, stub));
-                        p.line_segment([edge, tip], Stroke::new(2.0_f32, stub));
-                        p.circle_filled(tip, 2.2, stub);
-                        let label = if nc {
-                            format!("{} n/c", pin.name)
-                        } else {
-                            pin.name.clone()
-                        };
-                        let label_pos = if pin.output {
-                            egui::pos2(r.right() - 4.0, tip.y)
-                        } else {
-                            egui::pos2(r.left() + 4.0, tip.y)
-                        };
-                        p.text(
-                            label_pos,
-                            if pin.output {
-                                egui::Align2::RIGHT_CENTER
-                            } else {
-                                egui::Align2::LEFT_CENTER
-                            },
-                            label,
-                            egui::FontId::monospace(9.0),
-                            if nc {
-                                Color32::from_rgb(0x6a, 0x72, 0x78)
-                            } else {
-                                Color32::from_rgb(0x9a, 0xa4, 0xae)
-                            },
-                        );
+                        break;
                     }
                 }
             }
-            if resp.clicked() || resp.double_clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let lx = (pos.x - rect.left() - cam.pan_x) / z;
-                    let ly = (pos.y - rect.top() - cam.pan_y) / z;
-                    for sy in drawing.symbols.iter().rev() {
-                        if lx >= sy.x
-                            && lx <= sy.x + sy.w
-                            && ly >= sy.y
-                            && ly <= sy.y + sy.h
-                        {
-                            pick = Some(sy.name.clone());
-                            if resp.double_clicked() && !sy.kind.starts_with("PORT") {
-                                expand = Some(sy.name.clone());
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        }
+    }
     if let Some(id) = pick {
         model.select(&id);
     }
@@ -5457,71 +5476,70 @@ fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.goto_editor("");
         }
     });
-    let rows = model.source_line_rows().to_vec();
     let selected = model.selected_source_line;
     let markers = model.editor_markers();
+    let n = model.source_line_rows().len();
     let mut pick_line: Option<String> = None;
     let mut pick_mark: Option<String> = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Marker").strong());
+        ui.add_space(12.0);
+        ui.label(RichText::new("Line").strong());
+        ui.add_space(12.0);
+        ui.label(RichText::new("Kind").strong());
+        ui.add_space(12.0);
+        ui.label(RichText::new("Text").strong());
+    });
+    let row_h = 22.0;
     egui::ScrollArea::both()
         .id_salt("ug893_text_editor")
-        .show(ui, |ui| {
-            egui::Grid::new("ug893_text_editor_table")
-                .spacing([8.0, 2.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Marker").strong());
-                    ui.label(RichText::new("Line").strong());
-                    ui.label(RichText::new("Kind").strong());
-                    ui.label(RichText::new("Text").strong());
-                    ui.end_row();
-                    if rows.is_empty() {
-                        ui.label("—");
-                        ui.label("—");
-                        ui.label("—");
-                        ui.label("No sources yet.");
-                        ui.end_row();
-                    } else {
-                        for r in &rows {
-                            let on = selected == Some(r.line);
-                            let mk = markers
-                                .iter()
-                                .filter(|m| m.line == r.line)
-                                .min_by_key(|m| match m.kind.as_str() {
-                                    "error" => 0u8,
-                                    "warning" => 1,
-                                    "advisory" => 2,
-                                    "probe" => 3,
-                                    "bookmark" => 4,
-                                    _ => 9,
-                                });
-                            let mark = mk.map(|m| m.marker_cell()).unwrap_or("-");
-                            if ui.selectable_label(on && mk.is_some(), mark).clicked() {
-                                if mk.map(|m| m.kind.as_str()) == Some("bookmark")
-                                    || mk.is_none()
-                                {
-                                    pick_mark = Some(r.line.to_string());
-                                } else {
-                                    pick_line = Some(r.line.to_string());
-                                }
-                            }
-                            if ui
-                                .selectable_label(on, RichText::new(r.line.to_string()).monospace())
-                                .clicked()
-                            {
-                                pick_line = Some(r.line.to_string());
-                            }
-                            if ui.selectable_label(on, r.type_cell()).clicked() {
-                                pick_line = Some(r.line.to_string());
-                            }
-                            if ui
-                                .selectable_label(on, RichText::new(r.text.trim()).monospace())
-                                .clicked()
-                            {
-                                pick_line = Some(r.line.to_string());
-                            }
-                            ui.end_row();
+        .show_rows(ui, row_h, n.max(1), |ui, range| {
+            if n == 0 {
+                ui.label("No sources yet.");
+                return;
+            }
+            let rows = model.source_line_rows();
+            let end = range.end.min(n);
+            for r in &rows[range.start..end] {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(row_h);
+                    let on = selected == Some(r.line);
+                    let mk = markers
+                        .iter()
+                        .filter(|m| m.line == r.line)
+                        .min_by_key(|m| match m.kind.as_str() {
+                            "error" => 0u8,
+                            "warning" => 1,
+                            "advisory" => 2,
+                            "probe" => 3,
+                            "bookmark" => 4,
+                            _ => 9,
+                        });
+                    let mark = mk.map(|m| m.marker_cell()).unwrap_or("-");
+                    if ui.selectable_label(on && mk.is_some(), mark).clicked() {
+                        if mk.map(|m| m.kind.as_str()) == Some("bookmark") || mk.is_none() {
+                            pick_mark = Some(r.line.to_string());
+                        } else {
+                            pick_line = Some(r.line.to_string());
                         }
                     }
+                    if ui
+                        .selectable_label(on, RichText::new(r.line.to_string()).monospace())
+                        .clicked()
+                    {
+                        pick_line = Some(r.line.to_string());
+                    }
+                    if ui.selectable_label(on, r.type_cell()).clicked() {
+                        pick_line = Some(r.line.to_string());
+                    }
+                    if ui
+                        .selectable_label(on, RichText::new(r.text.trim()).monospace())
+                        .clicked()
+                    {
+                        pick_line = Some(r.line.to_string());
+                    }
                 });
+            }
         });
     if let Some(spec) = pick_mark {
         let _ = model.toggle_editor_bookmark(&spec);
@@ -5547,46 +5565,43 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
     let blocks = model.memory_rows().to_vec();
     let selected = model.selected_memory.clone();
     let mut pick: Option<String> = None;
-    data_scroll("ug900_memory")
-        .show(ui, |ui| {
-            egui::Grid::new("ug900_memory_table")
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Name").strong());
-                    ui.label(RichText::new("Type").strong());
-                    ui.label(RichText::new("Addr").strong());
-                    ui.label(RichText::new("Data").strong());
-                    ui.label(RichText::new("Width").strong());
-                    ui.label(RichText::new("Depth").strong());
-                    ui.end_row();
-                    if blocks.is_empty() {
-                        ui.label("—");
-                        ui.label("—");
-                        ui.label("—");
-                        ui.label("No memories until you run simulation.");
-                        ui.end_row();
-                        // CTA painted below grid
-                    } else {
-                        for (i, m) in blocks.iter().enumerate() {
-                            let on = selected.as_deref() == Some(m.name.as_str());
-                            if ui.selectable_label(on, &m.name).clicked() {
-                                pick = Some(i.to_string());
-                            }
-                            if ui.selectable_label(on, m.type_cell()).clicked() {
-                                pick = Some(i.to_string());
-                            }
-                            if ui.selectable_label(on, "0").clicked() {
-                                pick = Some(i.to_string());
-                            }
-                            if ui.selectable_label(on, m.data_cell()).clicked() {
-                                pick = Some(i.to_string());
-                            }
-                            ui.label(m.width.to_string());
-                            ui.label(m.depth().to_string());
-                            ui.end_row();
-                        }
-                    }
-                });
+    let remain = ui.available_height().max(160.0);
+    let list_h = (remain * 0.55).clamp(120.0, remain - 80.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Name").strong());
+        ui.add_space(48.0);
+        ui.label(RichText::new("Type").strong());
+        ui.add_space(24.0);
+        ui.label(RichText::new("Data").strong());
+        ui.add_space(24.0);
+        ui.label(RichText::new("W").strong());
+        ui.label(RichText::new("D").strong());
+    });
+    let row_h = 22.0;
+    egui::ScrollArea::vertical()
+        .id_salt("ug900_memory")
+        .max_height(list_h)
+        .show_rows(ui, row_h, blocks.len().max(1), |ui, range| {
+            if blocks.is_empty() {
+                ui.label("No memories until you run simulation.");
+                return;
+            }
+            let end = range.end.min(blocks.len());
+            for (i, m) in blocks[range.start..end].iter().enumerate() {
+                let i = range.start + i;
+                let on = selected.as_deref() == Some(m.name.as_str());
+                let shown = format!(
+                    "{}  {}  {}  {}/{}",
+                    helion_gui::schematic_short_name(&m.name),
+                    m.type_cell(),
+                    m.data_cell(),
+                    m.width,
+                    m.depth()
+                );
+                if paint_clipped_select(ui, on, &shown, &m.name) {
+                    pick = Some(i.to_string());
+                }
+            }
         });
     if let Some(spec) = pick {
         let _ = model.select_memory(&spec);
@@ -5599,25 +5614,19 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel) {
     if words.is_empty() {
         ui.label("Select a memory to view address and data.");
     } else {
-        data_scroll("ug900_memory_words")
-            .show(ui, |ui| {
-                egui::Grid::new("ug900_memory_words_table")
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Addr").strong());
-                        ui.label(RichText::new("Data").strong());
-                        ui.end_row();
-                        for r in &words {
-                            let on = sel_addr == Some(r.addr);
-                            if ui.selectable_label(on, r.addr.to_string()).clicked() {
-                                pick_addr = Some(r.addr);
-                            }
-                            if ui.selectable_label(on, &r.data).clicked() {
-                                pick_addr = Some(r.addr);
-                            }
-                            ui.end_row();
-                        }
-                    });
+        let rest = ui.available_height().max(80.0);
+        egui::ScrollArea::vertical()
+            .id_salt("ug900_memory_words")
+            .max_height(rest)
+            .show_rows(ui, row_h, words.len().max(1), |ui, range| {
+                let end = range.end.min(words.len());
+                for r in &words[range.start..end] {
+                    let on = sel_addr == Some(r.addr);
+                    let shown = format!("{:#x}  {}", r.addr, r.data);
+                    if paint_clipped_select(ui, on, &shown, &r.data) {
+                        pick_addr = Some(r.addr);
+                    }
+                }
             });
     }
     if let Some(addr) = pick_addr {
