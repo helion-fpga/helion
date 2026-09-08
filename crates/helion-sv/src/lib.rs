@@ -716,6 +716,8 @@ struct P<'a> {
     t: &'a [Tok],
     i: usize,
     params: HashMap<String, u128>,
+    /// Signal/port widths seen so far (slice assigns and const if).
+    widths: HashMap<String, usize>,
 }
 
 impl<'a> P<'a> {
@@ -981,7 +983,21 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
     let e = parse_shift(p)?;
     if matches!(p.peek(), Some(Tok::Eq)) {
         p.bump();
-        return Ok(RExpr::Eq(Box::new(e), Box::new(parse_shift(p)?)));
+        let r = parse_shift(p)?;
+        if let (
+            RExpr::Const { val: a, care: ca, .. },
+            RExpr::Const { val: b, care: cb, .. },
+        ) = (&e, &r)
+        {
+            if *ca & 1 == 1 && *cb & 1 == 1 {
+                return Ok(RExpr::Const {
+                    val: if a == b { 1 } else { 0 },
+                    width: 1,
+                    care: 1,
+                });
+            }
+        }
+        return Ok(RExpr::Eq(Box::new(e), Box::new(r)));
     }
     if matches!(p.peek(), Some(Tok::Ne)) {
         p.bump();
@@ -1285,6 +1301,14 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         return Ok(RExpr::Concat(parts));
     }
     match p.bump() {
+        Some(Tok::Str(s)) => {
+            let h = str_param_hash(s);
+            Ok(RExpr::Const {
+                val: h,
+                width: 32,
+                care: u128::MAX,
+            })
+        }
         Some(Tok::Number(v, w)) => {
             let care = if *w >= 128 { u128::MAX } else { (1u128 << (*w).max(1)) - 1 };
             Ok(RExpr::Const {
@@ -1594,7 +1618,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
                 other => other.clone(),
             })
             .collect();
-        let mut sp = P { t: &toks, i: 0, params: p.params.clone() };
+        let mut sp = P { t: &toks, i: 0, params: p.params.clone(), widths: p.widths.clone() };
         out.extend(parse_seq_block(&mut sp, block)?);
         i += step;
     }
@@ -1628,6 +1652,123 @@ fn parse_attr(p: &mut P) -> Option<(String, String)> {
     Some((k, v))
 }
 
+
+/// FNV-1a tag so a string parameter does not compare equal to a small integer.
+fn str_param_hash(s: &str) -> u128 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as u128) | (1u128 << 96)
+}
+
+fn bit_extract(e: RExpr, bit: usize) -> RExpr {
+    if bit == 0 {
+        e
+    } else {
+        RExpr::Shr(
+            Box::new(e),
+            Box::new(RExpr::Const {
+                val: bit as u128,
+                width: 32,
+                care: u128::MAX,
+            }),
+        )
+    }
+}
+
+fn note_width(p: &mut P, name: &str, w: usize) {
+    p.widths.insert(name.to_string(), w.max(1));
+}
+
+/// Last procedural write wins. Vector assigns become per-bit so a case arm
+/// that writes slices can mux against an arm that writes the whole vector.
+fn normalize_nbas(p: &P, stmts: Vec<Nba>) -> Vec<Nba> {
+    let mut order: Vec<(String, Option<usize>)> = Vec::new();
+    let mut map: HashMap<(String, Option<usize>), RExpr> = HashMap::new();
+    let mut put = |order: &mut Vec<(String, Option<usize>)>,
+                   map: &mut HashMap<(String, Option<usize>), RExpr>,
+                   key: (String, Option<usize>),
+                   rhs: RExpr| {
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.insert(key, rhs);
+    };
+    for (lhs, bit, rhs) in stmts {
+        let w = p.widths.get(&lhs).copied().unwrap_or(1).min(256);
+        match bit {
+            Some(b) => {
+                let full = (lhs.clone(), None);
+                if map.remove(&full).is_some() {
+                    order.retain(|k| k != &full);
+                }
+                put(&mut order, &mut map, (lhs, Some(b)), rhs);
+            }
+            None if w > 1 => {
+                order.retain(|(n, _)| n != &lhs);
+                map.retain(|(n, _), _| n != &lhs);
+                for i in 0..w {
+                    let key = (lhs.clone(), Some(i));
+                    order.push(key.clone());
+                    map.insert(key, bit_extract(rhs.clone(), i));
+                }
+            }
+            None => put(&mut order, &mut map, (lhs, None), rhs),
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| map.remove(&k).map(|rhs| (k.0, k.1, rhs)))
+        .collect()
+}
+
+/// Blocking assign, including `name[hi:lo] = expr` as per-bit writes.
+fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
+    let name = p.ident()?;
+    let mut range: Option<(usize, usize)> = None;
+    let mut bit = None;
+    if p.eat_sym('[') {
+        let hi = const_u(p)? as usize;
+        if p.eat_sym(':') {
+            let lo = const_u(p)? as usize;
+            if !p.eat_sym(']') {
+                return Err("]".into());
+            }
+            range = Some((hi, lo));
+        } else if p.eat_sym(']') {
+            bit = Some(hi);
+        } else {
+            return Err("lhs index".into());
+        }
+    }
+    if matches!(p.peek(), Some(Tok::Le)) {
+        p.bump();
+    } else if !p.eat_sym('=') {
+        return Err("nba".into());
+    }
+    let rhs = parse_rexpr(p)?;
+    let _ = p.eat_sym(';');
+    if let Some((a, b)) = range {
+        let hi = a.max(b);
+        let lo = a.min(b);
+        let mut v = Vec::new();
+        let mut k = 0usize;
+        let mut i = lo;
+        while i <= hi {
+            v.push((name.clone(), Some(i), bit_extract(rhs.clone(), k)));
+            k += 1;
+            if i == usize::MAX {
+                break;
+            }
+            i += 1;
+        }
+        return Ok(v);
+    }
+    Ok(vec![(name, bit, rhs)])
+}
+
 fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
     let _ = p.eat_kw("unique");
     let _ = p.eat_kw("priority");
@@ -1643,13 +1784,22 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
             return Err("if )".into());
         }
         let then_b = p.eat_kw("begin");
-        let then_s = parse_seq_block(p, then_b)?;
+        let then_raw = parse_seq_block(p, then_b)?;
+        let then_s = normalize_nbas(p, then_raw);
         let else_s = if p.eat_kw("else") {
             let eb = p.eat_kw("begin");
-            parse_seq_block(p, eb)?
+            let else_raw = parse_seq_block(p, eb)?;
+            normalize_nbas(p, else_raw)
         } else {
             Vec::new()
         };
+        // Parameter string compare (e.g. operation_mode == "dynamic") is
+        // an elaboration constant — keep the taken branch, do not mux both.
+        if let RExpr::Const { val, care, .. } = &cond {
+            if *care & 1 == 1 {
+                return Ok(if *val != 0 { then_s } else { else_s });
+            }
+        }
         let mut out = Vec::new();
         for (lhs, bit, rhs) in then_s {
             let other = else_s
@@ -1692,7 +1842,8 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
             if p.eat_kw("default") {
                 let _ = p.eat_sym(':');
                 let b = p.eat_kw("begin");
-                def = parse_seq_block(p, b)?;
+                let def_raw = parse_seq_block(p, b)?;
+                def = normalize_nbas(p, def_raw);
                 continue;
             }
             let item = parse_rexpr(p)?;
@@ -1700,7 +1851,8 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
                 return Err("case :".into());
             }
             let b = p.eat_kw("begin");
-            let body = parse_seq_block(p, b)?;
+            let body_raw = parse_seq_block(p, b)?;
+            let body = normalize_nbas(p, body_raw);
             arms.push((Some(item), body));
         }
         let mut out = Vec::new();
@@ -1728,7 +1880,7 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
         }
         return Ok(out);
     }
-    Ok(vec![parse_nba(p)?])
+    parse_assign_nbas(p)
 }
 
 fn skip_until_kw(p: &mut P, kw: &str) {
@@ -1752,7 +1904,7 @@ fn skip_until_kw(p: &mut P, kw: &str) {
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
-    let mut p = P { t: &toks, i: 0, params: HashMap::new() };
+    let mut p = P { t: &toks, i: 0, params: HashMap::new(), widths: HashMap::new() };
     let mut mods = Vec::new();
     while p.peek().is_some() {
         if p.eat_sym(';') {
@@ -2174,6 +2326,251 @@ fn parse_net_ref(p: &mut P) -> Result<String, String> {
     Ok(name)
 }
 
+
+#[derive(Clone, Debug)]
+struct FuncDef {
+    name: String,
+    ret_w: usize,
+    ports: Vec<(String, PortDir, usize)>,
+    signals: Vec<(String, usize)>,
+    stmts: Vec<Nba>,
+}
+
+/// Standing rule: a function is behavioral Verilog. Parse it so a call can
+/// inline, or an otherwise empty module can lift it into ports + assigns.
+fn parse_function(p: &mut P) -> Result<FuncDef, String> {
+    skip_sv_type(p);
+    let ret_w = match p.width_opt() {
+        Ok(w) => w,
+        Err(_) => 1,
+    };
+    let name = match p.ident() {
+        Ok(n) => n,
+        Err(_) => {
+            skip_until_kw(p, "endfunction");
+            return Err("function name".into());
+        }
+    };
+    let _ = p.eat_sym(';');
+    note_width(p, &name, ret_w);
+    let mut ports = Vec::new();
+    let mut signals = Vec::new();
+    let mut stmts = Vec::new();
+    while !p.eat_kw("endfunction") {
+        if p.peek().is_none()
+            || matches!(p.peek(), Some(Tok::Kw(k)) if k == "endmodule" || k == "module")
+        {
+            return Err("unterminated function".into());
+        }
+        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output" || k == "inout") {
+            let dir = parse_port_dir(p).unwrap_or(PortDir::In);
+            skip_sv_type(p);
+            let w = p.width_opt().unwrap_or(1);
+            if let Ok(n) = p.ident() {
+                ports.push((n.clone(), dir, w));
+                signals.push((n.clone(), w));
+                note_width(p, &n, w);
+            }
+            let _ = p.eat_sym(';');
+            continue;
+        }
+        if p.eat_kw("integer") {
+            if let Ok(n) = p.ident() {
+                signals.push((n.clone(), 32));
+                note_width(p, &n, 32);
+            }
+            let _ = p.eat_sym(';');
+            continue;
+        }
+        if p.eat_kw("reg") || p.eat_kw("wire") || p.eat_kw("logic") {
+            let w = p.width_opt().unwrap_or(1);
+            if let Ok(n) = p.ident() {
+                signals.push((n.clone(), w));
+                note_width(p, &n, w);
+            }
+            skip_to_semi(p);
+            continue;
+        }
+        if p.eat_kw("begin") {
+            if p.eat_sym(':') {
+                let _ = p.ident();
+            }
+            match parse_seq_block(p, true) {
+                Ok(s) => stmts.extend(normalize_nbas(p, s)),
+                Err(_) => {
+                    let _ = skip_begin_end(p);
+                }
+            }
+            continue;
+        }
+        let save = p.i;
+        match parse_assign_nbas(p) {
+            Ok(v) => stmts.extend(normalize_nbas(p, v)),
+            Err(_) => {
+                p.i = save;
+                let _ = skip_item_or_block(p);
+            }
+        }
+    }
+    Ok(FuncDef {
+        name,
+        ret_w,
+        ports,
+        signals,
+        stmts,
+    })
+}
+
+fn rexpr_names(e: &RExpr, out: &mut HashSet<String>) {
+    match e {
+        RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
+            out.insert(s.clone());
+        }
+        RExpr::IndexPart { name, base, .. } => {
+            out.insert(name.clone());
+            rexpr_names(base, out);
+        }
+        RExpr::Concat(parts) => {
+            for p in parts {
+                rexpr_names(p, out);
+            }
+        }
+        RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => {
+            rexpr_names(a, out);
+            rexpr_names(b, out);
+        }
+        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::Not(x) => rexpr_names(x, out),
+        RExpr::Mux(c, t, f) => {
+            rexpr_names(c, out);
+            rexpr_names(t, out);
+            rexpr_names(f, out);
+        }
+        RExpr::Const { .. } => {}
+    }
+}
+
+/// Empty module whose only Verilog is function(s): lift each function into
+/// module ports + comb assigns. Not used when the module already has a body
+/// (calls are inlined at the assign). Never invents a vendor architecture.
+fn lift_functions_if_no_body(
+    ports: &mut Vec<(String, PortDir, usize)>,
+    signals: &mut Vec<Signal>,
+    nbas: &[Nba],
+    assigns: &mut Vec<Nba>,
+    insts: &[Inst],
+    funcs: &[FuncDef],
+) {
+    if funcs.is_empty() || !nbas.is_empty() || !assigns.is_empty() || !insts.is_empty() {
+        return;
+    }
+    let multi = funcs.len() > 1;
+    let mut taken: HashSet<String> = HashSet::new();
+    let claim = |taken: &mut HashSet<String>, name: String| -> String {
+        if !taken.contains(&name) {
+            taken.insert(name.clone());
+            return name;
+        }
+        let mut i = 2u32;
+        loop {
+            let n = format!("{name}_{i}");
+            if !taken.contains(&n) {
+                taken.insert(n.clone());
+                return n;
+            }
+            i += 1;
+        }
+    };
+    for f in funcs {
+        let mut ids: HashSet<String> = HashSet::new();
+        ids.insert(f.name.clone());
+        for (n, _, _) in &f.ports {
+            ids.insert(n.clone());
+        }
+        for (n, _) in &f.signals {
+            ids.insert(n.clone());
+        }
+        for (lhs, _, rhs) in &f.stmts {
+            ids.insert(lhs.clone());
+            rexpr_names(rhs, &mut ids);
+        }
+        let mut subst: HashMap<String, String> = HashMap::new();
+        if multi {
+            for id in &ids {
+                if id == &f.name {
+                    continue;
+                }
+                subst.insert(id.clone(), format!("{}_{id}", f.name));
+            }
+        }
+        let mapped = |subst: &HashMap<String, String>, n: &str| {
+            subst.get(n).cloned().unwrap_or_else(|| n.to_string())
+        };
+        if ports.is_empty() {
+            for (n, dir, w) in &f.ports {
+                let pn = claim(&mut taken, mapped(&subst, n));
+                subst.insert(n.clone(), pn.clone());
+                ports.push((pn.clone(), *dir, *w));
+                if !signals.iter().any(|s| s.name == pn) {
+                    signals.push(Signal {
+                        name: pn,
+                        width: *w,
+                        depth: 0,
+                        keep: false,
+                        mark_debug: false,
+                    });
+                }
+            }
+            let on = claim(&mut taken, f.name.clone());
+            subst.insert(f.name.clone(), on.clone());
+            ports.push((on.clone(), PortDir::Out, f.ret_w));
+            if !signals.iter().any(|s| s.name == on) {
+                signals.push(Signal {
+                    name: on,
+                    width: f.ret_w,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
+            }
+        }
+        for (n, w) in &f.signals {
+            let pn = mapped(&subst, n);
+            if !signals.iter().any(|s| s.name == pn) {
+                signals.push(Signal {
+                    name: pn,
+                    width: *w,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
+            }
+        }
+        for (lhs, bit, rhs) in &f.stmts {
+            let ln = mapped(&subst, lhs);
+            if !signals.iter().any(|s| s.name == ln) {
+                signals.push(Signal {
+                    name: ln.clone(),
+                    width: 1,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
+            }
+            assigns.push((ln, *bit, rewrite_rexpr(rhs, &subst)));
+        }
+    }
+}
+
 fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let tok_start = p.i;
     if !p.eat_kw("module") {
@@ -2272,6 +2669,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut pending_keep = false;
     let mut pending_md = false;
     let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
+    let mut funcs: Vec<FuncDef> = Vec::new();
     if parse_module_items(
         &mut p,
         &mut ports,
@@ -2283,12 +2681,14 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         &mut pending_keep,
         &mut pending_md,
         &mut mem_inits,
+        &mut funcs,
         "endmodule",
     )
     .is_err()
     {
         skip_until_kw(&mut p, "endmodule");
     }
+    lift_functions_if_no_body(&mut ports, &mut signals, &nbas, &mut assigns, &insts, &funcs);
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
         module,
@@ -2314,8 +2714,12 @@ fn parse_module_items(
     pending_keep: &mut bool,
     pending_md: &mut bool,
     mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
+    funcs: &mut Vec<FuncDef>,
     endkw: &str,
 ) -> Result<(), String> {
+    for sig in signals.iter() {
+        note_width(p, &sig.name, sig.width);
+    }
     while !p.eat_kw(endkw) {
         if p.peek().is_none() {
             return Err(format!("unterminated until {endkw}"));
@@ -2333,7 +2737,9 @@ fn parse_module_items(
             }
         }
         if p.eat_kw("function") {
-            skip_until_kw(p, "endfunction");
+            if let Ok(f) = parse_function(p) {
+                funcs.push(f);
+            }
             continue;
         }
         if p.eat_kw("task") {
@@ -2346,7 +2752,7 @@ fn parse_module_items(
         }
         if p.eat_kw("generate") {
             parse_module_items(
-                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                 "endgenerate",
             )?;
             continue;
@@ -2364,14 +2770,20 @@ fn parse_module_items(
             match p.ident() {
                 Ok(name) => {
                     if p.eat_sym('=') {
-                        match const_u(p) {
-                            Ok(val) => {
-                                p.params.entry(name.clone()).or_insert(val);
-                                if !param_order.iter().any(|(n, _)| n == &name) {
-                                    param_order.push((name, val));
+                        if let Some(Tok::Str(sval)) = p.peek() {
+                            let h = str_param_hash(sval);
+                            p.bump();
+                            p.params.entry(name.clone()).or_insert(h);
+                        } else {
+                            match const_u(p) {
+                                Ok(val) => {
+                                    p.params.entry(name.clone()).or_insert(val);
+                                    if !param_order.iter().any(|(n, _)| n == &name) {
+                                        param_order.push((name, val));
+                                    }
                                 }
+                                Err(_) => skip_until_arg_end(p),
                             }
-                            Err(_) => skip_until_arg_end(p),
                         }
                     }
                     skip_to_semi(p);
@@ -2411,13 +2823,13 @@ fn parse_module_items(
                 if yes && !taken {
                     if then_begin {
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                             "end",
                         )?;
                     } else {
                         // one module item; require a following else/endgenerate/endmodule delimiter
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                             "else",
                         )?;
                         // parse_module_items consumed the else keyword — put it back
@@ -2443,7 +2855,7 @@ fn parse_module_items(
                 if !taken {
                     if eb {
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                             "end",
                         )?;
                     } else {
@@ -2484,16 +2896,25 @@ fn parse_module_items(
             skip_logic(&mut p);
             let w = p.width_opt()?;
             let n = p.ident()?;
-            ports.push((n.clone(), dir, w));
-            if !signals.iter().any(|s| s.name == n) {
+            if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n) {
+                // Non-ANSI header listed the name with default dir/width 1.
+                ex.1 = dir;
+                ex.2 = w;
+            } else {
+                ports.push((n.clone(), dir, w));
+            }
+            if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
+                sig.width = w;
+            } else {
                 signals.push(Signal {
-                    name: n,
+                    name: n.clone(),
                     width: w,
                     depth: 0,
                     keep: false,
                     mark_debug: false,
                 });
             }
+            note_width(p, &n, w);
             let _ = p.eat_sym(';');
             continue;
         }
@@ -2527,15 +2948,23 @@ fn parse_module_items(
                     skip_brackets(p);
                 }
             }
-            if !signals.iter().any(|s| s.name == n) {
+            if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
+                if w > 1 {
+                    sig.width = w;
+                }
+                if depth > 0 {
+                    sig.depth = depth;
+                }
+            } else {
                 signals.push(Signal {
-                    name: n,
+                    name: n.clone(),
                     width: w,
                     depth,
                     keep: *pending_keep,
                     mark_debug: *pending_md,
                 });
             }
+            note_width(p, &n, w);
             if p.eat_sym('=') {
                 skip_until_arg_end(p);
             }
@@ -2705,7 +3134,9 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("function") {
-            skip_until_kw(p, "endfunction");
+            if let Ok(f) = parse_function(p) {
+                funcs.push(f);
+            }
             continue;
         }
         if p.eat_kw("task") {
@@ -2807,6 +3238,7 @@ fn parse_for_unroll_module(
             t: &toks,
             i: 0,
             params: p.params.clone(),
+            widths: p.widths.clone(),
         };
         let mut dummy_ports = Vec::new();
         let mut dummy_sigs = Vec::new();
@@ -2816,6 +3248,7 @@ fn parse_for_unroll_module(
         let mut local_nbas = Vec::new();
         let mut local_assigns = Vec::new();
         let mut local_insts = Vec::new();
+        let mut dummy_funcs: Vec<FuncDef> = Vec::new();
         if block {
             parse_module_items(
                 &mut sp,
@@ -2828,6 +3261,7 @@ fn parse_for_unroll_module(
                 &mut pk,
                 &mut pmd,
                 mem_inits,
+                &mut dummy_funcs,
                 "end",
             )?;
         } else if let Ok(inst) = parse_inst(&mut sp) {
@@ -3372,6 +3806,68 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     }
 }
 
+
+/// Truth-table a boolean cone with ≤6 PIs. Linear in the AST, so a huge
+/// nested assign of a few inputs (Problem4) maps without lifting the Ibex
+/// AIG/add hang guard on wide cones.
+fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
+    fn collect(e: &Expr, vars: &mut Vec<String>, budget: &mut usize) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(_) => true,
+            Expr::Var(name) => {
+                if !vars.iter().any(|v| v == name) {
+                    if vars.len() >= 6 {
+                        return false;
+                    }
+                    vars.push(name.clone());
+                }
+                true
+            }
+            Expr::Not(x) => collect(x, vars, budget),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                collect(a, vars, budget) && collect(b, vars, budget)
+            }
+        }
+    }
+    fn eval(e: &Expr, env: &[(&str, bool)], budget: &mut usize) -> Option<bool> {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(b) => Some(*b),
+            Expr::Var(name) => env.iter().find(|(n, _)| *n == name.as_str()).map(|(_, b)| *b),
+            Expr::Not(x) => Some(!eval(x, env, budget)?),
+            Expr::And(a, b) => Some(eval(a, env, budget)? && eval(b, env, budget)?),
+            Expr::Or(a, b) => Some(eval(a, env, budget)? || eval(b, env, budget)?),
+            Expr::Xor(a, b) => Some(eval(a, env, budget)? ^ eval(b, env, budget)?),
+        }
+    }
+    let mut vars = Vec::new();
+    let mut budget = 64_000usize;
+    if !collect(expr, &mut vars, &mut budget) {
+        return None;
+    }
+    let n = vars.len();
+    let mut init = 0u64;
+    for addr in 0..64u64 {
+        let mut env: Vec<(&str, bool)> = Vec::with_capacity(n);
+        for (i, v) in vars.iter().enumerate() {
+            env.push((v.as_str(), (addr >> i) & 1 == 1));
+        }
+        let mut b = 80_000usize;
+        let bit = eval(expr, &env, &mut b)?;
+        if bit {
+            init |= 1u64 << addr;
+        }
+    }
+    Some((init, vars))
+}
+
 fn expr_node_count(e: &Expr) -> usize {
     fn walk(e: &Expr, budget: &mut usize) -> usize {
         if *budget == 0 {
@@ -3828,7 +4324,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 
     // Flatten NBAs into per-bit (name_bit, expr)
     // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
-    rexpr_bit_budget_reset(80_000);
+    // Linear visit budget. Add/cmp hang guards stay elsewhere (Ibex).
+    rexpr_bit_budget_reset(400_000);
     let mut reg_bits: Vec<(String, Expr)> = Vec::new();
     let mut n_mac = 0usize;
     let mut n_bram = 0usize;
@@ -4073,6 +4570,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             break;
         }
         if expr_node_count(expr) > 2_000 {
+            // Keep the node-count hang guard for wide/Add cones (Ibex).
+            // A ≤6-PI boolean is a real LUT6; evaluate it instead of skipping.
+            if let Some((init, pis)) = lut6_from_bool_cone(expr) {
+                let lut = format!("u_clut{i}");
+                d.add_cell(&lut, CellKind::Lut6 { init });
+                d.connect(bitn, &lut, "O");
+                for (pin, pi) in pis.iter().enumerate() {
+                    d.connect(pi, &lut, format!("I{pin}"));
+                }
+            }
             continue;
         }
         let aig = Aig::from_expr(expr);
@@ -4121,18 +4628,31 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         let w = sig_width(rtl, lhs);
         if bit.is_none() && w > 1 {
             for i in 0..w.min(256) {
-                let qnet = bit_name(lhs, w, i);
+                // Ident/range passthrough: the driver is the RHS bit, not a
+                // buffer LUT. Logic assigns drive the LHS bit name.
+                let qnet = match rhs {
+                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), i),
+                    RExpr::Range(s, lo, hi) => {
+                        let idx = lo + i;
+                        if idx <= *hi {
+                            bit_name(s, sig_width(rtl, s), idx)
+                        } else {
+                            bit_name(lhs, w, i)
+                        }
+                    }
+                    _ => bit_name(lhs, w, i),
+                };
                 emit_iob(&mut d, &mut iob_n, &qnet, lhs);
             }
             continue;
         }
-        let (qnet, _) = if let Some(b) = bit {
-            (bit_name(lhs, w, *b), *b)
+        let qnet = if let Some(b) = bit {
+            bit_name(lhs, w, *b)
+        } else if let Ok((q, _)) = drive_target(rhs, rtl) {
+            q
         } else {
-            match drive_target(rhs, rtl) {
-                Ok(x) => x,
-                Err(_) => continue,
-            }
+            // 1-bit comb assign (not a wire name): LUT already drives lhs.
+            bit_name(lhs, w, 0)
         };
         emit_iob(&mut d, &mut iob_n, &qnet, lhs);
     }
@@ -4242,6 +4762,7 @@ fn elaborate_rtl(src: &Rtl, overrides: &HashMap<String, u128>) -> Result<Rtl, St
         t: &src.toks,
         i: 0,
         params: overrides.clone(),
+        widths: HashMap::new(),
     };
     parse_one_module(&mut p)
 }
@@ -4391,6 +4912,32 @@ fn synth_from_parsed_top(
         d.cells.len(),
         t_syn.elapsed().as_millis()
     );
+    let n_logic = d
+        .cells
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.kind,
+                CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Mac27 | CellKind::Bram18
+            )
+        })
+        .count();
+    // Standing rule: ports-only shells and unknown vendor instances (no body
+    // in this file/set) do not invent gates. cells stay 0; timing must not
+    // report a closed WNS.
+    if n_logic == 0 && flat.nbas.is_empty() && flat.assigns.is_empty() {
+        d.attrs.set("NO_BODY", "1");
+        eprintln!(
+            "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
+            d.name
+        );
+    } else if n_logic == 0 {
+        eprintln!(
+            "diagnostic no_logic module={} cells={} (behavioral body present; no LUT/FF mapped under hang guards)",
+            d.name,
+            d.cells.len()
+        );
+    }
     record_instances(&map, &top_name, &mut d, "");
     Ok(d)
 }
@@ -5090,6 +5637,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -5105,6 +5653,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -5119,6 +5668,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         assert_eq!(const_cond(&mut p).unwrap(), false, "A==1 && A==2 with A=1");
 
@@ -5129,6 +5679,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         // left-assoc: (A==2 || A==3) && A==2 → true
         assert_eq!(const_cond(&mut p).unwrap(), true);
@@ -5779,5 +6330,72 @@ endmodule
             "assign out=in must emit IOB, cells={:?}",
             d.cells
         );
+    }
+
+    #[test]
+    fn empty_shell_is_no_body_not_invented_gates() {
+        let src = r#"
+module sky130_fd_sc_hs__tap(VGND,VPWR);
+  input VGND;
+  input VPWR;
+endmodule
+"#;
+        let d = synth_sv(src, "tap.v").expect("empty shell");
+        assert!(d.cells.is_empty(), "empty shell must not invent gates, cells={:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn string_param_always_case_maps_luts() {
+        let src = r#"
+module hardcopyii_reorder_output(datain, operation, dataout);
+  parameter operation_mode = "dynamic";
+  input [3:0] datain;
+  input [1:0] operation;
+  output [3:0] dataout;
+  reg [3:0] dataout_tmp;
+  assign dataout = dataout_tmp;
+  always @(datain)
+    begin
+      if (operation_mode == "dynamic")
+        begin
+          case (operation)
+            2'b00: dataout_tmp = datain;
+            2'b01: dataout_tmp = {datain[1:0], datain[3:2]};
+            default: dataout_tmp = 4'b0;
+          endcase
+        end
+      else dataout_tmp = datain;
+    end
+endmodule
+"#;
+        let d = synth_sv(src, "reord.v").expect("always/case");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(luts > 0, "string-param always/case must map LUTs, cells={:?}", d.cells);
+        assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn function_lifted_into_empty_module_maps_lut() {
+        let src = r#"
+module CRC_tiny();
+  function [3:0] nextCRC;
+    input [3:0] Data;
+    input [3:0] crc;
+    reg [3:0] newcrc;
+    begin
+      newcrc[0] = Data[0] ^ crc[0];
+      newcrc[1] = Data[1] ^ crc[1];
+      newcrc[2] = Data[2] & crc[2];
+      newcrc[3] = Data[3] | crc[3];
+      nextCRC = newcrc;
+    end
+  endfunction
+endmodule
+"#;
+        let d = synth_sv(src, "crc.v").expect("lift function");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(luts >= 4, "lifted function must map LUTs, luts={luts} cells={:?}", d.cells);
+        assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
     }
 }

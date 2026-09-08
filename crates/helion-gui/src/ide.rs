@@ -6310,12 +6310,15 @@ impl IdeModel {
                     .or_else(|| self.tree.sources.last().map(PathBuf::from))
                     .ok_or("synth_design: add a source first")?;
                 let d = crate::synth_hdl_path(&path)?;
-                let msg = format!(
+                let mut msg = format!(
                     "synth_design {} cells={} luts={}",
                     d.name,
                     d.cells.len(),
                     d.lut_inits().len()
                 );
+                if d.attrs.get("NO_BODY") == Some("1") {
+                    msg.push_str(" no_body");
+                }
                 self.shell.session.synth_design(d);
                 self.steps[FlowStep::Opt.index()] = StepState::Pending;
                 self.steps[FlowStep::Place.index()] = StepState::Pending;
@@ -16360,6 +16363,30 @@ impl IdeModel {
     pub fn report_timing_now(&mut self) -> Result<String, String> {
         if self.shell.session.design.is_none() {
             return Err("report_timing: no design".into());
+        }
+        {
+            let d = self.shell.session.design.as_ref().unwrap();
+            let n_logic = d.cells.iter().filter(|c| {
+                matches!(
+                    c.kind,
+                    helion_ir::CellKind::Lut6 { .. }
+                        | helion_ir::CellKind::Hff
+                        | helion_ir::CellKind::Mac27
+                        | helion_ir::CellKind::Bram18
+                )
+            }).count();
+            if n_logic == 0 {
+                let why = if d.attrs.get("NO_BODY") == Some("1") {
+                    "no_body"
+                } else {
+                    "no_logic"
+                };
+                return Ok(format!(
+                    "report_timing {} {why} cells={} (no timing: empty shell or no logic; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
         }
         if self.shell.session.routed.is_none() {
             let dev = self.device()?;
