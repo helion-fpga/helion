@@ -3621,9 +3621,52 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                                     pick_obj = Some(p.placed_cell().to_string());
                                 }
                             }
-                            ui.label(p.iostandard_cell());
-                            ui.label(p.drive_cell());
-                            ui.label(p.slew_cell());
+                            // ComboBox Set → model.exec set_property (HNF + table), not labels.
+                            let cur_std = p.iostandard_cell().to_string();
+                            egui::ComboBox::from_id_salt(("io_iostd", p.name.as_str()))
+                                .selected_text(if cur_std == "-" {
+                                    "— Set —"
+                                } else {
+                                    cur_std.as_str()
+                                })
+                                .width(96.0)
+                                .show_ui(ui, |ui| {
+                                    for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "LVCMOS25", "SSTL15"] {
+                                        if ui.selectable_label(cur_std == std, std).clicked() {
+                                            set_iostd = Some((p.name.clone(), std));
+                                        }
+                                    }
+                                });
+                            let cur_drv = p.drive_cell().to_string();
+                            egui::ComboBox::from_id_salt(("io_drive", p.name.as_str()))
+                                .selected_text(if cur_drv == "-" {
+                                    "— Set —"
+                                } else {
+                                    cur_drv.as_str()
+                                })
+                                .width(64.0)
+                                .show_ui(ui, |ui| {
+                                    for ma in ["4", "8", "12", "16", "24"] {
+                                        if ui.selectable_label(cur_drv == ma, ma).clicked() {
+                                            set_io = Some((p.name.clone(), "DRIVE", ma));
+                                        }
+                                    }
+                                });
+                            let cur_slew = p.slew_cell().to_string();
+                            egui::ComboBox::from_id_salt(("io_slew", p.name.as_str()))
+                                .selected_text(if cur_slew == "-" {
+                                    "— Set —"
+                                } else {
+                                    cur_slew.as_str()
+                                })
+                                .width(72.0)
+                                .show_ui(ui, |ui| {
+                                    for s in ["SLOW", "FAST"] {
+                                        if ui.selectable_label(cur_slew == s, s).clicked() {
+                                            set_io = Some((p.name.clone(), "SLEW", s));
+                                        }
+                                    }
+                                });
                             ui.label(p.pulltype_cell());
                             ui.label(p.diff_term_cell());
                             ui.label(p.in_term_cell());
@@ -3725,11 +3768,13 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         });
     }
     if let Some((port, std)) = set_iostd {
+        // ComboBox / button Set → set_iostandard (HNF + constraints); exec syncs the table.
         let _ = model.exec(&format!(
             "set_property IOSTANDARD {std} [get_ports {port}]"
         ));
     }
     if let Some((port, key, val)) = set_io {
+        // DRIVE / SLEW / … Set → model.set_*; illegal HAD values Err (not silent wallpaper).
         let _ = model.exec(&format!("set_property {key} {val} [get_ports {port}]"));
     }
     if let Some((port, pin)) = set_pkg_pin {
