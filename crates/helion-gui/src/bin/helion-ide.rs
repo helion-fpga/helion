@@ -216,6 +216,57 @@ fn run_gui() -> eframe::Result {
     )
 }
 
+
+/// Multi-step Create Project wizard (Vivado-shaped; no IP catalog / board DONE).
+#[derive(Clone, Debug)]
+struct CreateProjectWizard {
+    /// 0 name/dir, 1 part, 2 sources, 3 constraints, 4 summary
+    step: usize,
+    name: String,
+    directory: String,
+    part: String,
+    sources: Vec<String>,
+    source_draft: String,
+    constraints: Vec<String>,
+    constraint_draft: String,
+    error: Option<String>,
+}
+
+impl Default for CreateProjectWizard {
+    fn default() -> Self {
+        let dir = default_projects_dir();
+        Self {
+            step: 0,
+            name: "project_1".into(),
+            directory: dir.display().to_string(),
+            part: "HL10T-C32-1".into(),
+            sources: Vec::new(),
+            source_draft: String::new(),
+            constraints: Vec::new(),
+            constraint_draft: String::new(),
+            error: None,
+        }
+    }
+}
+
+fn default_projects_dir() -> PathBuf {
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h).join("helion-projects");
+        }
+    }
+    PathBuf::from("/tmp/helion-projects")
+}
+
+const CREATE_WIZARD_PARTS: &[&str] = &["HL10T-C32-1", "HL10T-DSP1"];
+const CREATE_WIZARD_STEPS: &[&str] = &[
+    "Project name",
+    "Part",
+    "Add sources",
+    "Add constraints",
+    "Finish",
+];
+
 struct HelionIde {
     model: IdeModel,
     tree_filter: String,
@@ -227,6 +278,8 @@ struct HelionIde {
     show_tcl: bool,
     show_palette: bool,
     show_examples: bool,
+    show_create_project: bool,
+    create_wizard: CreateProjectWizard,
     recent: Vec<PathBuf>,
     tcl_focus: bool,
     /// Last Program rail action: (ok, message) for honest empty/error/progress.
@@ -274,6 +327,8 @@ impl HelionIde {
             show_tcl: false,
             show_palette: false,
             show_examples: false,
+            show_create_project: false,
+            create_wizard: CreateProjectWizard::default(),
             recent: Vec::new(),
             tcl_focus: false,
             program_status: None,
@@ -521,6 +576,7 @@ impl eframe::App for HelionIde {
         paint_tcl_window(ctx, self);
         paint_palette(ctx, self);
         paint_examples_popup(ctx, self);
+        paint_create_project_wizard(ctx, self);
         capture_shot(ctx, self);
         paint_debug_overlay(ctx, self);
     }
@@ -738,6 +794,16 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
+                let new_proj = ui
+                    .add_sized(
+                        chrome::toolbar_ctrl_size("New Project…"),
+                        egui::Button::new("New Project…"),
+                    )
+                    .on_hover_text(tip("New Project", "", "create_project"));
+                if new_proj.clicked() {
+                    app.create_wizard = CreateProjectWizard::default();
+                    app.show_create_project = true;
+                }
                 let open = ui
                     .add_sized(
                         chrome::toolbar_ctrl_size("Open…"),
@@ -1573,6 +1639,292 @@ fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
     }
 }
 
+
+fn pick_rtl_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Add Sources")
+        .add_filter("RTL", &["sv", "v", "vhd", "vhdl"])
+        .pick_file()
+}
+
+fn pick_constraint_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Add Constraints")
+        .add_filter("Constraints", &["sdc", "xdc"])
+        .pick_file()
+}
+
+fn pick_directory_dialog(start: &str) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new().set_title("Project Directory");
+    let start_pb = PathBuf::from(start);
+    if start_pb.is_dir() {
+        d = d.set_directory(start_pb);
+    }
+    d.pick_folder()
+}
+
+fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
+    if !app.show_create_project {
+        return;
+    }
+    let mut open = app.show_create_project;
+    let mut finish = false;
+    let mut cancel = false;
+    egui::Window::new("Create Project")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            let step = app.create_wizard.step.min(CREATE_WIZARD_STEPS.len() - 1);
+            ui.label(
+                RichText::new(format!(
+                    "Step {} of {}: {}",
+                    step + 1,
+                    CREATE_WIZARD_STEPS.len(),
+                    CREATE_WIZARD_STEPS[step]
+                ))
+                .strong(),
+            );
+            ui.separator();
+
+            match step {
+                0 => {
+                    ui.label("Project name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.create_wizard.name)
+                            .desired_width(360.0)
+                            .hint_text("project_1"),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("Project directory");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.create_wizard.directory)
+                                .desired_width(320.0)
+                                .hint_text("/tmp/helion-projects"),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = pick_directory_dialog(&app.create_wizard.directory) {
+                                app.create_wizard.directory = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Creates <dir>/<name>/<name>.prj")
+                            .small()
+                            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                    );
+                }
+                1 => {
+                    ui.label("Part");
+                    egui::ComboBox::from_id_salt("create_wizard_part")
+                        .selected_text(&app.create_wizard.part)
+                        .show_ui(ui, |ui| {
+                            for p in CREATE_WIZARD_PARTS {
+                                ui.selectable_value(
+                                    &mut app.create_wizard.part,
+                                    (*p).to_string(),
+                                    *p,
+                                );
+                            }
+                        });
+                    ui.label(
+                        RichText::new("Default: HL10T-C32-1")
+                            .small()
+                            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                    );
+                }
+                2 => {
+                    ui.label("RTL sources (.sv / .v / .vhd)");
+                    let mut remove = None;
+                    for (i, s) in app.create_wizard.sources.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(s);
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        app.create_wizard.sources.remove(i);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.create_wizard.source_draft)
+                                .desired_width(300.0)
+                                .hint_text("Absolute path to .sv"),
+                        );
+                        if ui.button("Add").clicked() {
+                            let p = app.create_wizard.source_draft.trim().to_string();
+                            if !p.is_empty() && !app.create_wizard.sources.contains(&p) {
+                                app.create_wizard.sources.push(p);
+                                app.create_wizard.source_draft.clear();
+                                app.create_wizard.error = None;
+                            }
+                        }
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = pick_rtl_dialog() {
+                                let s = p.display().to_string();
+                                if !app.create_wizard.sources.contains(&s) {
+                                    app.create_wizard.sources.push(s);
+                                }
+                                app.create_wizard.error = None;
+                            }
+                        }
+                    });
+                }
+                3 => {
+                    ui.label("Constraints (.sdc / .xdc)");
+                    let mut remove = None;
+                    for (i, s) in app.create_wizard.constraints.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(s);
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        app.create_wizard.constraints.remove(i);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.create_wizard.constraint_draft)
+                                .desired_width(300.0)
+                                .hint_text("Absolute path to .sdc"),
+                        );
+                        if ui.button("Add").clicked() {
+                            let p = app.create_wizard.constraint_draft.trim().to_string();
+                            if !p.is_empty() && !app.create_wizard.constraints.contains(&p) {
+                                app.create_wizard.constraints.push(p);
+                                app.create_wizard.constraint_draft.clear();
+                                app.create_wizard.error = None;
+                            }
+                        }
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = pick_constraint_dialog() {
+                                let s = p.display().to_string();
+                                if !app.create_wizard.constraints.contains(&s) {
+                                    app.create_wizard.constraints.push(s);
+                                }
+                                app.create_wizard.error = None;
+                            }
+                        }
+                    });
+                }
+                _ => {
+                    ui.label(RichText::new("Summary").strong());
+                    ui.monospace(format!("Name: {}", app.create_wizard.name));
+                    ui.monospace(format!("Directory: {}", app.create_wizard.directory));
+                    ui.monospace(format!("Part: {}", app.create_wizard.part));
+                    ui.monospace(format!("Sources: {}", app.create_wizard.sources.len()));
+                    for s in &app.create_wizard.sources {
+                        ui.label(format!("  • {s}"));
+                    }
+                    ui.monospace(format!(
+                        "Constraints: {}",
+                        app.create_wizard.constraints.len()
+                    ));
+                    for s in &app.create_wizard.constraints {
+                        ui.label(format!("  • {s}"));
+                    }
+                    ui.label(
+                        RichText::new("Finish writes the .prj and opens it in the IDE.")
+                            .small()
+                            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                    );
+                }
+            }
+
+            if let Some(err) = &app.create_wizard.error {
+                ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), err);
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let last = step + 1 >= CREATE_WIZARD_STEPS.len();
+                    if last {
+                        if primary_button(ui, "Finish").clicked() {
+                            finish = true;
+                        }
+                    } else if ui.button("Next").clicked() {
+                        // Validate before advancing.
+                        let w = &mut app.create_wizard;
+                        w.error = None;
+                        match step {
+                            0 => {
+                                if w.name.trim().is_empty() {
+                                    w.error = Some("Enter a project name.".into());
+                                } else if w.directory.trim().is_empty() {
+                                    w.error = Some("Enter a project directory.".into());
+                                } else {
+                                    w.step += 1;
+                                }
+                            }
+                            1 => {
+                                if w.part.trim().is_empty() {
+                                    w.part = "HL10T-C32-1".into();
+                                }
+                                w.step += 1;
+                            }
+                            2 => {
+                                if w.sources.is_empty() {
+                                    w.error = Some("Add at least one RTL source.".into());
+                                } else {
+                                    w.step += 1;
+                                }
+                            }
+                            3 => {
+                                w.step += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if step > 0 && ui.button("Back").clicked() {
+                        app.create_wizard.error = None;
+                        app.create_wizard.step = step.saturating_sub(1);
+                    }
+                });
+            });
+        });
+
+    if cancel || !open {
+        app.show_create_project = false;
+        return;
+    }
+    app.show_create_project = open;
+
+    if finish {
+        let w = &app.create_wizard;
+        let name = w.name.trim().to_string();
+        let dir = PathBuf::from(w.directory.trim());
+        let part = w.part.clone();
+        let sources: Vec<PathBuf> = w.sources.iter().map(PathBuf::from).collect();
+        let constraints: Vec<PathBuf> = w.constraints.iter().map(PathBuf::from).collect();
+        match app
+            .model
+            .create_project(&name, &dir, &part, &sources, &constraints)
+        {
+            Ok(msg) => {
+                let prj = dir.join(&name).join(format!("{name}.prj"));
+                app.remember(prj);
+                app.set_activity(Activity::Files);
+                app.show_create_project = false;
+                app.create_wizard.error = None;
+                let _ = msg;
+            }
+            Err(e) => {
+                app.create_wizard.error = Some(e);
+            }
+        }
+    }
+}
+
 fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
     if !app.show_examples {
         return;
@@ -1836,6 +2188,14 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.add_space(48.0);
         ui.label(RichText::new("No sources yet.").size(16.0));
         ui.add_space(8.0);
+        if primary_button(ui, "New Project…")
+            .on_hover_text(tip("New Project", "", "create_project"))
+            .clicked()
+        {
+            app.create_wizard = CreateProjectWizard::default();
+            app.show_create_project = true;
+        }
+        ui.add_space(6.0);
         if primary_button(ui, "Open HDL…")
             .on_hover_text(tip("Open", "⌘O", "open_source"))
             .clicked()
