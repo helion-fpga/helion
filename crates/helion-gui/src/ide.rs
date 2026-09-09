@@ -19289,6 +19289,9 @@ impl IdeModel {
             for (i, (site, _ble)) in pl.lutff_sites.iter().enumerate() {
                 if let Some(lf) = pl.packed.lutffs.get(i) {
                     occupants.push(((site.x, site.y), lf.lut_cell.clone()));
+                    if !lf.ff_cell.is_empty() {
+                        occupants.push(((site.x, site.y), lf.ff_cell.clone()));
+                    }
                 }
             }
             for (i, site) in pl.iob_sites.iter().enumerate() {
