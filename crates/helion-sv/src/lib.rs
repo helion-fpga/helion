@@ -4169,29 +4169,41 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("parameter") || p.eat_kw("localparam") {
-            skip_sv_type(p);
-            match p.ident() {
-                Ok(name) => {
-                    if p.eat_sym('=') {
-                        if let Some(Tok::Str(sval)) = p.peek() {
-                            let h = str_param_hash(sval);
-                            p.bump();
-                            p.params.entry(name.clone()).or_insert(h);
-                        } else {
-                            match const_u(p) {
-                                Ok(val) => {
-                                    p.params.entry(name.clone()).or_insert(val);
-                                    if !param_order.iter().any(|(n, _)| n == &name) {
-                                        param_order.push((name, val));
+            // `parameter width = 16, cycles = 1` — every name is elaborated.
+            // Skipping after the first used to leave `cycles` unknown, so
+            // `res[(-1)+cycles]` looked like a signal index.
+            loop {
+                skip_sv_type(p);
+                match p.ident() {
+                    Ok(name) => {
+                        if p.eat_sym('=') {
+                            if let Some(Tok::Str(sval)) = p.peek() {
+                                let h = str_param_hash(sval);
+                                p.bump();
+                                p.params.entry(name.clone()).or_insert(h);
+                            } else {
+                                match const_u(p) {
+                                    Ok(val) => {
+                                        p.params.entry(name.clone()).or_insert(val);
+                                        if !param_order.iter().any(|(n, _)| n == &name) {
+                                            param_order.push((name, val));
+                                        }
                                     }
+                                    Err(_) => skip_until_arg_end(p),
                                 }
-                                Err(_) => skip_until_arg_end(p),
                             }
                         }
+                        if p.eat_sym(',') {
+                            continue;
+                        }
+                        skip_to_semi(p);
+                        break;
                     }
-                    skip_to_semi(p);
+                    Err(_) => {
+                        skip_to_semi(p);
+                        break;
+                    }
                 }
-                Err(_) => skip_to_semi(p),
             }
             continue;
         }
@@ -4318,6 +4330,30 @@ fn parse_module_items(
                 });
             }
             note_width(p, &n, w);
+            // `input signed [W-1:0] a,b` — the same range applies to each name.
+            while p.eat_sym(',') {
+                let Ok(n2) = p.ident() else {
+                    break;
+                };
+                if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n2) {
+                    ex.1 = dir;
+                    ex.2 = w;
+                } else {
+                    ports.push((n2.clone(), dir, w));
+                }
+                if let Some(sig) = signals.iter_mut().find(|s| s.name == n2) {
+                    sig.width = w;
+                } else {
+                    signals.push(Signal {
+                        name: n2.clone(),
+                        width: w,
+                        depth: 0,
+                        keep: false,
+                        mark_debug: false,
+                    });
+                }
+                note_width(p, &n2, w);
+            }
             let _ = p.eat_sym(';');
             continue;
         }
@@ -4335,6 +4371,8 @@ fn parse_module_items(
             // Split across a newline (`wire\n name = expr`) is the same form.
             // `reg name = expr` stays an initializer, not a comb assign.
             let net_assign = decl_kw != "reg";
+            // `reg signed [W-1:0] mem[N:0]` — signed is a qualifier, not the name.
+            skip_logic(p);
             let w = match p.width_opt() {
                 Ok(w) => w,
                 Err(_) => {
@@ -6064,6 +6102,45 @@ fn lut6_and2(a_inv: bool, b_inv: bool, o_inv: bool) -> u64 {
     acc
 }
 
+fn lut6_xor2() -> u64 {
+    0x6666_6666_6666_6666
+}
+
+fn lut6_from_i012(f: impl Fn(bool, bool, bool) -> bool) -> u64 {
+    let mut pat = 0u64;
+    for addr in 0..8u32 {
+        let i0 = addr & 1 == 1;
+        let i1 = addr & 2 == 2;
+        let i2 = addr & 4 == 4;
+        if f(i0, i1, i2) {
+            pat |= 1u64 << addr;
+        }
+    }
+    let mut acc = 0u64;
+    let mut sh = 0;
+    while sh < 64 {
+        acc |= pat << sh;
+        sh += 8;
+    }
+    acc
+}
+
+fn lut6_xor3() -> u64 {
+    lut6_from_i012(|a, b, c| a ^ b ^ c)
+}
+
+fn lut6_maj3() -> u64 {
+    lut6_from_i012(|a, b, c| (a && b) || (b && c) || (a && c))
+}
+
+fn emit_lut_pins(d: &mut Design, cell: &str, out: &str, init: u64, pins: &[(&str, &str)]) {
+    d.add_cell(cell, CellKind::Lut6 { init });
+    d.connect(out, cell, "O");
+    for (net, pin) in pins {
+        d.connect(*net, cell, *pin);
+    }
+}
+
 fn lut6_inv() -> u64 {
     0x5555_5555_5555_5555
 }
@@ -6367,6 +6444,200 @@ fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<Stri
     (out, lowered)
 }
 
+/// Constant word index of an unpacked array. A signal index is not a constant.
+fn const_rexpr_usize(e: &RExpr) -> Option<usize> {
+    match e {
+        RExpr::Const { val, .. } => usize::try_from(*val).ok(),
+        _ => None,
+    }
+}
+
+fn const_unpacked_word(rhs: &RExpr, rtl: &Rtl) -> Option<(String, usize)> {
+    match rhs {
+        RExpr::Bit(name, idx) if sig_depth(rtl, name) > 0 && *idx < sig_depth(rtl, name) => {
+            Some((name.clone(), *idx))
+        }
+        RExpr::IndexPart { name, base, .. } if sig_depth(rtl, name) > 0 => {
+            let idx = const_rexpr_usize(base)?;
+            if idx < sig_depth(rtl, name) {
+                Some((name.clone(), idx))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn packed_add_pair(rhs: &RExpr, rtl: &Rtl) -> Option<(String, String)> {
+    let RExpr::Add(a, b) = rhs else {
+        return None;
+    };
+    if expr_contains_mul(rhs) {
+        return None;
+    }
+    let a_name = match a.as_ref() {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 => s.clone(),
+        _ => return None,
+    };
+    let b_name = match b.as_ref() {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 => s.clone(),
+        _ => return None,
+    };
+    Some((a_name, b_name))
+}
+
+fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
+    let w = sig_width(rtl, name);
+    if bit >= w {
+        None
+    } else {
+        Some(bit_name(name, w, bit))
+    }
+}
+
+/// Ripple add of two packed vectors into one unpacked word, clocked by `clk`.
+/// Signed and unsigned agree on the `width` sum bits. Not a MAC.
+fn emit_word_add(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    mem: &str,
+    word: usize,
+    width: usize,
+    a: &str,
+    b: &str,
+) {
+    let mut cin: Option<String> = None;
+    for bit in 0..width {
+        let an = op_bit_net(rtl, a, bit);
+        let bn = op_bit_net(rtl, b, bit);
+        let sum = format!("u_add{word}_{bit}s");
+        let qn = unpacked_word_q(mem, word, width, bit);
+        let sum_cell = format!("u_alu{word}_{bit}s");
+        let cin_now = cin.clone();
+        match (an.as_deref(), bn.as_deref(), cin_now.as_deref()) {
+            (Some(an), Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum, lut6_xor2(), &[(an, "I0"), (bn, "I1")]);
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (bn, "I1")],
+                    );
+                    cin = Some(cout);
+                }
+            }
+            (Some(an), Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum,
+                    lut6_xor3(),
+                    &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_maj3(),
+                        &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                    );
+                    cin = Some(cout);
+                }
+            }
+            _ => {
+                let src = an.clone().or(bn.clone());
+                if let Some(src) = src.as_deref() {
+                    emit_lut_pins(
+                        d,
+                        &sum_cell,
+                        &sum,
+                        lut6_and2(false, false, false),
+                        &[(src, "I0"), (src, "I1")],
+                    );
+                } else {
+                    emit_lut_pins(d, &sum_cell, &sum, lut6_const(false), &[]);
+                }
+                if bit + 1 < width {
+                    cin = None;
+                }
+            }
+        }
+        let ff = format!("u_aff{word}_{bit}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(clk, &ff, "CLK");
+        d.connect(&sum, &ff, "D");
+        d.connect(&qn, &ff, "Q");
+    }
+    eprintln!("synth_rtl word_add mem={mem} word={word} bits={width} clk={clk}");
+}
+
+fn lower_const_word_adds(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    already: &HashSet<String>,
+) -> HashSet<String> {
+    const MAX_WIDTH: usize = 32;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, bit, rhs) in &rtl.nbas {
+        if already.contains(lhs) || sig_depth(rtl, lhs) == 0 || bit.is_none() {
+            continue;
+        }
+        if packed_add_pair(rhs, rtl).is_none() {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0 || width > MAX_WIDTH {
+            continue;
+        }
+        let mut words: Vec<(usize, String, String)> = Vec::new();
+        let mut ok = true;
+        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| lhs == &mem) {
+            let Some(word) = *bit else {
+                ok = false;
+                break;
+            };
+            if word >= depth {
+                ok = false;
+                break;
+            }
+            let Some((a, b)) = packed_add_pair(rhs, rtl) else {
+                ok = false;
+                break;
+            };
+            if let Some(slot) = words.iter_mut().find(|(w, _, _)| *w == word) {
+                *slot = (word, a, b);
+            } else {
+                words.push((word, a, b));
+            }
+        }
+        if !ok || words.is_empty() {
+            continue;
+        }
+        for (word, a, b) in &words {
+            emit_word_add(d, rtl, clk, &mem, *word, width, a, b);
+        }
+        lowered.insert(mem);
+    }
+    lowered
+}
+
 
 /// `we && (addr == word)` as one LUT6. Address plus enable must stay ≤6 PIs.
 fn addr_match_expr(addr: &str, addr_w: usize, word: usize, en: Option<&Expr>) -> Expr {
@@ -6640,6 +6911,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // A variable-index read is not expanded here.
     let (unpacked_bits, mut lowered_unpacked) = lower_unpacked_clocked_words(rtl);
     reg_bits.extend(unpacked_bits);
+    // Const-index word add (`res[0] <= a+b`) → ripple adder into Hffs.
+    // Not a MAC, and not the generic cone (that left 2 bits and a wide_cone).
+    lowered_unpacked.extend(lower_const_word_adds(&mut d, rtl, clk, &lowered_unpacked));
     // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
     // The read stays a single variable_index_read; do not walk a wide cone.
     lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk));
@@ -6781,9 +7055,19 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // kind of honesty: one clock_gate, no data LUT, not a closed WNS.
     let clock_mux_sigs = note_clock_muxes(rtl);
     let clock_gate_sigs = note_clock_gates(rtl, &clock_mux_sigs);
+    // `assign q = res[<constant>]` is a net alias to that word, not a
+    // variable-index read and not an unmapped assign. A signal index is not
+    // recorded here — that stays `variable_index_read`.
+    let mut word_alias: Vec<(String, String, usize)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.assigns {
         if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
             continue;
+        }
+        if bit.is_none() {
+            if let Some((mem, word)) = const_unpacked_word(rhs, rtl) {
+                word_alias.push((lhs.clone(), mem, word));
+                continue;
+            }
         }
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
@@ -6791,6 +7075,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         // Variable-index read of a clocked unpacked array. Do not walk it
         // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
+        // A constant word index was already aliased above.
         if rhs_reads_seq_mem(rhs, rtl) || rhs_unpacked_index(rhs, rtl) {
             if !lowered_unpacked.is_empty() {
                 note_variable_index_read(&rtl.module, lhs);
@@ -7084,6 +7369,18 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             .any(|(n, dir, _)| n == lhs && *dir == PortDir::Out);
         if !is_out {
             continue;
+        }
+        // Constant word read: q is that word. Same nets as the Hff Q, no buffer LUT.
+        if bit.is_none() {
+            if let Some((_, mem, word)) = word_alias.iter().find(|(n, _, _)| n == lhs) {
+                let ow = sig_width(rtl, lhs);
+                let mw = sig_width(rtl, mem).max(1);
+                for i in 0..ow.min(mw).min(256) {
+                    let qnet = unpacked_word_q(mem, *word, mw, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                }
+                continue;
+            }
         }
         let w = sig_width(rtl, lhs);
         if bit.is_none() && w > 1 {
@@ -9421,5 +9718,83 @@ endmodule
             joined.contains("incremental rebuilt module=inc_child"),
             "child must rebuild, log={joined}"
         );
+    }
+
+    #[test]
+    fn const_index_word_add_is_hffs_not_mac_or_leftover() {
+        // cycles=1 → q aliases res[0]. The for-loop body does not run.
+        // Signed width-16 add is a ripple adder into Hffs, not a MAC and not
+        // two leftover bits. A signal index is not aliased this way.
+        let src = r#"
+module addfxp(a,b,q,clk);
+  parameter  width = 16, cycles = 1;
+  input  signed  [(-1)+width:0] a,b;
+  input  clk;
+  output signed  [(-1)+width:0] q;
+  reg  signed  [(-1)+width:0] res[(-1)+cycles:0];
+  assign q = res[(-1)+cycles];
+  integer i;
+  always @(posedge clk)
+      begin
+        res[0] <= a+b;
+        for (i = 1; i < cycles; i = 1+i)
+            res[i] <= res[i-1];
+      end
+endmodule
+"#;
+        let d = synth_sv(src, "addfxp.v").expect("addfxp");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        let hffs: Vec<_> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .collect();
+        assert_eq!(hffs.len(), 16, "16-bit add, one stage, got {}", hffs.len());
+        assert!(hffs.iter().all(|c| d.net_on(&c.name, "CLK") == Some("clk")));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 30, "16-bit ripple adder LUTs, not leftover bits, luts={luts}");
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "res_w0_0"
+                && n.endpoints.iter().any(|e| e.pin == "Q")
+                && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(
+            aliased,
+            "q aliases res[0], nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("res_w1_0")
+            }),
+            "cycles=1 must not invent a second pipeline word"
+        );
+    }
+
+    #[test]
+    fn signal_index_read_is_not_const_word_alias() {
+        let src = r#"
+module vidx(input clk, input [1:0] sel, input [3:0] a, input [3:0] b, output [3:0] q);
+  reg [3:0] res[0:3];
+  assign q = res[sel];
+  always @(posedge clk) res[0] <= a+b;
+endmodule
+"#;
+        let d = synth_sv(src, "vidx.v").expect("vidx");
+        let aliased = d.nets.iter().any(|n| {
+            n.name.starts_with("res_w0_")
+                && n.endpoints
+                    .iter()
+                    .any(|e| e.pin == "I" && e.cell.starts_with("u_iob"))
+        });
+        assert!(!aliased, "signal index must not alias q onto res[0]");
+        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
     }
 }
