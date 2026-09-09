@@ -3146,7 +3146,9 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
         return Ok(Vec::new());
     }
     let mut i = start;
-    while i < end {
+    let mut n = 0usize;
+    let step = step.max(1);
+    while i < end && n < 4096 {
         let toks: Vec<Tok> = body
             .iter()
             .map(|t| match t {
@@ -3156,7 +3158,8 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
             .collect();
         let mut sp = P { t: &toks, i: 0, params: p.params.clone(), widths: p.widths.clone() };
         out.extend(parse_seq_block(&mut sp, block)?);
-        i += step;
+        i = i.saturating_add(step);
+        n += 1;
     }
     Ok(out)
 }
@@ -3318,10 +3321,19 @@ fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
     if let Some((a, b)) = range {
         let hi = a.max(b);
         let lo = a.min(b);
+        // A param that does not fit (rvfindfirst1 SHIFT) used to walk until
+        // the kill after one width_overflow line. Name it and stop. Not a LUT.
+        let span = match range_width(hi as u128, lo as u128) {
+            Ok(w) if w <= 4096 && !width_overflow_for(&cur_mod()) => w,
+            _ => {
+                note_width_overflow();
+                return Ok(Vec::new());
+            }
+        };
         let mut v = Vec::new();
         let mut k = 0usize;
         let mut i = lo;
-        while i <= hi {
+        for _ in 0..span {
             v.push((name.clone(), Some(i), bit_extract(rhs.clone(), k)));
             k += 1;
             if i == usize::MAX {
