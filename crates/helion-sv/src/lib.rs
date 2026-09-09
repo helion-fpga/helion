@@ -2,8 +2,9 @@
 //!
 //! Large cores (Ibex, PicoRV32) are ingested via `` `define ``/`ifdef`
 //! preprocess. Packages seed known enum defaults; always_ff / assign / generate
-//! / gate primitives / || && / concat-LHS all map to LUT/FF. Missing child
-//! modules flatten to empty stubs (missing source, not an unknown construct).
+//! / || && / concat-LHS map to LUT/FF. Verilog gate primitives are not a Helion
+//! product and are not a closed WNS. Missing child modules flatten to empty
+//! stubs (missing source, not an unknown construct).
 
 mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
@@ -456,6 +457,10 @@ thread_local! {
     /// inout used as a load enable that never reaches FF D is not a closed WNS.
     static INOUT_ENABLE_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `gate_primitive` line per module. bufif/notif/and/or/buf/not are
+    /// not LUTs and not a closed WNS. Not one line per instance.
+    static GATE_PRIM_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// Negedge-only always writes. Not mixed into the posedge NBA cone.
     /// (module, clk, signal, bit, optional RHS). None RHS cannot lower.
     static NEGEDGE_WRITES: std::cell::RefCell<
@@ -640,6 +645,24 @@ fn note_clock_gate(module: &str, signal: &str) {
 fn clock_gate_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     CLOCK_GATE_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Verilog gate primitive (`bufif1`, `and`, `not`, ...). One line per module.
+/// Not a LUT, not a closed WNS. Re-parse and sibling instances must not repeat it.
+fn note_gate_primitive(module: &str, primitive: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let primitive = if primitive.is_empty() { "gate" } else { primitive };
+    let fresh = GATE_PRIM_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic gate_primitive module={module} primitive={primitive} (gate primitive not mapped; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn gate_primitive_for(module: &str) -> bool {
+    GATE_PRIM_SEEN.with(|s| s.borrow().contains(module))
 }
 
 /// Read-only `inout` used as a load enable did not reach FF D. One line.
@@ -1410,6 +1433,9 @@ fn assemble_module(
         }
         if child.attrs.get("CLOCK_MUX") == Some("1") {
             d.attrs.set("CLOCK_MUX", "1");
+        }
+        if child.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            d.attrs.set("GATE_PRIMITIVE", "1");
         }
     }
     visiting.remove(name);
@@ -4489,8 +4515,8 @@ fn parse_module_items(
             continue;
         }
         if matches!(p.peek(), Some(Tok::Ident(_))) {
-            if let Ok(gate_as) = parse_gate_prim(&mut p) {
-                assigns.extend(gate_as);
+            if parse_gate_prim(&mut p).is_ok() {
+                // Consumed. Not an assign, not an unknown child, not a LUT.
                 continue;
             }
             if let Ok(inst) = parse_inst(&mut p) {
@@ -4605,6 +4631,8 @@ fn parse_for_unroll_module(
                 &mut dummy_funcs,
                 "end",
             )?;
+        } else if parse_gate_prim(&mut sp).is_ok() {
+            // Generate-for of a gate primitive is not an instance and not a LUT.
         } else if let Ok(inst) = parse_inst(&mut sp) {
             local_insts.push(inst);
         } else {
@@ -4697,71 +4725,103 @@ fn parse_inst_net(p: &mut P) -> Option<String> {
 fn is_gate_prim(s: &str) -> bool {
     matches!(
         s,
-        "and" | "nand" | "or" | "nor" | "xor" | "xnor" | "not" | "buf"
+        "and"
+            | "nand"
+            | "or"
+            | "nor"
+            | "xor"
+            | "xnor"
+            | "not"
+            | "buf"
+            | "bufif0"
+            | "bufif1"
+            | "notif0"
+            | "notif1"
     )
 }
 
-fn fold_bin(kind: fn(Box<RExpr>, Box<RExpr>) -> RExpr, xs: &[RExpr]) -> Option<RExpr> {
-    let mut it = xs.iter().cloned();
-    let first = it.next()?;
-    Some(it.fold(first, |a, b| kind(Box::new(a), Box::new(b))))
+fn skip_balanced_paren(p: &mut P) -> bool {
+    if !p.eat_sym('(') {
+        return false;
+    }
+    let mut d = 1i32;
+    while d > 0 && p.peek().is_some() {
+        if p.eat_sym('(') {
+            d += 1;
+        } else if p.eat_sym(')') {
+            d -= 1;
+        } else {
+            p.bump();
+        }
+    }
+    d == 0
 }
 
-fn parse_gate_prim(p: &mut P) -> Result<Vec<(String, Option<usize>, RExpr)>, String> {
+/// Verilog gate primitive. Consume the statement. Do not invent a LUT mux
+/// and do not leave a child named `bufif1` for flatten/assemble to reprint.
+fn parse_gate_prim(p: &mut P) -> Result<(), String> {
     let start = p.i;
     let kind = match p.peek() {
         Some(Tok::Ident(s)) if is_gate_prim(s) => s.clone(),
         _ => return Err("not a gate".into()),
     };
     p.bump();
+    if p.eat_sym('#') {
+        if matches!(p.peek(), Some(Tok::Sym('('))) {
+            if !skip_balanced_paren(p) {
+                p.i = start;
+                return Err("gate delay".into());
+            }
+        } else {
+            p.bump();
+        }
+    }
+    let mut saw_list = false;
+    if matches!(p.peek(), Some(Tok::Sym('('))) {
+        if !skip_balanced_paren(p) {
+            p.i = start;
+            return Err("gate (".into());
+        }
+        saw_list = true;
+    }
     if matches!(p.peek(), Some(Tok::Ident(_))) {
         let _ = p.ident();
-    }
-    if !p.eat_sym('(') {
-        p.i = start;
-        return Err("gate (".into());
-    }
-    let mut args: Vec<String> = Vec::new();
-    loop {
-        if p.eat_sym(')') {
-            break;
+        if p.eat_sym('[') {
+            let mut d = 1i32;
+            while d > 0 && p.peek().is_some() {
+                if p.eat_sym('[') {
+                    d += 1;
+                } else if p.eat_sym(']') {
+                    d -= 1;
+                } else {
+                    p.bump();
+                }
+            }
         }
-        if p.peek().is_none() {
-            break;
-        }
-        if let Some(n) = parse_inst_net(p) {
-            args.push(n);
-        }
-        let _ = p.eat_sym(',');
     }
-    let _ = p.eat_sym(';');
-    if args.len() < 2 {
-        p.i = start;
-        return Err("gate args".into());
-    }
-    let out = args[0].clone();
-    let ins: Vec<RExpr> = args[1..].iter().cloned().map(RExpr::Ident).collect();
-    let rhs = match kind.as_str() {
-        "not" => RExpr::Not(Box::new(ins[0].clone())),
-        "buf" => ins[0].clone(),
-        "and" => fold_bin(RExpr::And, &ins).ok_or_else(|| "and".to_string())?,
-        "nand" => RExpr::Not(Box::new(
-            fold_bin(RExpr::And, &ins).ok_or_else(|| "nand".to_string())?,
-        )),
-        "or" => fold_bin(RExpr::Or, &ins).ok_or_else(|| "or".to_string())?,
-        "nor" => RExpr::Not(Box::new(
-            fold_bin(RExpr::Or, &ins).ok_or_else(|| "nor".to_string())?,
-        )),
-        "xor" => fold_bin(RExpr::Xor, &ins).ok_or_else(|| "xor".to_string())?,
-        "xnor" => RExpr::Not(Box::new(
-            fold_bin(RExpr::Xor, &ins).ok_or_else(|| "xnor".to_string())?,
-        )),
-        _ => {
+    if matches!(p.peek(), Some(Tok::Sym('('))) {
+        if !skip_balanced_paren(p) {
             p.i = start;
-            return Err("gate kind".into());
+            return Err("gate ports".into());
         }
-    };
-    Ok(vec![(out, None, rhs)])
+        saw_list = true;
+    }
+    while p.eat_sym(',') {
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            let _ = p.ident();
+        }
+        if !skip_balanced_paren(p) {
+            p.i = start;
+            return Err("gate inst".into());
+        }
+        saw_list = true;
+    }
+    if !saw_list || !p.eat_sym(';') {
+        p.i = start;
+        return Err("gate ;".into());
+    }
+    note_gate_primitive(&cur_mod(), &kind);
+    Ok(())
 }
 
 fn parse_inst(p: &mut P) -> Result<Inst, String> {
@@ -6845,6 +6905,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     if clock_gate_for(&rtl.module) {
         d.attrs.set("CLOCK_GATE", "1");
     }
+    if gate_primitive_for(&rtl.module) {
+        d.attrs.set("GATE_PRIMITIVE", "1");
+    }
     // Inout load enable: FF D must depend on it, or one diagnostic and no WNS.
     if prove_inout_load_enables(&mut d, rtl) {
         d.attrs.set("INOUT_ENABLE_NOT_LOWERED", "1");
@@ -7266,6 +7329,9 @@ fn synth_from_parsed_top(
     // Standing rule: ports-only shells and unknown vendor instances (no body
     // in this file/set) do not invent gates. cells stay 0; timing must not
     // report a closed WNS.
+    if gate_primitive_for(&top_name) {
+        d.attrs.set("GATE_PRIMITIVE", "1");
+    }
     if n_logic == 0 && flat_nbas == 0 && flat_assigns == 0 {
         d.attrs.set("NO_BODY", "1");
         eprintln!(
@@ -7561,8 +7627,8 @@ mod tests {
     }
 
     #[test]
-    fn verilog_gate_primitives_map_to_luts() {
-        // ISCAS85/89 LogikBench style: `not`/`nand`/`xor` primitives, not SV assign.
+    fn verilog_gate_primitives_are_not_luts() {
+        // bufif/notif/and/or/nand/nor/xor/xnor/buf/not are not a Helion product.
         let src = r#"
 module gates(a, b, y, z);
   input a, b;
@@ -7574,16 +7640,31 @@ module gates(a, b, y, z);
 endmodule
 "#;
         let d = synth_sv(src, "gates.v").expect("gate synth");
-        let luts = d
-            .cells
-            .iter()
-            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-            .count();
         assert!(
-            luts >= 1,
-            "gate primitives must become LUT cells, cells={:?}",
-            d.cells.iter().map(|c| format!("{}:{:?}", c.name, c.kind)).collect::<Vec<_>>()
+            d.cells.is_empty(),
+            "gate primitives must not become LUT cells, cells={:?}",
+            d.cells
         );
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+        assert_eq!(d.attrs.get("GATE_PRIMITIVE"), Some("1"));
+    }
+
+    #[test]
+    fn bufif1_mux_is_one_gate_primitive_not_a_lut() {
+        let src = r#"
+module sky130_fd_sc_hdll__muxb16to1(Z,D,S);
+  output Z;
+  input  [15:0] D;
+  input  [15:0] S;
+  bufif1 bufif10(Z,!D[0],S[0]);
+  bufif1 bufif11(Z,!D[1],S[1]);
+endmodule
+"#;
+        let d = synth_sv(src, "muxb.v").expect("bufif1");
+        assert!(d.cells.is_empty(), "bufif1 must not invent a LUT mux, cells={:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+        assert_eq!(d.attrs.get("GATE_PRIMITIVE"), Some("1"));
+        assert!(d.instances.is_empty(), "bufif1 must not stay an unknown instance");
     }
 
     #[test]
