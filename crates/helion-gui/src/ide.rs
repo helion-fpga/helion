@@ -4739,6 +4739,8 @@ pub struct IdeModel {
     pub sdc_editor_text: String,
     /// True when `sdc_editor_text` differs from the last load/save on disk.
     pub sdc_editor_dirty: bool,
+    /// Last `write_report` / `export_report` summary (path + key numbers) for UI/status.
+    pub last_report_export: Option<String>,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
 }
@@ -4871,6 +4873,7 @@ impl IdeModel {
             sdc_editor_path: None,
             sdc_editor_text: String::new(),
             sdc_editor_dirty: false,
+            last_report_export: None,
             event_sim: None,
             fabric_sim: None,
         };
@@ -5376,6 +5379,10 @@ impl IdeModel {
             let text = self.methodology_text();
             self.mirror_methodology_messages();
             Ok(text)
+        } else if t == "write_report" || t.starts_with("write_report ")
+            || t == "export_report" || t.starts_with("export_report ")
+        {
+            self.write_report_cmd(t)
         } else if t == "report_utilization" || t == "utilization" {
             self.workspace = WorkspaceTab::Utilization;
             Ok(self.utilization_report().text())
@@ -14318,6 +14325,67 @@ impl IdeModel {
         self.timing_summary().text()
     }
 
+    /// Vivado-shaped `write_report` / `export_report` — UTF-8 Timing Summary or
+    /// Utilization text to a real path (create parents). Numbers match the pane.
+    pub fn write_report_cmd(&mut self, cmd: &str) -> Result<String, String> {
+        let mut parts = cmd.split_whitespace();
+        let _verb = parts.next().unwrap_or("write_report");
+        let kind = parts
+            .next()
+            .ok_or("write_report: need <timing|utilization> <path>")?
+            .to_ascii_lowercase();
+        let path_s = parts.collect::<Vec<_>>().join(" ");
+        let path_s = path_s.trim();
+        if path_s.is_empty() {
+            return Err("write_report: need <timing|utilization> <path>".into());
+        }
+        let path = PathBuf::from(path_s);
+        let (kind_tag, body, key) = match kind.as_str() {
+            "timing" | "timing_summary" | "report_timing_summary" => {
+                self.workspace = WorkspaceTab::Reports;
+                self.selected_report = Some("report_timing_summary".into());
+                let body = self.timing_summary_text();
+                let wns = self
+                    .wns_ps()
+                    .map(|w| format!("WNS_PS={w}"))
+                    .unwrap_or_else(|| "WNS_PS=n/a".into());
+                ("timing", body, wns)
+            }
+            "utilization" | "report_utilization" => {
+                self.workspace = WorkspaceTab::Utilization;
+                let body = self.utilization_report().text();
+                let lut = self
+                    .utilization_report()
+                    .row("LUTFF")
+                    .map(|r| format!("LUTFF={}/{}", r.used, r.available))
+                    .unwrap_or_else(|| "LUTFF=n/a".into());
+                ("utilization", body, lut)
+            }
+            other => {
+                return Err(format!(
+                    "write_report: unknown kind {other} (timing|utilization)"
+                ));
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("write_report: create_dir_all {}: {e}", parent.display())
+                })?;
+            }
+        }
+        std::fs::write(&path, body.as_bytes())
+            .map_err(|e| format!("write_report: write {}: {e}", path.display()))?;
+        let bytes = body.len();
+        let summary = format!(
+            "write_report kind={kind_tag} path={} bytes={bytes} {key}",
+            path.display()
+        );
+        self.last_report_export = Some(summary.clone());
+        self.status = summary.clone();
+        Ok(summary)
+    }
+
     fn timing_summary_object_hay(&self, g: &helion_sta::TimingSummaryGroup) -> String {
         let report = self.timing_summary();
         let mut hay = format!("{} {} {}", g.name, g.from, g.to);
@@ -20835,6 +20903,63 @@ mod tests {
         assert!(
             ide.console.iter().any(|l| l.cmd == "report_timing"),
             "console keeps the Tcl journal"
+        );
+    }
+
+    #[test]
+    fn write_report_timing_exports_wns_ps_to_disk() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().expect("implement counter");
+        let dir = std::env::temp_dir().join("helion-write-report-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let timing_path = dir.join("counter-timing-summary.rpt");
+        let out = ide
+            .exec(&format!("write_report timing {}", timing_path.display()))
+            .expect("write_report timing");
+        assert!(
+            out.contains("kind=timing"),
+            "write_report summary: {out}"
+        );
+        assert!(
+            out.contains(&format!("path={}", timing_path.display())),
+            "{out}"
+        );
+        let wns = ide.wns_ps().expect("STA WNS after implement");
+        assert_eq!(wns, 9640, "gold counter WNS_PS");
+        assert!(
+            out.contains(&format!("WNS_PS={wns}")),
+            "summary must echo pane WNS: {out}"
+        );
+        let body = std::fs::read_to_string(&timing_path).expect("timing rpt on disk");
+        assert!(
+            body.contains(&format!("WNS_PS={wns}")),
+            "file must match pane: {body}"
+        );
+        assert!(
+            ide.messages.iter().any(|m| {
+                m.severity == MsgSeverity::Info
+                    && m.id == "write_report"
+                    && m.text.contains(&format!("WNS_PS={wns}"))
+            }),
+            "Messages Info journal missing: {:?}",
+            ide.messages
+        );
+        let util_path = dir.join("counter-utilization.rpt");
+        let uout = ide
+            .exec(&format!("export_report utilization {}", util_path.display()))
+            .expect("export_report utilization");
+        assert!(uout.contains("kind=utilization"), "{uout}");
+        let ubody = std::fs::read_to_string(&util_path).expect("util rpt");
+        assert!(
+            ubody.contains("LUTFF=4/8192"),
+            "utilization export: {ubody}"
+        );
+        assert_eq!(
+            ide.last_report_export.as_deref(),
+            Some(uout.as_str()),
+            "UI last export path"
         );
     }
 
