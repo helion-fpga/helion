@@ -311,6 +311,7 @@ impl HelionIde {
         match std::env::var("HELION_FLOW").as_deref() {
             Ok("implement") => {
                 let _ = app.model.implement();
+                let _ = app.model.device_zoom_fit();
                 app.set_canvas(Canvas::Device);
                 app.set_activity(Activity::Device);
             }
@@ -5242,7 +5243,6 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     let narrow = chrome::device_window_narrow(screen.width());
     let short = chrome::device_window_short(screen.height());
     paint_device_legend(ui, model, narrow || short);
-    let share = chrome::share_available(screen.width(), screen.height());
     let after_legend = ui.available_height().max(1.0);
     let band = chrome::device_band_share(screen.width(), screen.height(), after_legend);
     let pane_w = ui.available_width().max(48.0);
@@ -5270,8 +5270,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 paint_clock_regions(ui, model);
             });
     } else {
-        // Wide: tables take a share; the die fills leftover.
-        let tables_h = band.tables_h.min(pane_w * 0.28).max(52.0);
+        // Wide: short table caps; the die ScrollArea takes the real leftover height.
+        let tables_h = band.tables_h;
         egui::ScrollArea::both()
             .id_salt("device_tables")
             .auto_shrink([false, true])
@@ -5282,9 +5282,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.set_width(pane_w);
                 paint_pblocks_table(ui, model);
             });
-        let remain = ui.available_height().max(1.0);
-        let die_need = share.canvas_floor_h.min(remain * 0.38).min(remain * 0.55);
-        let cr_h = (remain - die_need).clamp(28.0, 168.0);
+        let cr_h = band.clock_h;
         egui::ScrollArea::vertical()
             .id_salt("device_clock_regions_block")
             .auto_shrink([false, true])
