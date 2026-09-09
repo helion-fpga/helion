@@ -5600,6 +5600,10 @@ impl IdeModel {
             self.capture_ila(net, n)
         } else if t == "ila_arm" || t.starts_with("ila_arm ") {
             self.ila_arm(t.strip_prefix("ila_arm").unwrap_or("").trim())
+        } else if t == "mark_debug" || t.starts_with("mark_debug ") {
+            self.mark_debug_net(t.strip_prefix("mark_debug").unwrap_or("").trim())
+        } else if t == "add_probe" || t.starts_with("add_probe ") {
+            self.add_probe(t.strip_prefix("add_probe").unwrap_or("").trim())
         } else if t == "ila_dashboard" {
             self.workspace = WorkspaceTab::Hardware;
             Ok(self.ila_dashboard_text())
@@ -18838,6 +18842,78 @@ impl IdeModel {
         }
     }
 
+    /// Net selected on Device / Schematic / Netlist for UG908 Mark Debug / Add Probe.
+    pub fn selected_debug_net(&self) -> Option<String> {
+        if let Some(id) = self.selected.as_deref() {
+            if self.tree.has_net(id) {
+                return Some(id.to_string());
+            }
+            if self.device.route_named(id).is_some() {
+                return Some(id.to_string());
+            }
+            if let Some(d) = self.shell.session.design.as_ref() {
+                if d.nets.iter().any(|n| n.name == id) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        if let Some(name) = self.selected_netlist.as_deref() {
+            if self.tree.has_net(name) {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+
+    /// UG908 Mark Debug from Device/Schematic/Netlist selection (or explicit net).
+    pub fn mark_debug_net(&mut self, spec: &str) -> Result<String, String> {
+        let net = {
+            let s = spec.trim();
+            if s.is_empty() {
+                self.selected_debug_net().ok_or_else(|| {
+                    "mark_debug: select a net on Device or Schematic first".to_string()
+                })?
+            } else {
+                s.to_string()
+            }
+        };
+        self.shell.session.mark_debug(&net)?;
+        self.select(&net);
+        Ok(format!("mark_debug {net}"))
+    }
+
+    /// UG908 Add Probe: ensure mark_debug, bind ILA probe, open Hardware.
+    pub fn add_probe(&mut self, spec: &str) -> Result<String, String> {
+        let net = {
+            let s = spec.trim();
+            if !s.is_empty() {
+                s.to_string()
+            } else if let Some(n) = self.selected_debug_net() {
+                n
+            } else {
+                let d = self.default_ila_probe();
+                if d.is_empty() {
+                    return Err("add_probe: no net".into());
+                }
+                d
+            }
+        };
+        let already = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.marked_debug_nets().iter().any(|n| n == &net))
+            .unwrap_or(false);
+        if !already {
+            self.shell.session.mark_debug(&net)?;
+        }
+        self.ila.net = net.clone();
+        self.select(&net);
+        self.workspace = WorkspaceTab::Hardware;
+        Ok(format!("add_probe net={net}"))
+    }
+
     /// Status-bar / Messages crumb: mark_debug nets + last ILA capture (no layout).
     pub fn ila_status_crumb(&self) -> String {
         let md = self
@@ -20311,6 +20387,11 @@ impl IdeModel {
             if let Some(n) = d.nets.iter().find(|n| n.name == id) {
                 props.push(("TYPE".into(), "net".into()));
                 props.push(("ENDPOINTS".into(), n.endpoints.len().to_string()));
+                for (k, v) in &n.attrs.map {
+                    if !props.iter().any(|(pk, _)| pk == k) {
+                        props.push((k.clone(), v.clone()));
+                    }
+                }
             }
             if let Some(p) = d.ports.iter().find(|p| p.name == id) {
                 props.push(("TYPE".into(), "port".into()));
@@ -25258,6 +25339,49 @@ endmodule
             cap.contains("ILA cnt_3×8") || cap.contains("ILA cnt_3×"),
             "{cap}"
         );
+    }
+
+    /// Device/Schematic net selection → Mark Debug / Add Probe → ILA (UG908 cross-probe).
+    #[test]
+    fn device_schematic_net_mark_debug_add_probe_crossprobe() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+
+        let r = ide.exec("select_device_route cnt_3").unwrap();
+        assert!(r.contains("net=cnt_3"), "{r}");
+        assert_eq!(ide.selected_debug_net().as_deref(), Some("cnt_3"));
+        assert!(ide.exec("mark_debug").unwrap().contains("cnt_3"));
+        let marked = ide
+            .shell
+            .session
+            .design
+            .as_ref()
+            .unwrap()
+            .marked_debug_nets();
+        assert!(marked.iter().any(|n| n == "cnt_3"), "{marked:?}");
+        assert_eq!(ide.default_ila_probe(), "cnt_3");
+        assert!(
+            ide.property_rows()
+                .iter()
+                .any(|p| p.name == "mark_debug" && p.value == "true"),
+            "Properties must surface mark_debug: {:?}",
+            ide.property_rows()
+        );
+
+        // Schematic/Netlist selection path → Add Probe opens Hardware ILA.
+        ide.workspace = WorkspaceTab::Schematic;
+        ide.exec("select_netlist cnt_3").unwrap();
+        assert_eq!(ide.selected_debug_net().as_deref(), Some("cnt_3"));
+        let ap = ide.exec("add_probe").unwrap();
+        assert!(ap.contains("net=cnt_3"), "{ap}");
+        assert_eq!(ide.ila.net, "cnt_3");
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+
+        let ap2 = ide.exec("add_probe cnt_3").unwrap();
+        assert!(ap2.contains("net=cnt_3"), "{ap2}");
     }
 
     /// UG900 ILA dashboard: trigger/window from fabric samples on the wave, not a lamp.
