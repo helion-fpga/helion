@@ -7707,7 +7707,7 @@ impl IdeModel {
                 )
             })
             .count();
-        if d.attrs.get("NO_BODY") == Some("1") || n_logic == 0 {
+        if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") || n_logic == 0 {
             return format!(
                 "no_body cells={cells} (no timing: empty shell or no logic; not a closed WNS)"
             );
@@ -16627,8 +16627,8 @@ impl IdeModel {
                         | helion_ir::CellKind::Bram18
                 )
             }).count();
-            if n_logic == 0 {
-                let why = if d.attrs.get("NO_BODY") == Some("1") {
+            if d.attrs.get("SIM_ONLY") == Some("1") || n_logic == 0 {
+                let why = if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
                     "no_body"
                 } else {
                     "no_logic"

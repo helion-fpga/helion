@@ -3,8 +3,9 @@
 //! Large cores (Ibex, PicoRV32) are ingested via `` `define ``/`ifdef`
 //! preprocess. Packages seed known enum defaults; always_ff / assign / generate
 //! / || && / concat-LHS map to LUT/FF. Verilog gate primitives are not a Helion
-//! product and are not a closed WNS. Missing child modules flatten to empty
-//! stubs (missing source, not an unknown construct).
+//! product and are not a closed WNS. `$display`/`$write` and `===`/`!==`
+//! against X/Z are a sim model, not a LUT or a closed WNS. Missing child
+//! modules flatten to empty stubs (missing source, not an unknown construct).
 
 mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
@@ -461,6 +462,10 @@ thread_local! {
     /// not LUTs and not a closed WNS. Not one line per instance.
     static GATE_PRIM_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `sim_only` line per module. `$display`/`$write` or `===`/`!==`
+    /// against X/Z is a simulation model, not a LUT and not a closed WNS.
+    static SIM_ONLY_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// Negedge-only always writes. Not mixed into the posedge NBA cone.
     /// (module, clk, signal, bit, optional RHS). None RHS cannot lower.
     static NEGEDGE_WRITES: std::cell::RefCell<
@@ -663,6 +668,106 @@ fn note_gate_primitive(module: &str, primitive: &str) {
 
 fn gate_primitive_for(module: &str) -> bool {
     GATE_PRIM_SEEN.with(|s| s.borrow().contains(module))
+}
+
+fn is_sim_display(name: &str) -> bool {
+    name == "$display"
+        || name == "$write"
+        || name.starts_with("$display")
+        || name.starts_with("$write")
+}
+
+fn tok_is_xz_lit(t: &Tok) -> bool {
+    match t {
+        Tok::Pat { .. } => true,
+        Tok::Ident(s) if matches!(s.as_str(), "x" | "X" | "z" | "Z") => true,
+        _ => false,
+    }
+}
+
+/// `===` / `!==` are tokenized as `==`/`!=` plus a leftover `=`.
+fn is_case_eq_at(toks: &[Tok], i: usize) -> bool {
+    matches!(toks.get(i), Some(Tok::Eq) | Some(Tok::Ne))
+        && matches!(toks.get(i + 1), Some(Tok::Sym('=')))
+}
+
+fn case_eq_against_xz(toks: &[Tok], i: usize) -> bool {
+    let mut j = i + 2;
+    let mut depth = 0i32;
+    let mut n = 0usize;
+    while j < toks.len() && n < 12 {
+        match &toks[j] {
+            Tok::Sym('(') => depth += 1,
+            Tok::Sym(')') | Tok::Sym(';') | Tok::Sym(',') if depth == 0 => break,
+            Tok::Kw(k) if depth == 0 && matches!(k.as_str(), "begin" | "end" | "else" | "endcase") => {
+                break
+            }
+            t if tok_is_xz_lit(t) => return true,
+            _ => {}
+        }
+        j += 1;
+        n += 1;
+    }
+    let mut k = i;
+    let mut looked = 0usize;
+    while k > 0 && looked < 8 {
+        k -= 1;
+        looked += 1;
+        match &toks[k] {
+            Tok::Sym(')') => {}
+            Tok::Sym('(') | Tok::Sym(';') => break,
+            t if tok_is_xz_lit(t) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Module (or always) uses `$display`/`$write` or a 4-state compare against X/Z.
+fn slice_is_sim_only(toks: &[Tok]) -> bool {
+    let mut i = 0;
+    while i < toks.len() {
+        if matches!(&toks[i], Tok::Kw(k) if k == "endmodule") {
+            break;
+        }
+        if let Tok::Ident(s) = &toks[i] {
+            if is_sim_display(s) {
+                return true;
+            }
+        }
+        if is_case_eq_at(toks, i) && case_eq_against_xz(toks, i) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Simulation model. One line. Not a LUT, not a MAC, not a closed WNS.
+fn note_sim_only(module: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let fresh = SIM_ONLY_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic sim_only module={module} (X/Z compare or display; not mapped; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn sim_only_for(module: &str) -> bool {
+    SIM_ONLY_SEEN.with(|s| s.borrow().contains(module))
+}
+
+fn skip_procedural_body(p: &mut P) {
+    if p.eat_kw("begin") {
+        if p.eat_sym(':') {
+            let _ = p.ident();
+        }
+        let _ = skip_begin_end(p);
+    } else {
+        let _ = skip_item_or_block(p);
+    }
 }
 
 /// Read-only `inout` used as a load enable did not reach FF D. One line.
@@ -1436,6 +1541,10 @@ fn assemble_module(
         }
         if child.attrs.get("GATE_PRIMITIVE") == Some("1") {
             d.attrs.set("GATE_PRIMITIVE", "1");
+        }
+        if child.attrs.get("SIM_ONLY") == Some("1") {
+            d.attrs.set("SIM_ONLY", "1");
+            d.attrs.set("NO_BODY", "1");
         }
     }
     visiting.remove(name);
@@ -3819,6 +3928,9 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     }
     let module = p.ident()?;
     set_cur_mod(&module);
+    if slice_is_sim_only(&p.t[p.i..]) {
+        note_sim_only(&module);
+    }
     while p.eat_kw("import") {
         let _ = skip_item_or_block(&mut p);
     }
@@ -3945,6 +4057,13 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 note_function_not_called(&module, &name);
             }
         }
+    }
+    if sim_only_for(&module) {
+        // A sim model is not a counter. Drop the leftover `assign cout = tmp_cout`
+        // so it cannot become a LUT, a MAC, or a closed WNS.
+        nbas.clear();
+        assigns.clear();
+        mem_inits.clear();
     }
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
@@ -4409,6 +4528,10 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("always_comb") {
+            if sim_only_for(&cur_mod()) {
+                skip_procedural_body(p);
+                continue;
+            }
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
@@ -4427,6 +4550,11 @@ fn parse_module_items(
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
             let (combo, edge_clk, negedge_only) = skip_event_control(p);
+            if sim_only_for(&cur_mod()) {
+                let _ = (combo, edge_clk, negedge_only);
+                skip_procedural_body(p);
+                continue;
+            }
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
@@ -6494,6 +6622,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         .unwrap_or_else(|| "clk".into());
     let clk = clk_owned.as_str();
 
+    // `$display` / X/Z compare is a simulator model. Do not invent LUTs or MACs.
+    if sim_only_for(&rtl.module) {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+        return Ok(d);
+    }
+
     // Flatten NBAs into per-bit (name_bit, expr)
     // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
     // Linear visit budget. Add/cmp hang guards stay elsewhere (Ibex).
@@ -6907,6 +7042,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     if gate_primitive_for(&rtl.module) {
         d.attrs.set("GATE_PRIMITIVE", "1");
+    }
+    if sim_only_for(&rtl.module) {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
     }
     // Inout load enable: FF D must depend on it, or one diagnostic and no WNS.
     if prove_inout_load_enables(&mut d, rtl) {
@@ -7332,7 +7471,13 @@ fn synth_from_parsed_top(
     if gate_primitive_for(&top_name) {
         d.attrs.set("GATE_PRIMITIVE", "1");
     }
-    if n_logic == 0 && flat_nbas == 0 && flat_assigns == 0 {
+    if sim_only_for(&top_name) {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+        d.cells.clear();
+        d.nets.clear();
+    }
+    if sim_only_for(&top_name) || (n_logic == 0 && flat_nbas == 0 && flat_assigns == 0) {
         d.attrs.set("NO_BODY", "1");
         eprintln!(
             "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
@@ -7650,6 +7795,41 @@ endmodule
     }
 
     #[test]
+    fn sim_only_display_and_xz_compare_is_not_a_lut() {
+        // Vendor PLL sim model: $display and === 1'bx. Not a counter, not a MAC.
+        let src = r#"
+module hardcopyii_n_cntr(clk,reset,cout,modulus);
+  input clk;
+  input reset;
+  input [31:0] modulus;
+  output cout;
+  integer count;
+  reg tmp_cout;
+  initial count = 1;
+  always @(reset or clk) begin
+    if (reset) count = 1;
+    else if (clk === 1'bx) $display("Warning : X");
+    else if (count < modulus) count = count+1;
+    else begin count = 1; tmp_cout = ~tmp_cout; end
+    if (clk !== 1'bx) count = count;
+  end
+  assign cout = tmp_cout;
+endmodule
+"#;
+        let d = synth_sv(src, "n_cntr.v").expect("sim_only");
+        assert!(
+            d.cells.is_empty(),
+            "sim model must not invent LUT/MAC cells, cells={:?}",
+            d.cells
+        );
+        assert_eq!(d.attrs.get("SIM_ONLY"), Some("1"));
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "sim model must not invent a MAC"
+        );
+    }
+
     fn bufif1_mux_is_one_gate_primitive_not_a_lut() {
         let src = r#"
 module sky130_fd_sc_hdll__muxb16to1(Z,D,S);
