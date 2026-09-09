@@ -6130,33 +6130,45 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                             egui::vec2((cell_w - 1.0).max(1.0), (cell_h - 1.0).max(1.0)),
                         );
                         let site = model.device.site_at(x, y);
-                        let fill = match site {
-                            Some(s) if s.occupant.is_some() => match s.occupancy_char() {
-                                'O' => Color32::from_rgb(0x7e, 0xc8, 0xe3),
-                                'L' | 'C' => Color32::from_rgb(0x3d, 0xb8, 0x7a),
-                                _ => Color32::from_rgb(0xe5, 0xc0, 0x7b),
-                            },
-                            Some(s) => match s.kind {
-                                helion_device::SiteKind::Iob => Color32::from_rgb(0x1e, 0x3a, 0x55),
-                                helion_device::SiteKind::Bram => Color32::from_rgb(0x3a, 0x24, 0x52),
-                                helion_device::SiteKind::Dsp => Color32::from_rgb(0x52, 0x3a, 0x1e),
-                                helion_device::SiteKind::Clk => Color32::from_rgb(0x3a, 0x3a, 0x1e),
-                                helion_device::SiteKind::Clb => Color32::from_rgb(0x1a, 0x2e, 0x24),
-                            },
-                            None => Color32::from_rgb(0x0d, 0x10, 0x12),
+                        let path_hl = site.is_some_and(|s| s.highlighted);
+                        let fill = if path_hl {
+                            // STA path / selection: gold fill so multi-cell paths read on the die.
+                            Color32::from_rgb(0xe5, 0xc0, 0x7b)
+                        } else {
+                            match site {
+                                Some(s) if s.occupant.is_some() || !s.bels.is_empty() => {
+                                    match s.occupancy_char() {
+                                        'O' => Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                                        'L' | 'C' => Color32::from_rgb(0x3d, 0xb8, 0x7a),
+                                        _ => Color32::from_rgb(0xe5, 0xc0, 0x7b),
+                                    }
+                                }
+                                Some(s) => match s.kind {
+                                    helion_device::SiteKind::Iob => Color32::from_rgb(0x1e, 0x3a, 0x55),
+                                    helion_device::SiteKind::Bram => Color32::from_rgb(0x3a, 0x24, 0x52),
+                                    helion_device::SiteKind::Dsp => Color32::from_rgb(0x52, 0x3a, 0x1e),
+                                    helion_device::SiteKind::Clk => Color32::from_rgb(0x3a, 0x3a, 0x1e),
+                                    helion_device::SiteKind::Clb => Color32::from_rgb(0x1a, 0x2e, 0x24),
+                                },
+                                None => Color32::from_rgb(0x0d, 0x10, 0x12),
+                            }
                         };
                         p.rect_filled(tile, 1.0, fill);
-                        let selected = site.is_some_and(|s| {
-                            let id = model.selected.as_deref();
-                            id == s.occupant.as_deref()
-                                || id == Some(s.site_name().as_str())
-                                || s.bels.iter().any(|b| Some(b.as_str()) == id)
-                        });
+                        let selected = path_hl
+                            || site.is_some_and(|s| {
+                                let id = model.selected.as_deref();
+                                id == s.occupant.as_deref()
+                                    || id == Some(s.site_name().as_str())
+                                    || s.bels.iter().any(|b| Some(b.as_str()) == id)
+                            });
                         if selected {
                             p.rect_stroke(
                                 tile,
                                 1.0,
-                                Stroke::new(1.5_f32, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+                                Stroke::new(
+                                    if path_hl { 2.2_f32 } else { 1.5_f32 },
+                                    Color32::from_rgb(0xff, 0xe0, 0x8a),
+                                ),
                                 egui::StrokeKind::Outside,
                             );
                         }
