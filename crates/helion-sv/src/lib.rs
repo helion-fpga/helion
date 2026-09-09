@@ -440,6 +440,10 @@ thread_local! {
     /// One `variable_index_read` line per module. Write-side Hffs may still time.
     static INDEX_READ_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `assign_not_lowered` line per module+signal. A split `wire` assign
+    /// that did not lower is not a const 0 and is not a closed WNS.
+    static ASSIGN_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 fn skipped_funcs_clear() {
@@ -556,6 +560,26 @@ fn note_variable_index_read(module: &str, signal: &str) {
     note_skip(format!(
         "diagnostic variable_index_read module={module} signal={signal} (variable-index read not mapped; not a LUT; write-side Hff still timed)"
     ));
+}
+
+/// Continuous assign (including `wire` + newline + `name = expr`) did not lower.
+/// One line per signal. Not a LUT, not a const 0, not a closed WNS.
+fn note_assign_not_lowered(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "assign" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic assign_not_lowered module={module} signal={signal} (assign not lowered; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn assign_not_lowered_for(module: &str) -> bool {
+    let prefix = format!("{module}\0");
+    ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
 }
 
 fn lhs_before_assign(toks: &[Tok], nba_only: bool) -> Option<String> {
@@ -864,6 +888,9 @@ fn assemble_module(
         // A child cone that was not mapped makes this netlist incomplete.
         if child.attrs.get("WIDE_CONE") == Some("1") {
             d.attrs.set("WIDE_CONE", "1");
+        }
+        if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
+            d.attrs.set("ASSIGN_NOT_LOWERED", "1");
         }
     }
     visiting.remove(name);
@@ -3373,6 +3400,31 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     })
 }
 
+/// `wire`/`logic name = expr` (assignment may start on the next line).
+/// A `reg` initializer is not a continuous assign. An unparsed RHS is a named
+/// diagnostic, not a folded 0.
+fn push_decl_assign(
+    p: &mut P,
+    assigns: &mut Vec<(String, Option<usize>, RExpr)>,
+    name: &str,
+    net_assign: bool,
+) {
+    if !p.eat_sym('=') {
+        return;
+    }
+    if !net_assign {
+        skip_until_arg_end(p);
+        return;
+    }
+    match parse_rexpr(p) {
+        Ok(rhs) => assigns.push((name.to_string(), None, rhs)),
+        Err(_) => {
+            note_assign_not_lowered(&cur_mod(), name);
+            skip_until_arg_end(p);
+        }
+    }
+}
+
 fn parse_module_items(
     mut p: &mut P,
     ports: &mut Vec<(String, PortDir, usize)>,
@@ -3590,7 +3642,20 @@ fn parse_module_items(
             let _ = p.eat_sym(';');
             continue;
         }
-        if p.eat_kw("logic") || p.eat_kw("wire") || p.eat_kw("reg") {
+        let decl_kw = if p.eat_kw("logic") {
+            "logic"
+        } else if p.eat_kw("wire") {
+            "wire"
+        } else if p.eat_kw("reg") {
+            "reg"
+        } else {
+            ""
+        };
+        if !decl_kw.is_empty() {
+            // `wire` / `logic name = expr` is a net plus continuous assign.
+            // Split across a newline (`wire\n name = expr`) is the same form.
+            // `reg name = expr` stays an initializer, not a comb assign.
+            let net_assign = decl_kw != "reg";
             let w = match p.width_opt() {
                 Ok(w) => w,
                 Err(_) => {
@@ -3641,26 +3706,23 @@ fn parse_module_items(
                 });
             }
             note_width(p, &n, w);
-            if p.eat_sym('=') {
-                skip_until_arg_end(p);
-            }
+            push_decl_assign(p, assigns, &n, net_assign);
             while p.eat_sym(',') {
                 if let Ok(n2) = p.ident() {
                     if !signals.iter().any(|s| s.name == n2) {
                         signals.push(Signal {
-                            name: n2,
+                            name: n2.clone(),
                             width: w,
                             depth: 0,
                             keep: *pending_keep,
                             mark_debug: *pending_md,
                         });
                     }
+                    note_width(p, &n2, w);
                     if matches!(p.peek(), Some(Tok::Sym('['))) {
                         skip_brackets(p);
                     }
-                    if p.eat_sym('=') {
-                        skip_until_arg_end(p);
-                    }
+                    push_decl_assign(p, assigns, &n2, net_assign);
                 } else {
                     break;
                 }
@@ -4687,9 +4749,93 @@ fn rexpr_add_depth(e: &RExpr) -> usize {
     }
 }
 
+fn name_known(rtl: &Rtl, name: &str) -> bool {
+    rtl.signals.iter().any(|s| s.name == name)
+        || rtl.ports.iter().any(|(n, _, _)| n == name)
+}
+
+fn rexpr_unknown_name(e: &RExpr, rtl: &Rtl) -> Option<String> {
+    let mut names = HashSet::new();
+    rexpr_names(e, &mut names);
+    names.into_iter().find(|n| !name_known(rtl, n))
+}
+
+/// Relational assign (`<` / `>=` / `==` and `&&`/`||`/`!` of those).
+fn rexpr_is_rel(e: &RExpr) -> bool {
+    match e {
+        RExpr::Lt(_, _) | RExpr::Eq(_, _) | RExpr::Ne(_, _) => true,
+        RExpr::Not(x) => rexpr_is_rel(x),
+        RExpr::And(a, b) | RExpr::Or(a, b) => rexpr_is_rel(a) || rexpr_is_rel(b),
+        _ => false,
+    }
+}
+
+/// Unsized `'h8000` is tokenized with width = digit count, so the value does
+/// not fit. Expand only that case; sized literals keep their declared width.
+fn const_fit_width(val: u128, width: usize) -> usize {
+    let declared = width.max(1);
+    if declared >= 128 {
+        return declared;
+    }
+    let mask = care_mask(declared);
+    if val & !mask == 0 {
+        return declared;
+    }
+    let need = if val == 0 {
+        1
+    } else {
+        (128 - val.leading_zeros()) as usize
+    };
+    need.max(declared).min(128)
+}
+
+fn cmp_operand_width(e: &RExpr, rtl: &Rtl) -> usize {
+    match e {
+        RExpr::Const { val, width, .. } => const_fit_width(*val, *width),
+        other => rexpr_width(other, rtl).max(1),
+    }
+}
+
+/// Compare bit. Unknown names are an error, not const 0. Bits above a
+/// declared width are zero (unsigned), not a repeated MSB. A const whose
+/// value does not fit its token width uses the extra value bits.
+fn cmp_src_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    match e {
+        RExpr::Const { val, width, care } => {
+            let fitted = const_fit_width(*val, *width);
+            if bit >= fitted.max(1) {
+                return Ok(Expr::Const(false));
+            }
+            if bit < *width && (*care >> bit) & 1 == 0 && (*val >> bit) & 1 == 0 {
+                return Ok(Expr::Const(false));
+            }
+            Ok(Expr::Const((*val >> bit) & 1 == 1))
+        }
+        RExpr::Ident(s) => {
+            if !name_known(rtl, s) {
+                return Err(format!("unknown name {s}"));
+            }
+            let w = sig_width(rtl, s);
+            if bit >= w {
+                Ok(Expr::Const(false))
+            } else {
+                Ok(Expr::Var(bit_name(s, w, bit)))
+            }
+        }
+        RExpr::Bit(s, i) => {
+            if !name_known(rtl, s) {
+                return Err(format!("unknown name {s}"));
+            }
+            let w = sig_width(rtl, s);
+            Ok(Expr::Var(bit_name(s, w, *i)))
+        }
+        other => rexpr_to_bit(other, rtl, bit),
+    }
+}
+
 fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, String> {
-    let wa = rexpr_width(a, rtl);
-    let wb = rexpr_width(b, rtl);
+    let wa = cmp_operand_width(a, rtl);
+    let wb = cmp_operand_width(b, rtl);
     let w = wa.max(wb).max(1);
     // FM-HEL-HANG: wide/nested Add under Eq → huge AIG (Ibex hang after CORPUS cmp).
     // Skip instead of hang; simple Ident/Const compares (corpus hswish/lrelu) still map.
@@ -4705,8 +4851,8 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
         if (care >> i) & 1 == 0 {
             continue;
         }
-        let ai = rexpr_to_bit(a, rtl, i)?;
-        let bi = rexpr_to_bit(b, rtl, i)?;
+        let ai = cmp_src_bit(a, rtl, i)?;
+        let bi = cmp_src_bit(b, rtl, i)?;
         let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
         acc = Some(match acc {
             None => xnor,
@@ -4717,7 +4863,7 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
 }
 
 fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
-    let w = rexpr_width(a, rtl).max(rexpr_width(b, rtl)).max(1);
+    let w = cmp_operand_width(a, rtl).max(cmp_operand_width(b, rtl)).max(1);
     // FM-HEL-HANG: same bound as cmp_eq_bits — skip huge cones instead of hang.
     if w > 32 {
         return Err("lt width too wide".into());
@@ -4728,8 +4874,8 @@ fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
     let mut acc = Expr::Const(false);
     let mut eq_so_far = Expr::Const(true);
     for i in (0..w).rev() {
-        let ai = rexpr_to_bit(a, rtl, i)?;
-        let bi = rexpr_to_bit(b, rtl, i)?;
+        let ai = cmp_src_bit(a, rtl, i)?;
+        let bi = cmp_src_bit(b, rtl, i)?;
         let a0b1 = Expr::And(Box::new(Expr::Not(Box::new(ai.clone()))), Box::new(bi.clone()));
         acc = Expr::Or(
             Box::new(acc),
@@ -5645,6 +5791,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Ident/Bit/Range stay nets (IOB passthrough) so gold sequential WNS is
     // not broken by buffer LUTs — that is mapping a wire as a wire, not a skip.
     let mut comb_bits: Vec<(String, Expr)> = Vec::new();
+    // Relational wire-assigns that cannot map must name themselves. Do not
+    // spend the one wide_cone line on them — clocked cones still report that.
+    let mut rel_sig: HashMap<String, String> = HashMap::new();
     for (lhs, bit, rhs) in &rtl.assigns {
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
@@ -5664,18 +5813,42 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             n_mac += 1;
             continue;
         }
+        // Unknown name is not const 0.
+        if rexpr_unknown_name(rhs, rtl).is_some() {
+            note_assign_not_lowered(&rtl.module, lhs);
+            continue;
+        }
+        let rel = rexpr_is_rel(rhs);
         let w = sig_width(rtl, lhs);
+        let mut failed = false;
         if let Some(b) = bit {
-            if let Ok(e) = rexpr_to_bit(rhs, rtl, 0) {
-                comb_bits.push((bit_name(lhs, w, *b), e));
+            match rexpr_to_bit(rhs, rtl, 0) {
+                Ok(e) => {
+                    let bn = bit_name(lhs, w, *b);
+                    if rel {
+                        rel_sig.insert(bn.clone(), lhs.clone());
+                    }
+                    comb_bits.push((bn, e));
+                }
+                Err(_) => failed = true,
             }
         } else {
             let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
             for i in 0..rw.min(w) {
-                if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
-                    comb_bits.push((bit_name(lhs, w, i), e));
+                match rexpr_to_bit(rhs, rtl, i) {
+                    Ok(e) => {
+                        let bn = bit_name(lhs, w, i);
+                        if rel {
+                            rel_sig.insert(bn.clone(), lhs.clone());
+                        }
+                        comb_bits.push((bn, e));
+                    }
+                    Err(_) => failed = true,
                 }
             }
+        }
+        if failed && rel {
+            note_assign_not_lowered(&rtl.module, lhs);
         }
     }
 
@@ -5799,10 +5972,17 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     continue;
                 }
             }
+            if let Some(sig) = rel_sig.get(bitn) {
+                note_assign_not_lowered(&rtl.module, sig);
+                continue;
+            }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
+            if let Some(sig) = rel_sig.get(bitn) {
+                note_assign_not_lowered(&rtl.module, sig);
+            }
             continue;
         }
         let aig = Aig::from_expr(expr);
@@ -5811,6 +5991,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 || wide_aig_over_cap(&aig)
                 || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
             {
+                if let Some(sig) = rel_sig.get(bitn) {
+                    note_assign_not_lowered(&rtl.module, sig);
+                    continue;
+                }
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
                 continue;
             }
@@ -5835,6 +6019,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // variable_index_read does not set this: write-side Hffs may still time.
     if wide_capped {
         d.attrs.set("WIDE_CONE", "1");
+    }
+    if assign_not_lowered_for(&rtl.module) {
+        d.attrs.set("ASSIGN_NOT_LOWERED", "1");
     }
 
     // Clocked always either already became an Hff on the user's clock, or
@@ -7708,6 +7895,29 @@ endmodule
         assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+    }
+
+    #[test]
+    fn split_wire_assign_is_net_plus_assign() {
+        // Assignment on the next line after `wire` is a net plus assign.
+        let src = r#"
+module splitw(input a, input b, output y);
+  wire
+       y = a & b;
+endmodule
+"#;
+        let d = synth_sv(src, "splitw.v").expect("split wire");
+        let lut = d.cells.iter().find(|c| matches!(c.kind, CellKind::Lut6 { .. }));
+        let lut = lut.expect("split wire assign must map a LUT, not drop the name");
+        let init = match lut.kind {
+            CellKind::Lut6 { init } => init,
+            _ => unreachable!(),
+        };
+        assert_ne!(init, 0, "unknown/split wire name must not fold to const 0");
+        let on_y = d.nets.iter().any(|n| {
+            n.name == "y" && n.endpoints.iter().any(|e| e.cell == lut.name && e.pin == "O")
+        });
+        assert!(on_y, "split wire assign must drive y, nets={:?}", d.nets);
     }
 
     #[test]
