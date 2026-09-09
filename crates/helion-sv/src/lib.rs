@@ -4680,8 +4680,66 @@ fn lut6_const(one: bool) -> u64 {
     }
 }
 
+/// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
+/// printed `node_count` once per bit then spun in `map_wide_cone` until the
+/// 90s kill. Modest cones still lower; over this, one diagnostic and stop.
+const WIDE_CONE_PI_CAP: usize = 16;
+const WIDE_CONE_AND_CAP: usize = 96;
+const WIDE_CONE_MODULE_LUT_CAP: usize = 128;
+
+fn wide_aig_over_cap(aig: &Aig) -> bool {
+    aig.pis.len() > WIDE_CONE_PI_CAP || aig.ands.len() > WIDE_CONE_AND_CAP
+}
+
+/// One line per module. Further wide cones are skipped, not re-announced.
+fn emit_wide_cone(module: &str, signal: &str, capped: &mut bool) {
+    if *capped {
+        return;
+    }
+    *capped = true;
+    note_skip(format!(
+        "diagnostic wide_cone module={module} signal={signal} (wide_cone_cap pis>{pi} ands>{ands} luts>{luts}; cone not mapped; not a LUT; not a closed WNS)",
+        pi = WIDE_CONE_PI_CAP,
+        ands = WIDE_CONE_AND_CAP,
+        luts = WIDE_CONE_MODULE_LUT_CAP,
+    ));
+}
+
+/// True if the cone has more than `n` distinct PIs, or the walk budget dies
+/// before that can be ruled out. Stops at the (n+1)th variable so a wide
+/// compare does not full-eval.
+fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
+    fn walk(e: &Expr, vars: &mut Vec<String>, budget: &mut usize, n: usize) -> bool {
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(_) => false,
+            Expr::Var(name) => {
+                if !vars.iter().any(|v| v == name) {
+                    vars.push(name.clone());
+                    if vars.len() > n {
+                        return true;
+                    }
+                }
+                false
+            }
+            Expr::Not(x) => walk(x, vars, budget, n),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                walk(a, vars, budget, n) || walk(b, vars, budget, n)
+            }
+        }
+    }
+    let mut vars = Vec::new();
+    let mut budget = 8_000usize;
+    walk(e, &mut vars, &mut budget, n)
+}
+
 /// Map a >6-PI cone to a LUT2 tree. Output net is the function of `aig`.
 /// PI<=6 stays on the single-LUT6 path so gold INIT patterns do not move.
+/// Caller must refuse `wide_aig_over_cap` before calling; this does not invent
+/// a partial cone past the and/PI cap.
 fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
     use std::collections::HashMap;
     let mut node_net: HashMap<u32, String> = HashMap::new();
@@ -4954,23 +5012,35 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
+    // FM-HEL-10m-0854: one wide-cone diagnostic per module, then finish.
+    // Do not reprint node_count per bit, and do not map cones past the cap.
+    let mut wide_capped = false;
+    let mut wide_luts = 0usize;
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
         if expr_node_count(expr) > 8_000 {
-            note_skip(format!(
-                "diagnostic node_count signal={} nodes>8000 (cone too wide; not a LUT)",
-                bitn
-            ));
+            emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+            continue;
+        }
+        if wide_capped && cone_pi_exceeds(expr, 6) {
             continue;
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
+            if wide_capped
+                || wide_aig_over_cap(&aig)
+                || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
+            {
+                emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+                continue;
+            }
             let (ff, qnet) = if single_q {
                 ("u_ff".to_string(), "q".to_string())
             } else {
                 (format!("u_ff{i}"), bitn.clone())
             };
             let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"));
+            wide_luts = wide_luts.saturating_add(aig.ands.len());
             d.add_cell(&ff, CellKind::Hff);
             d.connect(clk, &ff, "CLK");
             d.connect(&wide, &ff, "D");
@@ -5014,26 +5084,36 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             break;
         }
         if expr_node_count(expr) > 2_000 {
-            // Keep the node-count hang guard for wide/Add cones (Ibex).
-            // A ≤6-PI boolean is a real LUT6; evaluate it instead of skipping.
-            if let Some((init, pis)) = lut6_from_bool_cone(expr) {
-                let lut = format!("u_clut{i}");
-                d.add_cell(&lut, CellKind::Lut6 { init });
-                d.connect(bitn, &lut, "O");
-                for (pin, pi) in pis.iter().enumerate() {
-                    d.connect(pi, &lut, format!("I{pin}"));
+            // ≤6-PI boolean (Problem4) is still a real LUT6. A wider cone is
+            // the VGA node_count storm: one wide_cone line, do not eval.
+            if !wide_capped && !cone_pi_exceeds(expr, 6) {
+                if let Some((init, pis)) = lut6_from_bool_cone(expr) {
+                    let lut = format!("u_clut{i}");
+                    d.add_cell(&lut, CellKind::Lut6 { init });
+                    d.connect(bitn, &lut, "O");
+                    for (pin, pi) in pis.iter().enumerate() {
+                        d.connect(pi, &lut, format!("I{pin}"));
+                    }
+                    continue;
                 }
-            } else {
-                note_skip(format!(
-                    "diagnostic node_count signal={} nodes>2000 (not a ≤6-PI LUT; not mapped)",
-                    bitn
-                ));
             }
+            emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+            continue;
+        }
+        if wide_capped && cone_pi_exceeds(expr, 6) {
             continue;
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
+            if wide_capped
+                || wide_aig_over_cap(&aig)
+                || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
+            {
+                emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+                continue;
+            }
             let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
+            wide_luts = wide_luts.saturating_add(aig.ands.len());
             // Alias wide cone output onto the assign net name.
             d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
             d.connect(&wide, format!("u_cbuf{i}"), "I0");
