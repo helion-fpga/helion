@@ -1510,7 +1510,9 @@ fn rhs_unpacked_index(rhs: &RExpr, rtl: &Rtl) -> bool {
     fn walk(e: &RExpr, rtl: &Rtl) -> bool {
         match e {
             RExpr::IndexPart { name, base, .. } => {
-                sig_depth(rtl, name) > 0 || walk(base, rtl)
+                // depth==1 collapses in index_part_bit; still walk nested bases.
+                let d = sig_depth(rtl, name);
+                (d > 1) || walk(base, rtl)
             }
             RExpr::Concat(parts) => parts.iter().any(|p| walk(p, rtl)),
             RExpr::WordAt { addr, data } => walk(addr, rtl) || walk(data, rtl),
@@ -1765,16 +1767,25 @@ fn assemble_module(
             "GATE_PRIMITIVE",
         ];
         let child_soft = soft_keys.iter().any(|k| child.attrs.get(k) == Some("1"));
-        // Hard incompletes always poison (wrong user clock / empty sim body).
+        // Hard clock incompletes always poison (wrong user clock).
         if child.attrs.get("CLOCK_MUX") == Some("1") {
             d.attrs.set("CLOCK_MUX", "1");
         }
         if child.attrs.get("CLOCK_GATE") == Some("1") {
             d.attrs.set("CLOCK_GATE", "1");
         }
+        // Sim-only DPI/X-compare child: under a heartbeat wrap, keep it a named
+        // miss (do not poison NO_BODY / kill wrap WNS). Flat parents still refuse.
         if child.attrs.get("SIM_ONLY") == Some("1") {
-            d.attrs.set("SIM_ONLY", "1");
-            d.attrs.set("NO_BODY", "1");
+            if parent_has_hff {
+                eprintln!(
+                    "diagnostic child_soft_incomplete module={} child={} (sim_only named miss; parent wrap keeps closed WNS on mapped paths)",
+                    name, inst.module
+                );
+            } else {
+                d.attrs.set("SIM_ONLY", "1");
+                d.attrs.set("NO_BODY", "1");
+            }
         }
         if child_soft && parent_has_hff {
             eprintln!(
@@ -1783,23 +1794,11 @@ fn assemble_module(
             );
             continue;
         }
-        // Flat / no-wrap parent: a child cone that was not mapped makes this
-        // netlist incomplete (do not invent closed WNS over soft fabric).
-        if child.attrs.get("WIDE_CONE") == Some("1") {
-            d.attrs.set("WIDE_CONE", "1");
-            // One diagnostic already fired in the child. Finish assemble so
-            // synth_design prints before the QA flatten/wide silence kill.
-            for key in soft_keys {
-                if child.attrs.get(key) == Some("1") {
-                    d.attrs.set(key, "1");
-                }
-            }
-            break;
-        }
+        // Flat / no-wrap parent: soft child cones make this netlist incomplete
+        // (do not invent closed WNS over soft fabric). Keep stitching siblings
+        // so more of the child tree maps to honest cells; one soft child must
+        // not discard the rest (Ibex bus wide_cone used to break before top).
         for key in soft_keys {
-            if key == "WIDE_CONE" {
-                continue;
-            }
             if child.attrs.get(key) == Some("1") {
                 d.attrs.set(key, "1");
             }
@@ -4495,14 +4494,36 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
             match p.ident() {
                 Ok(n) => {
                     ports.push((n.clone(), dir, w));
-                    signals.push(Signal {
-                        name: n,
-                        width: w,
-                        depth: 0,
-                        keep: false,
-                        mark_debug: false,
-                    });
-                    while p.eat_sym('[') {
+                    let mut unpack_depth = 0usize;
+                    // Peek unpacked dims before pushing the signal so depth is recorded.
+                    // `host_addr_i [NrHosts]` / `[N-1:0]` — do not leave depth=0 and
+                    // later treat word selects as packed bit muxes (Ibex bus wide_cone).
+                    let mut dims: Vec<usize> = Vec::new();
+                    while matches!(p.peek(), Some(Tok::Sym('['))) {
+                        let save = p.i;
+                        let _ = p.eat_sym('[');
+                        if let Ok(a) = const_u(p) {
+                            if p.eat_sym(':') {
+                                if let Ok(b) = const_u(p) {
+                                    if p.eat_sym(']') {
+                                        match range_width(a, b) {
+                                            Ok(dw) => dims.push(dw.max(1)),
+                                            Err(_) => {
+                                                note_width_overflow();
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else if p.eat_sym(']') {
+                                // Single bound `[NrHosts]` → depth N (not N bits of a range).
+                                dims.push((a as usize).max(1));
+                                continue;
+                            }
+                        }
+                        // Unparsed dim: skip brackets, leave depth unset for this dim.
+                        p.i = save;
+                        let _ = p.eat_sym('[');
                         let mut d = 1i32;
                         while d > 0 && p.peek().is_some() {
                             if p.eat_sym('[') {
@@ -4514,6 +4535,16 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                             }
                         }
                     }
+                    if let Some(&d0) = dims.first() {
+                        unpack_depth = d0.min(4096);
+                    }
+                    signals.push(Signal {
+                        name: n,
+                        width: w,
+                        depth: unpack_depth,
+                        keep: false,
+                        mark_debug: false,
+                    });
                 }
                 Err(_) => {
                     // skip this port to comma or ')'
@@ -4935,7 +4966,19 @@ fn parse_module_items(
                     }
                 } else {
                     p.i = save;
-                    skip_brackets(p);
+                    let _ = p.eat_sym('[');
+                    // Single bound `[NrHosts]` → depth N.
+                    if let Ok(n) = const_u(p) {
+                        if p.eat_sym(']') {
+                            depth = (n as usize).max(1).min(4096);
+                        } else {
+                            p.i = save;
+                            skip_brackets(p);
+                        }
+                    } else {
+                        p.i = save;
+                        skip_brackets(p);
+                    }
                 }
             }
             if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
@@ -5652,10 +5695,20 @@ fn index_part_bit(
     rtl: &Rtl,
     bit: usize,
 ) -> Result<Expr, String> {
+    let wsrc = sig_width(rtl, name);
+    let depth = sig_depth(rtl, name);
+    // Sole unpacked word (`[1]` / `[NrHosts]` with NrHosts=1): index is
+    // irrelevant. Read the packed element bits — do not build a 16-way bit mux
+    // that trips wide_cone on Ibex bus address compares.
+    if depth == 1 {
+        if bit >= wsrc {
+            return Ok(Expr::Const(false));
+        }
+        return Ok(Expr::Var(bit_name(name, wsrc, bit)));
+    }
     if bit >= part_w {
         return Ok(Expr::Const(false));
     }
-    let wsrc = sig_width(rtl, name);
     if let RExpr::Const { val, .. } = base {
         let idx = if ascending {
             (*val as usize).saturating_add(bit)
@@ -6453,7 +6506,13 @@ fn rexpr_width_checked(e: &RExpr, rtl: &Rtl) -> Option<usize> {
     match e {
         RExpr::Ident(s) | RExpr::Bit(s, _) => Some(sig_width(rtl, s)),
         RExpr::Range(_, lo, hi) => range_span(*lo, *hi),
-        RExpr::IndexPart { width, .. } => Some((*width).max(1)),
+        RExpr::IndexPart { name, width, .. } => {
+            if sig_depth(rtl, name) > 0 {
+                Some(sig_width(rtl, name).max(1))
+            } else {
+                Some((*width).max(1))
+            }
+        }
         RExpr::WordAt { data, .. } => Some(rexpr_width_checked(data, rtl)?.max(1)),
         RExpr::Const { width, .. } => Some((*width).max(1)),
         RExpr::Concat(parts) => {
@@ -6795,6 +6854,81 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
 /// PI<=6 stays on the single-LUT6 path so gold INIT patterns do not move.
 /// Caller must refuse `wide_aig_over_cap` before calling; this does not invent
 /// a partial cone past the and/PI cap.
+
+/// AND-tree of small bit-predicates (packed `a == b`, `(a&m)==b`, …) as a LUT
+/// reduction. Each And-leaf must fit one LUT6; the tree avoids one 64-PI AIG
+/// that would hit wide_cone_cap. Returns the output net, or None.
+fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
+    fn collect_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+        match e {
+            Expr::And(a, b) => collect_leaves(a, out) && collect_leaves(b, out),
+            Expr::Const(true) => true,
+            other => {
+                out.push(other);
+                true
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    if !collect_leaves(expr, &mut leaves) || leaves.is_empty() {
+        return None;
+    }
+    // Need an And-tree of several bit compares (or one wide leaf that is itself
+    // an eq of many bits already flattened into one Expr — still split above).
+    // Reject tiny non-eq cones (plain And of two vars) so gold paths stay put.
+    let looks_eq = leaves.iter().any(|leaf| {
+        matches!(leaf, Expr::Not(inner) if matches!(inner.as_ref(), Expr::Xor(_, _)))
+    });
+    if !looks_eq || leaves.len() > 128 {
+        return None;
+    }
+    let mut level: Vec<String> = Vec::new();
+    let mut n = 0usize;
+    for leaf in &leaves {
+        let (init, pis) = lut6_from_bool_cone(leaf)?;
+        let cell = format!("{prefix}eq{n}");
+        let net = format!("{prefix}eqn{n}");
+        n += 1;
+        d.add_cell(&cell, CellKind::Lut6 { init });
+        d.connect(&net, &cell, "O");
+        for (pin, pi) in pis.iter().enumerate() {
+            d.connect(pi, &cell, format!("I{pin}"));
+        }
+        level.push(net);
+    }
+    while level.len() > 1 {
+        let mut next = Vec::new();
+        let mut i = 0usize;
+        while i < level.len() {
+            let chunk = &level[i..level.len().min(i + 6)];
+            i += chunk.len();
+            if chunk.len() == 1 {
+                next.push(chunk[0].clone());
+                continue;
+            }
+            let cell = format!("{prefix}and{n}");
+            let net = format!("{prefix}andn{n}");
+            n += 1;
+            let k = chunk.len();
+            let mut init = 0u64;
+            let used = (1u64 << k) - 1;
+            for idx in 0..64u64 {
+                if (idx & used) == used && (idx >> k) == 0 {
+                    init |= 1u64 << idx;
+                }
+            }
+            d.add_cell(&cell, CellKind::Lut6 { init });
+            d.connect(&net, &cell, "O");
+            for (pin, src) in chunk.iter().enumerate() {
+                d.connect(src, &cell, format!("I{pin}"));
+            }
+            next.push(net);
+        }
+        level = next;
+    }
+    Some(level.pop().unwrap())
+}
+
 fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
     use std::collections::HashMap;
     let mut node_net: HashMap<u32, String> = HashMap::new();
@@ -8481,6 +8615,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     continue;
                 }
             }
+            if let Some(eq_net) = try_map_xnor_and_tree(&mut d, expr, &format!("u_eq{i}_")) {
+                d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
+                d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
+                d.connect(bitn, format!("u_cbuf{i}"), "O");
+                continue;
+            }
             if let Some(sig) = rel_sig.get(bitn) {
                 note_assign_not_lowered(&rtl.module, sig);
                 continue;
@@ -8492,6 +8632,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some(sig) = rel_sig.get(bitn) {
                 note_assign_not_lowered(&rtl.module, sig);
             }
+            continue;
+        }
+        // Packed `a == b` (AND of XNORs) → LUT reduction, not one 64-PI AIG.
+        if let Some(eq_net) = try_map_xnor_and_tree(&mut d, expr, &format!("u_eq{i}_")) {
+            d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
+            d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
+            d.connect(bitn, format!("u_cbuf{i}"), "O");
             continue;
         }
         let aig = Aig::from_expr(expr);
@@ -11540,4 +11687,86 @@ endmodule
         assert!(!aliased, "signal index must not alias q onto res[0]");
         assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
     }
+
+    #[test]
+    fn depth1_unpacked_index_is_not_wide_bit_mux() {
+        // ANSI `input [7:0] bus [1]` — sole word; bus[sel] must not 8-way mux.
+        let src = r#"
+module d1 (
+  input  wire [7:0] bus [1],
+  input  wire       sel,
+  input  wire [7:0] mask,
+  input  wire [7:0] base,
+  output wire       hit
+);
+  assign hit = (bus[sel] & mask) == base;
+endmodule
+"#;
+        let d = synth_sv(src, "d1.sv").expect("d1");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "depth-1 must not wide_cone");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"), "hit must lower");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(luts >= 8, "eq/and reduce should map LUTs, luts={luts}");
+    }
+
+    #[test]
+    fn ibex_pin_wrap_soft_child_diag() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let wrap = std::fs::read_to_string(root.join("ibex_pin_wrap.sv")).expect("wrap");
+        let ibex = std::fs::read_to_string(root.join("ysyx_ibex.sv")).expect("ibex");
+        let t0 = std::time::Instant::now();
+        let d = synth_sv_sources(&[
+            ("ysyx_ibex.sv", &ibex),
+            ("ibex_pin_wrap.sv", &wrap),
+        ])
+        .expect("synth wrap+ibex");
+        let soft = [
+            "WIDE_CONE",
+            "ASSIGN_NOT_LOWERED",
+            "GENERATE_NOT_LOWERED",
+            "WIDTH_OVERFLOW",
+            "WORD_PIPELINE_CAP",
+            "FLATTEN_CAP",
+            "GATE_PRIMITIVE",
+            "CLOCK_MUX",
+            "CLOCK_GATE",
+            "SIM_ONLY",
+            "NO_BODY",
+        ];
+        eprintln!("WRAP_DIAG name={} cells={} ms={}", d.name, d.cells.len(), t0.elapsed().as_millis());
+        for k in soft {
+            if let Some(v) = d.attrs.get(k) {
+                eprintln!("WRAP_ATTR {k}={v}");
+            }
+        }
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        eprintln!("WRAP_CELLS luts={luts} ffs={ffs} total={}", d.cells.len());
+        assert!(
+            d.cells.len() > 2000,
+            "assemble past soft bus must map mid-core fabric, cells={}",
+            d.cells.len()
+        );
+        assert_ne!(
+            d.attrs.get("SIM_ONLY"),
+            Some("1"),
+            "wrap heartbeat must not inherit child sim_only"
+        );
+        assert_ne!(d.attrs.get("NO_BODY"), Some("1"), "wrap must keep a body");
+        // Also synth bare child for attrs
+        let t1 = std::time::Instant::now();
+        let c = synth_sv_path(&root.join("ysyx_ibex.sv")).expect("bare ibex");
+        eprintln!("CHILD_DIAG name={} cells={} ms={}", c.name, c.cells.len(), t1.elapsed().as_millis());
+        for k in soft {
+            if let Some(v) = c.attrs.get(k) {
+                eprintln!("CHILD_ATTR {k}={v}");
+            }
+        }
+        let cl = c.cells.iter().filter(|x| matches!(x.kind, CellKind::Lut6 { .. })).count();
+        let cf = c.cells.iter().filter(|x| matches!(x.kind, CellKind::Hff)).count();
+        eprintln!("CHILD_CELLS luts={cl} ffs={cf} total={}", c.cells.len());
+        assert_eq!(d.name, "ibex_pin_wrap");
+        assert!(!d.cells.is_empty());
+    }
+
 }
