@@ -38,10 +38,15 @@ pub use helion_sta::{
 
 use helion_device::Device;
 use helion_ir::Design;
-use helion_proj::{get_cells, get_nets, get_pins, opt_design, Mode, Session};
+use helion_proj::{
+    expand_ip_packages, get_cells, get_nets, get_pins, load_prj, opt_design, resolve_prj_path, Mode,
+    Session,
+};
+use std::collections::HashMap;
 use std::path::Path;
 
-/// Elaborate RTL by extension: `.vhd`/`.vhdl` through helion-vhdl, else SV.
+/// Elaborate RTL by extension: `.prj` (multi-file + optional `top`), `.vhd`/`.vhdl`
+/// through helion-vhdl, else SV.
 pub fn synth_hdl_path(path: &Path) -> Result<Design, String> {
     let ext = path
         .extension()
@@ -49,9 +54,61 @@ pub fn synth_hdl_path(path: &Path) -> Result<Design, String> {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
+        "prj" => synth_prj_path(path),
         "vhd" | "vhdl" => helion_vhdl::synth_vhdl_path(path),
         _ => helion_sv::synth_sv_path(path),
     }
+}
+
+/// Multi-file Helion `.prj`: resolve `read_sv` sources and elaborate with optional `top`.
+fn synth_prj_path(path: &Path) -> Result<Design, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut prj = load_prj(&text)?;
+    let _ = expand_ip_packages(&mut prj, path)?;
+    let src_paths: Vec<std::path::PathBuf> = prj
+        .sources
+        .iter()
+        .map(|s| resolve_prj_path(path, s))
+        .collect();
+    for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+        if !resolved.exists() {
+            return Err(format!(
+                "project source {src}: not found (tried {})",
+                resolved.display()
+            ));
+        }
+    }
+    let rtl: Vec<std::path::PathBuf> = src_paths
+        .into_iter()
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    let e = e.to_ascii_lowercase();
+                    e == "sv" || e == "v"
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if rtl.is_empty() {
+        return Err("project has no SystemVerilog sources".into());
+    }
+    if rtl.len() == 1 && prj.top.is_none() {
+        return helion_sv::synth_sv_path(&rtl[0]);
+    }
+    let mut owned: Vec<(String, String)> = Vec::new();
+    for p in &rtl {
+        let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        owned.push((p.display().to_string(), src));
+    }
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let params: HashMap<String, u128> = HashMap::new();
+    let opts = Default::default();
+    let (d, _) = helion_sv::elaborate_sv_sources(&refs, prj.top.as_deref(), &params, &opts)?;
+    Ok(d)
 }
 
 #[derive(Clone, Debug)]
