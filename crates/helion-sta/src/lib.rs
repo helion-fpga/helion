@@ -2598,6 +2598,16 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                         i += 2;
                         continue;
                     }
+                    // Vivado: -max / -min qualify the following delay value.
+                    if toks[i] == "-max" || toks[i] == "-min" {
+                        if let Some(v) = toks.get(i + 1).and_then(|s| s.parse::<f64>().ok()) {
+                            delay_ns = Some(v);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        continue;
+                    }
                     if delay_ns.is_none() {
                         if let Ok(v) = toks[i].parse::<f64>() {
                             delay_ns = Some(v);
@@ -3748,6 +3758,15 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let d = Design::structural_blinky();
         let r = report_timing(&d, &clks).unwrap();
         assert_ne!(r.wns_ps, 10_000);
+    }
+
+    #[test]
+    fn xdc_output_delay_max_min_vivado_shape() {
+        let c = load_xdc(
+            "set_output_delay -clock clk -max 0.000 [get_ports led]\nset_output_delay -clock clk -min 0.000 [get_ports led]\n",
+        )
+        .unwrap();
+        assert_eq!(c.output_delay_ps.get("led"), Some(&0));
     }
 
     #[test]

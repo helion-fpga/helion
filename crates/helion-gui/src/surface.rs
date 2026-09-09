@@ -1066,6 +1066,40 @@ mod tests {
     }
 
     #[test]
+    fn open_counter_prj_then_implement_gold_wns_9640() {
+        let mut d = ChromeDriver::new();
+        let out = d.click_open(&example("counter.prj")).expect("open counter.prj");
+        assert!(
+            out.contains("open_project") || d.model.user_sdc,
+            "expected project open: {out}"
+        );
+        assert!(
+            d.model
+                .tree
+                .sources
+                .iter()
+                .any(|s| s.ends_with("counter.sv")),
+            "{:?}",
+            d.model.tree.sources
+        );
+        assert!(
+            d.model
+                .tree
+                .sources
+                .iter()
+                .any(|s| s.ends_with("counter.sdc")),
+            "Files must list SDC after open_project: {:?}",
+            d.model.tree.sources
+        );
+        d.click_implement().expect("implement");
+        assert_eq!(
+            d.model.wns_ps(),
+            Some(9640),
+            "Recent/Open .prj path must hold gold WNS"
+        );
+    }
+
+    #[test]
     fn jobs_are_not_run_inside_a_paint_callback() {
         let _ = take_jobs();
         queue_flow(FlowStep::Synthesis);

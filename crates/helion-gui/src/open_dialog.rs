@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 /// Extensions the Open HDL dialog accepts.
-pub const HDL_EXTENSIONS: &[&str] = &["sv", "v", "svh", "vhd", "vhdl", "sdc", "xdc"];
+pub const HDL_EXTENSIONS: &[&str] = &["sv", "v", "svh", "vhd", "vhdl", "sdc", "xdc", "prj"];
 
 /// Dialog backend id — always rfd, never osascript / HTML / silent no-op.
 pub fn dialog_backend() -> &'static str {
@@ -16,7 +16,7 @@ pub fn dialog_backend() -> &'static str {
 /// Configured native picker. Constructing this must work on macOS and Linux.
 pub fn hdl_file_dialog() -> rfd::FileDialog {
     rfd::FileDialog::new()
-        .set_title("Open HDL")
+        .set_title("Open HDL / Project")
         .add_filter("HDL", HDL_EXTENSIONS)
 }
 
@@ -34,6 +34,7 @@ mod tests {
         assert_eq!(dialog_backend(), "rfd");
         assert!(HDL_EXTENSIONS.contains(&"sv"));
         assert!(HDL_EXTENSIONS.contains(&"vhd"));
+        assert!(HDL_EXTENSIONS.contains(&"prj"), "Open must accept Helion .prj");
         // Building the native dialog must not be a compile-time None stub.
         let _dialog = hdl_file_dialog();
         assert_ne!(dialog_backend(), "none");

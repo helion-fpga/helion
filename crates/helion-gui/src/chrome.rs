@@ -638,6 +638,23 @@ pub fn schematic_frame_pan(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32, zoom: f
     ((vw - sheet_w.max(1.0) * z) * 0.5, (vh - sheet_h.max(1.0) * z) * 0.5)
 }
 
+/// Identity camera whose sheet bottom (full cell, including a name under the box)
+/// falls outside the pane. Zoom Fit then frames that bottom; a user pan/zoom is left alone.
+pub fn schematic_identity_clips_bottom(
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    sheet_h: f32,
+    vh: f32,
+) -> bool {
+    let identity = (zoom - 1.0).abs() < 0.02 && pan_x.abs() < 0.5 && pan_y.abs() < 0.5;
+    if !identity {
+        return false;
+    }
+    let z = if zoom.is_finite() { zoom.max(0.05) } else { 1.0 };
+    pan_y + sheet_h.max(1.0) * z > vh - 2.0
+}
+
 /// Device sidebar port line. Site is the full HAD name (`IOB_X17Y0`), never ellipsized.
 pub fn device_io_site_line(name: &str, dir: &str, site: &str) -> String {
     let site = if site.is_empty() || site == "-" {
@@ -739,7 +756,8 @@ pub fn clock_region_viewport_h(visible_rows: u32) -> f32 {
 /// How the Device pane under the legend is split.
 /// Narrow: tables floor then scroll horizontally; die keeps a usable height.
 /// Short: clock-region table floors on whole rows and scrolls; leftover is Zoom Fit.
-/// Wide: tables take a share; the die fills leftover (unchanged).
+/// Wide / default: pblock and clock-region tables are a short strip
+/// (heading plus 1–2 rows); the die takes the majority of leftover.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceBandShare {
     pub narrow: bool,
@@ -754,15 +772,17 @@ pub fn device_band_share(window_w: f32, window_h: f32, after_legend: f32) -> Dev
     let short = device_window_short(window_h);
     let after = after_legend.max(1.0);
     if !narrow && !short {
-        let share = share_available(window_w, window_h);
-        let die_reserve = share.canvas_floor_h.min(after * 0.62).max(56.0);
-        let tables_h = share.tables_max_h.min((after - die_reserve).max(40.0));
+        // Heading plus two rows. Do not hand clock regions 168px or 38–55% of the pane.
+        let strip = clock_region_viewport_h(2);
+        let clock_h = strip;
+        let tables_h = strip;
+        let die_min_h = (after - tables_h - clock_h - 8.0).max(after * 0.55);
         return DeviceBandShare {
             narrow,
             short,
             tables_h,
-            clock_h: 168.0,
-            die_min_h: die_reserve,
+            clock_h,
+            die_min_h,
         };
     }
     let cr_rows = if short { 1 } else { 2 };
@@ -1260,7 +1280,18 @@ mod tests {
         assert!(short_die_w <= 700.0 + 1.0);
         let wide_band = device_band_share(1270.0, 630.0, 400.0);
         assert!(!wide_band.narrow && !wide_band.short);
-        assert!(wide_band.die_min_h >= 56.0);
+        assert!(
+            wide_band.die_min_h > 400.0 * 0.5 && wide_band.die_min_h > 56.0,
+            "wide die must take the majority of leftover under the legend, got {}",
+            wide_band.die_min_h
+        );
+        assert_eq!(wide_band.clock_h, clock_region_viewport_h(2));
+        assert!(wide_band.clock_h < 168.0, "wide clock strip must stay short, got {}", wide_band.clock_h);
+        assert!(
+            wide_band.tables_h <= clock_region_viewport_h(2) + 0.5,
+            "wide pblock strip must stay short, got {}",
+            wide_band.tables_h
+        );
         let wide = share_available(1600.0, 900.0);
         let narrow = share_available(780.0, 700.0);
         let short = share_available(1200.0, 420.0);
@@ -1329,7 +1360,7 @@ mod tests {
         assert_eq!(HIT_COMFORT, 36.0);
         assert_eq!(TOOLBAR_CTRL_H, HIT_COMFORT);
         assert_eq!(flow_chip_size()[1], HIT_COMFORT);
-        for label in ["Open…", "Bitstream", "Implement", "Implementing…"] {
+        for label in ["New Project…", "Open…", "Bitstream", "Implement", "Implementing…"] {
             let s = toolbar_ctrl_size(label);
             assert_eq!(s[1], HIT_COMFORT, "{label} height");
             assert!(s[0] >= 72.0, "{label} width {}", s[0]);
