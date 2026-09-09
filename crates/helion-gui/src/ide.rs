@@ -1765,11 +1765,17 @@ impl SchematicView {
     pub fn apply_zoom_fit(&mut self, width: f32, height: f32) {
         let vw = self.viewport_w.max(1.0);
         let vh = self.viewport_h.max(1.0);
-        let zx = vw / width.max(1.0);
-        let zy = vh / height.max(1.0);
-        let zoom = zx.min(zy).clamp(0.05, 16.0);
-        let pan_x = (vw - width * zoom) * 0.5;
-        let pan_y = (vh - height * zoom) * 0.5;
+        let zoom = crate::chrome::schematic_fit_zoom(width, height, vw, vh);
+        let (pan_x, pan_y) = crate::chrome::schematic_frame_pan(width, height, vw, vh, zoom);
+        self.commit_camera(SchematicCamera { zoom, pan_x, pan_y });
+    }
+
+    /// Zoom Out and reset pan so PORT_OUT and the rest of the sheet stay in the canvas.
+    pub fn zoom_out_framed(&mut self, width: f32, height: f32) {
+        let vw = self.viewport_w.max(1.0);
+        let vh = self.viewport_h.max(1.0);
+        let zoom = crate::chrome::schematic_zoom_out_zoom(width, height, vw, vh, self.camera.zoom);
+        let (pan_x, pan_y) = crate::chrome::schematic_frame_pan(width, height, vw, vh, zoom);
         self.commit_camera(SchematicCamera { zoom, pan_x, pan_y });
     }
 
@@ -4529,6 +4535,8 @@ pub struct IdeModel {
     pub utilization: Option<Utilization>,
     pub status: String,
     pub clock_period_ps: u64,
+    /// True after a user SDC/XDC with a clock is loaded (not the built-in 10 ns).
+    pub user_sdc: bool,
     pub nav: NavSection,
     pub layout: LayoutKind,
     pub messages: Vec<IdeMessage>,
@@ -4536,6 +4544,8 @@ pub struct IdeModel {
     pub runs: Vec<DesignRun>,
     pub schematic: SchematicView,
     pub device: DeviceView,
+    /// Device canvas zoom. 1.0 = Zoom Fit (both axes). >1 scrolls the die.
+    pub device_zoom: f32,
     pub properties: Vec<(String, String)>,
     /// UG893 Properties selected Name (clickable Name/Value table).
     pub selected_property: Option<String>,
@@ -4714,6 +4724,7 @@ impl IdeModel {
             utilization: None,
             status: "idle".into(),
             clock_period_ps: 10_000,
+            user_sdc: false,
             nav: NavSection::ProjectManager,
             layout: LayoutKind::Default,
             messages: Vec::new(),
@@ -4724,6 +4735,7 @@ impl IdeModel {
             ],
             schematic: SchematicView::default(),
             device: DeviceView::default(),
+            device_zoom: 1.0,
             properties: Vec::new(),
             selected_property: None,
             selected: None,
@@ -5508,6 +5520,12 @@ impl IdeModel {
             self.collapse_inside()
         } else if t == "zoom_fit" || t == "schematic_zoom_fit" {
             self.schematic_zoom_fit()
+        } else if t == "device_zoom_fit" {
+            self.device_zoom_fit()
+        } else if t == "device_zoom_in" {
+            self.device_zoom_in()
+        } else if t == "device_zoom_out" {
+            self.device_zoom_out()
         } else if t == "schematic_previous" || t == "previous_view" {
             self.schematic_previous_view()
         } else if t == "schematic_next" || t == "next_view" {
@@ -6310,13 +6328,21 @@ impl IdeModel {
                     .or_else(|| self.tree.sources.last().map(PathBuf::from))
                     .ok_or("synth_design: add a source first")?;
                 let d = crate::synth_hdl_path(&path)?;
-                let msg = format!(
+                let mut msg = format!(
                     "synth_design {} cells={} luts={}",
                     d.name,
                     d.cells.len(),
                     d.lut_inits().len()
                 );
+                if d.attrs.get("NO_BODY") == Some("1") {
+                    msg.push_str(" no_body");
+                }
                 self.shell.session.synth_design(d);
+                self.load_sibling_sdc(&path);
+                let rtl_s = path.to_string_lossy().into_owned();
+                if self.tree.sources.last().map(|s| s.as_str()) != Some(rtl_s.as_str()) {
+                    self.tree.sources.push(rtl_s);
+                }
                 self.steps[FlowStep::Opt.index()] = StepState::Pending;
                 self.steps[FlowStep::Place.index()] = StepState::Pending;
                 self.steps[FlowStep::Route.index()] = StepState::Pending;
@@ -7634,8 +7660,125 @@ impl IdeModel {
 
     pub fn schematic_zoom_out(&mut self) -> Result<String, String> {
         self.workspace = WorkspaceTab::Schematic;
-        self.schematic.zoom_by(0.8);
+        let d = self.schematic.drawing_arc();
+        self.schematic.zoom_out_framed(d.width, d.height);
         Ok(self.schematic_camera_text())
+    }
+
+    /// Device Zoom Fit: cell scale 1.0 fits both axes of the die viewport.
+    pub fn device_zoom_fit(&mut self) -> Result<String, String> {
+        self.device_zoom = 1.0;
+        self.workspace = WorkspaceTab::Device;
+        Ok(format!("device_zoom fit zoom={:.3}", self.device_zoom))
+    }
+
+    /// Device zoom in. Paint uses a larger cell and the die ScrollArea scrolls.
+    pub fn device_zoom_in(&mut self) -> Result<String, String> {
+        self.device_zoom = (self.device_zoom * 1.35).clamp(0.40, 6.0);
+        self.workspace = WorkspaceTab::Device;
+        Ok(format!("device_zoom in zoom={:.3}", self.device_zoom))
+    }
+
+    /// Device zoom out. Stays above 0.40 so the die is not a single pixel.
+    pub fn device_zoom_out(&mut self) -> Result<String, String> {
+        self.device_zoom = (self.device_zoom / 1.35).clamp(0.40, 6.0);
+        self.workspace = WorkspaceTab::Device;
+        Ok(format!("device_zoom out zoom={:.3}", self.device_zoom))
+    }
+
+    /// Skip-map reason, or None if the design did not refuse a cone / primitive.
+    /// Checked before `no_clock_path`: leftover LUTs and no Hff is not "mapped,
+    /// simply no clock" when a cone was skipped.
+    fn timing_incomplete_reason(d: &helion_ir::Design) -> Option<&'static str> {
+        if d.attrs.get("WIDE_CONE") == Some("1") {
+            return Some("wide_cone skipped; not a closed WNS");
+        }
+        if d.attrs.get("CLOCK_MUX") == Some("1") {
+            return Some("clock_mux; not a single user clock; not a closed WNS");
+        }
+        if d.attrs.get("CLOCK_GATE") == Some("1") {
+            return Some("clock_gate; not a single user clock; not a closed WNS");
+        }
+        if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            return Some("gate primitive not mapped; not a LUT; not a closed WNS");
+        }
+        if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
+            return Some("inout load enable not mapped; not a closed WNS");
+        }
+        if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
+            return Some("assign not lowered; not a closed WNS");
+        }
+        if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            return Some("word_pipeline_cap; extra stages not invented; not a closed WNS");
+        }
+        None
+    }
+
+    /// On-screen timing line. Closed `WNS_PS=` only with cells>0 and an Hff clock path,
+    /// and only when no cone was skipped. A skipped map (`wide_cone`, `gate_primitive`,
+    /// and the other incomplete attrs) is `timing_incomplete` even with no Hff —
+    /// that is not `no_clock_path`. `sim_only` stays `no_body`. Built-in period
+    /// says `default period, not user SDC`.
+    pub fn timing_honesty_label(&self) -> String {
+        let Some(d) = self.shell.session.design.as_ref() else {
+            return "no_body cells=0 (no timing: empty shell or no logic; not a closed WNS)".into();
+        };
+        let cells = d.cells.len();
+        let n_logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    helion_ir::CellKind::Lut6 { .. }
+                        | helion_ir::CellKind::Hff
+                        | helion_ir::CellKind::Mac27
+                        | helion_ir::CellKind::Bram18
+                )
+            })
+            .count();
+        // sim_only stays no_body (empty simulation model), not a clock story.
+        if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
+            return format!(
+                "no_body cells={cells} (no timing: empty shell or no logic; not a closed WNS)"
+            );
+        }
+        // A refused cone / primitive is not "mapped, no clock" and not a closed WNS.
+        if let Some(why) = Self::timing_incomplete_reason(d) {
+            return format!("timing_incomplete cells={cells} ({why})");
+        }
+        if n_logic == 0 {
+            return format!(
+                "no_body cells={cells} (no timing: empty shell or no logic; not a closed WNS)"
+            );
+        }
+        let clock_path = d
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, helion_ir::CellKind::Hff));
+        if !clock_path {
+            return format!(
+                "no_clock_path cells={cells} (no timing: no clock path; not a closed WNS)"
+            );
+        }
+        match self.timing.as_ref() {
+            Some(t) => {
+                let note = if self.user_sdc {
+                    String::new()
+                } else {
+                    " default period, not user SDC".into()
+                };
+                format!("WNS_PS={} TNS_PS={}{note}", t.wns_ps, t.tns_ps)
+            }
+            None => format!(
+                "not routed cells={cells} (no timing: clock path present but not routed; not a closed WNS)"
+            ),
+        }
+    }
+
+    /// Closed WNS is legal only when the honesty label starts with WNS_PS=.
+    pub fn timing_closed_wns(&self) -> bool {
+        self.timing_honesty_label().starts_with("WNS_PS=")
     }
 
     pub fn schematic_previous_view(&mut self) -> Result<String, String> {
@@ -13931,15 +14074,9 @@ impl IdeModel {
         }
 
         let ts = self.timing_summary();
-        let ts_ready = !ts.clocks.is_empty();
-        let ts_sum = format!(
-            "WNS_PS={} TNS_PS={} clocks={}",
-            ts.wns_ps
-                .map(|w| w.to_string())
-                .unwrap_or_else(|| "n/a".into()),
-            ts.tns_ps,
-            ts.clocks.len()
-        );
+        let honest = self.timing_honesty_label();
+        let ts_ready = honest.starts_with("WNS_PS=") || !ts.clocks.is_empty();
+        let ts_sum = honest;
 
         let ci = self.clock_interaction();
         let ci_ready = !ci.clocks.is_empty();
@@ -16322,6 +16459,9 @@ impl IdeModel {
         let n_tb = extra.max_time_borrows.len();
         let n_dc = extra.data_checks.len();
         self.merge_constraints(extra);
+        if n > 0 {
+            self.user_sdc = true;
+        }
         let p = path.to_string();
         if !self.tree.sources.contains(&p) {
             self.tree.sources.push(p);
@@ -16331,10 +16471,134 @@ impl IdeModel {
         ))
     }
 
+    fn load_sibling_sdc(&mut self, rtl: &std::path::Path) {
+        if self.user_sdc {
+            return;
+        }
+        for ext in ["sdc", "xdc"] {
+            let cand = rtl.with_extension(ext);
+            if cand.is_file() {
+                if self.read_xdc_path(&cand.to_string_lossy()).is_ok() && self.user_sdc {
+                    eprintln!("loaded user SDC {}", cand.display());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn design_closed_timing(d: &helion_ir::Design) -> bool {
+        if d.attrs.get("NO_BODY") == Some("1") {
+            return false;
+        }
+        // A skipped cone is not a design WNS, even if leftover cells have a clock.
+        // sequential_not_lowered with no Hff is already rejected below (no clock path).
+        // variable_index_read does not set this flag.
+        if d.attrs.get("WIDE_CONE") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("CLOCK_MUX") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("CLOCK_GATE") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            return false;
+        }
+        let n_logic = d.cells.iter().filter(|c| {
+            matches!(
+                c.kind,
+                helion_ir::CellKind::Lut6 { .. }
+                    | helion_ir::CellKind::Hff
+                    | helion_ir::CellKind::Mac27
+                    | helion_ir::CellKind::Bram18
+            )
+        }).count();
+        let clock_path = d
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, helion_ir::CellKind::Hff));
+        n_logic > 0 && clock_path
+    }
+
+    /// Net that actually clocks Hffs. If several nets clock FFs, a leftover
+    /// net called `clk` does not win over the user's posedge clock.
+    fn hff_clock_net(d: &helion_ir::Design) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for c in &d.cells {
+            if !matches!(c.kind, helion_ir::CellKind::Hff) {
+                continue;
+            }
+            let Some(net) = d.net_on(&c.name, "CLK") else {
+                continue;
+            };
+            if net.is_empty() {
+                continue;
+            }
+            *counts.entry(net.to_string()).or_default() += 1;
+        }
+        let max = counts.values().copied().max()?;
+        let cands: Vec<&String> = counts
+            .iter()
+            .filter(|(_, n)| **n == max)
+            .map(|(k, _)| k)
+            .collect();
+        if cands.len() > 1 {
+            if let Some(real) = cands.iter().copied().find(|n| n.as_str() != "clk") {
+                return Some(real.clone());
+            }
+        }
+        cands.into_iter().next().cloned()
+    }
+
+    /// Implicit analysis clock (no user SDC) is named after the Hff clock.
+    /// Period stays the built-in default. User SDC clocks are not renamed.
+    fn name_implicit_analysis_clock(clks: &mut [helion_sta::Clock], d: &helion_ir::Design) {
+        let Some(net) = Self::hff_clock_net(d) else {
+            return;
+        };
+        if let Some(i) = clks
+            .iter()
+            .position(|c| c.name == net || c.source == net)
+        {
+            // Keep the analysis period: only bring a same-period matching
+            // clock to the front so the reported name is the Hff clock.
+            if i != 0 && clks[i].period_ps == clks[0].period_ps {
+                clks.swap(0, i);
+            }
+            return;
+        }
+        if clks.is_empty() {
+            return;
+        }
+        // Leftover `clk` is not the net that clocks the Hffs.
+        if clks[0].name == "clk" || clks[0].source == "clk" {
+            clks[0].name = net.clone();
+            clks[0].source = net;
+        }
+    }
+
     fn clocks_for_sta(&self) -> Vec<helion_sta::Clock> {
         let mut clks = self.constraints.clocks.clone();
         if clks.is_empty() {
-            create_clock(&mut clks, "clk", self.clock_period_ps, "clk");
+            let name = self
+                .shell
+                .session
+                .design
+                .as_ref()
+                .and_then(Self::hff_clock_net)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "clk".into());
+            create_clock(&mut clks, &name, self.clock_period_ps, &name);
         } else if let Some((i, _)) = clks
             .iter()
             .enumerate()
@@ -16344,6 +16608,10 @@ impl IdeModel {
             // UG903 create_generated_clock: divide_by / multiply_by / edges scale
             // the analysis period/WNS; -invert is a half-cycle setup.
             clks.swap(0, i);
+        } else if !self.user_sdc {
+            if let Some(d) = self.shell.session.design.as_ref() {
+                Self::name_implicit_analysis_clock(&mut clks, d);
+            }
         }
         clks
     }
@@ -16361,6 +16629,52 @@ impl IdeModel {
         if self.shell.session.design.is_none() {
             return Err("report_timing: no design".into());
         }
+        {
+            let d = self.shell.session.design.as_ref().unwrap();
+            let n_logic = d.cells.iter().filter(|c| {
+                matches!(
+                    c.kind,
+                    helion_ir::CellKind::Lut6 { .. }
+                        | helion_ir::CellKind::Hff
+                        | helion_ir::CellKind::Mac27
+                        | helion_ir::CellKind::Bram18
+                )
+            }).count();
+            // sim_only stays no_body. A skipped cone is timing_incomplete even
+            // with no Hff — leftover LUTs are not a mapped design with no clock.
+            if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
+                return Ok(format!(
+                    "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            if let Some(why) = Self::timing_incomplete_reason(d) {
+                return Ok(format!(
+                    "report_timing {} timing_incomplete cells={} ({why})",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            if n_logic == 0 {
+                return Ok(format!(
+                    "report_timing {} no_logic cells={} (no timing: empty shell or no logic; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            let clock_path = d
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, helion_ir::CellKind::Hff));
+            if !clock_path {
+                return Ok(format!(
+                    "report_timing {} no_clock_path cells={} (no timing: no clock path; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+        }
         if self.shell.session.routed.is_none() {
             let dev = self.device()?;
             if self.shell.session.placed.is_none() {
@@ -16372,8 +16686,33 @@ impl IdeModel {
         let d = self.shell.session.design.as_ref().unwrap();
         let r = self.shell.session.routed.as_ref().unwrap();
         let t = report_timing_routed_xdc(d, r, &clks, &self.constraints)?;
+        let clk = clks.first();
+        let clk_name = clk.map(|c| c.name.as_str()).unwrap_or("clk");
+        let period = clk.map(|c| c.period_ps).unwrap_or(self.clock_period_ps);
+        let src = clk.map(|c| c.source.as_str()).unwrap_or("clk");
+        let path = if t.wns_ps < 0 {
+            let need_ns = (t.setup_ps.max(1) as f64) / 1000.0;
+            format!(
+                " failing path: setup slack {wns} ps on clock {clk_name} (requirement {period} ps, data delay {setup} ps, r2r={r2r} iob={iob} route={route}). next constraint: create_clock -period {need_ns:.3} [get_ports {src}]",
+                wns = t.wns_ps,
+                setup = t.setup_ps,
+                r2r = t.r2r_ps,
+                iob = t.iob_ps,
+                route = t.route_ps,
+            )
+        } else {
+            format!(
+                " no failing path (setup slack {} ps on clock {clk_name})",
+                t.wns_ps
+            )
+        };
+        let period_note = if self.user_sdc {
+            String::new()
+        } else {
+            " default period, not user SDC".to_string()
+        };
         Ok(format!(
-            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}",
+            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}{period_note}{path}",
             d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps, t.clk_net_ps
         ))
     }
@@ -17589,7 +17928,9 @@ impl IdeModel {
             self.shell.session.design.as_ref(),
             self.shell.session.routed.as_ref(),
         ) {
-            (Some(d), Some(r)) => report_timing_routed_xdc(d, r, &clks, &self.constraints).ok(),
+            (Some(d), Some(r)) if Self::design_closed_timing(d) => {
+                report_timing_routed_xdc(d, r, &clks, &self.constraints).ok()
+            }
             _ => None,
         };
         self.timing_paths = match (self.shell.session.design.as_ref(), self.timing.as_ref()) {

@@ -360,7 +360,17 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 nplace,
                 t_aff.elapsed().as_millis()
             );
+            // 1113_5.v: 783 LUTFFs print this line then die -15 (SIGTERM) in
+            // bileg legalize. Keep the affinity placement and name the skip.
+            // Gold counter is far below this cap.
+            if nplace >= 256 {
+                eprintln!(
+                    "diagnostic place_affinity_cap lutffs={} (legalize skipped after affinity; placement kept)",
+                    nplace
+                );
+            }
             let t_leg = std::time::Instant::now();
+            let skip_legalize = nplace >= 256;
             // FM-HEL-TOP: bidirectional IMUX legalization — pull sinks toward
             // drivers AND drivers toward sinks onto real HAD reach (same-CLB /
             // N-S±1/±2 / E-W±1/±2 / diag±1 / knight); empty-BLE move then
@@ -510,7 +520,10 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                 let (site, _) = lutff_sites[i];
                 imux_illegal_pins(lf, site, &ff_at) == 0
             });
-            let pass_limit = if already_legal || nplace >= dev.lut6_count() as usize {
+            let pass_limit = if skip_legalize
+                || already_legal
+                || nplace >= dev.lut6_count() as usize
+            {
                 0
             } else {
                 32

@@ -137,9 +137,17 @@ fn run_headless_oneshot(path: &str) {
     match ide.exec("report_timing") {
         Ok(out) => {
             println!("{out}");
-            if let Some(wns) = ide.wns_ps() {
-                if !out.contains("WNS_PS=") {
-                    println!("WNS_PS={wns}");
+            // Do not append a closed WNS after an unfinished timing line.
+            let unfinished = out.contains("timing_incomplete")
+                || out.contains("no_clock_path")
+                || out.contains("no_body")
+                || out.contains("no_logic")
+                || out.contains("not a closed WNS");
+            if !unfinished {
+                if let Some(wns) = ide.wns_ps() {
+                    if !out.contains("WNS_PS=") {
+                        println!("WNS_PS={wns}");
+                    }
                 }
             }
         }
@@ -190,7 +198,7 @@ fn run_gui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([iw, ih])
-            .with_min_inner_size([1100.0, 640.0])
+            .with_min_inner_size([720.0, 400.0])
             .with_title("Helion"),
         ..Default::default()
     };
@@ -237,6 +245,9 @@ struct HelionIde {
     job: Option<JobHandle>,
     busy: bool,
     progress: String,
+    /// Last window size we shared chrome against.
+    last_share: [f32; 2],
+    force_share: bool,
 }
 
 impl HelionIde {
@@ -277,6 +288,8 @@ impl HelionIde {
             job: None,
             busy: false,
             progress: String::new(),
+            last_share: [0.0, 0.0],
+            force_share: true,
         };
         if let Ok(w) = std::env::var("HELION_SIDEBAR_WIDTH") {
             if let Ok(v) = w.parse::<f32>() {
@@ -318,6 +331,11 @@ impl HelionIde {
         if let Ok(name) = std::env::var("HELION_ACTIVITY") {
             if let Some(act) = Activity::ALL.iter().copied().find(|a| a.label().eq_ignore_ascii_case(name.trim())) {
                 app.set_activity(act);
+            }
+        }
+        if let Ok(z) = std::env::var("HELION_DEVICE_ZOOM") {
+            if let Ok(v) = z.parse::<f32>() {
+                app.model.device_zoom = v.clamp(0.40, 6.0);
             }
         }
         app
@@ -476,6 +494,7 @@ impl eframe::App for HelionIde {
         }
         self.poll_job(ctx);
         paint_toolbar(ctx, self);
+        apply_shared_chrome(ctx, self);
         let board_soft_hold = self.activity == Activity::Program
             && self
                 .board_detect
@@ -953,11 +972,20 @@ fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
 }
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
-    let mut width = app.sidebar_width.clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
-    let inner = egui::SidePanel::left("sidebar_v3")
+    let share = chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
+    let mut width = app.sidebar_width.clamp(share.sidebar_floor, share.sidebar_cap);
+    let mut panel = egui::SidePanel::left("sidebar_v3")
         .resizable(true)
-        .default_width(width)
-        .width_range(chrome::SIDEBAR_MIN_WIDTH..=chrome::SIDEBAR_MAX_WIDTH)
+        .default_width(width);
+    if app.force_share {
+        panel = panel.exact_width(width);
+        app.force_share = false;
+    }
+    let inner = panel
+        .width_range({
+            let share = chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
+            share.sidebar_floor..=share.sidebar_cap
+        })
         .show_separator_line(true)
         .show(ctx, |ui| {
             ui.set_width(ui.available_width());
@@ -996,7 +1024,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
             }
             width = ui.max_rect().width();
         });
-    app.sidebar_width = inner.response.rect.width().clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
+    app.sidebar_width = inner.response.rect.width().clamp(share.sidebar_floor, share.sidebar_cap);
     let _ = width;
 }
 
@@ -1291,10 +1319,18 @@ fn paint_status_bar(
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let wns = model
-                    .wns_ps()
-                    .map(|w| w.to_string())
-                    .unwrap_or_else(|| "—".into());
+                let honest = model.timing_honesty_label();
+                let wns = if model.timing_closed_wns() {
+                    honest
+                } else if honest.starts_with("no_body") {
+                    "no_body".into()
+                } else if honest.starts_with("no_clock_path") {
+                    "no_clock_path".into()
+                } else if honest.contains("default period") {
+                    honest
+                } else {
+                    honest
+                };
                 let lutff = model
                     .utilization
                     .as_ref()
@@ -1329,7 +1365,7 @@ fn paint_status_bar(
                 };
                 ui.label(
                     RichText::new(format!(
-                        "{} · {} · WNS {} · LUTFF {} · {}{}{}",
+                        "{} · {} · {} · LUTFF {} · {}{}{}",
                         crumb,
                         model.part(),
                         wns,
@@ -1381,12 +1417,32 @@ fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+fn apply_shared_chrome(ctx: &egui::Context, app: &mut HelionIde) {
+    let r = ctx.screen_rect();
+    let share = chrome::share_available(r.width(), r.height());
+    let size = [r.width(), r.height()];
+    if (app.last_share[0] - size[0]).abs() > 1.0 || (app.last_share[1] - size[1]).abs() > 1.0 {
+        app.sidebar_width = share.sidebar_w;
+        app.console_height = share.console_h;
+        app.last_share = size;
+        app.force_share = true;
+    } else {
+        app.sidebar_width = app.sidebar_width.clamp(share.sidebar_floor, share.sidebar_cap);
+        app.console_height = app.console_height.clamp(share.console_floor, share.console_cap);
+    }
+}
+
 fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
-    let inner = egui::TopBottomPanel::bottom("console")
+    let share = chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
+    let mut console = egui::TopBottomPanel::bottom("console")
         .resizable(true)
         .default_height(app.console_height)
-        .min_height(chrome::CONSOLE_MIN_HEIGHT)
-        .max_height(chrome::CONSOLE_MAX_HEIGHT)
+        .min_height(share.console_floor)
+        .max_height(share.console_cap);
+    if app.force_share || ctx.screen_rect().height() < 540.0 {
+        console = console.exact_height(app.console_height.min(share.console_h));
+    }
+    let inner = console
         .show_separator_line(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1442,7 +1498,7 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         .response
         .rect
         .height()
-        .clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
+        .clamp(share.console_floor, share.console_cap);
 }
 
 fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
@@ -2818,7 +2874,7 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick = None;
     let avail = ui.available_size();
     let view_w = avail.x.max(80.0);
-    let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
+    let view_h = chrome::pane_view_h(avail.y);
     let fit = chrome::hierarchy_fit(drawing.width, drawing.height, view_w, view_h);
     egui::ScrollArea::both()
         .id_salt("hierarchy_die_scroll")
@@ -2994,6 +3050,57 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
     let mut pick_obj: Option<String> = None;
     let mut set_iostd: Option<(String, &'static str)> = None;
     let mut set_io: Option<(String, &'static str, &'static str)> = None;
+    if grid_id == "sidebar_io" {
+        // Full HAD site names. The wide grid clipped Placed to "IOB_X…".
+        ui.label(RichText::new("Name  Dir  Site").small().weak());
+        if rows.is_empty() {
+            ui.label("Synth a design to list ports.");
+        }
+        for p in &rows {
+            let site = p.placed_cell();
+            let line = chrome::device_io_site_line(&p.name, &p.dir, site);
+            let on = selected_io.as_deref() == Some(p.name.as_str())
+                || selected.as_deref() == Some(p.name.as_str())
+                || selected.as_deref() == Some(p.placed_cell());
+            let resp = ui.add(
+                egui::Button::selectable(on, RichText::new(line).monospace())
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            );
+            if resp.clicked() {
+                pick_obj = Some(if site == "-" {
+                    p.name.clone()
+                } else {
+                    p.placed_cell().to_string()
+                });
+                pick_port = Some(p.name.clone());
+            }
+        }
+        egui::CollapsingHeader::new("Pin properties")
+            .default_open(false)
+            .id_salt("sidebar_io_props")
+            .show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("sidebar_io_props_scroll")
+                    .show(ui, |ui| {
+                        ui.set_min_width(420.0);
+                        for p in &rows {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  pin {}  {}  DRIVE {}  SLEW {}  {}",
+                                    p.name,
+                                    p.package_pin_cell(),
+                                    p.iostandard_cell(),
+                                    p.drive_cell(),
+                                    p.slew_cell(),
+                                    p.placed_cell(),
+                                ))
+                                .monospace()
+                                .small(),
+                            );
+                        }
+                    });
+            });
+    } else {
     data_scroll("io_ports_table_scroll")
         .show(ui, |ui| {
             egui::Grid::new(grid_id)
@@ -3066,6 +3173,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                     }
                 });
         });
+    }
     ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
     if let Some(port) = model.selected_io_port.as_deref().or_else(|| {
         model
@@ -3160,6 +3268,27 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.pblock_rows().to_vec();
     let mut pick_pblock: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    if rows.is_empty() {
+        let screen = ui.ctx().screen_rect();
+        let floor = chrome::device_window_narrow(screen.width())
+            || chrome::device_window_short(screen.height());
+        if floor {
+            // One complete line. Horizontal scroll keeps the sentence; wrap would crush the die.
+            ui.horizontal(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.set_min_width(420.0);
+                ui.label("No pblocks yet. Create one, then resize it on the die.");
+            });
+        } else {
+            ui.add(
+                egui::Label::new("No pblocks yet. Create one, then resize it on the die.").wrap(),
+            );
+        }
+        // Short leftover belongs to the die, not a dashed placeholder grid.
+        if chrome::device_window_short(screen.height()) {
+            return;
+        }
+    }
     data_scroll("pblocks_table_scroll").show(ui, |ui| {
     egui::Grid::new("pblocks_table")
         .spacing([8.0, 4.0])
@@ -3178,7 +3307,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.label("—");
                 ui.label("—");
                 ui.label("—");
-                ui.label("No pblocks yet. Create one, then resize it on the die.");
+                ui.label("—");
                 ui.label("—");
                 ui.end_row();
             } else {
@@ -3279,7 +3408,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
     let x0 = model.package.x0;
     let y0 = model.package.y0;
     let avail = ui.available_size();
-    let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
+    let view_h = chrome::pane_view_h(avail.y);
     let view_w = avail.x.max(80.0);
     // Wrap a 1-row HAD strip into a filled pin grid (Apple/Windows: content fills, no dead space).
     let (cols, rows, cell_w, cell_h) = chrome::stat_bit_grid(n_pins.max(1), view_w, view_h);
@@ -3608,54 +3737,37 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static 
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
-    let fill = salt == "reports_landing_catalog";
-    let n = rows.len().max(1) as f32;
-    let row_gap = if fill {
-        ((ui.available_height() - 28.0) / n - 18.0).clamp(4.0, 28.0)
-    } else {
-        4.0
-    };
-    egui::ScrollArea::both()
+    egui::ScrollArea::vertical()
         .id_salt(salt)
-        .auto_shrink([false, !fill])
-        .max_height(ui.available_height().max(120.0))
+        .auto_shrink([false, false])
+        .max_height(ui.available_height().max(1.0))
         .show(ui, |ui| {
-    let mut grid = egui::Grid::new(salt).spacing([8.0, row_gap]);
-    grid = if fill {
-        grid.min_col_width(80.0)
-    } else {
-        grid.min_col_width(48.0)
-    };
-    grid.show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.label(RichText::new("Name").strong());
-            ui.label(RichText::new("Category").strong());
-            ui.label(RichText::new("Status").strong());
-            ui.label(RichText::new("Summary").strong());
-            ui.end_row();
             for r in &rows {
                 let on = selected.as_deref() == Some(r.id.as_str());
-                if ui.selectable_label(on, &r.name).clicked() {
+                // Full name, wrapped to the sidebar — never "Timing Summ…".
+                let name = egui::Button::selectable(on, RichText::new(&r.name).strong())
+                    .wrap()
+                    .min_size(egui::vec2(ui.available_width(), 22.0));
+                if ui.add(name).clicked() {
                     pick = Some(r.id.clone());
                 }
-                ui.label(&r.category);
-                let fill = run_status_color(&r.status);
-                let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
-                    .fill(fill)
-                    .selected(on);
-                if ui.add(btn).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                let summary = if r.summary.len() > 28 {
-                    format!("{}…", r.summary.chars().take(28).collect::<String>())
-                } else {
-                    r.summary.clone()
-                };
-                if ui.selectable_label(on, summary).clicked() {
-                    pick = Some(r.id.clone());
-                }
-                ui.end_row();
+                let status_fill = run_status_color(&r.status);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&r.category).small());
+                    let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
+                        .fill(status_fill)
+                        .selected(on);
+                    if ui.add(btn).clicked() {
+                        pick = Some(r.id.clone());
+                    }
+                });
+                ui.add(
+                    egui::Label::new(RichText::new(&r.summary).small().weak()).wrap(),
+                );
+                ui.add_space(6.0);
             }
-        });
         });
     if let Some(id) = pick {
         let _ = model.select_report(&id);
@@ -3682,7 +3794,26 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("report_timing_summary");
         }
     });
+    // CLI-honest label. Closed WNS_PS= only with cells>0 and an Hff clock path.
+    let honest = model.timing_honesty_label();
+    let closed = model.timing_closed_wns();
+    ui.label(
+        RichText::new(honest.clone())
+            .monospace()
+            .size(16.0)
+            .color(if closed {
+                Color32::from_rgb(0xc8, 0xf0, 0xd8)
+            } else {
+                Color32::from_rgb(0xe5, 0xc0, 0x7b)
+            }),
+    );
+    if !closed {
+        ui.label("Not a closed WNS.");
+    }
     let report = model.timing_summary();
+    if !closed {
+        return;
+    }
     if report.clocks.is_empty() {
         ui.label("No clocks yet.");
         if primary_button(ui, "Add clock 10 ns").clicked() {
@@ -4606,35 +4737,25 @@ fn paint_dotted(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, stroke: Stroke)
 
 fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Schematic");
-    let vw = ui.available_width();
-    let vh = ui.available_height().max(240.0);
-    model.schematic.set_viewport(vw, vh);
-    let drawing = model.schematic.drawing_arc();
-    let cam = model.schematic.camera;
-    if chrome::schematic_should_auto_fit(
-        cam.zoom,
-        cam.pan_x,
-        cam.pan_y,
-        drawing.width,
-        drawing.height,
-        vw,
-        vh,
-    ) {
-        model.schematic.apply_zoom_fit(drawing.width, drawing.height);
-    }
-    let n_cells = drawing
+    // Stay on the schematic pane — do not fall back to Reports after More / Zoom.
+    model.workspace = WorkspaceTab::Schematic;
+    let mut zoom_fit = false;
+    let mut zoom_in = false;
+    let mut zoom_out = false;
+    let drawing_for_counts = model.schematic.drawing_arc();
+    let n_cells = drawing_for_counts
         .symbols
         .iter()
         .filter(|s| !s.kind.starts_with("PORT"))
         .count();
-    let n_ports = drawing
+    let n_ports = drawing_for_counts
         .symbols
         .iter()
         .filter(|s| s.kind.starts_with("PORT"))
         .count();
     let n_nets = {
         let mut s = std::collections::HashSet::new();
-        for w in &drawing.wires {
+        for w in &drawing_for_counts.wires {
             s.insert(w.net.as_str());
         }
         s.len()
@@ -4646,8 +4767,14 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Next").clicked() {
             let _ = model.schematic_next_view();
         }
+        if ui.button("Zoom In").clicked() {
+            zoom_in = true;
+        }
+        if ui.button("Zoom Out").clicked() {
+            zoom_out = true;
+        }
         if ui.button("Zoom Fit").clicked() {
-            let _ = model.schematic_zoom_fit();
+            zoom_fit = true;
         }
         if ui.button("Expand Cone").clicked() {
             let _ = model.exec("expand_cone");
@@ -4678,8 +4805,13 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
             ui.label(RichText::new(format!("Inside {inst}")).small().weak());
         }
         ui.label(RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0)).small().weak());
-        ui.label(RichText::new("pinch or ⌘-scroll to zoom · drag to pan").small().weak());
     });
+    // Full hint on hover. Visible words are complete — never "pinch or …".
+    let pinch_hint = "pinch or ⌘-scroll to zoom · drag to pan";
+    ui.add(
+        egui::Label::new(RichText::new("pinch to zoom · drag to pan").small().weak()).wrap(),
+    )
+    .on_hover_text(pinch_hint);
     if !model.timing_paths.is_empty() {
         // Results strip belongs under the drawing (UG893). Keep it collapsed so Zoom Fit owns the pane.
         egui::CollapsingHeader::new("Timing paths")
@@ -4719,7 +4851,33 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut expand = None;
     let selected = model.selected.clone();
     let avail = ui.available_size();
-    let (rect, resp) = ui.allocate_exact_size(avail.max(egui::vec2(240.0, 240.0)), Sense::click_and_drag());
+    // Canvas is the leftover pane — Zoom Fit fills this, not the heading/toolbar above.
+    let canvas = egui::vec2(avail.x.max(1.0), avail.y.max(1.0));
+    model.schematic.set_viewport(canvas.x, canvas.y);
+    let sheet = model.schematic.drawing_arc();
+    let cam0 = model.schematic.camera;
+    if zoom_fit
+        || chrome::schematic_should_auto_fit(
+            cam0.zoom,
+            cam0.pan_x,
+            cam0.pan_y,
+            sheet.width,
+            sheet.height,
+            canvas.x,
+            canvas.y,
+        )
+    {
+        model.workspace = WorkspaceTab::Schematic;
+        model.schematic.apply_zoom_fit(sheet.width, sheet.height);
+    } else if zoom_in {
+        model.workspace = WorkspaceTab::Schematic;
+        model.schematic.zoom_at(1.35, canvas.x * 0.5, canvas.y * 0.5);
+    } else if zoom_out {
+        model.workspace = WorkspaceTab::Schematic;
+        // Reset pan. zoom_at around the pane center clipped PORT_OUT on the right.
+        model.schematic.zoom_out_framed(sheet.width, sheet.height);
+    }
+    let (rect, resp) = ui.allocate_exact_size(canvas, Sense::click_and_drag());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         let (zoom_delta, scroll, mods, pointer) = ui.input(|i| {
@@ -4748,6 +4906,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         let d = resp.drag_delta();
         model.schematic.pan_by(d.x, d.y);
     }
+    let drawing = model.schematic.drawing_arc();
     let cam = model.schematic.camera;
     let z = cam.zoom.max(0.05);
     if ui.is_rect_visible(rect) {
@@ -4757,9 +4916,9 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         let net_col = Color32::from_rgb(0x3d, 0xb8, 0x7a);
         let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
         let path_col = Color32::from_rgb(0xe0, 0x6c, 0x75);
-        let name_fs = 10.0 * z;
+        let name_fs = (10.0 * z).clamp(8.0, 13.0);
         let pin_fs = 9.0 * z;
-        let show_names = name_fs >= 6.0;
+        let show_names = true;
         let show_pins = pin_fs >= 6.5;
         for w in &drawing.wires {
             if w.points.len() < 2 {
@@ -4852,9 +5011,35 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                 p.rect_filled(r, 3.0, fill);
                 p.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
             }
-            if show_names && r.width() >= 28.0 && r.height() >= 16.0 {
+            if port || sy.kind == "IOB_OUT" {
+                // Keep PORT_OUT / led readable even when the triangle is small.
+                // Text stays inside the canvas, not clipped to the symbol box.
+                let fs = name_fs.clamp(8.0, 12.0);
+                let kind = helion_gui::schematic_kind_label(&sy.kind);
+                let inward = sy.kind == "PORT_IN";
+                let anchor = if inward { r.left() + 6.0 } else { r.right() - 4.0 };
+                let align = if inward {
+                    egui::Align2::LEFT_CENTER
+                } else {
+                    egui::Align2::RIGHT_CENTER
+                };
+                p.text(
+                    egui::pos2(anchor, r.center().y - 7.0),
+                    align,
+                    kind,
+                    egui::FontId::monospace(fs),
+                    Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                );
+                p.text(
+                    egui::pos2(anchor, r.center().y + 8.0),
+                    align,
+                    &sy.name,
+                    egui::FontId::monospace(fs),
+                    Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                );
+            } else if show_names && r.width() >= 28.0 && r.height() >= 16.0 {
                 let clip = p.with_clip_rect(r.shrink(2.0).intersect(rect));
-                let fs = name_fs.clamp(6.0, 13.0);
+                let fs = name_fs.clamp(8.0, 13.0);
                 clip.text(
                     egui::pos2(r.center().x, r.top() + 3.0 * z),
                     egui::Align2::CENTER_TOP,
@@ -4947,90 +5132,224 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+
+fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel, floor_scroll: bool) {
+    let tools = |ui: &mut egui::Ui, model: &mut IdeModel| {
+        ui.horizontal(|ui| {
+            ui.set_min_width(360.0);
+            if ui.button("Zoom In").clicked() {
+                let _ = model.device_zoom_in();
+            }
+            if ui.button("Zoom Out").clicked() {
+                let _ = model.device_zoom_out();
+            }
+            if ui.button("Zoom Fit").clicked() {
+                let _ = model.device_zoom_fit();
+            }
+            ui.label(
+                RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
+                    .small()
+                    .weak(),
+            );
+        });
+    };
+    if floor_scroll {
+        // One tool row. Narrow windows scroll it; wrapping would steal die height.
+        egui::ScrollArea::horizontal()
+            .id_salt("device_legend_tools")
+            .auto_shrink([false, true])
+            .max_height(36.0)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| tools(ui, model));
+    } else {
+        tools(ui, model);
+    }
+    // Complete chips only. Narrow: one row, scroll sideways so names stay fully visible.
+    let chips: [(&str, Color32); 8] = [
+        ("CLB", Color32::from_rgb(0x3d, 0xb8, 0x7a)),
+        ("IOB", Color32::from_rgb(0x5b, 0x9b, 0xd5)),
+        ("BRAM", Color32::from_rgb(0xb0, 0x7c, 0xe8)),
+        ("placed LUT", Color32::from_rgb(0xc8, 0xf0, 0xd8)),
+        ("placed I/O", Color32::from_rgb(0x7e, 0xc8, 0xe3)),
+        ("clock region", Color32::from_rgb(0xb0, 0x7c, 0xe8)),
+        ("route", Color32::from_rgb(0x3d, 0xb8, 0x7a)),
+        ("pblock", Color32::from_rgb(0xe5, 0x9a, 0x3c)),
+    ];
+    if floor_scroll {
+        egui::ScrollArea::horizontal()
+            .id_salt("device_legend_chips")
+            .auto_shrink([false, true])
+            .max_height(chrome::DEVICE_LEGEND_ROW_H + 4.0)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    let mut used = 0.0_f32;
+                    for (text, col) in chips {
+                        used += text.chars().count() as f32 * 7.2 + 14.0;
+                        ui.label(RichText::new(text).small().color(col));
+                    }
+                    ui.set_min_width(used);
+                });
+            });
+        return;
+    }
+    let budget = ui
+        .available_width()
+        .min(ui.clip_rect().width())
+        .max(96.0)
+        - 12.0;
+    let mut rows: Vec<Vec<(&str, Color32)>> = vec![Vec::new()];
+    let mut used = 0.0_f32;
+    for chip in chips {
+        let w = chip.0.chars().count() as f32 * 7.2 + 14.0;
+        if !rows.last().unwrap().is_empty() && used + w > budget {
+            rows.push(Vec::new());
+            used = 0.0;
+        }
+        rows.last_mut().unwrap().push(chip);
+        used += w;
+    }
+    for row in rows {
+        ui.horizontal(|ui| {
+            for (text, col) in row {
+                ui.label(RichText::new(text).small().color(col));
+            }
+        });
+    }
+}
+
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Device");
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("CLB")
-                .small()
-                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
-        );
-        ui.label(
-            RichText::new("IOB")
-                .small()
-                .color(Color32::from_rgb(0x5b, 0x9b, 0xd5)),
-        );
-        ui.label(
-            RichText::new("BRAM")
-                .small()
-                .color(Color32::from_rgb(0xb0, 0x7c, 0xe8)),
-        );
-        ui.label(
-            RichText::new("placed LUT")
-                .small()
-                .color(Color32::from_rgb(0xc8, 0xf0, 0xd8)),
-        );
-        ui.label(
-            RichText::new("placed I/O")
-                .small()
-                .color(Color32::from_rgb(0x7e, 0xc8, 0xe3)),
-        );
-        ui.label(
-            RichText::new("clock region")
-                .small()
-                .color(Color32::from_rgb(0xb0, 0x7c, 0xe8)),
-        );
-        ui.label(
-            RichText::new("route")
-                .small()
-                .color(Color32::from_rgb(0x3d, 0xb8, 0x7a)),
-        );
-        ui.label(
-            RichText::new("pblock")
-                .small()
-                .color(Color32::from_rgb(0xe5, 0x9a, 0x3c)),
-        );
-    });
-    egui::ScrollArea::vertical()
-        .id_salt("device_tables")
-        .auto_shrink([false, true])
-        .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
-        .show(ui, |ui| {
-            paint_pblocks_table(ui, model);
-            paint_clock_regions(ui, model);
-            paint_device_routes(ui, model);
-        });
+    let screen = ui.ctx().screen_rect();
+    let narrow = chrome::device_window_narrow(screen.width());
+    let short = chrome::device_window_short(screen.height());
+    paint_device_legend(ui, model, narrow || short);
+    let share = chrome::share_available(screen.width(), screen.height());
+    let after_legend = ui.available_height().max(1.0);
+    let band = chrome::device_band_share(screen.width(), screen.height(), after_legend);
+    let pane_w = ui.available_width().max(48.0);
+    if narrow || short {
+        // Tables and legend floor, then scroll horizontally. Die keeps the leftover.
+        egui::ScrollArea::both()
+            .id_salt("device_tables")
+            .auto_shrink([false, true])
+            .max_height(band.tables_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_min_width(pane_w.max(640.0));
+                paint_pblocks_table(ui, model);
+            });
+        ui.add_space(2.0);
+        // Clock-region viewport is whole rows only so the last line is not sliced.
+        egui::ScrollArea::both()
+            .id_salt("device_clock_regions_block")
+            .auto_shrink([false, false])
+            .max_height(band.clock_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_min_width(pane_w.max(560.0));
+                ui.set_min_height(band.clock_h);
+                paint_clock_regions(ui, model);
+            });
+    } else {
+        // Wide: tables take a share; the die fills leftover.
+        let tables_h = band.tables_h.min(pane_w * 0.28).max(52.0);
+        egui::ScrollArea::both()
+            .id_salt("device_tables")
+            .auto_shrink([false, true])
+            .max_height(tables_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_max_width(pane_w);
+                ui.set_width(pane_w);
+                paint_pblocks_table(ui, model);
+            });
+        let remain = ui.available_height().max(1.0);
+        let die_need = share.canvas_floor_h.min(remain * 0.38).min(remain * 0.55);
+        let cr_h = (remain - die_need).clamp(28.0, 168.0);
+        egui::ScrollArea::vertical()
+            .id_salt("device_clock_regions_block")
+            .auto_shrink([false, true])
+            .max_height(cr_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_max_width(pane_w);
+                ui.set_width(pane_w);
+                paint_clock_regions(ui, model);
+            });
+    }
     ui.separator();
     let cols = model.device.cols.max(1);
     let rows = model.device.rows.max(1);
     let x0 = model.device.x0;
     let y0 = model.device.y0;
     let avail = ui.available_size();
-    let view_h = avail.y.max(chrome::DRAWING_MIN_HEIGHT);
-    let view_w = avail.x.max(80.0);
-    let cell = chrome::floorplan_fit_cell(cols, rows, view_w, view_h);
-    let die_w = chrome::floorplan_die_width(cols, cell);
-    let die_h = cell * rows as f32 + 16.0;
-    let draw_w = view_w.max(die_w);
-    let draw_h = die_h.max(chrome::DRAWING_MIN_HEIGHT);
+    // Real leftover pane only — do not inflate past it (that jammed an oversized die).
+    let view_h = avail.y.max(1.0);
+    let view_w = avail.x.max(1.0);
+    // Short leftover: Zoom Fit into this rect (zoom 1.0) so Y=0 is not a clipped 100% band.
+    if model.device_zoom <= 1.001 {
+        model.device_zoom = 1.0;
+    }
+    let (mut cell_w, mut cell_h) = chrome::floorplan_zoom_cells(cols, rows, view_w, view_h, model.device_zoom);
+    let mut die_w = chrome::FLOORPLAN_LEFT + cell_w * cols as f32 + chrome::FLOORPLAN_RIGHT;
+    let mut die_h = chrome::FLOORPLAN_TOP + cell_h * rows as f32 + chrome::FLOORPLAN_BOT;
+    // Fit must occupy the leftover, never paint a taller band and hide the bottom.
+    if model.device_zoom <= 1.001 && (die_w > view_w + 0.5 || die_h > view_h + 0.5) {
+        let sx = (view_w - 1.0).max(1.0) / die_w.max(1.0);
+        let sy = (view_h - 1.0).max(1.0) / die_h.max(1.0);
+        let s = sx.min(sy);
+        cell_w *= s;
+        cell_h *= s;
+        die_w *= s;
+        die_h *= s;
+    }
+    let overflow = model.device_zoom > 1.001 && (die_w > view_w + 1.0 || die_h > view_h + 1.0);
+    let zoomed_in = overflow;
+    let draw_w = if overflow { die_w.max(view_w + 8.0) } else { view_w.max(die_w) };
+    let draw_h = if overflow { die_h.max(view_h + 8.0) } else { view_h.max(die_h) };
+    let origin_dx = if model.device_zoom < 0.999 {
+        (view_w - die_w).max(0.0) * 0.5
+    } else {
+        0.0
+    };
+    let origin_dy = if model.device_zoom < 0.999 {
+        (view_h - die_h).max(0.0) * 0.5
+    } else {
+        0.0
+    };
     let mut pick_site: Option<(u32, u32)> = None;
     let mut pick_region: Option<String> = None;
     let mut click_pblock: Option<String> = None;
-    egui::ScrollArea::both()
+    let mut scroller = egui::ScrollArea::both()
         .id_salt("device_die_scroll")
         .auto_shrink([false, false])
-        .show(ui, |ui| {
+        .max_width(view_w)
+        .max_height(view_h)
+        .scroll_bar_visibility(if zoomed_in {
+            egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+        } else {
+            egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+        });
+    if zoomed_in && std::env::var("HELION_DEVICE_SCROLL").ok().as_deref() == Some("bottom") {
+        scroller = scroller.vertical_scroll_offset(1.0e6);
+    }
+    scroller.show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(
                 egui::vec2(draw_w, draw_h),
                 Sense::click(),
             );
             if ui.is_rect_visible(rect) {
-                let origin = egui::pos2(rect.left() + 24.0, rect.top() + 4.0);
+                let origin = egui::pos2(
+                    rect.left() + chrome::FLOORPLAN_LEFT + origin_dx,
+                    rect.top() + chrome::FLOORPLAN_TOP + origin_dy,
+                );
                 let p = ui.painter();
                 p.rect_filled(rect, 0.0, Color32::from_rgb(0x12, 0x16, 0x1a));
                 for dx in 0..cols {
                     let x = x0 + dx;
-                    let px = origin.x + dx as f32 * cell;
+                    let px = origin.x + dx as f32 * cell_w;
                     if dx % 4 == 0 {
                         p.text(
                             egui::pos2(px + 1.0, rect.bottom() - 12.0),
@@ -5044,7 +5363,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 for dy in 0..rows {
                     // HAD y=0 IOB at the bottom of the die (Vivado Y-up).
                     let y = y0 + (rows - 1 - dy);
-                    let py = origin.y + dy as f32 * cell;
+                    let py = origin.y + dy as f32 * cell_h;
                     if dy % 4 == 0 {
                         p.text(
                             egui::pos2(rect.left() + 2.0, py + 1.0),
@@ -5056,10 +5375,10 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                     for dx in 0..cols {
                         let x = x0 + dx;
-                        let px = origin.x + dx as f32 * cell;
+                        let px = origin.x + dx as f32 * cell_w;
                         let tile = egui::Rect::from_min_size(
                             egui::pos2(px + 0.5, py + 0.5),
-                            egui::vec2(cell - 1.0, cell - 1.0),
+                            egui::vec2((cell_w - 1.0).max(1.0), (cell_h - 1.0).max(1.0)),
                         );
                         let site = model.device.site_at(x, y);
                         let fill = match site {
@@ -5099,10 +5418,10 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 let gold = Color32::from_rgb(0xe5, 0xc0, 0x7b);
                 let amber = Color32::from_rgb(0xe5, 0x9a, 0x3c);
                 for cr in &model.device.clock_regions {
-                    let px = origin.x + (cr.x0 - x0) as f32 * cell;
-                    let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
-                    let pw = cr.cols() as f32 * cell;
-                    let ph = cr.rows() as f32 * cell;
+                    let px = origin.x + (cr.x0 - x0) as f32 * cell_w;
+                    let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell_h;
+                    let pw = cr.cols() as f32 * cell_w;
+                    let ph = cr.rows() as f32 * cell_h;
                     let rr = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
                     let on = model.selected.as_deref() == Some(cr.name.as_str());
                     p.rect_stroke(
@@ -5124,10 +5443,10 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     if !pb.ranged {
                         continue;
                     }
-                    let px = origin.x + (pb.x0 - x0) as f32 * cell;
-                    let py = origin.y + (rows - 1 - (pb.y1 - y0)) as f32 * cell;
-                    let pw = pb.cols() as f32 * cell;
-                    let ph = pb.rows() as f32 * cell;
+                    let px = origin.x + (pb.x0 - x0) as f32 * cell_w;
+                    let py = origin.y + (rows - 1 - (pb.y1 - y0)) as f32 * cell_h;
+                    let pw = pb.cols() as f32 * cell_w;
+                    let ph = pb.rows() as f32 * cell_h;
                     let rr = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
                     let on = model.selected.as_deref() == Some(pb.name.as_str());
                     p.rect_stroke(
@@ -5163,8 +5482,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     for &(x, y) in &rt.tiles {
                         let dx = x.saturating_sub(x0);
                         let dy = rows.saturating_sub(1).saturating_sub(y.saturating_sub(y0));
-                        let cx = origin.x + dx as f32 * cell + cell / 2.0;
-                        let cy = origin.y + dy as f32 * cell + cell / 2.0;
+                        let cx = origin.x + dx as f32 * cell_w + cell_w / 2.0;
+                        let cy = origin.y + dy as f32 * cell_h + cell_h / 2.0;
                         pts.push(egui::pos2(cx, cy));
                     }
                     for w in pts.windows(2) {
@@ -5180,8 +5499,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
                 if let Some(pos) = resp.hover_pos() {
-                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
-                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell_h).floor() as i32;
                     if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
                         let x = x0 + dx as u32;
                         let y = y0 + (rows - 1 - dy as u32);
@@ -5231,15 +5550,15 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
             }
             if resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    let origin = egui::pos2(rect.left() + 24.0, rect.top() + 4.0);
-                    let dx = ((pos.x - origin.x) / cell).floor() as i32;
-                    let dy = ((pos.y - origin.y) / cell).floor() as i32;
+                    let origin = egui::pos2(rect.left() + chrome::FLOORPLAN_LEFT + origin_dx, rect.top() + chrome::FLOORPLAN_TOP + origin_dy);
+                    let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
+                    let dy = ((pos.y - origin.y) / cell_h).floor() as i32;
                     if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
                         let x = x0 + dx as u32;
                         let y = y0 + (rows - 1 - dy as u32);
                         let mut header = false;
                         if let Some(pb) = model.pblocks.iter().find(|p| p.contains(x, y)) {
-                            let py = origin.y + (rows - 1 - (pb.y1 - y0)) as f32 * cell;
+                            let py = origin.y + (rows - 1 - (pb.y1 - y0)) as f32 * cell_h;
                             if pos.y - py <= 14.0 {
                                 click_pblock = Some(pb.name.clone());
                                 header = true;
@@ -5247,7 +5566,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                         }
                         if !header {
                             if let Some(cr) = model.device.clock_region_at(x, y) {
-                                let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell;
+                                let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell_h;
                                 if pos.y - py <= 14.0 {
                                     pick_region = Some(cr.name.clone());
                                     header = true;
@@ -5260,7 +5579,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                     }
                 }
             }
-        });
+    });
     if let Some(name) = click_pblock {
         let _ = model.select_pblock(&name);
     }
@@ -5273,7 +5592,6 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.label(RichText::new("Clock Regions").strong());
     let regions = model.device.clock_regions.clone();
 
     let selected = model.selected.clone();
@@ -5282,6 +5600,52 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.label("No clock regions on this die.");
         return;
     }
+    // Narrow or short: one complete line per region, whole-row height, then scroll.
+    // Never a two-line block that slices "Occupied" mid-row or crushes the die.
+    let screen = ui.ctx().screen_rect();
+    let pane_w = ui.clip_rect().width().min(ui.max_rect().width()).min(ui.available_width());
+    let floor = chrome::device_window_narrow(screen.width())
+        || chrome::device_window_short(screen.height())
+        || pane_w < 720.0;
+    if floor {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // Left-aligned heading. add_sized(full width) was painting this on the right.
+        ui.horizontal(|ui| {
+            ui.set_min_height(chrome::DEVICE_CR_HEAD_H);
+            ui.label(RichText::new("Clock Regions").strong());
+        });
+        for (i, cr) in regions.iter().enumerate() {
+            let sites = cr.site_count(&model.device.sites);
+            let occ = cr.occupied_count(&model.device.sites);
+            let on = selected.as_deref() == Some(cr.name.as_str());
+            let line = format!(
+                "{}   X0={}  Y0={}  X1={}  Y1={}   Sites={}  Occupied={}",
+                cr.name, cr.x0, cr.y0, cr.x1, cr.y1, sites, occ
+            );
+            let row_w = line.chars().count() as f32 * 7.2 + 24.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(row_w, chrome::DEVICE_CR_ROW_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    if ui
+                        .add_sized(
+                            [row_w, chrome::DEVICE_CR_ROW_H],
+                            egui::SelectableLabel::new(on, line),
+                        )
+                        .clicked()
+                    {
+                        pick = Some(i.to_string());
+                    }
+                },
+            );
+        }
+        if let Some(spec) = pick {
+            let _ = model.select_clock_region(&spec);
+        }
+        return;
+    }
+    ui.label(RichText::new("Clock Regions").strong());
     data_scroll("ug893_clock_regions_scroll").show(ui, |ui| {
     egui::Grid::new("ug893_clock_regions")
         .spacing([8.0, 4.0])
