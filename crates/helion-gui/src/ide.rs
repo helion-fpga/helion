@@ -5922,7 +5922,12 @@ impl IdeModel {
             "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
             _ => {
                 // Methodology/DRC check ids mirrored into Messages (TIMING-7, …).
-                if self.methodology_report().check(m.id.as_str()).is_some() {
+                // Prefer Vivado-shaped Constraints jump when a Fix template exists
+                // (TIMING-7 → set_output_delay), matching Methodology "Jump to
+                // Constraints"; still cross-probes objects (led) via that path.
+                if self.methodology_fix_template(m.id.as_str()).is_some() {
+                    let _ = self.goto_methodology_constraints(&m.id);
+                } else if self.methodology_report().check(m.id.as_str()).is_some() {
                     let _ = self.select_methodology(&m.id);
                 } else if self
                     .drc
@@ -29390,6 +29395,62 @@ endmodule
                 .map(|m| (m.severity, m.id.as_str()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Messages TIMING-7 click jumps Vivado-shaped to Constraints with the
+    /// set_output_delay Fix template (Methodology Jump path) and cross-probes led.
+    /// Editor may be dirty; examples/counter.sdc on disk must stay gold.
+    #[test]
+    fn messages_select_timing7_jumps_to_constraints_with_template() {
+        let gold_sdc = example("counter.sdc");
+        let gold_before = std::fs::read_to_string(&gold_sdc).expect("read gold counter.sdc");
+        assert!(
+            !gold_before.contains("set_output_delay"),
+            "repo counter.sdc must start without output delay: {gold_before}"
+        );
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        assert_eq!(ide.wns_ps(), Some(9640), "gold WNS before Messages jump");
+
+        ide.exec("report_methodology").unwrap();
+        ide.exec("filter_messages warning").unwrap();
+        let sel = ide.exec("select_message TIMING-7").unwrap();
+        assert!(sel.contains("ID=TIMING-7"), "{sel}");
+        assert_eq!(
+            ide.workspace,
+            WorkspaceTab::Constraints,
+            "TIMING-7 Messages click must open Constraints (not Methodology)"
+        );
+        assert!(
+            ide.sdc_editor_text
+                .contains("set_output_delay -clock clk -max 0.000 [get_ports led]"),
+            "must insert Vivado-shaped Fix template: {}",
+            ide.sdc_editor_text
+        );
+        assert!(
+            ide.sdc_editor_text
+                .contains("set_output_delay -clock clk -min 0.000 [get_ports led]"),
+            "optional min template: {}",
+            ide.sdc_editor_text
+        );
+        assert_eq!(
+            ide.selected.as_deref(),
+            Some("led"),
+            "must still cross-probe led: selected={:?}",
+            ide.selected
+        );
+        assert!(
+            ide.methodology_report().check("TIMING-7").is_some(),
+            "Jump alone must not clear TIMING-7"
+        );
+        let gold_after = std::fs::read_to_string(&gold_sdc).expect("re-read gold counter.sdc");
+        assert_eq!(
+            gold_after, gold_before,
+            "Messages TIMING-7 jump must not dirty examples/counter.sdc on disk"
+        );
+        assert_eq!(ide.wns_ps(), Some(9640), "Jump must keep gold WNS");
     }
 
     /// UG949 `report_methodology` + UG893 DRC/Utilization panes are engine-backed
