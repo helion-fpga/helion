@@ -25437,6 +25437,89 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Hardware);
     }
 
+    /// FM-HEL-CONT: complex mid-net x → Simulate + Mark/Add Probe → Program sim → ILA Arm filled bits.
+    /// complex.sv carries (* mark_debug = "true" *) on x; honest WNS ~8740 (counter gold 9640).
+    #[test]
+    fn complex_mid_net_sim_mark_probe_ila_arm() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("complex.prj")).unwrap();
+        ide.implement().unwrap();
+        let wns = ide.wns_ps().expect("complex STA WNS after implement");
+        assert!(
+            (8000..=9500).contains(&wns),
+            "complex honest WNS ~8740, got {wns} (counter gold stays 9640)"
+        );
+
+        // RTL mark_debug on mid-net x must survive synth → default probe.
+        assert_eq!(ide.default_ila_probe(), "x", "marked mid-net x");
+        assert!(
+            ide.shell
+                .session
+                .design
+                .as_ref()
+                .unwrap()
+                .marked_debug_nets()
+                .iter()
+                .any(|n| n == "x"),
+            "complex.x mark_debug attr"
+        );
+
+        // Simulate: clk + mid net / x / led present with filled bits.
+        let sim = ide.exec("sim_run 16").unwrap();
+        assert!(sim.contains("sim_run"), "{sim}");
+        assert!(
+            ide.wave.has_trace("clk") || ide.wave.has_trace("led") || ide.wave.has_trace("x"),
+            "Simulate traces: {:?}",
+            ide.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        if let Some(led) = ide.wave.bits_of("led") {
+            assert!(
+                led.contains('0') && led.contains('1'),
+                "led wave filled: {led}"
+            );
+        }
+
+        let r = ide.exec("select_device_route x").unwrap();
+        assert!(r.contains("net=x"), "{r}");
+        assert!(ide.exec("mark_debug").unwrap().contains("x"));
+
+        let ap = ide.exec("add_probe").unwrap();
+        assert!(ap.contains("net=x"), "{ap}");
+        assert_eq!(ide.ila.net, "x");
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+
+        let prog = ide.exec("program_hw").unwrap();
+        assert!(
+            prog.contains("DONE=1") || prog.contains("backend=sim"),
+            "Program sim: {prog}"
+        );
+
+        ide.exec("ila_window 16").unwrap();
+        ide.exec("ila_trigger rising").unwrap();
+        let arm = ide.exec("ila_arm").unwrap();
+        assert!(arm.contains("net=x"), "Arm default mid-net: {arm}");
+        assert!(arm.contains("samples=16"), "{arm}");
+        assert_eq!(ide.ila.bits.len(), 16);
+        assert_eq!(
+            ide.ila.bits, "0101010101010101",
+            "complex mid-net x gold window=16: {}",
+            ide.ila.bits
+        );
+        assert_eq!(ide.ila.trigger_at, Some(1), "rising at first 0→1");
+        assert!(
+            ide.wave.has_trace("ila:x"),
+            "wave must show ila:x: {:?}",
+            ide.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+
+        // Counter gold untouched.
+        let mut gold = IdeModel::new();
+        gold.open_source(&example("counter.prj")).unwrap();
+        gold.implement().unwrap();
+        assert_eq!(gold.wns_ps(), Some(9640), "counter gold WNS_PS");
+    }
+
     /// UG900 ILA dashboard: trigger/window from fabric samples on the wave, not a lamp.
     #[test]
     fn ila_dashboard_trigger_window_from_fabric_samples() {

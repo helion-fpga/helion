@@ -120,7 +120,8 @@ pub fn insert_arm_capture(
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
         fab.step_user();
-        samples.push(fab.ble_q(site.x, site.y, ble as u32));
+        // Comb mid-nets (LUT-only BLE) must sample LUT O, not stuck FF Q.
+        samples.push(fab.ble_out(site.x, site.y, ble as u32));
     }
     if samples.iter().all(|&s| s == samples[0]) {
         return Err(format!(

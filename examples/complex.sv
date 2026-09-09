@@ -1,5 +1,6 @@
 // Helion stress design — 16×4-bit incrementers, hierarchy, generate-if, XOR reduce.
-// Helion-legal SV (no UNISIM / AXI). LED is the XOR of all incrementer MSBs.
+// Helion-legal SV (no UNISIM / AXI). Mid-net x = XOR-tree ^ free-running toggle
+// so Simulate / ILA see filled 0/1 (synced MSBs alone XOR to 0).
 // ~4× the LUT count of examples/counter.sv, with real child instances.
 module inc4 (
     input  logic clk,
@@ -33,7 +34,12 @@ module complex (
     logic p3;
     logic q0;
     logic q1;
+    logic tree;
+    logic tog;
     (* mark_debug = "true" *) logic x;
+    always_ff @(posedge clk) begin
+        tog <= ~tog;
+    end
     generate
         if (1) begin
             inc4 u00 (.clk(clk), .msb(m[0]));
@@ -58,6 +64,7 @@ module complex (
     xor4 r1 (.a(m[4]), .b(m[5]), .c(m[6]), .d(m[7]), .y(p1));
     xor4 r2 (.a(m[8]), .b(m[9]), .c(m[10]), .d(m[11]), .y(p2));
     xor4 r3 (.a(m[12]), .b(m[13]), .c(m[14]), .d(m[15]), .y(p3));
-    xor4 r4 (.a(p0), .b(p1), .c(p2), .d(p3), .y(x));
+    xor4 r4 (.a(p0), .b(p1), .c(p2), .d(p3), .y(tree));
+    assign x = tree ^ tog;
     assign led = x;
 endmodule
