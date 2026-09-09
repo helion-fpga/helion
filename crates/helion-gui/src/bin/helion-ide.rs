@@ -137,9 +137,17 @@ fn run_headless_oneshot(path: &str) {
     match ide.exec("report_timing") {
         Ok(out) => {
             println!("{out}");
-            if let Some(wns) = ide.wns_ps() {
-                if !out.contains("WNS_PS=") {
-                    println!("WNS_PS={wns}");
+            // Do not append a closed WNS after an unfinished timing line.
+            let unfinished = out.contains("timing_incomplete")
+                || out.contains("no_clock_path")
+                || out.contains("no_body")
+                || out.contains("no_logic")
+                || out.contains("not a closed WNS");
+            if !unfinished {
+                if let Some(wns) = ide.wns_ps() {
+                    if !out.contains("WNS_PS=") {
+                        println!("WNS_PS={wns}");
+                    }
                 }
             }
         }
