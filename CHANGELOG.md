@@ -4,6 +4,39 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [1.2.0] — 2026-09-09
+
+Behavioral Verilog lowering on the 1.1.1 elaborator. `assign`, `always`/`case`,
+and functions (called, or lifted into an otherwise empty module) map to Helion
+LUT/FF. Ports-only shells and unknown vendor instances with no body in the file
+stay `cells=0` / `no_body`: no invented gates, no vendor IP clone, no fake closed
+WNS. Empty-XDC `examples/counter.sv` gold is unchanged (**WNS_PS=9640**).
+
+### Added
+
+- Standing elaborator rule: behavioral Verilog that has a body lowers to LUT/FF.
+  Not filename-special-cased.
+- Bounded clocked shifts, indexed concat assigns, constant range compares,
+  constant word aliases, and a 16-bit / named-bus add onto Hffs or a ripple of
+  full adders.
+- `examples/primitives/helion_cells.v` — named HELIONLIB cells for the same path.
+
+### Fixed
+
+- Empty shells quote `synth_design … cells=0 luts=0 no_body`. Timing is that
+  diagnostic, not a closed `WNS_PS`.
+- WNS closes only on a real clock path. Muxed, gated, and leftover `clk` names
+  do not pretend to be one user clock.
+- A clocked `always` that does not lower to an Hff fails loudly.
+- Skipped wide cones report `timing_incomplete` (one diagnostic), not a
+  `node_count` storm or a fake `no_clock_path`.
+- Sized-binary left-shift and range-width add overflow are diagnostics, not panics.
+- Ibex synth finishes after one `function_not_called` instead of flattening the tree.
+- Place names the LUTFF legalize cap instead of dying at 783 LUTFFs.
+- Device / schematic panes keep leftover height and honest timing on narrow windows.
+
+[1.2.0]: https://github.com/helion-fpga/helion/releases/tag/v1.2.0
+
 ## [1.1.1] — 2026-09-08
 
 Patch: the IDE Open / Synth rail actually elaborates `.vhd` / `.vhdl`.
