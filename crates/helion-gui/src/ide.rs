@@ -16477,10 +16477,75 @@ impl IdeModel {
         n_logic > 0 && clock_path
     }
 
+    /// Net that actually clocks Hffs. If several nets clock FFs, a leftover
+    /// net called `clk` does not win over the user's posedge clock.
+    fn hff_clock_net(d: &helion_ir::Design) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for c in &d.cells {
+            if !matches!(c.kind, helion_ir::CellKind::Hff) {
+                continue;
+            }
+            let Some(net) = d.net_on(&c.name, "CLK") else {
+                continue;
+            };
+            if net.is_empty() {
+                continue;
+            }
+            *counts.entry(net.to_string()).or_default() += 1;
+        }
+        let max = counts.values().copied().max()?;
+        let cands: Vec<&String> = counts
+            .iter()
+            .filter(|(_, n)| **n == max)
+            .map(|(k, _)| k)
+            .collect();
+        if cands.len() > 1 {
+            if let Some(real) = cands.iter().copied().find(|n| n.as_str() != "clk") {
+                return Some(real.clone());
+            }
+        }
+        cands.into_iter().next().cloned()
+    }
+
+    /// Implicit analysis clock (no user SDC) is named after the Hff clock.
+    /// Period stays the built-in default. User SDC clocks are not renamed.
+    fn name_implicit_analysis_clock(clks: &mut [helion_sta::Clock], d: &helion_ir::Design) {
+        let Some(net) = Self::hff_clock_net(d) else {
+            return;
+        };
+        if let Some(i) = clks
+            .iter()
+            .position(|c| c.name == net || c.source == net)
+        {
+            // Keep the analysis period: only bring a same-period matching
+            // clock to the front so the reported name is the Hff clock.
+            if i != 0 && clks[i].period_ps == clks[0].period_ps {
+                clks.swap(0, i);
+            }
+            return;
+        }
+        if clks.is_empty() {
+            return;
+        }
+        // Leftover `clk` is not the net that clocks the Hffs.
+        if clks[0].name == "clk" || clks[0].source == "clk" {
+            clks[0].name = net.clone();
+            clks[0].source = net;
+        }
+    }
+
     fn clocks_for_sta(&self) -> Vec<helion_sta::Clock> {
         let mut clks = self.constraints.clocks.clone();
         if clks.is_empty() {
-            create_clock(&mut clks, "clk", self.clock_period_ps, "clk");
+            let name = self
+                .shell
+                .session
+                .design
+                .as_ref()
+                .and_then(Self::hff_clock_net)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "clk".into());
+            create_clock(&mut clks, &name, self.clock_period_ps, &name);
         } else if let Some((i, _)) = clks
             .iter()
             .enumerate()
@@ -16490,6 +16555,10 @@ impl IdeModel {
             // UG903 create_generated_clock: divide_by / multiply_by / edges scale
             // the analysis period/WNS; -invert is a half-cycle setup.
             clks.swap(0, i);
+        } else if !self.user_sdc {
+            if let Some(d) = self.shell.session.design.as_ref() {
+                Self::name_implicit_analysis_clock(&mut clks, d);
+            }
         }
         clks
     }
