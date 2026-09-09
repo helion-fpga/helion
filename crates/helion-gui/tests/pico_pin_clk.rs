@@ -46,6 +46,26 @@ fn pico_pin_wrap_user_sdc_closed_wns() {
     eprintln!("default_ila_probe={probe}");
     assert!(!probe.is_empty(), "mark_debug hb should yield a probe");
 
+    // Pattern after SERV: Simulate + Mark/Probe + Program sim + ILA filled bits.
+    ide.exec("sim_run 16").unwrap();
+    ide.exec(&format!("mark_debug {probe}")).unwrap();
+    ide.exec("add_probe").unwrap();
+    let prog = ide.exec("program_hw").unwrap();
+    assert!(
+        prog.contains("DONE=1") || prog.contains("backend=sim") || prog.contains("soft-hold"),
+        "{prog}"
+    );
+    ide.exec("ila_window 16").unwrap();
+    ide.exec("ila_trigger rising").unwrap();
+    let arm = ide.exec("ila_arm").unwrap();
+    eprintln!("ila_arm={arm}");
+    eprintln!("ila_bits={}", ide.ila.bits);
+    assert!(
+        ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
+        "filled ILA bits: {}",
+        ide.ila.bits
+    );
+
     let mut c = IdeModel::new();
     c.open_source(&example("counter.sv")).unwrap();
     c.implement().unwrap();
