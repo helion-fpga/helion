@@ -458,6 +458,10 @@ thread_local! {
     /// inout used as a load enable that never reaches FF D is not a closed WNS.
     static INOUT_ENABLE_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `word_pipeline_cap` line per module. cycles>4 or not a constant:
+    /// do not invent extra word stages, and do not close WNS.
+    static WORD_PIPELINE_CAP_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// One `gate_primitive` line per module. bufif/notif/and/or/buf/not are
     /// not LUTs and not a closed WNS. Not one line per instance.
     static GATE_PRIM_SEEN: std::cell::RefCell<HashSet<String>> =
@@ -650,6 +654,25 @@ fn note_clock_gate(module: &str, signal: &str) {
 fn clock_gate_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     CLOCK_GATE_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Word pipeline longer than 4, or a bound that is not a constant. One line.
+/// Extra stages are not invented. Not a closed WNS.
+fn note_word_pipeline_cap(module: &str, signal: &str, cycles: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "res" } else { signal };
+    let cycles = if cycles.is_empty() { "?" } else { cycles };
+    let fresh = WORD_PIPELINE_CAP_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic word_pipeline_cap module={module} signal={signal} cycles={cycles} (word pipeline capped at 4; extra stages not invented; not a closed WNS)"
+    ));
+}
+
+fn word_pipeline_cap_for(module: &str) -> bool {
+    WORD_PIPELINE_CAP_SEEN.with(|s| s.borrow().contains(module))
 }
 
 /// Verilog gate primitive (`bufif1`, `and`, `not`, ...). One line per module.
@@ -1535,6 +1558,9 @@ fn assemble_module(
         }
         if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+        }
+        if child.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            d.attrs.set("WORD_PIPELINE_CAP", "1");
         }
         if child.attrs.get("CLOCK_MUX") == Some("1") {
             d.attrs.set("CLOCK_MUX", "1");
@@ -2811,6 +2837,105 @@ fn parse_for_step(p: &mut P) -> Result<usize, String> {
     Err("for step".into())
 }
 
+/// Procedural `mem[i] <= mem[i-1]` (optional begin/end). Not a generate.
+fn body_is_word_shift(body: &[Tok], var: &str) -> Option<String> {
+    let mut i = 0;
+    if matches!(body.get(i), Some(Tok::Kw(k)) if k == "begin") {
+        i += 1;
+        if matches!(body.get(i), Some(Tok::Sym(':'))) {
+            i += 1;
+            if matches!(body.get(i), Some(Tok::Ident(_))) {
+                i += 1;
+            }
+        }
+    }
+    let mem = match body.get(i) {
+        Some(Tok::Ident(s)) => s.clone(),
+        _ => return None,
+    };
+    i += 1;
+    if !matches!(body.get(i), Some(Tok::Sym('['))) {
+        return None;
+    }
+    let mut seen_le = false;
+    let mut rhs_mem = false;
+    let mut lhs_var = false;
+    for t in body.iter().skip(i) {
+        match t {
+            Tok::Le => seen_le = true,
+            Tok::Ident(s) if !seen_le && s == var => lhs_var = true,
+            Tok::Ident(s) if seen_le && s == &mem => rhs_mem = true,
+            Tok::Kw(k) if k == "end" => break,
+            Tok::Sym(';') if seen_le && rhs_mem => break,
+            _ => {}
+        }
+    }
+    if lhs_var && rhs_mem {
+        Some(mem)
+    } else {
+        None
+    }
+}
+
+/// Bound is not a constant. Consume the for if the body is a word shift.
+/// Caller emits `word_pipeline_cap` and does not invent stages.
+fn consume_nonconst_word_pipeline(p: &mut P, var: &str) -> Option<String> {
+    let save = p.i;
+    let mut depth = 1i32;
+    let mut closed = false;
+    while p.peek().is_some() {
+        if p.eat_sym('(') {
+            depth += 1;
+            continue;
+        }
+        if p.eat_sym(')') {
+            depth -= 1;
+            if depth == 0 {
+                closed = true;
+                break;
+            }
+            continue;
+        }
+        p.bump();
+    }
+    if !closed {
+        p.i = save;
+        return None;
+    }
+    let block = p.eat_kw("begin");
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
+    let start_i = p.i;
+    if block {
+        let mut d = 1i32;
+        while d > 0 {
+            match p.bump() {
+                Some(Tok::Kw(k)) if k == "begin" => d += 1,
+                Some(Tok::Kw(k)) if k == "end" => d -= 1,
+                None => {
+                    p.i = save;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    } else {
+        while p.peek().is_some() && !matches!(p.peek(), Some(Tok::Sym(';'))) {
+            p.bump();
+        }
+        let _ = p.eat_sym(';');
+    }
+    let body = p.t[start_i..p.i].to_vec();
+    match body_is_word_shift(&body, var) {
+        Some(mem) => Some(mem),
+        None => {
+            p.i = save;
+            None
+        }
+    }
+}
+
 fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     if !p.eat_sym('(') {
         return Err("for (".into());
@@ -2836,7 +2961,20 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     } else {
         return Err("for cmp".into());
     };
-    let end = const_u(p)? as usize;
+    let bound_at = p.i;
+    let end = match const_u(p) {
+        Ok(v) => v as usize,
+        Err(_) => {
+            // `for (i = 1; i < cycles; ...)` when cycles is not a constant.
+            // Do not invent the shift stages. One word_pipeline_cap.
+            p.i = bound_at;
+            if let Some(mem) = consume_nonconst_word_pipeline(p, &var) {
+                note_word_pipeline_cap(&cur_mod(), &mem, "nonconst");
+                return Ok(Vec::new());
+            }
+            return Err("for bound".into());
+        }
+    };
     // Inclusive `<=` used to `end + 1` and panic when the bound was usize::MAX.
     let end = if inclusive { end.saturating_add(1) } else { end };
     if !p.eat_sym(';') {
@@ -2870,6 +3008,13 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     let body = p.t[start_i..p.i].to_vec();
     let mut out = Vec::new();
     let niter = end.saturating_sub(start) / step.max(1);
+    // `for (i = 1; i < cycles; ...)` : exclusive end is the word count.
+    // Cap at 4 words. Do not unroll a deep chain into invented stages.
+    if let Some(mem) = body_is_word_shift(&body, &var) {
+        if end > 4 {
+            note_word_pipeline_cap(&cur_mod(), &mem, &end.to_string());
+        }
+    }
     if niter > 4096 {
         return Ok(Vec::new());
     }
@@ -6580,6 +6725,20 @@ fn emit_word_add(
     eprintln!("synth_rtl word_add mem={mem} word={word} bits={width} clk={clk}");
 }
 
+/// Pipeline word: Hff clocked by `clk`, D from the previous word. Not an adder.
+fn emit_word_shift(d: &mut Design, clk: &str, mem: &str, word: usize, from: usize, width: usize) {
+    for bit in 0..width {
+        let dnet = unpacked_word_q(mem, from, width, bit);
+        let qn = unpacked_word_q(mem, word, width, bit);
+        let ff = format!("u_sff{word}_{bit}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(clk, &ff, "CLK");
+        d.connect(&dnet, &ff, "D");
+        d.connect(&qn, &ff, "Q");
+    }
+    eprintln!("synth_rtl word_shift mem={mem} word={word} from={from} bits={width} clk={clk}");
+}
+
 fn lower_const_word_adds(
     d: &mut Design,
     rtl: &Rtl,
@@ -6638,6 +6797,115 @@ fn lower_const_word_adds(
     lowered
 }
 
+/// `res[0] <= a+b` plus `for (i = 1; i < cycles) res[i] <= res[i-1]`.
+/// Constant cycles 2, 3, or 4 unroll as Hff word shifts. q aliases the last
+/// word. More than 4 words, or a non-constant bound: one `word_pipeline_cap`,
+/// the add stays in word 0, extra stages are not invented, WNS is not closed.
+fn lower_word_pipeline(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    already: &HashSet<String>,
+) -> HashSet<String> {
+    const MAX_WORDS: usize = 4;
+    const MAX_WIDTH: usize = 32;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if already.contains(lhs) || sig_depth(rtl, lhs) == 0 {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0 || width > MAX_WIDTH {
+            continue;
+        }
+        let mut adds: Vec<(usize, String, String)> = Vec::new();
+        let mut shifts: Vec<(usize, usize)> = Vec::new();
+        let mut ok = true;
+        let mut saw_shift = false;
+        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| lhs == &mem) {
+            let Some(word) = *bit else {
+                ok = false;
+                break;
+            };
+            if word >= depth {
+                ok = false;
+                break;
+            }
+            let Some((en, src)) = peel_word_enable(rhs, &mem) else {
+                ok = false;
+                break;
+            };
+            if en.is_some() {
+                ok = false;
+                break;
+            }
+            if let Some((a, b)) = packed_add_pair(src, rtl) {
+                if let Some(slot) = adds.iter_mut().find(|(w, _, _)| *w == word) {
+                    *slot = (word, a, b);
+                } else {
+                    adds.push((word, a, b));
+                }
+            } else if let Some(WordShiftSrc::Word(from)) = classify_word_src(rtl, &mem, src) {
+                saw_shift = true;
+                if let Some(slot) = shifts.iter_mut().find(|(w, _)| *w == word) {
+                    *slot = (word, from);
+                } else {
+                    shifts.push((word, from));
+                }
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if !ok || !saw_shift || adds.len() != 1 || adds[0].0 != 0 {
+            continue;
+        }
+        if shifts
+            .iter()
+            .any(|(w, from)| *w == 0 || *from + 1 != *w || *from >= depth)
+        {
+            continue;
+        }
+        let max_word = shifts.iter().map(|(w, _)| *w).max().unwrap_or(0);
+        let words = depth.max(max_word + 1);
+        let add_a = adds[0].1.clone();
+        let add_b = adds[0].2.clone();
+        if words > MAX_WORDS || word_pipeline_cap_for(&rtl.module) {
+            note_word_pipeline_cap(&rtl.module, &mem, &words.to_string());
+            emit_word_add(d, rtl, clk, &mem, 0, width, &add_a, &add_b);
+            eprintln!(
+                "synth_rtl word_pipeline_cap mem={mem} words={words} hffs={width} add_word=0 clk={clk}"
+            );
+            lowered.insert(mem);
+            continue;
+        }
+        emit_word_add(d, rtl, clk, &mem, 0, width, &add_a, &add_b);
+        let mut emitted = 1usize;
+        let mut shift_ws = shifts.clone();
+        shift_ws.sort_by_key(|(w, _)| *w);
+        for (word, from) in shift_ws {
+            if word >= MAX_WORDS {
+                continue;
+            }
+            emit_word_shift(d, clk, &mem, word, from, width);
+            emitted += 1;
+        }
+        let q_word = words.saturating_sub(1);
+        eprintln!(
+            "synth_rtl word_pipeline mem={mem} words={words} q_word={q_word} hffs={} add_word=0 clk={clk}",
+            emitted * width
+        );
+        lowered.insert(mem.clone());
+    }
+    lowered
+}
 
 /// `we && (addr == word)` as one LUT6. Address plus enable must stay ≤6 PIs.
 fn addr_match_expr(addr: &str, addr_w: usize, word: usize, en: Option<&Expr>) -> Expr {
@@ -6914,6 +7182,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Const-index word add (`res[0] <= a+b`) → ripple adder into Hffs.
     // Not a MAC, and not the generic cone (that left 2 bits and a wide_cone).
     lowered_unpacked.extend(lower_const_word_adds(&mut d, rtl, clk, &lowered_unpacked));
+    // cycles=2..4: later words are Hff shifts of res[i-1], not a new add.
+    // Larger or non-constant: word_pipeline_cap, no extra stages, no closed WNS.
+    lowered_unpacked.extend(lower_word_pipeline(&mut d, rtl, clk, &lowered_unpacked));
     // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
     // The read stays a single variable_index_read; do not walk a wide cone.
     lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk));
@@ -7065,6 +7336,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         if bit.is_none() {
             if let Some((mem, word)) = const_unpacked_word(rhs, rtl) {
+                // Cap: do not alias q onto a stage that was not invented.
+                if word_pipeline_cap_for(&rtl.module) {
+                    continue;
+                }
                 word_alias.push((lhs.clone(), mem, word));
                 continue;
             }
@@ -7077,7 +7352,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
         // A constant word index was already aliased above.
         if rhs_reads_seq_mem(rhs, rtl) || rhs_unpacked_index(rhs, rtl) {
-            if !lowered_unpacked.is_empty() {
+            // word_pipeline_cap is the one diagnostic for an unrolled bound.
+            if !lowered_unpacked.is_empty() && !word_pipeline_cap_for(&rtl.module) {
                 note_variable_index_read(&rtl.module, lhs);
             }
             continue;
@@ -7318,6 +7594,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     if assign_not_lowered_for(&rtl.module) {
         d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+    }
+    if word_pipeline_cap_for(&rtl.module) {
+        d.attrs.set("WORD_PIPELINE_CAP", "1");
     }
     if clock_mux_for(&rtl.module) {
         d.attrs.set("CLOCK_MUX", "1");
@@ -9776,6 +10055,123 @@ endmodule
             }),
             "cycles=1 must not invent a second pipeline word"
         );
+    }
+
+    #[test]
+    fn const_cycles_2_unrolls_word_shift_not_a_second_add() {
+        // cycles=2 → q aliases res[1], the last word. 2*width Hffs.
+        // The add lands only in word 0. Word 1 is a shift, D from res[0].
+        let src = r#"
+module addfxp2(a,b,q,clk);
+  parameter  width = 8, cycles = 2;
+  input  signed  [(-1)+width:0] a,b;
+  input  clk;
+  output signed  [(-1)+width:0] q;
+  reg  signed  [(-1)+width:0] res[(-1)+cycles:0];
+  assign q = res[(-1)+cycles];
+  integer i;
+  always @(posedge clk)
+      begin
+        res[0] <= a+b;
+        for (i = 1; i < cycles; i = 1+i)
+            res[i] <= res[i-1];
+      end
+endmodule
+"#;
+        let d = synth_sv(src, "addfxp2.v").expect("addfxp2");
+        assert_ne!(d.attrs.get("WORD_PIPELINE_CAP"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        let hffs: Vec<_> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .collect();
+        assert_eq!(hffs.len(), 16, "2*width Hffs, got {}", hffs.len());
+        assert!(hffs.iter().all(|c| d.net_on(&c.name, "CLK") == Some("clk")));
+        for bit in 0..8 {
+            let q0 = format!("res_w0_{bit}");
+            let q1 = format!("res_w1_{bit}");
+            let ff0 = hffs
+                .iter()
+                .find(|c| d.net_on(&c.name, "Q") == Some(q0.as_str()))
+                .unwrap_or_else(|| panic!("word 0 bit {bit}"));
+            let d0 = d.net_on(&ff0.name, "D").unwrap_or("");
+            assert!(
+                d0.starts_with("u_add0_"),
+                "add only into word 0, bit {bit} D={d0}"
+            );
+            let ff1 = hffs
+                .iter()
+                .find(|c| d.net_on(&c.name, "Q") == Some(q1.as_str()))
+                .unwrap_or_else(|| panic!("word 1 bit {bit}"));
+            assert_eq!(
+                d.net_on(&ff1.name, "D"),
+                Some(q0.as_str()),
+                "word 1 D from res[0]"
+            );
+        }
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("res_w2_0")
+            }),
+            "cycles=2 must not invent a third pipeline word"
+        );
+        assert!(
+            !d.nets.iter().any(|n| n.name.starts_with("u_add1_")),
+            "no adder into word 1"
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "res_w1_0"
+                && n.endpoints.iter().any(|e| e.pin == "Q")
+                && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(
+            aliased,
+            "q aliases res[1], the last word, nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+        let word0_is_q = d.nets.iter().any(|n| {
+            n.name == "res_w0_0" && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(!word0_is_q, "q must not alias word 0 when cycles=2");
+    }
+
+    #[test]
+    fn cycles_above_cap_does_not_invent_stages_or_close() {
+        let src = r#"
+module addfxp5(a,b,q,clk);
+  parameter  width = 8, cycles = 5;
+  input  signed  [(-1)+width:0] a,b;
+  input  clk;
+  output signed  [(-1)+width:0] q;
+  reg  signed  [(-1)+width:0] res[(-1)+cycles:0];
+  assign q = res[(-1)+cycles];
+  integer i;
+  always @(posedge clk)
+      begin
+        res[0] <= a+b;
+        for (i = 1; i < cycles; i = 1+i)
+            res[i] <= res[i-1];
+      end
+endmodule
+"#;
+        let d = synth_sv(src, "addfxp5.v").expect("addfxp5");
+        assert_eq!(d.attrs.get("WORD_PIPELINE_CAP"), Some("1"));
+        let hffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(hffs, 8, "add into word 0 only, no extra stages, got {hffs}");
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff)
+                    && d.net_on(&c.name, "Q").is_some_and(|q| q.starts_with("res_w1_"))
+            }),
+            "cycles=5 must not invent word 1"
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name.starts_with("res_w4_") && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(!aliased, "cap must not alias q onto a missing last word");
     }
 
     #[test]
