@@ -1,5 +1,6 @@
-# FM-HEL-TOP: pin-reduced full Ibex fabric (clk+led board pins).
+# FM-HEL-CONT: pin-reduced full Ibex fabric (clk+led board pins) + user SDC
 part HL10T-C32-1
 read_sv examples/ysyx_ibex.sv
 read_sv examples/ibex_pin_wrap.sv
 top ibex_pin_wrap
+read_xdc examples/ibex.sdc

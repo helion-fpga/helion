@@ -11,8 +11,8 @@ module ibex_pin_wrap (
     logic reset;
     assign reset = 1'b0;
 
-    // Heartbeat FF → board-facing LED (driven IOB).
-    logic [7:0] hb;
+    // Heartbeat FF → board-facing LED (driven IOB); mark_debug for Probe/ILA.
+    (* mark_debug = "true" *) logic [7:0] hb;
     always_ff @(posedge clk) begin
         hb  <= hb + 8'd1;
         led <= hb[7];
