@@ -4870,6 +4870,13 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
             canvas.x,
             canvas.y,
         )
+        || chrome::schematic_identity_clips_bottom(
+            cam0.zoom,
+            cam0.pan_x,
+            cam0.pan_y,
+            sheet.height,
+            canvas.y,
+        )
     {
         model.workspace = WorkspaceTab::Schematic;
         model.schematic.apply_zoom_fit(sheet.width, sheet.height);
@@ -5042,7 +5049,13 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                     Color32::from_rgb(0xdc, 0xe0, 0xe4),
                 );
             } else if show_names && r.width() >= 28.0 && r.height() >= 16.0 {
-                let clip = p.with_clip_rect(r.shrink(2.0).intersect(rect));
+                // Do not shrink the bottom: the name band sits under the box and
+                // a tightened clip cropped u_lut1.
+                let mut name_r = r;
+                name_r.min.x += 2.0;
+                name_r.max.x -= 2.0;
+                name_r.min.y += 2.0;
+                let clip = p.with_clip_rect(name_r.intersect(rect));
                 let fs = name_fs.clamp(8.0, 13.0);
                 clip.text(
                     egui::pos2(r.center().x, r.top() + 3.0 * z),
@@ -5052,7 +5065,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                     Color32::from_rgb(0x7e, 0xc8, 0xe3),
                 );
                 clip.text(
-                    egui::pos2(r.center().x, r.bottom() - 3.0 * z),
+                    egui::pos2(r.center().x, r.bottom() - 2.0 * z),
                     egui::Align2::CENTER_BOTTOM,
                     &sy.name,
                     egui::FontId::monospace(fs),
