@@ -7708,6 +7708,9 @@ impl IdeModel {
         if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
             return Some("inout load enable not mapped; not a closed WNS");
         }
+        if d.attrs.get("GENERATE_NOT_LOWERED") == Some("1") {
+            return Some("generate_not_lowered; generate body not mapped; not a LUT; not a closed WNS");
+        }
         if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             return Some("assign not lowered; not a closed WNS");
         }
