@@ -798,6 +798,18 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
 }
 
 
+fn native_close_project(app: &mut HelionIde) {
+    match app.model.close_project() {
+        Ok(msg) => {
+            app.progress = msg;
+            app.set_activity(Activity::Files);
+        }
+        Err(e) => {
+            app.progress = e;
+        }
+    }
+}
+
 fn native_save_project_as(app: &mut HelionIde) {
     let default_name = app
         .model
@@ -947,6 +959,15 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     .on_hover_text(tip("Save Project As", "", "save_project_as"));
                 if save_as.clicked() {
                     native_save_project_as(app);
+                }
+                let close_proj = ui
+                    .add_sized(
+                        chrome::toolbar_ctrl_size("Close Project"),
+                        egui::Button::new("Close Project"),
+                    )
+                    .on_hover_text(tip("Close Project", "", "close_project"));
+                if close_proj.clicked() {
+                    native_close_project(app);
                 }
                 let recent_sz = chrome::toolbar_ctrl_size("Recent");
                 ui.allocate_ui(egui::vec2(recent_sz[0], recent_sz[1]), |ui| {

@@ -5382,6 +5382,8 @@ impl IdeModel {
             let text = self.methodology_text();
             self.mirror_methodology_messages();
             Ok(text)
+        } else if t == "close_project" || t == "close" {
+            self.close_project()
         } else if t == "save_project_as" || t.starts_with("save_project_as ")
             || t == "write_project" || t.starts_with("write_project ")
         {
@@ -6614,6 +6616,73 @@ impl IdeModel {
             "create_project {} {opened}",
             prj_path.display()
         ))
+    }
+
+    /// Vivado-shaped Close Project: drop the open design/session and return the
+    /// IDE to an idle Files state (empty Sources). Keeps the Recent list /
+    /// `last_project_path` so Open / Recent can reopen the same `.prj`.
+    /// Alias on the console: `close`.
+    pub fn close_project(&mut self) -> Result<String, String> {
+        self.shell.session.reset_synth();
+        self.tree = NetlistTree::default();
+        self.timing = None;
+        self.utilization = None;
+        self.user_sdc = false;
+        self.constraints = Constraints::default();
+        self.steps = [StepState::Pending; 5];
+        self.runs = vec![
+            DesignRun::new("synth_1", "Synthesis"),
+            DesignRun::new("impl_1", "Implementation"),
+        ];
+        self.selected_source = None;
+        self.selected_netlist = None;
+        self.selected = None;
+        self.sdc_editor_path = None;
+        self.sdc_editor_text.clear();
+        self.sdc_editor_dirty = false;
+        self.schematic = SchematicView::default();
+        self.hierarchy = HierarchyView::default();
+        self.timing_paths.clear();
+        self.selected_timing_path = None;
+        self.selected_timing_pin = None;
+        self.drc = None;
+        self.io_ports.clear();
+        self.pblocks.clear();
+        self.package_pins.clear();
+        self.source_lines.clear();
+        self.selected_source_line = None;
+        self.find_results.clear();
+        self.selected_find = None;
+        self.incremental_rows.clear();
+        self.selected_incremental = None;
+        self.selected_eco = None;
+        self.selected_utilization = None;
+        self.selected_report = None;
+        self.selected_summary = None;
+        self.selected_drc = None;
+        self.selected_methodology = None;
+        self.selected_cdc = None;
+        self.selected_clock_interaction = None;
+        self.selected_clock_network = None;
+        self.selected_timing_summary = None;
+        self.selected_power = None;
+        self.selected_io_port = None;
+        self.selected_pblock = None;
+        self.selected_clock_region = None;
+        self.package_pin_draft.clear();
+        self.block_design = None;
+        self.generated_ip_xml = None;
+        self.last_report_export = None;
+        self.event_sim = None;
+        self.fabric_sim = None;
+        self.methodology_cache = RefCell::new(None);
+        // Keep messages / log journal; Recent path stays for reopen.
+        self.status = "idle".into();
+        self.nav = NavSection::ProjectManager;
+        self.workspace = WorkspaceTab::Device;
+        self.refresh_device();
+        self.refresh_package();
+        Ok("close_project ok".into())
     }
 
     /// Vivado-shaped Save Project As / `write_project`: copy RTL + SDC into
@@ -34701,6 +34770,74 @@ endmodule
         );
         let _ = gold_md5_before;
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn close_project_clears_then_reopen_implement_wns_9640() {
+        let gold_sdc = example("counter.sdc");
+        let gold_bytes_before = std::fs::read(&gold_sdc).expect("gold sdc bytes");
+
+        let mut ide = IdeModel::new();
+        let prj = example("counter.prj");
+        assert!(prj.is_file(), "{}", prj.display());
+        let opened = ide.open_source(&prj).expect("open counter.prj");
+        assert!(opened.contains("open_project"), "{opened}");
+        assert!(
+            !ide.tree.sources.is_empty(),
+            "expected sources before close: {:?}",
+            ide.tree.sources
+        );
+        assert!(ide.design().is_some(), "expected design before close");
+
+        let out = ide.exec("close_project").expect("close_project");
+        assert!(out.contains("close_project ok"), "{out}");
+        assert!(
+            ide.tree.sources.is_empty(),
+            "Files/sources must be empty after close: {:?}",
+            ide.tree.sources
+        );
+        assert!(ide.design().is_none(), "design must clear on close");
+        assert!(ide.wns_ps().is_none(), "WNS must be none after close");
+        assert!(ide.utilization.is_none(), "utilization cleared");
+        // Recent reopen path retained for Open / Recent.
+        assert_eq!(
+            ide.last_project_path.as_deref(),
+            Some(prj.as_path()),
+            "keep last_project_path for Recent reopen"
+        );
+
+        // Alias `close` is idempotent on an already-idle IDE.
+        let again = ide.exec("close").expect("close alias");
+        assert!(again.contains("close_project ok"), "{again}");
+
+        let reopen_path = PathBuf::from("/tmp/helion-save-as/counter_copy/counter_copy.prj");
+        let reopen = if reopen_path.is_file() {
+            reopen_path
+        } else {
+            prj.clone()
+        };
+        let re = ide.open_source(&reopen).expect("reopen .prj");
+        assert!(re.contains("open_project"), "{re}");
+        assert!(
+            !ide.tree.sources.is_empty(),
+            "sources after reopen: {:?}",
+            ide.tree.sources
+        );
+        ide.implement().expect("implement after reopen");
+        let timing = ide.exec("report_timing").expect("report_timing");
+        let wns: i64 = timing
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("WNS_PS="))
+            .expect("WNS_PS=")
+            .parse()
+            .expect("numeric WNS");
+        assert_eq!(wns, 9640, "close→reopen implement must hold gold WNS: {timing}");
+
+        let gold_bytes_after = std::fs::read(&gold_sdc).expect("re-read gold sdc");
+        assert_eq!(
+            gold_bytes_before, gold_bytes_after,
+            "examples/counter.sdc must stay untouched"
+        );
     }
 
     #[test]
