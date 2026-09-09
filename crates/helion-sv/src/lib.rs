@@ -4770,6 +4770,222 @@ fn rexpr_is_rel(e: &RExpr) -> bool {
     }
 }
 
+/// A constant range is a test of a few bus bits, not a full-width cone.
+/// LUT6 holds at most this many inputs. Wider compares stay `assign_not_lowered`.
+const SMALL_REL_BITS: usize = 6;
+
+struct RelBus {
+    name: String,
+    width: usize,
+    /// Signal bit of vector bit 0 (`ident` is 0; `sig[hi:lo]` is `lo`).
+    lo: usize,
+}
+
+fn as_rel_bus(e: &RExpr, rtl: &Rtl) -> Option<RelBus> {
+    match e {
+        RExpr::Ident(s) if name_known(rtl, s) => {
+            let w = sig_width(rtl, s);
+            if w == 0 || w > 128 {
+                return None;
+            }
+            Some(RelBus {
+                name: s.clone(),
+                width: w,
+                lo: 0,
+            })
+        }
+        RExpr::Range(s, lo, hi) if name_known(rtl, s) && hi >= lo => {
+            let pw = sig_width(rtl, s);
+            if pw == 0 {
+                return None;
+            }
+            let hi = (*hi).min(pw - 1);
+            if *lo > hi {
+                return None;
+            }
+            let w = hi - *lo + 1;
+            if w > 128 {
+                return None;
+            }
+            Some(RelBus {
+                name: s.clone(),
+                width: w,
+                lo: *lo,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Numeric bound. A sized don't-care pattern is not a constant range.
+/// Unsized `'h8000` is tokenized with width = digit count; keep the value.
+fn const_rel_value(e: &RExpr) -> Option<u128> {
+    match e {
+        RExpr::Const { val, width, care } => {
+            if *width < 128 {
+                let mask = care_mask(*width);
+                if *care & mask != mask {
+                    return None;
+                }
+            }
+            Some(*val)
+        }
+        _ => None,
+    }
+}
+
+/// Signal bits that unsigned `bus < c` depends on. Empty = constant result.
+/// `None` if more bits matter than a LUT6 (not a small bit test).
+fn lt_relevant_sig_bits(bus: &RelBus, c: u128) -> Option<Vec<usize>> {
+    let w = bus.width;
+    let full = if w >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << w) - 1
+    };
+    let local: Vec<usize> = if c == 0 || c > full {
+        Vec::new()
+    } else {
+        let k = c.trailing_zeros() as usize;
+        if w - k > SMALL_REL_BITS {
+            return None;
+        }
+        (k..w).collect()
+    };
+    let pw = bus.lo.saturating_add(w);
+    let mut sig_bits = Vec::with_capacity(local.len());
+    for i in local {
+        let sb = bus.lo + i;
+        if sb >= pw {
+            return None;
+        }
+        sig_bits.push(sb);
+    }
+    Some(sig_bits)
+}
+
+fn push_rel_pi(out: &mut Vec<(String, usize)>, name: &str, bit: usize) -> bool {
+    if out.iter().any(|(n, b)| n == name && *b == bit) {
+        return true;
+    }
+    if out.len() >= SMALL_REL_BITS {
+        return false;
+    }
+    out.push((name.to_string(), bit));
+    true
+}
+
+/// `bus < const` / `const < bus` as a small bit set. Other compares are not this form.
+fn collect_lt_pis(a: &RExpr, b: &RExpr, rtl: &Rtl, out: &mut Vec<(String, usize)>) -> bool {
+    let (bus, c, _bus_on_left) = if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
+        (bus, c, true)
+    } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
+        // `const < bus` ≡ `bus > const` ≡ `!(bus < const+1)` when that stays in range.
+        let pw_ok = bus.width;
+        let full = if pw_ok >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << pw_ok) - 1
+        };
+        let bound = if c >= full { 0 } else { c + 1 };
+        // `bus > c` depends on the same bits as `bus < c+1` (or none if always false).
+        return match lt_relevant_sig_bits(&bus, bound) {
+            Some(bits) => bits.into_iter().all(|sb| push_rel_pi(out, &bus.name, sb)),
+            None => false,
+        };
+    } else {
+        return false;
+    };
+    let _ = _bus_on_left;
+    match lt_relevant_sig_bits(&bus, c) {
+        Some(bits) => bits.into_iter().all(|sb| push_rel_pi(out, &bus.name, sb)),
+        None => false,
+    }
+}
+
+fn formula_is_const_rel(e: &RExpr, rtl: &Rtl, out: &mut Vec<(String, usize)>, saw_lt: &mut bool) -> bool {
+    match e {
+        RExpr::Not(x) => formula_is_const_rel(x, rtl, out, saw_lt),
+        RExpr::And(a, b) | RExpr::Or(a, b) => {
+            formula_is_const_rel(a, rtl, out, saw_lt) && formula_is_const_rel(b, rtl, out, saw_lt)
+        }
+        RExpr::Lt(a, b) => {
+            *saw_lt = true;
+            collect_lt_pis(a, b, rtl, out)
+        }
+        _ => false,
+    }
+}
+
+fn eval_const_rel(e: &RExpr, rtl: &Rtl, env: &HashMap<String, bool>) -> Option<bool> {
+    match e {
+        RExpr::Not(x) => Some(!eval_const_rel(x, rtl, env)?),
+        RExpr::And(a, b) => Some(eval_const_rel(a, rtl, env)? && eval_const_rel(b, rtl, env)?),
+        RExpr::Or(a, b) => Some(eval_const_rel(a, rtl, env)? || eval_const_rel(b, rtl, env)?),
+        RExpr::Lt(a, b) => {
+            if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
+                Some(rel_bus_val(&bus, rtl, env) < c)
+            } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
+                Some(c < rel_bus_val(&bus, rtl, env))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn rel_bus_val(bus: &RelBus, rtl: &Rtl, env: &HashMap<String, bool>) -> u128 {
+    let pw = sig_width(rtl, &bus.name);
+    let mut v = 0u128;
+    for i in 0..bus.width {
+        let sb = bus.lo + i;
+        if sb >= 128 {
+            break;
+        }
+        if env
+            .get(&bit_name(&bus.name, pw, sb))
+            .copied()
+            .unwrap_or(false)
+        {
+            v |= 1u128 << i;
+        }
+    }
+    v
+}
+
+/// Lower `bus < const`, `bus >= const` (`!(bus < const)`), and `&&`/`||` of those
+/// to one LUT6 on only the bits that matter. A general compare wider than a LUT6
+/// returns `None` (caller keeps one `assign_not_lowered`).
+fn const_range_lut(e: &RExpr, rtl: &Rtl) -> Option<(u64, Vec<String>)> {
+    let mut pis: Vec<(String, usize)> = Vec::new();
+    let mut saw_lt = false;
+    if !formula_is_const_rel(e, rtl, &mut pis, &mut saw_lt) || !saw_lt {
+        return None;
+    }
+    let names: Vec<String> = pis
+        .iter()
+        .map(|(n, b)| bit_name(n, sig_width(rtl, n), *b))
+        .collect();
+    let n = names.len();
+    let mut init = 0u64;
+    let addrs = 1u64 << n;
+    for addr in 0..addrs {
+        let mut env = HashMap::new();
+        for (i, name) in names.iter().enumerate() {
+            env.insert(name.clone(), (addr >> i) & 1 == 1);
+        }
+        if eval_const_rel(e, rtl, &env)? {
+            init |= 1u64 << addr;
+        }
+    }
+    // Constant 0/1: fill the LUT so unused upper inputs do not matter.
+    if n == 0 {
+        init = if init & 1 == 1 { u64::MAX } else { 0 };
+    }
+    Some((init, names))
+}
+
 /// Unsized `'h8000` is tokenized with width = digit count, so the value does
 /// not fit. Expand only that case; sized literals keep their declared width.
 fn const_fit_width(val: u128, width: usize) -> usize {
@@ -5794,6 +6010,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Relational wire-assigns that cannot map must name themselves. Do not
     // spend the one wide_cone line on them — clocked cones still report that.
     let mut rel_sig: HashMap<String, String> = HashMap::new();
+    let mut n_rel = 0usize;
     for (lhs, bit, rhs) in &rtl.assigns {
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
@@ -5820,6 +6037,27 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         let rel = rexpr_is_rel(rhs);
         let w = sig_width(rtl, lhs);
+        // `bus < const` / `bus >= const` (and their && / ||) is a test of the
+        // bits that differ from the bound, not a 16-PI cone. `'h6000 <= x < 'h8000`
+        // is bits [15:13]==011. Wider than a LUT6 stays assign_not_lowered.
+        if rel && match bit {
+            Some(0) => true,
+            None => w <= 1,
+            Some(_) => false,
+        } {
+            if let Some((init, pis)) = const_range_lut(rhs, rtl) {
+                let bidx = (*bit).unwrap_or(0);
+                let bn = bit_name(lhs, w, bidx);
+                let lut = format!("u_rel{n_rel}");
+                n_rel += 1;
+                d.add_cell(&lut, CellKind::Lut6 { init });
+                d.connect(&bn, &lut, "O");
+                for (pin, pi) in pis.iter().enumerate() {
+                    d.connect(pi, &lut, format!("I{pin}"));
+                }
+                continue;
+            }
+        }
         let mut failed = false;
         if let Some(b) = bit {
             match rexpr_to_bit(rhs, rtl, 0) {
@@ -7895,6 +8133,96 @@ endmodule
         assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+    }
+
+    #[test]
+    fn const_range_compare_lowers_small_lut() {
+        let src = r#"
+module MMC4(input [15:0] prg_ain);
+  wire
+       prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
+endmodule
+"#;
+        let d = synth_sv(src, "mmc4_ram.v").expect("range compare");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "small range must lower, not assign_not_lowered"
+        );
+        let lut = d
+            .cells
+            .iter()
+            .find(|c| {
+                matches!(c.kind, CellKind::Lut6 { .. })
+                    && d.nets.iter().any(|n| {
+                        n.name == "prg_is_ram"
+                            && n.endpoints
+                                .iter()
+                                .any(|e| e.cell == c.name && e.pin == "O")
+                    })
+            })
+            .expect("prg_is_ram must drive a LUT");
+        let init = match lut.kind {
+            CellKind::Lut6 { init } => init,
+            _ => unreachable!(),
+        };
+        let mut pins = Vec::new();
+        for i in 0..6 {
+            if let Some(net) = d.net_on(&lut.name, &format!("I{i}")) {
+                pins.push(net.to_string());
+            }
+        }
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec!["prg_ain_13".to_string(), "prg_ain_14".to_string(), "prg_ain_15".to_string()],
+            "range is a 3-bit test, not a 16-PI cone: {pins:?}"
+        );
+        // I0 is the LSB of the LUT address. [15:13]==011.
+        let bit_of = |name: &str| -> usize {
+            match name {
+                "prg_ain_13" => 0,
+                "prg_ain_14" => 1,
+                "prg_ain_15" => 2,
+                _ => panic!("unexpected pin {name}"),
+            }
+        };
+        let mut pin_at = [""; 3];
+        for i in 0..6 {
+            if let Some(net) = d.net_on(&lut.name, &format!("I{i}")) {
+                pin_at[i] = net;
+            }
+        }
+        for addr in 0..8u64 {
+            let mut field = 0u64;
+            for i in 0..3 {
+                if pin_at[i].is_empty() {
+                    continue;
+                }
+                if (addr >> i) & 1 == 1 {
+                    field |= 1u64 << bit_of(pin_at[i]);
+                }
+            }
+            let want = field == 0b011;
+            let got = (init >> addr) & 1 == 1;
+            assert_eq!(got, want, "addr={addr:#b} field={field:#b} init={init:#x}");
+        }
+    }
+
+    #[test]
+    fn wide_const_compare_stays_not_lowered() {
+        // Lowest set bit of 'h00FF is 0: every bus bit matters. Not a small LUT.
+        let src = r#"
+module wide_cmp(input [15:0] a, output y);
+  assign y = a < 16'h00FF;
+endmodule
+"#;
+        let d = synth_sv(src, "wide_cmp.v").expect("wide cmp");
+        assert_eq!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "general compare wider than a LUT6 must stay assign_not_lowered"
+        );
     }
 
     #[test]
