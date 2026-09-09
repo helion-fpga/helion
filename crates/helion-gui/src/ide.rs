@@ -6624,14 +6624,25 @@ impl IdeModel {
         dest_dir: &Path,
         name: Option<&str>,
     ) -> Result<String, String> {
-        let rtl: Vec<PathBuf> = self
-            .tree
-            .sources
-            .iter()
-            .filter(|s| is_rtl_source(s))
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .collect();
+        // Sources may list the same RTL twice (open + sibling-SDC push); dedupe by canonical path.
+        let mut rtl: Vec<PathBuf> = Vec::new();
+        let mut seen_rtl: HashSet<String> = HashSet::new();
+        for s in &self.tree.sources {
+            if !is_rtl_source(s) {
+                continue;
+            }
+            let p = PathBuf::from(s);
+            if !p.is_file() {
+                continue;
+            }
+            let key = std::fs::canonicalize(&p)
+                .unwrap_or_else(|_| p.clone())
+                .to_string_lossy()
+                .into_owned();
+            if seen_rtl.insert(key) {
+                rtl.push(p);
+            }
+        }
         if rtl.is_empty() {
             return Err(
                 "save_project_as: open a design with at least one RTL source first".into(),
@@ -6700,17 +6711,33 @@ impl IdeModel {
             pf.sources.push(dest_name);
         }
 
-        let mut constraints: Vec<PathBuf> = self
-            .tree
-            .sources
-            .iter()
-            .filter(|s| source_type_of(s) == "constraint")
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .collect();
+        let mut constraints: Vec<PathBuf> = Vec::new();
+        let mut seen_c: HashSet<String> = HashSet::new();
+        for s in &self.tree.sources {
+            if source_type_of(s) != "constraint" {
+                continue;
+            }
+            let p = PathBuf::from(s);
+            if !p.is_file() {
+                continue;
+            }
+            let key = std::fs::canonicalize(&p)
+                .unwrap_or_else(|_| p.clone())
+                .to_string_lossy()
+                .into_owned();
+            if seen_c.insert(key) {
+                constraints.push(p);
+            }
+        }
         if let Some(p) = &self.sdc_editor_path {
-            if p.is_file() && !constraints.iter().any(|c| c == p) {
-                constraints.push(p.clone());
+            if p.is_file() {
+                let key = std::fs::canonicalize(p)
+                    .unwrap_or_else(|_| p.clone())
+                    .to_string_lossy()
+                    .into_owned();
+                if seen_c.insert(key) {
+                    constraints.push(p.clone());
+                }
             }
         }
         for c in &constraints {
@@ -34638,6 +34665,20 @@ endmodule
         );
         assert!(dest.join("counter_copy/counter.sv").is_file());
         assert!(dest.join("counter_copy/counter.sdc").is_file());
+        assert!(
+            !dest.join("counter_copy/2_counter.sv").exists(),
+            "RTL must be deduped, not double-copied"
+        );
+        assert_eq!(
+            body.matches("read_sv ").count(),
+            1,
+            "one RTL source in .prj: {body}"
+        );
+        assert_eq!(
+            body.matches("read_xdc ").count(),
+            1,
+            "one constraint in .prj: {body}"
+        );
 
         // Fresh IdeModel reopen + implement must hold gold WNS.
         let mut fresh = IdeModel::new();
