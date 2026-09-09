@@ -329,7 +329,7 @@ impl HelionIde {
             show_examples: false,
             show_create_project: false,
             create_wizard: CreateProjectWizard::default(),
-            recent: Vec::new(),
+            recent: load_recent(),
             tcl_focus: false,
             program_status: None,
             program_cable: "auto".into(),
@@ -521,9 +521,11 @@ impl HelionIde {
     }
 
     fn remember(&mut self, path: PathBuf) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.recent.retain(|p| p != &path);
         self.recent.insert(0, path);
         self.recent.truncate(8);
+        save_recent(&self.recent);
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -538,6 +540,82 @@ impl HelionIde {
         self.remember(path.to_path_buf());
         self.submit_job(JobKind::Open(path.to_path_buf()));
     }
+}
+
+/// Recent menu label: prefer clear `.prj` names (`counter.prj  (project)`).
+fn recent_menu_label(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "prj" {
+        format!("{name}  (project)")
+    } else {
+        name
+    }
+}
+
+fn recent_store_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HELION_RECENT") {
+        let pb = PathBuf::from(p.trim());
+        if !pb.as_os_str().is_empty() {
+            return Some(pb);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".helion").join("recent.txt"))
+}
+
+fn load_recent() -> Vec<PathBuf> {
+    let Some(store) = recent_store_path() else {
+        return Vec::new();
+    };
+    load_recent_from(&store)
+}
+
+fn load_recent_from(store: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(store) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(line);
+        if p.is_file() && !out.iter().any(|q| q == &p) {
+            out.push(p);
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+fn save_recent(paths: &[PathBuf]) {
+    let Some(store) = recent_store_path() else {
+        return;
+    };
+    save_recent_to(&store, paths);
+}
+
+fn save_recent_to(store: &Path, paths: &[PathBuf]) {
+    if let Some(parent) = store.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut body = String::new();
+    for p in paths {
+        body.push_str(&p.display().to_string());
+        body.push('\n');
+    }
+    let _ = std::fs::write(store, body);
 }
 
 impl eframe::App for HelionIde {
@@ -822,10 +900,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                             } else {
                                 let paths: Vec<PathBuf> = app.recent.clone();
                                 for p in paths {
-                                    let name = p
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| p.display().to_string());
+                                    let name = recent_menu_label(&p);
                                     if ui.button(name).clicked() {
                                         app.open_path_async(&p);
                                         ui.close();
@@ -7706,5 +7781,35 @@ fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
         });
     if let Some(name) = pick {
         let _ = model.select_ip_core(&name);
+    }
+}
+
+
+#[cfg(test)]
+mod recent_tests {
+    use super::{load_recent_from, recent_menu_label, save_recent_to};
+    use std::path::PathBuf;
+
+    #[test]
+    fn recent_menu_label_marks_prj() {
+        let p = PathBuf::from("/tmp/counter.prj");
+        assert_eq!(recent_menu_label(&p), "counter.prj  (project)");
+        let sv = PathBuf::from("/tmp/counter.sv");
+        assert_eq!(recent_menu_label(&sv), "counter.sv");
+    }
+
+    #[test]
+    fn recent_persist_round_trip_keeps_prj() {
+        let dir = std::env::temp_dir().join(format!("helion-recent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("recent.txt");
+        // Use a real file so load_recent_from keeps it.
+        let prj = dir.join("counter_wiz.prj");
+        std::fs::write(&prj, "part HL10T-C32-1\n").unwrap();
+        save_recent_to(&store, &[prj.clone()]);
+        let loaded = load_recent_from(&store);
+        assert_eq!(loaded, vec![prj]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

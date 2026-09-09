@@ -34,6 +34,7 @@ mod tests {
         assert_eq!(dialog_backend(), "rfd");
         assert!(HDL_EXTENSIONS.contains(&"sv"));
         assert!(HDL_EXTENSIONS.contains(&"vhd"));
+        assert!(HDL_EXTENSIONS.contains(&"prj"), "Open must accept Helion .prj");
         // Building the native dialog must not be a compile-time None stub.
         let _dialog = hdl_file_dialog();
         assert_ne!(dialog_backend(), "none");
