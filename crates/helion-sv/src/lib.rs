@@ -435,6 +435,9 @@ thread_local! {
     /// One `sequential_not_lowered` line per module.
     static SEQ_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `variable_index_read` line per module. Write-side Hffs may still time.
+    static INDEX_READ_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 fn skipped_funcs_clear() {
@@ -539,6 +542,17 @@ fn note_sequential_not_lowered(module: &str, signal: &str) {
     }
     note_skip(format!(
         "diagnostic sequential_not_lowered module={module} signal={signal} (posedge always not mapped to an Hff; not a closed WNS)"
+    ));
+}
+
+/// Variable-index read of a clocked unpacked array. One line. Does not walk a cone.
+fn note_variable_index_read(module: &str, signal: &str) {
+    let fresh = INDEX_READ_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic variable_index_read module={module} signal={signal} (variable-index read not mapped; not a LUT; write-side Hff still timed)"
     ));
 }
 
@@ -2031,7 +2045,7 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
 
 /// Parse for-loop step: `i++`, `i += N`, or `i = i + N` (default step 1).
 fn parse_for_step(p: &mut P) -> Result<usize, String> {
-    let _ = p.ident(); // loop variable
+    let _var = p.ident()?;
     // i++
     if p.eat_sym('+') {
         if p.eat_sym('+') {
@@ -2044,21 +2058,36 @@ fn parse_for_step(p: &mut P) -> Result<usize, String> {
         }
         return Err("for step +".into());
     }
-    // i = i + N
+    // i = i + N, or i = N + i (SRL `i = 1+i`).
     if p.eat_sym('=') {
-        let _ = p.ident();
-        if !p.eat_sym('+') {
-            return Err("for step =+".into());
-        }
-        let n = match p.peek() {
-            Some(Tok::Number(v, _)) => {
-                let n = (*v as usize).max(1);
-                p.bump();
-                n
+        // i = N + i — do not call const_u: the loop var is not a parameter.
+        if matches!(p.peek(), Some(Tok::Number(_, _))) {
+            let n = match p.bump() {
+                Some(Tok::Number(v, _)) => (*v as usize).max(1),
+                _ => 1,
+            };
+            if p.eat_sym('+') {
+                let _ = p.ident();
             }
-            _ => 1,
-        };
-        return Ok(n);
+            return Ok(n);
+        }
+        // i = i + N
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            let _ = p.ident();
+            if !p.eat_sym('+') {
+                return Err("for step =+".into());
+            }
+            let n = match p.peek() {
+                Some(Tok::Number(v, _)) => {
+                    let n = (*v as usize).max(1);
+                    p.bump();
+                    n
+                }
+                _ => 1,
+            };
+            return Ok(n);
+        }
+        return Err("for step =".into());
     }
     Err("for step".into())
 }
@@ -4986,6 +5015,174 @@ fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
     lit_net(d, aig, aig.output, prefix, &mut n_lut, &mut node_net)
 }
 
+/// Q net of one bit of an unpacked word. Distinct from packed `bit_name`.
+fn unpacked_word_q(mem: &str, word: usize, width: usize, bit: usize) -> String {
+    if width <= 1 {
+        format!("{mem}_w{word}")
+    } else {
+        format!("{mem}_w{word}_{bit}")
+    }
+}
+
+/// Hold-through CE, or the naked next-state if the always is not gated.
+fn peel_word_enable<'a>(rhs: &'a RExpr, mem: &str) -> Option<(Option<RExpr>, &'a RExpr)> {
+    match rhs {
+        RExpr::Mux(c, t, f) => {
+            let hold = match f.as_ref() {
+                RExpr::Ident(s) if s == mem => true,
+                RExpr::Bit(s, _) if s == mem => true,
+                _ => false,
+            };
+            if !hold {
+                return None;
+            }
+            Some((Some((**c).clone()), t.as_ref()))
+        }
+        other => Some((None, other)),
+    }
+}
+
+enum WordShiftSrc {
+    Packed(String),
+    Word(usize),
+}
+
+/// Const-index unpacked write source: another word of the same array, or a packed vector.
+fn classify_word_src(rtl: &Rtl, mem: &str, rhs: &RExpr) -> Option<WordShiftSrc> {
+    match rhs {
+        RExpr::Ident(s) if s != mem && sig_depth(rtl, s) == 0 => {
+            Some(WordShiftSrc::Packed(s.clone()))
+        }
+        RExpr::Bit(s, w) if s == mem && sig_depth(rtl, s) > 0 => Some(WordShiftSrc::Word(*w)),
+        _ => None,
+    }
+}
+
+/// Enable must stay a handful of PIs. A wide enable is not this shift.
+fn simple_word_enable(en: &RExpr, rtl: &Rtl) -> Option<Expr> {
+    let e = rexpr_to_bit(en, rtl, 0).ok()?;
+    if cone_pi_exceeds(&e, 4) {
+        return None;
+    }
+    Some(e)
+}
+
+fn word_ce_mux(en: Expr, next: Expr, hold: Expr) -> Expr {
+    Expr::Or(
+        Box::new(Expr::And(Box::new(en.clone()), Box::new(next))),
+        Box::new(Expr::And(Box::new(Expr::Not(Box::new(en))), Box::new(hold))),
+    )
+}
+
+/// Bounded unpacked clocked shift / load onto the user's clock.
+/// 3×12 enable-gated word copies become per-bit Hffs. A variable-index read
+/// is not expanded here — that would be a wide mux, not this lower.
+/// Returns (reg bits, memory names that lowered). Empty if no safe write.
+fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<String>) {
+    const MAX_DEPTH: usize = 16;
+    const MAX_WIDTH: usize = 32;
+    const MAX_BITS: usize = 128;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if sig_depth(rtl, lhs) == 0 {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut out = Vec::new();
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0
+            || depth > MAX_DEPTH
+            || width > MAX_WIDTH
+            || depth.saturating_mul(width) > MAX_BITS
+        {
+            continue;
+        }
+        let writes: Vec<_> = rtl
+            .nbas
+            .iter()
+            .filter(|(lhs, _, _)| lhs == &mem)
+            .collect();
+        if writes.is_empty() {
+            continue;
+        }
+        let mut planned: Vec<(usize, Option<Expr>, WordShiftSrc)> = Vec::new();
+        let mut ok = true;
+        for (_, bit, rhs) in writes {
+            let Some(word) = *bit else {
+                ok = false;
+                break;
+            };
+            if word >= depth {
+                ok = false;
+                break;
+            }
+            let Some((en_r, src_r)) = peel_word_enable(rhs, &mem) else {
+                ok = false;
+                break;
+            };
+            let Some(src) = classify_word_src(rtl, &mem, src_r) else {
+                ok = false;
+                break;
+            };
+            if let WordShiftSrc::Word(w) = &src {
+                if *w >= depth {
+                    ok = false;
+                    break;
+                }
+            }
+            let en = if let Some(er) = en_r {
+                match simple_word_enable(&er, rtl) {
+                    Some(e) => Some(e),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(slot) = planned.iter_mut().find(|(w, _, _)| *w == word) {
+                *slot = (word, en, src);
+            } else {
+                planned.push((word, en, src));
+            }
+        }
+        if !ok || planned.is_empty() {
+            continue;
+        }
+        for (word, en, src) in planned {
+            for bit in 0..width {
+                let next = match &src {
+                    WordShiftSrc::Packed(s) => {
+                        let sw = sig_width(rtl, s);
+                        if bit >= sw {
+                            Expr::Const(false)
+                        } else {
+                            Expr::Var(bit_name(s, sw, bit))
+                        }
+                    }
+                    WordShiftSrc::Word(w) => Expr::Var(unpacked_word_q(&mem, *w, width, bit)),
+                };
+                let qn = unpacked_word_q(&mem, word, width, bit);
+                let d = if let Some(en) = en.clone() {
+                    word_ce_mux(en, next, Expr::Var(qn.clone()))
+                } else {
+                    next
+                };
+                out.push((qn, d));
+            }
+        }
+        lowered.insert(mem);
+    }
+    (out, lowered)
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
@@ -5016,6 +5213,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut reg_bits: Vec<(String, Expr)> = Vec::new();
     let mut n_mac = 0usize;
     let mut n_bram = 0usize;
+    // Bounded unpacked shift (const word index, small depth×width) → Hffs.
+    // A variable-index read is not expanded here.
+    let (unpacked_bits, lowered_unpacked) = lower_unpacked_clocked_words(rtl);
+    reg_bits.extend(unpacked_bits);
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
             continue;
@@ -5106,7 +5307,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     eprintln!("synth_rtl after nbas reg_bits={}", reg_bits.len());
     let mut mem_names: HashSet<String> = HashSet::new();
     for (lhs, _, _) in &rtl.nbas {
-        if sig_depth(rtl, lhs) > 0 {
+        if sig_depth(rtl, lhs) > 0 && !lowered_unpacked.contains(lhs) {
             mem_names.insert(lhs.clone());
         }
     }
@@ -5149,9 +5350,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
         }
-        // Clocked unpacked write was not an Hff. Do not bitblast the read
-        // into a wide_cone; finish_seq_honesty emits one sequential line.
+        // Variable-index read of a clocked unpacked array. Do not walk it
+        // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
         if rhs_reads_seq_mem(rhs, rtl) {
+            if !lowered_unpacked.is_empty() {
+                note_variable_index_read(&rtl.module, lhs);
+            }
             continue;
         }
         // Comb multiply → DSP MAC (do not bitblast).
