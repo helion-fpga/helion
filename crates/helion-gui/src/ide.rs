@@ -6336,12 +6336,19 @@ impl IdeModel {
 
     /// Open a Helion `.prj` (part / read_sv / read_xdc). Registers RTL + constraints
     /// and synthesizes so Implement can place+route.
+    ///
+    /// Files lists this project's sources (`.sv`/`.v`/…) and constraint files (`.sdc`/`.xdc`)
+    /// — prior Sources rows are replaced so Recent → Open `.prj` matches Create Project.
     pub fn open_project(&mut self, path: &Path) -> Result<String, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("open_project {}: {e}", path.display()))?;
         let mut prj = load_prj(&text)?;
         let _ = expand_ip_packages(&mut prj, path)?;
         self.set_part(&prj.part)?;
+
+        // Fresh project context (Open / Recent / create_project all land here).
+        self.tree.sources.clear();
+        self.selected_source = None;
 
         let mut rtl_paths: Vec<PathBuf> = Vec::new();
         for src in &prj.sources {
@@ -6379,6 +6386,11 @@ impl IdeModel {
                     "open_project: constraint {cf} not found (tried {})",
                     resolved.display()
                 ));
+            }
+            // Always show constraints in Files, even if read_xdc skips empty bodies.
+            let cs = resolved.to_string_lossy().into_owned();
+            if !self.tree.sources.contains(&cs) {
+                self.tree.sources.push(cs);
             }
             match self.read_xdc_path(&resolved.to_string_lossy()) {
                 Ok(_) => n_xdc += 1,
@@ -33510,6 +33522,11 @@ endmodule
             "{:?}",
             ide.tree.sources
         );
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sdc")),
+            "Files must list SDC: {:?}",
+            ide.tree.sources
+        );
         assert_eq!(ide.part(), "HL10T-C32-1");
         assert!(ide.user_sdc, "project SDC must load");
         ide.implement().expect("implement");
@@ -33522,6 +33539,65 @@ endmodule
             .expect("numeric WNS");
         assert_eq!(wns, 9640, "create_project counter must hold gold WNS: {timing}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_counter_prj_loads_sv_sdc_and_wns_9640() {
+        let prj = example("counter.prj");
+        assert!(prj.is_file(), "{}", prj.display());
+        let mut ide = IdeModel::new();
+        let out = ide.open_source(&prj).expect("open counter.prj");
+        assert!(out.contains("open_project"), "{out}");
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sv")),
+            "Files must list RTL: {:?}",
+            ide.tree.sources
+        );
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sdc")),
+            "Files must list SDC: {:?}",
+            ide.tree.sources
+        );
+        assert!(ide.user_sdc, "project SDC must load");
+        ide.implement().expect("implement");
+        let timing = ide.exec("report_timing").expect("report_timing");
+        let wns: i64 = timing
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("WNS_PS="))
+            .expect("WNS_PS=")
+            .parse()
+            .expect("numeric WNS");
+        assert_eq!(wns, 9640, "open counter.prj must hold gold WNS: {timing}");
+    }
+
+    /// Recent menu calls `open_path_async` → `open_source` on the remembered `.prj` path.
+    /// Re-opening the same project must reload RTL+SDC and keep gold WNS.
+    #[test]
+    fn recent_reopen_counter_prj_keeps_wns_9640() {
+        let prj = example("counter.prj");
+        let mut ide = IdeModel::new();
+        ide.open_source(&prj).expect("first open");
+        ide.implement().expect("implement");
+        assert_eq!(ide.wns_ps(), Some(9640));
+
+        // Simulate Recent → click `counter.prj` (second open_source on same path).
+        let out = ide.open_source(&prj).expect("recent reopen");
+        assert!(out.contains("open_project"), "{out}");
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sv"))
+                && ide.tree.sources.iter().any(|s| s.ends_with("counter.sdc")),
+            "{:?}",
+            ide.tree.sources
+        );
+        ide.implement().expect("re-implement");
+        let timing = ide.exec("report_timing").expect("report_timing");
+        let wns: i64 = timing
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("WNS_PS="))
+            .expect("WNS_PS=")
+            .parse()
+            .expect("numeric WNS");
+        assert_eq!(wns, 9640, "Recent reopen counter.prj must hold gold WNS: {timing}");
     }
 
     #[test]
