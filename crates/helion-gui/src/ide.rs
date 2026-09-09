@@ -4644,6 +4644,8 @@ pub struct IdeModel {
     netlist_object_click: bool,
     /// UG893 I/O Ports selected port name (object links vs row click).
     pub selected_io_port: Option<String>,
+    /// Package Pins site draft (`IOB_X…`) for the selected port text field.
+    pub package_pin_draft: String,
     /// Last click was a UG893 I/O Ports object link (cross-probe).
     io_object_click: bool,
     /// UG893 Floorplanning selected pblock name (object links vs row click).
@@ -4819,6 +4821,7 @@ impl IdeModel {
             selected_netlist: None,
             netlist_object_click: false,
             selected_io_port: None,
+            package_pin_draft: String::new(),
             io_object_click: false,
             selected_pblock: None,
             pblock_object_click: false,
@@ -10059,6 +10062,13 @@ impl IdeModel {
         self.nav = NavSection::BoardDevice;
         self.workspace = WorkspaceTab::Package;
         self.selected_io_port = Some(p.name.clone());
+        self.package_pin_draft = p
+            .package_pin
+            .as_deref()
+            .or(p.site.as_deref())
+            .filter(|s| *s != "-")
+            .unwrap_or("")
+            .to_string();
         self.io_object_click = false;
         self.select(&p.name);
         Ok(p.row_text())
@@ -10115,6 +10125,13 @@ impl IdeModel {
         };
         let p = self.io_ports[idx].clone();
         self.selected_io_port = Some(p.name.clone());
+        self.package_pin_draft = p
+            .package_pin
+            .as_deref()
+            .or(p.site.as_deref())
+            .filter(|s| *s != "-")
+            .unwrap_or("")
+            .to_string();
         self.selected_find = None;
         self.selected_utilization = None;
         self.selected_power = None;
@@ -25422,9 +25439,7 @@ endmodule
         );
     }
 
-    /// Fig. 56 Expand Inside regenerates nested instance contents; primitives refuse.
-    #[test]
-
+    /// UG893 Hierarchy: Open Sheet expands an instance onto the schematic.
     #[test]
     fn hierarchy_open_sheet_navigates_instance_to_schematic() {
         let mut ide = IdeModel::new();
@@ -25439,7 +25454,9 @@ endmodule
         assert!(e.contains("select"), "{e}");
     }
 
-        fn schematic_expand_inside_instance_primitives_refuse() {
+    /// Fig. 56 Expand Inside regenerates nested instance contents; primitives refuse.
+    #[test]
+    fn schematic_expand_inside_instance_primitives_refuse() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("hier.sv")).unwrap();
         assert!(
@@ -27659,6 +27676,62 @@ endmodule
         assert!(bsel.contains("OBJECT=u_lut"), "{bsel}");
         assert_eq!(blinky.selected.as_deref(), Some("u_lut"));
         assert_eq!(blinky.workspace, WorkspaceTab::Schematic);
+    }
+
+    /// Counter Device floorplanning: create + resize + add_cells fills the
+    /// pblocks table (name/range/cells); gold WNS holds after re-implement.
+    #[test]
+    fn counter_pblock_filled_table_keeps_gold_wns() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold before pblock");
+        assert!(ide.pblock_rows().is_empty());
+
+        ide.exec("create_pblock pblock_0").unwrap();
+        ide.exec("resize_pblock pblock_0 -add CLOCKREGION_X1Y1")
+            .unwrap();
+        ide.exec("add_cells_to_pblock pblock_0").unwrap();
+
+        let pb = ide.pblock_rows().first().cloned().expect("pblocks table must list the created pblock");
+        assert_eq!(pb.name, "pblock_0");
+        assert!(pb.ranged, "resize must set a CLB/CLOCKREGION range");
+        assert!(
+            !pb.cells.is_empty(),
+            "add_cells_to_pblock must assign design cells: {:?}",
+            pb.cells
+        );
+        assert!(
+            pb.cells.iter().any(|c| c.starts_with("u_lut")),
+            "counter LUT cells expected: {:?}",
+            pb.cells
+        );
+        let n_cells = pb.cells.len();
+        let table = ide.exec("pblocks").unwrap();
+        assert!(table.contains("NAME=pblock_0"), "{table}");
+        assert!(table.contains("RANGE=CLB_"), "{table}");
+        assert!(
+            table.contains(&format!("CELLS={n_cells}")),
+            "{table}"
+        );
+
+        // PACKAGE_PIN re-places via place_design (gold LOCs) so WNS returns to 9640
+        // while the pblocks table stays filled for the Device shot.
+        ide.exec("set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]")
+            .unwrap();
+        ide.exec("set_property PACKAGE_PIN IOB_X3Y0 [get_ports clk]")
+            .unwrap();
+        assert_eq!(
+            ide.wns_ps(),
+            Some(9640),
+            "gold WNS must hold after assigning clk/led package pins"
+        );
+        assert!(
+            !ide.pblock_rows().is_empty(),
+            "pblock_rows stay filled after package pin assign"
+        );
     }
 
     /// UG949 Clock Interaction (`report_clock_interaction`) pane is STA clocks
