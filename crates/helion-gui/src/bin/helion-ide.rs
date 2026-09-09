@@ -3525,6 +3525,8 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Constraints");
+    // Sibling/user SDC may already be loaded before the editor was painted.
+    model.ensure_sdc_editor_populated();
     ui.horizontal(|ui| {
         ui.menu_button("Add…", |ui| {
             let recipes: &[(&str, &str)] = &[
@@ -3538,7 +3540,7 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
                 if ui.button(*name).clicked() {
                     if *tcl == "__read_sdc__" {
                         let p = helion_device::Device::examples_dir().join("counter.sdc");
-                        let _ = model.exec(&format!("read_xdc {}", p.display()));
+                        let _ = model.open_sdc_editor(&p);
                     } else {
                         let _ = model.exec(tcl);
                     }
@@ -3546,7 +3548,39 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
             }
         });
+        if ui.button("Open counter.sdc").clicked() {
+            let p = helion_device::Device::examples_dir().join("counter.sdc");
+            let _ = model.open_sdc_editor(&p);
+        }
+        if ui.button("Save").clicked() {
+            let _ = model.save_sdc_editor();
+        }
     });
+    ui.add_space(6.0);
+    // Vivado-shaped SDC/XDC text editor (monospace). Keep tables below.
+    let file_label = model
+        .sdc_editor_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("counter.sdc")
+        .to_string();
+    let dirty = model.sdc_editor_dirty;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&file_label).strong().monospace());
+        if dirty {
+            ui.weak("•");
+        }
+    });
+    let resp = ui.add(
+        egui::TextEdit::multiline(&mut model.sdc_editor_text)
+            .code_editor()
+            .desired_rows(10)
+            .desired_width(f32::INFINITY),
+    );
+    if resp.changed() {
+        model.sdc_editor_dirty = true;
+    }
     ui.add_space(6.0);
     paint_constraints_tables(ui, model);
 }

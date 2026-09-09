@@ -4731,6 +4731,12 @@ pub struct IdeModel {
     pub selected_wave_cursor: Option<String>,
     /// UG900 Virtual Bus selected Name.
     pub selected_virtual_bus: Option<String>,
+    /// Constraints pane SDC/XDC text editor path (examples/counter.sdc, sibling .sdc, …).
+    pub sdc_editor_path: Option<PathBuf>,
+    /// Editable SDC/XDC buffer shown in the Constraints workspace.
+    pub sdc_editor_text: String,
+    /// True when `sdc_editor_text` differs from the last load/save on disk.
+    pub sdc_editor_dirty: bool,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
 }
@@ -4859,6 +4865,9 @@ impl IdeModel {
             selected_wave_marker: None,
             selected_wave_cursor: None,
             selected_virtual_bus: None,
+            sdc_editor_path: None,
+            sdc_editor_text: String::new(),
+            sdc_editor_dirty: false,
             event_sim: None,
             fabric_sim: None,
         };
@@ -5495,6 +5504,19 @@ impl IdeModel {
             .or_else(|| t.strip_prefix("read_sdc "))
         {
             self.read_xdc_path(path.trim())
+        } else if let Some(path) = t.strip_prefix("open_sdc_editor ") {
+            let p = path.trim();
+            let pb = if p.is_empty() {
+                helion_device::Device::examples_dir().join("counter.sdc")
+            } else {
+                PathBuf::from(p)
+            };
+            self.open_sdc_editor(&pb)
+        } else if t == "open_sdc_editor" {
+            let pb = helion_device::Device::examples_dir().join("counter.sdc");
+            self.open_sdc_editor(&pb)
+        } else if t == "save_sdc_editor" {
+            self.save_sdc_editor()
         } else if t == "create_bd" || t == "create_bd_design" || t == "ip_integrator" {
             self.create_block_design()
         } else if t == "bd_drawing" {
@@ -16529,8 +16551,11 @@ impl IdeModel {
         }
         let p = path.to_string();
         if !self.tree.sources.contains(&p) {
-            self.tree.sources.push(p);
+            self.tree.sources.push(p.clone());
         }
+        self.sdc_editor_path = Some(PathBuf::from(&p));
+        self.sdc_editor_text = text;
+        self.sdc_editor_dirty = false;
         Ok(format!(
             "read_xdc clocks={n} PERIOD_PS={period} input_delay={n_in} output_delay={n_out} false_path={n_fp} multicycle={n_mcp} max_delay={n_md} min_delay={n_mind} clock_groups={n_cg} uncertainty={n_u} latency={n_l} disable_timing={n_dt} case_analysis={n_ca} propagated_clock={n_pc} clock_sense={n_cs} input_jitter={n_ij} system_jitter={n_sj} timing_derate={n_td} operating_conditions={n_oc} bus_skew={n_bs} group_path={n_gp} time_borrow={n_tb} data_check={n_dc}"
         ))
@@ -16545,6 +16570,77 @@ impl IdeModel {
             if cand.is_file() {
                 if self.read_xdc_path(&cand.to_string_lossy()).is_ok() && self.user_sdc {
                     eprintln!("loaded user SDC {}", cand.display());
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Open an SDC/XDC file in the Constraints text editor and apply it to STA.
+    pub fn open_sdc_editor(&mut self, path: &Path) -> Result<String, String> {
+        let path = path.to_path_buf();
+        if !path.is_file() {
+            // Create examples/counter.sdc (or any missing path) with the stock 10 ns clock.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
+            }
+            let stock = "# Helion SDC — 100 MHz on clk\ncreate_clock -period 10.000 [get_ports clk]\n";
+            std::fs::write(&path, stock)
+                .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
+        self.sdc_editor_path = Some(path.clone());
+        self.sdc_editor_text = text;
+        self.sdc_editor_dirty = false;
+        self.read_xdc_path(&path.to_string_lossy())?;
+        Ok(format!("open_sdc_editor {}", path.display()))
+    }
+
+    /// Write the Constraints editor buffer back to disk and re-apply via `read_xdc`.
+    pub fn save_sdc_editor(&mut self) -> Result<String, String> {
+        let path = self
+            .sdc_editor_path
+            .clone()
+            .ok_or_else(|| "save_sdc_editor: no SDC open".to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("save_sdc_editor {}: {e}", path.display()))?;
+        }
+        std::fs::write(&path, &self.sdc_editor_text)
+            .map_err(|e| format!("save_sdc_editor {}: {e}", path.display()))?;
+        self.sdc_editor_dirty = false;
+        // Re-parse so STA uses the same on-disk SDC (no-op save must keep WNS).
+        self.read_xdc_path(&path.to_string_lossy())?;
+        Ok(format!("save_sdc_editor {}", path.display()))
+    }
+
+    /// If the Constraints editor is empty but a user/sibling SDC is already loaded, fill it.
+    pub fn ensure_sdc_editor_populated(&mut self) {
+        if !self.sdc_editor_text.is_empty() {
+            return;
+        }
+        if let Some(path) = self.sdc_editor_path.clone() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                self.sdc_editor_text = text;
+                self.sdc_editor_dirty = false;
+                return;
+            }
+        }
+        // Fall back to any .sdc/.xdc already on the sources list (sibling load).
+        for src in self.tree.sources.clone() {
+            let p = PathBuf::from(&src);
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if (ext == "sdc" || ext == "xdc") && p.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    self.sdc_editor_path = Some(p);
+                    self.sdc_editor_text = text;
+                    self.sdc_editor_dirty = false;
                     return;
                 }
             }
