@@ -2183,6 +2183,8 @@ pub struct DeviceSiteView {
     pub occupant: Option<String>,
     /// Every packed HNF cell at this HAD xy (Vivado BEL occupancy).
     pub bels: Vec<String>,
+    /// STA path / selection highlight for Device die paint.
+    pub highlighted: bool,
 }
 
 impl DeviceSiteView {
@@ -5651,6 +5653,10 @@ impl IdeModel {
             self.schematic_zoom_in()
         } else if t == "schematic_zoom_out" || t == "zoom_out" {
             self.schematic_zoom_out()
+        } else if let Some(spec) = t.strip_prefix("select_timing_path_device ") {
+            self.select_timing_path_device(spec.trim())
+        } else if t == "select_timing_path_device" {
+            self.select_timing_path_device("0")
         } else if let Some(spec) = t.strip_prefix("select_timing_path ") {
             self.select_timing_path(spec.trim())
         } else if t == "select_timing_path" {
@@ -8483,6 +8489,7 @@ impl IdeModel {
     }
 
     /// Fig. 59: isolate/highlight the STA path's cells and nets on the schematic.
+    /// Also marks Device die sites/routes for the same path (paint-ready).
     pub fn select_timing_path(&mut self, spec: &str) -> Result<String, String> {
         self.ensure_timing_paths()?;
         let idx = self.timing_path_index(spec)?;
@@ -8504,6 +8511,8 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Schematic;
         if let Some(end) = path.cells.first() {
             self.select(end);
+        } else {
+            self.highlight_device_routes();
         }
         Ok(format!(
             "timing_path {} start={} end={} cells={} nets={} slack_ps={} {}",
@@ -8515,6 +8524,13 @@ impl IdeModel {
             path.slack_ps,
             self.schematic_drawing_text()
         ))
+    }
+
+    /// Same as `select_timing_path`, then stay on / open Device for die highlight.
+    pub fn select_timing_path_device(&mut self, spec: &str) -> Result<String, String> {
+        let out = self.select_timing_path(spec)?;
+        self.workspace = WorkspaceTab::Device;
+        Ok(out)
     }
 
     fn ensure_timing_paths(&mut self) -> Result<(), String> {
@@ -19310,6 +19326,7 @@ impl IdeModel {
                 kind,
                 occupant,
                 bels,
+                highlighted: false,
             });
         }
         for s in dev.iob_sites() {
@@ -19325,6 +19342,7 @@ impl IdeModel {
                 kind: SiteKind::Iob,
                 occupant,
                 bels,
+                highlighted: false,
             });
         }
         let (x0, y0, cols, rows) = if let (Some(xmin), Some(xmax), Some(ymin), Some(ymax)) = (
@@ -19368,23 +19386,39 @@ impl IdeModel {
     }
 
     fn highlight_device_routes(&mut self) {
-        let Some(sel) = self.selected.clone() else {
+        let sel = self.selected.clone();
+        let path_cells = &self.schematic.highlight_cells;
+        let path_nets = &self.schematic.highlight_nets;
+        if sel.is_none() && path_cells.is_empty() && path_nets.is_empty() {
+            for s in &mut self.device.sites {
+                s.highlighted = false;
+            }
             for r in &mut self.device.routes {
                 r.highlighted = false;
             }
             return;
-        };
-        let occ: HashSet<(u32, u32)> = self
-            .device
-            .sites
-            .iter()
-            .filter(|s| {
-                s.occupant.as_deref() == Some(sel.as_str()) || s.bels.iter().any(|b| b == &sel)
-            })
-            .map(|s| (s.x, s.y))
-            .collect();
+        }
+        let mut occ: HashSet<(u32, u32)> = HashSet::new();
+        for s in &mut self.device.sites {
+            let by_sel = sel.as_deref().is_some_and(|id| {
+                s.occupant.as_deref() == Some(id)
+                    || s.site_name() == id
+                    || s.bels.iter().any(|b| b == id)
+            });
+            let by_path = s
+                .occupant
+                .as_ref()
+                .is_some_and(|o| path_cells.contains(o))
+                || s.bels.iter().any(|b| path_cells.contains(b));
+            s.highlighted = by_sel || by_path;
+            if s.highlighted {
+                occ.insert((s.x, s.y));
+            }
+        }
         for r in &mut self.device.routes {
-            r.highlighted = r.net == sel || r.tiles.iter().any(|t| occ.contains(t));
+            r.highlighted = sel.as_deref() == Some(r.net.as_str())
+                || path_nets.contains(&r.net)
+                || r.tiles.iter().any(|t| occ.contains(t));
         }
     }
 
@@ -25916,6 +25950,103 @@ endmodule
                 assert!(p1.cells.contains(n), "path 1 cells only: {n} not in {:?}", p1.cells);
             }
         }
+    }
+
+    /// Timing path select also highlights placed Device sites / PathFinder routes.
+    #[test]
+    fn select_timing_path_highlights_device_sites_and_routes() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        assert_eq!(ide.wns_ps(), Some(9640), "counter gold WNS");
+        ide.exec("report_timing").unwrap();
+        assert!(
+            ide.timing_paths.len() >= 2,
+            "need path 1 (u_ff0→u_ff1): {:?}",
+            ide.timing_paths.iter().map(|p| (&p.startpoint, &p.endpoint)).collect::<Vec<_>>()
+        );
+        let p1 = ide.timing_paths[1].clone();
+        assert!(!p1.cells.is_empty(), "path 1 cells: {p1:?}");
+        ide.exec("select_timing_path 1").unwrap();
+        assert!(ide.schematic.path_only);
+        for c in &p1.cells {
+            assert!(
+                ide.schematic.highlight_cells.contains(c),
+                "path cell {c} in highlight_cells"
+            );
+        }
+        let path_sites: Vec<_> = ide
+            .device
+            .sites
+            .iter()
+            .filter(|s| s.highlighted)
+            .collect();
+        assert!(
+            !path_sites.is_empty(),
+            "placed path sites must highlight on Device: cells={:?} sites={:?}",
+            p1.cells,
+            ide.device
+                .sites
+                .iter()
+                .filter(|s| s.occupant.is_some() || !s.bels.is_empty())
+                .map(|s| (s.site_name(), s.occupant.clone(), s.bels.clone(), s.highlighted))
+                .collect::<Vec<_>>()
+        );
+        for s in &path_sites {
+            let hit = s
+                .occupant
+                .as_ref()
+                .is_some_and(|o| p1.cells.contains(o))
+                || s.bels.iter().any(|b| p1.cells.contains(b))
+                || ide.selected.as_deref() == Some(s.site_name().as_str());
+            assert!(hit, "highlighted site must be a path cell site: {s:?}");
+        }
+        let path_cell_site_count = ide
+            .device
+            .sites
+            .iter()
+            .filter(|s| {
+                s.occupant
+                    .as_ref()
+                    .is_some_and(|o| p1.cells.contains(o))
+                    || s.bels.iter().any(|b| p1.cells.contains(b))
+            })
+            .count();
+        if path_cell_site_count >= 2 {
+            assert!(
+                path_sites.len() >= 2,
+                "multi-cell path highlights every placed site, not only select(): hl={} cellsites={} cells={:?}",
+                path_sites.len(),
+                path_cell_site_count,
+                p1.cells
+            );
+        }
+        for net in &p1.nets {
+            if let Some(r) = ide.device.routes.iter().find(|r| r.net == *net) {
+                assert!(
+                    r.highlighted,
+                    "path net route must highlight: net={net} routes={:?}",
+                    ide.device.routes
+                );
+            }
+        }
+        let occ: HashSet<(u32, u32)> = path_sites.iter().map(|s| (s.x, s.y)).collect();
+        for r in &ide.device.routes {
+            if r.tiles.iter().any(|t| occ.contains(t)) {
+                assert!(
+                    r.highlighted,
+                    "route through path site tiles must highlight: {}",
+                    r.net
+                );
+            }
+        }
+        ide.exec("select_timing_path_device 1").unwrap();
+        assert_eq!(ide.workspace, WorkspaceTab::Device);
+        assert!(
+            ide.device.sites.iter().any(|s| s.highlighted),
+            "Device alias keeps site highlights"
+        );
+        assert_eq!(ide.wns_ps(), Some(9640));
     }
 
     /// UG893 Fig. 55 schematic path picker is Name/From/To/Slack_ps, not `endpoint slack=` chips.
