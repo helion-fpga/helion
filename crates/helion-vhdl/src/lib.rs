@@ -8,8 +8,52 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub fn synth_vhdl(source: &str) -> Result<Design, String> {
+    if let Some(name) = osvvm_harness_module(source) {
+        // OSVVM / PoC test harness (CreateClock, library.entity). The
+        // body is a simulator model, not a netlist. Do not elaborate it.
+        // Not a LUT. Not AXI as a product. Not a closed WNS.
+        eprintln!(
+            "diagnostic sim_only module={name} (OSVVM test harness; external entity not ingested; not a LUT; not a closed WNS)"
+        );
+        let mut d = Design::new(&name);
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+        return Ok(d);
+    }
     let sv = vhdl_to_sv(source)?;
     helion_sv::synth_sv(&sv, "vhdl.sv")
+}
+
+/// OSVVM clock/reset harness or library-qualified AXI testbench. Not synth RTL.
+fn osvvm_harness_module(source: &str) -> Option<String> {
+    let low = source.to_ascii_lowercase();
+    if !(low.contains("osvvm") || low.contains("createclock")) {
+        return None;
+    }
+    Some(last_entity_is(source).unwrap_or_else(|| "osvvm_tb".into()))
+}
+
+fn last_entity_is(source: &str) -> Option<String> {
+    let low = source.to_ascii_lowercase();
+    let mut best = None;
+    let mut search = 0usize;
+    while let Some(rel) = low[search..].find("entity ") {
+        let at = search + rel + "entity ".len();
+        let rest = source.get(at..)?.trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let after = rest.get(name.len()..)?.trim_start();
+        if !name.is_empty() && after.to_ascii_lowercase().starts_with("is") {
+            best = Some(name);
+        }
+        search = at;
+        if search >= source.len() {
+            break;
+        }
+    }
+    best
 }
 
 pub fn synth_vhdl_path(path: &Path) -> Result<Design, String> {

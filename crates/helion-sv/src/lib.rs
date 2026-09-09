@@ -520,7 +520,17 @@ fn range_width(msb: u128, lsb: u128) -> Result<usize, String> {
 }
 
 fn note_width_overflow() {
-    let module = cur_mod();
+    note_width_overflow_named(&cur_mod());
+}
+
+/// `hi - lo + 1` or a concat of those widths used to panic (old lib.rs:6042 /
+/// accum.rs). One line per module. Not a LUT, not a closed WNS.
+fn note_width_overflow_named(module: &str) {
+    let module = if module.is_empty() {
+        cur_mod()
+    } else {
+        module.to_string()
+    };
     let key = if module.is_empty() {
         "width_overflow".to_string()
     } else {
@@ -534,6 +544,16 @@ fn note_width_overflow() {
     note_skip(format!(
         "diagnostic width_overflow module={module} (range does not fit; string or overflowing parameter used as width; not a LUT)"
     ));
+}
+
+fn width_overflow_for(module: &str) -> bool {
+    WIDTH_OVERFLOW_SEEN.with(|s| s.borrow().contains(module))
+}
+
+/// Inclusive `[hi:lo]` span. `hi - lo + 1` overflowed when a parameter
+/// underflowed (`W-1` with `W=0`, `AW-3` with `AW=2`). Do not invent a bus.
+fn range_span(lo: usize, hi: usize) -> Option<usize> {
+    hi.checked_sub(lo)?.checked_add(1)
 }
 
 fn clear_seq_notes() {
@@ -723,6 +743,19 @@ fn rexpr_has_mux(e: &RExpr) -> bool {
 /// 15011: nbas=0, assigns>=32, combo case expanded to per-bit mux assigns.
 /// 14777: nbas>=128 and a wide unpacked word (width>16) that var-index lower refuses.
 fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
+    // Generated TB (deque nbas=11508) walks into tens of thousands of
+    // reg bits after `hang_diag flatten` and never returns. Name one
+    // signal and stop. Not a LUT. Not a closed WNS.
+    if rtl.nbas.len() >= 2048 {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (lhs, _, _) in &rtl.nbas {
+            *counts.entry(lhs.clone()).or_insert(0) += 1;
+        }
+        if let Some((name, _)) = counts.into_iter().max_by_key(|(_, n)| *n) {
+            return Some(name);
+        }
+        return Some("flatten".into());
+    }
     if rtl.nbas.is_empty() && rtl.assigns.len() >= 32 {
         let per_bit = rtl
             .assigns
@@ -1646,6 +1679,9 @@ fn assemble_module(
         }
         if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+        }
+        if child.attrs.get("WIDTH_OVERFLOW") == Some("1") {
+            d.attrs.set("WIDTH_OVERFLOW", "1");
         }
         if child.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
             d.attrs.set("WORD_PIPELINE_CAP", "1");
@@ -5473,8 +5509,12 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             Ok(Expr::Var(bit_name(s, w, *i)))
         }
         RExpr::Range(s, lo, hi) => {
+            if range_span(*lo, *hi).is_none() {
+                note_width_overflow();
+                return Err("width_overflow".into());
+            }
             let w = sig_width(rtl, s);
-            let idx = (*lo + bit).min(*hi).min(w.saturating_sub(1));
+            let idx = lo.saturating_add(bit).min(*hi).min(w.saturating_sub(1));
             Ok(Expr::Var(bit_name(s, w, idx)))
         }
         RExpr::IndexPart {
@@ -5487,8 +5527,12 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
         RExpr::Concat(parts) => {
             let mut offset = 0usize;
             for part in parts.iter().rev() {
-                let w = rexpr_width(part, rtl).max(1);
-                if bit < offset + w {
+                let Some(w) = rexpr_width_checked(part, rtl) else {
+                    note_width_overflow();
+                    return Err("width_overflow".into());
+                };
+                let w = w.max(1);
+                if bit < offset.saturating_add(w) {
                     return rexpr_to_bit(part, rtl, bit - offset);
                 }
                 offset = offset.saturating_add(w);
@@ -5525,7 +5569,11 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if bit != 0 {
                 return Ok(Expr::Const(false));
             }
-            let w = rexpr_width(x, rtl).max(1);
+            let Some(w) = rexpr_width_checked(x, rtl) else {
+                note_width_overflow();
+                return Err("width_overflow".into());
+            };
+            let w = w.max(1);
             if w > 128 {
                 return Err("reduction width too wide".into());
             }
@@ -5539,7 +5587,11 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if bit != 0 {
                 return Ok(Expr::Const(false));
             }
-            let w = rexpr_width(x, rtl).max(1);
+            let Some(w) = rexpr_width_checked(x, rtl) else {
+                note_width_overflow();
+                return Err("width_overflow".into());
+            };
+            let w = w.max(1);
             if w > 128 {
                 return Err("reduction width too wide".into());
             }
@@ -5553,7 +5605,11 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if bit != 0 {
                 return Ok(Expr::Const(false));
             }
-            let w = rexpr_width(x, rtl).max(1);
+            let Some(w) = rexpr_width_checked(x, rtl) else {
+                note_width_overflow();
+                return Err("width_overflow".into());
+            };
+            let w = w.max(1);
             if w > 128 {
                 return Err("reduction width too wide".into());
             }
@@ -5827,7 +5883,7 @@ fn as_rel_bus(e: &RExpr, rtl: &Rtl) -> Option<RelBus> {
             if *lo > hi {
                 return None;
             }
-            let w = hi - *lo + 1;
+            let w = range_span(*lo, hi)?;
             if w > 128 {
                 return None;
             }
@@ -6127,29 +6183,56 @@ fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
     Ok(acc)
 }
 
-fn rexpr_width(e: &RExpr, rtl: &Rtl) -> usize {
+/// Width, or `None` when a slice/concat does not fit. Probe reductions,
+/// compares, and mux conditions so a nested `sig[W-1:0]` with `W=0` is not
+/// a 1-bit cone.
+fn rexpr_width_checked(e: &RExpr, rtl: &Rtl) -> Option<usize> {
     match e {
-        RExpr::Ident(s) | RExpr::Bit(s, _) => sig_width(rtl, s),
-        RExpr::Range(_, lo, hi) => hi - lo + 1,
-        RExpr::IndexPart { width, .. } => (*width).max(1),
-        RExpr::WordAt { data, .. } => rexpr_width(data, rtl).max(1),
-        RExpr::Const { width, .. } => (*width).max(1),
-        RExpr::Concat(parts) => parts.iter().map(|p| rexpr_width(p, rtl).max(1)).sum(),
-        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width(a, rtl),
-        RExpr::RedXor(_)
-        | RExpr::RedAnd(_)
-        | RExpr::RedOr(_)
-        | RExpr::Eq(_, _)
-        | RExpr::Ne(_, _)
-        | RExpr::Lt(_, _) => 1,
-        RExpr::Not(x) => rexpr_width(x, rtl).min(1).max(1),
+        RExpr::Ident(s) | RExpr::Bit(s, _) => Some(sig_width(rtl, s)),
+        RExpr::Range(_, lo, hi) => range_span(*lo, *hi),
+        RExpr::IndexPart { width, .. } => Some((*width).max(1)),
+        RExpr::WordAt { data, .. } => Some(rexpr_width_checked(data, rtl)?.max(1)),
+        RExpr::Const { width, .. } => Some((*width).max(1)),
+        RExpr::Concat(parts) => {
+            let mut acc = 0usize;
+            for p in parts {
+                acc = acc.checked_add(rexpr_width_checked(p, rtl)?.max(1))?;
+            }
+            Some(acc)
+        }
+        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width_checked(a, rtl),
+        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+            rexpr_width_checked(x, rtl)?;
+            Some(1)
+        }
+        RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) => {
+            rexpr_width_checked(a, rtl)?;
+            rexpr_width_checked(b, rtl)?;
+            Some(1)
+        }
+        RExpr::Not(x) => Some(rexpr_width_checked(x, rtl)?.min(1).max(1)),
         RExpr::And(a, b)
         | RExpr::Or(a, b)
         | RExpr::Xor(a, b)
         | RExpr::Add(a, b)
         | RExpr::Sub(a, b)
-        | RExpr::Mul(a, b) => rexpr_width(a, rtl).max(rexpr_width(b, rtl)),
-        RExpr::Mux(_, t, f) => rexpr_width(t, rtl).max(rexpr_width(f, rtl)),
+        | RExpr::Mul(a, b) => {
+            Some(rexpr_width_checked(a, rtl)?.max(rexpr_width_checked(b, rtl)?))
+        }
+        RExpr::Mux(c, t, f) => {
+            rexpr_width_checked(c, rtl)?;
+            Some(rexpr_width_checked(t, rtl)?.max(rexpr_width_checked(f, rtl)?))
+        }
+    }
+}
+
+fn rexpr_width(e: &RExpr, rtl: &Rtl) -> usize {
+    match rexpr_width_checked(e, rtl) {
+        Some(w) => w,
+        None => {
+            note_width_overflow();
+            0
+        }
     }
 }
 
@@ -7904,8 +7987,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 }
                 Err(_) => failed = true,
             }
+        } else if rexpr_width_checked(rhs, rtl).is_none() {
+            // Slice/concat does not fit (`hi - lo + 1` or accum sum). Do not
+            // walk a bit and do not invent a LUT. Closed WNS is refused below.
+            note_width_overflow_named(&rtl.module);
         } else {
             let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
+            let before = comb_bits.len();
             for i in 0..rw.min(w) {
                 match rexpr_to_bit(rhs, rtl, i) {
                     Ok(e) => {
@@ -7915,7 +8003,14 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         }
                         comb_bits.push((bn, e));
                     }
-                    Err(_) => failed = true,
+                    Err(err) => {
+                        failed = true;
+                        if err.contains("width_overflow") {
+                            comb_bits.truncate(before);
+                            note_width_overflow_named(&rtl.module);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -8094,6 +8189,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     if assign_not_lowered_for(&rtl.module) {
         d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+    }
+    if width_overflow_for(&rtl.module) {
+        d.attrs.set("WIDTH_OVERFLOW", "1");
     }
     if word_pipeline_cap_for(&rtl.module) {
         d.attrs.set("WORD_PIPELINE_CAP", "1");
@@ -10371,6 +10469,33 @@ endmodule
     }
 
     #[test]
+    fn zero_param_range_does_not_panic() {
+        // `bits_in=0` makes `in[bits_in-1:0]` a wrapped range. `hi - lo + 1`
+        // used to panic (cpuv/16677.v, old lib.rs:6042). Named diagnostic,
+        // no invented bus, not a closed WNS.
+        let src = r#"
+module clip #(parameter bits_in=0, parameter bits_out=0)
+    (input [bits_in-1:0] in, output [bits_out-1:0] out);
+   wire overflow = |in[bits_in-1:bits_out] & ~(&in[bits_in-1:bits_out]);
+   assign out = overflow ? in[bits_out-1:0] : in[bits_out-1:0];
+endmodule
+"#;
+        let d = synth_sv(src, "clip0.sv").expect("zero-width range must not panic");
+        assert_eq!(d.name, "clip");
+        assert_eq!(d.attrs.get("WIDTH_OVERFLOW"), Some("1"));
+        let logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Bram18
+                )
+            })
+            .count();
+        assert_eq!(logic, 0, "must not invent gates from a range that does not fit, cells={:?}", d.cells);
+    }
+
     fn string_param_width_does_not_panic() {
         // `parameter DATA_WIDTH = ""` hashed past usize and panicked on
         // range `+ 1` (old lib.rs:1052). Named diagnostic, no invented bus.

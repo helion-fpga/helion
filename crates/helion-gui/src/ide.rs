@@ -7690,6 +7690,9 @@ impl IdeModel {
     /// Checked before `no_clock_path`: leftover LUTs and no Hff is not "mapped,
     /// simply no clock" when a cone was skipped.
     fn timing_incomplete_reason(d: &helion_ir::Design) -> Option<&'static str> {
+        if d.attrs.get("WIDTH_OVERFLOW") == Some("1") {
+            return Some("width_overflow; range does not fit; not a LUT; not a closed WNS");
+        }
         if d.attrs.get("WIDE_CONE") == Some("1") {
             return Some("wide_cone skipped; not a closed WNS");
         }
