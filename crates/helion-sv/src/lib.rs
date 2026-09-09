@@ -2,15 +2,18 @@
 //!
 //! Large cores (Ibex, PicoRV32) are ingested via `` `define ``/`ifdef`
 //! preprocess. Packages seed known enum defaults; always_ff / assign / generate
-//! / gate primitives / || && / concat-LHS all map to LUT/FF. Missing child
+//! / || && / concat-LHS map to LUT/FF. Verilog gate primitives are not a Helion
+//! product and are not a closed WNS. `$display`/`$write` and `===`/`!==`
+//! against X/Z are a sim model, not a LUT or a closed WNS. Missing child
 //! modules flatten to empty stubs (missing source, not an unknown construct).
 
 mod preprocess;
-pub use preprocess::preprocess_sv;
+pub use preprocess::{expand_includes, preprocess_sv};
 
 use helion_ir::{CellKind, Design, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
 use sv_parser::{parse_sv_str, Define, DefineText};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -348,6 +351,8 @@ enum RExpr {
         width: usize,
         ascending: bool,
     },
+    /// Unpacked word write `mem[addr] <= data`. Not a comb cone.
+    WordAt { addr: Box<RExpr>, data: Box<RExpr> },
     /// Concatenation `{a,b,...}` (left = MSB). Replication `{N{e}}` may fold to Const.
     Concat(Vec<RExpr>),
     /// Logical right shift `a >> sh` (const shift amount in rexpr_to_bit; zero-fill).
@@ -393,6 +398,1239 @@ struct Rtl {
     params: Vec<(String, u128)>,
     toks: Vec<Tok>,
     mem_inits: HashMap<String, BTreeMap<usize, u128>>,
+}
+
+
+thread_local! {
+    static CUR_MOD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn set_cur_mod(name: &str) {
+    CUR_MOD.with(|c| *c.borrow_mut() = name.to_string());
+}
+
+fn cur_mod() -> String {
+    CUR_MOD.with(|c| c.borrow().clone())
+}
+
+fn note_skip(msg: String) {
+    eprintln!("{msg}");
+}
+
+thread_local! {
+    /// Function names skipped in the current module parse (not re-entered).
+    static SKIPPED_FUNCS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Once per module+function for the process. Re-elaboration must not loop the line.
+    static FUNC_NOT_CALLED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `width_overflow` line per module. String-param hashes used as a
+    /// range used to panic on `diff + 1` (old lib.rs:1052).
+    static WIDTH_OVERFLOW_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `wide_literal` line per process. Sized binaries wider than u128
+    /// used to panic on `1u128 << bit` (old lib.rs:959).
+    static WIDE_LITERAL_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Posedge always writes that still need an Hff on the always edge.
+    static SEQ_WRITES: std::cell::RefCell<Vec<(String, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Clock net from the first posedge/negedge of each module.
+    static EDGE_CLK: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// One `sequential_not_lowered` line per module.
+    static SEQ_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `variable_index_read` line per module. Write-side Hffs may still time.
+    static INDEX_READ_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `assign_not_lowered` line per module+signal. A split `wire` assign
+    /// that did not lower is not a const 0 and is not a closed WNS.
+    static ASSIGN_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `clock_mux` line per module+signal. A posedge on a mux of two
+    /// clocks is not one user clock and is not a closed WNS.
+    static CLOCK_MUX_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `clock_gate` line per module+signal. A posedge on an AND/OR of a
+    /// clock and an enable is not one user clock and is not a closed WNS.
+    static CLOCK_GATE_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `inout_enable_not_lowered` line per module+signal. A read-only
+    /// inout used as a load enable that never reaches FF D is not a closed WNS.
+    static INOUT_ENABLE_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `word_pipeline_cap` line per module. cycles>4 or not a constant:
+    /// do not invent extra word stages, and do not close WNS.
+    static WORD_PIPELINE_CAP_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `gate_primitive` line per module. bufif/notif/and/or/buf/not are
+    /// not LUTs and not a closed WNS. Not one line per instance.
+    static GATE_PRIM_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `sim_only` line per module. `$display`/`$write` or `===`/`!==`
+    /// against X/Z is a simulation model, not a LUT and not a closed WNS.
+    static SIM_ONLY_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// Negedge-only always writes. Not mixed into the posedge NBA cone.
+    /// (module, clk, signal, bit, optional RHS). None RHS cannot lower.
+    static NEGEDGE_WRITES: std::cell::RefCell<
+        Vec<(String, String, String, Option<usize>, Option<RExpr>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+    /// One `negedge_not_lowered` line per module+signal.
+    static NEGEDGE_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn skipped_funcs_clear() {
+    SKIPPED_FUNCS.with(|s| s.borrow_mut().clear());
+}
+
+fn skipped_funcs_push(name: String) {
+    SKIPPED_FUNCS.with(|s| s.borrow_mut().push(name));
+}
+
+fn skipped_funcs_take() -> Vec<String> {
+    SKIPPED_FUNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// Emit `function_not_called` once per function. A second entry (flatten
+/// re-parse, generate copy) is not another LUT and must not loop.
+fn note_function_not_called(module: &str, function: &str) {
+    let key = format!("{module}\0{function}");
+    let fresh = FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic function_not_called module={module} function={function} (function is not called; not a LUT)"
+    ));
+}
+
+/// `[msb:lsb]` width. A string parameter is hashed above bit 96; the old
+/// `as usize` then `max - min + 1` overflowed. Do not invent a bus.
+fn range_width(msb: u128, lsb: u128) -> Result<usize, String> {
+    let span = msb.abs_diff(lsb);
+    let Some(w) = span.checked_add(1) else {
+        return Err("width_overflow".into());
+    };
+    usize::try_from(w).map_err(|_| "width_overflow".to_string())
+}
+
+fn note_width_overflow() {
+    let module = cur_mod();
+    let key = if module.is_empty() {
+        "width_overflow".to_string()
+    } else {
+        module.clone()
+    };
+    let fresh = WIDTH_OVERFLOW_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    let module = if module.is_empty() { "?" } else { module.as_str() };
+    note_skip(format!(
+        "diagnostic width_overflow module={module} (range does not fit; string or overflowing parameter used as width; not a LUT)"
+    ));
+}
+
+fn clear_seq_notes() {
+    SEQ_WRITES.with(|s| s.borrow_mut().clear());
+    EDGE_CLK.with(|m| m.borrow_mut().clear());
+    NEGEDGE_WRITES.with(|s| s.borrow_mut().clear());
+}
+
+fn note_seq_write(module: &str, clk: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let clk = if clk.is_empty() { "clk" } else { clk };
+    let signal = if signal.is_empty() { "always" } else { signal };
+    EDGE_CLK.with(|m| {
+        m.borrow_mut()
+            .entry(module.to_string())
+            .or_insert_with(|| clk.to_string());
+    });
+    SEQ_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.iter().any(|(m, _, sig)| m == module && sig == signal) {
+            v.push((module.to_string(), clk.to_string(), signal.to_string()));
+        }
+    });
+}
+
+fn take_seq_writes(module: &str) -> Vec<(String, String)> {
+    SEQ_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        let mut keep = Vec::new();
+        let mut out = Vec::new();
+        for (m, clk, sig) in v.drain(..) {
+            if m == module {
+                out.push((clk, sig));
+            } else {
+                keep.push((m, clk, sig));
+            }
+        }
+        *v = keep;
+        out
+    })
+}
+
+fn edge_clk_of(module: &str) -> Option<String> {
+    EDGE_CLK.with(|m| m.borrow().get(module).cloned())
+}
+
+fn note_sequential_not_lowered(module: &str, signal: &str) {
+    let fresh = SEQ_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic sequential_not_lowered module={module} signal={signal} (posedge always not mapped to an Hff; not a closed WNS)"
+    ));
+}
+
+/// Variable-index read of a clocked unpacked array. One line. Does not walk a cone.
+fn note_variable_index_read(module: &str, signal: &str) {
+    let fresh = INDEX_READ_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic variable_index_read module={module} signal={signal} (variable-index read not mapped; not a LUT; write-side Hff still timed)"
+    ));
+}
+
+/// Continuous assign (including `wire` + newline + `name = expr`) did not lower.
+/// One line per signal. Not a LUT, not a const 0, not a closed WNS.
+fn note_assign_not_lowered(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "assign" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic assign_not_lowered module={module} signal={signal} (assign not lowered; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn assign_not_lowered_for(module: &str) -> bool {
+    let prefix = format!("{module}\0");
+    ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Posedge of a muxed clock. One line. Not a LUT, not a single user clock.
+fn note_clock_mux(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "clk" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = CLOCK_MUX_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic clock_mux module={module} signal={signal} (posedge is a mux of clocks; not a single user clock; not a closed WNS)"
+    ));
+}
+
+fn clock_mux_for(module: &str) -> bool {
+    let prefix = format!("{module}\0");
+    CLOCK_MUX_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Posedge of a gated clock (AND/OR of a clock and an enable). One line.
+/// Not a LUT, not a single user clock. Not a ternary of two clocks.
+fn note_clock_gate(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "clk" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = CLOCK_GATE_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic clock_gate module={module} signal={signal} (posedge is a gated clock; not a single user clock; not a closed WNS)"
+    ));
+}
+
+fn clock_gate_for(module: &str) -> bool {
+    let prefix = format!("{module}\0");
+    CLOCK_GATE_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Word pipeline longer than 4, or a bound that is not a constant. One line.
+/// Extra stages are not invented. Not a closed WNS.
+fn note_word_pipeline_cap(module: &str, signal: &str, cycles: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "res" } else { signal };
+    let cycles = if cycles.is_empty() { "?" } else { cycles };
+    let fresh = WORD_PIPELINE_CAP_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic word_pipeline_cap module={module} signal={signal} cycles={cycles} (word pipeline capped at 4; extra stages not invented; not a closed WNS)"
+    ));
+}
+
+fn word_pipeline_cap_for(module: &str) -> bool {
+    WORD_PIPELINE_CAP_SEEN.with(|s| s.borrow().contains(module))
+}
+
+/// Verilog gate primitive (`bufif1`, `and`, `not`, ...). One line per module.
+/// Not a LUT, not a closed WNS. Re-parse and sibling instances must not repeat it.
+fn note_gate_primitive(module: &str, primitive: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let primitive = if primitive.is_empty() { "gate" } else { primitive };
+    let fresh = GATE_PRIM_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic gate_primitive module={module} primitive={primitive} (gate primitive not mapped; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn gate_primitive_for(module: &str) -> bool {
+    GATE_PRIM_SEEN.with(|s| s.borrow().contains(module))
+}
+
+fn is_sim_display(name: &str) -> bool {
+    name == "$display"
+        || name == "$write"
+        || name.starts_with("$display")
+        || name.starts_with("$write")
+}
+
+fn tok_is_xz_lit(t: &Tok) -> bool {
+    match t {
+        Tok::Pat { .. } => true,
+        Tok::Ident(s) if matches!(s.as_str(), "x" | "X" | "z" | "Z") => true,
+        _ => false,
+    }
+}
+
+/// `===` / `!==` are tokenized as `==`/`!=` plus a leftover `=`.
+fn is_case_eq_at(toks: &[Tok], i: usize) -> bool {
+    matches!(toks.get(i), Some(Tok::Eq) | Some(Tok::Ne))
+        && matches!(toks.get(i + 1), Some(Tok::Sym('=')))
+}
+
+fn case_eq_against_xz(toks: &[Tok], i: usize) -> bool {
+    let mut j = i + 2;
+    let mut depth = 0i32;
+    let mut n = 0usize;
+    while j < toks.len() && n < 12 {
+        match &toks[j] {
+            Tok::Sym('(') => depth += 1,
+            Tok::Sym(')') | Tok::Sym(';') | Tok::Sym(',') if depth == 0 => break,
+            Tok::Kw(k) if depth == 0 && matches!(k.as_str(), "begin" | "end" | "else" | "endcase") => {
+                break
+            }
+            t if tok_is_xz_lit(t) => return true,
+            _ => {}
+        }
+        j += 1;
+        n += 1;
+    }
+    let mut k = i;
+    let mut looked = 0usize;
+    while k > 0 && looked < 8 {
+        k -= 1;
+        looked += 1;
+        match &toks[k] {
+            Tok::Sym(')') => {}
+            Tok::Sym('(') | Tok::Sym(';') => break,
+            t if tok_is_xz_lit(t) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Module (or always) uses `$display`/`$write` or a 4-state compare against X/Z.
+fn slice_is_sim_only(toks: &[Tok]) -> bool {
+    let mut i = 0;
+    while i < toks.len() {
+        if matches!(&toks[i], Tok::Kw(k) if k == "endmodule") {
+            break;
+        }
+        if let Tok::Ident(s) = &toks[i] {
+            if is_sim_display(s) {
+                return true;
+            }
+        }
+        if is_case_eq_at(toks, i) && case_eq_against_xz(toks, i) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Simulation model. One line. Not a LUT, not a MAC, not a closed WNS.
+fn note_sim_only(module: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let fresh = SIM_ONLY_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic sim_only module={module} (X/Z compare or display; not mapped; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn sim_only_for(module: &str) -> bool {
+    SIM_ONLY_SEEN.with(|s| s.borrow().contains(module))
+}
+
+fn skip_procedural_body(p: &mut P) {
+    if p.eat_kw("begin") {
+        if p.eat_sym(':') {
+            let _ = p.ident();
+        }
+        let _ = skip_begin_end(p);
+    } else {
+        let _ = skip_item_or_block(p);
+    }
+}
+
+/// Read-only `inout` used as a load enable did not reach FF D. One line.
+/// Not a closed WNS. Do not invent a bus for the port.
+fn note_inout_enable_not_lowered(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "ena" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = INOUT_ENABLE_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic inout_enable_not_lowered module={module} signal={signal} (inout load enable not mapped; not a closed WNS)"
+    ));
+}
+
+fn note_negedge_write(
+    module: &str,
+    clk: &str,
+    signal: &str,
+    bit: Option<usize>,
+    rhs: Option<RExpr>,
+) {
+    let module = if module.is_empty() { "?" } else { module };
+    let clk = if clk.is_empty() { "clk" } else { clk };
+    let signal = if signal.is_empty() { "always" } else { signal };
+    NEGEDGE_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.iter().any(|(m, _, sig, _, _)| m == module && sig == signal) {
+            v.push((
+                module.to_string(),
+                clk.to_string(),
+                signal.to_string(),
+                bit,
+                rhs,
+            ));
+        }
+    });
+}
+
+fn take_negedge_writes(module: &str) -> Vec<(String, String, Option<usize>, Option<RExpr>)> {
+    NEGEDGE_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        let mut keep = Vec::new();
+        let mut out = Vec::new();
+        for (m, clk, sig, bit, rhs) in v.drain(..) {
+            if m == module {
+                out.push((clk, sig, bit, rhs));
+            } else {
+                keep.push((m, clk, sig, bit, rhs));
+            }
+        }
+        *v = keep;
+        out
+    })
+}
+
+/// Negedge-only always that did not become an Hff. One line. Not a closed WNS.
+fn note_negedge_not_lowered(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "always" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = NEGEDGE_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic negedge_not_lowered module={module} signal={signal} (negedge always not mapped to an Hff; not a closed WNS)"
+    ));
+}
+
+/// D net of a negedge flop: a named bit or a 1-bit ident. No cone walk.
+fn negedge_d_net(rtl: &Rtl, signal: &str, bit: Option<usize>, rhs: &RExpr) -> Option<String> {
+    let w = sig_width(rtl, signal).max(1);
+    if bit.is_none() && w != 1 {
+        return None;
+    }
+    if bit.is_some() && bit != Some(0) && w == 1 {
+        return None;
+    }
+    match rhs {
+        RExpr::Ident(s) => {
+            let sw = sig_width(rtl, s).max(1);
+            if sw == 1 {
+                Some(bit_name(s, sw, 0))
+            } else {
+                None
+            }
+        }
+        RExpr::Bit(s, i) => {
+            let sw = sig_width(rtl, s).max(1);
+            if *i < sw {
+                Some(bit_name(s, sw, *i))
+            } else {
+                None
+            }
+        }
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ..
+        } if *width == 1 => {
+            let RExpr::Const { val, .. } = base.as_ref() else {
+                return None;
+            };
+            let sw = sig_width(rtl, name).max(1);
+            let i = *val as usize;
+            if i < sw {
+                Some(bit_name(name, sw, i))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn hff_q_is(d: &Design, signal: &str) -> bool {
+    d.cells.iter().any(|c| {
+        matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some(signal)
+    })
+}
+
+/// One Hff per negedge-only always when the write is a 1-bit flop on a named
+/// clock. Falling versus rising does not invent a WNS. Otherwise one diagnostic.
+fn lower_negedge_hffs(d: &mut Design, rtl: &Rtl) {
+    let writes = take_negedge_writes(&rtl.module);
+    for (clk, signal, bit, rhs) in writes {
+        if hff_q_is(d, &signal) && is_input_port(rtl, &clk) {
+            if let Some(ff) = d.cells.iter().find(|c| {
+                matches!(c.kind, CellKind::Hff)
+                    && d.net_on(&c.name, "Q") == Some(signal.as_str())
+                    && d.net_on(&c.name, "CLK") == Some(clk.as_str())
+            }) {
+                eprintln!(
+                    "hff_path cell={} CLK={} Q={}",
+                    ff.name, clk, signal
+                );
+                continue;
+            }
+        }
+        let Some(rhs) = rhs else {
+            note_negedge_not_lowered(&rtl.module, &signal);
+            continue;
+        };
+        if !is_input_port(rtl, &clk) {
+            note_negedge_not_lowered(&rtl.module, &signal);
+            continue;
+        }
+        let Some(dnet) = negedge_d_net(rtl, &signal, bit, &rhs) else {
+            note_negedge_not_lowered(&rtl.module, &signal);
+            continue;
+        };
+        let qnet = if bit.is_none() {
+            bit_name(&signal, sig_width(rtl, &signal).max(1), 0)
+        } else {
+            bit_name(&signal, sig_width(rtl, &signal).max(1), bit.unwrap_or(0))
+        };
+        let ff = format!("u_nff_{signal}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(&clk, &ff, "CLK");
+        d.connect(&dnet, &ff, "D");
+        d.connect(&qnet, &ff, "Q");
+        eprintln!("hff_path cell={ff} CLK={clk} D={dnet} Q={qnet}");
+    }
+}
+
+fn seq_clocks_of(module: &str) -> Vec<String> {
+    SEQ_WRITES.with(|s| {
+        let mut out = Vec::new();
+        for (m, clk, _) in s.borrow().iter() {
+            if m == module && !out.iter().any(|c| c == clk) {
+                out.push(clk.clone());
+            }
+        }
+        out
+    })
+}
+
+fn is_input_port(rtl: &Rtl, name: &str) -> bool {
+    rtl.ports
+        .iter()
+        .any(|(n, dir, _)| n == name && *dir == PortDir::In)
+}
+
+/// Data arm of a clock mux: a plain input-port ident (a user clock).
+fn clock_port_arm<'a>(rtl: &Rtl, e: &'a RExpr) -> Option<&'a str> {
+    match e {
+        RExpr::Ident(n) if is_input_port(rtl, n) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+fn is_clock_mux_expr(rtl: &Rtl, e: &RExpr) -> bool {
+    let RExpr::Mux(_, t, f) = e else {
+        return false;
+    };
+    let Some(a) = clock_port_arm(rtl, t) else {
+        return false;
+    };
+    let Some(b) = clock_port_arm(rtl, f) else {
+        return false;
+    };
+    a != b
+}
+
+/// Posedge/negedge is not a plain port clock, and that net is a ternary of
+/// two clock ports. One diagnostic; the mux is not lowered as a data LUT.
+fn note_clock_muxes(rtl: &Rtl) -> HashSet<String> {
+    let mut sigs = HashSet::new();
+    for clk in seq_clocks_of(&rtl.module) {
+        if is_input_port(rtl, &clk) {
+            continue;
+        }
+        let muxed = rtl
+            .assigns
+            .iter()
+            .any(|(lhs, _, rhs)| lhs == &clk && is_clock_mux_expr(rtl, rhs));
+        if muxed {
+            note_clock_mux(&rtl.module, &clk);
+            sigs.insert(clk);
+        }
+    }
+    sigs
+}
+
+fn peel_not(e: &RExpr) -> &RExpr {
+    let mut cur = e;
+    while let RExpr::Not(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// Enable arm of a clock gate: a signal, a bit, or `~` of those. Not a const.
+fn is_enable_arm(e: &RExpr) -> bool {
+    matches!(peel_not(e), RExpr::Ident(_) | RExpr::Bit(_, _))
+}
+
+fn clock_gate_clock_arm<'a>(rtl: &Rtl, e: &'a RExpr) -> Option<&'a str> {
+    clock_port_arm(rtl, peel_not(e))
+}
+
+/// `assign gclk = clk & en` / `clk & ~en` / `clk | en`. One side is a clock
+/// port; the other is an enable. Not a ternary of two clocks (that is clock_mux).
+fn is_clock_gate_expr(rtl: &Rtl, e: &RExpr) -> bool {
+    let (a, b) = match e {
+        RExpr::And(a, b) | RExpr::Or(a, b) => (a.as_ref(), b.as_ref()),
+        _ => return false,
+    };
+    let ca = clock_gate_clock_arm(rtl, a).is_some();
+    let cb = clock_gate_clock_arm(rtl, b).is_some();
+    let ea = is_enable_arm(a);
+    let eb = is_enable_arm(b);
+    (ca && eb) || (cb && ea)
+}
+
+/// Posedge/negedge is not a plain port clock, and that net is an AND/OR of a
+/// clock and an enable. One diagnostic; the gate is not lowered as a data LUT.
+fn note_clock_gates(rtl: &Rtl, already: &HashSet<String>) -> HashSet<String> {
+    let mut sigs = HashSet::new();
+    for clk in seq_clocks_of(&rtl.module) {
+        if is_input_port(rtl, &clk) || already.contains(&clk) {
+            continue;
+        }
+        let gated = rtl
+            .assigns
+            .iter()
+            .any(|(lhs, _, rhs)| lhs == &clk && is_clock_gate_expr(rtl, rhs));
+        if gated {
+            note_clock_gate(&rtl.module, &clk);
+            sigs.insert(clk);
+        }
+    }
+    sigs
+}
+
+fn lhs_before_assign(toks: &[Tok], nba_only: bool) -> Option<String> {
+    let mut i = 0;
+    while i < toks.len() {
+        let Tok::Ident(name) = &toks[i] else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        if matches!(toks.get(j), Some(Tok::Sym('['))) {
+            let mut d = 0i32;
+            while j < toks.len() {
+                match &toks[j] {
+                    Tok::Sym('[') => d += 1,
+                    Tok::Sym(']') => {
+                        d -= 1;
+                        j += 1;
+                        if d == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        let hit = if nba_only {
+            matches!(toks.get(j), Some(Tok::Le))
+        } else {
+            matches!(toks.get(j), Some(Tok::Le) | Some(Tok::Sym('=')))
+        };
+        if hit {
+            return Some(name.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// First procedural LHS in an always body that did not yield an NBA.
+/// Prefer `<=` so a `for (i = ...)` header does not steal the signal name.
+fn seq_lhs_from_toks(toks: &[Tok]) -> String {
+    lhs_before_assign(toks, true)
+        .or_else(|| lhs_before_assign(toks, false))
+        .unwrap_or_else(|| "always".into())
+}
+
+/// `ena` appears in a mux condition (load enable), not only as data.
+fn mux_cond_mentions(e: &RExpr, name: &str) -> bool {
+    match e {
+        RExpr::Mux(c, t, f) => {
+            let mut names = HashSet::new();
+            rexpr_names(c, &mut names);
+            names.contains(name) || mux_cond_mentions(t, name) || mux_cond_mentions(f, name)
+        }
+        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+            mux_cond_mentions(x, name)
+        }
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b)
+        | RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b) => mux_cond_mentions(a, name) || mux_cond_mentions(b, name),
+        RExpr::Concat(parts) => parts.iter().any(|p| mux_cond_mentions(p, name)),
+        RExpr::IndexPart { base, .. } => mux_cond_mentions(base, name),
+        RExpr::WordAt { addr, data } => mux_cond_mentions(addr, name) || mux_cond_mentions(data, name),
+        _ => false,
+    }
+}
+
+fn signal_is_driven(rtl: &Rtl, name: &str) -> bool {
+    rtl.nbas.iter().any(|(lhs, _, _)| lhs == name)
+        || rtl.assigns.iter().any(|(lhs, _, _)| lhs == name)
+}
+
+/// Read-only inout ports that gate a clocked load. Not a driven bidirectional bus.
+fn inout_load_enables(rtl: &Rtl) -> Vec<String> {
+    let mut out = Vec::new();
+    for (n, dir, _) in &rtl.ports {
+        if !matches!(dir, PortDir::Inout) || signal_is_driven(rtl, n) {
+            continue;
+        }
+        let used = rtl
+            .nbas
+            .iter()
+            .any(|(_, _, rhs)| mux_cond_mentions(rhs, n));
+        if used {
+            out.push(n.clone());
+        }
+    }
+    out
+}
+
+fn enabled_q_names(rtl: &Rtl, en: &str) -> HashSet<String> {
+    let mut q = HashSet::new();
+    for (lhs, bit, rhs) in &rtl.nbas {
+        if !mux_cond_mentions(rhs, en) {
+            continue;
+        }
+        let w = sig_width(rtl, lhs).max(1);
+        if let Some(b) = bit {
+            q.insert(bit_name(lhs, w, *b));
+        } else {
+            for i in 0..w {
+                q.insert(bit_name(lhs, w, i));
+            }
+        }
+    }
+    q
+}
+
+/// Comb cone feeding `ff` D. Returns the cell pin where `want` is connected.
+/// Does not walk through Hff Q, and does not invent a net.
+fn d_cone_connect(d: &Design, ff: &str, want: &str) -> Option<(String, String)> {
+    let start = d.net_on(ff, "D")?;
+    if start == want {
+        return Some((ff.to_string(), "D".into()));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    let mut steps = 0usize;
+    while let Some(net) = stack.pop() {
+        if steps > 256 {
+            break;
+        }
+        steps += 1;
+        if !seen.insert(net.clone()) {
+            continue;
+        }
+        let Some(nrec) = d.nets.iter().find(|n| n.name == net) else {
+            continue;
+        };
+        for ep in &nrec.endpoints {
+            if ep.pin != "O" {
+                continue;
+            }
+            for i in 0..6 {
+                let pin = format!("I{i}");
+                let Some(inode) = d.net_on(&ep.cell, &pin) else {
+                    continue;
+                };
+                if inode == want {
+                    return Some((ep.cell.clone(), pin));
+                }
+                stack.push(inode.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Reset-then-enable load: every gated FF D must include the inout enable.
+/// One `hff_path` plus a connect when that is true. Otherwise one diagnostic
+/// and the design is not a closed WNS. Does not invent a bus.
+fn prove_inout_load_enables(d: &Design, rtl: &Rtl) -> bool {
+    let enables = inout_load_enables(rtl);
+    if enables.is_empty() {
+        return false;
+    }
+    let mut dropped = false;
+    for en in enables {
+        let w = sig_width(rtl, &en).max(1);
+        // 1-bit inout stays the port net. Do not widen it into a bus.
+        let en_net = if w == 1 {
+            en.clone()
+        } else {
+            bit_name(&en, w, 0)
+        };
+        let qnames = enabled_q_names(rtl, &en);
+        let matched: Vec<String> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .filter_map(|c| {
+                let q = d.net_on(&c.name, "Q")?;
+                if qnames.contains(q) {
+                    Some(c.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if matched.is_empty() {
+            note_inout_enable_not_lowered(&rtl.module, &en);
+            dropped = true;
+            continue;
+        }
+        let mut proof: Option<(String, String, String, String, String, String)> = None;
+        for ff in &matched {
+            match d_cone_connect(d, ff, &en_net) {
+                Some((cell, pin)) => {
+                    if proof.is_none() {
+                        let clk = d.net_on(ff, "CLK").unwrap_or("clk").to_string();
+                        let dnet = d.net_on(ff, "D").unwrap_or("").to_string();
+                        let qnet = d.net_on(ff, "Q").unwrap_or("").to_string();
+                        proof = Some((ff.clone(), clk, dnet, en_net.clone(), qnet, format!("{cell} {pin}")));
+                    }
+                }
+                None => {
+                    note_inout_enable_not_lowered(&rtl.module, &en);
+                    dropped = true;
+                }
+            }
+        }
+        if dropped {
+            continue;
+        }
+        if let Some((ff, clk, dnet, en_net, qnet, cell_pin)) = proof {
+            let mut parts = cell_pin.split_whitespace();
+            let cell = parts.next().unwrap_or("");
+            let pin = parts.next().unwrap_or("");
+            eprintln!("hff_path cell={ff} CLK={clk} D={dnet} EN={en_net} Q={qnet}");
+            eprintln!("connect net={en_net} cell={cell} pin={pin}");
+        } else {
+            note_inout_enable_not_lowered(&rtl.module, &en);
+            dropped = true;
+        }
+    }
+    dropped
+}
+
+/// Clocked always that did not become an Hff. One line, then finish.
+/// A wide_cone already fired for this module — do not add a second diagnostic.
+fn rhs_reads_seq_mem(rhs: &RExpr, rtl: &Rtl) -> bool {
+    let mut names = HashSet::new();
+    rexpr_names(rhs, &mut names);
+    names.iter().any(|n| {
+        sig_depth(rtl, n) > 0 && rtl.nbas.iter().any(|(lhs, _, _)| lhs == n)
+    })
+}
+
+/// `mem[index]` / concat of those. Never walk into a cone; depth>0 is a word read.
+fn rhs_unpacked_index(rhs: &RExpr, rtl: &Rtl) -> bool {
+    fn walk(e: &RExpr, rtl: &Rtl) -> bool {
+        match e {
+            RExpr::IndexPart { name, base, .. } => {
+                sig_depth(rtl, name) > 0 || walk(base, rtl)
+            }
+            RExpr::Concat(parts) => parts.iter().any(|p| walk(p, rtl)),
+            RExpr::WordAt { addr, data } => walk(addr, rtl) || walk(data, rtl),
+            RExpr::Mux(c, t, f) => walk(c, rtl) || walk(t, rtl) || walk(f, rtl),
+            RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => walk(x, rtl),
+            RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b)
+            | RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Add(a, b)
+            | RExpr::Sub(a, b)
+            | RExpr::Mul(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b) => walk(a, rtl) || walk(b, rtl),
+            _ => false,
+        }
+    }
+    walk(rhs, rtl)
+}
+
+fn finish_seq_honesty(d: &Design, module: &str, wide_capped: bool) {
+    let writes = take_seq_writes(module);
+    if writes.is_empty() || wide_capped {
+        return;
+    }
+    let hffs = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .count();
+    if hffs == 0 {
+        let sig = writes
+            .first()
+            .map(|(_, sig)| sig.clone())
+            .unwrap_or_else(|| "always".into());
+        note_sequential_not_lowered(module, &sig);
+    }
+}
+
+fn note_wide_literal(width: usize) {
+    let fresh = WIDE_LITERAL_SEEN.with(|c| {
+        let seen = c.get();
+        if seen {
+            false
+        } else {
+            c.set(true);
+            true
+        }
+    });
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic wide_literal width={width} (sized binary exceeds 128-bit const; high bits not folded; not a LUT)"
+    ));
+}
+
+/// Set bit `bit` of a u128 accumulator. Shift-left of 128+ used to panic.
+fn or_u128_bit(acc: &mut u128, bit: usize) -> bool {
+    if bit >= 128 {
+        return false;
+    }
+    *acc |= 1u128 << bit;
+    true
+}
+
+/// Name after `function` has been eaten. Does not parse statements.
+fn function_name_after_kw(p: &mut P) -> String {
+    let save = p.i;
+    skip_sv_type(p);
+    let _ = p.width_opt();
+    match p.ident() {
+        Ok(n) => n,
+        Err(_) => {
+            p.i = save;
+            String::new()
+        }
+    }
+}
+
+/// Skip a function body without entering for/if/case/assign. Uncalled.
+fn skip_function_without_reentry(p: &mut P) -> String {
+    let name = function_name_after_kw(p);
+    skip_until_kw(p, "endfunction");
+    if name.is_empty() {
+        "unknown".into()
+    } else {
+        name
+    }
+}
+
+struct OwnCache {
+    /// module:hash → own-logic Design (instances not included)
+    by_key: HashMap<String, Design>,
+    log: Vec<String>,
+}
+
+fn cache() -> &'static Mutex<OwnCache> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<OwnCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(OwnCache {
+            by_key: HashMap::new(),
+            log: Vec::new(),
+        })
+    })
+}
+
+/// Last incremental reused/rebuilt lines (process cache, not a fake flag).
+pub fn incremental_log() -> Vec<String> {
+    cache()
+        .lock()
+        .map(|c| c.log.clone())
+        .unwrap_or_default()
+}
+
+fn hash_own(rtl: &Rtl) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut feed = |s: &str| {
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    feed(&rtl.module);
+    for (n, dir, w) in &rtl.ports {
+        feed(n);
+        feed(&format!("{dir:?}:{w}"));
+    }
+    for (lhs, bit, rhs) in &rtl.nbas {
+        feed(lhs);
+        feed(&format!("{bit:?}"));
+        feed(&format!("{rhs:?}"));
+    }
+    for (lhs, bit, rhs) in &rtl.assigns {
+        feed(lhs);
+        feed(&format!("{bit:?}"));
+        feed(&format!("{rhs:?}"));
+    }
+    h
+}
+
+fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
+    let h = hash_own(rtl);
+    let key = format!("{}:{h:x}", rtl.module);
+    if let Ok(mut c) = cache().lock() {
+        if let Some(hit) = c.by_key.get(&key).cloned() {
+            let line = format!("incremental reused module={}", rtl.module);
+            eprintln!("{line}");
+            c.log.push(line);
+            return Ok(hit);
+        }
+    }
+    let line = format!("incremental rebuilt module={}", rtl.module);
+    eprintln!("{line}");
+    if let Ok(mut c) = cache().lock() {
+        c.log.push(line);
+    }
+    let mut own = rtl.clone();
+    own.insts.clear();
+    let d = synth_rtl(&own)?;
+    if let Ok(mut c) = cache().lock() {
+        c.by_key.insert(key, d.clone());
+    }
+    Ok(d)
+}
+
+fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
+    let prefix = format!("{}_", inst.name);
+    let mut port_map: HashMap<String, String> = HashMap::new();
+    for (i, p) in child.ports.iter().enumerate() {
+        if let Some((_, net)) = inst
+            .conns
+            .iter()
+            .find(|(pn, _)| pn == &p.name)
+            .or_else(|| inst.conns.iter().find(|(pn, _)| pn == &format!("#{i}")))
+        {
+            port_map.insert(p.name.clone(), net.clone());
+        }
+    }
+    let map_net = |n: &str| -> String {
+        if let Some(p) = port_map.get(n) {
+            return p.clone();
+        }
+        format!("{prefix}{n}")
+    };
+    for c in &child.cells {
+        let mut cell = c.clone();
+        cell.name = format!("{prefix}{}", c.name);
+        dst.cells.push(cell);
+    }
+    for n in &child.nets {
+        let mut net = n.clone();
+        net.name = map_net(&n.name);
+        for e in &mut net.endpoints {
+            e.cell = format!("{prefix}{}", e.cell);
+        }
+        if let Some(ex) = dst.nets.iter_mut().find(|x| x.name == net.name) {
+            ex.endpoints.extend(net.endpoints);
+        } else {
+            dst.nets.push(net);
+        }
+    }
+}
+
+fn assemble_module(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    visiting: &mut HashSet<String>,
+) -> Result<Design, String> {
+    let proto = mods
+        .get(name)
+        .ok_or_else(|| format!("unknown module {name}"))?;
+    if !visiting.insert(name.to_string()) {
+        return lower_own_cached(proto);
+    }
+    let mut d = lower_own_cached(proto)?;
+    d.name = proto.module.clone();
+    for inst in &proto.insts {
+        if !mods.contains_key(&inst.module) {
+            note_skip(format!(
+                "diagnostic unknown_instance module={} inst={} child={} (child body absent; not a LUT)",
+                name, inst.name, inst.module
+            ));
+            continue;
+        }
+        // Ibex-scale trees: keep already-lowered cells, do not copy the rest.
+        if d.cells.len() >= 8_000 {
+            note_skip(format!(
+                "diagnostic assemble_cap module={} inst={} child={} (hierarchy cap; not a LUT)",
+                name, inst.name, inst.module
+            ));
+            continue;
+        }
+        let child = assemble_module(mods, &inst.module, visiting)?;
+        stitch_child(&mut d, &child, inst);
+        // A child cone that was not mapped makes this netlist incomplete.
+        if child.attrs.get("WIDE_CONE") == Some("1") {
+            d.attrs.set("WIDE_CONE", "1");
+        }
+        if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
+            d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+        }
+        if child.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            d.attrs.set("WORD_PIPELINE_CAP", "1");
+        }
+        if child.attrs.get("CLOCK_MUX") == Some("1") {
+            d.attrs.set("CLOCK_MUX", "1");
+        }
+        if child.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            d.attrs.set("GATE_PRIMITIVE", "1");
+        }
+        if child.attrs.get("SIM_ONLY") == Some("1") {
+            d.attrs.set("SIM_ONLY", "1");
+            d.attrs.set("NO_BODY", "1");
+        }
+    }
+    visiting.remove(name);
+    Ok(d)
+}
+
+fn fnv_module_present(text: &str, name: &str) -> bool {
+    let mut i = 0;
+    let b = text.as_bytes();
+    while i + 6 < b.len() {
+        if &b[i..i + 6] == b"module" {
+            let prev_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+            let next = i + 6;
+            if prev_ok && next < b.len() && b[next].is_ascii_whitespace() {
+                let mut j = next;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if &text[start..j] == name {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result<Vec<Rtl>, String> {
+    let mut out = Vec::new();
+    if missing.is_empty() || !dir.is_dir() {
+        return Ok(out);
+    }
+    let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p == skip {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "v" && ext != "sv" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        if !missing.iter().any(|m| fnv_module_present(&text, m)) {
+            continue;
+        }
+        let expanded = expand_includes(&text, dir);
+        let pre = preprocess_sv(&strip_comments(&expanded));
+        out.extend(parse_source(&pre)?);
+    }
+    Ok(out)
 }
 
 fn strip_comments(s: &str) -> String {
@@ -664,20 +1902,24 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 let mut care = 0u128;
                 let mut dc = false;
                 if base == 2 {
+                    let mut wide = width > 128;
                     for (off, ch) in digits.chars().enumerate() {
                         let bit = width.saturating_sub(off + 1);
                         match ch {
                             '1' => {
-                                val |= 1u128 << bit;
-                                care |= 1u128 << bit;
+                                wide |= !or_u128_bit(&mut val, bit);
+                                wide |= !or_u128_bit(&mut care, bit);
                             }
                             '0' => {
-                                care |= 1u128 << bit;
+                                wide |= !or_u128_bit(&mut care, bit);
                             }
                             _ => {
                                 dc = true;
                             }
                         }
+                    }
+                    if wide {
+                        note_wide_literal(width);
                     }
                 } else {
                     let parsed = u128::from_str_radix(
@@ -716,6 +1958,8 @@ struct P<'a> {
     t: &'a [Tok],
     i: usize,
     params: HashMap<String, u128>,
+    /// Signal/port widths seen so far (slice assigns and const if).
+    widths: HashMap<String, usize>,
 }
 
 impl<'a> P<'a> {
@@ -755,15 +1999,21 @@ impl<'a> P<'a> {
         if !self.eat_sym('[') {
             return Ok(1);
         }
-        let msb = const_u(self)? as usize;
+        let msb = const_u(self)?;
         if !self.eat_sym(':') {
             return Err("range :".into());
         }
-        let lsb = const_u(self)? as usize;
+        let lsb = const_u(self)?;
         if !self.eat_sym(']') {
             return Err("]".into());
         }
-        Ok(msb.max(lsb) - msb.min(lsb) + 1)
+        match range_width(msb, lsb) {
+            Ok(w) => Ok(w),
+            Err(e) => {
+                note_width_overflow();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -796,6 +2046,14 @@ fn clog2_u(n: u128) -> u128 {
 }
 
 fn const_atom(p: &mut P) -> Result<u128, String> {
+    // Unary `(-3)+W` / `(-1)+W` are elaboration consts, not a dropped always.
+    if p.eat_sym('+') {
+        return const_atom(p);
+    }
+    if p.eat_sym('-') {
+        let n = const_atom(p)?;
+        return Ok(0u128.wrapping_sub(n));
+    }
     if p.eat_sym('(') {
         let v = const_u(p)?;
         if !p.eat_sym(')') {
@@ -845,9 +2103,10 @@ fn const_u(p: &mut P) -> Result<u128, String> {
     let mut v = const_atom(p)?;
     loop {
         if p.eat_sym('+') {
-            v = v.saturating_add(const_atom(p)?);
+            // wrapping so `(-1)+W` is W-1, not a saturated width_overflow.
+            v = v.wrapping_add(const_atom(p)?);
         } else if p.eat_sym('-') {
-            v = v.saturating_sub(const_atom(p)?);
+            v = v.wrapping_sub(const_atom(p)?);
         } else if p.eat_sym('*') {
             if p.eat_sym('*') {
                 let e = const_atom(p)? as u32;
@@ -981,7 +2240,21 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
     let e = parse_shift(p)?;
     if matches!(p.peek(), Some(Tok::Eq)) {
         p.bump();
-        return Ok(RExpr::Eq(Box::new(e), Box::new(parse_shift(p)?)));
+        let r = parse_shift(p)?;
+        if let (
+            RExpr::Const { val: a, care: ca, .. },
+            RExpr::Const { val: b, care: cb, .. },
+        ) = (&e, &r)
+        {
+            if *ca & 1 == 1 && *cb & 1 == 1 {
+                return Ok(RExpr::Const {
+                    val: if a == b { 1 } else { 0 },
+                    width: 1,
+                    care: 1,
+                });
+            }
+        }
+        return Ok(RExpr::Eq(Box::new(e), Box::new(r)));
     }
     if matches!(p.peek(), Some(Tok::Ne)) {
         p.bump();
@@ -1185,9 +2458,16 @@ fn parse_un_r(p: &mut P) -> Result<RExpr, String> {
     if p.eat_sym('~') || p.eat_sym('!') {
         return Ok(RExpr::Not(Box::new(parse_un_r(p)?)));
     }
-    // Unary minus: -a  ≡  0 - a
+    // Unary minus: -a  ≡  0 - a. Fold consts so `(-3)+W` is a range bound.
     if p.eat_sym('-') {
         let x = parse_un_r(p)?;
+        if let RExpr::Const { val, width, care } = x {
+            return Ok(RExpr::Const {
+                val: 0u128.wrapping_sub(val),
+                width,
+                care,
+            });
+        }
         return Ok(RExpr::Sub(
             Box::new(RExpr::Const {
                 val: 0,
@@ -1285,6 +2565,14 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         return Ok(RExpr::Concat(parts));
     }
     match p.bump() {
+        Some(Tok::Str(s)) => {
+            let h = str_param_hash(s);
+            Ok(RExpr::Const {
+                val: h,
+                width: 32,
+                care: u128::MAX,
+            })
+        }
         Some(Tok::Number(v, w)) => {
             let care = if *w >= 128 { u128::MAX } else { (1u128 << (*w).max(1)) - 1 };
             Ok(RExpr::Const {
@@ -1303,7 +2591,9 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             if p.eat_sym('[') {
                 // Indexed part-select: sig[base +: W] / sig[base -: W]
                 // or range/bit. Prefer +: / -: before treating ':' as range.
-                let base = parse_add(p)?;
+                // `lut[addr_b<<1+1]`: shift binds looser than `+` (Verilog), so
+                // parse_add stops at `<<` and the index never reaches `]`.
+                let base = parse_shift(p)?;
                 if p.eat_sym('+') && p.eat_sym(':') {
                     let w = const_u(p)? as usize;
                     if !p.eat_sym(']') {
@@ -1339,7 +2629,13 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                     let lo = a.min(b);
                     // Parameter part-select e.g. SEED[STATE_WIDTH-1:0]
                     if let Some(v) = p.params.get(&name).copied() {
-                        let w = (hi - lo + 1).max(1);
+                        let w = match range_width(hi as u128, lo as u128) {
+                            Ok(w) => w.max(1),
+                            Err(e) => {
+                                note_width_overflow();
+                                return Err(e);
+                            }
+                        };
                         let mask = care_mask(w.min(128));
                         let val = (v >> lo) & mask;
                         return Ok(RExpr::Const {
@@ -1394,7 +2690,9 @@ fn parse_port_dir(p: &mut P) -> Option<PortDir> {
     } else if p.eat_kw("output") {
         Some(PortDir::Out)
     } else if p.eat_kw("inout") {
-        Some(PortDir::In)
+        // Keep the declaration. Synthesis treats a read-only inout as the
+        // load-enable input; it is not rewritten into a bus.
+        Some(PortDir::Inout)
     } else {
         None
     }
@@ -1492,7 +2790,7 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
 
 /// Parse for-loop step: `i++`, `i += N`, or `i = i + N` (default step 1).
 fn parse_for_step(p: &mut P) -> Result<usize, String> {
-    let _ = p.ident(); // loop variable
+    let _var = p.ident()?;
     // i++
     if p.eat_sym('+') {
         if p.eat_sym('+') {
@@ -1505,23 +2803,137 @@ fn parse_for_step(p: &mut P) -> Result<usize, String> {
         }
         return Err("for step +".into());
     }
-    // i = i + N
+    // i = i + N, or i = N + i (SRL `i = 1+i`).
     if p.eat_sym('=') {
-        let _ = p.ident();
-        if !p.eat_sym('+') {
-            return Err("for step =+".into());
-        }
-        let n = match p.peek() {
-            Some(Tok::Number(v, _)) => {
-                let n = (*v as usize).max(1);
-                p.bump();
-                n
+        // i = N + i — do not call const_u: the loop var is not a parameter.
+        if matches!(p.peek(), Some(Tok::Number(_, _))) {
+            let n = match p.bump() {
+                Some(Tok::Number(v, _)) => (*v as usize).max(1),
+                _ => 1,
+            };
+            if p.eat_sym('+') {
+                let _ = p.ident();
             }
-            _ => 1,
-        };
-        return Ok(n);
+            return Ok(n);
+        }
+        // i = i + N
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            let _ = p.ident();
+            if !p.eat_sym('+') {
+                return Err("for step =+".into());
+            }
+            let n = match p.peek() {
+                Some(Tok::Number(v, _)) => {
+                    let n = (*v as usize).max(1);
+                    p.bump();
+                    n
+                }
+                _ => 1,
+            };
+            return Ok(n);
+        }
+        return Err("for step =".into());
     }
     Err("for step".into())
+}
+
+/// Procedural `mem[i] <= mem[i-1]` (optional begin/end). Not a generate.
+fn body_is_word_shift(body: &[Tok], var: &str) -> Option<String> {
+    let mut i = 0;
+    if matches!(body.get(i), Some(Tok::Kw(k)) if k == "begin") {
+        i += 1;
+        if matches!(body.get(i), Some(Tok::Sym(':'))) {
+            i += 1;
+            if matches!(body.get(i), Some(Tok::Ident(_))) {
+                i += 1;
+            }
+        }
+    }
+    let mem = match body.get(i) {
+        Some(Tok::Ident(s)) => s.clone(),
+        _ => return None,
+    };
+    i += 1;
+    if !matches!(body.get(i), Some(Tok::Sym('['))) {
+        return None;
+    }
+    let mut seen_le = false;
+    let mut rhs_mem = false;
+    let mut lhs_var = false;
+    for t in body.iter().skip(i) {
+        match t {
+            Tok::Le => seen_le = true,
+            Tok::Ident(s) if !seen_le && s == var => lhs_var = true,
+            Tok::Ident(s) if seen_le && s == &mem => rhs_mem = true,
+            Tok::Kw(k) if k == "end" => break,
+            Tok::Sym(';') if seen_le && rhs_mem => break,
+            _ => {}
+        }
+    }
+    if lhs_var && rhs_mem {
+        Some(mem)
+    } else {
+        None
+    }
+}
+
+/// Bound is not a constant. Consume the for if the body is a word shift.
+/// Caller emits `word_pipeline_cap` and does not invent stages.
+fn consume_nonconst_word_pipeline(p: &mut P, var: &str) -> Option<String> {
+    let save = p.i;
+    let mut depth = 1i32;
+    let mut closed = false;
+    while p.peek().is_some() {
+        if p.eat_sym('(') {
+            depth += 1;
+            continue;
+        }
+        if p.eat_sym(')') {
+            depth -= 1;
+            if depth == 0 {
+                closed = true;
+                break;
+            }
+            continue;
+        }
+        p.bump();
+    }
+    if !closed {
+        p.i = save;
+        return None;
+    }
+    let block = p.eat_kw("begin");
+    if p.eat_sym(':') {
+        let _ = p.ident();
+    }
+    let start_i = p.i;
+    if block {
+        let mut d = 1i32;
+        while d > 0 {
+            match p.bump() {
+                Some(Tok::Kw(k)) if k == "begin" => d += 1,
+                Some(Tok::Kw(k)) if k == "end" => d -= 1,
+                None => {
+                    p.i = save;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    } else {
+        while p.peek().is_some() && !matches!(p.peek(), Some(Tok::Sym(';'))) {
+            p.bump();
+        }
+        let _ = p.eat_sym(';');
+    }
+    let body = p.t[start_i..p.i].to_vec();
+    match body_is_word_shift(&body, var) {
+        Some(mem) => Some(mem),
+        None => {
+            p.i = save;
+            None
+        }
+    }
 }
 
 fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
@@ -1549,8 +2961,22 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     } else {
         return Err("for cmp".into());
     };
-    let end = const_u(p)? as usize;
-    let end = if inclusive { end + 1 } else { end };
+    let bound_at = p.i;
+    let end = match const_u(p) {
+        Ok(v) => v as usize,
+        Err(_) => {
+            // `for (i = 1; i < cycles; ...)` when cycles is not a constant.
+            // Do not invent the shift stages. One word_pipeline_cap.
+            p.i = bound_at;
+            if let Some(mem) = consume_nonconst_word_pipeline(p, &var) {
+                note_word_pipeline_cap(&cur_mod(), &mem, "nonconst");
+                return Ok(Vec::new());
+            }
+            return Err("for bound".into());
+        }
+    };
+    // Inclusive `<=` used to `end + 1` and panic when the bound was usize::MAX.
+    let end = if inclusive { end.saturating_add(1) } else { end };
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
@@ -1582,6 +3008,13 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     let body = p.t[start_i..p.i].to_vec();
     let mut out = Vec::new();
     let niter = end.saturating_sub(start) / step.max(1);
+    // `for (i = 1; i < cycles; ...)` : exclusive end is the word count.
+    // Cap at 4 words. Do not unroll a deep chain into invented stages.
+    if let Some(mem) = body_is_word_shift(&body, &var) {
+        if end > 4 {
+            note_word_pipeline_cap(&cur_mod(), &mem, &end.to_string());
+        }
+    }
     if niter > 4096 {
         return Ok(Vec::new());
     }
@@ -1594,7 +3027,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
                 other => other.clone(),
             })
             .collect();
-        let mut sp = P { t: &toks, i: 0, params: p.params.clone() };
+        let mut sp = P { t: &toks, i: 0, params: p.params.clone(), widths: p.widths.clone() };
         out.extend(parse_seq_block(&mut sp, block)?);
         i += step;
     }
@@ -1628,6 +3061,152 @@ fn parse_attr(p: &mut P) -> Option<(String, String)> {
     Some((k, v))
 }
 
+
+/// FNV-1a tag so a string parameter does not compare equal to a small integer.
+fn str_param_hash(s: &str) -> u128 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as u128) | (1u128 << 96)
+}
+
+fn bit_extract(e: RExpr, bit: usize) -> RExpr {
+    if bit == 0 {
+        e
+    } else {
+        RExpr::Shr(
+            Box::new(e),
+            Box::new(RExpr::Const {
+                val: bit as u128,
+                width: 32,
+                care: u128::MAX,
+            }),
+        )
+    }
+}
+
+fn note_width(p: &mut P, name: &str, w: usize) {
+    p.widths.insert(name.to_string(), w.max(1));
+}
+
+/// Last procedural write wins. Vector assigns become per-bit so a case arm
+/// that writes slices can mux against an arm that writes the whole vector.
+fn normalize_nbas(p: &P, stmts: Vec<Nba>) -> Vec<Nba> {
+    let mut order: Vec<(String, Option<usize>)> = Vec::new();
+    let mut map: HashMap<(String, Option<usize>), RExpr> = HashMap::new();
+    let mut put = |order: &mut Vec<(String, Option<usize>)>,
+                   map: &mut HashMap<(String, Option<usize>), RExpr>,
+                   key: (String, Option<usize>),
+                   rhs: RExpr| {
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.insert(key, rhs);
+    };
+    for (lhs, bit, rhs) in stmts {
+        let w = p.widths.get(&lhs).copied().unwrap_or(1).min(256);
+        match bit {
+            Some(b) => {
+                let full = (lhs.clone(), None);
+                if map.remove(&full).is_some() {
+                    order.retain(|k| k != &full);
+                }
+                put(&mut order, &mut map, (lhs, Some(b)), rhs);
+            }
+            None if matches!(rhs, RExpr::WordAt { .. }) => {
+                // Whole-word `mem[addr] <= data`. Do not Shr-split into bits.
+                put(&mut order, &mut map, (lhs, None), rhs);
+            }
+            None if w > 1 => {
+                order.retain(|(n, _)| n != &lhs);
+                map.retain(|(n, _), _| n != &lhs);
+                for i in 0..w {
+                    let key = (lhs.clone(), Some(i));
+                    order.push(key.clone());
+                    map.insert(key, bit_extract(rhs.clone(), i));
+                }
+            }
+            None => put(&mut order, &mut map, (lhs, None), rhs),
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| map.remove(&k).map(|rhs| (k.0, k.1, rhs)))
+        .collect()
+}
+
+/// Blocking assign, including `name[hi:lo] = expr` as per-bit writes.
+fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
+    let name = p.ident()?;
+    let mut range: Option<(usize, usize)> = None;
+    let mut bit = None;
+    let mut word_addr: Option<RExpr> = None;
+    if p.eat_sym('[') {
+        let save = p.i;
+        let const_ok = const_u(p);
+        if let Ok(hi) = const_ok {
+            if p.eat_sym(':') {
+                let lo = const_u(p)? as usize;
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                range = Some((hi as usize, lo));
+            } else if p.eat_sym(']') {
+                bit = Some(hi as usize);
+            } else {
+                p.i = save;
+                word_addr = Some(parse_shift(p)?);
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+            }
+        } else {
+            // `lut[addr_a]` — variable word index, not a bit-blast.
+            p.i = save;
+            word_addr = Some(parse_shift(p)?);
+            if !p.eat_sym(']') {
+                return Err("]".into());
+            }
+        }
+    }
+    if matches!(p.peek(), Some(Tok::Le)) {
+        p.bump();
+    } else if !p.eat_sym('=') {
+        return Err("nba".into());
+    }
+    let rhs = parse_rexpr(p)?;
+    let _ = p.eat_sym(';');
+    if let Some(addr) = word_addr {
+        return Ok(vec![(
+            name,
+            None,
+            RExpr::WordAt {
+                addr: Box::new(addr),
+                data: Box::new(rhs),
+            },
+        )]);
+    }
+    if let Some((a, b)) = range {
+        let hi = a.max(b);
+        let lo = a.min(b);
+        let mut v = Vec::new();
+        let mut k = 0usize;
+        let mut i = lo;
+        while i <= hi {
+            v.push((name.clone(), Some(i), bit_extract(rhs.clone(), k)));
+            k += 1;
+            if i == usize::MAX {
+                break;
+            }
+            i += 1;
+        }
+        return Ok(v);
+    }
+    Ok(vec![(name, bit, rhs)])
+}
+
 fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
     let _ = p.eat_kw("unique");
     let _ = p.eat_kw("priority");
@@ -1643,13 +3222,22 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
             return Err("if )".into());
         }
         let then_b = p.eat_kw("begin");
-        let then_s = parse_seq_block(p, then_b)?;
+        let then_raw = parse_seq_block(p, then_b)?;
+        let then_s = normalize_nbas(p, then_raw);
         let else_s = if p.eat_kw("else") {
             let eb = p.eat_kw("begin");
-            parse_seq_block(p, eb)?
+            let else_raw = parse_seq_block(p, eb)?;
+            normalize_nbas(p, else_raw)
         } else {
             Vec::new()
         };
+        // Parameter string compare (e.g. operation_mode == "dynamic") is
+        // an elaboration constant — keep the taken branch, do not mux both.
+        if let RExpr::Const { val, care, .. } = &cond {
+            if *care & 1 == 1 {
+                return Ok(if *val != 0 { then_s } else { else_s });
+            }
+        }
         let mut out = Vec::new();
         for (lhs, bit, rhs) in then_s {
             let other = else_s
@@ -1692,7 +3280,8 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
             if p.eat_kw("default") {
                 let _ = p.eat_sym(':');
                 let b = p.eat_kw("begin");
-                def = parse_seq_block(p, b)?;
+                let def_raw = parse_seq_block(p, b)?;
+                def = normalize_nbas(p, def_raw);
                 continue;
             }
             let item = parse_rexpr(p)?;
@@ -1700,7 +3289,8 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
                 return Err("case :".into());
             }
             let b = p.eat_kw("begin");
-            let body = parse_seq_block(p, b)?;
+            let body_raw = parse_seq_block(p, b)?;
+            let body = normalize_nbas(p, body_raw);
             arms.push((Some(item), body));
         }
         let mut out = Vec::new();
@@ -1728,7 +3318,7 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
         }
         return Ok(out);
     }
-    Ok(vec![parse_nba(p)?])
+    parse_assign_nbas(p)
 }
 
 fn skip_until_kw(p: &mut P, kw: &str) {
@@ -1750,9 +3340,10 @@ fn skip_until_kw(p: &mut P, kw: &str) {
 }
 
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
+    clear_seq_notes();
     let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
-    let mut p = P { t: &toks, i: 0, params: HashMap::new() };
+    let mut p = P { t: &toks, i: 0, params: HashMap::new(), widths: HashMap::new() };
     let mut mods = Vec::new();
     while p.peek().is_some() {
         if p.eat_sym(';') {
@@ -2059,25 +3650,46 @@ fn skip_until_arg_end(p: &mut P) {
     }
 }
 
-/// Skip `@...` sensitivity. Returns true for combo `@*` / `@(*)` (no edge).
-/// Async `posedge clk or negedge nreset` is treated like sync (edges ignored).
-fn skip_event_control(p: &mut P) -> bool {
+/// Skip `@...` sensitivity. Returns `(combo, edge clock, negedge_only)`.
+/// Combo is `@*` / `@(*)` (no edge). Async `posedge clk or negedge nreset`
+/// is treated like sync; the first edge name is the user's clock.
+/// `negedge_only` is a lone falling edge — not mixed with posedge.
+fn skip_event_control(p: &mut P) -> (bool, Option<String>, bool) {
     let _ = p.eat_sym('@');
     if p.eat_sym('*') {
-        return true;
+        return (true, None, false);
     }
     if p.eat_sym('(') {
         let start = p.i;
         if p.eat_sym('*') && matches!(p.peek(), Some(Tok::Sym(')'))) {
             p.bump();
-            return true;
+            return (true, None, false);
         }
         p.i = start;
         let mut d = 1i32;
-        let mut has_edge = false;
+        let mut has_posedge = false;
+        let mut has_negedge = false;
+        let mut clk = None;
         while d > 0 && p.peek().is_some() {
-            if p.eat_kw("posedge") || p.eat_kw("negedge") {
-                has_edge = true;
+            if p.eat_kw("posedge") {
+                has_posedge = true;
+                if clk.is_none() {
+                    if let Some(Tok::Ident(name)) = p.peek() {
+                        clk = Some(name.clone());
+                        p.bump();
+                    }
+                }
+                continue;
+            }
+            if p.eat_kw("negedge") {
+                has_negedge = true;
+                if clk.is_none() {
+                    if let Some(Tok::Ident(name)) = p.peek() {
+                        clk = Some(name.clone());
+                        p.bump();
+                    }
+                }
+                continue;
             } else if p.eat_sym('(') {
                 d += 1;
             } else if p.eat_sym(')') {
@@ -2086,9 +3698,10 @@ fn skip_event_control(p: &mut P) -> bool {
                 p.bump();
             }
         }
-        return !has_edge;
+        let has_edge = has_posedge || has_negedge;
+        return (!has_edge, clk, has_negedge && !has_posedge);
     }
-    false
+    (false, None, false)
 }
 
 fn skip_for_rest(p: &mut P) {
@@ -2174,12 +3787,295 @@ fn parse_net_ref(p: &mut P) -> Result<String, String> {
     Ok(name)
 }
 
+
+#[derive(Clone, Debug)]
+struct FuncDef {
+    name: String,
+    ret_w: usize,
+    ports: Vec<(String, PortDir, usize)>,
+    signals: Vec<(String, usize)>,
+    stmts: Vec<Nba>,
+}
+
+/// Standing rule: a function is behavioral Verilog. Parse it so a call can
+/// inline, or an otherwise empty module can lift it into ports + assigns.
+fn parse_function(p: &mut P) -> Result<FuncDef, String> {
+    skip_sv_type(p);
+    let ret_w = match p.width_opt() {
+        Ok(w) => w,
+        Err(_) => 1,
+    };
+    let name = match p.ident() {
+        Ok(n) => n,
+        Err(_) => {
+            skip_until_kw(p, "endfunction");
+            return Err("function name".into());
+        }
+    };
+    let _ = p.eat_sym(';');
+    note_width(p, &name, ret_w);
+    let mut ports = Vec::new();
+    let mut signals = Vec::new();
+    let mut stmts = Vec::new();
+    while !p.eat_kw("endfunction") {
+        if p.peek().is_none()
+            || matches!(p.peek(), Some(Tok::Kw(k)) if k == "endmodule" || k == "module")
+        {
+            return Err("unterminated function".into());
+        }
+        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output" || k == "inout") {
+            let dir = parse_port_dir(p).unwrap_or(PortDir::In);
+            skip_sv_type(p);
+            let w = p.width_opt().unwrap_or(1);
+            if let Ok(n) = p.ident() {
+                ports.push((n.clone(), dir, w));
+                signals.push((n.clone(), w));
+                note_width(p, &n, w);
+            }
+            let _ = p.eat_sym(';');
+            continue;
+        }
+        if p.eat_kw("integer") {
+            if let Ok(n) = p.ident() {
+                signals.push((n.clone(), 32));
+                note_width(p, &n, 32);
+            }
+            let _ = p.eat_sym(';');
+            continue;
+        }
+        if p.eat_kw("reg") || p.eat_kw("wire") || p.eat_kw("logic") {
+            let w = p.width_opt().unwrap_or(1);
+            if let Ok(n) = p.ident() {
+                signals.push((n.clone(), w));
+                note_width(p, &n, w);
+            }
+            skip_to_semi(p);
+            continue;
+        }
+        if p.eat_kw("begin") {
+            if p.eat_sym(':') {
+                let _ = p.ident();
+            }
+            match parse_seq_block(p, true) {
+                Ok(s) => stmts.extend(normalize_nbas(p, s)),
+                Err(_) => {
+                    let _ = skip_begin_end(p);
+                }
+            }
+            continue;
+        }
+        let save = p.i;
+        match parse_assign_nbas(p) {
+            Ok(v) => stmts.extend(normalize_nbas(p, v)),
+            Err(_) => {
+                p.i = save;
+                let _ = skip_item_or_block(p);
+            }
+        }
+        if p.i == save {
+            let _ = p.bump();
+        }
+    }
+    Ok(FuncDef {
+        name,
+        ret_w,
+        ports,
+        signals,
+        stmts,
+    })
+}
+
+fn rexpr_names(e: &RExpr, out: &mut HashSet<String>) {
+    match e {
+        RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
+            out.insert(s.clone());
+        }
+        RExpr::IndexPart { name, base, .. } => {
+            out.insert(name.clone());
+            rexpr_names(base, out);
+        }
+        RExpr::WordAt { addr, data } => {
+            rexpr_names(addr, out);
+            rexpr_names(data, out);
+        }
+        RExpr::Concat(parts) => {
+            for p in parts {
+                rexpr_names(p, out);
+            }
+        }
+        RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => {
+            rexpr_names(a, out);
+            rexpr_names(b, out);
+        }
+        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::Not(x) => rexpr_names(x, out),
+        RExpr::Mux(c, t, f) => {
+            rexpr_names(c, out);
+            rexpr_names(t, out);
+            rexpr_names(f, out);
+        }
+        RExpr::Const { .. } => {}
+    }
+}
+
+/// Empty module whose only Verilog is function(s): lift each function into
+/// module ports + comb assigns. Not used when the module already has a body
+/// (calls are inlined at the assign). Never invents a vendor architecture.
+
+/// One-shot parse of functions in a function-only module (lift path).
+fn parse_functions_in_slice(toks: &[Tok]) -> Vec<FuncDef> {
+    let mut p = P {
+        t: toks,
+        i: 0,
+        params: HashMap::new(),
+        widths: HashMap::new(),
+    };
+    let mut funcs = Vec::new();
+    while p.peek().is_some() {
+        if p.eat_kw("function") {
+            match parse_function(&mut p) {
+                Ok(f) => funcs.push(f),
+                Err(_) => skip_until_kw(&mut p, "endfunction"),
+            }
+        } else {
+            let before = p.i;
+            p.bump();
+            if p.i == before {
+                break;
+            }
+        }
+    }
+    funcs
+}
+
+fn lift_functions_if_no_body(
+    ports: &mut Vec<(String, PortDir, usize)>,
+    signals: &mut Vec<Signal>,
+    nbas: &[Nba],
+    assigns: &mut Vec<Nba>,
+    insts: &[Inst],
+    funcs: &[FuncDef],
+) {
+    if funcs.is_empty() || !nbas.is_empty() || !assigns.is_empty() || !insts.is_empty() {
+        return;
+    }
+    let multi = funcs.len() > 1;
+    let mut taken: HashSet<String> = HashSet::new();
+    let claim = |taken: &mut HashSet<String>, name: String| -> String {
+        if !taken.contains(&name) {
+            taken.insert(name.clone());
+            return name;
+        }
+        let mut i = 2u32;
+        loop {
+            let n = format!("{name}_{i}");
+            if !taken.contains(&n) {
+                taken.insert(n.clone());
+                return n;
+            }
+            i += 1;
+        }
+    };
+    for f in funcs {
+        let mut ids: HashSet<String> = HashSet::new();
+        ids.insert(f.name.clone());
+        for (n, _, _) in &f.ports {
+            ids.insert(n.clone());
+        }
+        for (n, _) in &f.signals {
+            ids.insert(n.clone());
+        }
+        for (lhs, _, rhs) in &f.stmts {
+            ids.insert(lhs.clone());
+            rexpr_names(rhs, &mut ids);
+        }
+        let mut subst: HashMap<String, String> = HashMap::new();
+        if multi {
+            for id in &ids {
+                if id == &f.name {
+                    continue;
+                }
+                subst.insert(id.clone(), format!("{}_{id}", f.name));
+            }
+        }
+        let mapped = |subst: &HashMap<String, String>, n: &str| {
+            subst.get(n).cloned().unwrap_or_else(|| n.to_string())
+        };
+        if ports.is_empty() {
+            for (n, dir, w) in &f.ports {
+                let pn = claim(&mut taken, mapped(&subst, n));
+                subst.insert(n.clone(), pn.clone());
+                ports.push((pn.clone(), *dir, *w));
+                if !signals.iter().any(|s| s.name == pn) {
+                    signals.push(Signal {
+                        name: pn,
+                        width: *w,
+                        depth: 0,
+                        keep: false,
+                        mark_debug: false,
+                    });
+                }
+            }
+            let on = claim(&mut taken, f.name.clone());
+            subst.insert(f.name.clone(), on.clone());
+            ports.push((on.clone(), PortDir::Out, f.ret_w));
+            if !signals.iter().any(|s| s.name == on) {
+                signals.push(Signal {
+                    name: on,
+                    width: f.ret_w,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
+            }
+        }
+        for (n, w) in &f.signals {
+            let pn = mapped(&subst, n);
+            if !signals.iter().any(|s| s.name == pn) {
+                signals.push(Signal {
+                    name: pn,
+                    width: *w,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
+            }
+        }
+        for (lhs, bit, rhs) in &f.stmts {
+            let ln = mapped(&subst, lhs);
+            if !signals.iter().any(|s| s.name == ln) {
+                signals.push(Signal {
+                    name: ln.clone(),
+                    width: 1,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                });
+            }
+            assigns.push((ln, *bit, rewrite_rexpr(rhs, &subst)));
+        }
+    }
+}
+
 fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let tok_start = p.i;
     if !p.eat_kw("module") {
         return Err("expected module".into());
     }
     let module = p.ident()?;
+    set_cur_mod(&module);
+    if slice_is_sim_only(&p.t[p.i..]) {
+        note_sim_only(&module);
+    }
     while p.eat_kw("import") {
         let _ = skip_item_or_block(&mut p);
     }
@@ -2272,6 +4168,8 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut pending_keep = false;
     let mut pending_md = false;
     let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
+    let mut funcs: Vec<FuncDef> = Vec::new();
+    skipped_funcs_clear();
     if parse_module_items(
         &mut p,
         &mut ports,
@@ -2283,11 +4181,34 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         &mut pending_keep,
         &mut pending_md,
         &mut mem_inits,
+        &mut funcs,
         "endmodule",
     )
     .is_err()
     {
         skip_until_kw(&mut p, "endmodule");
+    }
+    // Uncalled functions are skipped without re-entering the body.
+    // Lift only a function-only module, and parse those functions once.
+    let skipped = skipped_funcs_take();
+    let will_lift = !skipped.is_empty() && nbas.is_empty() && assigns.is_empty() && insts.is_empty();
+    if will_lift {
+        funcs = parse_functions_in_slice(&p.t[tok_start..p.i]);
+        lift_functions_if_no_body(&mut ports, &mut signals, &nbas, &mut assigns, &insts, &funcs);
+    } else {
+        let mut seen_fn = HashSet::new();
+        for name in skipped {
+            if seen_fn.insert(name.clone()) {
+                note_function_not_called(&module, &name);
+            }
+        }
+    }
+    if sim_only_for(&module) {
+        // A sim model is not a counter. Drop the leftover `assign cout = tmp_cout`
+        // so it cannot become a LUT, a MAC, or a closed WNS.
+        nbas.clear();
+        assigns.clear();
+        mem_inits.clear();
     }
     let toks = p.t[tok_start..p.i].to_vec();
     Ok(Rtl {
@@ -2303,6 +4224,31 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     })
 }
 
+/// `wire`/`logic name = expr` (assignment may start on the next line).
+/// A `reg` initializer is not a continuous assign. An unparsed RHS is a named
+/// diagnostic, not a folded 0.
+fn push_decl_assign(
+    p: &mut P,
+    assigns: &mut Vec<(String, Option<usize>, RExpr)>,
+    name: &str,
+    net_assign: bool,
+) {
+    if !p.eat_sym('=') {
+        return;
+    }
+    if !net_assign {
+        skip_until_arg_end(p);
+        return;
+    }
+    match parse_rexpr(p) {
+        Ok(rhs) => assigns.push((name.to_string(), None, rhs)),
+        Err(_) => {
+            note_assign_not_lowered(&cur_mod(), name);
+            skip_until_arg_end(p);
+        }
+    }
+}
+
 fn parse_module_items(
     mut p: &mut P,
     ports: &mut Vec<(String, PortDir, usize)>,
@@ -2314,8 +4260,12 @@ fn parse_module_items(
     pending_keep: &mut bool,
     pending_md: &mut bool,
     mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
+    funcs: &mut Vec<FuncDef>,
     endkw: &str,
 ) -> Result<(), String> {
+    for sig in signals.iter() {
+        note_width(p, &sig.name, sig.width);
+    }
     while !p.eat_kw(endkw) {
         if p.peek().is_none() {
             return Err(format!("unterminated until {endkw}"));
@@ -2333,7 +4283,11 @@ fn parse_module_items(
             }
         }
         if p.eat_kw("function") {
-            skip_until_kw(p, "endfunction");
+            // Do not parse the body. Uncalled functions are not LUTs; re-entering
+            // for/if/case inside them loops (Ibex mhpmcounter_get / PMP).
+            let name = skip_function_without_reentry(p);
+            skipped_funcs_push(name);
+            let _ = funcs;
             continue;
         }
         if p.eat_kw("task") {
@@ -2346,7 +4300,7 @@ fn parse_module_items(
         }
         if p.eat_kw("generate") {
             parse_module_items(
-                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                 "endgenerate",
             )?;
             continue;
@@ -2360,23 +4314,41 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("parameter") || p.eat_kw("localparam") {
-            skip_sv_type(p);
-            match p.ident() {
-                Ok(name) => {
-                    if p.eat_sym('=') {
-                        match const_u(p) {
-                            Ok(val) => {
-                                p.params.entry(name.clone()).or_insert(val);
-                                if !param_order.iter().any(|(n, _)| n == &name) {
-                                    param_order.push((name, val));
+            // `parameter width = 16, cycles = 1` — every name is elaborated.
+            // Skipping after the first used to leave `cycles` unknown, so
+            // `res[(-1)+cycles]` looked like a signal index.
+            loop {
+                skip_sv_type(p);
+                match p.ident() {
+                    Ok(name) => {
+                        if p.eat_sym('=') {
+                            if let Some(Tok::Str(sval)) = p.peek() {
+                                let h = str_param_hash(sval);
+                                p.bump();
+                                p.params.entry(name.clone()).or_insert(h);
+                            } else {
+                                match const_u(p) {
+                                    Ok(val) => {
+                                        p.params.entry(name.clone()).or_insert(val);
+                                        if !param_order.iter().any(|(n, _)| n == &name) {
+                                            param_order.push((name, val));
+                                        }
+                                    }
+                                    Err(_) => skip_until_arg_end(p),
                                 }
                             }
-                            Err(_) => skip_until_arg_end(p),
                         }
+                        if p.eat_sym(',') {
+                            continue;
+                        }
+                        skip_to_semi(p);
+                        break;
                     }
-                    skip_to_semi(p);
+                    Err(_) => {
+                        skip_to_semi(p);
+                        break;
+                    }
                 }
-                Err(_) => skip_to_semi(p),
             }
             continue;
         }
@@ -2411,13 +4383,13 @@ fn parse_module_items(
                 if yes && !taken {
                     if then_begin {
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                             "end",
                         )?;
                     } else {
                         // one module item; require a following else/endgenerate/endmodule delimiter
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                             "else",
                         )?;
                         // parse_module_items consumed the else keyword — put it back
@@ -2443,7 +4415,7 @@ fn parse_module_items(
                 if !taken {
                     if eb {
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
                             "end",
                         )?;
                     } else {
@@ -2484,20 +4456,68 @@ fn parse_module_items(
             skip_logic(&mut p);
             let w = p.width_opt()?;
             let n = p.ident()?;
-            ports.push((n.clone(), dir, w));
-            if !signals.iter().any(|s| s.name == n) {
+            if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n) {
+                // Non-ANSI header listed the name with default dir/width 1.
+                ex.1 = dir;
+                ex.2 = w;
+            } else {
+                ports.push((n.clone(), dir, w));
+            }
+            if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
+                sig.width = w;
+            } else {
                 signals.push(Signal {
-                    name: n,
+                    name: n.clone(),
                     width: w,
                     depth: 0,
                     keep: false,
                     mark_debug: false,
                 });
             }
+            note_width(p, &n, w);
+            // `input signed [W-1:0] a,b` — the same range applies to each name.
+            while p.eat_sym(',') {
+                let Ok(n2) = p.ident() else {
+                    break;
+                };
+                if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n2) {
+                    ex.1 = dir;
+                    ex.2 = w;
+                } else {
+                    ports.push((n2.clone(), dir, w));
+                }
+                if let Some(sig) = signals.iter_mut().find(|s| s.name == n2) {
+                    sig.width = w;
+                } else {
+                    signals.push(Signal {
+                        name: n2.clone(),
+                        width: w,
+                        depth: 0,
+                        keep: false,
+                        mark_debug: false,
+                    });
+                }
+                note_width(p, &n2, w);
+            }
             let _ = p.eat_sym(';');
             continue;
         }
-        if p.eat_kw("logic") || p.eat_kw("wire") || p.eat_kw("reg") {
+        let decl_kw = if p.eat_kw("logic") {
+            "logic"
+        } else if p.eat_kw("wire") {
+            "wire"
+        } else if p.eat_kw("reg") {
+            "reg"
+        } else {
+            ""
+        };
+        if !decl_kw.is_empty() {
+            // `wire` / `logic name = expr` is a net plus continuous assign.
+            // Split across a newline (`wire\n name = expr`) is the same form.
+            // `reg name = expr` stays an initializer, not a comb assign.
+            let net_assign = decl_kw != "reg";
+            // `reg signed [W-1:0] mem[N:0]` — signed is a qualifier, not the name.
+            skip_logic(p);
             let w = match p.width_opt() {
                 Ok(w) => w,
                 Err(_) => {
@@ -2519,43 +4539,52 @@ fn parse_module_items(
                 if let (Ok(hi), true, Ok(lo), true) =
                     (const_u(p), p.eat_sym(':'), const_u(p), p.eat_sym(']'))
                 {
-                    let hi = hi as usize;
-                    let lo = lo as usize;
-                    depth = hi.max(lo) - hi.min(lo) + 1;
+                    match range_width(hi, lo) {
+                        Ok(w) => depth = w,
+                        Err(_) => {
+                            note_width_overflow();
+                            depth = 0;
+                        }
+                    }
                 } else {
                     p.i = save;
                     skip_brackets(p);
                 }
             }
-            if !signals.iter().any(|s| s.name == n) {
+            if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
+                if w > 1 {
+                    sig.width = w;
+                }
+                if depth > 0 {
+                    sig.depth = depth;
+                }
+            } else {
                 signals.push(Signal {
-                    name: n,
+                    name: n.clone(),
                     width: w,
                     depth,
                     keep: *pending_keep,
                     mark_debug: *pending_md,
                 });
             }
-            if p.eat_sym('=') {
-                skip_until_arg_end(p);
-            }
+            note_width(p, &n, w);
+            push_decl_assign(p, assigns, &n, net_assign);
             while p.eat_sym(',') {
                 if let Ok(n2) = p.ident() {
                     if !signals.iter().any(|s| s.name == n2) {
                         signals.push(Signal {
-                            name: n2,
+                            name: n2.clone(),
                             width: w,
                             depth: 0,
                             keep: *pending_keep,
                             mark_debug: *pending_md,
                         });
                     }
+                    note_width(p, &n2, w);
                     if matches!(p.peek(), Some(Tok::Sym('['))) {
                         skip_brackets(p);
                     }
-                    if p.eat_sym('=') {
-                        skip_until_arg_end(p);
-                    }
+                    push_decl_assign(p, assigns, &n2, net_assign);
                 } else {
                     break;
                 }
@@ -2576,11 +4605,17 @@ fn parse_module_items(
                 }
                 match parse_nba(p) {
                     Ok((lhs, bit, rhs)) => {
-                        if let RExpr::Const { val, .. } = rhs {
-                            mem_inits
-                                .entry(lhs)
-                                .or_default()
-                                .insert(bit.unwrap_or(0), val);
+                        if let RExpr::Const { val, width, .. } = rhs {
+                            // A >128-bit initial does not fit the u128 const
+                            // model. Do not invent a BRAM from the low slice.
+                            if width > 128 {
+                                note_wide_literal(width);
+                            } else {
+                                mem_inits
+                                    .entry(lhs)
+                                    .or_default()
+                                    .insert(bit.unwrap_or(0), val);
+                            }
                         }
                     }
                     Err(_) => {
@@ -2664,12 +4699,22 @@ fn parse_module_items(
                         let _ = p.eat_sym(';');
                         assigns.push((lhs, bit, rhs));
                     }
-                    _ => skip_to_semi(p),
+                    _ => {
+                        note_skip(format!(
+                            "diagnostic skip_assign module={} (assign not parsed; not a LUT)",
+                            cur_mod()
+                        ));
+                        skip_to_semi(p);
+                    }
                 }
             }
             continue;
         }
         if p.eat_kw("always_comb") {
+            if sim_only_for(&cur_mod()) {
+                skip_procedural_body(p);
+                continue;
+            }
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
@@ -2677,35 +4722,99 @@ fn parse_module_items(
             match parse_seq_block(&mut p, block) {
                 Ok(stmts) => assigns.extend(stmts),
                 Err(_) => {
+                    note_skip(format!(
+                        "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
+                        cur_mod()
+                    ));
                     let _ = skip_item_or_block(p);
                 }
             }
             continue;
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
-            let combo = skip_event_control(p);
+            let (combo, edge_clk, negedge_only) = skip_event_control(p);
+            if sim_only_for(&cur_mod()) {
+                let _ = (combo, edge_clk, negedge_only);
+                skip_procedural_body(p);
+                continue;
+            }
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
             }
+            let body_start = p.i;
             match parse_seq_block(&mut p, block) {
                 Ok(stmts) => {
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
                         assigns.extend(stmts);
+                    } else if negedge_only {
+                        // Falling-edge always is its own clock. Do not fold it
+                        // into the posedge cone (that drops the name).
+                        let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        if stmts.is_empty() {
+                            let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
+                            note_negedge_write(&cur_mod(), &clk, &sig, None, None);
+                        } else {
+                            let mut seen = HashSet::new();
+                            for (lhs, bit, rhs) in &stmts {
+                                if seen.insert(lhs.clone()) {
+                                    note_negedge_write(
+                                        &cur_mod(),
+                                        &clk,
+                                        lhs,
+                                        *bit,
+                                        Some(rhs.clone()),
+                                    );
+                                }
+                            }
+                        }
                     } else {
                         // Includes async `posedge clk or negedge rst` (sync-reset mux).
+                        let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        if stmts.is_empty() {
+                            let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
+                            note_seq_write(&cur_mod(), &clk, &sig);
+                        } else {
+                            let mut seen = HashSet::new();
+                            for (lhs, _, _) in &stmts {
+                                if seen.insert(lhs.clone()) {
+                                    note_seq_write(&cur_mod(), &clk, lhs);
+                                }
+                            }
+                        }
                         nbas.extend(stmts);
                     }
                 }
                 Err(_) => {
+                    if negedge_only {
+                        let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        let end = p.i.min(p.t.len());
+                        let sig = seq_lhs_from_toks(&p.t[body_start..end]);
+                        note_negedge_write(&cur_mod(), &clk, &sig, None, None);
+                    } else {
+                        note_skip(format!(
+                            "diagnostic skip_always module={} (always body not parsed; not a LUT)",
+                            cur_mod()
+                        ));
+                        if !combo {
+                            let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                            let end = p.i.min(p.t.len());
+                            let sig = seq_lhs_from_toks(&p.t[body_start..end]);
+                            note_seq_write(&cur_mod(), &clk, &sig);
+                        }
+                    }
                     let _ = skip_item_or_block(p);
                 }
             }
             continue;
         }
         if p.eat_kw("function") {
-            skip_until_kw(p, "endfunction");
+            // Do not parse the body. Uncalled functions are not LUTs; re-entering
+            // for/if/case inside them loops (Ibex mhpmcounter_get / PMP).
+            let name = skip_function_without_reentry(p);
+            skipped_funcs_push(name);
+            let _ = funcs;
             continue;
         }
         if p.eat_kw("task") {
@@ -2717,8 +4826,8 @@ fn parse_module_items(
             continue;
         }
         if matches!(p.peek(), Some(Tok::Ident(_))) {
-            if let Ok(gate_as) = parse_gate_prim(&mut p) {
-                assigns.extend(gate_as);
+            if parse_gate_prim(&mut p).is_ok() {
+                // Consumed. Not an assign, not an unknown child, not a LUT.
                 continue;
             }
             if let Ok(inst) = parse_inst(&mut p) {
@@ -2768,7 +4877,7 @@ fn parse_for_unroll_module(
         return Err("for cmp".into());
     };
     let end = const_u(p)? as usize;
-    let end = if inclusive { end + 1 } else { end };
+    let end = if inclusive { end.saturating_add(1) } else { end };
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
@@ -2807,6 +4916,7 @@ fn parse_for_unroll_module(
             t: &toks,
             i: 0,
             params: p.params.clone(),
+            widths: p.widths.clone(),
         };
         let mut dummy_ports = Vec::new();
         let mut dummy_sigs = Vec::new();
@@ -2816,6 +4926,7 @@ fn parse_for_unroll_module(
         let mut local_nbas = Vec::new();
         let mut local_assigns = Vec::new();
         let mut local_insts = Vec::new();
+        let mut dummy_funcs: Vec<FuncDef> = Vec::new();
         if block {
             parse_module_items(
                 &mut sp,
@@ -2828,8 +4939,11 @@ fn parse_for_unroll_module(
                 &mut pk,
                 &mut pmd,
                 mem_inits,
+                &mut dummy_funcs,
                 "end",
             )?;
+        } else if parse_gate_prim(&mut sp).is_ok() {
+            // Generate-for of a gate primitive is not an instance and not a LUT.
         } else if let Ok(inst) = parse_inst(&mut sp) {
             local_insts.push(inst);
         } else {
@@ -2922,71 +5036,103 @@ fn parse_inst_net(p: &mut P) -> Option<String> {
 fn is_gate_prim(s: &str) -> bool {
     matches!(
         s,
-        "and" | "nand" | "or" | "nor" | "xor" | "xnor" | "not" | "buf"
+        "and"
+            | "nand"
+            | "or"
+            | "nor"
+            | "xor"
+            | "xnor"
+            | "not"
+            | "buf"
+            | "bufif0"
+            | "bufif1"
+            | "notif0"
+            | "notif1"
     )
 }
 
-fn fold_bin(kind: fn(Box<RExpr>, Box<RExpr>) -> RExpr, xs: &[RExpr]) -> Option<RExpr> {
-    let mut it = xs.iter().cloned();
-    let first = it.next()?;
-    Some(it.fold(first, |a, b| kind(Box::new(a), Box::new(b))))
+fn skip_balanced_paren(p: &mut P) -> bool {
+    if !p.eat_sym('(') {
+        return false;
+    }
+    let mut d = 1i32;
+    while d > 0 && p.peek().is_some() {
+        if p.eat_sym('(') {
+            d += 1;
+        } else if p.eat_sym(')') {
+            d -= 1;
+        } else {
+            p.bump();
+        }
+    }
+    d == 0
 }
 
-fn parse_gate_prim(p: &mut P) -> Result<Vec<(String, Option<usize>, RExpr)>, String> {
+/// Verilog gate primitive. Consume the statement. Do not invent a LUT mux
+/// and do not leave a child named `bufif1` for flatten/assemble to reprint.
+fn parse_gate_prim(p: &mut P) -> Result<(), String> {
     let start = p.i;
     let kind = match p.peek() {
         Some(Tok::Ident(s)) if is_gate_prim(s) => s.clone(),
         _ => return Err("not a gate".into()),
     };
     p.bump();
+    if p.eat_sym('#') {
+        if matches!(p.peek(), Some(Tok::Sym('('))) {
+            if !skip_balanced_paren(p) {
+                p.i = start;
+                return Err("gate delay".into());
+            }
+        } else {
+            p.bump();
+        }
+    }
+    let mut saw_list = false;
+    if matches!(p.peek(), Some(Tok::Sym('('))) {
+        if !skip_balanced_paren(p) {
+            p.i = start;
+            return Err("gate (".into());
+        }
+        saw_list = true;
+    }
     if matches!(p.peek(), Some(Tok::Ident(_))) {
         let _ = p.ident();
-    }
-    if !p.eat_sym('(') {
-        p.i = start;
-        return Err("gate (".into());
-    }
-    let mut args: Vec<String> = Vec::new();
-    loop {
-        if p.eat_sym(')') {
-            break;
+        if p.eat_sym('[') {
+            let mut d = 1i32;
+            while d > 0 && p.peek().is_some() {
+                if p.eat_sym('[') {
+                    d += 1;
+                } else if p.eat_sym(']') {
+                    d -= 1;
+                } else {
+                    p.bump();
+                }
+            }
         }
-        if p.peek().is_none() {
-            break;
-        }
-        if let Some(n) = parse_inst_net(p) {
-            args.push(n);
-        }
-        let _ = p.eat_sym(',');
     }
-    let _ = p.eat_sym(';');
-    if args.len() < 2 {
-        p.i = start;
-        return Err("gate args".into());
-    }
-    let out = args[0].clone();
-    let ins: Vec<RExpr> = args[1..].iter().cloned().map(RExpr::Ident).collect();
-    let rhs = match kind.as_str() {
-        "not" => RExpr::Not(Box::new(ins[0].clone())),
-        "buf" => ins[0].clone(),
-        "and" => fold_bin(RExpr::And, &ins).ok_or_else(|| "and".to_string())?,
-        "nand" => RExpr::Not(Box::new(
-            fold_bin(RExpr::And, &ins).ok_or_else(|| "nand".to_string())?,
-        )),
-        "or" => fold_bin(RExpr::Or, &ins).ok_or_else(|| "or".to_string())?,
-        "nor" => RExpr::Not(Box::new(
-            fold_bin(RExpr::Or, &ins).ok_or_else(|| "nor".to_string())?,
-        )),
-        "xor" => fold_bin(RExpr::Xor, &ins).ok_or_else(|| "xor".to_string())?,
-        "xnor" => RExpr::Not(Box::new(
-            fold_bin(RExpr::Xor, &ins).ok_or_else(|| "xnor".to_string())?,
-        )),
-        _ => {
+    if matches!(p.peek(), Some(Tok::Sym('('))) {
+        if !skip_balanced_paren(p) {
             p.i = start;
-            return Err("gate kind".into());
+            return Err("gate ports".into());
         }
-    };
-    Ok(vec![(out, None, rhs)])
+        saw_list = true;
+    }
+    while p.eat_sym(',') {
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            let _ = p.ident();
+        }
+        if !skip_balanced_paren(p) {
+            p.i = start;
+            return Err("gate inst".into());
+        }
+        saw_list = true;
+    }
+    if !saw_list || !p.eat_sym(';') {
+        p.i = start;
+        return Err("gate ;".into());
+    }
+    note_gate_primitive(&cur_mod(), &kind);
+    Ok(())
 }
 
 fn parse_inst(p: &mut P) -> Result<Inst, String> {
@@ -3246,6 +5392,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             width,
             ascending,
         } => index_part_bit(name, base, *width, *ascending, rtl, bit),
+        RExpr::WordAt { .. } => Err("word write is not a comb cone".into()),
         RExpr::Concat(parts) => {
             let mut offset = 0usize;
             for part in parts.iter().rev() {
@@ -3372,6 +5519,68 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
     }
 }
 
+
+/// Truth-table a boolean cone with ≤6 PIs. Linear in the AST, so a huge
+/// nested assign of a few inputs (Problem4) maps without lifting the Ibex
+/// AIG/add hang guard on wide cones.
+fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
+    fn collect(e: &Expr, vars: &mut Vec<String>, budget: &mut usize) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(_) => true,
+            Expr::Var(name) => {
+                if !vars.iter().any(|v| v == name) {
+                    if vars.len() >= 6 {
+                        return false;
+                    }
+                    vars.push(name.clone());
+                }
+                true
+            }
+            Expr::Not(x) => collect(x, vars, budget),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                collect(a, vars, budget) && collect(b, vars, budget)
+            }
+        }
+    }
+    fn eval(e: &Expr, env: &[(&str, bool)], budget: &mut usize) -> Option<bool> {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(b) => Some(*b),
+            Expr::Var(name) => env.iter().find(|(n, _)| *n == name.as_str()).map(|(_, b)| *b),
+            Expr::Not(x) => Some(!eval(x, env, budget)?),
+            Expr::And(a, b) => Some(eval(a, env, budget)? && eval(b, env, budget)?),
+            Expr::Or(a, b) => Some(eval(a, env, budget)? || eval(b, env, budget)?),
+            Expr::Xor(a, b) => Some(eval(a, env, budget)? ^ eval(b, env, budget)?),
+        }
+    }
+    let mut vars = Vec::new();
+    let mut budget = 64_000usize;
+    if !collect(expr, &mut vars, &mut budget) {
+        return None;
+    }
+    let n = vars.len();
+    let mut init = 0u64;
+    for addr in 0..64u64 {
+        let mut env: Vec<(&str, bool)> = Vec::with_capacity(n);
+        for (i, v) in vars.iter().enumerate() {
+            env.push((v.as_str(), (addr >> i) & 1 == 1));
+        }
+        let mut b = 80_000usize;
+        let bit = eval(expr, &env, &mut b)?;
+        if bit {
+            init |= 1u64 << addr;
+        }
+    }
+    Some((init, vars))
+}
+
 fn expr_node_count(e: &Expr) -> usize {
     fn walk(e: &Expr, budget: &mut usize) -> usize {
         if *budget == 0 {
@@ -3468,13 +5677,314 @@ fn rexpr_add_depth(e: &RExpr) -> usize {
             .max(rexpr_add_depth(t))
             .max(rexpr_add_depth(f)),
         RExpr::IndexPart { base, .. } => rexpr_add_depth(base),
+        RExpr::WordAt { addr, data } => rexpr_add_depth(addr).max(rexpr_add_depth(data)),
         RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
     }
 }
 
+fn name_known(rtl: &Rtl, name: &str) -> bool {
+    rtl.signals.iter().any(|s| s.name == name)
+        || rtl.ports.iter().any(|(n, _, _)| n == name)
+}
+
+fn rexpr_unknown_name(e: &RExpr, rtl: &Rtl) -> Option<String> {
+    let mut names = HashSet::new();
+    rexpr_names(e, &mut names);
+    names.into_iter().find(|n| !name_known(rtl, n))
+}
+
+/// Relational assign (`<` / `>=` / `==` and `&&`/`||`/`!` of those).
+fn rexpr_is_rel(e: &RExpr) -> bool {
+    match e {
+        RExpr::Lt(_, _) | RExpr::Eq(_, _) | RExpr::Ne(_, _) => true,
+        RExpr::Not(x) => rexpr_is_rel(x),
+        RExpr::And(a, b) | RExpr::Or(a, b) => rexpr_is_rel(a) || rexpr_is_rel(b),
+        _ => false,
+    }
+}
+
+/// A constant range is a test of a few bus bits, not a full-width cone.
+/// LUT6 holds at most this many inputs. Wider compares stay `assign_not_lowered`.
+const SMALL_REL_BITS: usize = 6;
+
+struct RelBus {
+    name: String,
+    width: usize,
+    /// Signal bit of vector bit 0 (`ident` is 0; `sig[hi:lo]` is `lo`).
+    lo: usize,
+}
+
+fn as_rel_bus(e: &RExpr, rtl: &Rtl) -> Option<RelBus> {
+    match e {
+        RExpr::Ident(s) if name_known(rtl, s) => {
+            let w = sig_width(rtl, s);
+            if w == 0 || w > 128 {
+                return None;
+            }
+            Some(RelBus {
+                name: s.clone(),
+                width: w,
+                lo: 0,
+            })
+        }
+        RExpr::Range(s, lo, hi) if name_known(rtl, s) && hi >= lo => {
+            let pw = sig_width(rtl, s);
+            if pw == 0 {
+                return None;
+            }
+            let hi = (*hi).min(pw - 1);
+            if *lo > hi {
+                return None;
+            }
+            let w = hi - *lo + 1;
+            if w > 128 {
+                return None;
+            }
+            Some(RelBus {
+                name: s.clone(),
+                width: w,
+                lo: *lo,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Numeric bound. A sized don't-care pattern is not a constant range.
+/// Unsized `'h8000` is tokenized with width = digit count; keep the value.
+fn const_rel_value(e: &RExpr) -> Option<u128> {
+    match e {
+        RExpr::Const { val, width, care } => {
+            if *width < 128 {
+                let mask = care_mask(*width);
+                if *care & mask != mask {
+                    return None;
+                }
+            }
+            Some(*val)
+        }
+        _ => None,
+    }
+}
+
+/// Signal bits that unsigned `bus < c` depends on. Empty = constant result.
+/// `None` if more bits matter than a LUT6 (not a small bit test).
+fn lt_relevant_sig_bits(bus: &RelBus, c: u128) -> Option<Vec<usize>> {
+    let w = bus.width;
+    let full = if w >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << w) - 1
+    };
+    let local: Vec<usize> = if c == 0 || c > full {
+        Vec::new()
+    } else {
+        let k = c.trailing_zeros() as usize;
+        if w - k > SMALL_REL_BITS {
+            return None;
+        }
+        (k..w).collect()
+    };
+    let pw = bus.lo.saturating_add(w);
+    let mut sig_bits = Vec::with_capacity(local.len());
+    for i in local {
+        let sb = bus.lo + i;
+        if sb >= pw {
+            return None;
+        }
+        sig_bits.push(sb);
+    }
+    Some(sig_bits)
+}
+
+fn push_rel_pi(out: &mut Vec<(String, usize)>, name: &str, bit: usize) -> bool {
+    if out.iter().any(|(n, b)| n == name && *b == bit) {
+        return true;
+    }
+    if out.len() >= SMALL_REL_BITS {
+        return false;
+    }
+    out.push((name.to_string(), bit));
+    true
+}
+
+/// `bus < const` / `const < bus` as a small bit set. Other compares are not this form.
+fn collect_lt_pis(a: &RExpr, b: &RExpr, rtl: &Rtl, out: &mut Vec<(String, usize)>) -> bool {
+    let (bus, c, _bus_on_left) = if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
+        (bus, c, true)
+    } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
+        // `const < bus` ≡ `bus > const` ≡ `!(bus < const+1)` when that stays in range.
+        let pw_ok = bus.width;
+        let full = if pw_ok >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << pw_ok) - 1
+        };
+        let bound = if c >= full { 0 } else { c + 1 };
+        // `bus > c` depends on the same bits as `bus < c+1` (or none if always false).
+        return match lt_relevant_sig_bits(&bus, bound) {
+            Some(bits) => bits.into_iter().all(|sb| push_rel_pi(out, &bus.name, sb)),
+            None => false,
+        };
+    } else {
+        return false;
+    };
+    let _ = _bus_on_left;
+    match lt_relevant_sig_bits(&bus, c) {
+        Some(bits) => bits.into_iter().all(|sb| push_rel_pi(out, &bus.name, sb)),
+        None => false,
+    }
+}
+
+fn formula_is_const_rel(e: &RExpr, rtl: &Rtl, out: &mut Vec<(String, usize)>, saw_lt: &mut bool) -> bool {
+    match e {
+        RExpr::Not(x) => formula_is_const_rel(x, rtl, out, saw_lt),
+        RExpr::And(a, b) | RExpr::Or(a, b) => {
+            formula_is_const_rel(a, rtl, out, saw_lt) && formula_is_const_rel(b, rtl, out, saw_lt)
+        }
+        RExpr::Lt(a, b) => {
+            *saw_lt = true;
+            collect_lt_pis(a, b, rtl, out)
+        }
+        _ => false,
+    }
+}
+
+fn eval_const_rel(e: &RExpr, rtl: &Rtl, env: &HashMap<String, bool>) -> Option<bool> {
+    match e {
+        RExpr::Not(x) => Some(!eval_const_rel(x, rtl, env)?),
+        RExpr::And(a, b) => Some(eval_const_rel(a, rtl, env)? && eval_const_rel(b, rtl, env)?),
+        RExpr::Or(a, b) => Some(eval_const_rel(a, rtl, env)? || eval_const_rel(b, rtl, env)?),
+        RExpr::Lt(a, b) => {
+            if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
+                Some(rel_bus_val(&bus, rtl, env) < c)
+            } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
+                Some(c < rel_bus_val(&bus, rtl, env))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn rel_bus_val(bus: &RelBus, rtl: &Rtl, env: &HashMap<String, bool>) -> u128 {
+    let pw = sig_width(rtl, &bus.name);
+    let mut v = 0u128;
+    for i in 0..bus.width {
+        let sb = bus.lo + i;
+        if sb >= 128 {
+            break;
+        }
+        if env
+            .get(&bit_name(&bus.name, pw, sb))
+            .copied()
+            .unwrap_or(false)
+        {
+            v |= 1u128 << i;
+        }
+    }
+    v
+}
+
+/// Lower `bus < const`, `bus >= const` (`!(bus < const)`), and `&&`/`||` of those
+/// to one LUT6 on only the bits that matter. A general compare wider than a LUT6
+/// returns `None` (caller keeps one `assign_not_lowered`).
+fn const_range_lut(e: &RExpr, rtl: &Rtl) -> Option<(u64, Vec<String>)> {
+    let mut pis: Vec<(String, usize)> = Vec::new();
+    let mut saw_lt = false;
+    if !formula_is_const_rel(e, rtl, &mut pis, &mut saw_lt) || !saw_lt {
+        return None;
+    }
+    let names: Vec<String> = pis
+        .iter()
+        .map(|(n, b)| bit_name(n, sig_width(rtl, n), *b))
+        .collect();
+    let n = names.len();
+    let mut init = 0u64;
+    let addrs = 1u64 << n;
+    for addr in 0..addrs {
+        let mut env = HashMap::new();
+        for (i, name) in names.iter().enumerate() {
+            env.insert(name.clone(), (addr >> i) & 1 == 1);
+        }
+        if eval_const_rel(e, rtl, &env)? {
+            init |= 1u64 << addr;
+        }
+    }
+    // Constant 0/1: fill the LUT so unused upper inputs do not matter.
+    if n == 0 {
+        init = if init & 1 == 1 { u64::MAX } else { 0 };
+    }
+    Some((init, names))
+}
+
+/// Unsized `'h8000` is tokenized with width = digit count, so the value does
+/// not fit. Expand only that case; sized literals keep their declared width.
+fn const_fit_width(val: u128, width: usize) -> usize {
+    let declared = width.max(1);
+    if declared >= 128 {
+        return declared;
+    }
+    let mask = care_mask(declared);
+    if val & !mask == 0 {
+        return declared;
+    }
+    let need = if val == 0 {
+        1
+    } else {
+        (128 - val.leading_zeros()) as usize
+    };
+    need.max(declared).min(128)
+}
+
+fn cmp_operand_width(e: &RExpr, rtl: &Rtl) -> usize {
+    match e {
+        RExpr::Const { val, width, .. } => const_fit_width(*val, *width),
+        other => rexpr_width(other, rtl).max(1),
+    }
+}
+
+/// Compare bit. Unknown names are an error, not const 0. Bits above a
+/// declared width are zero (unsigned), not a repeated MSB. A const whose
+/// value does not fit its token width uses the extra value bits.
+fn cmp_src_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+    match e {
+        RExpr::Const { val, width, care } => {
+            let fitted = const_fit_width(*val, *width);
+            if bit >= fitted.max(1) {
+                return Ok(Expr::Const(false));
+            }
+            if bit < *width && (*care >> bit) & 1 == 0 && (*val >> bit) & 1 == 0 {
+                return Ok(Expr::Const(false));
+            }
+            Ok(Expr::Const((*val >> bit) & 1 == 1))
+        }
+        RExpr::Ident(s) => {
+            if !name_known(rtl, s) {
+                return Err(format!("unknown name {s}"));
+            }
+            let w = sig_width(rtl, s);
+            if bit >= w {
+                Ok(Expr::Const(false))
+            } else {
+                Ok(Expr::Var(bit_name(s, w, bit)))
+            }
+        }
+        RExpr::Bit(s, i) => {
+            if !name_known(rtl, s) {
+                return Err(format!("unknown name {s}"));
+            }
+            let w = sig_width(rtl, s);
+            Ok(Expr::Var(bit_name(s, w, *i)))
+        }
+        other => rexpr_to_bit(other, rtl, bit),
+    }
+}
+
 fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, String> {
-    let wa = rexpr_width(a, rtl);
-    let wb = rexpr_width(b, rtl);
+    let wa = cmp_operand_width(a, rtl);
+    let wb = cmp_operand_width(b, rtl);
     let w = wa.max(wb).max(1);
     // FM-HEL-HANG: wide/nested Add under Eq → huge AIG (Ibex hang after CORPUS cmp).
     // Skip instead of hang; simple Ident/Const compares (corpus hswish/lrelu) still map.
@@ -3490,8 +6000,8 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
         if (care >> i) & 1 == 0 {
             continue;
         }
-        let ai = rexpr_to_bit(a, rtl, i)?;
-        let bi = rexpr_to_bit(b, rtl, i)?;
+        let ai = cmp_src_bit(a, rtl, i)?;
+        let bi = cmp_src_bit(b, rtl, i)?;
         let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
         acc = Some(match acc {
             None => xnor,
@@ -3502,7 +6012,7 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
 }
 
 fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
-    let w = rexpr_width(a, rtl).max(rexpr_width(b, rtl)).max(1);
+    let w = cmp_operand_width(a, rtl).max(cmp_operand_width(b, rtl)).max(1);
     // FM-HEL-HANG: same bound as cmp_eq_bits — skip huge cones instead of hang.
     if w > 32 {
         return Err("lt width too wide".into());
@@ -3513,8 +6023,8 @@ fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
     let mut acc = Expr::Const(false);
     let mut eq_so_far = Expr::Const(true);
     for i in (0..w).rev() {
-        let ai = rexpr_to_bit(a, rtl, i)?;
-        let bi = rexpr_to_bit(b, rtl, i)?;
+        let ai = cmp_src_bit(a, rtl, i)?;
+        let bi = cmp_src_bit(b, rtl, i)?;
         let a0b1 = Expr::And(Box::new(Expr::Not(Box::new(ai.clone()))), Box::new(bi.clone()));
         acc = Expr::Or(
             Box::new(acc),
@@ -3531,6 +6041,7 @@ fn rexpr_width(e: &RExpr, rtl: &Rtl) -> usize {
         RExpr::Ident(s) | RExpr::Bit(s, _) => sig_width(rtl, s),
         RExpr::Range(_, lo, hi) => hi - lo + 1,
         RExpr::IndexPart { width, .. } => (*width).max(1),
+        RExpr::WordAt { data, .. } => rexpr_width(data, rtl).max(1),
         RExpr::Const { width, .. } => (*width).max(1),
         RExpr::Concat(parts) => parts.iter().map(|p| rexpr_width(p, rtl).max(1)).sum(),
         RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width(a, rtl),
@@ -3736,6 +6247,45 @@ fn lut6_and2(a_inv: bool, b_inv: bool, o_inv: bool) -> u64 {
     acc
 }
 
+fn lut6_xor2() -> u64 {
+    0x6666_6666_6666_6666
+}
+
+fn lut6_from_i012(f: impl Fn(bool, bool, bool) -> bool) -> u64 {
+    let mut pat = 0u64;
+    for addr in 0..8u32 {
+        let i0 = addr & 1 == 1;
+        let i1 = addr & 2 == 2;
+        let i2 = addr & 4 == 4;
+        if f(i0, i1, i2) {
+            pat |= 1u64 << addr;
+        }
+    }
+    let mut acc = 0u64;
+    let mut sh = 0;
+    while sh < 64 {
+        acc |= pat << sh;
+        sh += 8;
+    }
+    acc
+}
+
+fn lut6_xor3() -> u64 {
+    lut6_from_i012(|a, b, c| a ^ b ^ c)
+}
+
+fn lut6_maj3() -> u64 {
+    lut6_from_i012(|a, b, c| (a && b) || (b && c) || (a && c))
+}
+
+fn emit_lut_pins(d: &mut Design, cell: &str, out: &str, init: u64, pins: &[(&str, &str)]) {
+    d.add_cell(cell, CellKind::Lut6 { init });
+    d.connect(out, cell, "O");
+    for (net, pin) in pins {
+        d.connect(*net, cell, *pin);
+    }
+}
+
 fn lut6_inv() -> u64 {
     0x5555_5555_5555_5555
 }
@@ -3748,8 +6298,66 @@ fn lut6_const(one: bool) -> u64 {
     }
 }
 
+/// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
+/// printed `node_count` once per bit then spun in `map_wide_cone` until the
+/// 90s kill. Modest cones still lower; over this, one diagnostic and stop.
+const WIDE_CONE_PI_CAP: usize = 16;
+const WIDE_CONE_AND_CAP: usize = 96;
+const WIDE_CONE_MODULE_LUT_CAP: usize = 128;
+
+fn wide_aig_over_cap(aig: &Aig) -> bool {
+    aig.pis.len() > WIDE_CONE_PI_CAP || aig.ands.len() > WIDE_CONE_AND_CAP
+}
+
+/// One line per module. Further wide cones are skipped, not re-announced.
+fn emit_wide_cone(module: &str, signal: &str, capped: &mut bool) {
+    if *capped {
+        return;
+    }
+    *capped = true;
+    note_skip(format!(
+        "diagnostic wide_cone module={module} signal={signal} (wide_cone_cap pis>{pi} ands>{ands} luts>{luts}; cone not mapped; not a LUT; not a closed WNS)",
+        pi = WIDE_CONE_PI_CAP,
+        ands = WIDE_CONE_AND_CAP,
+        luts = WIDE_CONE_MODULE_LUT_CAP,
+    ));
+}
+
+/// True if the cone has more than `n` distinct PIs, or the walk budget dies
+/// before that can be ruled out. Stops at the (n+1)th variable so a wide
+/// compare does not full-eval.
+fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
+    fn walk(e: &Expr, vars: &mut Vec<String>, budget: &mut usize, n: usize) -> bool {
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        match e {
+            Expr::Const(_) => false,
+            Expr::Var(name) => {
+                if !vars.iter().any(|v| v == name) {
+                    vars.push(name.clone());
+                    if vars.len() > n {
+                        return true;
+                    }
+                }
+                false
+            }
+            Expr::Not(x) => walk(x, vars, budget, n),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                walk(a, vars, budget, n) || walk(b, vars, budget, n)
+            }
+        }
+    }
+    let mut vars = Vec::new();
+    let mut budget = 8_000usize;
+    walk(e, &mut vars, &mut budget, n)
+}
+
 /// Map a >6-PI cone to a LUT2 tree. Output net is the function of `aig`.
 /// PI<=6 stays on the single-LUT6 path so gold INIT patterns do not move.
+/// Caller must refuse `wide_aig_over_cap` before calling; this does not invent
+/// a partial cone past the and/PI cap.
 fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
     use std::collections::HashMap;
     let mut node_net: HashMap<u32, String> = HashMap::new();
@@ -3813,25 +6421,874 @@ fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
     lit_net(d, aig, aig.output, prefix, &mut n_lut, &mut node_net)
 }
 
+/// Q net of one bit of an unpacked word. Distinct from packed `bit_name`.
+fn unpacked_word_q(mem: &str, word: usize, width: usize, bit: usize) -> String {
+    if width <= 1 {
+        format!("{mem}_w{word}")
+    } else {
+        format!("{mem}_w{word}_{bit}")
+    }
+}
+
+/// Hold-through CE, or the naked next-state if the always is not gated.
+fn peel_word_enable<'a>(rhs: &'a RExpr, mem: &str) -> Option<(Option<RExpr>, &'a RExpr)> {
+    match rhs {
+        RExpr::Mux(c, t, f) => {
+            let hold = match f.as_ref() {
+                RExpr::Ident(s) if s == mem => true,
+                RExpr::Bit(s, _) if s == mem => true,
+                _ => false,
+            };
+            if !hold {
+                return None;
+            }
+            Some((Some((**c).clone()), t.as_ref()))
+        }
+        other => Some((None, other)),
+    }
+}
+
+enum WordShiftSrc {
+    Packed(String),
+    Word(usize),
+}
+
+/// Const-index unpacked write source: another word of the same array, or a packed vector.
+fn classify_word_src(rtl: &Rtl, mem: &str, rhs: &RExpr) -> Option<WordShiftSrc> {
+    match rhs {
+        RExpr::Ident(s) if s != mem && sig_depth(rtl, s) == 0 => {
+            Some(WordShiftSrc::Packed(s.clone()))
+        }
+        RExpr::Bit(s, w) if s == mem && sig_depth(rtl, s) > 0 => Some(WordShiftSrc::Word(*w)),
+        _ => None,
+    }
+}
+
+/// Enable must stay a handful of PIs. A wide enable is not this shift.
+fn simple_word_enable(en: &RExpr, rtl: &Rtl) -> Option<Expr> {
+    let e = rexpr_to_bit(en, rtl, 0).ok()?;
+    if cone_pi_exceeds(&e, 4) {
+        return None;
+    }
+    Some(e)
+}
+
+fn word_ce_mux(en: Expr, next: Expr, hold: Expr) -> Expr {
+    Expr::Or(
+        Box::new(Expr::And(Box::new(en.clone()), Box::new(next))),
+        Box::new(Expr::And(Box::new(Expr::Not(Box::new(en))), Box::new(hold))),
+    )
+}
+
+/// Bounded unpacked clocked shift / load onto the user's clock.
+/// 3×12 enable-gated word copies become per-bit Hffs. A variable-index read
+/// is not expanded here — that would be a wide mux, not this lower.
+/// Returns (reg bits, memory names that lowered). Empty if no safe write.
+fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<String>) {
+    const MAX_DEPTH: usize = 16;
+    const MAX_WIDTH: usize = 32;
+    const MAX_BITS: usize = 128;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if sig_depth(rtl, lhs) == 0 {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut out = Vec::new();
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0
+            || depth > MAX_DEPTH
+            || width > MAX_WIDTH
+            || depth.saturating_mul(width) > MAX_BITS
+        {
+            continue;
+        }
+        let writes: Vec<_> = rtl
+            .nbas
+            .iter()
+            .filter(|(lhs, _, _)| lhs == &mem)
+            .collect();
+        if writes.is_empty() {
+            continue;
+        }
+        let mut planned: Vec<(usize, Option<Expr>, WordShiftSrc)> = Vec::new();
+        let mut ok = true;
+        for (_, bit, rhs) in writes {
+            let Some(word) = *bit else {
+                ok = false;
+                break;
+            };
+            if word >= depth {
+                ok = false;
+                break;
+            }
+            let Some((en_r, src_r)) = peel_word_enable(rhs, &mem) else {
+                ok = false;
+                break;
+            };
+            let Some(src) = classify_word_src(rtl, &mem, src_r) else {
+                ok = false;
+                break;
+            };
+            if let WordShiftSrc::Word(w) = &src {
+                if *w >= depth {
+                    ok = false;
+                    break;
+                }
+            }
+            let en = if let Some(er) = en_r {
+                match simple_word_enable(&er, rtl) {
+                    Some(e) => Some(e),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(slot) = planned.iter_mut().find(|(w, _, _)| *w == word) {
+                *slot = (word, en, src);
+            } else {
+                planned.push((word, en, src));
+            }
+        }
+        if !ok || planned.is_empty() {
+            continue;
+        }
+        for (word, en, src) in planned {
+            for bit in 0..width {
+                let next = match &src {
+                    WordShiftSrc::Packed(s) => {
+                        let sw = sig_width(rtl, s);
+                        if bit >= sw {
+                            Expr::Const(false)
+                        } else {
+                            Expr::Var(bit_name(s, sw, bit))
+                        }
+                    }
+                    WordShiftSrc::Word(w) => Expr::Var(unpacked_word_q(&mem, *w, width, bit)),
+                };
+                let qn = unpacked_word_q(&mem, word, width, bit);
+                let d = if let Some(en) = en.clone() {
+                    word_ce_mux(en, next, Expr::Var(qn.clone()))
+                } else {
+                    next
+                };
+                out.push((qn, d));
+            }
+        }
+        lowered.insert(mem);
+    }
+    (out, lowered)
+}
+
+/// Constant word index of an unpacked array. A signal index is not a constant.
+fn const_rexpr_usize(e: &RExpr) -> Option<usize> {
+    match e {
+        RExpr::Const { val, .. } => usize::try_from(*val).ok(),
+        _ => None,
+    }
+}
+
+/// `{bus, {K{1'b0}}}` — zeros on the low side. `Ok((bus, K))` when K is
+/// 1..=8 and the bus is a wire. `Err(())` is that shape but not a wire
+/// alignment (not a LUT, caller names `assign_not_lowered`). Other concats
+/// are `None` and stay on the existing path.
+fn zero_fill_concat(rhs: &RExpr) -> Option<Result<(String, usize), ()>> {
+    let RExpr::Concat(parts) = rhs else {
+        return None;
+    };
+    if parts.len() != 2 {
+        return None;
+    }
+    let zeros = match &parts[1] {
+        RExpr::Const { val: 0, width, .. } if *width >= 1 => *width,
+        _ => return None,
+    };
+    let bus = match &parts[0] {
+        RExpr::Ident(s) => s.clone(),
+        _ => return Some(Err(())),
+    };
+    if (1..=8).contains(&zeros) {
+        Some(Ok((bus, zeros)))
+    } else {
+        Some(Err(()))
+    }
+}
+
+fn const_unpacked_word(rhs: &RExpr, rtl: &Rtl) -> Option<(String, usize)> {
+    match rhs {
+        RExpr::Bit(name, idx) if sig_depth(rtl, name) > 0 && *idx < sig_depth(rtl, name) => {
+            Some((name.clone(), *idx))
+        }
+        RExpr::IndexPart { name, base, .. } if sig_depth(rtl, name) > 0 => {
+            let idx = const_rexpr_usize(base)?;
+            if idx < sig_depth(rtl, name) {
+                Some((name.clone(), idx))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn packed_add_pair(rhs: &RExpr, rtl: &Rtl) -> Option<(String, String)> {
+    let RExpr::Add(a, b) = rhs else {
+        return None;
+    };
+    if expr_contains_mul(rhs) {
+        return None;
+    }
+    let a_name = match a.as_ref() {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 => s.clone(),
+        _ => return None,
+    };
+    let b_name = match b.as_ref() {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 => s.clone(),
+        _ => return None,
+    };
+    Some((a_name, b_name))
+}
+
+fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
+    let w = sig_width(rtl, name);
+    if bit >= w {
+        None
+    } else {
+        Some(bit_name(name, w, bit))
+    }
+}
+
+/// Combinational ripple of two named buses into `assign sum = a + b`.
+/// Each bit is a 1-bit full adder (a, b, cin), not one 64-PI cone.
+/// No clock, no Hff, not a MAC. `width` > 32 is refused by the caller
+/// so a shorter bus is not invented. Returns false if any bit is skipped.
+fn emit_ripple_add(
+    d: &mut Design,
+    rtl: &Rtl,
+    sum: &str,
+    width: usize,
+    a: &str,
+    b: &str,
+) -> bool {
+    if width == 0 || width > 32 {
+        return false;
+    }
+    // A missing operand bit is a skip, not a zero-extended invented bus.
+    if (0..width).any(|bit| op_bit_net(rtl, a, bit).is_none() || op_bit_net(rtl, b, bit).is_none()) {
+        return false;
+    }
+    let mut cin: Option<String> = None;
+    for bit in 0..width {
+        let an = op_bit_net(rtl, a, bit);
+        let bn = op_bit_net(rtl, b, bit);
+        let sum_net = bit_name(sum, width, bit);
+        let sum_cell = format!("u_ra_{sum}_{bit}s");
+        let cin_now = cin.clone();
+        let emitted = match (an.as_deref(), bn.as_deref(), cin_now.as_deref()) {
+            (Some(an), Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(an, "I0"), (bn, "I1")]);
+                if bit + 1 < width {
+                    let cout = format!("n_ra_{sum}_{bit}c");
+                    let cry_cell = format!("u_ra_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (bn, "I1")],
+                    );
+                    cin = Some(cout);
+                }
+                true
+            }
+            (Some(an), Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xor3(),
+                    &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("n_ra_{sum}_{bit}c");
+                    let cry_cell = format!("u_ra_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_maj3(),
+                        &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                    );
+                    cin = Some(cout);
+                }
+                true
+            }
+            _ => false,
+        };
+        if !emitted {
+            return false;
+        }
+    }
+    eprintln!("synth_rtl ripple_add signal={sum} bits={width}");
+    true
+}
+
+/// Ripple add of two packed vectors into one unpacked word, clocked by `clk`.
+/// Signed and unsigned agree on the `width` sum bits. Not a MAC.
+fn emit_word_add(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    mem: &str,
+    word: usize,
+    width: usize,
+    a: &str,
+    b: &str,
+) {
+    let mut cin: Option<String> = None;
+    for bit in 0..width {
+        let an = op_bit_net(rtl, a, bit);
+        let bn = op_bit_net(rtl, b, bit);
+        let sum = format!("u_add{word}_{bit}s");
+        let qn = unpacked_word_q(mem, word, width, bit);
+        let sum_cell = format!("u_alu{word}_{bit}s");
+        let cin_now = cin.clone();
+        match (an.as_deref(), bn.as_deref(), cin_now.as_deref()) {
+            (Some(an), Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum, lut6_xor2(), &[(an, "I0"), (bn, "I1")]);
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (bn, "I1")],
+                    );
+                    cin = Some(cout);
+                }
+            }
+            (Some(an), Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum,
+                    lut6_xor3(),
+                    &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_maj3(),
+                        &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                    );
+                    cin = Some(cout);
+                }
+            }
+            _ => {
+                let src = an.clone().or(bn.clone());
+                if let Some(src) = src.as_deref() {
+                    emit_lut_pins(
+                        d,
+                        &sum_cell,
+                        &sum,
+                        lut6_and2(false, false, false),
+                        &[(src, "I0"), (src, "I1")],
+                    );
+                } else {
+                    emit_lut_pins(d, &sum_cell, &sum, lut6_const(false), &[]);
+                }
+                if bit + 1 < width {
+                    cin = None;
+                }
+            }
+        }
+        let ff = format!("u_aff{word}_{bit}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(clk, &ff, "CLK");
+        d.connect(&sum, &ff, "D");
+        d.connect(&qn, &ff, "Q");
+    }
+    eprintln!("synth_rtl word_add mem={mem} word={word} bits={width} clk={clk}");
+}
+
+/// Pipeline word: Hff clocked by `clk`, D from the previous word. Not an adder.
+fn emit_word_shift(d: &mut Design, clk: &str, mem: &str, word: usize, from: usize, width: usize) {
+    for bit in 0..width {
+        let dnet = unpacked_word_q(mem, from, width, bit);
+        let qn = unpacked_word_q(mem, word, width, bit);
+        let ff = format!("u_sff{word}_{bit}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(clk, &ff, "CLK");
+        d.connect(&dnet, &ff, "D");
+        d.connect(&qn, &ff, "Q");
+    }
+    eprintln!("synth_rtl word_shift mem={mem} word={word} from={from} bits={width} clk={clk}");
+}
+
+fn lower_const_word_adds(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    already: &HashSet<String>,
+) -> HashSet<String> {
+    const MAX_WIDTH: usize = 32;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, bit, rhs) in &rtl.nbas {
+        if already.contains(lhs) || sig_depth(rtl, lhs) == 0 || bit.is_none() {
+            continue;
+        }
+        if packed_add_pair(rhs, rtl).is_none() {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0 || width > MAX_WIDTH {
+            continue;
+        }
+        let mut words: Vec<(usize, String, String)> = Vec::new();
+        let mut ok = true;
+        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| lhs == &mem) {
+            let Some(word) = *bit else {
+                ok = false;
+                break;
+            };
+            if word >= depth {
+                ok = false;
+                break;
+            }
+            let Some((a, b)) = packed_add_pair(rhs, rtl) else {
+                ok = false;
+                break;
+            };
+            if let Some(slot) = words.iter_mut().find(|(w, _, _)| *w == word) {
+                *slot = (word, a, b);
+            } else {
+                words.push((word, a, b));
+            }
+        }
+        if !ok || words.is_empty() {
+            continue;
+        }
+        for (word, a, b) in &words {
+            emit_word_add(d, rtl, clk, &mem, *word, width, a, b);
+        }
+        lowered.insert(mem);
+    }
+    lowered
+}
+
+/// `res[0] <= a+b` plus `for (i = 1; i < cycles) res[i] <= res[i-1]`.
+/// Constant cycles 2, 3, or 4 unroll as Hff word shifts. q aliases the last
+/// word. More than 4 words, or a non-constant bound: one `word_pipeline_cap`,
+/// the add stays in word 0, extra stages are not invented, WNS is not closed.
+fn lower_word_pipeline(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    already: &HashSet<String>,
+) -> HashSet<String> {
+    const MAX_WORDS: usize = 4;
+    const MAX_WIDTH: usize = 32;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if already.contains(lhs) || sig_depth(rtl, lhs) == 0 {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0 || width > MAX_WIDTH {
+            continue;
+        }
+        let mut adds: Vec<(usize, String, String)> = Vec::new();
+        let mut shifts: Vec<(usize, usize)> = Vec::new();
+        let mut ok = true;
+        let mut saw_shift = false;
+        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| lhs == &mem) {
+            let Some(word) = *bit else {
+                ok = false;
+                break;
+            };
+            if word >= depth {
+                ok = false;
+                break;
+            }
+            let Some((en, src)) = peel_word_enable(rhs, &mem) else {
+                ok = false;
+                break;
+            };
+            if en.is_some() {
+                ok = false;
+                break;
+            }
+            if let Some((a, b)) = packed_add_pair(src, rtl) {
+                if let Some(slot) = adds.iter_mut().find(|(w, _, _)| *w == word) {
+                    *slot = (word, a, b);
+                } else {
+                    adds.push((word, a, b));
+                }
+            } else if let Some(WordShiftSrc::Word(from)) = classify_word_src(rtl, &mem, src) {
+                saw_shift = true;
+                if let Some(slot) = shifts.iter_mut().find(|(w, _)| *w == word) {
+                    *slot = (word, from);
+                } else {
+                    shifts.push((word, from));
+                }
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if !ok || !saw_shift || adds.len() != 1 || adds[0].0 != 0 {
+            continue;
+        }
+        if shifts
+            .iter()
+            .any(|(w, from)| *w == 0 || *from + 1 != *w || *from >= depth)
+        {
+            continue;
+        }
+        let max_word = shifts.iter().map(|(w, _)| *w).max().unwrap_or(0);
+        let words = depth.max(max_word + 1);
+        let add_a = adds[0].1.clone();
+        let add_b = adds[0].2.clone();
+        if words > MAX_WORDS || word_pipeline_cap_for(&rtl.module) {
+            note_word_pipeline_cap(&rtl.module, &mem, &words.to_string());
+            emit_word_add(d, rtl, clk, &mem, 0, width, &add_a, &add_b);
+            eprintln!(
+                "synth_rtl word_pipeline_cap mem={mem} words={words} hffs={width} add_word=0 clk={clk}"
+            );
+            lowered.insert(mem);
+            continue;
+        }
+        emit_word_add(d, rtl, clk, &mem, 0, width, &add_a, &add_b);
+        let mut emitted = 1usize;
+        let mut shift_ws = shifts.clone();
+        shift_ws.sort_by_key(|(w, _)| *w);
+        for (word, from) in shift_ws {
+            if word >= MAX_WORDS {
+                continue;
+            }
+            emit_word_shift(d, clk, &mem, word, from, width);
+            emitted += 1;
+        }
+        let q_word = words.saturating_sub(1);
+        eprintln!(
+            "synth_rtl word_pipeline mem={mem} words={words} q_word={q_word} hffs={} add_word=0 clk={clk}",
+            emitted * width
+        );
+        lowered.insert(mem.clone());
+    }
+    lowered
+}
+
+/// `we && (addr == word)` as one LUT6. Address plus enable must stay ≤6 PIs.
+fn addr_match_expr(addr: &str, addr_w: usize, word: usize, en: Option<&Expr>) -> Expr {
+    let mut acc: Option<Expr> = None;
+    for i in 0..addr_w.max(1) {
+        let bit = Expr::Var(bit_name(addr, addr_w, i));
+        let term = if (word >> i) & 1 == 1 {
+            bit
+        } else {
+            Expr::Not(Box::new(bit))
+        };
+        acc = Some(match acc {
+            None => term,
+            Some(a) => Expr::And(Box::new(a), Box::new(term)),
+        });
+    }
+    let eq = acc.unwrap_or(Expr::Const(true));
+    if let Some(en) = en {
+        Expr::And(Box::new(en.clone()), Box::new(eq))
+    } else {
+        eq
+    }
+}
+
+fn emit_small_lut(d: &mut Design, cell: &str, out: &str, expr: &Expr) -> bool {
+    if cone_pi_exceeds(expr, 6) || expr_node_count(expr) > 256 {
+        return false;
+    }
+    let aig = Aig::from_expr(expr);
+    if aig.pis.len() > 6 {
+        return false;
+    }
+    let init = aig.flowmap_lut6();
+    d.add_cell(cell, CellKind::Lut6 { init });
+    d.connect(out, cell, "O");
+    for (pin, pi) in aig.pis.iter().enumerate() {
+        d.connect(pi, cell, format!("I{pin}"));
+    }
+    true
+}
+
+struct VarWordWrite {
+    en: Option<Expr>,
+    addr: String,
+    addr_w: usize,
+    data: String,
+}
+
+/// Peel `if (we) mem[addr] <= data` (hold the unselected words).
+fn peel_var_word_write(rhs: &RExpr, mem: &str, rtl: &Rtl) -> Option<VarWordWrite> {
+    let (en_r, payload) = match rhs {
+        RExpr::WordAt { .. } => (None, rhs),
+        RExpr::Mux(c, t, f) => {
+            let hold = match f.as_ref() {
+                RExpr::Ident(s) if s == mem => true,
+                RExpr::Bit(s, _) if s == mem => true,
+                _ => false,
+            };
+            if !hold {
+                return None;
+            }
+            (Some(c.as_ref()), t.as_ref())
+        }
+        _ => return None,
+    };
+    let RExpr::WordAt { addr, data } = payload else {
+        return None;
+    };
+    let RExpr::Ident(addr_name) = addr.as_ref() else {
+        return None;
+    };
+    let RExpr::Ident(data_name) = data.as_ref() else {
+        return None;
+    };
+    if sig_depth(rtl, addr_name) > 0 || sig_depth(rtl, data_name) > 0 {
+        return None;
+    }
+    let addr_w = sig_width(rtl, addr_name).max(1);
+    if addr_w > 6 {
+        return None;
+    }
+    let en = if let Some(er) = en_r {
+        Some(simple_word_enable(er, rtl)?)
+    } else {
+        None
+    };
+    if en.is_some() && addr_w > 5 {
+        return None;
+    }
+    Some(VarWordWrite {
+        en,
+        addr: addr_name.clone(),
+        addr_w,
+        data: data_name.clone(),
+    })
+}
+
+/// Bounded unpacked variable-index write: one Hff per bit, clocked by `clk`.
+/// Depth ≤32 and width ≤16. The read is not expanded — address compare is a
+/// shared ≤6-PI LUT, then a 3-PI hold mux per bit. Not a >16 PI cone.
+fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String> {
+    const MAX_DEPTH: usize = 32;
+    const MAX_WIDTH: usize = 16;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if sig_depth(rtl, lhs) == 0 {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0 || depth > MAX_DEPTH || width > MAX_WIDTH {
+            continue;
+        }
+        let need = if depth <= 1 {
+            1
+        } else {
+            (usize::BITS - (depth - 1).leading_zeros()) as usize
+        };
+        let writes: Vec<_> = rtl
+            .nbas
+            .iter()
+            .filter(|(lhs, _, _)| lhs == &mem)
+            .collect();
+        if writes.is_empty() {
+            continue;
+        }
+        let mut planned: Option<VarWordWrite> = None;
+        let mut ok = true;
+        for (_, bit, rhs) in writes {
+            if bit.is_some() {
+                ok = false;
+                break;
+            }
+            let Some(w) = peel_var_word_write(rhs, &mem, rtl) else {
+                ok = false;
+                break;
+            };
+            if w.addr_w < need || depth > (1usize << w.addr_w.min(16)) {
+                ok = false;
+                break;
+            }
+            if let Some(prev) = &planned {
+                if prev.addr != w.addr || prev.data != w.data {
+                    ok = false;
+                    break;
+                }
+            } else {
+                planned = Some(w);
+            }
+        }
+        let Some(plan) = planned else {
+            continue;
+        };
+        if !ok {
+            continue;
+        }
+        let mut matches: Vec<(String, Expr)> = Vec::new();
+        for word in 0..depth {
+            let expr = addr_match_expr(&plan.addr, plan.addr_w, word, plan.en.as_ref());
+            if cone_pi_exceeds(&expr, 6) {
+                ok = false;
+                break;
+            }
+            let aig = Aig::from_expr(&expr);
+            if aig.pis.len() > 6 {
+                ok = false;
+                break;
+            }
+            matches.push((format!("{mem}_we{word}"), expr));
+        }
+        if !ok || matches.len() != depth {
+            continue;
+        }
+        let data_w = sig_width(rtl, &plan.data);
+        for (net, expr) in &matches {
+            let cell = format!("u_{net}");
+            if !emit_small_lut(d, &cell, net, expr) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mut bit_i = 0usize;
+        for word in 0..depth {
+            let mnet = format!("{mem}_we{word}");
+            for bit in 0..width {
+                let next = if bit >= data_w {
+                    Expr::Const(false)
+                } else {
+                    Expr::Var(bit_name(&plan.data, data_w, bit))
+                };
+                let qn = unpacked_word_q(&mem, word, width, bit);
+                let mux = word_ce_mux(Expr::Var(mnet.clone()), next, Expr::Var(qn.clone()));
+                let lut = format!("u_vwl{bit_i}");
+                let dnet = format!("u_vwd{bit_i}");
+                if !emit_small_lut(d, &lut, &dnet, &mux) {
+                    ok = false;
+                    break;
+                }
+                let ff = format!("u_vwff{bit_i}");
+                d.add_cell(&ff, CellKind::Hff);
+                d.connect(clk, &ff, "CLK");
+                d.connect(&dnet, &ff, "D");
+                d.connect(&qn, &ff, "Q");
+                bit_i += 1;
+            }
+            if !ok {
+                break;
+            }
+        }
+        if ok && bit_i == depth.saturating_mul(width) {
+            lowered.insert(mem);
+        }
+    }
+    lowered
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
-        d.add_port(n, *dir);
+        // A read-only inout is a load-enable input, not an output pad and
+        // not a made-up bus. Timing still sees a plain input.
+        let dir = if matches!(dir, PortDir::Inout) {
+            PortDir::In
+        } else {
+            *dir
+        };
+        d.add_port(n, dir);
     }
-    let clk = rtl
-        .ports
-        .iter()
-        .find(|(n, dir, _)| *dir == PortDir::In && n == "clk")
-        .or_else(|| rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
-        .map(|(n, _, _)| n.as_str())
-        .unwrap_or("clk");
+    // User clock is the posedge/negedge name when that port exists.
+    // Otherwise the historical first-`clk`/first-input pick (gold counter).
+    let clk_owned = edge_clk_of(&rtl.module)
+        .filter(|c| {
+            rtl.ports
+                .iter()
+                .any(|(n, dir, _)| n == c && *dir == PortDir::In)
+        })
+        .or_else(|| {
+            rtl.ports
+                .iter()
+                .find(|(n, dir, _)| *dir == PortDir::In && n == "clk")
+                .or_else(|| rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
+                .map(|(n, _, _)| n.clone())
+        })
+        .unwrap_or_else(|| "clk".into());
+    let clk = clk_owned.as_str();
+
+    // `$display` / X/Z compare is a simulator model. Do not invent LUTs or MACs.
+    if sim_only_for(&rtl.module) {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+        return Ok(d);
+    }
 
     // Flatten NBAs into per-bit (name_bit, expr)
     // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
-    rexpr_bit_budget_reset(80_000);
+    // Linear visit budget. Add/cmp hang guards stay elsewhere (Ibex).
+    rexpr_bit_budget_reset(400_000);
     let mut reg_bits: Vec<(String, Expr)> = Vec::new();
     let mut n_mac = 0usize;
     let mut n_bram = 0usize;
+    // Bounded unpacked shift (const word index, small depth×width) → Hffs.
+    // A variable-index read is not expanded here.
+    let (unpacked_bits, mut lowered_unpacked) = lower_unpacked_clocked_words(rtl);
+    reg_bits.extend(unpacked_bits);
+    // Const-index word add (`res[0] <= a+b`) → ripple adder into Hffs.
+    // Not a MAC, and not the generic cone (that left 2 bits and a wide_cone).
+    lowered_unpacked.extend(lower_const_word_adds(&mut d, rtl, clk, &lowered_unpacked));
+    // cycles=2..4: later words are Hff shifts of res[i-1], not a new add.
+    // Larger or non-constant: word_pipeline_cap, no extra stages, no closed WNS.
+    lowered_unpacked.extend(lower_word_pipeline(&mut d, rtl, clk, &lowered_unpacked));
+    // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
+    // The read stays a single variable_index_read; do not walk a wide cone.
+    lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk));
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
             continue;
@@ -3922,7 +7379,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     eprintln!("synth_rtl after nbas reg_bits={}", reg_bits.len());
     let mut mem_names: HashSet<String> = HashSet::new();
     for (lhs, _, _) in &rtl.nbas {
-        if sig_depth(rtl, lhs) > 0 {
+        if sig_depth(rtl, lhs) > 0 && !lowered_unpacked.contains(lhs) {
             mem_names.insert(lhs.clone());
         }
     }
@@ -3960,10 +7417,80 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Ident/Bit/Range stay nets (IOB passthrough) so gold sequential WNS is
     // not broken by buffer LUTs — that is mapping a wire as a wire, not a skip.
     let mut comb_bits: Vec<(String, Expr)> = Vec::new();
+    // Relational wire-assigns that cannot map must name themselves. Do not
+    // spend the one wide_cone line on them — clocked cones still report that.
+    let mut rel_sig: HashMap<String, String> = HashMap::new();
+    let mut n_rel = 0usize;
+    // A posedge clock that is a mux of two clocks is not a data LUT and not
+    // one user clock. Name it; do not close WNS on a leftover input.
+    // A posedge clock that is an AND/OR of a clock and an enable is the same
+    // kind of honesty: one clock_gate, no data LUT, not a closed WNS.
+    let clock_mux_sigs = note_clock_muxes(rtl);
+    let clock_gate_sigs = note_clock_gates(rtl, &clock_mux_sigs);
+    // `assign q = res[<constant>]` is a net alias to that word, not a
+    // variable-index read and not an unmapped assign. A signal index is not
+    // recorded here — that stays `variable_index_read`.
+    let mut word_alias: Vec<(String, String, usize)> = Vec::new();
+    // `{bus, {K{1'b0}}}` K=1..8 is a wire alignment (zeros on the low
+    // side), not a 16-PI cone and not a LUT. A nested concat inside an
+    // add is not this form — that add stays wide_cone.
+    let mut concat_align: Vec<(String, String, usize)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.assigns {
+        if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
+            continue;
+        }
+        if bit.is_none() {
+            if let Some(kind) = zero_fill_concat(rhs) {
+                match kind {
+                    Ok((bus, zeros)) => {
+                        eprintln!("synth_rtl concat_align signal={lhs} zeros={zeros}");
+                        concat_align.push((lhs.clone(), bus, zeros));
+                    }
+                    Err(()) => {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                }
+                continue;
+            }
+        }
+        if bit.is_none() {
+            if let Some((mem, word)) = const_unpacked_word(rhs, rtl) {
+                // Cap: do not alias q onto a stage that was not invented.
+                if word_pipeline_cap_for(&rtl.module) {
+                    continue;
+                }
+                word_alias.push((lhs.clone(), mem, word));
+                continue;
+            }
+        }
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
+        }
+        // width<=32 `assign sum = a + b` of two named buses is a ripple of
+        // 1-bit full adders, not one 64-PI cone and not a MAC. No clock.
+        // Wider than 32 stays unlowered — do not invent a shorter bus, and
+        // do not walk the expression tree. A skipped bit stays incomplete.
+        if bit.is_none() {
+            if let Some((a_name, b_name)) = packed_add_pair(rhs, rtl) {
+                if rexpr_unknown_name(rhs, rtl).is_none() {
+                    let w = sig_width(rtl, lhs).max(1);
+                    if w > 32 || !emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name) {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                    continue;
+                }
+            }
+        }
+        // Variable-index read of a clocked unpacked array. Do not walk it
+        // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
+        // A constant word index was already aliased above.
+        if rhs_reads_seq_mem(rhs, rtl) || rhs_unpacked_index(rhs, rtl) {
+            // word_pipeline_cap is the one diagnostic for an unrolled bound.
+            if !lowered_unpacked.is_empty() && !word_pipeline_cap_for(&rtl.module) {
+                note_variable_index_read(&rtl.module, lhs);
+            }
+            continue;
         }
         // Comb multiply → DSP MAC (do not bitblast).
         if expr_contains_mul(rhs) {
@@ -3971,18 +7498,63 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             n_mac += 1;
             continue;
         }
+        // Unknown name is not const 0.
+        if rexpr_unknown_name(rhs, rtl).is_some() {
+            note_assign_not_lowered(&rtl.module, lhs);
+            continue;
+        }
+        let rel = rexpr_is_rel(rhs);
         let w = sig_width(rtl, lhs);
+        // `bus < const` / `bus >= const` (and their && / ||) is a test of the
+        // bits that differ from the bound, not a 16-PI cone. `'h6000 <= x < 'h8000`
+        // is bits [15:13]==011. Wider than a LUT6 stays assign_not_lowered.
+        if rel && match bit {
+            Some(0) => true,
+            None => w <= 1,
+            Some(_) => false,
+        } {
+            if let Some((init, pis)) = const_range_lut(rhs, rtl) {
+                let bidx = (*bit).unwrap_or(0);
+                let bn = bit_name(lhs, w, bidx);
+                let lut = format!("u_rel{n_rel}");
+                n_rel += 1;
+                d.add_cell(&lut, CellKind::Lut6 { init });
+                d.connect(&bn, &lut, "O");
+                for (pin, pi) in pis.iter().enumerate() {
+                    d.connect(pi, &lut, format!("I{pin}"));
+                }
+                continue;
+            }
+        }
+        let mut failed = false;
         if let Some(b) = bit {
-            if let Ok(e) = rexpr_to_bit(rhs, rtl, 0) {
-                comb_bits.push((bit_name(lhs, w, *b), e));
+            match rexpr_to_bit(rhs, rtl, 0) {
+                Ok(e) => {
+                    let bn = bit_name(lhs, w, *b);
+                    if rel {
+                        rel_sig.insert(bn.clone(), lhs.clone());
+                    }
+                    comb_bits.push((bn, e));
+                }
+                Err(_) => failed = true,
             }
         } else {
             let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
             for i in 0..rw.min(w) {
-                if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
-                    comb_bits.push((bit_name(lhs, w, i), e));
+                match rexpr_to_bit(rhs, rtl, i) {
+                    Ok(e) => {
+                        let bn = bit_name(lhs, w, i);
+                        if rel {
+                            rel_sig.insert(bn.clone(), lhs.clone());
+                        }
+                        comb_bits.push((bn, e));
+                    }
+                    Err(_) => failed = true,
                 }
             }
+        }
+        if failed && rel {
+            note_assign_not_lowered(&rtl.module, lhs);
         }
     }
 
@@ -4021,19 +7593,35 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
+    // FM-HEL-10m-0854: one wide-cone diagnostic per module, then finish.
+    // Do not reprint node_count per bit, and do not map cones past the cap.
+    let mut wide_capped = false;
+    let mut wide_luts = 0usize;
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
         if expr_node_count(expr) > 8_000 {
+            emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+            continue;
+        }
+        if wide_capped && cone_pi_exceeds(expr, 6) {
             continue;
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
+            if wide_capped
+                || wide_aig_over_cap(&aig)
+                || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
+            {
+                emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+                continue;
+            }
             let (ff, qnet) = if single_q {
                 ("u_ff".to_string(), "q".to_string())
             } else {
                 (format!("u_ff{i}"), bitn.clone())
             };
             let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"));
+            wide_luts = wide_luts.saturating_add(aig.ands.len());
             d.add_cell(&ff, CellKind::Hff);
             d.connect(clk, &ff, "CLK");
             d.connect(&wide, &ff, "D");
@@ -4070,14 +7658,54 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
         if i >= 256 {
+            note_skip(format!(
+                "diagnostic assign_cap signal={} (assign-cap 256; remaining assigns not a LUT)",
+                bitn
+            ));
             break;
         }
         if expr_node_count(expr) > 2_000 {
+            // ≤6-PI boolean (Problem4) is still a real LUT6. A wider cone is
+            // the VGA node_count storm: one wide_cone line, do not eval.
+            if !wide_capped && !cone_pi_exceeds(expr, 6) {
+                if let Some((init, pis)) = lut6_from_bool_cone(expr) {
+                    let lut = format!("u_clut{i}");
+                    d.add_cell(&lut, CellKind::Lut6 { init });
+                    d.connect(bitn, &lut, "O");
+                    for (pin, pi) in pis.iter().enumerate() {
+                        d.connect(pi, &lut, format!("I{pin}"));
+                    }
+                    continue;
+                }
+            }
+            if let Some(sig) = rel_sig.get(bitn) {
+                note_assign_not_lowered(&rtl.module, sig);
+                continue;
+            }
+            emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+            continue;
+        }
+        if wide_capped && cone_pi_exceeds(expr, 6) {
+            if let Some(sig) = rel_sig.get(bitn) {
+                note_assign_not_lowered(&rtl.module, sig);
+            }
             continue;
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
+            if wide_capped
+                || wide_aig_over_cap(&aig)
+                || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
+            {
+                if let Some(sig) = rel_sig.get(bitn) {
+                    note_assign_not_lowered(&rtl.module, sig);
+                    continue;
+                }
+                emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+                continue;
+            }
             let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
+            wide_luts = wide_luts.saturating_add(aig.ands.len());
             // Alias wide cone output onto the assign net name.
             d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
             d.connect(&wide, format!("u_cbuf{i}"), "I0");
@@ -4092,6 +7720,43 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             d.connect(pi, &lut, format!("I{pin}"));
         }
     }
+
+    // A refused cone is not a closed design, even if leftover FFs remain.
+    // variable_index_read does not set this: write-side Hffs may still time.
+    if wide_capped {
+        d.attrs.set("WIDE_CONE", "1");
+    }
+    if assign_not_lowered_for(&rtl.module) {
+        d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+    }
+    if word_pipeline_cap_for(&rtl.module) {
+        d.attrs.set("WORD_PIPELINE_CAP", "1");
+    }
+    if clock_mux_for(&rtl.module) {
+        d.attrs.set("CLOCK_MUX", "1");
+    }
+    if clock_gate_for(&rtl.module) {
+        d.attrs.set("CLOCK_GATE", "1");
+    }
+    if gate_primitive_for(&rtl.module) {
+        d.attrs.set("GATE_PRIMITIVE", "1");
+    }
+    if sim_only_for(&rtl.module) {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+    }
+    // Inout load enable: FF D must depend on it, or one diagnostic and no WNS.
+    if prove_inout_load_enables(&mut d, rtl) {
+        d.attrs.set("INOUT_ENABLE_NOT_LOWERED", "1");
+    }
+
+    // Negedge-only always: one Hff on that clock, or one named diagnostic.
+    // Do not walk a cone. Falling versus rising is not a fake WNS.
+    lower_negedge_hffs(&mut d, rtl);
+
+    // Clocked always either already became an Hff on the user's clock, or
+    // one sequential_not_lowered. wide_cone already finished this module.
+    finish_seq_honesty(&d, &rtl.module, wide_capped);
 
     // Output IOBs from assigns.
     // FM-HEL-TOP: under skip_comb_assigns, AXI/out continuous assigns have no
@@ -4118,21 +7783,61 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if !is_out {
             continue;
         }
+        // Constant word read: q is that word. Same nets as the Hff Q, no buffer LUT.
+        if bit.is_none() {
+            if let Some((_, mem, word)) = word_alias.iter().find(|(n, _, _)| n == lhs) {
+                let ow = sig_width(rtl, lhs);
+                let mw = sig_width(rtl, mem).max(1);
+                for i in 0..ow.min(mw).min(256) {
+                    let qnet = unpacked_word_q(mem, *word, mw, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                }
+                continue;
+            }
+            // Zero-fill concat: high bits are the bus, low bits are 0.
+            // No buffer LUT. Zero bits have no source wire.
+            if let Some((_, bus, zeros)) = concat_align.iter().find(|(n, _, _)| n == lhs) {
+                let ow = sig_width(rtl, lhs);
+                let bw = sig_width(rtl, bus).max(1);
+                for i in *zeros..ow.min(256) {
+                    let src = i - zeros;
+                    if src >= bw {
+                        break;
+                    }
+                    let qnet = bit_name(bus, bw, src);
+                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                }
+                continue;
+            }
+        }
         let w = sig_width(rtl, lhs);
         if bit.is_none() && w > 1 {
             for i in 0..w.min(256) {
-                let qnet = bit_name(lhs, w, i);
+                // Ident/range passthrough: the driver is the RHS bit, not a
+                // buffer LUT. Logic assigns drive the LHS bit name.
+                let qnet = match rhs {
+                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), i),
+                    RExpr::Range(s, lo, hi) => {
+                        let idx = lo + i;
+                        if idx <= *hi {
+                            bit_name(s, sig_width(rtl, s), idx)
+                        } else {
+                            bit_name(lhs, w, i)
+                        }
+                    }
+                    _ => bit_name(lhs, w, i),
+                };
                 emit_iob(&mut d, &mut iob_n, &qnet, lhs);
             }
             continue;
         }
-        let (qnet, _) = if let Some(b) = bit {
-            (bit_name(lhs, w, *b), *b)
+        let qnet = if let Some(b) = bit {
+            bit_name(lhs, w, *b)
+        } else if let Ok((q, _)) = drive_target(rhs, rtl) {
+            q
         } else {
-            match drive_target(rhs, rtl) {
-                Ok(x) => x,
-                Err(_) => continue,
-            }
+            // 1-bit comb assign (not a wire name): LUT already drives lhs.
+            bit_name(lhs, w, 0)
         };
         emit_iob(&mut d, &mut iob_n, &qnet, lhs);
     }
@@ -4171,6 +7876,10 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
             base: Box::new(rewrite_rexpr(base, subst)),
             width: *width,
             ascending: *ascending,
+        },
+        RExpr::WordAt { addr, data } => RExpr::WordAt {
+            addr: Box::new(rewrite_rexpr(addr, subst)),
+            data: Box::new(rewrite_rexpr(data, subst)),
         },
         RExpr::Concat(parts) => RExpr::Concat(
             parts.iter().map(|p| rewrite_rexpr(p, subst)).collect(),
@@ -4242,6 +7951,7 @@ fn elaborate_rtl(src: &Rtl, overrides: &HashMap<String, u128>) -> Result<Rtl, St
         t: &src.toks,
         i: 0,
         params: overrides.clone(),
+        widths: HashMap::new(),
     };
     parse_one_module(&mut p)
 }
@@ -4306,6 +8016,10 @@ fn flatten_module_ov_vis(
     };
     for inst in &src.insts {
         let Some(child_proto) = mods.get(&inst.module) else {
+            note_skip(format!(
+                "diagnostic unknown_instance module={} inst={} child={} (child body absent; not a LUT)",
+                name, inst.name, inst.module
+            ));
             continue;
         };
         let ov = inst_overrides(inst, child_proto);
@@ -4347,6 +8061,56 @@ fn flatten_module_ov_vis(
     Ok(out)
 }
 
+fn inst_tree_len(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    cap: usize,
+    visiting: &mut HashSet<String>,
+) -> usize {
+    if !visiting.insert(name.to_string()) {
+        return 0;
+    }
+    let Some(rtl) = mods.get(name) else {
+        visiting.remove(name);
+        return 0;
+    };
+    let mut n = rtl.insts.len();
+    if n >= cap {
+        visiting.remove(name);
+        return n;
+    }
+    for inst in &rtl.insts {
+        n = n.saturating_add(inst_tree_len(mods, &inst.module, cap, visiting));
+        if n >= cap {
+            break;
+        }
+    }
+    visiting.remove(name);
+    n
+}
+
+fn tree_has_rtl_body(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if !visiting.insert(name.to_string()) {
+        return false;
+    }
+    let Some(rtl) = mods.get(name) else {
+        return false;
+    };
+    if !rtl.nbas.is_empty() || !rtl.assigns.is_empty() {
+        return true;
+    }
+    for inst in &rtl.insts {
+        if tree_has_rtl_body(mods, &inst.module, visiting) {
+            return true;
+        }
+    }
+    false
+}
+
 fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
     synth_from_parsed_top(mods, None, &HashMap::new())
 }
@@ -4375,23 +8139,94 @@ fn synth_from_parsed_top(
             .module
             .clone()
     };
-    let t_flat = std::time::Instant::now();
-    let flat = flatten_module_ov(&map, &top_name, overrides)?;
-    eprintln!(
-        "hang_diag flatten nbas={} assigns={} signals={} ms={}",
-        flat.nbas.len(),
-        flat.assigns.len(),
-        flat.signals.len(),
-        t_flat.elapsed().as_millis()
-    );
     let t_syn = std::time::Instant::now();
-    let mut d = synth_rtl(&flat)?;
+    let t_flat = std::time::Instant::now();
+    // Leaf designs (no instances) still flatten + synth_rtl, so gold counter
+    // mapping is the same call. Fat instance trees must not flatten: that
+    // re-enters uncalled functions and copies every child into one Rtl.
+    let top_rtl = map.get(&top_name).expect("top");
+    let fat = !top_rtl.insts.is_empty()
+        && inst_tree_len(&map, &top_name, 64, &mut HashSet::new()) >= 64;
+    let (flat_nbas, flat_assigns, mut d) = if fat {
+        eprintln!(
+            "hang_diag assemble module={} insts={} reason=skip_flatten",
+            top_name,
+            top_rtl.insts.len()
+        );
+        let d = assemble_module(&map, &top_name, &mut HashSet::new())?;
+        let body = tree_has_rtl_body(&map, &top_name, &mut HashSet::new());
+        (usize::from(body), 0usize, d)
+    } else {
+        let flat = flatten_module_ov(&map, &top_name, overrides)?;
+        eprintln!(
+            "hang_diag flatten nbas={} assigns={} signals={} ms={}",
+            flat.nbas.len(),
+            flat.assigns.len(),
+            flat.signals.len(),
+            t_flat.elapsed().as_millis()
+        );
+        let nbas = flat.nbas.len();
+        let assigns = flat.assigns.len();
+        let d = if top_rtl.insts.is_empty() {
+            lower_own_cached(&flat)?
+        } else {
+            assemble_module(&map, &top_name, &mut HashSet::new())?
+        };
+        (nbas, assigns, d)
+    };
+    d.name = top_name.clone();
     eprintln!(
         "hang_diag synth_rtl cells={} ms={}",
         d.cells.len(),
         t_syn.elapsed().as_millis()
     );
+    let n_logic = d
+        .cells
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.kind,
+                CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Mac27 | CellKind::Bram18
+            )
+        })
+        .count();
+    // Standing rule: ports-only shells and unknown vendor instances (no body
+    // in this file/set) do not invent gates. cells stay 0; timing must not
+    // report a closed WNS.
+    if gate_primitive_for(&top_name) {
+        d.attrs.set("GATE_PRIMITIVE", "1");
+    }
+    if sim_only_for(&top_name) {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+        d.cells.clear();
+        d.nets.clear();
+    }
+    if sim_only_for(&top_name) || (n_logic == 0 && flat_nbas == 0 && flat_assigns == 0) {
+        d.attrs.set("NO_BODY", "1");
+        eprintln!(
+            "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
+            d.name
+        );
+    } else if n_logic == 0 {
+        eprintln!(
+            "diagnostic no_logic module={} cells={} (behavioral body present; no LUT/FF mapped under hang guards)",
+            d.name,
+            d.cells.len()
+        );
+    }
     record_instances(&map, &top_name, &mut d, "");
+    let n_luts = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+        .count();
+    eprintln!(
+        "synth_design {} cells={} luts={}",
+        d.name,
+        d.cells.len(),
+        n_luts
+    );
     Ok(d)
 }
 
@@ -4433,8 +8268,31 @@ fn record_instances_vis(
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     let t_parse = std::time::Instant::now();
-    let pre = preprocess_sv(&strip_comments(source));
-    let mods = parse_source(&pre)?;
+    let origin_path = Path::new(origin);
+    let base = origin_path.parent().filter(|d| !d.as_os_str().is_empty() && d.exists());
+    let expanded = if let Some(dir) = base {
+        expand_includes(source, dir)
+    } else {
+        source.to_string()
+    };
+    let pre = preprocess_sv(&strip_comments(&expanded));
+    let mut mods = parse_source(&pre)?;
+    if let Some(dir) = base {
+        let have: HashSet<String> = mods.iter().map(|m| m.module.clone()).collect();
+        let mut missing: HashSet<String> = HashSet::new();
+        for m in &mods {
+            for inst in &m.insts {
+                if !have.contains(&inst.module) {
+                    missing.insert(inst.module.clone());
+                }
+            }
+        }
+        if !missing.is_empty() {
+            if let Ok(extra) = sibling_modules(dir, &missing, origin_path) {
+                mods.extend(extra);
+            }
+        }
+    }
     eprintln!(
         "hang_diag parse mods={} bytes={} ms={}",
         mods.len(),
@@ -4597,6 +8455,12 @@ pub fn synth_sv_path(path: &Path) -> Result<Design, String> {
     synth_sv(&src, &path.display().to_string())
 }
 
+/// Same-directory wrapper: parent file instantiates a child whose body is
+/// `child.v` next to it (no `` `include `` required).
+pub fn synth_sv_path_with_siblings(path: &Path) -> Result<Design, String> {
+    synth_sv_path(path)
+}
+
 pub fn lut_init_of(source: &str) -> Result<u64, String> {
     match synth_sv(source, "t.sv")?.cell("u_lut").unwrap().kind {
         CellKind::Lut6 { init } => Ok(init),
@@ -4633,8 +8497,8 @@ mod tests {
     }
 
     #[test]
-    fn verilog_gate_primitives_map_to_luts() {
-        // ISCAS85/89 LogikBench style: `not`/`nand`/`xor` primitives, not SV assign.
+    fn verilog_gate_primitives_are_not_luts() {
+        // bufif/notif/and/or/nand/nor/xor/xnor/buf/not are not a Helion product.
         let src = r#"
 module gates(a, b, y, z);
   input a, b;
@@ -4646,16 +8510,66 @@ module gates(a, b, y, z);
 endmodule
 "#;
         let d = synth_sv(src, "gates.v").expect("gate synth");
-        let luts = d
-            .cells
-            .iter()
-            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-            .count();
         assert!(
-            luts >= 1,
-            "gate primitives must become LUT cells, cells={:?}",
-            d.cells.iter().map(|c| format!("{}:{:?}", c.name, c.kind)).collect::<Vec<_>>()
+            d.cells.is_empty(),
+            "gate primitives must not become LUT cells, cells={:?}",
+            d.cells
         );
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+        assert_eq!(d.attrs.get("GATE_PRIMITIVE"), Some("1"));
+    }
+
+    #[test]
+    fn sim_only_display_and_xz_compare_is_not_a_lut() {
+        // Vendor PLL sim model: $display and === 1'bx. Not a counter, not a MAC.
+        let src = r#"
+module hardcopyii_n_cntr(clk,reset,cout,modulus);
+  input clk;
+  input reset;
+  input [31:0] modulus;
+  output cout;
+  integer count;
+  reg tmp_cout;
+  initial count = 1;
+  always @(reset or clk) begin
+    if (reset) count = 1;
+    else if (clk === 1'bx) $display("Warning : X");
+    else if (count < modulus) count = count+1;
+    else begin count = 1; tmp_cout = ~tmp_cout; end
+    if (clk !== 1'bx) count = count;
+  end
+  assign cout = tmp_cout;
+endmodule
+"#;
+        let d = synth_sv(src, "n_cntr.v").expect("sim_only");
+        assert!(
+            d.cells.is_empty(),
+            "sim model must not invent LUT/MAC cells, cells={:?}",
+            d.cells
+        );
+        assert_eq!(d.attrs.get("SIM_ONLY"), Some("1"));
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            "sim model must not invent a MAC"
+        );
+    }
+
+    fn bufif1_mux_is_one_gate_primitive_not_a_lut() {
+        let src = r#"
+module sky130_fd_sc_hdll__muxb16to1(Z,D,S);
+  output Z;
+  input  [15:0] D;
+  input  [15:0] S;
+  bufif1 bufif10(Z,!D[0],S[0]);
+  bufif1 bufif11(Z,!D[1],S[1]);
+endmodule
+"#;
+        let d = synth_sv(src, "muxb.v").expect("bufif1");
+        assert!(d.cells.is_empty(), "bufif1 must not invent a LUT mux, cells={:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+        assert_eq!(d.attrs.get("GATE_PRIMITIVE"), Some("1"));
+        assert!(d.instances.is_empty(), "bufif1 must not stay an unknown instance");
     }
 
     #[test]
@@ -5090,6 +9004,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -5105,6 +9020,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -5119,6 +9035,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         assert_eq!(const_cond(&mut p).unwrap(), false, "A==1 && A==2 with A=1");
 
@@ -5129,6 +9046,7 @@ endmodule
             t: &toks,
             i: 0,
             params,
+            widths: HashMap::new(),
         };
         // left-assoc: (A==2 || A==3) && A==2 → true
         assert_eq!(const_cond(&mut p).unwrap(), true);
@@ -5767,6 +9685,275 @@ endmodule
     }
 
     #[test]
+    fn dp_lut_var_index_write_is_hffs_not_skip_assign() {
+        let src = r#"
+module dp_lut_7x5_14x4(clk,din_a,we_a,addr_a,dout_b,addr_b);
+  input  clk;
+  input  we_a;
+  input  [4:0] addr_a;
+  input  [6:0] din_a;
+  input  [3:0] addr_b;
+  output [13:0] dout_b;
+  reg  [6:0] lut[0:31];
+  always @(posedge clk)
+      begin
+        if (we_a)
+          begin
+            lut[addr_a] <= din_a;
+          end
+      end
+  assign dout_b = {lut[addr_b<<1+1],lut[addr_b<<1]};
+endmodule
+"#;
+        let d = synth_sv(src, "dp_lut.sv").expect("dp_lut");
+        let hffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(hffs, 32 * 7, "32x7 write-side Hffs, got {hffs}");
+        assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+    }
+
+    #[test]
+    fn const_range_compare_lowers_small_lut() {
+        let src = r#"
+module MMC4(input [15:0] prg_ain);
+  wire
+       prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
+endmodule
+"#;
+        let d = synth_sv(src, "mmc4_ram.v").expect("range compare");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "small range must lower, not assign_not_lowered"
+        );
+        let lut = d
+            .cells
+            .iter()
+            .find(|c| {
+                matches!(c.kind, CellKind::Lut6 { .. })
+                    && d.nets.iter().any(|n| {
+                        n.name == "prg_is_ram"
+                            && n.endpoints
+                                .iter()
+                                .any(|e| e.cell == c.name && e.pin == "O")
+                    })
+            })
+            .expect("prg_is_ram must drive a LUT");
+        let init = match lut.kind {
+            CellKind::Lut6 { init } => init,
+            _ => unreachable!(),
+        };
+        let mut pins = Vec::new();
+        for i in 0..6 {
+            if let Some(net) = d.net_on(&lut.name, &format!("I{i}")) {
+                pins.push(net.to_string());
+            }
+        }
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec!["prg_ain_13".to_string(), "prg_ain_14".to_string(), "prg_ain_15".to_string()],
+            "range is a 3-bit test, not a 16-PI cone: {pins:?}"
+        );
+        // I0 is the LSB of the LUT address. [15:13]==011.
+        let bit_of = |name: &str| -> usize {
+            match name {
+                "prg_ain_13" => 0,
+                "prg_ain_14" => 1,
+                "prg_ain_15" => 2,
+                _ => panic!("unexpected pin {name}"),
+            }
+        };
+        let mut pin_at = [""; 3];
+        for i in 0..6 {
+            if let Some(net) = d.net_on(&lut.name, &format!("I{i}")) {
+                pin_at[i] = net;
+            }
+        }
+        for addr in 0..8u64 {
+            let mut field = 0u64;
+            for i in 0..3 {
+                if pin_at[i].is_empty() {
+                    continue;
+                }
+                if (addr >> i) & 1 == 1 {
+                    field |= 1u64 << bit_of(pin_at[i]);
+                }
+            }
+            let want = field == 0b011;
+            let got = (init >> addr) & 1 == 1;
+            assert_eq!(got, want, "addr={addr:#b} field={field:#b} init={init:#x}");
+        }
+    }
+
+    #[test]
+    fn clock_mux_posedge_is_not_a_user_clock() {
+        let src = r#"
+module clk_mux_q(input csr_clk, input csr_ena, input ram_clk, input d, output reg q);
+  wire int_clk;
+  assign int_clk = ~csr_ena ? csr_clk : ram_clk;
+  always @(posedge int_clk) q <= d;
+endmodule
+"#;
+        let d = synth_sv(src, "clk_mux.v").expect("clock mux");
+        assert_eq!(
+            d.attrs.get("CLOCK_MUX"),
+            Some("1"),
+            "muxed posedge must not be a single user clock"
+        );
+        let invented = d.nets.iter().any(|n| {
+            n.name == "int_clk"
+                && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(
+            !invented,
+            "clock mux must not be lowered as a data LUT, nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clock_gate_posedge_is_not_a_user_clock() {
+        // Sibling of clock_mux: AND/OR of a clock and an enable (`~en` too).
+        // Not a ternary of two clocks. Not a data LUT. Not a closed WNS.
+        let src = r#"
+module clk_gate_q(input clk, input en, input d, output reg q);
+  wire gclk;
+  assign gclk = clk & ~en;
+  always @(posedge gclk) q <= d;
+endmodule
+"#;
+        let d = synth_sv(src, "clk_gate.v").expect("clock gate");
+        assert_eq!(
+            d.attrs.get("CLOCK_GATE"),
+            Some("1"),
+            "gated posedge must not be a single user clock"
+        );
+        assert_ne!(
+            d.attrs.get("CLOCK_MUX"),
+            Some("1"),
+            "clk & ~en is a gate, not a mux of two clocks"
+        );
+        let invented = d.nets.iter().any(|n| {
+            n.name == "gclk" && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(
+            !invented,
+            "clock gate must not be lowered as a data LUT, nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn inout_load_enable_reaches_ff_d() {
+        // reset has priority; read-only inout ena gates the load. Hold otherwise.
+        // D must depend on ena. Not a dropped enable, not an invented bus.
+        let src = r#"
+module latch_EX_MEM(input clk, input reset, inout ena, input din, output reg q);
+  always @(posedge clk) begin
+    if (reset)
+      q <= 0;
+    else if (ena == 1'b1)
+      q <= din;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "latch_ex_mem.v").expect("inout load enable");
+        assert_ne!(
+            d.attrs.get("INOUT_ENABLE_NOT_LOWERED"),
+            Some("1"),
+            "ena must be mapped onto FF D, not dropped"
+        );
+        assert!(
+            d.ports.iter().any(|p| p.name == "ena" && matches!(p.dir, PortDir::In)),
+            "read-only inout is the load-enable input, not a bus"
+        );
+        let ff = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("q"))
+            .expect("q must be an Hff");
+        assert_eq!(d.net_on(&ff.name, "CLK"), Some("clk"));
+        let on_ena = d.nets.iter().any(|n| {
+            n.name == "ena"
+                && n.endpoints
+                    .iter()
+                    .any(|e| e.pin.starts_with('I') || (e.cell == ff.name && e.pin == "D"))
+        });
+        assert!(on_ena, "ena must connect into the enable path of D");
+    }
+
+    #[test]
+    fn negedge_always_lowers_hff_on_named_clock() {
+        let src = r#"
+module rw_manager_ram_csr #(parameter DATA_WIDTH = 32, ADDR_WIDTH = 1+1, NUM_WORDS = 4)
+  (input csr_clk, input csr_ena, input csr_din, input ram_clk, input wren,
+   input [DATA_WIDTH-1:0] data, input [ADDR_WIDTH+(-1):0] wraddress,
+   input [ADDR_WIDTH+(-1):0] rdaddress, output reg [DATA_WIDTH-1:0] q,
+   output reg csr_dout);
+  localparam integer DATA_COUNT = NUM_WORDS*DATA_WIDTH;
+  reg [DATA_COUNT+(-1):0] all_data;
+  wire int_clk;
+  assign int_clk = ~csr_ena ? csr_clk : ram_clk;
+  always @(posedge int_clk) begin
+    q <= data;
+  end
+  always @(negedge csr_clk) begin
+    csr_dout <= all_data[DATA_COUNT+(-1)];
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "negedge_csr.v").expect("negedge always");
+        assert_eq!(d.attrs.get("CLOCK_MUX"), Some("1"), "muxed posedge still clock_mux");
+        let ff = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("csr_dout"))
+            .expect("csr_dout must be an Hff Q");
+        assert_eq!(d.net_on(&ff.name, "CLK"), Some("csr_clk"), "negedge clock is csr_clk");
+    }
+
+    #[test]
+    fn wide_const_compare_stays_not_lowered() {
+        // Lowest set bit of 'h00FF is 0: every bus bit matters. Not a small LUT.
+        let src = r#"
+module wide_cmp(input [15:0] a, output y);
+  assign y = a < 16'h00FF;
+endmodule
+"#;
+        let d = synth_sv(src, "wide_cmp.v").expect("wide cmp");
+        assert_eq!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "general compare wider than a LUT6 must stay assign_not_lowered"
+        );
+    }
+
+    #[test]
+    fn split_wire_assign_is_net_plus_assign() {
+        // Assignment on the next line after `wire` is a net plus assign.
+        let src = r#"
+module splitw(input a, input b, output y);
+  wire
+       y = a & b;
+endmodule
+"#;
+        let d = synth_sv(src, "splitw.v").expect("split wire");
+        let lut = d.cells.iter().find(|c| matches!(c.kind, CellKind::Lut6 { .. }));
+        let lut = lut.expect("split wire assign must map a LUT, not drop the name");
+        let init = match lut.kind {
+            CellKind::Lut6 { init } => init,
+            _ => unreachable!(),
+        };
+        assert_ne!(init, 0, "unknown/split wire name must not fold to const 0");
+        let on_y = d.nets.iter().any(|n| {
+            n.name == "y" && n.endpoints.iter().any(|e| e.cell == lut.name && e.pin == "O")
+        });
+        assert!(on_y, "split wire assign must drive y, nets={:?}", d.nets);
+    }
+
+    #[test]
     fn wire_through_assign_emits_iob() {
         let src = r#"
 module RefModule (input in, output out);
@@ -5779,5 +9966,495 @@ endmodule
             "assign out=in must emit IOB, cells={:?}",
             d.cells
         );
+    }
+
+    #[test]
+    fn wide_binary_literal_does_not_panic() {
+        // 255-bit sized binary used to `1u128 << bit` and panic (old lib.rs:959).
+        let bits = "1".repeat(130);
+        let src = format!(
+            "module data_generator(input wire CLK, input wire CE, output wire D1);\n  reg [129:0] ring1;\n  initial ring1 <= 130'b{bits};\n  always @(posedge CLK)\n    if (CE) ring1 <= {{ring1[0], ring1[129:1]}};\n  assign D1 = ring1[0];\nendmodule\n"
+        );
+        let d = synth_sv(&src, "wide_lit.sv").expect("wide literal must not panic");
+        assert_eq!(d.name, "data_generator");
+        assert_ne!(
+            d.attrs.get("NO_BODY"),
+            Some("1"),
+            "rotate is behavioral; do not drop the body, cells={:?}",
+            d.cells
+        );
+        let logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Bram18
+                )
+            })
+            .count();
+        assert!(logic > 0, "wide rotate must lower real cells, cells={:?}", d.cells);
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            "wide initial must not invent a BRAM, cells={:?}",
+            d.cells
+        );
+    }
+
+    #[test]
+    fn string_param_width_does_not_panic() {
+        // `parameter DATA_WIDTH = ""` hashed past usize and panicked on
+        // range `+ 1` (old lib.rs:1052). Named diagnostic, no invented bus.
+        let src = r#"
+module rw_manager_bitcheck(ck, read_data);
+  parameter DATA_WIDTH = "";
+  parameter AFI_RATIO = "";
+  localparam NUMBER_OF_WORDS = 1<<1*AFI_RATIO;
+  localparam DATA_BUS_SIZE = DATA_WIDTH*NUMBER_OF_WORDS;
+  input ck;
+  input [DATA_BUS_SIZE+(0-1):0] read_data;
+  output [DATA_WIDTH-1:0] error_word;
+endmodule
+"#;
+        let d = synth_sv(src, "str_width.sv").expect("string width must not panic");
+        assert_eq!(d.name, "rw_manager_bitcheck");
+        let logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Bram18
+                )
+            })
+            .count();
+        assert_eq!(logic, 0, "must not invent gates from a string width, cells={:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn empty_shell_is_no_body_not_invented_gates() {
+        let src = r#"
+module sky130_fd_sc_hs__tap(VGND,VPWR);
+  input VGND;
+  input VPWR;
+endmodule
+"#;
+        let d = synth_sv(src, "tap.v").expect("empty shell");
+        assert!(d.cells.is_empty(), "empty shell must not invent gates, cells={:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn string_param_always_case_maps_luts() {
+        let src = r#"
+module hardcopyii_reorder_output(datain, operation, dataout);
+  parameter operation_mode = "dynamic";
+  input [3:0] datain;
+  input [1:0] operation;
+  output [3:0] dataout;
+  reg [3:0] dataout_tmp;
+  assign dataout = dataout_tmp;
+  always @(datain)
+    begin
+      if (operation_mode == "dynamic")
+        begin
+          case (operation)
+            2'b00: dataout_tmp = datain;
+            2'b01: dataout_tmp = {datain[1:0], datain[3:2]};
+            default: dataout_tmp = 4'b0;
+          endcase
+        end
+      else dataout_tmp = datain;
+    end
+endmodule
+"#;
+        let d = synth_sv(src, "reord.v").expect("always/case");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(luts > 0, "string-param always/case must map LUTs, cells={:?}", d.cells);
+        assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn function_lifted_into_empty_module_maps_lut() {
+        let src = r#"
+module CRC_tiny();
+  function [3:0] nextCRC;
+    input [3:0] Data;
+    input [3:0] crc;
+    reg [3:0] newcrc;
+    begin
+      newcrc[0] = Data[0] ^ crc[0];
+      newcrc[1] = Data[1] ^ crc[1];
+      newcrc[2] = Data[2] & crc[2];
+      newcrc[3] = Data[3] | crc[3];
+      nextCRC = newcrc;
+    end
+  endfunction
+endmodule
+"#;
+        let d = synth_sv(src, "crc.v").expect("lift function");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(luts >= 4, "lifted function must map LUTs, luts={luts} cells={:?}", d.cells);
+        assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
+    }
+
+    #[test]
+    fn unknown_instance_names_itself() {
+        let src = r#"
+module wrap(input a, output y);
+  missing_child u0(.a(a), .y(y));
+endmodule
+"#;
+        let d = synth_sv(src, "wrap.sv").expect("unknown child");
+        assert!(d.cells.is_empty(), "absent child must not invent gates {:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn incremental_reuses_parent_when_child_changes() {
+        let parent = r#"
+module inc_parent(input clk, input en, output led);
+  wire q;
+  inc_child u0(.clk(clk), .q(q));
+  assign led = q & en;
+endmodule
+"#;
+        let child1 = r#"
+module inc_child(input clk, output reg q);
+  always @(posedge clk) q <= ~q;
+endmodule
+"#;
+        let child2 = r#"
+module inc_child(input clk, output reg q);
+  always @(posedge clk) q <= q;
+endmodule
+"#;
+        let s1 = format!("{parent}\n{child1}");
+        let s2 = format!("{parent}\n{child2}");
+        let _ = synth_sv(&s1, "inc1.sv").expect("first");
+        let before = incremental_log();
+        let _ = synth_sv(&s2, "inc2.sv").expect("second");
+        let after = incremental_log();
+        let fresh: Vec<_> = after.iter().skip(before.len()).cloned().collect();
+        let joined = fresh.join("\n");
+        assert!(
+            joined.contains("incremental reused module=inc_parent"),
+            "parent own-logic must be reused, log={joined}"
+        );
+        assert!(
+            joined.contains("incremental rebuilt module=inc_child"),
+            "child must rebuild, log={joined}"
+        );
+    }
+
+    #[test]
+    fn const_index_word_add_is_hffs_not_mac_or_leftover() {
+        // cycles=1 → q aliases res[0]. The for-loop body does not run.
+        // Signed width-16 add is a ripple adder into Hffs, not a MAC and not
+        // two leftover bits. A signal index is not aliased this way.
+        let src = r#"
+module addfxp(a,b,q,clk);
+  parameter  width = 16, cycles = 1;
+  input  signed  [(-1)+width:0] a,b;
+  input  clk;
+  output signed  [(-1)+width:0] q;
+  reg  signed  [(-1)+width:0] res[(-1)+cycles:0];
+  assign q = res[(-1)+cycles];
+  integer i;
+  always @(posedge clk)
+      begin
+        res[0] <= a+b;
+        for (i = 1; i < cycles; i = 1+i)
+            res[i] <= res[i-1];
+      end
+endmodule
+"#;
+        let d = synth_sv(src, "addfxp.v").expect("addfxp");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        let hffs: Vec<_> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .collect();
+        assert_eq!(hffs.len(), 16, "16-bit add, one stage, got {}", hffs.len());
+        assert!(hffs.iter().all(|c| d.net_on(&c.name, "CLK") == Some("clk")));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 30, "16-bit ripple adder LUTs, not leftover bits, luts={luts}");
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "res_w0_0"
+                && n.endpoints.iter().any(|e| e.pin == "Q")
+                && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(
+            aliased,
+            "q aliases res[0], nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("res_w1_0")
+            }),
+            "cycles=1 must not invent a second pipeline word"
+        );
+    }
+
+    #[test]
+    fn const_cycles_2_unrolls_word_shift_not_a_second_add() {
+        // cycles=2 → q aliases res[1], the last word. 2*width Hffs.
+        // The add lands only in word 0. Word 1 is a shift, D from res[0].
+        let src = r#"
+module addfxp2(a,b,q,clk);
+  parameter  width = 8, cycles = 2;
+  input  signed  [(-1)+width:0] a,b;
+  input  clk;
+  output signed  [(-1)+width:0] q;
+  reg  signed  [(-1)+width:0] res[(-1)+cycles:0];
+  assign q = res[(-1)+cycles];
+  integer i;
+  always @(posedge clk)
+      begin
+        res[0] <= a+b;
+        for (i = 1; i < cycles; i = 1+i)
+            res[i] <= res[i-1];
+      end
+endmodule
+"#;
+        let d = synth_sv(src, "addfxp2.v").expect("addfxp2");
+        assert_ne!(d.attrs.get("WORD_PIPELINE_CAP"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        let hffs: Vec<_> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .collect();
+        assert_eq!(hffs.len(), 16, "2*width Hffs, got {}", hffs.len());
+        assert!(hffs.iter().all(|c| d.net_on(&c.name, "CLK") == Some("clk")));
+        for bit in 0..8 {
+            let q0 = format!("res_w0_{bit}");
+            let q1 = format!("res_w1_{bit}");
+            let ff0 = hffs
+                .iter()
+                .find(|c| d.net_on(&c.name, "Q") == Some(q0.as_str()))
+                .unwrap_or_else(|| panic!("word 0 bit {bit}"));
+            let d0 = d.net_on(&ff0.name, "D").unwrap_or("");
+            assert!(
+                d0.starts_with("u_add0_"),
+                "add only into word 0, bit {bit} D={d0}"
+            );
+            let ff1 = hffs
+                .iter()
+                .find(|c| d.net_on(&c.name, "Q") == Some(q1.as_str()))
+                .unwrap_or_else(|| panic!("word 1 bit {bit}"));
+            assert_eq!(
+                d.net_on(&ff1.name, "D"),
+                Some(q0.as_str()),
+                "word 1 D from res[0]"
+            );
+        }
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("res_w2_0")
+            }),
+            "cycles=2 must not invent a third pipeline word"
+        );
+        assert!(
+            !d.nets.iter().any(|n| n.name.starts_with("u_add1_")),
+            "no adder into word 1"
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "res_w1_0"
+                && n.endpoints.iter().any(|e| e.pin == "Q")
+                && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(
+            aliased,
+            "q aliases res[1], the last word, nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+        let word0_is_q = d.nets.iter().any(|n| {
+            n.name == "res_w0_0" && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(!word0_is_q, "q must not alias word 0 when cycles=2");
+    }
+
+    #[test]
+    fn cycles_above_cap_does_not_invent_stages_or_close() {
+        let src = r#"
+module addfxp5(a,b,q,clk);
+  parameter  width = 8, cycles = 5;
+  input  signed  [(-1)+width:0] a,b;
+  input  clk;
+  output signed  [(-1)+width:0] q;
+  reg  signed  [(-1)+width:0] res[(-1)+cycles:0];
+  assign q = res[(-1)+cycles];
+  integer i;
+  always @(posedge clk)
+      begin
+        res[0] <= a+b;
+        for (i = 1; i < cycles; i = 1+i)
+            res[i] <= res[i-1];
+      end
+endmodule
+"#;
+        let d = synth_sv(src, "addfxp5.v").expect("addfxp5");
+        assert_eq!(d.attrs.get("WORD_PIPELINE_CAP"), Some("1"));
+        let hffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(hffs, 8, "add into word 0 only, no extra stages, got {hffs}");
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Hff)
+                    && d.net_on(&c.name, "Q").is_some_and(|q| q.starts_with("res_w1_"))
+            }),
+            "cycles=5 must not invent word 1"
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name.starts_with("res_w4_") && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(!aliased, "cap must not alias q onto a missing last word");
+    }
+
+    #[test]
+    fn zero_fill_concat_is_wire_align_not_a_cone() {
+        let src = r#"
+module align(input [7:0] bus, output [9:0] y);
+  assign y = {bus, {1<<1{1'b0}}};
+endmodule
+"#;
+        let d = synth_sv(src, "align.sv").expect("concat align");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "zero-fill concat must not invent a LUT, cells={:?}",
+            d.cells
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "bus_0" && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(aliased, "y[2] aliases bus[0], nets={:?}", d.nets);
+    }
+
+    #[test]
+    fn zero_fill_concat_k_above_8_is_not_lowered() {
+        let src = r#"
+module widepad(input [3:0] bus, output [15:0] y);
+  assign y = {bus, {9{1'b0}}};
+endmodule
+"#;
+        let d = synth_sv(src, "widepad.sv").expect("wide pad");
+        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "unlowered zero-fill must not become a LUT"
+        );
+    }
+
+    #[test]
+    fn comb_named_bus_add_is_ripple_not_wide_cone() {
+        let src = r#"
+module BranchAdder(input  wire [31:0] pc_plus_four,
+                   input  wire [31:0] extended_times_four,
+                   output wire [31:0] branch_address);
+  assign branch_address = pc_plus_four + extended_times_four;
+endmodule
+"#;
+        let d = synth_sv(src, "10162_1.v").expect("BranchAdder");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "combinational ripple has no clock and no Hff"
+        );
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 63, "32-bit ripple of full adders, luts={luts}");
+        let driven = d.nets.iter().any(|n| {
+            n.name == "branch_address_0"
+                && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(driven, "sum bit 0 is a LUT, not a wide cone");
+    }
+
+    #[test]
+    fn comb_named_bus_add_wider_than_32_is_not_invented() {
+        let src = r#"
+module WideAdd(input [33:0] a, input [33:0] b, output [33:0] sum);
+  assign sum = a + b;
+endmodule
+"#;
+        let d = synth_sv(src, "wideadd.v").expect("WideAdd");
+        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "width>32 must not invent a shorter adder"
+        );
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+    }
+
+    #[test]
+    fn nested_add_concat_stays_wide_cone() {
+        let src = r#"
+module branch_control #(parameter DATA_WIDTH = 32, PC_WIDTH = 6, PC_OFFSET_WIDTH = 25)
+  (input jmp_inst_in, input jmp_use_r_in, input branch_use_r_in, input branch_inst_in,
+   input branch_result_in, input [(0-1)+PC_WIDTH:0] pc_in,
+   input [DATA_WIDTH-1:0] reg_a_data_in, input [DATA_WIDTH-1:0] reg_b_data_in,
+   input [PC_OFFSET_WIDTH+(0-1):0] pc_offset_in,
+   output select_new_pc_out, output [(0-1)+PC_WIDTH:0] pc_out);
+  wire [DATA_WIDTH-1:0] jmp_val;
+  wire [DATA_WIDTH-1:0] branch_val;
+  wire [(0-1)+PC_WIDTH:0] pc_jump;
+  assign pc_jump = {pc_offset_in,{1<<1{1'b0}}};
+  assign select_new_pc_out = (jmp_inst_in | branch_result_in) & (jmp_inst_in | branch_inst_in);
+  assign branch_val = branch_use_r_in ? reg_a_data_in : (pc_in+(4+{reg_b_data_in,{1<<1{1'b0}}}));
+  assign jmp_val = jmp_use_r_in ? reg_a_data_in : pc_jump;
+  assign pc_out = jmp_inst_in ? jmp_val : branch_val;
+endmodule
+"#;
+        let d = synth_sv(src, "branch_control.v").expect("branch_control");
+        assert_eq!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Lut6 { .. })
+                    && d.net_on(&c.name, "O").is_some_and(|o| o.starts_with("pc_jump"))
+            }),
+            "pc_jump concat must not be a LUT"
+        );
+    }
+
+    #[test]
+    fn signal_index_read_is_not_const_word_alias() {
+        let src = r#"
+module vidx(input clk, input [1:0] sel, input [3:0] a, input [3:0] b, output [3:0] q);
+  reg [3:0] res[0:3];
+  assign q = res[sel];
+  always @(posedge clk) res[0] <= a+b;
+endmodule
+"#;
+        let d = synth_sv(src, "vidx.v").expect("vidx");
+        let aliased = d.nets.iter().any(|n| {
+            n.name.starts_with("res_w0_")
+                && n.endpoints
+                    .iter()
+                    .any(|e| e.pin == "I" && e.cell.starts_with("u_iob"))
+        });
+        assert!(!aliased, "signal index must not alias q onto res[0]");
+        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
     }
 }

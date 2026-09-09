@@ -10,6 +10,105 @@ struct Macro {
     body: String,
 }
 
+use std::path::{Path, PathBuf};
+
+/// Expand `` `include "file" `` from the including file's directory and
+/// obvious include dirs (`include/`, parent `include/`). Quoted form only.
+/// Missing files are left in place so the preprocessor can still drop the
+/// directive; a named diagnostic is printed.
+pub fn expand_includes(source: &str, base: &Path) -> String {
+    expand_includes_depth(source, base, &mut Vec::new(), 0)
+}
+
+fn expand_includes_depth(
+    source: &str,
+    base: &Path,
+    seen: &mut Vec<PathBuf>,
+    depth: usize,
+) -> String {
+    if depth > 8 {
+        return source.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = source;
+    while let Some(idx) = rest.find("`include") {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + "`include".len()..];
+        let trimmed = after.trim_start();
+        let ws = after.len() - trimmed.len();
+        let (path_s, consumed) = if let Some(q) = trimmed.strip_prefix('"') {
+            if let Some(end) = q.find('"') {
+                (q[..end].to_string(), ws + 1 + end + 1)
+            } else {
+                out.push_str("`include");
+                rest = after;
+                continue;
+            }
+        } else if let Some(q) = trimmed.strip_prefix('<') {
+            if let Some(end) = q.find('>') {
+                (q[..end].to_string(), ws + 1 + end + 1)
+            } else {
+                out.push_str("`include");
+                rest = after;
+                continue;
+            }
+        } else {
+            out.push_str("`include");
+            rest = after;
+            continue;
+        };
+        rest = &after[consumed..];
+        if let Some(nl) = rest.find('\n') {
+            // keep newline for line structure; drop the rest of the include line
+            rest = &rest[nl..];
+        }
+        match resolve_include(base, &path_s) {
+            Some(found) => {
+                if seen.iter().any(|p| p == &found) {
+                    eprintln!(
+                        "diagnostic skip_include file={} why=include cycle; not a LUT",
+                        found.display()
+                    );
+                } else {
+                    seen.push(found.clone());
+                    let text = std::fs::read_to_string(&found).unwrap_or_default();
+                    let child_base = found.parent().unwrap_or(base);
+                    out.push_str(&expand_includes_depth(&text, child_base, seen, depth + 1));
+                    out.push('\n');
+                }
+            }
+            None => {
+                eprintln!(
+                    "diagnostic skip_include file={} base={} why=include not found in same dir or include path; not a LUT",
+                    path_s,
+                    base.display()
+                );
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_include(base: &Path, spec: &str) -> Option<PathBuf> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let mut cands = Vec::new();
+    cands.push(base.join(spec));
+    if let Some(name) = Path::new(spec).file_name() {
+        cands.push(base.join(name));
+        cands.push(base.join("include").join(name));
+        if let Some(parent) = base.parent() {
+            cands.push(parent.join("include").join(name));
+            cands.push(parent.join(spec));
+        }
+    }
+    cands.push(base.join("include").join(spec));
+    cands.into_iter().find(|p| p.is_file())
+}
+
 /// Expand `` `define `` / `` `ifdef `` and strip leftover backticks.
 pub fn preprocess_sv(source: &str) -> String {
     let chars: Vec<char> = source.chars().collect();
