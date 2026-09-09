@@ -15757,6 +15757,13 @@ impl IdeModel {
         self.ensure_sdc_editor_populated();
         if self.sdc_editor_path.is_none() {
             let p = helion_device::Device::examples_dir().join("counter.sdc");
+            // Load on-disk create_clock (etc.) before appending, so a later
+            // save_sdc_editor does not clobber the stock SDC with only the Fix.
+            if self.sdc_editor_text.is_empty() {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    self.sdc_editor_text = text;
+                }
+            }
             self.sdc_editor_path = Some(p);
         }
         let already = template
@@ -15796,8 +15803,10 @@ impl IdeModel {
     }
 
     /// Apply the methodology Fix (TIMING-7 → set_output_delay), insert into the
-    /// Constraints SDC editor, and open Constraints. Timing numbers may move —
-    /// that is honest; untouched default without this Fix still keeps gold WNS.
+    /// Constraints SDC editor, persist via `save_sdc_editor`, and open Constraints.
+    /// Timing numbers may move — that is honest; untouched default without this
+    /// Fix still keeps gold WNS. Callers that must not dirty `examples/counter.sdc`
+    /// should `open_sdc_editor` on a temp copy first.
     pub fn fix_methodology(&mut self, id: &str) -> Result<String, String> {
         let id = id.trim();
         if id.is_empty() {
@@ -15817,9 +15826,12 @@ impl IdeModel {
         }
         self.insert_methodology_sdc_template(&template);
         self.workspace = WorkspaceTab::Constraints;
+        // Persist editor buffer to the open SDC path (Firstmate: disk must show
+        // set_output_delay after Apply, then re-time via read_xdc).
+        let saved = self.save_sdc_editor()?;
         let cleared = self.methodology_report().check(id).is_none();
         Ok(format!(
-            "fix_methodology ID={id} CLEARED={} TEMPLATE={template}",
+            "fix_methodology ID={id} CLEARED={} {saved} TEMPLATE={template}",
             u8::from(cleared)
         ))
     }
@@ -29501,9 +29513,17 @@ endmodule
     }
 
     /// TIMING-7 Fix applies Vivado-shaped set_output_delay, clears the check,
-    /// and opens Constraints with the template. Untouched gold path stays 9640.
+    /// persists to the open SDC path, and opens Constraints. Untouched gold
+    /// path stays 9640; examples/counter.sdc must not be left dirty.
     #[test]
     fn methodology_timing7_fix_applies_output_delay() {
+        let gold_sdc = example("counter.sdc");
+        let gold_sdc_before = std::fs::read_to_string(&gold_sdc).expect("read gold counter.sdc");
+        assert!(
+            !gold_sdc_before.contains("set_output_delay"),
+            "repo counter.sdc must start without output delay (gold): {gold_sdc_before}"
+        );
+
         // Gold without the Fix: headless counter still WNS_PS=9640.
         let mut gold_ide = IdeModel::new();
         gold_ide.open_source(&example("counter.sv")).unwrap();
@@ -29521,6 +29541,19 @@ endmodule
             gold_ide.methodology_report().text()
         );
 
+        // Write test uses a temp project SDC so Apply does not dirty examples/.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "helion-timing7-sdc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_sdc = tmp_dir.join("counter.sdc");
+        std::fs::write(&tmp_sdc, &gold_sdc_before).unwrap();
+
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
@@ -29528,6 +29561,9 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         let wns_before = ide.wns_ps().expect("STA after route");
         assert_eq!(wns_before, 9640, "pre-Fix gold WNS");
+
+        // Point the Constraints editor at the temp SDC (not examples/counter.sdc).
+        ide.open_sdc_editor(&tmp_sdc).expect("open temp SDC");
 
         ide.exec("report_methodology").unwrap();
         let sel = ide.exec("select_methodology TIMING-7").unwrap();
@@ -29546,7 +29582,7 @@ endmodule
             "optional min template: {tmpl}"
         );
 
-        // Jump inserts template without clearing yet.
+        // Jump inserts template without clearing / without persisting yet.
         let jump = ide.exec("goto_methodology_constraints TIMING-7").unwrap();
         assert!(jump.contains("TEMPLATE="), "{jump}");
         assert_eq!(ide.workspace, WorkspaceTab::Constraints);
@@ -29562,15 +29598,28 @@ endmodule
             "Jump alone must not clear TIMING-7: {}",
             ide.methodology_report().text()
         );
+        let tmp_after_jump = std::fs::read_to_string(&tmp_sdc).unwrap();
+        assert!(
+            !tmp_after_jump.contains("set_output_delay"),
+            "Jump alone must not write disk: {tmp_after_jump}"
+        );
 
-        // Fix applies SDC + clears TIMING-7 (timing may move — honest).
+        // Fix applies SDC, persists to open path, clears TIMING-7 (timing may move).
         let fx = ide.exec("fix_methodology TIMING-7").unwrap();
         assert!(fx.contains("CLEARED=1"), "{fx}");
+        assert!(
+            fx.contains("save_sdc_editor"),
+            "Apply must persist via save_sdc_editor: {fx}"
+        );
         assert!(
             fx.contains("set_output_delay -clock clk -max 0.000 [get_ports led]"),
             "{fx}"
         );
         assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert!(
+            !ide.sdc_editor_dirty,
+            "save_sdc_editor must clear dirty after Apply"
+        );
         assert!(
             ide.methodology_report().check("TIMING-7").is_none(),
             "Fix must clear TIMING-7: {}",
@@ -29581,8 +29630,32 @@ endmodule
             Some(&0),
             "led output delay applied"
         );
+        let tmp_after_fix = std::fs::read_to_string(&tmp_sdc).expect("read temp SDC after Fix");
+        assert!(
+            tmp_after_fix.contains("set_output_delay -clock clk -max 0.000 [get_ports led]"),
+            "Apply must write set_output_delay to open SDC path: {tmp_after_fix}"
+        );
+        assert!(
+            tmp_after_fix.contains("set_output_delay -clock clk -min 0.000 [get_ports led]"),
+            "Apply must write min set_output_delay too: {tmp_after_fix}"
+        );
+        assert!(
+            tmp_after_fix.contains("create_clock"),
+            "persisted SDC must keep create_clock: {tmp_after_fix}"
+        );
         // Do not fake gold 9640 after adding delay — just assert STA still runs.
         assert!(ide.wns_ps().is_some(), "STA after Fix");
+
+        // Repo gold SDC must remain create_clock-only (no committed output delay).
+        let gold_sdc_after = std::fs::read_to_string(&gold_sdc).expect("re-read gold counter.sdc");
+        assert_eq!(
+            gold_sdc_after, gold_sdc_before,
+            "examples/counter.sdc must stay untouched by the temp-path Fix test"
+        );
+        assert!(
+            !gold_sdc_after.contains("set_output_delay"),
+            "do not leave output delay in repo counter.sdc"
+        );
 
         // Gold ide from the start of the test is still untouched.
         assert_eq!(
@@ -29590,6 +29663,8 @@ endmodule
             Some(9640),
             "separate gold path must remain 9640 after Fix on another IdeModel"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     /// Bitstream pane is a helion-bits FAR table, not a hash/bytes/frames dump.

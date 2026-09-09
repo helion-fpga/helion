@@ -4949,8 +4949,9 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report methodology").clicked() {
             let _ = model.exec("report_methodology");
         }
-        // TIMING-7 (and TIMING-6): Fix applies Vivado-shaped set_*_delay and
-        // opens Constraints; Jump inserts the template ready to Save.
+        // TIMING-7 (and TIMING-6): Fix applies Vivado-shaped set_*_delay,
+        // persists via save_sdc_editor, and opens Constraints; Jump inserts
+        // the template ready to Save (disk write is Apply-only).
         if let Some(id) = model.selected_methodology.clone() {
             if model.methodology_fix_template(&id).is_some() {
                 let fix_label = if id == "TIMING-7" {
