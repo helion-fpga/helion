@@ -5366,10 +5366,16 @@ impl IdeModel {
         } else if t == "select_bitstream_frame" {
             self.select_bitstream_frame("0")
         } else if t == "report_drc" {
-            self.run_drc()
+            let r = self.run_drc();
+            if r.is_ok() {
+                self.mirror_drc_messages();
+            }
+            r
         } else if t == "report_methodology" || t == "methodology" {
             self.workspace = WorkspaceTab::Methodology;
-            Ok(self.methodology_text())
+            let text = self.methodology_text();
+            self.mirror_methodology_messages();
+            Ok(text)
         } else if t == "report_utilization" || t == "utilization" {
             self.workspace = WorkspaceTab::Utilization;
             Ok(self.utilization_report().text())
@@ -5914,7 +5920,18 @@ impl IdeModel {
                 self.workspace = WorkspaceTab::Schematic;
             }
             "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
-            _ => {}
+            _ => {
+                // Methodology/DRC check ids mirrored into Messages (TIMING-7, …).
+                if self.methodology_report().check(m.id.as_str()).is_some() {
+                    let _ = self.select_methodology(&m.id);
+                } else if self
+                    .drc
+                    .as_ref()
+                    .is_some_and(|d| d.item(m.id.as_str()).is_some())
+                {
+                    let _ = self.select_drc(&m.id);
+                }
+            }
         }
         let obj_cell = self
             .properties
@@ -6323,6 +6340,69 @@ impl IdeModel {
         } else {
             format!("{cmd}: {out}")
         };
+    }
+
+    fn msg_severity_from_methodology(sev: MethodologySeverity) -> MsgSeverity {
+        match sev {
+            MethodologySeverity::Error => MsgSeverity::Error,
+            MethodologySeverity::CriticalWarning | MethodologySeverity::Warning => {
+                MsgSeverity::Warning
+            }
+            MethodologySeverity::Advisory => MsgSeverity::Info,
+        }
+    }
+
+    fn msg_severity_from_drc(sev: DrcSeverity) -> MsgSeverity {
+        match sev {
+            DrcSeverity::Error => MsgSeverity::Error,
+            DrcSeverity::Warning => MsgSeverity::Warning,
+            DrcSeverity::Advisory => MsgSeverity::Info,
+        }
+    }
+
+    /// Replace any prior row with the same id, then push (re-runs must not duplicate).
+    fn upsert_ide_message(&mut self, severity: MsgSeverity, id: &str, text: String) {
+        self.messages.retain(|m| m.id != id);
+        self.messages.push(IdeMessage {
+            severity,
+            id: id.to_string(),
+            text,
+        });
+    }
+
+    /// Mirror UG949 methodology checks into the Messages pane severity filters.
+    fn mirror_methodology_messages(&mut self) {
+        let report = self.methodology_report();
+        for c in &report.checks {
+            let text = if c.objects.is_empty() {
+                c.message.clone()
+            } else {
+                format!("{} {}", c.objects, c.message)
+            };
+            self.upsert_ide_message(
+                Self::msg_severity_from_methodology(c.severity),
+                &c.id,
+                text,
+            );
+        }
+    }
+
+    /// Mirror UG893 DRC items into Messages. Clean designs (violations=0) add nothing.
+    fn mirror_drc_messages(&mut self) {
+        let Some(drc) = self.drc.clone() else {
+            return;
+        };
+        if drc.violations.is_empty() && drc.items.is_empty() {
+            return;
+        }
+        for v in &drc.items {
+            let text = if v.objects.is_empty() {
+                v.message.clone()
+            } else {
+                format!("{} {}", v.objects, v.message)
+            };
+            self.upsert_ide_message(Self::msg_severity_from_drc(v.severity), &v.id, text);
+        }
     }
 
     /// Submit whatever is in the console input box (what the widget calls on Enter).
@@ -29226,6 +29306,89 @@ endmodule
             hier_ide.wns_ps().expect("hier STA"),
             9640,
             "utilization hierarchy is per-design, not canned WNS"
+        );
+    }
+
+    /// Methodology/DRC checks also appear in Messages All/Errors/Warnings/Info
+    /// filters (Vivado-for-Mac gap): TIMING-7 is Warning; clean DRC invents none.
+    #[test]
+    fn messages_mirror_methodology_drc_checks_into_severity_filters() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+
+        ide.exec("report_methodology").unwrap();
+        assert!(
+            ide.messages.iter().any(|m| {
+                m.id == "TIMING-7" && m.severity == MsgSeverity::Warning
+            }),
+            "TIMING-7 must journal as MsgSeverity::Warning: {:?}",
+            ide.messages
+                .iter()
+                .map(|m| (m.severity, m.id.as_str(), m.text.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        let warn = ide.exec("filter_messages warning").unwrap();
+        assert!(warn.contains("filter=warning"), "{warn}");
+        assert!(
+            ide.message_rows()
+                .iter()
+                .any(|(_, m)| m.id == "TIMING-7" && m.severity == MsgSeverity::Warning),
+            "Warnings filter must show TIMING-7: {:?}",
+            ide.message_rows()
+                .iter()
+                .map(|(_, m)| (m.severity, m.id.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        let err = ide.exec("filter_messages error").unwrap();
+        assert!(err.contains("filter=error"), "{err}");
+        assert!(
+            ide.message_rows()
+                .iter()
+                .all(|(_, m)| m.id != "TIMING-7"),
+            "Errors filter must hide TIMING-7 Warning: {:?}",
+            ide.message_rows()
+                .iter()
+                .map(|(_, m)| (m.severity, m.id.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        ide.exec("filter_messages all").unwrap();
+        ide.exec("report_methodology").unwrap();
+        assert_eq!(
+            ide.messages.iter().filter(|m| m.id == "TIMING-7").count(),
+            1,
+            "re-run must not duplicate TIMING-7: {:?}",
+            ide.messages
+                .iter()
+                .filter(|m| m.id == "TIMING-7")
+                .collect::<Vec<_>>()
+        );
+
+        let dout = ide.exec("report_drc").unwrap();
+        assert!(
+            dout.contains("violations=0"),
+            "clean counter DRC: {dout}"
+        );
+        let drc = ide.drc.as_ref().expect("DRC after report_drc");
+        assert!(
+            drc.items.is_empty() && drc.violations.is_empty(),
+            "clean counter must have no DRC items: {:?}",
+            drc.items
+        );
+        assert!(
+            !ide.messages
+                .iter()
+                .any(|m| m.severity == MsgSeverity::Warning && m.id == "report_drc"),
+            "violations=0 must not invent a DRC Warning summary: {:?}",
+            ide.messages
+                .iter()
+                .map(|m| (m.severity, m.id.as_str()))
+                .collect::<Vec<_>>()
         );
     }
 
