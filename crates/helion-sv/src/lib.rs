@@ -448,6 +448,10 @@ thread_local! {
     /// clocks is not one user clock and is not a closed WNS.
     static CLOCK_MUX_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `clock_gate` line per module+signal. A posedge on an AND/OR of a
+    /// clock and an enable is not one user clock and is not a closed WNS.
+    static CLOCK_GATE_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// Negedge-only always writes. Not mixed into the posedge NBA cone.
     /// (module, clk, signal, bit, optional RHS). None RHS cannot lower.
     static NEGEDGE_WRITES: std::cell::RefCell<
@@ -612,6 +616,26 @@ fn note_clock_mux(module: &str, signal: &str) {
 fn clock_mux_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     CLOCK_MUX_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Posedge of a gated clock (AND/OR of a clock and an enable). One line.
+/// Not a LUT, not a single user clock. Not a ternary of two clocks.
+fn note_clock_gate(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "clk" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = CLOCK_GATE_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic clock_gate module={module} signal={signal} (posedge is a gated clock; not a single user clock; not a closed WNS)"
+    ));
+}
+
+fn clock_gate_for(module: &str) -> bool {
+    let prefix = format!("{module}\0");
+    CLOCK_GATE_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
 }
 
 fn note_negedge_write(
@@ -819,6 +843,57 @@ fn note_clock_muxes(rtl: &Rtl) -> HashSet<String> {
             .any(|(lhs, _, rhs)| lhs == &clk && is_clock_mux_expr(rtl, rhs));
         if muxed {
             note_clock_mux(&rtl.module, &clk);
+            sigs.insert(clk);
+        }
+    }
+    sigs
+}
+
+fn peel_not(e: &RExpr) -> &RExpr {
+    let mut cur = e;
+    while let RExpr::Not(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// Enable arm of a clock gate: a signal, a bit, or `~` of those. Not a const.
+fn is_enable_arm(e: &RExpr) -> bool {
+    matches!(peel_not(e), RExpr::Ident(_) | RExpr::Bit(_, _))
+}
+
+fn clock_gate_clock_arm<'a>(rtl: &Rtl, e: &'a RExpr) -> Option<&'a str> {
+    clock_port_arm(rtl, peel_not(e))
+}
+
+/// `assign gclk = clk & en` / `clk & ~en` / `clk | en`. One side is a clock
+/// port; the other is an enable. Not a ternary of two clocks (that is clock_mux).
+fn is_clock_gate_expr(rtl: &Rtl, e: &RExpr) -> bool {
+    let (a, b) = match e {
+        RExpr::And(a, b) | RExpr::Or(a, b) => (a.as_ref(), b.as_ref()),
+        _ => return false,
+    };
+    let ca = clock_gate_clock_arm(rtl, a).is_some();
+    let cb = clock_gate_clock_arm(rtl, b).is_some();
+    let ea = is_enable_arm(a);
+    let eb = is_enable_arm(b);
+    (ca && eb) || (cb && ea)
+}
+
+/// Posedge/negedge is not a plain port clock, and that net is an AND/OR of a
+/// clock and an enable. One diagnostic; the gate is not lowered as a data LUT.
+fn note_clock_gates(rtl: &Rtl, already: &HashSet<String>) -> HashSet<String> {
+    let mut sigs = HashSet::new();
+    for clk in seq_clocks_of(&rtl.module) {
+        if is_input_port(rtl, &clk) || already.contains(&clk) {
+            continue;
+        }
+        let gated = rtl
+            .assigns
+            .iter()
+            .any(|(lhs, _, rhs)| lhs == &clk && is_clock_gate_expr(rtl, rhs));
+        if gated {
+            note_clock_gate(&rtl.module, &clk);
             sigs.insert(clk);
         }
     }
@@ -6300,9 +6375,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut n_rel = 0usize;
     // A posedge clock that is a mux of two clocks is not a data LUT and not
     // one user clock. Name it; do not close WNS on a leftover input.
+    // A posedge clock that is an AND/OR of a clock and an enable is the same
+    // kind of honesty: one clock_gate, no data LUT, not a closed WNS.
     let clock_mux_sigs = note_clock_muxes(rtl);
+    let clock_gate_sigs = note_clock_gates(rtl, &clock_mux_sigs);
     for (lhs, bit, rhs) in &rtl.assigns {
-        if clock_mux_sigs.contains(lhs) {
+        if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
             continue;
         }
         match rhs {
@@ -6556,6 +6634,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     if clock_mux_for(&rtl.module) {
         d.attrs.set("CLOCK_MUX", "1");
+    }
+    if clock_gate_for(&rtl.module) {
+        d.attrs.set("CLOCK_GATE", "1");
     }
 
     // Negedge-only always: one Hff on that clock, or one named diagnostic.
@@ -8531,6 +8612,38 @@ endmodule
         assert!(
             !invented,
             "clock mux must not be lowered as a data LUT, nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clock_gate_posedge_is_not_a_user_clock() {
+        // Sibling of clock_mux: AND/OR of a clock and an enable (`~en` too).
+        // Not a ternary of two clocks. Not a data LUT. Not a closed WNS.
+        let src = r#"
+module clk_gate_q(input clk, input en, input d, output reg q);
+  wire gclk;
+  assign gclk = clk & ~en;
+  always @(posedge gclk) q <= d;
+endmodule
+"#;
+        let d = synth_sv(src, "clk_gate.v").expect("clock gate");
+        assert_eq!(
+            d.attrs.get("CLOCK_GATE"),
+            Some("1"),
+            "gated posedge must not be a single user clock"
+        );
+        assert_ne!(
+            d.attrs.get("CLOCK_MUX"),
+            Some("1"),
+            "clk & ~en is a gate, not a mux of two clocks"
+        );
+        let invented = d.nets.iter().any(|n| {
+            n.name == "gclk" && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(
+            !invented,
+            "clock gate must not be lowered as a data LUT, nets={:?}",
             d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
         );
     }
