@@ -396,6 +396,10 @@ impl HelionIde {
                     let _ = app.model.exec(t);
                 }
             }
+            // Save Project As / open_project push the .prj onto Recent.
+            if let Some(prj) = app.model.last_project_path.clone() {
+                app.remember(prj);
+            }
         }
         if let Ok(name) = std::env::var("HELION_BOTTOM") {
             if let Some(tab) = BottomTab::ALL.iter().copied().find(|t| {
@@ -793,6 +797,34 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
     }
 }
 
+
+fn native_save_project_as(app: &mut HelionIde) {
+    let default_name = app
+        .model
+        .design()
+        .map(|d| d.name.clone())
+        .or_else(|| app.model.tree.top.clone())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "project".into());
+    let start = default_projects_dir();
+    let start_s = start.to_string_lossy().into_owned();
+    let Some(dir) = pick_directory_dialog(&start_s) else {
+        return;
+    };
+    match app.model.save_project_as(&dir, Some(&default_name)) {
+        Ok(msg) => {
+            if let Some(prj) = app.model.last_project_path.clone() {
+                app.remember(prj);
+            }
+            app.progress = msg;
+            app.set_activity(Activity::Files);
+        }
+        Err(e) => {
+            app.progress = e;
+        }
+    }
+}
+
 fn native_open(app: &mut HelionIde) {
     if let Some(path) = native_open_dialog() {
         app.open_path_async(&path);
@@ -906,6 +938,15 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     .on_hover_text(tip("Open", "⌘O", "open_source"));
                 if open.clicked() {
                     native_open(app);
+                }
+                let save_as = ui
+                    .add_sized(
+                        chrome::toolbar_ctrl_size("Save Project As…"),
+                        egui::Button::new("Save Project As…"),
+                    )
+                    .on_hover_text(tip("Save Project As", "", "save_project_as"));
+                if save_as.clicked() {
+                    native_save_project_as(app);
                 }
                 let recent_sz = chrome::toolbar_ctrl_size("Recent");
                 ui.allocate_ui(egui::vec2(recent_sz[0], recent_sz[1]), |ui| {
