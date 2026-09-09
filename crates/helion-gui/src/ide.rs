@@ -2517,7 +2517,7 @@ pub enum WaveRadix {
 #[derive(Clone, Debug)]
 pub struct WaveTrace {
     pub name: String,
-    /// One sample per cycle. Width 1 = scalar net; width >1 = packed bus (LSB = bit 0).
+    /// Samples on the wave grid (two half-cycles per user clk). Width 1 = scalar; width >1 = bus.
     pub samples: Vec<u64>,
     pub width: u8,
     pub style: WaveStyle,
@@ -2672,7 +2672,7 @@ impl VirtualBus {
 pub struct Waveform {
     pub traces: Vec<WaveTrace>,
     pub cursor: usize,
-    /// Picoseconds per sample (clock period). UG900 timescale ruler.
+    /// Picoseconds per sample (half clock period when clk is half-cycle sampled).
     pub timescale_ps: u64,
     pub markers: Vec<WaveMarker>,
     pub virtual_buses: Vec<VirtualBus>,
@@ -2698,6 +2698,25 @@ impl Default for Waveform {
 
 impl Waveform {
     pub fn bits_of(&self, name: &str) -> Option<String> {
+        // Half-cycle clk grid records two samples per user cycle; LED gold /
+        // UG900 bitstrings stay one bit per cycle (posedge / active-edge sample).
+        if name == "led" {
+            if let (Some(clk), Some(led)) = (self.trace("clk"), self.trace("led")) {
+                if clk.samples.len() >= 2
+                    && clk.samples.len() % 2 == 0
+                    && led.samples.len() == clk.samples.len()
+                {
+                    return Some(
+                        led.samples
+                            .iter()
+                            .skip(1)
+                            .step_by(2)
+                            .map(|v| if v & 1 == 1 { '1' } else { '0' })
+                            .collect(),
+                    );
+                }
+            }
+        }
         self.traces.iter().find(|t| t.name == name).map(|t| t.bit_string())
     }
 
@@ -12646,7 +12665,7 @@ impl IdeModel {
         if let Some(sim) = &self.event_sim {
             sim.time
         } else if self.fabric_sim.is_some() {
-            self.wave.sample_len() as u64 * self.sim_timescale_ps.max(1)
+            self.wave.sample_len() as u64 * self.wave.timescale_ps.max(1)
         } else {
             0
         }
@@ -16798,7 +16817,8 @@ impl IdeModel {
         );
         self.wave.traces.clear();
         self.wave.cursor = 0;
-        self.wave.timescale_ps = self.sim_timescale_ps.max(1);
+        // Half-cycle samples in sim_step_inner; period/2 keeps TIME_PS honest.
+        self.wave.timescale_ps = (self.sim_timescale_ps.max(1) / 2).max(1);
         self.bp_prev.clear();
         let mut hit: Option<String> = None;
         let mut ran = 0u32;
@@ -16823,10 +16843,7 @@ impl IdeModel {
             self.wave.cursor_a = None;
             self.wave.cursor_b = None;
         }
-        let led = self
-            .wave
-            .bits_of("led")
-            .unwrap_or_default();
+        let led = self.wave_posedge_led_bits();
         let time_ps = self.sim_engine_time_ps();
         self.bottom_tab = BottomTab::SimLog;
         if let Some(h) = hit {
@@ -16932,7 +16949,7 @@ impl IdeModel {
             self.event_sim = Some(Sim::new(&d));
             self.fabric_sim = None;
         }
-        self.wave.timescale_ps = self.sim_timescale_ps.max(1);
+        self.wave.timescale_ps = (self.sim_timescale_ps.max(1) / 2).max(1);
         if self.wave.traces.is_empty() {
             self.wave.traces.push(WaveTrace::scalar("led"));
         }
@@ -17009,8 +17026,41 @@ impl IdeModel {
         }
     }
 
+    fn last_wave_outputs(&self) -> (u64, u64, u8) {
+        let led = self
+            .wave
+            .trace("led")
+            .and_then(|t| t.samples.last().copied())
+            .unwrap_or(0);
+        let cnt_t = self.wave.trace("cnt");
+        let cnt = cnt_t.and_then(|t| t.samples.last().copied()).unwrap_or(0);
+        let w = cnt_t.map(|t| t.width).unwrap_or(1);
+        (led, cnt, w)
+    }
+
+    /// Posedge-only LED bitstring (one bit per user cycle) from half-cycle wave samples.
+    fn wave_posedge_led_bits(&self) -> String {
+        match self.wave.trace("led") {
+            Some(t) if t.samples.len() >= 2 => t
+                .samples
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .map(|v| if v & 1 == 1 { '1' } else { '0' })
+                .collect(),
+            Some(t) => t.bit_string(),
+            None => String::new(),
+        }
+    }
+
     fn sim_step_inner(&mut self) -> Result<(), String> {
         let delay = self.sim_timescale_ps.max(1);
+        // Two samples per user cycle: half-period timescale so the ruler stays honest.
+        let half = (delay / 2).max(1);
+        self.wave.timescale_ps = half;
+
+        let (prev_led, prev_cnt, prev_w) = self.last_wave_outputs();
+
         if let Some(fab) = self.fabric_sim.as_mut() {
             let _iob = self
                 .shell
@@ -17027,11 +17077,24 @@ impl IdeModel {
         }
         self.apply_scheduled_forces();
         let (led, bus, bus_w) = self.current_sim_outputs()?;
+
+        // Inactive half-cycle: clk low; led/cnt hold until the active edge.
+        Self::push_sample(&mut self.wave, "clk", 0, 1, WaveStyle::Digital);
+        Self::push_sample(&mut self.wave, "led", prev_led, 1, WaveStyle::Digital);
+        if bus_w > 1 {
+            let hold_w = prev_w.max(bus_w);
+            Self::push_sample(&mut self.wave, "cnt", prev_cnt, hold_w, WaveStyle::Analog);
+        }
+
+        // Active edge sample: clk high; led/cnt update once per user cycle.
+        Self::push_sample(&mut self.wave, "clk", 1, 1, WaveStyle::Digital);
         Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
         if bus_w > 1 {
             Self::push_sample(&mut self.wave, "cnt", bus, bus_w, WaveStyle::Analog);
         }
         if self.sim_log_all_signals {
+            // Align extras to the two half-cycle samples; never flatten clk.
+            self.push_log_all_samples();
             self.push_log_all_samples();
         }
         self.wave.rebuild_virtual_buses();
@@ -17504,7 +17567,8 @@ impl IdeModel {
         let mut extras: Vec<(String, u64, u8)> = Vec::new();
         if let Some(sim) = &self.event_sim {
             for (name, value) in sim.object_values() {
-                if name == "led" {
+                // clk is owned by sim_step_inner half-cycle sampling — never flatten it.
+                if name == "led" || name == "clk" {
                     continue;
                 }
                 if let Some((v, w)) = Self::parse_wave_bit(&value) {
@@ -17513,7 +17577,7 @@ impl IdeModel {
             }
         } else {
             for l in &self.locals {
-                if l.name == "led" || l.name == "cnt" {
+                if l.name == "led" || l.name == "cnt" || l.name == "clk" {
                     continue;
                 }
                 if let Some((v, w)) = Self::parse_wave_bit(&l.value) {
@@ -17521,7 +17585,7 @@ impl IdeModel {
                 }
             }
             for o in &self.objects {
-                if o.name == "led" || o.name == "cnt" {
+                if o.name == "led" || o.name == "cnt" || o.name == "clk" {
                     continue;
                 }
                 if extras.iter().any(|(n, _, _)| n == &o.name) {
@@ -20423,8 +20487,13 @@ mod tests {
 
         let out = ide.sim_run(16).unwrap();
         assert!(out.contains("LED[16]="), "{out}");
-        let wave = ide.wave.bits_of("led").expect("wave has led trace");
-        assert_eq!(wave, gold, "UG900 wave samples the fabric LED net");
+        let wave = ide.wave_posedge_led_bits();
+        assert_eq!(wave, gold, "UG900 wave samples the fabric LED net on posedge");
+        assert!(ide.wave.has_trace("clk"), "sim records toggling clk");
+        assert!(
+            ide.wave.trace("clk").unwrap().has_digital_transition(),
+            "clk must toggle 0↔1 across half-cycles"
+        );
         assert!(ide.scopes.iter().any(|s| s.name == "counter"), "{:?}", ide.scopes);
         assert!(ide.objects.iter().any(|o| o.name == "led"), "{:?}", ide.objects);
 
@@ -20435,7 +20504,7 @@ mod tests {
         );
         ide.sim_step().unwrap();
         ide.sim_step().unwrap();
-        let two = ide.wave.bits_of("led").unwrap();
+        let two = ide.wave_posedge_led_bits();
         assert_eq!(two, &gold[..2], "step is a real cycle, not a dummy");
     }
 
@@ -20452,9 +20521,12 @@ mod tests {
 
         let led = ide.wave.trace("led").expect("led wave object");
         assert_eq!(led.name, "led");
-        assert_eq!(led.samples.len(), 16);
-        assert_eq!(led.analog_series().len(), 16);
-        for (i, y) in led.analog_series().iter().enumerate() {
+        // Two half-cycle samples per user cycle.
+        assert_eq!(led.samples.len(), 32);
+        assert_eq!(led.analog_series().len(), 32);
+        let posedge: Vec<f64> = led.analog_series().into_iter().skip(1).step_by(2).collect();
+        assert_eq!(posedge.len(), 16);
+        for (i, y) in posedge.iter().enumerate() {
             let bit = gold.as_bytes()[i] == b'1';
             assert_eq!(*y, if bit { 1.0 } else { 0.0 }, "analog Y is the engine bit");
         }
@@ -20462,13 +20534,16 @@ mod tests {
             led.has_digital_transition(),
             "digital 0↔1 when gold LED has both: {gold}"
         );
+        let clk = ide.wave.trace("clk").expect("clk wave object");
+        assert!(clk.has_digital_transition(), "clk toggles each half-cycle");
+        assert_eq!(clk.bit_string(), "01".repeat(16));
         assert!(
-            ide.wave.cursor < 16,
+            ide.wave.cursor < 32,
             "main cursor indexes a sample: {}",
             ide.wave.cursor
         );
-        assert_eq!(ide.wave.time_ps(1), ide.clock_period_ps);
-        assert_eq!(ide.wave.timescale_ps, 10_000);
+        assert_eq!(ide.wave.time_ps(2), ide.clock_period_ps);
+        assert_eq!(ide.wave.timescale_ps, 5_000);
 
         let before = led.samples.clone();
         ide.exec("wave_radix led binary").unwrap();
@@ -20484,12 +20559,12 @@ mod tests {
         ide.exec("wave_style led analog").unwrap();
         assert_eq!(ide.wave.trace("led").unwrap().style, WaveStyle::Analog);
         ide.exec("wave_style led digital").unwrap();
-        assert_eq!(ide.wave.bits_of("led").as_deref(), Some(gold.as_str()));
+        assert_eq!(ide.wave_posedge_led_bits(), gold);
 
         assert!(ide.wave.has_trace("cnt"), "packed LUTFF bus from fabric Q");
         let cnt = ide.wave.trace("cnt").unwrap();
         assert!(cnt.width > 1, "cnt is a bus, not a scalar dump");
-        assert_eq!(cnt.analog_series().len(), 16);
+        assert_eq!(cnt.analog_series().len(), 32);
         let ymax = cnt.analog_series().iter().cloned().fold(0.0, f64::max);
         assert!(ymax > 1.0, "analog bus is the integer series, not a canned sine: {ymax}");
 
@@ -20510,7 +20585,7 @@ mod tests {
         ide.run_step(FlowStep::Bitstream).unwrap();
         let gold = ide.fabric_led_bits(16).unwrap();
         ide.sim_run(16).unwrap();
-        assert_eq!(ide.wave.bits_of("led").as_deref(), Some(gold.as_str()));
+        assert_eq!(ide.wave_posedge_led_bits(), gold);
         assert!(ide.wave.has_trace("cnt"), "packed LUTFF bus from fabric Q");
         let cnt = ide.wave.trace("cnt").unwrap().samples.clone();
         let cnt_w = ide.wave.trace("cnt").unwrap().width;
@@ -20524,15 +20599,16 @@ mod tests {
             mcur.sample as u64 * ide.wave.timescale_ps
         );
 
-        let out = ide.exec("add_wave_marker M4 4").unwrap();
-        assert!(out.contains("sample=4"), "{out}");
+        // Half-cycle grid: sample 8 is 8*5000=40000 ps (was sample 4 at 10ns).
+        let out = ide.exec("add_wave_marker M8 8").unwrap();
+        assert!(out.contains("sample=8"), "{out}");
         assert!(out.contains("TIME_PS=40000"), "{out}");
-        let m4 = ide.wave.marker("M4").unwrap();
-        assert_eq!(m4.sample, 4);
-        assert_eq!(ide.wave.time_ps(4), 40_000);
+        let m8 = ide.wave.marker("M8").unwrap();
+        assert_eq!(m8.sample, 8);
+        assert_eq!(ide.wave.time_ps(8), 40_000);
         let tmark = ide.exec("add_wave_marker Mt -time 80000").unwrap();
-        assert!(tmark.contains("sample=8"), "{tmark}");
-        assert_eq!(ide.wave.marker("Mt").unwrap().sample, 8);
+        assert!(tmark.contains("sample=16"), "{tmark}");
+        assert_eq!(ide.wave.marker("Mt").unwrap().sample, 16);
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
 
         let vb = ide.exec("add_wave_virtual_bus vb led cnt").unwrap();
@@ -20540,9 +20616,10 @@ mod tests {
         assert!(vb.contains(&format!("width={}", 1 + cnt_w)), "{vb}");
         let packed = ide.wave.trace("vb").expect("virtual bus trace");
         assert_eq!(packed.width, 1 + cnt_w);
-        assert_eq!(packed.samples.len(), 16);
-        for i in 0..16 {
-            let led_bit = u64::from(gold.as_bytes()[i] == b'1');
+        assert_eq!(packed.samples.len(), 32);
+        let led_samples = ide.wave.trace("led").unwrap().samples.clone();
+        for i in 0..32 {
+            let led_bit = led_samples[i] & 1;
             let expect = led_bit | (cnt[i] << 1);
             assert_eq!(
                 packed.samples[i], expect,
@@ -20630,14 +20707,15 @@ mod tests {
         ide.sim_run(16).unwrap();
         assert_eq!(ide.wave.bits_of("led").as_deref(), Some(gold.as_str()));
         let main = ide.wave.cursor;
-        assert_eq!(main, 15, "sim_run parks the main cursor on the last sample");
+        assert_eq!(main, 31, "sim_run parks the main cursor on the last half-cycle sample");
 
-        let a = ide.exec("wave_cursor_a 2").unwrap();
-        assert!(a.contains("wave_cursor A sample=2"), "{a}");
+        // Half-cycle timescale 5ns: sample 4 → 20ns, sample 16 → 80ns.
+        let a = ide.exec("wave_cursor_a 4").unwrap();
+        assert!(a.contains("wave_cursor A sample=4"), "{a}");
         assert!(a.contains("TIME_PS=20000"), "{a}");
         assert!(a.contains("DELTA_PS=n/a"), "{a}");
-        assert_eq!(ide.wave.cursor_a, Some(2));
-        assert_eq!(ide.wave.time_ps(2), 20_000);
+        assert_eq!(ide.wave.cursor_a, Some(4));
+        assert_eq!(ide.wave.time_ps(4), 20_000);
         assert_eq!(ide.wave.cursor, main, "placing A must not move the main cursor");
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
         assert!(
@@ -20648,34 +20726,35 @@ mod tests {
             ide.properties
         );
 
-        let b = ide.exec("wave_cursor_b 8").unwrap();
-        assert!(b.contains("wave_cursor B sample=8"), "{b}");
+        let b = ide.exec("wave_cursor_b 16").unwrap();
+        assert!(b.contains("wave_cursor B sample=16"), "{b}");
         assert!(b.contains("TIME_PS=80000"), "{b}");
         assert!(b.contains("DELTA_PS=60000"), "{b}");
-        assert_eq!(ide.wave.cursor_b, Some(8));
-        assert_eq!(ide.wave.time_ps(8), 80_000);
+        assert_eq!(ide.wave.cursor_b, Some(16));
+        assert_eq!(ide.wave.time_ps(16), 80_000);
         assert_eq!(ide.wave.time_delta_ps(), Some(60_000));
         assert_eq!(ide.wave.cursor, main, "placing B must not move the main cursor");
 
         let pane = ide.exec("wave_cursors").unwrap();
-        assert!(pane.contains("A_SAMPLE=2 A_TIME_PS=20000"), "{pane}");
-        assert!(pane.contains("B_SAMPLE=8 B_TIME_PS=80000"), "{pane}");
+        assert!(pane.contains("A_SAMPLE=4 A_TIME_PS=20000"), "{pane}");
+        assert!(pane.contains("B_SAMPLE=16 B_TIME_PS=80000"), "{pane}");
         assert!(pane.contains("DELTA_PS=60000"), "{pane}");
         let led = ide.wave.trace("led").unwrap();
-        let va = led.value_at(2);
-        let vb = led.value_at(8);
+        let va = led.value_at(4);
+        let vb = led.value_at(16);
         assert!(pane.contains(&format!("led A={va} B={vb}")), "{pane}");
-        assert_eq!(va.chars().last().unwrap(), gold.as_bytes()[2] as char);
-        assert_eq!(vb.chars().last().unwrap(), gold.as_bytes()[8] as char);
-        if gold.as_bytes()[2] != gold.as_bytes()[8] {
+        // Even samples are inactive halves holding the prior posedge bit.
+        assert_eq!(va.chars().last().unwrap(), gold.as_bytes()[1] as char);
+        assert_eq!(vb.chars().last().unwrap(), gold.as_bytes()[7] as char);
+        if gold.as_bytes()[1] != gold.as_bytes()[7] {
             assert_ne!(va, vb, "A/B values are engine bits at those samples");
         }
 
         let tmark = ide.exec("wave_cursor A -time 40000").unwrap();
-        assert!(tmark.contains("sample=4"), "{tmark}");
-        assert_eq!(ide.wave.cursor_a, Some(4));
+        assert!(tmark.contains("sample=8"), "{tmark}");
+        assert_eq!(ide.wave.cursor_a, Some(8));
         assert_eq!(ide.wave.time_delta_ps(), Some(40_000));
-        let swapped = ide.exec("wave_cursor B 1").unwrap();
+        let swapped = ide.exec("wave_cursor B 2").unwrap();
         assert!(swapped.contains("DELTA_PS=-30000"), "{swapped}");
         assert_eq!(ide.wave.time_delta_ps(), Some(-30_000));
 
@@ -20693,12 +20772,12 @@ mod tests {
         blinky.sim_run(16).unwrap();
         let gold_b = blinky.fabric_led_bits(16).unwrap();
         assert_ne!(gold, gold_b, "LED wave is per-design from fabric");
-        blinky.exec("wave_cursor_a 2").unwrap();
-        blinky.exec("wave_cursor_b 8").unwrap();
+        blinky.exec("wave_cursor_a 4").unwrap();
+        blinky.exec("wave_cursor_b 16").unwrap();
         assert_eq!(blinky.wave.time_delta_ps(), Some(60_000));
-        let va_b = blinky.wave.trace("led").unwrap().value_at(2);
-        let vb_b = blinky.wave.trace("led").unwrap().value_at(8);
-        if gold.as_bytes()[2] != gold_b.as_bytes()[2] || gold.as_bytes()[8] != gold_b.as_bytes()[8]
+        let va_b = blinky.wave.trace("led").unwrap().value_at(4);
+        let vb_b = blinky.wave.trace("led").unwrap().value_at(16);
+        if gold.as_bytes()[1] != gold_b.as_bytes()[1] || gold.as_bytes()[7] != gold_b.as_bytes()[7]
         {
             assert_ne!(
                 (va.clone(), vb.clone()),
@@ -20707,8 +20786,8 @@ mod tests {
             );
         }
 
-        ide.exec("wave_cursor_a 2").unwrap();
-        ide.exec("wave_cursor_b 8").unwrap();
+        ide.exec("wave_cursor_a 4").unwrap();
+        ide.exec("wave_cursor_b 16").unwrap();
         assert_eq!(ide.wave.time_delta_ps(), Some(60_000));
         ide.sim_restart().unwrap();
         assert!(ide.wave.cursor_a.is_none());
@@ -25438,7 +25517,7 @@ endmodule
             !full.contains("HIT"),
             "disabled breakpoint must not stop: {full}"
         );
-        assert_eq!(ide.wave.sample_len(), 16);
+        assert_eq!(ide.wave.sample_len(), 32);
         ide.exec("enable_bp 1").unwrap();
         let hit2 = ide.exec("sim_run 16").unwrap();
         assert!(hit2.contains("HIT"), "{hit2}");
@@ -25689,7 +25768,7 @@ endmodule
             !full.contains("HIT"),
             "disabled line BP must not stop: {full}"
         );
-        assert_eq!(ide.wave.sample_len(), 16);
+        assert_eq!(ide.wave.sample_len(), 32);
         ide.exec("enable_bp 1").unwrap();
         let hit2 = ide.exec("sim_run 16").unwrap();
         assert!(hit2.contains("HIT"), "{hit2}");
@@ -30936,9 +31015,9 @@ endmodule
 
         let run = ide.exec("run_simulation").unwrap();
         assert!(run.contains("cycles=4"), "run_simulation uses RUNTIME_CYCLES: {run}");
-        assert_eq!(ide.wave.sample_len(), 4);
-        assert_eq!(ide.wave.timescale_ps, 5_000);
-        assert_eq!(ide.wave.time_ps(1), 5_000);
+        assert_eq!(ide.wave.sample_len(), 8);
+        assert_eq!(ide.wave.timescale_ps, 2_500);
+        assert_eq!(ide.wave.time_ps(1), 2_500);
         assert!(
             ide.wave.traces.len() > 1,
             "LOG_ALL_SIGNALS samples helion-sim objects, not only LED: {:?}",
@@ -30999,11 +31078,11 @@ endmodule
             Some(gold_led.as_str()),
             "default runtime still samples 16 fabric cycles"
         );
-        assert_eq!(ide.wave.timescale_ps, 10_000);
+        assert_eq!(ide.wave.timescale_ps, 5_000);
         ide.exec("set_runtime 8").unwrap();
         let short = ide.exec("run_simulation").unwrap();
         assert!(short.contains("cycles=8"), "{short}");
-        assert_eq!(ide.wave.sample_len(), 8);
+        assert_eq!(ide.wave.sample_len(), 16);
         assert_eq!(
             ide.wave.bits_of("led").as_deref(),
             Some(&gold_led[..8]),
@@ -31013,7 +31092,7 @@ endmodule
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "SAMPLES" && v == "8"),
+                .any(|(k, v)| k == "SAMPLES" && v == "16"),
             "{:?}",
             ide.properties
         );
@@ -31032,8 +31111,8 @@ endmodule
         );
         let brun = blinky.exec("run_simulation").unwrap();
         assert!(brun.contains("cycles=4"), "{brun}");
-        assert_eq!(blinky.wave.sample_len(), 4);
-        assert_eq!(blinky.wave.timescale_ps, 2_000);
+        assert_eq!(blinky.wave.sample_len(), 8);
+        assert_eq!(blinky.wave.timescale_ps, 1_000);
         let bled = blinky.wave.bits_of("led").unwrap();
         let cled = ide.wave.bits_of("led").unwrap();
         assert_ne!(bled, cled, "LED wave is per-design from helion-sim");
@@ -32257,17 +32336,17 @@ endmodule
         assert!(run.contains("cycles=16"), "{run}");
         let led = ide.wave.bits_of("led").expect("event-sim LED");
         assert_eq!(led.len(), 16, "{led}");
-        ide.exec("add_wave_marker M4 4").unwrap();
+        ide.exec("add_wave_marker M4 8").unwrap();
         ide.exec("add_wave_marker M8 -time 80000").unwrap();
         let table = ide.exec("wave_markers").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
         assert!(table.contains("wave_markers n="), "{table}");
         assert!(table.contains("engine=helion-sim"), "{table}");
         assert!(table.contains("NAME=M4"), "{table}");
-        assert!(table.contains("SAMPLE=4"), "{table}");
+        assert!(table.contains("SAMPLE=8"), "{table}");
         assert!(table.contains("TIME_PS=40000"), "{table}");
         assert!(table.contains("NAME=M8"), "{table}");
-        assert!(table.contains("SAMPLE=8"), "{table}");
+        assert!(table.contains("SAMPLE=16"), "{table}");
         assert!(table.contains("TIME_PS=80000"), "{table}");
         assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
         assert!(
@@ -32280,10 +32359,10 @@ endmodule
         );
 
         let sel = ide.exec("select_wave_marker M4").unwrap();
-        assert!(sel.contains("SAMPLE=4"), "{sel}");
+        assert!(sel.contains("SAMPLE=8"), "{sel}");
         assert!(sel.contains("TIME_PS=40000"), "{sel}");
         assert!(sel.contains(&format!("LED={led}")), "{sel}");
-        assert_eq!(ide.wave.cursor, 4);
+        assert_eq!(ide.wave.cursor, 8);
         assert_eq!(ide.selected_wave_marker.as_deref(), Some("M4"));
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
         assert!(
@@ -32315,7 +32394,7 @@ endmodule
         assert_eq!(gold, 9640, "empty XDC counter gold WNS");
         ide.exec("wave_markers").unwrap();
         ide.exec("select_wave_marker M8").unwrap();
-        assert_eq!(ide.wave.cursor, 8);
+        assert_eq!(ide.wave.cursor, 16);
         assert_eq!(
             ide.wns_ps(),
             Some(gold),
@@ -32325,10 +32404,10 @@ endmodule
         ide.run_step(FlowStep::Bitstream).unwrap();
         let gold_led = ide.fabric_led_bits(16).expect("fabric LED");
         ide.exec("sim_run 16").unwrap();
-        ide.exec("add_wave_marker Mf 15").unwrap();
+        ide.exec("add_wave_marker Mf 31").unwrap();
         let ftable = ide.exec("wave_markers").unwrap();
         assert!(ftable.contains("NAME=Mf"), "{ftable}");
-        assert!(ftable.contains("SAMPLE=15"), "{ftable}");
+        assert!(ftable.contains("SAMPLE=31"), "{ftable}");
         let fsel = ide.exec("select_wave_marker Mf").unwrap();
         assert!(fsel.contains(&format!("LED={gold_led}")), "{fsel}");
         assert_eq!(
@@ -32401,16 +32480,16 @@ endmodule
         assert!(run.contains("cycles=16"), "{run}");
         let led = ide.wave.bits_of("led").expect("event-sim LED");
         assert_eq!(led.len(), 16, "{led}");
-        ide.exec("wave_cursor_a 2").unwrap();
-        ide.exec("wave_cursor_b 8").unwrap();
+        ide.exec("wave_cursor_a 4").unwrap();
+        ide.exec("wave_cursor_b 16").unwrap();
         let table = ide.exec("wave_cursors").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
         assert!(table.contains("engine=helion-sim"), "{table}");
         assert!(table.contains("NAME=A"), "{table}");
-        assert!(table.contains("SAMPLE=2"), "{table}");
+        assert!(table.contains("SAMPLE=4"), "{table}");
         assert!(table.contains("TIME_PS=20000"), "{table}");
         assert!(table.contains("NAME=B"), "{table}");
-        assert!(table.contains("SAMPLE=8"), "{table}");
+        assert!(table.contains("SAMPLE=16"), "{table}");
         assert!(table.contains("TIME_PS=80000"), "{table}");
         assert!(table.contains("NAME=B-A"), "{table}");
         assert!(table.contains("DELTA_PS=60000"), "{table}");
@@ -32419,23 +32498,23 @@ endmodule
             !table.contains("xsim") && !table.contains("questa") && !table.contains("vcs"),
             "helion-sim only: {table}"
         );
-        let va = ide.wave.trace("led").unwrap().value_at(2);
-        let vb = ide.wave.trace("led").unwrap().value_at(8);
+        let va = ide.wave.trace("led").unwrap().value_at(4);
+        let vb = ide.wave.trace("led").unwrap().value_at(16);
         assert!(table.contains(&format!("VALUE={va}")) || table.contains(&format!("led A={va}")), "{table}");
         assert!(
             ide.wave_cursor_rows()
                 .iter()
-                .any(|r| r.name == "A" && r.sample == Some(2) && r.time_ps == Some(20_000)),
+                .any(|r| r.name == "A" && r.sample == Some(4) && r.time_ps == Some(20_000)),
             "{:?}",
             ide.wave_cursor_rows()
         );
 
         let sel = ide.exec("select_wave_cursor A").unwrap();
-        assert!(sel.contains("SAMPLE=2"), "{sel}");
+        assert!(sel.contains("SAMPLE=4"), "{sel}");
         assert!(sel.contains("TIME_PS=20000"), "{sel}");
         assert!(sel.contains(&format!("LED={led}")), "{sel}");
         assert_eq!(ide.selected_wave_cursor.as_deref(), Some("A"));
-        assert_eq!(ide.wave.cursor_a, Some(2));
+        assert_eq!(ide.wave.cursor_a, Some(4));
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
         assert!(
             ide.properties
@@ -32462,7 +32541,7 @@ endmodule
         assert_eq!(gold, 9640, "empty XDC counter gold WNS");
         ide.exec("wave_cursors").unwrap();
         ide.exec("select_wave_cursor B").unwrap();
-        assert_eq!(ide.wave.cursor_b, Some(8));
+        assert_eq!(ide.wave.cursor_b, Some(16));
         assert_eq!(
             ide.wns_ps(),
             Some(gold),
@@ -32472,8 +32551,8 @@ endmodule
         ide.run_step(FlowStep::Bitstream).unwrap();
         let gold_led = ide.fabric_led_bits(16).expect("fabric LED");
         ide.exec("sim_run 16").unwrap();
-        ide.exec("wave_cursor_a 2").unwrap();
-        ide.exec("wave_cursor_b 8").unwrap();
+        ide.exec("wave_cursor_a 4").unwrap();
+        ide.exec("wave_cursor_b 16").unwrap();
         let fsel = ide.exec("select_wave_cursor A").unwrap();
         assert!(fsel.contains(&format!("LED={gold_led}")), "{fsel}");
         assert_eq!(
