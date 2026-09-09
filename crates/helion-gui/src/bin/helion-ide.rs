@@ -3809,6 +3809,10 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     );
     if !closed {
         ui.label("Not a closed WNS.");
+        let pane = model.timing_text();
+        if pane != honest {
+            ui.label(RichText::new(pane).monospace().size(13.0));
+        }
     }
     let report = model.timing_summary();
     if !closed {
