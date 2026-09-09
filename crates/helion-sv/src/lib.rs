@@ -426,6 +426,15 @@ thread_local! {
     /// One `wide_literal` line per process. Sized binaries wider than u128
     /// used to panic on `1u128 << bit` (old lib.rs:959).
     static WIDE_LITERAL_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Posedge always writes that still need an Hff on the always edge.
+    static SEQ_WRITES: std::cell::RefCell<Vec<(String, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Clock net from the first posedge/negedge of each module.
+    static EDGE_CLK: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// One `sequential_not_lowered` line per module.
+    static SEQ_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 fn skipped_funcs_clear() {
@@ -478,6 +487,135 @@ fn note_width_overflow() {
     note_skip(format!(
         "diagnostic width_overflow module={module} (range does not fit; string or overflowing parameter used as width; not a LUT)"
     ));
+}
+
+fn clear_seq_notes() {
+    SEQ_WRITES.with(|s| s.borrow_mut().clear());
+    EDGE_CLK.with(|m| m.borrow_mut().clear());
+}
+
+fn note_seq_write(module: &str, clk: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let clk = if clk.is_empty() { "clk" } else { clk };
+    let signal = if signal.is_empty() { "always" } else { signal };
+    EDGE_CLK.with(|m| {
+        m.borrow_mut()
+            .entry(module.to_string())
+            .or_insert_with(|| clk.to_string());
+    });
+    SEQ_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.iter().any(|(m, _, sig)| m == module && sig == signal) {
+            v.push((module.to_string(), clk.to_string(), signal.to_string()));
+        }
+    });
+}
+
+fn take_seq_writes(module: &str) -> Vec<(String, String)> {
+    SEQ_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        let mut keep = Vec::new();
+        let mut out = Vec::new();
+        for (m, clk, sig) in v.drain(..) {
+            if m == module {
+                out.push((clk, sig));
+            } else {
+                keep.push((m, clk, sig));
+            }
+        }
+        *v = keep;
+        out
+    })
+}
+
+fn edge_clk_of(module: &str) -> Option<String> {
+    EDGE_CLK.with(|m| m.borrow().get(module).cloned())
+}
+
+fn note_sequential_not_lowered(module: &str, signal: &str) {
+    let fresh = SEQ_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic sequential_not_lowered module={module} signal={signal} (posedge always not mapped to an Hff; not a closed WNS)"
+    ));
+}
+
+fn lhs_before_assign(toks: &[Tok], nba_only: bool) -> Option<String> {
+    let mut i = 0;
+    while i < toks.len() {
+        let Tok::Ident(name) = &toks[i] else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        if matches!(toks.get(j), Some(Tok::Sym('['))) {
+            let mut d = 0i32;
+            while j < toks.len() {
+                match &toks[j] {
+                    Tok::Sym('[') => d += 1,
+                    Tok::Sym(']') => {
+                        d -= 1;
+                        j += 1;
+                        if d == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        let hit = if nba_only {
+            matches!(toks.get(j), Some(Tok::Le))
+        } else {
+            matches!(toks.get(j), Some(Tok::Le) | Some(Tok::Sym('=')))
+        };
+        if hit {
+            return Some(name.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// First procedural LHS in an always body that did not yield an NBA.
+/// Prefer `<=` so a `for (i = ...)` header does not steal the signal name.
+fn seq_lhs_from_toks(toks: &[Tok]) -> String {
+    lhs_before_assign(toks, true)
+        .or_else(|| lhs_before_assign(toks, false))
+        .unwrap_or_else(|| "always".into())
+}
+
+/// Clocked always that did not become an Hff. One line, then finish.
+/// A wide_cone already fired for this module — do not add a second diagnostic.
+fn rhs_reads_seq_mem(rhs: &RExpr, rtl: &Rtl) -> bool {
+    let mut names = HashSet::new();
+    rexpr_names(rhs, &mut names);
+    names.iter().any(|n| {
+        sig_depth(rtl, n) > 0 && rtl.nbas.iter().any(|(lhs, _, _)| lhs == n)
+    })
+}
+
+fn finish_seq_honesty(d: &Design, module: &str, wide_capped: bool) {
+    let writes = take_seq_writes(module);
+    if writes.is_empty() || wide_capped {
+        return;
+    }
+    let hffs = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .count();
+    if hffs == 0 {
+        let sig = writes
+            .first()
+            .map(|(_, sig)| sig.clone())
+            .unwrap_or_else(|| "always".into());
+        note_sequential_not_lowered(module, &sig);
+    }
 }
 
 fn note_wide_literal(width: usize) {
@@ -1153,6 +1291,14 @@ fn clog2_u(n: u128) -> u128 {
 }
 
 fn const_atom(p: &mut P) -> Result<u128, String> {
+    // Unary `(-3)+W` / `(-1)+W` are elaboration consts, not a dropped always.
+    if p.eat_sym('+') {
+        return const_atom(p);
+    }
+    if p.eat_sym('-') {
+        let n = const_atom(p)?;
+        return Ok(0u128.wrapping_sub(n));
+    }
     if p.eat_sym('(') {
         let v = const_u(p)?;
         if !p.eat_sym(')') {
@@ -1202,9 +1348,10 @@ fn const_u(p: &mut P) -> Result<u128, String> {
     let mut v = const_atom(p)?;
     loop {
         if p.eat_sym('+') {
-            v = v.saturating_add(const_atom(p)?);
+            // wrapping so `(-1)+W` is W-1, not a saturated width_overflow.
+            v = v.wrapping_add(const_atom(p)?);
         } else if p.eat_sym('-') {
-            v = v.saturating_sub(const_atom(p)?);
+            v = v.wrapping_sub(const_atom(p)?);
         } else if p.eat_sym('*') {
             if p.eat_sym('*') {
                 let e = const_atom(p)? as u32;
@@ -1556,9 +1703,16 @@ fn parse_un_r(p: &mut P) -> Result<RExpr, String> {
     if p.eat_sym('~') || p.eat_sym('!') {
         return Ok(RExpr::Not(Box::new(parse_un_r(p)?)));
     }
-    // Unary minus: -a  ≡  0 - a
+    // Unary minus: -a  ≡  0 - a. Fold consts so `(-3)+W` is a range bound.
     if p.eat_sym('-') {
         let x = parse_un_r(p)?;
+        if let RExpr::Const { val, width, care } = x {
+            return Ok(RExpr::Const {
+                val: 0u128.wrapping_sub(val),
+                width,
+                care,
+            });
+        }
         return Ok(RExpr::Sub(
             Box::new(RExpr::Const {
                 val: 0,
@@ -2264,6 +2418,7 @@ fn skip_until_kw(p: &mut P, kw: &str) {
 }
 
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
+    clear_seq_notes();
     let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
     let mut p = P { t: &toks, i: 0, params: HashMap::new(), widths: HashMap::new() };
@@ -2573,25 +2728,34 @@ fn skip_until_arg_end(p: &mut P) {
     }
 }
 
-/// Skip `@...` sensitivity. Returns true for combo `@*` / `@(*)` (no edge).
-/// Async `posedge clk or negedge nreset` is treated like sync (edges ignored).
-fn skip_event_control(p: &mut P) -> bool {
+/// Skip `@...` sensitivity. Returns `(combo, edge clock)`.
+/// Combo is `@*` / `@(*)` (no edge). Async `posedge clk or negedge nreset`
+/// is treated like sync; the first edge name is the user's clock.
+fn skip_event_control(p: &mut P) -> (bool, Option<String>) {
     let _ = p.eat_sym('@');
     if p.eat_sym('*') {
-        return true;
+        return (true, None);
     }
     if p.eat_sym('(') {
         let start = p.i;
         if p.eat_sym('*') && matches!(p.peek(), Some(Tok::Sym(')'))) {
             p.bump();
-            return true;
+            return (true, None);
         }
         p.i = start;
         let mut d = 1i32;
         let mut has_edge = false;
+        let mut clk = None;
         while d > 0 && p.peek().is_some() {
             if p.eat_kw("posedge") || p.eat_kw("negedge") {
                 has_edge = true;
+                if clk.is_none() {
+                    if let Some(Tok::Ident(name)) = p.peek() {
+                        clk = Some(name.clone());
+                        p.bump();
+                    }
+                }
+                continue;
             } else if p.eat_sym('(') {
                 d += 1;
             } else if p.eat_sym(')') {
@@ -2600,9 +2764,9 @@ fn skip_event_control(p: &mut P) -> bool {
                 p.bump();
             }
         }
-        return !has_edge;
+        return (!has_edge, clk);
     }
-    false
+    (false, None)
 }
 
 fn skip_for_rest(p: &mut P) {
@@ -3542,11 +3706,12 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
-            let combo = skip_event_control(p);
+            let (combo, edge_clk) = skip_event_control(p);
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
             }
+            let body_start = p.i;
             match parse_seq_block(&mut p, block) {
                 Ok(stmts) => {
                     if combo {
@@ -3554,6 +3719,18 @@ fn parse_module_items(
                         assigns.extend(stmts);
                     } else {
                         // Includes async `posedge clk or negedge rst` (sync-reset mux).
+                        let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        if stmts.is_empty() {
+                            let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
+                            note_seq_write(&cur_mod(), &clk, &sig);
+                        } else {
+                            let mut seen = HashSet::new();
+                            for (lhs, _, _) in &stmts {
+                                if seen.insert(lhs.clone()) {
+                                    note_seq_write(&cur_mod(), &clk, lhs);
+                                }
+                            }
+                        }
                         nbas.extend(stmts);
                     }
                 }
@@ -3562,6 +3739,12 @@ fn parse_module_items(
                         "diagnostic skip_always module={} (always body not parsed; not a LUT)",
                         cur_mod()
                     ));
+                    if !combo {
+                        let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        let end = p.i.min(p.t.len());
+                        let sig = seq_lhs_from_toks(&p.t[body_start..end]);
+                        note_seq_write(&cur_mod(), &clk, &sig);
+                    }
                     let _ = skip_item_or_block(p);
                 }
             }
@@ -4808,13 +4991,23 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     for (n, dir, _) in &rtl.ports {
         d.add_port(n, *dir);
     }
-    let clk = rtl
-        .ports
-        .iter()
-        .find(|(n, dir, _)| *dir == PortDir::In && n == "clk")
-        .or_else(|| rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
-        .map(|(n, _, _)| n.as_str())
-        .unwrap_or("clk");
+    // User clock is the posedge/negedge name when that port exists.
+    // Otherwise the historical first-`clk`/first-input pick (gold counter).
+    let clk_owned = edge_clk_of(&rtl.module)
+        .filter(|c| {
+            rtl.ports
+                .iter()
+                .any(|(n, dir, _)| n == c && *dir == PortDir::In)
+        })
+        .or_else(|| {
+            rtl.ports
+                .iter()
+                .find(|(n, dir, _)| *dir == PortDir::In && n == "clk")
+                .or_else(|| rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
+                .map(|(n, _, _)| n.clone())
+        })
+        .unwrap_or_else(|| "clk".into());
+    let clk = clk_owned.as_str();
 
     // Flatten NBAs into per-bit (name_bit, expr)
     // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
@@ -4955,6 +5148,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
+        }
+        // Clocked unpacked write was not an Hff. Do not bitblast the read
+        // into a wide_cone; finish_seq_honesty emits one sequential line.
+        if rhs_reads_seq_mem(rhs, rtl) {
+            continue;
         }
         // Comb multiply → DSP MAC (do not bitblast).
         if expr_contains_mul(rhs) {
@@ -5128,6 +5326,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             d.connect(pi, &lut, format!("I{pin}"));
         }
     }
+
+    // Clocked always either already became an Hff on the user's clock, or
+    // one sequential_not_lowered. wide_cone already finished this module.
+    finish_seq_honesty(&d, &rtl.module, wide_capped);
 
     // Output IOBs from assigns.
     // FM-HEL-TOP: under skip_comb_assigns, AXI/out continuous assigns have no
