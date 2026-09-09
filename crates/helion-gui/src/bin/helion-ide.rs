@@ -5232,6 +5232,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.set_min_width(pane_w.max(640.0));
                 paint_pblocks_table(ui, model);
             });
+        ui.add_space(2.0);
         // Clock-region viewport is whole rows only so the last line is not sliced.
         egui::ScrollArea::both()
             .id_salt("device_clock_regions_block")
@@ -5600,10 +5601,11 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
         || pane_w < 720.0;
     if floor {
         ui.spacing_mut().item_spacing.y = 0.0;
-        ui.add_sized(
-            [ui.available_width().max(160.0), chrome::DEVICE_CR_HEAD_H],
-            egui::Label::new(RichText::new("Clock Regions").strong()),
-        );
+        // Left-aligned heading. add_sized(full width) was painting this on the right.
+        ui.horizontal(|ui| {
+            ui.set_min_height(chrome::DEVICE_CR_HEAD_H);
+            ui.label(RichText::new("Clock Regions").strong());
+        });
         for (i, cr) in regions.iter().enumerate() {
             let sites = cr.site_count(&model.device.sites);
             let occ = cr.occupied_count(&model.device.sites);
