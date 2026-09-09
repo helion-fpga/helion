@@ -444,6 +444,10 @@ thread_local! {
     /// that did not lower is not a const 0 and is not a closed WNS.
     static ASSIGN_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `clock_mux` line per module+signal. A posedge on a mux of two
+    /// clocks is not one user clock and is not a closed WNS.
+    static CLOCK_MUX_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 fn skipped_funcs_clear() {
@@ -580,6 +584,84 @@ fn note_assign_not_lowered(module: &str, signal: &str) {
 fn assign_not_lowered_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Posedge of a muxed clock. One line. Not a LUT, not a single user clock.
+fn note_clock_mux(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "clk" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = CLOCK_MUX_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic clock_mux module={module} signal={signal} (posedge is a mux of clocks; not a single user clock; not a closed WNS)"
+    ));
+}
+
+fn clock_mux_for(module: &str) -> bool {
+    let prefix = format!("{module}\0");
+    CLOCK_MUX_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+fn seq_clocks_of(module: &str) -> Vec<String> {
+    SEQ_WRITES.with(|s| {
+        let mut out = Vec::new();
+        for (m, clk, _) in s.borrow().iter() {
+            if m == module && !out.iter().any(|c| c == clk) {
+                out.push(clk.clone());
+            }
+        }
+        out
+    })
+}
+
+fn is_input_port(rtl: &Rtl, name: &str) -> bool {
+    rtl.ports
+        .iter()
+        .any(|(n, dir, _)| n == name && *dir == PortDir::In)
+}
+
+/// Data arm of a clock mux: a plain input-port ident (a user clock).
+fn clock_port_arm<'a>(rtl: &Rtl, e: &'a RExpr) -> Option<&'a str> {
+    match e {
+        RExpr::Ident(n) if is_input_port(rtl, n) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+fn is_clock_mux_expr(rtl: &Rtl, e: &RExpr) -> bool {
+    let RExpr::Mux(_, t, f) = e else {
+        return false;
+    };
+    let Some(a) = clock_port_arm(rtl, t) else {
+        return false;
+    };
+    let Some(b) = clock_port_arm(rtl, f) else {
+        return false;
+    };
+    a != b
+}
+
+/// Posedge/negedge is not a plain port clock, and that net is a ternary of
+/// two clock ports. One diagnostic; the mux is not lowered as a data LUT.
+fn note_clock_muxes(rtl: &Rtl) -> HashSet<String> {
+    let mut sigs = HashSet::new();
+    for clk in seq_clocks_of(&rtl.module) {
+        if is_input_port(rtl, &clk) {
+            continue;
+        }
+        let muxed = rtl
+            .assigns
+            .iter()
+            .any(|(lhs, _, rhs)| lhs == &clk && is_clock_mux_expr(rtl, rhs));
+        if muxed {
+            note_clock_mux(&rtl.module, &clk);
+            sigs.insert(clk);
+        }
+    }
+    sigs
 }
 
 fn lhs_before_assign(toks: &[Tok], nba_only: bool) -> Option<String> {
@@ -891,6 +973,9 @@ fn assemble_module(
         }
         if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+        }
+        if child.attrs.get("CLOCK_MUX") == Some("1") {
+            d.attrs.set("CLOCK_MUX", "1");
         }
     }
     visiting.remove(name);
@@ -6011,7 +6096,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // spend the one wide_cone line on them — clocked cones still report that.
     let mut rel_sig: HashMap<String, String> = HashMap::new();
     let mut n_rel = 0usize;
+    // A posedge clock that is a mux of two clocks is not a data LUT and not
+    // one user clock. Name it; do not close WNS on a leftover input.
+    let clock_mux_sigs = note_clock_muxes(rtl);
     for (lhs, bit, rhs) in &rtl.assigns {
+        if clock_mux_sigs.contains(lhs) {
+            continue;
+        }
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
@@ -6260,6 +6351,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     if assign_not_lowered_for(&rtl.module) {
         d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+    }
+    if clock_mux_for(&rtl.module) {
+        d.attrs.set("CLOCK_MUX", "1");
     }
 
     // Clocked always either already became an Hff on the user's clock, or
@@ -8207,6 +8301,32 @@ endmodule
             let got = (init >> addr) & 1 == 1;
             assert_eq!(got, want, "addr={addr:#b} field={field:#b} init={init:#x}");
         }
+    }
+
+    #[test]
+    fn clock_mux_posedge_is_not_a_user_clock() {
+        let src = r#"
+module clk_mux_q(input csr_clk, input csr_ena, input ram_clk, input d, output reg q);
+  wire int_clk;
+  assign int_clk = ~csr_ena ? csr_clk : ram_clk;
+  always @(posedge int_clk) q <= d;
+endmodule
+"#;
+        let d = synth_sv(src, "clk_mux.v").expect("clock mux");
+        assert_eq!(
+            d.attrs.get("CLOCK_MUX"),
+            Some("1"),
+            "muxed posedge must not be a single user clock"
+        );
+        let invented = d.nets.iter().any(|n| {
+            n.name == "int_clk"
+                && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(
+            !invented,
+            "clock mux must not be lowered as a data LUT, nets={:?}",
+            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
