@@ -6667,6 +6667,81 @@ fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
     }
 }
 
+/// Combinational ripple of two named buses into `assign sum = a + b`.
+/// Each bit is a 1-bit full adder (a, b, cin), not one 64-PI cone.
+/// No clock, no Hff, not a MAC. `width` > 32 is refused by the caller
+/// so a shorter bus is not invented. Returns false if any bit is skipped.
+fn emit_ripple_add(
+    d: &mut Design,
+    rtl: &Rtl,
+    sum: &str,
+    width: usize,
+    a: &str,
+    b: &str,
+) -> bool {
+    if width == 0 || width > 32 {
+        return false;
+    }
+    // A missing operand bit is a skip, not a zero-extended invented bus.
+    if (0..width).any(|bit| op_bit_net(rtl, a, bit).is_none() || op_bit_net(rtl, b, bit).is_none()) {
+        return false;
+    }
+    let mut cin: Option<String> = None;
+    for bit in 0..width {
+        let an = op_bit_net(rtl, a, bit);
+        let bn = op_bit_net(rtl, b, bit);
+        let sum_net = bit_name(sum, width, bit);
+        let sum_cell = format!("u_ra_{sum}_{bit}s");
+        let cin_now = cin.clone();
+        let emitted = match (an.as_deref(), bn.as_deref(), cin_now.as_deref()) {
+            (Some(an), Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(an, "I0"), (bn, "I1")]);
+                if bit + 1 < width {
+                    let cout = format!("n_ra_{sum}_{bit}c");
+                    let cry_cell = format!("u_ra_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (bn, "I1")],
+                    );
+                    cin = Some(cout);
+                }
+                true
+            }
+            (Some(an), Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xor3(),
+                    &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("n_ra_{sum}_{bit}c");
+                    let cry_cell = format!("u_ra_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_maj3(),
+                        &[(an, "I0"), (bn, "I1"), (cn, "I2")],
+                    );
+                    cin = Some(cout);
+                }
+                true
+            }
+            _ => false,
+        };
+        if !emitted {
+            return false;
+        }
+    }
+    eprintln!("synth_rtl ripple_add signal={sum} bits={width}");
+    true
+}
+
 /// Ripple add of two packed vectors into one unpacked word, clocked by `clk`.
 /// Signed and unsigned agree on the `width` sum bits. Not a MAC.
 fn emit_word_add(
@@ -7391,6 +7466,21 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
+        }
+        // width<=32 `assign sum = a + b` of two named buses is a ripple of
+        // 1-bit full adders, not one 64-PI cone and not a MAC. No clock.
+        // Wider than 32 stays unlowered — do not invent a shorter bus, and
+        // do not walk the expression tree. A skipped bit stays incomplete.
+        if bit.is_none() {
+            if let Some((a_name, b_name)) = packed_add_pair(rhs, rtl) {
+                if rexpr_unknown_name(rhs, rtl).is_none() {
+                    let w = sig_width(rtl, lhs).max(1);
+                    if w > 32 || !emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name) {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                    continue;
+                }
+            }
         }
         // Variable-index read of a clocked unpacked array. Do not walk it
         // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
@@ -10268,6 +10358,53 @@ endmodule
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
             "unlowered zero-fill must not become a LUT"
         );
+    }
+
+    #[test]
+    fn comb_named_bus_add_is_ripple_not_wide_cone() {
+        let src = r#"
+module BranchAdder(input  wire [31:0] pc_plus_four,
+                   input  wire [31:0] extended_times_four,
+                   output wire [31:0] branch_address);
+  assign branch_address = pc_plus_four + extended_times_four;
+endmodule
+"#;
+        let d = synth_sv(src, "10162_1.v").expect("BranchAdder");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "combinational ripple has no clock and no Hff"
+        );
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 63, "32-bit ripple of full adders, luts={luts}");
+        let driven = d.nets.iter().any(|n| {
+            n.name == "branch_address_0"
+                && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(driven, "sum bit 0 is a LUT, not a wide cone");
+    }
+
+    #[test]
+    fn comb_named_bus_add_wider_than_32_is_not_invented() {
+        let src = r#"
+module WideAdd(input [33:0] a, input [33:0] b, output [33:0] sum);
+  assign sum = a + b;
+endmodule
+"#;
+        let d = synth_sv(src, "wideadd.v").expect("WideAdd");
+        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "width>32 must not invent a shorter adder"
+        );
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
     }
 
     #[test]
