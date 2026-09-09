@@ -6597,6 +6597,32 @@ fn const_rexpr_usize(e: &RExpr) -> Option<usize> {
     }
 }
 
+/// `{bus, {K{1'b0}}}` — zeros on the low side. `Ok((bus, K))` when K is
+/// 1..=8 and the bus is a wire. `Err(())` is that shape but not a wire
+/// alignment (not a LUT, caller names `assign_not_lowered`). Other concats
+/// are `None` and stay on the existing path.
+fn zero_fill_concat(rhs: &RExpr) -> Option<Result<(String, usize), ()>> {
+    let RExpr::Concat(parts) = rhs else {
+        return None;
+    };
+    if parts.len() != 2 {
+        return None;
+    }
+    let zeros = match &parts[1] {
+        RExpr::Const { val: 0, width, .. } if *width >= 1 => *width,
+        _ => return None,
+    };
+    let bus = match &parts[0] {
+        RExpr::Ident(s) => s.clone(),
+        _ => return Some(Err(())),
+    };
+    if (1..=8).contains(&zeros) {
+        Some(Ok((bus, zeros)))
+    } else {
+        Some(Err(()))
+    }
+}
+
 fn const_unpacked_word(rhs: &RExpr, rtl: &Rtl) -> Option<(String, usize)> {
     match rhs {
         RExpr::Bit(name, idx) if sig_depth(rtl, name) > 0 && *idx < sig_depth(rtl, name) => {
@@ -7330,9 +7356,27 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // variable-index read and not an unmapped assign. A signal index is not
     // recorded here — that stays `variable_index_read`.
     let mut word_alias: Vec<(String, String, usize)> = Vec::new();
+    // `{bus, {K{1'b0}}}` K=1..8 is a wire alignment (zeros on the low
+    // side), not a 16-PI cone and not a LUT. A nested concat inside an
+    // add is not this form — that add stays wide_cone.
+    let mut concat_align: Vec<(String, String, usize)> = Vec::new();
     for (lhs, bit, rhs) in &rtl.assigns {
         if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
             continue;
+        }
+        if bit.is_none() {
+            if let Some(kind) = zero_fill_concat(rhs) {
+                match kind {
+                    Ok((bus, zeros)) => {
+                        eprintln!("synth_rtl concat_align signal={lhs} zeros={zeros}");
+                        concat_align.push((lhs.clone(), bus, zeros));
+                    }
+                    Err(()) => {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                }
+                continue;
+            }
         }
         if bit.is_none() {
             if let Some((mem, word)) = const_unpacked_word(rhs, rtl) {
@@ -7656,6 +7700,21 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 let mw = sig_width(rtl, mem).max(1);
                 for i in 0..ow.min(mw).min(256) {
                     let qnet = unpacked_word_q(mem, *word, mw, i);
+                    emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                }
+                continue;
+            }
+            // Zero-fill concat: high bits are the bus, low bits are 0.
+            // No buffer LUT. Zero bits have no source wire.
+            if let Some((_, bus, zeros)) = concat_align.iter().find(|(n, _, _)| n == lhs) {
+                let ow = sig_width(rtl, lhs);
+                let bw = sig_width(rtl, bus).max(1);
+                for i in *zeros..ow.min(256) {
+                    let src = i - zeros;
+                    if src >= bw {
+                        break;
+                    }
+                    let qnet = bit_name(bus, bw, src);
                     emit_iob(&mut d, &mut iob_n, &qnet, lhs);
                 }
                 continue;
@@ -10172,6 +10231,74 @@ endmodule
             n.name.starts_with("res_w4_") && n.endpoints.iter().any(|e| e.pin == "I")
         });
         assert!(!aliased, "cap must not alias q onto a missing last word");
+    }
+
+    #[test]
+    fn zero_fill_concat_is_wire_align_not_a_cone() {
+        let src = r#"
+module align(input [7:0] bus, output [9:0] y);
+  assign y = {bus, {1<<1{1'b0}}};
+endmodule
+"#;
+        let d = synth_sv(src, "align.sv").expect("concat align");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "zero-fill concat must not invent a LUT, cells={:?}",
+            d.cells
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "bus_0" && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(aliased, "y[2] aliases bus[0], nets={:?}", d.nets);
+    }
+
+    #[test]
+    fn zero_fill_concat_k_above_8_is_not_lowered() {
+        let src = r#"
+module widepad(input [3:0] bus, output [15:0] y);
+  assign y = {bus, {9{1'b0}}};
+endmodule
+"#;
+        let d = synth_sv(src, "widepad.sv").expect("wide pad");
+        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "unlowered zero-fill must not become a LUT"
+        );
+    }
+
+    #[test]
+    fn nested_add_concat_stays_wide_cone() {
+        let src = r#"
+module branch_control #(parameter DATA_WIDTH = 32, PC_WIDTH = 6, PC_OFFSET_WIDTH = 25)
+  (input jmp_inst_in, input jmp_use_r_in, input branch_use_r_in, input branch_inst_in,
+   input branch_result_in, input [(0-1)+PC_WIDTH:0] pc_in,
+   input [DATA_WIDTH-1:0] reg_a_data_in, input [DATA_WIDTH-1:0] reg_b_data_in,
+   input [PC_OFFSET_WIDTH+(0-1):0] pc_offset_in,
+   output select_new_pc_out, output [(0-1)+PC_WIDTH:0] pc_out);
+  wire [DATA_WIDTH-1:0] jmp_val;
+  wire [DATA_WIDTH-1:0] branch_val;
+  wire [(0-1)+PC_WIDTH:0] pc_jump;
+  assign pc_jump = {pc_offset_in,{1<<1{1'b0}}};
+  assign select_new_pc_out = (jmp_inst_in | branch_result_in) & (jmp_inst_in | branch_inst_in);
+  assign branch_val = branch_use_r_in ? reg_a_data_in : (pc_in+(4+{reg_b_data_in,{1<<1{1'b0}}}));
+  assign jmp_val = jmp_use_r_in ? reg_a_data_in : pc_jump;
+  assign pc_out = jmp_inst_in ? jmp_val : branch_val;
+endmodule
+"#;
+        let d = synth_sv(src, "branch_control.v").expect("branch_control");
+        assert_eq!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| {
+                matches!(c.kind, CellKind::Lut6 { .. })
+                    && d.net_on(&c.name, "O").is_some_and(|o| o.starts_with("pc_jump"))
+            }),
+            "pc_jump concat must not be a LUT"
+        );
     }
 
     #[test]
