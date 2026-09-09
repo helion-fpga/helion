@@ -2184,6 +2184,9 @@ fn enum_const_default(name: &str) -> Option<u128> {
         "RV32BBalanced" => Some(1),
         "RV32BOTEarlGrey" => Some(2),
         "RV32BFull" => Some(3),
+        // common_cells cc_pkg::lzc_mode_e. Packages are skipped.
+        "LZC_TRAILING_ZERO_CNT" => Some(0),
+        "LZC_LEADING_ZERO_CNT" => Some(1),
         _ => None,
     }
 }
@@ -2229,9 +2232,25 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             }
             Ok(clog2_u(arg))
         }
+        Some(Tok::Kw(k)) if k == "unsigned" || k == "signed" => {
+            // `unsigned'(expr)` — keyword form of a size cast. Value is inner.
+            p.bump();
+            if !(p.eat_sym('\'') && p.eat_sym('(')) {
+                return Err("cast".into());
+            }
+            let v = const_u(p)?;
+            let _ = p.eat_sym(')');
+            Ok(v)
+        }
         Some(Tok::Ident(s)) => {
             let mut name = s.clone();
             p.bump();
+            // `unsigned'(expr)` size cast. The value is the inner const.
+            if p.eat_sym('\'') && p.eat_sym('(') {
+                let v = const_u(p)?;
+                let _ = p.eat_sym(')');
+                return Ok(v);
+            }
             // `pkg::EnumLit` after skipped packages — resolve the member name.
             if matches!(p.peek(), Some(Tok::Sym(':')))
                 && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
@@ -2243,6 +2262,12 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             }
             if let Some(v) = p.params.get(&name).copied() {
                 return Ok(v);
+            }
+            // cc_pkg::idx_width(n): clog2, minimum 1. Package function is not a LUT.
+            if name == "idx_width" && p.eat_sym('(') {
+                let n = const_u(p)?;
+                let _ = p.eat_sym(')');
+                return Ok(if n > 1 { clog2_u(n) } else { 1 });
             }
             enum_const_default(&name).ok_or_else(|| format!("unknown param {name}"))
         }
@@ -2352,6 +2377,13 @@ fn parse_rexpr(p: &mut P) -> Result<RExpr, String> {
             return Err("ternary :".into());
         }
         let f = parse_rexpr(p)?;
+        // Generate-time `param > 0 ? a : b` is the taken arm, not a runtime mux
+        // and not a relational that cannot be a LUT.
+        if let RExpr::Const { val, care, .. } = &e {
+            if care & 1 == 1 {
+                return Ok(if *val != 0 { t } else { f });
+            }
+        }
         return Ok(RExpr::Mux(Box::new(e), Box::new(t), Box::new(f)));
     }
     Ok(e)
@@ -2438,8 +2470,22 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
         return Ok(e);
     }
     if p.eat_sym('>') {
+        let r = parse_shift(p)?;
+        if let (
+            RExpr::Const { val: a, care: ca, .. },
+            RExpr::Const { val: b, care: cb, .. },
+        ) = (&e, &r)
+        {
+            if ca & 1 == 1 && cb & 1 == 1 {
+                return Ok(RExpr::Const {
+                    val: if a > b { 1 } else { 0 },
+                    width: 1,
+                    care: 1,
+                });
+            }
+        }
         // a > b  ≡  b < a
-        return Ok(RExpr::Lt(Box::new(parse_shift(p)?), Box::new(e)));
+        return Ok(RExpr::Lt(Box::new(r), Box::new(e)));
     }
     Ok(e)
 }
@@ -2655,6 +2701,18 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         if !p.eat_sym(')') {
             return Err(")".into());
         }
+        // `(width)'(value)` size cast. The value is the inner expr, not a multiplier.
+        if matches!(p.peek(), Some(Tok::Sym('\'')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('(')))
+        {
+            p.bump();
+            p.bump();
+            let inner = parse_rexpr(p)?;
+            if !p.eat_sym(')') {
+                return Err("cast )".into());
+            }
+            return Ok(inner);
+        }
         return Ok(e);
     }
     // Concat `{a,b}` or replication `{N{expr}}` (fold `{N{1'b0}}` to Const zero).
@@ -2737,8 +2795,46 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             width: *width,
             care: *care,
         }),
+        Some(Tok::Kw(k)) if k == "unsigned" || k == "signed" => {
+            // `unsigned'(expr)` size cast. Value is the inner expr.
+            // Keyword already consumed by the match.
+            if !(p.eat_sym('\'') && p.eat_sym('(')) {
+                return Err("cast".into());
+            }
+            let inner = parse_rexpr(p)?;
+            if !p.eat_sym(')') {
+                return Err("cast )".into());
+            }
+            Ok(inner)
+        }
         Some(Tok::Ident(s)) => {
             let name = s.clone();
+            if name == "$clog2" && p.eat_sym('(') {
+                let arg = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$clog2 )".into());
+                }
+                let RExpr::Const { val, .. } = arg else {
+                    return Err("$clog2 needs const".into());
+                };
+                return Ok(RExpr::Const {
+                    val: clog2_u(val),
+                    width: 32,
+                    care: u128::MAX,
+                });
+            }
+            // Ident form of a size cast, if the type was not a keyword.
+            if matches!(p.peek(), Some(Tok::Sym('\'')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym('(')))
+            {
+                p.bump();
+                p.bump();
+                let inner = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("cast )".into());
+                }
+                return Ok(inner);
+            }
             if p.eat_sym('[') {
                 // Indexed part-select: sig[base +: W] / sig[base -: W]
                 // or range/bit. Prefer +: / -: before treating ':' as range.
@@ -2940,6 +3036,21 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
 
 
 /// Parse for-loop step: `i++`, `i += N`, or `i = i + N` (default step 1).
+
+/// `unsigned'(expr)` / `signed'(expr)`. `unsigned` is a keyword, not an ident.
+fn eat_unsigned_cast_prefix(p: &mut P) -> bool {
+    let cast = matches!(p.peek(), Some(Tok::Kw(k)) if k == "unsigned" || k == "signed")
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym('\'')))
+        && matches!(p.t.get(p.i + 2), Some(Tok::Sym('(')));
+    if !cast {
+        return false;
+    }
+    p.bump();
+    let _ = p.eat_sym('\'');
+    let _ = p.eat_sym('(');
+    true
+}
+
 fn parse_for_step(p: &mut P) -> Result<usize, String> {
     let _var = p.ident()?;
     // i++
@@ -3103,7 +3214,13 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     if !p.eat_sym(';') {
         return Err("for ;".into());
     }
-    let _ = p.ident();
+    // `unsigned'(j) < Width` — `unsigned` is a keyword, then the loop var.
+    if eat_unsigned_cast_prefix(p) {
+        let _ = p.ident();
+        let _ = p.eat_sym(')');
+    } else {
+        let _ = p.ident();
+    }
     let inclusive = if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
         true
@@ -3607,7 +3724,11 @@ fn parse_param_assigns(p: &mut P) -> Result<Vec<(String, u128)>, String> {
                 }
             }
         } else if matches!(p.peek(), Some(Tok::Ident(_))) {
-            let name = p.ident().unwrap();
+            let mut name = p.ident().unwrap();
+            // `parameter lzc_mode_e Mode = ...` — type token, then the name.
+            if matches!(p.peek(), Some(Tok::Ident(_))) {
+                name = p.ident().unwrap();
+            }
             skip_sv_type(p);
             if p.eat_sym('=') {
                 match const_u(p) {
@@ -4484,6 +4605,10 @@ fn parse_module_items(
                 skip_sv_type(p);
                 match p.ident() {
                     Ok(name) => {
+                        let mut name = name;
+                        if matches!(p.peek(), Some(Tok::Ident(_))) {
+                            name = p.ident().unwrap_or(name);
+                        }
                         if p.eat_sym('=') {
                             if let Some(Tok::Str(sval)) = p.peek() {
                                 let h = str_param_hash(sval);
@@ -5027,7 +5152,13 @@ fn parse_for_unroll_module(
     if !p.eat_sym(';') {
         return Err("for ;".into());
     }
-    let _ = p.ident();
+    // `unsigned'(j) < Width` — `unsigned` is a keyword, then the loop var.
+    if eat_unsigned_cast_prefix(p) {
+        let _ = p.ident();
+        let _ = p.eat_sym(')');
+    } else {
+        let _ = p.ident();
+    }
     let inclusive = if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
         true
@@ -7674,6 +7805,70 @@ fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String
     lowered
 }
 
+
+/// Bit copies and const index tables (`in_tmp[i] = in_i[...]`, `index_lut[j] = j`).
+/// Later OR/mux assigns see the source net, not a floating generate temp.
+/// Not a buffer LUT. Does not invent a multiplier.
+fn collect_net_copies(assigns: &[(String, Option<usize>, RExpr)]) -> HashMap<(String, usize), RExpr> {
+    let mut map = HashMap::new();
+    for (lhs, bit, rhs) in assigns {
+        let Some(b) = *bit else { continue };
+        match rhs {
+            RExpr::Bit(_, _) | RExpr::Const { .. } => {
+                map.insert((lhs.clone(), b), rhs.clone());
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn subst_net_copies(e: &RExpr, map: &HashMap<(String, usize), RExpr>) -> RExpr {
+    fn walk(e: &RExpr, map: &HashMap<(String, usize), RExpr>, depth: usize) -> RExpr {
+        if depth > 8 {
+            return e.clone();
+        }
+        let w = |x: &RExpr| walk(x, map, depth + 1);
+        match e {
+            RExpr::Bit(s, i) => {
+                if let Some(rep) = map.get(&(s.clone(), *i)) {
+                    return walk(rep, map, depth + 1);
+                }
+                e.clone()
+            }
+            RExpr::Not(a) => RExpr::Not(Box::new(w(a))),
+            RExpr::And(a, b) => RExpr::And(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Or(a, b) => RExpr::Or(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Xor(a, b) => RExpr::Xor(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Add(a, b) => RExpr::Add(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Sub(a, b) => RExpr::Sub(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Mul(a, b) => RExpr::Mul(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Mux(c, t, f) => RExpr::Mux(Box::new(w(c)), Box::new(w(t)), Box::new(w(f))),
+            RExpr::Eq(a, b) => RExpr::Eq(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Ne(a, b) => RExpr::Ne(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Lt(a, b) => RExpr::Lt(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Shr(a, b) => RExpr::Shr(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Ashr(a, b) => RExpr::Ashr(Box::new(w(a)), Box::new(w(b))),
+            RExpr::RedXor(a) => RExpr::RedXor(Box::new(w(a))),
+            RExpr::RedAnd(a) => RExpr::RedAnd(Box::new(w(a))),
+            RExpr::RedOr(a) => RExpr::RedOr(Box::new(w(a))),
+            RExpr::Concat(parts) => RExpr::Concat(parts.iter().map(w).collect()),
+            RExpr::IndexPart { name, base, width, ascending } => RExpr::IndexPart {
+                name: name.clone(),
+                base: Box::new(w(base)),
+                width: *width,
+                ascending: *ascending,
+            },
+            RExpr::WordAt { addr, data } => RExpr::WordAt {
+                addr: Box::new(w(addr)),
+                data: Box::new(w(data)),
+            },
+            RExpr::Const { .. } | RExpr::Ident(_) | RExpr::Range(_, _, _) => e.clone(),
+        }
+    }
+    walk(e, map, 0)
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
@@ -7886,7 +8081,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // side), not a 16-PI cone and not a LUT. A nested concat inside an
     // add is not this form — that add stays wide_cone.
     let mut concat_align: Vec<(String, String, usize)> = Vec::new();
-    for (lhs, bit, rhs) in &rtl.assigns {
+    let net_copies = collect_net_copies(&rtl.assigns);
+    for (lhs, bit, rhs0) in &rtl.assigns {
+        let rhs_sub = subst_net_copies(rhs0, &net_copies);
+        let rhs = &rhs_sub;
         if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
             continue;
         }
