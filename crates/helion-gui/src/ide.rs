@@ -4958,11 +4958,12 @@ impl IdeModel {
         self.timing.as_ref().map(|t| t.wns_ps)
     }
 
-    /// Timing pane text. Empty until the design is routed.
+    /// Timing pane text. A closed WNS line only when STA ran on an Hff clock.
+    /// A placed/routed design with no clock still shows the honesty label and
+    /// the place/route result. Not an invented WNS.
     pub fn timing_text(&self) -> String {
-        match &self.timing {
-            None => "no routed design — run Route".into(),
-            Some(t) => format!(
+        if let Some(t) = &self.timing {
+            return format!(
                 "WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}",
                 t.wns_ps,
                 t.tns_ps,
@@ -4974,8 +4975,32 @@ impl IdeModel {
                 t.iob_ps,
                 t.route_ps,
                 t.clk_net_ps
-            ),
+            );
         }
+        if self.shell.session.design.is_some() {
+            return self.placed_timing_pane();
+        }
+        "no routed design — run Route".into()
+    }
+
+    /// Place/route facts plus the honesty label. No closed WNS without an Hff.
+    fn placed_timing_pane(&self) -> String {
+        let mut s = self.timing_honesty_label();
+        if let Some(p) = self.shell.session.placed.as_ref() {
+            s.push_str(&format!(
+                " place_design lutff_sites={} iob_sites={}",
+                p.lutff_sites.len(),
+                p.iob_sites.len()
+            ));
+        }
+        if let Some(r) = self.shell.session.routed.as_ref() {
+            let hops = r.iob_src.first().map(|i| i.hops).unwrap_or(0);
+            s.push_str(&format!(
+                " route_design overused={} hops={}",
+                r.overused, hops
+            ));
+        }
+        s
     }
 
     /// Utilization pane text. Empty until the design is packed/placed.
