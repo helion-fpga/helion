@@ -250,6 +250,12 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         shell.session.mark_debug(net.trim())?;
         return Ok(format!("mark_debug {}", net.trim()));
     }
+    if let Some(net) = t.strip_prefix("add_probe ") {
+        // Tcl alias: Mark Debug + bind probe net (IdeModel::add_probe also opens Hardware).
+        let net = net.trim();
+        shell.session.mark_debug(net)?;
+        return Ok(format!("add_probe {net}"));
+    }
     if let Some(rest) = t.strip_prefix("eco ") {
         impl_if_needed(shell)?;
         let dev = Device::load_part(&shell.part)?;
