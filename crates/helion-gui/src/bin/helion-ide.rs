@@ -3486,6 +3486,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
     let mut pick_obj: Option<String> = None;
     let mut set_iostd: Option<(String, &'static str)> = None;
     let mut set_io: Option<(String, &'static str, &'static str)> = None;
+    let mut set_pkg_pin: Option<(String, String)> = None;
     if grid_id == "sidebar_io" {
         // Full HAD site names. The wide grid clipped Placed to "IOB_X…".
         ui.label(RichText::new("Name  Dir  Site").small().weak());
@@ -3581,13 +3582,38 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                             if ui.selectable_label(on, &p.dir).clicked() {
                                 pick_port = Some(p.name.clone());
                             }
-                            if ui.selectable_label(on_obj, p.package_pin_cell()).clicked() {
-                                if p.package_pin_cell() == "-" {
-                                    pick_port = Some(p.name.clone());
+                            let cur_pin = p.package_pin_cell().to_string();
+                            let pin_ports: Vec<(String, Option<String>)> = model
+                                .package_pins
+                                .iter()
+                                .map(|pin| (pin.pin.clone(), pin.port.clone()))
+                                .collect();
+                            egui::ComboBox::from_id_salt(("io_pkg_pin", p.name.as_str()))
+                                .selected_text(if cur_pin == "-" {
+                                    "— set site —"
                                 } else {
-                                    pick_obj = Some(p.package_pin_cell().to_string());
-                                }
-                            }
+                                    cur_pin.as_str()
+                                })
+                                .width(118.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(cur_pin == "-", "— (select port) —")
+                                        .clicked()
+                                    {
+                                        pick_port = Some(p.name.clone());
+                                    }
+                                    for (pin, owner) in &pin_ports {
+                                        let label = match owner.as_deref() {
+                                            Some(port) if port != p.name => {
+                                                format!("{pin} ({port})")
+                                            }
+                                            _ => pin.clone(),
+                                        };
+                                        if ui.selectable_label(cur_pin == *pin, label).clicked() {
+                                            set_pkg_pin = Some((p.name.clone(), pin.clone()));
+                                        }
+                                    }
+                                });
                             if ui.selectable_label(on_obj, p.placed_cell()).clicked() {
                                 if p.placed_cell() == "-" {
                                     pick_port = Some(p.name.clone());
@@ -3610,18 +3636,50 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 });
         });
     }
-    ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
-    if let Some(port) = model.selected_io_port.as_deref().or_else(|| {
-        model
-            .selected
-            .as_deref()
-            .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
-    }) {
+    ui.weak("Package Pin: dropdown on each row, or type a site below / click the package drawing.");
+    let selected_port = model
+        .selected_io_port
+        .clone()
+        .or_else(|| {
+            model.selected.clone().filter(|s| model.io_ports.iter().any(|p| p.name == *s))
+        });
+    if let Some(port) = selected_port {
+        ui.horizontal(|ui| {
+            ui.weak("PACKAGE_PIN");
+            let edit = egui::TextEdit::singleline(&mut model.package_pin_draft)
+                .desired_width(120.0)
+                .hint_text("IOB_X…");
+            let resp = ui.add(edit);
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let pin = model.package_pin_draft.trim().to_string();
+                if !pin.is_empty() {
+                    set_pkg_pin = Some((port.clone(), pin));
+                }
+            }
+            if ui.button("Set pin").clicked() {
+                let pin = model.package_pin_draft.trim().to_string();
+                if !pin.is_empty() {
+                    set_pkg_pin = Some((port.clone(), pin));
+                }
+            }
+            for site in ["IOB_X2Y0", "IOB_X3Y0", "IOB_X0Y0", "IOB_X5Y0"] {
+                if ui
+                    .add_sized(
+                        [ui.spacing().interact_size.x.max(72.0), chrome::HIT_SIDEBAR],
+                        egui::Button::new(site),
+                    )
+                    .clicked()
+                {
+                    model.package_pin_draft = site.to_string();
+                    set_pkg_pin = Some((port.clone(), site.to_string()));
+                }
+            }
+        });
         ui.horizontal(|ui| {
             ui.weak("IOSTANDARD");
             for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
                 if ui.add_sized([64.0, chrome::HIT_SIDEBAR], egui::Button::new(std)).clicked() {
-                    set_iostd = Some((port.to_string(), std));
+                    set_iostd = Some((port.clone(), std));
                 }
             }
         });
@@ -3629,7 +3687,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("DRIVE");
             for ma in ["4", "8", "12", "16"] {
                 if ui.add_sized([40.0, chrome::HIT_SIDEBAR], egui::Button::new(ma)).clicked() {
-                    set_io = Some((port.to_string(), "DRIVE", ma));
+                    set_io = Some((port.clone(), "DRIVE", ma));
                 }
             }
         });
@@ -3637,7 +3695,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("SLEW");
             for s in ["SLOW", "FAST"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "SLEW", s));
+                    set_io = Some((port.clone(), "SLEW", s));
                 }
             }
         });
@@ -3645,7 +3703,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("PULLTYPE");
             for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "PULLTYPE", s));
+                    set_io = Some((port.clone(), "PULLTYPE", s));
                 }
             }
         });
@@ -3653,7 +3711,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("DIFF_TERM");
             for s in ["FALSE", "TRUE"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "DIFF_TERM", s));
+                    set_io = Some((port.clone(), "DIFF_TERM", s));
                 }
             }
         });
@@ -3661,7 +3719,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("IN_TERM");
             for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "IN_TERM", s));
+                    set_io = Some((port.clone(), "IN_TERM", s));
                 }
             }
         });
@@ -3673,6 +3731,12 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
     }
     if let Some((port, key, val)) = set_io {
         let _ = model.exec(&format!("set_property {key} {val} [get_ports {port}]"));
+    }
+    if let Some((port, pin)) = set_pkg_pin {
+        let _ = model.exec(&format!(
+            "set_property PACKAGE_PIN {pin} [get_ports {port}]"
+        ));
+        model.package_pin_draft = pin;
     }
     if let Some(name) = pick_obj {
         let _ = model.select_io_port_object(&name);
@@ -3697,6 +3761,36 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
                 let _ = model.exec("create_pblock pblock_0");
             }
             let _ = model.exec(&format!("resize_pblock {name} -add CLOCKREGION_X1Y1"));
+        }
+        let pb_name = model
+            .selected_pblock
+            .clone()
+            .or_else(|| model.pblocks.first().map(|p| p.name.clone()));
+        if ui
+            .add_enabled(pb_name.is_some(), egui::Button::new("Add design cells"))
+            .on_hover_text("add_cells_to_pblock — assign all design LUT cells")
+            .clicked()
+        {
+            if let Some(name) = pb_name.as_deref() {
+                let _ = model.exec(&format!("add_cells_to_pblock {name}"));
+            }
+        }
+        let sel_cell = model
+            .selected
+            .as_deref()
+            .filter(|s| model.tree.has_cell(s))
+            .map(|s| s.to_string());
+        if ui
+            .add_enabled(
+                pb_name.is_some() && sel_cell.is_some(),
+                egui::Button::new("Add selected cells"),
+            )
+            .on_hover_text("add_cells_to_pblock — assign the netlist selection")
+            .clicked()
+        {
+            if let (Some(name), Some(cell)) = (pb_name.as_deref(), sel_cell.as_deref()) {
+                let _ = model.exec(&format!("add_cells_to_pblock {name} {cell}"));
+            }
         }
     });
     let selected = model.selected.clone();
