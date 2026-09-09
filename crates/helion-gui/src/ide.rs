@@ -7736,6 +7736,11 @@ impl IdeModel {
                 "timing_incomplete cells={cells} (clock_gate; not a single user clock; not a closed WNS)"
             );
         }
+        if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            return format!(
+                "timing_incomplete cells={cells} (gate primitive not mapped; not a LUT; not a closed WNS)"
+            );
+        }
         if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
             return format!(
                 "timing_incomplete cells={cells} (inout load enable not mapped; not a closed WNS)"
@@ -16487,6 +16492,9 @@ impl IdeModel {
         if d.attrs.get("CLOCK_GATE") == Some("1") {
             return false;
         }
+        if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            return false;
+        }
         if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
             return false;
         }
@@ -16660,6 +16668,13 @@ impl IdeModel {
             if d.attrs.get("CLOCK_GATE") == Some("1") {
                 return Ok(format!(
                     "report_timing {} timing_incomplete cells={} (clock_gate; not a single user clock; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
+                return Ok(format!(
+                    "report_timing {} timing_incomplete cells={} (gate primitive not mapped; not a LUT; not a closed WNS)",
                     d.name,
                     d.cells.len()
                 ));
