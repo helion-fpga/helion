@@ -1511,8 +1511,15 @@ fn rhs_unpacked_index(rhs: &RExpr, rtl: &Rtl) -> bool {
         match e {
             RExpr::IndexPart { name, base, .. } => {
                 // depth==1 collapses in index_part_bit; still walk nested bases.
+                // Const word index of depth>1 is a fixed word read (not a mux).
                 let d = sig_depth(rtl, name);
-                (d > 1) || walk(base, rtl)
+                if d <= 1 {
+                    return walk(base, rtl);
+                }
+                if const_rexpr_usize(base).is_some() {
+                    return false;
+                }
+                true
             }
             RExpr::Concat(parts) => parts.iter().any(|p| walk(p, rtl)),
             RExpr::WordAt { addr, data } => walk(addr, rtl) || walk(data, rtl),
@@ -1932,7 +1939,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         "module", "endmodule", "input", "output", "logic", "wire", "reg", "always_ff", "always",
         "begin", "end", "posedge", "negedge", "assign", "inout", "if", "else", "always_comb",
         "case", "casez", "casex", "endcase", "default", "generate", "endgenerate", "genvar",
-        "for", "int", "parameter", "localparam", "initial", "package", "endpackage", "typedef",
+        "for", "int", "integer", "parameter", "localparam", "initial", "package", "endpackage", "typedef",
         "import", "export", "struct", "enum", "packed", "signed", "unsigned", "function",
         "endfunction", "task", "endtask", "return", "always_latch", "unique", "priority",
         "automatic", "void", "const", "var", "ref", "static", "extern", "virtual", "pure",
@@ -3150,6 +3157,11 @@ fn eat_unsigned_cast_prefix(p: &mut P) -> bool {
 }
 
 fn parse_for_step(p: &mut P) -> Result<usize, String> {
+    Ok(parse_for_step_signed(p)?.unsigned_abs().max(1) as usize)
+}
+
+/// Positive = ascending step, negative = descending (`i = i - 1`).
+fn parse_for_step_signed(p: &mut P) -> Result<i32, String> {
     let _var = p.ident()?;
     // i++
     if p.eat_sym('+') {
@@ -3158,39 +3170,67 @@ fn parse_for_step(p: &mut P) -> Result<usize, String> {
         }
         // i += N
         if p.eat_sym('=') {
-            let n = const_u(p)? as usize;
+            let n = const_u(p)? as i32;
             return Ok(n.max(1));
         }
         return Err("for step +".into());
     }
-    // i = i + N, or i = N + i (SRL `i = 1+i`).
+    // i--
+    if p.eat_sym('-') {
+        if p.eat_sym('-') {
+            return Ok(-1);
+        }
+        // i -= N
+        if p.eat_sym('=') {
+            let n = const_u(p)? as i32;
+            return Ok(-(n.max(1)));
+        }
+        return Err("for step -".into());
+    }
+    // i = i + N, i = i - N, or i = N + i (SRL `i = 1+i`).
     if p.eat_sym('=') {
         // i = N + i — do not call const_u: the loop var is not a parameter.
         if matches!(p.peek(), Some(Tok::Number(_, _))) {
             let n = match p.bump() {
-                Some(Tok::Number(v, _)) => (*v as usize).max(1),
+                Some(Tok::Number(v, _)) => (*v as i32).max(1),
                 _ => 1,
             };
             if p.eat_sym('+') {
                 let _ = p.ident();
+                return Ok(n);
+            }
+            if p.eat_sym('-') {
+                let _ = p.ident();
+                return Ok(-n);
             }
             return Ok(n);
         }
-        // i = i + N
+        // i = i + N / i = i - N
         if matches!(p.peek(), Some(Tok::Ident(_))) {
             let _ = p.ident();
-            if !p.eat_sym('+') {
-                return Err("for step =+".into());
+            if p.eat_sym('+') {
+                let n = match p.peek() {
+                    Some(Tok::Number(v, _)) => {
+                        let n = (*v as i32).max(1);
+                        p.bump();
+                        n
+                    }
+                    _ => 1,
+                };
+                return Ok(n);
             }
-            let n = match p.peek() {
-                Some(Tok::Number(v, _)) => {
-                    let n = (*v as usize).max(1);
-                    p.bump();
-                    n
-                }
-                _ => 1,
-            };
-            return Ok(n);
+            if p.eat_sym('-') {
+                let n = match p.peek() {
+                    Some(Tok::Number(v, _)) => {
+                        let n = (*v as i32).max(1);
+                        p.bump();
+                        n
+                    }
+                    _ => 1,
+                };
+                return Ok(-n);
+            }
+            return Err("for step =+".into());
         }
         return Err("for step =".into());
     }
@@ -3301,6 +3341,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
         return Err("for (".into());
     }
     let _ = p.eat_kw("int");
+    let _ = p.eat_kw("integer");
     let _ = p.eat_kw("genvar");
     let _ = p.eat_kw("unsigned");
     let _ = p.eat_kw("signed");
@@ -3319,11 +3360,17 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     } else {
         let _ = p.ident();
     }
-    let inclusive = if matches!(p.peek(), Some(Tok::Le)) {
+    // Ascending `<` / `<=`, or descending `>` / `>=` (Ibex bus host arbiter).
+    let (inclusive, descending) = if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
-        true
+        (true, false)
+    } else if matches!(p.peek(), Some(Tok::Ge)) {
+        p.bump();
+        (true, true)
     } else if p.eat_sym('<') {
-        false
+        (false, false)
+    } else if p.eat_sym('>') {
+        (false, true)
     } else {
         return Err("for cmp".into());
     };
@@ -3341,15 +3388,43 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
             return Err("for bound".into());
         }
     };
-    // Inclusive `<=` used to `end + 1` and panic when the bound was usize::MAX.
-    let end = if inclusive { end.saturating_add(1) } else { end };
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
-    let step = parse_for_step(p)?;
+    let step_signed = parse_for_step_signed(p)?;
     if !p.eat_sym(')') {
         return Err("for )".into());
     }
+    let step = step_signed.unsigned_abs().max(1) as usize;
+    let step_down = descending || step_signed < 0;
+    // Half-open ascending [lo, hi) for the iteration set; walk high→low when step_down.
+    let (lo, hi) = if descending {
+        // start >= end → values end..=start (inclusive end when >=)
+        let last = if inclusive { end } else { end.saturating_add(1) };
+        if start < last {
+            (0usize, 0usize) // empty
+        } else {
+            (last, start.saturating_add(1))
+        }
+    } else {
+        let end = if inclusive { end.saturating_add(1) } else { end };
+        (start, end)
+    };
+    let empty = lo >= hi;
+    let start = if empty {
+        0usize
+    } else if step_down {
+        hi - 1
+    } else {
+        lo
+    };
+    let end = if empty {
+        0usize
+    } else if step_down {
+        lo
+    } else {
+        hi
+    };
     let block = p.eat_kw("begin");
     if p.eat_sym(':') {
         let _ = p.ident();
@@ -3373,21 +3448,27 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     }
     let body = p.t[start_i..p.i].to_vec();
     let mut out = Vec::new();
-    let niter = end.saturating_sub(start) / step.max(1);
+    let niter = if empty {
+        0usize
+    } else if step_down {
+        start.saturating_sub(end) / step.max(1) + 1
+    } else {
+        end.saturating_sub(start) / step.max(1)
+    };
     // `for (i = 1; i < cycles; ...)` : exclusive end is the word count.
     // Cap at 4 words. Do not unroll a deep chain into invented stages.
     if let Some(mem) = body_is_word_shift(&body, &var) {
-        if end > 4 {
-            note_word_pipeline_cap(&cur_mod(), &mem, &end.to_string());
+        let span = if step_down { start.saturating_sub(end).saturating_add(1) } else { end };
+        if span > 4 {
+            note_word_pipeline_cap(&cur_mod(), &mem, &span.to_string());
         }
     }
     if niter > 4096 {
         return Ok(Vec::new());
     }
-    let mut i = start;
-    let mut n = 0usize;
     let step = step.max(1);
-    while i < end && n < 4096 {
+    let mut i = start;
+    for _ in 0..niter.min(4096) {
         let toks: Vec<Tok> = body
             .iter()
             .map(|t| match t {
@@ -3397,8 +3478,11 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
             .collect();
         let mut sp = P { t: &toks, i: 0, params: p.params.clone(), widths: p.widths.clone() };
         out.extend(parse_seq_block(&mut sp, block)?);
-        i = i.saturating_add(step);
-        n += 1;
+        if step_down {
+            i = i.saturating_sub(step);
+        } else {
+            i = i.saturating_add(step);
+        }
     }
     Ok(out)
 }
@@ -3462,6 +3546,62 @@ fn note_width(p: &mut P, name: &str, w: usize) {
 
 /// Last procedural write wins. Vector assigns become per-bit so a case arm
 /// that writes slices can mux against an arm that writes the whole vector.
+/// Fold blocking assigns in an always_comb block so `x = 0; if (c) x = v;`
+/// becomes `x = c ? v : 0` instead of a self-referential Mux hold on `x`
+/// (Ibex bus host_sel_req arbiter).
+fn fold_blocking_assigns(stmts: Vec<Nba>) -> Vec<Nba> {
+    fn subst(e: &RExpr, env: &HashMap<(String, Option<usize>), RExpr>, lhs: &str, bit: Option<usize>) -> RExpr {
+        match e {
+            RExpr::Ident(s) if s == lhs && bit.is_none() => env
+                .get(&(s.clone(), None))
+                .cloned()
+                .unwrap_or_else(|| e.clone()),
+            RExpr::Not(x) => RExpr::Not(Box::new(subst(x, env, lhs, bit))),
+            RExpr::And(a, b) => RExpr::And(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Or(a, b) => RExpr::Or(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Xor(a, b) => RExpr::Xor(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Mux(c, t, f) => RExpr::Mux(
+                Box::new(subst(c, env, lhs, bit)),
+                Box::new(subst(t, env, lhs, bit)),
+                Box::new(subst(f, env, lhs, bit)),
+            ),
+            RExpr::Eq(a, b) => RExpr::Eq(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Ne(a, b) => RExpr::Ne(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Lt(a, b) => RExpr::Lt(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Add(a, b) => RExpr::Add(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Sub(a, b) => RExpr::Sub(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Mul(a, b) => RExpr::Mul(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Shr(a, b) => RExpr::Shr(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::Ashr(a, b) => RExpr::Ashr(Box::new(subst(a, env, lhs, bit)), Box::new(subst(b, env, lhs, bit))),
+            RExpr::IndexPart { name, base, width, ascending } => RExpr::IndexPart {
+                name: name.clone(),
+                base: Box::new(subst(base, env, lhs, bit)),
+                width: *width,
+                ascending: *ascending,
+            },
+            RExpr::Concat(parts) => RExpr::Concat(parts.iter().map(|p| subst(p, env, lhs, bit)).collect()),
+            RExpr::RedXor(x) => RExpr::RedXor(Box::new(subst(x, env, lhs, bit))),
+            RExpr::RedAnd(x) => RExpr::RedAnd(Box::new(subst(x, env, lhs, bit))),
+            RExpr::RedOr(x) => RExpr::RedOr(Box::new(subst(x, env, lhs, bit))),
+            other => other.clone(),
+        }
+    }
+    let mut env: HashMap<(String, Option<usize>), RExpr> = HashMap::new();
+    let mut order: Vec<(String, Option<usize>)> = Vec::new();
+    for (lhs, bit, rhs) in stmts {
+        let key = (lhs.clone(), bit);
+        let rhs = subst(&rhs, &env, &lhs, bit);
+        if !env.contains_key(&key) {
+            order.push(key.clone());
+        }
+        env.insert(key, rhs);
+    }
+    order
+        .into_iter()
+        .filter_map(|k| env.remove(&k).map(|rhs| (k.0, k.1, rhs)))
+        .collect()
+}
+
 fn normalize_nbas(p: &P, stmts: Vec<Nba>) -> Vec<Nba> {
     let mut order: Vec<(String, Option<usize>)> = Vec::new();
     let mut map: HashMap<(String, Option<usize>), RExpr> = HashMap::new();
@@ -4484,10 +4624,27 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 let _ = p.eat_sym(':');
                 let _ = p.eat_sym(':');
             }
-            if matches!(p.peek(), Some(Tok::Ident(_)))
-                && matches!(p.t.get(p.i + 1), Some(Tok::Ident(_)) | Some(Tok::Sym('[')))
-            {
+            // Optional typedef before the port ident: `foo_t name` or
+            // `foo_t [W-1:0] name`. Do NOT treat `name [N]` (unpacked dim) as a
+            // typedef — that used to swallow `host_req_i` in Ibex bus ports.
+            if matches!(p.peek(), Some(Tok::Ident(_))) {
+                let save = p.i;
                 let _ = p.ident();
+                let mut ok_typedef = false;
+                if matches!(p.peek(), Some(Tok::Ident(_))) {
+                    ok_typedef = true; // foo_t name
+                } else if p.eat_sym('[') {
+                    let dim_ok = match (const_u(p), p.eat_sym(':'), const_u(p), p.eat_sym(']')) {
+                        (Ok(_), true, Ok(_), true) => true,
+                        _ => false,
+                    };
+                    if dim_ok && matches!(p.peek(), Some(Tok::Ident(_))) {
+                        ok_typedef = true; // foo_t [W-1:0] name
+                    }
+                }
+                if !ok_typedef {
+                    p.i = save;
+                }
             }
             skip_logic(&mut p);
             let w = p.width_opt().unwrap_or(1);
@@ -5147,7 +5304,7 @@ fn parse_module_items(
                 let _ = p.ident();
             }
             match parse_seq_block(&mut p, block) {
-                Ok(stmts) => assigns.extend(stmts),
+                Ok(stmts) => assigns.extend(fold_blocking_assigns(stmts)),
                 Err(_) => {
                     note_skip(format!(
                         "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
@@ -5174,7 +5331,7 @@ fn parse_module_items(
                 Ok(stmts) => {
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
-                        assigns.extend(stmts);
+                        assigns.extend(fold_blocking_assigns(stmts));
                     } else if negedge_only {
                         // Falling-edge always is its own clock. Do not fold it
                         // into the posedge cone (that drops the name).
@@ -5283,6 +5440,7 @@ fn parse_for_unroll_module(
         return Err("for (".into());
     }
     let _ = p.eat_kw("int");
+    let _ = p.eat_kw("integer");
     let _ = p.eat_kw("genvar");
     let _ = p.eat_kw("unsigned");
     let _ = p.eat_kw("signed");
@@ -5706,6 +5864,16 @@ fn index_part_bit(
         }
         return Ok(Expr::Var(bit_name(name, wsrc, bit)));
     }
+    // Const word index of unpacked depth>1: one fixed word's packed bits.
+    if depth > 1 {
+        if let RExpr::Const { val, .. } = base {
+            let word = *val as usize;
+            if bit >= wsrc {
+                return Ok(Expr::Const(false));
+            }
+            return Ok(Expr::Var(unpacked_word_q(name, word, wsrc, bit)));
+        }
+    }
     if bit >= part_w {
         return Ok(Expr::Const(false));
     }
@@ -5822,6 +5990,22 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
         }
         RExpr::Bit(s, i) => {
             let w = sig_width(rtl, s);
+            let depth = sig_depth(rtl, s);
+            // depth==1: sole word uses packed bit names (same as index_part_bit).
+            // depth>1 const word index: distinct per-word nets.
+            if depth > 1 {
+                if bit >= w {
+                    return Ok(Expr::Const(false));
+                }
+                return Ok(Expr::Var(unpacked_word_q(s, *i, w, bit)));
+            }
+            if depth == 1 {
+                if bit >= w {
+                    return Ok(Expr::Const(false));
+                }
+                // Const word index on a sole-word array collapses to packed bits.
+                return Ok(Expr::Var(bit_name(s, w, bit)));
+            }
             Ok(Expr::Var(bit_name(s, w, *i)))
         }
         RExpr::Range(s, lo, hi) => {
@@ -6439,6 +6623,19 @@ fn cmp_src_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 return Err(format!("unknown name {s}"));
             }
             let w = sig_width(rtl, s);
+            let depth = sig_depth(rtl, s);
+            if depth > 1 {
+                if bit >= w {
+                    return Ok(Expr::Const(false));
+                }
+                return Ok(Expr::Var(unpacked_word_q(s, *i, w, bit)));
+            }
+            if depth == 1 {
+                if bit >= w {
+                    return Ok(Expr::Const(false));
+                }
+                return Ok(Expr::Var(bit_name(s, w, bit)));
+            }
             Ok(Expr::Var(bit_name(s, w, *i)))
         }
         other => rexpr_to_bit(other, rtl, bit),
@@ -6858,75 +7055,273 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
 /// AND-tree of small bit-predicates (packed `a == b`, `(a&m)==b`, …) as a LUT
 /// reduction. Each And-leaf must fit one LUT6; the tree avoids one 64-PI AIG
 /// that would hit wide_cone_cap. Returns the output net, or None.
+/// Also maps `!=` as Not(And-of-XNORs) and And-mixes of eq/ne/small leaves
+/// (Ibex bus `sim_en` / address decode).
 fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
-    fn collect_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+    fn is_xnor_leaf(e: &Expr) -> bool {
+        matches!(e, Expr::Not(inner) if matches!(inner.as_ref(), Expr::Xor(_, _)))
+    }
+    fn collect_xnor_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
         match e {
-            Expr::And(a, b) => collect_leaves(a, out) && collect_leaves(b, out),
+            Expr::And(a, b) => collect_xnor_and(a, out) && collect_xnor_and(b, out),
             Expr::Const(true) => true,
-            other => {
+            other if is_xnor_leaf(other) => {
                 out.push(other);
                 true
             }
+            _ => false,
         }
     }
-    let mut leaves = Vec::new();
-    if !collect_leaves(expr, &mut leaves) || leaves.is_empty() {
-        return None;
+    fn collect_and_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::And(a, b) => {
+                collect_and_leaves(a, out);
+                collect_and_leaves(b, out);
+            }
+            Expr::Const(true) => {}
+            other => out.push(other),
+        }
     }
-    // Need an And-tree of several bit compares (or one wide leaf that is itself
-    // an eq of many bits already flattened into one Expr — still split above).
-    // Reject tiny non-eq cones (plain And of two vars) so gold paths stay put.
-    let looks_eq = leaves.iter().any(|leaf| {
-        matches!(leaf, Expr::Not(inner) if matches!(inner.as_ref(), Expr::Xor(_, _)))
-    });
-    if !looks_eq || leaves.len() > 128 {
-        return None;
+    fn emit_and_reduce(d: &mut Design, prefix: &str, n: &mut usize, mut level: Vec<String>) -> Option<String> {
+        if level.is_empty() {
+            return None;
+        }
+        while level.len() > 1 {
+            let mut next = Vec::new();
+            let mut i = 0usize;
+            while i < level.len() {
+                let chunk = &level[i..level.len().min(i + 6)];
+                i += chunk.len();
+                if chunk.len() == 1 {
+                    next.push(chunk[0].clone());
+                    continue;
+                }
+                let cell = format!("{prefix}and{n}");
+                let net = format!("{prefix}andn{n}");
+                *n += 1;
+                let k = chunk.len();
+                let mut init = 0u64;
+                let used = (1u64 << k) - 1;
+                for idx in 0..64u64 {
+                    if (idx & used) == used && (idx >> k) == 0 {
+                        init |= 1u64 << idx;
+                    }
+                }
+                d.add_cell(&cell, CellKind::Lut6 { init });
+                d.connect(&net, &cell, "O");
+                for (pin, src) in chunk.iter().enumerate() {
+                    d.connect(src, &cell, format!("I{pin}"));
+                }
+                next.push(net);
+            }
+            level = next;
+        }
+        Some(level.pop().unwrap())
     }
-    let mut level: Vec<String> = Vec::new();
-    let mut n = 0usize;
-    for leaf in &leaves {
+    fn map_xnor_leaves(
+        d: &mut Design,
+        prefix: &str,
+        n: &mut usize,
+        xnors: &[&Expr],
+    ) -> Option<String> {
+        if xnors.is_empty() || xnors.len() > 128 {
+            return None;
+        }
+        let mut level = Vec::new();
+        for leaf in xnors {
+            let (init, pis) = lut6_from_bool_cone(leaf)?;
+            let cell = format!("{prefix}eq{n}");
+            let net = format!("{prefix}eqn{n}");
+            *n += 1;
+            d.add_cell(&cell, CellKind::Lut6 { init });
+            d.connect(&net, &cell, "O");
+            for (pin, pi) in pis.iter().enumerate() {
+                d.connect(pi, &cell, format!("I{pin}"));
+            }
+            level.push(net);
+        }
+        emit_and_reduce(d, prefix, n, level)
+    }
+    fn map_one_leaf(d: &mut Design, prefix: &str, n: &mut usize, leaf: &Expr) -> Option<String> {
+        // `!=` → Not(And-of-XNORs)
+        if let Expr::Not(inner) = leaf {
+            let mut xnors = Vec::new();
+            if collect_xnor_and(inner, &mut xnors) && !xnors.is_empty() {
+                let eq = map_xnor_leaves(d, prefix, n, &xnors)?;
+                let cell = format!("{prefix}ne{n}");
+                let net = format!("{prefix}nen{n}");
+                *n += 1;
+                d.add_cell(&cell, CellKind::Lut6 { init: lut6_inv() });
+                d.connect(&eq, &cell, "I0");
+                d.connect(&net, &cell, "O");
+                return Some(net);
+            }
+        }
+        // Nested And-of-XNORs as one leaf of a wider And.
+        let mut xnors = Vec::new();
+        if collect_xnor_and(leaf, &mut xnors) && xnors.len() >= 2 {
+            return map_xnor_leaves(d, prefix, n, &xnors);
+        }
         let (init, pis) = lut6_from_bool_cone(leaf)?;
         let cell = format!("{prefix}eq{n}");
         let net = format!("{prefix}eqn{n}");
-        n += 1;
+        *n += 1;
         d.add_cell(&cell, CellKind::Lut6 { init });
         d.connect(&net, &cell, "O");
         for (pin, pi) in pis.iter().enumerate() {
             d.connect(pi, &cell, format!("I{pin}"));
         }
-        level.push(net);
+        Some(net)
     }
-    while level.len() > 1 {
-        let mut next = Vec::new();
-        let mut i = 0usize;
-        while i < level.len() {
-            let chunk = &level[i..level.len().min(i + 6)];
-            i += chunk.len();
-            if chunk.len() == 1 {
-                next.push(chunk[0].clone());
-                continue;
+
+    // Whole expr is a lone Ne / eq tree.
+    {
+        let mut xnors = Vec::new();
+        if let Expr::Not(inner) = expr {
+            if collect_xnor_and(inner, &mut xnors) && !xnors.is_empty() {
+                let mut n = 0usize;
+                return map_one_leaf(d, prefix, &mut n, expr);
             }
-            let cell = format!("{prefix}and{n}");
-            let net = format!("{prefix}andn{n}");
-            n += 1;
-            let k = chunk.len();
-            let mut init = 0u64;
-            let used = (1u64 << k) - 1;
-            for idx in 0..64u64 {
-                if (idx & used) == used && (idx >> k) == 0 {
-                    init |= 1u64 << idx;
+        }
+        xnors.clear();
+        if collect_xnor_and(expr, &mut xnors) && xnors.len() >= 2 {
+            let mut n = 0usize;
+            return map_xnor_leaves(d, prefix, &mut n, &xnors);
+        }
+    }
+
+    let mut leaves = Vec::new();
+    collect_and_leaves(expr, &mut leaves);
+    if leaves.is_empty() || leaves.len() > 128 {
+        return None;
+    }
+    let looks_eq = leaves.iter().any(|leaf| {
+        is_xnor_leaf(leaf)
+            || matches!(leaf, Expr::Not(inner) if {
+                let mut v = Vec::new();
+                collect_xnor_and(inner, &mut v) && !v.is_empty()
+            })
+            || {
+                let mut v = Vec::new();
+                collect_xnor_and(leaf, &mut v) && v.len() >= 2
+            }
+    });
+    if !looks_eq {
+        return None;
+    }
+    let mut n = 0usize;
+    let mut level = Vec::new();
+    for leaf in &leaves {
+        level.push(map_one_leaf(d, prefix, &mut n, leaf)?);
+    }
+    emit_and_reduce(d, prefix, &mut n, level)
+}
+
+/// `c ? t : f` encoded as Or(And(c,t), And(Not(c),f)) with const/ITE arms —
+/// Ibex bus `device_sel_req` if/else decode. Map cond via eq/ne reduce.
+fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
+    fn same_struct(a: &Expr, b: &Expr) -> bool {
+        match (a, b) {
+            (Expr::Const(x), Expr::Const(y)) => x == y,
+            (Expr::Var(x), Expr::Var(y)) => x == y,
+            (Expr::Not(x), Expr::Not(y)) => same_struct(x, y),
+            (Expr::And(a1, a2), Expr::And(b1, b2))
+            | (Expr::Or(a1, a2), Expr::Or(b1, b2))
+            | (Expr::Xor(a1, a2), Expr::Xor(b1, b2)) => {
+                same_struct(a1, b1) && same_struct(a2, b2)
+            }
+            _ => false,
+        }
+    }
+    fn match_ite<'a>(e: &'a Expr) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
+        let Expr::Or(l, r) = e else {
+            return None;
+        };
+        // Or(And(c,t), And(Not(c),f)) or swapped
+        for (a, b) in [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())] {
+            let Expr::And(a1, a2) = a else {
+                continue;
+            };
+            let Expr::And(b1, b2) = b else {
+                continue;
+            };
+            // And(c,t) / And(Not(c),f)
+            if let Expr::Not(nc) = b1.as_ref() {
+                if same_struct(a1, nc) {
+                    return Some((a1.as_ref(), a2.as_ref(), b2.as_ref()));
                 }
             }
-            d.add_cell(&cell, CellKind::Lut6 { init });
-            d.connect(&net, &cell, "O");
-            for (pin, src) in chunk.iter().enumerate() {
-                d.connect(src, &cell, format!("I{pin}"));
+            if let Expr::Not(nc) = b2.as_ref() {
+                if same_struct(a1, nc) {
+                    return Some((a1.as_ref(), a2.as_ref(), b1.as_ref()));
+                }
             }
-            next.push(net);
+            if let Expr::Not(nc) = a1.as_ref() {
+                if same_struct(b1, nc) {
+                    return Some((b1.as_ref(), b2.as_ref(), a2.as_ref()));
+                }
+            }
+            if let Expr::Not(nc) = a2.as_ref() {
+                if same_struct(b1, nc) {
+                    return Some((b1.as_ref(), b2.as_ref(), a1.as_ref()));
+                }
+            }
         }
-        level = next;
+        None
     }
-    Some(level.pop().unwrap())
+    fn map_arm(d: &mut Design, e: &Expr, prefix: &str, n: &mut usize) -> Option<String> {
+        if let Expr::Const(v) = e {
+            let cell = format!("{prefix}k{n}");
+            let net = format!("{prefix}kn{n}");
+            *n += 1;
+            d.add_cell(&cell, CellKind::Lut6 { init: lut6_const(*v) });
+            d.connect(&net, &cell, "O");
+            return Some(net);
+        }
+        if let Some(net) = try_map_ite_const_tree(d, e, &format!("{prefix}i{n}_")) {
+            *n += 1;
+            return Some(net);
+        }
+        if let Some(net) = try_map_xnor_and_tree(d, e, &format!("{prefix}e{n}_")) {
+            *n += 1;
+            return Some(net);
+        }
+        let (init, pis) = lut6_from_bool_cone(e)?;
+        let cell = format!("{prefix}a{n}");
+        let net = format!("{prefix}an{n}");
+        *n += 1;
+        d.add_cell(&cell, CellKind::Lut6 { init });
+        d.connect(&net, &cell, "O");
+        for (pin, pi) in pis.iter().enumerate() {
+            d.connect(pi, &cell, format!("I{pin}"));
+        }
+        Some(net)
+    }
+    let (c, t, f) = match_ite(expr)?;
+    let mut n = 0usize;
+    let c_net = map_arm(d, c, prefix, &mut n)?;
+    let t_net = map_arm(d, t, prefix, &mut n)?;
+    let f_net = map_arm(d, f, prefix, &mut n)?;
+    // O = c ? t : f  with I0=c I1=t I2=f → bits where (idx&1)!=0 ? t : f
+    // init[idx] = if idx&1 { (idx>>1)&1 } else { (idx>>2)&1 } for 3 inputs
+    let mut init = 0u64;
+    for idx in 0..8u64 {
+        let cbit = idx & 1;
+        let tbit = (idx >> 1) & 1;
+        let fbit = (idx >> 2) & 1;
+        let o = if cbit != 0 { tbit } else { fbit };
+        if o != 0 {
+            init |= 1u64 << idx;
+        }
+    }
+    let cell = format!("{prefix}mx{n}");
+    let net = format!("{prefix}mxn{n}");
+    d.add_cell(&cell, CellKind::Lut6 { init });
+    d.connect(&net, &cell, "O");
+    d.connect(&c_net, &cell, "I0");
+    d.connect(&t_net, &cell, "I1");
+    d.connect(&f_net, &cell, "I2");
+    Some(net)
 }
 
 fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
@@ -8621,6 +9016,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 d.connect(bitn, format!("u_cbuf{i}"), "O");
                 continue;
             }
+            if let Some(eq_net) = try_map_ite_const_tree(&mut d, expr, &format!("u_ite{i}_")) {
+                d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
+                d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
+                d.connect(bitn, format!("u_cbuf{i}"), "O");
+                continue;
+            }
             if let Some(sig) = rel_sig.get(bitn) {
                 note_assign_not_lowered(&rtl.module, sig);
                 continue;
@@ -8636,6 +9037,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         // Packed `a == b` (AND of XNORs) → LUT reduction, not one 64-PI AIG.
         if let Some(eq_net) = try_map_xnor_and_tree(&mut d, expr, &format!("u_eq{i}_")) {
+            d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
+            d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
+            d.connect(bitn, format!("u_cbuf{i}"), "O");
+            continue;
+        }
+        // If/else const decode (Or/And ITE of eq/ne) → LUT mux tree.
+        if let Some(eq_net) = try_map_ite_const_tree(&mut d, expr, &format!("u_ite{i}_")) {
             d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
             d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
             d.connect(bitn, format!("u_cbuf{i}"), "O");
