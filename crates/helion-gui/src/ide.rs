@@ -17008,7 +17008,20 @@ impl IdeModel {
             }
             Ok((led, bus, w))
         } else if let Some(sim) = self.event_sim.as_ref() {
-            Ok((sim.led, u64::from(sim.led), 1))
+            // Pack Hff Q bits into a cnt bus (u_ff0.. sorted); fabric_sim path unchanged.
+            let mut names: Vec<_> = sim.ff_q.keys().cloned().collect();
+            names.sort();
+            let w = names.len().min(8) as u8;
+            if w == 0 {
+                return Ok((sim.led, u64::from(sim.led), 1));
+            }
+            let mut bus = 0u64;
+            for (i, name) in names.iter().take(w as usize).enumerate() {
+                if sim.ff_q.get(name).copied().unwrap_or(false) {
+                    bus |= 1u64 << i;
+                }
+            }
+            Ok((sim.led, bus, w))
         } else {
             Err("sim: not started".into())
         }
@@ -20506,6 +20519,43 @@ mod tests {
         ide.sim_step().unwrap();
         let two = ide.wave_posedge_led_bits();
         assert_eq!(two, &gold[..2], "step is a real cycle, not a dummy");
+    }
+
+    /// HELION_FLOW=implement (no write_bitstream) uses event_sim; pack FF Q into cnt.
+    #[test]
+    fn event_sim_packs_ff_q_into_cnt_bus() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        assert!(
+            ide.shell.session.bitstream.is_none(),
+            "implement without write_bitstream"
+        );
+        ide.sim_run(16).unwrap();
+        assert!(ide.fabric_sim.is_none(), "no bitstream => event_sim kernel");
+        let sim = ide.event_sim.as_ref().expect("event_sim after prepare_sim");
+        let n_ff = sim.ff_q.len();
+        assert!(n_ff >= 2, "counter has multiple Hffs: {n_ff}");
+        let mut names: Vec<_> = sim.ff_q.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names[0], "u_ff0");
+        assert!(ide.wave.has_trace("clk"), "half-cycle clk");
+        assert!(ide.wave.has_trace("led"));
+        assert!(
+            ide.wave.has_trace("cnt"),
+            "event_sim must push cnt when bus_w>1 from sorted ff_q"
+        );
+        let cnt = ide.wave.trace("cnt").unwrap();
+        assert_eq!(cnt.width, n_ff.min(8) as u8);
+        assert!(cnt.width > 1);
+        assert_eq!(cnt.samples.len(), 32);
+        let vals: Vec<u64> = cnt.samples.iter().copied().skip(1).step_by(2).collect();
+        assert!(
+            vals.iter().any(|&v| v != 0),
+            "packed cnt bus should not stay zero: {vals:?}"
+        );
+        let ymax = cnt.analog_series().iter().cloned().fold(0.0, f64::max);
+        assert!(ymax > 1.0, "cnt is a multi-bit bus series: {ymax}");
     }
 
     #[test]
