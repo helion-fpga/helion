@@ -831,6 +831,10 @@ fn assemble_module(
         }
         let child = assemble_module(mods, &inst.module, visiting)?;
         stitch_child(&mut d, &child, inst);
+        // A child cone that was not mapped makes this netlist incomplete.
+        if child.attrs.get("WIDE_CONE") == Some("1") {
+            d.attrs.set("WIDE_CONE", "1");
+        }
     }
     visiting.remove(name);
     Ok(d)
@@ -5529,6 +5533,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         for (pin, pi) in aig.pis.iter().enumerate() {
             d.connect(pi, &lut, format!("I{pin}"));
         }
+    }
+
+    // A refused cone is not a closed design, even if leftover FFs remain.
+    // variable_index_read does not set this: write-side Hffs may still time.
+    if wide_capped {
+        d.attrs.set("WIDE_CONE", "1");
     }
 
     // Clocked always either already became an Hff on the user's clock, or

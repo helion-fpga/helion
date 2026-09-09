@@ -7686,8 +7686,9 @@ impl IdeModel {
         Ok(format!("device_zoom out zoom={:.3}", self.device_zoom))
     }
 
-    /// On-screen timing line. Closed `WNS_PS=` only with cells>0 and an Hff clock path.
-    /// Otherwise `no_body` / `no_clock_path`. Built-in period says `default period, not user SDC`.
+    /// On-screen timing line. Closed `WNS_PS=` only with cells>0 and an Hff clock path,
+    /// and only when no cone was skipped. Otherwise `no_body` / `no_clock_path` /
+    /// `timing_incomplete`. Built-in period says `default period, not user SDC`.
     pub fn timing_honesty_label(&self) -> String {
         let Some(d) = self.shell.session.design.as_ref() else {
             return "no_body cells=0 (no timing: empty shell or no logic; not a closed WNS)".into();
@@ -7718,6 +7719,11 @@ impl IdeModel {
         if !clock_path {
             return format!(
                 "no_clock_path cells={cells} (no timing: no clock path; not a closed WNS)"
+            );
+        }
+        if d.attrs.get("WIDE_CONE") == Some("1") {
+            return format!(
+                "timing_incomplete cells={cells} (wide_cone skipped; not a closed WNS)"
             );
         }
         match self.timing.as_ref() {
@@ -16449,6 +16455,12 @@ impl IdeModel {
         if d.attrs.get("NO_BODY") == Some("1") {
             return false;
         }
+        // A skipped cone is not a design WNS, even if leftover cells have a clock.
+        // sequential_not_lowered with no Hff is already rejected below (no clock path).
+        // variable_index_read does not set this flag.
+        if d.attrs.get("WIDE_CONE") == Some("1") {
+            return false;
+        }
         let n_logic = d.cells.iter().filter(|c| {
             matches!(
                 c.kind,
@@ -16525,6 +16537,14 @@ impl IdeModel {
             if !clock_path {
                 return Ok(format!(
                     "report_timing {} no_clock_path cells={} (no timing: no clock path; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            // Leftover FFs after a refused cone are not a closed design WNS.
+            if d.attrs.get("WIDE_CONE") == Some("1") {
+                return Ok(format!(
+                    "report_timing {} timing_incomplete cells={} (wide_cone skipped; not a closed WNS)",
                     d.name,
                     d.cells.len()
                 ));
