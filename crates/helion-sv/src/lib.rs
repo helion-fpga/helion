@@ -419,6 +419,13 @@ thread_local! {
     /// Once per module+function for the process. Re-elaboration must not loop the line.
     static FUNC_NOT_CALLED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `width_overflow` line per module. String-param hashes used as a
+    /// range used to panic on `diff + 1` (old lib.rs:1052).
+    static WIDTH_OVERFLOW_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// One `wide_literal` line per process. Sized binaries wider than u128
+    /// used to panic on `1u128 << bit` (old lib.rs:959).
+    static WIDE_LITERAL_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn skipped_funcs_clear() {
@@ -444,6 +451,60 @@ fn note_function_not_called(module: &str, function: &str) {
     note_skip(format!(
         "diagnostic function_not_called module={module} function={function} (function is not called; not a LUT)"
     ));
+}
+
+/// `[msb:lsb]` width. A string parameter is hashed above bit 96; the old
+/// `as usize` then `max - min + 1` overflowed. Do not invent a bus.
+fn range_width(msb: u128, lsb: u128) -> Result<usize, String> {
+    let span = msb.abs_diff(lsb);
+    let Some(w) = span.checked_add(1) else {
+        return Err("width_overflow".into());
+    };
+    usize::try_from(w).map_err(|_| "width_overflow".to_string())
+}
+
+fn note_width_overflow() {
+    let module = cur_mod();
+    let key = if module.is_empty() {
+        "width_overflow".to_string()
+    } else {
+        module.clone()
+    };
+    let fresh = WIDTH_OVERFLOW_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    let module = if module.is_empty() { "?" } else { module.as_str() };
+    note_skip(format!(
+        "diagnostic width_overflow module={module} (range does not fit; string or overflowing parameter used as width; not a LUT)"
+    ));
+}
+
+fn note_wide_literal(width: usize) {
+    let fresh = WIDE_LITERAL_SEEN.with(|c| {
+        let seen = c.get();
+        if seen {
+            false
+        } else {
+            c.set(true);
+            true
+        }
+    });
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic wide_literal width={width} (sized binary exceeds 128-bit const; high bits not folded; not a LUT)"
+    ));
+}
+
+/// Set bit `bit` of a u128 accumulator. Shift-left of 128+ used to panic.
+fn or_u128_bit(acc: &mut u128, bit: usize) -> bool {
+    if bit >= 128 {
+        return false;
+    }
+    *acc |= 1u128 << bit;
+    true
 }
 
 /// Name after `function` has been eaten. Does not parse statements.
@@ -948,20 +1009,24 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 let mut care = 0u128;
                 let mut dc = false;
                 if base == 2 {
+                    let mut wide = width > 128;
                     for (off, ch) in digits.chars().enumerate() {
                         let bit = width.saturating_sub(off + 1);
                         match ch {
                             '1' => {
-                                val |= 1u128 << bit;
-                                care |= 1u128 << bit;
+                                wide |= !or_u128_bit(&mut val, bit);
+                                wide |= !or_u128_bit(&mut care, bit);
                             }
                             '0' => {
-                                care |= 1u128 << bit;
+                                wide |= !or_u128_bit(&mut care, bit);
                             }
                             _ => {
                                 dc = true;
                             }
                         }
+                    }
+                    if wide {
+                        note_wide_literal(width);
                     }
                 } else {
                     let parsed = u128::from_str_radix(
@@ -1041,15 +1106,21 @@ impl<'a> P<'a> {
         if !self.eat_sym('[') {
             return Ok(1);
         }
-        let msb = const_u(self)? as usize;
+        let msb = const_u(self)?;
         if !self.eat_sym(':') {
             return Err("range :".into());
         }
-        let lsb = const_u(self)? as usize;
+        let lsb = const_u(self)?;
         if !self.eat_sym(']') {
             return Err("]".into());
         }
-        Ok(msb.max(lsb) - msb.min(lsb) + 1)
+        match range_width(msb, lsb) {
+            Ok(w) => Ok(w),
+            Err(e) => {
+                note_width_overflow();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1647,7 +1718,13 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                     let lo = a.min(b);
                     // Parameter part-select e.g. SEED[STATE_WIDTH-1:0]
                     if let Some(v) = p.params.get(&name).copied() {
-                        let w = (hi - lo + 1).max(1);
+                        let w = match range_width(hi as u128, lo as u128) {
+                            Ok(w) => w.max(1),
+                            Err(e) => {
+                                note_width_overflow();
+                                return Err(e);
+                            }
+                        };
                         let mask = care_mask(w.min(128));
                         let val = (v >> lo) & mask;
                         return Ok(RExpr::Const {
@@ -1858,7 +1935,8 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
         return Err("for cmp".into());
     };
     let end = const_u(p)? as usize;
-    let end = if inclusive { end + 1 } else { end };
+    // Inclusive `<=` used to `end + 1` and panic when the bound was usize::MAX.
+    let end = if inclusive { end.saturating_add(1) } else { end };
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
@@ -3272,9 +3350,13 @@ fn parse_module_items(
                 if let (Ok(hi), true, Ok(lo), true) =
                     (const_u(p), p.eat_sym(':'), const_u(p), p.eat_sym(']'))
                 {
-                    let hi = hi as usize;
-                    let lo = lo as usize;
-                    depth = hi.max(lo) - hi.min(lo) + 1;
+                    match range_width(hi, lo) {
+                        Ok(w) => depth = w,
+                        Err(_) => {
+                            note_width_overflow();
+                            depth = 0;
+                        }
+                    }
                 } else {
                     p.i = save;
                     skip_brackets(p);
@@ -3337,11 +3419,17 @@ fn parse_module_items(
                 }
                 match parse_nba(p) {
                     Ok((lhs, bit, rhs)) => {
-                        if let RExpr::Const { val, .. } = rhs {
-                            mem_inits
-                                .entry(lhs)
-                                .or_default()
-                                .insert(bit.unwrap_or(0), val);
+                        if let RExpr::Const { val, width, .. } = rhs {
+                            // A >128-bit initial does not fit the u128 const
+                            // model. Do not invent a BRAM from the low slice.
+                            if width > 128 {
+                                note_wide_literal(width);
+                            } else {
+                                mem_inits
+                                    .entry(lhs)
+                                    .or_default()
+                                    .insert(bit.unwrap_or(0), val);
+                            }
                         }
                     }
                     Err(_) => {
@@ -3547,7 +3635,7 @@ fn parse_for_unroll_module(
         return Err("for cmp".into());
     };
     let end = const_u(p)? as usize;
-    let end = if inclusive { end + 1 } else { end };
+    let end = if inclusive { end.saturating_add(1) } else { end };
     if !p.eat_sym(';') {
         return Err("for ;2".into());
     }
@@ -6810,6 +6898,70 @@ endmodule
             "assign out=in must emit IOB, cells={:?}",
             d.cells
         );
+    }
+
+    #[test]
+    fn wide_binary_literal_does_not_panic() {
+        // 255-bit sized binary used to `1u128 << bit` and panic (old lib.rs:959).
+        let bits = "1".repeat(130);
+        let src = format!(
+            "module data_generator(input wire CLK, input wire CE, output wire D1);\n  reg [129:0] ring1;\n  initial ring1 <= 130'b{bits};\n  always @(posedge CLK)\n    if (CE) ring1 <= {{ring1[0], ring1[129:1]}};\n  assign D1 = ring1[0];\nendmodule\n"
+        );
+        let d = synth_sv(&src, "wide_lit.sv").expect("wide literal must not panic");
+        assert_eq!(d.name, "data_generator");
+        assert_ne!(
+            d.attrs.get("NO_BODY"),
+            Some("1"),
+            "rotate is behavioral; do not drop the body, cells={:?}",
+            d.cells
+        );
+        let logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Bram18
+                )
+            })
+            .count();
+        assert!(logic > 0, "wide rotate must lower real cells, cells={:?}", d.cells);
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            "wide initial must not invent a BRAM, cells={:?}",
+            d.cells
+        );
+    }
+
+    #[test]
+    fn string_param_width_does_not_panic() {
+        // `parameter DATA_WIDTH = ""` hashed past usize and panicked on
+        // range `+ 1` (old lib.rs:1052). Named diagnostic, no invented bus.
+        let src = r#"
+module rw_manager_bitcheck(ck, read_data);
+  parameter DATA_WIDTH = "";
+  parameter AFI_RATIO = "";
+  localparam NUMBER_OF_WORDS = 1<<1*AFI_RATIO;
+  localparam DATA_BUS_SIZE = DATA_WIDTH*NUMBER_OF_WORDS;
+  input ck;
+  input [DATA_BUS_SIZE+(0-1):0] read_data;
+  output [DATA_WIDTH-1:0] error_word;
+endmodule
+"#;
+        let d = synth_sv(src, "str_width.sv").expect("string width must not panic");
+        assert_eq!(d.name, "rw_manager_bitcheck");
+        let logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Bram18
+                )
+            })
+            .count();
+        assert_eq!(logic, 0, "must not invent gates from a string width, cells={:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
     }
 
     #[test]
