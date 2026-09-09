@@ -389,6 +389,22 @@ impl HelionIde {
                 app.set_activity(act);
             }
         }
+        if let Ok(cmds) = std::env::var("HELION_EXEC") {
+            for cmd in cmds.split(';') {
+                let t = cmd.trim();
+                if !t.is_empty() {
+                    let _ = app.model.exec(t);
+                }
+            }
+        }
+        if let Ok(name) = std::env::var("HELION_BOTTOM") {
+            if let Some(tab) = BottomTab::ALL.iter().copied().find(|t| {
+                format!("{t:?}").eq_ignore_ascii_case(name.trim())
+                    || t.label().eq_ignore_ascii_case(name.trim())
+            }) {
+                app.model.bottom_tab = tab;
+            }
+        }
         if let Ok(z) = std::env::var("HELION_DEVICE_ZOOM") {
             if let Ok(v) = z.parse::<f32>() {
                 app.model.device_zoom = v.clamp(0.40, 6.0);
