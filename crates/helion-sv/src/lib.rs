@@ -6658,6 +6658,27 @@ fn packed_add_pair(rhs: &RExpr, rtl: &Rtl) -> Option<(String, String)> {
     Some((a_name, b_name))
 }
 
+/// `assign y = bus + K` (either order). K is a small constant 1..=16.
+/// Not two named buses, not a multiply, not an unpacked word.
+fn packed_add_const(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128)> {
+    let RExpr::Add(a, b) = rhs else {
+        return None;
+    };
+    if expr_contains_mul(rhs) {
+        return None;
+    }
+    let (bus, k) = match (a.as_ref(), b.as_ref()) {
+        (RExpr::Ident(s), RExpr::Const { val, .. }) if sig_depth(rtl, s) == 0 => (s.clone(), *val),
+        (RExpr::Const { val, .. }, RExpr::Ident(s)) if sig_depth(rtl, s) == 0 => (s.clone(), *val),
+        _ => return None,
+    };
+    if (1u128..=16).contains(&k) {
+        Some((bus, k))
+    } else {
+        None
+    }
+}
+
 fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
     let w = sig_width(rtl, name);
     if bit >= w {
@@ -6739,6 +6760,106 @@ fn emit_ripple_add(
         }
     }
     eprintln!("synth_rtl ripple_add signal={sum} bits={width}");
+    true
+}
+
+fn lut6_buf() -> u64 {
+    // O = I0, independent of I1..I5.
+    0xAAAA_AAAA_AAAA_AAAA
+}
+
+fn lut6_xnor2() -> u64 {
+    0x9999_9999_9999_9999
+}
+
+/// Combinational ripple of `assign sum = bus + K`. K is a constant 1..=16,
+/// not a second 32-bit addend bus and not a MAC. Carry is injected on the
+/// low bits where the constant is 1; zero constant bits with no carry are
+/// a copy of that bus bit. No clock, no Hff. `width` > 32 is refused by
+/// the caller so a shorter bus is not invented. Returns false if any bit
+/// is skipped.
+fn emit_ripple_add_const(
+    d: &mut Design,
+    rtl: &Rtl,
+    sum: &str,
+    width: usize,
+    bus: &str,
+    k: u128,
+) -> bool {
+    if width == 0 || width > 32 || !(1u128..=16).contains(&k) {
+        return false;
+    }
+    // A missing bus bit is a skip, not a zero-extended invented bus.
+    if (0..width).any(|bit| op_bit_net(rtl, bus, bit).is_none()) {
+        return false;
+    }
+    let mut cin: Option<String> = None;
+    for bit in 0..width {
+        let Some(an) = op_bit_net(rtl, bus, bit) else {
+            return false;
+        };
+        let kbit = ((k >> bit) & 1) == 1;
+        let sum_net = bit_name(sum, width, bit);
+        let sum_cell = format!("u_rac_{sum}_{bit}s");
+        let cin_now = cin.clone();
+        match (kbit, cin_now.as_deref()) {
+            (false, None) => {
+                // Constant bit is 0 and no carry yet: this bit is the bus bit.
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(&an, "I0")]);
+            }
+            (true, None) => {
+                // First 1 in K: sum = ~bus, carry-out is that bus bit. No
+                // constant vector is invented for the addend.
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_inv(), &[(&an, "I0")]);
+                if bit + 1 < width {
+                    cin = Some(an);
+                }
+            }
+            (false, Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xor2(),
+                    &[(&an, "I0"), (cn, "I1")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("n_rac_{sum}_{bit}c");
+                    let cry_cell = format!("u_rac_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(&an, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                }
+            }
+            (true, Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xnor2(),
+                    &[(&an, "I0"), (cn, "I1")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("n_rac_{sum}_{bit}c");
+                    let cry_cell = format!("u_rac_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(true, true, true),
+                        &[(&an, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                }
+            }
+        }
+    }
+    eprintln!("synth_rtl ripple_add_const signal={sum} bits={width} const={k}");
     true
 }
 
@@ -7466,6 +7587,21 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         match rhs {
             RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
             _ => {}
+        }
+        // width<=32 `assign y = bus + K` (K in 1..=16) is a ripple from that
+        // constant: carry on the low bits, not a 32-PI cone and not a second
+        // 32-bit addend bus. No clock, no MAC. Wider than 32, or a skipped
+        // bit, stays unlowered — do not invent a shorter bus.
+        if bit.is_none() {
+            if let Some((bus, k)) = packed_add_const(rhs, rtl) {
+                if rexpr_unknown_name(rhs, rtl).is_none() {
+                    let w = sig_width(rtl, lhs).max(1);
+                    if w > 32 || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                    continue;
+                }
+            }
         }
         // width<=32 `assign sum = a + b` of two named buses is a ripple of
         // 1-bit full adders, not one 64-PI cone and not a MAC. No clock.
@@ -10388,6 +10524,52 @@ endmodule
                 && n.endpoints.iter().any(|e| e.pin == "O")
         });
         assert!(driven, "sum bit 0 is a LUT, not a wide cone");
+    }
+
+    #[test]
+    fn comb_bus_plus_small_const_is_ripple_not_a_second_operand() {
+        let src = r#"
+module PCPlus4(input  wire [31:0] pc,
+               output wire [31:0] pc_plus_four);
+  assign pc_plus_four = pc+4;
+endmodule
+"#;
+        let d = synth_sv(src, "10174_1.v").expect("PCPlus4");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "combinational const add has no clock and no Hff"
+        );
+        for bit in 0..32 {
+            let name = format!("pc_plus_four_{bit}");
+            let driven = d.nets.iter().any(|n| {
+                n.name == name && n.endpoints.iter().any(|e| e.pin == "O")
+            });
+            assert!(driven, "bit {bit} must lower, not a skipped cone");
+        }
+        // Carry uses the bus bit itself. No invented 32-bit addend.
+        let addend = d.nets.iter().any(|n| {
+            n.name.starts_with("k_")
+                || n.name.starts_with("const_")
+                || n.name.contains("_addend")
+        });
+        assert!(!addend, "must not invent a second 32-bit operand bus");
+        let lut_ins: Vec<_> = d
+            .nets
+            .iter()
+            .filter(|n| {
+                n.endpoints
+                    .iter()
+                    .any(|e| e.pin.starts_with('I') && e.cell.starts_with("u_rac_"))
+            })
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            lut_ins.iter().all(|n| n.starts_with("pc_") || n.starts_with("n_rac_")),
+            "ripple inputs are the bus and carry, not a second operand: {lut_ins:?}"
+        );
     }
 
     #[test]
