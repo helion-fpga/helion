@@ -1,0 +1,4 @@
+# Helion project — complex mid stress + SDC (user clock)
+part HL10T-C32-1
+read_sv examples/complex.sv
+read_xdc examples/complex.sdc
