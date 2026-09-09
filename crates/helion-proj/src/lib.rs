@@ -912,6 +912,56 @@ pub fn expand_ip_packages(
     Ok(loaded)
 }
 
+/// Serialize a [`ProjectFile`] to Vivado-shaped `.prj` text (`part` / `read_sv` / `read_xdc`).
+pub fn format_prj(prj: &ProjectFile) -> String {
+    let mut out = String::new();
+    if !prj.part.is_empty() {
+        out.push_str(&format!("part {}\n", prj.part));
+    } else {
+        out.push_str("part HL10T-C32-1\n");
+    }
+    if let Some(top) = &prj.top {
+        out.push_str(&format!("top {top}\n"));
+    }
+    for s in &prj.sources {
+        let ext = std::path::Path::new(s)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let cmd = match ext.as_str() {
+            "vhd" | "vhdl" => "read_vhdl",
+            "c" | "cc" | "cpp" => "read_c",
+            _ => "read_sv",
+        };
+        out.push_str(&format!("{cmd} {s}\n"));
+    }
+    for ip in &prj.ip_packages {
+        out.push_str(&format!("read_ip {ip}\n"));
+    }
+    for c in &prj.constraint_files {
+        out.push_str(&format!("read_xdc {c}\n"));
+    }
+    for line in &prj.sdc {
+        out.push_str(line);
+        if !line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Write `prj` to `path` (parent directories must exist or be creatable by the caller).
+pub fn write_prj(path: &std::path::Path, prj: &ProjectFile) -> Result<(), String> {
+    let body = format_prj(prj);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("write_prj mkdir: {e}"))?;
+        }
+    }
+    std::fs::write(path, body).map_err(|e| format!("write_prj {}: {e}", path.display()))
+}
+
 /// Flatten inline SDC + `read_xdc` files + `set_property` IO into one XDC blob, then `load_xdc`.
 /// Empty constraints keep the CLI gold WNS path (default 10 ns clk applied by the runner).
 pub fn constraints_from_project(
@@ -1111,6 +1161,19 @@ mod tests {
         assert!(s.design.as_ref().unwrap().net("q3").unwrap().attrs.flag("mark_debug"));
         assert!(get_cells(s.design.as_ref().unwrap(), None).iter().any(|c| c.contains("lut")));
         assert!(!get_pins(s.design.as_ref().unwrap(), "u_lut0").is_empty());
+    }
+
+    #[test]
+    fn format_prj_round_trips_load() {
+        let prj = load_prj(
+            "part HL10T-C32-1\nread_sv examples/counter.sv\nread_xdc examples/counter.sdc\n",
+        )
+        .unwrap();
+        let text = format_prj(&prj);
+        let again = load_prj(&text).unwrap();
+        assert_eq!(again.part, "HL10T-C32-1");
+        assert_eq!(again.sources, vec!["examples/counter.sv"]);
+        assert_eq!(again.constraint_files, vec!["examples/counter.sdc"]);
     }
 
     #[test]

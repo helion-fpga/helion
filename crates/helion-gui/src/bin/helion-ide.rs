@@ -216,6 +216,57 @@ fn run_gui() -> eframe::Result {
     )
 }
 
+
+/// Multi-step Create Project wizard (Vivado-shaped; no IP catalog / board DONE).
+#[derive(Clone, Debug)]
+struct CreateProjectWizard {
+    /// 0 name/dir, 1 part, 2 sources, 3 constraints, 4 summary
+    step: usize,
+    name: String,
+    directory: String,
+    part: String,
+    sources: Vec<String>,
+    source_draft: String,
+    constraints: Vec<String>,
+    constraint_draft: String,
+    error: Option<String>,
+}
+
+impl Default for CreateProjectWizard {
+    fn default() -> Self {
+        let dir = default_projects_dir();
+        Self {
+            step: 0,
+            name: "project_1".into(),
+            directory: dir.display().to_string(),
+            part: "HL10T-C32-1".into(),
+            sources: Vec::new(),
+            source_draft: String::new(),
+            constraints: Vec::new(),
+            constraint_draft: String::new(),
+            error: None,
+        }
+    }
+}
+
+fn default_projects_dir() -> PathBuf {
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h).join("helion-projects");
+        }
+    }
+    PathBuf::from("/tmp/helion-projects")
+}
+
+const CREATE_WIZARD_PARTS: &[&str] = &["HL10T-C32-1", "HL10T-DSP1"];
+const CREATE_WIZARD_STEPS: &[&str] = &[
+    "Project name",
+    "Part",
+    "Add sources",
+    "Add constraints",
+    "Finish",
+];
+
 struct HelionIde {
     model: IdeModel,
     tree_filter: String,
@@ -227,6 +278,8 @@ struct HelionIde {
     show_tcl: bool,
     show_palette: bool,
     show_examples: bool,
+    show_create_project: bool,
+    create_wizard: CreateProjectWizard,
     recent: Vec<PathBuf>,
     tcl_focus: bool,
     /// Last Program rail action: (ok, message) for honest empty/error/progress.
@@ -274,7 +327,9 @@ impl HelionIde {
             show_tcl: false,
             show_palette: false,
             show_examples: false,
-            recent: Vec::new(),
+            show_create_project: false,
+            create_wizard: CreateProjectWizard::default(),
+            recent: load_recent(),
             tcl_focus: false,
             program_status: None,
             program_cable: "auto".into(),
@@ -311,6 +366,7 @@ impl HelionIde {
         match std::env::var("HELION_FLOW").as_deref() {
             Ok("implement") => {
                 let _ = app.model.implement();
+                let _ = app.model.device_zoom_fit();
                 app.set_canvas(Canvas::Device);
                 app.set_activity(Activity::Device);
             }
@@ -331,6 +387,26 @@ impl HelionIde {
         if let Ok(name) = std::env::var("HELION_ACTIVITY") {
             if let Some(act) = Activity::ALL.iter().copied().find(|a| a.label().eq_ignore_ascii_case(name.trim())) {
                 app.set_activity(act);
+            }
+        }
+        if let Ok(cmds) = std::env::var("HELION_EXEC") {
+            for cmd in cmds.split(';') {
+                let t = cmd.trim();
+                if !t.is_empty() {
+                    let _ = app.model.exec(t);
+                }
+            }
+            // Save Project As / open_project push the .prj onto Recent.
+            if let Some(prj) = app.model.last_project_path.clone() {
+                app.remember(prj);
+            }
+        }
+        if let Ok(name) = std::env::var("HELION_BOTTOM") {
+            if let Some(tab) = BottomTab::ALL.iter().copied().find(|t| {
+                format!("{t:?}").eq_ignore_ascii_case(name.trim())
+                    || t.label().eq_ignore_ascii_case(name.trim())
+            }) {
+                app.model.bottom_tab = tab;
             }
         }
         if let Ok(z) = std::env::var("HELION_DEVICE_ZOOM") {
@@ -465,9 +541,11 @@ impl HelionIde {
     }
 
     fn remember(&mut self, path: PathBuf) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.recent.retain(|p| p != &path);
         self.recent.insert(0, path);
         self.recent.truncate(8);
+        save_recent(&self.recent);
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -482,6 +560,82 @@ impl HelionIde {
         self.remember(path.to_path_buf());
         self.submit_job(JobKind::Open(path.to_path_buf()));
     }
+}
+
+/// Recent menu label: prefer clear `.prj` names (`counter.prj  (project)`).
+fn recent_menu_label(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "prj" {
+        format!("{name}  (project)")
+    } else {
+        name
+    }
+}
+
+fn recent_store_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HELION_RECENT") {
+        let pb = PathBuf::from(p.trim());
+        if !pb.as_os_str().is_empty() {
+            return Some(pb);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".helion").join("recent.txt"))
+}
+
+fn load_recent() -> Vec<PathBuf> {
+    let Some(store) = recent_store_path() else {
+        return Vec::new();
+    };
+    load_recent_from(&store)
+}
+
+fn load_recent_from(store: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(store) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(line);
+        if p.is_file() && !out.iter().any(|q| q == &p) {
+            out.push(p);
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+fn save_recent(paths: &[PathBuf]) {
+    let Some(store) = recent_store_path() else {
+        return;
+    };
+    save_recent_to(&store, paths);
+}
+
+fn save_recent_to(store: &Path, paths: &[PathBuf]) {
+    if let Some(parent) = store.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut body = String::new();
+    for p in paths {
+        body.push_str(&p.display().to_string());
+        body.push('\n');
+    }
+    let _ = std::fs::write(store, body);
 }
 
 impl eframe::App for HelionIde {
@@ -520,6 +674,7 @@ impl eframe::App for HelionIde {
         paint_tcl_window(ctx, self);
         paint_palette(ctx, self);
         paint_examples_popup(ctx, self);
+        paint_create_project_wizard(ctx, self);
         capture_shot(ctx, self);
         paint_debug_overlay(ctx, self);
     }
@@ -642,6 +797,46 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
     }
 }
 
+
+fn native_close_project(app: &mut HelionIde) {
+    match app.model.close_project() {
+        Ok(msg) => {
+            app.progress = msg;
+            app.set_activity(Activity::Files);
+        }
+        Err(e) => {
+            app.progress = e;
+        }
+    }
+}
+
+fn native_save_project_as(app: &mut HelionIde) {
+    let default_name = app
+        .model
+        .design()
+        .map(|d| d.name.clone())
+        .or_else(|| app.model.tree.top.clone())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "project".into());
+    let start = default_projects_dir();
+    let start_s = start.to_string_lossy().into_owned();
+    let Some(dir) = pick_directory_dialog(&start_s) else {
+        return;
+    };
+    match app.model.save_project_as(&dir, Some(&default_name)) {
+        Ok(msg) => {
+            if let Some(prj) = app.model.last_project_path.clone() {
+                app.remember(prj);
+            }
+            app.progress = msg;
+            app.set_activity(Activity::Files);
+        }
+        Err(e) => {
+            app.progress = e;
+        }
+    }
+}
+
 fn native_open(app: &mut HelionIde) {
     if let Some(path) = native_open_dialog() {
         app.open_path_async(&path);
@@ -737,6 +932,16 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
+                let new_proj = ui
+                    .add_sized(
+                        chrome::toolbar_ctrl_size("New Project…"),
+                        egui::Button::new("New Project…"),
+                    )
+                    .on_hover_text(tip("New Project", "", "create_project"));
+                if new_proj.clicked() {
+                    app.create_wizard = CreateProjectWizard::default();
+                    app.show_create_project = true;
+                }
                 let open = ui
                     .add_sized(
                         chrome::toolbar_ctrl_size("Open…"),
@@ -745,6 +950,24 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                     .on_hover_text(tip("Open", "⌘O", "open_source"));
                 if open.clicked() {
                     native_open(app);
+                }
+                let save_as = ui
+                    .add_sized(
+                        chrome::toolbar_ctrl_size("Save Project As…"),
+                        egui::Button::new("Save Project As…"),
+                    )
+                    .on_hover_text(tip("Save Project As", "", "save_project_as"));
+                if save_as.clicked() {
+                    native_save_project_as(app);
+                }
+                let close_proj = ui
+                    .add_sized(
+                        chrome::toolbar_ctrl_size("Close Project"),
+                        egui::Button::new("Close Project"),
+                    )
+                    .on_hover_text(tip("Close Project", "", "close_project"));
+                if close_proj.clicked() {
+                    native_close_project(app);
                 }
                 let recent_sz = chrome::toolbar_ctrl_size("Recent");
                 ui.allocate_ui(egui::vec2(recent_sz[0], recent_sz[1]), |ui| {
@@ -755,10 +978,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                             } else {
                                 let paths: Vec<PathBuf> = app.recent.clone();
                                 for p in paths {
-                                    let name = p
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| p.display().to_string());
+                                    let name = recent_menu_label(&p);
                                     if ui.button(name).clicked() {
                                         app.open_path_async(&p);
                                         ui.close();
@@ -1572,6 +1792,292 @@ fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
     }
 }
 
+
+fn pick_rtl_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Add Sources")
+        .add_filter("RTL", &["sv", "v", "vhd", "vhdl"])
+        .pick_file()
+}
+
+fn pick_constraint_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Add Constraints")
+        .add_filter("Constraints", &["sdc", "xdc"])
+        .pick_file()
+}
+
+fn pick_directory_dialog(start: &str) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new().set_title("Project Directory");
+    let start_pb = PathBuf::from(start);
+    if start_pb.is_dir() {
+        d = d.set_directory(start_pb);
+    }
+    d.pick_folder()
+}
+
+fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
+    if !app.show_create_project {
+        return;
+    }
+    let mut open = app.show_create_project;
+    let mut finish = false;
+    let mut cancel = false;
+    egui::Window::new("Create Project")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            let step = app.create_wizard.step.min(CREATE_WIZARD_STEPS.len() - 1);
+            ui.label(
+                RichText::new(format!(
+                    "Step {} of {}: {}",
+                    step + 1,
+                    CREATE_WIZARD_STEPS.len(),
+                    CREATE_WIZARD_STEPS[step]
+                ))
+                .strong(),
+            );
+            ui.separator();
+
+            match step {
+                0 => {
+                    ui.label("Project name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.create_wizard.name)
+                            .desired_width(360.0)
+                            .hint_text("project_1"),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("Project directory");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.create_wizard.directory)
+                                .desired_width(320.0)
+                                .hint_text("/tmp/helion-projects"),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = pick_directory_dialog(&app.create_wizard.directory) {
+                                app.create_wizard.directory = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Creates <dir>/<name>/<name>.prj")
+                            .small()
+                            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                    );
+                }
+                1 => {
+                    ui.label("Part");
+                    egui::ComboBox::from_id_salt("create_wizard_part")
+                        .selected_text(&app.create_wizard.part)
+                        .show_ui(ui, |ui| {
+                            for p in CREATE_WIZARD_PARTS {
+                                ui.selectable_value(
+                                    &mut app.create_wizard.part,
+                                    (*p).to_string(),
+                                    *p,
+                                );
+                            }
+                        });
+                    ui.label(
+                        RichText::new("Default: HL10T-C32-1")
+                            .small()
+                            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                    );
+                }
+                2 => {
+                    ui.label("RTL sources (.sv / .v / .vhd)");
+                    let mut remove = None;
+                    for (i, s) in app.create_wizard.sources.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(s);
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        app.create_wizard.sources.remove(i);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.create_wizard.source_draft)
+                                .desired_width(300.0)
+                                .hint_text("Absolute path to .sv"),
+                        );
+                        if ui.button("Add").clicked() {
+                            let p = app.create_wizard.source_draft.trim().to_string();
+                            if !p.is_empty() && !app.create_wizard.sources.contains(&p) {
+                                app.create_wizard.sources.push(p);
+                                app.create_wizard.source_draft.clear();
+                                app.create_wizard.error = None;
+                            }
+                        }
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = pick_rtl_dialog() {
+                                let s = p.display().to_string();
+                                if !app.create_wizard.sources.contains(&s) {
+                                    app.create_wizard.sources.push(s);
+                                }
+                                app.create_wizard.error = None;
+                            }
+                        }
+                    });
+                }
+                3 => {
+                    ui.label("Constraints (.sdc / .xdc)");
+                    let mut remove = None;
+                    for (i, s) in app.create_wizard.constraints.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(s);
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        app.create_wizard.constraints.remove(i);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.create_wizard.constraint_draft)
+                                .desired_width(300.0)
+                                .hint_text("Absolute path to .sdc"),
+                        );
+                        if ui.button("Add").clicked() {
+                            let p = app.create_wizard.constraint_draft.trim().to_string();
+                            if !p.is_empty() && !app.create_wizard.constraints.contains(&p) {
+                                app.create_wizard.constraints.push(p);
+                                app.create_wizard.constraint_draft.clear();
+                                app.create_wizard.error = None;
+                            }
+                        }
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = pick_constraint_dialog() {
+                                let s = p.display().to_string();
+                                if !app.create_wizard.constraints.contains(&s) {
+                                    app.create_wizard.constraints.push(s);
+                                }
+                                app.create_wizard.error = None;
+                            }
+                        }
+                    });
+                }
+                _ => {
+                    ui.label(RichText::new("Summary").strong());
+                    ui.monospace(format!("Name: {}", app.create_wizard.name));
+                    ui.monospace(format!("Directory: {}", app.create_wizard.directory));
+                    ui.monospace(format!("Part: {}", app.create_wizard.part));
+                    ui.monospace(format!("Sources: {}", app.create_wizard.sources.len()));
+                    for s in &app.create_wizard.sources {
+                        ui.label(format!("  • {s}"));
+                    }
+                    ui.monospace(format!(
+                        "Constraints: {}",
+                        app.create_wizard.constraints.len()
+                    ));
+                    for s in &app.create_wizard.constraints {
+                        ui.label(format!("  • {s}"));
+                    }
+                    ui.label(
+                        RichText::new("Finish writes the .prj and opens it in the IDE.")
+                            .small()
+                            .color(Color32::from_rgb(0xa0, 0xa8, 0xb0)),
+                    );
+                }
+            }
+
+            if let Some(err) = &app.create_wizard.error {
+                ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), err);
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let last = step + 1 >= CREATE_WIZARD_STEPS.len();
+                    if last {
+                        if primary_button(ui, "Finish").clicked() {
+                            finish = true;
+                        }
+                    } else if ui.button("Next").clicked() {
+                        // Validate before advancing.
+                        let w = &mut app.create_wizard;
+                        w.error = None;
+                        match step {
+                            0 => {
+                                if w.name.trim().is_empty() {
+                                    w.error = Some("Enter a project name.".into());
+                                } else if w.directory.trim().is_empty() {
+                                    w.error = Some("Enter a project directory.".into());
+                                } else {
+                                    w.step += 1;
+                                }
+                            }
+                            1 => {
+                                if w.part.trim().is_empty() {
+                                    w.part = "HL10T-C32-1".into();
+                                }
+                                w.step += 1;
+                            }
+                            2 => {
+                                if w.sources.is_empty() {
+                                    w.error = Some("Add at least one RTL source.".into());
+                                } else {
+                                    w.step += 1;
+                                }
+                            }
+                            3 => {
+                                w.step += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if step > 0 && ui.button("Back").clicked() {
+                        app.create_wizard.error = None;
+                        app.create_wizard.step = step.saturating_sub(1);
+                    }
+                });
+            });
+        });
+
+    if cancel || !open {
+        app.show_create_project = false;
+        return;
+    }
+    app.show_create_project = open;
+
+    if finish {
+        let w = &app.create_wizard;
+        let name = w.name.trim().to_string();
+        let dir = PathBuf::from(w.directory.trim());
+        let part = w.part.clone();
+        let sources: Vec<PathBuf> = w.sources.iter().map(PathBuf::from).collect();
+        let constraints: Vec<PathBuf> = w.constraints.iter().map(PathBuf::from).collect();
+        match app
+            .model
+            .create_project(&name, &dir, &part, &sources, &constraints)
+        {
+            Ok(msg) => {
+                let prj = dir.join(&name).join(format!("{name}.prj"));
+                app.remember(prj);
+                app.set_activity(Activity::Files);
+                app.show_create_project = false;
+                app.create_wizard.error = None;
+                let _ = msg;
+            }
+            Err(e) => {
+                app.create_wizard.error = Some(e);
+            }
+        }
+    }
+}
+
 fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
     if !app.show_examples {
         return;
@@ -1835,6 +2341,14 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.add_space(48.0);
         ui.label(RichText::new("No sources yet.").size(16.0));
         ui.add_space(8.0);
+        if primary_button(ui, "New Project…")
+            .on_hover_text(tip("New Project", "", "create_project"))
+            .clicked()
+        {
+            app.create_wizard = CreateProjectWizard::default();
+            app.show_create_project = true;
+        }
+        ui.add_space(6.0);
         if primary_button(ui, "Open HDL…")
             .on_hover_text(tip("Open", "⌘O", "open_source"))
             .clicked()
@@ -3050,6 +3564,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
     let mut pick_obj: Option<String> = None;
     let mut set_iostd: Option<(String, &'static str)> = None;
     let mut set_io: Option<(String, &'static str, &'static str)> = None;
+    let mut set_pkg_pin: Option<(String, String)> = None;
     if grid_id == "sidebar_io" {
         // Full HAD site names. The wide grid clipped Placed to "IOB_X…".
         ui.label(RichText::new("Name  Dir  Site").small().weak());
@@ -3145,13 +3660,38 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                             if ui.selectable_label(on, &p.dir).clicked() {
                                 pick_port = Some(p.name.clone());
                             }
-                            if ui.selectable_label(on_obj, p.package_pin_cell()).clicked() {
-                                if p.package_pin_cell() == "-" {
-                                    pick_port = Some(p.name.clone());
+                            let cur_pin = p.package_pin_cell().to_string();
+                            let pin_ports: Vec<(String, Option<String>)> = model
+                                .package_pins
+                                .iter()
+                                .map(|pin| (pin.pin.clone(), pin.port.clone()))
+                                .collect();
+                            egui::ComboBox::from_id_salt(("io_pkg_pin", p.name.as_str()))
+                                .selected_text(if cur_pin == "-" {
+                                    "— set site —"
                                 } else {
-                                    pick_obj = Some(p.package_pin_cell().to_string());
-                                }
-                            }
+                                    cur_pin.as_str()
+                                })
+                                .width(118.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(cur_pin == "-", "— (select port) —")
+                                        .clicked()
+                                    {
+                                        pick_port = Some(p.name.clone());
+                                    }
+                                    for (pin, owner) in &pin_ports {
+                                        let label = match owner.as_deref() {
+                                            Some(port) if port != p.name => {
+                                                format!("{pin} ({port})")
+                                            }
+                                            _ => pin.clone(),
+                                        };
+                                        if ui.selectable_label(cur_pin == *pin, label).clicked() {
+                                            set_pkg_pin = Some((p.name.clone(), pin.clone()));
+                                        }
+                                    }
+                                });
                             if ui.selectable_label(on_obj, p.placed_cell()).clicked() {
                                 if p.placed_cell() == "-" {
                                     pick_port = Some(p.name.clone());
@@ -3159,9 +3699,52 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                                     pick_obj = Some(p.placed_cell().to_string());
                                 }
                             }
-                            ui.label(p.iostandard_cell());
-                            ui.label(p.drive_cell());
-                            ui.label(p.slew_cell());
+                            // ComboBox Set → model.exec set_property (HNF + table), not labels.
+                            let cur_std = p.iostandard_cell().to_string();
+                            egui::ComboBox::from_id_salt(("io_iostd", p.name.as_str()))
+                                .selected_text(if cur_std == "-" {
+                                    "— Set —"
+                                } else {
+                                    cur_std.as_str()
+                                })
+                                .width(96.0)
+                                .show_ui(ui, |ui| {
+                                    for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "LVCMOS25", "SSTL15"] {
+                                        if ui.selectable_label(cur_std == std, std).clicked() {
+                                            set_iostd = Some((p.name.clone(), std));
+                                        }
+                                    }
+                                });
+                            let cur_drv = p.drive_cell().to_string();
+                            egui::ComboBox::from_id_salt(("io_drive", p.name.as_str()))
+                                .selected_text(if cur_drv == "-" {
+                                    "— Set —"
+                                } else {
+                                    cur_drv.as_str()
+                                })
+                                .width(64.0)
+                                .show_ui(ui, |ui| {
+                                    for ma in ["4", "8", "12", "16", "24"] {
+                                        if ui.selectable_label(cur_drv == ma, ma).clicked() {
+                                            set_io = Some((p.name.clone(), "DRIVE", ma));
+                                        }
+                                    }
+                                });
+                            let cur_slew = p.slew_cell().to_string();
+                            egui::ComboBox::from_id_salt(("io_slew", p.name.as_str()))
+                                .selected_text(if cur_slew == "-" {
+                                    "— Set —"
+                                } else {
+                                    cur_slew.as_str()
+                                })
+                                .width(72.0)
+                                .show_ui(ui, |ui| {
+                                    for s in ["SLOW", "FAST"] {
+                                        if ui.selectable_label(cur_slew == s, s).clicked() {
+                                            set_io = Some((p.name.clone(), "SLEW", s));
+                                        }
+                                    }
+                                });
                             ui.label(p.pulltype_cell());
                             ui.label(p.diff_term_cell());
                             ui.label(p.in_term_cell());
@@ -3174,18 +3757,50 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 });
         });
     }
-    ui.weak("Select a port, then click an unassigned pin to loc + re-place.");
-    if let Some(port) = model.selected_io_port.as_deref().or_else(|| {
-        model
-            .selected
-            .as_deref()
-            .filter(|s| model.io_ports.iter().any(|p| p.name == *s))
-    }) {
+    ui.weak("Package Pin: dropdown on each row, or type a site below / click the package drawing.");
+    let selected_port = model
+        .selected_io_port
+        .clone()
+        .or_else(|| {
+            model.selected.clone().filter(|s| model.io_ports.iter().any(|p| p.name == *s))
+        });
+    if let Some(port) = selected_port {
+        ui.horizontal(|ui| {
+            ui.weak("PACKAGE_PIN");
+            let edit = egui::TextEdit::singleline(&mut model.package_pin_draft)
+                .desired_width(120.0)
+                .hint_text("IOB_X…");
+            let resp = ui.add(edit);
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let pin = model.package_pin_draft.trim().to_string();
+                if !pin.is_empty() {
+                    set_pkg_pin = Some((port.clone(), pin));
+                }
+            }
+            if ui.button("Set pin").clicked() {
+                let pin = model.package_pin_draft.trim().to_string();
+                if !pin.is_empty() {
+                    set_pkg_pin = Some((port.clone(), pin));
+                }
+            }
+            for site in ["IOB_X2Y0", "IOB_X3Y0", "IOB_X0Y0", "IOB_X5Y0"] {
+                if ui
+                    .add_sized(
+                        [ui.spacing().interact_size.x.max(72.0), chrome::HIT_SIDEBAR],
+                        egui::Button::new(site),
+                    )
+                    .clicked()
+                {
+                    model.package_pin_draft = site.to_string();
+                    set_pkg_pin = Some((port.clone(), site.to_string()));
+                }
+            }
+        });
         ui.horizontal(|ui| {
             ui.weak("IOSTANDARD");
             for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
                 if ui.add_sized([64.0, chrome::HIT_SIDEBAR], egui::Button::new(std)).clicked() {
-                    set_iostd = Some((port.to_string(), std));
+                    set_iostd = Some((port.clone(), std));
                 }
             }
         });
@@ -3193,7 +3808,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("DRIVE");
             for ma in ["4", "8", "12", "16"] {
                 if ui.add_sized([40.0, chrome::HIT_SIDEBAR], egui::Button::new(ma)).clicked() {
-                    set_io = Some((port.to_string(), "DRIVE", ma));
+                    set_io = Some((port.clone(), "DRIVE", ma));
                 }
             }
         });
@@ -3201,7 +3816,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("SLEW");
             for s in ["SLOW", "FAST"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "SLEW", s));
+                    set_io = Some((port.clone(), "SLEW", s));
                 }
             }
         });
@@ -3209,7 +3824,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("PULLTYPE");
             for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "PULLTYPE", s));
+                    set_io = Some((port.clone(), "PULLTYPE", s));
                 }
             }
         });
@@ -3217,7 +3832,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("DIFF_TERM");
             for s in ["FALSE", "TRUE"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "DIFF_TERM", s));
+                    set_io = Some((port.clone(), "DIFF_TERM", s));
                 }
             }
         });
@@ -3225,18 +3840,26 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             ui.weak("IN_TERM");
             for s in ["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"] {
                 if ui.add_sized([ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR], egui::Button::new(s)).clicked() {
-                    set_io = Some((port.to_string(), "IN_TERM", s));
+                    set_io = Some((port.clone(), "IN_TERM", s));
                 }
             }
         });
     }
     if let Some((port, std)) = set_iostd {
+        // ComboBox / button Set → set_iostandard (HNF + constraints); exec syncs the table.
         let _ = model.exec(&format!(
             "set_property IOSTANDARD {std} [get_ports {port}]"
         ));
     }
     if let Some((port, key, val)) = set_io {
+        // DRIVE / SLEW / … Set → model.set_*; illegal HAD values Err (not silent wallpaper).
         let _ = model.exec(&format!("set_property {key} {val} [get_ports {port}]"));
+    }
+    if let Some((port, pin)) = set_pkg_pin {
+        let _ = model.exec(&format!(
+            "set_property PACKAGE_PIN {pin} [get_ports {port}]"
+        ));
+        model.package_pin_draft = pin;
     }
     if let Some(name) = pick_obj {
         let _ = model.select_io_port_object(&name);
@@ -3261,6 +3884,36 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
                 let _ = model.exec("create_pblock pblock_0");
             }
             let _ = model.exec(&format!("resize_pblock {name} -add CLOCKREGION_X1Y1"));
+        }
+        let pb_name = model
+            .selected_pblock
+            .clone()
+            .or_else(|| model.pblocks.first().map(|p| p.name.clone()));
+        if ui
+            .add_enabled(pb_name.is_some(), egui::Button::new("Add design cells"))
+            .on_hover_text("add_cells_to_pblock — assign all design LUT cells")
+            .clicked()
+        {
+            if let Some(name) = pb_name.as_deref() {
+                let _ = model.exec(&format!("add_cells_to_pblock {name}"));
+            }
+        }
+        let sel_cell = model
+            .selected
+            .as_deref()
+            .filter(|s| model.tree.has_cell(s))
+            .map(|s| s.to_string());
+        if ui
+            .add_enabled(
+                pb_name.is_some() && sel_cell.is_some(),
+                egui::Button::new("Add selected cells"),
+            )
+            .on_hover_text("add_cells_to_pblock — assign the netlist selection")
+            .clicked()
+        {
+            if let (Some(name), Some(cell)) = (pb_name.as_deref(), sel_cell.as_deref()) {
+                let _ = model.exec(&format!("add_cells_to_pblock {name} {cell}"));
+            }
         }
     });
     let selected = model.selected.clone();
@@ -3524,6 +4177,8 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Constraints");
+    // Sibling/user SDC may already be loaded before the editor was painted.
+    model.ensure_sdc_editor_populated();
     ui.horizontal(|ui| {
         ui.menu_button("Add…", |ui| {
             let recipes: &[(&str, &str)] = &[
@@ -3537,7 +4192,7 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
                 if ui.button(*name).clicked() {
                     if *tcl == "__read_sdc__" {
                         let p = helion_device::Device::examples_dir().join("counter.sdc");
-                        let _ = model.exec(&format!("read_xdc {}", p.display()));
+                        let _ = model.open_sdc_editor(&p);
                     } else {
                         let _ = model.exec(tcl);
                     }
@@ -3545,7 +4200,39 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
             }
         });
+        if ui.button("Open counter.sdc").clicked() {
+            let p = helion_device::Device::examples_dir().join("counter.sdc");
+            let _ = model.open_sdc_editor(&p);
+        }
+        if ui.button("Save").clicked() {
+            let _ = model.save_sdc_editor();
+        }
     });
+    ui.add_space(6.0);
+    // Vivado-shaped SDC/XDC text editor (monospace). Keep tables below.
+    let file_label = model
+        .sdc_editor_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("counter.sdc")
+        .to_string();
+    let dirty = model.sdc_editor_dirty;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&file_label).strong().monospace());
+        if dirty {
+            ui.weak("•");
+        }
+    });
+    let resp = ui.add(
+        egui::TextEdit::multiline(&mut model.sdc_editor_text)
+            .code_editor()
+            .desired_rows(10)
+            .desired_width(f32::INFINITY),
+    );
+    if resp.changed() {
+        model.sdc_editor_dirty = true;
+    }
     ui.add_space(6.0);
     paint_constraints_tables(ui, model);
 }
@@ -3793,7 +4480,21 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report timing summary").clicked() {
             let _ = model.exec("report_timing_summary");
         }
+        if ui.button("Write Report…").clicked() {
+            let path = std::env::var("HELION_REPORT_PATH").unwrap_or_else(|_| {
+                "/tmp/helion-reports/timing-summary.rpt".into()
+            });
+            let _ = model.exec(&format!("write_report timing {path}"));
+        }
     });
+    if let Some(exp) = model.last_report_export.clone() {
+        ui.label(
+            RichText::new(exp)
+                .monospace()
+                .size(12.0)
+                .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
+        );
+    }
     // CLI-honest label. Closed WNS_PS= only with cells>0 and an Hff clock path.
     let honest = model.timing_honesty_label();
     let closed = model.timing_closed_wns();
@@ -3809,6 +4510,10 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     );
     if !closed {
         ui.label("Not a closed WNS.");
+        let pane = model.timing_text();
+        if pane != honest {
+            ui.label(RichText::new(pane).monospace().size(13.0));
+        }
     }
     let report = model.timing_summary();
     if !closed {
@@ -4336,6 +5041,26 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report methodology").clicked() {
             let _ = model.exec("report_methodology");
         }
+        // TIMING-7 (and TIMING-6): Fix applies Vivado-shaped set_*_delay,
+        // persists via save_sdc_editor, and opens Constraints; Jump inserts
+        // the template ready to Save (disk write is Apply-only).
+        if let Some(id) = model.selected_methodology.clone() {
+            if model.methodology_fix_template(&id).is_some() {
+                let fix_label = if id == "TIMING-7" {
+                    "Apply set_output_delay"
+                } else if id == "TIMING-6" {
+                    "Apply set_input_delay"
+                } else {
+                    "Fix"
+                };
+                if ui.button(fix_label).clicked() {
+                    let _ = model.fix_methodology(&id);
+                }
+                if ui.button("Jump to Constraints").clicked() {
+                    let _ = model.goto_methodology_constraints(&id);
+                }
+            }
+        }
     });
     ui.add_space(6.0);
     if model.tree.top.is_none() {
@@ -4604,7 +5329,21 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report utilization").clicked() {
             let _ = model.exec("report_utilization");
         }
+        if ui.button("Export").clicked() {
+            let path = std::env::var("HELION_REPORT_PATH").unwrap_or_else(|_| {
+                "/tmp/helion-reports/utilization.rpt".into()
+            });
+            let _ = model.exec(&format!("write_report utilization {path}"));
+        }
     });
+    if let Some(exp) = model.last_report_export.clone() {
+        ui.label(
+            RichText::new(exp)
+                .monospace()
+                .size(12.0)
+                .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
+        );
+    }
     ui.add_space(6.0);
     let report = model.utilization_report();
     if report.part.is_empty() {
@@ -4866,6 +5605,13 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
             canvas.x,
             canvas.y,
         )
+        || chrome::schematic_identity_clips_bottom(
+            cam0.zoom,
+            cam0.pan_x,
+            cam0.pan_y,
+            sheet.height,
+            canvas.y,
+        )
     {
         model.workspace = WorkspaceTab::Schematic;
         model.schematic.apply_zoom_fit(sheet.width, sheet.height);
@@ -5038,7 +5784,13 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                     Color32::from_rgb(0xdc, 0xe0, 0xe4),
                 );
             } else if show_names && r.width() >= 28.0 && r.height() >= 16.0 {
-                let clip = p.with_clip_rect(r.shrink(2.0).intersect(rect));
+                // Do not shrink the bottom: the name band sits under the box and
+                // a tightened clip cropped u_lut1.
+                let mut name_r = r;
+                name_r.min.x += 2.0;
+                name_r.max.x -= 2.0;
+                name_r.min.y += 2.0;
+                let clip = p.with_clip_rect(name_r.intersect(rect));
                 let fs = name_fs.clamp(8.0, 13.0);
                 clip.text(
                     egui::pos2(r.center().x, r.top() + 3.0 * z),
@@ -5048,7 +5800,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                     Color32::from_rgb(0x7e, 0xc8, 0xe3),
                 );
                 clip.text(
-                    egui::pos2(r.center().x, r.bottom() - 3.0 * z),
+                    egui::pos2(r.center().x, r.bottom() - 2.0 * z),
                     egui::Align2::CENTER_BOTTOM,
                     &sy.name,
                     egui::FontId::monospace(fs),
@@ -5225,7 +5977,6 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     let narrow = chrome::device_window_narrow(screen.width());
     let short = chrome::device_window_short(screen.height());
     paint_device_legend(ui, model, narrow || short);
-    let share = chrome::share_available(screen.width(), screen.height());
     let after_legend = ui.available_height().max(1.0);
     let band = chrome::device_band_share(screen.width(), screen.height(), after_legend);
     let pane_w = ui.available_width().max(48.0);
@@ -5253,8 +6004,8 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 paint_clock_regions(ui, model);
             });
     } else {
-        // Wide: tables take a share; the die fills leftover.
-        let tables_h = band.tables_h.min(pane_w * 0.28).max(52.0);
+        // Wide: short table caps; the die ScrollArea takes the real leftover height.
+        let tables_h = band.tables_h;
         egui::ScrollArea::both()
             .id_salt("device_tables")
             .auto_shrink([false, true])
@@ -5265,9 +6016,7 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.set_width(pane_w);
                 paint_pblocks_table(ui, model);
             });
-        let remain = ui.available_height().max(1.0);
-        let die_need = share.canvas_floor_h.min(remain * 0.38).min(remain * 0.55);
-        let cr_h = (remain - die_need).clamp(28.0, 168.0);
+        let cr_h = band.clock_h;
         egui::ScrollArea::vertical()
             .id_salt("device_clock_regions_block")
             .auto_shrink([false, true])
@@ -5381,33 +6130,45 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
                             egui::vec2((cell_w - 1.0).max(1.0), (cell_h - 1.0).max(1.0)),
                         );
                         let site = model.device.site_at(x, y);
-                        let fill = match site {
-                            Some(s) if s.occupant.is_some() => match s.occupancy_char() {
-                                'O' => Color32::from_rgb(0x7e, 0xc8, 0xe3),
-                                'L' | 'C' => Color32::from_rgb(0x3d, 0xb8, 0x7a),
-                                _ => Color32::from_rgb(0xe5, 0xc0, 0x7b),
-                            },
-                            Some(s) => match s.kind {
-                                helion_device::SiteKind::Iob => Color32::from_rgb(0x1e, 0x3a, 0x55),
-                                helion_device::SiteKind::Bram => Color32::from_rgb(0x3a, 0x24, 0x52),
-                                helion_device::SiteKind::Dsp => Color32::from_rgb(0x52, 0x3a, 0x1e),
-                                helion_device::SiteKind::Clk => Color32::from_rgb(0x3a, 0x3a, 0x1e),
-                                helion_device::SiteKind::Clb => Color32::from_rgb(0x1a, 0x2e, 0x24),
-                            },
-                            None => Color32::from_rgb(0x0d, 0x10, 0x12),
+                        let path_hl = site.is_some_and(|s| s.highlighted);
+                        let fill = if path_hl {
+                            // STA path / selection: gold fill so multi-cell paths read on the die.
+                            Color32::from_rgb(0xe5, 0xc0, 0x7b)
+                        } else {
+                            match site {
+                                Some(s) if s.occupant.is_some() || !s.bels.is_empty() => {
+                                    match s.occupancy_char() {
+                                        'O' => Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                                        'L' | 'C' => Color32::from_rgb(0x3d, 0xb8, 0x7a),
+                                        _ => Color32::from_rgb(0xe5, 0xc0, 0x7b),
+                                    }
+                                }
+                                Some(s) => match s.kind {
+                                    helion_device::SiteKind::Iob => Color32::from_rgb(0x1e, 0x3a, 0x55),
+                                    helion_device::SiteKind::Bram => Color32::from_rgb(0x3a, 0x24, 0x52),
+                                    helion_device::SiteKind::Dsp => Color32::from_rgb(0x52, 0x3a, 0x1e),
+                                    helion_device::SiteKind::Clk => Color32::from_rgb(0x3a, 0x3a, 0x1e),
+                                    helion_device::SiteKind::Clb => Color32::from_rgb(0x1a, 0x2e, 0x24),
+                                },
+                                None => Color32::from_rgb(0x0d, 0x10, 0x12),
+                            }
                         };
                         p.rect_filled(tile, 1.0, fill);
-                        let selected = site.is_some_and(|s| {
-                            let id = model.selected.as_deref();
-                            id == s.occupant.as_deref()
-                                || id == Some(s.site_name().as_str())
-                                || s.bels.iter().any(|b| Some(b.as_str()) == id)
-                        });
+                        let selected = path_hl
+                            || site.is_some_and(|s| {
+                                let id = model.selected.as_deref();
+                                id == s.occupant.as_deref()
+                                    || id == Some(s.site_name().as_str())
+                                    || s.bels.iter().any(|b| Some(b.as_str()) == id)
+                            });
                         if selected {
                             p.rect_stroke(
                                 tile,
                                 1.0,
-                                Stroke::new(1.5_f32, Color32::from_rgb(0xe5, 0xc0, 0x7b)),
+                                Stroke::new(
+                                    if path_hl { 2.2_f32 } else { 1.5_f32 },
+                                    Color32::from_rgb(0xff, 0xe0, 0x8a),
+                                ),
                                 egui::StrokeKind::Outside,
                             );
                         }
@@ -7297,5 +8058,35 @@ fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
         });
     if let Some(name) = pick {
         let _ = model.select_ip_core(&name);
+    }
+}
+
+
+#[cfg(test)]
+mod recent_tests {
+    use super::{load_recent_from, recent_menu_label, save_recent_to};
+    use std::path::PathBuf;
+
+    #[test]
+    fn recent_menu_label_marks_prj() {
+        let p = PathBuf::from("/tmp/counter.prj");
+        assert_eq!(recent_menu_label(&p), "counter.prj  (project)");
+        let sv = PathBuf::from("/tmp/counter.sv");
+        assert_eq!(recent_menu_label(&sv), "counter.sv");
+    }
+
+    #[test]
+    fn recent_persist_round_trip_keeps_prj() {
+        let dir = std::env::temp_dir().join(format!("helion-recent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("recent.txt");
+        // Use a real file so load_recent_from keeps it.
+        let prj = dir.join("counter_wiz.prj");
+        std::fs::write(&prj, "part HL10T-C32-1\n").unwrap();
+        save_recent_to(&store, &[prj.clone()]);
+        let loaded = load_recent_from(&store);
+        assert_eq!(loaded, vec![prj]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
