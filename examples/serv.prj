@@ -1,0 +1,19 @@
+# FM-HEL-CONT: public SERV (bit-serial RISC-V) pin-wrap + user SDC
+part HL10T-C32-1
+read_sv examples/serv/serv_bufreg.v
+read_sv examples/serv/serv_bufreg2.v
+read_sv examples/serv/serv_alu.v
+read_sv examples/serv/serv_csr.v
+read_sv examples/serv/serv_ctrl.v
+read_sv examples/serv/serv_decode.v
+read_sv examples/serv/serv_immdec.v
+read_sv examples/serv/serv_mem_if.v
+read_sv examples/serv/serv_rf_if.v
+read_sv examples/serv/serv_state.v
+read_sv examples/serv/serv_debug.v
+read_sv examples/serv/serv_aligner.v
+read_sv examples/serv/serv_compdec.v
+read_sv examples/serv/serv_top.v
+read_sv examples/serv_pin_wrap.sv
+top serv_pin_wrap
+read_xdc examples/serv.sdc
