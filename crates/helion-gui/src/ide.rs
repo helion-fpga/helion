@@ -7711,6 +7711,9 @@ impl IdeModel {
         if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
             return Some("word_pipeline_cap; extra stages not invented; not a closed WNS");
         }
+        if d.attrs.get("FLATTEN_CAP") == Some("1") {
+            return Some("flatten_cap; flatten cone not bit-blasted; not a closed WNS");
+        }
         None
     }
 
@@ -16512,6 +16515,9 @@ impl IdeModel {
             return false;
         }
         if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            return false;
+        }
+        if d.attrs.get("FLATTEN_CAP") == Some("1") {
             return false;
         }
         let n_logic = d.cells.iter().filter(|c| {
