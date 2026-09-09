@@ -584,6 +584,15 @@ impl Fabric {
             .unwrap_or(false)
     }
 
+    /// Registered BLE → FF Q; comb-only BLE (FF.USED=0) → LUT O (same rule as IOB pads).
+    pub fn ble_out(&self, x: u32, y: u32, ble: u32) -> bool {
+        if self.clb_feature_bit(x, y, &format!("BLE{ble}.FF.USED")) {
+            self.ble_q(x, y, ble)
+        } else {
+            self.lut_o_at(x, y, ble as u8)
+        }
+    }
+
     /// UG900 force/deposit poke on a BLE FF Q; IOBs sourced from that BLE follow.
     pub fn set_ble_q(&mut self, x: u32, y: u32, ble: u32, v: bool) {
         if let Some(c) = self.clbs.get_mut(&(x, y)) {

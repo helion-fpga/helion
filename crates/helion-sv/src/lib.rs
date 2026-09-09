@@ -1801,6 +1801,24 @@ fn assemble_module(
             d.attrs.set("NO_BODY", "1");
         }
     }
+    // Preserve (* mark_debug *) on parent wires driven by instance ports
+    // (e.g. complex.x ← xor4.y) — lower_own never sees those as comb_bits.
+    for s in &proto.signals {
+        if !s.mark_debug {
+            continue;
+        }
+        if d.nets.iter().any(|n| n.name == s.name) {
+            let _ = d.mark_debug(&s.name);
+        }
+        if s.width > 1 {
+            for b in 0..s.width {
+                let bn = bit_name(&s.name, s.width, b);
+                if d.nets.iter().any(|n| n.name == bn) {
+                    let _ = d.mark_debug(&bn);
+                }
+            }
+        }
+    }
     visiting.remove(name);
     Ok(d)
 }
@@ -8495,6 +8513,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         for (pin, pi) in aig.pis.iter().enumerate() {
             d.connect(pi, &lut, format!("I{pin}"));
         }
+        if md_bits.contains(bitn) {
+            let _ = d.mark_debug(bitn);
+        }
+    }
+
+    // Parent / instance-port wires with (* mark_debug *) and leftover md bits.
+    for name in &md_bits {
+        if d.nets.iter().any(|n| n.name == *name) {
+            let _ = d.mark_debug(name);
+        }
     }
 
     // A refused cone is not a closed design, even if leftover FFs remain.
@@ -9696,6 +9724,49 @@ endmodule
         assert!(
             d.marked_debug_nets().iter().any(|n| n == "q"),
             "{:?}",
+            d.marked_debug_nets()
+        );
+    }
+
+    /// Comb assign (* mark_debug *) must stick on the net (not only FF Q).
+    #[test]
+    fn mark_debug_attr_on_comb_x() {
+        let src = r#"
+module m(input logic clk, output logic led);
+  logic a, b;
+  (* mark_debug = "true" *) logic x;
+  always_ff @(posedge clk) begin a <= ~a; b <= a; end
+  assign x = a ^ b;
+  assign led = x;
+endmodule
+"#;
+        let d = synth_sv(src, "md_comb.sv").unwrap();
+        assert!(
+            d.marked_debug_nets().iter().any(|n| n == "x"),
+            "comb mark_debug lost: {:?}",
+            d.marked_debug_nets()
+        );
+    }
+
+    /// Hierarchical mid-net: parent wire driven by child port keeps mark_debug.
+    #[test]
+    fn mark_debug_attr_on_hier_mid_net() {
+        let src = r#"
+module xor2(input logic a, input logic b, output logic y);
+  assign y = a ^ b;
+endmodule
+module top(input logic clk, output logic led);
+  logic a, b;
+  (* mark_debug = "true" *) logic x;
+  always_ff @(posedge clk) begin a <= ~a; b <= a; end
+  xor2 u(.a(a), .b(b), .y(x));
+  assign led = x;
+endmodule
+"#;
+        let d = synth_sv(src, "md_hier.sv").unwrap();
+        assert!(
+            d.marked_debug_nets().iter().any(|n| n == "x"),
+            "hier mid-net mark_debug lost: {:?}",
             d.marked_debug_nets()
         );
     }
