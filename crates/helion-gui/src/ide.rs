@@ -7172,6 +7172,83 @@ impl IdeModel {
         }
     }
 
+    /// Map a wave/Objects name to an event-sim probe key (LED or Hff cell).
+    /// ILA uses design Q-net names (`hb_0`); helion-sim keys FFs by cell (`u_ff0`).
+    fn resolve_event_sim_probe(&self, name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("led") {
+            return Some("led".into());
+        }
+        if let Some(sim) = &self.event_sim {
+            if sim.ff_q.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+                return Some(
+                    sim.ff_q
+                        .keys()
+                        .find(|k| k.eq_ignore_ascii_case(name))
+                        .cloned()
+                        .unwrap_or_else(|| name.to_string()),
+                );
+            }
+        }
+        let d = self.shell.session.design.as_ref()?;
+        let net = d.nets.iter().find(|n| n.name.eq_ignore_ascii_case(name))?;
+        let ff = net.endpoints.iter().find(|e| e.pin == "Q")?;
+        Some(ff.cell.clone())
+    }
+
+    /// True when `name` is a design Q-net (RTL/ILA probe name) or already in Objects.
+    fn wave_probe_available(&self, name: &str) -> bool {
+        if name == "led" || name == "clk" || name == "cnt" {
+            return true;
+        }
+        if self.objects.iter().any(|o| o.name == name) {
+            return true;
+        }
+        if self.resolve_event_sim_probe(name).is_some() {
+            return true;
+        }
+        if let Some(d) = self.shell.session.design.as_ref() {
+            if d.marked_debug_nets().iter().any(|n| n == name) {
+                return true;
+            }
+            if d.nets.iter().any(|n| {
+                n.name == name && n.endpoints.iter().any(|e| e.pin == "Q")
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Bus root vs bit-blast (`hb` → try `hb_0`): ILA/sim scopes use bit nets.
+    fn add_wave_bitblast_hint(&self, name: &str) -> Option<String> {
+        let d = self.shell.session.design.as_ref()?;
+        let pfx = format!("{name}_");
+        let mut bits: Vec<String> = d
+            .nets
+            .iter()
+            .filter(|n| {
+                n.name.starts_with(&pfx)
+                    && n.endpoints.iter().any(|e| e.pin == "Q")
+            })
+            .map(|n| n.name.clone())
+            .collect();
+        if bits.is_empty() {
+            bits = d
+                .marked_debug_nets()
+                .into_iter()
+                .filter(|n| n.starts_with(&pfx))
+                .collect();
+        }
+        if bits.is_empty() {
+            return None;
+        }
+        bits.sort();
+        Some(format!(
+            "sim/ILA bit-blast; try {} (not bus {})",
+            bits[0], name
+        ))
+    }
+
     pub fn add_wave(&mut self, name: &str) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {
@@ -7183,6 +7260,15 @@ impl IdeModel {
         if name == "led" || self.objects.iter().any(|o| o.name == name) {
             self.wave.traces.push(WaveTrace::scalar(name));
             return Ok(format!("add_wave {name}"));
+        }
+        // ILA probe / mark_debug Q-net (`hb_0`) vs sim FF cell (`u_ff0`).
+        if self.wave_probe_available(name) {
+            self.wave.traces.push(WaveTrace::scalar(name));
+            self.refresh_sim_objects();
+            return Ok(format!("add_wave {name}"));
+        }
+        if let Some(hint) = self.add_wave_bitblast_hint(name) {
+            return Err(format!("add_wave: no scoped object {name} ({hint})"));
         }
         Err(format!("add_wave: no scoped object {name}"))
     }
@@ -17740,7 +17826,23 @@ impl IdeModel {
                 self.sim_timescale_ps.max(1)
             ),
         );
+        // Keep user add_wave probes (hb_0 / mark_debug Q-nets); rebuild samples.
+        let user_traces: Vec<String> = self
+            .wave
+            .traces
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|n| {
+                n != "clk"
+                    && n != "led"
+                    && n != "cnt"
+                    && !n.starts_with("ila:")
+            })
+            .collect();
         self.wave.traces.clear();
+        for name in &user_traces {
+            self.wave.traces.push(WaveTrace::scalar(name));
+        }
         self.wave.cursor = 0;
         // Half-cycle samples in sim_step_inner; period/2 keeps TIME_PS honest.
         self.wave.timescale_ps = (self.sim_timescale_ps.max(1) / 2).max(1);
@@ -17998,6 +18100,29 @@ impl IdeModel {
         self.wave.timescale_ps = half;
 
         let (prev_led, prev_cnt, prev_w) = self.last_wave_outputs();
+        let extra_names: Vec<String> = self
+            .wave
+            .traces
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|n| {
+                n != "clk"
+                    && n != "led"
+                    && n != "cnt"
+                    && !n.starts_with("ila:")
+            })
+            .collect();
+        let extra_prev: Vec<(String, u64)> = extra_names
+            .iter()
+            .map(|n| {
+                let v = self
+                    .wave
+                    .trace(n)
+                    .and_then(|t| t.samples.last().copied())
+                    .unwrap_or(0);
+                (n.clone(), v)
+            })
+            .collect();
 
         if let Some(fab) = self.fabric_sim.as_mut() {
             let _iob = self
@@ -18023,12 +18148,19 @@ impl IdeModel {
             let hold_w = prev_w.max(bus_w);
             Self::push_sample(&mut self.wave, "cnt", prev_cnt, hold_w, WaveStyle::Analog);
         }
+        for (name, v) in &extra_prev {
+            Self::push_sample(&mut self.wave, name, *v, 1, WaveStyle::Digital);
+        }
 
         // Active edge sample: clk high; led/cnt update once per user cycle.
         Self::push_sample(&mut self.wave, "clk", 1, 1, WaveStyle::Digital);
         Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
         if bus_w > 1 {
             Self::push_sample(&mut self.wave, "cnt", bus, bus_w, WaveStyle::Analog);
+        }
+        for name in &extra_names {
+            let v = self.sim_signal_value(name).unwrap_or(0);
+            Self::push_sample(&mut self.wave, name, v, 1, WaveStyle::Digital);
         }
         if self.sim_log_all_signals {
             // Align extras to the two half-cycle samples; never flatten clk.
@@ -18089,6 +18221,29 @@ impl IdeModel {
         if let Some(sim) = &self.event_sim {
             for (name, value) in sim.object_values() {
                 push(&mut v, &mut seen, name, value);
+            }
+            // ILA/Objects: expose design Q-net names (`hb_0`) alongside FF cells (`u_ff0`).
+            if let Some(d) = self.shell.session.design.as_ref() {
+                let marked: HashSet<String> = d.marked_debug_nets().into_iter().collect();
+                for n in &d.nets {
+                    let Some(ff) = n.endpoints.iter().find(|e| e.pin == "Q") else {
+                        continue;
+                    };
+                    if !(marked.contains(&n.name) || self.wave.has_trace(&n.name)) {
+                        continue;
+                    }
+                    let value = sim
+                        .ff_q
+                        .get(&ff.cell)
+                        .map(|b| if *b { "1" } else { "0" }.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    push(&mut v, &mut seen, n.name.clone(), value);
+                }
+            }
+        } else if let Some(d) = self.shell.session.design.as_ref() {
+            // Pre-sim: still list mark_debug Q-nets so add_wave hb_0 works after Implement.
+            for n in d.marked_debug_nets() {
+                push(&mut v, &mut seen, n, "-".into());
             }
         }
         let cur = self.wave.cursor;
@@ -18368,6 +18523,14 @@ impl IdeModel {
         if let Some(sim) = &self.event_sim {
             if let Some(v) = sim.signal_value(name) {
                 return Some(v);
+            }
+            // Q-net alias (hb_0 → u_ff0) so add_wave / breakpoints match ILA probe names.
+            if let Some(key) = self.resolve_event_sim_probe(name) {
+                if key != name {
+                    if let Some(v) = sim.signal_value(&key) {
+                        return Some(v);
+                    }
+                }
             }
         }
         if let Some(t) = self.wave.trace(name) {
