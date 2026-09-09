@@ -7751,6 +7751,11 @@ impl IdeModel {
                 "timing_incomplete cells={cells} (assign not lowered; not a closed WNS)"
             );
         }
+        if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            return format!(
+                "timing_incomplete cells={cells} (word_pipeline_cap; extra stages not invented; not a closed WNS)"
+            );
+        }
         match self.timing.as_ref() {
             Some(t) => {
                 let note = if self.user_sdc {
@@ -16501,6 +16506,9 @@ impl IdeModel {
         if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             return false;
         }
+        if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            return false;
+        }
         let n_logic = d.cells.iter().filter(|c| {
             matches!(
                 c.kind,
@@ -16689,6 +16697,13 @@ impl IdeModel {
             if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
                 return Ok(format!(
                     "report_timing {} timing_incomplete cells={} (assign not lowered; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+                return Ok(format!(
+                    "report_timing {} timing_incomplete cells={} (word_pipeline_cap; extra stages not invented; not a closed WNS)",
                     d.name,
                     d.cells.len()
                 ));
