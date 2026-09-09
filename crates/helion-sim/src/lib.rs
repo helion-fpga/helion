@@ -25,7 +25,7 @@ pub struct Sim {
     lut_pins: HashMap<String, Vec<(u8, String)>>,
     ff_d_lut: HashMap<String, String>,
     iob_from_ff: Option<String>,
-    ff_q: HashMap<String, bool>,
+    pub ff_q: HashMap<String, bool>,
     pub led: bool,
     /// Continuous UG900 forces (name → value). Re-applied after each posedge.
     forces: HashMap<String, u64>,
