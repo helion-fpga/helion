@@ -452,6 +452,10 @@ thread_local! {
     /// clock and an enable is not one user clock and is not a closed WNS.
     static CLOCK_GATE_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `inout_enable_not_lowered` line per module+signal. A read-only
+    /// inout used as a load enable that never reaches FF D is not a closed WNS.
+    static INOUT_ENABLE_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// Negedge-only always writes. Not mixed into the posedge NBA cone.
     /// (module, clk, signal, bit, optional RHS). None RHS cannot lower.
     static NEGEDGE_WRITES: std::cell::RefCell<
@@ -636,6 +640,21 @@ fn note_clock_gate(module: &str, signal: &str) {
 fn clock_gate_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     CLOCK_GATE_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Read-only `inout` used as a load enable did not reach FF D. One line.
+/// Not a closed WNS. Do not invent a bus for the port.
+fn note_inout_enable_not_lowered(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "ena" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = INOUT_ENABLE_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic inout_enable_not_lowered module={module} signal={signal} (inout load enable not mapped; not a closed WNS)"
+    ));
 }
 
 fn note_negedge_write(
@@ -945,6 +964,185 @@ fn seq_lhs_from_toks(toks: &[Tok]) -> String {
     lhs_before_assign(toks, true)
         .or_else(|| lhs_before_assign(toks, false))
         .unwrap_or_else(|| "always".into())
+}
+
+/// `ena` appears in a mux condition (load enable), not only as data.
+fn mux_cond_mentions(e: &RExpr, name: &str) -> bool {
+    match e {
+        RExpr::Mux(c, t, f) => {
+            let mut names = HashSet::new();
+            rexpr_names(c, &mut names);
+            names.contains(name) || mux_cond_mentions(t, name) || mux_cond_mentions(f, name)
+        }
+        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+            mux_cond_mentions(x, name)
+        }
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b)
+        | RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b) => mux_cond_mentions(a, name) || mux_cond_mentions(b, name),
+        RExpr::Concat(parts) => parts.iter().any(|p| mux_cond_mentions(p, name)),
+        RExpr::IndexPart { base, .. } => mux_cond_mentions(base, name),
+        RExpr::WordAt { addr, data } => mux_cond_mentions(addr, name) || mux_cond_mentions(data, name),
+        _ => false,
+    }
+}
+
+fn signal_is_driven(rtl: &Rtl, name: &str) -> bool {
+    rtl.nbas.iter().any(|(lhs, _, _)| lhs == name)
+        || rtl.assigns.iter().any(|(lhs, _, _)| lhs == name)
+}
+
+/// Read-only inout ports that gate a clocked load. Not a driven bidirectional bus.
+fn inout_load_enables(rtl: &Rtl) -> Vec<String> {
+    let mut out = Vec::new();
+    for (n, dir, _) in &rtl.ports {
+        if !matches!(dir, PortDir::Inout) || signal_is_driven(rtl, n) {
+            continue;
+        }
+        let used = rtl
+            .nbas
+            .iter()
+            .any(|(_, _, rhs)| mux_cond_mentions(rhs, n));
+        if used {
+            out.push(n.clone());
+        }
+    }
+    out
+}
+
+fn enabled_q_names(rtl: &Rtl, en: &str) -> HashSet<String> {
+    let mut q = HashSet::new();
+    for (lhs, bit, rhs) in &rtl.nbas {
+        if !mux_cond_mentions(rhs, en) {
+            continue;
+        }
+        let w = sig_width(rtl, lhs).max(1);
+        if let Some(b) = bit {
+            q.insert(bit_name(lhs, w, *b));
+        } else {
+            for i in 0..w {
+                q.insert(bit_name(lhs, w, i));
+            }
+        }
+    }
+    q
+}
+
+/// Comb cone feeding `ff` D. Returns the cell pin where `want` is connected.
+/// Does not walk through Hff Q, and does not invent a net.
+fn d_cone_connect(d: &Design, ff: &str, want: &str) -> Option<(String, String)> {
+    let start = d.net_on(ff, "D")?;
+    if start == want {
+        return Some((ff.to_string(), "D".into()));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    let mut steps = 0usize;
+    while let Some(net) = stack.pop() {
+        if steps > 256 {
+            break;
+        }
+        steps += 1;
+        if !seen.insert(net.clone()) {
+            continue;
+        }
+        let Some(nrec) = d.nets.iter().find(|n| n.name == net) else {
+            continue;
+        };
+        for ep in &nrec.endpoints {
+            if ep.pin != "O" {
+                continue;
+            }
+            for i in 0..6 {
+                let pin = format!("I{i}");
+                let Some(inode) = d.net_on(&ep.cell, &pin) else {
+                    continue;
+                };
+                if inode == want {
+                    return Some((ep.cell.clone(), pin));
+                }
+                stack.push(inode.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Reset-then-enable load: every gated FF D must include the inout enable.
+/// One `hff_path` plus a connect when that is true. Otherwise one diagnostic
+/// and the design is not a closed WNS. Does not invent a bus.
+fn prove_inout_load_enables(d: &Design, rtl: &Rtl) -> bool {
+    let enables = inout_load_enables(rtl);
+    if enables.is_empty() {
+        return false;
+    }
+    let mut dropped = false;
+    for en in enables {
+        let w = sig_width(rtl, &en).max(1);
+        // 1-bit inout stays the port net. Do not widen it into a bus.
+        let en_net = if w == 1 {
+            en.clone()
+        } else {
+            bit_name(&en, w, 0)
+        };
+        let qnames = enabled_q_names(rtl, &en);
+        let matched: Vec<String> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .filter_map(|c| {
+                let q = d.net_on(&c.name, "Q")?;
+                if qnames.contains(q) {
+                    Some(c.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if matched.is_empty() {
+            note_inout_enable_not_lowered(&rtl.module, &en);
+            dropped = true;
+            continue;
+        }
+        let mut proof: Option<(String, String, String, String, String, String)> = None;
+        for ff in &matched {
+            match d_cone_connect(d, ff, &en_net) {
+                Some((cell, pin)) => {
+                    if proof.is_none() {
+                        let clk = d.net_on(ff, "CLK").unwrap_or("clk").to_string();
+                        let dnet = d.net_on(ff, "D").unwrap_or("").to_string();
+                        let qnet = d.net_on(ff, "Q").unwrap_or("").to_string();
+                        proof = Some((ff.clone(), clk, dnet, en_net.clone(), qnet, format!("{cell} {pin}")));
+                    }
+                }
+                None => {
+                    note_inout_enable_not_lowered(&rtl.module, &en);
+                    dropped = true;
+                }
+            }
+        }
+        if dropped {
+            continue;
+        }
+        if let Some((ff, clk, dnet, en_net, qnet, cell_pin)) = proof {
+            let mut parts = cell_pin.split_whitespace();
+            let cell = parts.next().unwrap_or("");
+            let pin = parts.next().unwrap_or("");
+            eprintln!("hff_path cell={ff} CLK={clk} D={dnet} EN={en_net} Q={qnet}");
+            eprintln!("connect net={en_net} cell={cell} pin={pin}");
+        } else {
+            note_inout_enable_not_lowered(&rtl.module, &en);
+            dropped = true;
+        }
+    }
+    dropped
 }
 
 /// Clocked always that did not become an Hff. One line, then finish.
@@ -2331,7 +2529,9 @@ fn parse_port_dir(p: &mut P) -> Option<PortDir> {
     } else if p.eat_kw("output") {
         Some(PortDir::Out)
     } else if p.eat_kw("inout") {
-        Some(PortDir::In)
+        // Keep the declaration. Synthesis treats a read-only inout as the
+        // load-enable input; it is not rewritten into a bus.
+        Some(PortDir::Inout)
     } else {
         None
     }
@@ -6207,7 +6407,14 @@ fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
-        d.add_port(n, *dir);
+        // A read-only inout is a load-enable input, not an output pad and
+        // not a made-up bus. Timing still sees a plain input.
+        let dir = if matches!(dir, PortDir::Inout) {
+            PortDir::In
+        } else {
+            *dir
+        };
+        d.add_port(n, dir);
     }
     // User clock is the posedge/negedge name when that port exists.
     // Otherwise the historical first-`clk`/first-input pick (gold counter).
@@ -6637,6 +6844,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
     if clock_gate_for(&rtl.module) {
         d.attrs.set("CLOCK_GATE", "1");
+    }
+    // Inout load enable: FF D must depend on it, or one diagnostic and no WNS.
+    if prove_inout_load_enables(&mut d, rtl) {
+        d.attrs.set("INOUT_ENABLE_NOT_LOWERED", "1");
     }
 
     // Negedge-only always: one Hff on that clock, or one named diagnostic.
@@ -8646,6 +8857,45 @@ endmodule
             "clock gate must not be lowered as a data LUT, nets={:?}",
             d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn inout_load_enable_reaches_ff_d() {
+        // reset has priority; read-only inout ena gates the load. Hold otherwise.
+        // D must depend on ena. Not a dropped enable, not an invented bus.
+        let src = r#"
+module latch_EX_MEM(input clk, input reset, inout ena, input din, output reg q);
+  always @(posedge clk) begin
+    if (reset)
+      q <= 0;
+    else if (ena == 1'b1)
+      q <= din;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "latch_ex_mem.v").expect("inout load enable");
+        assert_ne!(
+            d.attrs.get("INOUT_ENABLE_NOT_LOWERED"),
+            Some("1"),
+            "ena must be mapped onto FF D, not dropped"
+        );
+        assert!(
+            d.ports.iter().any(|p| p.name == "ena" && matches!(p.dir, PortDir::In)),
+            "read-only inout is the load-enable input, not a bus"
+        );
+        let ff = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("q"))
+            .expect("q must be an Hff");
+        assert_eq!(d.net_on(&ff.name, "CLK"), Some("clk"));
+        let on_ena = d.nets.iter().any(|n| {
+            n.name == "ena"
+                && n.endpoints
+                    .iter()
+                    .any(|e| e.pin.starts_with('I') || (e.cell == ff.name && e.pin == "D"))
+        });
+        assert!(on_ena, "ena must connect into the enable path of D");
     }
 
     #[test]
