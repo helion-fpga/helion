@@ -4418,7 +4418,21 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report timing summary").clicked() {
             let _ = model.exec("report_timing_summary");
         }
+        if ui.button("Write Report…").clicked() {
+            let path = std::env::var("HELION_REPORT_PATH").unwrap_or_else(|_| {
+                "/tmp/helion-reports/timing-summary.rpt".into()
+            });
+            let _ = model.exec(&format!("write_report timing {path}"));
+        }
     });
+    if let Some(exp) = model.last_report_export.clone() {
+        ui.label(
+            RichText::new(exp)
+                .monospace()
+                .size(12.0)
+                .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
+        );
+    }
     // CLI-honest label. Closed WNS_PS= only with cells>0 and an Hff clock path.
     let honest = model.timing_honesty_label();
     let closed = model.timing_closed_wns();
@@ -5253,7 +5267,21 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report utilization").clicked() {
             let _ = model.exec("report_utilization");
         }
+        if ui.button("Export").clicked() {
+            let path = std::env::var("HELION_REPORT_PATH").unwrap_or_else(|_| {
+                "/tmp/helion-reports/utilization.rpt".into()
+            });
+            let _ = model.exec(&format!("write_report utilization {path}"));
+        }
     });
+    if let Some(exp) = model.last_report_export.clone() {
+        ui.label(
+            RichText::new(exp)
+                .monospace()
+                .size(12.0)
+                .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
+        );
+    }
     ui.add_space(6.0);
     let report = model.utilization_report();
     if report.part.is_empty() {
