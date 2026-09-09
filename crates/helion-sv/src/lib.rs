@@ -446,6 +446,10 @@ thread_local! {
     /// that did not lower is not a const 0 and is not a closed WNS.
     static ASSIGN_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `generate_not_lowered` line per module. A generate/for body that
+    /// did not parse is not a LUT and not a closed WNS.
+    static GEN_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// One `clock_mux` line per module+signal. A posedge on a mux of two
     /// clocks is not one user clock and is not a closed WNS.
     static CLOCK_MUX_SEEN: std::cell::RefCell<HashSet<String>> =
@@ -639,6 +643,23 @@ fn note_assign_not_lowered(module: &str, signal: &str) {
 fn assign_not_lowered_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+/// Generate or for-generate assign did not parse. One line per module.
+/// Not a LUT. Not a closed WNS. Do not invent gates.
+fn note_generate_not_lowered(module: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let fresh = GEN_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic generate_not_lowered module={module} (generate body not mapped; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn generate_not_lowered_for(module: &str) -> bool {
+    GEN_NOT_LOWERED_SEEN.with(|s| s.borrow().contains(module))
 }
 
 /// Posedge of a muxed clock. One line. Not a LUT, not a single user clock.
@@ -1679,6 +1700,9 @@ fn assemble_module(
         }
         if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             d.attrs.set("ASSIGN_NOT_LOWERED", "1");
+        }
+        if child.attrs.get("GENERATE_NOT_LOWERED") == Some("1") {
+            d.attrs.set("GENERATE_NOT_LOWERED", "1");
         }
         if child.attrs.get("WIDTH_OVERFLOW") == Some("1") {
             d.attrs.set("WIDTH_OVERFLOW", "1");
@@ -4839,10 +4863,7 @@ fn parse_module_items(
                         assigns.push((lhs, bit, rhs));
                     }
                     _ => {
-                        note_skip(format!(
-                            "diagnostic skip_assign module={} (assign not parsed; not a LUT)",
-                            cur_mod()
-                        ));
+                        note_generate_not_lowered(&cur_mod());
                         skip_to_semi(p);
                     }
                 }
@@ -8202,6 +8223,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     if assign_not_lowered_for(&rtl.module) {
         d.attrs.set("ASSIGN_NOT_LOWERED", "1");
     }
+    if generate_not_lowered_for(&rtl.module) {
+        d.attrs.set("GENERATE_NOT_LOWERED", "1");
+    }
     if width_overflow_for(&rtl.module) {
         d.attrs.set("WIDTH_OVERFLOW", "1");
     }
@@ -8687,7 +8711,11 @@ fn synth_from_parsed_top(
             "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
             d.name
         );
-    } else if n_logic == 0 && d.attrs.get("FLATTEN_CAP") != Some("1") {
+    } else if n_logic == 0
+        && d.attrs.get("FLATTEN_CAP") != Some("1")
+        && d.attrs.get("GENERATE_NOT_LOWERED") != Some("1")
+        && d.attrs.get("ASSIGN_NOT_LOWERED") != Some("1")
+    {
         eprintln!(
             "diagnostic no_logic module={} cells={} (behavioral body present; no LUT/FF mapped under hang guards)",
             d.name,
