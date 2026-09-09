@@ -7686,9 +7686,39 @@ impl IdeModel {
         Ok(format!("device_zoom out zoom={:.3}", self.device_zoom))
     }
 
+    /// Skip-map reason, or None if the design did not refuse a cone / primitive.
+    /// Checked before `no_clock_path`: leftover LUTs and no Hff is not "mapped,
+    /// simply no clock" when a cone was skipped.
+    fn timing_incomplete_reason(d: &helion_ir::Design) -> Option<&'static str> {
+        if d.attrs.get("WIDE_CONE") == Some("1") {
+            return Some("wide_cone skipped; not a closed WNS");
+        }
+        if d.attrs.get("CLOCK_MUX") == Some("1") {
+            return Some("clock_mux; not a single user clock; not a closed WNS");
+        }
+        if d.attrs.get("CLOCK_GATE") == Some("1") {
+            return Some("clock_gate; not a single user clock; not a closed WNS");
+        }
+        if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
+            return Some("gate primitive not mapped; not a LUT; not a closed WNS");
+        }
+        if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
+            return Some("inout load enable not mapped; not a closed WNS");
+        }
+        if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
+            return Some("assign not lowered; not a closed WNS");
+        }
+        if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
+            return Some("word_pipeline_cap; extra stages not invented; not a closed WNS");
+        }
+        None
+    }
+
     /// On-screen timing line. Closed `WNS_PS=` only with cells>0 and an Hff clock path,
-    /// and only when no cone was skipped. Otherwise `no_body` / `no_clock_path` /
-    /// `timing_incomplete`. Built-in period says `default period, not user SDC`.
+    /// and only when no cone was skipped. A skipped map (`wide_cone`, `gate_primitive`,
+    /// and the other incomplete attrs) is `timing_incomplete` even with no Hff —
+    /// that is not `no_clock_path`. `sim_only` stays `no_body`. Built-in period
+    /// says `default period, not user SDC`.
     pub fn timing_honesty_label(&self) -> String {
         let Some(d) = self.shell.session.design.as_ref() else {
             return "no_body cells=0 (no timing: empty shell or no logic; not a closed WNS)".into();
@@ -7707,7 +7737,17 @@ impl IdeModel {
                 )
             })
             .count();
-        if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") || n_logic == 0 {
+        // sim_only stays no_body (empty simulation model), not a clock story.
+        if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
+            return format!(
+                "no_body cells={cells} (no timing: empty shell or no logic; not a closed WNS)"
+            );
+        }
+        // A refused cone / primitive is not "mapped, no clock" and not a closed WNS.
+        if let Some(why) = Self::timing_incomplete_reason(d) {
+            return format!("timing_incomplete cells={cells} ({why})");
+        }
+        if n_logic == 0 {
             return format!(
                 "no_body cells={cells} (no timing: empty shell or no logic; not a closed WNS)"
             );
@@ -7719,41 +7759,6 @@ impl IdeModel {
         if !clock_path {
             return format!(
                 "no_clock_path cells={cells} (no timing: no clock path; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("WIDE_CONE") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (wide_cone skipped; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("CLOCK_MUX") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (clock_mux; not a single user clock; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("CLOCK_GATE") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (clock_gate; not a single user clock; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (gate primitive not mapped; not a LUT; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (inout load enable not mapped; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (assign not lowered; not a closed WNS)"
-            );
-        }
-        if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
-            return format!(
-                "timing_incomplete cells={cells} (word_pipeline_cap; extra stages not invented; not a closed WNS)"
             );
         }
         match self.timing.as_ref() {
@@ -16635,14 +16640,25 @@ impl IdeModel {
                         | helion_ir::CellKind::Bram18
                 )
             }).count();
-            if d.attrs.get("SIM_ONLY") == Some("1") || n_logic == 0 {
-                let why = if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
-                    "no_body"
-                } else {
-                    "no_logic"
-                };
+            // sim_only stays no_body. A skipped cone is timing_incomplete even
+            // with no Hff — leftover LUTs are not a mapped design with no clock.
+            if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
                 return Ok(format!(
-                    "report_timing {} {why} cells={} (no timing: empty shell or no logic; not a closed WNS)",
+                    "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            if let Some(why) = Self::timing_incomplete_reason(d) {
+                return Ok(format!(
+                    "report_timing {} timing_incomplete cells={} ({why})",
+                    d.name,
+                    d.cells.len()
+                ));
+            }
+            if n_logic == 0 {
+                return Ok(format!(
+                    "report_timing {} no_logic cells={} (no timing: empty shell or no logic; not a closed WNS)",
                     d.name,
                     d.cells.len()
                 ));
@@ -16654,56 +16670,6 @@ impl IdeModel {
             if !clock_path {
                 return Ok(format!(
                     "report_timing {} no_clock_path cells={} (no timing: no clock path; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            // Leftover FFs after a refused cone are not a closed design WNS.
-            if d.attrs.get("WIDE_CONE") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (wide_cone skipped; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            if d.attrs.get("CLOCK_MUX") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (clock_mux; not a single user clock; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            if d.attrs.get("CLOCK_GATE") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (clock_gate; not a single user clock; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            if d.attrs.get("GATE_PRIMITIVE") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (gate primitive not mapped; not a LUT; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            if d.attrs.get("INOUT_ENABLE_NOT_LOWERED") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (inout load enable not mapped; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (assign not lowered; not a closed WNS)",
-                    d.name,
-                    d.cells.len()
-                ));
-            }
-            if d.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
-                return Ok(format!(
-                    "report_timing {} timing_incomplete cells={} (word_pipeline_cap; extra stages not invented; not a closed WNS)",
                     d.name,
                     d.cells.len()
                 ));
