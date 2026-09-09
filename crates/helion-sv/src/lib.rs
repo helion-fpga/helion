@@ -462,6 +462,10 @@ thread_local! {
     /// do not invent extra word stages, and do not close WNS.
     static WORD_PIPELINE_CAP_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// One `flatten_cap` line per module. Post-flatten assign/NBA cones that
+    /// stall after `hang_diag flatten` are not bit-blasted and not a closed WNS.
+    static FLATTEN_CAP_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// One `gate_primitive` line per module. bufif/notif/and/or/buf/not are
     /// not LUTs and not a closed WNS. Not one line per instance.
     static GATE_PRIM_SEEN: std::cell::RefCell<HashSet<String>> =
@@ -673,6 +677,90 @@ fn note_word_pipeline_cap(module: &str, signal: &str, cycles: &str) {
 
 fn word_pipeline_cap_for(module: &str) -> bool {
     WORD_PIPELINE_CAP_SEEN.with(|s| s.borrow().contains(module))
+}
+
+/// Post-flatten leftover that hangs after `hang_diag flatten`. One line.
+/// Assign cones and wide NBA cones are not bit-blasted. Not a LUT. Not a closed WNS.
+fn note_flatten_cap(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "flatten" } else { signal };
+    let fresh = FLATTEN_CAP_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic flatten_cap module={module} signal={signal} (flatten cone not bit-blasted; not a LUT; not a closed WNS)"
+    ));
+}
+
+fn flatten_cap_for(module: &str) -> bool {
+    FLATTEN_CAP_SEEN.with(|s| s.borrow().contains(module))
+}
+
+fn rexpr_has_mux(e: &RExpr) -> bool {
+    match e {
+        RExpr::Mux(_, _, _) => true,
+        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => rexpr_has_mux(x),
+        RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => rexpr_has_mux(a) || rexpr_has_mux(b),
+        RExpr::Concat(parts) => parts.iter().any(rexpr_has_mux),
+        RExpr::IndexPart { base, .. } => rexpr_has_mux(base),
+        RExpr::WordAt { addr, data } => rexpr_has_mux(addr) || rexpr_has_mux(data),
+        _ => false,
+    }
+}
+
+/// Name the signal whose post-flatten cone stalls, or None.
+/// 15011: nbas=0, assigns>=32, combo case expanded to per-bit mux assigns.
+/// 14777: nbas>=128 and a wide unpacked word (width>16) that var-index lower refuses.
+fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
+    if rtl.nbas.is_empty() && rtl.assigns.len() >= 32 {
+        let per_bit = rtl
+            .assigns
+            .iter()
+            .filter(|(_, bit, _)| bit.is_some())
+            .count();
+        if per_bit >= 32 && rtl.assigns.iter().any(|(_, _, rhs)| rexpr_has_mux(rhs)) {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for (lhs, bit, rhs) in &rtl.assigns {
+                if bit.is_some() && rexpr_has_mux(rhs) {
+                    *counts.entry(lhs.clone()).or_insert(0) += 1;
+                }
+            }
+            if let Some((name, _)) = counts.into_iter().max_by_key(|(_, n)| *n) {
+                return Some(name);
+            }
+        }
+    }
+    if rtl.nbas.len() < 128 {
+        return None;
+    }
+    let mem = rtl
+        .signals
+        .iter()
+        .find(|sig| sig.depth >= 16 && sig.width > 16)?;
+    let mentions = rtl.nbas.iter().any(|(lhs, _, rhs)| {
+        if lhs == &mem.name {
+            return true;
+        }
+        let mut names = HashSet::new();
+        rexpr_names(rhs, &mut names);
+        names.contains(&mem.name)
+    });
+    if mentions {
+        Some(mem.name.clone())
+    } else {
+        None
+    }
 }
 
 /// Verilog gate primitive (`bufif1`, `and`, `not`, ...). One line per module.
@@ -1561,6 +1649,9 @@ fn assemble_module(
         }
         if child.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
             d.attrs.set("WORD_PIPELINE_CAP", "1");
+        }
+        if child.attrs.get("FLATTEN_CAP") == Some("1") {
+            d.attrs.set("FLATTEN_CAP", "1");
         }
         if child.attrs.get("CLOCK_MUX") == Some("1") {
             d.attrs.set("CLOCK_MUX", "1");
@@ -7504,6 +7595,15 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         return Ok(d);
     }
 
+    // FM-HEL-10m-0835: after `hang_diag flatten`, 15011 (assigns, no nbas)
+    // and 14777 (wide unpacked nbas) stall in the bit-blast. Name that path
+    // and stop. One diagnostic. No invented LUT, no closed WNS.
+    if let Some(sig) = flatten_leftover_signal(rtl) {
+        note_flatten_cap(&rtl.module, &sig);
+        d.attrs.set("FLATTEN_CAP", "1");
+        return Ok(d);
+    }
+
     // Flatten NBAs into per-bit (name_bit, expr)
     // FM-HEL-HANG: hard cap bit-blast work (Ibex synth_sv_path hung after CORPUS).
     // Linear visit budget. Add/cmp hang guards stay elsewhere (Ibex).
@@ -7998,6 +8098,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     if word_pipeline_cap_for(&rtl.module) {
         d.attrs.set("WORD_PIPELINE_CAP", "1");
     }
+    if flatten_cap_for(&rtl.module) {
+        d.attrs.set("FLATTEN_CAP", "1");
+    }
     if clock_mux_for(&rtl.module) {
         d.attrs.set("CLOCK_MUX", "1");
     }
@@ -8474,7 +8577,7 @@ fn synth_from_parsed_top(
             "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
             d.name
         );
-    } else if n_logic == 0 {
+    } else if n_logic == 0 && d.attrs.get("FLATTEN_CAP") != Some("1") {
         eprintln!(
             "diagnostic no_logic module={} cells={} (behavioral body present; no LUT/FF mapped under hang guards)",
             d.name,
@@ -10703,6 +10806,38 @@ endmodule
     }
 
     #[test]
+    fn flatten_assign_case_is_one_cap_not_a_closed_cone() {
+        // Same leftover as 15011: combo case expanded to per-bit assigns,
+        // no NBAs. Do not bit-blast. One flatten_cap. No Hff, no MAC.
+        let mut arms = String::new();
+        for i in 0..4 {
+            arms.push_str(&format!(
+                "          2'd{i}: sreg_n = {{data, data}} | sreg;\n"
+            ));
+        }
+        let src = format!(
+            r#"
+module decode_in(input [1:0] cnt, input [15:0] data, input [31:0] sreg,
+                 output [31:0] stream_data);
+  reg [31:0] sreg_n;
+  always @(cnt or data or sreg) begin
+    sreg_n = sreg;
+    case (cnt)
+{arms}    endcase
+  end
+  assign stream_data = sreg_n;
+endmodule
+"#
+        );
+        let d = synth_sv(&src, "decode_in.v").expect("flatten cap");
+        assert_eq!(d.attrs.get("FLATTEN_CAP"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })));
+    }
+
+    #[test]
     fn comb_bus_minus_small_const_is_ripple_not_a_second_operand() {
         let src = r#"
 module BusMinus4(input  wire [15:0] bus,
@@ -10712,6 +10847,7 @@ endmodule
 "#;
         let d = synth_sv(src, "bus_minus4.v").expect("bus - 4");
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
         assert!(
