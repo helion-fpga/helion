@@ -5453,6 +5453,22 @@ impl IdeModel {
             self.select_methodology_object(spec.trim())
         } else if t == "select_methodology_object" {
             self.select_methodology_object("")
+        } else if let Some(id) = t.strip_prefix("fix_methodology ") {
+            self.fix_methodology(id.trim())
+        } else if t == "fix_methodology" {
+            let id = self
+                .selected_methodology
+                .clone()
+                .unwrap_or_default();
+            self.fix_methodology(&id)
+        } else if let Some(id) = t.strip_prefix("goto_methodology_constraints ") {
+            self.goto_methodology_constraints(id.trim())
+        } else if t == "goto_methodology_constraints" {
+            let id = self
+                .selected_methodology
+                .clone()
+                .unwrap_or_default();
+            self.goto_methodology_constraints(&id)
         } else if let Some(id) = t.strip_prefix("select_drc ") {
             self.select_drc(id.trim())
         } else if t == "select_drc" {
@@ -15673,6 +15689,139 @@ impl IdeModel {
             .apply_object_crossprobe(&named)
             .ok_or_else(|| format!("select_methodology_object: no object {named}"))?;
         Ok(format!("methodology_object OBJECT={probed}"))
+    }
+
+    /// Vivado-shaped SDC template that clears a methodology check (TIMING-7 → set_output_delay).
+    pub fn methodology_fix_template(&self, id: &str) -> Option<String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let report = self.methodology_report();
+        let v = report
+            .check(id)
+            .or_else(|| {
+                report
+                    .checks
+                    .iter()
+                    .find(|c| c.id.eq_ignore_ascii_case(id))
+            })?;
+        let clk = self
+            .constraints
+            .clocks
+            .iter()
+            .find(|c| !c.generated)
+            .map(|c| c.name.as_str())
+            .or_else(|| self.constraints.clocks.first().map(|c| c.name.as_str()))
+            .unwrap_or("clk");
+        let ports: Vec<&str> = v
+            .objects
+            .split(|c: char| c == ',' || c == ' ')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "-")
+            .collect();
+        if ports.is_empty() {
+            return None;
+        }
+        match v.id.as_str() {
+            "TIMING-7" => {
+                let mut lines = Vec::new();
+                for p in ports {
+                    lines.push(format!(
+                        "set_output_delay -clock {clk} -max 0.000 [get_ports {p}]"
+                    ));
+                    lines.push(format!(
+                        "set_output_delay -clock {clk} -min 0.000 [get_ports {p}]"
+                    ));
+                }
+                Some(lines.join("\n"))
+            }
+            "TIMING-6" => {
+                let mut lines = Vec::new();
+                for p in ports {
+                    lines.push(format!(
+                        "set_input_delay -clock {clk} -max 0.000 [get_ports {p}]"
+                    ));
+                    lines.push(format!(
+                        "set_input_delay -clock {clk} -min 0.000 [get_ports {p}]"
+                    ));
+                }
+                Some(lines.join("\n"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Insert a methodology Fix template into the Constraints SDC editor (dirty, ready to Save).
+    fn insert_methodology_sdc_template(&mut self, template: &str) {
+        self.ensure_sdc_editor_populated();
+        if self.sdc_editor_path.is_none() {
+            let p = helion_device::Device::examples_dir().join("counter.sdc");
+            self.sdc_editor_path = Some(p);
+        }
+        let already = template
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .all(|l| self.sdc_editor_text.contains(l));
+        if already {
+            return;
+        }
+        if !self.sdc_editor_text.is_empty() && !self.sdc_editor_text.ends_with('\n') {
+            self.sdc_editor_text.push('\n');
+        }
+        self.sdc_editor_text.push_str(template);
+        if !self.sdc_editor_text.ends_with('\n') {
+            self.sdc_editor_text.push('\n');
+        }
+        self.sdc_editor_dirty = true;
+    }
+
+    /// Jump to Constraints with a Vivado-shaped Fix template inserted (ready to Save).
+    /// Does not apply STA yet — Save / Apply set_output_delay does.
+    pub fn goto_methodology_constraints(&mut self, id: &str) -> Result<String, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("goto_methodology_constraints: missing id".into());
+        }
+        let template = self
+            .methodology_fix_template(id)
+            .ok_or_else(|| format!("goto_methodology_constraints: no Fix template for {id}"))?;
+        // Keep selection so Methodology still shows which check we jumped from.
+        let _ = self.select_methodology(id);
+        self.insert_methodology_sdc_template(&template);
+        self.workspace = WorkspaceTab::Constraints;
+        Ok(format!(
+            "goto_methodology_constraints ID={id} TEMPLATE={template}"
+        ))
+    }
+
+    /// Apply the methodology Fix (TIMING-7 → set_output_delay), insert into the
+    /// Constraints SDC editor, and open Constraints. Timing numbers may move —
+    /// that is honest; untouched default without this Fix still keeps gold WNS.
+    pub fn fix_methodology(&mut self, id: &str) -> Result<String, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("fix_methodology: missing id".into());
+        }
+        let template = self
+            .methodology_fix_template(id)
+            .ok_or_else(|| format!("fix_methodology: no Fix template for {id}"))?;
+        let _ = self.select_methodology(id);
+        // Apply each SDC line so TIMING-7 clears immediately.
+        for line in template.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            self.apply_sdc_exception(line)?;
+        }
+        self.insert_methodology_sdc_template(&template);
+        self.workspace = WorkspaceTab::Constraints;
+        let cleared = self.methodology_report().check(id).is_none();
+        Ok(format!(
+            "fix_methodology ID={id} CLEARED={} TEMPLATE={template}",
+            u8::from(cleared)
+        ))
     }
 
     /// UG893 Timing Constraints Editor: clickable clocks / I/O-delay / exception
@@ -29348,6 +29497,98 @@ endmodule
             ide.wns_ps(),
             Some(9640),
             "Methodology cross-probe must not disturb gold WNS"
+        );
+    }
+
+    /// TIMING-7 Fix applies Vivado-shaped set_output_delay, clears the check,
+    /// and opens Constraints with the template. Untouched gold path stays 9640.
+    #[test]
+    fn methodology_timing7_fix_applies_output_delay() {
+        // Gold without the Fix: headless counter still WNS_PS=9640.
+        let mut gold_ide = IdeModel::new();
+        gold_ide.open_source(&example("counter.sv")).unwrap();
+        gold_ide.run_step(FlowStep::Opt).unwrap();
+        gold_ide.run_step(FlowStep::Place).unwrap();
+        gold_ide.run_step(FlowStep::Route).unwrap();
+        assert_eq!(
+            gold_ide.wns_ps(),
+            Some(9640),
+            "untouched default path without Fix must keep gold WNS"
+        );
+        assert!(
+            gold_ide.methodology_report().check("TIMING-7").is_some(),
+            "gold path still reports TIMING-7: {}",
+            gold_ide.methodology_report().text()
+        );
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let wns_before = ide.wns_ps().expect("STA after route");
+        assert_eq!(wns_before, 9640, "pre-Fix gold WNS");
+
+        ide.exec("report_methodology").unwrap();
+        let sel = ide.exec("select_methodology TIMING-7").unwrap();
+        assert!(sel.contains("ID=TIMING-7"), "{sel}");
+        assert!(sel.contains("OBJECTS=led") || sel.contains("OBJECT=led"), "{sel}");
+
+        let tmpl = ide
+            .methodology_fix_template("TIMING-7")
+            .expect("TIMING-7 Fix template");
+        assert!(
+            tmpl.contains("set_output_delay -clock clk -max 0.000 [get_ports led]"),
+            "honest Vivado-shaped max template: {tmpl}"
+        );
+        assert!(
+            tmpl.contains("set_output_delay -clock clk -min 0.000 [get_ports led]"),
+            "optional min template: {tmpl}"
+        );
+
+        // Jump inserts template without clearing yet.
+        let jump = ide.exec("goto_methodology_constraints TIMING-7").unwrap();
+        assert!(jump.contains("TEMPLATE="), "{jump}");
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert!(
+            ide.sdc_editor_text
+                .contains("set_output_delay -clock clk -max 0.000 [get_ports led]"),
+            "Jump must insert template into SDC editor: {}",
+            ide.sdc_editor_text
+        );
+        assert!(ide.sdc_editor_dirty, "template ready to Save");
+        assert!(
+            ide.methodology_report().check("TIMING-7").is_some(),
+            "Jump alone must not clear TIMING-7: {}",
+            ide.methodology_report().text()
+        );
+
+        // Fix applies SDC + clears TIMING-7 (timing may move — honest).
+        let fx = ide.exec("fix_methodology TIMING-7").unwrap();
+        assert!(fx.contains("CLEARED=1"), "{fx}");
+        assert!(
+            fx.contains("set_output_delay -clock clk -max 0.000 [get_ports led]"),
+            "{fx}"
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Constraints);
+        assert!(
+            ide.methodology_report().check("TIMING-7").is_none(),
+            "Fix must clear TIMING-7: {}",
+            ide.methodology_report().text()
+        );
+        assert_eq!(
+            ide.constraints.output_delay_ps.get("led"),
+            Some(&0),
+            "led output delay applied"
+        );
+        // Do not fake gold 9640 after adding delay — just assert STA still runs.
+        assert!(ide.wns_ps().is_some(), "STA after Fix");
+
+        // Gold ide from the start of the test is still untouched.
+        assert_eq!(
+            gold_ide.wns_ps(),
+            Some(9640),
+            "separate gold path must remain 9640 after Fix on another IdeModel"
         );
     }
 
