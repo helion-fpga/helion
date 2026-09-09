@@ -6679,6 +6679,26 @@ fn packed_add_const(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128)> {
     }
 }
 
+/// `assign y = bus - K`. K is a small constant 1..=16 on the right only.
+/// Not `K - bus`, not two named buses, not a multiply, not an unpacked word.
+fn packed_sub_const(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128)> {
+    let RExpr::Sub(a, b) = rhs else {
+        return None;
+    };
+    if expr_contains_mul(rhs) {
+        return None;
+    }
+    let (bus, k) = match (a.as_ref(), b.as_ref()) {
+        (RExpr::Ident(s), RExpr::Const { val, .. }) if sig_depth(rtl, s) == 0 => (s.clone(), *val),
+        _ => return None,
+    };
+    if (1u128..=16).contains(&k) {
+        Some((bus, k))
+    } else {
+        None
+    }
+}
+
 fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
     let w = sig_width(rtl, name);
     if bit >= w {
@@ -6860,6 +6880,100 @@ fn emit_ripple_add_const(
         }
     }
     eprintln!("synth_rtl ripple_add_const signal={sum} bits={width} const={k}");
+    true
+}
+
+/// Combinational ripple of `assign y = bus - K`. K is a constant 1..=16
+/// on the right, not a second operand bus and not a MAC. Borrow is injected
+/// where the constant bit is 1; a zero constant bit with no borrow is a
+/// copy of that bus bit. The first borrow is the inverted bus bit (the
+/// result bit itself). No clock, no Hff. `width` > 32 is refused by the
+/// caller so a shorter bus is not invented. Returns false if any bit
+/// is skipped.
+fn emit_ripple_sub_const(
+    d: &mut Design,
+    rtl: &Rtl,
+    diff: &str,
+    width: usize,
+    bus: &str,
+    k: u128,
+) -> bool {
+    if width == 0 || width > 32 || !(1u128..=16).contains(&k) {
+        return false;
+    }
+    // A missing bus bit is a skip, not a zero-extended invented bus.
+    if (0..width).any(|bit| op_bit_net(rtl, bus, bit).is_none()) {
+        return false;
+    }
+    let mut bin: Option<String> = None;
+    for bit in 0..width {
+        let Some(an) = op_bit_net(rtl, bus, bit) else {
+            return false;
+        };
+        let kbit = ((k >> bit) & 1) == 1;
+        let diff_net = bit_name(diff, width, bit);
+        let diff_cell = format!("u_rsc_{diff}_{bit}s");
+        let bin_now = bin.clone();
+        match (kbit, bin_now.as_deref()) {
+            (false, None) => {
+                // Constant bit is 0 and no borrow yet: this bit is the bus bit.
+                emit_lut_pins(d, &diff_cell, &diff_net, lut6_buf(), &[(&an, "I0")]);
+            }
+            (true, None) => {
+                // First 1 in K: diff = ~bus, borrow-out is that inverted bus
+                // bit. No constant vector is invented for the subtrahend.
+                emit_lut_pins(d, &diff_cell, &diff_net, lut6_inv(), &[(&an, "I0")]);
+                if bit + 1 < width {
+                    bin = Some(diff_net);
+                }
+            }
+            (false, Some(bn)) => {
+                emit_lut_pins(
+                    d,
+                    &diff_cell,
+                    &diff_net,
+                    lut6_xor2(),
+                    &[(&an, "I0"), (bn, "I1")],
+                );
+                if bit + 1 < width {
+                    let bout = format!("n_rsc_{diff}_{bit}b");
+                    let cry_cell = format!("u_rsc_{diff}_{bit}b");
+                    // bout = ~bus & bin
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &bout,
+                        lut6_and2(true, false, false),
+                        &[(&an, "I0"), (bn, "I1")],
+                    );
+                    bin = Some(bout);
+                }
+            }
+            (true, Some(bn)) => {
+                emit_lut_pins(
+                    d,
+                    &diff_cell,
+                    &diff_net,
+                    lut6_xnor2(),
+                    &[(&an, "I0"), (bn, "I1")],
+                );
+                if bit + 1 < width {
+                    let bout = format!("n_rsc_{diff}_{bit}b");
+                    let cry_cell = format!("u_rsc_{diff}_{bit}b");
+                    // bout = ~bus | bin
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &bout,
+                        lut6_and2(false, true, true),
+                        &[(&an, "I0"), (bn, "I1")],
+                    );
+                    bin = Some(bout);
+                }
+            }
+        }
+    }
+    eprintln!("synth_rtl ripple_sub_const signal={diff} bits={width} const={k}");
     true
 }
 
@@ -7597,6 +7711,22 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
                     if w > 32 || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                    continue;
+                }
+            }
+        }
+        // width<=32 `assign y = bus - K` (K in 1..=16, bus on the left) is a
+        // borrow ripple from that constant, not a second operand bus and not
+        // a 32-PI cone. No clock, no MAC. Wider than 32, or a skipped bit,
+        // stays unlowered — do not invent a shorter bus. `K - bus` is not
+        // this form.
+        if bit.is_none() {
+            if let Some((bus, k)) = packed_sub_const(rhs, rtl) {
+                if rexpr_unknown_name(rhs, rtl).is_none() {
+                    let w = sig_width(rtl, lhs).max(1);
+                    if w > 32 || !emit_ripple_sub_const(&mut d, rtl, lhs, w, &bus, k) {
                         note_assign_not_lowered(&rtl.module, lhs);
                     }
                     continue;
@@ -10570,6 +10700,73 @@ endmodule
             lut_ins.iter().all(|n| n.starts_with("pc_") || n.starts_with("n_rac_")),
             "ripple inputs are the bus and carry, not a second operand: {lut_ins:?}"
         );
+    }
+
+    #[test]
+    fn comb_bus_minus_small_const_is_ripple_not_a_second_operand() {
+        let src = r#"
+module BusMinus4(input  wire [15:0] bus,
+                 output wire [15:0] y);
+  assign y = bus - 4;
+endmodule
+"#;
+        let d = synth_sv(src, "bus_minus4.v").expect("bus - 4");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "combinational const subtract has no clock and no Hff"
+        );
+        for bit in 0..16 {
+            let name = format!("y_{bit}");
+            let driven = d.nets.iter().any(|n| {
+                n.name == name && n.endpoints.iter().any(|e| e.pin == "O")
+            });
+            assert!(driven, "bit {bit} must lower, not a skipped cone");
+        }
+        // Borrow uses the bus bit or a carry net. No invented subtrahend.
+        let addend = d.nets.iter().any(|n| {
+            n.name.starts_with("k_")
+                || n.name.starts_with("const_")
+                || n.name.contains("_addend")
+                || n.name.contains("_subtrahend")
+        });
+        assert!(!addend, "must not invent a second operand bus");
+        let lut_ins: Vec<_> = d
+            .nets
+            .iter()
+            .filter(|n| {
+                n.endpoints
+                    .iter()
+                    .any(|e| e.pin.starts_with('I') && e.cell.starts_with("u_rsc_"))
+            })
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            lut_ins
+                .iter()
+                .all(|n| n.starts_with("bus_") || n.starts_with("n_rsc_") || n.starts_with("y_")),
+            "ripple inputs are the bus and borrow, not a second operand: {lut_ins:?}"
+        );
+    }
+
+    #[test]
+    fn comb_bus_minus_const_wider_than_32_is_not_invented() {
+        let src = r#"
+module WideSub(input [33:0] bus, output [33:0] y);
+  assign y = bus - 4;
+endmodule
+"#;
+        let d = synth_sv(src, "widesub.v").expect("WideSub");
+        assert_eq!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "width>32 must not invent a shorter subtractor"
+        );
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
     }
 
     #[test]
