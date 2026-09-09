@@ -4949,6 +4949,25 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Report methodology").clicked() {
             let _ = model.exec("report_methodology");
         }
+        // TIMING-7 (and TIMING-6): Fix applies Vivado-shaped set_*_delay and
+        // opens Constraints; Jump inserts the template ready to Save.
+        if let Some(id) = model.selected_methodology.clone() {
+            if model.methodology_fix_template(&id).is_some() {
+                let fix_label = if id == "TIMING-7" {
+                    "Apply set_output_delay"
+                } else if id == "TIMING-6" {
+                    "Apply set_input_delay"
+                } else {
+                    "Fix"
+                };
+                if ui.button(fix_label).clicked() {
+                    let _ = model.fix_methodology(&id);
+                }
+                if ui.button("Jump to Constraints").clicked() {
+                    let _ = model.goto_methodology_constraints(&id);
+                }
+            }
+        }
     });
     ui.add_space(6.0);
     if model.tree.top.is_none() {
