@@ -3261,11 +3261,23 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick_pblock: Option<String> = None;
     let mut pick_obj: Option<String> = None;
     if rows.is_empty() {
-        ui.add(
-            egui::Label::new("No pblocks yet. Create one, then resize it on the die.").wrap(),
-        );
+        let screen = ui.ctx().screen_rect();
+        let floor = chrome::device_window_narrow(screen.width())
+            || chrome::device_window_short(screen.height());
+        if floor {
+            // One complete line. Horizontal scroll keeps the sentence; wrap would crush the die.
+            ui.horizontal(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.set_min_width(420.0);
+                ui.label("No pblocks yet. Create one, then resize it on the die.");
+            });
+        } else {
+            ui.add(
+                egui::Label::new("No pblocks yet. Create one, then resize it on the die.").wrap(),
+            );
+        }
         // Short leftover belongs to the die, not a dashed placeholder grid.
-        if ui.ctx().screen_rect().height() < 540.0 {
+        if chrome::device_window_short(screen.height()) {
             return;
         }
     }
@@ -5113,25 +5125,38 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 
-fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.horizontal(|ui| {
-        if ui.button("Zoom In").clicked() {
-            let _ = model.device_zoom_in();
-        }
-        if ui.button("Zoom Out").clicked() {
-            let _ = model.device_zoom_out();
-        }
-        if ui.button("Zoom Fit").clicked() {
-            let _ = model.device_zoom_fit();
-        }
-        ui.label(
-            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
-                .small()
-                .weak(),
-        );
-    });
-    // Complete chips only. Budget is the visible pane minus a margin so the last
-    // word cannot be cut as "clock region r".
+fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel, floor_scroll: bool) {
+    let tools = |ui: &mut egui::Ui, model: &mut IdeModel| {
+        ui.horizontal(|ui| {
+            ui.set_min_width(360.0);
+            if ui.button("Zoom In").clicked() {
+                let _ = model.device_zoom_in();
+            }
+            if ui.button("Zoom Out").clicked() {
+                let _ = model.device_zoom_out();
+            }
+            if ui.button("Zoom Fit").clicked() {
+                let _ = model.device_zoom_fit();
+            }
+            ui.label(
+                RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
+                    .small()
+                    .weak(),
+            );
+        });
+    };
+    if floor_scroll {
+        // One tool row. Narrow windows scroll it; wrapping would steal die height.
+        egui::ScrollArea::horizontal()
+            .id_salt("device_legend_tools")
+            .auto_shrink([false, true])
+            .max_height(36.0)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| tools(ui, model));
+    } else {
+        tools(ui, model);
+    }
+    // Complete chips only. Narrow: one row, scroll sideways so names stay fully visible.
     let chips: [(&str, Color32); 8] = [
         ("CLB", Color32::from_rgb(0x3d, 0xb8, 0x7a)),
         ("IOB", Color32::from_rgb(0x5b, 0x9b, 0xd5)),
@@ -5142,6 +5167,25 @@ fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel) {
         ("route", Color32::from_rgb(0x3d, 0xb8, 0x7a)),
         ("pblock", Color32::from_rgb(0xe5, 0x9a, 0x3c)),
     ];
+    if floor_scroll {
+        egui::ScrollArea::horizontal()
+            .id_salt("device_legend_chips")
+            .auto_shrink([false, true])
+            .max_height(chrome::DEVICE_LEGEND_ROW_H + 4.0)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    let mut used = 0.0_f32;
+                    for (text, col) in chips {
+                        used += text.chars().count() as f32 * 7.2 + 14.0;
+                        ui.label(RichText::new(text).small().color(col));
+                    }
+                    ui.set_min_width(used);
+                });
+            });
+        return;
+    }
     let budget = ui
         .available_width()
         .min(ui.clip_rect().width())
@@ -5169,54 +5213,63 @@ fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Device");
-    paint_device_legend(ui, model);
-    let share = chrome::share_available(ui.ctx().screen_rect().width(), ui.ctx().screen_rect().height());
-    // Floor, then scroll. Reserve leftover height so a short window can Zoom Fit the die.
+    let screen = ui.ctx().screen_rect();
+    let narrow = chrome::device_window_narrow(screen.width());
+    let short = chrome::device_window_short(screen.height());
+    paint_device_legend(ui, model, narrow || short);
+    let share = chrome::share_available(screen.width(), screen.height());
     let after_legend = ui.available_height().max(1.0);
-    let screen_h = ui.ctx().screen_rect().height();
-    let short = screen_h < 540.0;
-    let die_reserve = if short {
-        (after_legend * 0.55).max(140.0)
-    } else {
-        share.canvas_floor_h.min(after_legend * 0.62).max(56.0)
-    };
-    let tables_h = if short {
-        56.0
-    } else {
-        share.tables_max_h.min((after_legend - die_reserve).max(40.0))
-    };
+    let band = chrome::device_band_share(screen.width(), screen.height(), after_legend);
     let pane_w = ui.available_width().max(48.0);
-    // Pblock grid scrolls. Clock-region names stay outside that cap so Occupied
-    // is not the row that gets sliced off.
-    egui::ScrollArea::both()
-        .id_salt("device_tables")
-        .auto_shrink([false, true])
-        .max_height(if short { 56.0 } else { tables_h.min(pane_w * 0.28).max(52.0) })
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-        .show(ui, |ui| {
-            ui.set_max_width(pane_w);
-            ui.set_width(pane_w);
-            paint_pblocks_table(ui, model);
-        });
-    // Cap the region list so a short window still has leftover height for Zoom Fit.
-    let remain = ui.available_height().max(1.0);
-    // Short window: one readable region line, then the die owns the leftover.
-    let cr_h = if short {
-        48.0
+    if narrow || short {
+        // Tables and legend floor, then scroll horizontally. Die keeps the leftover.
+        egui::ScrollArea::both()
+            .id_salt("device_tables")
+            .auto_shrink([false, true])
+            .max_height(band.tables_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_min_width(pane_w.max(640.0));
+                paint_pblocks_table(ui, model);
+            });
+        // Clock-region viewport is whole rows only so the last line is not sliced.
+        egui::ScrollArea::both()
+            .id_salt("device_clock_regions_block")
+            .auto_shrink([false, false])
+            .max_height(band.clock_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_min_width(pane_w.max(560.0));
+                ui.set_min_height(band.clock_h);
+                paint_clock_regions(ui, model);
+            });
     } else {
+        // Wide: tables take a share; the die fills leftover.
+        let tables_h = band.tables_h.min(pane_w * 0.28).max(52.0);
+        egui::ScrollArea::both()
+            .id_salt("device_tables")
+            .auto_shrink([false, true])
+            .max_height(tables_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_max_width(pane_w);
+                ui.set_width(pane_w);
+                paint_pblocks_table(ui, model);
+            });
+        let remain = ui.available_height().max(1.0);
         let die_need = share.canvas_floor_h.min(remain * 0.38).min(remain * 0.55);
-        (remain - die_need).clamp(28.0, 168.0)
-    };
-    egui::ScrollArea::vertical()
-        .id_salt("device_clock_regions_block")
-        .auto_shrink([false, true])
-        .max_height(cr_h)
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-        .show(ui, |ui| {
-            ui.set_max_width(pane_w);
-            ui.set_width(pane_w);
-            paint_clock_regions(ui, model);
-        });
+        let cr_h = (remain - die_need).clamp(28.0, 168.0);
+        egui::ScrollArea::vertical()
+            .id_salt("device_clock_regions_block")
+            .auto_shrink([false, true])
+            .max_height(cr_h)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_max_width(pane_w);
+                ui.set_width(pane_w);
+                paint_clock_regions(ui, model);
+            });
+    }
     ui.separator();
     let cols = model.device.cols.max(1);
     let rows = model.device.rows.max(1);
@@ -5530,7 +5583,6 @@ fn paint_device(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.label(RichText::new("Clock Regions").strong());
     let regions = model.device.clock_regions.clone();
 
     let selected = model.selected.clone();
@@ -5539,29 +5591,51 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
         ui.label("No clock regions on this die.");
         return;
     }
-    // Narrow or short pane: two complete lines. Never one overflowing "Occupied…" clip.
+    // Narrow or short: one complete line per region, whole-row height, then scroll.
+    // Never a two-line block that slices "Occupied" mid-row or crushes the die.
+    let screen = ui.ctx().screen_rect();
     let pane_w = ui.clip_rect().width().min(ui.max_rect().width()).min(ui.available_width());
-    let short_window = ui.ctx().screen_rect().height() < 540.0;
-    if pane_w < 720.0 || short_window {
-        let shown = if short_window { 1 } else { regions.len() };
-        for (i, cr) in regions.iter().enumerate().take(shown) {
+    let floor = chrome::device_window_narrow(screen.width())
+        || chrome::device_window_short(screen.height())
+        || pane_w < 720.0;
+    if floor {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add_sized(
+            [ui.available_width().max(160.0), chrome::DEVICE_CR_HEAD_H],
+            egui::Label::new(RichText::new("Clock Regions").strong()),
+        );
+        for (i, cr) in regions.iter().enumerate() {
             let sites = cr.site_count(&model.device.sites);
             let occ = cr.occupied_count(&model.device.sites);
             let on = selected.as_deref() == Some(cr.name.as_str());
-            let line1 = format!("{}   X0={}  Y0={}  X1={}  Y1={}", cr.name, cr.x0, cr.y0, cr.x1, cr.y1);
-            let line2 = format!("Sites={}  Occupied={}", sites, occ);
-            if ui.selectable_label(on, line1).clicked() {
-                pick = Some(i.to_string());
-            }
-            if ui.selectable_label(on, line2).clicked() {
-                pick = Some(i.to_string());
-            }
+            let line = format!(
+                "{}   X0={}  Y0={}  X1={}  Y1={}   Sites={}  Occupied={}",
+                cr.name, cr.x0, cr.y0, cr.x1, cr.y1, sites, occ
+            );
+            let row_w = line.chars().count() as f32 * 7.2 + 24.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(row_w, chrome::DEVICE_CR_ROW_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    if ui
+                        .add_sized(
+                            [row_w, chrome::DEVICE_CR_ROW_H],
+                            egui::SelectableLabel::new(on, line),
+                        )
+                        .clicked()
+                    {
+                        pick = Some(i.to_string());
+                    }
+                },
+            );
         }
         if let Some(spec) = pick {
             let _ = model.select_clock_region(&spec);
         }
         return;
     }
+    ui.label(RichText::new("Clock Regions").strong());
     data_scroll("ug893_clock_regions_scroll").show(ui, |ui| {
     egui::Grid::new("ug893_clock_regions")
         .spacing([8.0, 4.0])
