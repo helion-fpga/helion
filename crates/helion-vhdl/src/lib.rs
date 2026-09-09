@@ -15,16 +15,68 @@ pub fn synth_vhdl(source: &str) -> Result<Design, String> {
         eprintln!(
             "diagnostic sim_only module={name} (OSVVM test harness; external entity not ingested; not a LUT; not a closed WNS)"
         );
-        let mut d = Design::new(&name);
-        d.attrs.set("SIM_ONLY", "1");
-        d.attrs.set("NO_BODY", "1");
-        return Ok(d);
+        return Ok(empty_named(name));
+    }
+    if let Some((kind, name)) = banner_hang_module(source) {
+        // Banner-only 90s kills: vendor IP wrapper, or a record/package
+        // type the parser would walk forever. One line. Not a LUT.
+        // Not a vendor product. Not a closed WNS.
+        let why = match kind {
+            "vendor_wrapper" => "vendor IP wrapper; not ingested; not a LUT; not a closed WNS",
+            _ => "record or package type; not bit-blasted; not a LUT; not a closed WNS",
+        };
+        eprintln!("diagnostic {kind} module={name} ({why})");
+        return Ok(empty_named(name));
     }
     let sv = vhdl_to_sv(source)?;
     helion_sv::synth_sv(&sv, "vhdl.sv")
 }
 
 /// OSVVM clock/reset harness or library-qualified AXI testbench. Not synth RTL.
+fn empty_named(name: String) -> Design {
+    let mut d = Design::new(&name);
+    d.attrs.set("SIM_ONLY", "1");
+    d.attrs.set("NO_BODY", "1");
+    d
+}
+
+/// Files that previously printed a banner and then died at 90s.
+/// Vendor wrapper: IP-packaging / AXI bridge shell. Record: `is record`
+/// or a package bus record (`bus_req_t`). Do not elaborate either.
+fn banner_hang_module(source: &str) -> Option<(&'static str, String)> {
+    let low = source.to_ascii_lowercase();
+    let name = first_entity_is(source).or_else(|| last_entity_is(source))?;
+    if low.contains("ip packaging") || low.contains("xbus2axi4") {
+        return Some(("vendor_wrapper", name));
+    }
+    if low.contains("is record") || low.contains("bus_req_t") || low.contains("bus_rsp_t") {
+        return Some(("record_type", name));
+    }
+    None
+}
+
+fn first_entity_is(source: &str) -> Option<String> {
+    let low = source.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(rel) = low[search..].find("entity ") {
+        let at = search + rel + "entity ".len();
+        let rest = source.get(at..)?.trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let after = rest.get(name.len()..)?.trim_start();
+        if !name.is_empty() && after.to_ascii_lowercase().starts_with("is") {
+            return Some(name);
+        }
+        search = at;
+        if search >= source.len() {
+            break;
+        }
+    }
+    None
+}
+
 fn osvvm_harness_module(source: &str) -> Option<String> {
     let low = source.to_ascii_lowercase();
     if !(low.contains("osvvm") || low.contains("createclock")) {
