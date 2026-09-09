@@ -1856,6 +1856,8 @@ impl SchematicView {
         const PIN_PITCH: f32 = 22.0;
         const HEADER: f32 = 24.0;
         const FOOTER: f32 = 20.0;
+        // Pin/cell name band under the box so a bottom label is part of the symbol.
+        const LABEL_BELOW: f32 = 16.0;
         const MARGIN: f32 = 40.0;
         const STUB: f32 = 16.0;
         const TRACK: f32 = 8.0;
@@ -1927,7 +1929,7 @@ impl SchematicView {
                 let ins: Vec<&SchematicPin> = pins.iter().filter(|p| !p.output).collect();
                 let outs: Vec<&SchematicPin> = pins.iter().filter(|p| p.output).collect();
                 let slots = ins.len().max(outs.len()).max(1);
-                let h = HEADER + slots as f32 * PIN_PITCH + FOOTER;
+                let h = HEADER + slots as f32 * PIN_PITCH + FOOTER + LABEL_BELOW;
                 let mut geom = Vec::new();
                 for (k, pin) in ins.iter().enumerate() {
                     geom.push(SchematicPinGeom {
@@ -2138,7 +2140,15 @@ impl SchematicView {
             );
         let height = symbols
             .iter()
-            .map(|s| s.y + s.h + MARGIN)
+            .map(|s| {
+                // Include a pin name that hangs below the box, not just the stroke.
+                let pin_below = s
+                    .pins
+                    .iter()
+                    .map(|p| p.y + 12.0)
+                    .fold(s.y + s.h, f32::max);
+                pin_below + MARGIN
+            })
             .fold(240.0f32, f32::max)
             .max(
                 wires
@@ -18212,6 +18222,64 @@ impl IdeModel {
         }
     }
 
+    /// View bind of clock input ports onto unused HAD IOB sites.
+    /// Clock ports are `PortDir::In` names that match create_clock / timing
+    /// clock names and have no packed IOB. Reads `dev.iob_sites()` and
+    /// skips every `(x, y)` already in `pl.iob_sites`. Does not change pack,
+    /// place, route, or STA.
+    fn clock_port_view_sites(&self) -> Vec<(String, u32, u32)> {
+        let Some(d) = self.shell.session.design.as_ref() else {
+            return Vec::new();
+        };
+        let Some(pl) = self.shell.session.placed.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(dev) = self.device() else {
+            return Vec::new();
+        };
+        let mut names = HashSet::new();
+        for c in self.clocks_for_sta() {
+            if !c.name.is_empty() {
+                names.insert(c.name);
+            }
+            if !c.source.is_empty() {
+                names.insert(c.source);
+            }
+        }
+        if let Some(t) = self.timing.as_ref() {
+            for c in &t.clocks {
+                if !c.name.is_empty() {
+                    names.insert(c.name.clone());
+                }
+                if !c.source.is_empty() {
+                    names.insert(c.source.clone());
+                }
+            }
+        }
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let mut used: HashSet<(u32, u32)> = pl.iob_sites.iter().map(|s| (s.x, s.y)).collect();
+        let mut out = Vec::new();
+        for p in &d.ports {
+            if p.dir != PortDir::In || !names.contains(&p.name) {
+                continue;
+            }
+            let packed = pl.packed.iobs.iter().any(|iob| {
+                iob.cell == p.name || iob.cell.contains(&p.name)
+            });
+            if packed {
+                continue;
+            }
+            let Some(site) = dev.iob_sites().find(|s| !used.contains(&(s.x, s.y))) else {
+                break;
+            };
+            used.insert((site.x, site.y));
+            out.push((p.name.clone(), site.x, site.y));
+        }
+        out
+    }
+
     fn refresh_device(&mut self) {
         let Ok(dev) = self.device() else {
             self.device = DeviceView::default();
@@ -18229,6 +18297,12 @@ impl IdeModel {
                     occupants.push(((site.x, site.y), iob.cell.clone()));
                 }
             }
+        }
+        for (name, x, y) in self.clock_port_view_sites() {
+            if occupants.iter().any(|((ox, oy), _)| *ox == x && *oy == y) {
+                continue;
+            }
+            occupants.push(((x, y), name));
         }
         let bram: HashSet<(u32, u32)> = dev.bram_sites().map(|s| (s.x, s.y)).collect();
         let dsp: HashSet<(u32, u32)> = dev.dsp_sites().map(|s| (s.x, s.y)).collect();
@@ -18350,6 +18424,11 @@ impl IdeModel {
                 .map(|(s, i)| (i.cell.clone(), format!("IOB_X{}Y{}", s.x, s.y)))
                 .collect::<Vec<_>>()
         });
+        let clock_sites: HashMap<String, String> = self
+            .clock_port_view_sites()
+            .into_iter()
+            .map(|(name, x, y)| (name, format!("IOB_X{x}Y{y}")))
+            .collect();
         self.io_ports = d
             .ports
             .iter()
@@ -18408,7 +18487,8 @@ impl IdeModel {
                             None
                         }
                     })
-                });
+                })
+                .or_else(|| clock_sites.get(&p.name).cloned());
                 IoPortView {
                     name: p.name.clone(),
                     dir: dir.into(),
@@ -26715,6 +26795,25 @@ endmodule
             .cloned()
             .expect("led");
         assert!(led.site.as_deref().unwrap_or("").starts_with("IOB_"), "{led:?}");
+        let clk = ide
+            .io_port_rows()
+            .iter()
+            .find(|p| p.name == "clk")
+            .cloned()
+            .expect("clk");
+        let clk_site = clk.site.clone().expect("clk view-binds an unused HAD IOB");
+        assert!(
+            clk_site.starts_with("IOB_"),
+            "clk must not stay unplaced: {clk:?}"
+        );
+        assert_ne!(Some(clk_site.as_str()), led.site.as_deref(), "clk must not steal led");
+        assert!(
+            ide.device
+                .sites
+                .iter()
+                .any(|s| s.kind == SiteKind::Iob && s.occupant.as_deref() == Some("clk")),
+            "clk occupies the view-bound IOB, not a packed cell"
+        );
         ide.exec("set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]")
             .unwrap();
         let loc = ide.exec("select_io_port led").unwrap();

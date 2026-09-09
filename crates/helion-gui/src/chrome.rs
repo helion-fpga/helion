@@ -638,6 +638,23 @@ pub fn schematic_frame_pan(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32, zoom: f
     ((vw - sheet_w.max(1.0) * z) * 0.5, (vh - sheet_h.max(1.0) * z) * 0.5)
 }
 
+/// Identity camera whose sheet bottom (full cell, including a name under the box)
+/// falls outside the pane. Zoom Fit then frames that bottom; a user pan/zoom is left alone.
+pub fn schematic_identity_clips_bottom(
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    sheet_h: f32,
+    vh: f32,
+) -> bool {
+    let identity = (zoom - 1.0).abs() < 0.02 && pan_x.abs() < 0.5 && pan_y.abs() < 0.5;
+    if !identity {
+        return false;
+    }
+    let z = if zoom.is_finite() { zoom.max(0.05) } else { 1.0 };
+    pan_y + sheet_h.max(1.0) * z > vh - 2.0
+}
+
 /// Device sidebar port line. Site is the full HAD name (`IOB_X17Y0`), never ellipsized.
 pub fn device_io_site_line(name: &str, dir: &str, site: &str) -> String {
     let site = if site.is_empty() || site == "-" {
