@@ -711,6 +711,81 @@ pub fn pane_view_h(avail_h: f32) -> f32 {
     avail_h.max(1.0)
 }
 
+/// Narrow Device window: tables and legend floor, then scroll sideways.
+pub const DEVICE_NARROW_W: f32 = 1100.0;
+/// Short Device window: clock-region table floors on whole rows; leftover is Zoom Fit.
+pub const DEVICE_SHORT_H: f32 = 540.0;
+/// Die leftover on a narrow window. A few pixels is a crushed sliver.
+pub const DEVICE_DIE_MIN_H: f32 = 168.0;
+/// One legend / table row. Viewport heights are multiples of this so a row is not sliced.
+pub const DEVICE_LEGEND_ROW_H: f32 = 22.0;
+pub const DEVICE_TABLE_FLOOR_H: f32 = 92.0;
+pub const DEVICE_CR_HEAD_H: f32 = 22.0;
+pub const DEVICE_CR_ROW_H: f32 = 22.0;
+
+pub fn device_window_narrow(window_w: f32) -> bool {
+    window_w < DEVICE_NARROW_W
+}
+
+pub fn device_window_short(window_h: f32) -> bool {
+    window_h < DEVICE_SHORT_H
+}
+
+/// Clock-region viewport: heading plus whole rows only.
+pub fn clock_region_viewport_h(visible_rows: u32) -> f32 {
+    DEVICE_CR_HEAD_H + DEVICE_CR_ROW_H * visible_rows.max(1) as f32
+}
+
+/// How the Device pane under the legend is split.
+/// Narrow: tables floor then scroll horizontally; die keeps a usable height.
+/// Short: clock-region table floors on whole rows and scrolls; leftover is Zoom Fit.
+/// Wide: tables take a share; the die fills leftover (unchanged).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceBandShare {
+    pub narrow: bool,
+    pub short: bool,
+    pub tables_h: f32,
+    pub clock_h: f32,
+    pub die_min_h: f32,
+}
+
+pub fn device_band_share(window_w: f32, window_h: f32, after_legend: f32) -> DeviceBandShare {
+    let narrow = device_window_narrow(window_w);
+    let short = device_window_short(window_h);
+    let after = after_legend.max(1.0);
+    if !narrow && !short {
+        let share = share_available(window_w, window_h);
+        let die_reserve = share.canvas_floor_h.min(after * 0.62).max(56.0);
+        let tables_h = share.tables_max_h.min((after - die_reserve).max(40.0));
+        return DeviceBandShare {
+            narrow,
+            short,
+            tables_h,
+            clock_h: 168.0,
+            die_min_h: die_reserve,
+        };
+    }
+    let cr_rows = if short { 1 } else { 2 };
+    let clock_h = clock_region_viewport_h(cr_rows);
+    let tables_floor = if short { 72.0 } else { DEVICE_TABLE_FLOOR_H };
+    let die_want = if short {
+        // Leftover after the floors is Zoom Fit. Do not invent a slab past that leftover.
+        (after - tables_floor - clock_h - 10.0).clamp(64.0, after)
+    } else {
+        DEVICE_DIE_MIN_H.min((after * 0.50).max(120.0))
+    };
+    let tables_h = tables_floor.min((after - clock_h - die_want - 8.0).max(48.0));
+    let die_left = (after - tables_h - clock_h - 8.0).max(1.0);
+    DeviceBandShare {
+        narrow,
+        short,
+        tables_h,
+        clock_h,
+        die_min_h: die_left,
+    }
+}
+
+
 /// Remaining-pane fill bar (Program / Package / Schematic / Hierarchy / IP drawings).
 pub const PANE_FILL_MIN: f32 = 0.80;
 pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
@@ -1160,6 +1235,32 @@ mod tests {
         assert!(px + 0.5 >= 0.0, "PORT_IN must stay inside, pan={px}");
         assert!(device_io_site_line_fits("led", "OUT", "IOB_X31Y16", SIDEBAR_WIDTH - 16.0));
         assert!(!device_io_site_line("led", "OUT", "IOB_X31Y16").contains('…'));
+        let narrow_band = device_band_share(920.0, 620.0, 360.0);
+        assert!(narrow_band.narrow && !narrow_band.short);
+        assert!(
+            narrow_band.die_min_h >= 120.0,
+            "narrow die must stay usable, got {}",
+            narrow_band.die_min_h
+        );
+        assert!(narrow_band.tables_h <= DEVICE_TABLE_FLOOR_H + 0.5);
+        assert_eq!(narrow_band.clock_h, clock_region_viewport_h(2));
+        assert_eq!(
+            clock_region_viewport_h(2) - DEVICE_CR_HEAD_H,
+            DEVICE_CR_ROW_H * 2.0
+        );
+        let short_band = device_band_share(1120.0, 490.0, 240.0);
+        assert!(short_band.short && !short_band.narrow);
+        assert_eq!(short_band.clock_h, clock_region_viewport_h(1));
+        let (short_die_w, short_die_h) =
+            floorplan_zoom_content(32, 33, 700.0, short_band.die_min_h, 1.0);
+        assert!(
+            short_die_h <= short_band.die_min_h + 1.0,
+            "short leftover must Zoom Fit, not a clipped 100% band, h={short_die_h}"
+        );
+        assert!(short_die_w <= 700.0 + 1.0);
+        let wide_band = device_band_share(1270.0, 630.0, 400.0);
+        assert!(!wide_band.narrow && !wide_band.short);
+        assert!(wide_band.die_min_h >= 56.0);
         let wide = share_available(1600.0, 900.0);
         let narrow = share_available(780.0, 700.0);
         let short = share_available(1200.0, 420.0);
