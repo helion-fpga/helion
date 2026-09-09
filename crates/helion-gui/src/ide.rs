@@ -6506,7 +6506,8 @@ impl IdeModel {
         self.load_rtl_source(&rtl_s);
 
         // Prefer project constraint files over sibling auto-load: mark user_sdc after.
-        let msg = self.run_step_from(FlowStep::Synthesis, Some(rtl))?;
+        // Synth via the `.prj` path so multi-file + `top` elaborate together (SERV / multi).
+        let msg = self.run_step_from(FlowStep::Synthesis, Some(path.to_path_buf()))?;
 
         let mut n_xdc = 0usize;
         for cf in &prj.constraint_files {
