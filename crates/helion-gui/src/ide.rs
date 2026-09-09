@@ -25384,6 +25384,59 @@ endmodule
         assert!(ap2.contains("net=cnt_3"), "{ap2}");
     }
 
+    /// FM-HEL-CONT one-flow: marked cnt_3 → Add Probe → Program sim → Arm/Capture → filled ILA bits.
+    /// Mirrors HELION_FLOW=implement (no write_bitstream) then the Program/ILA dashboard path.
+    #[test]
+    fn mark_add_probe_program_sim_ila_arm_one_flow() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        // Same as HELION_FLOW=implement: synth→opt→place→route, no bitstream yet.
+        ide.implement().unwrap();
+        assert!(ide.shell.session.bitstream.is_none(), "implement leaves bitstream for Program");
+
+        let r = ide.exec("select_device_route cnt_3").unwrap();
+        assert!(r.contains("net=cnt_3"), "{r}");
+        assert!(ide.exec("mark_debug").unwrap().contains("cnt_3"));
+
+        let ap = ide.exec("add_probe").unwrap();
+        assert!(ap.contains("net=cnt_3"), "{ap}");
+        assert_eq!(ide.ila.net, "cnt_3");
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        assert_eq!(ide.default_ila_probe(), "cnt_3");
+
+        let prog = ide.exec("program_hw").unwrap();
+        assert!(
+            prog.contains("DONE=1") || prog.contains("backend=sim"),
+            "Program sim must leave fabric ready: {prog}"
+        );
+        assert!(ide.hw.programmed || ide.shell.session.programmed, "programmed after sim");
+        assert!(ide.hw.open || ide.shell.session.hw_open, "hw manager open");
+
+        ide.exec("ila_window 16").unwrap();
+        ide.exec("ila_trigger rising").unwrap();
+        let arm = ide.exec("ila_arm").unwrap();
+        assert!(arm.contains("net=cnt_3"), "Add Probe must bind Arm default: {arm}");
+        assert!(arm.contains("samples=16"), "{arm}");
+        assert_eq!(ide.ila.bits.len(), 16);
+        assert!(
+            ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
+            "ILA waveform filled bits for cnt_3: {}",
+            ide.ila.bits
+        );
+        assert_eq!(
+            ide.ila.bits, "0000000111111110",
+            "cnt_3 MSB gold window=16: {}",
+            ide.ila.bits
+        );
+        assert_eq!(ide.ila.trigger_at, Some(7), "rising at first 0→1");
+        assert!(
+            ide.wave.has_trace("ila:cnt_3"),
+            "wave must show ila:cnt_3: {:?}",
+            ide.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+    }
+
     /// UG900 ILA dashboard: trigger/window from fabric samples on the wave, not a lamp.
     #[test]
     fn ila_dashboard_trigger_window_from_fabric_samples() {
