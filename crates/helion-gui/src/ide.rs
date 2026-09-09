@@ -6333,6 +6333,8 @@ impl IdeModel {
                 last = self.run_step(step)?;
             }
         }
+        // Land on Zoom Fit so a previous zoom-in does not leave the die scrolled off.
+        let _ = self.device_zoom_fit();
         if last.is_empty() {
             Ok("implement already done".into())
         } else {
