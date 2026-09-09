@@ -1360,7 +1360,7 @@ mod tests {
         assert_eq!(HIT_COMFORT, 36.0);
         assert_eq!(TOOLBAR_CTRL_H, HIT_COMFORT);
         assert_eq!(flow_chip_size()[1], HIT_COMFORT);
-        for label in ["Open…", "Bitstream", "Implement", "Implementing…"] {
+        for label in ["New Project…", "Open…", "Bitstream", "Implement", "Implementing…"] {
             let s = toolbar_ctrl_size(label);
             assert_eq!(s[1], HIT_COMFORT, "{label} height");
             assert!(s[0] >= 72.0, "{label} width {}", s[0]);

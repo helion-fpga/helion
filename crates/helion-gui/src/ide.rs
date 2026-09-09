@@ -15,7 +15,7 @@ use helion_drc::{check_placed, check_routed, Drc, DrcSeverity};
 use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_ipxact::{catalog as ipxact_catalog, to_xml, IpCore};
-use helion_proj::{get_cells, get_nets, ImplStrategy, Mode, ReuseReport, Session};
+use helion_proj::{expand_ip_packages, format_prj, get_cells, get_nets, load_prj, resolve_prj_path, ImplStrategy, Mode, ProjectFile, ReuseReport, Session};
 use helion_sim::{Sim, SimLocal};
 use helion_sta::{
     clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
@@ -6318,12 +6318,171 @@ impl IdeModel {
 
     /// Add an RTL source and elaborate it (Vivado "Add Sources" + synth).
     pub fn open_source(&mut self, path: &Path) -> Result<String, String> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "prj" {
+            return self.open_project(path);
+        }
         let p = path.to_string_lossy().into_owned();
         if !self.tree.sources.contains(&p) {
             self.tree.sources.push(p.clone());
         }
         self.load_rtl_source(&p);
         self.run_step_from(FlowStep::Synthesis, Some(PathBuf::from(path)))
+    }
+
+    /// Open a Helion `.prj` (part / read_sv / read_xdc). Registers RTL + constraints
+    /// and synthesizes so Implement can place+route.
+    pub fn open_project(&mut self, path: &Path) -> Result<String, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("open_project {}: {e}", path.display()))?;
+        let mut prj = load_prj(&text)?;
+        let _ = expand_ip_packages(&mut prj, path)?;
+        self.set_part(&prj.part)?;
+
+        let mut rtl_paths: Vec<PathBuf> = Vec::new();
+        for src in &prj.sources {
+            let resolved = resolve_prj_path(path, src);
+            if !resolved.exists() {
+                return Err(format!(
+                    "open_project: source {src} not found (tried {})",
+                    resolved.display()
+                ));
+            }
+            let s = resolved.to_string_lossy().into_owned();
+            if !self.tree.sources.contains(&s) {
+                self.tree.sources.push(s.clone());
+            }
+            if is_rtl_source(&s) {
+                rtl_paths.push(resolved);
+            }
+        }
+        let rtl = rtl_paths
+            .last()
+            .cloned()
+            .ok_or_else(|| "open_project: no RTL sources in project".to_string())?;
+        let rtl_s = rtl.to_string_lossy().into_owned();
+        self.selected_source = Some(rtl_s.clone());
+        self.load_rtl_source(&rtl_s);
+
+        // Prefer project constraint files over sibling auto-load: mark user_sdc after.
+        let msg = self.run_step_from(FlowStep::Synthesis, Some(rtl))?;
+
+        let mut n_xdc = 0usize;
+        for cf in &prj.constraint_files {
+            let resolved = resolve_prj_path(path, cf);
+            if !resolved.exists() {
+                return Err(format!(
+                    "open_project: constraint {cf} not found (tried {})",
+                    resolved.display()
+                ));
+            }
+            match self.read_xdc_path(&resolved.to_string_lossy()) {
+                Ok(_) => n_xdc += 1,
+                Err(e) => {
+                    // Empty constraint file is not fatal; keep sibling/default clocks.
+                    eprintln!("open_project read_xdc skip: {e}");
+                }
+            }
+        }
+        // Inline create_clock lines from the .prj itself.
+        if !prj.sdc.is_empty() {
+            let blob = prj.sdc.join("
+");
+            if let Ok(extra) = load_xdc(&blob) {
+                let n = extra.clocks.len();
+                self.merge_constraints(extra);
+                if n > 0 {
+                    self.user_sdc = true;
+                }
+            }
+        }
+
+        Ok(format!(
+            "open_project {} part={} sources={} constraints={n_xdc} {msg}",
+            path.display(),
+            self.part(),
+            rtl_paths.len()
+        ))
+    }
+
+    /// Create a Helion project directory + `.prj`, then [`open_project`].
+    /// `sources` / `constraints` are absolute or CWD-relative paths the user picked.
+    pub fn create_project(
+        &mut self,
+        name: &str,
+        directory: &Path,
+        part: &str,
+        sources: &[PathBuf],
+        constraints: &[PathBuf],
+    ) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("create_project: project name required".into());
+        }
+        if name.contains('/') || name.contains('\\') || name.contains('\0') {
+            return Err("create_project: name must be a single path segment".into());
+        }
+        if sources.is_empty() {
+            return Err("create_project: add at least one RTL source (.sv/.v/.vhd)".into());
+        }
+        let part = if part.trim().is_empty() {
+            "HL10T-C32-1"
+        } else {
+            part.trim()
+        };
+        // Validate part early.
+        let _ = Device::load_part(part)?;
+
+        let proj_dir = directory.join(name);
+        std::fs::create_dir_all(&proj_dir)
+            .map_err(|e| format!("create_project mkdir {}: {e}", proj_dir.display()))?;
+        let prj_path = proj_dir.join(format!("{name}.prj"));
+
+        let mut pf = ProjectFile {
+            part: part.to_string(),
+            ..Default::default()
+        };
+        for s in sources {
+            if !s.exists() {
+                return Err(format!("create_project: source not found: {}", s.display()));
+            }
+            let abs = std::fs::canonicalize(s).unwrap_or_else(|_| s.clone());
+            let ss = abs.to_string_lossy().into_owned();
+            if !is_rtl_source(&ss) {
+                return Err(format!(
+                    "create_project: not an RTL source: {}",
+                    s.display()
+                ));
+            }
+            pf.sources.push(ss);
+        }
+        for c in constraints {
+            if !c.exists() {
+                return Err(format!(
+                    "create_project: constraint not found: {}",
+                    c.display()
+                ));
+            }
+            let abs = std::fs::canonicalize(c).unwrap_or_else(|_| c.clone());
+            pf.constraint_files
+                .push(abs.to_string_lossy().into_owned());
+        }
+
+        let mut commented = String::new();
+        commented.push_str(&format!("# Helion project — {name}\n"));
+        commented.push_str(&format_prj(&pf));
+        std::fs::write(&prj_path, &commented)
+            .map_err(|e| format!("create_project write {}: {e}", prj_path.display()))?;
+
+        let opened = self.open_project(&prj_path)?;
+        Ok(format!(
+            "create_project {} {opened}",
+            prj_path.display()
+        ))
     }
 
     /// Run one rail step. Refuses to run out of order — Route before Place is an error,
@@ -33318,6 +33477,51 @@ endmodule
             pb.english_range()
         );
         assert!(pb.range_text().starts_with("CLB_X"), "Tcl console keeps CLB_X");
+    }
+
+    #[test]
+    fn create_project_wizard_loads_counter_and_wns_9640() {
+        let sv = example("counter.sv");
+        let sdc = example("counter.sdc");
+        assert!(sv.is_file(), "{}", sv.display());
+        assert!(sdc.is_file(), "{}", sdc.display());
+        let dir = std::env::temp_dir().join(format!("helion-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ide = IdeModel::new();
+        let out = ide
+            .create_project(
+                "counter_wiz",
+                &dir,
+                "HL10T-C32-1",
+                &[sv],
+                &[sdc],
+            )
+            .expect("create_project");
+        assert!(out.contains("create_project"), "{out}");
+        let prj = dir.join("counter_wiz/counter_wiz.prj");
+        assert!(prj.is_file(), "missing {}", prj.display());
+        let body = std::fs::read_to_string(&prj).unwrap();
+        assert!(body.contains("part HL10T-C32-1"), "{body}");
+        assert!(body.contains("read_sv"), "{body}");
+        assert!(body.contains("read_xdc"), "{body}");
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sv")),
+            "{:?}",
+            ide.tree.sources
+        );
+        assert_eq!(ide.part(), "HL10T-C32-1");
+        assert!(ide.user_sdc, "project SDC must load");
+        ide.implement().expect("implement");
+        let timing = ide.exec("report_timing").expect("report_timing");
+        let wns: i64 = timing
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("WNS_PS="))
+            .expect("WNS_PS=")
+            .parse()
+            .expect("numeric WNS");
+        assert_eq!(wns, 9640, "create_project counter must hold gold WNS: {timing}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
