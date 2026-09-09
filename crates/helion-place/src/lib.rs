@@ -959,7 +959,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
 
 /// UG893 floorplanning: place into a Pblock rectangle (CLB_XxYy:CLB_XxYy).
 /// Hits the same site picker as `place_with`, then relocates LUTFF (and IOB if
-/// the rectangle covers HAD IOB rows) into the region.
+/// the rectangle covers HAD IOB rows) into the region. IOB cells with a LOC /
+/// PACKAGE_PIN keep their pin — fabric pblocks must not displace gold IOBs.
 pub fn place_in_region(
     packed: &Packed,
     dev: &Device,
@@ -996,6 +997,11 @@ pub fn place_in_region(
     if !iobs.is_empty() {
         iobs.sort_by_key(|s| (s.x, s.y));
         for (i, slot) in placed.iob_sites.iter_mut().enumerate() {
+            // Keep PACKAGE_PIN / LOC from place_with — pblock fabric move must
+            // not displace gold IOB sites (clk=IOB_X3Y0, led=IOB_X2Y0).
+            if packed.iobs.get(i).and_then(|io| io.loc.as_ref()).is_some() {
+                continue;
+            }
             *slot = iobs[i.min(iobs.len() - 1)];
         }
     }
