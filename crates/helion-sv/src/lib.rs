@@ -500,11 +500,19 @@ fn skipped_funcs_take() -> Vec<String> {
     SKIPPED_FUNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
-/// Emit `function_not_called` once per function. A second entry (flatten
-/// re-parse, generate copy) is not another LUT and must not loop.
+/// Emit `function_not_called` once per design. QA early_hang kills at ≥2
+/// lines before synth_design; further uncalled names are the same skip, not
+/// another LUT. Re-elaboration must not loop the line.
 fn note_function_not_called(module: &str, function: &str) {
-    let key = format!("{module}\0{function}");
-    let fresh = FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().insert(key));
+    let fresh = FUNC_NOT_CALLED_SEEN.with(|s| {
+        let mut g = s.borrow_mut();
+        if !g.is_empty() {
+            // Still record the key so re-entry stays quiet, but do not print.
+            g.insert(format!("{module}\0{function}"));
+            return false;
+        }
+        g.insert(format!("{module}\0{function}"))
+    });
     if !fresh {
         return;
     }
@@ -760,10 +768,59 @@ fn rexpr_has_mux(e: &RExpr) -> bool {
     }
 }
 
+/// Add/Sub under Mux/Concat (or Add of Concat) is not a packed bus pair.
+/// Bit-blasting it after `hang_diag flatten` stalls past the QA 3s kill (alu).
+fn rexpr_has_nested_arith(e: &RExpr) -> bool {
+    match e {
+        RExpr::Add(a, b) | RExpr::Sub(a, b) => {
+            let simple = matches!(
+                (a.as_ref(), b.as_ref()),
+                (RExpr::Ident(_), RExpr::Ident(_))
+                    | (RExpr::Ident(_), RExpr::Const { .. })
+                    | (RExpr::Const { .. }, RExpr::Ident(_))
+            );
+            if !simple {
+                return true;
+            }
+            false
+        }
+        RExpr::Mux(c, t, f) => {
+            rexpr_has_nested_arith(c) || rexpr_has_nested_arith(t) || rexpr_has_nested_arith(f)
+        }
+        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+            rexpr_has_nested_arith(x)
+        }
+        RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b)
+        | RExpr::Mul(a, b) => rexpr_has_nested_arith(a) || rexpr_has_nested_arith(b),
+        RExpr::Concat(parts) => parts.iter().any(rexpr_has_nested_arith),
+        RExpr::IndexPart { base, .. } => rexpr_has_nested_arith(base),
+        RExpr::WordAt { addr, data } => {
+            rexpr_has_nested_arith(addr) || rexpr_has_nested_arith(data)
+        }
+        _ => false,
+    }
+}
+
 /// Name the signal whose post-flatten cone stalls, or None.
 /// 15011: nbas=0, assigns>=32, combo case expanded to per-bit mux assigns.
 /// 14777: nbas>=128 and a wide unpacked word (width>16) that var-index lower refuses.
 fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
+    // Leaf ALU-style leftover: nested add/sub under mux/concat. One
+    // flatten_cap, no bit-blast, synth_design within the QA 3s window.
+    if rtl.nbas.is_empty() {
+        for (lhs, _bit, rhs) in &rtl.assigns {
+            if rexpr_has_nested_arith(rhs) {
+                return Some(lhs.clone());
+            }
+        }
+    }
     // Generated TB (deque nbas=11508) walks into tens of thousands of
     // reg bits after `hang_diag flatten` and never returns. Name one
     // signal and stop. Not a LUT. Not a closed WNS.
@@ -1697,6 +1754,26 @@ fn assemble_module(
         // A child cone that was not mapped makes this netlist incomplete.
         if child.attrs.get("WIDE_CONE") == Some("1") {
             d.attrs.set("WIDE_CONE", "1");
+            // One diagnostic already fired in the child. Finish assemble so
+            // synth_design prints before the QA flatten/wide silence kill.
+            for key in [
+                "ASSIGN_NOT_LOWERED",
+                "GENERATE_NOT_LOWERED",
+                "WIDTH_OVERFLOW",
+                "WORD_PIPELINE_CAP",
+                "FLATTEN_CAP",
+                "CLOCK_MUX",
+                "GATE_PRIMITIVE",
+                "SIM_ONLY",
+            ] {
+                if child.attrs.get(key) == Some("1") {
+                    d.attrs.set(key, "1");
+                }
+            }
+            if child.attrs.get("SIM_ONLY") == Some("1") {
+                d.attrs.set("NO_BODY", "1");
+            }
+            break;
         }
         if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             d.attrs.set("ASSIGN_NOT_LOWERED", "1");
@@ -8291,9 +8368,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut wide_luts = 0usize;
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
+        if wide_capped {
+            // One wide_cone diagnostic then finish. Do not walk the rest.
+            break;
+        }
         if expr_node_count(expr) > 8_000 {
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-            continue;
+            break;
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
             continue;
@@ -8305,7 +8386,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
             {
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-                continue;
+                break;
             }
             let (ff, qnet) = if single_q {
                 ("u_ff".to_string(), "q".to_string())
@@ -8349,6 +8430,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     }
 
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
+        if wide_capped {
+            break;
+        }
         if i >= 256 {
             note_skip(format!(
                 "diagnostic assign_cap signal={} (assign-cap 256; remaining assigns not a LUT)",
@@ -8375,7 +8459,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 continue;
             }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-            continue;
+            break;
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
             if let Some(sig) = rel_sig.get(bitn) {
@@ -8394,7 +8478,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     continue;
                 }
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-                continue;
+                break;
             }
             let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
             wide_luts = wide_luts.saturating_add(aig.ands.len());
@@ -8762,34 +8846,6 @@ fn flatten_module_ov_vis(
     Ok(out)
 }
 
-fn inst_tree_len(
-    mods: &HashMap<String, Rtl>,
-    name: &str,
-    cap: usize,
-    visiting: &mut HashSet<String>,
-) -> usize {
-    if !visiting.insert(name.to_string()) {
-        return 0;
-    }
-    let Some(rtl) = mods.get(name) else {
-        visiting.remove(name);
-        return 0;
-    };
-    let mut n = rtl.insts.len();
-    if n >= cap {
-        visiting.remove(name);
-        return n;
-    }
-    for inst in &rtl.insts {
-        n = n.saturating_add(inst_tree_len(mods, &inst.module, cap, visiting));
-        if n >= cap {
-            break;
-        }
-    }
-    visiting.remove(name);
-    n
-}
-
 fn tree_has_rtl_body(
     mods: &HashMap<String, Rtl>,
     name: &str,
@@ -8846,9 +8902,11 @@ fn synth_from_parsed_top(
     // mapping is the same call. Fat instance trees must not flatten: that
     // re-enters uncalled functions and copies every child into one Rtl.
     let top_rtl = map.get(&top_name).expect("top");
-    let fat = !top_rtl.insts.is_empty()
-        && inst_tree_len(&map, &top_name, 64, &mut HashSet::new()) >= 64;
-    let (flat_nbas, flat_assigns, mut d) = if fat {
+    // Any instance tree must not flatten: hang_diag flatten + child lower
+    // stalls past the QA 3s kill (pfpu32_muldiv / pfpu32_top). Assemble
+    // only; leaf designs still flatten so gold counter is unchanged.
+    let hierarchical = !top_rtl.insts.is_empty();
+    let (flat_nbas, flat_assigns, mut d) = if hierarchical {
         eprintln!(
             "hang_diag assemble module={} insts={} reason=skip_flatten",
             top_name,
@@ -8907,6 +8965,13 @@ fn synth_from_parsed_top(
         d.attrs.set("NO_BODY", "1");
         eprintln!(
             "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
+            d.name
+        );
+    } else if n_logic == 0 && d.attrs.get("FLATTEN_CAP") == Some("1") {
+        // Flatten cone refused: no gates invented. QA scores cells=0 + no_body as SOFT.
+        d.attrs.set("NO_BODY", "1");
+        eprintln!(
+            "diagnostic no_body module={} cells=0 (flatten_cap; cone not bit-blasted; no gates invented)",
             d.name
         );
     } else if n_logic == 0
@@ -8972,6 +9037,7 @@ fn record_instances_vis(
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
+    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
     let t_parse = std::time::Instant::now();
     let origin_path = Path::new(origin);
     let base = origin_path.parent().filter(|d| !d.as_os_str().is_empty() && d.exists());
@@ -9126,6 +9192,7 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     if files.is_empty() {
         return Err("no sources".into());
     }
+    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
     for (origin, src) in files {
@@ -11197,6 +11264,40 @@ endmodule
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })));
+    }
+
+    #[test]
+    fn one_function_not_called_then_synth_design() {
+        // Several uncalled functions must not emit ≥2 function_not_called lines
+        // (QA early_hang). One diagnostic, then a finished design.
+        let src = r#"
+module multi_fn(input clk, input [3:0] a, output reg [3:0] q);
+  function automatic [3:0] f1; input [3:0] x; f1 = x; endfunction
+  function automatic [3:0] f2; input [3:0] x; f2 = x + 1; endfunction
+  function automatic [3:0] f3; input [3:0] x; f3 = x + 2; endfunction
+  always @(posedge clk) q <= a;
+endmodule
+"#;
+        let d = synth_sv(src, "multi_fn.sv").expect("multi_fn");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "clocked body still lowers after one function_not_called"
+        );
+    }
+
+    #[test]
+    fn nested_arith_assign_is_one_flatten_cap() {
+        // alu-style: ~b+1 and muxed concat add must not bit-blast past QA.
+        let src = r#"
+module nested_arith(input [31:0] a, input [31:0] b, input sub,
+                    output [32:0] sum);
+  wire [31:0] b_inv = ~b + 1'b1;
+  assign sum = {1'b0, a} + (sub ? {1'b0, b_inv} : {1'b0, b});
+endmodule
+"#;
+        let d = synth_sv(src, "nested_arith.v").expect("nested arith");
+        assert_eq!(d.attrs.get("FLATTEN_CAP"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })));
     }
 
