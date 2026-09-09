@@ -1,0 +1,6 @@
+# FM-HEL-CONT: public PicoRV32 (RV32I) pin-wrap + user SDC
+part HL10T-C32-1
+read_sv third_party/picorv32/picorv32.v
+read_sv examples/pico_pin_wrap.sv
+top pico_pin_wrap
+read_xdc examples/pico.sdc

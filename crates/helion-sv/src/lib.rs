@@ -1749,56 +1749,60 @@ fn assemble_module(
             ));
             continue;
         }
+        // Pin-wrap mid-suite: parent already has closed FF paths (heartbeat)
+        // before stitching the child. Soft child cones stay named misses;
+        // prefer closed WNS on wrap heartbeat / mapped fabric.
+        let parent_has_hff = d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
         let child = assemble_module(mods, &inst.module, visiting)?;
         stitch_child(&mut d, &child, inst);
-        // A child cone that was not mapped makes this netlist incomplete.
-        if child.attrs.get("WIDE_CONE") == Some("1") {
-            d.attrs.set("WIDE_CONE", "1");
-            // One diagnostic already fired in the child. Finish assemble so
-            // synth_design prints before the QA flatten/wide silence kill.
-            for key in [
-                "ASSIGN_NOT_LOWERED",
-                "GENERATE_NOT_LOWERED",
-                "WIDTH_OVERFLOW",
-                "WORD_PIPELINE_CAP",
-                "FLATTEN_CAP",
-                "CLOCK_MUX",
-                "GATE_PRIMITIVE",
-                "SIM_ONLY",
-            ] {
-                if child.attrs.get(key) == Some("1") {
-                    d.attrs.set(key, "1");
-                }
-            }
-            if child.attrs.get("SIM_ONLY") == Some("1") {
-                d.attrs.set("NO_BODY", "1");
-            }
-            break;
-        }
-        if child.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
-            d.attrs.set("ASSIGN_NOT_LOWERED", "1");
-        }
-        if child.attrs.get("GENERATE_NOT_LOWERED") == Some("1") {
-            d.attrs.set("GENERATE_NOT_LOWERED", "1");
-        }
-        if child.attrs.get("WIDTH_OVERFLOW") == Some("1") {
-            d.attrs.set("WIDTH_OVERFLOW", "1");
-        }
-        if child.attrs.get("WORD_PIPELINE_CAP") == Some("1") {
-            d.attrs.set("WORD_PIPELINE_CAP", "1");
-        }
-        if child.attrs.get("FLATTEN_CAP") == Some("1") {
-            d.attrs.set("FLATTEN_CAP", "1");
-        }
+        let soft_keys = [
+            "WIDE_CONE",
+            "ASSIGN_NOT_LOWERED",
+            "GENERATE_NOT_LOWERED",
+            "WIDTH_OVERFLOW",
+            "WORD_PIPELINE_CAP",
+            "FLATTEN_CAP",
+            "GATE_PRIMITIVE",
+        ];
+        let child_soft = soft_keys.iter().any(|k| child.attrs.get(k) == Some("1"));
+        // Hard incompletes always poison (wrong user clock / empty sim body).
         if child.attrs.get("CLOCK_MUX") == Some("1") {
             d.attrs.set("CLOCK_MUX", "1");
         }
-        if child.attrs.get("GATE_PRIMITIVE") == Some("1") {
-            d.attrs.set("GATE_PRIMITIVE", "1");
+        if child.attrs.get("CLOCK_GATE") == Some("1") {
+            d.attrs.set("CLOCK_GATE", "1");
         }
         if child.attrs.get("SIM_ONLY") == Some("1") {
             d.attrs.set("SIM_ONLY", "1");
             d.attrs.set("NO_BODY", "1");
+        }
+        if child_soft && parent_has_hff {
+            eprintln!(
+                "diagnostic child_soft_incomplete module={} child={} (named miss; parent wrap keeps closed WNS on mapped paths)",
+                name, inst.module
+            );
+            continue;
+        }
+        // Flat / no-wrap parent: a child cone that was not mapped makes this
+        // netlist incomplete (do not invent closed WNS over soft fabric).
+        if child.attrs.get("WIDE_CONE") == Some("1") {
+            d.attrs.set("WIDE_CONE", "1");
+            // One diagnostic already fired in the child. Finish assemble so
+            // synth_design prints before the QA flatten/wide silence kill.
+            for key in soft_keys {
+                if child.attrs.get(key) == Some("1") {
+                    d.attrs.set(key, "1");
+                }
+            }
+            break;
+        }
+        for key in soft_keys {
+            if key == "WIDE_CONE" {
+                continue;
+            }
+            if child.attrs.get(key) == Some("1") {
+                d.attrs.set(key, "1");
+            }
         }
     }
     // Preserve (* mark_debug *) on parent wires driven by instance ports
