@@ -448,6 +448,14 @@ thread_local! {
     /// clocks is not one user clock and is not a closed WNS.
     static CLOCK_MUX_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// Negedge-only always writes. Not mixed into the posedge NBA cone.
+    /// (module, clk, signal, bit, optional RHS). None RHS cannot lower.
+    static NEGEDGE_WRITES: std::cell::RefCell<
+        Vec<(String, String, String, Option<usize>, Option<RExpr>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+    /// One `negedge_not_lowered` line per module+signal.
+    static NEGEDGE_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 fn skipped_funcs_clear() {
@@ -505,6 +513,7 @@ fn note_width_overflow() {
 fn clear_seq_notes() {
     SEQ_WRITES.with(|s| s.borrow_mut().clear());
     EDGE_CLK.with(|m| m.borrow_mut().clear());
+    NEGEDGE_WRITES.with(|s| s.borrow_mut().clear());
 }
 
 fn note_seq_write(module: &str, clk: &str, signal: &str) {
@@ -603,6 +612,158 @@ fn note_clock_mux(module: &str, signal: &str) {
 fn clock_mux_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     CLOCK_MUX_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+fn note_negedge_write(
+    module: &str,
+    clk: &str,
+    signal: &str,
+    bit: Option<usize>,
+    rhs: Option<RExpr>,
+) {
+    let module = if module.is_empty() { "?" } else { module };
+    let clk = if clk.is_empty() { "clk" } else { clk };
+    let signal = if signal.is_empty() { "always" } else { signal };
+    NEGEDGE_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.iter().any(|(m, _, sig, _, _)| m == module && sig == signal) {
+            v.push((
+                module.to_string(),
+                clk.to_string(),
+                signal.to_string(),
+                bit,
+                rhs,
+            ));
+        }
+    });
+}
+
+fn take_negedge_writes(module: &str) -> Vec<(String, String, Option<usize>, Option<RExpr>)> {
+    NEGEDGE_WRITES.with(|s| {
+        let mut v = s.borrow_mut();
+        let mut keep = Vec::new();
+        let mut out = Vec::new();
+        for (m, clk, sig, bit, rhs) in v.drain(..) {
+            if m == module {
+                out.push((clk, sig, bit, rhs));
+            } else {
+                keep.push((m, clk, sig, bit, rhs));
+            }
+        }
+        *v = keep;
+        out
+    })
+}
+
+/// Negedge-only always that did not become an Hff. One line. Not a closed WNS.
+fn note_negedge_not_lowered(module: &str, signal: &str) {
+    let module = if module.is_empty() { "?" } else { module };
+    let signal = if signal.is_empty() { "always" } else { signal };
+    let key = format!("{module}\0{signal}");
+    let fresh = NEGEDGE_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(key));
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic negedge_not_lowered module={module} signal={signal} (negedge always not mapped to an Hff; not a closed WNS)"
+    ));
+}
+
+/// D net of a negedge flop: a named bit or a 1-bit ident. No cone walk.
+fn negedge_d_net(rtl: &Rtl, signal: &str, bit: Option<usize>, rhs: &RExpr) -> Option<String> {
+    let w = sig_width(rtl, signal).max(1);
+    if bit.is_none() && w != 1 {
+        return None;
+    }
+    if bit.is_some() && bit != Some(0) && w == 1 {
+        return None;
+    }
+    match rhs {
+        RExpr::Ident(s) => {
+            let sw = sig_width(rtl, s).max(1);
+            if sw == 1 {
+                Some(bit_name(s, sw, 0))
+            } else {
+                None
+            }
+        }
+        RExpr::Bit(s, i) => {
+            let sw = sig_width(rtl, s).max(1);
+            if *i < sw {
+                Some(bit_name(s, sw, *i))
+            } else {
+                None
+            }
+        }
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ..
+        } if *width == 1 => {
+            let RExpr::Const { val, .. } = base.as_ref() else {
+                return None;
+            };
+            let sw = sig_width(rtl, name).max(1);
+            let i = *val as usize;
+            if i < sw {
+                Some(bit_name(name, sw, i))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn hff_q_is(d: &Design, signal: &str) -> bool {
+    d.cells.iter().any(|c| {
+        matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some(signal)
+    })
+}
+
+/// One Hff per negedge-only always when the write is a 1-bit flop on a named
+/// clock. Falling versus rising does not invent a WNS. Otherwise one diagnostic.
+fn lower_negedge_hffs(d: &mut Design, rtl: &Rtl) {
+    let writes = take_negedge_writes(&rtl.module);
+    for (clk, signal, bit, rhs) in writes {
+        if hff_q_is(d, &signal) && is_input_port(rtl, &clk) {
+            if let Some(ff) = d.cells.iter().find(|c| {
+                matches!(c.kind, CellKind::Hff)
+                    && d.net_on(&c.name, "Q") == Some(signal.as_str())
+                    && d.net_on(&c.name, "CLK") == Some(clk.as_str())
+            }) {
+                eprintln!(
+                    "hff_path cell={} CLK={} Q={}",
+                    ff.name, clk, signal
+                );
+                continue;
+            }
+        }
+        let Some(rhs) = rhs else {
+            note_negedge_not_lowered(&rtl.module, &signal);
+            continue;
+        };
+        if !is_input_port(rtl, &clk) {
+            note_negedge_not_lowered(&rtl.module, &signal);
+            continue;
+        }
+        let Some(dnet) = negedge_d_net(rtl, &signal, bit, &rhs) else {
+            note_negedge_not_lowered(&rtl.module, &signal);
+            continue;
+        };
+        let qnet = if bit.is_none() {
+            bit_name(&signal, sig_width(rtl, &signal).max(1), 0)
+        } else {
+            bit_name(&signal, sig_width(rtl, &signal).max(1), bit.unwrap_or(0))
+        };
+        let ff = format!("u_nff_{signal}");
+        d.add_cell(&ff, CellKind::Hff);
+        d.connect(&clk, &ff, "CLK");
+        d.connect(&dnet, &ff, "D");
+        d.connect(&qnet, &ff, "Q");
+        eprintln!("hff_path cell={ff} CLK={clk} D={dnet} Q={qnet}");
+    }
 }
 
 fn seq_clocks_of(module: &str) -> Vec<String> {
@@ -2934,27 +3095,39 @@ fn skip_until_arg_end(p: &mut P) {
     }
 }
 
-/// Skip `@...` sensitivity. Returns `(combo, edge clock)`.
+/// Skip `@...` sensitivity. Returns `(combo, edge clock, negedge_only)`.
 /// Combo is `@*` / `@(*)` (no edge). Async `posedge clk or negedge nreset`
 /// is treated like sync; the first edge name is the user's clock.
-fn skip_event_control(p: &mut P) -> (bool, Option<String>) {
+/// `negedge_only` is a lone falling edge — not mixed with posedge.
+fn skip_event_control(p: &mut P) -> (bool, Option<String>, bool) {
     let _ = p.eat_sym('@');
     if p.eat_sym('*') {
-        return (true, None);
+        return (true, None, false);
     }
     if p.eat_sym('(') {
         let start = p.i;
         if p.eat_sym('*') && matches!(p.peek(), Some(Tok::Sym(')'))) {
             p.bump();
-            return (true, None);
+            return (true, None, false);
         }
         p.i = start;
         let mut d = 1i32;
-        let mut has_edge = false;
+        let mut has_posedge = false;
+        let mut has_negedge = false;
         let mut clk = None;
         while d > 0 && p.peek().is_some() {
-            if p.eat_kw("posedge") || p.eat_kw("negedge") {
-                has_edge = true;
+            if p.eat_kw("posedge") {
+                has_posedge = true;
+                if clk.is_none() {
+                    if let Some(Tok::Ident(name)) = p.peek() {
+                        clk = Some(name.clone());
+                        p.bump();
+                    }
+                }
+                continue;
+            }
+            if p.eat_kw("negedge") {
+                has_negedge = true;
                 if clk.is_none() {
                     if let Some(Tok::Ident(name)) = p.peek() {
                         clk = Some(name.clone());
@@ -2970,9 +3143,10 @@ fn skip_event_control(p: &mut P) -> (bool, Option<String>) {
                 p.bump();
             }
         }
-        return (!has_edge, clk);
+        let has_edge = has_posedge || has_negedge;
+        return (!has_edge, clk, has_negedge && !has_posedge);
     }
-    (false, None)
+    (false, None, false)
 }
 
 fn skip_for_rest(p: &mut P) {
@@ -3951,7 +4125,7 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("always_ff") || p.eat_kw("always") || p.eat_kw("always_latch") {
-            let (combo, edge_clk) = skip_event_control(p);
+            let (combo, edge_clk, negedge_only) = skip_event_control(p);
             let block = p.eat_kw("begin");
             if p.eat_sym(':') {
                 let _ = p.ident();
@@ -3962,6 +4136,27 @@ fn parse_module_items(
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
                         assigns.extend(stmts);
+                    } else if negedge_only {
+                        // Falling-edge always is its own clock. Do not fold it
+                        // into the posedge cone (that drops the name).
+                        let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                        if stmts.is_empty() {
+                            let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
+                            note_negedge_write(&cur_mod(), &clk, &sig, None, None);
+                        } else {
+                            let mut seen = HashSet::new();
+                            for (lhs, bit, rhs) in &stmts {
+                                if seen.insert(lhs.clone()) {
+                                    note_negedge_write(
+                                        &cur_mod(),
+                                        &clk,
+                                        lhs,
+                                        *bit,
+                                        Some(rhs.clone()),
+                                    );
+                                }
+                            }
+                        }
                     } else {
                         // Includes async `posedge clk or negedge rst` (sync-reset mux).
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
@@ -3980,15 +4175,22 @@ fn parse_module_items(
                     }
                 }
                 Err(_) => {
-                    note_skip(format!(
-                        "diagnostic skip_always module={} (always body not parsed; not a LUT)",
-                        cur_mod()
-                    ));
-                    if !combo {
+                    if negedge_only {
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
                         let end = p.i.min(p.t.len());
                         let sig = seq_lhs_from_toks(&p.t[body_start..end]);
-                        note_seq_write(&cur_mod(), &clk, &sig);
+                        note_negedge_write(&cur_mod(), &clk, &sig, None, None);
+                    } else {
+                        note_skip(format!(
+                            "diagnostic skip_always module={} (always body not parsed; not a LUT)",
+                            cur_mod()
+                        ));
+                        if !combo {
+                            let clk = edge_clk.unwrap_or_else(|| "clk".into());
+                            let end = p.i.min(p.t.len());
+                            let sig = seq_lhs_from_toks(&p.t[body_start..end]);
+                            note_seq_write(&cur_mod(), &clk, &sig);
+                        }
                     }
                     let _ = skip_item_or_block(p);
                 }
@@ -6356,6 +6558,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         d.attrs.set("CLOCK_MUX", "1");
     }
 
+    // Negedge-only always: one Hff on that clock, or one named diagnostic.
+    // Do not walk a cone. Falling versus rising is not a fake WNS.
+    lower_negedge_hffs(&mut d, rtl);
+
     // Clocked always either already became an Hff on the user's clock, or
     // one sequential_not_lowered. wide_cone already finished this module.
     finish_seq_honesty(&d, &rtl.module, wide_capped);
@@ -8327,6 +8533,36 @@ endmodule
             "clock mux must not be lowered as a data LUT, nets={:?}",
             d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn negedge_always_lowers_hff_on_named_clock() {
+        let src = r#"
+module rw_manager_ram_csr #(parameter DATA_WIDTH = 32, ADDR_WIDTH = 1+1, NUM_WORDS = 4)
+  (input csr_clk, input csr_ena, input csr_din, input ram_clk, input wren,
+   input [DATA_WIDTH-1:0] data, input [ADDR_WIDTH+(-1):0] wraddress,
+   input [ADDR_WIDTH+(-1):0] rdaddress, output reg [DATA_WIDTH-1:0] q,
+   output reg csr_dout);
+  localparam integer DATA_COUNT = NUM_WORDS*DATA_WIDTH;
+  reg [DATA_COUNT+(-1):0] all_data;
+  wire int_clk;
+  assign int_clk = ~csr_ena ? csr_clk : ram_clk;
+  always @(posedge int_clk) begin
+    q <= data;
+  end
+  always @(negedge csr_clk) begin
+    csr_dout <= all_data[DATA_COUNT+(-1)];
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "negedge_csr.v").expect("negedge always");
+        assert_eq!(d.attrs.get("CLOCK_MUX"), Some("1"), "muxed posedge still clock_mux");
+        let ff = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("csr_dout"))
+            .expect("csr_dout must be an Hff Q");
+        assert_eq!(d.net_on(&ff.name, "CLK"), Some("csr_clk"), "negedge clock is csr_clk");
     }
 
     #[test]
