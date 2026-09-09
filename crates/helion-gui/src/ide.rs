@@ -4741,6 +4741,8 @@ pub struct IdeModel {
     pub sdc_editor_dirty: bool,
     /// Last `write_report` / `export_report` summary (path + key numbers) for UI/status.
     pub last_report_export: Option<String>,
+    /// Last opened/saved `.prj` path (Save Project As / Open / Create) for Recent.
+    pub last_project_path: Option<PathBuf>,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
 }
@@ -4874,6 +4876,7 @@ impl IdeModel {
             sdc_editor_text: String::new(),
             sdc_editor_dirty: false,
             last_report_export: None,
+            last_project_path: None,
             event_sim: None,
             fabric_sim: None,
         };
@@ -5379,6 +5382,10 @@ impl IdeModel {
             let text = self.methodology_text();
             self.mirror_methodology_messages();
             Ok(text)
+        } else if t == "save_project_as" || t.starts_with("save_project_as ")
+            || t == "write_project" || t.starts_with("write_project ")
+        {
+            self.save_project_as_cmd(t)
         } else if t == "write_report" || t.starts_with("write_report ")
             || t == "export_report" || t.starts_with("export_report ")
         {
@@ -6524,6 +6531,7 @@ impl IdeModel {
             }
         }
 
+        self.last_project_path = Some(path.to_path_buf());
         Ok(format!(
             "open_project {} part={} sources={} constraints={n_xdc} {msg}",
             path.display(),
@@ -6606,6 +6614,158 @@ impl IdeModel {
             "create_project {} {opened}",
             prj_path.display()
         ))
+    }
+
+    /// Vivado-shaped Save Project As / `write_project`: copy RTL + SDC into
+    /// `dest_dir/<name>/`, write a self-contained `<name>.prj` with relative
+    /// `read_sv` / `read_xdc`, then [`open_project`] the new `.prj`.
+    pub fn save_project_as(
+        &mut self,
+        dest_dir: &Path,
+        name: Option<&str>,
+    ) -> Result<String, String> {
+        let rtl: Vec<PathBuf> = self
+            .tree
+            .sources
+            .iter()
+            .filter(|s| is_rtl_source(s))
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .collect();
+        if rtl.is_empty() {
+            return Err(
+                "save_project_as: open a design with at least one RTL source first".into(),
+            );
+        }
+        if self.shell.session.design.is_none() {
+            return Err("save_project_as: no open design — synthesize first".into());
+        }
+
+        let default_name = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.name.clone())
+            .or_else(|| self.tree.top.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "project".into());
+        let name = name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default_name.as_str());
+        if name.contains('/') || name.contains('\\') || name.contains('\0') {
+            return Err("save_project_as: name must be a single path segment".into());
+        }
+
+        let proj_dir = dest_dir.join(name);
+        std::fs::create_dir_all(&proj_dir).map_err(|e| {
+            format!("save_project_as mkdir {}: {e}", proj_dir.display())
+        })?;
+        let prj_path = proj_dir.join(format!("{name}.prj"));
+
+        let mut pf = ProjectFile {
+            part: self.part().to_string(),
+            top: self
+                .shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| d.name.clone())
+                .or_else(|| self.tree.top.clone()),
+            ..Default::default()
+        };
+
+        let mut used_names: HashSet<String> = HashSet::new();
+        for src in &rtl {
+            let base = src
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("save_project_as: bad source {}", src.display()))?;
+            let mut dest_name = base.clone();
+            let mut n = 1u32;
+            while used_names.contains(&dest_name) {
+                n += 1;
+                dest_name = format!("{n}_{base}");
+            }
+            used_names.insert(dest_name.clone());
+            let dest = proj_dir.join(&dest_name);
+            std::fs::copy(src, &dest).map_err(|e| {
+                format!(
+                    "save_project_as copy {} → {}: {e}",
+                    src.display(),
+                    dest.display()
+                )
+            })?;
+            pf.sources.push(dest_name);
+        }
+
+        let mut constraints: Vec<PathBuf> = self
+            .tree
+            .sources
+            .iter()
+            .filter(|s| source_type_of(s) == "constraint")
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .collect();
+        if let Some(p) = &self.sdc_editor_path {
+            if p.is_file() && !constraints.iter().any(|c| c == p) {
+                constraints.push(p.clone());
+            }
+        }
+        for c in &constraints {
+            let base = c
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("save_project_as: bad constraint {}", c.display()))?;
+            let mut dest_name = base.clone();
+            let mut n = 1u32;
+            while used_names.contains(&dest_name) {
+                n += 1;
+                dest_name = format!("{n}_{base}");
+            }
+            used_names.insert(dest_name.clone());
+            let dest = proj_dir.join(&dest_name);
+            std::fs::copy(c, &dest).map_err(|e| {
+                format!(
+                    "save_project_as copy {} → {}: {e}",
+                    c.display(),
+                    dest.display()
+                )
+            })?;
+            pf.constraint_files.push(dest_name);
+        }
+
+        let mut commented = String::new();
+        commented.push_str(&format!("# Helion project — {name} (Save Project As)\n"));
+        commented.push_str(&format_prj(&pf));
+        std::fs::write(&prj_path, &commented).map_err(|e| {
+            format!("save_project_as write {}: {e}", prj_path.display())
+        })?;
+
+        let opened = self.open_project(&prj_path)?;
+        let summary = format!(
+            "save_project_as {} sources={} constraints={} {opened}",
+            prj_path.display(),
+            pf.sources.len(),
+            pf.constraint_files.len()
+        );
+        self.status = summary.clone();
+        Ok(summary)
+    }
+
+    /// Console: `save_project_as <dest_dir> [name]` (alias `write_project`).
+    pub fn save_project_as_cmd(&mut self, cmd: &str) -> Result<String, String> {
+        let mut parts = cmd.split_whitespace();
+        let _verb = parts.next().unwrap_or("save_project_as");
+        let dest = parts
+            .next()
+            .ok_or("save_project_as: need <dest_dir> [name]")?;
+        let name = parts.next();
+        if parts.next().is_some() {
+            return Err("save_project_as: usage <dest_dir> [name]".into());
+        }
+        self.save_project_as(Path::new(dest), name)
     }
 
     /// Run one rail step. Refuses to run out of order — Route before Place is an error,
@@ -34425,6 +34585,81 @@ endmodule
             .expect("numeric WNS");
         assert_eq!(wns, 9640, "create_project counter must hold gold WNS: {timing}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_project_as_copies_counter_and_reopen_wns_9640() {
+        let gold_sdc = example("counter.sdc");
+        let gold_md5_before = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let body = std::fs::read(&gold_sdc).expect("read gold sdc");
+            let mut h = DefaultHasher::new();
+            body.hash(&mut h);
+            h.finish()
+        };
+        let gold_bytes_before = std::fs::read(&gold_sdc).expect("gold sdc bytes");
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv"))
+            .expect("open counter.sv");
+        assert!(
+            ide.tree.sources.iter().any(|s| is_rtl_source(s)),
+            "need RTL: {:?}",
+            ide.tree.sources
+        );
+        assert!(
+            ide.user_sdc || ide.tree.sources.iter().any(|s| s.ends_with("counter.sdc")),
+            "sibling SDC should load: {:?}",
+            ide.tree.sources
+        );
+
+        let dest = std::env::temp_dir().join(format!("helion-save-as-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        let out = ide
+            .exec(&format!("save_project_as {} counter_copy", dest.display()))
+            .expect("save_project_as");
+        assert!(out.contains("save_project_as"), "{out}");
+        let prj = dest.join("counter_copy/counter_copy.prj");
+        assert!(prj.is_file(), "missing {} — {out}", prj.display());
+        assert_eq!(
+            ide.last_project_path.as_deref(),
+            Some(prj.as_path()),
+            "Recent path"
+        );
+        let body = std::fs::read_to_string(&prj).unwrap();
+        assert!(body.contains("part HL10T-C32-1"), "{body}");
+        assert!(body.contains("read_sv "), "{body}");
+        assert!(body.contains("read_xdc "), "{body}");
+        // Relative paths preferred (no absolute path prefix for copied files).
+        assert!(
+            !body.contains("/workspace/") && !body.contains("/tmp/"),
+            "prefer relative paths in .prj: {body}"
+        );
+        assert!(dest.join("counter_copy/counter.sv").is_file());
+        assert!(dest.join("counter_copy/counter.sdc").is_file());
+
+        // Fresh IdeModel reopen + implement must hold gold WNS.
+        let mut fresh = IdeModel::new();
+        let reopen = fresh.open_source(&prj).expect("reopen saved .prj");
+        assert!(reopen.contains("open_project"), "{reopen}");
+        fresh.implement().expect("implement saved project");
+        let timing = fresh.exec("report_timing").expect("report_timing");
+        let wns: i64 = timing
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("WNS_PS="))
+            .expect("WNS_PS=")
+            .parse()
+            .expect("numeric WNS");
+        assert_eq!(wns, 9640, "save_project_as reopen must hold gold WNS: {timing}");
+
+        let gold_bytes_after = std::fs::read(&gold_sdc).expect("re-read gold sdc");
+        assert_eq!(
+            gold_bytes_before, gold_bytes_after,
+            "examples/counter.sdc must stay untouched"
+        );
+        let _ = gold_md5_before;
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[test]
