@@ -349,6 +349,8 @@ enum RExpr {
         width: usize,
         ascending: bool,
     },
+    /// Unpacked word write `mem[addr] <= data`. Not a comb cone.
+    WordAt { addr: Box<RExpr>, data: Box<RExpr> },
     /// Concatenation `{a,b,...}` (left = MSB). Replication `{N{e}}` may fold to Const.
     Concat(Vec<RExpr>),
     /// Logical right shift `a >> sh` (const shift amount in rexpr_to_bit; zero-fill).
@@ -611,6 +613,34 @@ fn rhs_reads_seq_mem(rhs: &RExpr, rtl: &Rtl) -> bool {
     names.iter().any(|n| {
         sig_depth(rtl, n) > 0 && rtl.nbas.iter().any(|(lhs, _, _)| lhs == n)
     })
+}
+
+/// `mem[index]` / concat of those. Never walk into a cone; depth>0 is a word read.
+fn rhs_unpacked_index(rhs: &RExpr, rtl: &Rtl) -> bool {
+    fn walk(e: &RExpr, rtl: &Rtl) -> bool {
+        match e {
+            RExpr::IndexPart { name, base, .. } => {
+                sig_depth(rtl, name) > 0 || walk(base, rtl)
+            }
+            RExpr::Concat(parts) => parts.iter().any(|p| walk(p, rtl)),
+            RExpr::WordAt { addr, data } => walk(addr, rtl) || walk(data, rtl),
+            RExpr::Mux(c, t, f) => walk(c, rtl) || walk(t, rtl) || walk(f, rtl),
+            RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => walk(x, rtl),
+            RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b)
+            | RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Add(a, b)
+            | RExpr::Sub(a, b)
+            | RExpr::Mul(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b) => walk(a, rtl) || walk(b, rtl),
+            _ => false,
+        }
+    }
+    walk(rhs, rtl)
 }
 
 fn finish_seq_honesty(d: &Design, module: &str, wide_capped: bool) {
@@ -1854,7 +1884,9 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             if p.eat_sym('[') {
                 // Indexed part-select: sig[base +: W] / sig[base -: W]
                 // or range/bit. Prefer +: / -: before treating ':' as range.
-                let base = parse_add(p)?;
+                // `lut[addr_b<<1+1]`: shift binds looser than `+` (Verilog), so
+                // parse_add stops at `<<` and the index never reaches `]`.
+                let base = parse_shift(p)?;
                 if p.eat_sym('+') && p.eat_sym(':') {
                     let w = const_u(p)? as usize;
                     if !p.eat_sym(']') {
@@ -2255,6 +2287,10 @@ fn normalize_nbas(p: &P, stmts: Vec<Nba>) -> Vec<Nba> {
                 }
                 put(&mut order, &mut map, (lhs, Some(b)), rhs);
             }
+            None if matches!(rhs, RExpr::WordAt { .. }) => {
+                // Whole-word `mem[addr] <= data`. Do not Shr-split into bits.
+                put(&mut order, &mut map, (lhs, None), rhs);
+            }
             None if w > 1 => {
                 order.retain(|(n, _)| n != &lhs);
                 map.retain(|(n, _), _| n != &lhs);
@@ -2278,18 +2314,33 @@ fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
     let name = p.ident()?;
     let mut range: Option<(usize, usize)> = None;
     let mut bit = None;
+    let mut word_addr: Option<RExpr> = None;
     if p.eat_sym('[') {
-        let hi = const_u(p)? as usize;
-        if p.eat_sym(':') {
-            let lo = const_u(p)? as usize;
+        let save = p.i;
+        let const_ok = const_u(p);
+        if let Ok(hi) = const_ok {
+            if p.eat_sym(':') {
+                let lo = const_u(p)? as usize;
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                range = Some((hi as usize, lo));
+            } else if p.eat_sym(']') {
+                bit = Some(hi as usize);
+            } else {
+                p.i = save;
+                word_addr = Some(parse_shift(p)?);
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+            }
+        } else {
+            // `lut[addr_a]` — variable word index, not a bit-blast.
+            p.i = save;
+            word_addr = Some(parse_shift(p)?);
             if !p.eat_sym(']') {
                 return Err("]".into());
             }
-            range = Some((hi, lo));
-        } else if p.eat_sym(']') {
-            bit = Some(hi);
-        } else {
-            return Err("lhs index".into());
         }
     }
     if matches!(p.peek(), Some(Tok::Le)) {
@@ -2299,6 +2350,16 @@ fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
     }
     let rhs = parse_rexpr(p)?;
     let _ = p.eat_sym(';');
+    if let Some(addr) = word_addr {
+        return Ok(vec![(
+            name,
+            None,
+            RExpr::WordAt {
+                addr: Box::new(addr),
+                data: Box::new(rhs),
+            },
+        )]);
+    }
     if let Some((a, b)) = range {
         let hi = a.max(b);
         let lo = a.min(b);
@@ -2991,6 +3052,10 @@ fn rexpr_names(e: &RExpr, out: &mut HashSet<String>) {
         RExpr::IndexPart { name, base, .. } => {
             out.insert(name.clone());
             rexpr_names(base, out);
+        }
+        RExpr::WordAt { addr, data } => {
+            rexpr_names(addr, out);
+            rexpr_names(data, out);
         }
         RExpr::Concat(parts) => {
             for p in parts {
@@ -4332,6 +4397,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             width,
             ascending,
         } => index_part_bit(name, base, *width, *ascending, rtl, bit),
+        RExpr::WordAt { .. } => Err("word write is not a comb cone".into()),
         RExpr::Concat(parts) => {
             let mut offset = 0usize;
             for part in parts.iter().rev() {
@@ -4616,6 +4682,7 @@ fn rexpr_add_depth(e: &RExpr) -> usize {
             .max(rexpr_add_depth(t))
             .max(rexpr_add_depth(f)),
         RExpr::IndexPart { base, .. } => rexpr_add_depth(base),
+        RExpr::WordAt { addr, data } => rexpr_add_depth(addr).max(rexpr_add_depth(data)),
         RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
     }
 }
@@ -4679,6 +4746,7 @@ fn rexpr_width(e: &RExpr, rtl: &Rtl) -> usize {
         RExpr::Ident(s) | RExpr::Bit(s, _) => sig_width(rtl, s),
         RExpr::Range(_, lo, hi) => hi - lo + 1,
         RExpr::IndexPart { width, .. } => (*width).max(1),
+        RExpr::WordAt { data, .. } => rexpr_width(data, rtl).max(1),
         RExpr::Const { width, .. } => (*width).max(1),
         RExpr::Concat(parts) => parts.iter().map(|p| rexpr_width(p, rtl).max(1)).sum(),
         RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width(a, rtl),
@@ -5187,6 +5255,231 @@ fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<Stri
     (out, lowered)
 }
 
+
+/// `we && (addr == word)` as one LUT6. Address plus enable must stay ≤6 PIs.
+fn addr_match_expr(addr: &str, addr_w: usize, word: usize, en: Option<&Expr>) -> Expr {
+    let mut acc: Option<Expr> = None;
+    for i in 0..addr_w.max(1) {
+        let bit = Expr::Var(bit_name(addr, addr_w, i));
+        let term = if (word >> i) & 1 == 1 {
+            bit
+        } else {
+            Expr::Not(Box::new(bit))
+        };
+        acc = Some(match acc {
+            None => term,
+            Some(a) => Expr::And(Box::new(a), Box::new(term)),
+        });
+    }
+    let eq = acc.unwrap_or(Expr::Const(true));
+    if let Some(en) = en {
+        Expr::And(Box::new(en.clone()), Box::new(eq))
+    } else {
+        eq
+    }
+}
+
+fn emit_small_lut(d: &mut Design, cell: &str, out: &str, expr: &Expr) -> bool {
+    if cone_pi_exceeds(expr, 6) || expr_node_count(expr) > 256 {
+        return false;
+    }
+    let aig = Aig::from_expr(expr);
+    if aig.pis.len() > 6 {
+        return false;
+    }
+    let init = aig.flowmap_lut6();
+    d.add_cell(cell, CellKind::Lut6 { init });
+    d.connect(out, cell, "O");
+    for (pin, pi) in aig.pis.iter().enumerate() {
+        d.connect(pi, cell, format!("I{pin}"));
+    }
+    true
+}
+
+struct VarWordWrite {
+    en: Option<Expr>,
+    addr: String,
+    addr_w: usize,
+    data: String,
+}
+
+/// Peel `if (we) mem[addr] <= data` (hold the unselected words).
+fn peel_var_word_write(rhs: &RExpr, mem: &str, rtl: &Rtl) -> Option<VarWordWrite> {
+    let (en_r, payload) = match rhs {
+        RExpr::WordAt { .. } => (None, rhs),
+        RExpr::Mux(c, t, f) => {
+            let hold = match f.as_ref() {
+                RExpr::Ident(s) if s == mem => true,
+                RExpr::Bit(s, _) if s == mem => true,
+                _ => false,
+            };
+            if !hold {
+                return None;
+            }
+            (Some(c.as_ref()), t.as_ref())
+        }
+        _ => return None,
+    };
+    let RExpr::WordAt { addr, data } = payload else {
+        return None;
+    };
+    let RExpr::Ident(addr_name) = addr.as_ref() else {
+        return None;
+    };
+    let RExpr::Ident(data_name) = data.as_ref() else {
+        return None;
+    };
+    if sig_depth(rtl, addr_name) > 0 || sig_depth(rtl, data_name) > 0 {
+        return None;
+    }
+    let addr_w = sig_width(rtl, addr_name).max(1);
+    if addr_w > 6 {
+        return None;
+    }
+    let en = if let Some(er) = en_r {
+        Some(simple_word_enable(er, rtl)?)
+    } else {
+        None
+    };
+    if en.is_some() && addr_w > 5 {
+        return None;
+    }
+    Some(VarWordWrite {
+        en,
+        addr: addr_name.clone(),
+        addr_w,
+        data: data_name.clone(),
+    })
+}
+
+/// Bounded unpacked variable-index write: one Hff per bit, clocked by `clk`.
+/// Depth ≤32 and width ≤16. The read is not expanded — address compare is a
+/// shared ≤6-PI LUT, then a 3-PI hold mux per bit. Not a >16 PI cone.
+fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String> {
+    const MAX_DEPTH: usize = 32;
+    const MAX_WIDTH: usize = 16;
+    let mut names: Vec<String> = Vec::new();
+    for (lhs, _, _) in &rtl.nbas {
+        if sig_depth(rtl, lhs) == 0 {
+            continue;
+        }
+        if !names.iter().any(|n| n == lhs) {
+            names.push(lhs.clone());
+        }
+    }
+    let mut lowered = HashSet::new();
+    for mem in names {
+        let depth = sig_depth(rtl, &mem);
+        let width = sig_width(rtl, &mem).max(1);
+        if depth == 0 || depth > MAX_DEPTH || width > MAX_WIDTH {
+            continue;
+        }
+        let need = if depth <= 1 {
+            1
+        } else {
+            (usize::BITS - (depth - 1).leading_zeros()) as usize
+        };
+        let writes: Vec<_> = rtl
+            .nbas
+            .iter()
+            .filter(|(lhs, _, _)| lhs == &mem)
+            .collect();
+        if writes.is_empty() {
+            continue;
+        }
+        let mut planned: Option<VarWordWrite> = None;
+        let mut ok = true;
+        for (_, bit, rhs) in writes {
+            if bit.is_some() {
+                ok = false;
+                break;
+            }
+            let Some(w) = peel_var_word_write(rhs, &mem, rtl) else {
+                ok = false;
+                break;
+            };
+            if w.addr_w < need || depth > (1usize << w.addr_w.min(16)) {
+                ok = false;
+                break;
+            }
+            if let Some(prev) = &planned {
+                if prev.addr != w.addr || prev.data != w.data {
+                    ok = false;
+                    break;
+                }
+            } else {
+                planned = Some(w);
+            }
+        }
+        let Some(plan) = planned else {
+            continue;
+        };
+        if !ok {
+            continue;
+        }
+        let mut matches: Vec<(String, Expr)> = Vec::new();
+        for word in 0..depth {
+            let expr = addr_match_expr(&plan.addr, plan.addr_w, word, plan.en.as_ref());
+            if cone_pi_exceeds(&expr, 6) {
+                ok = false;
+                break;
+            }
+            let aig = Aig::from_expr(&expr);
+            if aig.pis.len() > 6 {
+                ok = false;
+                break;
+            }
+            matches.push((format!("{mem}_we{word}"), expr));
+        }
+        if !ok || matches.len() != depth {
+            continue;
+        }
+        let data_w = sig_width(rtl, &plan.data);
+        for (net, expr) in &matches {
+            let cell = format!("u_{net}");
+            if !emit_small_lut(d, &cell, net, expr) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mut bit_i = 0usize;
+        for word in 0..depth {
+            let mnet = format!("{mem}_we{word}");
+            for bit in 0..width {
+                let next = if bit >= data_w {
+                    Expr::Const(false)
+                } else {
+                    Expr::Var(bit_name(&plan.data, data_w, bit))
+                };
+                let qn = unpacked_word_q(&mem, word, width, bit);
+                let mux = word_ce_mux(Expr::Var(mnet.clone()), next, Expr::Var(qn.clone()));
+                let lut = format!("u_vwl{bit_i}");
+                let dnet = format!("u_vwd{bit_i}");
+                if !emit_small_lut(d, &lut, &dnet, &mux) {
+                    ok = false;
+                    break;
+                }
+                let ff = format!("u_vwff{bit_i}");
+                d.add_cell(&ff, CellKind::Hff);
+                d.connect(clk, &ff, "CLK");
+                d.connect(&dnet, &ff, "D");
+                d.connect(&qn, &ff, "Q");
+                bit_i += 1;
+            }
+            if !ok {
+                break;
+            }
+        }
+        if ok && bit_i == depth.saturating_mul(width) {
+            lowered.insert(mem);
+        }
+    }
+    lowered
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
@@ -5219,8 +5512,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut n_bram = 0usize;
     // Bounded unpacked shift (const word index, small depth×width) → Hffs.
     // A variable-index read is not expanded here.
-    let (unpacked_bits, lowered_unpacked) = lower_unpacked_clocked_words(rtl);
+    let (unpacked_bits, mut lowered_unpacked) = lower_unpacked_clocked_words(rtl);
     reg_bits.extend(unpacked_bits);
+    // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
+    // The read stays a single variable_index_read; do not walk a wide cone.
+    lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk));
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
             continue;
@@ -5356,7 +5652,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         // Variable-index read of a clocked unpacked array. Do not walk it
         // into a >16 PI / >96 AND cone. Write-side Hffs, if any, still time.
-        if rhs_reads_seq_mem(rhs, rtl) {
+        if rhs_reads_seq_mem(rhs, rtl) || rhs_unpacked_index(rhs, rtl) {
             if !lowered_unpacked.is_empty() {
                 note_variable_index_read(&rtl.module, lhs);
             }
@@ -5636,6 +5932,10 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
             base: Box::new(rewrite_rexpr(base, subst)),
             width: *width,
             ascending: *ascending,
+        },
+        RExpr::WordAt { addr, data } => RExpr::WordAt {
+            addr: Box::new(rewrite_rexpr(addr, subst)),
+            data: Box::new(rewrite_rexpr(data, subst)),
         },
         RExpr::Concat(parts) => RExpr::Concat(
             parts.iter().map(|p| rewrite_rexpr(p, subst)).collect(),
@@ -7379,6 +7679,35 @@ endmodule
             "bit reverse must map LUT/IOB, cells={:?}",
             d.cells
         );
+    }
+
+    #[test]
+    fn dp_lut_var_index_write_is_hffs_not_skip_assign() {
+        let src = r#"
+module dp_lut_7x5_14x4(clk,din_a,we_a,addr_a,dout_b,addr_b);
+  input  clk;
+  input  we_a;
+  input  [4:0] addr_a;
+  input  [6:0] din_a;
+  input  [3:0] addr_b;
+  output [13:0] dout_b;
+  reg  [6:0] lut[0:31];
+  always @(posedge clk)
+      begin
+        if (we_a)
+          begin
+            lut[addr_a] <= din_a;
+          end
+      end
+  assign dout_b = {lut[addr_b<<1+1],lut[addr_b<<1]};
+endmodule
+"#;
+        let d = synth_sv(src, "dp_lut.sv").expect("dp_lut");
+        let hffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
+        assert_eq!(hffs, 32 * 7, "32x7 write-side Hffs, got {hffs}");
+        assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
     }
 
     #[test]
