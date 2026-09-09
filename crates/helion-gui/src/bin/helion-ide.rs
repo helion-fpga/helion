@@ -1605,6 +1605,24 @@ fn paint_status_bar(
 fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.separator();
     ui.label(RichText::new("Properties").strong());
+    if let Some(net) = model.selected_debug_net() {
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("Mark Debug {net}"))
+                .on_hover_text("UG908 Mark Debug")
+                .clicked()
+            {
+                let _ = model.exec("mark_debug");
+            }
+            if ui
+                .button("Add Probe")
+                .on_hover_text("UG908 Add Probe → ILA")
+                .clicked()
+            {
+                let _ = model.exec("add_probe");
+            }
+        });
+    }
     let rows = model.property_rows();
     let selected = model.selected_property.clone();
     let mut pick: Option<String> = None;
@@ -5537,6 +5555,28 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.link(format!("{n_nets} Nets")).clicked() {
             let _ = model.exec("sheet_find nets");
         }
+        // UG908: Device/Schematic net → Mark Debug / Add Probe → ILA.
+        let dbg_net = model.selected_debug_net();
+        ui.add_enabled_ui(dbg_net.is_some(), |ui| {
+            let md = match &dbg_net {
+                Some(n) => format!("Mark Debug {n}"),
+                None => "Mark Debug".into(),
+            };
+            if ui
+                .button(md)
+                .on_hover_text("UG908 Mark Debug on the selected Schematic/Device net")
+                .clicked()
+            {
+                let _ = model.exec("mark_debug");
+            }
+            if ui
+                .button("Add Probe")
+                .on_hover_text("UG908 Add Probe → ILA dashboard")
+                .clicked()
+            {
+                let _ = model.exec("add_probe");
+            }
+        });
         if let Some(root) = &model.schematic.cone_root {
             ui.label(RichText::new(format!("Cone {root}")).small().weak());
         }
@@ -5869,6 +5909,37 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                         break;
                     }
                 }
+                // Vivado Schematic: click a net/wire for Mark Debug / Add Probe.
+                if pick.is_none() {
+                    let mut best: Option<(f32, String)> = None;
+                    let thresh = (8.0 / z).clamp(4.0, 14.0);
+                    for w in &drawing.wires {
+                        for pair in w.points.windows(2) {
+                            let (ax, ay) = pair[0];
+                            let (bx, by) = pair[1];
+                            let dx = bx - ax;
+                            let dy = by - ay;
+                            let len2 = dx * dx + dy * dy;
+                            let tseg = if len2 < 1e-6 {
+                                0.0
+                            } else {
+                                ((lx - ax) * dx + (ly - ay) * dy) / len2
+                            }
+                            .clamp(0.0, 1.0);
+                            let px = ax + tseg * dx;
+                            let py = ay + tseg * dy;
+                            let dist = ((lx - px).hypot(ly - py));
+                            if dist <= thresh {
+                                if best.as_ref().map(|(bd, _)| dist < *bd).unwrap_or(true) {
+                                    best = Some((dist, w.net.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((_, net)) = best {
+                        pick = Some(net);
+                    }
+                }
             }
         }
     }
@@ -5898,6 +5969,27 @@ fn paint_device_legend(ui: &mut egui::Ui, model: &mut IdeModel, floor_scroll: bo
             if ui.button("Zoom Fit").clicked() {
                 let _ = model.device_zoom_fit();
             }
+            let dbg_net = model.selected_debug_net();
+            ui.add_enabled_ui(dbg_net.is_some(), |ui| {
+                let md = match &dbg_net {
+                    Some(n) => format!("Mark Debug {n}"),
+                    None => "Mark Debug".into(),
+                };
+                if ui
+                    .button(md)
+                    .on_hover_text("UG908 Mark Debug on the selected Device route/net")
+                    .clicked()
+                {
+                    let _ = model.exec("mark_debug");
+                }
+                if ui
+                    .button("Add Probe")
+                    .on_hover_text("UG908 Add Probe → ILA dashboard")
+                    .clicked()
+                {
+                    let _ = model.exec("add_probe");
+                }
+            });
             ui.label(
                 RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
                     .small()
