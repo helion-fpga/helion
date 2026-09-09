@@ -6591,6 +6591,13 @@ impl IdeModel {
                 }
                 self.shell.session.synth_design(d);
                 self.load_sibling_sdc(&path);
+                // Soft-hold I/O Planning: UI/Tcl set_property IOSTANDARD/DRIVE/SLEW
+                // live in constraints + HNF. Re-synth rebuilds the design, so re-apply
+                // onto the new ports — otherwise the I/O Ports table falls back to
+                // constraints labels (wallpaper) while STA/DRC lose the attrs.
+                if let Some(d) = self.shell.session.design.as_mut() {
+                    let _ = self.constraints.apply(d);
+                }
                 let rtl_s = path.to_string_lossy().into_owned();
                 if self.tree.sources.last().map(|s| s.as_str()) != Some(rtl_s.as_str()) {
                     self.tree.sources.push(rtl_s);
@@ -27008,6 +27015,112 @@ endmodule
         assert!(
             clean.contains("violations=0") || clean.contains("ok"),
             "defaults are legal: {clean}"
+        );
+    }
+
+    /// FM-HEL-CONT: IOSTANDARD / DRIVE Set must stick on HNF + I/O Ports after
+    /// re-Implement (not constraints-only wallpaper). LVCMOS33+DRIVE 12 is HAD-legal.
+    #[test]
+    fn io_planning_iostandard_drive_sticks_after_reimplement() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().expect("implement");
+        assert_eq!(ide.wns_ps(), Some(9640), "gold WNS before I/O Set");
+
+        ide.exec("set_property IOSTANDARD LVCMOS33 [get_ports led]")
+            .unwrap();
+        ide.exec("set_property DRIVE 12 [get_ports led]").unwrap();
+
+        let led = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after Set");
+        assert_eq!(led.iostandard.as_deref(), Some("LVCMOS33"), "{led:?}");
+        assert_eq!(led.drive.as_deref(), Some("12"), "{led:?}");
+        let attr_std = ide
+            .design()
+            .unwrap()
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("IOSTANDARD"));
+        let attr_drv = ide
+            .design()
+            .unwrap()
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("DRIVE"));
+        assert_eq!(attr_std, Some("LVCMOS33"), "HNF IOSTANDARD after Set");
+        assert_eq!(attr_drv, Some("12"), "HNF DRIVE after Set");
+
+        let wns_set = ide.wns_ps().expect("STA after LVCMOS33");
+        // LVCMOS33 pad slows IOB; closed WNS moves 9640 → 9600 (usable, honest).
+        assert_eq!(
+            wns_set, 9600,
+            "LVCMOS33+DRIVE12 closed WNS ({wns_set})"
+        );
+        let clean = ide.exec("report_drc").unwrap();
+        assert!(
+            clean.contains("violations=0") || clean.contains("ok"),
+            "LVCMOS33 + DRIVE 12 is HAD-legal: {clean}"
+        );
+
+        // Force a real re-Implement (synth rebuilds HNF).
+        ide.reset_runs("synth_1").unwrap();
+        ide.implement().expect("re-implement");
+
+        let led2 = ide
+            .io_ports
+            .iter()
+            .find(|p| p.name == "led")
+            .cloned()
+            .expect("led after re-implement");
+        assert_eq!(
+            led2.iostandard.as_deref(),
+            Some("LVCMOS33"),
+            "I/O Ports table must keep IOSTANDARD after re-Implement: {led2:?}"
+        );
+        assert_eq!(
+            led2.drive.as_deref(),
+            Some("12"),
+            "I/O Ports table must keep DRIVE after re-Implement: {led2:?}"
+        );
+        let attr_std2 = ide
+            .design()
+            .unwrap()
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("IOSTANDARD"));
+        let attr_drv2 = ide
+            .design()
+            .unwrap()
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("DRIVE"));
+        assert_eq!(
+            attr_std2,
+            Some("LVCMOS33"),
+            "HNF IOSTANDARD must stick after re-Implement (not wallpaper)"
+        );
+        assert_eq!(
+            attr_drv2,
+            Some("12"),
+            "HNF DRIVE must stick after re-Implement (not wallpaper)"
+        );
+        let wns_back = ide.wns_ps().expect("STA after re-implement");
+        assert_eq!(
+            wns_back, wns_set,
+            "re-Implement must keep the same closed WNS with stuck attrs ({wns_back} vs {wns_set})"
+        );
+        let clean2 = ide.exec("report_drc").unwrap();
+        assert!(
+            clean2.contains("violations=0") || clean2.contains("ok"),
+            "legal combo must stay clean after re-Implement: {clean2}"
         );
     }
 
