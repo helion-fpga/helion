@@ -7030,11 +7030,12 @@ fn const_rexpr_usize(e: &RExpr) -> Option<usize> {
     }
 }
 
-/// `{bus, {K{1'b0}}}` — zeros on the low side. `Ok((bus, K))` when K is
-/// 1..=8 and the bus is a wire. `Err(())` is that shape but not a wire
-/// alignment (not a LUT, caller names `assign_not_lowered`). Other concats
-/// are `None` and stay on the existing path.
-fn zero_fill_concat(rhs: &RExpr) -> Option<Result<(String, usize), ()>> {
+/// `{bus, {K{1'b0}}}` or `{bus[hi:lo], K'b0}` — zeros on the low side.
+/// `Ok((bus, K, bus_lo))` when K is 1..=8 and the high part is a wire or
+/// packed range. `bus_lo` is 0 for a full Ident, or `lo` for `bus[hi:lo]`.
+/// `Err(())` is that shape but not a wire alignment (not a LUT, caller names
+/// `assign_not_lowered`). Other concats are `None` and stay on the existing path.
+fn zero_fill_concat(rhs: &RExpr) -> Option<Result<(String, usize, usize), ()>> {
     let RExpr::Concat(parts) = rhs else {
         return None;
     };
@@ -7045,12 +7046,14 @@ fn zero_fill_concat(rhs: &RExpr) -> Option<Result<(String, usize), ()>> {
         RExpr::Const { val: 0, width, .. } if *width >= 1 => *width,
         _ => return None,
     };
-    let bus = match &parts[0] {
-        RExpr::Ident(s) => s.clone(),
+    let (bus, bus_lo) = match &parts[0] {
+        RExpr::Ident(s) => (s.clone(), 0usize),
+        // Clear-LSB form used by SERV bufreg: `{data[31:2], 2'b00}`.
+        RExpr::Range(s, lo, _hi) => (s.clone(), *lo),
         _ => return Some(Err(())),
     };
     if (1..=8).contains(&zeros) {
-        Some(Ok((bus, zeros)))
+        Some(Ok((bus, zeros, bus_lo)))
     } else {
         Some(Err(()))
     }
@@ -8175,7 +8178,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // `{bus, {K{1'b0}}}` K=1..8 is a wire alignment (zeros on the low
     // side), not a 16-PI cone and not a LUT. A nested concat inside an
     // add is not this form — that add stays wide_cone.
-    let mut concat_align: Vec<(String, String, usize)> = Vec::new();
+    let mut concat_align: Vec<(String, String, usize, usize)> = Vec::new();
     let net_copies = collect_net_copies(&rtl.assigns);
     for (lhs, bit, rhs0) in &rtl.assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies);
@@ -8186,9 +8189,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if bit.is_none() {
             if let Some(kind) = zero_fill_concat(rhs) {
                 match kind {
-                    Ok((bus, zeros)) => {
-                        eprintln!("synth_rtl concat_align signal={lhs} zeros={zeros}");
-                        concat_align.push((lhs.clone(), bus, zeros));
+                    Ok((bus, zeros, bus_lo)) => {
+                        eprintln!(
+                            "synth_rtl concat_align signal={lhs} zeros={zeros} bus_lo={bus_lo}"
+                        );
+                        concat_align.push((lhs.clone(), bus, zeros, bus_lo));
                     }
                     Err(()) => {
                         note_assign_not_lowered(&rtl.module, lhs);
@@ -8609,11 +8614,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             // Zero-fill concat: high bits are the bus, low bits are 0.
             // No buffer LUT. Zero bits have no source wire.
-            if let Some((_, bus, zeros)) = concat_align.iter().find(|(n, _, _)| n == lhs) {
+            if let Some((_, bus, zeros, bus_lo)) =
+                concat_align.iter().find(|(n, _, _, _)| n == lhs)
+            {
                 let ow = sig_width(rtl, lhs);
                 let bw = sig_width(rtl, bus).max(1);
                 for i in *zeros..ow.min(256) {
-                    let src = i - zeros;
+                    let src = bus_lo + (i - zeros);
                     if src >= bw {
                         break;
                     }
@@ -11212,6 +11219,28 @@ endmodule
             n.name == "bus_0" && n.endpoints.iter().any(|e| e.pin == "I")
         });
         assert!(aliased, "y[2] aliases bus[0], nets={:?}", d.nets);
+    }
+
+    #[test]
+    fn zero_fill_concat_range_clear_lsb_is_wire_align() {
+        // SERV bufreg: assign o_dbus_adr = {data[31:2], 2'b00};
+        let src = r#"
+module clear_lsb(input [31:0] data, output [31:0] o_dbus_adr);
+  assign o_dbus_adr = {data[31:2], 2'b00};
+endmodule
+"#;
+        let d = synth_sv(src, "clear_lsb.v").expect("range clear lsb");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "clear-lsb concat must not invent a LUT, cells={:?}",
+            d.cells
+        );
+        let aliased = d.nets.iter().any(|n| {
+            n.name == "data_2" && n.endpoints.iter().any(|e| e.pin == "I")
+        });
+        assert!(aliased, "o_dbus_adr[2] aliases data[2], nets={:?}", d.nets);
     }
 
     #[test]
