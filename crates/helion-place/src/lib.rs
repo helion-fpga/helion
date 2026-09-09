@@ -89,7 +89,6 @@ pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
 
 pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Placed, String> {
     let iob_all: Vec<Site> = dev.iob_sites().collect();
-    let mut iob_sites = Vec::new();
     let iob_take = packed.iobs.len().min(iob_all.len());
     if packed.iobs.len() > iob_all.len() {
         eprintln!(
@@ -98,17 +97,36 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             iob_take
         );
     }
-    for (i, iob) in packed.iobs.iter().enumerate().take(iob_take) {
+    // Prefer PACKAGE_PIN / LOC IOBs when capping to the device budget so board
+    // pins (led) survive mid-size fabrics that emit hundreds of tied IOBs.
+    let mut order: Vec<usize> = (0..packed.iobs.len()).collect();
+    order.sort_by_key(|&i| if packed.iobs[i].loc.is_some() { 0 } else { 1 });
+    order.truncate(iob_take);
+    let mut iob_sites = Vec::with_capacity(order.len());
+    let mut claimed: HashSet<(u32, u32)> = HashSet::new();
+    for &i in &order {
+        let iob = &packed.iobs[i];
         let s = if let Some(loc) = &iob.loc {
             parse_iob_loc(loc, &iob_all)
                 .ok_or_else(|| format!("LOC {loc} is not an IOB site"))?
         } else {
-            *iob_all.get(i).ok_or_else(|| {
-                format!("need {} IOB sites, device has {}", packed.iobs.len(), iob_all.len())
-            })?
+            *iob_all
+                .iter()
+                .find(|s| !claimed.contains(&(s.x, s.y)))
+                .ok_or_else(|| {
+                    format!(
+                        "need {} IOB sites, device has {}",
+                        packed.iobs.len(),
+                        iob_all.len()
+                    )
+                })?
         };
+        claimed.insert((s.x, s.y));
         iob_sites.push(s);
     }
+    // Keep packed.iobs aligned with iob_sites after the LOC-preferring cap.
+    let mut packed = packed.clone();
+    packed.iobs = order.iter().map(|&i| packed.iobs[i].clone()).collect();
 
     let mut lutff_sites = Vec::new();
     if !packed.lutffs.is_empty() {
@@ -941,7 +959,6 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             .unwrap_or(0.0)
     };
 
-    let mut packed = packed.clone();
     packed.lutffs.truncate(lutff_sites.len());
     packed.iobs.truncate(iob_sites.len());
     packed.macs.truncate(mac_sites.len());

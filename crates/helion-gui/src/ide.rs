@@ -19298,11 +19298,12 @@ impl IdeModel {
         }
     }
 
-    /// View bind of clock input ports onto unused HAD IOB sites.
+    /// View bind of clock input ports onto HAD IOB sites.
     /// Clock ports are `PortDir::In` names that match create_clock / timing
-    /// clock names and have no packed IOB. Reads `dev.iob_sites()` and
-    /// skips every `(x, y)` already in `pl.iob_sites`. Does not change pack,
-    /// place, route, or STA.
+    /// clock names and have no packed IOB. Prefers `PACKAGE_PIN` / LOC when
+    /// set (even if a capped fabric IOB already claims the site — Device must
+    /// show clk occupied). Otherwise picks the first unused `dev.iob_sites()`
+    /// slot. Does not change pack, place, route, or STA.
     fn clock_port_view_sites(&self) -> Vec<(String, u32, u32)> {
         let Some(d) = self.shell.session.design.as_ref() else {
             return Vec::new();
@@ -19347,6 +19348,20 @@ impl IdeModel {
             if packed {
                 continue;
             }
+            // PACKAGE_PIN / LOC wins — mid-size fabrics can fill every HAD IOB
+            // via place_iob_cap; clk must still land on the user pin.
+            let pin = p.attrs.get("LOC").or_else(|| {
+                self.constraints.package_pins.get(&p.name).map(|s| s.as_str())
+            });
+            if let Some(pin) = pin {
+                if let Ok((x, y)) = parse_site_xy(pin) {
+                    if dev.iob_major(x, y).is_some() {
+                        used.insert((x, y));
+                        out.push((p.name.clone(), x, y));
+                        continue;
+                    }
+                }
+            }
             let Some(site) = dev.iob_sites().find(|s| !used.contains(&(s.x, s.y))) else {
                 break;
             };
@@ -19378,7 +19393,24 @@ impl IdeModel {
             }
         }
         for (name, x, y) in self.clock_port_view_sites() {
-            if occupants.iter().any(|((ox, oy), _)| *ox == x && *oy == y) {
+            // PACKAGE_PIN clocks replace a capped fabric IOB occupant so Device
+            // shows clk on the real HAD site (Firstmate: clk must not stay bare).
+            let pin_forced = self
+                .constraints
+                .package_pins
+                .get(&name)
+                .is_some()
+                || self
+                    .shell
+                    .session
+                    .design
+                    .as_ref()
+                    .and_then(|d| d.ports.iter().find(|p| p.name == name))
+                    .and_then(|p| p.attrs.get("LOC"))
+                    .is_some();
+            if pin_forced {
+                occupants.retain(|((ox, oy), _)| !(*ox == x && *oy == y));
+            } else if occupants.iter().any(|((ox, oy), _)| *ox == x && *oy == y) {
                 continue;
             }
             occupants.push(((x, y), name));

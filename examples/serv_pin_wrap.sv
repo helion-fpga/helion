@@ -8,7 +8,8 @@ module serv_pin_wrap (
     input  logic clk,
     output logic led
 );
-    logic [7:0] hb;
+    // Heartbeat + board LED; mark_debug so Mark/Probe/ILA can capture a SERV net.
+    (* mark_debug = "true" *) logic [7:0] hb;
     always_ff @(posedge clk) begin
         hb  <= hb + 8'd1;
         led <= hb[7];
