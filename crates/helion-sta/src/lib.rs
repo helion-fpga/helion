@@ -558,11 +558,25 @@ pub struct PowerReport {
 }
 
 impl PowerReport {
+    /// LUTFF used/available occupancy percent (0 when capacity unknown).
+    pub fn lutff_occupancy_pct(&self) -> u32 {
+        if self.lutff_cap == 0 {
+            return 0;
+        }
+        ((self.lutff as u64 * 100) / self.lutff_cap as u64) as u32
+    }
+
+    /// UG907 POWER-2: warn when LUTFF occupancy is ≥ 80%. Tiny demos (counter
+    /// 4/8192) never fire this — unit tests cover the threshold synthetically.
+    pub fn power2_high_occupancy(&self) -> bool {
+        self.lutff_occupancy_pct() >= 80
+    }
+
     pub fn text(&self) -> String {
         if self.part.is_empty() {
             return "no design — synth / report_power".into();
         }
-        format!(
+        let mut s = format!(
             "report_power part={} VOLTAGE_MV={} TEMP_C={} TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} CLOCKS_UW={} LOGIC_UW={} SIGNALS_UW={} IO_UW={} BRAM_UW={} DSP_UW={} F_MHZ={} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
             self.part,
             self.voltage_mv,
@@ -585,7 +599,11 @@ impl PowerReport {
             self.bram_cap,
             self.dsp,
             self.dsp_cap
-        )
+        );
+        if self.power2_high_occupancy() {
+            s.push_str(" POWER-2=high_occupancy");
+        }
+        s
     }
 }
 
@@ -5147,6 +5165,41 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         );
         let gold2 = report_timing_placed(&d, &placed, &clks).unwrap();
         assert_eq!(gold2.wns_ps, gold.wns_ps, "report_power must not move WNS");
+    }
+
+    /// POWER-2 fires at ≥80% LUTFF occupancy. Counter (4/8192) stays clean;
+    /// synthetic occupancy proves the warn without moving WNS.
+    #[test]
+    fn report_power_power2_warns_at_80_pct_occupancy() {
+        let d = Design::structural_counter();
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let packed = pack(&d, &dev).unwrap();
+        let placed = place(&packed, &dev).unwrap();
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let p = report_power(&dev, Some(&d), Some(&placed), &clks, &OperatingConditions::default());
+        assert_eq!(p.lutff, 4, "{}", p.text());
+        assert_eq!(p.lutff_cap, 8192);
+        assert!(
+            p.lutff_occupancy_pct() < 80,
+            "tiny counter cannot hit POWER-2: pct={} text={}",
+            p.lutff_occupancy_pct(),
+            p.text()
+        );
+        assert!(!p.power2_high_occupancy());
+        assert!(!p.text().contains("POWER-2"), "{}", p.text());
+        let gold = report_timing_placed(&d, &placed, &clks).unwrap();
+
+        let mut hot = p.clone();
+        hot.lutff = (hot.lutff_cap as usize * 80).div_ceil(100);
+        assert!(hot.power2_high_occupancy(), "pct={}", hot.lutff_occupancy_pct());
+        assert!(
+            hot.text().contains("POWER-2=high_occupancy"),
+            "{}",
+            hot.text()
+        );
+        let gold2 = report_timing_placed(&d, &placed, &clks).unwrap();
+        assert_eq!(gold2.wns_ps, gold.wns_ps, "POWER-2 must not move WNS");
     }
 
     #[test]
