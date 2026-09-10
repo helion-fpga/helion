@@ -3550,7 +3550,7 @@ pub struct IlaDashboard {
     pub trigger_at: Option<usize>,
     /// Samples kept before trigger in deep fabric-BRAM arm (`ila_arm_deep`).
     pub pre_trigger: usize,
-    /// soft_ble_out | fabric_bram_sample_buffer
+    /// soft_ble_out | jtag_usr1_bram_dr
     pub backend: String,
     /// Multi-probe nets from last deep arm (single-net soft arm → one entry).
     pub probes: Vec<String>,
@@ -19088,7 +19088,7 @@ impl IdeModel {
         Ok(self.ila_dashboard_text())
     }
 
-    /// Fabric BRAM sample-buffer arm: multi-probe + trigger-before-fill (deeper than soft ble_out).
+    /// Deep arm: fabric BRAM fill + IR_USR1 JTAG DR upload; multi-probe + trigger-before-fill.
     pub fn capture_ila_deep(&mut self, nets: &[String], n: usize) -> Result<String, String> {
         let d = self
             .shell
@@ -26031,7 +26031,7 @@ endmodule
         assert_eq!(ide.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff, Some(4));
     }
 
-    /// Deep path: fabric BRAM sample buffer + pre-trigger + multi-probe (soft ila_arm unchanged).
+    /// Deep path: IR_USR1 JTAG DR upload of fabric BRAM + pre-trigger + multi-probe (soft ila_arm unchanged).
     #[test]
     fn ila_arm_deep_bram_pretrigger_multiprobe() {
         let mut ide = IdeModel::new();
@@ -26046,17 +26046,17 @@ endmodule
         ide.exec("ila_trigger rising").unwrap();
         ide.exec("ila_pre_trigger 4").unwrap();
         let out = ide.exec("ila_arm_deep cnt_3,cnt_0").unwrap();
-        assert!(out.contains("backend=fabric_bram_sample_buffer"), "{out}");
+        assert!(out.contains("backend=jtag_usr1_bram_dr"), "{out}");
         assert!(out.contains("pre_trigger=4"), "{out}");
         assert!(out.contains("probes=cnt_3,cnt_0") || out.contains("probes=cnt_3"), "{out}");
-        assert_eq!(ide.ila.backend, "fabric_bram_sample_buffer");
+        assert_eq!(ide.ila.backend, "jtag_usr1_bram_dr");
         assert_eq!(ide.ila.bits.len(), 16);
         let at = ide.ila.trigger_at.expect("deep rising trigger_at");
         assert!(at >= 1, "trigger_at={at} bits={}", ide.ila.bits);
         assert_eq!(&ide.ila.bits[at - 1..at + 1], "01");
         assert!(ide.wave.has_trace("ila:cnt_3"));
         let dump = ide.exec("ila_dashboard").unwrap();
-        assert!(dump.contains("backend=fabric_bram_sample_buffer"), "{dump}");
+        assert!(dump.contains("backend=jtag_usr1_bram_dr"), "{dump}");
         assert!(dump.contains("pre_trigger=4"), "{dump}");
 
         // Soft path gold still holds on plain ila_arm.

@@ -2,11 +2,13 @@
 //!
 //! Soft path (`insert_arm_capture`): host `step_user` + `ble_out` readback.
 //! Deep path (`insert_arm_capture_deep`): fabric BRAM sample buffer + trigger-before-fill
-//! + multi-probe; upload via `bram_read_word`. Residual: not full UG908 JTAG DR upload.
+//! + multi-probe; upload via Helion TAP `IR_USR1` JTAG DR scan of capture RAM.
+//! Residual: not full UG908 user-defined trigger FSM IP / match units / compressed upload.
 
 use helion_bits::bitgen;
 use helion_device::Device;
 use helion_fabric::Fabric;
+use helion_hw::Tap;
 use helion_ir::{CellKind, Design};
 use helion_pack::pack;
 use helion_place::place;
@@ -83,7 +85,7 @@ pub struct IlaCaptureDeep {
 }
 
 const CAPTURE_BRAM: &str = "ila_capture_ram";
-const DEEP_BACKEND: &str = "fabric_bram_sample_buffer";
+const DEEP_BACKEND: &str = "jtag_usr1_bram_dr";
 
 fn ila_cell_names(net: &str) -> [String; 3] {
     [
@@ -259,10 +261,11 @@ fn trigger_fires(kind: IlaTriggerKind, prev: Option<bool>, cur: bool, first: boo
 /// Fabric BRAM–backed multi-probe ILA with real trigger-before-fill window.
 ///
 /// Strictly deeper than soft `insert_arm_capture` (`ble_out` host poll):
-/// probe LUTFFs + capture Bram18 in the bitstream, samples written into fabric
-/// BRAM during the arm, then uploaded via `bram_read_word`.
+/// probe LUTFFs + capture Bram18 in the bitstream, samples written into the TAP
+/// fabric BRAM during the arm, then uploaded via Helion `IR_USR1` JTAG DR scans
+/// (`Tap::usr1_upload_bram`) — not a host `bram_read_word` backdoor.
 ///
-/// Residual vs UG908: no JTAG DR scan of capture RAM / user-defined trigger FSM IP.
+/// Residual vs UG908: no user-defined trigger FSM IP / match units, no compressed upload.
 pub fn insert_arm_capture_deep(
     dev: &Device,
     design: &Design,
@@ -336,9 +339,9 @@ pub fn insert_arm_capture_deep(
         .position(|n| n == &cfg.trigger_net)
         .unwrap();
 
-    let mut fab = Fabric::new(dev);
-    fab.program(&bits1)?;
-    fab.finish_startup();
+    // Capture + upload share one TAP fabric so IR_USR1 DR sees the same BRAM bank.
+    let mut tap = Tap::new(dev);
+    tap.program(&bits1)?;
 
     let pre = if cfg.trigger == IlaTriggerKind::Immediate {
         0
@@ -357,41 +360,45 @@ pub fn insert_arm_capture_deep(
     let mut steps = 0usize;
     let mut wr = 0usize;
 
-    while steps < max_steps {
-        fab.step_user();
-        let mut sample = Vec::with_capacity(sites.len());
-        for &(site, ble) in &sites {
-            sample.push(fab.ble_out(site.x, site.y, ble as u32));
-        }
-        let word = pack_sample_word(&sample);
-        fab.bram_write_word(bram_major, wr % window, word);
-        wr = wr.wrapping_add(1);
-        if ring.len() == window {
-            ring.pop_front();
-        }
-        ring.push_back(sample.clone());
+    // Scoped mutable fabric borrow — must end before USR1 DR upload on `tap`.
+    {
+        let fab = tap.fabric_mut();
+        while steps < max_steps {
+            fab.step_user();
+            let mut sample = Vec::with_capacity(sites.len());
+            for &(site, ble) in &sites {
+                sample.push(fab.ble_out(site.x, site.y, ble as u32));
+            }
+            let word = pack_sample_word(&sample);
+            fab.bram_write_word(bram_major, wr % window, word);
+            wr = wr.wrapping_add(1);
+            if ring.len() == window {
+                ring.pop_front();
+            }
+            ring.push_back(sample.clone());
 
-        let cur_trig = sample[trig_idx];
-        if !triggered {
-            if trigger_fires(cfg.trigger, prev_trig, cur_trig, first) {
-                triggered = true;
-                post_left = post_after_trig.saturating_sub(1);
-                if post_left == 0 && ring.len() >= window.min(pre + 1) {
+            let cur_trig = sample[trig_idx];
+            if !triggered {
+                if trigger_fires(cfg.trigger, prev_trig, cur_trig, first) {
+                    triggered = true;
+                    post_left = post_after_trig.saturating_sub(1);
+                    if post_left == 0 && ring.len() >= window.min(pre + 1) {
+                        break;
+                    }
+                }
+            } else {
+                if post_left == 0 {
+                    break;
+                }
+                post_left -= 1;
+                if post_left == 0 {
                     break;
                 }
             }
-        } else {
-            if post_left == 0 {
-                break;
-            }
-            post_left -= 1;
-            if post_left == 0 {
-                break;
-            }
+            prev_trig = Some(cur_trig);
+            first = false;
+            steps += 1;
         }
-        prev_trig = Some(cur_trig);
-        first = false;
-        steps += 1;
     }
 
     if !triggered {
@@ -418,15 +425,14 @@ pub fn insert_arm_capture_deep(
         v
     };
 
-    // Upload from BRAM: last `window` writes in chrono order.
-    let start = wr.saturating_sub(window);
-    let mut uploaded = Vec::with_capacity(window);
-    for i in 0..window {
-        let addr = (start + i) % window;
-        let w = fab.bram_read_word(bram_major, addr);
-        uploaded.push(unpack_sample_word(w, cfg.nets.len()));
-    }
-    // Prefer BRAM upload as source of truth when lengths match ring window.
+    // Upload from capture RAM via Helion TAP IR_USR1 JTAG DR scans (not host bram_read_word).
+    let start = wr.saturating_sub(window) % window;
+    let uploaded_words = tap.usr1_upload_bram(bram_major, start as u32, window, window as u32);
+    let uploaded: Vec<Vec<bool>> = uploaded_words
+        .into_iter()
+        .map(|w| unpack_sample_word(w, cfg.nets.len()))
+        .collect();
+    // Prefer JTAG USR1 upload as source of truth when lengths match ring window.
     let samples = if uploaded.len() == samples_ring.len() {
         uploaded
     } else {
@@ -608,7 +614,7 @@ mod tests {
 
         let cfg = IlaArmConfig::single("q3", 16);
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
-        assert_eq!(deep.backend, "fabric_bram_sample_buffer");
+        assert_eq!(deep.backend, "jtag_usr1_bram_dr");
         assert_eq!(deep.probes, vec!["q3".to_string()]);
         assert_eq!(deep.trigger_at, Some(0));
         let deep_bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
@@ -668,6 +674,17 @@ mod tests {
             bits[at..].contains('1'),
             "post-trigger must include highs: {bits}"
         );
+    }
+
+    #[test]
+    fn deep_upload_backend_is_jtag_usr1_dr() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let d = Design::structural_counter();
+        let cfg = IlaArmConfig::single("q3", 16);
+        let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
+        assert_eq!(deep.backend, "jtag_usr1_bram_dr");
+        let bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
+        assert_eq!(bits, "0000000111111110");
     }
 
     #[test]

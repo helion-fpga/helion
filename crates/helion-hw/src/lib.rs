@@ -51,6 +51,13 @@ pub enum TapState {
 pub const IR_IDCODE: u8 = 0b000011;
 pub const IR_STAT: u8 = 0b010010;
 pub const IR_CFG_W: u8 = 0b010000;
+/// USER1-class IR: ILA capture-RAM / fabric BRAM sample-buffer DR (64-bit).
+///
+/// Capture-DR loads `bram_read_word(usr1_major, usr1_addr)`; Shift-DR scans 64 bits
+/// LSB-first; Update-DR either sets the BRAM pointer (TDI bit63=1) or auto-increments
+/// the address (TDI bit63=0). This is the JTAG upload path for deep ILA — not a
+/// host `bram_read_word` backdoor.
+pub const IR_USR1: u8 = 0b000010;
 
 #[derive(Clone, Debug)]
 pub struct Tap {
@@ -58,7 +65,7 @@ pub struct Tap {
     pub ir: u8,
     fabric: Fabric,
     ir_shift: u8,
-    /// DR shift register (IDCODE/STAT words use low 32 bits).
+    /// DR shift register (IDCODE/STAT: low 32 bits; USR1: full 64-bit BRAM word).
     dr_shift: u64,
     shlen: u8,
     /// CFG_W payload accumulating during Shift-DR (`IR_CFG_W`), LSB-first per byte.
@@ -67,6 +74,12 @@ pub struct Tap {
     cfg_bit_count: u32,
     /// Last CFG_W Update-DR decode/program error (cleared on successful commit).
     cfg_last_err: Option<String>,
+    /// USR1 capture-RAM pointer: BRAM major (packed `ila_capture_ram`).
+    usr1_major: u16,
+    /// USR1 word address within that BRAM.
+    usr1_addr: u32,
+    /// Optional ring wrap for auto-increment (`0` = no wrap).
+    usr1_wrap: u32,
 }
 
 impl Tap {
@@ -81,6 +94,9 @@ impl Tap {
             cfg_buf: Vec::new(),
             cfg_bit_count: 0,
             cfg_last_err: None,
+            usr1_major: 0,
+            usr1_addr: 0,
+            usr1_wrap: 0,
         }
     }
 
@@ -90,6 +106,11 @@ impl Tap {
     /// In-process fabric (sim / bitbang harness). Not a board probe.
     pub fn fabric(&self) -> &Fabric {
         &self.fabric
+    }
+
+    /// Mutable fabric for deep ILA arm (step + BRAM fill) on the same die the TAP scans.
+    pub fn fabric_mut(&mut self) -> &mut Fabric {
+        &mut self.fabric
     }
 
     /// Last CFG_W Update-DR error, if any.
@@ -131,6 +152,10 @@ impl Tap {
                         self.cfg_buf[byte_i] |= 1 << bit_i;
                     }
                     self.cfg_bit_count = self.cfg_bit_count.saturating_add(1);
+                } else if self.ir == IR_USR1 {
+                    // 64-bit USR1 DR: ILA capture-RAM word (LSB first).
+                    self.dr_shift = (self.dr_shift >> 1) | ((u64::from(tdi)) << 63);
+                    self.shlen = self.shlen.saturating_add(1);
                 } else {
                     // 32-bit DR window for IDCODE/STAT.
                     self.dr_shift = (self.dr_shift >> 1) | ((u64::from(tdi)) << 31);
@@ -151,6 +176,9 @@ impl Tap {
             self.dr_shift = match self.ir {
                 IR_IDCODE => u64::from(self.fabric.idcode),
                 IR_STAT => u64::from(self.fabric.stat.word()),
+                IR_USR1 => self
+                    .fabric
+                    .bram_read_word(self.usr1_major, self.usr1_addr as usize),
                 IR_CFG_W => {
                     self.cfg_buf.clear();
                     self.cfg_bit_count = 0;
@@ -180,6 +208,8 @@ impl Tap {
                         self.cfg_last_err = Some(e);
                     }
                 }
+            } else if self.ir == IR_USR1 {
+                self.usr1_update_dr();
             }
         }
         tdo
@@ -252,6 +282,86 @@ impl Tap {
         self.fabric.program(bits)?;
         self.fabric.finish_startup();
         Ok(self.read_stat())
+    }
+
+    /// USR1 Update-DR: pointer command (bit63=1) or auto-increment (bit63=0).
+    ///
+    /// Command word (TDI after 64-bit Shift-DR):
+    /// - bit63 = 1 → set `usr1_major`=[47:32], `usr1_wrap`=[31:16], `usr1_addr`=[15:0]
+    /// - bit63 = 0 → `usr1_addr += 1` (mod wrap when wrap != 0)
+    fn usr1_update_dr(&mut self) {
+        let v = self.dr_shift;
+        if (v >> 63) & 1 == 1 {
+            self.usr1_major = ((v >> 32) & 0xffff) as u16;
+            self.usr1_wrap = ((v >> 16) & 0xffff) as u32;
+            self.usr1_addr = (v & 0xffff) as u32;
+        } else if self.usr1_wrap > 0 {
+            self.usr1_addr = (self.usr1_addr + 1) % self.usr1_wrap;
+        } else {
+            self.usr1_addr = self.usr1_addr.wrapping_add(1);
+        }
+    }
+
+    /// Build USR1 pointer-command TDI word.
+    pub fn usr1_ptr_cmd(major: u16, addr: u32, wrap: u32) -> u64 {
+        (1u64 << 63)
+            | ((u64::from(major) & 0xffff) << 32)
+            | ((u64::from(wrap) & 0xffff) << 16)
+            | (u64::from(addr) & 0xffff)
+    }
+
+    /// High-level 64-bit DR shift while `IR_USR1` (or any non-CFG_W IR using 64-bit window).
+    /// Applies Capture → Shift → Update semantics without requiring bitbang ticks.
+    pub fn shift_dr_u64(&mut self, tdi_val: u64) -> u64 {
+        // Capture-DR
+        self.dr_shift = match self.ir {
+            IR_IDCODE => u64::from(self.fabric.idcode),
+            IR_STAT => u64::from(self.fabric.stat.word()),
+            IR_USR1 => self
+                .fabric
+                .bram_read_word(self.usr1_major, self.usr1_addr as usize),
+            _ => 0,
+        };
+        let captured = self.dr_shift;
+        // Shift-DR 64, LSB first — TDO sequence reconstructs `captured`.
+        let mut dr = self.dr_shift;
+        for i in 0..64 {
+            let tdi = ((tdi_val >> i) & 1) != 0;
+            dr = (dr >> 1) | ((u64::from(tdi)) << 63);
+        }
+        self.dr_shift = dr;
+        // Update-DR
+        if self.ir == IR_USR1 {
+            self.usr1_update_dr();
+        }
+        let _ = captured;
+        // With LSB-first scan, scanned-out word equals Capture-DR value.
+        captured
+    }
+
+    /// Select `IR_USR1` and set capture-RAM pointer (+ optional ring wrap).
+    pub fn usr1_set_ptr(&mut self, major: u16, addr: u32, wrap: u32) {
+        self.shift_ir(IR_USR1);
+        let _ = self.shift_dr_u64(Self::usr1_ptr_cmd(major, addr, wrap));
+    }
+
+    /// One USR1 data DR: Capture BRAM word at pointer, scan it out, auto-increment.
+    pub fn usr1_read_inc(&mut self) -> u64 {
+        if self.ir != IR_USR1 {
+            self.shift_ir(IR_USR1);
+        }
+        self.shift_dr_u64(0)
+    }
+
+    /// Upload `n` words from fabric BRAM major via USR1 JTAG DR scans (ring wrap).
+    pub fn usr1_upload_bram(&mut self, major: u16, start: u32, n: usize, wrap: u32) -> Vec<u64> {
+        let wrap = if wrap == 0 { n as u32 } else { wrap };
+        self.usr1_set_ptr(major, start % wrap, wrap);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.usr1_read_inc());
+        }
+        out
     }
 }
 
@@ -2318,6 +2428,71 @@ mod tests {
         assert_eq!(tap.state, TapState::TestLogicReset);
         assert_eq!(tap.ir, IR_IDCODE);
         assert!(tap.cfg_last_err().is_none());
+    }
+
+    #[test]
+    fn usr1_jtag_dr_scans_capture_bram_words() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        // Plant known words in fabric BRAM major 0 (capture RAM stand-in).
+        tap.fabric_mut().bram_write_word(0, 0, 0x0000_0000_0000_0001);
+        tap.fabric_mut().bram_write_word(0, 1, 0x0000_0000_0000_0002);
+        tap.fabric_mut().bram_write_word(0, 2, 0xABCD_EF01_2345_6789);
+        tap.fabric_mut().bram_write_word(0, 3, 0x1111_2222_3333_4444);
+
+        let words = tap.usr1_upload_bram(0, 0, 4, 4);
+        assert_eq!(words[0], 0x0000_0000_0000_0001);
+        assert_eq!(words[1], 0x0000_0000_0000_0002);
+        assert_eq!(words[2], 0xABCD_EF01_2345_6789);
+        assert_eq!(words[3], 0x1111_2222_3333_4444);
+        assert_eq!(tap.ir, IR_USR1);
+
+        // Ring wrap: start mid-window, wrap to front.
+        let wrapped = tap.usr1_upload_bram(0, 2, 4, 4);
+        assert_eq!(wrapped, vec![words[2], words[3], words[0], words[1]]);
+    }
+
+    #[test]
+    fn usr1_tick_bitbang_matches_high_level_upload() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        tap.fabric_mut().bram_write_word(1, 0, 0x55AA_55AA_55AA_55AA);
+        tap.fabric_mut().bram_write_word(1, 1, 0xF00D_F00D_F00D_F00D);
+
+        // High-level set ptr
+        tap.usr1_set_ptr(1, 0, 2);
+        assert_eq!(tap.usr1_major, 1);
+        assert_eq!(tap.usr1_addr, 0);
+        assert_eq!(tap.usr1_wrap, 2);
+
+        // Tick-accurate Shift-DR of one USR1 word (must already be in IR_USR1 / idle).
+        // Walk: Select-DR → Capture-DR → Shift-DR ×64 → Exit1 → Update → Idle
+        fn shift_dr_u64_tick(tap: &mut Tap, tdi_val: u64) -> u64 {
+            tap.tick(true, false); // Select-DR
+            tap.tick(false, false); // Capture-DR
+            tap.tick(false, false); // Shift-DR
+            assert_eq!(tap.state, TapState::ShiftDr);
+            let mut scanned = 0u64;
+            for i in 0..64 {
+                let tdi = ((tdi_val >> i) & 1) != 0;
+                let last = i == 63;
+                let tdo = tap.tick(last, tdi);
+                if tdo {
+                    scanned |= 1u64 << i;
+                }
+            }
+            assert_eq!(tap.state, TapState::Exit1Dr);
+            tap.tick(true, false); // Update-DR
+            tap.tick(false, false); // Idle
+            scanned
+        }
+
+        let w0 = shift_dr_u64_tick(&mut tap, 0);
+        assert_eq!(w0, 0x55AA_55AA_55AA_55AA, "Capture-DR must load BRAM via IR_USR1");
+        assert_eq!(tap.usr1_addr, 1, "Update-DR auto-inc");
+        let w1 = shift_dr_u64_tick(&mut tap, 0);
+        assert_eq!(w1, 0xF00D_F00D_F00D_F00D);
+        assert_eq!(tap.usr1_addr, 0, "wrap back to 0");
     }
 
     #[test]
