@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST center-aligned PWM
+format 1
+vlnv community:helion:h_pwm_center:1.0
+bus Helion-ST
+top h_pwm_center
+file h_pwm_center.v

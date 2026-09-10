@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM SPI slave shift+sticky byte
+format 1
+vlnv community:helion:h_spi_slave:1.0
+bus Helion-MM
+top h_spi_slave
+file h_spi_slave.v
