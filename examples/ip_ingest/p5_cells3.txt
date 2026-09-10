@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #3 — h_debounce (+ h_clkdiv) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_debounce_ip.prj
+synth_design h_debounce cells=47 luts=35
+project examples/ip_ingest/h_debounce_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_debounce xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=35 WNS_PS=9640 frames=36
+# Instantiated IP: community:helion:h_debounce:1.0 (Helion-ST)
+# cells=47 luts=35 lutffs=35  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_clkdiv_ip.prj
+synth_design h_clkdiv cells=188 luts=181
+project examples/ip_ingest/h_clkdiv_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_clkdiv xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=181 WNS_PS=9680 frames=111
+# Instantiated IP: community:helion:h_clkdiv:1.0 (Helion-ST)
+# cells=188 luts=181 lutffs=181  (>0 real fabric)
