@@ -894,19 +894,25 @@ fn rexpr_has_mux(e: &RExpr) -> bool {
 
 /// Add/Sub under Mux/Concat (or Add of Concat) is not a packed bus pair.
 /// Bit-blasting it after `hang_diag flatten` stalls past the QA 3s kill (alu).
+fn rexpr_is_arith_leaf(e: &RExpr) -> bool {
+    matches!(
+        e,
+        RExpr::Ident(_)
+            | RExpr::Const { .. }
+            | RExpr::Bit(_, _)
+            | RExpr::Range(_, _, _)
+    )
+}
+
 fn rexpr_has_nested_arith(e: &RExpr) -> bool {
     match e {
         RExpr::Add(a, b) | RExpr::Sub(a, b) => {
-            let simple = matches!(
-                (a.as_ref(), b.as_ref()),
-                (RExpr::Ident(_), RExpr::Ident(_))
-                    | (RExpr::Ident(_), RExpr::Const { .. })
-                    | (RExpr::Const { .. }, RExpr::Ident(_))
-            );
-            if !simple {
-                return true;
+            // Ident/Const/Bit/Range leaves are packed forms (ripple or bit-blast).
+            // Mux/Concat/Not under add/sub still stalls QA — keep flatten_cap.
+            if rexpr_is_arith_leaf(a) && rexpr_is_arith_leaf(b) {
+                return false;
             }
-            false
+            true
         }
         RExpr::Mux(c, t, f) => {
             rexpr_has_nested_arith(c) || rexpr_has_nested_arith(t) || rexpr_has_nested_arith(f)
@@ -1878,7 +1884,9 @@ fn assemble_module(
         // Cap is hierarchy stitch budget (not die/LUTFF capacity). Affinity still
         // soft-holds place at 8192; raising this lets deeper core children stitch
         // after if_stage/decode cones grow — prefer lowering over skipping them.
-        if d.cells.len() >= 64_000 {
+        // Raised with deeper if_stage/LSU/ex cones (inside + scoped enum +
+        // const-minus). Affinity soft-hold stays 8192; this is stitch budget only.
+        if d.cells.len() >= 96_000 {
             note_skip(format!(
                 "diagnostic assemble_cap module={} inst={} child={} (hierarchy cap; not a LUT)",
                 name, inst.name, inst.module
@@ -2071,7 +2079,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         "endfunction", "task", "endtask", "return", "always_latch", "unique", "priority",
         "automatic", "void", "const", "var", "ref", "static", "extern", "virtual", "pure",
         "interface", "endinterface", "modport", "clocking", "property", "endproperty",
-        "assert", "assume", "cover", "sequence", "endsequence",
+        "assert", "assume", "cover", "sequence", "endsequence", "inside",
     ];
     while i < chars.len() {
         let c = chars[i];
@@ -2720,6 +2728,31 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
         }
         // a > b  ≡  b < a
         return Ok(RExpr::Lt(Box::new(r), Box::new(e)));
+    }
+    // `sig inside {a, b}` ≡ (sig==a)||(sig==b). Same honesty as multi-value case.
+    if p.eat_kw("inside") {
+        if !p.eat_sym('{') {
+            return Err("inside {".into());
+        }
+        let mut items = Vec::new();
+        while !p.eat_sym('}') {
+            if p.peek().is_none() {
+                return Err("inside }".into());
+            }
+            items.push(parse_shift(p)?);
+            let _ = p.eat_sym(',');
+        }
+        if items.is_empty() {
+            return Err("inside empty".into());
+        }
+        let mut cond = RExpr::Eq(Box::new(e.clone()), Box::new(items[0].clone()));
+        for it in items.into_iter().skip(1) {
+            cond = RExpr::Or(
+                Box::new(cond),
+                Box::new(RExpr::Eq(Box::new(e.clone()), Box::new(it))),
+            );
+        }
+        return Ok(cond);
     }
     Ok(e)
 }
@@ -5584,11 +5617,27 @@ fn parse_module_items(
                 // Consumed. Not an assign, not an unknown child, not a LUT.
                 continue;
             }
-            // `opcode_e opcode;` / `ls_fsm_e ls_fsm_ns;` — typedef-typed signal,
-            // not an instance (no port list). Width from harvested enum type.
+            // `opcode_e opcode;` / `ibex_pkg::pc_sel_e pc_mux_internal;` —
+            // typedef-typed signal, not an instance (no port list). Optional
+            // `pkg::` prefix. Width from harvested enum type.
             let save_td = p.i;
-            if let Ok(ty) = p.ident() {
-                let mut w = pkg_enum_type_width(&ty).unwrap_or(0);
+            if let Ok(first) = p.ident() {
+                let ty = if p.eat_sym(':') && p.eat_sym(':') {
+                    match p.ident() {
+                        Ok(t) => t,
+                        Err(_) => {
+                            p.i = save_td;
+                            String::new()
+                        }
+                    }
+                } else {
+                    first
+                };
+                let mut w = if ty.is_empty() {
+                    0
+                } else {
+                    pkg_enum_type_width(&ty).unwrap_or(0)
+                };
                 if matches!(p.peek(), Some(Tok::Sym('['))) {
                     p.bump();
                     if let (Ok(hi), true, Ok(lo), true) = (
@@ -7904,6 +7953,43 @@ fn packed_sub_const(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128)> {
     }
 }
 
+/// `assign y = K - bus` / `K - bus[hi:lo]`. K is 1..=32 on the left only.
+/// Ibex ALU: `shift_amt_compl = 32 - operand_b_i[4:0]`. Not `bus - K`,
+/// not two named buses, not a multiply. `bus_lo`/`bus_bits` describe the
+/// subtrahend slice (Ident ⇒ lo=0, bits=width).
+fn packed_const_minus_bus(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128, usize, usize)> {
+    let RExpr::Sub(a, b) = rhs else {
+        return None;
+    };
+    if expr_contains_mul(rhs) {
+        return None;
+    }
+    let k = match a.as_ref() {
+        RExpr::Const { val, .. } => *val,
+        _ => return None,
+    };
+    if !(1u128..=32).contains(&k) {
+        return None;
+    }
+    match b.as_ref() {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 => {
+            let bits = sig_width(rtl, s);
+            if bits == 0 || bits > 32 {
+                return None;
+            }
+            Some((s.clone(), k, 0, bits))
+        }
+        RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 && *hi >= *lo => {
+            let bits = (*hi - *lo).saturating_add(1);
+            if bits == 0 || bits > 32 {
+                return None;
+            }
+            Some((s.clone(), k, *lo, bits))
+        }
+        _ => None,
+    }
+}
+
 fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
     let w = sig_width(rtl, name);
     if bit >= w {
@@ -8179,6 +8265,112 @@ fn emit_ripple_sub_const(
         }
     }
     eprintln!("synth_rtl ripple_sub_const signal={diff} bits={width} const={k}");
+    true
+}
+
+/// Combinational ripple of `assign y = K - bus` (const minuend). K is 1..=32.
+/// Subtrahend bits come from `bus[bus_lo + i]` for i < bus_bits, else 0
+/// (zero-extend into `width`). No invented subtrahend vector, no clock, no MAC.
+/// Returns false if a live bus bit is missing.
+fn emit_ripple_const_minus(
+    d: &mut Design,
+    rtl: &Rtl,
+    diff: &str,
+    width: usize,
+    bus: &str,
+    k: u128,
+    bus_lo: usize,
+    bus_bits: usize,
+) -> bool {
+    if width == 0 || width > 32 || !(1u128..=32).contains(&k) || bus_bits == 0 || bus_bits > 32 {
+        return false;
+    }
+    for i in 0..bus_bits.min(width) {
+        if op_bit_net(rtl, bus, bus_lo + i).is_none() {
+            return false;
+        }
+    }
+    // Constant-0 for zero-extended high bits (not a second operand bus).
+    let zero = format!("n_rcm_{diff}_z");
+    let zero_cell = format!("u_rcm_{diff}_z");
+    let Some(any) = op_bit_net(rtl, bus, bus_lo) else {
+        return false;
+    };
+    emit_lut_pins(d, &zero_cell, &zero, lut6_const(false), &[(&any, "I0")]);
+    let mut bin: Option<String> = None;
+    for bit in 0..width {
+        let kbit = ((k >> bit) & 1) == 1;
+        let xn = if bit < bus_bits {
+            op_bit_net(rtl, bus, bus_lo + bit).unwrap()
+        } else {
+            zero.clone()
+        };
+        let diff_net = bit_name(diff, width, bit);
+        let diff_cell = format!("u_rcm_{diff}_{bit}s");
+        let bin_now = bin.clone();
+        // diff = kbit ⊕ x ⊕ bin; bout = (~kbit & x) | (~kbit & bin) | (x & bin)
+        match (kbit, bin_now.as_deref()) {
+            (true, None) => {
+                // 1 - x: diff = ~x, bout = 0 (no borrow out).
+                emit_lut_pins(d, &diff_cell, &diff_net, lut6_inv(), &[(&xn, "I0")]);
+                bin = None;
+            }
+            (false, None) => {
+                // 0 - x: diff = x, bout = x.
+                emit_lut_pins(d, &diff_cell, &diff_net, lut6_buf(), &[(&xn, "I0")]);
+                if bit + 1 < width {
+                    bin = Some(xn);
+                }
+            }
+            (true, Some(bn)) => {
+                // diff = ~(x ⊕ bin); bout = x & bin
+                emit_lut_pins(
+                    d,
+                    &diff_cell,
+                    &diff_net,
+                    lut6_xnor2(),
+                    &[(&xn, "I0"), (bn, "I1")],
+                );
+                if bit + 1 < width {
+                    let bout = format!("n_rcm_{diff}_{bit}b");
+                    let cry_cell = format!("u_rcm_{diff}_{bit}b");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &bout,
+                        lut6_and2(false, false, false),
+                        &[(&xn, "I0"), (bn, "I1")],
+                    );
+                    bin = Some(bout);
+                }
+            }
+            (false, Some(bn)) => {
+                // diff = x ⊕ bin; bout = x | bin = ~(~x & ~bin)
+                emit_lut_pins(
+                    d,
+                    &diff_cell,
+                    &diff_net,
+                    lut6_xor2(),
+                    &[(&xn, "I0"), (bn, "I1")],
+                );
+                if bit + 1 < width {
+                    let bout = format!("n_rcm_{diff}_{bit}b");
+                    let cry_cell = format!("u_rcm_{diff}_{bit}b");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &bout,
+                        lut6_and2(true, true, true),
+                        &[(&xn, "I0"), (bn, "I1")],
+                    );
+                    bin = Some(bout);
+                }
+            }
+        }
+    }
+    eprintln!(
+        "synth_rtl ripple_const_minus signal={diff} bits={width} const={k} bus_bits={bus_bits}"
+    );
     true
 }
 
@@ -9003,13 +9195,29 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // width<=32 `assign y = bus - K` (K in 1..=16, bus on the left) is a
         // borrow ripple from that constant, not a second operand bus and not
         // a 32-PI cone. No clock, no MAC. Wider than 32, or a skipped bit,
-        // stays unlowered — do not invent a shorter bus. `K - bus` is not
-        // this form.
+        // stays unlowered — do not invent a shorter bus.
         if bit.is_none() {
             if let Some((bus, k)) = packed_sub_const(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
                     if w > 32 || !emit_ripple_sub_const(&mut d, rtl, lhs, w, &bus, k) {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                    continue;
+                }
+            }
+        }
+        // width<=32 `assign y = K - bus` / `K - bus[hi:lo]` (K in 1..=32).
+        // Ibex ALU shift_amt_compl. Zero-extends the slice; no second operand bus.
+        if bit.is_none() {
+            if let Some((bus, k, bus_lo, bus_bits)) = packed_const_minus_bus(rhs, rtl) {
+                if rexpr_unknown_name(rhs, rtl).is_none() {
+                    let w = sig_width(rtl, lhs).max(1);
+                    if w > 32
+                        || !emit_ripple_const_minus(
+                            &mut d, rtl, lhs, w, &bus, k, bus_lo, bus_bits,
+                        )
+                    {
                         note_assign_not_lowered(&rtl.module, lhs);
                     }
                     continue;
@@ -12112,6 +12320,86 @@ endmodule
             "opcode case must map LUTs, cells={:?}",
             d.cells
         );
+    }
+
+    #[test]
+    fn inside_set_lowers_like_multi_value_case() {
+        let src = r#"
+package p;
+  typedef enum logic [1:0] { IDLE = 2'd0, WAIT_A = 2'd1, WAIT_B = 2'd2 } st_e;
+endpackage
+module ins(input logic [1:0] cs, input logic rvalid, output logic hit);
+  assign hit = cs inside {WAIT_A, WAIT_B} && rvalid;
+endmodule
+"#;
+        let d = synth_sv(src, "inside.sv").expect("inside");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"), "inside must lower");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"), "inside is not generate");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "inside set must map a LUT"
+        );
+    }
+
+    #[test]
+    fn scoped_pkg_typedef_signal_lowers_case() {
+        let src = r#"
+package ibex_pkg;
+  typedef enum logic [2:0] {
+    PC_BOOT, PC_JUMP, PC_EXC, PC_ERET, PC_DRET, PC_BP
+  } pc_sel_e;
+endpackage
+module ifm(input logic clk_i,
+           input logic [2:0] pc_mux_i,
+           input logic [31:0] boot_addr_i,
+           input logic [31:0] jump_i,
+           output logic [31:0] fetch_addr_n,
+           output logic [31:0] pc_q);
+  ibex_pkg::pc_sel_e pc_mux_internal;
+  assign pc_mux_internal = pc_mux_i;
+  // Real if_stage has NBAs; flatten_cap only fires on nbas=0 leftovers.
+  always_ff @(posedge clk_i) pc_q <= fetch_addr_n;
+  always_comb begin
+    unique case (pc_mux_internal)
+      PC_BOOT: fetch_addr_n = boot_addr_i;
+      PC_JUMP: fetch_addr_n = jump_i;
+      default: fetch_addr_n = boot_addr_i;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "scoped_pc.sv").expect("scoped_pc");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "pkg::pc_sel_e fetch mux must lower"
+        );
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "scoped enum case must map LUTs"
+        );
+    }
+
+    #[test]
+    fn const_minus_range_is_ripple_not_flatten_cap() {
+        // Ibex ALU: assign shift_amt_compl = 32 - operand_b_i[4:0];
+        let src = r#"
+module shift_compl(input wire [31:0] operand_b_i,
+                   output wire [5:0] shift_amt_compl);
+  assign shift_amt_compl = 32 - operand_b_i[4:0];
+endmodule
+"#;
+        let d = synth_sv(src, "shift_compl.sv").expect("shift_compl");
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"), "must not flatten_cap");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        for bit in 0..6 {
+            let name = format!("shift_amt_compl_{bit}");
+            let driven = d.nets.iter().any(|n| {
+                n.name == name && n.endpoints.iter().any(|e| e.pin == "O")
+            });
+            assert!(driven, "bit {bit} must lower");
+        }
     }
 
     #[test]
