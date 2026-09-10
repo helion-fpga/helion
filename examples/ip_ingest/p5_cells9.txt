@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #9 — h_clz (+ h_byte_rev) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_clz_ip.prj
+synth_design h_clz cells=669 luts=628
+project examples/ip_ingest/h_clz_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_clz xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=628 WNS_PS=9600 frames=359
+# Instantiated IP: community:helion:h_clz:1.0 (Helion-ST)
+# cells=669 luts=628 lutffs=628  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_byte_rev_ip.prj
+synth_design h_byte_rev cells=165 luts=98
+project examples/ip_ingest/h_byte_rev_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_byte_rev xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=98 WNS_PS=9460 frames=93
+# Instantiated IP: community:helion:h_byte_rev:1.0 (Helion-ST)
+# cells=165 luts=98 lutffs=98  (>0 real fabric)

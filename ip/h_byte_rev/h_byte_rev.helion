@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered endian byte-reverse
+format 1
+vlnv community:helion:h_byte_rev:1.0
+bus Helion-ST
+top h_byte_rev
+file h_byte_rev.v
