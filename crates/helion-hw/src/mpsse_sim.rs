@@ -220,6 +220,43 @@ impl FtdiBitbangSim {
         Ok(out)
     }
 
+    /// Bitbang `IR_USR1` RLE-compressed upload (TAP encodes; host expands).
+    pub fn usr1_upload_bram_rle(
+        &mut self,
+        major: u16,
+        start: u32,
+        n: usize,
+        wrap: u32,
+    ) -> Result<crate::Usr1RleUpload, MpsseSimError> {
+        self.require_open()?;
+        let wrap = if wrap == 0 { n as u32 } else { wrap };
+        let start = start % wrap;
+        let _ = self.shift_ir(IR_USR1)?;
+        let _ = self.shift_dr_u64(crate::Tap::usr1_rle_cmd(major, start, wrap, n))?;
+        let header = self.shift_dr_u64(0)?;
+        let magic = ((header >> 48) & 0xffff) as u16;
+        let n_samples = ((header >> 32) & 0xffff) as usize;
+        let n_tokens = ((header >> 16) & 0xffff) as usize;
+        if magic != crate::USR1_RLE_HEADER_MAGIC {
+            return Err(MpsseSimError::CfgW(format!(
+                "USR1 RLE header magic {magic:#06x}, expected {:#06x}",
+                crate::USR1_RLE_HEADER_MAGIC
+            )));
+        }
+        let mut tokens = Vec::with_capacity(n_tokens);
+        for _ in 0..n_tokens {
+            tokens.push(self.shift_dr_u64(0)?);
+        }
+        let words = crate::rle_expand_tokens(&tokens, n_samples);
+        Ok(crate::Usr1RleUpload {
+            words,
+            dr_scans: 1 + n_tokens,
+            raw_scans: n,
+            n_tokens,
+            n_samples,
+        })
+    }
+
     /// Open-path helper: shift `IR_IDCODE`, then scan 32-bit DR.
     pub fn read_idcode(&mut self) -> Result<u32, MpsseSimError> {
         let _ = self.shift_ir(IR_IDCODE)?;
@@ -438,6 +475,24 @@ mod tests {
         let words = bb.usr1_upload_bram(0, 0, 3, 3).unwrap();
         assert_eq!(words, vec![1, 2, 4]);
         assert_eq!(bb.tap().ir, IR_USR1);
+    }
+
+    #[test]
+    fn usr1_bitbang_rle_upload_compresses_runs() {
+        use helion_device::Device;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut bb = FtdiBitbangSim::new(&dev);
+        bb.open().unwrap();
+        for i in 0..8u32 {
+            bb.tap_mut().fabric_mut().bram_write_word(0, i as usize, 0);
+        }
+        for i in 8..12u32 {
+            bb.tap_mut().fabric_mut().bram_write_word(0, i as usize, 1);
+        }
+        let rle = bb.usr1_upload_bram_rle(0, 0, 12, 12).unwrap();
+        assert_eq!(rle.words, [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]);
+        assert!(rle.dr_scans < rle.raw_scans, "{rle:?}");
+        assert_eq!(rle.n_tokens, 2);
     }
 
     #[test]
