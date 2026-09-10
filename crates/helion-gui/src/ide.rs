@@ -31573,6 +31573,25 @@ endmodule
             cat.status, "Failed",
             "CDC-10 Critical must paint Failed: {cat:?}"
         );
+        // Honest unsync: methodology keeps CDC-1 CriticalWarning → Failed.
+        let meth = ide.methodology_report();
+        let m1 = meth.check("CDC-1").expect("unsync methodology CDC-1");
+        assert_eq!(
+            m1.severity,
+            helion_sta::MethodologySeverity::CriticalWarning,
+            "unsync must CriticalWarning: {}",
+            meth.text()
+        );
+        assert!(meth.critical_count() > 0, "{}", meth.text());
+        let meth_cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_methodology")
+            .expect("methodology row");
+        assert_eq!(
+            meth_cat.status, "Failed",
+            "unsync methodology CriticalWarning must Failed: {meth_cat:?}"
+        );
 
         // Counter gold must still hold on a fresh session (no WNS bleed).
         let mut again = IdeModel::new();
@@ -31593,7 +31612,7 @@ endmodule
     }
 
     /// examples/cdc_sync.sv: 2FF synchronizer → CDC-1 Warning / catalog Warnings.
-    /// Methodology CriticalWarning (TimedUnsafe CDC-1) still paints Failed.
+    /// Methodology is sync-aware: CDC-1 Warning (not CriticalWarning) → Warnings.
     /// Counter gold WNS_PS=9640 unchanged.
     #[test]
     fn cdc_sync_example_cdc1_warning_catalog_warnings() {
@@ -31632,16 +31651,19 @@ endmodule
             "CDC-1 Warning-only must paint Warnings: {cat:?}"
         );
 
-        // Methodology: TimedUnsafe still CriticalWarning → Failed (not Warnings).
+        // Methodology: sync-aware CDC-1 Warning (aligned with report_cdc), not Failed.
         let meth = ide.methodology_report();
-        assert!(
-            meth.check("CDC-1").is_some(),
-            "methodology CDC-1 CriticalWarning must remain: {}",
+        let m1 = meth.check("CDC-1").expect("methodology CDC-1");
+        assert_eq!(
+            m1.severity,
+            helion_sta::MethodologySeverity::Warning,
+            "2FF sync methodology must Warning not Critical: {}",
             meth.text()
         );
-        assert!(
-            meth.critical_count() > 0,
-            "unsafe CDC methodology must CriticalWarning: {}",
+        assert_eq!(
+            meth.critical_count(),
+            0,
+            "sync CDC must not CriticalWarning: {}",
             meth.text()
         );
         let meth_cat = ide
@@ -31650,8 +31672,8 @@ endmodule
             .find(|r| r.id == "report_methodology")
             .expect("methodology row");
         assert_eq!(
-            meth_cat.status, "Failed",
-            "methodology CriticalWarning must paint Failed: {meth_cat:?}"
+            meth_cat.status, "Warnings",
+            "methodology Warning-only must paint Warnings: {meth_cat:?}"
         );
 
         let mut again = IdeModel::new();
@@ -31666,6 +31688,74 @@ endmodule
             .find(|r| r.id == "report_cdc")
             .unwrap();
         assert_eq!(cdc_clean.status, "Complete", "{cdc_clean:?}");
+    }
+
+    /// examples/cdc_async_groups.sv+.sdc: set_clock_groups -asynchronous → CDC-15 Info /
+    /// catalog Complete (Info-only). Unsync cdc_cross without groups stays Failed.
+    /// Counter gold WNS_PS=9640 unchanged.
+    #[test]
+    fn cdc_async_groups_cdc15_info_catalog_complete() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("cdc_async_groups.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert!(
+            ide.pane_clocks().len() >= 2,
+            "sibling SDC must create clk_a/clk_b: {:?}",
+            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            ide.constraints.clock_groups.iter().any(|g| g.asynchronous),
+            "sibling SDC must set_clock_groups -asynchronous: {:?}",
+            ide.constraints.clock_groups
+        );
+        let out = ide.exec("report_cdc").unwrap();
+        assert!(out.contains("report_cdc"), "{out}");
+        let r = ide.cdc_report();
+        assert_eq!(r.critical_count(), 0, "async groups must not Critical: {}", r.text());
+        assert_eq!(r.warning_count(), 0, "async groups must not Warning: {}", r.text());
+        assert!(
+            r.info_count() > 0,
+            "async groups must Info: {}",
+            r.text()
+        );
+        let row = r
+            .violation("clk_a", "clk_b")
+            .or_else(|| r.violation("clk_b", "clk_a"))
+            .expect("clk_a↔clk_b CDC row");
+        assert_eq!(row.check, "CDC-15", "{row:?}");
+        assert_eq!(row.severity, helion_sta::CdcSeverity::Info, "{row:?}");
+        assert_eq!(row.relation, helion_sta::ClockRelation::Asynchronous, "{row:?}");
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cat.status, "Complete",
+            "Info-only CDC must paint Complete: {cat:?}"
+        );
+        // Methodology: async groups clear TimedUnsafe CDC-1 CriticalWarning.
+        let meth = ide.methodology_report();
+        assert!(
+            meth.check("CDC-1").is_none(),
+            "async groups must clear methodology CDC-1: {}",
+            meth.text()
+        );
+        assert_eq!(
+            meth.critical_count(),
+            0,
+            "async methodology must not Critical: {}",
+            meth.text()
+        );
+
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
     }
 
     /// POWER-2 occupancy warn is wired into report_power text + catalog; counter
