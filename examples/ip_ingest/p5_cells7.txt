@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #7 — h_popcount (+ h_saturate) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_popcount_ip.prj
+synth_design h_popcount cells=81 luts=40
+project examples/ip_ingest/h_popcount_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_popcount xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=40 WNS_PS=9600 frames=39
+# Instantiated IP: community:helion:h_popcount:1.0 (Helion-ST)
+# cells=81 luts=40 lutffs=40  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_saturate_ip.prj
+synth_design h_saturate cells=293 luts=264
+project examples/ip_ingest/h_saturate_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_saturate xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=264 WNS_PS=9600 frames=158
+# Instantiated IP: community:helion:h_saturate:1.0 (Helion-ST)
+# cells=293 luts=264 lutffs=264  (>0 real fabric)

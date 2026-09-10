@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST saturating add/sub with sticky OV
+format 1
+vlnv community:helion:h_saturate:1.0
+bus Helion-ST
+top h_saturate
+file h_saturate.v
