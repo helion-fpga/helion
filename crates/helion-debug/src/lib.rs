@@ -1,13 +1,14 @@
 //! ILA: mark net → extra LUTFF in netlist/bitstream → arm → capture.
 //!
 //! Soft path (`insert_arm_capture`): host `step_user` + `ble_out` readback.
-//! Deep path (`insert_arm_capture_deep`): fabric BRAM sample buffer + trigger-before-fill
-//! + multi-probe; upload via Helion TAP `IR_USR1` JTAG DR scan of capture RAM.
-//! Residual: not full UG908 user-defined trigger FSM IP / match units / compressed upload.
+//! Deep path (`insert_arm_capture_deep`): fabric BRAM sample buffer + **match-unit LUT /
+//! trigger FSM IP** (not host ble_out edge compare) + multi-probe; upload via Helion TAP
+//! `IR_USR1` JTAG DR scan of capture RAM.
+//! Residual: not full silicon UG908 compressed upload protocol.
 
 use helion_bits::bitgen;
 use helion_device::Device;
-use helion_fabric::Fabric;
+use helion_fabric::{Fabric, IlaMatchKind};
 use helion_hw::Tap;
 use helion_ir::{CellKind, Design};
 use helion_pack::pack;
@@ -85,7 +86,10 @@ pub struct IlaCaptureDeep {
 }
 
 const CAPTURE_BRAM: &str = "ila_capture_ram";
-const DEEP_BACKEND: &str = "jtag_usr1_bram_dr";
+const MATCH_HIT_NET: &str = "ila_match_hit";
+const MATCH_PREV_NET: &str = "ila_match_prev";
+const TRIG_FSM_CELL: &str = "ila_trig_fsm";
+const DEEP_BACKEND: &str = "jtag_usr1_match_fsm";
 
 fn ila_cell_names(net: &str) -> [String; 3] {
     [
@@ -229,11 +233,101 @@ pub fn insert_capture_bram(design: &mut Design, words: usize) -> Result<(), Stri
     Ok(())
 }
 
+
+/// LUT6 INIT for match unit: I0=probe, I1=prev (unused inputs assumed 0).
+/// Rising = I0 & ~I1 → 0x2222…; Falling = ~I0 & I1 → 0x4444…; Immediate = 1.
+pub fn match_unit_init(kind: IlaTriggerKind) -> u64 {
+    match kind {
+        IlaTriggerKind::Immediate => 0xFFFF_FFFF_FFFF_FFFF,
+        IlaTriggerKind::Rising => 0x2222_2222_2222_2222,
+        IlaTriggerKind::Falling => 0x4444_4444_4444_4444,
+    }
+}
+
+fn match_unit_cell_names() -> [&'static str; 4] {
+    [
+        "ila_match_delay_lut",
+        "ila_match_delay_ff",
+        "ila_match_lut",
+        TRIG_FSM_CELL,
+    ]
+}
+
+pub fn strip_match_unit(design: &mut Design) {
+    let names = match_unit_cell_names();
+    design.cells.retain(|c| !names.iter().any(|n| *n == c.name));
+    design.nets.retain(|n| n.name != MATCH_HIT_NET && n.name != MATCH_PREV_NET && n.name != "ila_match_delay_d");
+    for n in &mut design.nets {
+        n.endpoints
+            .retain(|e| !names.iter().any(|c| *c == e.cell));
+    }
+}
+
+/// Insert UG908-class match unit + trigger FSM IP marker on `trigger_net`.
+///
+/// - Delay LUT+FF: samples previous probe value onto `ila_match_prev`.
+/// - Comb match LUT: INIT encodes Immediate / Rising / Falling → `ila_match_hit`.
+/// - BlackBox `ila_trig_fsm` (`h_ila_trig`): catalog FSM IP with MATCH/NET attrs.
+pub fn insert_match_unit(
+    design: &mut Design,
+    trigger_net: &str,
+    kind: IlaTriggerKind,
+) -> Result<(), String> {
+    if !design.nets.iter().any(|n| n.name == trigger_net) {
+        return Err(format!("match unit: no net {trigger_net}"));
+    }
+    strip_match_unit(design);
+    // Catalog / IP marker (does not pack to LUTFF).
+    design.add_cell(
+        TRIG_FSM_CELL,
+        CellKind::BlackBox {
+            module: "h_ila_trig".into(),
+        },
+    );
+    if let Some(c) = design.cells.iter_mut().find(|c| c.name == TRIG_FSM_CELL) {
+        c.attrs.set("MATCH", kind.as_str());
+        c.attrs.set("NET", trigger_net);
+        c.attrs.set("VLNV", "community:helion:h_ila_trig:1.0");
+    }
+    // Delay FF: buffer LUT O=I0 on trigger_net → registered prev.
+    design.add_cell(
+        "ila_match_delay_lut",
+        CellKind::Lut6 {
+            init: 0xAAAA_AAAA_AAAA_AAAA,
+        },
+    );
+    design.add_cell("ila_match_delay_ff", CellKind::Hff);
+    design.connect(trigger_net, "ila_match_delay_lut", "I0");
+    design.connect("ila_match_delay_d", "ila_match_delay_lut", "O");
+    design.connect("ila_match_delay_d", "ila_match_delay_ff", "D");
+    design.connect(MATCH_PREV_NET, "ila_match_delay_ff", "Q");
+    // Comb match LUT (no FF on O) — host reads LUT O after refresh_comb.
+    design.add_cell(
+        "ila_match_lut",
+        CellKind::Lut6 {
+            init: match_unit_init(kind),
+        },
+    );
+    design.connect(trigger_net, "ila_match_lut", "I0");
+    design.connect(MATCH_PREV_NET, "ila_match_lut", "I1");
+    design.connect(MATCH_HIT_NET, "ila_match_lut", "O");
+    Ok(())
+}
+
+fn to_fabric_match_kind(kind: IlaTriggerKind) -> IlaMatchKind {
+    match kind {
+        IlaTriggerKind::Immediate => IlaMatchKind::Immediate,
+        IlaTriggerKind::Rising => IlaMatchKind::Rising,
+        IlaTriggerKind::Falling => IlaMatchKind::Falling,
+    }
+}
+
 fn strip_deep_ila(design: &mut Design, nets: &[String]) {
     for n in nets {
         strip_ila(design, n);
     }
     strip_capture_bram(design);
+    strip_match_unit(design);
 }
 
 fn pack_sample_word(bits: &[bool]) -> u64 {
@@ -250,22 +344,15 @@ fn unpack_sample_word(w: u64, n: usize) -> Vec<bool> {
     (0..n).map(|i| ((w >> i) & 1) == 1).collect()
 }
 
-fn trigger_fires(kind: IlaTriggerKind, prev: Option<bool>, cur: bool, first: bool) -> bool {
-    match kind {
-        IlaTriggerKind::Immediate => first,
-        IlaTriggerKind::Rising => prev == Some(false) && cur,
-        IlaTriggerKind::Falling => prev == Some(true) && !cur,
-    }
-}
-
-/// Fabric BRAM–backed multi-probe ILA with real trigger-before-fill window.
+/// Fabric BRAM–backed multi-probe ILA with match-unit / trigger-FSM IP.
 ///
-/// Strictly deeper than soft `insert_arm_capture` (`ble_out` host poll):
-/// probe LUTFFs + capture Bram18 in the bitstream, samples written into the TAP
-/// fabric BRAM during the arm, then uploaded via Helion `IR_USR1` JTAG DR scans
-/// (`Tap::usr1_upload_bram`) — not a host `bram_read_word` backdoor.
+/// Strictly deeper than soft `insert_arm_capture` (`ble_out` host poll) and past
+/// host-side edge compare during arm:
+/// probe LUTFFs + capture Bram18 + **match-unit LUT / `h_ila_trig` FSM** in the
+/// bitstream; trigger advances via fabric `IlaTriggerFsm` on match-unit `ila_match_hit`
+/// (after `refresh_comb`), then the window is uploaded via Helion `IR_USR1` JTAG DR.
 ///
-/// Residual vs UG908: no user-defined trigger FSM IP / match units, no compressed upload.
+/// Residual vs UG908: no compressed upload protocol yet.
 pub fn insert_arm_capture_deep(
     dev: &Device,
     design: &Design,
@@ -304,6 +391,7 @@ pub fn insert_arm_capture_deep(
         insert_ila(&mut d, n)?;
     }
     insert_capture_bram(&mut d, window)?;
+    insert_match_unit(&mut d, &cfg.trigger_net, cfg.trigger)?;
     let (routed, bits1) = compile(dev, &d)?;
     if bits0.frames == bits1.frames {
         return Err("ILA deep insert was a no-op (bitstream unchanged)".into());
@@ -313,6 +401,22 @@ pub fn insert_arm_capture_deep(
     }
     if routed.placed.packed.brams.is_empty() {
         return Err("ILA deep did not pack capture BRAM".into());
+    }
+    if !routed
+        .placed
+        .packed
+        .lutffs
+        .iter()
+        .any(|l| l.lut_cell == "ila_match_lut")
+    {
+        return Err("ILA deep did not pack match-unit LUT".into());
+    }
+    if !d
+        .cells
+        .iter()
+        .any(|c| c.name == TRIG_FSM_CELL)
+    {
+        return Err("ILA deep missing ila_trig_fsm IP marker".into());
     }
     let bram_major = routed
         .placed
@@ -343,28 +447,29 @@ pub fn insert_arm_capture_deep(
     let mut tap = Tap::new(dev);
     tap.program(&bits1)?;
 
-    let pre = if cfg.trigger == IlaTriggerKind::Immediate {
-        0
-    } else {
-        cfg.pre_trigger
-    };
-    let post_after_trig = window - pre; // includes trigger sample
+    let match_site = probe_site(&routed.placed, &d, MATCH_HIT_NET)?;
+    let fab_kind = to_fabric_match_kind(cfg.trigger);
+
     let mut ring: std::collections::VecDeque<Vec<bool>> =
         std::collections::VecDeque::with_capacity(window);
-    let mut prev_trig: Option<bool> = None;
-    let mut triggered = false;
-    let mut post_left = 0usize;
-    let mut first = true;
     // Hunt bound: allow slow nets (e.g. MSB) to reach an edge.
     let max_steps = window.saturating_mul(64).max(256);
     let mut steps = 0usize;
     let mut wr = 0usize;
+    let pre = if cfg.trigger == IlaTriggerKind::Immediate {
+        0
+    } else {
+        cfg.pre_trigger.min(window.saturating_sub(1))
+    };
 
     // Scoped mutable fabric borrow — must end before USR1 DR upload on `tap`.
     {
         let fab = tap.fabric_mut();
+        fab.ila_arm_fsm(fab_kind, window, cfg.pre_trigger);
         while steps < max_steps {
             fab.step_user();
+            // Match LUT must see post-tick Q (probe=cur, delay FF=prev).
+            fab.refresh_comb();
             let mut sample = Vec::with_capacity(sites.len());
             for &(site, ble) in &sites {
                 sample.push(fab.ble_out(site.x, site.y, ble as u32));
@@ -375,39 +480,25 @@ pub fn insert_arm_capture_deep(
             if ring.len() == window {
                 ring.pop_front();
             }
-            ring.push_back(sample.clone());
+            ring.push_back(sample);
 
-            let cur_trig = sample[trig_idx];
-            if !triggered {
-                if trigger_fires(cfg.trigger, prev_trig, cur_trig, first) {
-                    triggered = true;
-                    post_left = post_after_trig.saturating_sub(1);
-                    if post_left == 0 && ring.len() >= window.min(pre + 1) {
-                        break;
-                    }
-                }
-            } else {
-                if post_left == 0 {
-                    break;
-                }
-                post_left -= 1;
-                if post_left == 0 {
-                    break;
-                }
-            }
-            prev_trig = Some(cur_trig);
-            first = false;
+            // Trigger from fabric match-unit LUT + FSM — not host ble_out edge compare.
+            let match_hit = fab.ble_out(match_site.0.x, match_site.0.y, match_site.1 as u32);
+            let done = fab.ila_fsm.on_sample(match_hit);
             steps += 1;
+            if done {
+                break;
+            }
+        }
+        if !fab.ila_fsm.fired {
+            return Err(format!(
+                "ILA deep: match-unit/FSM {} never fired on {} in {steps} steps",
+                cfg.trigger.as_str(),
+                cfg.trigger_net
+            ));
         }
     }
 
-    if !triggered {
-        return Err(format!(
-            "ILA deep: trigger {} never fired on {} in {steps} steps",
-            cfg.trigger.as_str(),
-            cfg.trigger_net
-        ));
-    }
     if ring.len() < window && cfg.trigger == IlaTriggerKind::Immediate {
         return Err(format!(
             "ILA deep: short capture {} < window {window}",
@@ -614,7 +705,7 @@ mod tests {
 
         let cfg = IlaArmConfig::single("q3", 16);
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
-        assert_eq!(deep.backend, "jtag_usr1_bram_dr");
+        assert_eq!(deep.backend, "jtag_usr1_match_fsm");
         assert_eq!(deep.probes, vec!["q3".to_string()]);
         assert_eq!(deep.trigger_at, Some(0));
         let deep_bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
@@ -677,14 +768,27 @@ mod tests {
     }
 
     #[test]
-    fn deep_upload_backend_is_jtag_usr1_dr() {
+    fn deep_upload_backend_is_jtag_usr1_match_fsm() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let d = Design::structural_counter();
         let cfg = IlaArmConfig::single("q3", 16);
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
-        assert_eq!(deep.backend, "jtag_usr1_bram_dr");
+        assert_eq!(deep.backend, "jtag_usr1_match_fsm");
         let bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
         assert_eq!(bits, "0000000111111110");
+    }
+
+    #[test]
+    fn match_unit_insert_packs_lut_and_fsm_marker() {
+        let mut d = Design::structural_counter();
+        insert_match_unit(&mut d, "q3", IlaTriggerKind::Rising).unwrap();
+        assert!(d.cells.iter().any(|c| c.name == "ila_match_lut"));
+        assert!(d.cells.iter().any(|c| {
+            matches!(&c.kind, CellKind::BlackBox { module } if module == "h_ila_trig")
+        }));
+        assert_eq!(match_unit_init(IlaTriggerKind::Rising), 0x2222_2222_2222_2222);
+        strip_match_unit(&mut d);
+        assert!(!d.cells.iter().any(|c| c.name == "ila_match_lut"));
     }
 
     #[test]
