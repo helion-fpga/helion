@@ -3853,7 +3853,10 @@ fn compact_priority_onehot_unroll(stmts: &[Nba]) -> Option<Vec<Nba>> {
         }
     }
     let (bus, nbits) = bits_per.into_iter().max_by_key(|(_, n)| *n)?;
-    if nbits < 32 {
+    // Ibex routinely bit-blasts 32-bit buses (instr_o/rdata_o/…). Only the
+    // hang-class DW≥48 priority for-loops (logikbench bin2prio DW=64) may
+    // compact; never strip honest 32-bit fabric.
+    if nbits < 48 {
         return None;
     }
     // already_granted / found (and optional valid) must appear as scalars.
