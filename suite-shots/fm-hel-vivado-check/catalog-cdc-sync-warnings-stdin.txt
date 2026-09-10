@@ -17,7 +17,7 @@ NAME=report_clock_interaction CATEGORY=Timing STATUS=Complete SUMMARY=clocks=2 c
 NAME=report_cdc CATEGORY=Timing STATUS=Warnings SUMMARY=critical=0 warning=1 info=0 safe=1 TCL=report_cdc
 NAME=report_clock_networks CATEGORY=Timing STATUS=Complete SUMMARY=loads=3 buffers=2 INSERTION_PS=40 TCL=report_clock_networks
 NAME=report_power CATEGORY=Implementation STATUS=Complete SUMMARY=TOTAL_UW=14591 STATIC_UW=8716 DYNAMIC_UW=5875 VOLTAGE_MV=1000 TCL=report_power
-NAME=report_methodology CATEGORY=Implementation STATUS=Failed SUMMARY=checks=5 errors=0 warning=2 TCL=report_methodology
+NAME=report_methodology CATEGORY=Implementation STATUS=Warnings SUMMARY=checks=4 errors=0 warning=3 TCL=report_methodology
 NAME=report_drc CATEGORY=Implementation STATUS=Complete SUMMARY=violations=0 errors=0 TCL=report_drc
 NAME=report_utilization CATEGORY=Implementation STATUS=Complete SUMMARY=LUTFF=3/8192 IOB=1/32 TCL=report_utilization
 NAME=report_bitstream CATEGORY=Program STATUS=Not generated SUMMARY=- TCL=report_bitstream

@@ -2381,8 +2381,9 @@ fn q_used_as_clock(design: &Design) -> Vec<(String, String, String)> {
 }
 
 /// UG949 `report_methodology`: STA/XDC/HNF checks (missing clocks, I/O delay,
-/// LUT-as-clock, missing generated clock, unsafe CDC). Empty design yields no
-/// rows. Does not move WNS.
+/// LUT-as-clock, missing generated clock, unsafe CDC). TimedUnsafe CDC is
+/// sync-aware like `report_cdc`: 2FF synchronizer → CDC-1 Warning; unsync →
+/// CriticalWarning. Empty design yields no rows. Does not move WNS.
 pub fn report_methodology(
     clocks: &[Clock],
     xdc: &Constraints,
@@ -2490,17 +2491,61 @@ pub fn report_methodology(
     };
     if clks.len() >= 2 {
         let interaction = report_clock_interaction(clks, xdc, timing);
+        // Align with report_cdc: TimedUnsafe + 2FF sync → CDC-1 Warning;
+        // unsynchronized TimedUnsafe → CriticalWarning / catalog Failed.
+        // Reverse of a synced pair is not a second Critical (phantom B→A).
+        let mut synced_pairs: Vec<(String, String)> = Vec::new();
+        let mut pending: Vec<(String, String, bool)> = Vec::new();
         for cell in &interaction.cells {
-            if cell.relation == ClockRelation::TimedUnsafe {
+            if cell.relation != ClockRelation::TimedUnsafe || cell.from == cell.to {
+                continue;
+            }
+            let sync = {
+                let from = clks.iter().find(|c| c.name == cell.from);
+                let to = clks.iter().find(|c| c.name == cell.to);
+                match (from, to) {
+                    (Some(f), Some(t)) => {
+                        let fn_ = clock_net_name(d, f);
+                        let tn = clock_net_name(d, t);
+                        cdc_synchronizer(d, &fn_, &tn).1
+                    }
+                    _ => false,
+                }
+            };
+            if sync {
+                synced_pairs.push((cell.from.clone(), cell.to.clone()));
+            }
+            pending.push((cell.from.clone(), cell.to.clone(), sync));
+        }
+        for (from, to, sync) in pending {
+            if !sync
+                && synced_pairs
+                    .iter()
+                    .any(|(f, t)| f == &to && t == &from)
+            {
+                // Covered by the reverse 2FF sync; do not CriticalWarning.
+                continue;
+            }
+            if sync {
+                methodology_push(
+                    &mut checks,
+                    "CDC-1",
+                    MethodologySeverity::Warning,
+                    "CDC",
+                    format!("{from}->{to}"),
+                    format!(
+                        "Timed (unsafe) CDC {from} → {to} with synchronizer (UG906 CDC-1)"
+                    ),
+                );
+            } else {
                 methodology_push(
                     &mut checks,
                     "CDC-1",
                     MethodologySeverity::CriticalWarning,
                     "CDC",
-                    format!("{}->{}", cell.from, cell.to),
+                    format!("{from}->{to}"),
                     format!(
-                        "Timed (unsafe) CDC {} → {} without a clock-group or false-path exception",
-                        cell.from, cell.to
+                        "Timed (unsafe) CDC {from} → {to} without a clock-group or false-path exception"
                     ),
                 );
             }
