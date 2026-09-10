@@ -53,6 +53,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_addsub_mm` | Helion-MM | MM add/sub with sticky carry/borrow |
 | `h_ones_comp` | Helion-ST | Registered ones-complement / invert+inc negate |
 | `h_pulse_ext` | Helion-ST | Pulse stretcher/extender with programmable width |
+| `h_rng_xorshift` | Helion-ST | Registered xorshift32 PRNG with seed/enable |
+| `h_prio_enc` | Helion-ST | Registered 16→4 priority encoder + valid |
+| `h_skid_buf` | Helion-ST | 1-deep skid buffer (valid/ready Helion-ST) |
+| `h_bcd_inc` | Helion-ST | Registered 4-digit BCD incrementer + carry |
 
 ## Use
 
@@ -91,6 +95,10 @@ helion ip show ip/h_mux4/h_mux4.helion
 helion ip show ip/h_addsub_mm/h_addsub_mm.helion
 helion ip show ip/h_ones_comp/h_ones_comp.helion
 helion ip show ip/h_pulse_ext/h_pulse_ext.helion
+helion ip show ip/h_rng_xorshift/h_rng_xorshift.helion
+helion ip show ip/h_prio_enc/h_prio_enc.helion
+helion ip show ip/h_skid_buf/h_skid_buf.helion
+helion ip show ip/h_bcd_inc/h_bcd_inc.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -124,6 +132,10 @@ helion project examples/ip_ingest/h_mux4_ip.prj
 helion project examples/ip_ingest/h_addsub_mm_ip.prj
 helion project examples/ip_ingest/h_ones_comp_ip.prj
 helion project examples/ip_ingest/h_pulse_ext_ip.prj
+helion project examples/ip_ingest/h_rng_xorshift_ip.prj
+helion project examples/ip_ingest/h_prio_enc_ip.prj
+helion project examples/ip_ingest/h_skid_buf_ip.prj
+helion project examples/ip_ingest/h_bcd_inc_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -150,6 +162,10 @@ helion project examples/ip_ingest/h_pulse_ext_ip.prj
 #   read_ip ip/h_addsub_mm/h_addsub_mm.helion
 #   read_ip ip/h_ones_comp/h_ones_comp.helion
 #   read_ip ip/h_pulse_ext/h_pulse_ext.helion
+#   read_ip ip/h_rng_xorshift/h_rng_xorshift.helion
+#   read_ip ip/h_prio_enc/h_prio_enc.helion
+#   read_ip ip/h_skid_buf/h_skid_buf.helion
+#   read_ip ip/h_bcd_inc/h_bcd_inc.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.

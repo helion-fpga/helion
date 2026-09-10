@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered 16→4 priority encoder
+format 1
+vlnv community:helion:h_prio_enc:1.0
+bus Helion-ST
+top h_prio_enc
+file h_prio_enc.v

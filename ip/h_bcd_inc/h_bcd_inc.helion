@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered 4-digit BCD incrementer
+format 1
+vlnv community:helion:h_bcd_inc:1.0
+bus Helion-ST
+top h_bcd_inc
+file h_bcd_inc.v
