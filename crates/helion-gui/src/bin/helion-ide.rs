@@ -3085,7 +3085,7 @@ fn paint_sim_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn run_status_color(status: &str) -> Color32 {
     match status {
         "Complete" => Color32::from_rgb(0x50, 0xc0, 0x70),
-        "Running" => Color32::from_rgb(0xf0, 0xc0, 0x40),
+        "Running" | "Warnings" => Color32::from_rgb(0xf0, 0xc0, 0x40),
         "Failed" => Color32::from_rgb(0xe0, 0x50, 0x50),
         _ => Color32::from_rgb(0x6a, 0x70, 0x78),
     }

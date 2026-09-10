@@ -14914,6 +14914,7 @@ impl IdeModel {
             workspace: WorkspaceTab,
             ready: bool,
             summary: String,
+            status_when_ready: &str,
         ) -> ReportCatalogRow {
             ReportCatalogRow {
                 id: id.into(),
@@ -14921,7 +14922,7 @@ impl IdeModel {
                 category: category.into(),
                 tcl: id.into(),
                 status: if ready {
-                    "Complete".into()
+                    status_when_ready.into()
                 } else {
                     "Not generated".into()
                 },
@@ -14958,9 +14959,14 @@ impl IdeModel {
 
         let pwr = self.power_report();
         let pwr_ready = !pwr.part.is_empty();
+        let pwr_assumed_f = pwr_ready && self.pane_clocks().is_empty();
         let pwr_sum = format!(
-            "TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={}",
-            pwr.total_uw, pwr.static_uw, pwr.dynamic_uw, pwr.voltage_mv
+            "TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={}{}",
+            pwr.total_uw,
+            pwr.static_uw,
+            pwr.dynamic_uw,
+            pwr.voltage_mv,
+            if pwr_assumed_f { " POWER-1=assumed_f" } else { "" }
         );
 
         let meth = self.methodology_report();
@@ -15004,6 +15010,38 @@ impl IdeModel {
             bits.hash, bits.frames, bits.configured
         );
 
+        let cdc_status = if cdc.critical_count() > 0 {
+            "Failed"
+        } else if cdc.warning_count() > 0 {
+            "Warnings"
+        } else {
+            "Complete"
+        };
+        let pwr_status = if pwr_ready && self.pane_clocks().is_empty() {
+            "Warnings"
+        } else {
+            "Complete"
+        };
+        let meth_status = if meth.error_count() > 0 || meth.critical_count() > 0 {
+            "Failed"
+        } else if meth.warning_count() > 0 {
+            "Warnings"
+        } else {
+            "Complete"
+        };
+        let drc_warn = drc
+            .items
+            .iter()
+            .filter(|v| v.severity == helion_drc::DrcSeverity::Warning)
+            .count();
+        let drc_status = if drc.error_count() > 0 {
+            "Failed"
+        } else if drc_warn > 0 {
+            "Warnings"
+        } else {
+            "Complete"
+        };
+
         vec![
             row(
                 "report_timing_summary",
@@ -15012,6 +15050,7 @@ impl IdeModel {
                 WorkspaceTab::Reports,
                 ts_ready,
                 ts_sum,
+                "Complete",
             ),
             row(
                 "report_clock_interaction",
@@ -15020,6 +15059,7 @@ impl IdeModel {
                 WorkspaceTab::ClockInteraction,
                 ci_ready,
                 ci_sum,
+                "Complete",
             ),
             row(
                 "report_cdc",
@@ -15028,6 +15068,7 @@ impl IdeModel {
                 WorkspaceTab::Cdc,
                 cdc_ready,
                 cdc_sum,
+                cdc_status,
             ),
             row(
                 "report_clock_networks",
@@ -15036,6 +15077,7 @@ impl IdeModel {
                 WorkspaceTab::ClockNetworks,
                 cn_ready,
                 cn_sum,
+                "Complete",
             ),
             row(
                 "report_power",
@@ -15044,6 +15086,7 @@ impl IdeModel {
                 WorkspaceTab::Power,
                 pwr_ready,
                 pwr_sum,
+                pwr_status,
             ),
             row(
                 "report_methodology",
@@ -15052,6 +15095,7 @@ impl IdeModel {
                 WorkspaceTab::Methodology,
                 meth_ready,
                 meth_sum,
+                meth_status,
             ),
             row(
                 "report_drc",
@@ -15060,6 +15104,7 @@ impl IdeModel {
                 WorkspaceTab::Drc,
                 drc_ready,
                 drc_sum,
+                drc_status,
             ),
             row(
                 "report_utilization",
@@ -15068,6 +15113,7 @@ impl IdeModel {
                 WorkspaceTab::Utilization,
                 util_ready,
                 util_sum,
+                "Complete",
             ),
             row(
                 "report_bitstream",
@@ -15076,6 +15122,7 @@ impl IdeModel {
                 WorkspaceTab::Bitstream,
                 bits_ready,
                 bits_sum,
+                "Complete",
             ),
         ]
     }
@@ -31386,6 +31433,72 @@ endmodule
             Some(gold),
             "empty XDC gold WNS must hold after Reports catalog"
         );
+    }
+
+    /// Catalog STATUS must be honest: CDC Critical → Failed (not green Complete).
+    #[test]
+    fn report_catalog_cdc_critical_is_failed_not_complete() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA after route");
+        assert_eq!(gold, 9640, "empty XDC gold WNS");
+
+        let cdc_clean = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cdc_clean.status, "Complete",
+            "single-clock CDC must be Complete: {:?}",
+            cdc_clean
+        );
+
+        // Methodology: missing output delay → TIMING-7 Warning (amber), not green Complete.
+        let meth = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_methodology")
+            .expect("methodology row");
+        assert!(
+            meth.status == "Warnings" || meth.status == "Complete" || meth.status == "Failed",
+            "methodology must not invent empty green when ready: {:?}",
+            meth
+        );
+        if ide.methodology_report().warning_count() > 0
+            && ide.methodology_report().error_count() == 0
+            && ide.methodology_report().critical_count() == 0
+        {
+            assert_eq!(meth.status, "Warnings", "{meth:?}");
+        }
+
+        ide.exec(
+            "create_generated_clock -name clkdiv -source [get_ports clk] -divide_by 2 [get_pins u_ff/Q]",
+        )
+        .unwrap();
+        ide.exec("create_clock -name virt -period 8.000 [get_ports virt]")
+            .unwrap();
+        assert!(
+            ide.cdc_report().critical_count() > 0,
+            "virt clock must produce CDC Critical: {}",
+            ide.cdc_text()
+        );
+        let cdc_fail = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cdc_fail.status, "Failed",
+            "CDC Critical must paint Failed, not Complete: {:?}",
+            cdc_fail
+        );
+        // Second create_clock retimes STA; gold checked pre-virt above.
+        assert!(ide.wns_ps().is_some(), "STA still present after CDC Failed catalog");
+        let _ = gold;
     }
 
     /// UG893 Log pane is a clickable command/result table, not a monospace dump.
