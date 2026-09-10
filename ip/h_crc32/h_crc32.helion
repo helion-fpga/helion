@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST byte-serial CRC32
+format 1
+vlnv community:helion:h_crc32:1.0
+bus Helion-ST
+top h_crc32
+file h_crc32.v
