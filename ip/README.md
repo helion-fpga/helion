@@ -41,6 +41,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_ctz` | Helion-ST | Registered 32b count-trailing-zeros (pair to h_clz) |
 | `h_minmax` | Helion-ST | Registered min/max of two 32b + mode |
 | `h_accum_mm` | Helion-MM | Loadable accumulator + clear/add |
+| `h_parity` | Helion-ST | Registered even/odd parity + sticky error |
+| `h_hamming` | Helion-ST | Registered Hamming distance of two 32b |
+| `h_rot_mm` | Helion-MM | MM-programmed rotate left/right by N |
+| `h_mask_gen` | Helion-ST | Registered bitmask from width/offset |
 
 ## Use
 
@@ -67,6 +71,10 @@ helion ip show ip/h_arb_rr/h_arb_rr.helion
 helion ip show ip/h_ctz/h_ctz.helion
 helion ip show ip/h_minmax/h_minmax.helion
 helion ip show ip/h_accum_mm/h_accum_mm.helion
+helion ip show ip/h_parity/h_parity.helion
+helion ip show ip/h_hamming/h_hamming.helion
+helion ip show ip/h_rot_mm/h_rot_mm.helion
+helion ip show ip/h_mask_gen/h_mask_gen.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -88,6 +96,10 @@ helion project examples/ip_ingest/h_arb_rr_ip.prj
 helion project examples/ip_ingest/h_ctz_ip.prj
 helion project examples/ip_ingest/h_minmax_ip.prj
 helion project examples/ip_ingest/h_accum_mm_ip.prj
+helion project examples/ip_ingest/h_parity_ip.prj
+helion project examples/ip_ingest/h_hamming_ip.prj
+helion project examples/ip_ingest/h_rot_mm_ip.prj
+helion project examples/ip_ingest/h_mask_gen_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -102,6 +114,10 @@ helion project examples/ip_ingest/h_accum_mm_ip.prj
 #   read_ip ip/h_ctz/h_ctz.helion
 #   read_ip ip/h_minmax/h_minmax.helion
 #   read_ip ip/h_accum_mm/h_accum_mm.helion
+#   read_ip ip/h_parity/h_parity.helion
+#   read_ip ip/h_hamming/h_hamming.helion
+#   read_ip ip/h_rot_mm/h_rot_mm.helion
+#   read_ip ip/h_mask_gen/h_mask_gen.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.

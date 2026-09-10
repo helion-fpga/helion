@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM programmed rotate left/right by N
+format 1
+vlnv community:helion:h_rot_mm:1.0
+bus Helion-MM
+top h_rot_mm
+file h_rot_mm.v

@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered Hamming distance of two 32b
+format 1
+vlnv community:helion:h_hamming:1.0
+bus Helion-ST
+top h_hamming
+file h_hamming.v
