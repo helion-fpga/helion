@@ -75,6 +75,29 @@ pub fn pack_timer() -> IpCore {
     }
 }
 
+
+/// Helion-MM PWM period/duty/compare (ip/h_pwm). Not AXI PWM.
+pub fn pack_pwm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_pwm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Helion-MM SPI master bit-engine (ip/h_spi_mm). Not Xilinx AXI SPI.
+pub fn pack_spi_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_spi_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -84,6 +107,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_ila_trig(),
         pack_sync_fifo(),
         pack_timer(),
+        pack_pwm(),
+        pack_spi_mm(),
     ]
 }
 
@@ -166,6 +191,14 @@ mod tests {
         assert_eq!(timer.name, "h_timer");
         assert_eq!(timer.bus, "Helion-MM");
         assert_ne!(timer.bus, "AXI");
+        let pwm = pack_pwm();
+        assert_eq!(pwm.name, "h_pwm");
+        assert_eq!(pwm.bus, "Helion-MM");
+        assert_ne!(pwm.bus, "AXI");
+        let spi = pack_spi_mm();
+        assert_eq!(spi.name, "h_spi_mm");
+        assert_eq!(spi.bus, "Helion-MM");
+        assert_ne!(spi.bus, "AXI");
         let cat = catalog();
         assert!(cat.iter().any(|c| c.name == "h_uart"));
         assert!(cat.iter().any(|c| c.name == "h_gpio"));
@@ -176,11 +209,15 @@ mod tests {
         assert_eq!(trig.vlnv(), "community:helion:h_ila_trig:1.0");
         assert!(cat.iter().any(|c| c.name == "h_sync_fifo"));
         assert!(cat.iter().any(|c| c.name == "h_timer"));
+        assert!(cat.iter().any(|c| c.name == "h_pwm"));
+        assert!(cat.iter().any(|c| c.name == "h_spi_mm"));
         assert!(cat.iter().all(|c| c.bus != "AXI"));
         assert!(cat.iter().all(|c| !c.bus.to_ascii_lowercase().contains("axi")));
         assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
         assert_eq!(pack_sync_fifo().vlnv(), "community:helion:h_sync_fifo:1.0");
         assert_eq!(pack_timer().vlnv(), "community:helion:h_timer:1.0");
+        assert_eq!(pack_pwm().vlnv(), "community:helion:h_pwm:1.0");
+        assert_eq!(pack_spi_mm().vlnv(), "community:helion:h_spi_mm:1.0");
     }
 }
 
