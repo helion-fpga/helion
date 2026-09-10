@@ -1,0 +1,13 @@
+# FM-HEL-VIVADO-P5 fabric proof #5 — h_crc32 (+ h_lfsr) via read_ip
+# (h_i2c_mm substituted: synth mapped 0 LUTs under hang guards)
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_crc32_ip.prj
+synth_design h_crc32 cells=232 luts=226
+project examples/ip_ingest/h_crc32_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_crc32 xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=226 WNS_PS=9680 frames=129
+# Instantiated IP: community:helion:h_crc32:1.0 (Helion-ST)
+# cells=232 luts=226 lutffs=226  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_lfsr_ip.prj
+synth_design h_lfsr cells=227 luts=220
+project examples/ip_ingest/h_lfsr_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_lfsr xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=220 WNS_PS=9680 frames=149
+# Instantiated IP: community:helion:h_lfsr:1.0 (Helion-ST)
+# cells=227 luts=220 lutffs=220  (>0 real fabric)
