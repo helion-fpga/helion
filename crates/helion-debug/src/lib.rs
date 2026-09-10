@@ -3,8 +3,7 @@
 //! Soft path (`insert_arm_capture`): host `step_user` + `ble_out` readback.
 //! Deep path (`insert_arm_capture_deep`): fabric BRAM sample buffer + **match-unit LUT /
 //! trigger FSM IP** (not host ble_out edge compare) + multi-probe; upload via Helion TAP
-//! `IR_USR1` JTAG DR scan of capture RAM.
-//! Residual: not full silicon UG908 compressed upload protocol.
+//! `IR_USR1` **RLE-compressed** JTAG DR scan of capture RAM (`jtag_usr1_match_fsm_rle`).
 
 use helion_bits::bitgen;
 use helion_device::Device;
@@ -83,13 +82,17 @@ pub struct IlaCaptureDeep {
     pub pre_trigger: usize,
     pub bram_major: u16,
     pub backend: &'static str,
+    /// 64-bit USR1 data DR scans used by the RLE upload (header + tokens).
+    pub upload_dr_scans: usize,
+    /// Uncompressed upload would use one DR per sample word.
+    pub upload_raw_scans: usize,
 }
 
 const CAPTURE_BRAM: &str = "ila_capture_ram";
 const MATCH_HIT_NET: &str = "ila_match_hit";
 const MATCH_PREV_NET: &str = "ila_match_prev";
 const TRIG_FSM_CELL: &str = "ila_trig_fsm";
-const DEEP_BACKEND: &str = "jtag_usr1_match_fsm";
+const DEEP_BACKEND: &str = "jtag_usr1_match_fsm_rle";
 
 fn ila_cell_names(net: &str) -> [String; 3] {
     [
@@ -516,19 +519,23 @@ pub fn insert_arm_capture_deep(
         v
     };
 
-    // Upload from capture RAM via Helion TAP IR_USR1 JTAG DR scans (not host bram_read_word).
+    // Upload from capture RAM via Helion TAP IR_USR1 **RLE** JTAG DR (not host bram_read_word).
     let start = wr.saturating_sub(window) % window;
-    let uploaded_words = tap.usr1_upload_bram(bram_major, start as u32, window, window as u32);
-    let uploaded: Vec<Vec<bool>> = uploaded_words
-        .into_iter()
+    let rle = tap.usr1_upload_bram_rle(bram_major, start as u32, window, window as u32);
+    let uploaded: Vec<Vec<bool>> = rle
+        .words
+        .iter()
+        .copied()
         .map(|w| unpack_sample_word(w, cfg.nets.len()))
         .collect();
-    // Prefer JTAG USR1 upload as source of truth when lengths match ring window.
+    // Prefer JTAG USR1 RLE upload as source of truth when lengths match ring window.
     let samples = if uploaded.len() == samples_ring.len() {
         uploaded
     } else {
         samples_ring
     };
+    let upload_dr_scans = rle.dr_scans;
+    let upload_raw_scans = rle.raw_scans;
 
     let trigger_at = match cfg.trigger {
         IlaTriggerKind::Immediate => Some(0),
@@ -565,6 +572,8 @@ pub fn insert_arm_capture_deep(
         pre_trigger: pre,
         bram_major,
         backend: DEEP_BACKEND,
+        upload_dr_scans,
+        upload_raw_scans,
     })
 }
 
@@ -705,7 +714,7 @@ mod tests {
 
         let cfg = IlaArmConfig::single("q3", 16);
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
-        assert_eq!(deep.backend, "jtag_usr1_match_fsm");
+        assert_eq!(deep.backend, "jtag_usr1_match_fsm_rle");
         assert_eq!(deep.probes, vec!["q3".to_string()]);
         assert_eq!(deep.trigger_at, Some(0));
         let deep_bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
@@ -768,14 +777,34 @@ mod tests {
     }
 
     #[test]
-    fn deep_upload_backend_is_jtag_usr1_match_fsm() {
+    fn deep_upload_backend_is_jtag_usr1_match_fsm_rle() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let d = Design::structural_counter();
         let cfg = IlaArmConfig::single("q3", 16);
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
-        assert_eq!(deep.backend, "jtag_usr1_match_fsm");
+        assert_eq!(deep.backend, "jtag_usr1_match_fsm_rle");
         let bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
         assert_eq!(bits, "0000000111111110");
+        assert!(
+            deep.upload_dr_scans < deep.upload_raw_scans,
+            "RLE must reduce DR scans: dr={} raw={}",
+            deep.upload_dr_scans,
+            deep.upload_raw_scans
+        );
+        assert_eq!(deep.upload_raw_scans, 16);
+    }
+
+    #[test]
+    fn rle_encode_expand_roundtrip_host_side() {
+        use helion_hw::{rle_encode_words, rle_expand_tokens};
+        // Identical to soft gold bit pattern as 1-bit packed words.
+        let words: Vec<u64> = "0000000111111110"
+            .chars()
+            .map(|c| if c == '1' { 1 } else { 0 })
+            .collect();
+        let tok = rle_encode_words(&words);
+        assert_eq!(tok.len(), 3, "7×0, 7×1, 1×0");
+        assert_eq!(rle_expand_tokens(&tok, 16), words);
     }
 
     #[test]

@@ -53,11 +53,18 @@ pub const IR_STAT: u8 = 0b010010;
 pub const IR_CFG_W: u8 = 0b010000;
 /// USER1-class IR: ILA capture-RAM / fabric BRAM sample-buffer DR (64-bit).
 ///
-/// Capture-DR loads `bram_read_word(usr1_major, usr1_addr)`; Shift-DR scans 64 bits
-/// LSB-first; Update-DR either sets the BRAM pointer (TDI bit63=1) or auto-increments
-/// the address (TDI bit63=0). This is the JTAG upload path for deep ILA — not a
-/// host `bram_read_word` backdoor.
+/// Capture-DR loads `bram_read_word(usr1_major, usr1_addr)` in raw mode, or the next
+/// RLE token when bit62 arm is active; Shift-DR scans 64 bits LSB-first; Update-DR
+/// either sets the BRAM pointer (TDI bit63=1; bit62=1 arms RLE encode of N words),
+/// advances the RLE token cursor, or auto-increments the address (TDI bit63=0).
+/// This is the JTAG upload path for deep ILA — not a host `bram_read_word` backdoor.
 pub const IR_USR1: u8 = 0b000010;
+
+/// Magic in bits[63:48] of the first Capture-DR word after an RLE arm.
+pub const USR1_RLE_HEADER_MAGIC: u16 = 0xC0DE;
+
+/// Escape run-length: next DR word is the full 64-bit sample value.
+pub const USR1_RLE_ESCAPE_RUN: u16 = 0xFFFF;
 
 #[derive(Clone, Debug)]
 pub struct Tap {
@@ -80,6 +87,12 @@ pub struct Tap {
     usr1_addr: u32,
     /// Optional ring wrap for auto-increment (`0` = no wrap).
     usr1_wrap: u32,
+    /// When set, Capture-DR emits RLE tokens (header + runs) instead of raw BRAM words.
+    usr1_rle_active: bool,
+    /// Encoded RLE stream queued at arm time (header at [0]).
+    usr1_rle_queue: Vec<u64>,
+    /// Next token index for Capture-DR while `usr1_rle_active`.
+    usr1_rle_idx: usize,
 }
 
 impl Tap {
@@ -97,6 +110,9 @@ impl Tap {
             usr1_major: 0,
             usr1_addr: 0,
             usr1_wrap: 0,
+            usr1_rle_active: false,
+            usr1_rle_queue: Vec::new(),
+            usr1_rle_idx: 0,
         }
     }
 
@@ -176,9 +192,7 @@ impl Tap {
             self.dr_shift = match self.ir {
                 IR_IDCODE => u64::from(self.fabric.idcode),
                 IR_STAT => u64::from(self.fabric.stat.word()),
-                IR_USR1 => self
-                    .fabric
-                    .bram_read_word(self.usr1_major, self.usr1_addr as usize),
+                IR_USR1 => self.usr1_capture_dr_word(),
                 IR_CFG_W => {
                     self.cfg_buf.clear();
                     self.cfg_bit_count = 0;
@@ -284,17 +298,45 @@ impl Tap {
         Ok(self.read_stat())
     }
 
-    /// USR1 Update-DR: pointer command (bit63=1) or auto-increment (bit63=0).
+    /// Capture-DR payload for `IR_USR1`: raw BRAM word, or next RLE token.
+    fn usr1_capture_dr_word(&mut self) -> u64 {
+        if self.usr1_rle_active {
+            if self.usr1_rle_idx < self.usr1_rle_queue.len() {
+                self.usr1_rle_queue[self.usr1_rle_idx]
+            } else {
+                0
+            }
+        } else {
+            self.fabric
+                .bram_read_word(self.usr1_major, self.usr1_addr as usize)
+        }
+    }
+
+    /// USR1 Update-DR: pointer/RLE-arm (bit63=1) or advance (bit63=0).
     ///
     /// Command word (TDI after 64-bit Shift-DR):
-    /// - bit63 = 1 → set `usr1_major`=[47:32], `usr1_wrap`=[31:16], `usr1_addr`=[15:0]
-    /// - bit63 = 0 → `usr1_addr += 1` (mod wrap when wrap != 0)
+    /// - bit63=1, bit62=0 → raw ptr: `major`=[47:32], `wrap`=[31:16], `addr`=[15:0]
+    /// - bit63=1, bit62=1 → RLE arm: also `n_samples`=[61:48]; encode ring into token queue
+    /// - bit63=0 → if RLE active, advance token cursor; else `usr1_addr += 1` (mod wrap)
     fn usr1_update_dr(&mut self) {
         let v = self.dr_shift;
         if (v >> 63) & 1 == 1 {
             self.usr1_major = ((v >> 32) & 0xffff) as u16;
             self.usr1_wrap = ((v >> 16) & 0xffff) as u32;
             self.usr1_addr = (v & 0xffff) as u32;
+            if (v >> 62) & 1 == 1 {
+                let n = ((v >> 48) & 0x3fff) as usize;
+                self.usr1_arm_rle(n);
+            } else {
+                self.usr1_rle_active = false;
+                self.usr1_rle_queue.clear();
+                self.usr1_rle_idx = 0;
+            }
+        } else if self.usr1_rle_active {
+            self.usr1_rle_idx = self.usr1_rle_idx.saturating_add(1);
+            if self.usr1_rle_idx >= self.usr1_rle_queue.len() {
+                self.usr1_rle_active = false;
+            }
         } else if self.usr1_wrap > 0 {
             self.usr1_addr = (self.usr1_addr + 1) % self.usr1_wrap;
         } else {
@@ -302,9 +344,45 @@ impl Tap {
         }
     }
 
-    /// Build USR1 pointer-command TDI word.
+    /// Read `n` ring words from capture BRAM and build the RLE token queue (header + runs).
+    fn usr1_arm_rle(&mut self, n: usize) {
+        let wrap = if self.usr1_wrap == 0 {
+            n.max(1) as u32
+        } else {
+            self.usr1_wrap
+        };
+        let mut raw = Vec::with_capacity(n);
+        let mut addr = self.usr1_addr;
+        for _ in 0..n {
+            raw.push(self.fabric.bram_read_word(self.usr1_major, addr as usize));
+            addr = (addr + 1) % wrap;
+        }
+        let tokens = rle_encode_words(&raw);
+        let header = ((USR1_RLE_HEADER_MAGIC as u64) << 48)
+            | ((n as u64) << 32)
+            | ((tokens.len() as u64) << 16)
+            | ((1 + tokens.len()) as u64);
+        self.usr1_rle_queue.clear();
+        self.usr1_rle_queue.push(header);
+        self.usr1_rle_queue.extend(tokens);
+        self.usr1_rle_idx = 0;
+        self.usr1_rle_active = true;
+    }
+
+    /// Build USR1 pointer-command TDI word (raw mode).
     pub fn usr1_ptr_cmd(major: u16, addr: u32, wrap: u32) -> u64 {
         (1u64 << 63)
+            | ((u64::from(major) & 0xffff) << 32)
+            | ((u64::from(wrap) & 0xffff) << 16)
+            | (u64::from(addr) & 0xffff)
+    }
+
+    /// Build USR1 RLE-arm command: bit63|bit62 + n_samples[61:48] + major/wrap/addr.
+    pub fn usr1_rle_cmd(major: u16, addr: u32, wrap: u32, n_samples: usize) -> u64 {
+        let n = (n_samples as u64) & 0x3fff;
+        (1u64 << 63)
+            | (1u64 << 62)
+            | (n << 48)
             | ((u64::from(major) & 0xffff) << 32)
             | ((u64::from(wrap) & 0xffff) << 16)
             | (u64::from(addr) & 0xffff)
@@ -317,9 +395,7 @@ impl Tap {
         self.dr_shift = match self.ir {
             IR_IDCODE => u64::from(self.fabric.idcode),
             IR_STAT => u64::from(self.fabric.stat.word()),
-            IR_USR1 => self
-                .fabric
-                .bram_read_word(self.usr1_major, self.usr1_addr as usize),
+            IR_USR1 => self.usr1_capture_dr_word(),
             _ => 0,
         };
         let captured = self.dr_shift;
@@ -363,6 +439,119 @@ impl Tap {
         }
         out
     }
+
+    /// Compressed upload: TAP RLE-encodes the ring; host scans header + tokens and expands.
+    ///
+    /// `dr_scans` counts 64-bit data DR shifts after the arm command (header + tokens).
+    /// Honest compression: `dr_scans` is `1 + n_tokens` and is `< n` when runs collapse.
+    pub fn usr1_upload_bram_rle(
+        &mut self,
+        major: u16,
+        start: u32,
+        n: usize,
+        wrap: u32,
+    ) -> Usr1RleUpload {
+        let wrap = if wrap == 0 { n as u32 } else { wrap };
+        let start = if wrap == 0 { start } else { start % wrap };
+        self.shift_ir(IR_USR1);
+        let _ = self.shift_dr_u64(Self::usr1_rle_cmd(major, start, wrap, n));
+        let header = self.shift_dr_u64(0);
+        let magic = ((header >> 48) & 0xffff) as u16;
+        let n_samples = ((header >> 32) & 0xffff) as usize;
+        let n_tokens = ((header >> 16) & 0xffff) as usize;
+        let n_dr = (header & 0xffff) as usize;
+        debug_assert_eq!(magic, USR1_RLE_HEADER_MAGIC);
+        debug_assert_eq!(n_dr, 1 + n_tokens);
+        let mut tokens = Vec::with_capacity(n_tokens);
+        for _ in 0..n_tokens {
+            tokens.push(self.shift_dr_u64(0));
+        }
+        let words = rle_expand_tokens(&tokens, n_samples);
+        Usr1RleUpload {
+            words,
+            dr_scans: 1 + n_tokens,
+            raw_scans: n,
+            n_tokens,
+            n_samples,
+        }
+    }
+}
+
+/// Result of [`Tap::usr1_upload_bram_rle`]: reconstructed words + DR traffic accounting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usr1RleUpload {
+    pub words: Vec<u64>,
+    /// 64-bit data DR scans used for header + tokens (excludes the arm command DR).
+    pub dr_scans: usize,
+    /// Uncompressed upload would use this many data DRs (`n` sample words).
+    pub raw_scans: usize,
+    pub n_tokens: usize,
+    pub n_samples: usize,
+}
+
+/// RLE-encode BRAM sample words into USR1 data tokens.
+///
+/// Compact token: `run_len[63:48] | value[47:0]` when `value < 2^48`.
+/// Escape: `0xFFFF` run field then a full 64-bit value word (high bits set).
+pub fn rle_encode_words(words: &[u64]) -> Vec<u64> {
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < words.len() {
+        let v = words[i];
+        let mut j = i + 1;
+        while j < words.len() && words[j] == v && (j - i) < 0xfffe {
+            j += 1;
+        }
+        let run = (j - i) as u16;
+        if v >> 48 == 0 {
+            tokens.push(((run as u64) << 48) | v);
+        } else {
+            tokens.push(((USR1_RLE_ESCAPE_RUN as u64) << 48) | (run as u64));
+            tokens.push(v);
+        }
+        i = j;
+    }
+    tokens
+}
+
+/// Expand RLE tokens back to `n_samples` words.
+pub fn rle_expand_tokens(tokens: &[u64], n_samples: usize) -> Vec<u64> {
+    let mut out = Vec::with_capacity(n_samples);
+    let mut i = 0usize;
+    while i < tokens.len() && out.len() < n_samples {
+        let t = tokens[i];
+        let run_field = ((t >> 48) & 0xffff) as u16;
+        if run_field == USR1_RLE_ESCAPE_RUN {
+            let run = (t & 0xffff) as usize;
+            let val = if i + 1 < tokens.len() {
+                tokens[i + 1]
+            } else {
+                0
+            };
+            i += 2;
+            for _ in 0..run.max(1) {
+                if out.len() >= n_samples {
+                    break;
+                }
+                out.push(val);
+            }
+        } else {
+            let run = run_field.max(1) as usize;
+            let val = t & 0x0000_FFFF_FFFF_FFFF;
+            i += 1;
+            for _ in 0..run {
+                if out.len() >= n_samples {
+                    break;
+                }
+                out.push(val);
+            }
+        }
+    }
+    while out.len() < n_samples {
+        out.push(0);
+    }
+    out.truncate(n_samples);
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -2450,6 +2639,40 @@ mod tests {
         // Ring wrap: start mid-window, wrap to front.
         let wrapped = tap.usr1_upload_bram(0, 2, 4, 4);
         assert_eq!(wrapped, vec![words[2], words[3], words[0], words[1]]);
+    }
+
+    #[test]
+    fn usr1_rle_upload_fewer_dr_scans_on_runs() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        // Gold-like q3 window as packed 1-bit sample words: 7×0, 7×1, 1×0 → 3 runs.
+        let pattern = [0u64, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0xA5];
+        for (i, &w) in pattern.iter().enumerate() {
+            tap.fabric_mut().bram_write_word(0, i, w);
+        }
+        let raw = tap.usr1_upload_bram(0, 0, pattern.len(), pattern.len() as u32);
+        assert_eq!(raw, pattern);
+
+        let rle = tap.usr1_upload_bram_rle(0, 0, pattern.len(), pattern.len() as u32);
+        assert_eq!(rle.words, pattern);
+        assert_eq!(rle.raw_scans, pattern.len());
+        assert!(
+            rle.dr_scans < rle.raw_scans,
+            "RLE must cut DR traffic: dr_scans={} raw={}",
+            rle.dr_scans,
+            rle.raw_scans
+        );
+        // 4 compact runs (7×0, 7×1, 1×0, 1×A5) + header → 5 data DRs vs 16 raw.
+        assert_eq!(rle.n_tokens, 4);
+        assert_eq!(rle.dr_scans, 5);
+    }
+
+    #[test]
+    fn usr1_rle_roundtrip_escape_high_bits() {
+        let words = vec![0xABCD_EF01_2345_6789u64; 5];
+        let tok = rle_encode_words(&words);
+        assert_eq!(tok.len(), 2, "escape + value");
+        assert_eq!(rle_expand_tokens(&tok, 5), words);
     }
 
     #[test]

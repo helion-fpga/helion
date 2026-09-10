@@ -3550,7 +3550,7 @@ pub struct IlaDashboard {
     pub trigger_at: Option<usize>,
     /// Samples kept before trigger in deep fabric-BRAM arm (`ila_arm_deep`).
     pub pre_trigger: usize,
-    /// soft_ble_out | jtag_usr1_match_fsm
+    /// soft_ble_out | jtag_usr1_match_fsm_rle
     pub backend: String,
     /// Multi-probe nets from last deep arm (single-net soft arm → one entry).
     pub probes: Vec<String>,
@@ -19164,14 +19164,16 @@ impl IdeModel {
             .map(|i| i.to_string())
             .unwrap_or_else(|| "-".into());
         Ok(format!(
-            "ila_arm_deep net={} probes={} samples={} bits={bits} trigger={} trigger_at={at} pre_trigger={} backend={} bram_major={}",
+            "ila_arm_deep net={} probes={} samples={} bits={bits} trigger={} trigger_at={at} pre_trigger={} backend={} bram_major={} upload_dr={} upload_raw={}",
             self.ila.net,
             cap.probes.join(","),
             cap.samples.len(),
             self.ila.trigger.tcl(),
             cap.pre_trigger,
             cap.backend,
-            cap.bram_major
+            cap.bram_major,
+            cap.upload_dr_scans,
+            cap.upload_raw_scans
         ))
     }
 
@@ -26031,7 +26033,7 @@ endmodule
         assert_eq!(ide.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff, Some(4));
     }
 
-    /// Deep path: match-unit/FSM + IR_USR1 JTAG DR upload + pre-trigger + multi-probe (soft ila_arm unchanged).
+    /// Deep path: match-unit/FSM + IR_USR1 RLE upload + pre-trigger + multi-probe (soft ila_arm unchanged).
     #[test]
     fn ila_arm_deep_bram_pretrigger_multiprobe() {
         let mut ide = IdeModel::new();
@@ -26046,18 +26048,31 @@ endmodule
         ide.exec("ila_trigger rising").unwrap();
         ide.exec("ila_pre_trigger 4").unwrap();
         let out = ide.exec("ila_arm_deep cnt_3,cnt_0").unwrap();
-        assert!(out.contains("backend=jtag_usr1_match_fsm"), "{out}");
+        assert!(out.contains("backend=jtag_usr1_match_fsm_rle"), "{out}");
+        assert!(out.contains("upload_dr="), "{out}");
+        assert!(out.contains("upload_raw=16"), "{out}");
         assert!(out.contains("pre_trigger=4"), "{out}");
         assert!(out.contains("probes=cnt_3,cnt_0") || out.contains("probes=cnt_3"), "{out}");
-        assert_eq!(ide.ila.backend, "jtag_usr1_match_fsm");
+        assert_eq!(ide.ila.backend, "jtag_usr1_match_fsm_rle");
         assert_eq!(ide.ila.bits.len(), 16);
         let at = ide.ila.trigger_at.expect("deep rising trigger_at");
         assert!(at >= 1, "trigger_at={at} bits={}", ide.ila.bits);
         assert_eq!(&ide.ila.bits[at - 1..at + 1], "01");
         assert!(ide.wave.has_trace("ila:cnt_3"));
         let dump = ide.exec("ila_dashboard").unwrap();
-        assert!(dump.contains("backend=jtag_usr1_match_fsm"), "{dump}");
+        assert!(dump.contains("backend=jtag_usr1_match_fsm_rle"), "{dump}");
         assert!(dump.contains("pre_trigger=4"), "{dump}");
+        // Multiprobe with toggling LSB often has no RLE runs; still report honest DR counts.
+        let dr = out
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("upload_dr=").and_then(|s| s.parse::<usize>().ok()))
+            .expect("upload_dr");
+        let raw = out
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("upload_raw=").and_then(|s| s.parse::<usize>().ok()))
+            .expect("upload_raw");
+        assert_eq!(raw, 16, "{out}");
+        assert!(dr >= 1, "header+tokens: {out}");
 
         // Soft path gold still holds on plain ila_arm.
         ide.exec("ila_trigger rising").unwrap();
