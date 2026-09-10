@@ -31758,6 +31758,154 @@ endmodule
         assert_eq!(again.wns_ps(), Some(9640));
     }
 
+
+    /// examples/cdc_datapath.sv+.sdc: set_max_delay -datapath_only → CDC-13 Warning /
+    /// catalog Warnings (TimedDatapath). Unsync cdc_cross without exception stays Failed.
+    /// Counter gold WNS_PS=9640 unchanged.
+    #[test]
+    fn cdc_datapath_cdc13_warning_catalog_warnings() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("cdc_datapath.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert!(
+            ide.pane_clocks().len() >= 2,
+            "sibling SDC must create clk_a/clk_b: {:?}",
+            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            ide.constraints
+                .max_delays
+                .iter()
+                .any(|m| m.datapath_only),
+            "sibling SDC must set_max_delay -datapath_only: {:?}",
+            ide.constraints.max_delays
+        );
+        let out = ide.exec("report_cdc").unwrap();
+        assert!(out.contains("report_cdc"), "{out}");
+        let r = ide.cdc_report();
+        assert_eq!(r.critical_count(), 0, "datapath_only must not Critical: {}", r.text());
+        assert!(
+            r.warning_count() > 0,
+            "datapath_only must Warning: {}",
+            r.text()
+        );
+        let row = r
+            .violation("clk_a", "clk_b")
+            .or_else(|| r.violation("clk_b", "clk_a"))
+            .expect("clk_a↔clk_b CDC row");
+        assert_eq!(row.check, "CDC-13", "{row:?}");
+        assert_eq!(row.severity, helion_sta::CdcSeverity::Warning, "{row:?}");
+        assert_eq!(row.relation, helion_sta::ClockRelation::TimedDatapath, "{row:?}");
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cat.status, "Warnings",
+            "CDC-13 Warning-only must paint Warnings: {cat:?}"
+        );
+        // Methodology: TimedDatapath is not TimedUnsafe → no CDC-1 CriticalWarning.
+        let meth = ide.methodology_report();
+        assert!(
+            meth.check("CDC-1").is_none(),
+            "datapath_only must clear methodology CDC-1: {}",
+            meth.text()
+        );
+        assert_eq!(
+            meth.critical_count(),
+            0,
+            "datapath methodology must not Critical: {}",
+            meth.text()
+        );
+
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
+        assert_eq!(
+            again
+                .report_catalog()
+                .into_iter()
+                .find(|r| r.id == "report_cdc")
+                .unwrap()
+                .status,
+            "Complete"
+        );
+    }
+
+    /// examples/cdc_exclusive_groups.sv+.sdc: set_clock_groups -exclusive → CDC-16 Info /
+    /// catalog Complete (Info-only). Unsync cdc_cross without groups stays Failed.
+    /// Counter gold WNS_PS=9640 unchanged.
+    #[test]
+    fn cdc_exclusive_groups_cdc16_info_catalog_complete() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("cdc_exclusive_groups.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert!(
+            ide.pane_clocks().len() >= 2,
+            "sibling SDC must create clk_a/clk_b: {:?}",
+            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            ide.constraints.clock_groups.iter().any(|g| g.exclusive),
+            "sibling SDC must set_clock_groups -exclusive: {:?}",
+            ide.constraints.clock_groups
+        );
+        let out = ide.exec("report_cdc").unwrap();
+        assert!(out.contains("report_cdc"), "{out}");
+        let r = ide.cdc_report();
+        assert_eq!(r.critical_count(), 0, "exclusive groups must not Critical: {}", r.text());
+        assert_eq!(r.warning_count(), 0, "exclusive groups must not Warning: {}", r.text());
+        assert!(
+            r.info_count() > 0,
+            "exclusive groups must Info: {}",
+            r.text()
+        );
+        let row = r
+            .violation("clk_a", "clk_b")
+            .or_else(|| r.violation("clk_b", "clk_a"))
+            .expect("clk_a↔clk_b CDC row");
+        assert_eq!(row.check, "CDC-16", "{row:?}");
+        assert_eq!(row.severity, helion_sta::CdcSeverity::Info, "{row:?}");
+        assert_eq!(row.relation, helion_sta::ClockRelation::Exclusive, "{row:?}");
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cat.status, "Complete",
+            "Info-only CDC must paint Complete: {cat:?}"
+        );
+        // Methodology: exclusive groups clear TimedUnsafe CDC-1 CriticalWarning.
+        let meth = ide.methodology_report();
+        assert!(
+            meth.check("CDC-1").is_none(),
+            "exclusive groups must clear methodology CDC-1: {}",
+            meth.text()
+        );
+        assert_eq!(
+            meth.critical_count(),
+            0,
+            "exclusive methodology must not Critical: {}",
+            meth.text()
+        );
+
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
+    }
+
     /// POWER-2 occupancy warn is wired into report_power text + catalog; counter
     /// (4/8192) stays below 80% so POWER-1 assumed_f remains the demo warn path.
     #[test]
