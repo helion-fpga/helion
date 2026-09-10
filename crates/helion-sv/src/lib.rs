@@ -486,6 +486,14 @@ thread_local! {
     /// One `negedge_not_lowered` line per module+signal.
     static NEGEDGE_NOT_LOWERED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// `typedef enum` members harvested from packages / modules (packages are
+    /// otherwise skipped). Resolves OPCODE_*/ALU_*/FSM states so Ibex decoder
+    /// and LSU case cones can map instead of assign_not_lowered.
+    static PKG_ENUMS: std::cell::RefCell<HashMap<String, u128>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Enum type name → bit width (from `typedef enum logic [N:0]`).
+    static PKG_ENUM_TYPES: std::cell::RefCell<HashMap<String, usize>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 fn skipped_funcs_clear() {
@@ -498,6 +506,122 @@ fn skipped_funcs_push(name: String) {
 
 fn skipped_funcs_take() -> Vec<String> {
     SKIPPED_FUNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+fn pkg_enums_clear() {
+    PKG_ENUMS.with(|m| m.borrow_mut().clear());
+    PKG_ENUM_TYPES.with(|m| m.borrow_mut().clear());
+}
+
+fn pkg_enum_type_width(name: &str) -> Option<usize> {
+    PKG_ENUM_TYPES.with(|m| m.borrow().get(name).copied())
+}
+
+fn pkg_enum_get(name: &str) -> Option<u128> {
+    PKG_ENUMS.with(|m| m.borrow().get(name).copied())
+}
+
+fn pkg_enum_insert(name: String, val: u128) {
+    PKG_ENUMS.with(|m| {
+        m.borrow_mut().insert(name, val);
+    });
+}
+
+/// After `typedef` was eaten: harvest `enum … { members } name;` into PKG_ENUMS.
+/// Other typedefs stay skipped. Auto-numbered and `= expr` members both work.
+fn harvest_typedef_enum(p: &mut P) {
+    if !p.eat_kw("enum") {
+        let _ = skip_item_or_block(p);
+        return;
+    }
+    // Optional base type (`logic [6:0]`, `integer`, …) before `{`.
+    let mut width = 32usize;
+    while p.peek().is_some() && !matches!(p.peek(), Some(Tok::Sym('{'))) {
+        if matches!(p.peek(), Some(Tok::Sym('['))) {
+            let save = p.i;
+            p.bump(); // [
+            if let Ok(hi) = const_u(p) {
+                if p.eat_sym(':') {
+                    if let Ok(lo) = const_u(p) {
+                        if p.eat_sym(']') {
+                            let (a, b) = (hi as usize, lo as usize);
+                            width = a.abs_diff(b).saturating_add(1).max(1);
+                            continue;
+                        }
+                    }
+                }
+            }
+            p.i = save;
+            skip_brackets(p);
+            continue;
+        }
+        if p.eat_kw("logic")
+            || p.eat_kw("bit")
+            || p.eat_kw("reg")
+            || p.eat_kw("wire")
+            || p.eat_kw("signed")
+            || p.eat_kw("unsigned")
+        {
+            width = 1; // scalar until a range overrides
+            continue;
+        }
+        if p.eat_kw("integer") || p.eat_kw("int") {
+            width = 32;
+            continue;
+        }
+        if p.eat_kw("byte") {
+            width = 8;
+            continue;
+        }
+        if matches!(p.peek(), Some(Tok::Ident(_))) {
+            p.bump();
+            continue;
+        }
+        // Unrecognized typedef enum form — do not invent members.
+        let _ = skip_item_or_block(p);
+        return;
+    }
+    if !p.eat_sym('{') {
+        let _ = skip_item_or_block(p);
+        return;
+    }
+    let mut next = 0u128;
+    while !p.eat_sym('}') {
+        if p.peek().is_none() {
+            return;
+        }
+        let name = match p.ident() {
+            Ok(n) => n,
+            Err(_) => {
+                p.bump();
+                continue;
+            }
+        };
+        let val = if p.eat_sym('=') {
+            match const_u(p) {
+                Ok(v) => v,
+                Err(_) => {
+                    while p.peek().is_some()
+                        && !matches!(p.peek(), Some(Tok::Sym(',')) | Some(Tok::Sym('}')))
+                    {
+                        p.bump();
+                    }
+                    next
+                }
+            }
+        } else {
+            next
+        };
+        pkg_enum_insert(name, val);
+        next = val.wrapping_add(1);
+        let _ = p.eat_sym(',');
+    }
+    if let Ok(tname) = p.ident() {
+        PKG_ENUM_TYPES.with(|m| {
+            m.borrow_mut().insert(tname, width.max(1));
+        });
+    }
+    let _ = p.eat_sym(';');
 }
 
 /// Emit `function_not_called` once per design. QA early_hang kills at ≥2
@@ -1751,7 +1875,10 @@ fn assemble_module(
             continue;
         }
         // Ibex-scale trees: keep already-lowered cells, do not copy the rest.
-        if d.cells.len() >= 8_000 {
+        // Cap is hierarchy stitch budget (not die/LUTFF capacity). Affinity still
+        // soft-holds place at 8192; raising this lets deeper core children stitch
+        // after if_stage/decode cones grow — prefer lowering over skipping them.
+        if d.cells.len() >= 64_000 {
             note_skip(format!(
                 "diagnostic assemble_cap module={} inst={} child={} (hierarchy cap; not a LUT)",
                 name, inst.name, inst.module
@@ -2374,7 +2501,9 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
                 let _ = p.eat_sym(')');
                 return Ok(if n > 1 { clog2_u(n) } else { 1 });
             }
-            enum_const_default(&name).ok_or_else(|| format!("unknown param {name}"))
+            pkg_enum_get(&name)
+                .or_else(|| enum_const_default(&name))
+                .ok_or_else(|| format!("unknown param {name}"))
         }
         other => Err(format!("const atom {other:?}")),
     }
@@ -3023,6 +3152,13 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                 }
             } else if let Some(v) = p.params.get(&name).copied() {
                 // Parameter used in an expression (e.g. sel*DW +: DW).
+                Ok(RExpr::Const {
+                    val: v,
+                    width: 32,
+                    care: u128::MAX,
+                })
+            } else if let Some(v) = pkg_enum_get(&name).or_else(|| enum_const_default(&name)) {
+                // Harvested / seeded enum literal (packages skipped otherwise).
                 Ok(RExpr::Const {
                     val: v,
                     width: 32,
@@ -3802,19 +3938,31 @@ fn parse_seq_item(p: &mut P) -> Result<Vec<Nba>, String> {
                 def = normalize_nbas(p, def_raw);
                 continue;
             }
-            let item = parse_rexpr(p)?;
+            // Multi-value arm: `2'b10, 2'b11:` (Ibex LSU / decoder).
+            let first = parse_rexpr(p)?;
+            let mut items = vec![first];
+            while p.eat_sym(',') {
+                items.push(parse_rexpr(p)?);
+            }
             if !p.eat_sym(':') {
                 return Err("case :".into());
             }
             let b = p.eat_kw("begin");
             let body_raw = parse_seq_block(p, b)?;
             let body = normalize_nbas(p, body_raw);
-            arms.push((Some(item), body));
+            // One Or-of-Eq cond shared by the arm (not N duplicate arms).
+            let mut cond = RExpr::Eq(Box::new(sel.clone()), Box::new(items[0].clone()));
+            for it in items.into_iter().skip(1) {
+                cond = RExpr::Or(
+                    Box::new(cond),
+                    Box::new(RExpr::Eq(Box::new(sel.clone()), Box::new(it))),
+                );
+            }
+            arms.push((Some(cond), body));
         }
         let mut out = Vec::new();
         for (item, body) in arms.into_iter().rev() {
-            let item = item.unwrap();
-            let cond = RExpr::Eq(Box::new(sel.clone()), Box::new(item));
+            let cond = item.unwrap();
             for (lhs, bit, rhs) in body {
                 let other = out
                     .iter()
@@ -3858,6 +4006,7 @@ fn skip_until_kw(p: &mut P, kw: &str) {
 }
 
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
+    pkg_enums_clear();
     clear_seq_notes();
     let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
@@ -3872,11 +4021,22 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
             continue;
         }
         if p.eat_kw("package") {
-            skip_until_kw(&mut p, "endpackage");
+            // Walk the package so `typedef enum` members seed PKG_ENUMS.
+            // Blind skip left OPCODE_*/ALU_* as unknown Idents → soft miss.
+            while !p.eat_kw("endpackage") {
+                if p.peek().is_none() {
+                    break;
+                }
+                if p.eat_kw("typedef") {
+                    harvest_typedef_enum(&mut p);
+                    continue;
+                }
+                p.bump();
+            }
             continue;
         }
         if p.eat_kw("typedef") {
-            let _ = skip_item_or_block(&mut p);
+            harvest_typedef_enum(&mut p);
             continue;
         }
         if p.eat_kw("interface") {
@@ -4865,7 +5025,12 @@ fn parse_module_items(
             skip_until_kw(p, "endtask");
             continue;
         }
-        if p.eat_kw("typedef") || p.eat_kw("import") || p.eat_kw("export") {
+        if p.eat_kw("typedef") {
+            // Module-local FSMs (ls_fsm_e, md_fsm_e, mult_fsm_e, id_fsm_e).
+            harvest_typedef_enum(p);
+            continue;
+        }
+        if p.eat_kw("import") || p.eat_kw("export") {
             let _ = skip_item_or_block(p);
             continue;
         }
@@ -5405,7 +5570,12 @@ fn parse_module_items(
             skip_until_kw(p, "endtask");
             continue;
         }
-        if p.eat_kw("typedef") || p.eat_kw("import") || p.eat_kw("export") {
+        if p.eat_kw("typedef") {
+            // Module-local FSMs (ls_fsm_e, md_fsm_e, mult_fsm_e, id_fsm_e).
+            harvest_typedef_enum(p);
+            continue;
+        }
+        if p.eat_kw("import") || p.eat_kw("export") {
             let _ = skip_item_or_block(p);
             continue;
         }
@@ -5414,6 +5584,70 @@ fn parse_module_items(
                 // Consumed. Not an assign, not an unknown child, not a LUT.
                 continue;
             }
+            // `opcode_e opcode;` / `ls_fsm_e ls_fsm_ns;` — typedef-typed signal,
+            // not an instance (no port list). Width from harvested enum type.
+            let save_td = p.i;
+            if let Ok(ty) = p.ident() {
+                let mut w = pkg_enum_type_width(&ty).unwrap_or(0);
+                if matches!(p.peek(), Some(Tok::Sym('['))) {
+                    p.bump();
+                    if let (Ok(hi), true, Ok(lo), true) = (
+                        const_u(p),
+                        p.eat_sym(':'),
+                        const_u(p),
+                        p.eat_sym(']'),
+                    ) {
+                        w = (hi as usize).abs_diff(lo as usize).saturating_add(1).max(1);
+                    } else {
+                        p.i = save_td;
+                        w = 0;
+                    }
+                }
+                if w > 0 {
+                    if let Ok(n) = p.ident() {
+                        if matches!(p.peek(), Some(Tok::Sym(';')))
+                            || matches!(p.peek(), Some(Tok::Sym('=')))
+                            || matches!(p.peek(), Some(Tok::Sym(',')))
+                        {
+                            if !signals.iter().any(|s| s.name == n) {
+                                signals.push(Signal {
+                                    name: n.clone(),
+                                    width: w,
+                                    depth: 0,
+                                    keep: *pending_keep,
+                                    mark_debug: *pending_md,
+                                });
+                            }
+                            note_width(p, &n, w);
+                            *pending_keep = false;
+                            *pending_md = false;
+                            if p.eat_sym('=') {
+                                match parse_rexpr(p) {
+                                    Ok(rhs) => assigns.push((n, None, rhs)),
+                                    Err(_) => note_assign_not_lowered(&cur_mod(), &n),
+                                }
+                            }
+                            while p.eat_sym(',') {
+                                if let Ok(n2) = p.ident() {
+                                    if !signals.iter().any(|s| s.name == n2) {
+                                        signals.push(Signal {
+                                            name: n2.clone(),
+                                            width: w,
+                                            depth: 0,
+                                            keep: false,
+                                            mark_debug: false,
+                                        });
+                                    }
+                                    note_width(p, &n2, w);
+                                }
+                            }
+                            let _ = p.eat_sym(';');
+                            continue;
+                        }
+                    }
+                }
+            }
+            p.i = save_td;
             if let Ok(inst) = parse_inst(&mut p) {
                 insts.push(inst);
                 continue;
@@ -7564,7 +7798,7 @@ fn const_rexpr_usize(e: &RExpr) -> Option<usize> {
 }
 
 /// `{bus, {K{1'b0}}}` or `{bus[hi:lo], K'b0}` — zeros on the low side.
-/// `Ok((bus, K, bus_lo))` when K is 1..=8 and the high part is a wire or
+/// `Ok((bus, K, bus_lo))` when K is 1..=20 and the high part is a wire or
 /// packed range. `bus_lo` is 0 for a full Ident, or `lo` for `bus[hi:lo]`.
 /// `Err(())` is that shape but not a wire alignment (not a LUT, caller names
 /// `assign_not_lowered`). Other concats are `None` and stay on the existing path.
@@ -7585,7 +7819,9 @@ fn zero_fill_concat(rhs: &RExpr) -> Option<Result<(String, usize, usize), ()>> {
         RExpr::Range(s, lo, _hi) => (s.clone(), *lo),
         _ => return Some(Err(())),
     };
-    if (1..=8).contains(&zeros) {
+    // K<=20: wire align for SERV clear-LSB and Ibex U-type `{instr[31:12],12'b0}`.
+    // Wider zero pads stay assign_not_lowered (not a LUT; not invented capacity).
+    if (1..=20).contains(&zeros) {
         Some(Ok((bus, zeros, bus_lo)))
     } else {
         Some(Err(()))
@@ -9632,6 +9868,7 @@ fn record_instances_vis(
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    pkg_enums_clear();
     let t_parse = std::time::Instant::now();
     let origin_path = Path::new(origin);
     let base = origin_path.parent().filter(|d| !d.as_os_str().is_empty() && d.exists());
@@ -9787,6 +10024,7 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
         return Err("no sources".into());
     }
     FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    pkg_enums_clear();
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
     for (origin, src) in files {
@@ -11803,10 +12041,84 @@ endmodule
     }
 
     #[test]
-    fn zero_fill_concat_k_above_8_is_not_lowered() {
+    fn ibex_u_type_imm_zero_fill_aligns() {
+        // Ibex decoder: assign imm_u_type_o = { instr[31:12], 12'b0 };
         let src = r#"
-module widepad(input [3:0] bus, output [15:0] y);
-  assign y = {bus, {9{1'b0}}};
+module imm_u(input [31:0] instr, output [31:0] imm_u_type_o);
+  assign imm_u_type_o = { instr[31:12], 12'b0 };
+endmodule
+"#;
+        let d = synth_sv(src, "imm_u.sv").expect("imm_u");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "U-type zero-fill must be wire align, not LUTs"
+        );
+    }
+
+    #[test]
+    fn multi_value_case_arm_lowers() {
+        let src = r#"
+module mvc(input wire [1:0] sel, output logic y);
+  always_comb begin
+    y = 1'b0;
+    unique case (sel)
+      2'b10,
+      2'b11: y = 1'b1;
+      default: y = 1'b0;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "mvc.sv").expect("mvc");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"), "multi-value case");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "multi-value case must map a LUT"
+        );
+    }
+
+    #[test]
+    fn package_enum_opcode_case_lowers() {
+        let src = r#"
+package ibex_pkg;
+  typedef enum logic [6:0] {
+    OPCODE_LOAD = 7'h03,
+    OPCODE_LUI  = 7'h37,
+    OPCODE_JAL  = 7'h6f
+  } opcode_e;
+endpackage
+module dec(input logic [31:0] instr, output logic jump);
+  opcode_e opcode;
+  always_comb begin
+    jump = 1'b0;
+    opcode = opcode_e'(instr[6:0]);
+    unique case (opcode)
+      OPCODE_JAL: jump = 1'b1;
+      OPCODE_LUI: jump = 1'b0;
+      default: jump = 1'b0;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "dec_pkg.sv").expect("dec_pkg");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "harvested OPCODE_* must lower case"
+        );
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "opcode case must map LUTs, cells={:?}",
+            d.cells
+        );
+    }
+
+    #[test]
+    fn zero_fill_concat_k_above_20_is_not_lowered() {
+        let src = r#"
+module widepad(input [3:0] bus, output [31:0] y);
+  assign y = {bus, {21{1'b0}}};
 endmodule
 "#;
         let d = synth_sv(src, "widepad.sv").expect("wide pad");
