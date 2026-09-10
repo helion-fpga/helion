@@ -31890,6 +31890,171 @@ endmodule
         assert_eq!(again.wns_ps(), Some(9640));
     }
 
+    /// examples/cdc_partial_false.sv+.sdc: pin-scoped set_false_path → CDC-14 Warning /
+    /// catalog Warnings (PartialFalsePath). Clock-level FP stays Safe; unsync stays Failed.
+    /// Counter gold WNS_PS=9640 unchanged.
+    #[test]
+    fn cdc_partial_false_cdc14_warning_catalog_warnings() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("cdc_partial_false.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert!(
+            ide.pane_clocks().len() >= 2,
+            "sibling SDC must create clk_a/clk_b: {:?}",
+            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            ide.constraints
+                .false_paths
+                .iter()
+                .any(|fp| fp.contains("get_pins")),
+            "sibling SDC must set pin-scoped false_path: {:?}",
+            ide.constraints.false_paths
+        );
+        assert!(
+            ide.constraints
+                .false_path_partial_covers_clocks("clk_a", "clk_b"),
+            "pin-scoped FP must classify PartialFalsePath: {:?}",
+            ide.constraints.false_paths
+        );
+        assert!(
+            !ide.constraints.false_path_covers_clocks("clk_a", "clk_b"),
+            "pin-scoped FP must not be full FalsePath: {:?}",
+            ide.constraints.false_paths
+        );
+        let out = ide.exec("report_cdc").unwrap();
+        assert!(out.contains("report_cdc"), "{out}");
+        let r = ide.cdc_report();
+        assert_eq!(r.critical_count(), 0, "partial FP must not Critical: {}", r.text());
+        assert!(
+            r.warning_count() > 0,
+            "partial FP must Warning: {}",
+            r.text()
+        );
+        let row = r
+            .violation("clk_a", "clk_b")
+            .or_else(|| r.violation("clk_b", "clk_a"))
+            .expect("clk_a↔clk_b CDC row");
+        assert_eq!(row.check, "CDC-14", "{row:?}");
+        assert_eq!(row.severity, helion_sta::CdcSeverity::Warning, "{row:?}");
+        assert_eq!(
+            row.relation,
+            helion_sta::ClockRelation::PartialFalsePath,
+            "{row:?}"
+        );
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cat.status, "Warnings",
+            "CDC-14 Warning-only must paint Warnings: {cat:?}"
+        );
+        let meth = ide.methodology_report();
+        assert!(
+            meth.check("CDC-1").is_none(),
+            "partial FP must clear methodology CDC-1: {}",
+            meth.text()
+        );
+        assert_eq!(
+            meth.critical_count(),
+            0,
+            "partial methodology must not Critical: {}",
+            meth.text()
+        );
+
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
+        assert_eq!(
+            again
+                .report_catalog()
+                .into_iter()
+                .find(|r| r.id == "report_cdc")
+                .unwrap()
+                .status,
+            "Complete"
+        );
+    }
+
+    /// examples/timing_lut_as_clock.sv+.sdc: LUT drives FF CLK → TIMING-10 Warning /
+    /// catalog Warnings. Honest gated-clock netlist only — no fake methodology rows.
+    /// Counter gold WNS_PS=9640 unchanged.
+    #[test]
+    fn timing_lut_as_clock_timing10_warning_catalog_warnings() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("timing_lut_as_clock.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let design = ide.design().expect("design after synth");
+        let lut_clk = design.cells.iter().any(|c| {
+            matches!(c.kind, CellKind::Hff)
+                && design.net_on(&c.name, "CLK").is_some_and(|clk_net| {
+                    design.net(clk_net).is_some_and(|n| {
+                        n.endpoints.iter().any(|e| {
+                            e.pin == "O"
+                                && design.cell(&e.cell).is_some_and(|lc| {
+                                    matches!(lc.kind, CellKind::Lut6 { .. })
+                                })
+                        })
+                    })
+                })
+        });
+        assert!(
+            lut_clk,
+            "gated clock must tech-map to LUT→FF CLK; cells={:?}",
+            design
+                .cells
+                .iter()
+                .map(|c| format!("{}:{:?}", c.name, c.kind))
+                .collect::<Vec<_>>()
+        );
+        let out = ide.exec("report_methodology").unwrap();
+        assert!(out.contains("report_methodology") || out.contains("TIMING"), "{out}");
+        let meth = ide.methodology_report();
+        let row = meth
+            .check("TIMING-10")
+            .expect(&format!("TIMING-10 row missing: {}", meth.text()));
+        assert_eq!(
+            row.severity,
+            helion_sta::MethodologySeverity::Warning,
+            "{row:?}"
+        );
+        assert!(
+            row.message.contains("drives clock") || row.message.contains("LUT"),
+            "{row:?}"
+        );
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_methodology")
+            .expect("methodology catalog row");
+        assert_eq!(
+            cat.status, "Warnings",
+            "TIMING-10 Warning must paint Warnings: {cat:?}"
+        );
+
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
+        let cm = again.methodology_report();
+        assert!(
+            cm.check("TIMING-10").is_none(),
+            "counter must not emit TIMING-10: {}",
+            cm.text()
+        );
+    }
+
     /// POWER-2 occupancy warn is wired into report_power text + catalog; counter
     /// (4/8192) stays below 80% so POWER-1 assumed_f remains the demo warn path.
     #[test]
