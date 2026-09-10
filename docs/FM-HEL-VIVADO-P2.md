@@ -40,3 +40,22 @@ cargo run -q -p helion-cli -- report_timing examples/counter.sv --sdc examples/c
 - Board DONE requires OFL programmer-ok or native live STAT TDO DONE=1.
 - USB=0 / no FTDI → detect `physical_had=0`; program **Err** (no soft-hold Ok).
 - Sim / mpsse-sim remain available **only** via explicit cable; labeled not board DONE.
+
+## Bitgen harden (Linux bits branch)
+
+| Check | Behavior |
+|-------|----------|
+| `bitgen` empty pack | **Err** — refuses empty/fake `.hbits` (no LUTFF/IOB/DSP/BRAM) |
+| `bitgen` zero frames | **Err** — INIT=0 / no IOB / no IMUX that set bits → refuse |
+| `Session::write_bitstream` | **Err** if no design / not routed / empty frames |
+| CLI `helion bitstream` | Exits 1 if configured frames == 0 |
+| Counter gold | **185 B** sparse `.hbits`; frames/packets deterministic across runs |
+| CRC / hash | Header CRC32C + body hash always set; in-stream `CRC_CHECK` (0x21) remains 0 stub (device CRC not modeled) — size-stable |
+| Program path | Unchanged: `auto` USB=0 refuses DONE; `sim` labeled not board DONE |
+
+```bash
+cargo test -p helion-bits --lib
+cargo test -p helion-proj --lib write_bitstream_refuses
+cargo run -q -p helion-cli -- bitstream examples/counter.sv -o /tmp/counter.hbits   # 185 B
+```
+
