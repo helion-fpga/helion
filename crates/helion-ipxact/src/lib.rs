@@ -42,9 +42,37 @@ pub fn pack_rv32() -> IpCore {
     }
 }
 
+/// Helion-ST sync FIFO (ip/h_sync_fifo). Depth 8 / width 8. Not AXI-Stream.
+pub fn pack_sync_fifo() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_sync_fifo".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM loadable down-counter timer (ip/h_timer). Not AXI timer.
+pub fn pack_timer() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_timer".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
-    vec![pack_uart(), pack_gpio(), pack_rv32()]
+    vec![
+        pack_uart(),
+        pack_gpio(),
+        pack_rv32(),
+        pack_sync_fifo(),
+        pack_timer(),
+    ]
 }
 
 impl IpCore {
@@ -118,12 +146,25 @@ mod tests {
         assert_eq!(rv.name, "h_rv32_hb1");
         assert_eq!(rv.bus, "Helion-MM");
         assert_ne!(rv.bus, "AXI");
+        let fifo = pack_sync_fifo();
+        assert_eq!(fifo.name, "h_sync_fifo");
+        assert_eq!(fifo.bus, "Helion-ST");
+        assert_ne!(fifo.bus, "AXI");
+        let timer = pack_timer();
+        assert_eq!(timer.name, "h_timer");
+        assert_eq!(timer.bus, "Helion-MM");
+        assert_ne!(timer.bus, "AXI");
         let cat = catalog();
         assert!(cat.iter().any(|c| c.name == "h_uart"));
         assert!(cat.iter().any(|c| c.name == "h_gpio"));
         assert!(cat.iter().any(|c| c.name == "h_rv32_hb1"));
+        assert!(cat.iter().any(|c| c.name == "h_sync_fifo"));
+        assert!(cat.iter().any(|c| c.name == "h_timer"));
         assert!(cat.iter().all(|c| c.bus != "AXI"));
+        assert!(cat.iter().all(|c| !c.bus.to_ascii_lowercase().contains("axi")));
         assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
+        assert_eq!(pack_sync_fifo().vlnv(), "community:helion:h_sync_fifo:1.0");
+        assert_eq!(pack_timer().vlnv(), "community:helion:h_timer:1.0");
     }
 }
 
