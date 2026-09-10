@@ -27,6 +27,8 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_clkdiv` | Helion-ST | Programmable clock divider (loadable div/en/out) |
 | `h_edge_det` | Helion-ST | Rising/falling edge detect, sticky status + clear |
 | `h_watchdog` | Helion-MM | Loadable countdown watchdog, enable/timeout/pet |
+| `h_crc32` | Helion-ST | Byte-serial CRC32 (init/enable/data_valid) |
+| `h_lfsr` | Helion-ST | Programmable-tap LFSR PRBS (enable/load/seed) |
 
 ## Use
 
@@ -39,6 +41,8 @@ helion ip show ip/h_debounce/h_debounce.helion
 helion ip show ip/h_clkdiv/h_clkdiv.helion
 helion ip show ip/h_edge_det/h_edge_det.helion
 helion ip show ip/h_watchdog/h_watchdog.helion
+helion ip show ip/h_crc32/h_crc32.helion
+helion ip show ip/h_lfsr/h_lfsr.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -46,8 +50,10 @@ helion project examples/ip_ingest/h_debounce_ip.prj
 helion project examples/ip_ingest/h_clkdiv_ip.prj
 helion project examples/ip_ingest/h_edge_det_ip.prj
 helion project examples/ip_ingest/h_watchdog_ip.prj
+helion project examples/ip_ingest/h_crc32_ip.prj
+helion project examples/ip_ingest/h_lfsr_ip.prj
 # in a .prj:
-#   read_ip ip/h_watchdog/h_watchdog.helion
+#   read_ip ip/h_crc32/h_crc32.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
