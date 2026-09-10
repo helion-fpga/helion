@@ -1239,14 +1239,35 @@ impl Constraints {
         })
     }
 
-    /// Inter-clock `set_false_path` whose stored tokens name both clocks.
+    /// Clock-level inter-clock `set_false_path` naming both clocks (no pin/cell scope).
     pub fn false_path_covers_clocks(&self, from: &str, to: &str) -> bool {
         if from == to {
             return false;
         }
-        self.false_paths
-            .iter()
-            .any(|fp| sdc_token_eq(fp, from) && sdc_token_eq(fp, to))
+        self.false_paths.iter().any(|fp| {
+            let clock_level = !fp.contains("get_pins") && !fp.contains("get_cells");
+            clock_level && sdc_token_eq(fp, from) && sdc_token_eq(fp, to)
+        })
+    }
+
+    /// Pin/cell-scoped or mixed clock↔pin `set_false_path` for the pair (CDC-14).
+    /// Full clock-to-clock false paths are `false_path_covers_clocks` instead.
+    pub fn false_path_partial_covers_clocks(&self, from: &str, to: &str) -> bool {
+        if from == to {
+            return false;
+        }
+        if self.false_path_covers_clocks(from, to) {
+            return false;
+        }
+        self.false_paths.iter().any(|fp| {
+            let pin_scoped = fp.contains("get_pins")
+                || fp.contains("get_cells")
+                || fp.contains('/');
+            if !pin_scoped {
+                return false;
+            }
+            sdc_token_eq(fp, from) || sdc_token_eq(fp, to)
+        })
     }
 
     /// Tightest `set_max_delay -datapath_only` covering the clock pair (ps).
@@ -1561,6 +1582,9 @@ fn classify_clock_pair(from: &Clock, to: &Clock, clocks: &[Clock], xdc: &Constra
         }
         if xdc.false_path_covers_clocks(&from.name, &to.name) {
             return ClockRelation::FalsePath;
+        }
+        if xdc.false_path_partial_covers_clocks(&from.name, &to.name) {
+            return ClockRelation::PartialFalsePath;
         }
         if xdc.datapath_max_delay_covers(&from.name, &to.name).is_some() {
             return ClockRelation::TimedDatapath;
@@ -2769,15 +2793,9 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                 }
             }
             "set_false_path" => {
-                let joined = toks.join(" ");
-                if let Some(n) = tcl_name(&joined, "get_ports")
-                    .or_else(|| tcl_name(&joined, "get_pins"))
-                    .or_else(|| tcl_name(&joined, "get_cells"))
-                {
-                    c.false_paths.push(n);
-                } else {
-                    c.false_paths.push(joined);
-                }
+                // Always keep the full command so clock-level vs pin-scoped
+                // (PartialFalsePath / CDC-14) can be distinguished later.
+                c.false_paths.push(toks.join(" "));
             }
             "set_multicycle_path" => {
                 let mut want_setup = false;
@@ -3921,7 +3939,11 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(c.clocks[1].period_ps, 20_000);
         assert_eq!(c.output_delay_ps["led"], 2000);
         assert_eq!(c.input_delay_ps["clk"], 1500);
-        assert!(c.false_paths.iter().any(|p| p == "clk" || p == "led"));
+        assert!(
+            c.false_paths.iter().any(|p| sdc_token_eq(p, "clk") && sdc_token_eq(p, "led")),
+            "false_path must retain both ports: {:?}",
+            c.false_paths
+        );
         assert_eq!(c.package_pins["led"], "IOB_X5Y0");
 
         let mut d = Design::structural_blinky();
@@ -4924,6 +4946,30 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
             rf.cell("clk", "virt").unwrap().relation,
             ClockRelation::FalsePath
         );
+
+        let mut partial = Constraints::default();
+        partial.false_paths.push(
+            "set_false_path -from [get_clocks clk] -to [get_pins u_ff/D]".into(),
+        );
+        assert!(
+            partial.false_path_partial_covers_clocks("clk", "virt"),
+            "mixed clock↔pin FP must be partial"
+        );
+        assert!(
+            !partial.false_path_covers_clocks("clk", "virt"),
+            "pin-scoped FP must not be full FalsePath"
+        );
+        let rp = report_clock_interaction(&clks, &partial, None);
+        assert_eq!(
+            rp.cell("clk", "virt").unwrap().relation,
+            ClockRelation::PartialFalsePath
+        );
+        let cdc_p = report_cdc(&clks, &partial, None, None);
+        let row_p = cdc_p
+            .violation("clk", "virt")
+            .expect("partial false path CDC row");
+        assert_eq!(row_p.check, "CDC-14");
+        assert_eq!(row_p.severity, CdcSeverity::Warning);
 
         let mut dp = Constraints::default();
         dp.max_delays.push(MaxDelay {

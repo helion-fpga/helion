@@ -1,0 +1,21 @@
+helion-ide 1.1.1
+target aarch64-apple-darwin
+part HL10T-C32-1
+stdin Tcl console + flow rail. `help` for commands, `quit` to exit.
+synth_design timing_lut_as_clock cells=4 luts=2
+synth_design timing_lut_as_clock cells=4 luts=2
+opt_design removed=0
+place_design lutff_sites=2 iob_sites=1 cost=0.750
+route_design pathfinder_iters=1 overused=0 hops=1
+report_methodology checks=1 errors=0 critical=0 warning=1 advisory=0
+TIMING-10 Warning TIMING u_clut0,u_ff LUT u_clut0 drives clock net gated on u_ff
+reports n=9 complete=7
+NAME=report_timing_summary CATEGORY=Timing STATUS=Complete SUMMARY=WNS_PS=7580 TNS_PS=0 TCL=report_timing_summary
+NAME=report_clock_interaction CATEGORY=Timing STATUS=Complete SUMMARY=clocks=1 cells=1 TCL=report_clock_interaction
+NAME=report_cdc CATEGORY=Timing STATUS=Complete SUMMARY=critical=0 warning=0 info=0 safe=0 TCL=report_cdc
+NAME=report_clock_networks CATEGORY=Timing STATUS=Complete SUMMARY=loads=0 buffers=1 INSERTION_PS=40 TCL=report_clock_networks
+NAME=report_power CATEGORY=Implementation STATUS=Complete SUMMARY=TOTAL_UW=12413 STATIC_UW=8713 DYNAMIC_UW=3700 VOLTAGE_MV=1000 TCL=report_power
+NAME=report_methodology CATEGORY=Implementation STATUS=Warnings SUMMARY=checks=1 errors=0 warning=1 TCL=report_methodology
+NAME=report_drc CATEGORY=Implementation STATUS=Complete SUMMARY=violations=0 errors=0 TCL=report_drc
+NAME=report_utilization CATEGORY=Implementation STATUS=Complete SUMMARY=LUTFF=2/8192 IOB=1/32 TCL=report_utilization
+NAME=report_bitstream CATEGORY=Program STATUS=Not generated SUMMARY=- TCL=report_bitstream
