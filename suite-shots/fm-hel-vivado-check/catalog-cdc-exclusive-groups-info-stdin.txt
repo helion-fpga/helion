@@ -1,0 +1,23 @@
+helion-ide 1.1.1
+target aarch64-apple-darwin
+part HL10T-C32-1
+stdin Tcl console + flow rail. `help` for commands, `quit` to exit.
+synth_design cdc_exclusive_groups cells=5 luts=2
+opt_design removed=0
+place_design lutff_sites=2 iob_sites=1 cost=0.750
+route_design pathfinder_iters=1 overused=0 hops=1
+report_cdc clocks=2 violations=2 critical=0 warning=0 info=2 safe=0
+clock clk_a PERIOD_PS=10000 generated=0 MASTER=-
+clock clk_b PERIOD_PS=8000 generated=0 MASTER=-
+FROM=clk_a TO=clk_b SEVERITY=Info CHECK=CDC-16 SYNC=0 ENDPOINTS=1 WNS_PS=n/a RELATION=Exclusive
+FROM=clk_b TO=clk_a SEVERITY=Info CHECK=CDC-16 SYNC=0 ENDPOINTS=0 WNS_PS=n/a RELATION=Exclusive
+reports n=9 complete=7
+NAME=report_timing_summary CATEGORY=Timing STATUS=Complete SUMMARY=WNS_PS=9700 TNS_PS=0 TCL=report_timing_summary
+NAME=report_clock_interaction CATEGORY=Timing STATUS=Complete SUMMARY=clocks=2 cells=4 TCL=report_clock_interaction
+NAME=report_cdc CATEGORY=Timing STATUS=Complete SUMMARY=critical=0 warning=0 info=2 safe=0 TCL=report_cdc
+NAME=report_clock_networks CATEGORY=Timing STATUS=Complete SUMMARY=loads=2 buffers=2 INSERTION_PS=40 TCL=report_clock_networks
+NAME=report_power CATEGORY=Implementation STATUS=Complete SUMMARY=TOTAL_UW=13588 STATIC_UW=8713 DYNAMIC_UW=4875 VOLTAGE_MV=1000 TCL=report_power
+NAME=report_methodology CATEGORY=Implementation STATUS=Warnings SUMMARY=checks=3 errors=0 warning=2 TCL=report_methodology
+NAME=report_drc CATEGORY=Implementation STATUS=Complete SUMMARY=violations=0 errors=0 TCL=report_drc
+NAME=report_utilization CATEGORY=Implementation STATUS=Complete SUMMARY=LUTFF=2/8192 IOB=1/32 TCL=report_utilization
+NAME=report_bitstream CATEGORY=Program STATUS=Not generated SUMMARY=- TCL=report_bitstream
