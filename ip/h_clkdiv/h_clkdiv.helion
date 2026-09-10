@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST programmable clock divider
+format 1
+vlnv community:helion:h_clkdiv:1.0
+bus Helion-ST
+top h_clkdiv
+file h_clkdiv.v
