@@ -743,6 +743,51 @@ pub fn pack_cam_slot() -> IpCore {
     }
 }
 
+
+/// Helion-ST serial-in parallel-out shift register WIDTH=16 (ip/h_sipo). Not AXI.
+pub fn pack_sipo() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_sipo".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST parallel-in serial-out shift register WIDTH=16 (ip/h_piso). Not AXI.
+pub fn pack_piso() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_piso".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST simple FSM traffic light registered states+timers (ip/h_traffic_light). Not AXI.
+pub fn pack_traffic_light() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_traffic_light".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM outstanding-id scoreboard / sticky 4-entry ID CAM (ip/h_scoreboard). Not AXI.
+pub fn pack_scoreboard() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_scoreboard".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -811,6 +856,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_rr_token(),
         pack_pwm_phase(),
         pack_cam_slot(),
+        pack_sipo(),
+        pack_piso(),
+        pack_traffic_light(),
+        pack_scoreboard(),
     ]
 }
 
@@ -1264,6 +1313,30 @@ mod tests {
         assert_eq!(pack_rr_token().vlnv(), "community:helion:h_rr_token:1.0");
         assert_eq!(pack_pwm_phase().vlnv(), "community:helion:h_pwm_phase:1.0");
         assert_eq!(pack_cam_slot().vlnv(), "community:helion:h_cam_slot:1.0");
+        let sipo = pack_sipo();
+        assert_eq!(sipo.name, "h_sipo");
+        assert_eq!(sipo.bus, "Helion-ST");
+        assert_ne!(sipo.bus, "AXI");
+        let piso = pack_piso();
+        assert_eq!(piso.name, "h_piso");
+        assert_eq!(piso.bus, "Helion-ST");
+        assert_ne!(piso.bus, "AXI");
+        let tl = pack_traffic_light();
+        assert_eq!(tl.name, "h_traffic_light");
+        assert_eq!(tl.bus, "Helion-ST");
+        assert_ne!(tl.bus, "AXI");
+        let sb = pack_scoreboard();
+        assert_eq!(sb.name, "h_scoreboard");
+        assert_eq!(sb.bus, "Helion-MM");
+        assert_ne!(sb.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_sipo"));
+        assert!(cat.iter().any(|c| c.name == "h_piso"));
+        assert!(cat.iter().any(|c| c.name == "h_traffic_light"));
+        assert!(cat.iter().any(|c| c.name == "h_scoreboard"));
+        assert_eq!(pack_sipo().vlnv(), "community:helion:h_sipo:1.0");
+        assert_eq!(pack_piso().vlnv(), "community:helion:h_piso:1.0");
+        assert_eq!(pack_traffic_light().vlnv(), "community:helion:h_traffic_light:1.0");
+        assert_eq!(pack_scoreboard().vlnv(), "community:helion:h_scoreboard:1.0");
     }
 }
 

@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST serial-in parallel-out shift register
+format 1
+vlnv community:helion:h_sipo:1.0
+bus Helion-ST
+top h_sipo
+file h_sipo.v
