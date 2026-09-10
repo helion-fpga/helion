@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #21 — h_sipo + h_piso + h_traffic_light + h_scoreboard via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_sipo_ip.prj
+synth_design h_sipo cells=292 luts=277
+project examples/ip_ingest/h_sipo_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_sipo xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=277 WNS_PS=9600 frames=183
+# Instantiated IP: community:helion:h_sipo:1.0 (Helion-ST)
+# cells=292 luts=277 lutffs=277  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_piso_ip.prj
+synth_design h_piso cells=278 luts=265
+project examples/ip_ingest/h_piso_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_piso xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=265 WNS_PS=9680 frames=169
+# Instantiated IP: community:helion:h_piso:1.0 (Helion-ST)
+# cells=278 luts=265 lutffs=265  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_traffic_light_ip.prj
+synth_design h_traffic_light cells=227 luts=212
+project examples/ip_ingest/h_traffic_light_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_traffic_light xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=212 WNS_PS=9680 frames=130
+# Instantiated IP: community:helion:h_traffic_light:1.0 (Helion-ST)
+# cells=227 luts=212 lutffs=212  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_scoreboard_ip.prj
+synth_design h_scoreboard cells=283 luts=266
+project examples/ip_ingest/h_scoreboard_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_scoreboard xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=266 WNS_PS=9680 frames=161
+# Instantiated IP: community:helion:h_scoreboard:1.0 (Helion-MM)
+# cells=283 luts=266 lutffs=266  (>0 real fabric)

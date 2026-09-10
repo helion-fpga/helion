@@ -81,6 +81,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_rr_token` | Helion-ST | Token-ring rotating grant among 4 requesters (distinct from h_arb_rr) |
 | `h_pwm_phase` | Helion-ST | Phase-shifted dual PWM (shared counter, two compares) |
 | `h_cam_slot` | Helion-MM | Tiny CAM/tag compare slot (MM write tag/data, sticky match) |
+| `h_sipo` | Helion-ST | Serial-in parallel-out shift register (width 16) |
+| `h_piso` | Helion-ST | Parallel-in serial-out shift register (width 16) |
+| `h_traffic_light` | Helion-ST | Simple FSM traffic light (registered states + timers) |
+| `h_scoreboard` | Helion-MM | MM scoreboard / outstanding-id tracker (4-entry sticky CAM) |
 
 ## Use
 
@@ -246,6 +250,10 @@ helion project examples/ip_ingest/h_pwm_center_ip.prj
 #   read_ip ip/h_rr_token/h_rr_token.helion
 #   read_ip ip/h_pwm_phase/h_pwm_phase.helion
 #   read_ip ip/h_cam_slot/h_cam_slot.helion
+#   read_ip ip/h_sipo/h_sipo.helion
+#   read_ip ip/h_piso/h_piso.helion
+#   read_ip ip/h_traffic_light/h_traffic_light.helion
+#   read_ip ip/h_scoreboard/h_scoreboard.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
