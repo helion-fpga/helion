@@ -293,6 +293,51 @@ pub fn pack_accum_mm() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered even/odd parity + sticky error over 32b (ip/h_parity). Not AXI.
+pub fn pack_parity() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_parity".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered Hamming distance between two 32b (ip/h_hamming). Not AXI.
+pub fn pack_hamming() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_hamming".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM programmed rotate left/right by N on 32b (ip/h_rot_mm). Not AXI.
+pub fn pack_rot_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_rot_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Helion-ST registered bitmask generator from width/offset (ip/h_mask_gen). Not AXI.
+pub fn pack_mask_gen() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_mask_gen".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -321,6 +366,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_ctz(),
         pack_minmax(),
         pack_accum_mm(),
+        pack_parity(),
+        pack_hamming(),
+        pack_rot_mm(),
+        pack_mask_gen(),
     ]
 }
 
@@ -534,6 +583,30 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_accum_mm"));
         assert_eq!(pack_minmax().vlnv(), "community:helion:h_minmax:1.0");
         assert_eq!(pack_accum_mm().vlnv(), "community:helion:h_accum_mm:1.0");
+        let par = pack_parity();
+        assert_eq!(par.name, "h_parity");
+        assert_eq!(par.bus, "Helion-ST");
+        assert_ne!(par.bus, "AXI");
+        let ham = pack_hamming();
+        assert_eq!(ham.name, "h_hamming");
+        assert_eq!(ham.bus, "Helion-ST");
+        assert_ne!(ham.bus, "AXI");
+        let rot = pack_rot_mm();
+        assert_eq!(rot.name, "h_rot_mm");
+        assert_eq!(rot.bus, "Helion-MM");
+        assert_ne!(rot.bus, "AXI");
+        let mgen = pack_mask_gen();
+        assert_eq!(mgen.name, "h_mask_gen");
+        assert_eq!(mgen.bus, "Helion-ST");
+        assert_ne!(mgen.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_parity"));
+        assert!(cat.iter().any(|c| c.name == "h_hamming"));
+        assert!(cat.iter().any(|c| c.name == "h_rot_mm"));
+        assert!(cat.iter().any(|c| c.name == "h_mask_gen"));
+        assert_eq!(pack_parity().vlnv(), "community:helion:h_parity:1.0");
+        assert_eq!(pack_hamming().vlnv(), "community:helion:h_hamming:1.0");
+        assert_eq!(pack_rot_mm().vlnv(), "community:helion:h_rot_mm:1.0");
+        assert_eq!(pack_mask_gen().vlnv(), "community:helion:h_mask_gen:1.0");
     }
 }
 
