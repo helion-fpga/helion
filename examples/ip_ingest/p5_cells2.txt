@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #2 — h_pwm (+ h_spi_mm) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_pwm_ip.prj
+synth_design h_pwm cells=229 luts=223
+project examples/ip_ingest/h_pwm_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_pwm xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=223 WNS_PS=9680 frames=129
+# Instantiated IP: community:helion:h_pwm:1.0 (Helion-MM)
+# cells=229 luts=223 lutffs=223  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_spi_mm_ip.prj
+synth_design h_spi_mm cells=130 luts=124
+project examples/ip_ingest/h_spi_mm_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_spi_mm xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=124 WNS_PS=9680 frames=79
+# Instantiated IP: community:helion:h_spi_mm:1.0 (Helion-MM)
+# cells=130 luts=124 lutffs=124  (>0 real fabric)
