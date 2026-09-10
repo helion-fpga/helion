@@ -4,6 +4,37 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [1.3.0] — 2026-09-10
+
+Pin-wrap suite, deep ILA, CDC methodology, Helion-ST/MM catalog, and hang-class
+lowering on the 1.2.0 elaborator. Empty-XDC `examples/counter.sv` gold is
+unchanged (**WNS_PS=9640**, `.hbits` 185 B). Public corpus waves are hang-free
+and do not close WNS on `cells=0`; they are **not** 100% PASS (mostly SOFT).
+
+### Added
+
+- Ibex / PicoRV32 / SERV pin-wrap examples with user SDC and heartbeat WNS.
+- Mark Debug → Add Probe → Program sim → ILA Arm. Deep ILA uses fabric BRAM
+  capture, IR_USR1 scan, match-unit / trigger FSM (`ip/h_ila_trig`), and RLE
+  upload. Soft LUTFF probe remains; this is not a vendor ILA clone.
+- CDC-1/10/13/14/15/16, TIMING-10, POWER-2 in Reports catalog (Failed / Warnings
+  / Info, not empty-green Complete).
+- Helion-ST and Helion-MM catalog cores with real fabric (plus Helion-DBG
+  `h_ila_trig`). Never AXI.
+- Create Project / Recent `.prj` / `save_project_as` / `close_project`, editable
+  Constraints SDC, pblocks, Simulate wave, Device STA-path highlight.
+
+### Fixed
+
+- Bitgen refuses empty/fake `.hbits`. `write_bitstream` / board program refuse
+  DONE without a cable. `helion reports` still matches occupancy on 0-LUT
+  wrappers.
+- Hang-class Verilog (logikbench arbiter / sha256_k / bin2prio, Ibex ITE density)
+  lowers or diagnoses; does not walk until kill.
+- LUT6 ROM collapse is gated to case-of-const.
+
+[1.3.0]: https://github.com/helion-fpga/helion/releases/tag/v1.3.0
+
 ## [1.2.0] — 2026-09-09
 
 Behavioral Verilog lowering on the 1.1.1 elaborator. `assign`, `always`/`case`,
