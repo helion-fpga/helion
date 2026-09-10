@@ -98,6 +98,29 @@ pub fn pack_spi_mm() -> IpCore {
     }
 }
 
+
+/// Helion-ST N-stage shift-reg debounce (ip/h_debounce). Not AXI.
+pub fn pack_debounce() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_debounce".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST programmable clock divider (ip/h_clkdiv). Not AXI.
+pub fn pack_clkdiv() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_clkdiv".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -109,6 +132,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_timer(),
         pack_pwm(),
         pack_spi_mm(),
+        pack_debounce(),
+        pack_clkdiv(),
     ]
 }
 
@@ -199,6 +224,14 @@ mod tests {
         assert_eq!(spi.name, "h_spi_mm");
         assert_eq!(spi.bus, "Helion-MM");
         assert_ne!(spi.bus, "AXI");
+        let deb = pack_debounce();
+        assert_eq!(deb.name, "h_debounce");
+        assert_eq!(deb.bus, "Helion-ST");
+        assert_ne!(deb.bus, "AXI");
+        let cdiv = pack_clkdiv();
+        assert_eq!(cdiv.name, "h_clkdiv");
+        assert_eq!(cdiv.bus, "Helion-ST");
+        assert_ne!(cdiv.bus, "AXI");
         let cat = catalog();
         assert!(cat.iter().any(|c| c.name == "h_uart"));
         assert!(cat.iter().any(|c| c.name == "h_gpio"));
@@ -211,6 +244,8 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_timer"));
         assert!(cat.iter().any(|c| c.name == "h_pwm"));
         assert!(cat.iter().any(|c| c.name == "h_spi_mm"));
+        assert!(cat.iter().any(|c| c.name == "h_debounce"));
+        assert!(cat.iter().any(|c| c.name == "h_clkdiv"));
         assert!(cat.iter().all(|c| c.bus != "AXI"));
         assert!(cat.iter().all(|c| !c.bus.to_ascii_lowercase().contains("axi")));
         assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
@@ -218,6 +253,8 @@ mod tests {
         assert_eq!(pack_timer().vlnv(), "community:helion:h_timer:1.0");
         assert_eq!(pack_pwm().vlnv(), "community:helion:h_pwm:1.0");
         assert_eq!(pack_spi_mm().vlnv(), "community:helion:h_spi_mm:1.0");
+        assert_eq!(pack_debounce().vlnv(), "community:helion:h_debounce:1.0");
+        assert_eq!(pack_clkdiv().vlnv(), "community:helion:h_clkdiv:1.0");
     }
 }
 
