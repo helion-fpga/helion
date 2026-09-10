@@ -80,7 +80,10 @@ mod tests {
     #[test]
     fn doctor_prints_toolchain_had_and_triple() {
         let d = doctor_report();
-        assert!(d.starts_with("helion-ide 1.0.0"), "{d}");
+        assert!(
+            d.starts_with(concat!("helion-ide ", env!("CARGO_PKG_VERSION"))),
+            "{d}"
+        );
         assert!(d.contains("target "), "{d}");
         assert!(d.contains("rustc release:") || d.contains("rustc not"), "{d}");
         assert!(
