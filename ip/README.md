@@ -61,6 +61,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_pwm_deadtime` | Helion-ST | Complementary PWM with programmable deadtime counters |
 | `h_lfsr16` | Helion-ST | 16-bit LFSR PRBS (distinct from 8b h_lfsr) |
 | `h_edge_cnt` | Helion-ST | Rising-edge counter with clear |
+| `h_uart_rx` | Helion-MM | UART RX bit sampler (baud div, start/data/stop, sticky byte) |
+| `h_div_restoring` | Helion-ST | Restoring divider step engine (registered quot/rem) |
+| `h_sqrt_digit` | Helion-ST | Digit-by-digit integer sqrt step (registered) |
+| `h_cordic_step` | Helion-ST | One CORDIC rotation step (registered x/y/z) |
 
 ## Use
 
@@ -107,6 +111,10 @@ helion ip show ip/h_mailbox_mm/h_mailbox_mm.helion
 helion ip show ip/h_pwm_deadtime/h_pwm_deadtime.helion
 helion ip show ip/h_lfsr16/h_lfsr16.helion
 helion ip show ip/h_edge_cnt/h_edge_cnt.helion
+helion ip show ip/h_uart_rx/h_uart_rx.helion
+helion ip show ip/h_div_restoring/h_div_restoring.helion
+helion ip show ip/h_sqrt_digit/h_sqrt_digit.helion
+helion ip show ip/h_cordic_step/h_cordic_step.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -148,6 +156,10 @@ helion project examples/ip_ingest/h_mailbox_mm_ip.prj
 helion project examples/ip_ingest/h_pwm_deadtime_ip.prj
 helion project examples/ip_ingest/h_lfsr16_ip.prj
 helion project examples/ip_ingest/h_edge_cnt_ip.prj
+helion project examples/ip_ingest/h_uart_rx_ip.prj
+helion project examples/ip_ingest/h_div_restoring_ip.prj
+helion project examples/ip_ingest/h_sqrt_digit_ip.prj
+helion project examples/ip_ingest/h_cordic_step_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion

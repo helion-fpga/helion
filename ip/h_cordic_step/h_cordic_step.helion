@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST one CORDIC rotation step
+format 1
+vlnv community:helion:h_cordic_step:1.0
+bus Helion-ST
+top h_cordic_step
+file h_cordic_step.v
