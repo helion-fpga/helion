@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM single-slot mailbox
+format 1
+vlnv community:helion:h_mailbox_mm:1.0
+bus Helion-MM
+top h_mailbox_mm
+file h_mailbox_mm.v

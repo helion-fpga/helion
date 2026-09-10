@@ -473,6 +473,51 @@ pub fn pack_bcd_inc() -> IpCore {
     }
 }
 
+
+/// Helion-MM single-slot mailbox write/read + sticky full/empty (ip/h_mailbox_mm). Not AXI.
+pub fn pack_mailbox_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_mailbox_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Helion-ST complementary PWM with deadtime counters (ip/h_pwm_deadtime). Not AXI.
+pub fn pack_pwm_deadtime() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_pwm_deadtime".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST 16-bit LFSR PRBS (ip/h_lfsr16). Distinct from 8b h_lfsr. Not AXI.
+pub fn pack_lfsr16() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_lfsr16".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST rising-edge counter with clear (ip/h_edge_cnt). Not AXI.
+pub fn pack_edge_cnt() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_edge_cnt".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -517,6 +562,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_prio_enc(),
         pack_skid_buf(),
         pack_bcd_inc(),
+        pack_mailbox_mm(),
+        pack_pwm_deadtime(),
+        pack_lfsr16(),
+        pack_edge_cnt(),
     ]
 }
 
@@ -826,6 +875,30 @@ mod tests {
         assert_eq!(pack_prio_enc().vlnv(), "community:helion:h_prio_enc:1.0");
         assert_eq!(pack_skid_buf().vlnv(), "community:helion:h_skid_buf:1.0");
         assert_eq!(pack_bcd_inc().vlnv(), "community:helion:h_bcd_inc:1.0");
+        let mb = pack_mailbox_mm();
+        assert_eq!(mb.name, "h_mailbox_mm");
+        assert_eq!(mb.bus, "Helion-MM");
+        assert_ne!(mb.bus, "AXI");
+        let pdt = pack_pwm_deadtime();
+        assert_eq!(pdt.name, "h_pwm_deadtime");
+        assert_eq!(pdt.bus, "Helion-ST");
+        assert_ne!(pdt.bus, "AXI");
+        let l16 = pack_lfsr16();
+        assert_eq!(l16.name, "h_lfsr16");
+        assert_eq!(l16.bus, "Helion-ST");
+        assert_ne!(l16.bus, "AXI");
+        let ec = pack_edge_cnt();
+        assert_eq!(ec.name, "h_edge_cnt");
+        assert_eq!(ec.bus, "Helion-ST");
+        assert_ne!(ec.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_mailbox_mm"));
+        assert!(cat.iter().any(|c| c.name == "h_pwm_deadtime"));
+        assert!(cat.iter().any(|c| c.name == "h_lfsr16"));
+        assert!(cat.iter().any(|c| c.name == "h_edge_cnt"));
+        assert_eq!(pack_mailbox_mm().vlnv(), "community:helion:h_mailbox_mm:1.0");
+        assert_eq!(pack_pwm_deadtime().vlnv(), "community:helion:h_pwm_deadtime:1.0");
+        assert_eq!(pack_lfsr16().vlnv(), "community:helion:h_lfsr16:1.0");
+        assert_eq!(pack_edge_cnt().vlnv(), "community:helion:h_edge_cnt:1.0");
     }
 }
 
