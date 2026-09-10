@@ -81,9 +81,9 @@ fn ibex_pin_wrap_user_sdc_closed_wns_or_named_miss() {
 
     ide.exec(&format!("mark_debug {probe}")).unwrap();
     ide.exec("add_probe").unwrap();
-    let prog = ide.exec("program_hw").unwrap();
+    let prog = ide.exec("program_hw cable=sim").unwrap();
     assert!(
-        prog.contains("DONE=1") || prog.contains("backend=sim") || prog.contains("soft-hold"),
+        prog.contains("DONE=1") || prog.contains("backend=sim"),
         "{prog}"
     );
     ide.exec("ila_window 16").unwrap();

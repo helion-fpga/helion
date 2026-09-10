@@ -966,6 +966,9 @@ pub fn detect_boards() -> DetectReport {
 }
 
 /// Resolve `--cable auto|sim|mpsse-sim|usb|ofl|native|sim0|mpsse-sim0|ofl0|usb0|native0`.
+///
+/// `auto` always selects the OFL board path (probe present → program may DONE;
+/// USB=0 → program fails honestly). Never falls back to sim DONE.
 pub fn resolve_cable(spec: &str) -> Result<CableInfo, String> {
     resolve_cable_from(spec, &detect_boards())
 }
@@ -1003,11 +1006,11 @@ pub fn resolve_cable_from(spec: &str, det: &DetectReport) -> Result<CableInfo, S
         "usb" | "usb0" | "ofl" | "ofl0" | "openfpgaloader" => Ok(ofl),
         "native" | "native0" | "ftdi" | "libusb" => Ok(native),
         "auto" => {
-            if det.physical_had {
-                Ok(ofl)
-            } else {
-                Ok(sim)
-            }
+            // Prefer OFL for board program. With USB=0, resolve to ofl so program
+            // fails honestly (no soft-hold / no invented sim DONE). Explicit
+            // --cable sim|mpsse-sim remains for in-process fabric only.
+            let _ = &sim;
+            Ok(ofl)
         }
         other => Err(format!(
             "unknown cable {other:?}: use --cable auto|sim|mpsse-sim|usb|ofl|native"
@@ -1483,7 +1486,7 @@ impl ProgramOutcome {
     pub fn summary_line(&self, sub: &str, part: &str) -> String {
         match self {
             ProgramOutcome::Sim { bits, stat } => format!(
-                "hw {sub} backend=sim part={part} frames={} bytes={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
+                "hw {sub} backend=sim part={part} frames={} bytes={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={} (sim fabric; not board DONE)",
                 bits.frames.len(),
                 bits.packets.len(),
                 stat.init as u8,
@@ -1686,7 +1689,8 @@ mod tests {
         if d.usb.probes.is_empty() {
             assert!(!d.physical_had);
             let auto = resolve_cable("auto").unwrap();
-            assert_eq!(auto.backend, CableBackend::Sim);
+            // USB=0: auto stays on OFL so program refuses DONE (never invents sim DONE).
+            assert_eq!(auto.backend, CableBackend::OpenFpgaLoader);
         }
     }
 
@@ -1704,15 +1708,39 @@ mod tests {
             "IDE paint path must not shell openFPGALoader again (got {})",
             usb_scan_invocations()
         );
-        assert_eq!(cable.backend, CableBackend::Sim);
+        assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
     }
 
     #[test]
     fn backend_selection_auto_prefers_ofl_when_probes() {
-        // Auto without probes → sim (covered above). With empty scan, usb still resolves to ofl backend.
+        // Auto always OFL (USB=0 → honest program fail; probes → OFL program).
         let usb = resolve_cable("usb0").unwrap();
         assert_eq!(usb.backend, CableBackend::OpenFpgaLoader);
         assert_eq!(usb.id, "ofl0");
+        let auto = resolve_cable("auto").unwrap();
+        assert_eq!(auto.backend, CableBackend::OpenFpgaLoader);
+    }
+
+    #[test]
+    fn auto_usb0_program_refuses_done_no_soft_hold() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("helion-auto-usb0");
+        let _ = std::fs::create_dir_all(&dir);
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let bits_path = dir.join("counter.hbits");
+        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        // Ensure real OFL on PATH is used (or missing → still honest refuse).
+        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+        unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
+        let cable = resolve_cable("auto").unwrap();
+        assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
+        let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+        assert!(
+            err.contains("no USB") || err.contains("openFPGALoader") || err.contains("programmer"),
+            "USB=0 must honest-fail, got: {err}"
+        );
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+        assert!(!err.to_ascii_lowercase().contains("soft-hold"), "must not soft-hold: {err}");
     }
 
     #[test]
