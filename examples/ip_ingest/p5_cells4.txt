@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #4 — h_edge_det (+ h_watchdog) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_edge_det_ip.prj
+synth_design h_edge_det cells=16 luts=7
+project examples/ip_ingest/h_edge_det_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_edge_det xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=7 WNS_PS=9600 frames=10
+# Instantiated IP: community:helion:h_edge_det:1.0 (Helion-ST)
+# cells=16 luts=7 lutffs=7  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_watchdog_ip.prj
+synth_design h_watchdog cells=247 luts=241
+project examples/ip_ingest/h_watchdog_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_watchdog xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=241 WNS_PS=9680 frames=187
+# Instantiated IP: community:helion:h_watchdog:1.0 (Helion-MM)
+# cells=247 luts=241 lutffs=241  (>0 real fabric)

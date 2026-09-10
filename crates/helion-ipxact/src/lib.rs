@@ -121,6 +121,29 @@ pub fn pack_clkdiv() -> IpCore {
     }
 }
 
+
+/// Helion-ST rising/falling edge detect with sticky status (ip/h_edge_det). Not AXI.
+pub fn pack_edge_det() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_edge_det".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM loadable countdown watchdog (ip/h_watchdog). Not AXI watchdog.
+pub fn pack_watchdog() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_watchdog".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -134,6 +157,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_spi_mm(),
         pack_debounce(),
         pack_clkdiv(),
+        pack_edge_det(),
+        pack_watchdog(),
     ]
 }
 
@@ -255,6 +280,18 @@ mod tests {
         assert_eq!(pack_spi_mm().vlnv(), "community:helion:h_spi_mm:1.0");
         assert_eq!(pack_debounce().vlnv(), "community:helion:h_debounce:1.0");
         assert_eq!(pack_clkdiv().vlnv(), "community:helion:h_clkdiv:1.0");
+        let edge = pack_edge_det();
+        assert_eq!(edge.name, "h_edge_det");
+        assert_eq!(edge.bus, "Helion-ST");
+        assert_ne!(edge.bus, "AXI");
+        let wdog = pack_watchdog();
+        assert_eq!(wdog.name, "h_watchdog");
+        assert_eq!(wdog.bus, "Helion-MM");
+        assert_ne!(wdog.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_edge_det"));
+        assert!(cat.iter().any(|c| c.name == "h_watchdog"));
+        assert_eq!(pack_edge_det().vlnv(), "community:helion:h_edge_det:1.0");
+        assert_eq!(pack_watchdog().vlnv(), "community:helion:h_watchdog:1.0");
     }
 }
 

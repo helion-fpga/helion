@@ -1,0 +1,5 @@
+# Ingest Helion-MM watchdog via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_watchdog/h_watchdog.helion
+read_xdc examples/ip_ingest/h_watchdog.sdc
+top h_watchdog
