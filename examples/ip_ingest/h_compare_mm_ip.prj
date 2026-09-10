@@ -1,0 +1,5 @@
+# Ingest Helion-MM compare via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_compare_mm/h_compare_mm.helion
+read_xdc examples/ip_ingest/h_compare_mm.sdc
+top h_compare_mm

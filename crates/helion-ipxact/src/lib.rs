@@ -212,6 +212,29 @@ pub fn pack_saturate() -> IpCore {
     }
 }
 
+
+/// Helion-ST loadable N-bit shift register with dir/serial (ip/h_shift_reg). Not AXI.
+pub fn pack_shift_reg() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_shift_reg".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM threshold/compare regs + sticky match/irq (ip/h_compare_mm). Not AXI.
+pub fn pack_compare_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_compare_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -233,6 +256,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_scratch_mm(),
         pack_popcount(),
         pack_saturate(),
+        pack_shift_reg(),
+        pack_compare_mm(),
     ]
 }
 
@@ -402,6 +427,18 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_saturate"));
         assert_eq!(pack_popcount().vlnv(), "community:helion:h_popcount:1.0");
         assert_eq!(pack_saturate().vlnv(), "community:helion:h_saturate:1.0");
+        let sreg = pack_shift_reg();
+        assert_eq!(sreg.name, "h_shift_reg");
+        assert_eq!(sreg.bus, "Helion-ST");
+        assert_ne!(sreg.bus, "AXI");
+        let cmp = pack_compare_mm();
+        assert_eq!(cmp.name, "h_compare_mm");
+        assert_eq!(cmp.bus, "Helion-MM");
+        assert_ne!(cmp.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_shift_reg"));
+        assert!(cat.iter().any(|c| c.name == "h_compare_mm"));
+        assert_eq!(pack_shift_reg().vlnv(), "community:helion:h_shift_reg:1.0");
+        assert_eq!(pack_compare_mm().vlnv(), "community:helion:h_compare_mm:1.0");
     }
 }
 
