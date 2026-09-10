@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST rising/falling edge detect
+format 1
+vlnv community:helion:h_edge_det:1.0
+bus Helion-ST
+top h_edge_det
+file h_edge_det.v
