@@ -5611,10 +5611,20 @@ impl IdeModel {
             let r = tcl_eval(&mut self.shell, t);
             self.workspace = WorkspaceTab::Hardware;
             r
-        } else if t == "program_hw" || t == "program_hw_devices" {
+        } else if t == "program_hw"
+            || t == "program_hw_devices"
+            || t.starts_with("program_hw ")
+            || t.starts_with("program_hw_devices ")
+        {
             let r = tcl_eval(&mut self.shell, t);
             self.hw.stat = None;
             self.workspace = WorkspaceTab::Hardware;
+            if r.is_ok() {
+                self.hw.programmed = self.shell.session.programmed;
+                self.hw.open = true;
+                self.shell.session.hw_open = true;
+                self.refresh_hw();
+            }
             r
         } else if t == "report_hw" || t == "hw_stat" || t == "report_hw_stat" {
             self.shell.session.open_hw_manager();
@@ -22130,7 +22140,7 @@ mod tests {
         ide.run_step(FlowStep::Bitstream).unwrap();
         ide.sim_run(16).unwrap();
         ide.exec("open_hw_manager").unwrap();
-        ide.exec("program_hw").unwrap();
+        ide.exec("program_hw cable=sim").unwrap();
 
         for stage in UltraFastStage::ALL {
             let out = ide.open_ultrafast(stage.tcl()).unwrap();
@@ -22200,7 +22210,13 @@ mod tests {
 
         let hw = ide.exec("open_hw_manager").unwrap();
         assert!(hw.contains("sim"), "{hw}");
-        let prog = ide.exec("program_hw").unwrap();
+        // USB=0: bare program_hw refuses board DONE; sim cable for fabric STAT.
+        let board_err = ide.exec("program_hw").unwrap_err();
+        assert!(
+            board_err.contains("refused DONE") || board_err.contains("no USB") || board_err.contains("programmer"),
+            "{board_err}"
+        );
+        let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(prog.contains("DONE=1"), "{prog}");
         assert!(ide.hw.programmed);
         assert_eq!(ide.hw.stat.as_ref().map(|s| s.done), Some(true));
@@ -25600,7 +25616,7 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Hardware);
         assert_eq!(ide.default_ila_probe(), "cnt_3");
 
-        let prog = ide.exec("program_hw").unwrap();
+        let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(
             prog.contains("DONE=1") || prog.contains("backend=sim"),
             "Program sim must leave fabric ready: {prog}"
@@ -25684,7 +25700,7 @@ endmodule
         assert_eq!(ide.ila.net, "x");
         assert_eq!(ide.workspace, WorkspaceTab::Hardware);
 
-        let prog = ide.exec("program_hw").unwrap();
+        let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(
             prog.contains("DONE=1") || prog.contains("backend=sim"),
             "Program sim: {prog}"
@@ -31107,7 +31123,7 @@ endmodule
             ide.properties
         );
 
-        let prog = ide.exec("program_hw").unwrap();
+        let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(prog.contains("DONE=1"), "{prog}");
         assert!(ide.hw.programmed);
         let started = ide.hw_stat_report();
@@ -31178,7 +31194,7 @@ endmodule
         blinky.run_step(FlowStep::Route).unwrap();
         blinky.run_step(FlowStep::Bitstream).unwrap();
         blinky.exec("open_hw_manager").unwrap();
-        blinky.exec("program_hw").unwrap();
+        blinky.exec("program_hw cable=sim").unwrap();
         let br = blinky.hw_stat_report();
         assert_eq!(br.word, Stat::STARTUP_WORD);
         assert_eq!(br.idcode, started.idcode);
