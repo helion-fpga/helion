@@ -1,0 +1,17 @@
+hang_diag parse mods=1 bytes=247 ms=1
+hang_diag flatten nbas=1 assigns=1 signals=3 ms=0
+incremental rebuilt module=counter
+synth_rtl after nbas reg_bits=4
+synth_rtl after assigns comb_bits=0
+synth_rtl reg_bits=4 comb_bits=0 mac=0 bram=0
+hang_diag synth_rtl cells=9 ms=0
+synth_design counter cells=9 luts=4
+hang_diag device part=HL10T-C32-1 ms=1
+hang_diag pack lutffs=4 iobs=1 ms=0
+hang_diag place affinity lutffs=4 ms=0
+hang_diag place legalize ms=1
+hang_diag place lutff_sites=4 ms=2
+hang_diag route imux=10 imux_skip=0 pathfinder_iters=1 overused=0 ms=0
+hang_diag bitgen bytes=185 ms=0
+hang_diag timing WNS_PS=9640 TNS_PS=0 endpoints=4 r2r_ps=360 iob_ps=220 ms=0
+report_timing counter WNS_PS=9640 TNS_PS=0 endpoints=4 r2r_ps=360 iob_ps=220

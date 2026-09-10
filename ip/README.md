@@ -35,6 +35,8 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_saturate` | Helion-ST | Saturating add/sub + sticky signed OV flags |
 | `h_shift_reg` | Helion-ST | Loadable 32b shift reg (dir/serial in/out) |
 | `h_compare_mm` | Helion-MM | Threshold/compare regs + sticky match/irq |
+| `h_clz` | Helion-ST | Registered 32b count-leading-zeros |
+| `h_byte_rev` | Helion-ST | Registered endian byte-reverse (32b↔bytes) |
 
 ## Use
 
@@ -55,6 +57,8 @@ helion ip show ip/h_popcount/h_popcount.helion
 helion ip show ip/h_saturate/h_saturate.helion
 helion ip show ip/h_shift_reg/h_shift_reg.helion
 helion ip show ip/h_compare_mm/h_compare_mm.helion
+helion ip show ip/h_clz/h_clz.helion
+helion ip show ip/h_byte_rev/h_byte_rev.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -70,6 +74,8 @@ helion project examples/ip_ingest/h_popcount_ip.prj
 helion project examples/ip_ingest/h_saturate_ip.prj
 helion project examples/ip_ingest/h_shift_reg_ip.prj
 helion project examples/ip_ingest/h_compare_mm_ip.prj
+helion project examples/ip_ingest/h_clz_ip.prj
+helion project examples/ip_ingest/h_byte_rev_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -78,6 +84,8 @@ helion project examples/ip_ingest/h_compare_mm_ip.prj
 #   read_ip ip/h_saturate/h_saturate.helion
 #   read_ip ip/h_shift_reg/h_shift_reg.helion
 #   read_ip ip/h_compare_mm/h_compare_mm.helion
+#   read_ip ip/h_clz/h_clz.helion
+#   read_ip ip/h_byte_rev/h_byte_rev.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.

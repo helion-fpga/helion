@@ -1,0 +1,34 @@
+warning: variable does not need to be mutable
+    --> crates/helion-sv/src/lib.rs:3897:9
+     |
+3897 |     let mut put = |order: &mut Vec<(String, Option<usize>)>,
+     |         ----^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` on by default
+
+warning: `helion-sv` (lib) generated 1 warning (run `cargo fix --lib -p helion-sv` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running `target/debug/helion ip list`
+ip h_uart bus=Helion-MM vlnv=community:helion:h_uart:1.0
+ip h_gpio bus=Helion-MM vlnv=community:helion:h_gpio:1.0
+ip h_rv32_hb1 bus=Helion-MM vlnv=community:helion:h_rv32_hb1:1.0
+ip h_sync_fifo bus=Helion-ST vlnv=community:helion:h_sync_fifo:1.0
+ip h_timer bus=Helion-MM vlnv=community:helion:h_timer:1.0
+ip h_pwm bus=Helion-MM vlnv=community:helion:h_pwm:1.0
+ip h_spi_mm bus=Helion-MM vlnv=community:helion:h_spi_mm:1.0
+ip h_debounce bus=Helion-ST vlnv=community:helion:h_debounce:1.0
+ip h_clkdiv bus=Helion-ST vlnv=community:helion:h_clkdiv:1.0
+ip h_edge_det bus=Helion-ST vlnv=community:helion:h_edge_det:1.0
+ip h_watchdog bus=Helion-MM vlnv=community:helion:h_watchdog:1.0
+ip h_crc32 bus=Helion-ST vlnv=community:helion:h_crc32:1.0
+ip h_lfsr bus=Helion-ST vlnv=community:helion:h_lfsr:1.0
+ip h_gray_cnt bus=Helion-ST vlnv=community:helion:h_gray_cnt:1.0
+ip h_scratch_mm bus=Helion-MM vlnv=community:helion:h_scratch_mm:1.0
+ip h_popcount bus=Helion-ST vlnv=community:helion:h_popcount:1.0
+ip h_saturate bus=Helion-ST vlnv=community:helion:h_saturate:1.0
+ip h_shift_reg bus=Helion-ST vlnv=community:helion:h_shift_reg:1.0
+ip h_compare_mm bus=Helion-MM vlnv=community:helion:h_compare_mm:1.0
+ip h_clz bus=Helion-ST vlnv=community:helion:h_clz:1.0
+ip h_byte_rev bus=Helion-ST vlnv=community:helion:h_byte_rev:1.0
