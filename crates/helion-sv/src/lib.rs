@@ -7921,21 +7921,8 @@ fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<St
     emit_and_reduce(d, prefix, &mut n, level)
 }
 
-/// `c ? t : f` encoded as Or(And(c,t), And(Not(c),f)) with const/ITE arms —
-/// Ibex bus `device_sel_req` if/else decode. Map cond via eq/ne reduce.
-fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
-    // Prefer one LUT6 when the whole ITE/case cone is ≤6 PIs (sha256_k_constants).
-    // Expanding a 64-arm const case into mux LUTs was 84k cells / ~45s hang-class.
-    if let Some((init, pis)) = lut6_from_bool_cone(expr) {
-        let cell = format!("{prefix}rom");
-        let net = format!("{prefix}rom_n");
-        d.add_cell(&cell, CellKind::Lut6 { init });
-        d.connect(&net, &cell, "O");
-        for (pin, pi) in pis.iter().enumerate() {
-            d.connect(pi, &cell, format!("I{pin}"));
-        }
-        return Some(net);
-    }
+/// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
+fn match_ite_expr<'a>(e: &'a Expr) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
     fn same_struct(a: &Expr, b: &Expr) -> bool {
         match (a, b) {
             (Expr::Const(x), Expr::Const(y)) => x == y,
@@ -7949,41 +7936,93 @@ fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<S
             _ => false,
         }
     }
-    fn match_ite<'a>(e: &'a Expr) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
-        let Expr::Or(l, r) = e else {
-            return None;
+    let Expr::Or(l, r) = e else {
+        return None;
+    };
+    for (a, b) in [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())] {
+        let Expr::And(a1, a2) = a else {
+            continue;
         };
-        // Or(And(c,t), And(Not(c),f)) or swapped
-        for (a, b) in [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())] {
-            let Expr::And(a1, a2) = a else {
-                continue;
-            };
-            let Expr::And(b1, b2) = b else {
-                continue;
-            };
-            // And(c,t) / And(Not(c),f)
-            if let Expr::Not(nc) = b1.as_ref() {
-                if same_struct(a1, nc) {
-                    return Some((a1.as_ref(), a2.as_ref(), b2.as_ref()));
-                }
-            }
-            if let Expr::Not(nc) = b2.as_ref() {
-                if same_struct(a1, nc) {
-                    return Some((a1.as_ref(), a2.as_ref(), b1.as_ref()));
-                }
-            }
-            if let Expr::Not(nc) = a1.as_ref() {
-                if same_struct(b1, nc) {
-                    return Some((b1.as_ref(), b2.as_ref(), a2.as_ref()));
-                }
-            }
-            if let Expr::Not(nc) = a2.as_ref() {
-                if same_struct(b1, nc) {
-                    return Some((b1.as_ref(), b2.as_ref(), a1.as_ref()));
-                }
+        let Expr::And(b1, b2) = b else {
+            continue;
+        };
+        if let Expr::Not(nc) = b1.as_ref() {
+            if same_struct(a1, nc) {
+                return Some((a1.as_ref(), a2.as_ref(), b2.as_ref()));
             }
         }
-        None
+        if let Expr::Not(nc) = b2.as_ref() {
+            if same_struct(a1, nc) {
+                return Some((a1.as_ref(), a2.as_ref(), b1.as_ref()));
+            }
+        }
+        if let Expr::Not(nc) = a1.as_ref() {
+            if same_struct(b1, nc) {
+                return Some((b1.as_ref(), b2.as_ref(), a2.as_ref()));
+            }
+        }
+        if let Expr::Not(nc) = a2.as_ref() {
+            if same_struct(b1, nc) {
+                return Some((b1.as_ref(), b2.as_ref(), a1.as_ref()));
+            }
+        }
+    }
+    None
+}
+
+fn expr_only_const_leaves(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) => true,
+        Expr::Var(_) => false,
+        Expr::Not(x) => expr_only_const_leaves(x),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_only_const_leaves(a) && expr_only_const_leaves(b)
+        }
+    }
+}
+
+/// True when ITE data arms are const-only (sha256_k case-of-const). Conditions
+/// may use Vars. Wire mux arms (`sel ? a : b`) are not const-ROM.
+fn ite_arm_is_const_rom(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) => true,
+        Expr::Var(_) => false,
+        Expr::Not(x) => ite_arm_is_const_rom(x),
+        other => {
+            if let Some((_, t, f)) = match_ite_expr(other) {
+                ite_arm_is_const_rom(t) && ite_arm_is_const_rom(f)
+            } else {
+                expr_only_const_leaves(other)
+            }
+        }
+    }
+}
+
+fn ite_tree_is_case_of_const(e: &Expr) -> bool {
+    match match_ite_expr(e) {
+        Some((_, t, f)) => ite_arm_is_const_rom(t) && ite_arm_is_const_rom(f),
+        None => false,
+    }
+}
+
+/// `c ? t : f` encoded as Or(And(c,t), And(Not(c),f)) with const/ITE arms —
+/// Ibex bus `device_sel_req` if/else decode. Map cond via eq/ne reduce.
+fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
+    // Hang-class sha256_k: case-of-const ≤6-PI → one LUT6 ROM. Expanding a
+    // 64-arm const case into mux LUTs was 84k cells / ~45s. Ibex wire/ITE
+    // muxes (Ident arms) must NOT collapse here — that stripped ~77k cells
+    // vs bc3449f ITE-era density; expand the mux tree instead.
+    if ite_tree_is_case_of_const(expr) {
+        if let Some((init, pis)) = lut6_from_bool_cone(expr) {
+            let cell = format!("{prefix}rom");
+            let net = format!("{prefix}rom_n");
+            d.add_cell(&cell, CellKind::Lut6 { init });
+            d.connect(&net, &cell, "O");
+            for (pin, pi) in pis.iter().enumerate() {
+                d.connect(pi, &cell, format!("I{pin}"));
+            }
+            return Some(net);
+        }
     }
     fn map_arm(d: &mut Design, e: &Expr, prefix: &str, n: &mut usize) -> Option<String> {
         if let Expr::Const(v) = e {
@@ -8013,7 +8052,7 @@ fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<S
         }
         Some(net)
     }
-    let (c, t, f) = match_ite(expr)?;
+    let (c, t, f) = match_ite_expr(expr)?;
     let mut n = 0usize;
     let c_net = map_arm(d, c, prefix, &mut n)?;
     let t_net = map_arm(d, t, prefix, &mut n)?;
@@ -10613,7 +10652,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             // ≤6-PI boolean (Problem4) is still a real LUT6. A wider cone is
             // the VGA node_count storm: one wide_cone line, do not eval.
             let expr_rom = strip_self_hold(expr, bitn);
-            if !wide_capped && !cone_pi_exceeds(&expr_rom, 6) {
+            // Const-ROM (sha256) or tiny cones → LUT6. Large wire/ITE → expand.
+            if !wide_capped
+                && !cone_pi_exceeds(&expr_rom, 6)
+                && (ite_tree_is_case_of_const(&expr_rom) || expr_node_count(expr) <= 64)
+            {
                 match lut6_from_bool_cone(&expr_rom) {
                     Some((init, pis)) => {
                         let lut = format!("u_clut{i}");
@@ -10653,10 +10696,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             continue;
         }
-        // ≤6-PI boolean (incl. deep case-of-const) → one LUT6 before ITE fanout.
-        // Strip unreachable case-hold self PI so 64-arm × 6-bit ROM collapses.
+        // Strip unreachable case-hold self PI (sha256_k). Const-ROM / tiny
+        // cones → one LUT6; large wire/ITE muxes expand below (Ibex density).
         let expr_rom = strip_self_hold(expr, bitn);
-        if !cone_pi_exceeds(&expr_rom, 6) {
+        if !cone_pi_exceeds(&expr_rom, 6)
+            && (ite_tree_is_case_of_const(&expr_rom) || expr_node_count(expr) <= 64)
+        {
             if let Some((init, pis)) = lut6_from_bool_cone(&expr_rom) {
                 let lut = format!("u_clut{i}");
                 d.add_cell(&lut, CellKind::Lut6 { init });
