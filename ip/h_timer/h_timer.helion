@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM loadable down-counter
+format 1
+vlnv community:helion:h_timer:1.0
+bus Helion-MM
+top h_timer
+file h_timer.v
