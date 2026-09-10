@@ -3838,7 +3838,60 @@ fn note_width(p: &mut P, name: &str, w: usize) {
 /// Fold blocking assigns in an always_comb block so `x = 0; if (c) x = v;`
 /// becomes `x = c ? v : 0` instead of a self-referential Mux hold on `x`
 /// (Ibex bus host_sel_req arbiter).
+/// Compact a priority-encoder for-loop unroll (≥32 bit writes + scalar flag)
+/// before fold. DW=64 bin2prio substitutes `found` through 64 mux arms and
+/// hangs (~40s banner-only); arbiter N=16 stays on the normal fold path.
+fn compact_priority_onehot_unroll(stmts: &[Nba]) -> Option<Vec<Nba>> {
+    let mut bits_per: HashMap<String, usize> = HashMap::new();
+    let mut scalar_writes: HashSet<String> = HashSet::new();
+    for (lhs, bit, _) in stmts {
+        match bit {
+            Some(_) => *bits_per.entry(lhs.clone()).or_default() += 1,
+            None => {
+                scalar_writes.insert(lhs.clone());
+            }
+        }
+    }
+    let (bus, nbits) = bits_per.into_iter().max_by_key(|(_, n)| *n)?;
+    if nbits < 32 {
+        return None;
+    }
+    // already_granted / found (and optional valid) must appear as scalars.
+    if !scalar_writes.iter().any(|s| s != &bus) {
+        return None;
+    }
+    eprintln!(
+        "synth_rtl compact_priority_onehot signal={bus} bit_writes={nbits} (skip hang-class fold)"
+    );
+    let mut out = vec![(
+        bus.clone(),
+        None,
+        RExpr::Const {
+            val: 0,
+            width: 32,
+            care: u128::MAX,
+        },
+    )];
+    for s in scalar_writes {
+        if s != bus {
+            out.push((
+                s,
+                None,
+                RExpr::Const {
+                    val: 0,
+                    width: 1,
+                    care: 1,
+                },
+            ));
+        }
+    }
+    Some(out)
+}
+
 fn fold_blocking_assigns(stmts: Vec<Nba>) -> Vec<Nba> {
+    if let Some(compact) = compact_priority_onehot_unroll(&stmts) {
+        return compact;
+    }
     fn subst(e: &RExpr, env: &HashMap<(String, Option<usize>), RExpr>, lhs: &str, bit: Option<usize>) -> RExpr {
         match e {
             RExpr::Ident(s) if s == lhs && bit.is_none() => env
@@ -7492,10 +7545,13 @@ fn lut6_const(one: bool) -> u64 {
     }
 }
 
-/// LogikBench fixed-priority onehot: `grant[i] = request[i] & ~OR(request[0..i))`.
-/// N=16 for-loop fold was a 31-PI wide_cone / ~30s AIG hang-class; emit a carry
-/// cascade of LUT2s instead (real cells, no silent drop).
-fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<String> {
+/// LogikBench fixed-priority onehot cascade (real LUT2s, no silent drop).
+/// - Ascending (arbiter): `grant[i] = request[i] & ~OR(request[0..i))` — 1 out.
+/// - Descending MSB-first (bin2prio): `out[i] = in[i] & ~OR(in[i+1..])` plus
+///   optional 1-bit `valid = OR(in[*])` — 2 outs. DW=64 for-loop fold was a
+///   banner-only ~40s AIG hang-class; cascade clears it.
+/// Returns `(onehot_out, optional_valid_out)` so callers skip both cones.
+fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, Option<String>)> {
     if !rtl.nbas.is_empty() {
         return None;
     }
@@ -7508,32 +7564,56 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<String> {
             PortDir::Inout => return None,
         }
     }
-    if ins.len() != 1 || outs.len() != 1 {
+    if ins.len() != 1 || !(outs.len() == 1 || outs.len() == 2) {
         return None;
     }
     let req = ins[0];
-    let gnt = outs[0];
     let n = sig_width(rtl, req);
-    if n < 2 || n > 64 || sig_width(rtl, gnt) != n {
+    if n < 2 || n > 64 {
         return None;
     }
+    // Onehot out must match IN width; optional second out is 1-bit valid.
+    let (gnt, valid, msb_first) = if outs.len() == 1 {
+        let g = outs[0];
+        if sig_width(rtl, g) != n {
+            return None;
+        }
+        (g, None, false)
+    } else {
+        let (a, b) = (outs[0], outs[1]);
+        let (wa, wb) = (sig_width(rtl, a), sig_width(rtl, b));
+        let (g, v) = if wa == n && wb == 1 {
+            (a, b)
+        } else if wb == n && wa == 1 {
+            (b, a)
+        } else {
+            return None;
+        };
+        (g, Some(v), true)
+    };
     if !rtl.assigns.iter().any(|(lhs, _, _)| lhs == gnt) {
         return None;
     }
-    // Require an internal 1-bit (already_granted-style) so random N:N comb
+    // Require an internal 1-bit (already_granted / found) so random N:N comb
     // modules are not mistaken for a priority encoder.
     let has_carry = rtl.signals.iter().any(|s| {
         s.width == 1
             && s.depth == 0
             && s.name != req
             && s.name != gnt
+            && valid.map(|v| s.name != v).unwrap_or(true)
             && !rtl.ports.iter().any(|(p, _, _)| p == &s.name)
     });
     if !has_carry {
         return None;
     }
+    let order: Vec<usize> = if msb_first {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
     let mut carry: Option<String> = None;
-    for i in 0..n {
+    for &i in &order {
         let r = bit_name(req, n, i);
         let g = bit_name(gnt, n, i);
         let gcell = format!("u_prio_{gnt}_{i}g");
@@ -7551,7 +7631,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<String> {
                 carry = Some(cnet);
             }
             Some(c) => {
-                // grant = request & ~carry
+                // grant/out = request/in & ~carry
                 emit_lut_pins(
                     d,
                     &gcell,
@@ -7560,7 +7640,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<String> {
                     &[(&r, "I0"), (c.as_str(), "I1")],
                 );
                 let cnet = format!("n_prio_{gnt}_{i}c");
-                // carry' = carry | request
+                // carry' = carry | request/in
                 emit_lut_pins(
                     d,
                     &format!("u_prio_{gnt}_{i}c"),
@@ -7572,8 +7652,14 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<String> {
             }
         }
     }
-    eprintln!("synth_rtl priority_onehot signal={gnt} bits={n}");
-    Some(gnt.to_string())
+    if let (Some(v), Some(c)) = (valid, carry.as_ref()) {
+        // valid = OR(all inputs) = final carry after the cascade.
+        emit_lut_pins(d, &format!("u_prio_{v}_buf"), v, lut6_buf(), &[(c.as_str(), "I0")]);
+        eprintln!("synth_rtl priority_onehot signal={gnt} bits={n} valid={v} msb_first=1");
+    } else {
+        eprintln!("synth_rtl priority_onehot signal={gnt} bits={n}");
+    }
+    Some((gnt.to_string(), valid.map(|s| s.to_string())))
 }
 
 /// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
@@ -10137,15 +10223,14 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
             continue;
         }
-        // Priority cascade already drives grant[*]; skip folded always @(*) body.
-        if priority_grant.as_ref() == Some(lhs) {
-            continue;
-        }
-        if priority_grant.is_some()
-            && sig_width(rtl, lhs) == 1
-            && !rtl.ports.iter().any(|(p, _, _)| p == lhs)
-        {
-            continue;
+        // Priority cascade already drives onehot[+valid]; skip folded always @(*) body.
+        if let Some((ref gnt, ref valid)) = priority_grant {
+            if lhs == gnt || valid.as_ref() == Some(lhs) {
+                continue;
+            }
+            if sig_width(rtl, lhs) == 1 && !rtl.ports.iter().any(|(p, _, _)| p == lhs) {
+                continue;
+            }
         }
         if bit.is_none() {
             if let Some(kind) = zero_fill_concat(rhs) {
@@ -13870,6 +13955,51 @@ endmodule
         assert!(
             (20..=96).contains(&luts),
             "N=16 priority cascade should be modest LUTs, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn logikbench_bin2prio_dw64_is_msb_cascade_not_hang() {
+        // Descending MSB-first + valid; DW=64 for-loop was banner-only ~40s hang.
+        let src = r#"
+module bin2prio #(parameter DW = 64)
+   (
+    input [DW-1:0]      in,
+    output reg [DW-1:0] out,
+    output reg          valid
+    );
+   integer i;
+   reg     found;
+   always @(*) begin
+      out   = {DW{1'b0}};
+      valid = 0;
+      found = 0;
+      for (i = DW-1; i >= 0; i = i - 1) begin
+         if (!found && in[i]) begin
+            out[i] = 1'b1;
+            valid  = 1;
+            found  = 1;
+         end
+      end
+   end
+endmodule
+"#;
+        let d = synth_sv(src, "bin2prio.v").expect("bin2prio");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"), "must not flatten_cap");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        // 64 grant + 64 carry + 1 valid buf ≈ 129 LUTs; allow headroom.
+        assert!(
+            (96..=320).contains(&luts),
+            "DW=64 MSB cascade should be modest LUTs, luts={luts}"
+        );
+        assert!(
+            d.nets.iter().any(|n| n.name == "valid" || n.name.starts_with("valid")),
+            "valid net must be driven"
         );
     }
 
