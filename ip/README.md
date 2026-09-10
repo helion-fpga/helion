@@ -33,6 +33,8 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_scratch_mm` | Helion-MM | 4×32b MM-mapped scratch regfile (wr/rd strobes) |
 | `h_popcount` | Helion-ST | Registered 32b population-count |
 | `h_saturate` | Helion-ST | Saturating add/sub + sticky signed OV flags |
+| `h_shift_reg` | Helion-ST | Loadable 32b shift reg (dir/serial in/out) |
+| `h_compare_mm` | Helion-MM | Threshold/compare regs + sticky match/irq |
 
 ## Use
 
@@ -51,6 +53,8 @@ helion ip show ip/h_gray_cnt/h_gray_cnt.helion
 helion ip show ip/h_scratch_mm/h_scratch_mm.helion
 helion ip show ip/h_popcount/h_popcount.helion
 helion ip show ip/h_saturate/h_saturate.helion
+helion ip show ip/h_shift_reg/h_shift_reg.helion
+helion ip show ip/h_compare_mm/h_compare_mm.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -64,12 +68,16 @@ helion project examples/ip_ingest/h_gray_cnt_ip.prj
 helion project examples/ip_ingest/h_scratch_mm_ip.prj
 helion project examples/ip_ingest/h_popcount_ip.prj
 helion project examples/ip_ingest/h_saturate_ip.prj
+helion project examples/ip_ingest/h_shift_reg_ip.prj
+helion project examples/ip_ingest/h_compare_mm_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
 #   read_ip ip/h_scratch_mm/h_scratch_mm.helion
 #   read_ip ip/h_popcount/h_popcount.helion
 #   read_ip ip/h_saturate/h_saturate.helion
+#   read_ip ip/h_shift_reg/h_shift_reg.helion
+#   read_ip ip/h_compare_mm/h_compare_mm.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.

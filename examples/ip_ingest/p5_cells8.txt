@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #8 — h_shift_reg (+ h_compare_mm) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_shift_reg_ip.prj
+synth_design h_shift_reg cells=292 luts=280
+project examples/ip_ingest/h_shift_reg_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_shift_reg xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=280 WNS_PS=9680 frames=180
+# Instantiated IP: community:helion:h_shift_reg:1.0 (Helion-ST)
+# cells=292 luts=280 lutffs=280  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_compare_mm_ip.prj
+synth_design h_compare_mm cells=266 luts=253
+project examples/ip_ingest/h_compare_mm_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_compare_mm xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=253 WNS_PS=9680 frames=174
+# Instantiated IP: community:helion:h_compare_mm:1.0 (Helion-MM)
+# cells=266 luts=253 lutffs=253  (>0 real fabric)

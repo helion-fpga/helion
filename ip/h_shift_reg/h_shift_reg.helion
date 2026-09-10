@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST loadable N-bit shift register
+format 1
+vlnv community:helion:h_shift_reg:1.0
+bus Helion-ST
+top h_shift_reg
+file h_shift_reg.v
