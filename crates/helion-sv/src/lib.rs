@@ -8069,13 +8069,231 @@ fn const_unpacked_word(rhs: &RExpr, rtl: &Rtl) -> Option<(String, usize)> {
     }
 }
 
-/// `bus[hi:lo] + {N'd0, w0, w1, ...}` / `bus + {N'd0, ...}`. Zero-padded
-/// wire addend of at most 8 low bits (Ibex fetch_fifo `instr_addr_next`).
-/// Returns (bus, bus_lo, bus_bits, low_bit_exprs).
-fn packed_add_zpad_wires(
-    rhs: &RExpr,
+/// Zero-padded wire addend on one side of `+` (Ibex fetch_fifo / prefetch).
+/// Bus side may be Ident/Range or a 2:1 mux of Ident vs `{bus[hi:lo], zeros}`
+/// (Ibex `fetch_addr_d`). Pad may place And/Or/Not/Ident/Bit among zero consts.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum ZpadBus {
+    Plain {
+        name: String,
+        lo: usize,
+        bits: usize,
+    },
+    /// `sel ? t_name : {f_name[f_hi:f_lo], {zeros_lo{1'b0}}}` (or t/f swapped
+    /// is normalized so zeros_lo is always on the false-aligned side via
+    /// `t_is_aligned`).
+    MuxAligned {
+        sel: RExpr,
+        t_name: String,
+        f_name: String,
+        f_lo: usize,
+        f_bits: usize, // width check only
+        zeros_lo: usize,
+        width: usize,
+        /// When true, true-arm is the aligned concat and false-arm is Ident.
+        t_is_aligned: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ZpadAdd {
+    bus: ZpadBus,
+    /// LSB-first addend bits; None = const 0. Live leaves <= 8.
+    add_bits: Vec<Option<RExpr>>,
+}
+
+fn zpad_one_bit_leaf(e: &RExpr, rtl: &Rtl) -> Option<RExpr> {
+    match e {
+        RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
+            Some(RExpr::Ident(s.clone()))
+        }
+        RExpr::Bit(s, i) if name_known(rtl, s) => Some(RExpr::Bit(s.clone(), *i)),
+        RExpr::Not(x) => match x.as_ref() {
+            RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
+                Some(RExpr::Not(Box::new(RExpr::Ident(s.clone()))))
+            }
+            RExpr::Bit(s, i) if name_known(rtl, s) => {
+                Some(RExpr::Not(Box::new(RExpr::Bit(s.clone(), *i))))
+            }
+            _ => None,
+        },
+        RExpr::And(a, b) => {
+            let aa = zpad_one_bit_leaf(a, rtl)?;
+            let bb = zpad_one_bit_leaf(b, rtl)?;
+            Some(RExpr::And(Box::new(aa), Box::new(bb)))
+        }
+        RExpr::Or(a, b) => {
+            let aa = zpad_one_bit_leaf(a, rtl)?;
+            let bb = zpad_one_bit_leaf(b, rtl)?;
+            Some(RExpr::Or(Box::new(aa), Box::new(bb)))
+        }
+        _ => None,
+    }
+}
+
+fn zpad_parse_pad(pad_e: &RExpr, rtl: &Rtl) -> Option<Vec<Option<RExpr>>> {
+    let RExpr::Concat(parts) = pad_e else {
+        return None;
+    };
+    let mut msb: Vec<Option<RExpr>> = Vec::new();
+    for p in parts {
+        match p {
+            RExpr::Const { val: 0, width, .. } => {
+                for _ in 0..(*width).min(RIPPLE_ADD_MAX) {
+                    msb.push(None);
+                }
+            }
+            other => {
+                let leaf = zpad_one_bit_leaf(other, rtl)?;
+                msb.push(Some(leaf));
+            }
+        }
+        if msb.len() > RIPPLE_ADD_MAX {
+            return None;
+        }
+    }
+    let live = msb.iter().filter(|b| b.is_some()).count();
+    if msb.is_empty() || live == 0 || live > 8 {
+        return None;
+    }
+    msb.reverse();
+    Some(msb)
+}
+
+fn zpad_parse_plain_bus(bus_e: &RExpr, rtl: &Rtl) -> Option<(String, usize, usize)> {
+    match bus_e {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let w = sig_width(rtl, s);
+            if w == 0 || w > RIPPLE_ADD_MAX {
+                return None;
+            }
+            Some((s.clone(), 0usize, w))
+        }
+        RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 && name_known(rtl, s) && hi >= lo => {
+            let bits = (*hi - *lo).saturating_add(1);
+            if bits == 0 || bits > RIPPLE_ADD_MAX {
+                return None;
+            }
+            let sw = sig_width(rtl, s);
+            if bits == sw {
+                Some((s.clone(), 0usize, bits))
+            } else if *hi < sw {
+                Some((s.clone(), *lo, bits))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `{bus[hi:lo], K'b0}` / `{bus, K'b0}` with K in 1..=8 (Ibex fetch_addr align).
+fn zpad_parse_aligned_concat(
+    e: &RExpr,
     rtl: &Rtl,
-) -> Option<(String, usize, usize, Vec<RExpr>)> {
+) -> Option<(String, usize, usize, usize, usize)> {
+    let RExpr::Concat(parts) = e else {
+        return None;
+    };
+    if parts.len() != 2 {
+        return None;
+    }
+    let (bus_e, z_e) = (&parts[0], &parts[1]);
+    let zeros = match z_e {
+        RExpr::Const { val: 0, width, .. } if (1..=8).contains(width) => *width,
+        _ => return None,
+    };
+    match bus_e {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let bits = sig_width(rtl, s);
+            let width = bits.saturating_add(zeros);
+            if bits == 0 || width > RIPPLE_ADD_MAX {
+                return None;
+            }
+            Some((s.clone(), 0usize, bits, zeros, width))
+        }
+        RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 && name_known(rtl, s) && hi >= lo => {
+            let bits = (*hi - *lo).saturating_add(1);
+            let width = bits.saturating_add(zeros);
+            if bits == 0 || width > RIPPLE_ADD_MAX {
+                return None;
+            }
+            let sw = sig_width(rtl, s);
+            let (name, flo, fbits) = if bits == sw {
+                (s.clone(), 0usize, bits)
+            } else if *hi < sw {
+                (s.clone(), *lo, bits)
+            } else {
+                return None;
+            };
+            Some((name, flo, fbits, zeros, width))
+        }
+        _ => None,
+    }
+}
+
+fn zpad_parse_bus(bus_e: &RExpr, rtl: &Rtl) -> Option<ZpadBus> {
+    if let Some((name, lo, bits)) = zpad_parse_plain_bus(bus_e, rtl) {
+        return Some(ZpadBus::Plain { name, lo, bits });
+    }
+    let RExpr::Mux(sel, t, f) = bus_e else {
+        return None;
+    };
+    let sel_e = zpad_one_bit_leaf(sel, rtl)?;
+    // Prefer Ident true + aligned false (fetch_addr_d). Also accept swap.
+    match (
+        zpad_parse_plain_bus(t, rtl),
+        zpad_parse_aligned_concat(f, rtl),
+        zpad_parse_aligned_concat(t, rtl),
+        zpad_parse_plain_bus(f, rtl),
+    ) {
+        (Some((t_name, 0, t_bits)), Some((f_name, f_lo, f_bits, zeros_lo, width)), _, _)
+            if t_bits == width && f_bits + zeros_lo == width =>
+        {
+            Some(ZpadBus::MuxAligned {
+                sel: sel_e,
+                t_name,
+                f_name,
+                f_lo,
+                f_bits,
+                zeros_lo,
+                width,
+                t_is_aligned: false,
+            })
+        }
+        (_, _, Some((t_name, t_lo, t_bits, zeros_lo, width)), Some((f_name, 0, f_bits)))
+            if f_bits == width && t_bits + zeros_lo == width =>
+        {
+            Some(ZpadBus::MuxAligned {
+                sel: sel_e,
+                t_name,
+                f_name,
+                f_lo: t_lo,
+                f_bits: t_bits,
+                zeros_lo,
+                width,
+                t_is_aligned: true,
+            })
+        }
+        // Two plain Idents of equal width.
+        (Some((t_name, 0, t_bits)), _, _, Some((f_name, 0, f_bits))) if t_bits == f_bits => {
+            Some(ZpadBus::MuxAligned {
+                sel: sel_e,
+                t_name,
+                f_name,
+                f_lo: 0,
+                f_bits,
+                zeros_lo: 0,
+                width: t_bits,
+                t_is_aligned: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn packed_add_zpad_wires(rhs: &RExpr, rtl: &Rtl) -> Option<ZpadAdd> {
     let RExpr::Add(a, b) = rhs else {
         return None;
     };
@@ -8087,73 +8305,88 @@ fn packed_add_zpad_wires(
         (RExpr::Concat(_), bus) => (bus, a.as_ref()),
         _ => return None,
     };
-    let (bus, bus_lo, bus_bits) = match bus_e {
-        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
-            let w = sig_width(rtl, s);
-            if w == 0 || w > RIPPLE_ADD_MAX {
-                return None;
-            }
-            (s.clone(), 0usize, w)
-        }
-        RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 && name_known(rtl, s) && hi >= lo => {
-            let bits = (*hi - *lo).saturating_add(1);
-            if bits == 0 || bits > RIPPLE_ADD_MAX {
-                return None;
-            }
-            let sw = sig_width(rtl, s);
-            // `logic [31:1] q; q[31:1]` — full-span on a non-zero LSB decl
-            // uses IR bits 0..bits-1, not Verilog indices as IR offsets.
-            if bits == sw {
-                (s.clone(), 0usize, bits)
-            } else if *hi < sw {
-                (s.clone(), *lo, bits)
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
+    let bus = zpad_parse_bus(bus_e, rtl)?;
+    let add_bits = zpad_parse_pad(pad_e, rtl)?;
+    let bus_w = match &bus {
+        ZpadBus::Plain { bits, .. } => *bits,
+        ZpadBus::MuxAligned { width, .. } => *width,
     };
-    let RExpr::Concat(parts) = pad_e else {
-        return None;
-    };
-    // High parts must be zero consts; low parts are wire/not/bit leaves.
-    let mut zeros = 0usize;
-    let mut low: Vec<RExpr> = Vec::new();
-    let mut seen_wire = false;
-    for p in parts {
-        match p {
-            RExpr::Const { val: 0, width, .. } if !seen_wire => {
-                zeros = zeros.saturating_add(*width);
-            }
-            RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
-                seen_wire = true;
-                low.push(RExpr::Ident(s.clone()));
-            }
-            RExpr::Bit(s, i) if name_known(rtl, s) => {
-                seen_wire = true;
-                low.push(RExpr::Bit(s.clone(), *i));
-            }
-            RExpr::Not(x) => match x.as_ref() {
-                RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
-                    seen_wire = true;
-                    low.push(RExpr::Not(Box::new(RExpr::Ident(s.clone()))));
-                }
-                RExpr::Bit(s, i) if name_known(rtl, s) => {
-                    seen_wire = true;
-                    low.push(RExpr::Not(Box::new(RExpr::Bit(s.clone(), *i))));
-                }
-                _ => return None,
-            },
-            _ => return None,
-        }
-    }
-    if low.is_empty() || low.len() > 8 {
+    if add_bits.len() != bus_w {
+        // Allow pad narrower than bus only when high zeros were truncated by
+        // width mismatch — refuse rather than invent.
         return None;
     }
-    let _ = zeros;
-    // Concat is MSB-first; ripple addend bit 0 is the LSB of the pad.
-    low.reverse();
-    Some((bus, bus_lo, bus_bits, low))
+    Some(ZpadAdd { bus, add_bits })
+}
+
+fn lut6_mux2() -> u64 {
+    // O = sel ? t : f with I0=f, I1=t, I2=sel.
+    lut6_from_i012(|f, t, sel| if sel { t } else { f })
+}
+
+fn lut6_or2() -> u64 {
+    lut6_and2(true, true, true) // ~(~a & ~b) = a|b
+}
+
+fn emit_zpad_leaf_net(
+    d: &mut Design,
+    rtl: &Rtl,
+    cell: &str,
+    net: &str,
+    leaf: &RExpr,
+) -> bool {
+    match leaf {
+        RExpr::Ident(s) => {
+            let src = bit_name(s, sig_width(rtl, s), 0);
+            emit_lut_pins(d, cell, net, lut6_buf(), &[(&src, "I0")]);
+            true
+        }
+        RExpr::Bit(s, b) => {
+            let src = bit_name(s, sig_width(rtl, s), *b);
+            emit_lut_pins(d, cell, net, lut6_buf(), &[(&src, "I0")]);
+            true
+        }
+        RExpr::Not(x) => {
+            let src = match x.as_ref() {
+                RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), 0),
+                RExpr::Bit(s, b) => bit_name(s, sig_width(rtl, s), *b),
+                _ => return false,
+            };
+            emit_lut_pins(d, cell, net, lut6_inv(), &[(&src, "I0")]);
+            true
+        }
+        RExpr::And(a, b) => {
+            let an = format!("{net}_a");
+            let bn = format!("{net}_b");
+            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_a"), &an, a) {
+                return false;
+            }
+            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_b"), &bn, b) {
+                return false;
+            }
+            emit_lut_pins(
+                d,
+                cell,
+                net,
+                lut6_and2(false, false, false),
+                &[(&an, "I0"), (&bn, "I1")],
+            );
+            true
+        }
+        RExpr::Or(a, b) => {
+            let an = format!("{net}_a");
+            let bn = format!("{net}_b");
+            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_a"), &an, a) {
+                return false;
+            }
+            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_b"), &bn, b) {
+                return false;
+            }
+            emit_lut_pins(d, cell, net, lut6_or2(), &[(&an, "I0"), (&bn, "I1")]);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn emit_ripple_add_zpad_wires(
@@ -8161,66 +8394,158 @@ fn emit_ripple_add_zpad_wires(
     rtl: &Rtl,
     sum: &str,
     width: usize,
-    bus: &str,
-    bus_lo: usize,
-    bus_bits: usize,
-    low: &[RExpr],
+    zpad: &ZpadAdd,
 ) -> bool {
-    if width == 0 || width > RIPPLE_ADD_MAX || bus_bits == 0 || width != bus_bits {
+    if width == 0 || width > RIPPLE_ADD_MAX {
         return false;
     }
-    if (0..bus_bits).any(|i| op_bit_net(rtl, bus, bus_lo + i).is_none()) {
+    let bus_w = match &zpad.bus {
+        ZpadBus::Plain { bits, .. } => *bits,
+        ZpadBus::MuxAligned { width: w, .. } => *w,
+    };
+    if bus_w != width || zpad.add_bits.len() != width {
         return false;
     }
-    // Materialize addend low bits as nets (Ident/Bit/Not).
+    // Materialize sel once for mux bus.
+    let sel_net = match &zpad.bus {
+        ZpadBus::MuxAligned { sel, .. } => {
+            let net = format!("n_raz_{sum}_sel");
+            if !emit_zpad_leaf_net(d, rtl, &format!("u_raz_{sum}_sel"), &net, sel) {
+                return false;
+            }
+            Some(net)
+        }
+        ZpadBus::Plain { .. } => None,
+    };
+    // Materialize bus operand bits.
+    let mut bus_nets: Vec<Option<String>> = Vec::with_capacity(width);
+    match &zpad.bus {
+        ZpadBus::Plain { name, lo, .. } => {
+            for bit in 0..width {
+                let Some(src) = op_bit_net(rtl, name, lo + bit) else {
+                    return false;
+                };
+                bus_nets.push(Some(src));
+            }
+        }
+        ZpadBus::MuxAligned {
+            t_name,
+            f_name,
+            f_lo,
+            zeros_lo,
+            t_is_aligned,
+            ..
+        } => {
+            let sel = sel_net.as_ref().unwrap();
+            for bit in 0..width {
+                let aligned = |i: usize, name: &str, lo: usize| -> Option<String> {
+                    if i < *zeros_lo {
+                        None
+                    } else {
+                        op_bit_net(rtl, name, lo + (i - zeros_lo))
+                    }
+                };
+                let (t_opt, f_opt) = if *t_is_aligned {
+                    (
+                        aligned(bit, t_name, *f_lo),
+                        op_bit_net(rtl, f_name, bit),
+                    )
+                } else if *zeros_lo == 0 {
+                    (
+                        op_bit_net(rtl, t_name, bit),
+                        op_bit_net(rtl, f_name, bit),
+                    )
+                } else {
+                    (
+                        op_bit_net(rtl, t_name, bit),
+                        aligned(bit, f_name, *f_lo),
+                    )
+                };
+                let out = format!("n_raz_{sum}_{bit}b");
+                let cell = format!("u_raz_{sum}_{bit}b");
+                match (t_opt.as_deref(), f_opt.as_deref()) {
+                    (Some(t), Some(f)) => {
+                        emit_lut_pins(
+                            d,
+                            &cell,
+                            &out,
+                            lut6_mux2(),
+                            &[(f, "I0"), (t, "I1"), (sel, "I2")],
+                        );
+                        bus_nets.push(Some(out));
+                    }
+                    (Some(t), None) => {
+                        emit_lut_pins(
+                            d,
+                            &cell,
+                            &out,
+                            lut6_and2(false, false, false),
+                            &[(t, "I0"), (sel, "I1")],
+                        );
+                        bus_nets.push(Some(out));
+                    }
+                    (None, Some(f)) => {
+                        emit_lut_pins(
+                            d,
+                            &cell,
+                            &out,
+                            lut6_and2(true, false, false),
+                            &[(sel, "I0"), (f, "I1")],
+                        );
+                        bus_nets.push(Some(out));
+                    }
+                    (None, None) => bus_nets.push(None),
+                }
+            }
+        }
+    }
+
+    // Materialize addend bits.
     let mut add_nets: Vec<Option<String>> = Vec::with_capacity(width);
     for i in 0..width {
-        if i >= low.len() {
-            add_nets.push(None); // const 0
-            continue;
-        }
-        let net = format!("n_raz_{sum}_{i}a");
-        match &low[i] {
-            RExpr::Ident(s) => {
-                let w = sig_width(rtl, s);
-                let src = bit_name(s, w, 0);
-                emit_lut_pins(d, &format!("u_raz_{sum}_{i}a"), &net, lut6_buf(), &[(&src, "I0")]);
+        match &zpad.add_bits[i] {
+            None => add_nets.push(None),
+            Some(leaf) => {
+                let net = format!("n_raz_{sum}_{i}a");
+                if !emit_zpad_leaf_net(d, rtl, &format!("u_raz_{sum}_{i}a"), &net, leaf) {
+                    return false;
+                }
                 add_nets.push(Some(net));
             }
-            RExpr::Bit(s, b) => {
-                let w = sig_width(rtl, s);
-                let src = bit_name(s, w, *b);
-                emit_lut_pins(d, &format!("u_raz_{sum}_{i}a"), &net, lut6_buf(), &[(&src, "I0")]);
-                add_nets.push(Some(net));
-            }
-            RExpr::Not(x) => {
-                let src = match x.as_ref() {
-                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), 0),
-                    RExpr::Bit(s, b) => bit_name(s, sig_width(rtl, s), *b),
-                    _ => return false,
-                };
-                emit_lut_pins(d, &format!("u_raz_{sum}_{i}a"), &net, lut6_inv(), &[(&src, "I0")]);
-                add_nets.push(Some(net));
-            }
-            _ => return false,
         }
     }
     let mut cin: Option<String> = None;
     for bit in 0..width {
-        let an = op_bit_net(rtl, bus, bus_lo + bit).unwrap();
+        let an = bus_nets[bit].clone();
         let bn = add_nets[bit].clone();
         let sum_net = bit_name(sum, width, bit);
         let sum_cell = format!("u_raz_{sum}_{bit}s");
         let cin_now = cin.clone();
         let need_cout = bit + 1 < width;
-        let ok = match (bn.as_deref(), cin_now.as_deref()) {
-            (None, None) => {
-                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(&an, "I0")]);
+        let ok = match (an.as_deref(), bn.as_deref(), cin_now.as_deref()) {
+            (None, None, None) => {
+                // const 0
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_const(false), &[]);
                 cin = None;
                 true
             }
-            (Some(bn), None) => {
-                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(&an, "I0"), (bn, "I1")]);
+            (None, None, Some(cn)) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(cn, "I0")]);
+                cin = None;
+                true
+            }
+            (Some(an), None, None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(an, "I0")]);
+                cin = None;
+                true
+            }
+            (None, Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(bn, "I0")]);
+                cin = None;
+                true
+            }
+            (Some(an), Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(an, "I0"), (bn, "I1")]);
                 if need_cout {
                     let cout = format!("n_raz_{sum}_{bit}c");
                     emit_lut_pins(
@@ -8228,7 +8553,7 @@ fn emit_ripple_add_zpad_wires(
                         &format!("u_raz_{sum}_{bit}c"),
                         &cout,
                         lut6_and2(false, false, false),
-                        &[(&an, "I0"), (bn, "I1")],
+                        &[(an, "I0"), (bn, "I1")],
                     );
                     cin = Some(cout);
                 } else {
@@ -8236,8 +8561,8 @@ fn emit_ripple_add_zpad_wires(
                 }
                 true
             }
-            (None, Some(cn)) => {
-                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(&an, "I0"), (cn, "I1")]);
+            (Some(an), None, Some(cn)) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(an, "I0"), (cn, "I1")]);
                 if need_cout {
                     let cout = format!("n_raz_{sum}_{bit}c");
                     emit_lut_pins(
@@ -8245,7 +8570,7 @@ fn emit_ripple_add_zpad_wires(
                         &format!("u_raz_{sum}_{bit}c"),
                         &cout,
                         lut6_and2(false, false, false),
-                        &[(&an, "I0"), (cn, "I1")],
+                        &[(an, "I0"), (cn, "I1")],
                     );
                     cin = Some(cout);
                 } else {
@@ -8253,13 +8578,30 @@ fn emit_ripple_add_zpad_wires(
                 }
                 true
             }
-            (Some(bn), Some(cn)) => {
+            (None, Some(bn), Some(cn)) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(bn, "I0"), (cn, "I1")]);
+                if need_cout {
+                    let cout = format!("n_raz_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &format!("u_raz_{sum}_{bit}c"),
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(bn, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+                true
+            }
+            (Some(an), Some(bn), Some(cn)) => {
                 emit_lut_pins(
                     d,
                     &sum_cell,
                     &sum_net,
                     lut6_xor3(),
-                    &[(&an, "I0"), (bn, "I1"), (cn, "I2")],
+                    &[(an, "I0"), (bn, "I1"), (cn, "I2")],
                 );
                 if need_cout {
                     let cout = format!("n_raz_{sum}_{bit}c");
@@ -8268,7 +8610,7 @@ fn emit_ripple_add_zpad_wires(
                         &format!("u_raz_{sum}_{bit}c"),
                         &cout,
                         lut6_maj3(),
-                        &[(&an, "I0"), (bn, "I1"), (cn, "I2")],
+                        &[(an, "I0"), (bn, "I1"), (cn, "I2")],
                     );
                     cin = Some(cout);
                 } else {
@@ -8281,10 +8623,12 @@ fn emit_ripple_add_zpad_wires(
             return false;
         }
     }
-    eprintln!(
-        "synth_rtl ripple_add_zpad signal={sum} bits={width} addend_bits={}",
-        low.len()
-    );
+    let live = zpad.add_bits.iter().filter(|b| b.is_some()).count();
+    let kind = match &zpad.bus {
+        ZpadBus::Plain { .. } => "ripple_add_zpad",
+        ZpadBus::MuxAligned { .. } => "ripple_add_mux_zpad",
+    };
+    eprintln!("synth_rtl {kind} signal={sum} bits={width} addend_bits={live}");
     true
 }
 
@@ -9733,13 +10077,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // `bus[hi:lo] + {zeros, wire bits}` (Ibex instr_addr_next): ripple
         // with a small zero-padded wire addend, not a 31-PI wide_cone.
         if bit.is_none() {
-            if let Some((bus, bus_lo, bus_bits, low)) = packed_add_zpad_wires(rhs, rtl) {
+            if let Some(zpad) = packed_add_zpad_wires(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
                     if w > RIPPLE_ADD_MAX
-                        || !emit_ripple_add_zpad_wires(
-                            &mut d, rtl, lhs, w, &bus, bus_lo, bus_bits, &low,
-                        )
+                        || !emit_ripple_add_zpad_wires(&mut d, rtl, lhs, w, &zpad)
                     {
                         note_assign_not_lowered(&rtl.module, lhs);
                     }
@@ -13316,6 +13658,32 @@ endmodule
     }
 
     #[test]
+    fn fetch_addr_d_mux_zpad_is_ripple_not_wide_cone() {
+        // Ibex prefetch_buffer fetch_addr_d: muxed align + {zeros, and, zeros}.
+        let src = r#"
+module prefetch_fetch_addr(input logic branch_i,
+                           input logic [31:0] addr_i,
+                           input logic [31:0] fetch_addr_q,
+                           input logic valid_new_req,
+                           input logic valid_req_q,
+                           output logic [31:0] fetch_addr_d);
+  assign fetch_addr_d = (branch_i ? addr_i : {fetch_addr_q[31:2], 2'b00}) +
+                        {{29{1'b0}},(valid_new_req & ~valid_req_q),2'b00};
+endmodule
+"#;
+        let d = synth_sv(src, "prefetch_fetch_addr.sv").expect("prefetch_fetch_addr");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"), "must not flatten_cap");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 40, "32-bit mux+zpad ripple must map LUTs, luts={luts}");
+    }
+
+    #[test]
     fn packed_multidim_word_slice_lowers_not_generate() {
         // Ibex fetch_fifo: `rdata_q[1][15:0]` double index on packed multi-dim.
         let src = r#"
@@ -13391,7 +13759,11 @@ module branch_control #(parameter DATA_WIDTH = 32, PC_WIDTH = 6, PC_OFFSET_WIDTH
 endmodule
 "#;
         let d = synth_sv(src, "branch_control.v").expect("branch_control");
-        assert_eq!(d.attrs.get("WIDE_CONE"), Some("1"));
+        // nbas=0 nested Add under Mux is flatten_cap (named); not silent LUT invent.
+        assert!(
+            d.attrs.get("FLATTEN_CAP") == Some("1") || d.attrs.get("WIDE_CONE") == Some("1"),
+            "nested add/concat must name flatten_cap or wide_cone"
+        );
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert!(
             !d.cells.iter().any(|c| {
