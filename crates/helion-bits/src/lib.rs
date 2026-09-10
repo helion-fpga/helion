@@ -79,9 +79,22 @@ impl Bitstream {
 }
 
 /// Bitgen a routed design: every LUTFF INIT/FF, IMUX from PathFinder, IOB src, DSP/BRAM USED.
+///
+/// Honesty: refuses an empty/fake success. `Bitstream::empty` remains for explicit
+/// sim smoke only — `bitgen` never returns a header-only stream for a real design.
 pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
+    let packed = &routed.placed.packed;
+    if packed.lutffs.is_empty()
+        && packed.iobs.is_empty()
+        && packed.macs.is_empty()
+        && packed.brams.is_empty()
+    {
+        return Err(
+            "bitgen: empty design (no LUTFF/IOB/DSP/BRAM) — refusing empty/fake bitstream".into(),
+        );
+    }
     let mut feats = FeatureSet::new();
-    for (i, lutff) in routed.placed.packed.lutffs.iter().enumerate() {
+    for (i, lutff) in packed.lutffs.iter().enumerate() {
         let (site, ble) = routed.placed.lutff_sites[i];
         feats.set_init(site.x, site.y, ble as u32, lutff.init);
         // Comb packs leave ff_cell empty — do not assert FF.USED.
@@ -96,9 +109,7 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             .iob_major(r.iob.0, r.iob.1)
             .ok_or_else(|| format!("IOB_X{}Y{} has no major", r.iob.0, r.iob.1))?;
         // bit0 USED, [3:1] BLE, [15:4] CLB y; [24:16] DRIVE/SLEW/PULLTYPE/DIFF_TERM/IN_TERM (0 = default)
-        let elec = routed
-            .placed
-            .packed
+        let elec = packed
             .iobs
             .iter()
             .find(|i| i.from_net == r.net)
@@ -115,12 +126,12 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         let word = 1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4) | elec;
         bs.frames.insert((Far::IOB, major, 0), word);
     }
-    for (i, _m) in routed.placed.packed.macs.iter().enumerate() {
+    for (i, _m) in packed.macs.iter().enumerate() {
         let site = routed.placed.mac_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
         bs.frames.insert((Far::DSP, i as u16, 0), word);
     }
-    for (i, b) in routed.placed.packed.brams.iter().enumerate() {
+    for (i, b) in packed.brams.iter().enumerate() {
         let site = routed.placed.bram_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
         bs.frames.insert((Far::BRAM, i as u16, 0), word);
@@ -129,7 +140,22 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             bs.frames.insert((Far::BRAM, i as u16, minor), *w as u128);
         }
     }
+    // Drop zero frames so emptiness matches the sparse encoder.
+    bs.frames.retain(|_, w| *w != 0);
+    if bs.frames.is_empty() {
+        return Err(
+            "bitgen: no configured frames — refusing empty/fake bitstream (design set no bits)"
+                .into(),
+        );
+    }
     bs.packets = encode_packets(dev.idcode, &bs.frames);
+    // Header CRC + body hash are always computed in encode_packets. In-stream
+    // CRC_CHECK (0x21) remains a 0 stub (device CRC not modeled); size-stable.
+    debug_assert_ne!(
+        bs.packets,
+        Bitstream::empty(dev).packets,
+        "bitgen must not equal Bitstream::empty"
+    );
     Ok(bs)
 }
 
@@ -406,7 +432,7 @@ fn sha256_lite(data: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use helion_device::Device;
-    use helion_ir::{CellKind, Design};
+    use helion_ir::{CellKind, Design, PortDir};
     use helion_pack::pack;
     use helion_place::place;
     use helion_route::route;
@@ -602,5 +628,105 @@ mod tests {
             "partial packets must not exceed full"
         );
         assert!(!pb.frames.is_empty(), "pblock must carry the placed major");
+    }
+
+    /// Gold counter sparse `.hbits` size (README / QoR table). Must stay stable.
+    const COUNTER_HBITS_BYTES: usize = 185;
+
+    #[test]
+    fn counter_bitgen_golden_size_and_deterministic() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let a = bitgen(&dev, &r).unwrap();
+        let b = bitgen(&dev, &r).unwrap();
+        assert_eq!(
+            a.packets.len(),
+            COUNTER_HBITS_BYTES,
+            "counter .hbits must stay {COUNTER_HBITS_BYTES} B (got {})",
+            a.packets.len()
+        );
+        assert_eq!(a.frames.len(), 5, "counter configures 5 sparse frames");
+        assert_eq!(a.packets, b.packets, "counter bitgen must be deterministic");
+        assert_eq!(a.frames, b.frames);
+        assert_ne!(
+            a.packets,
+            Bitstream::empty(&dev).packets,
+            "counter must not be an empty/fake stream"
+        );
+        let (idcode, decoded) = decode_packets(&a.packets).unwrap();
+        assert_eq!(idcode, dev.idcode);
+        assert_eq!(decoded.len(), 5);
+        // Header integrity: CRC + body hash already enforced by decode_packets.
+        assert!(a.packets.len() > HBITS_HEADER_BYTES);
+    }
+
+    #[test]
+    fn bitgen_refuses_empty_design() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let empty = Routed {
+            placed: helion_place::Placed {
+                packed: helion_pack::Packed {
+                    lutffs: vec![],
+                    iobs: vec![],
+                    macs: vec![],
+                    brams: vec![],
+                },
+                lutff_sites: vec![],
+                iob_sites: vec![],
+                mac_sites: vec![],
+                bram_sites: vec![],
+                timing_weight: 0.0,
+                cost: 0.0,
+            },
+            iob_src: vec![],
+            imux: vec![],
+            pathfinder_iters: 0,
+            overused: 0,
+            imux_skip: 0,
+        };
+        let err = bitgen(&dev, &empty).unwrap_err();
+        assert!(
+            err.contains("empty design") || err.contains("refusing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bitgen_refuses_all_zero_init_with_no_iob() {
+        // Soft path: LUT INIT=0 + no FF.USED + no IOB → assemble writes nothing.
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::new("zero_only");
+        d.add_port("clk", PortDir::In);
+        d.add_cell("u_lut", CellKind::Lut6 { init: 0 });
+        d.add_cell("u_ff", CellKind::Hff);
+        // Leave ff unpackable (no D/Q nets) so pack may still produce a LUTFF
+        // with empty ff_cell — or pack a lone LUT. Either way INIT=0 sets no bits.
+        let p = pack(&d, &dev).unwrap();
+        if p.lutffs.is_empty() && p.iobs.is_empty() {
+            // Pack dropped everything — bitgen empty-design path.
+            let pl = place(&p, &dev).unwrap();
+            let r = route(&pl, &dev).unwrap();
+            let err = bitgen(&dev, &r).unwrap_err();
+            assert!(err.contains("refusing") || err.contains("empty"), "{err}");
+            return;
+        }
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        // Force INIT=0 and strip IOB routes so frames stay empty if soft.
+        let mut r = r;
+        for l in &mut r.placed.packed.lutffs {
+            l.init = 0;
+            l.ff_cell.clear();
+        }
+        r.iob_src.clear();
+        r.imux.clear();
+        r.placed.packed.iobs.clear();
+        let err = bitgen(&dev, &r).unwrap_err();
+        assert!(
+            err.contains("no configured frames") || err.contains("refusing") || err.contains("empty"),
+            "{err}"
+        );
     }
 }

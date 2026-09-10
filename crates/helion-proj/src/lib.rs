@@ -381,9 +381,17 @@ impl Session {
     }
 
     pub fn write_bitstream(&mut self, dev: &Device) -> Result<&Bitstream, String> {
+        if self.design.is_none() {
+            return Err("write_bitstream: no design".into());
+        }
         self.sync_iob_electrical();
         let routed = self.routed.as_ref().ok_or("write_bitstream: not routed")?;
         let bits = bitgen(dev, routed)?;
+        if bits.frames.is_empty() {
+            return Err(
+                "write_bitstream: empty/fake bitstream refused (no configured frames)".into(),
+            );
+        }
         self.bitstream = Some(bits);
         Ok(self.bitstream.as_ref().unwrap())
     }
@@ -1142,6 +1150,24 @@ mod tests {
         s.eco(&dev, "u_lut", 0xAAAA_AAAA_AAAA_AAAA).unwrap();
         assert_ne!(s.blinky_hash(), h0, "ECO must change bitstream hash");
         let _ = PortDir::In;
+    }
+
+    #[test]
+    fn write_bitstream_refuses_missing_design_and_unrouted() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::NonProject);
+        let e = s.write_bitstream(&dev).unwrap_err();
+        assert!(e.contains("no design"), "{e}");
+        s.synth_design(Design::structural_counter());
+        let e = s.write_bitstream(&dev).unwrap_err();
+        assert!(e.contains("not routed"), "{e}");
+        s.place_design(&dev).unwrap();
+        let e = s.write_bitstream(&dev).unwrap_err();
+        assert!(e.contains("not routed"), "{e}");
+        s.route_design(&dev).unwrap();
+        let bits = s.write_bitstream(&dev).unwrap();
+        assert_eq!(bits.packets.len(), 185, "counter golden size");
+        assert!(!bits.frames.is_empty());
     }
 
     #[test]
