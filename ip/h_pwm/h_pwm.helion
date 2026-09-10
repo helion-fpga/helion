@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM PWM period/duty/compare
+format 1
+vlnv community:helion:h_pwm:1.0
+bus Helion-MM
+top h_pwm
+file h_pwm.v

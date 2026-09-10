@@ -1,0 +1,5 @@
+# Ingest Helion-MM SPI master via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_spi_mm/h_spi_mm.helion
+read_xdc examples/ip_ingest/h_spi_mm.sdc
+top h_spi_mm
