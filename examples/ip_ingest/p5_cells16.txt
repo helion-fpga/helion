@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #16 — h_uart_rx + h_div_restoring + h_sqrt_digit + h_cordic_step via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_uart_rx_ip.prj
+synth_design h_uart_rx cells=217 luts=208
+project examples/ip_ingest/h_uart_rx_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_uart_rx xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=208 WNS_PS=9680 frames=125
+# Instantiated IP: community:helion:h_uart_rx:1.0 (Helion-MM)
+# cells=217 luts=208 lutffs=208  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_div_restoring_ip.prj
+synth_design h_div_restoring cells=254 luts=242
+project examples/ip_ingest/h_div_restoring_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_div_restoring xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=242 WNS_PS=9680 frames=174
+# Instantiated IP: community:helion:h_div_restoring:1.0 (Helion-ST)
+# cells=254 luts=242 lutffs=242  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_sqrt_digit_ip.prj
+synth_design h_sqrt_digit cells=267 luts=252
+project examples/ip_ingest/h_sqrt_digit_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_sqrt_digit xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=252 WNS_PS=9680 frames=199
+# Instantiated IP: community:helion:h_sqrt_digit:1.0 (Helion-ST)
+# cells=267 luts=252 lutffs=252  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_cordic_step_ip.prj
+synth_design h_cordic_step cells=292 luts=280
+project examples/ip_ingest/h_cordic_step_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_cordic_step xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=280 WNS_PS=9680 frames=170
+# Instantiated IP: community:helion:h_cordic_step:1.0 (Helion-ST)
+# cells=292 luts=280 lutffs=280  (>0 real fabric)

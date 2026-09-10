@@ -518,6 +518,51 @@ pub fn pack_edge_cnt() -> IpCore {
     }
 }
 
+
+/// Helion-MM UART RX bit sampler start/data/stop + sticky byte (ip/h_uart_rx). Not AXI UART.
+pub fn pack_uart_rx() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_uart_rx".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Helion-ST restoring divider step engine, registered quot/rem (ip/h_div_restoring). Not AXI.
+pub fn pack_div_restoring() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_div_restoring".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST digit-by-digit integer sqrt step, registered rem/root (ip/h_sqrt_digit). Not AXI.
+pub fn pack_sqrt_digit() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_sqrt_digit".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST one CORDIC rotation step, registered x/y/z (ip/h_cordic_step). Not AXI.
+pub fn pack_cordic_step() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_cordic_step".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -566,6 +611,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_pwm_deadtime(),
         pack_lfsr16(),
         pack_edge_cnt(),
+        pack_uart_rx(),
+        pack_div_restoring(),
+        pack_sqrt_digit(),
+        pack_cordic_step(),
     ]
 }
 
@@ -899,6 +948,30 @@ mod tests {
         assert_eq!(pack_pwm_deadtime().vlnv(), "community:helion:h_pwm_deadtime:1.0");
         assert_eq!(pack_lfsr16().vlnv(), "community:helion:h_lfsr16:1.0");
         assert_eq!(pack_edge_cnt().vlnv(), "community:helion:h_edge_cnt:1.0");
+        let urx = pack_uart_rx();
+        assert_eq!(urx.name, "h_uart_rx");
+        assert_eq!(urx.bus, "Helion-MM");
+        assert_ne!(urx.bus, "AXI");
+        let dvr = pack_div_restoring();
+        assert_eq!(dvr.name, "h_div_restoring");
+        assert_eq!(dvr.bus, "Helion-ST");
+        assert_ne!(dvr.bus, "AXI");
+        let sq = pack_sqrt_digit();
+        assert_eq!(sq.name, "h_sqrt_digit");
+        assert_eq!(sq.bus, "Helion-ST");
+        assert_ne!(sq.bus, "AXI");
+        let cord = pack_cordic_step();
+        assert_eq!(cord.name, "h_cordic_step");
+        assert_eq!(cord.bus, "Helion-ST");
+        assert_ne!(cord.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_uart_rx"));
+        assert!(cat.iter().any(|c| c.name == "h_div_restoring"));
+        assert!(cat.iter().any(|c| c.name == "h_sqrt_digit"));
+        assert!(cat.iter().any(|c| c.name == "h_cordic_step"));
+        assert_eq!(pack_uart_rx().vlnv(), "community:helion:h_uart_rx:1.0");
+        assert_eq!(pack_div_restoring().vlnv(), "community:helion:h_div_restoring:1.0");
+        assert_eq!(pack_sqrt_digit().vlnv(), "community:helion:h_sqrt_digit:1.0");
+        assert_eq!(pack_cordic_step().vlnv(), "community:helion:h_cordic_step:1.0");
     }
 }
 

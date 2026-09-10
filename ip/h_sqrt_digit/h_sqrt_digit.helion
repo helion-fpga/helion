@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST digit-by-digit integer sqrt step
+format 1
+vlnv community:helion:h_sqrt_digit:1.0
+bus Helion-ST
+top h_sqrt_digit
+file h_sqrt_digit.v

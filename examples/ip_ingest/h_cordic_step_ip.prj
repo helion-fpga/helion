@@ -1,0 +1,5 @@
+# Ingest Helion IP via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_cordic_step/h_cordic_step.helion
+read_xdc examples/ip_ingest/h_cordic_step.sdc
+top h_cordic_step
