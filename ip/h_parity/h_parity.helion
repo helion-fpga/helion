@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered even/odd parity + sticky error
+format 1
+vlnv community:helion:h_parity:1.0
+bus Helion-ST
+top h_parity
+file h_parity.v

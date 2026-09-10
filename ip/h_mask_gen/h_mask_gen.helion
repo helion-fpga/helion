@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered bitmask from width/offset
+format 1
+vlnv community:helion:h_mask_gen:1.0
+bus Helion-ST
+top h_mask_gen
+file h_mask_gen.v

@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #11 — h_parity + h_hamming + h_rot_mm + h_mask_gen via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_parity_ip.prj
+synth_design h_parity cells=73 luts=36
+project examples/ip_ingest/h_parity_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_parity xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=36 WNS_PS=9600 frames=36
+# Instantiated IP: community:helion:h_parity:1.0 (Helion-ST)
+# cells=73 luts=36 lutffs=36  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_hamming_ip.prj
+synth_design h_hamming cells=288 luts=276
+project examples/ip_ingest/h_hamming_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_hamming xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=276 WNS_PS=9680 frames=169
+# Instantiated IP: community:helion:h_hamming:1.0 (Helion-ST)
+# cells=288 luts=276 lutffs=276  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_rot_mm_ip.prj
+synth_design h_rot_mm cells=266 luts=253
+project examples/ip_ingest/h_rot_mm_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_rot_mm xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=253 WNS_PS=9680 frames=174
+# Instantiated IP: community:helion:h_rot_mm:1.0 (Helion-MM)
+# cells=266 luts=253 lutffs=253  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_mask_gen_ip.prj
+synth_design h_mask_gen cells=124 luts=78
+project examples/ip_ingest/h_mask_gen_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_mask_gen xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=78 WNS_PS=9580 frames=86
+# Instantiated IP: community:helion:h_mask_gen:1.0 (Helion-ST)
+# cells=124 luts=78 lutffs=78  (>0 real fabric)
