@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered CRC-16
+format 1
+vlnv community:helion:h_crc16:1.0
+bus Helion-ST
+top h_crc16
+file h_crc16.v
