@@ -21,6 +21,8 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_rv32_hb1` | Helion-MM | PicoRV32 wrap (not Zynq / not AXI) |
 | `h_sync_fifo` | Helion-ST | Depth-8 / width-8 sync FIFO (wr/rd ptrs) |
 | `h_timer` | Helion-MM | Loadable down-counter + enable/zero |
+| `h_pwm` | Helion-MM | Period/duty regs, counter, output compare |
+| `h_spi_mm` | Helion-MM | SPI master bit-engine (clk-div/shift/busy) |
 
 ## Use
 
@@ -28,10 +30,12 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 helion ip list
 helion ip show ip/h_gpio/h_gpio.helion
 helion ip show ip/h_timer/h_timer.helion
+helion ip show ip/h_pwm/h_pwm.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
+helion project examples/ip_ingest/h_pwm_ip.prj
 # in a .prj:
-#   read_ip ip/h_timer/h_timer.helion
+#   read_ip ip/h_pwm/h_pwm.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
