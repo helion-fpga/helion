@@ -73,6 +73,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_spi_slave` | Helion-MM | SPI slave shift+sticky RX byte (Helion-MM status) |
 | `h_quad_enc` | Helion-ST | Quadrature decoder with count up/down |
 | `h_pwm_center` | Helion-ST | Center-aligned PWM (up/down triangle vs duty) |
+| `h_manchester_enc` | Helion-ST | Manchester encoder from bit stream + enable |
+| `h_gray2bin` | Helion-ST | Registered gray→binary converter (8b) |
+| `h_bin2gray` | Helion-ST | Registered binary→gray converter (8b) |
+| `h_majority3` | Helion-ST | 3-input majority voter registered (width 8) |
 
 ## Use
 
@@ -230,6 +234,10 @@ helion project examples/ip_ingest/h_pwm_center_ip.prj
 #   read_ip ip/h_spi_slave/h_spi_slave.helion
 #   read_ip ip/h_quad_enc/h_quad_enc.helion
 #   read_ip ip/h_pwm_center/h_pwm_center.helion
+#   read_ip ip/h_manchester_enc/h_manchester_enc.helion
+#   read_ip ip/h_gray2bin/h_gray2bin.helion
+#   read_ip ip/h_bin2gray/h_bin2gray.helion
+#   read_ip ip/h_majority3/h_majority3.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.

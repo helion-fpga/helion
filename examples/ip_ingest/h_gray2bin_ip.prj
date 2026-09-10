@@ -1,0 +1,5 @@
+# Ingest Helion IP via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_gray2bin/h_gray2bin.helion
+read_xdc examples/ip_ingest/h_gray2bin.sdc
+top h_gray2bin

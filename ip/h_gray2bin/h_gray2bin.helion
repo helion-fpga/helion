@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered gray→binary
+format 1
+vlnv community:helion:h_gray2bin:1.0
+bus Helion-ST
+top h_gray2bin
+file h_gray2bin.v
