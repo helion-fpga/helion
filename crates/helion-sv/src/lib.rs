@@ -736,6 +736,23 @@ fn edge_clk_of(module: &str) -> Option<String> {
     EDGE_CLK.with(|m| m.borrow().get(module).cloned())
 }
 
+/// Per-NBA clock for a bit/signal name. Dual-clock modules (cdc_cross /
+/// cdc_sync) must not collapse every Hff onto the first posedge port.
+fn seq_clk_for(module: &str, bitn: &str, fallback: &str) -> String {
+    SEQ_WRITES.with(|s| {
+        let v = s.borrow();
+        for (m, clk, sig) in v.iter() {
+            if m != module {
+                continue;
+            }
+            if sig == bitn || bitn.starts_with(&format!("{sig}_")) {
+                return clk.clone();
+            }
+        }
+        fallback.to_string()
+    })
+}
+
 fn note_sequential_not_lowered(module: &str, signal: &str) {
     let fresh = SEQ_NOT_LOWERED_SEEN.with(|s| s.borrow_mut().insert(module.to_string()));
     if !fresh {
@@ -10604,7 +10621,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"));
             wide_luts = wide_luts.saturating_add(aig.ands.len());
             d.add_cell(&ff, CellKind::Hff);
-            d.connect(clk, &ff, "CLK");
+            let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
+            d.connect(&bit_clk, &ff, "CLK");
             d.connect(&wide, &ff, "D");
             d.connect(&qnet, &ff, "Q");
             continue;
@@ -10622,7 +10640,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         };
         d.add_cell(&lut, CellKind::Lut6 { init });
         d.add_cell(&ff, CellKind::Hff);
-        d.connect(clk, &ff, "CLK");
+        let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
+        d.connect(&bit_clk, &ff, "CLK");
         d.connect(&dnet, &lut, "O");
         d.connect(&dnet, &ff, "D");
         d.connect(&qnet, &ff, "Q");
@@ -12888,6 +12907,43 @@ endmodule
     }
 
     #[test]
+    #[test]
+    fn dual_clock_cdc_assigns_per_always_clk() {
+        let src = r#"
+module cdc_sync(
+    input logic clk_a,
+    input logic clk_b,
+    input logic d_a,
+    output logic q_b
+);
+    logic q_a;
+    logic sync0;
+    always_ff @(posedge clk_a) q_a <= d_a;
+    always_ff @(posedge clk_b) begin
+        sync0 <= q_a;
+        q_b <= sync0;
+    end
+endmodule
+"#;
+        let d = synth_sv(src, "cdc_sync").expect("synth");
+        let clk_of = |ff: &str| d.net_on(ff, "CLK").unwrap_or("?").to_string();
+        let ffs: Vec<_> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, helion_ir::CellKind::Hff))
+            .map(|c| c.name.clone())
+            .collect();
+        assert!(ffs.len() >= 3, "expected 3 FFs, got {ffs:?}");
+        let mut clks: Vec<String> = ffs.iter().map(|f| clk_of(f)).collect();
+        clks.sort();
+        clks.dedup();
+        assert!(
+            clks.iter().any(|c| c == "clk_a") && clks.iter().any(|c| c == "clk_b"),
+            "dual-clock module must keep both clocks on Hffs: ffs={ffs:?} clks={clks:?} map={:?}",
+            ffs.iter().map(|f| (f.clone(), clk_of(f))).collect::<Vec<_>>()
+        );
+    }
+
     fn clock_mux_posedge_is_not_a_user_clock() {
         let src = r#"
 module clk_mux_q(input csr_clk, input csr_ena, input ram_clk, input d, output reg q);
