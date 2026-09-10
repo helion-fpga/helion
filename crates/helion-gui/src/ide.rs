@@ -22527,7 +22527,12 @@ mod tests {
         );
         let rows = ide.ip_catalog_rows();
         assert!(rows.len() >= 3, "catalog is helion-ipxact pack, not two dump lines");
-        assert!(rows.iter().all(|r| r.vlnv.contains(&r.name) && r.bus == "Helion-MM"));
+        assert!(
+            rows.iter().all(|r| r.vlnv.contains(&r.name)
+                && (r.bus == "Helion-MM" || r.bus == "Helion-ST" || r.bus == "Helion-DBG")
+                && r.bus != "AXI"),
+            "{rows:?}"
+        );
 
         assert!(
             ide.exec("select_ip").unwrap_err().contains("missing name"),

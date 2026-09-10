@@ -139,7 +139,19 @@ fn compile_design_xdc(
     }
     drc.fail()?;
     let t3 = std::time::Instant::now();
-    let bits = bitgen(&dev, &routed)?;
+    let bits = match bitgen(&dev, &routed) {
+        Ok(b) => b,
+        Err(e) if e.contains("empty design") => {
+            // 0-LUT identity / no_body: reports still match occupancy.
+            // write_bitstream / `helion bitstream` keep refusing empty frames.
+            eprintln!(
+                "hang_diag bitgen empty/honest ms={}",
+                t3.elapsed().as_millis()
+            );
+            helion_bits::Bitstream::empty(&dev)
+        }
+        Err(e) => return Err(e),
+    };
     eprintln!(
         "hang_diag bitgen bytes={} ms={}",
         bits.packets.len(),
