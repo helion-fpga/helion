@@ -1,0 +1,5 @@
+# Ingest Helion-MM scratch regfile via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_scratch_mm/h_scratch_mm.helion
+read_xdc examples/ip_ingest/h_scratch_mm.sdc
+top h_scratch_mm
