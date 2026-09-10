@@ -1,0 +1,6 @@
+# FM-HEL-VIVADO-P5 fabric proof — h_timer via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_timer_ip.prj
+synth_design h_timer cells=213 luts=209
+project examples/ip_ingest/h_timer_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_timer xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=209 WNS_PS=9680 frames=133
+# Instantiated IP: community:helion:h_timer:1.0 (Helion-MM)
+# cells=213 luts=209 lutffs=209  (>0 real fabric)
