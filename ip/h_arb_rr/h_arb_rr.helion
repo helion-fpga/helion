@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST 4-request round-robin arbiter
+format 1
+vlnv community:helion:h_arb_rr:1.0
+bus Helion-ST
+top h_arb_rr
+file h_arb_rr.v
