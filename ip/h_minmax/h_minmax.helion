@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered min/max of two 32b
+format 1
+vlnv community:helion:h_minmax:1.0
+bus Helion-ST
+top h_minmax
+file h_minmax.v

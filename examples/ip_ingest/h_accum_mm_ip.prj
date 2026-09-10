@@ -1,0 +1,5 @@
+# Ingest Helion-MM accumulator via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_accum_mm/h_accum_mm.helion
+read_xdc examples/ip_ingest/h_accum_mm.sdc
+top h_accum_mm
