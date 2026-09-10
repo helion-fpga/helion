@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST complementary PWM with deadtime
+format 1
+vlnv community:helion:h_pwm_deadtime:1.0
+bus Helion-ST
+top h_pwm_deadtime
+file h_pwm_deadtime.v

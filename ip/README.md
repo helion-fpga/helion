@@ -57,6 +57,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_prio_enc` | Helion-ST | Registered 16→4 priority encoder + valid |
 | `h_skid_buf` | Helion-ST | 1-deep skid buffer (valid/ready Helion-ST) |
 | `h_bcd_inc` | Helion-ST | Registered 4-digit BCD incrementer + carry |
+| `h_mailbox_mm` | Helion-MM | Single-slot MM mailbox (write, sticky full/empty, read clears) |
+| `h_pwm_deadtime` | Helion-ST | Complementary PWM with programmable deadtime counters |
+| `h_lfsr16` | Helion-ST | 16-bit LFSR PRBS (distinct from 8b h_lfsr) |
+| `h_edge_cnt` | Helion-ST | Rising-edge counter with clear |
 
 ## Use
 
@@ -99,6 +103,10 @@ helion ip show ip/h_rng_xorshift/h_rng_xorshift.helion
 helion ip show ip/h_prio_enc/h_prio_enc.helion
 helion ip show ip/h_skid_buf/h_skid_buf.helion
 helion ip show ip/h_bcd_inc/h_bcd_inc.helion
+helion ip show ip/h_mailbox_mm/h_mailbox_mm.helion
+helion ip show ip/h_pwm_deadtime/h_pwm_deadtime.helion
+helion ip show ip/h_lfsr16/h_lfsr16.helion
+helion ip show ip/h_edge_cnt/h_edge_cnt.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -136,6 +144,10 @@ helion project examples/ip_ingest/h_rng_xorshift_ip.prj
 helion project examples/ip_ingest/h_prio_enc_ip.prj
 helion project examples/ip_ingest/h_skid_buf_ip.prj
 helion project examples/ip_ingest/h_bcd_inc_ip.prj
+helion project examples/ip_ingest/h_mailbox_mm_ip.prj
+helion project examples/ip_ingest/h_pwm_deadtime_ip.prj
+helion project examples/ip_ingest/h_lfsr16_ip.prj
+helion project examples/ip_ingest/h_edge_cnt_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -166,6 +178,10 @@ helion project examples/ip_ingest/h_bcd_inc_ip.prj
 #   read_ip ip/h_prio_enc/h_prio_enc.helion
 #   read_ip ip/h_skid_buf/h_skid_buf.helion
 #   read_ip ip/h_bcd_inc/h_bcd_inc.helion
+#   read_ip ip/h_mailbox_mm/h_mailbox_mm.helion
+#   read_ip ip/h_pwm_deadtime/h_pwm_deadtime.helion
+#   read_ip ip/h_lfsr16/h_lfsr16.helion
+#   read_ip ip/h_edge_cnt/h_edge_cnt.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
