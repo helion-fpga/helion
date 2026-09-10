@@ -9,7 +9,7 @@
 
 use crate::{tcl_eval, GpuiShell};
 use helion_bd::{emit_sv, validate, BlockDesign};
-use helion_debug::{insert_arm_capture, IlaCapture};
+use helion_debug::{insert_arm_capture, insert_arm_capture_deep, IlaArmConfig, IlaCapture, IlaCaptureDeep, IlaTriggerKind};
 use helion_device::{Device, Far, SiteKind};
 use helion_drc::{check_placed, check_routed, Drc, DrcSeverity};
 use helion_fabric::{Fabric, Stat, StatBit};
@@ -3548,6 +3548,12 @@ pub struct IlaDashboard {
     pub armed: bool,
     pub bits: String,
     pub trigger_at: Option<usize>,
+    /// Samples kept before trigger in deep fabric-BRAM arm (`ila_arm_deep`).
+    pub pre_trigger: usize,
+    /// soft_ble_out | fabric_bram_sample_buffer
+    pub backend: String,
+    /// Multi-probe nets from last deep arm (single-net soft arm → one entry).
+    pub probes: Vec<String>,
 }
 
 impl Default for IlaDashboard {
@@ -3559,6 +3565,9 @@ impl Default for IlaDashboard {
             armed: false,
             bits: String::new(),
             trigger_at: None,
+            pre_trigger: 0,
+            backend: "soft_ble_out".into(),
+            probes: Vec::new(),
         }
     }
 }
@@ -5598,6 +5607,8 @@ impl IdeModel {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(self.ila.window);
             self.capture_ila(net, n)
+        } else if t == "ila_arm_deep" || t.starts_with("ila_arm_deep ") {
+            self.ila_arm_deep(t.strip_prefix("ila_arm_deep").unwrap_or("").trim())
         } else if t == "ila_arm" || t.starts_with("ila_arm ") {
             self.ila_arm(t.strip_prefix("ila_arm").unwrap_or("").trim())
         } else if t == "mark_debug" || t.starts_with("mark_debug ") {
@@ -5641,6 +5652,8 @@ impl IdeModel {
             self.select_ila_sample("0")
         } else if let Some(rest) = t.strip_prefix("ila_trigger ") {
             self.set_ila_trigger(rest)
+        } else if let Some(rest) = t.strip_prefix("ila_pre_trigger ") {
+            self.set_ila_pre_trigger(rest)
         } else if let Some(rest) = t.strip_prefix("ila_window ") {
             self.set_ila_window(rest)
         } else if t == "expand_cone" || t.starts_with("expand_cone ") {
@@ -18809,6 +18822,9 @@ impl IdeModel {
         self.ila.window = cap.samples.len();
         self.ila.bits = bits.clone();
         self.ila.armed = false;
+        self.ila.backend = "soft_ble_out".into();
+        self.ila.probes = vec![cap.net.clone()];
+        self.ila.pre_trigger = 0;
         self.apply_ila_trigger_to_wave();
         self.workspace = WorkspaceTab::Hardware;
         self.hw.open = true;
@@ -18836,8 +18852,13 @@ impl IdeModel {
         } else {
             self.ila.bits.len()
         };
+        let probes = if self.ila.probes.is_empty() {
+            "-".into()
+        } else {
+            self.ila.probes.join(",")
+        };
         let mut s = format!(
-            "ila dashboard net={} window={} trigger={} armed={} captured={} trigger_at={} bits={}",
+            "ila dashboard net={} window={} trigger={} armed={} captured={} trigger_at={} pre_trigger={} backend={} probes={} bits={}",
             if self.ila.net.is_empty() {
                 "-"
             } else {
@@ -18848,6 +18869,13 @@ impl IdeModel {
             u8::from(self.ila.armed),
             captured,
             at,
+            self.ila.pre_trigger,
+            if self.ila.backend.is_empty() {
+                "-"
+            } else {
+                self.ila.backend.as_str()
+            },
+            probes,
             if self.ila.bits.is_empty() {
                 "-"
             } else {
@@ -19042,6 +19070,128 @@ impl IdeModel {
         self.ila.window = n;
         self.workspace = WorkspaceTab::Hardware;
         Ok(self.ila_dashboard_text())
+    }
+
+    pub fn set_ila_pre_trigger(&mut self, spec: &str) -> Result<String, String> {
+        let n: usize = spec
+            .trim()
+            .parse()
+            .map_err(|_| format!("ila_pre_trigger: not a count {spec}"))?;
+        if n >= self.ila.window {
+            return Err(format!(
+                "ila_pre_trigger: need < window ({})",
+                self.ila.window
+            ));
+        }
+        self.ila.pre_trigger = n;
+        self.workspace = WorkspaceTab::Hardware;
+        Ok(self.ila_dashboard_text())
+    }
+
+    /// Fabric BRAM sample-buffer arm: multi-probe + trigger-before-fill (deeper than soft ble_out).
+    pub fn capture_ila_deep(&mut self, nets: &[String], n: usize) -> Result<String, String> {
+        let d = self
+            .shell
+            .session
+            .design
+            .clone()
+            .ok_or("ila_arm_deep: no design")?;
+        let dev = self.device()?;
+        let n = n.max(1);
+        let nets: Vec<String> = if nets.is_empty() {
+            vec![self.default_ila_probe()]
+        } else {
+            nets.to_vec()
+        };
+        let trigger = match self.ila.trigger {
+            IlaTrigger::Immediate => IlaTriggerKind::Immediate,
+            IlaTrigger::Rising => IlaTriggerKind::Rising,
+            IlaTrigger::Falling => IlaTriggerKind::Falling,
+        };
+        let trigger_net = nets[0].clone();
+        let cfg = IlaArmConfig {
+            nets: nets.clone(),
+            window: n,
+            trigger,
+            trigger_net: trigger_net.clone(),
+            pre_trigger: self.ila.pre_trigger,
+        };
+        self.ila.armed = true;
+        let cap: IlaCaptureDeep = insert_arm_capture_deep(&dev, &d, &cfg)?;
+        let trig_idx = cap
+            .probes
+            .iter()
+            .position(|p| p == &trigger_net)
+            .unwrap_or(0);
+        let bits: String = cap
+            .samples
+            .iter()
+            .map(|s| if s.get(trig_idx).copied().unwrap_or(false) { '1' } else { '0' })
+            .collect();
+        // Primary trigger probe on wave; extra probes as ila:<net>.
+        for (pi, pname) in cap.probes.iter().enumerate() {
+            let tname = format!("ila:{pname}");
+            let samples: Vec<u64> = cap
+                .samples
+                .iter()
+                .map(|s| u64::from(s.get(pi).copied().unwrap_or(false)))
+                .collect();
+            if let Some(t) = self.wave.traces.iter_mut().find(|t| t.name == tname) {
+                t.samples = samples;
+                t.width = 1;
+            } else {
+                let mut t = WaveTrace::scalar(tname);
+                t.samples = samples;
+                self.wave.traces.push(t);
+            }
+        }
+        self.ila.net = trigger_net;
+        self.ila.window = cap.samples.len();
+        self.ila.bits = bits.clone();
+        self.ila.armed = false;
+        self.ila.backend = cap.backend.into();
+        self.ila.probes = cap.probes.clone();
+        self.ila.pre_trigger = cap.pre_trigger;
+        self.ila.trigger_at = cap.trigger_at;
+        if let Some(i) = self.ila.trigger_at {
+            self.wave.set_cursor(i);
+        }
+        self.workspace = WorkspaceTab::Hardware;
+        self.hw.open = true;
+        let at = self
+            .ila
+            .trigger_at
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "-".into());
+        Ok(format!(
+            "ila_arm_deep net={} probes={} samples={} bits={bits} trigger={} trigger_at={at} pre_trigger={} backend={} bram_major={}",
+            self.ila.net,
+            cap.probes.join(","),
+            cap.samples.len(),
+            self.ila.trigger.tcl(),
+            cap.pre_trigger,
+            cap.backend,
+            cap.bram_major
+        ))
+    }
+
+    pub fn ila_arm_deep(&mut self, spec: &str) -> Result<String, String> {
+        let mut nets = Vec::new();
+        let mut window = None;
+        for tok in spec.split_whitespace() {
+            if let Ok(n) = tok.parse::<usize>() {
+                window = Some(n);
+            } else {
+                for part in tok.split(',') {
+                    let p = part.trim();
+                    if !p.is_empty() {
+                        nets.push(p.to_string());
+                    }
+                }
+            }
+        }
+        let n = window.unwrap_or(self.ila.window);
+        self.capture_ila_deep(&nets, n)
     }
 
     /// Prefer mark_debug nets, then last armed, then cnt_3/q3/led if present in the design.
@@ -25879,6 +26029,42 @@ endmodule
         assert!(!blinky.wave.has_trace("ila:cnt_3"));
         assert_eq!(blinky.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff, Some(1));
         assert_eq!(ide.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff, Some(4));
+    }
+
+    /// Deep path: fabric BRAM sample buffer + pre-trigger + multi-probe (soft ila_arm unchanged).
+    #[test]
+    fn ila_arm_deep_bram_pretrigger_multiprobe() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        assert_eq!(ide.wns_ps(), Some(9640), "counter gold WNS_PS");
+
+        ide.exec("ila_window 16").unwrap();
+        ide.exec("ila_trigger rising").unwrap();
+        ide.exec("ila_pre_trigger 4").unwrap();
+        let out = ide.exec("ila_arm_deep cnt_3,cnt_0").unwrap();
+        assert!(out.contains("backend=fabric_bram_sample_buffer"), "{out}");
+        assert!(out.contains("pre_trigger=4"), "{out}");
+        assert!(out.contains("probes=cnt_3,cnt_0") || out.contains("probes=cnt_3"), "{out}");
+        assert_eq!(ide.ila.backend, "fabric_bram_sample_buffer");
+        assert_eq!(ide.ila.bits.len(), 16);
+        let at = ide.ila.trigger_at.expect("deep rising trigger_at");
+        assert!(at >= 1, "trigger_at={at} bits={}", ide.ila.bits);
+        assert_eq!(&ide.ila.bits[at - 1..at + 1], "01");
+        assert!(ide.wave.has_trace("ila:cnt_3"));
+        let dump = ide.exec("ila_dashboard").unwrap();
+        assert!(dump.contains("backend=fabric_bram_sample_buffer"), "{dump}");
+        assert!(dump.contains("pre_trigger=4"), "{dump}");
+
+        // Soft path gold still holds on plain ila_arm.
+        ide.exec("ila_trigger rising").unwrap();
+        ide.exec("ila_arm cnt_3").unwrap();
+        assert_eq!(ide.ila.backend, "soft_ble_out");
+        assert_eq!(ide.ila.bits, "0000000111111110");
+        assert_eq!(ide.wns_ps(), Some(9640));
     }
 
     /// UG893 Device is a HAD die occupancy grid, not a list of occupied site names.
