@@ -7,7 +7,7 @@ use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{create_clock, load_xdc, report_timing_routed, Constraints};
-use helion_hw::{prog_sim, resolve_cable, CableBackend};
+use helion_hw::{program_hbits_with_cable, prog_sim, resolve_cable, CableBackend};
 use helion_debug::insert_ila;
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
@@ -448,6 +448,8 @@ impl Session {
 
     /// Program last bitstream. `cable` is `auto|sim|usb|ofl` (default `auto`).
     pub fn program_hw(&mut self, dev: &Device) -> Result<String, String> {
+        // Product default = auto → OFL board path. USB=0 → honest Err (never
+        // soft-hold / never invent sim DONE=1). Explicit cable=sim for fabric.
         self.program_hw_cable(dev, "auto")
     }
 
@@ -470,7 +472,7 @@ impl Session {
                 let st = prog_sim(dev, bits)?;
                 self.programmed = true;
                 Ok(format!(
-                    "program_hw cable={} backend=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={}",
+                    "program_hw cable={} backend=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={} (sim fabric; not board DONE)",
                     info.id,
                     dev.part,
                     frames,
@@ -497,11 +499,32 @@ impl Session {
                 ))
             }
             CableBackend::OpenFpgaLoader | CableBackend::NativeUsb => {
-                // Board program: soft-hold until a cable exists. Do not probe
-                // FTDI as the primary check and do not claim programmed/DONE.
-                let _ = (bits, dev);
-                self.programmed = false;
-                Ok("program_hw status=soft-hold (no cable; not programmed)".into())
+                // Board path: write packets and invoke helion-hw. DONE only if
+                // OFL/native confirms — never soft-hold Ok, never invent DONE.
+                let dir = std::env::temp_dir().join("helion-program-hw");
+                std::fs::create_dir_all(&dir).map_err(|e| format!("program_hw: temp dir: {e}"))?;
+                let path = dir.join(format!("session-{}.hbits", std::process::id()));
+                std::fs::write(&path, &bits.packets)
+                    .map_err(|e| format!("program_hw: write {}: {e}", path.display()))?;
+                match program_hbits_with_cable(dev, &path, &info, false) {
+                    Ok(outcome) => {
+                        self.programmed = true;
+                        let line = outcome.summary_line("program", &dev.part);
+                        Ok(format!(
+                            "program_hw cable={} {}",
+                            info.id,
+                            line
+                        ))
+                    }
+                    Err(e) => {
+                        self.programmed = false;
+                        Err(format!(
+                            "program_hw cable={} backend={} refused DONE (USB/programmer): {e}",
+                            info.id,
+                            info.backend.as_str()
+                        ))
+                    }
+                }
             }
         }
     }
@@ -1149,8 +1172,16 @@ mod tests {
         s.set_property("DONT_TOUCH", "true", "u_lut0").unwrap();
         assert!(s.design.as_ref().unwrap().cell("u_lut0").unwrap().attrs.flag("DONT_TOUCH"));
         s.open_hw_manager();
-        let hw = s.program_hw(&dev).unwrap();
+        // USB=0: product program_hw (auto) must refuse DONE — no soft-hold / no sim invent.
+        let board_err = s.program_hw(&dev).unwrap_err();
+        assert!(
+            board_err.contains("refused DONE") || board_err.contains("no USB") || board_err.contains("programmer"),
+            "{board_err}"
+        );
+        assert!(!board_err.contains("soft-hold"), "{board_err}");
+        let hw = s.program_hw_cable(&dev, "sim").unwrap();
         assert!(hw.contains("DONE=1"), "{hw}");
+        assert!(hw.contains("not board DONE"), "{hw}");
         let h0 = s.blinky_hash().unwrap();
         let ck = s.checkpoint();
         let s2 = Session::restore_session(&ck, &dev).unwrap();

@@ -51,9 +51,9 @@ fn serv_pin_wrap_clk_package_pin_and_ila() {
     ide.exec("sim_run 16").unwrap();
     ide.exec(&format!("mark_debug {probe}")).unwrap();
     ide.exec("add_probe").unwrap();
-    let prog = ide.exec("program_hw").unwrap();
+    let prog = ide.exec("program_hw cable=sim").unwrap();
     assert!(
-        prog.contains("DONE=1") || prog.contains("backend=sim") || prog.contains("soft-hold"),
+        prog.contains("DONE=1") || prog.contains("backend=sim"),
         "{prog}"
     );
     ide.exec("ila_window 16").unwrap();
