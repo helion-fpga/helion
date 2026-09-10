@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST rising-edge counter with clear
+format 1
+vlnv community:helion:h_edge_cnt:1.0
+bus Helion-ST
+top h_edge_cnt
+file h_edge_cnt.v
