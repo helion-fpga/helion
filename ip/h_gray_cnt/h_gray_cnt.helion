@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST binary↔gray counter
+format 1
+vlnv community:helion:h_gray_cnt:1.0
+bus Helion-ST
+top h_gray_cnt
+file h_gray_cnt.v

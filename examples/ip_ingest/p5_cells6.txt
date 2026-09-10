@@ -1,0 +1,12 @@
+# FM-HEL-VIVADO-P5 fabric proof #6 — h_gray_cnt (+ h_scratch_mm) via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_gray_cnt_ip.prj
+synth_design h_gray_cnt cells=96 luts=85
+project examples/ip_ingest/h_gray_cnt_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_gray_cnt xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=85 WNS_PS=9220 frames=84
+# Instantiated IP: community:helion:h_gray_cnt:1.0 (Helion-ST)
+# cells=96 luts=85 lutffs=85  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_scratch_mm_ip.prj
+synth_design h_scratch_mm cells=267 luts=253
+project examples/ip_ingest/h_scratch_mm_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_scratch_mm xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=253 WNS_PS=9680 frames=174
+# Instantiated IP: community:helion:h_scratch_mm:1.0 (Helion-MM)
+# cells=267 luts=253 lutffs=253  (>0 real fabric)

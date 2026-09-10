@@ -29,6 +29,8 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_watchdog` | Helion-MM | Loadable countdown watchdog, enable/timeout/pet |
 | `h_crc32` | Helion-ST | Byte-serial CRC32 (init/enable/data_valid) |
 | `h_lfsr` | Helion-ST | Programmable-tap LFSR PRBS (enable/load/seed) |
+| `h_gray_cnt` | Helion-ST | Binary↔gray counter with enable/load |
+| `h_scratch_mm` | Helion-MM | 4×32b MM-mapped scratch regfile (wr/rd strobes) |
 
 ## Use
 
@@ -43,6 +45,8 @@ helion ip show ip/h_edge_det/h_edge_det.helion
 helion ip show ip/h_watchdog/h_watchdog.helion
 helion ip show ip/h_crc32/h_crc32.helion
 helion ip show ip/h_lfsr/h_lfsr.helion
+helion ip show ip/h_gray_cnt/h_gray_cnt.helion
+helion ip show ip/h_scratch_mm/h_scratch_mm.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -52,8 +56,12 @@ helion project examples/ip_ingest/h_edge_det_ip.prj
 helion project examples/ip_ingest/h_watchdog_ip.prj
 helion project examples/ip_ingest/h_crc32_ip.prj
 helion project examples/ip_ingest/h_lfsr_ip.prj
+helion project examples/ip_ingest/h_gray_cnt_ip.prj
+helion project examples/ip_ingest/h_scratch_mm_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
+#   read_ip ip/h_gray_cnt/h_gray_cnt.helion
+#   read_ip ip/h_scratch_mm/h_scratch_mm.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.

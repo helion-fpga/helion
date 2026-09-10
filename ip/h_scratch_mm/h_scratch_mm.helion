@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM 4×32b scratch register file
+format 1
+vlnv community:helion:h_scratch_mm:1.0
+bus Helion-MM
+top h_scratch_mm
+file h_scratch_mm.v
