@@ -982,7 +982,14 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
             if rexpr_has_nested_arith(rhs) {
                 // bus + {zeros, wire bits} lowers via ripple_add_zpad — not a
                 // flatten_cap (Ibex fetch_fifo instr_addr_next).
-                if packed_add_zpad_wires(rhs, rtl).is_some() {
+                // bus[hi:0] + {{N{0}},1'b1} / bus+K lowers via ripple_add_const
+                // (Ibex MHPM counter_upd width≤RIPPLE_ADD_MAX).
+                if packed_add_zpad_wires(rhs, rtl).is_some()
+                    || packed_add_const(rhs, rtl).is_some()
+                    || packed_sub_const(rhs, rtl).is_some()
+                    || packed_const_minus_bus(rhs, rtl).is_some()
+                    || packed_add_pair(rhs, rtl).is_some()
+                {
                     continue;
                 }
                 return Some(lhs.clone());
@@ -7698,7 +7705,8 @@ fn wide_aig_over_cap(aig: &Aig) -> bool {
     aig.pis.len() > WIDE_CONE_PI_CAP || aig.ands.len() > WIDE_CONE_AND_CAP
 }
 
-/// One line per module. Further wide cones are skipped, not re-announced.
+/// One line per module (attr WIDE_CONE). Further wide cones are skipped via
+/// `wide_capped` + continue — sibling soft cones still map (selective widen).
 fn emit_wide_cone(module: &str, signal: &str, capped: &mut bool) {
     if *capped {
         return;
@@ -8902,6 +8910,40 @@ fn packed_add_pair(rhs: &RExpr, rtl: &Rtl) -> Option<(String, String)> {
 
 /// `assign y = bus + K` (either order). K is a small constant 1..=16.
 /// Not two named buses, not a multiply, not an unpacked word.
+/// `{{N{1'b0}}, 1'b1}` / `{1'b1, {N{1'b0}}}` — Ibex counter_upd +1 pad.
+fn plus_one_concat(e: &RExpr) -> bool {
+    let RExpr::Concat(parts) = e else {
+        return false;
+    };
+    match parts.as_slice() {
+        // MSB-first zeros then LSB 1 (Ibex `{{W-1{1'b0}}, 1'b1}`).
+        [RExpr::Const { val: 0, width: n, .. }, RExpr::Const { val: 1, width: 1, .. }]
+            if *n >= 1 =>
+        {
+            true
+        }
+        // Single-bit 1 alone is not a pad; refuse other shapes.
+        _ => false,
+    }
+}
+
+fn packed_add_bus_name(e: &RExpr, rtl: &Rtl) -> Option<String> {
+    match e {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => Some(s.clone()),
+        // `counter[CounterWidth-1:0]` on a wider `counter` bus (Ibex MHPM 40-in-64).
+        RExpr::Range(s, lo, hi)
+            if sig_depth(rtl, s) == 0
+                && name_known(rtl, s)
+                && *lo == 0
+                && *hi >= *lo
+                && (*hi + 1) <= sig_width(rtl, s) =>
+        {
+            Some(s.clone())
+        }
+        _ => None,
+    }
+}
+
 fn packed_add_const(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128)> {
     let RExpr::Add(a, b) = rhs else {
         return None;
@@ -8910,8 +8952,10 @@ fn packed_add_const(rhs: &RExpr, rtl: &Rtl) -> Option<(String, u128)> {
         return None;
     }
     let (bus, k) = match (a.as_ref(), b.as_ref()) {
-        (RExpr::Ident(s), RExpr::Const { val, .. }) if sig_depth(rtl, s) == 0 => (s.clone(), *val),
-        (RExpr::Const { val, .. }, RExpr::Ident(s)) if sig_depth(rtl, s) == 0 => (s.clone(), *val),
+        (bus_e, RExpr::Const { val, .. }) => (packed_add_bus_name(bus_e, rtl)?, *val),
+        (RExpr::Const { val, .. }, bus_e) => (packed_add_bus_name(bus_e, rtl)?, *val),
+        (bus_e, pad) if plus_one_concat(pad) => (packed_add_bus_name(bus_e, rtl)?, 1u128),
+        (pad, bus_e) if plus_one_concat(pad) => (packed_add_bus_name(bus_e, rtl)?, 1u128),
         _ => return None,
     };
     if (1u128..=16).contains(&k) {
@@ -9197,7 +9241,7 @@ fn emit_ripple_add_const(
     bus: &str,
     k: u128,
 ) -> bool {
-    if width == 0 || width > 32 || !(1u128..=16).contains(&k) {
+    if width == 0 || width > RIPPLE_ADD_MAX || !(1u128..=16).contains(&k) {
         return false;
     }
     // A missing bus bit is a skip, not a zero-extended invented bus.
@@ -10295,7 +10339,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((bus, k)) = packed_add_const(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > 32 || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
+                    if w > RIPPLE_ADD_MAX || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
                         note_assign_not_lowered(&rtl.module, lhs);
                     }
                     continue;
@@ -10488,19 +10532,18 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
     let single_q = reg_bits.len() == 1 && reg_bits[0].0 == "q";
-    // FM-HEL-10m-0854: one wide-cone diagnostic per module, then finish.
-    // Do not reprint node_count per bit, and do not map cones past the cap.
+    // FM-HEL-10m-0854: one wide-cone diagnostic per module (attr), then
+    // continue — selective soft-cone widen maps sibling bits; over-cap cones
+    // stay unmapped (named). Do not reprint node_count per bit.
     let mut wide_capped = false;
     let mut wide_luts = 0usize;
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
-        if wide_capped {
-            // One wide_cone diagnostic then finish. Do not walk the rest.
-            break;
-        }
+        // Soft-cone widen: one named wide_cone diagnostic, then keep mapping
+        // sibling bits (≤6-PI / ITE / xnor). Do not abort the whole module.
         if expr_node_count(expr) > 8_000 {
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-            break;
+            continue;
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
             continue;
@@ -10512,7 +10555,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
             {
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-                break;
+                continue;
             }
             let (ff, qnet) = if single_q {
                 ("u_ff".to_string(), "q".to_string())
@@ -10555,13 +10598,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
 
+    // Soft-cone widen: map more assign bits per module (Ibex pin_wrap /
+    // ALU / multdiv exceed 256). Named diagnostic when still capped.
+    const ASSIGN_BIT_CAP: usize = 2048;
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
-        if wide_capped {
-            break;
-        }
-        if i >= 256 {
+        if i >= ASSIGN_BIT_CAP {
             note_skip(format!(
-                "diagnostic assign_cap signal={} (assign-cap 256; remaining assigns not a LUT)",
+                "diagnostic assign_cap signal={} (assign-cap {ASSIGN_BIT_CAP}; remaining assigns not a LUT)",
                 bitn
             ));
             break;
@@ -10602,7 +10645,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 continue;
             }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-            break;
+            continue;
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
             if let Some(sig) = rel_sig.get(bitn) {
@@ -10648,7 +10691,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 continue;
             }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-            break;
+            continue;
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
@@ -10661,7 +10704,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     continue;
                 }
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
-                break;
+                continue;
             }
             let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
             wide_luts = wide_luts.saturating_add(aig.ands.len());
@@ -14063,6 +14106,30 @@ endmodule
         assert!(
             luts <= 96,
             "6-PI case-of-const must collapse per bit, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn ibex_counter_upd_plus_one_zpad_is_ripple_not_wide_cone() {
+        // MHPMCounterWidth=40: `counter[39:0] + {{39{1'b0}}, 1'b1}` must ripple
+        // (RIPPLE_ADD_MAX=40), not bit-blast into counter_upd_16 wide_cone.
+        let src = r#"
+module ibex_counter_upd(input logic [63:0] counter,
+                        output logic [39:0] counter_upd);
+  assign counter_upd = counter[39:0] + {{39{1'b0}}, 1'b1};
+endmodule
+"#;
+        let d = synth_sv(src, "ibex_counter_upd.sv").expect("counter_upd");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts >= 40,
+            "40-bit +1 ripple must map LUTs, luts={luts}"
         );
     }
 
