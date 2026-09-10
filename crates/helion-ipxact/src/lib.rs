@@ -178,6 +178,29 @@ pub fn pack_scratch_mm() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered 32b population count (ip/h_popcount). Not AXI.
+pub fn pack_popcount() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_popcount".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST saturating add/sub with sticky signed overflow (ip/h_saturate). Not AXI.
+pub fn pack_saturate() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_saturate".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -196,6 +219,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_lfsr(),
         pack_gray_cnt(),
         pack_scratch_mm(),
+        pack_popcount(),
+        pack_saturate(),
     ]
 }
 
@@ -349,6 +374,18 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_scratch_mm"));
         assert_eq!(pack_gray_cnt().vlnv(), "community:helion:h_gray_cnt:1.0");
         assert_eq!(pack_scratch_mm().vlnv(), "community:helion:h_scratch_mm:1.0");
+        let pop = pack_popcount();
+        assert_eq!(pop.name, "h_popcount");
+        assert_eq!(pop.bus, "Helion-ST");
+        assert_ne!(pop.bus, "AXI");
+        let sat = pack_saturate();
+        assert_eq!(sat.name, "h_saturate");
+        assert_eq!(sat.bus, "Helion-ST");
+        assert_ne!(sat.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_popcount"));
+        assert!(cat.iter().any(|c| c.name == "h_saturate"));
+        assert_eq!(pack_popcount().vlnv(), "community:helion:h_popcount:1.0");
+        assert_eq!(pack_saturate().vlnv(), "community:helion:h_saturate:1.0");
     }
 }
 

@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered 32b population count
+format 1
+vlnv community:helion:h_popcount:1.0
+bus Helion-ST
+top h_popcount
+file h_popcount.v
