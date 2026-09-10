@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM tiny CAM/tag compare slot
+format 1
+vlnv community:helion:h_cam_slot:1.0
+bus Helion-MM
+top h_cam_slot
+file h_cam_slot.v

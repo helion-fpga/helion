@@ -709,6 +709,51 @@ pub fn pack_majority3() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered CRC-16 poly 0x1021 byte-serial (ip/h_crc16). Not AXI.
+pub fn pack_crc16() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_crc16".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST token-ring rotating grant among N requesters (ip/h_rr_token). Distinct from h_arb_rr. Not AXI.
+pub fn pack_rr_token() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_rr_token".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST phase-shifted dual PWM shared counter (ip/h_pwm_phase). Not AXI.
+pub fn pack_pwm_phase() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_pwm_phase".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM tiny CAM/tag compare slot sticky match (ip/h_cam_slot). Not AXI.
+pub fn pack_cam_slot() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_cam_slot".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -774,6 +819,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_gray2bin(),
         pack_bin2gray(),
         pack_majority3(),
+        pack_crc16(),
+        pack_rr_token(),
+        pack_pwm_phase(),
+        pack_cam_slot(),
     ]
 }
 
@@ -1207,6 +1256,30 @@ mod tests {
         assert_eq!(pack_gray2bin().vlnv(), "community:helion:h_gray2bin:1.0");
         assert_eq!(pack_bin2gray().vlnv(), "community:helion:h_bin2gray:1.0");
         assert_eq!(pack_majority3().vlnv(), "community:helion:h_majority3:1.0");
+        let c16 = pack_crc16();
+        assert_eq!(c16.name, "h_crc16");
+        assert_eq!(c16.bus, "Helion-ST");
+        assert_ne!(c16.bus, "AXI");
+        let rrt = pack_rr_token();
+        assert_eq!(rrt.name, "h_rr_token");
+        assert_eq!(rrt.bus, "Helion-ST");
+        assert_ne!(rrt.bus, "AXI");
+        let pp = pack_pwm_phase();
+        assert_eq!(pp.name, "h_pwm_phase");
+        assert_eq!(pp.bus, "Helion-ST");
+        assert_ne!(pp.bus, "AXI");
+        let cam = pack_cam_slot();
+        assert_eq!(cam.name, "h_cam_slot");
+        assert_eq!(cam.bus, "Helion-MM");
+        assert_ne!(cam.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_crc16"));
+        assert!(cat.iter().any(|c| c.name == "h_rr_token"));
+        assert!(cat.iter().any(|c| c.name == "h_pwm_phase"));
+        assert!(cat.iter().any(|c| c.name == "h_cam_slot"));
+        assert_eq!(pack_crc16().vlnv(), "community:helion:h_crc16:1.0");
+        assert_eq!(pack_rr_token().vlnv(), "community:helion:h_rr_token:1.0");
+        assert_eq!(pack_pwm_phase().vlnv(), "community:helion:h_pwm_phase:1.0");
+        assert_eq!(pack_cam_slot().vlnv(), "community:helion:h_cam_slot:1.0");
     }
 }
 
