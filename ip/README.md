@@ -45,6 +45,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_hamming` | Helion-ST | Registered Hamming distance of two 32b |
 | `h_rot_mm` | Helion-MM | MM-programmed rotate left/right by N |
 | `h_mask_gen` | Helion-ST | Registered bitmask from width/offset |
+| `h_absdiff` | Helion-ST | Registered absolute difference |a-b| on 32b |
+| `h_clamp` | Helion-ST | Registered clamp of 32b value to [lo,hi] |
+| `h_bin2oh` | Helion-ST | Registered binary→onehot (4b→16b) |
+| `h_timer_cap` | Helion-MM | Free-run capture timer + sticky edge capture |
 
 ## Use
 
@@ -75,6 +79,10 @@ helion ip show ip/h_parity/h_parity.helion
 helion ip show ip/h_hamming/h_hamming.helion
 helion ip show ip/h_rot_mm/h_rot_mm.helion
 helion ip show ip/h_mask_gen/h_mask_gen.helion
+helion ip show ip/h_absdiff/h_absdiff.helion
+helion ip show ip/h_clamp/h_clamp.helion
+helion ip show ip/h_bin2oh/h_bin2oh.helion
+helion ip show ip/h_timer_cap/h_timer_cap.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -100,6 +108,10 @@ helion project examples/ip_ingest/h_parity_ip.prj
 helion project examples/ip_ingest/h_hamming_ip.prj
 helion project examples/ip_ingest/h_rot_mm_ip.prj
 helion project examples/ip_ingest/h_mask_gen_ip.prj
+helion project examples/ip_ingest/h_absdiff_ip.prj
+helion project examples/ip_ingest/h_clamp_ip.prj
+helion project examples/ip_ingest/h_bin2oh_ip.prj
+helion project examples/ip_ingest/h_timer_cap_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion

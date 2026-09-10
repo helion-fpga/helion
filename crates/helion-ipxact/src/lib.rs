@@ -349,6 +349,51 @@ pub fn pack_mask_gen() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered absolute difference |a-b| on 32b (ip/h_absdiff). Not AXI.
+pub fn pack_absdiff() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_absdiff".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered clamp of 32b value to [lo,hi] (ip/h_clamp). Not AXI.
+pub fn pack_clamp() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_clamp".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered binary→onehot 4b→16b (ip/h_bin2oh). Not AXI.
+pub fn pack_bin2oh() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_bin2oh".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM free-run capture timer + sticky edge capture (ip/h_timer_cap). Not AXI.
+pub fn pack_timer_cap() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_timer_cap".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -382,6 +427,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_hamming(),
         pack_rot_mm(),
         pack_mask_gen(),
+        pack_absdiff(),
+        pack_clamp(),
+        pack_bin2oh(),
+        pack_timer_cap(),
     ]
 }
 
@@ -623,6 +672,30 @@ mod tests {
         assert_eq!(pack_hamming().vlnv(), "community:helion:h_hamming:1.0");
         assert_eq!(pack_rot_mm().vlnv(), "community:helion:h_rot_mm:1.0");
         assert_eq!(pack_mask_gen().vlnv(), "community:helion:h_mask_gen:1.0");
+        let ad = pack_absdiff();
+        assert_eq!(ad.name, "h_absdiff");
+        assert_eq!(ad.bus, "Helion-ST");
+        assert_ne!(ad.bus, "AXI");
+        let cl = pack_clamp();
+        assert_eq!(cl.name, "h_clamp");
+        assert_eq!(cl.bus, "Helion-ST");
+        assert_ne!(cl.bus, "AXI");
+        let b2 = pack_bin2oh();
+        assert_eq!(b2.name, "h_bin2oh");
+        assert_eq!(b2.bus, "Helion-ST");
+        assert_ne!(b2.bus, "AXI");
+        let tc = pack_timer_cap();
+        assert_eq!(tc.name, "h_timer_cap");
+        assert_eq!(tc.bus, "Helion-MM");
+        assert_ne!(tc.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_absdiff"));
+        assert!(cat.iter().any(|c| c.name == "h_clamp"));
+        assert!(cat.iter().any(|c| c.name == "h_bin2oh"));
+        assert!(cat.iter().any(|c| c.name == "h_timer_cap"));
+        assert_eq!(pack_absdiff().vlnv(), "community:helion:h_absdiff:1.0");
+        assert_eq!(pack_clamp().vlnv(), "community:helion:h_clamp:1.0");
+        assert_eq!(pack_bin2oh().vlnv(), "community:helion:h_bin2oh:1.0");
+        assert_eq!(pack_timer_cap().vlnv(), "community:helion:h_timer_cap:1.0");
     }
 }
 

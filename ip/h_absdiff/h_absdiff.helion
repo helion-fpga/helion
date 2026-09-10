@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered |a-b| on 32b
+format 1
+vlnv community:helion:h_absdiff:1.0
+bus Helion-ST
+top h_absdiff
+file h_absdiff.v
