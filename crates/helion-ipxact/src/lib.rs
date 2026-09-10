@@ -42,9 +42,20 @@ pub fn pack_rv32() -> IpCore {
     }
 }
 
+/// UG908-class ILA match-unit / trigger FSM (not AXI ILA).
+pub fn pack_ila_trig() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_ila_trig".into(),
+        version: "1.0".into(),
+        bus: "Helion-DBG".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
-    vec![pack_uart(), pack_gpio(), pack_rv32()]
+    vec![pack_uart(), pack_gpio(), pack_rv32(), pack_ila_trig()]
 }
 
 impl IpCore {
@@ -122,6 +133,10 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_uart"));
         assert!(cat.iter().any(|c| c.name == "h_gpio"));
         assert!(cat.iter().any(|c| c.name == "h_rv32_hb1"));
+        assert!(cat.iter().any(|c| c.name == "h_ila_trig"));
+        let trig = pack_ila_trig();
+        assert_eq!(trig.bus, "Helion-DBG");
+        assert_eq!(trig.vlnv(), "community:helion:h_ila_trig:1.0");
         assert!(cat.iter().all(|c| c.bus != "AXI"));
         assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
     }
