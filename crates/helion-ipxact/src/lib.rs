@@ -439,6 +439,51 @@ pub fn pack_pulse_ext() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered xorshift32 PRNG with seed/enable (ip/h_rng_xorshift). Not AXI.
+pub fn pack_rng_xorshift() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_rng_xorshift".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered 16→4 priority encoder + valid (ip/h_prio_enc). Not AXI.
+pub fn pack_prio_enc() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_prio_enc".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST 1-deep skid buffer valid/ready (ip/h_skid_buf). Not AXI.
+pub fn pack_skid_buf() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_skid_buf".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered 4-digit BCD incrementer + carry (ip/h_bcd_inc). Not AXI.
+pub fn pack_bcd_inc() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_bcd_inc".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -480,6 +525,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_addsub_mm(),
         pack_ones_comp(),
         pack_pulse_ext(),
+        pack_rng_xorshift(),
+        pack_prio_enc(),
+        pack_skid_buf(),
+        pack_bcd_inc(),
     ]
 }
 
@@ -769,6 +818,30 @@ mod tests {
         assert_eq!(pack_addsub_mm().vlnv(), "community:helion:h_addsub_mm:1.0");
         assert_eq!(pack_ones_comp().vlnv(), "community:helion:h_ones_comp:1.0");
         assert_eq!(pack_pulse_ext().vlnv(), "community:helion:h_pulse_ext:1.0");
+        let rng = pack_rng_xorshift();
+        assert_eq!(rng.name, "h_rng_xorshift");
+        assert_eq!(rng.bus, "Helion-ST");
+        assert_ne!(rng.bus, "AXI");
+        let penc = pack_prio_enc();
+        assert_eq!(penc.name, "h_prio_enc");
+        assert_eq!(penc.bus, "Helion-ST");
+        assert_ne!(penc.bus, "AXI");
+        let sk = pack_skid_buf();
+        assert_eq!(sk.name, "h_skid_buf");
+        assert_eq!(sk.bus, "Helion-ST");
+        assert_ne!(sk.bus, "AXI");
+        let bcd = pack_bcd_inc();
+        assert_eq!(bcd.name, "h_bcd_inc");
+        assert_eq!(bcd.bus, "Helion-ST");
+        assert_ne!(bcd.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_rng_xorshift"));
+        assert!(cat.iter().any(|c| c.name == "h_prio_enc"));
+        assert!(cat.iter().any(|c| c.name == "h_skid_buf"));
+        assert!(cat.iter().any(|c| c.name == "h_bcd_inc"));
+        assert_eq!(pack_rng_xorshift().vlnv(), "community:helion:h_rng_xorshift:1.0");
+        assert_eq!(pack_prio_enc().vlnv(), "community:helion:h_prio_enc:1.0");
+        assert_eq!(pack_skid_buf().vlnv(), "community:helion:h_skid_buf:1.0");
+        assert_eq!(pack_bcd_inc().vlnv(), "community:helion:h_bcd_inc:1.0");
     }
 }
 
