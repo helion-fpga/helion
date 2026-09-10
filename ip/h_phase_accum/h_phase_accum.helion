@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST NCO phase accumulator
+format 1
+vlnv community:helion:h_phase_accum:1.0
+bus Helion-ST
+top h_phase_accum
+file h_phase_accum.v
