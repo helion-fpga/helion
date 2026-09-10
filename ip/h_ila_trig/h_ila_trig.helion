@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — UG908-class ILA match-unit / trigger FSM
+format 1
+vlnv community:helion:h_ila_trig:1.0
+bus Helion-DBG
+top h_ila_trig
+file h_ila_trig.v
