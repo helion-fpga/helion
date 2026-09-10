@@ -25,6 +25,8 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_spi_mm` | Helion-MM | SPI master bit-engine (clk-div/shift/busy) |
 | `h_debounce` | Helion-ST | N-stage shift-reg debounce, stable out |
 | `h_clkdiv` | Helion-ST | Programmable clock divider (loadable div/en/out) |
+| `h_edge_det` | Helion-ST | Rising/falling edge detect, sticky status + clear |
+| `h_watchdog` | Helion-MM | Loadable countdown watchdog, enable/timeout/pet |
 
 ## Use
 
@@ -35,13 +37,17 @@ helion ip show ip/h_timer/h_timer.helion
 helion ip show ip/h_pwm/h_pwm.helion
 helion ip show ip/h_debounce/h_debounce.helion
 helion ip show ip/h_clkdiv/h_clkdiv.helion
+helion ip show ip/h_edge_det/h_edge_det.helion
+helion ip show ip/h_watchdog/h_watchdog.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
 helion project examples/ip_ingest/h_debounce_ip.prj
 helion project examples/ip_ingest/h_clkdiv_ip.prj
+helion project examples/ip_ingest/h_edge_det_ip.prj
+helion project examples/ip_ingest/h_watchdog_ip.prj
 # in a .prj:
-#   read_ip ip/h_pwm/h_pwm.helion
+#   read_ip ip/h_watchdog/h_watchdog.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
