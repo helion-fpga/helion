@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM threshold/compare + sticky match
+format 1
+vlnv community:helion:h_compare_mm:1.0
+bus Helion-MM
+top h_compare_mm
+file h_compare_mm.v
