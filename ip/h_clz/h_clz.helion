@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered 32b count-leading-zeros
+format 1
+vlnv community:helion:h_clz:1.0
+bus Helion-ST
+top h_clz
+file h_clz.v

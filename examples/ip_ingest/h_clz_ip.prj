@@ -1,0 +1,5 @@
+# Ingest Helion-ST CLZ via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_clz/h_clz.helion
+read_xdc examples/ip_ingest/h_clz.sdc
+top h_clz

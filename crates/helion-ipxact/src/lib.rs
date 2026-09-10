@@ -235,6 +235,29 @@ pub fn pack_compare_mm() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered 32b count-leading-zeros (ip/h_clz). Not AXI.
+pub fn pack_clz() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_clz".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered endian byte-reverse 32b↔bytes (ip/h_byte_rev). Not AXI.
+pub fn pack_byte_rev() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_byte_rev".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -258,6 +281,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_saturate(),
         pack_shift_reg(),
         pack_compare_mm(),
+        pack_clz(),
+        pack_byte_rev(),
     ]
 }
 
@@ -439,6 +464,18 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_compare_mm"));
         assert_eq!(pack_shift_reg().vlnv(), "community:helion:h_shift_reg:1.0");
         assert_eq!(pack_compare_mm().vlnv(), "community:helion:h_compare_mm:1.0");
+        let clz = pack_clz();
+        assert_eq!(clz.name, "h_clz");
+        assert_eq!(clz.bus, "Helion-ST");
+        assert_ne!(clz.bus, "AXI");
+        let brev = pack_byte_rev();
+        assert_eq!(brev.name, "h_byte_rev");
+        assert_eq!(brev.bus, "Helion-ST");
+        assert_ne!(brev.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_clz"));
+        assert!(cat.iter().any(|c| c.name == "h_byte_rev"));
+        assert_eq!(pack_clz().vlnv(), "community:helion:h_clz:1.0");
+        assert_eq!(pack_byte_rev().vlnv(), "community:helion:h_byte_rev:1.0");
     }
 }
 
