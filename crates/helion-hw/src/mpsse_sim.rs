@@ -18,7 +18,7 @@ use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_fabric::Stat;
 
-use crate::{Tap, TapState, IR_CFG_W, IR_IDCODE, IR_STAT};
+use crate::{Tap, TapState, IR_CFG_W, IR_IDCODE, IR_STAT, IR_USR1};
 
 /// Error from the sim bitbang harness (never pretends to be USB I/O failure).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +71,10 @@ impl FtdiBitbangSim {
 
     pub fn tap(&self) -> &Tap {
         &self.tap
+    }
+
+    pub fn tap_mut(&mut self) -> &mut Tap {
+        &mut self.tap
     }
 
     fn require_open(&self) -> Result<(), MpsseSimError> {
@@ -176,6 +180,44 @@ impl FtdiBitbangSim {
         debug_assert_eq!(self.tap.state, TapState::Exit1Dr);
         self.exit_update_idle();
         Ok(scanned)
+    }
+
+    /// Bitbang one 64-bit DR shift (LSB first) — used for `IR_USR1` capture-RAM upload.
+    pub fn shift_dr_u64(&mut self, val: u64) -> Result<u64, MpsseSimError> {
+        self.require_open()?;
+        self.enter_shift_dr();
+        let mut scanned = 0u64;
+        for i in 0..64 {
+            let tdi = ((val >> i) & 1) != 0;
+            let last = i == 63;
+            let tdo = self.tap.tick(last, tdi);
+            if tdo {
+                scanned |= 1u64 << i;
+            }
+        }
+        debug_assert_eq!(self.tap.state, TapState::Exit1Dr);
+        self.exit_update_idle();
+        Ok(scanned)
+    }
+
+    /// `IR_USR1` pointer set + N word upload from fabric BRAM (sim bitbang path).
+    pub fn usr1_upload_bram(
+        &mut self,
+        major: u16,
+        start: u32,
+        n: usize,
+        wrap: u32,
+    ) -> Result<Vec<u64>, MpsseSimError> {
+        self.require_open()?;
+        let wrap = if wrap == 0 { n as u32 } else { wrap };
+        let _ = self.shift_ir(IR_USR1)?;
+        let cmd = crate::Tap::usr1_ptr_cmd(major, start % wrap, wrap);
+        let _ = self.shift_dr_u64(cmd)?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.shift_dr_u64(0)?);
+        }
+        Ok(out)
     }
 
     /// Open-path helper: shift `IR_IDCODE`, then scan 32-bit DR.
@@ -382,6 +424,20 @@ mod tests {
         // Fabric must remain unconfigured (RESET) — no fake DONE.
         assert!(!bb.tap().fabric().stat.done);
         assert_eq!(bb.read_stat_word().unwrap(), Stat::RESET_WORD);
+    }
+
+    #[test]
+    fn usr1_bitbang_uploads_bram_capture_ram() {
+        use helion_device::Device;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut bb = FtdiBitbangSim::new(&dev);
+        bb.open().unwrap();
+        bb.tap_mut().fabric_mut().bram_write_word(0, 0, 0x1);
+        bb.tap_mut().fabric_mut().bram_write_word(0, 1, 0x2);
+        bb.tap_mut().fabric_mut().bram_write_word(0, 2, 0x4);
+        let words = bb.usr1_upload_bram(0, 0, 3, 3).unwrap();
+        assert_eq!(words, vec![1, 2, 4]);
+        assert_eq!(bb.tap().ir, IR_USR1);
     }
 
     #[test]
