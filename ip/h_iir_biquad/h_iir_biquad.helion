@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST DF1 biquad step
+format 1
+vlnv community:helion:h_iir_biquad:1.0
+bus Helion-ST
+top h_iir_biquad
+file h_iir_biquad.v

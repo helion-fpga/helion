@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST single MAC FIR tap
+format 1
+vlnv community:helion:h_fir_tap:1.0
+bus Helion-ST
+top h_fir_tap
+file h_fir_tap.v

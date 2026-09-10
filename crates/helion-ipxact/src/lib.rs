@@ -563,6 +563,51 @@ pub fn pack_cordic_step() -> IpCore {
     }
 }
 
+
+/// Helion-ST NCO phase accumulator with freq word + MSB carrier (ip/h_phase_accum). Not AXI.
+pub fn pack_phase_accum() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_phase_accum".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST single MAC FIR tap, registered acc += x*coeff (ip/h_fir_tap). Not AXI.
+pub fn pack_fir_tap() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_fir_tap".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST DF1 biquad step with small coeffs (ip/h_iir_biquad). Not AXI.
+pub fn pack_iir_biquad() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_iir_biquad".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST 2FF toggle-pulse CDC synchronizer (ip/h_cdc_pulse). Not AXI / not XPM.
+pub fn pack_cdc_pulse() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_cdc_pulse".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -615,6 +660,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_div_restoring(),
         pack_sqrt_digit(),
         pack_cordic_step(),
+        pack_phase_accum(),
+        pack_fir_tap(),
+        pack_iir_biquad(),
+        pack_cdc_pulse(),
     ]
 }
 
@@ -972,6 +1021,30 @@ mod tests {
         assert_eq!(pack_div_restoring().vlnv(), "community:helion:h_div_restoring:1.0");
         assert_eq!(pack_sqrt_digit().vlnv(), "community:helion:h_sqrt_digit:1.0");
         assert_eq!(pack_cordic_step().vlnv(), "community:helion:h_cordic_step:1.0");
+        let pa = pack_phase_accum();
+        assert_eq!(pa.name, "h_phase_accum");
+        assert_eq!(pa.bus, "Helion-ST");
+        assert_ne!(pa.bus, "AXI");
+        let ft = pack_fir_tap();
+        assert_eq!(ft.name, "h_fir_tap");
+        assert_eq!(ft.bus, "Helion-ST");
+        assert_ne!(ft.bus, "AXI");
+        let iir = pack_iir_biquad();
+        assert_eq!(iir.name, "h_iir_biquad");
+        assert_eq!(iir.bus, "Helion-ST");
+        assert_ne!(iir.bus, "AXI");
+        let cdc = pack_cdc_pulse();
+        assert_eq!(cdc.name, "h_cdc_pulse");
+        assert_eq!(cdc.bus, "Helion-ST");
+        assert_ne!(cdc.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_phase_accum"));
+        assert!(cat.iter().any(|c| c.name == "h_fir_tap"));
+        assert!(cat.iter().any(|c| c.name == "h_iir_biquad"));
+        assert!(cat.iter().any(|c| c.name == "h_cdc_pulse"));
+        assert_eq!(pack_phase_accum().vlnv(), "community:helion:h_phase_accum:1.0");
+        assert_eq!(pack_fir_tap().vlnv(), "community:helion:h_fir_tap:1.0");
+        assert_eq!(pack_iir_biquad().vlnv(), "community:helion:h_iir_biquad:1.0");
+        assert_eq!(pack_cdc_pulse().vlnv(), "community:helion:h_cdc_pulse:1.0");
     }
 }
 
