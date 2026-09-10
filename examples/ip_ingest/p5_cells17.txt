@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #17 — h_phase_accum + h_fir_tap + h_iir_biquad + h_cdc_pulse via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_phase_accum_ip.prj
+synth_design h_phase_accum cells=342 luts=311
+project examples/ip_ingest/h_phase_accum_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_phase_accum xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=311 WNS_PS=9620 frames=214
+# Instantiated IP: community:helion:h_phase_accum:1.0 (Helion-ST)
+# cells=342 luts=311 lutffs=311  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_fir_tap_ip.prj
+synth_design h_fir_tap cells=370 luts=323
+project examples/ip_ingest/h_fir_tap_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_fir_tap xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=323 WNS_PS=9600 frames=217
+# Instantiated IP: community:helion:h_fir_tap:1.0 (Helion-ST)
+# cells=370 luts=323 lutffs=323  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_iir_biquad_ip.prj
+synth_design h_iir_biquad cells=388 luts=244
+project examples/ip_ingest/h_iir_biquad_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_iir_biquad xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=244 WNS_PS=9100 frames=181
+# Instantiated IP: community:helion:h_iir_biquad:1.0 (Helion-ST)
+# cells=388 luts=244 lutffs=244  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_cdc_pulse_ip.prj
+synth_design h_cdc_pulse cells=18 luts=9
+project examples/ip_ingest/h_cdc_pulse_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_cdc_pulse xdc_files=1 create_clock=2 PACKAGE_PIN=0 lutffs=9 WNS_PS=9660 frames=10
+# Instantiated IP: community:helion:h_cdc_pulse:1.0 (Helion-ST)
+# cells=18 luts=9 lutffs=9  (>0 real fabric)

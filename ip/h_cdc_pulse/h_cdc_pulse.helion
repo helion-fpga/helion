@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST 2FF toggle-pulse CDC
+format 1
+vlnv community:helion:h_cdc_pulse:1.0
+bus Helion-ST
+top h_cdc_pulse
+file h_cdc_pulse.v

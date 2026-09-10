@@ -65,6 +65,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_div_restoring` | Helion-ST | Restoring divider step engine (registered quot/rem) |
 | `h_sqrt_digit` | Helion-ST | Digit-by-digit integer sqrt step (registered) |
 | `h_cordic_step` | Helion-ST | One CORDIC rotation step (registered x/y/z) |
+| `h_phase_accum` | Helion-ST | NCO phase accumulator (freq word + MSB carrier) |
+| `h_fir_tap` | Helion-ST | Single MAC FIR tap (registered acc += x*coeff) |
+| `h_iir_biquad` | Helion-ST | DF1 biquad step (registered, small coeffs) |
+| `h_cdc_pulse` | Helion-ST | 2FF toggle-pulse CDC synchronizer (Helion-native) |
 
 ## Use
 
@@ -115,6 +119,10 @@ helion ip show ip/h_uart_rx/h_uart_rx.helion
 helion ip show ip/h_div_restoring/h_div_restoring.helion
 helion ip show ip/h_sqrt_digit/h_sqrt_digit.helion
 helion ip show ip/h_cordic_step/h_cordic_step.helion
+helion ip show ip/h_phase_accum/h_phase_accum.helion
+helion ip show ip/h_fir_tap/h_fir_tap.helion
+helion ip show ip/h_iir_biquad/h_iir_biquad.helion
+helion ip show ip/h_cdc_pulse/h_cdc_pulse.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -160,6 +168,10 @@ helion project examples/ip_ingest/h_uart_rx_ip.prj
 helion project examples/ip_ingest/h_div_restoring_ip.prj
 helion project examples/ip_ingest/h_sqrt_digit_ip.prj
 helion project examples/ip_ingest/h_cordic_step_ip.prj
+helion project examples/ip_ingest/h_phase_accum_ip.prj
+helion project examples/ip_ingest/h_fir_tap_ip.prj
+helion project examples/ip_ingest/h_iir_biquad_ip.prj
+helion project examples/ip_ingest/h_cdc_pulse_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -194,6 +206,14 @@ helion project examples/ip_ingest/h_cordic_step_ip.prj
 #   read_ip ip/h_pwm_deadtime/h_pwm_deadtime.helion
 #   read_ip ip/h_lfsr16/h_lfsr16.helion
 #   read_ip ip/h_edge_cnt/h_edge_cnt.helion
+#   read_ip ip/h_uart_rx/h_uart_rx.helion
+#   read_ip ip/h_div_restoring/h_div_restoring.helion
+#   read_ip ip/h_sqrt_digit/h_sqrt_digit.helion
+#   read_ip ip/h_cordic_step/h_cordic_step.helion
+#   read_ip ip/h_phase_accum/h_phase_accum.helion
+#   read_ip ip/h_fir_tap/h_fir_tap.helion
+#   read_ip ip/h_iir_biquad/h_iir_biquad.helion
+#   read_ip ip/h_cdc_pulse/h_cdc_pulse.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
