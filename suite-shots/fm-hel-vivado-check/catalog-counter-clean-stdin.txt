@@ -1,0 +1,18 @@
+helion-ide 1.1.1
+target aarch64-apple-darwin
+part HL10T-C32-1
+stdin Tcl console + flow rail. `help` for commands, `quit` to exit.
+synth counter cells 9 luts 4
+opt removed 0 dead LUTFF
+place_design sites 4
+route_design hops 1
+reports n=9 complete=7
+NAME=report_timing_summary CATEGORY=Timing STATUS=Complete SUMMARY=WNS_PS=9640 TNS_PS=0 default period, not user SDC TCL=report_timing_summary
+NAME=report_clock_interaction CATEGORY=Timing STATUS=Complete SUMMARY=clocks=1 cells=1 TCL=report_clock_interaction
+NAME=report_cdc CATEGORY=Timing STATUS=Complete SUMMARY=critical=0 warning=0 info=0 safe=0 TCL=report_cdc
+NAME=report_clock_networks CATEGORY=Timing STATUS=Complete SUMMARY=loads=4 buffers=1 INSERTION_PS=40 TCL=report_clock_networks
+NAME=report_power CATEGORY=Implementation STATUS=Complete SUMMARY=TOTAL_UW=14119 STATIC_UW=8719 DYNAMIC_UW=5400 VOLTAGE_MV=1000 TCL=report_power
+NAME=report_methodology CATEGORY=Implementation STATUS=Warnings SUMMARY=checks=2 errors=0 warning=2 TCL=report_methodology
+NAME=report_drc CATEGORY=Implementation STATUS=Complete SUMMARY=violations=0 errors=0 TCL=report_drc
+NAME=report_utilization CATEGORY=Implementation STATUS=Complete SUMMARY=LUTFF=4/8192 IOB=1/32 TCL=report_utilization
+NAME=report_bitstream CATEGORY=Program STATUS=Not generated SUMMARY=- TCL=report_bitstream
