@@ -510,6 +510,12 @@ fn cmd_bits(args: &[String]) {
         eprintln!("bitstream: {e}");
         std::process::exit(1);
     });
+    if c.bits.frames.is_empty() {
+        eprintln!(
+            "bitstream: empty/fake bitstream refused (no configured frames) — check design routed"
+        );
+        std::process::exit(1);
+    }
     if let Some(p) = out {
         std::fs::write(&p, &c.bits.packets).unwrap_or_else(|e| {
             eprintln!("write {p}: {e}");
