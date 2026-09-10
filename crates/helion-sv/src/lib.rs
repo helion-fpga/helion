@@ -980,6 +980,11 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
     if rtl.nbas.is_empty() {
         for (lhs, _bit, rhs) in &rtl.assigns {
             if rexpr_has_nested_arith(rhs) {
+                // bus + {zeros, wire bits} lowers via ripple_add_zpad — not a
+                // flatten_cap (Ibex fetch_fifo instr_addr_next).
+                if packed_add_zpad_wires(rhs, rtl).is_some() {
+                    continue;
+                }
                 return Some(lhs.clone());
             }
         }
@@ -3000,6 +3005,12 @@ fn care_mask(width: usize) -> u128 {
 }
 
 fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
+    // `'{default: '0}` — apostrophe before the brace (SV assignment pattern).
+    if matches!(p.peek(), Some(Tok::Sym('\'')))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym('{')))
+    {
+        p.bump(); // '
+    }
     if p.eat_sym('(') {
         let e = parse_rexpr(p)?;
         if !p.eat_sym(')') {
@@ -3020,7 +3031,23 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         return Ok(e);
     }
     // Concat `{a,b}` or replication `{N{expr}}` (fold `{N{1'b0}}` to Const zero).
+    // Assignment pattern `'{default: '0}` / `'{default: 0}` (Ibex ALU) is
+    // all-zeros, not a generate miss and not a LUT.
     if p.eat_sym('{') {
+        if p.eat_kw("default") {
+            if !p.eat_sym(':') {
+                return Err("default :".into());
+            }
+            let _ = parse_rexpr(p)?;
+            if !p.eat_sym('}') {
+                return Err("default }".into());
+            }
+            return Ok(RExpr::Const {
+                val: 0,
+                width: 1,
+                care: 1,
+            });
+        }
         let first = parse_rexpr(p)?;
         if p.eat_sym('{') {
             let inner = parse_rexpr(p)?;
@@ -3113,6 +3140,15 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
         }
         Some(Tok::Ident(s)) => {
             let name = s.clone();
+            // Ibex ALU: `$unsigned(a) + $unsigned(b)`. Value is the inner expr
+            // (unsigned/signed cast does not invent bits). Not a generate miss.
+            if (name == "$unsigned" || name == "$signed") && p.eat_sym('(') {
+                let inner = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("$cast )".into());
+                }
+                return Ok(inner);
+            }
             if name == "$clog2" && p.eat_sym('(') {
                 let arg = parse_rexpr(p)?;
                 if !p.eat_sym(')') {
@@ -3208,6 +3244,53 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                                     val: (v >> bit) & 1,
                                     width: 1,
                                     care: 1,
+                                });
+                            }
+                            // Packed multi-dim second select: `rdata_q[1][15:0]`
+                            // (Ibex fetch_fifo). Encode word<<16|lo in IndexPart base.
+                            if p.eat_sym('[') {
+                                let a = const_u(p)? as usize;
+                                if p.eat_sym(':') {
+                                    let b = const_u(p)? as usize;
+                                    if !p.eat_sym(']') {
+                                        return Err("]".into());
+                                    }
+                                    let hi = a.max(b);
+                                    let lo = a.min(b);
+                                    let w = hi.saturating_sub(lo).saturating_add(1).max(1);
+                                    let word = val as usize;
+                                    if word >= 0x1_0000 || lo >= 0x1_0000 {
+                                        return Err("word slice too large".into());
+                                    }
+                                    return Ok(RExpr::IndexPart {
+                                        name,
+                                        base: Box::new(RExpr::Const {
+                                            val: ((word as u128) << 16) | (lo as u128),
+                                            width: 32,
+                                            care: u128::MAX,
+                                        }),
+                                        width: w,
+                                        ascending: true,
+                                    });
+                                }
+                                if !p.eat_sym(']') {
+                                    return Err("]".into());
+                                }
+                                // `rdata_q[1][b]` single bit of word.
+                                let word = val as usize;
+                                let bit = a;
+                                if word >= 0x1_0000 || bit >= 0x1_0000 {
+                                    return Err("word bit too large".into());
+                                }
+                                return Ok(RExpr::IndexPart {
+                                    name,
+                                    base: Box::new(RExpr::Const {
+                                        val: ((word as u128) << 16) | (bit as u128),
+                                        width: 32,
+                                        care: u128::MAX,
+                                    }),
+                                    width: 1,
+                                    ascending: true,
                                 });
                             }
                             Ok(RExpr::Bit(name, val as usize))
@@ -4877,16 +4960,42 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 }
             }
             skip_logic(&mut p);
-            let w = p.width_opt().unwrap_or(1);
+            // Packed multi-dim before the port name (Ibex fetch_fifo rdata_q):
+            // `input logic [DEPTH-1:0][31:0] rdata_q` → width=32, depth=DEPTH.
+            let mut packed_dims: Vec<usize> = Vec::new();
+            while matches!(p.peek(), Some(Tok::Sym('['))) {
+                let save = p.i;
+                match p.width_opt() {
+                    Ok(w) => packed_dims.push(w.max(1)),
+                    Err(_) => {
+                        p.i = save;
+                        break;
+                    }
+                }
+            }
+            let (w, packed_depth) = match packed_dims.as_slice() {
+                [] => (1usize, 0usize),
+                [only] => (*only, 0usize),
+                dims => {
+                    let elem = *dims.last().unwrap();
+                    let outer = dims[..dims.len() - 1]
+                        .iter()
+                        .try_fold(1usize, |a, &b| a.checked_mul(b))
+                        .unwrap_or(0)
+                        .min(4096);
+                    (elem, outer)
+                }
+            };
             match p.ident() {
                 Ok(n) => {
                     ports.push((n.clone(), dir, w));
-                    let mut unpack_depth = 0usize;
+                    let mut unpack_depth = packed_depth;
                     // Peek unpacked dims before pushing the signal so depth is recorded.
                     // `host_addr_i [NrHosts]` / `[N-1:0]` — do not leave depth=0 and
                     // later treat word selects as packed bit muxes (Ibex bus wide_cone).
+                    // If packed multi-dim already set depth, keep it (do not overwrite).
                     let mut dims: Vec<usize> = Vec::new();
-                    while matches!(p.peek(), Some(Tok::Sym('['))) {
+                    while packed_depth == 0 && matches!(p.peek(), Some(Tok::Sym('['))) {
                         let save = p.i;
                         let _ = p.eat_sym('[');
                         if let Ok(a) = const_u(p) {
@@ -5327,12 +5436,31 @@ fn parse_module_items(
             // `reg name = expr` stays an initializer, not a comb assign.
             let net_assign = decl_kw != "reg";
             // `reg signed [W-1:0] mem[N:0]` — signed is a qualifier, not the name.
+            // Packed multi-dim before the name (Ibex fetch_fifo):
+            // `logic [DEPTH-1:0][31:0] rdata_q` → width=32, depth=DEPTH.
             skip_logic(p);
-            let w = match p.width_opt() {
-                Ok(w) => w,
-                Err(_) => {
-                    skip_to_semi(p);
-                    continue;
+            let mut packed_dims: Vec<usize> = Vec::new();
+            while matches!(p.peek(), Some(Tok::Sym('['))) {
+                let save = p.i;
+                match p.width_opt() {
+                    Ok(w) => packed_dims.push(w.max(1)),
+                    Err(_) => {
+                        p.i = save;
+                        break;
+                    }
+                }
+            }
+            let (w, mut depth) = match packed_dims.as_slice() {
+                [] => (1usize, 0usize),
+                [only] => (*only, 0usize),
+                dims => {
+                    let elem = *dims.last().unwrap();
+                    let outer = dims[..dims.len() - 1]
+                        .iter()
+                        .try_fold(1usize, |a, &b| a.checked_mul(b))
+                        .unwrap_or(0)
+                        .min(4096);
+                    (elem, outer)
                 }
             };
             let n = match p.ident() {
@@ -5342,8 +5470,7 @@ fn parse_module_items(
                     continue;
                 }
             };
-            let mut depth = 0usize;
-            if matches!(p.peek(), Some(Tok::Sym('['))) {
+            if depth == 0 && matches!(p.peek(), Some(Tok::Sym('['))) {
                 let save = p.i;
                 let _ = p.eat_sym('[');
                 if let (Ok(hi), true, Ok(lo), true) =
@@ -5397,7 +5524,7 @@ fn parse_module_items(
                         signals.push(Signal {
                             name: n2.clone(),
                             width: w,
-                            depth: 0,
+                            depth,
                             keep: *pending_keep,
                             mark_debug: *pending_md,
                         });
@@ -6184,14 +6311,25 @@ fn index_part_bit(
         }
         return Ok(Expr::Var(bit_name(name, wsrc, bit)));
     }
-    // Const word index of unpacked depth>1: one fixed word's packed bits.
+    // Const word index of unpacked/packed-multi-dim depth>1: one fixed
+    // word's packed bits. `name[w][hi:lo]` encodes base as (word<<16)|lo.
     if depth > 1 {
         if let RExpr::Const { val, .. } = base {
-            let word = *val as usize;
-            if bit >= wsrc {
+            let word = if *val >= 0x1_0000 {
+                (*val >> 16) as usize
+            } else {
+                *val as usize
+            };
+            let bit_lo = if *val >= 0x1_0000 {
+                (*val & 0xffff) as usize
+            } else {
+                0usize
+            };
+            let src = bit_lo.saturating_add(bit);
+            if src >= wsrc {
                 return Ok(Expr::Const(false));
             }
-            return Ok(Expr::Var(unpacked_word_q(name, word, wsrc, bit)));
+            return Ok(Expr::Var(unpacked_word_q(name, word, wsrc, src)));
         }
     }
     if bit >= part_w {
@@ -7931,6 +8069,225 @@ fn const_unpacked_word(rhs: &RExpr, rtl: &Rtl) -> Option<(String, usize)> {
     }
 }
 
+/// `bus[hi:lo] + {N'd0, w0, w1, ...}` / `bus + {N'd0, ...}`. Zero-padded
+/// wire addend of at most 8 low bits (Ibex fetch_fifo `instr_addr_next`).
+/// Returns (bus, bus_lo, bus_bits, low_bit_exprs).
+fn packed_add_zpad_wires(
+    rhs: &RExpr,
+    rtl: &Rtl,
+) -> Option<(String, usize, usize, Vec<RExpr>)> {
+    let RExpr::Add(a, b) = rhs else {
+        return None;
+    };
+    if expr_contains_mul(rhs) {
+        return None;
+    }
+    let (bus_e, pad_e) = match (a.as_ref(), b.as_ref()) {
+        (bus, RExpr::Concat(_)) => (bus, b.as_ref()),
+        (RExpr::Concat(_), bus) => (bus, a.as_ref()),
+        _ => return None,
+    };
+    let (bus, bus_lo, bus_bits) = match bus_e {
+        RExpr::Ident(s) if sig_depth(rtl, s) == 0 && name_known(rtl, s) => {
+            let w = sig_width(rtl, s);
+            if w == 0 || w > RIPPLE_ADD_MAX {
+                return None;
+            }
+            (s.clone(), 0usize, w)
+        }
+        RExpr::Range(s, lo, hi) if sig_depth(rtl, s) == 0 && name_known(rtl, s) && hi >= lo => {
+            let bits = (*hi - *lo).saturating_add(1);
+            if bits == 0 || bits > RIPPLE_ADD_MAX {
+                return None;
+            }
+            let sw = sig_width(rtl, s);
+            // `logic [31:1] q; q[31:1]` — full-span on a non-zero LSB decl
+            // uses IR bits 0..bits-1, not Verilog indices as IR offsets.
+            if bits == sw {
+                (s.clone(), 0usize, bits)
+            } else if *hi < sw {
+                (s.clone(), *lo, bits)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let RExpr::Concat(parts) = pad_e else {
+        return None;
+    };
+    // High parts must be zero consts; low parts are wire/not/bit leaves.
+    let mut zeros = 0usize;
+    let mut low: Vec<RExpr> = Vec::new();
+    let mut seen_wire = false;
+    for p in parts {
+        match p {
+            RExpr::Const { val: 0, width, .. } if !seen_wire => {
+                zeros = zeros.saturating_add(*width);
+            }
+            RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
+                seen_wire = true;
+                low.push(RExpr::Ident(s.clone()));
+            }
+            RExpr::Bit(s, i) if name_known(rtl, s) => {
+                seen_wire = true;
+                low.push(RExpr::Bit(s.clone(), *i));
+            }
+            RExpr::Not(x) => match x.as_ref() {
+                RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
+                    seen_wire = true;
+                    low.push(RExpr::Not(Box::new(RExpr::Ident(s.clone()))));
+                }
+                RExpr::Bit(s, i) if name_known(rtl, s) => {
+                    seen_wire = true;
+                    low.push(RExpr::Not(Box::new(RExpr::Bit(s.clone(), *i))));
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    if low.is_empty() || low.len() > 8 {
+        return None;
+    }
+    let _ = zeros;
+    // Concat is MSB-first; ripple addend bit 0 is the LSB of the pad.
+    low.reverse();
+    Some((bus, bus_lo, bus_bits, low))
+}
+
+fn emit_ripple_add_zpad_wires(
+    d: &mut Design,
+    rtl: &Rtl,
+    sum: &str,
+    width: usize,
+    bus: &str,
+    bus_lo: usize,
+    bus_bits: usize,
+    low: &[RExpr],
+) -> bool {
+    if width == 0 || width > RIPPLE_ADD_MAX || bus_bits == 0 || width != bus_bits {
+        return false;
+    }
+    if (0..bus_bits).any(|i| op_bit_net(rtl, bus, bus_lo + i).is_none()) {
+        return false;
+    }
+    // Materialize addend low bits as nets (Ident/Bit/Not).
+    let mut add_nets: Vec<Option<String>> = Vec::with_capacity(width);
+    for i in 0..width {
+        if i >= low.len() {
+            add_nets.push(None); // const 0
+            continue;
+        }
+        let net = format!("n_raz_{sum}_{i}a");
+        match &low[i] {
+            RExpr::Ident(s) => {
+                let w = sig_width(rtl, s);
+                let src = bit_name(s, w, 0);
+                emit_lut_pins(d, &format!("u_raz_{sum}_{i}a"), &net, lut6_buf(), &[(&src, "I0")]);
+                add_nets.push(Some(net));
+            }
+            RExpr::Bit(s, b) => {
+                let w = sig_width(rtl, s);
+                let src = bit_name(s, w, *b);
+                emit_lut_pins(d, &format!("u_raz_{sum}_{i}a"), &net, lut6_buf(), &[(&src, "I0")]);
+                add_nets.push(Some(net));
+            }
+            RExpr::Not(x) => {
+                let src = match x.as_ref() {
+                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), 0),
+                    RExpr::Bit(s, b) => bit_name(s, sig_width(rtl, s), *b),
+                    _ => return false,
+                };
+                emit_lut_pins(d, &format!("u_raz_{sum}_{i}a"), &net, lut6_inv(), &[(&src, "I0")]);
+                add_nets.push(Some(net));
+            }
+            _ => return false,
+        }
+    }
+    let mut cin: Option<String> = None;
+    for bit in 0..width {
+        let an = op_bit_net(rtl, bus, bus_lo + bit).unwrap();
+        let bn = add_nets[bit].clone();
+        let sum_net = bit_name(sum, width, bit);
+        let sum_cell = format!("u_raz_{sum}_{bit}s");
+        let cin_now = cin.clone();
+        let need_cout = bit + 1 < width;
+        let ok = match (bn.as_deref(), cin_now.as_deref()) {
+            (None, None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(&an, "I0")]);
+                cin = None;
+                true
+            }
+            (Some(bn), None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(&an, "I0"), (bn, "I1")]);
+                if need_cout {
+                    let cout = format!("n_raz_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &format!("u_raz_{sum}_{bit}c"),
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(&an, "I0"), (bn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+                true
+            }
+            (None, Some(cn)) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(&an, "I0"), (cn, "I1")]);
+                if need_cout {
+                    let cout = format!("n_raz_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &format!("u_raz_{sum}_{bit}c"),
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(&an, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+                true
+            }
+            (Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xor3(),
+                    &[(&an, "I0"), (bn, "I1"), (cn, "I2")],
+                );
+                if need_cout {
+                    let cout = format!("n_raz_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &format!("u_raz_{sum}_{bit}c"),
+                        &cout,
+                        lut6_maj3(),
+                        &[(&an, "I0"), (bn, "I1"), (cn, "I2")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+                true
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    eprintln!(
+        "synth_rtl ripple_add_zpad signal={sum} bits={width} addend_bits={}",
+        low.len()
+    );
+    true
+}
+
 fn packed_add_pair(rhs: &RExpr, rtl: &Rtl) -> Option<(String, String)> {
     let RExpr::Add(a, b) = rhs else {
         return None;
@@ -8040,6 +8397,10 @@ fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
 /// Each bit is a 1-bit full adder (a, b, cin), not one 64-PI cone.
 /// No clock, no Hff, not a MAC. `width` > 32 is refused by the caller
 /// so a shorter bus is not invented. Returns false if any bit is skipped.
+/// Max ripple width for named-bus add. Ibex ALU adder_result_ext is 34
+/// (33+33 with carry-out). Wider than this stays unlowered — do not invent.
+const RIPPLE_ADD_MAX: usize = 40;
+
 fn emit_ripple_add(
     d: &mut Design,
     rtl: &Rtl,
@@ -8048,24 +8409,46 @@ fn emit_ripple_add(
     a: &str,
     b: &str,
 ) -> bool {
-    if width == 0 || width > 32 {
+    if width == 0 || width > RIPPLE_ADD_MAX {
         return false;
     }
-    // A missing operand bit is a skip, not a zero-extended invented bus.
-    if (0..width).any(|bit| op_bit_net(rtl, a, bit).is_none() || op_bit_net(rtl, b, bit).is_none()) {
+    let aw = sig_width(rtl, a);
+    let bw = sig_width(rtl, b);
+    let op_w = aw.max(bw);
+    // Operand bits must exist. Sum may be op_w (truncate unused) or op_w+1
+    // (unsigned carry-out — Ibex `$unsigned(a)+$unsigned(b)` into [33:0]).
+    // Do not invent a shorter operand bus, and do not invent >1 carry bit.
+    if op_w == 0 || op_w > RIPPLE_ADD_MAX || width < op_w || width > op_w + 1 {
+        return false;
+    }
+    if (0..op_w).any(|bit| {
+        (bit < aw && op_bit_net(rtl, a, bit).is_none())
+            || (bit < bw && op_bit_net(rtl, b, bit).is_none())
+    }) {
         return false;
     }
     let mut cin: Option<String> = None;
-    for bit in 0..width {
-        let an = op_bit_net(rtl, a, bit);
-        let bn = op_bit_net(rtl, b, bit);
+    for bit in 0..op_w {
+        // Narrower operand zero-extends (unsigned); bits above declared width
+        // are const 0, not an invented wire.
+        let an = if bit < aw {
+            op_bit_net(rtl, a, bit)
+        } else {
+            None
+        };
+        let bn = if bit < bw {
+            op_bit_net(rtl, b, bit)
+        } else {
+            None
+        };
         let sum_net = bit_name(sum, width, bit);
         let sum_cell = format!("u_ra_{sum}_{bit}s");
         let cin_now = cin.clone();
+        let need_cout = bit + 1 < op_w || width == op_w + 1;
         let emitted = match (an.as_deref(), bn.as_deref(), cin_now.as_deref()) {
             (Some(an), Some(bn), None) => {
                 emit_lut_pins(d, &sum_cell, &sum_net, lut6_xor2(), &[(an, "I0"), (bn, "I1")]);
-                if bit + 1 < width {
+                if need_cout {
                     let cout = format!("n_ra_{sum}_{bit}c");
                     let cry_cell = format!("u_ra_{sum}_{bit}c");
                     emit_lut_pins(
@@ -8076,6 +8459,8 @@ fn emit_ripple_add(
                         &[(an, "I0"), (bn, "I1")],
                     );
                     cin = Some(cout);
+                } else {
+                    cin = None;
                 }
                 true
             }
@@ -8087,7 +8472,7 @@ fn emit_ripple_add(
                     lut6_xor3(),
                     &[(an, "I0"), (bn, "I1"), (cn, "I2")],
                 );
-                if bit + 1 < width {
+                if need_cout {
                     let cout = format!("n_ra_{sum}_{bit}c");
                     let cry_cell = format!("u_ra_{sum}_{bit}c");
                     emit_lut_pins(
@@ -8098,13 +8483,97 @@ fn emit_ripple_add(
                         &[(an, "I0"), (bn, "I1"), (cn, "I2")],
                     );
                     cin = Some(cout);
+                } else {
+                    cin = None;
                 }
                 true
             }
-            _ => false,
+            // Zero-extended high bit of the narrower operand: FA with a 0.
+            (None, Some(bn), None) => {
+                // sum = b, cout = 0
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(bn, "I0")]);
+                cin = None;
+                true
+            }
+            (Some(an), None, None) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(an, "I0")]);
+                cin = None;
+                true
+            }
+            (None, Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xor2(),
+                    &[(bn, "I0"), (cn, "I1")],
+                );
+                if need_cout {
+                    let cout = format!("n_ra_{sum}_{bit}c");
+                    let cry_cell = format!("u_ra_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(bn, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+                true
+            }
+            (Some(an), None, Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum_net,
+                    lut6_xor2(),
+                    &[(an, "I0"), (cn, "I1")],
+                );
+                if need_cout {
+                    let cout = format!("n_ra_{sum}_{bit}c");
+                    let cry_cell = format!("u_ra_{sum}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+                true
+            }
+            (None, None, Some(cn)) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(cn, "I0")]);
+                cin = None;
+                true
+            }
+            (None, None, None) => {
+                // 0+0 with no cin: sum bit tied low via empty AND (O=0).
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_const(false), &[]);
+                cin = None;
+                true
+            }
         };
         if !emitted {
             return false;
+        }
+    }
+    if width == op_w + 1 {
+        let sum_net = bit_name(sum, width, op_w);
+        let sum_cell = format!("u_ra_{sum}_{op_w}s");
+        match cin.as_deref() {
+            Some(cn) => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_buf(), &[(cn, "I0")]);
+            }
+            None => {
+                emit_lut_pins(d, &sum_cell, &sum_net, lut6_const(false), &[]);
+            }
         }
     }
     eprintln!("synth_rtl ripple_add signal={sum} bits={width}");
@@ -9261,15 +9730,33 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 }
             }
         }
-        // width<=32 `assign sum = a + b` of two named buses is a ripple of
-        // 1-bit full adders, not one 64-PI cone and not a MAC. No clock.
-        // Wider than 32 stays unlowered — do not invent a shorter bus, and
-        // do not walk the expression tree. A skipped bit stays incomplete.
+        // `bus[hi:lo] + {zeros, wire bits}` (Ibex instr_addr_next): ripple
+        // with a small zero-padded wire addend, not a 31-PI wide_cone.
+        if bit.is_none() {
+            if let Some((bus, bus_lo, bus_bits, low)) = packed_add_zpad_wires(rhs, rtl) {
+                if rexpr_unknown_name(rhs, rtl).is_none() {
+                    let w = sig_width(rtl, lhs).max(1);
+                    if w > RIPPLE_ADD_MAX
+                        || !emit_ripple_add_zpad_wires(
+                            &mut d, rtl, lhs, w, &bus, bus_lo, bus_bits, &low,
+                        )
+                    {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                    }
+                    continue;
+                }
+            }
+        }
+        // width<=RIPPLE_ADD_MAX `assign sum = a + b` of two named buses is a
+        // ripple of 1-bit full adders, not one 64-PI cone and not a MAC.
+        // Wider stays unlowered — do not invent a shorter bus.
         if bit.is_none() {
             if let Some((a_name, b_name)) = packed_add_pair(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > 32 || !emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name) {
+                    if w > RIPPLE_ADD_MAX
+                        || !emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name)
+                    {
                         note_assign_not_lowered(&rtl.module, lhs);
                     }
                     continue;
@@ -12762,9 +13249,10 @@ endmodule
     }
 
     #[test]
-    fn comb_named_bus_add_wider_than_32_is_not_invented() {
+    fn comb_named_bus_add_wider_than_ripple_max_is_not_invented() {
+        // RIPPLE_ADD_MAX=40 covers Ibex 33+33→34; 48 stays unlowered.
         let src = r#"
-module WideAdd(input [33:0] a, input [33:0] b, output [33:0] sum);
+module WideAdd(input [47:0] a, input [47:0] b, output [47:0] sum);
   assign sum = a + b;
 endmodule
 "#;
@@ -12773,9 +13261,114 @@ endmodule
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert!(
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
-            "width>32 must not invent a shorter adder"
+            "width>RIPPLE_ADD_MAX must not invent a shorter adder"
         );
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+    }
+
+    #[test]
+    fn unsigned_cast_adder_ext_is_ripple_with_carry_out() {
+        // Ibex ALU: `$unsigned(a)+$unsigned(b)` into [33:0] from [32:0] operands.
+        let src = r#"
+module alu_add_ext(input logic [32:0] adder_in_a,
+                   input logic [32:0] adder_in_b,
+                   output logic [33:0] adder_result_ext_o);
+  assign adder_result_ext_o = $unsigned(adder_in_a) + $unsigned(adder_in_b);
+endmodule
+"#;
+        let d = synth_sv(src, "alu_add_ext.sv").expect("alu_add_ext");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 33, "33-bit ripple + carry-out, luts={luts}");
+        let cout = d.nets.iter().any(|n| {
+            n.name == "adder_result_ext_o_33" && n.endpoints.iter().any(|e| e.pin == "O")
+        });
+        assert!(cout, "carry-out bit 33 must be driven");
+    }
+
+    #[test]
+    fn instr_addr_next_zpad_wires_is_ripple_not_wide_cone() {
+        // Ibex fetch_fifo: instr_addr_q[31:1] + {29'd0, ~incr, incr}.
+        let src = r#"
+module instr_next(input logic [31:1] instr_addr_q,
+                  input logic addr_incr_two,
+                  output logic [31:1] instr_addr_next);
+  assign instr_addr_next = (instr_addr_q[31:1] +
+                            {29'd0,~addr_incr_two,addr_incr_two});
+endmodule
+"#;
+        let d = synth_sv(src, "instr_next.sv").expect("instr_next");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 30, "31-bit ripple with 2-bit addend, luts={luts}");
+    }
+
+    #[test]
+    fn packed_multidim_word_slice_lowers_not_generate() {
+        // Ibex fetch_fifo: `rdata_q[1][15:0]` double index on packed multi-dim.
+        let src = r#"
+module fetch_unaligned(input logic [2:0][31:0] rdata_q,
+                       input logic [31:0] in_rdata_i,
+                       input logic valid_q_1,
+                       output logic [31:0] rdata_unaligned);
+  assign rdata_unaligned = valid_q_1 ? {rdata_q[1][15:0], in_rdata_i[31:16]} :
+                                       {in_rdata_i[15:0], in_rdata_i[31:16]};
+endmodule
+"#;
+        let d = synth_sv(src, "fetch_unaligned.sv").expect("fetch_unaligned");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "word slice mux must map LUTs, cells={}",
+            d.cells.len()
+        );
+    }
+
+    #[test]
+    fn assignment_pattern_default_zero_is_not_generate() {
+        let src = r#"
+module pat(input logic [3:0] a, output logic [3:0] q);
+  always_comb begin
+    q = '{default: '0};
+    q = a;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "pat.sv").expect("pat");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+    }
+
+    #[test]
+    fn packed_multidim_fifo_word_mux_lowers() {
+        // Ibex fetch_fifo: `logic [DEPTH-1:0][31:0] rdata_q` + mux word select.
+        let src = r#"
+module fetch_word(input logic [2:0] valid_q,
+                  input logic [2:0][31:0] rdata_q,
+                  input logic [31:0] in_rdata_i,
+                  output logic [31:0] rdata);
+  assign rdata = valid_q[0] ? rdata_q[0] : in_rdata_i;
+endmodule
+"#;
+        let d = synth_sv(src, "fetch_word.sv").expect("fetch_word");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "rdata mux over packed multi-dim word must map LUTs, cells={}",
+            d.cells.len()
+        );
     }
 
     #[test]
