@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #18 — h_crc8 + h_spi_slave + h_quad_enc + h_pwm_center via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_crc8_ip.prj
+synth_design h_crc8 cells=211 luts=205
+project examples/ip_ingest/h_crc8_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_crc8 xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=205 WNS_PS=9680 frames=121
+# Instantiated IP: community:helion:h_crc8:1.0 (Helion-ST)
+# cells=211 luts=205 lutffs=205  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_spi_slave_ip.prj
+synth_design h_spi_slave cells=283 luts=272
+project examples/ip_ingest/h_spi_slave_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_spi_slave xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=272 WNS_PS=9680 frames=177
+# Instantiated IP: community:helion:h_spi_slave:1.0 (Helion-MM)
+# cells=283 luts=272 lutffs=272  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_quad_enc_ip.prj
+synth_design h_quad_enc cells=185 luts=178
+project examples/ip_ingest/h_quad_enc_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_quad_enc xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=178 WNS_PS=9620 frames=142
+# Instantiated IP: community:helion:h_quad_enc:1.0 (Helion-ST)
+# cells=185 luts=178 lutffs=178  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_pwm_center_ip.prj
+synth_design h_pwm_center cells=239 luts=224
+project examples/ip_ingest/h_pwm_center_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_pwm_center xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=224 WNS_PS=9680 frames=138
+# Instantiated IP: community:helion:h_pwm_center:1.0 (Helion-ST)
+# cells=239 luts=224 lutffs=224  (>0 real fabric)

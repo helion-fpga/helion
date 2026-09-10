@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST quadrature decoder
+format 1
+vlnv community:helion:h_quad_enc:1.0
+bus Helion-ST
+top h_quad_enc
+file h_quad_enc.v

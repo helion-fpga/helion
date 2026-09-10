@@ -608,6 +608,51 @@ pub fn pack_cdc_pulse() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered CRC-8 poly 0x07 byte-serial (ip/h_crc8). Not AXI.
+pub fn pack_crc8() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_crc8".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM SPI slave shift+sticky byte (ip/h_spi_slave). Not AXI SPI.
+pub fn pack_spi_slave() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_spi_slave".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Helion-ST quadrature decoder count up/down (ip/h_quad_enc). Not AXI.
+pub fn pack_quad_enc() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_quad_enc".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST center-aligned PWM up/down triangle (ip/h_pwm_center). Not AXI.
+pub fn pack_pwm_center() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_pwm_center".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -664,6 +709,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_fir_tap(),
         pack_iir_biquad(),
         pack_cdc_pulse(),
+        pack_crc8(),
+        pack_spi_slave(),
+        pack_quad_enc(),
+        pack_pwm_center(),
     ]
 }
 
@@ -1045,6 +1094,30 @@ mod tests {
         assert_eq!(pack_fir_tap().vlnv(), "community:helion:h_fir_tap:1.0");
         assert_eq!(pack_iir_biquad().vlnv(), "community:helion:h_iir_biquad:1.0");
         assert_eq!(pack_cdc_pulse().vlnv(), "community:helion:h_cdc_pulse:1.0");
+        let c8 = pack_crc8();
+        assert_eq!(c8.name, "h_crc8");
+        assert_eq!(c8.bus, "Helion-ST");
+        assert_ne!(c8.bus, "AXI");
+        let ss = pack_spi_slave();
+        assert_eq!(ss.name, "h_spi_slave");
+        assert_eq!(ss.bus, "Helion-MM");
+        assert_ne!(ss.bus, "AXI");
+        let qe = pack_quad_enc();
+        assert_eq!(qe.name, "h_quad_enc");
+        assert_eq!(qe.bus, "Helion-ST");
+        assert_ne!(qe.bus, "AXI");
+        let pc = pack_pwm_center();
+        assert_eq!(pc.name, "h_pwm_center");
+        assert_eq!(pc.bus, "Helion-ST");
+        assert_ne!(pc.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_crc8"));
+        assert!(cat.iter().any(|c| c.name == "h_spi_slave"));
+        assert!(cat.iter().any(|c| c.name == "h_quad_enc"));
+        assert!(cat.iter().any(|c| c.name == "h_pwm_center"));
+        assert_eq!(pack_crc8().vlnv(), "community:helion:h_crc8:1.0");
+        assert_eq!(pack_spi_slave().vlnv(), "community:helion:h_spi_slave:1.0");
+        assert_eq!(pack_quad_enc().vlnv(), "community:helion:h_quad_enc:1.0");
+        assert_eq!(pack_pwm_center().vlnv(), "community:helion:h_pwm_center:1.0");
     }
 }
 
