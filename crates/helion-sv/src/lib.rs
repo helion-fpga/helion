@@ -938,6 +938,39 @@ fn rexpr_has_nested_arith(e: &RExpr) -> bool {
     }
 }
 
+/// Wire/concat/mux tree: Ident/Const/Bit/Range, Concat of those, Mux of those,
+/// Not/Eq/Ne/And/Or used as case selects. Ibex `adder_in_a` / `result_o` /
+/// compressed `instr_o`. Or/And of Concat (decode_in leftover) and Add/Sub
+/// stay out — those hang in bit-blast.
+fn rexpr_is_wire_mux_form(e: &RExpr) -> bool {
+    match e {
+        RExpr::Ident(_) | RExpr::Const { .. } | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => true,
+        RExpr::Not(x) => rexpr_is_wire_mux_form(x),
+        RExpr::Mux(c, t, f) => {
+            rexpr_is_wire_mux_form(c)
+                && rexpr_is_wire_mux_form(t)
+                && rexpr_is_wire_mux_form(f)
+        }
+        RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) => {
+            rexpr_is_wire_mux_form(a) && rexpr_is_wire_mux_form(b)
+        }
+        // Nested if/case boolean connectives. Or/And of Concat
+        // (decode_in `{data,data}|sreg`) still hangs — refuse Concat ops.
+        RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) => {
+            !matches!(a.as_ref(), RExpr::Concat(_))
+                && !matches!(b.as_ref(), RExpr::Concat(_))
+                && rexpr_is_wire_mux_form(a)
+                && rexpr_is_wire_mux_form(b)
+        }
+        // Const shift of a wire/concat leaf (normalize_nbas bit_extract).
+        RExpr::Shr(a, s) | RExpr::Ashr(a, s) => {
+            matches!(s.as_ref(), RExpr::Const { .. }) && rexpr_is_wire_mux_form(a)
+        }
+        RExpr::Concat(parts) => parts.iter().all(rexpr_is_wire_mux_form),
+        _ => false,
+    }
+}
+
 /// Name the signal whose post-flatten cone stalls, or None.
 /// 15011: nbas=0, assigns>=32, combo case expanded to per-bit mux assigns.
 /// 14777: nbas>=128 and a wide unpacked word (width>16) that var-index lower refuses.
@@ -964,6 +997,9 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
         }
         return Some("flatten".into());
     }
+    // Per-bit mux leftover (15011): Or/And/Xor-of-Concat case cones hang in
+    // bit-blast. Wire/concat mux trees (Ibex adder_in_a, compressed instr_o)
+    // lower via rexpr_to_bit — do not flatten_cap those.
     if rtl.nbas.is_empty() && rtl.assigns.len() >= 32 {
         let per_bit = rtl
             .assigns
@@ -973,7 +1009,7 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
         if per_bit >= 32 && rtl.assigns.iter().any(|(_, _, rhs)| rexpr_has_mux(rhs)) {
             let mut counts: HashMap<String, usize> = HashMap::new();
             for (lhs, bit, rhs) in &rtl.assigns {
-                if bit.is_some() && rexpr_has_mux(rhs) {
+                if bit.is_some() && rexpr_has_mux(rhs) && !rexpr_is_wire_mux_form(rhs) {
                     *counts.entry(lhs.clone()).or_insert(0) += 1;
                 }
             }
@@ -1884,9 +1920,10 @@ fn assemble_module(
         // Cap is hierarchy stitch budget (not die/LUTFF capacity). Affinity still
         // soft-holds place at 8192; raising this lets deeper core children stitch
         // after if_stage/decode cones grow — prefer lowering over skipping them.
-        // Raised with deeper if_stage/LSU/ex cones (inside + scoped enum +
-        // const-minus). Affinity soft-hold stays 8192; this is stitch budget only.
-        if d.cells.len() >= 96_000 {
+        // Raised with wire-mux concat lowers (ALU result_o / compressed instr_o)
+        // after inside + scoped enum + const-minus. Affinity soft-hold stays
+        // 8192; this is stitch budget only — not die/LUTFF capacity.
+        if d.cells.len() >= 160_000 {
             note_skip(format!(
                 "diagnostic assemble_cap module={} inst={} child={} (hierarchy cap; not a LUT)",
                 name, inst.name, inst.module
@@ -12558,6 +12595,102 @@ endmodule
         let d = synth_sv(src, "nested_arith.v").expect("nested arith");
         assert_eq!(d.attrs.get("FLATTEN_CAP"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })));
+    }
+
+    #[test]
+    fn muxed_concat_adder_in_a_lowers_not_flatten_cap() {
+        // Ibex ALU prepare-operand-a: unique case of Concat/Ident, no nested Add.
+        let src = r#"
+module alu_prep(input logic multdiv_sel_i,
+                input logic shift1,
+                input logic [31:0] operand_a_i,
+                input logic [32:0] multdiv_operand_a_i,
+                output logic [32:0] adder_in_a);
+  always_comb begin
+    unique case (1'b1)
+      multdiv_sel_i: adder_in_a = multdiv_operand_a_i;
+      shift1:        adder_in_a = {operand_a_i[30:0],2'b01};
+      default:       adder_in_a = {operand_a_i,1'b1};
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "alu_prep.sv").expect("alu_prep");
+        assert_ne!(
+            d.attrs.get("FLATTEN_CAP"),
+            Some("1"),
+            "muxed concat must not flatten_cap"
+        );
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "adder_in_a muxed concat must map LUTs, cells={}",
+            d.cells.len()
+        );
+    }
+
+    #[test]
+    fn multivalue_case_result_mux_lowers_not_flatten_cap() {
+        // Ibex ALU result_o: multi-value arms → Or-of-Eq selects over Ident/Concat.
+        let src = r#"
+module alu_result(input logic [5:0] operator_i,
+                  input logic [31:0] bwlogic_result,
+                  input logic [31:0] adder_result,
+                  input logic cmp_result,
+                  output logic [31:0] result_o);
+  localparam logic [5:0] ALU_XOR = 6'd0;
+  localparam logic [5:0] ALU_OR  = 6'd1;
+  localparam logic [5:0] ALU_AND = 6'd2;
+  localparam logic [5:0] ALU_ADD = 6'd3;
+  localparam logic [5:0] ALU_SLT = 6'd4;
+  always_comb begin
+    result_o = '0;
+    unique case (operator_i)
+      ALU_XOR, ALU_OR, ALU_AND: result_o = bwlogic_result;
+      ALU_ADD: result_o = adder_result;
+      ALU_SLT: result_o = {31'h0, cmp_result};
+      default: ;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "alu_result.sv").expect("alu_result");
+        assert_ne!(
+            d.attrs.get("FLATTEN_CAP"),
+            Some("1"),
+            "multi-value result mux must not flatten_cap"
+        );
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "result_o must map LUTs, cells={}",
+            d.cells.len()
+        );
+    }
+
+    #[test]
+    fn muxed_concat_instr_o_lowers_not_flatten_cap() {
+        // Compressed-decoder shape: case arms write Concat into instr_o.
+        let src = r#"
+module cdec(input logic [15:0] instr_i, output logic [31:0] instr_o);
+  always_comb begin
+    unique case (instr_i[1:0])
+      2'b00: instr_o = {2'b0, instr_i[10:7], instr_i[12:11], instr_i[5],
+                        instr_i[6], 2'b00, instr_i[9:7], 5'b0, 7'b0010011};
+      2'b01: instr_o = {5'b0, instr_i[5], instr_i[12:10], instr_i[6],
+                        2'b01, instr_i[9:7], 3'b010, 2'b01, instr_i[4:2], 7'b0000011};
+      2'b10: instr_o = {{6 {instr_i[12]}}, instr_i[12], instr_i[6:2],
+                        instr_i[11:7], 3'b0, instr_i[11:7], 7'b0010011};
+      default: instr_o = {16'b0, instr_i};
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "cdec.sv").expect("cdec");
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"), "instr_o must not flatten_cap");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "instr_o muxed concat must map LUTs, cells={}",
+            d.cells.len()
+        );
     }
 
     #[test]
