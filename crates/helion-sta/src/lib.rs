@@ -1849,34 +1849,92 @@ fn clock_ff_loads(design: &Design, net: &str) -> usize {
         .count()
 }
 
-/// True when a capture FF on `to_net` is fed by a launch FF Q on `from_net`
-/// (single-FF synchronizer). Combinational LUT in between is not a sync.
+/// Driver FF of `ff`'s D pin: direct Q, or one tech-mapped passthrough LUT
+/// whose sole data PI is an FF Q. Multi-input LUTs are not passthrough.
+fn ff_d_source_ff(design: &Design, ff: &str) -> Option<String> {
+    let d_net = design.net_on(ff, "D")?;
+    let net = design.net(d_net)?;
+    let q_drivers: Vec<String> = net
+        .endpoints
+        .iter()
+        .filter(|e| e.pin == "Q")
+        .filter(|e| design.cell(&e.cell).is_some_and(|c| matches!(c.kind, CellKind::Hff)))
+        .map(|e| e.cell.clone())
+        .collect();
+    if q_drivers.len() == 1 {
+        return Some(q_drivers[0].clone());
+    }
+    let lut_drivers: Vec<String> = net
+        .endpoints
+        .iter()
+        .filter(|e| e.pin == "O")
+        .filter(|e| {
+            design
+                .cell(&e.cell)
+                .is_some_and(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+        })
+        .map(|e| e.cell.clone())
+        .collect();
+    if lut_drivers.len() != 1 {
+        return None;
+    }
+    let lut = &lut_drivers[0];
+    let mut q_pis = Vec::new();
+    for pin in ["I0", "I1", "I2", "I3", "I4", "I5"] {
+        let Some(pi) = design.net_on(lut, pin) else {
+            continue;
+        };
+        let Some(pin_net) = design.net(pi) else {
+            continue;
+        };
+        for e in &pin_net.endpoints {
+            if e.pin == "Q"
+                && design
+                    .cell(&e.cell)
+                    .is_some_and(|c| matches!(c.kind, CellKind::Hff))
+            {
+                if !q_pis.iter().any(|x| x == &e.cell) {
+                    q_pis.push(e.cell.clone());
+                }
+            }
+        }
+    }
+    if q_pis.len() == 1 {
+        Some(q_pis[0].clone())
+    } else {
+        None
+    }
+}
+
+/// UG906-style sync detect: a 2FF chain on `to_net` whose first stage samples
+/// a launch FF on `from_net`. Tech-map inserts a LUT on every D; walk one
+/// passthrough LUT. A lone capture FF (cdc_cross) stays unsynchronized.
 fn cdc_synchronizer(design: &Design, from_net: &str, to_net: &str) -> (usize, bool) {
     let mut endpoints = 0usize;
     let mut sync = false;
-    for c in &design.cells {
-        if !matches!(c.kind, CellKind::Hff) {
-            continue;
-        }
-        if design.net_on(&c.name, "CLK") != Some(to_net) {
-            continue;
-        }
-        let Some(d_net) = design.net_on(&c.name, "D") else {
-            continue;
-        };
-        let Some(net) = design.net(d_net) else {
+    let dest_ffs: Vec<String> = design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+        .filter(|c| design.net_on(&c.name, "CLK") == Some(to_net))
+        .map(|c| c.name.clone())
+        .collect();
+    for ff in &dest_ffs {
+        let Some(src) = ff_d_source_ff(design, ff) else {
             continue;
         };
-        let from_q = net.endpoints.iter().any(|e| {
-            e.pin == "Q" && design.net_on(&e.cell, "CLK") == Some(from_net)
-        });
-        let from_lut = net.endpoints.iter().any(|e| {
-            e.pin == "O"
-                && design.cell(&e.cell).is_some_and(|x| matches!(x.kind, CellKind::Lut6 { .. }))
-        });
-        if from_q || from_lut {
+        let src_clk = design.net_on(&src, "CLK");
+        if src_clk == Some(from_net) {
             endpoints += 1;
-            if from_q && !from_lut {
+            continue;
+        }
+        if src_clk != Some(to_net) {
+            continue;
+        }
+        // Second stage of a 2FF sync: dest FF ← dest FF ← launch FF.
+        if let Some(launch) = ff_d_source_ff(design, &src) {
+            if design.net_on(&launch, "CLK") == Some(from_net) {
+                endpoints += 1;
                 sync = true;
             }
         }
@@ -1885,8 +1943,8 @@ fn cdc_synchronizer(design: &Design, from_net: &str, to_net: &str) -> (usize, bo
 }
 
 /// UG906 `report_cdc`: inter-clock rows from STA clocks + XDC CDC exceptions.
-/// Optional HNF marks single-FF synchronizers. Empty clocks yield an empty
-/// report (not a canned table). Does not move WNS.
+/// Optional HNF marks 2FF synchronizers (CDC-1 Warning). Empty clocks yield
+/// an empty report (not a canned table). Does not move WNS.
 pub fn report_cdc(
     clocks: &[Clock],
     xdc: &Constraints,
@@ -1934,6 +1992,21 @@ pub fn report_cdc(
             synchronizer: sync,
             wns_ps: cell.wns_ps,
         });
+    }
+    // A 2FF sync A→B covers that crossing; do not keep a phantom B→A
+    // CDC-10 Critical that would paint the catalog Failed over Warnings.
+    let synced: Vec<(String, String)> = violations
+        .iter()
+        .filter(|v| v.synchronizer)
+        .map(|v| (v.from.clone(), v.to.clone()))
+        .collect();
+    for v in &mut violations {
+        if v.severity == CdcSeverity::Critical
+            && synced.iter().any(|(f, t)| f == &v.to && t == &v.from)
+        {
+            v.severity = CdcSeverity::Safe;
+            v.check = "CDC-0".into();
+        }
     }
     CdcReport {
         clocks: clocks.to_vec(),
