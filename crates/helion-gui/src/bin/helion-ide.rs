@@ -7800,7 +7800,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
         let probe = model.default_ila_probe();
         if ui
             .button(format!("Arm / Capture {probe}"))
-            .on_hover_text("insert_arm_capture → fabric ble_q readback")
+            .on_hover_text("ila_arm soft ble_out; ila_arm_deep → fabric BRAM sample buffer")
             .clicked()
         {
             let _ = model.exec(&format!("ila_arm {probe}"));

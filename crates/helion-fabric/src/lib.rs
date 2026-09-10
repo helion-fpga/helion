@@ -138,6 +138,9 @@ pub struct Fabric {
     iob_src: BTreeMap<(u32, u32), (u32, u32, u8)>,
     pub stat: Stat,
     cfg_steps: u32,
+    /// Runtime BRAM data plane (capture RAM / dual-port writes). Seeded empty on program;
+    /// falls back to INIT frames via `bram_init_word` when unread.
+    bram_data: BTreeMap<u16, Vec<u64>>,
 }
 
 impl Fabric {
@@ -171,6 +174,7 @@ impl Fabric {
             iob_src: BTreeMap::new(),
             stat: Stat::reset(),
             cfg_steps: 0,
+            bram_data: BTreeMap::new(),
         }
     }
 
@@ -184,6 +188,7 @@ impl Fabric {
         self.frames = bits.frames.clone();
         self.stat = Stat::reset();
         self.cfg_steps = 0;
+        self.bram_data.clear();
         self.iob_src.clear();
         self.used = self
             .clbs
@@ -625,6 +630,25 @@ impl Fabric {
             .unwrap_or(0) as u64
     }
 
+    /// Runtime write into BRAM major `idx` (fabric capture RAM / sample buffer).
+    pub fn bram_write_word(&mut self, idx: u16, addr: usize, val: u64) {
+        let bank = self.bram_data.entry(idx).or_default();
+        if bank.len() <= addr {
+            bank.resize(addr + 1, 0);
+        }
+        bank[addr] = val;
+    }
+
+    /// Runtime read: prefers `bram_write_word` data, else programmed INIT.
+    pub fn bram_read_word(&self, idx: u16, addr: usize) -> u64 {
+        if let Some(bank) = self.bram_data.get(&idx) {
+            if let Some(&w) = bank.get(addr) {
+                return w;
+            }
+        }
+        self.bram_init_word(idx, addr)
+    }
+
     /// Overlay frames without wiping the rest of the die (DFX partial).
     pub fn program_partial(&mut self, bits: &Bitstream) -> Result<(), String> {
         if bits.idcode != self.idcode {
@@ -823,5 +847,15 @@ mod tests {
         assert_eq!(rm_after, 0xAAAA_AAAA_AAAA_AAAA, "RM LUT must swap");
         assert_ne!(full_a.frames, full_b.frames);
         assert!(partial.frames.keys().all(|(b, maj, _)| *b != Far::CLB_IO_CLK || *maj == rm_maj));
+    }
+
+    #[test]
+    fn bram_runtime_write_read_roundtrip() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut fab = Fabric::new(&dev);
+        assert_eq!(fab.bram_read_word(0, 3), 0);
+        fab.bram_write_word(0, 3, 0xA5A5_A5A5_A5A5_A5A5);
+        assert_eq!(fab.bram_read_word(0, 3), 0xA5A5_A5A5_A5A5_A5A5);
+        assert_eq!(fab.bram_read_word(0, 4), 0, "unwritten addr stays init/zero");
     }
 }

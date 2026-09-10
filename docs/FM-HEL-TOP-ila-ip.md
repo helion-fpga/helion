@@ -1,56 +1,54 @@
-# FM-HEL-TOP — ILA mark→arm fix + examples/ip read_ip
+# FM-HEL-TOP — ILA mark→arm fix + deep fabric BRAM sample buffer
 
-**Date:** 2026-09-06 ~08:19 America/New_York (EDT)  
-**Branch:** `fm-hel-top` — PR https://github.com/helion-fpga/helion/pull/8 (**NO MERGE**)  
+**Date:** 2026-09-09 ~23:10 America/New_York (EDT)  
+**Branch:** `fm-hel-vivado-sim` (**NO MERGE** / soft-hold)  
 **Author:** saksham-45 `<72103486+saksham-45@users.noreply.github.com>`  
-**Tip:** `a5bf9c58653bce010ddce3b78dacfd4fb0ed0b8e` (`a5bf9c5`)  
-**Remote:** push **only** `helion-fpga HEAD:fm-hel-top` (never `fm-hel-corpus-soft-pass`, never merge, never force-push master)
+**Remote:** push **only** `origin fm-hel-vivado-sim` (never force-push, never rewrite history)
 
 ## Problem
 
-1. **ILA:** `Session::mark_debug` / `insert_marked` already injects the probe LUTFF. `ila_arm` → `insert_arm_capture` then compiled baseline **with** the probe still present, so `insert_ila` was a no-op and the flow failed with `ILA insert was a no-op (bitstream unchanged)` on `examples/counter.sv` after mark → (re)implement → arm. Prior crumb test was weakened to avoid a false unwrap (5cb85d4).
-2. **IP:** `.helion` + `read_ip` already existed (`examples/counter.helion`, `examples/ip_ingest/`). Needed a tiny **`examples/ip/`** surface + smoke that matches directory-form packages, with AXI legal fence held.
+1. Soft ILA (`insert_arm_capture`) programs fabric then host-polls `step_user` → `ble_out` / `ble_q`. Documented residual: not full on-chip capture RAM / JTAG upload (UG908).
+2. Prior mark→arm no-op (probe already inserted) was fixed via `strip_ila` baseline.
 
-## What shipped
+## What shipped (P3 deepen)
 
-### ILA (real fix, small)
+### Soft path (unchanged gold)
 
-- `helion-debug`: `strip_ila(net)` removes prior probe cells/aux nets/endpoints.
-- `insert_arm_capture` baselines a **stripped** design, then rebuilds the probe cleanly before the bitstream-diff / extra-LUTFF checks.
-- Unit tests: `mark_debug_then_arm_inserts_probe_not_noop`, `strip_ila_removes_probe_cells` (structural counter gold `0000000111111110`).
-- GUI: restore full `mark_debug cnt_3` → Place/Route/Bitstream → `ila_arm` in `ila_status_crumb_surfaces_mark_debug_and_capture`.
+- `insert_arm_capture` / GUI `ila_arm` still host `ble_out` readback.
+- Counter soft gold `cnt_3` / `q3` window=16 → `0000000111111110`, WNS_PS=9640.
 
-### IP (tiny examples/ip + smoke)
+### Deep path (strictly beyond soft)
 
-- `examples/ip/counter/package.helion` — directory form, Helion-MM, files via `../../counter.sv` + SDC.
-- `examples/ip/counter.helion` — file form sibling.
-- `examples/ip/read_ip_counter.prj` — `read_ip examples/ip/counter`.
-- CLI smokes: `project_read_ip_examples_ip_dir_holds_gold`, `helion_ip_show_rejects_axi_fence`.
-
-## Not touched
-
-- Sim absolute split / `SPLITTER_GRAB_PX` / void Timing-Reports layouts.
+- Fabric runtime BRAM data plane: `Fabric::bram_write_word` / `bram_read_word`.
+- `helion-debug`: `IlaArmConfig`, `IlaTriggerKind`, `IlaCaptureDeep`, `insert_capture_bram`, `insert_arm_capture_deep`.
+  - Probe LUTFFs **plus** `ila_capture_ram` Bram18 in the bitstream (`Far::BRAM`).
+  - Multi-probe window; samples packed into fabric BRAM each step.
+  - Real trigger-before-fill (`pre_trigger`) for rising/falling; upload via BRAM readback.
+  - Backend label: `fabric_bram_sample_buffer`.
+- GUI/Tcl: `ila_pre_trigger N`, `ila_arm_deep [nets…] [window]` (soft `ila_arm` untouched).
+- Unit tests: deep immediate matches soft q3 gold; multi-probe q0+q3; rising pre_trigger=4; GUI deep + soft gold hold.
 
 ## Gold
 
 ```
 report_timing examples/counter.sv → WNS_PS=9640
-examples/ip/read_ip_counter.prj   → WNS_PS=9640 LED[16]=0000000111111110
+soft q3/cnt_3 window=16 → 0000000111111110
 ```
 
 ## Verify
 
 ```bash
 cargo test -p helion-debug --lib
-cargo test -p helion-cli --test project
-cargo test -p helion-gui --lib ila_status_crumb_surfaces_mark_debug_and_capture
+cargo test -p helion-gui --lib ila_arm_deep_bram_pretrigger_multiprobe
 cargo run -p helion-cli -- report_timing examples/counter.sv
-cargo run -p helion-cli -- project run examples/ip/read_ip_counter.prj --cycles 16
-cargo run -p helion-cli -- ip show examples/ip/counter
+# headless deepen proof:
+printf '%s\n' 'open examples/counter.sv' 'implement' 'ila_window 16' 'ila_trigger rising' 'ila_pre_trigger 4' 'ila_arm_deep cnt_3,cnt_0' 'ila_dashboard' 'quit' \
+  | helion-ide --stdin
 ```
 
 ## Remains (honest)
 
-- ILA is still a soft probe (identity LUTFF + fabric `ble_q` readback), not a full UG908 on-chip capture RAM / JTAG upload path.
-- CovertEDA-class encrypted IP vault / Generate Output Products GUI still open; text `.helion` + ingest only.
+- Still **not** full UG908: no JTAG DR scan of capture RAM, no user-defined trigger FSM IP / match units, no compressed upload protocol.
+- Deep path is fabric-sim BRAM sample buffer + bitstream-backed Bram18 cell — intermediate past soft `ble_out`, short of silicon ILA IP.
+- Soft `ila_arm` remains the default GUI Arm button path.
 - No merge to master until Firstmate/captain.
