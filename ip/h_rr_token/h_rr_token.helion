@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST token-ring rotating grant
+format 1
+vlnv community:helion:h_rr_token:1.0
+bus Helion-ST
+top h_rr_token
+file h_rr_token.v

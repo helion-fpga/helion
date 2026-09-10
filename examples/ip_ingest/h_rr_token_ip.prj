@@ -1,0 +1,5 @@
+# Ingest Helion IP via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_rr_token/h_rr_token.helion
+read_xdc examples/ip_ingest/h_rr_token.sdc
+top h_rr_token

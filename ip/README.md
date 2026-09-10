@@ -77,6 +77,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_gray2bin` | Helion-ST | Registered gray→binary converter (8b) |
 | `h_bin2gray` | Helion-ST | Registered binary→gray converter (8b) |
 | `h_majority3` | Helion-ST | 3-input majority voter registered (width 8) |
+| `h_crc16` | Helion-ST | Registered CRC-16 (poly 0x1021 byte-serial) |
+| `h_rr_token` | Helion-ST | Token-ring rotating grant among 4 requesters (distinct from h_arb_rr) |
+| `h_pwm_phase` | Helion-ST | Phase-shifted dual PWM (shared counter, two compares) |
+| `h_cam_slot` | Helion-MM | Tiny CAM/tag compare slot (MM write tag/data, sticky match) |
 
 ## Use
 
@@ -238,6 +242,10 @@ helion project examples/ip_ingest/h_pwm_center_ip.prj
 #   read_ip ip/h_gray2bin/h_gray2bin.helion
 #   read_ip ip/h_bin2gray/h_bin2gray.helion
 #   read_ip ip/h_majority3/h_majority3.helion
+#   read_ip ip/h_crc16/h_crc16.helion
+#   read_ip ip/h_rr_token/h_rr_token.helion
+#   read_ip ip/h_pwm_phase/h_pwm_phase.helion
+#   read_ip ip/h_cam_slot/h_cam_slot.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
