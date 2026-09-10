@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered binary→onehot
+format 1
+vlnv community:helion:h_bin2oh:1.0
+bus Helion-ST
+top h_bin2oh
+file h_bin2oh.v

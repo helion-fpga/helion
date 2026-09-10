@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered clamp to [lo,hi]
+format 1
+vlnv community:helion:h_clamp:1.0
+bus Helion-ST
+top h_clamp
+file h_clamp.v

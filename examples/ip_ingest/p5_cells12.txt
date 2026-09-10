@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #12 — h_absdiff + h_clamp + h_bin2oh + h_timer_cap via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_absdiff_ip.prj
+synth_design h_absdiff cells=288 luts=276
+project examples/ip_ingest/h_absdiff_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_absdiff xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=276 WNS_PS=9680 frames=169
+# Instantiated IP: community:helion:h_absdiff:1.0 (Helion-ST)
+# cells=288 luts=276 lutffs=276  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_clamp_ip.prj
+synth_design h_clamp cells=315 luts=304
+project examples/ip_ingest/h_clamp_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_clamp xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=304 WNS_PS=9680 frames=183
+# Instantiated IP: community:helion:h_clamp:1.0 (Helion-ST)
+# cells=315 luts=304 lutffs=304  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_bin2oh_ip.prj
+synth_design h_bin2oh cells=61 luts=38
+project examples/ip_ingest/h_bin2oh_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_bin2oh xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=38 WNS_PS=9620 frames=32
+# Instantiated IP: community:helion:h_bin2oh:1.0 (Helion-ST)
+# cells=61 luts=38 lutffs=38  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_timer_cap_ip.prj
+synth_design h_timer_cap cells=226 luts=211
+project examples/ip_ingest/h_timer_cap_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_timer_cap xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=211 WNS_PS=9600 frames=203
+# Instantiated IP: community:helion:h_timer_cap:1.0 (Helion-MM)
+# cells=226 luts=211 lutffs=211  (>0 real fabric)

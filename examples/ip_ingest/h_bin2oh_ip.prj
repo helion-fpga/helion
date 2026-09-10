@@ -1,0 +1,5 @@
+# Ingest Helion-ST bin2oh via read_ip; prove real fabric (lutffs > 0)
+part HL10T-C32-1
+read_ip ip/h_bin2oh/h_bin2oh.helion
+read_xdc examples/ip_ingest/h_bin2oh.sdc
+top h_bin2oh
