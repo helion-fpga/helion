@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST N-stage shift-reg debounce
+format 1
+vlnv community:helion:h_debounce:1.0
+bus Helion-ST
+top h_debounce
+file h_debounce.v
