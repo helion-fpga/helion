@@ -49,6 +49,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_clamp` | Helion-ST | Registered clamp of 32b value to [lo,hi] |
 | `h_bin2oh` | Helion-ST | Registered binary→onehot (4b→16b) |
 | `h_timer_cap` | Helion-MM | Free-run capture timer + sticky edge capture |
+| `h_mux4` | Helion-ST | Registered 4:1 mux 32b + sel |
+| `h_addsub_mm` | Helion-MM | MM add/sub with sticky carry/borrow |
+| `h_ones_comp` | Helion-ST | Registered ones-complement / invert+inc negate |
+| `h_pulse_ext` | Helion-ST | Pulse stretcher/extender with programmable width |
 
 ## Use
 
@@ -83,6 +87,10 @@ helion ip show ip/h_absdiff/h_absdiff.helion
 helion ip show ip/h_clamp/h_clamp.helion
 helion ip show ip/h_bin2oh/h_bin2oh.helion
 helion ip show ip/h_timer_cap/h_timer_cap.helion
+helion ip show ip/h_mux4/h_mux4.helion
+helion ip show ip/h_addsub_mm/h_addsub_mm.helion
+helion ip show ip/h_ones_comp/h_ones_comp.helion
+helion ip show ip/h_pulse_ext/h_pulse_ext.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -112,6 +120,10 @@ helion project examples/ip_ingest/h_absdiff_ip.prj
 helion project examples/ip_ingest/h_clamp_ip.prj
 helion project examples/ip_ingest/h_bin2oh_ip.prj
 helion project examples/ip_ingest/h_timer_cap_ip.prj
+helion project examples/ip_ingest/h_mux4_ip.prj
+helion project examples/ip_ingest/h_addsub_mm_ip.prj
+helion project examples/ip_ingest/h_ones_comp_ip.prj
+helion project examples/ip_ingest/h_pulse_ext_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -130,6 +142,14 @@ helion project examples/ip_ingest/h_timer_cap_ip.prj
 #   read_ip ip/h_hamming/h_hamming.helion
 #   read_ip ip/h_rot_mm/h_rot_mm.helion
 #   read_ip ip/h_mask_gen/h_mask_gen.helion
+#   read_ip ip/h_absdiff/h_absdiff.helion
+#   read_ip ip/h_clamp/h_clamp.helion
+#   read_ip ip/h_bin2oh/h_bin2oh.helion
+#   read_ip ip/h_timer_cap/h_timer_cap.helion
+#   read_ip ip/h_mux4/h_mux4.helion
+#   read_ip ip/h_addsub_mm/h_addsub_mm.helion
+#   read_ip ip/h_ones_comp/h_ones_comp.helion
+#   read_ip ip/h_pulse_ext/h_pulse_ext.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
