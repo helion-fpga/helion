@@ -1275,7 +1275,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.label(format!("{} · {}", c.id, c.backend.as_str()));
         ui.label(RichText::new(c.detail.as_str()).small().color(Color32::from_rgb(0xa0, 0xa8, 0xb0)));
     }
-    // Soft-hold banner while no physical FTDI/HAD — never claim board DONE from detect alone.
+    // No USB → honest refuse board DONE (never soft-hold success / never invent DONE).
     if det.physical_had {
         ui.label(
             RichText::new("Physical USB programmer detected (openFPGALoader / native FTDI).")
@@ -1285,7 +1285,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     } else {
         ui.label(
             RichText::new(
-                "Physical board soft-hold — no USB programmer detected. Use sim cable or attach FTDI/HAD.",
+                "No USB programmer (USB=0) — board DONE refused. Use cable=sim for in-process fabric only, or attach FTDI/HAD.",
             )
             .color(Color32::from_rgb(0xe0, 0xa0, 0x40))
             .small(),
@@ -1353,11 +1353,11 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
 
     let cable_needs_phys = matches!(
         app.program_cable.as_str(),
-        "usb" | "ofl" | "native" | "ftdi" | "libusb" | "openfpgaloader"
+        "auto" | "usb" | "ofl" | "native" | "ftdi" | "libusb" | "openfpgaloader"
     );
     let phys_blocked = cable_needs_phys && !det.physical_had;
     let phys_block_msg =
-        "No USB programmer detected (physical soft-hold). Switch cable to sim, or attach FTDI/HAD and Detect.";
+        "No USB programmer (USB=0) — refusing board DONE. Switch cable to sim for fabric only, or attach FTDI/HAD and Detect.";
 
     ui.horizontal(|ui| {
         if sidebar_button(ui, "Detect")
@@ -1571,10 +1571,9 @@ fn paint_status_bar(
                     _ => model.workspace.canvas_label(),
                 };
                 let crumb = format!("{} › {}", activity.label(), where_label);
-                // Soft-hold crumb on Program rail — visible without opening Program side.
-                // Detect only; never claims board DONE. Sim Program path unchanged.
+                // No-cable crumb on Program rail — never claims board DONE.
                 let board_crumb = if board_soft_hold {
-                    " · board:soft-hold"
+                    " · board:no-cable"
                 } else {
                     ""
                 };
@@ -7636,7 +7635,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
     if !det.physical_had {
         ui.label(
             RichText::new(
-                "Physical board soft-hold — no USB programmer detected. Use sim cable or attach FTDI/HAD.",
+                "No USB programmer (USB=0) — board DONE refused. Use Program Device (sim) for fabric only, or attach FTDI/HAD.",
             )
             .color(Color32::from_rgb(0xe0, 0xa0, 0x40))
             .small(),
@@ -7669,7 +7668,13 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = model.exec("open_hw_manager");
         }
         if ui.button("Program Device (sim)").clicked() {
-            let _ = model.exec("program_hw");
+            // Explicit sim cable — fabric DONE only; never board DONE invent.
+            match model.program_hw_with_cable("sim") {
+                Ok(s) => {
+                    let _ = s;
+                }
+                Err(e) => eprintln!("program Device (sim): {e}"),
+            }
         }
         if ui.button("Refresh STAT").clicked() {
             let _ = model.exec("report_hw_stat");

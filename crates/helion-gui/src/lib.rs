@@ -293,7 +293,7 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         shell.session.open_hw_manager();
         return Ok("open_hw_manager sim".into());
     }
-    if t == "program_hw" || t == "program_hw_devices" {
+    if t == "program_hw" || t == "program_hw_devices" || t.starts_with("program_hw ") {
         let dev = Device::load_part(&shell.part)?;
         if shell.session.bitstream.is_none() {
             impl_if_needed(shell)?;
@@ -301,7 +301,14 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         if !shell.session.hw_open {
             shell.session.open_hw_manager();
         }
-        return shell.session.program_hw(&dev);
+        // Optional `program_hw cable=sim|mpsse-sim|auto|ofl|native`.
+        // Bare program_hw = auto (board path) — USB=0 refuses DONE.
+        let cable = t
+            .split_whitespace()
+            .skip(1)
+            .find_map(|a| a.strip_prefix("cable="))
+            .unwrap_or("auto");
+        return shell.session.program_hw_cable(&dev, cable);
     }
     if let Some(net) = t.strip_prefix("mark_debug ") {
         shell.session.mark_debug(net.trim())?;
@@ -379,8 +386,16 @@ mod tests {
         let util = tcl_eval(&mut sh, "report_utilization").unwrap();
         assert!(util.contains("LUTFF="), "{util}");
         assert!(tcl_eval(&mut sh, "open_hw_manager").unwrap().contains("sim"));
-        let hw = tcl_eval(&mut sh, "program_hw").unwrap();
+        // USB=0: bare program_hw refuses board DONE; explicit sim for fabric.
+        let board_err = tcl_eval(&mut sh, "program_hw").unwrap_err();
+        assert!(
+            board_err.contains("refused DONE") || board_err.contains("no USB") || board_err.contains("programmer"),
+            "{board_err}"
+        );
+        assert!(!board_err.contains("soft-hold"), "{board_err}");
+        let hw = tcl_eval(&mut sh, "program_hw cable=sim").unwrap();
         assert!(hw.contains("DONE=1"), "{hw}");
+        assert!(hw.contains("not board DONE") || hw.contains("backend=sim"), "{hw}");
         let md = tcl_eval(&mut sh, "mark_debug cnt_3").unwrap();
         assert!(md.contains("cnt_3"), "{md}");
         let eco = tcl_eval(&mut sh, "eco u_lut0 0xAAAAAAAAAAAAAAAA").unwrap();
