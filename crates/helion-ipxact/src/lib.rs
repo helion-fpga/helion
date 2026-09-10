@@ -394,6 +394,51 @@ pub fn pack_timer_cap() -> IpCore {
     }
 }
 
+
+/// Helion-ST registered 4:1 mux 32b + sel (ip/h_mux4). Not AXI.
+pub fn pack_mux4() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_mux4".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM add/sub with sticky carry/borrow (ip/h_addsub_mm). Not AXI.
+pub fn pack_addsub_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_addsub_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
+/// Helion-ST registered ones-complement / invert+inc negate (ip/h_ones_comp). Not AXI.
+pub fn pack_ones_comp() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_ones_comp".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST pulse stretcher/extender with programmable width (ip/h_pulse_ext). Not AXI.
+pub fn pack_pulse_ext() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_pulse_ext".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -431,6 +476,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_clamp(),
         pack_bin2oh(),
         pack_timer_cap(),
+        pack_mux4(),
+        pack_addsub_mm(),
+        pack_ones_comp(),
+        pack_pulse_ext(),
     ]
 }
 
@@ -696,6 +745,30 @@ mod tests {
         assert_eq!(pack_clamp().vlnv(), "community:helion:h_clamp:1.0");
         assert_eq!(pack_bin2oh().vlnv(), "community:helion:h_bin2oh:1.0");
         assert_eq!(pack_timer_cap().vlnv(), "community:helion:h_timer_cap:1.0");
+        let m4 = pack_mux4();
+        assert_eq!(m4.name, "h_mux4");
+        assert_eq!(m4.bus, "Helion-ST");
+        assert_ne!(m4.bus, "AXI");
+        let asmm = pack_addsub_mm();
+        assert_eq!(asmm.name, "h_addsub_mm");
+        assert_eq!(asmm.bus, "Helion-MM");
+        assert_ne!(asmm.bus, "AXI");
+        let oc = pack_ones_comp();
+        assert_eq!(oc.name, "h_ones_comp");
+        assert_eq!(oc.bus, "Helion-ST");
+        assert_ne!(oc.bus, "AXI");
+        let pe = pack_pulse_ext();
+        assert_eq!(pe.name, "h_pulse_ext");
+        assert_eq!(pe.bus, "Helion-ST");
+        assert_ne!(pe.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_mux4"));
+        assert!(cat.iter().any(|c| c.name == "h_addsub_mm"));
+        assert!(cat.iter().any(|c| c.name == "h_ones_comp"));
+        assert!(cat.iter().any(|c| c.name == "h_pulse_ext"));
+        assert_eq!(pack_mux4().vlnv(), "community:helion:h_mux4:1.0");
+        assert_eq!(pack_addsub_mm().vlnv(), "community:helion:h_addsub_mm:1.0");
+        assert_eq!(pack_ones_comp().vlnv(), "community:helion:h_ones_comp:1.0");
+        assert_eq!(pack_pulse_ext().vlnv(), "community:helion:h_pulse_ext:1.0");
     }
 }
 
