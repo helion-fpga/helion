@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST pulse stretcher/extender
+format 1
+vlnv community:helion:h_pulse_ext:1.0
+bus Helion-ST
+top h_pulse_ext
+file h_pulse_ext.v

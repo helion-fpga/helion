@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM add/sub with carry/borrow sticky
+format 1
+vlnv community:helion:h_addsub_mm:1.0
+bus Helion-MM
+top h_addsub_mm
+file h_addsub_mm.v

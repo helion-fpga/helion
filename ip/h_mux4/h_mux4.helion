@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered 4:1 mux 32b + sel
+format 1
+vlnv community:helion:h_mux4:1.0
+bus Helion-ST
+top h_mux4
+file h_mux4.v
