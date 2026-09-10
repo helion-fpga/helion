@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST phase-shifted dual PWM
+format 1
+vlnv community:helion:h_pwm_phase:1.0
+bus Helion-ST
+top h_pwm_phase
+file h_pwm_phase.v
