@@ -119,6 +119,109 @@ struct ClbState {
     lut_o: [bool; 8],
 }
 
+/// Match kind programmed into the fabric ILA trigger FSM / match unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IlaMatchKind {
+    Immediate = 0,
+    Rising = 1,
+    Falling = 2,
+}
+
+impl IlaMatchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Rising => "rising",
+            Self::Falling => "falling",
+        }
+    }
+}
+
+/// UG908-class trigger FSM resident in fabric (Idle → Armed → Fired → Done).
+///
+/// Match decisions for Rising/Falling come from the bitstream match-unit LUT
+/// (`refresh_comb` + `ble_out` of `ila_match_hit`), not host compare of probe
+/// `ble_out` history. Immediate fires on the first armed sample.
+#[derive(Clone, Debug)]
+pub struct IlaTriggerFsm {
+    pub kind: IlaMatchKind,
+    pub armed: bool,
+    pub fired: bool,
+    pub done: bool,
+    pub pre_trigger: usize,
+    pub post_left: usize,
+    pub window: usize,
+    pub first: bool,
+}
+
+impl Default for IlaTriggerFsm {
+    fn default() -> Self {
+        Self {
+            kind: IlaMatchKind::Immediate,
+            armed: false,
+            fired: false,
+            done: false,
+            pre_trigger: 0,
+            post_left: 0,
+            window: 0,
+            first: true,
+        }
+    }
+}
+
+impl IlaTriggerFsm {
+    pub fn arm(kind: IlaMatchKind, window: usize, pre_trigger: usize) -> Self {
+        let window = window.max(1);
+        let pre = if kind == IlaMatchKind::Immediate {
+            0
+        } else {
+            pre_trigger.min(window.saturating_sub(1))
+        };
+        let post_after_trig = window - pre; // includes trigger sample
+        Self {
+            kind,
+            armed: true,
+            fired: false,
+            done: false,
+            pre_trigger: pre,
+            post_left: post_after_trig.saturating_sub(1),
+            window,
+            first: true,
+        }
+    }
+
+    /// Advance on one fabric sample. `match_hit` is the match-unit LUT output
+    /// (Rising/Falling) or ignored for Immediate (fires on first armed sample).
+    /// Returns true when the capture window is complete.
+    pub fn on_sample(&mut self, match_hit: bool) -> bool {
+        if self.done || !self.armed {
+            return self.done;
+        }
+        if !self.fired {
+            let fire = match self.kind {
+                IlaMatchKind::Immediate => self.first,
+                IlaMatchKind::Rising | IlaMatchKind::Falling => match_hit,
+            };
+            if fire {
+                self.fired = true;
+                if self.post_left == 0 {
+                    self.done = true;
+                }
+            }
+        } else if self.post_left == 0 {
+            self.done = true;
+        } else {
+            self.post_left -= 1;
+            if self.post_left == 0 {
+                self.done = true;
+            }
+        }
+        self.first = false;
+        self.done
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Fabric {
     pub idcode: u32,
@@ -141,6 +244,8 @@ pub struct Fabric {
     /// Runtime BRAM data plane (capture RAM / dual-port writes). Seeded empty on program;
     /// falls back to INIT frames via `bram_init_word` when unread.
     bram_data: BTreeMap<u16, Vec<u64>>,
+    /// Optional ILA trigger FSM (armed by deep capture path).
+    pub ila_fsm: IlaTriggerFsm,
 }
 
 impl Fabric {
@@ -175,6 +280,7 @@ impl Fabric {
             stat: Stat::reset(),
             cfg_steps: 0,
             bram_data: BTreeMap::new(),
+            ila_fsm: IlaTriggerFsm::default(),
         }
     }
 
@@ -189,6 +295,7 @@ impl Fabric {
         self.stat = Stat::reset();
         self.cfg_steps = 0;
         self.bram_data.clear();
+        self.ila_fsm = IlaTriggerFsm::default();
         self.iob_src.clear();
         self.used = self
             .clbs
@@ -531,6 +638,17 @@ impl Fabric {
         }
     }
 
+    /// Re-evaluate combo LUTs without ticking FFs — used so the ILA match-unit
+    /// LUT sees post-`step_user` Q values (delay FF = prev, probe = cur).
+    pub fn refresh_comb(&mut self) {
+        self.eval_comb();
+    }
+
+    /// Arm the fabric-resident ILA trigger FSM (deep path).
+    pub fn ila_arm_fsm(&mut self, kind: IlaMatchKind, window: usize, pre_trigger: usize) {
+        self.ila_fsm = IlaTriggerFsm::arm(kind, window, pre_trigger);
+    }
+
     fn tick_ff(&mut self) {
         if !self.stat.gwe || self.stat.gsr {
             return;
@@ -857,5 +975,31 @@ mod tests {
         fab.bram_write_word(0, 3, 0xA5A5_A5A5_A5A5_A5A5);
         assert_eq!(fab.bram_read_word(0, 3), 0xA5A5_A5A5_A5A5_A5A5);
         assert_eq!(fab.bram_read_word(0, 4), 0, "unwritten addr stays init/zero");
+    }
+
+    #[test]
+    fn ila_trigger_fsm_rising_completes_window() {
+        let mut fsm = IlaTriggerFsm::arm(IlaMatchKind::Rising, 8, 2);
+        assert!(fsm.armed && !fsm.fired);
+        // miss, miss, hit → then 5 more post samples (post_left starts at 5)
+        assert!(!fsm.on_sample(false));
+        assert!(!fsm.on_sample(false));
+        assert!(!fsm.on_sample(true)); // fire; post_left=5
+        for _ in 0..4 {
+            assert!(!fsm.on_sample(false));
+        }
+        assert!(fsm.on_sample(false));
+        assert!(fsm.done && fsm.fired);
+        assert_eq!(fsm.pre_trigger, 2);
+    }
+
+    #[test]
+    fn ila_trigger_fsm_immediate_fires_first() {
+        let mut fsm = IlaTriggerFsm::arm(IlaMatchKind::Immediate, 4, 99);
+        assert_eq!(fsm.pre_trigger, 0);
+        assert!(!fsm.on_sample(false)); // fire on first; post_left=3
+        assert!(!fsm.on_sample(false));
+        assert!(!fsm.on_sample(false));
+        assert!(fsm.on_sample(false));
     }
 }
