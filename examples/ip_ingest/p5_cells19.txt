@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #19 — h_manchester_enc + h_gray2bin + h_bin2gray + h_majority3 via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_manchester_enc_ip.prj
+synth_design h_manchester_enc cells=255 luts=247
+project examples/ip_ingest/h_manchester_enc_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_manchester_enc xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=247 WNS_PS=9680 frames=150
+# Instantiated IP: community:helion:h_manchester_enc:1.0 (Helion-ST)
+# cells=255 luts=247 lutffs=247  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_gray2bin_ip.prj
+synth_design h_gray2bin cells=44 luts=25
+project examples/ip_ingest/h_gray2bin_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_gray2bin xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=25 WNS_PS=9620 frames=22
+# Instantiated IP: community:helion:h_gray2bin:1.0 (Helion-ST)
+# cells=44 luts=25 lutffs=25  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_bin2gray_ip.prj
+synth_design h_bin2gray cells=45 luts=26
+project examples/ip_ingest/h_bin2gray_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_bin2gray xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=26 WNS_PS=9620 frames=29
+# Instantiated IP: community:helion:h_bin2gray:1.0 (Helion-ST)
+# cells=45 luts=26 lutffs=26  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_majority3_ip.prj
+synth_design h_majority3 cells=77 luts=42
+project examples/ip_ingest/h_majority3_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_majority3 xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=42 WNS_PS=9600 frames=46
+# Instantiated IP: community:helion:h_majority3:1.0 (Helion-ST)
+# cells=77 luts=42 lutffs=42  (>0 real fabric)

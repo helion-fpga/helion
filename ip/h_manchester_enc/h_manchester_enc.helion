@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST Manchester encoder
+format 1
+vlnv community:helion:h_manchester_enc:1.0
+bus Helion-ST
+top h_manchester_enc
+file h_manchester_enc.v
