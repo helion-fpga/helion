@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #13 — h_mux4 + h_addsub_mm + h_ones_comp + h_pulse_ext via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_mux4_ip.prj
+synth_design h_mux4 cells=315 luts=304
+project examples/ip_ingest/h_mux4_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_mux4 xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=304 WNS_PS=9680 frames=183
+# Instantiated IP: community:helion:h_mux4:1.0 (Helion-ST)
+# cells=315 luts=304 lutffs=304  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_addsub_mm_ip.prj
+synth_design h_addsub_mm cells=267 luts=253
+project examples/ip_ingest/h_addsub_mm_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_addsub_mm xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=253 WNS_PS=9680 frames=174
+# Instantiated IP: community:helion:h_addsub_mm:1.0 (Helion-MM)
+# cells=267 luts=253 lutffs=253  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_ones_comp_ip.prj
+synth_design h_ones_comp cells=325 luts=258
+project examples/ip_ingest/h_ones_comp_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_ones_comp xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=258 WNS_PS=9460 frames=155
+# Instantiated IP: community:helion:h_ones_comp:1.0 (Helion-ST)
+# cells=325 luts=258 lutffs=258  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_pulse_ext_ip.prj
+synth_design h_pulse_ext cells=64 luts=46
+project examples/ip_ingest/h_pulse_ext_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_pulse_ext xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=46 WNS_PS=9600 frames=34
+# Instantiated IP: community:helion:h_pulse_ext:1.0 (Helion-ST)
+# cells=64 luts=46 lutffs=46  (>0 real fabric)
