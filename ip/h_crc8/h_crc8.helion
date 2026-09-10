@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered CRC-8
+format 1
+vlnv community:helion:h_crc8:1.0
+bus Helion-ST
+top h_crc8
+file h_crc8.v

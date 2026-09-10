@@ -69,6 +69,10 @@ Bus must be **Helion-MM** or **Helion-ST** (never AXI as a Helion product).
 | `h_fir_tap` | Helion-ST | Single MAC FIR tap (registered acc += x*coeff) |
 | `h_iir_biquad` | Helion-ST | DF1 biquad step (registered, small coeffs) |
 | `h_cdc_pulse` | Helion-ST | 2FF toggle-pulse CDC synchronizer (Helion-native) |
+| `h_crc8` | Helion-ST | Registered CRC-8 (poly 0x07 byte-serial) |
+| `h_spi_slave` | Helion-MM | SPI slave shift+sticky RX byte (Helion-MM status) |
+| `h_quad_enc` | Helion-ST | Quadrature decoder with count up/down |
+| `h_pwm_center` | Helion-ST | Center-aligned PWM (up/down triangle vs duty) |
 
 ## Use
 
@@ -123,6 +127,10 @@ helion ip show ip/h_phase_accum/h_phase_accum.helion
 helion ip show ip/h_fir_tap/h_fir_tap.helion
 helion ip show ip/h_iir_biquad/h_iir_biquad.helion
 helion ip show ip/h_cdc_pulse/h_cdc_pulse.helion
+helion ip show ip/h_crc8/h_crc8.helion
+helion ip show ip/h_spi_slave/h_spi_slave.helion
+helion ip show ip/h_quad_enc/h_quad_enc.helion
+helion ip show ip/h_pwm_center/h_pwm_center.helion
 helion project examples/ip_ingest/counter_ip.prj
 helion project examples/ip_ingest/h_timer_ip.prj
 helion project examples/ip_ingest/h_pwm_ip.prj
@@ -172,6 +180,10 @@ helion project examples/ip_ingest/h_phase_accum_ip.prj
 helion project examples/ip_ingest/h_fir_tap_ip.prj
 helion project examples/ip_ingest/h_iir_biquad_ip.prj
 helion project examples/ip_ingest/h_cdc_pulse_ip.prj
+helion project examples/ip_ingest/h_crc8_ip.prj
+helion project examples/ip_ingest/h_spi_slave_ip.prj
+helion project examples/ip_ingest/h_quad_enc_ip.prj
+helion project examples/ip_ingest/h_pwm_center_ip.prj
 # in a .prj:
 #   read_ip ip/h_crc32/h_crc32.helion
 #   read_ip ip/h_gray_cnt/h_gray_cnt.helion
@@ -214,6 +226,10 @@ helion project examples/ip_ingest/h_cdc_pulse_ip.prj
 #   read_ip ip/h_fir_tap/h_fir_tap.helion
 #   read_ip ip/h_iir_biquad/h_iir_biquad.helion
 #   read_ip ip/h_cdc_pulse/h_cdc_pulse.helion
+#   read_ip ip/h_crc8/h_crc8.helion
+#   read_ip ip/h_spi_slave/h_spi_slave.helion
+#   read_ip ip/h_quad_enc/h_quad_enc.helion
+#   read_ip ip/h_pwm_center/h_pwm_center.helion
 ```
 
 `read_ip` expands package `file` / `xdc` entries into the project source and constraint lists before synth.
