@@ -653,6 +653,51 @@ pub fn pack_pwm_center() -> IpCore {
     }
 }
 
+
+/// Helion-ST Manchester encoder from bit stream + enable (ip/h_manchester_enc). Not AXI.
+pub fn pack_manchester_enc() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_manchester_enc".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered gray→binary converter 8b (ip/h_gray2bin). Not AXI.
+pub fn pack_gray2bin() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_gray2bin".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered binary→gray converter 8b (ip/h_bin2gray). Not AXI.
+pub fn pack_bin2gray() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_bin2gray".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST 3-input majority voter registered width-8 (ip/h_majority3). Not AXI.
+pub fn pack_majority3() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_majority3".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -713,6 +758,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_spi_slave(),
         pack_quad_enc(),
         pack_pwm_center(),
+        pack_manchester_enc(),
+        pack_gray2bin(),
+        pack_bin2gray(),
+        pack_majority3(),
     ]
 }
 
@@ -1118,6 +1167,30 @@ mod tests {
         assert_eq!(pack_spi_slave().vlnv(), "community:helion:h_spi_slave:1.0");
         assert_eq!(pack_quad_enc().vlnv(), "community:helion:h_quad_enc:1.0");
         assert_eq!(pack_pwm_center().vlnv(), "community:helion:h_pwm_center:1.0");
+        let me = pack_manchester_enc();
+        assert_eq!(me.name, "h_manchester_enc");
+        assert_eq!(me.bus, "Helion-ST");
+        assert_ne!(me.bus, "AXI");
+        let g2b = pack_gray2bin();
+        assert_eq!(g2b.name, "h_gray2bin");
+        assert_eq!(g2b.bus, "Helion-ST");
+        assert_ne!(g2b.bus, "AXI");
+        let b2g = pack_bin2gray();
+        assert_eq!(b2g.name, "h_bin2gray");
+        assert_eq!(b2g.bus, "Helion-ST");
+        assert_ne!(b2g.bus, "AXI");
+        let maj = pack_majority3();
+        assert_eq!(maj.name, "h_majority3");
+        assert_eq!(maj.bus, "Helion-ST");
+        assert_ne!(maj.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_manchester_enc"));
+        assert!(cat.iter().any(|c| c.name == "h_gray2bin"));
+        assert!(cat.iter().any(|c| c.name == "h_bin2gray"));
+        assert!(cat.iter().any(|c| c.name == "h_majority3"));
+        assert_eq!(pack_manchester_enc().vlnv(), "community:helion:h_manchester_enc:1.0");
+        assert_eq!(pack_gray2bin().vlnv(), "community:helion:h_gray2bin:1.0");
+        assert_eq!(pack_bin2gray().vlnv(), "community:helion:h_bin2gray:1.0");
+        assert_eq!(pack_majority3().vlnv(), "community:helion:h_majority3:1.0");
     }
 }
 

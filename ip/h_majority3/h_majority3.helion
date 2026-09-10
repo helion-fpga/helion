@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST 3-input majority voter
+format 1
+vlnv community:helion:h_majority3:1.0
+bus Helion-ST
+top h_majority3
+file h_majority3.v
