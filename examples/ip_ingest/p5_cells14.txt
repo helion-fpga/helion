@@ -1,0 +1,24 @@
+# FM-HEL-VIVADO-P5 fabric proof #14 — h_rng_xorshift + h_prio_enc + h_skid_buf + h_bcd_inc via read_ip
+# Command: cargo run -p helion-cli -- project examples/ip_ingest/h_rng_xorshift_ip.prj
+synth_design h_rng_xorshift cells=277 luts=268
+project examples/ip_ingest/h_rng_xorshift_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_rng_xorshift xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=268 WNS_PS=9680 frames=159
+# Instantiated IP: community:helion:h_rng_xorshift:1.0 (Helion-ST)
+# cells=277 luts=268 lutffs=268  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_prio_enc_ip.prj
+synth_design h_prio_enc cells=280 luts=256
+project examples/ip_ingest/h_prio_enc_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_prio_enc xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=256 WNS_PS=9620 frames=151
+# Instantiated IP: community:helion:h_prio_enc:1.0 (Helion-ST)
+# cells=280 luts=256 lutffs=256  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_skid_buf_ip.prj
+synth_design h_skid_buf cells=52 luts=24
+project examples/ip_ingest/h_skid_buf_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_skid_buf xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=24 WNS_PS=9340 frames=37
+# Instantiated IP: community:helion:h_skid_buf:1.0 (Helion-ST)
+# cells=52 luts=24 lutffs=24  (>0 real fabric)
+#
+# Also: cargo run -p helion-cli -- project examples/ip_ingest/h_bcd_inc_ip.prj
+synth_design h_bcd_inc cells=278 luts=265
+project examples/ip_ingest/h_bcd_inc_ip.prj part=HL10T-C32-1 sources=1 ip=1 top=h_bcd_inc xdc_files=1 create_clock=1 PACKAGE_PIN=0 lutffs=265 WNS_PS=9640 frames=154
+# Instantiated IP: community:helion:h_bcd_inc:1.0 (Helion-ST)
+# cells=278 luts=265 lutffs=265  (>0 real fabric)
