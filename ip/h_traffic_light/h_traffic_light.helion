@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST simple FSM traffic light
+format 1
+vlnv community:helion:h_traffic_light:1.0
+bus Helion-ST
+top h_traffic_light
+file h_traffic_light.v

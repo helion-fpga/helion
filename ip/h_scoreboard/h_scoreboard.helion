@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-MM outstanding-id scoreboard / sticky CAM
+format 1
+vlnv community:helion:h_scoreboard:1.0
+bus Helion-MM
+top h_scoreboard
+file h_scoreboard.v
