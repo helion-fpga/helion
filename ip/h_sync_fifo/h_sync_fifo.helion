@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST sync FIFO catalog core
+format 1
+vlnv community:helion:h_sync_fifo:1.0
+bus Helion-ST
+top h_sync_fifo
+file h_sync_fifo.v
