@@ -166,6 +166,29 @@ pub fn pack_lfsr() -> IpCore {
     }
 }
 
+
+/// Helion-ST binary↔gray counter with enable/load (ip/h_gray_cnt). Not AXI.
+pub fn pack_gray_cnt() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_gray_cnt".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM 4×32b scratch register file (ip/h_scratch_mm). Not AXI.
+pub fn pack_scratch_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_scratch_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -183,6 +206,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_watchdog(),
         pack_crc32(),
         pack_lfsr(),
+        pack_gray_cnt(),
+        pack_scratch_mm(),
     ]
 }
 
@@ -328,6 +353,18 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_lfsr"));
         assert_eq!(pack_crc32().vlnv(), "community:helion:h_crc32:1.0");
         assert_eq!(pack_lfsr().vlnv(), "community:helion:h_lfsr:1.0");
+        let gray = pack_gray_cnt();
+        assert_eq!(gray.name, "h_gray_cnt");
+        assert_eq!(gray.bus, "Helion-ST");
+        assert_ne!(gray.bus, "AXI");
+        let scratch = pack_scratch_mm();
+        assert_eq!(scratch.name, "h_scratch_mm");
+        assert_eq!(scratch.bus, "Helion-MM");
+        assert_ne!(scratch.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_gray_cnt"));
+        assert!(cat.iter().any(|c| c.name == "h_scratch_mm"));
+        assert_eq!(pack_gray_cnt().vlnv(), "community:helion:h_gray_cnt:1.0");
+        assert_eq!(pack_scratch_mm().vlnv(), "community:helion:h_scratch_mm:1.0");
     }
 }
 
