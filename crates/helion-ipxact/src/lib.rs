@@ -133,6 +133,28 @@ pub fn pack_watchdog() -> IpCore {
     }
 }
 
+/// Helion-ST byte-serial CRC32 (ip/h_crc32). Not AXI CRC.
+pub fn pack_crc32() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_crc32".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST programmable-tap LFSR PRBS generator (ip/h_lfsr). Not AXI.
+pub fn pack_lfsr() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_lfsr".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -147,6 +169,8 @@ pub fn catalog() -> Vec<IpCore> {
         pack_clkdiv(),
         pack_edge_det(),
         pack_watchdog(),
+        pack_crc32(),
+        pack_lfsr(),
     ]
 }
 
@@ -276,6 +300,18 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_watchdog"));
         assert_eq!(pack_edge_det().vlnv(), "community:helion:h_edge_det:1.0");
         assert_eq!(pack_watchdog().vlnv(), "community:helion:h_watchdog:1.0");
+        let crc = pack_crc32();
+        assert_eq!(crc.name, "h_crc32");
+        assert_eq!(crc.bus, "Helion-ST");
+        assert_ne!(crc.bus, "AXI");
+        let lfsr = pack_lfsr();
+        assert_eq!(lfsr.name, "h_lfsr");
+        assert_eq!(lfsr.bus, "Helion-ST");
+        assert_ne!(lfsr.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_crc32"));
+        assert!(cat.iter().any(|c| c.name == "h_lfsr"));
+        assert_eq!(pack_crc32().vlnv(), "community:helion:h_crc32:1.0");
+        assert_eq!(pack_lfsr().vlnv(), "community:helion:h_lfsr:1.0");
     }
 }
 

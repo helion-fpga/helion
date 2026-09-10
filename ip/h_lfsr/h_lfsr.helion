@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST programmable-tap LFSR PRBS
+format 1
+vlnv community:helion:h_lfsr:1.0
+bus Helion-ST
+top h_lfsr
+file h_lfsr.v
