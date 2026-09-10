@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST 1-deep skid buffer (valid/ready)
+format 1
+vlnv community:helion:h_skid_buf:1.0
+bus Helion-ST
+top h_skid_buf
+file h_skid_buf.v

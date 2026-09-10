@@ -1,0 +1,6 @@
+# Helion IP package (format 1) — Helion-ST registered xorshift32 PRNG
+format 1
+vlnv community:helion:h_rng_xorshift:1.0
+bus Helion-ST
+top h_rng_xorshift
+file h_rng_xorshift.v
