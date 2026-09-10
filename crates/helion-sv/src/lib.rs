@@ -3841,12 +3841,28 @@ fn note_width(p: &mut P, name: &str, w: usize) {
 /// Compact a priority-encoder for-loop unroll (≥32 bit writes + scalar flag)
 /// before fold. DW=64 bin2prio substitutes `found` through 64 mux arms and
 /// hangs (~40s banner-only); arbiter N=16 stays on the normal fold path.
+fn rhs_looks_like_priority_bit_set(e: &RExpr) -> bool {
+    match e {
+        RExpr::Const { val, .. } => *val == 1,
+        RExpr::Mux(_, t, f) => {
+            rhs_looks_like_priority_bit_set(t) || rhs_looks_like_priority_bit_set(f)
+        }
+        _ => false,
+    }
+}
+
 fn compact_priority_onehot_unroll(stmts: &[Nba]) -> Option<Vec<Nba>> {
     let mut bits_per: HashMap<String, usize> = HashMap::new();
+    let mut prio_sets: HashMap<String, usize> = HashMap::new();
     let mut scalar_writes: HashSet<String> = HashSet::new();
-    for (lhs, bit, _) in stmts {
+    for (lhs, bit, rhs) in stmts {
         match bit {
-            Some(_) => *bits_per.entry(lhs.clone()).or_default() += 1,
+            Some(_) => {
+                *bits_per.entry(lhs.clone()).or_default() += 1;
+                if rhs_looks_like_priority_bit_set(rhs) {
+                    *prio_sets.entry(lhs.clone()).or_default() += 1;
+                }
+            }
             None => {
                 scalar_writes.insert(lhs.clone());
             }
@@ -3857,6 +3873,12 @@ fn compact_priority_onehot_unroll(stmts: &[Nba]) -> Option<Vec<Nba>> {
     // hang-class DW≥48 priority for-loops (logikbench bin2prio DW=64) may
     // compact; never strip honest 32-bit fabric.
     if nbits < 48 {
+        return None;
+    }
+    // Priority encoders write 1'b1 into each claimed bit; counter_load / ALU
+    // bit-blasts do not. Require ≥75% set-to-1 shaped RHSs.
+    let sets = prio_sets.get(&bus).copied().unwrap_or(0);
+    if sets * 4 < nbits * 3 {
         return None;
     }
     // already_granted / found (and optional valid) must appear as scalars.
