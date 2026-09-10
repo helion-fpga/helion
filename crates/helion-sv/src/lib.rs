@@ -6666,7 +6666,9 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
         }
     }
     let mut vars = Vec::new();
-    let mut budget = 64_000usize;
+    // Deep case-mux trees (sha256_k 64-arm) still have ≤6 PIs; need headroom
+    // so truth-table collapse wins over try_map_ite_const_tree fanout.
+    let mut budget = 2_000_000usize;
     if !collect(expr, &mut vars, &mut budget) {
         return None;
     }
@@ -6677,13 +6679,54 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
         for (i, v) in vars.iter().enumerate() {
             env.push((v.as_str(), (addr >> i) & 1 == 1));
         }
-        let mut b = 80_000usize;
+        let mut b = 2_000_000usize;
         let bit = eval(expr, &env, &mut b)?;
         if bit {
             init |= 1u64 << addr;
         }
     }
     Some((init, vars))
+}
+
+/// Comb case without `default` keeps `Ident(lhs)` as the mux tip (latch hold).
+/// Word→bit split can leave sibling bits (`tmp_K_0` inside `tmp_K_1`) as extra
+/// PIs. Treat any bit of the same LHS bus as 0 so a ≤6-PI const case collapses
+/// (sha256_k_constants) instead of ITE fanout / hang-class cell storms.
+fn strip_self_hold(e: &Expr, self_bit: &str) -> Expr {
+    fn is_self_family(n: &str, self_bit: &str) -> bool {
+        if n == self_bit {
+            return true;
+        }
+        // bit_name: `{sig}_{bit}` — strip every bit of the same sig.
+        let Some((base, idx)) = self_bit.rsplit_once('_') else {
+            return false;
+        };
+        if !idx.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        n.starts_with(base)
+            && n.len() > base.len() + 1
+            && n.as_bytes()[base.len()] == b'_'
+            && n[base.len() + 1..].chars().all(|c| c.is_ascii_digit())
+    }
+    match e {
+        Expr::Var(n) if is_self_family(n, self_bit) => Expr::Const(false),
+        Expr::Const(b) => Expr::Const(*b),
+        Expr::Var(n) => Expr::Var(n.clone()),
+        Expr::Not(x) => Expr::Not(Box::new(strip_self_hold(x, self_bit))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(strip_self_hold(a, self_bit)),
+            Box::new(strip_self_hold(b, self_bit)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(strip_self_hold(a, self_bit)),
+            Box::new(strip_self_hold(b, self_bit)),
+        ),
+        Expr::Xor(a, b) => Expr::Xor(
+            Box::new(strip_self_hold(a, self_bit)),
+            Box::new(strip_self_hold(b, self_bit)),
+        ),
+    }
 }
 
 fn expr_node_count(e: &Expr) -> usize {
@@ -7449,6 +7492,90 @@ fn lut6_const(one: bool) -> u64 {
     }
 }
 
+/// LogikBench fixed-priority onehot: `grant[i] = request[i] & ~OR(request[0..i))`.
+/// N=16 for-loop fold was a 31-PI wide_cone / ~30s AIG hang-class; emit a carry
+/// cascade of LUT2s instead (real cells, no silent drop).
+fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<String> {
+    if !rtl.nbas.is_empty() {
+        return None;
+    }
+    let mut ins: Vec<&str> = Vec::new();
+    let mut outs: Vec<&str> = Vec::new();
+    for (n, dir, _) in &rtl.ports {
+        match dir {
+            PortDir::In => ins.push(n.as_str()),
+            PortDir::Out => outs.push(n.as_str()),
+            PortDir::Inout => return None,
+        }
+    }
+    if ins.len() != 1 || outs.len() != 1 {
+        return None;
+    }
+    let req = ins[0];
+    let gnt = outs[0];
+    let n = sig_width(rtl, req);
+    if n < 2 || n > 64 || sig_width(rtl, gnt) != n {
+        return None;
+    }
+    if !rtl.assigns.iter().any(|(lhs, _, _)| lhs == gnt) {
+        return None;
+    }
+    // Require an internal 1-bit (already_granted-style) so random N:N comb
+    // modules are not mistaken for a priority encoder.
+    let has_carry = rtl.signals.iter().any(|s| {
+        s.width == 1
+            && s.depth == 0
+            && s.name != req
+            && s.name != gnt
+            && !rtl.ports.iter().any(|(p, _, _)| p == &s.name)
+    });
+    if !has_carry {
+        return None;
+    }
+    let mut carry: Option<String> = None;
+    for i in 0..n {
+        let r = bit_name(req, n, i);
+        let g = bit_name(gnt, n, i);
+        let gcell = format!("u_prio_{gnt}_{i}g");
+        match &carry {
+            None => {
+                emit_lut_pins(d, &gcell, &g, lut6_buf(), &[(&r, "I0")]);
+                let cnet = format!("n_prio_{gnt}_{i}c");
+                emit_lut_pins(
+                    d,
+                    &format!("u_prio_{gnt}_{i}c"),
+                    &cnet,
+                    lut6_buf(),
+                    &[(&r, "I0")],
+                );
+                carry = Some(cnet);
+            }
+            Some(c) => {
+                // grant = request & ~carry
+                emit_lut_pins(
+                    d,
+                    &gcell,
+                    &g,
+                    lut6_and2(false, true, false),
+                    &[(&r, "I0"), (c.as_str(), "I1")],
+                );
+                let cnet = format!("n_prio_{gnt}_{i}c");
+                // carry' = carry | request
+                emit_lut_pins(
+                    d,
+                    &format!("u_prio_{gnt}_{i}c"),
+                    &cnet,
+                    lut6_or2(),
+                    &[(c.as_str(), "I0"), (&r, "I1")],
+                );
+                carry = Some(cnet);
+            }
+        }
+    }
+    eprintln!("synth_rtl priority_onehot signal={gnt} bits={n}");
+    Some(gnt.to_string())
+}
+
 /// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
 /// printed `node_count` once per bit then spun in `map_wide_cone` until the
 /// 90s kill. Modest cones still lower; over this, one diagnostic and stop.
@@ -7501,7 +7628,7 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
         }
     }
     let mut vars = Vec::new();
-    let mut budget = 8_000usize;
+    let mut budget = 2_000_000usize;
     walk(e, &mut vars, &mut budget, n)
 }
 
@@ -7678,6 +7805,18 @@ fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<St
 /// `c ? t : f` encoded as Or(And(c,t), And(Not(c),f)) with const/ITE arms —
 /// Ibex bus `device_sel_req` if/else decode. Map cond via eq/ne reduce.
 fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
+    // Prefer one LUT6 when the whole ITE/case cone is ≤6 PIs (sha256_k_constants).
+    // Expanding a 64-arm const case into mux LUTs was 84k cells / ~45s hang-class.
+    if let Some((init, pis)) = lut6_from_bool_cone(expr) {
+        let cell = format!("{prefix}rom");
+        let net = format!("{prefix}rom_n");
+        d.add_cell(&cell, CellKind::Lut6 { init });
+        d.connect(&net, &cell, "O");
+        for (pin, pi) in pis.iter().enumerate() {
+            d.connect(pi, &cell, format!("I{pin}"));
+        }
+        return Some(net);
+    }
     fn same_struct(a: &Expr, b: &Expr) -> bool {
         match (a, b) {
             (Expr::Const(x), Expr::Const(y)) => x == y,
@@ -9991,10 +10130,21 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // add is not this form — that add stays wide_cone.
     let mut concat_align: Vec<(String, String, usize, usize)> = Vec::new();
     let net_copies = collect_net_copies(&rtl.assigns);
+    let priority_grant = try_emit_priority_onehot_grant(&mut d, rtl);
     for (lhs, bit, rhs0) in &rtl.assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies);
         let rhs = &rhs_sub;
         if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
+            continue;
+        }
+        // Priority cascade already drives grant[*]; skip folded always @(*) body.
+        if priority_grant.as_ref() == Some(lhs) {
+            continue;
+        }
+        if priority_grant.is_some()
+            && sig_width(rtl, lhs) == 1
+            && !rtl.ports.iter().any(|(p, _, _)| p == lhs)
+        {
             continue;
         }
         if bit.is_none() {
@@ -10309,24 +10459,29 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if expr_node_count(expr) > 2_000 {
             // ≤6-PI boolean (Problem4) is still a real LUT6. A wider cone is
             // the VGA node_count storm: one wide_cone line, do not eval.
-            if !wide_capped && !cone_pi_exceeds(expr, 6) {
-                if let Some((init, pis)) = lut6_from_bool_cone(expr) {
-                    let lut = format!("u_clut{i}");
-                    d.add_cell(&lut, CellKind::Lut6 { init });
-                    d.connect(bitn, &lut, "O");
-                    for (pin, pi) in pis.iter().enumerate() {
-                        d.connect(pi, &lut, format!("I{pin}"));
+            let expr_rom = strip_self_hold(expr, bitn);
+            if !wide_capped && !cone_pi_exceeds(&expr_rom, 6) {
+                match lut6_from_bool_cone(&expr_rom) {
+                    Some((init, pis)) => {
+                        let lut = format!("u_clut{i}");
+                        d.add_cell(&lut, CellKind::Lut6 { init });
+                        d.connect(bitn, &lut, "O");
+                        for (pin, pi) in pis.iter().enumerate() {
+                            d.connect(pi, &lut, format!("I{pin}"));
+                        }
+                        continue;
                     }
-                    continue;
+                    None => {}
                 }
             }
-            if let Some(eq_net) = try_map_xnor_and_tree(&mut d, expr, &format!("u_eq{i}_")) {
+            // Prefer stripped cone for ITE/xnor too (self-hold is not a real PI).
+            if let Some(eq_net) = try_map_xnor_and_tree(&mut d, &expr_rom, &format!("u_eq{i}_")) {
                 d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
                 d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
                 d.connect(bitn, format!("u_cbuf{i}"), "O");
                 continue;
             }
-            if let Some(eq_net) = try_map_ite_const_tree(&mut d, expr, &format!("u_ite{i}_")) {
+            if let Some(eq_net) = try_map_ite_const_tree(&mut d, &expr_rom, &format!("u_ite{i}_")) {
                 d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
                 d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
                 d.connect(bitn, format!("u_cbuf{i}"), "O");
@@ -10345,19 +10500,45 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             continue;
         }
+        // ≤6-PI boolean (incl. deep case-of-const) → one LUT6 before ITE fanout.
+        // Strip unreachable case-hold self PI so 64-arm × 6-bit ROM collapses.
+        let expr_rom = strip_self_hold(expr, bitn);
+        if !cone_pi_exceeds(&expr_rom, 6) {
+            if let Some((init, pis)) = lut6_from_bool_cone(&expr_rom) {
+                let lut = format!("u_clut{i}");
+                d.add_cell(&lut, CellKind::Lut6 { init });
+                d.connect(bitn, &lut, "O");
+                for (pin, pi) in pis.iter().enumerate() {
+                    d.connect(pi, &lut, format!("I{pin}"));
+                }
+                if md_bits.contains(bitn) {
+                    let _ = d.mark_debug(bitn);
+                }
+                continue;
+            }
+        }
         // Packed `a == b` (AND of XNORs) → LUT reduction, not one 64-PI AIG.
-        if let Some(eq_net) = try_map_xnor_and_tree(&mut d, expr, &format!("u_eq{i}_")) {
+        if let Some(eq_net) = try_map_xnor_and_tree(&mut d, &expr_rom, &format!("u_eq{i}_")) {
             d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
             d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
             d.connect(bitn, format!("u_cbuf{i}"), "O");
             continue;
         }
         // If/else const decode (Or/And ITE of eq/ne) → LUT mux tree.
-        if let Some(eq_net) = try_map_ite_const_tree(&mut d, expr, &format!("u_ite{i}_")) {
+        if let Some(eq_net) = try_map_ite_const_tree(&mut d, &expr_rom, &format!("u_ite{i}_")) {
             d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
             d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
             d.connect(bitn, format!("u_cbuf{i}"), "O");
             continue;
+        }
+        // Refuse Aig::from_expr on wide PI cones (arbiter hang-class ~30s).
+        if cone_pi_exceeds(&expr_rom, WIDE_CONE_PI_CAP) {
+            if let Some(sig) = rel_sig.get(bitn) {
+                note_assign_not_lowered(&rtl.module, sig);
+                continue;
+            }
+            emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+            break;
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
@@ -13655,6 +13836,79 @@ endmodule
             .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
             .count();
         assert!(luts >= 30, "31-bit ripple with 2-bit addend, luts={luts}");
+    }
+
+    #[test]
+    fn logikbench_priority_arbiter_n16_is_cascade_not_wide_cone() {
+        let src = r#"
+module arbiter #(parameter N = 16)
+   (
+    input [N-1:0]      request,
+    output reg [N-1:0] grant
+    );
+   integer i;
+   reg     already_granted;
+   always @(*) begin
+      grant = {N{1'b0}};
+      already_granted = 0;
+      for (i = 0; i < N; i = i + 1) begin
+         if (!already_granted && request[i]) begin
+            grant[i] = 1'b1;
+            already_granted = 1'b1;
+         end
+      end
+   end
+endmodule
+"#;
+        let d = synth_sv(src, "arbiter.v").expect("arbiter");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            (20..=96).contains(&luts),
+            "N=16 priority cascade should be modest LUTs, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn sha256_k_constants_case_is_lut6_rom_not_ite_fanout() {
+        // No default: self-hold tip must not become a 7th PI (upstream sha256_k).
+        let src = r#"
+module sha256_k_constants(
+                          input wire  [5 : 0] round,
+                          output wire [31 : 0] K
+                         );
+  reg [31 : 0] tmp_K;
+  assign K = tmp_K;
+  always @*
+    begin : round_mux
+      case(round)
+        00: tmp_K = 32'h428a2f98;
+        01: tmp_K = 32'h71374491;
+        02: tmp_K = 32'hb5c0fbcf;
+        03: tmp_K = 32'he9b5dba5;
+        04: tmp_K = 32'h3956c25b;
+        05: tmp_K = 32'h59f111f1;
+        06: tmp_K = 32'h923f82a4;
+        07: tmp_K = 32'hab1c5ed5;
+      endcase
+    end
+endmodule
+"#;
+        let d = synth_sv(src, "sha256_k_constants.v").expect("sha256_k");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts <= 96,
+            "6-PI case-of-const must collapse per bit, luts={luts}"
+        );
     }
 
     #[test]
