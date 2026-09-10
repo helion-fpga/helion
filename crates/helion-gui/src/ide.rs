@@ -31592,6 +31592,82 @@ endmodule
         );
     }
 
+    /// examples/cdc_sync.sv: 2FF synchronizer → CDC-1 Warning / catalog Warnings.
+    /// Methodology CriticalWarning (TimedUnsafe CDC-1) still paints Failed.
+    /// Counter gold WNS_PS=9640 unchanged.
+    #[test]
+    fn cdc_sync_example_cdc1_warning_catalog_warnings() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("cdc_sync.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert!(
+            ide.pane_clocks().len() >= 2,
+            "sibling SDC must create clk_a/clk_b: {:?}",
+            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        let out = ide.exec("report_cdc").unwrap();
+        assert!(out.contains("report_cdc"), "{out}");
+        let r = ide.cdc_report();
+        assert_eq!(r.critical_count(), 0, "2FF sync must not Critical: {}", r.text());
+        assert!(
+            r.warning_count() > 0,
+            "2FF sync must Warning: {}",
+            r.text()
+        );
+        let row = r
+            .violation("clk_a", "clk_b")
+            .expect("clk_a→clk_b CDC row");
+        assert_eq!(row.check, "CDC-1", "{row:?}");
+        assert_eq!(row.severity, helion_sta::CdcSeverity::Warning, "{row:?}");
+        assert!(row.synchronizer, "2FF must set synchronizer: {row:?}");
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cat.status, "Warnings",
+            "CDC-1 Warning-only must paint Warnings: {cat:?}"
+        );
+
+        // Methodology: TimedUnsafe still CriticalWarning → Failed (not Warnings).
+        let meth = ide.methodology_report();
+        assert!(
+            meth.check("CDC-1").is_some(),
+            "methodology CDC-1 CriticalWarning must remain: {}",
+            meth.text()
+        );
+        assert!(
+            meth.critical_count() > 0,
+            "unsafe CDC methodology must CriticalWarning: {}",
+            meth.text()
+        );
+        let meth_cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_methodology")
+            .expect("methodology row");
+        assert_eq!(
+            meth_cat.status, "Failed",
+            "methodology CriticalWarning must paint Failed: {meth_cat:?}"
+        );
+
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
+        let cdc_clean = again
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .unwrap();
+        assert_eq!(cdc_clean.status, "Complete", "{cdc_clean:?}");
+    }
+
     /// POWER-2 occupancy warn is wired into report_power text + catalog; counter
     /// (4/8192) stays below 80% so POWER-1 assumed_f remains the demo warn path.
     #[test]
