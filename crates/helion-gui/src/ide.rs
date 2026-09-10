@@ -14960,13 +14960,17 @@ impl IdeModel {
         let pwr = self.power_report();
         let pwr_ready = !pwr.part.is_empty();
         let pwr_assumed_f = pwr_ready && self.pane_clocks().is_empty();
+        // POWER-2: LUTFF occupancy ≥ 80%. Tiny demos (counter 4/8192) never hit this;
+        // catalog still wires the warn when a dense design does.
+        let pwr_high_occ = pwr_ready && pwr.power2_high_occupancy();
         let pwr_sum = format!(
-            "TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={}{}",
+            "TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={}{}{}",
             pwr.total_uw,
             pwr.static_uw,
             pwr.dynamic_uw,
             pwr.voltage_mv,
-            if pwr_assumed_f { " POWER-1=assumed_f" } else { "" }
+            if pwr_assumed_f { " POWER-1=assumed_f" } else { "" },
+            if pwr_high_occ { " POWER-2=high_occupancy" } else { "" }
         );
 
         let meth = self.methodology_report();
@@ -15017,7 +15021,7 @@ impl IdeModel {
         } else {
             "Complete"
         };
-        let pwr_status = if pwr_ready && self.pane_clocks().is_empty() {
+        let pwr_status = if pwr_assumed_f || pwr_high_occ {
             "Warnings"
         } else {
             "Complete"
@@ -31499,6 +31503,114 @@ endmodule
         // Second create_clock retimes STA; gold checked pre-virt above.
         assert!(ide.wns_ps().is_some(), "STA still present after CDC Failed catalog");
         let _ = gold;
+    }
+
+    /// examples/cdc_cross.sv: real dual-clock unsync FF→FF → CDC-10 Critical / Failed.
+    /// Clean counter still Complete CDC + gold WNS_PS=9640.
+    #[test]
+    fn cdc_cross_example_cdc10_critical_catalog_failed() {
+        let mut clean = IdeModel::new();
+        clean.open_source(&example("counter.sv")).unwrap();
+        clean.run_step(FlowStep::Opt).unwrap();
+        clean.run_step(FlowStep::Place).unwrap();
+        clean.run_step(FlowStep::Route).unwrap();
+        let gold = clean.wns_ps().expect("counter STA");
+        assert_eq!(gold, 9640, "empty XDC gold WNS");
+        let cdc_clean = clean
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(cdc_clean.status, "Complete", "{cdc_clean:?}");
+        assert_eq!(clean.cdc_report().critical_count(), 0, "{}", clean.cdc_text());
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("cdc_cross.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        assert!(
+            ide.pane_clocks().len() >= 2,
+            "sibling SDC must create clk_a/clk_b: {:?}",
+            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        let out = ide.exec("report_cdc").unwrap();
+        assert!(out.contains("report_cdc"), "{out}");
+        let r = ide.cdc_report();
+        assert!(
+            r.critical_count() > 0,
+            "unsync dual-clock cross must Critical: {}",
+            r.text()
+        );
+        let row = r
+            .violation("clk_a", "clk_b")
+            .or_else(|| r.violation("clk_b", "clk_a"))
+            .expect("clk_a↔clk_b CDC row");
+        assert_eq!(row.check, "CDC-10", "{row:?}");
+        assert_eq!(row.severity, helion_sta::CdcSeverity::Critical, "{row:?}");
+        let cat = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_cdc")
+            .expect("cdc row");
+        assert_eq!(
+            cat.status, "Failed",
+            "CDC-10 Critical must paint Failed: {cat:?}"
+        );
+
+        // Counter gold must still hold on a fresh session (no WNS bleed).
+        let mut again = IdeModel::new();
+        again.open_source(&example("counter.sv")).unwrap();
+        again.run_step(FlowStep::Opt).unwrap();
+        again.run_step(FlowStep::Place).unwrap();
+        again.run_step(FlowStep::Route).unwrap();
+        assert_eq!(again.wns_ps(), Some(9640));
+        assert_eq!(
+            again
+                .report_catalog()
+                .into_iter()
+                .find(|r| r.id == "report_cdc")
+                .unwrap()
+                .status,
+            "Complete"
+        );
+    }
+
+    /// POWER-2 occupancy warn is wired into report_power text + catalog; counter
+    /// (4/8192) stays below 80% so POWER-1 assumed_f remains the demo warn path.
+    #[test]
+    fn report_power_power2_wired_counter_below_threshold() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        let gold = ide.wns_ps().expect("STA");
+        assert_eq!(gold, 9640);
+        let p = ide.power_report();
+        assert_eq!(p.lutff, 4, "{}", p.text());
+        assert!(
+            p.lutff_occupancy_pct() < 80,
+            "counter cannot hit POWER-2: pct={}",
+            p.lutff_occupancy_pct()
+        );
+        assert!(!p.text().contains("POWER-2"), "{}", p.text());
+        let pwr = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_power")
+            .expect("power row");
+        assert!(
+            !pwr.summary.contains("POWER-2"),
+            "counter catalog must not fire POWER-2: {pwr:?}"
+        );
+        assert_ne!(pwr.status, "Failed", "{pwr:?}");
+        // Synthetic high occupancy still formats POWER-2 without touching STA.
+        let mut hot = p.clone();
+        hot.lutff = (hot.lutff_cap as usize * 80).div_ceil(100);
+        assert!(hot.power2_high_occupancy());
+        assert!(hot.text().contains("POWER-2=high_occupancy"), "{}", hot.text());
+        assert_eq!(ide.wns_ps(), Some(gold), "POWER-2 path must not move WNS");
     }
 
     /// UG893 Log pane is a clickable command/result table, not a monospace dump.
