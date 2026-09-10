@@ -247,6 +247,52 @@ pub fn pack_byte_rev() -> IpCore {
     }
 }
 
+
+/// Helion-ST 4-request round-robin arbiter with grant + sticky mask (ip/h_arb_rr). Not AXI.
+pub fn pack_arb_rr() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_arb_rr".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-ST registered 32b count-trailing-zeros (ip/h_ctz). Not AXI. Pair to h_clz.
+pub fn pack_ctz() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_ctz".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+
+/// Helion-ST registered min/max of two 32b + mode (ip/h_minmax). Not AXI.
+pub fn pack_minmax() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_minmax".into(),
+        version: "1.0".into(),
+        bus: "Helion-ST".into(),
+    }
+}
+
+/// Helion-MM loadable accumulator + clear/add (ip/h_accum_mm). Not AXI.
+pub fn pack_accum_mm() -> IpCore {
+    IpCore {
+        vendor: "community".into(),
+        library: "helion".into(),
+        name: "h_accum_mm".into(),
+        version: "1.0".into(),
+        bus: "Helion-MM".into(),
+    }
+}
+
 /// UG893 IP Catalog contents: packed Helion-MM/ST cores from helion-ipxact.
 pub fn catalog() -> Vec<IpCore> {
     vec![
@@ -271,6 +317,10 @@ pub fn catalog() -> Vec<IpCore> {
         pack_compare_mm(),
         pack_clz(),
         pack_byte_rev(),
+        pack_arb_rr(),
+        pack_ctz(),
+        pack_minmax(),
+        pack_accum_mm(),
     ]
 }
 
@@ -460,6 +510,30 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_byte_rev"));
         assert_eq!(pack_clz().vlnv(), "community:helion:h_clz:1.0");
         assert_eq!(pack_byte_rev().vlnv(), "community:helion:h_byte_rev:1.0");
+        let arb = pack_arb_rr();
+        assert_eq!(arb.name, "h_arb_rr");
+        assert_eq!(arb.bus, "Helion-ST");
+        assert_ne!(arb.bus, "AXI");
+        let ctz = pack_ctz();
+        assert_eq!(ctz.name, "h_ctz");
+        assert_eq!(ctz.bus, "Helion-ST");
+        assert_ne!(ctz.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_arb_rr"));
+        assert!(cat.iter().any(|c| c.name == "h_ctz"));
+        assert_eq!(pack_arb_rr().vlnv(), "community:helion:h_arb_rr:1.0");
+        assert_eq!(pack_ctz().vlnv(), "community:helion:h_ctz:1.0");
+        let mmx = pack_minmax();
+        assert_eq!(mmx.name, "h_minmax");
+        assert_eq!(mmx.bus, "Helion-ST");
+        assert_ne!(mmx.bus, "AXI");
+        let acc = pack_accum_mm();
+        assert_eq!(acc.name, "h_accum_mm");
+        assert_eq!(acc.bus, "Helion-MM");
+        assert_ne!(acc.bus, "AXI");
+        assert!(cat.iter().any(|c| c.name == "h_minmax"));
+        assert!(cat.iter().any(|c| c.name == "h_accum_mm"));
+        assert_eq!(pack_minmax().vlnv(), "community:helion:h_minmax:1.0");
+        assert_eq!(pack_accum_mm().vlnv(), "community:helion:h_accum_mm:1.0");
     }
 }
 
