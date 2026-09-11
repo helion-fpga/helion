@@ -54,7 +54,7 @@ helion-gui IdeModel paints the Session</code></pre>
           <tr><td><code>helion-pack</code></td><td>LUTFF, IOB, MAC27, BRAM18</td></tr>
           <tr><td><code>helion-place</code></td><td>Timing-driven place (timing_weight 0.75 on gold run)</td></tr>
           <tr><td><code>helion-route</code></td><td>PathFinder A* with hop delay in the cost</td></tr>
-          <tr><td><code>helion-sta</code></td><td>XDC clocks / I-O delay / false path, WNS + hold</td></tr>
+          <tr><td><code>helion-sta</code></td><td>XDC/SDC constraints, WNS + hold (see <code>crates/helion-sta/src/lib.rs::load_xdc</code>)</td></tr>
           <tr><td><code>helion-drc</code></td><td>Occupancy, unrouted IO, clocks</td></tr>
           <tr><td><code>helion-bits</code></td><td>FeatureMap frames, sparse <code>.hbits</code>, partial (DFX)</td></tr>
           <tr><td><code>helion-fabric</code> / <code>helion-sim</code></td><td>Cycle fabric (6-input IMUX LUT + FF + IOB + STAT) and event kernel</td></tr>
@@ -65,6 +65,18 @@ helion-gui IdeModel paints the Session</code></pre>
           <tr><td><code>helion-cli</code></td><td><code>helion</code> binary</td></tr>
         </tbody>
       </table></div>
+
+      <h3>XDC/SDC command subset</h3>
+      <p><code>helion-sta::load_xdc</code> parses <code>create_clock</code>, <code>create_generated_clock</code>,
+        <code>set_input_delay</code>, <code>set_output_delay</code>, <code>set_false_path</code>,
+        <code>set_multicycle_path</code>, <code>set_max_delay</code>, <code>set_min_delay</code>,
+        <code>set_clock_groups</code>, <code>set_clock_uncertainty</code>, <code>set_clock_latency</code>,
+        <code>set_disable_timing</code>, <code>set_case_analysis</code>, <code>set_propagated_clock</code>,
+        <code>set_clock_sense</code>, <code>set_input_jitter</code>, <code>set_system_jitter</code>,
+        <code>set_timing_derate</code>, <code>set_operating_conditions</code>, <code>set_bus_skew</code>,
+        <code>group_path</code>, <code>set_max_time_borrow</code>, <code>set_data_check</code>, and
+        <code>set_property</code> for <code>PACKAGE_PIN</code>, <code>IOSTANDARD</code>, <code>DRIVE</code>,
+        <code>SLEW</code>, <code>PULLTYPE</code>, <code>DIFF_TERM</code>, and <code>IN_TERM</code>.</p>
 
       <h2>Part HL10T-C32-1</h2>
       <p>
