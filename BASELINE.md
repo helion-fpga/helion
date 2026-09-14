@@ -65,7 +65,19 @@ See Phase 0 shell log: `WNS_PS=9640`, `no_body`, `push_cell`, `collapse_hierarch
 
 ## Exit criteria
 - [x] BASELINE.md written
-- [ ] `wip/1.4-baseline` branch
-- [ ] A-bucket commit (saksham-45)
-- [ ] gold×2: `helion-ide --headless examples/counter.sv` → WNS_PS=9640 twice
-- [ ] soft-hold / no merge to master
+- [x] `wip/1.4-baseline` branch
+- [x] A-bucket commit `585659e` (saksham-45)
+- [x] gold×2: `helion-ide --headless examples/counter.sv` → WNS_PS=9640 twice
+- [x] soft-hold / no merge to master
+
+## Gold×2 proof
+
+```
+# run1
+report_timing counter WNS_PS=9640 ...
+# run2
+report_timing counter WNS_PS=9640 ...
+cargo test -p helion-cli --test gold_lab → 4 passed
+```
+
+**Tip after land:** `585659e` on `wip/1.4-baseline` (parent `9997c18`).
