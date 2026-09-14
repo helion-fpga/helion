@@ -689,13 +689,12 @@ pub fn get_nets(d: &Design, filter: Option<&str>) -> Vec<String> {
 }
 
 pub fn get_pins(d: &Design, cell: &str) -> Vec<String> {
-    d.nets
-        .iter()
-        .flat_map(|n| {
-            n.endpoints
-                .iter()
-                .filter(|e| e.cell == cell)
-                .map(|e| format!("{}/{}", e.cell, e.pin))
+    let idx = d.pin_index();
+    ["I0", "I1", "I2", "I3", "I4", "I5", "O", "D", "Q", "CLK", "I", "PAD"]
+        .into_iter()
+        .filter_map(|pin| {
+            idx.net_on(cell, pin)
+                .map(|_| format!("{cell}/{pin}"))
         })
         .collect()
 }
@@ -1051,37 +1050,48 @@ pub fn constraints_from_project(
 }
 
 pub fn opt_design(d: &mut Design) -> usize {
-    let iob_nets: std::collections::HashSet<String> = d
+    let pins = d.pin_index();
+    let iob_nets: std::collections::HashSet<&str> = d
         .cells
         .iter()
         .filter(|c| matches!(c.kind, CellKind::IobOut))
-        .filter_map(|c| d.net_on(&c.name, "I").map(|s| s.to_string()))
+        .filter_map(|c| pins.net_on(&c.name, "I"))
         .collect();
-    let mut drop = Vec::new();
+    let mut d_to_ff: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for f in &d.cells {
+        if matches!(f.kind, CellKind::Hff) {
+            if let Some(dnet) = pins.net_on(&f.name, "D") {
+                d_to_ff.entry(dnet).or_insert(f.name.as_str());
+            }
+        }
+    }
+    let mut drop: std::collections::HashSet<String> = std::collections::HashSet::new();
     for c in &d.cells {
         let CellKind::Lut6 { init: 0 } = c.kind else {
             continue;
         };
-        let Some(o) = d.net_on(&c.name, "O") else {
+        let Some(o) = pins.net_on(&c.name, "O") else {
             continue;
         };
-        let Some(ff) = d.cells.iter().find(|f| {
-            matches!(f.kind, CellKind::Hff) && d.net_on(&f.name, "D") == Some(o)
-        }) else {
+        let Some(ff_name) = d_to_ff.get(o).copied() else {
             continue;
         };
-        let q = d.net_on(&ff.name, "Q").unwrap_or("");
+        let Some(ff) = d.cell(ff_name) else {
+            continue;
+        };
+        let q = pins.net_on(ff_name, "Q").unwrap_or("");
         if iob_nets.contains(q) {
             continue;
         }
         if c.attrs.flag("DONT_TOUCH") || c.attrs.flag("keep") || ff.attrs.flag("DONT_TOUCH") {
             continue;
         }
-        drop.push(c.name.clone());
-        drop.push(ff.name.clone());
+        drop.insert(c.name.clone());
+        drop.insert(ff.name.clone());
     }
     let n = drop.len() / 2;
     d.cells.retain(|c| !drop.contains(&c.name));
+    d.rebuild_indexes();
     n
 }
 

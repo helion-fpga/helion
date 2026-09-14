@@ -82,10 +82,12 @@ fn compile_design_xdc(
     let iob_budget = dev.iob_sites().count();
     // Prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
     // device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32 IOBs.
+    let q_nets: std::collections::HashSet<&str> =
+        packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
     let driven: Vec<_> = packed
         .iobs
         .iter()
-        .filter(|io| packed.lutffs.iter().any(|l| l.q_net == io.from_net))
+        .filter(|io| q_nets.contains(io.from_net.as_str()))
         .cloned()
         .collect();
     let undriven = packed.iobs.len().saturating_sub(driven.len());
@@ -164,11 +166,19 @@ fn compile_design_xdc(
     // Empty / clock-only XDC keeps gold WNS (9640 on counter @ 10 ns).
     let t4 = std::time::Instant::now();
     let timing = report_timing_routed_xdc(&design, &routed, &clks, xdc)?;
-    eprintln!(
-        "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
-        timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps,
-        t4.elapsed().as_millis()
-    );
+    if timing.endpoints == 0 {
+        eprintln!(
+            "hang_diag timing no_body cells={} (not a closed WNS) ms={}",
+            design.cells.len(),
+            t4.elapsed().as_millis()
+        );
+    } else {
+        eprintln!(
+            "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
+            timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps,
+            t4.elapsed().as_millis()
+        );
+    }
     Ok(Compiled {
         dev,
         design,
@@ -400,6 +410,14 @@ fn cmd_timing(args: &[String]) {
             eprintln!("report_timing: {e}");
             std::process::exit(1);
         });
+    }
+    if c.routed.placed.packed.lutffs.is_empty() || timing.endpoints == 0 {
+        println!(
+            "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
+            c.design.name,
+            c.design.cells.len()
+        );
+        return;
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",

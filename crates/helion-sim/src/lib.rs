@@ -61,16 +61,14 @@ impl Sim {
                 ff_d_lut.insert(f.cell.clone(), l.cell.clone());
             }
         }
+        let pin_ix = d.pin_index();
         let iob_from_ff = d.cells.iter().find_map(|c| {
             if !matches!(c.kind, CellKind::IobOut) {
                 return None;
             }
-            let net = d.nets.iter().find(|n| {
-                n.endpoints
-                    .iter()
-                    .any(|e| e.cell == c.name && e.pin == "I")
-            })?;
-            net.endpoints
+            let net = pin_ix.net_on(&c.name, "I")?;
+            d.net(net)?
+                .endpoints
                 .iter()
                 .find(|e| e.pin == "Q")
                 .map(|e| e.cell.clone())
@@ -203,18 +201,21 @@ impl Sim {
             .collect()
     }
 
-    /// UG900 Memory: each LUT INIT is a 64×1 ROM (addr = LUT input, data = INIT bit).
+    /// UG900 Memory: LUT INIT as 64×1 ROM. Cap the dump — Ibex is 100k LUTs.
     pub fn memory_cells(&self) -> Vec<SimMemory> {
-        let mut v: Vec<SimMemory> = self
-            .lut_init
-            .iter()
-            .map(|(name, init)| SimMemory {
+        const CAP: usize = 32;
+        let mut v: Vec<SimMemory> = Vec::new();
+        for (name, init) in &self.lut_init {
+            if v.len() >= CAP {
+                break;
+            }
+            v.push(SimMemory {
                 name: name.clone(),
                 kind: "lut_init".into(),
                 width: 1,
                 words: (0..64).map(|a| (init >> a) & 1).collect(),
-            })
-            .collect();
+            });
+        }
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -229,7 +230,7 @@ impl Sim {
         }];
         let mut ffs: Vec<_> = self.ff_q.iter().collect();
         ffs.sort_by_key(|(n, _)| *n);
-        for (n, q) in ffs {
+        for (n, q) in ffs.into_iter().take(256) {
             v.push(SimLocal {
                 name: n.clone(),
                 kind: "reg".into(),
@@ -355,6 +356,23 @@ mod tests {
             "{loc:?}"
         );
         assert_eq!(s.signal_value("led"), Some(u64::from(s.led)));
+    }
+
+    #[test]
+    fn memory_cells_capped_on_wide_netlist() {
+        let mut d = Design::new("wide");
+        for i in 0..400u32 {
+            d.add_cell(format!("lut{i}"), CellKind::Lut6 { init: 1 });
+        }
+        let s = Sim::new(&d);
+        assert_eq!(s.lut_init.len(), 400, "kernel still holds every INIT");
+        let mem = s.memory_cells();
+        assert!(
+            mem.len() <= 32,
+            "Memory pane must not dump 400 LUT ROMs: {}",
+            mem.len()
+        );
+        assert!(!mem.is_empty());
     }
 
     #[test]

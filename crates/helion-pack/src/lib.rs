@@ -83,11 +83,11 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             used_ff.insert(n.to_string());
         }
         let mut lut_pins = Vec::new();
-        for pin in 0u8..6 {
-            let key = format!("I{pin}");
-            if let Some(net) = pins.net_on(&c.name, &key) {
+        const IPINS: [&str; 6] = ["I0", "I1", "I2", "I3", "I4", "I5"];
+        for (pin, key) in IPINS.iter().enumerate() {
+            if let Some(net) = pins.net_on(&c.name, key) {
                 if let Some(src) = q_driver.get(net) {
-                    lut_pins.push((pin, (*src).to_string()));
+                    lut_pins.push((pin as u8, (*src).to_string()));
                 }
             }
         }
@@ -164,9 +164,12 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
 /// Copy HNF port DRIVE / SLEW / PULLTYPE / DIFF_TERM / IN_TERM onto packed IOBs
 /// (post-pack set_property).
 pub fn apply_iob_electrical(design: &Design, iobs: &mut [PackedIob]) {
+    let pins = design.pin_index();
+    let ports: std::collections::HashMap<&str, &helion_ir::Port> =
+        design.ports.iter().map(|p| (p.name.as_str(), p)).collect();
     for iob in iobs.iter_mut() {
-        let pad = design.net_on(&iob.cell, "PAD").unwrap_or("");
-        if let Some(p) = design.ports.iter().find(|p| p.name == pad) {
+        let pad = pins.net_on(&iob.cell, "PAD").unwrap_or("");
+        if let Some(p) = ports.get(pad) {
             iob.drive = p.attrs.get("DRIVE").map(|s| s.to_string());
             iob.slew = p.attrs.get("SLEW").map(|s| s.to_string());
             iob.pulltype = p.attrs.get("PULLTYPE").map(|s| s.to_string());
@@ -247,6 +250,37 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         assert_eq!(p.macs.len(), 1);
         assert!(p.lutffs.is_empty());
+    }
+
+    #[test]
+    fn pack_thousands_of_lutff_pairs_is_subquadratic() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut d = Design::new("wide");
+        d.add_port("clk", helion_ir::PortDir::In);
+        const N: u32 = 3_000;
+        for i in 0..N {
+            let lut = format!("lut{i}");
+            let ff = format!("ff{i}");
+            d.add_cell(&lut, CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect("clk", &ff, "CLK");
+            d.connect(format!("d{i}"), &lut, "O");
+            d.connect(format!("d{i}"), &ff, "D");
+            d.connect(format!("q{i}"), &ff, "Q");
+            d.connect(format!("q{i}"), &lut, "I0");
+        }
+        let t0 = std::time::Instant::now();
+        let p = pack(&d, &dev).unwrap();
+        let ms = t0.elapsed().as_millis();
+        assert_eq!(p.lutffs.len(), N as usize, "every LUT/FF pair packs");
+        assert!(
+            p.lutffs.iter().all(|l| !l.ff_cell.is_empty() && !l.q_net.is_empty()),
+            "clusters keep FF and Q net"
+        );
+        assert!(
+            ms < 2000,
+            "pack of {N} LUT/FF pairs must stay subquadratic, took {ms}ms"
+        );
     }
 
     #[test]

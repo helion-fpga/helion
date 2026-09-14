@@ -30,6 +30,7 @@ pub enum Expr {
 #[derive(Clone, Debug)]
 pub struct Aig {
     pub pis: Vec<String>,
+    pi_ix: HashMap<String, u32>,
     pub ands: Vec<(Lit, Lit)>,
     pub output: Lit,
 }
@@ -59,6 +60,7 @@ impl Aig {
     pub fn from_expr(e: &Expr) -> Self {
         let mut a = Self {
             pis: Vec::new(),
+            pi_ix: HashMap::new(),
             ands: Vec::new(),
             output: Lit::c0(),
         };
@@ -84,15 +86,17 @@ impl Aig {
     }
 
     fn pi(&mut self, name: &str) -> Lit {
-        if let Some(i) = self.pis.iter().position(|p| p == name) {
+        if let Some(&i) = self.pi_ix.get(name) {
             return Lit {
-                node: 1 + i as u32,
+                node: 1 + i,
                 inv: false,
             };
         }
+        let i = self.pis.len() as u32;
         self.pis.push(name.into());
+        self.pi_ix.insert(self.pis[i as usize].clone(), i);
         Lit {
-            node: self.pis.len() as u32,
+            node: 1 + i,
             inv: false,
         }
     }
@@ -1598,7 +1602,7 @@ fn d_cone_connect(d: &Design, ff: &str, want: &str) -> Option<(String, String)> 
         if !seen.insert(net.clone()) {
             continue;
         }
-        let Some(nrec) = d.nets.iter().find(|n| n.name == net) else {
+        let Some(nrec) = d.net(&net) else {
             continue;
         };
         for ep in &nrec.endpoints {
@@ -1833,32 +1837,186 @@ pub fn incremental_log() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn hash_own(rtl: &Rtl) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    let mut feed = |s: &str| {
-        for b in s.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+struct OwnHash {
+    h: u64,
+}
+
+impl OwnHash {
+    fn new() -> Self {
+        Self {
+            h: 0xcbf29ce484222325,
         }
-        h ^= 0xff;
-        h = h.wrapping_mul(0x100000001b3);
-    };
-    feed(&rtl.module);
+    }
+    fn feed(&mut self, s: &str) {
+        for b in s.as_bytes() {
+            self.h ^= *b as u64;
+            self.h = self.h.wrapping_mul(0x100000001b3);
+        }
+        self.h ^= 0xff;
+        self.h = self.h.wrapping_mul(0x100000001b3);
+    }
+    fn feed_u64(&mut self, v: u64) {
+        for b in v.to_le_bytes() {
+            self.h ^= b as u64;
+            self.h = self.h.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn feed_rexpr(&mut self, e: &RExpr) {
+        match e {
+            RExpr::Const { val, width, care } => {
+                self.feed("C");
+                self.feed_u64(*val as u64);
+                self.feed_u64((*val >> 64) as u64);
+                self.feed_u64(*width as u64);
+                self.feed_u64(*care as u64);
+                self.feed_u64((*care >> 64) as u64);
+            }
+            RExpr::Ident(s) => {
+                self.feed("I");
+                self.feed(s);
+            }
+            RExpr::Bit(s, i) => {
+                self.feed("B");
+                self.feed(s);
+                self.feed_u64(*i as u64);
+            }
+            RExpr::Range(s, hi, lo) => {
+                self.feed("R");
+                self.feed(s);
+                self.feed_u64(*hi as u64);
+                self.feed_u64(*lo as u64);
+            }
+            RExpr::IndexPart {
+                name,
+                base,
+                width,
+                ascending,
+            } => {
+                self.feed("P");
+                self.feed(name);
+                self.feed_rexpr(base);
+                self.feed_u64(*width as u64);
+                self.feed(if *ascending { "A" } else { "D" });
+            }
+            RExpr::WordAt { addr, data } => {
+                self.feed("W");
+                self.feed_rexpr(addr);
+                self.feed_rexpr(data);
+            }
+            RExpr::Concat(v) => {
+                self.feed("K");
+                self.feed_u64(v.len() as u64);
+                for x in v {
+                    self.feed_rexpr(x);
+                }
+            }
+            RExpr::Shr(a, b) => {
+                self.feed(">>");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Ashr(a, b) => {
+                self.feed(">>>");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::RedXor(a) => {
+                self.feed("^r");
+                self.feed_rexpr(a);
+            }
+            RExpr::RedAnd(a) => {
+                self.feed("&r");
+                self.feed_rexpr(a);
+            }
+            RExpr::RedOr(a) => {
+                self.feed("|r");
+                self.feed_rexpr(a);
+            }
+            RExpr::Not(a) => {
+                self.feed("~");
+                self.feed_rexpr(a);
+            }
+            RExpr::And(a, b) => {
+                self.feed("&");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Or(a, b) => {
+                self.feed("|");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Xor(a, b) => {
+                self.feed("^");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Add(a, b) => {
+                self.feed("+");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Sub(a, b) => {
+                self.feed("-");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Mul(a, b) => {
+                self.feed("*");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Mux(c, t, f) => {
+                self.feed("?");
+                self.feed_rexpr(c);
+                self.feed_rexpr(t);
+                self.feed_rexpr(f);
+            }
+            RExpr::Eq(a, b) => {
+                self.feed("==");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Ne(a, b) => {
+                self.feed("!=");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Lt(a, b) => {
+                self.feed("<");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+        }
+    }
+}
+
+fn hash_own(rtl: &Rtl) -> u64 {
+    let mut h = OwnHash::new();
+    h.feed(&rtl.module);
     for (n, dir, w) in &rtl.ports {
-        feed(n);
-        feed(&format!("{dir:?}:{w}"));
+        h.feed(n);
+        h.feed(&format!("{dir:?}:{w}"));
     }
     for (lhs, bit, rhs) in &rtl.nbas {
-        feed(lhs);
-        feed(&format!("{bit:?}"));
-        feed(&format!("{rhs:?}"));
+        h.feed(lhs);
+        if let Some(b) = bit {
+            h.feed_u64(*b as u64);
+        } else {
+            h.feed("_");
+        }
+        h.feed_rexpr(rhs);
     }
     for (lhs, bit, rhs) in &rtl.assigns {
-        feed(lhs);
-        feed(&format!("{bit:?}"));
-        feed(&format!("{rhs:?}"));
+        h.feed(lhs);
+        if let Some(b) = bit {
+            h.feed_u64(*b as u64);
+        } else {
+            h.feed("_");
+        }
+        h.feed_rexpr(rhs);
     }
-    h
+    h.h
 }
 
 fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
@@ -1908,7 +2066,7 @@ fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
     for c in &child.cells {
         let mut cell = c.clone();
         cell.name = format!("{prefix}{}", c.name);
-        dst.cells.push(cell);
+        dst.push_cell(cell);
     }
     for n in &child.nets {
         let mut net = n.clone();
@@ -1916,11 +2074,7 @@ fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
         for e in &mut net.endpoints {
             e.cell = format!("{prefix}{}", e.cell);
         }
-        if let Some(ex) = dst.nets.iter_mut().find(|x| x.name == net.name) {
-            ex.endpoints.extend(net.endpoints);
-        } else {
-            dst.nets.push(net);
-        }
+        dst.merge_net(net);
     }
 }
 
@@ -1937,6 +2091,7 @@ fn assemble_module(
     }
     let mut d = lower_own_cached(proto)?;
     d.name = proto.module.clone();
+    let mut parent_has_hff = d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
     for inst in &proto.insts {
         if !mods.contains_key(&inst.module) {
             note_skip(format!(
@@ -1962,9 +2117,14 @@ fn assemble_module(
         // Pin-wrap mid-suite: parent already has closed FF paths (heartbeat)
         // before stitching the child. Soft child cones stay named misses;
         // prefer closed WNS on wrap heartbeat / mapped fabric.
-        let parent_has_hff = d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
         let child = assemble_module(mods, &inst.module, visiting)?;
+        let child_has_hff = child.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
+        // Snapshot: this child's FFs are not a parent wrap for its own soft cones.
+        let wrap = parent_has_hff;
         stitch_child(&mut d, &child, inst);
+        if child_has_hff {
+            parent_has_hff = true;
+        }
         let soft_keys = [
             "WIDE_CONE",
             "ASSIGN_NOT_LOWERED",
@@ -1985,7 +2145,7 @@ fn assemble_module(
         // Sim-only DPI/X-compare child: under a heartbeat wrap, keep it a named
         // miss (do not poison NO_BODY / kill wrap WNS). Flat parents still refuse.
         if child.attrs.get("SIM_ONLY") == Some("1") {
-            if parent_has_hff {
+            if wrap {
                 eprintln!(
                     "diagnostic child_soft_incomplete module={} child={} (sim_only named miss; parent wrap keeps closed WNS on mapped paths)",
                     name, inst.module
@@ -1995,7 +2155,7 @@ fn assemble_module(
                 d.attrs.set("NO_BODY", "1");
             }
         }
-        if child_soft && parent_has_hff {
+        if child_soft && wrap {
             eprintln!(
                 "diagnostic child_soft_incomplete module={} child={} (named miss; parent wrap keeps closed WNS on mapped paths)",
                 name, inst.module
@@ -2018,13 +2178,13 @@ fn assemble_module(
         if !s.mark_debug {
             continue;
         }
-        if d.nets.iter().any(|n| n.name == s.name) {
+        if d.net(&s.name).is_some() {
             let _ = d.mark_debug(&s.name);
         }
         if s.width > 1 {
             for b in 0..s.width {
                 let bn = bit_name(&s.name, s.width, b);
-                if d.nets.iter().any(|n| n.name == bn) {
+                if d.net(&bn).is_some() {
                     let _ = d.mark_debug(&bn);
                 }
             }
@@ -11733,6 +11893,40 @@ endmodule
                 d.cells.len()
             );
         }
+    }
+
+    #[test]
+    fn stitch_child_cell_lookup_is_subquadratic() {
+        let mut dst = Design::new("top");
+        dst.add_cell("keep", CellKind::Hff);
+        const N: u32 = 3_000;
+        for i in 0..N {
+            let mut child = Design::new("leaf");
+            child.add_cell("ff", CellKind::Hff);
+            child.connect("q", "ff", "Q");
+            let inst = Inst {
+                module: "leaf".into(),
+                name: format!("u{i}"),
+                conns: vec![],
+                params: vec![],
+            };
+            super::stitch_child(&mut dst, &child, &inst);
+        }
+        assert_eq!(dst.cells.len(), N as usize + 1);
+        let t0 = std::time::Instant::now();
+        let mut hits = 0usize;
+        for i in 0..N {
+            if dst.cell(&format!("u{i}_ff")).is_some() {
+                hits += 1;
+            }
+        }
+        let ms = t0.elapsed().as_millis();
+        assert_eq!(hits, N as usize, "every stitched cell must hit cell_ix");
+        assert_eq!(dst.cell("keep").map(|c| c.name.as_str()), Some("keep"));
+        assert!(
+            ms < 800,
+            "3k stitch + 3k cell() lookups must stay O(1) per cell, took {ms}ms"
+        );
     }
 
     #[test]

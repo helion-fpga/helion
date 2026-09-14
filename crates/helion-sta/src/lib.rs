@@ -7,7 +7,7 @@ use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
 use helion_route::Routed;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug)]
 pub struct Clock {
@@ -833,13 +833,35 @@ pub fn report_timing(design: &Design, clocks: &[Clock]) -> Result<TimingResult, 
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
         .count();
+    let has_logic = design.cells.iter().any(|c| {
+        matches!(
+            c.kind,
+            CellKind::Hff | CellKind::Lut6 { .. } | CellKind::IobOut
+        )
+    });
+    if ffs == 0 || !has_logic {
+        // Empty / no_body shells must not close a fake WNS.
+        return Ok(TimingResult {
+            clocks: clocks.to_vec(),
+            wns_ps: 0,
+            tns_ps: 0,
+            endpoints: 0,
+            r2r_ps: 0,
+            iob_ps: 0,
+            setup_ps: 0,
+            hold_ps: 0,
+            hold_slack_ps: 0,
+            route_ps: 0,
+            clk_net_ps: 0,
+        });
+    }
     let r2r = r2r_ps(design);
     let wns = clk.period_ps as i64 - r2r;
     Ok(TimingResult {
         clocks: clocks.to_vec(),
         wns_ps: wns,
         tns_ps: wns.min(0),
-        endpoints: ffs.max(1),
+        endpoints: ffs,
         r2r_ps: r2r,
         iob_ps: 0,
         setup_ps: r2r,
@@ -857,6 +879,9 @@ pub fn report_timing_placed(
     clocks: &[Clock],
 ) -> Result<TimingResult, String> {
     let mut r = report_timing(design, clocks)?;
+    if r.endpoints == 0 {
+        return Ok(r);
+    }
     let iob_ps = placed
         .lutff_sites
         .iter()
@@ -890,6 +915,9 @@ pub fn report_timing_routed(
     clocks: &[Clock],
 ) -> Result<TimingResult, String> {
     let mut r = report_timing_placed(design, &routed.placed, clocks)?;
+    if r.endpoints == 0 {
+        return Ok(r);
+    }
     let route_ps = routed
         .iob_src
         .iter()
@@ -2351,53 +2379,61 @@ fn clock_pin_names(clocks: &[Clock], xdc: &Constraints) -> BTreeSet<String> {
 }
 
 fn lut_drives_clock(design: &Design) -> Vec<(String, String, String)> {
+    let pins = design.pin_index();
+    let mut lut_o: HashMap<&str, Vec<&str>> = HashMap::new();
+    for c in &design.cells {
+        if matches!(c.kind, CellKind::Lut6 { .. }) {
+            if let Some(o) = pins.net_on(&c.name, "O") {
+                lut_o.entry(o).or_default().push(c.name.as_str());
+            }
+        }
+    }
     let mut hits = Vec::new();
     for ff in design
         .cells
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        let Some(clk_net) = design.net_on(&ff.name, "CLK") else {
+        let Some(clk_net) = pins.net_on(&ff.name, "CLK") else {
             continue;
         };
-        let Some(net) = design.net(clk_net) else {
+        let Some(luts) = lut_o.get(clk_net) else {
             continue;
         };
-        for e in &net.endpoints {
-            if e.pin != "O" {
-                continue;
-            }
-            if design
-                .cell(&e.cell)
-                .is_some_and(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-            {
-                hits.push((e.cell.clone(), ff.name.clone(), clk_net.to_string()));
-            }
+        for lut in luts {
+            hits.push(((*lut).to_string(), ff.name.clone(), clk_net.to_string()));
         }
     }
     hits
 }
 
 fn q_used_as_clock(design: &Design) -> Vec<(String, String, String)> {
+    let pins = design.pin_index();
+    let mut clk_loads: HashMap<&str, Vec<&str>> = HashMap::new();
+    for dst in design
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Hff))
+    {
+        if let Some(clk) = pins.net_on(&dst.name, "CLK") {
+            clk_loads.entry(clk).or_default().push(dst.name.as_str());
+        }
+    }
     let mut hits = Vec::new();
     for src in design
         .cells
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        let Some(q_net) = design.net_on(&src.name, "Q") else {
+        let Some(q_net) = pins.net_on(&src.name, "Q") else {
             continue;
         };
-        for dst in design
-            .cells
-            .iter()
-            .filter(|c| matches!(c.kind, CellKind::Hff))
-        {
-            if dst.name == src.name {
-                continue;
-            }
-            if design.net_on(&dst.name, "CLK") == Some(q_net) {
-                hits.push((src.name.clone(), dst.name.clone(), q_net.to_string()));
+        let Some(dsts) = clk_loads.get(q_net) else {
+            continue;
+        };
+        for dst in dsts {
+            if *dst != src.name.as_str() {
+                hits.push((src.name.clone(), (*dst).to_string(), q_net.to_string()));
             }
         }
     }
@@ -5446,5 +5482,42 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         assert!(rb.check("TIMING-1").is_some(), "{}", rb.text());
         assert_eq!(rb.check("TIMING-7").unwrap().objects, "led");
         assert_eq!(tb.wns_ps, report_timing(&blinky, &clks[..1]).unwrap().wns_ps);
+    }
+
+    #[test]
+    fn lut_drives_clock_shared_clk_is_subquadratic() {
+        let mut d = Design::new("clkbuf");
+        d.add_cell("u_lut", CellKind::Lut6 { init: 0x2 });
+        d.connect("clk", "u_lut", "O");
+        const N: u32 = 4_000;
+        for i in 0..N {
+            let ff = format!("ff{i}");
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect("clk", &ff, "CLK");
+        }
+        let t0 = std::time::Instant::now();
+        let hits = lut_drives_clock(&d);
+        let scan_ms = t0.elapsed().as_millis();
+        assert_eq!(hits.len(), N as usize, "one LUT-O on shared clk hits every FF");
+        assert!(
+            hits.iter().all(|(lut, _, net)| lut == "u_lut" && net == "clk"),
+            "hits must name the clock LUT"
+        );
+        assert!(
+            scan_ms < 800,
+            "shared-clock lut_drives_clock must stay linear, took {scan_ms}ms for {N} FFs"
+        );
+        let t1 = std::time::Instant::now();
+        let r = report_methodology(&[], &Constraints::default(), None, Some(&d));
+        let meth_ms = t1.elapsed().as_millis();
+        assert!(
+            r.check("TIMING-10").is_some(),
+            "methodology must still flag LUT-as-clock: {}",
+            r.text()
+        );
+        assert!(
+            meth_ms < 800,
+            "methodology on {N} shared-clock FFs must stay linear, took {meth_ms}ms"
+        );
     }
 }
