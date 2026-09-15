@@ -12,7 +12,21 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.2...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.3...HEAD
+
+## [1.5.3] — 2026-09-15
+
+Soft-clear: Ibex `assign_not_lowered` batch (ALU / CSR / counter / timer /
+core_busy). Empty-XDC `examples/counter.sv` gold is unchanged (**WNS_PS=9640**).
+Native Apple Silicon `Helion.app` ships on this GitHub Release.
+
+### Fixed
+
+- assign_not_lowered: bwlogic_or/and, illegal_csr_*/csr_rdata_int/mie_d,
+  counter_upd, core_busy_o, mtime_inc/interrupt_d. cells 14484→14896,
+  luts 9340→9979.
+
+[1.5.3]: https://github.com/helion-fpga/helion/releases/tag/v1.5.3
 
 ## [1.5.2] — 2026-09-15
 
