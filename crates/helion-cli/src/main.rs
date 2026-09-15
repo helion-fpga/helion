@@ -826,12 +826,7 @@ fn cmd_project_checkpoint_write(args: &[String]) {
                 .to_string_lossy()
                 .into_owned()
         });
-    let dest_path = Path::new(&dest);
-    let dest_buf = if dest_path.is_absolute() {
-        dest_path.to_path_buf()
-    } else {
-        resolve_prj_path(Path::new(path), &dest)
-    };
+    let dest_buf = resolve_checkpoint_dest(Path::new(path), &dest);
     let wr = session.write_checkpoint_to(&dest_buf).unwrap_or_else(|e| {
         eprintln!("write_checkpoint: {e}");
         std::process::exit(1);
@@ -851,6 +846,21 @@ fn cmd_project_checkpoint_write(args: &[String]) {
     );
     println!("{wr}");
     println!("{timing}");
+}
+
+/// Write destination for `-o` / `checkpoint_path`: absolute as-is, relative
+/// next to the `.prj`. Do not use `resolve_prj_path` (existence search would
+/// overwrite a different existing file).
+fn resolve_checkpoint_dest(prj_path: &Path, dest: &str) -> std::path::PathBuf {
+    let dest = Path::new(dest);
+    if dest.is_absolute() {
+        dest.to_path_buf()
+    } else {
+        match prj_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(dest),
+            _ => dest.to_path_buf(),
+        }
+    }
 }
 
 fn cmd_project_checkpoint_open(args: &[String]) {

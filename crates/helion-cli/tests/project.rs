@@ -256,6 +256,69 @@ fn project_checkpoint_write_applies_package_pin() {
 }
 
 #[test]
+fn project_checkpoint_write_relative_o_joins_prj_parent() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    let dir = std::env::temp_dir().join(format!(
+        "helion-ck-rel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let sv = root.join("examples/counter.sv");
+    let prj = sub.join("c.prj");
+    std::fs::write(
+        &prj,
+        format!(
+            "part HL10T-C32-1\nread_sv {}\ncreate_clock -period 10.000 [get_ports clk]\n",
+            sv.display()
+        ),
+    )
+    .unwrap();
+    // Existence-based resolve_prj_path would find this ancestor and overwrite it.
+    let decoy = dir.join("out.hckp");
+    std::fs::write(&decoy, b"decoy").unwrap();
+    let out = Command::new(bin)
+        .args([
+            "project",
+            "checkpoint",
+            "write",
+            prj.to_str().unwrap(),
+            "-o",
+            "out.hckp",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "checkpoint write failed:\n{stdout}\n{stderr}"
+    );
+    let dest = sub.join("out.hckp");
+    assert!(
+        dest.is_file(),
+        "relative -o must join the .prj parent, got missing {}",
+        dest.display()
+    );
+    assert_eq!(
+        std::fs::read(&decoy).unwrap(),
+        b"decoy",
+        "must not overwrite an existing ancestor out.hckp via resolve_prj_path"
+    );
+    assert!(
+        stdout.contains("path=") && stdout.contains("out.hckp"),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn helion_ip_show_rejects_axi_fence() {
     let bin = env!("CARGO_BIN_EXE_helion");
     let root = root();
