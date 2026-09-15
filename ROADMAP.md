@@ -55,6 +55,18 @@ A stranger can clone, `cargo test --workspace`, run headless gold **WNS_PS=9640*
 
 [Milestone 2.0](https://github.com/helion-fpga/helion/milestone/5)
 
+
+
+## Releases (public install)
+
+Version **X.Y.Z** matches `workspace.package.version`, annotated tag `vX.Y.Z`,
+and a [GitHub Release](https://github.com/helion-fpga/helion/releases) of the
+same name. That Release (not `master` HEAD, not a WIP branch) is the public
+install surface: `Helion.app` (Apple Silicon), CLI / headless `helion-ide`
+tarballs, and `SHA256SUMS.txt`. How to cut a tag: [`RELEASING.md`](RELEASING.md).
+Notes: [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog). CI gold on every
+release candidate: empty-XDC `examples/counter.sv` → **WNS_PS=9640**.
+
 ## Legal fence (every release)
 
 - Original Helion ISA and CAD only.

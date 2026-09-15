@@ -109,8 +109,9 @@ route → STA → bitgen flow (~30 ms per example here); the gate fails above
 
 ## Download
 
-[GitHub Releases](https://github.com/helion-fpga/helion/releases/latest) publish
-versioned builds for each `vX.Y.Z` tag:
+[GitHub Releases](https://github.com/helion-fpga/helion/releases/latest) are the
+**public install surface**. Each annotated tag `vX.Y.Z` (same string as
+`workspace.package.version`) publishes:
 
 | File | What |
 |---|---|
