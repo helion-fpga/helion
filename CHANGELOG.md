@@ -12,7 +12,26 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.4...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.6.0...HEAD
+
+## [1.6.0] — 2026-09-15
+
+IDE clock/led contract + disk `.hckp` CLI ECO. Empty-XDC `examples/counter.sv`
+gold is unchanged (**WNS_PS=9640**). Native Apple Silicon `Helion.app` ships on
+this GitHub Release.
+
+### Added
+
+- CLI `open.hckp` → ECO LUT → `write_bitstream` hash change; `read_checkpoint`
+  alias for restore.
+- VHDL clock port keep-name so GUI HFF / add_wave contract holds on rng/blinky.
+
+### Fixed
+
+- Lab honesty already on master (empty refuse / no-cable refuse DONE / overlay
+  labeled). Issue #16 PNR closed-WNS closed.
+
+[1.6.0]: https://github.com/helion-fpga/helion/releases/tag/v1.6.0
 
 ## [1.5.4] — 2026-09-15
 
