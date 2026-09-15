@@ -1676,12 +1676,10 @@ impl SchematicView {
         if !named.is_empty() {
             return named;
         }
-        // Flattened HNF (hier.sv): LUT/FF body of the child, IOB stays at parent.
-        self.nodes
-            .iter()
-            .filter(|n| matches!(n.kind.as_str(), "LUT6" | "HFF" | "MAC27" | "BRAM18" | "ILA"))
-            .map(|n| n.name.clone())
-            .collect()
+        // Prefix miss: do not claim every primitive as this instance's body
+        // (that broke multi-instance default sheets). Flattened single-child
+        // hier.sv now emits u0_* names so the prefix path above hits.
+        HashSet::new()
     }
 
     fn sheet_cell_names(&self) -> HashSet<String> {
@@ -1696,7 +1694,28 @@ impl SchematicView {
                 .map(|n| n.name.clone())
                 .collect();
         }
-        self.nodes.iter().map(|n| n.name.clone()).collect()
+        let mut names: HashSet<String> = self.nodes.iter().map(|n| n.name.clone()).collect();
+        // Single-instance full-cover (hier.sv): collapse the child into its
+        // instance box until Expand Inside. Multi-instance trees (Ibex,
+        // sys_u_core_*) keep every cell on the default sheet.
+        if self.expand_inside.is_none() && self.instances.len() == 1 {
+            let inst = self.instances[0].as_str();
+            let members = self.instance_member_cells(inst);
+            let logic: Vec<&str> = self
+                .nodes
+                .iter()
+                .filter(|n| {
+                    !n.kind.starts_with("instance") && !n.kind.starts_with("PORT")
+                })
+                .map(|n| n.name.as_str())
+                .collect();
+            if !logic.is_empty() && logic.iter().all(|n| members.contains(*n)) {
+                for m in members {
+                    names.remove(&m);
+                }
+            }
+        }
+        names
     }
 
     fn cone_cell_names(&self) -> HashSet<String> {
@@ -16262,12 +16281,18 @@ impl IdeModel {
             ),
             None => (0, 0, 0),
         };
+        // Include CDC / XDC exception counts so set_clock_groups / set_false_path
+        // invalidate the pane cache (otherwise CDC-1 sticks after async groups).
         cells.wrapping_mul(1_000_003)
             ^ nets.wrapping_mul(1_000_033)
             ^ ports.wrapping_mul(1_000_037)
             ^ (self.constraints.clocks.len() as u64).wrapping_mul(1_000_039)
             ^ (self.constraints.input_delay_ps.len() as u64).wrapping_mul(1_000_041)
             ^ (self.constraints.output_delay_ps.len() as u64).wrapping_mul(1_000_043)
+            ^ (self.constraints.clock_groups.len() as u64).wrapping_mul(1_000_049)
+            ^ (self.constraints.false_paths.len() as u64).wrapping_mul(1_000_051)
+            ^ (self.constraints.max_delays.len() as u64).wrapping_mul(1_000_053)
+            ^ (self.constraints.clock_uncertainties.len() as u64).wrapping_mul(1_000_057)
             ^ self.timing.as_ref().map(|t| t.wns_ps as u64).unwrap_or(0)
     }
 
@@ -18385,20 +18410,26 @@ impl IdeModel {
         let clk_name = self.implicit_clock_name();
         let out_name = self.primary_out_port();
         let (prev_led, prev_cnt, prev_w) = self.last_wave_outputs();
-        let extra_names: Vec<String> = self
-            .wave
-            .traces
-            .iter()
-            .map(|t| t.name.clone())
-            .filter(|n| {
-                n != "clk"
-                    && n != clk_name.as_str()
-                    && n != "led"
-                    && n != out_name.as_str()
-                    && n != "cnt"
-                    && !n.starts_with("ila:")
-            })
-            .collect();
+        // When LOG_ALL_SIGNALS is on, push_log_all_samples owns the two
+        // half-cycle pushes for every non-clk/led/cnt probe. Do not also push
+        // them via extra_names or sample_len grows past 2×cycles.
+        let extra_names: Vec<String> = if self.sim_log_all_signals {
+            Vec::new()
+        } else {
+            self.wave
+                .traces
+                .iter()
+                .map(|t| t.name.clone())
+                .filter(|n| {
+                    n != "clk"
+                        && n != clk_name.as_str()
+                        && n != "led"
+                        && n != out_name.as_str()
+                        && n != "cnt"
+                        && !n.starts_with("ila:")
+                })
+                .collect()
+        };
         let extra_prev: Vec<(String, u64)> = extra_names
             .iter()
             .map(|n| {
@@ -18893,7 +18924,8 @@ impl IdeModel {
                 current.insert(bp.signal.clone(), v);
             }
         }
-        let cycle = self.wave.sample_len();
+        // Wave stores two half-cycle samples per user cycle; BP CYCLE is full cycles.
+        let cycle = self.wave.sample_len() / 2;
         let pc = self.sim_pc_line;
         let mut hit: Option<String> = None;
         let mut hit_line = false;
@@ -21878,6 +21910,29 @@ mod tests {
             .join(name)
     }
 
+    /// Copy RTL into a TEMP dir with no sibling .sdc/.xdc so empty-XDC gold holds
+    /// (examples/counter.sdc auto-loads beside counter.sv and invents constraint rows).
+    fn example_rtl_only(name: &str) -> PathBuf {
+        let src = example(name);
+        let stem = Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rtl");
+        let dir = std::env::temp_dir().join(format!(
+            "helion-rtl-only-{}-{}-{}",
+            stem,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join(Path::new(name).file_name().unwrap());
+        std::fs::copy(&src, &dest).unwrap();
+        dest
+    }
+
     /// The console widget must be a pipe onto the real engines: `report_timing` has to
     /// come back with a *numeric* WNS that differs per design, not a canned string.
     #[test]
@@ -22986,7 +23041,7 @@ end architecture;
     #[test]
     fn timing_constraints_pane_drives_sta_wns() {
         let mut ide = IdeModel::new();
-        ide.open_source(&example("counter.sv")).unwrap();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
@@ -23077,7 +23132,7 @@ end architecture;
             "Flow Navigator Timing Analysis must offer the pane"
         );
 
-        ide.open_source(&example("counter.sv")).unwrap();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
@@ -23230,7 +23285,7 @@ end architecture;
     #[test]
     fn timing_constraints_generated_clock_divide_by_moves_sta() {
         let mut ide = IdeModel::new();
-        ide.open_source(&example("counter.sv")).unwrap();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
@@ -23328,7 +23383,7 @@ end architecture;
     #[test]
     fn timing_constraints_generated_clock_multiply_by_invert_edges_moves_sta() {
         let mut ide = IdeModel::new();
-        ide.open_source(&example("counter.sv")).unwrap();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
@@ -23372,7 +23427,7 @@ end architecture;
         );
 
         let mut inv = IdeModel::new();
-        inv.open_source(&example("counter.sv")).unwrap();
+        inv.open_source(&example_rtl_only("counter.sv")).unwrap();
         inv.run_step(FlowStep::Opt).unwrap();
         inv.run_step(FlowStep::Place).unwrap();
         inv.run_step(FlowStep::Route).unwrap();
@@ -23402,7 +23457,7 @@ end architecture;
         );
 
         let mut edg = IdeModel::new();
-        edg.open_source(&example("counter.sv")).unwrap();
+        edg.open_source(&example_rtl_only("counter.sv")).unwrap();
         edg.run_step(FlowStep::Opt).unwrap();
         edg.run_step(FlowStep::Place).unwrap();
         edg.run_step(FlowStep::Route).unwrap();
@@ -27493,9 +27548,13 @@ endmodule
         let led_top = ide
             .objects
             .iter()
-            .find(|o| o.name.starts_with("u_ff"))
+            .find(|o| {
+                o.name.starts_with("u_ff")
+                    || o.name.contains("_u_ff")
+                    || o.name.starts_with("u0")
+            })
             .map(|o| o.value.clone());
-        assert!(led_top.is_some());
+        assert!(led_top.is_some(), "child scope must expose FF probes: {:?}", ide.objects);
         // Values are engine bits, not placeholders.
         assert!(
             ide.objects.iter().any(|o| o.value == "0" || o.value == "1"),
@@ -27767,7 +27826,8 @@ endmodule
             ide.breakpoints
         );
         let n = ide.wave.sample_len();
-        assert!(n < 16, "sim_run must stop at the breakpoint, not run to completion: n={n}");
+        // Half-cycle wave: 16 user cycles → 32 samples; stop at led=1 is 8 cycles → 16.
+        assert!(n < 32, "sim_run must stop at the breakpoint, not run to completion: n={n}");
         let click = ide.exec("select_breakpoint 1").unwrap();
         assert!(click.contains("SIGNAL=led"), "{click}");
         assert_eq!(ide.selected_breakpoint, Some(1));
@@ -28010,7 +28070,8 @@ endmodule
         assert_eq!(ide.sim_pc_line, Some(8));
         assert_eq!(ide.workspace, WorkspaceTab::Source);
         let n = ide.wave.sample_len();
-        assert!(n < 16, "sim_run must stop at the line BP, not run out: n={n}");
+        // Half-cycle wave: stop at first seq edge is 1 cycle → 2 samples (<< 32).
+        assert!(n < 32, "sim_run must stop at the line BP, not run out: n={n}");
         assert!(
             ide.breakpoints
                 .iter()
@@ -28050,7 +28111,8 @@ endmodule
             "led rises at cnt[3]: {ahit}"
         );
         let an = ide.wave.sample_len();
-        assert!(an < 16, "assign line BP must stop sim: n={an}");
+        // Half-cycle wave: led rises at cycle 8 → 16 samples; full run would be 32.
+        assert!(an < 32, "assign line BP must stop sim: n={an}");
 
         let mut blinky = IdeModel::new();
         blinky.open_source(&example("blinky.sv")).unwrap();
@@ -31127,7 +31189,7 @@ endmodule
             "Flow Navigator Implementation must offer report_utilization"
         );
 
-        ide.open_source(&example("counter.sv")).unwrap();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
@@ -31200,7 +31262,7 @@ endmodule
         );
 
         let mut util_ide = IdeModel::new();
-        util_ide.open_source(&example("counter.sv")).unwrap();
+        util_ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         util_ide.run_step(FlowStep::Place).unwrap();
         util_ide.run_step(FlowStep::Route).unwrap();
         let gold_u = util_ide.wns_ps().expect("STA");
@@ -34032,7 +34094,7 @@ endmodule
         );
 
         let mut ide = IdeModel::new();
-        ide.open_source(&example("counter.sv")).unwrap();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
         let table = ide.exec("text_editor").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::TextEditor);
         assert_eq!(ide.layout, LayoutKind::Default);
