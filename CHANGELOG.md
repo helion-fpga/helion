@@ -12,7 +12,20 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.0...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.1...HEAD
+
+## [2.0.1] — 2026-09-15
+
+Soft-clear polish on the 2.0.0 bar. Empty-XDC `examples/counter.sv` gold is
+unchanged (**WNS_PS=9640**). Native Apple Silicon `Helion.app` ships on this
+GitHub Release.
+
+### Fixed
+
+- `generate_not_lowered` prim_ram_1p_scr; hierarchical outstanding_*/RVFI
+  assigns. cells 17027→16741, luts 11845→11559. fcov_ not invented.
+
+[2.0.1]: https://github.com/helion-fpga/helion/releases/tag/v2.0.1
 
 ## [2.0.0] — 2026-09-15
 
