@@ -489,6 +489,7 @@ fn resolve_readmem_path(spec: &str) -> Option<PathBuf> {
 
 fn set_cur_mod(name: &str) {
     CUR_MOD.with(|c| *c.borrow_mut() = name.to_string());
+    SIG_TYPES.with(|m| m.borrow_mut().clear());
 }
 
 fn cur_mod() -> String {
@@ -579,6 +580,28 @@ thread_local! {
     /// Enum type name → bit width (from `typedef enum logic [N:0]`).
     static PKG_ENUM_TYPES: std::cell::RefCell<HashMap<String, usize>> =
         std::cell::RefCell::new(HashMap::new());
+    /// `typedef struct packed` layouts (Ibex `exc_cause_t.irq_ext`).
+    static PKG_PACKED: std::cell::RefCell<HashMap<String, PackedStruct>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Signal/port → packed-struct or enum type name for the current module.
+    static SIG_TYPES: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// One packed-struct field: bit `lo` is LSB of the field in the parent.
+#[derive(Clone, Debug)]
+struct PackedField {
+    lo: usize,
+    width: usize,
+    ty: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PackedStruct {
+    width: usize,
+    fields: HashMap<String, PackedField>,
+    /// Declaration order, first = MSB.
+    order: Vec<String>,
 }
 
 fn skipped_funcs_clear() {
@@ -596,6 +619,8 @@ fn skipped_funcs_take() -> Vec<String> {
 fn pkg_enums_clear() {
     PKG_ENUMS.with(|m| m.borrow_mut().clear());
     PKG_ENUM_TYPES.with(|m| m.borrow_mut().clear());
+    PKG_PACKED.with(|m| m.borrow_mut().clear());
+    SIG_TYPES.with(|m| m.borrow_mut().clear());
 }
 
 fn pkg_enum_type_width(name: &str) -> Option<usize> {
@@ -612,10 +637,328 @@ fn pkg_enum_insert(name: String, val: u128) {
     });
 }
 
+fn packed_struct_get(name: &str) -> Option<PackedStruct> {
+    PKG_PACKED.with(|m| m.borrow().get(name).cloned())
+}
+
+fn packed_struct_width(name: &str) -> Option<usize> {
+    PKG_PACKED.with(|m| m.borrow().get(name).map(|s| s.width.max(1)))
+}
+
+fn typed_width(name: &str) -> Option<usize> {
+    pkg_enum_type_width(name).or_else(|| packed_struct_width(name))
+}
+
+fn note_sig_type(name: &str, ty: &str) {
+    if name.is_empty() || ty.is_empty() {
+        return;
+    }
+    SIG_TYPES.with(|m| {
+        m.borrow_mut().insert(name.to_string(), ty.to_string());
+    });
+}
+
+fn sig_type_of(name: &str) -> Option<String> {
+    SIG_TYPES.with(|m| m.borrow().get(name).cloned())
+}
+
+fn packed_struct_insert(name: String, st: PackedStruct) {
+    PKG_PACKED.with(|m| {
+        m.borrow_mut().insert(name, st);
+    });
+}
+
+/// Resolve `sig.field` against harvested packed structs. Unique field names
+/// (Ibex `irq_ext` / `lower_cause`) do not need a tracked type.
+fn resolve_packed_field(
+    p: &P,
+    sig: &str,
+    field: &str,
+) -> Result<(usize, usize, Option<String>), String> {
+    if let Some(ty) = sig_type_of(sig) {
+        if let Some(st) = packed_struct_get(&ty) {
+            if let Some(f) = st.fields.get(field) {
+                return Ok((f.lo, f.width.max(1), f.ty.clone()));
+            }
+        }
+    }
+    let mut hits: Vec<(usize, usize, Option<String>, usize)> = Vec::new();
+    PKG_PACKED.with(|m| {
+        for st in m.borrow().values() {
+            if let Some(f) = st.fields.get(field) {
+                hits.push((f.lo, f.width.max(1), f.ty.clone(), st.width.max(1)));
+            }
+        }
+    });
+    if hits.len() == 1 {
+        let (lo, w, ty, _) = hits.pop().unwrap();
+        return Ok((lo, w, ty));
+    }
+    if let Some(&sw) = p.widths.get(sig) {
+        let mut by_w: Vec<_> = hits
+            .into_iter()
+            .filter(|h| h.3 == sw.max(1))
+            .collect();
+        if by_w.len() == 1 {
+            let (lo, w, ty, _) = by_w.pop().unwrap();
+            return Ok((lo, w, ty));
+        }
+    }
+    Err(format!("unknown packed field {sig}.{field}"))
+}
+
+fn packed_field_select_expr(p: &mut P, name: String) -> Result<RExpr, String> {
+    let field = p.ident()?;
+    let (mut lo, mut width, mut nested) = resolve_packed_field(p, &name, &field)?;
+    while p.eat_sym('.') {
+        let f2 = p.ident()?;
+        let Some(ty) = nested.as_deref() else {
+            return Err("nested field".into());
+        };
+        let Some(st) = packed_struct_get(ty) else {
+            return Err("nested packed type".into());
+        };
+        let Some(fld) = st.fields.get(&f2) else {
+            return Err("unknown nested field".into());
+        };
+        lo = lo.saturating_add(fld.lo);
+        width = fld.width.max(1);
+        nested = fld.ty.clone();
+    }
+    if let Some(v) = p
+        .params
+        .get(&name)
+        .copied()
+        .or_else(|| pkg_enum_get(&name))
+    {
+        let w = width.min(128).max(1);
+        let mask = care_mask(w);
+        return Ok(RExpr::Const {
+            val: (v >> lo) & mask,
+            width: w,
+            care: mask,
+        });
+    }
+    if width <= 1 {
+        Ok(RExpr::Bit(name, lo))
+    } else {
+        Ok(RExpr::Range(name, lo, lo + width - 1))
+    }
+}
+
+fn find_packed_struct_for_fields(names: &HashSet<String>) -> Option<PackedStruct> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut hits: Vec<PackedStruct> = Vec::new();
+    PKG_PACKED.with(|m| {
+        for st in m.borrow().values() {
+            if names.iter().all(|n| st.fields.contains_key(n)) {
+                hits.push(st.clone());
+            }
+        }
+    });
+    if hits.len() == 1 {
+        return hits.pop();
+    }
+    // Prefer an exact field-set match when several structs share names.
+    let mut exact: Vec<PackedStruct> = hits
+        .iter()
+        .filter(|st| st.fields.len() == names.len())
+        .cloned()
+        .collect();
+    if exact.len() == 1 {
+        return exact.pop();
+    }
+    None
+}
+
+fn pack_named_assign_pattern(fields: Vec<(String, RExpr)>) -> Result<RExpr, String> {
+    let names: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+    let Some(st) = find_packed_struct_for_fields(&names) else {
+        return Err("named pattern unknown struct".into());
+    };
+    let mut acc = 0u128;
+    let mut all_const = true;
+    for (fname, expr) in &fields {
+        let Some(f) = st.fields.get(fname) else {
+            continue;
+        };
+        match expr {
+            RExpr::Const { val, .. } => {
+                let w = f.width.min(128).max(1);
+                acc |= (*val & care_mask(w)) << f.lo;
+            }
+            _ => all_const = false,
+        }
+    }
+    if all_const {
+        let w = st.width.min(128).max(1);
+        return Ok(RExpr::Const {
+            val: acc,
+            width: w,
+            care: care_mask(w),
+        });
+    }
+    let mut parts = Vec::new();
+    for fname in &st.order {
+        let f = st.fields.get(fname).unwrap();
+        let expr = fields
+            .iter()
+            .find(|(n, _)| n == fname)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_else(|| RExpr::Const {
+                val: 0,
+                width: f.width.max(1),
+                care: care_mask(f.width.min(128).max(1)),
+            });
+        parts.push(expr);
+    }
+    if parts.len() == 1 {
+        return Ok(parts.pop().unwrap());
+    }
+    Ok(RExpr::Concat(parts))
+}
+
+fn harvest_struct_field(p: &mut P) -> Result<(String, usize, Option<String>), String> {
+    let _ = p.eat_kw("logic");
+    let _ = p.eat_kw("bit");
+    let _ = p.eat_kw("reg");
+    let _ = p.eat_kw("wire");
+    let _ = p.eat_kw("signed");
+    let _ = p.eat_kw("unsigned");
+    let _ = p.eat_kw("var");
+    let mut width = 1usize;
+    let mut ty = None;
+    if p.eat_kw("int") || p.eat_kw("integer") {
+        width = 32;
+    } else if p.eat_kw("byte") {
+        width = 8;
+    }
+    if matches!(p.peek(), Some(Tok::Ident(_))) {
+        let save = p.i;
+        let tname = p.ident()?;
+        if matches!(p.peek(), Some(Tok::Ident(_))) || matches!(p.peek(), Some(Tok::Sym('['))) {
+            if let Some(tw) = typed_width(&tname) {
+                width = tw;
+            }
+            ty = Some(tname);
+        } else {
+            p.i = save;
+        }
+    }
+    if matches!(p.peek(), Some(Tok::Sym('['))) {
+        width = p.width_opt()?.max(1);
+    }
+    let fname = p.ident()?;
+    let _ = p.eat_sym(';');
+    Ok((fname, width.max(1), ty))
+}
+
+/// `typedef` + `struct packed { fields } name;` — first field is MSB.
+fn harvest_packed_struct(p: &mut P) {
+    if !p.eat_kw("packed") {
+        let _ = skip_item_or_block(p);
+        return;
+    }
+    if !p.eat_sym('{') {
+        let _ = skip_item_or_block(p);
+        return;
+    }
+    let mut order: Vec<(String, usize, Option<String>)> = Vec::new();
+    while !p.eat_sym('}') {
+        if p.peek().is_none() {
+            return;
+        }
+        match harvest_struct_field(p) {
+            Ok(f) => order.push(f),
+            Err(_) => {
+                while p.peek().is_some()
+                    && !matches!(p.peek(), Some(Tok::Sym('}')) | Some(Tok::Sym(';')))
+                {
+                    p.bump();
+                }
+                let _ = p.eat_sym(';');
+            }
+        }
+    }
+    let Ok(tname) = p.ident() else {
+        let _ = p.eat_sym(';');
+        return;
+    };
+    let _ = p.eat_sym(';');
+    if order.is_empty() {
+        return;
+    }
+    let total: usize = order.iter().map(|(_, w, _)| *w).sum();
+    if total == 0 || total > 128 {
+        return;
+    }
+    let mut lo = total;
+    let mut fields = HashMap::new();
+    let mut names = Vec::new();
+    for (fname, w, ty) in &order {
+        lo = lo.saturating_sub(*w);
+        fields.insert(
+            fname.clone(),
+            PackedField {
+                lo,
+                width: *w,
+                ty: ty.clone(),
+            },
+        );
+        names.push(fname.clone());
+    }
+    packed_struct_insert(
+        tname,
+        PackedStruct {
+            width: total,
+            fields,
+            order: names,
+        },
+    );
+}
+
+/// Package `localparam exc_cause_t ExcCauseIrqNm = '{irq_ext: 1'b1, ...};`.
+/// Named packed patterns become consts so `ExcCauseIrqNm.lower_cause` folds
+/// instead of an unknown-name assign_not_lowered. Other package params stay
+/// skipped (do not re-elaborate ICache/PMP sizes).
+fn harvest_pkg_packed_param(p: &mut P) {
+    skip_sv_type(p);
+    let Ok(mut name) = p.ident() else {
+        skip_to_semi(p);
+        return;
+    };
+    if matches!(p.peek(), Some(Tok::Ident(_))) {
+        name = p.ident().unwrap_or(name);
+    }
+    if p.eat_sym('=') {
+        let named = matches!(p.peek(), Some(Tok::Sym('\'')))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym('{')))
+            && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+            && matches!(p.t.get(p.i + 3), Some(Tok::Sym(':')));
+        if named {
+            match parse_rexpr(p) {
+                Ok(RExpr::Const { val, .. }) => {
+                    p.params.entry(name.clone()).or_insert(val);
+                    pkg_enum_insert(name, val);
+                }
+                _ => {}
+            }
+        }
+    }
+    skip_to_semi(p);
+}
+
 /// After `typedef` was eaten: harvest `enum … { members } name;` into PKG_ENUMS.
-/// Other typedefs stay skipped. Auto-numbered and `= expr` members both work.
+/// Packed structs seed field layouts so `exc_cause.irq_ext` is a bit select,
+/// not a generate miss. Other typedefs stay skipped.
 fn harvest_typedef_enum(p: &mut P) {
     if !p.eat_kw("enum") {
+        if p.eat_kw("struct") {
+            harvest_packed_struct(p);
+            return;
+        }
         let _ = skip_item_or_block(p);
         return;
     }
@@ -3414,6 +3757,30 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                 care: 1,
             });
         }
+        // Named packed-struct pattern: `'{irq_ext: 1'b1, irq_int: 1'b0, lower_cause: 5'd31}`.
+        if matches!(p.peek(), Some(Tok::Ident(_)))
+            && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+        {
+            let mut fields: Vec<(String, RExpr)> = Vec::new();
+            loop {
+                let fname = p.ident()?;
+                if !p.eat_sym(':') {
+                    return Err("pattern :".into());
+                }
+                let val = parse_rexpr(p)?;
+                fields.push((fname, val));
+                if p.eat_sym('}') {
+                    break;
+                }
+                if !p.eat_sym(',') {
+                    return Err("pattern ,".into());
+                }
+                if p.eat_sym('}') {
+                    break;
+                }
+            }
+            return pack_named_assign_pattern(fields);
+        }
         let first = parse_rexpr(p)?;
         if p.eat_sym('{') {
             let inner = parse_rexpr(p)?;
@@ -3694,6 +4061,8 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                         }),
                     }
                 }
+            } else if p.eat_sym('.') {
+                packed_field_select_expr(p, name)
             } else if let Some(v) = p.params.get(&name).copied() {
                 // Parameter used in an expression (e.g. sel*DW +: DW).
                 Ok(RExpr::Const {
@@ -3742,6 +4111,21 @@ fn skip_logic(p: &mut P) -> bool {
 
 fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
     let name = p.ident()?;
+    if p.eat_sym('.') {
+        let field = p.ident()?;
+        let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+        if p.eat_sym('[') {
+            let idx = const_u(p)? as usize;
+            if !p.eat_sym(']') {
+                return Err("]".into());
+            }
+            return Ok((name, Some(lo + idx)));
+        }
+        if width <= 1 {
+            return Ok((name, Some(lo)));
+        }
+        return Err("lhs multi-bit field".into());
+    }
     if p.eat_sym('[') {
         // Bit, or const range name[hi:lo] (treated as full-vector assign).
         let save = p.i;
@@ -4857,6 +5241,10 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
                     harvest_typedef_enum(&mut p);
                     continue;
                 }
+                if p.eat_kw("parameter") || p.eat_kw("localparam") {
+                    harvest_pkg_packed_param(&mut p);
+                    continue;
+                }
                 p.bump();
             }
             continue;
@@ -5099,7 +5487,7 @@ fn skip_to_semi(p: &mut P) {
                 p.bump();
             }
             Some(Tok::Kw(k)) if d == 0
-                && matches!(k.as_str(), "end" | "endmodule" | "endgenerate" | "endcase" | "else") =>
+                && matches!(k.as_str(), "end" | "endmodule" | "endgenerate" | "endpackage" | "endcase" | "else") =>
             {
                 return;
             }
@@ -5855,9 +6243,10 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
             // Optional typedef before the port ident: `foo_t name` or
             // `foo_t [W-1:0] name`. Do NOT treat `name [N]` (unpacked dim) as a
             // typedef — that used to swallow `host_req_i` in Ibex bus ports.
+            let mut type_name: Option<String> = None;
             if matches!(p.peek(), Some(Tok::Ident(_))) {
                 let save = p.i;
-                let _ = p.ident();
+                let tname = p.ident().unwrap_or_default();
                 let mut ok_typedef = false;
                 if matches!(p.peek(), Some(Tok::Ident(_))) {
                     ok_typedef = true; // foo_t name
@@ -5872,6 +6261,8 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 }
                 if !ok_typedef {
                     p.i = save;
+                } else if !tname.is_empty() {
+                    type_name = Some(tname);
                 }
             }
             is_signed |= skip_logic(&mut p);
@@ -5889,7 +6280,13 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 }
             }
             let (w, packed_depth) = match packed_dims.as_slice() {
-                [] => (1usize, 0usize),
+                [] => (
+                    type_name
+                        .as_deref()
+                        .and_then(typed_width)
+                        .unwrap_or(1),
+                    0usize,
+                ),
                 [only] => (*only, 0usize),
                 dims => {
                     let elem = *dims.last().unwrap();
@@ -5951,6 +6348,9 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                     }
                     if is_signed {
                         note_signed(p, &n);
+                    }
+                    if let Some(ty) = type_name.as_deref() {
+                        note_sig_type(&n, ty);
                     }
                     signals.push(Signal {
                         name: n,
@@ -6214,14 +6614,26 @@ fn parse_module_items(
                                 p.bump();
                                 p.params.entry(name.clone()).or_insert(h);
                             } else {
+                                let save_c = p.i;
                                 match const_u(p) {
                                     Ok(val) => {
                                         p.params.entry(name.clone()).or_insert(val);
                                         if !param_order.iter().any(|(n, _)| n == &name) {
-                                            param_order.push((name, val));
+                                            param_order.push((name.clone(), val));
                                         }
                                     }
-                                    Err(_) => skip_until_arg_end(p),
+                                    Err(_) => {
+                                        p.i = save_c;
+                                        match parse_rexpr(p) {
+                                            Ok(RExpr::Const { val, .. }) => {
+                                                p.params.entry(name.clone()).or_insert(val);
+                                                if !param_order.iter().any(|(n, _)| n == &name) {
+                                                    param_order.push((name.clone(), val));
+                                                }
+                                            }
+                                            _ => skip_until_arg_end(p),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -6781,9 +7193,9 @@ fn parse_module_items(
                 // Consumed. Not an assign, not an unknown child, not a LUT.
                 continue;
             }
-            // `opcode_e opcode;` / `ibex_pkg::pc_sel_e pc_mux_internal;` —
-            // typedef-typed signal, not an instance (no port list). Optional
-            // `pkg::` prefix. Width from harvested enum type.
+            // `opcode_e opcode;` / `ibex_pkg::pc_sel_e pc_mux_internal;` /
+            // `exc_cause_t exc_cause;` — typedef-typed signal, not an instance.
+            // Optional `pkg::` prefix. Width from harvested enum or packed struct.
             let save_td = p.i;
             if let Ok(first) = p.ident() {
                 let ty = if p.eat_sym(':') && p.eat_sym(':') {
@@ -6800,7 +7212,7 @@ fn parse_module_items(
                 let mut w = if ty.is_empty() {
                     0
                 } else {
-                    pkg_enum_type_width(&ty).unwrap_or(0)
+                    typed_width(&ty).unwrap_or(0)
                 };
                 if matches!(p.peek(), Some(Tok::Sym('['))) {
                     p.bump();
@@ -6837,6 +7249,9 @@ fn parse_module_items(
                                 }
                             }
                             note_width(p, &n, w);
+                            if !ty.is_empty() {
+                                note_sig_type(&n, &ty);
+                            }
                             *pending_keep = false;
                             *pending_md = false;
                             *pending_bram = false;
@@ -16214,6 +16629,69 @@ endmodule
     }
 
     #[test]
+    fn packed_struct_field_select_in_generate_lowers() {
+        // Ibex if_stage: `|{exc_cause.irq_ext, exc_cause.irq_int}` in a generate
+        // body used to fail parse_rexpr ('.' leftover) and fire generate_not_lowered.
+        let src = r#"
+package ibex_pkg;
+  typedef struct packed {
+    logic       irq_int;
+    logic       irq_ext;
+    logic [4:0] lower_cause;
+  } exc_cause_t;
+  localparam exc_cause_t ExcCauseIrqNm =
+    '{irq_ext: 1'b1, irq_int: 1'b0, lower_cause: 5'd31};
+endpackage
+module ibex_if_stage(
+  input  logic clk_i,
+  input  exc_cause_t exc_cause,
+  output logic unused_exc_cause,
+  output logic [4:0] irq_vec,
+  output logic q
+);
+  generate
+    assign unused_exc_cause = |{exc_cause.irq_ext, exc_cause.irq_int};
+  endgenerate
+  always_comb begin
+    irq_vec = exc_cause.lower_cause;
+    if (exc_cause.irq_int) begin
+      irq_vec = ExcCauseIrqNm.lower_cause;
+    end
+  end
+  always_ff @(posedge clk_i) q <= unused_exc_cause;
+endmodule
+"#;
+        let d = synth_sv(src, "if_stage_exc.sv").expect("if_stage_exc");
+        assert_ne!(
+            d.attrs.get("GENERATE_NOT_LOWERED"),
+            Some("1"),
+            "exc_cause.irq_ext in generate must lower, not generate_not_lowered"
+        );
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "irq_vec mux of lower_cause / ExcCauseIrqNm.lower_cause must lower"
+        );
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "field-select OR must map a LUT, cells={}",
+            d.cells.len()
+        );
+        assert!(
+            hff_on_clk(&d, "q", "clk_i"),
+            "clocked capture of unused_exc_cause must sit on clk_i"
+        );
+        assert!(
+            lut_driven(&d, "unused_exc_cause"),
+            "unused_exc_cause must be driven"
+        );
+        assert!(
+            (0..5).all(|i| lut_driven(&d, &format!("irq_vec_{i}"))),
+            "irq_vec bits must be driven from packed field mux"
+        );
+    }
+
+    #[test]
     fn packed_multidim_fifo_word_mux_lowers() {
         // Ibex fetch_fifo: `logic [DEPTH-1:0][31:0] rdata_q` + mux word select.
         let src = r#"
@@ -16575,6 +17053,14 @@ endmodule
         eprintln!("CHILD_CELLS luts={cl} ffs={cf} total={}", c.cells.len());
         assert_eq!(d.name, "ibex_pin_wrap");
         assert!(!d.cells.is_empty());
+        assert!(
+            !generate_not_lowered_for("ibex_if_stage"),
+            "generate_not_lowered ibex_if_stage must be gone"
+        );
+        assert!(
+            !assign_not_lowered_for("ibex_if_stage"),
+            "ibex_if_stage irq_vec / packed field assigns must lower"
+        );
     }
 
     #[test]
