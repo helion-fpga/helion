@@ -2,18 +2,21 @@ use helion_bits::{bitgen, bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
 use helion_device::Device;
 use helion_drc::check_routed;
 use helion_fabric::Fabric;
-use helion_hw::{detect_boards, list_cables, program_hbits_with_cable, prog_sim, resolve_cable, CableBackend, ProgramOutcome, Tap};
+use helion_hls::synth_c_path;
+use helion_hw::{
+    detect_boards, list_cables, prog_sim, program_hbits_with_cable, resolve_cable, CableBackend,
+    ProgramOutcome, Tap,
+};
 use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
-use helion_route::{route_with, RouteOpts, Routed};
-use helion_sta::{
-    apply_xdc, create_clock, load_sdc, report_power, report_timing_routed, report_timing_routed_xdc,
-    Constraints, OperatingConditions, PowerReport, TimingResult,
-};
-use helion_hls::synth_c_path;
 use helion_proj::{
     constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path, Mode, Session,
+};
+use helion_route::{route_with, RouteOpts, Routed};
+use helion_sta::{
+    apply_xdc, create_clock, load_sdc, load_xdc, report_power, report_timing_routed,
+    report_timing_routed_xdc, Constraints, OperatingConditions, PowerReport, TimingResult,
 };
 use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
@@ -39,11 +42,8 @@ fn synth_any(path: &str) -> Result<helion_ir::Design, String> {
             let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
             let mut prj = load_prj(&text)?;
             let _ips = expand_ip_packages(&mut prj, p)?;
-            let src_paths: Vec<std::path::PathBuf> = prj
-                .sources
-                .iter()
-                .map(|s| resolve_prj_path(p, s))
-                .collect();
+            let src_paths: Vec<std::path::PathBuf> =
+                prj.sources.iter().map(|s| resolve_prj_path(p, s)).collect();
             for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
                 if !resolved.exists() {
                     return Err(format!(
@@ -78,7 +78,11 @@ fn compile_design_xdc(
     apply_xdc(&mut design, xdc)?;
     let t_dev = std::time::Instant::now();
     let dev = Device::load_part(part).map_err(|e| format!("HAD {part}: {e}"))?;
-    eprintln!("hang_diag device part={} ms={}", part, t_dev.elapsed().as_millis());
+    eprintln!(
+        "hang_diag device part={} ms={}",
+        part,
+        t_dev.elapsed().as_millis()
+    );
     let t0 = std::time::Instant::now();
     let mut packed = pack(&design, &dev)?;
     let iob_budget = dev.iob_sites().count();
@@ -177,7 +181,11 @@ fn compile_design_xdc(
     } else {
         eprintln!(
             "hang_diag timing WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} ms={}",
-            timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps,
+            timing.wns_ps,
+            timing.tns_ps,
+            timing.endpoints,
+            timing.r2r_ps,
+            timing.iob_ps,
             t4.elapsed().as_millis()
         );
     }
@@ -220,8 +228,12 @@ fn synth_project_sources(
             let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
             owned.push((p.display().to_string(), src));
         }
-        let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-        let (d, _) = elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
+        let refs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (d, _) =
+            elaborate_sv_sources(&refs, Some(t), &Default::default(), &Default::default())?;
         Ok(d)
     } else {
         let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
@@ -285,7 +297,9 @@ fn usage() {
   helion project <file.prj>
   helion project run <file.prj> [--cycles N]
   helion project checkpoint write <file.prj> [-o out.hckp]
-  helion project checkpoint open <file.hckp> [--part P]
+  helion project checkpoint open|read <file.hckp> [--part P] [--sdc f.sdc|--prj f.prj]
+  helion project checkpoint eco <file.hckp> --cell u_lut0 --init 0xAAAAAAAAAAAAAAAA [--part P] [-o out.hbits]
+  helion project checkpoint write_bitstream <file.hckp> [--part P] [-o out.hbits]
   helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
@@ -425,12 +439,7 @@ fn cmd_timing(args: &[String]) {
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name,
-        timing.wns_ps,
-        timing.tns_ps,
-        timing.endpoints,
-        timing.r2r_ps,
-        timing.iob_ps
+        c.design.name, timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
     );
 }
 
@@ -650,7 +659,16 @@ fn cmd_hnf(args: &[String]) {
 /// Synth + apply XDC (PACKAGE_PIN/IOSTANDARD/SDC) + `impl_project` (pblock/runs).
 fn impl_project_file(
     path: &str,
-) -> Result<(Session, Device, Constraints, helion_proj::ProjectFile, usize), String> {
+) -> Result<
+    (
+        Session,
+        Device,
+        Constraints,
+        helion_proj::ProjectFile,
+        usize,
+    ),
+    String,
+> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("project {path}: {e}"))?;
     let mut prj = load_prj(&text)?;
     let prj_path = Path::new(path);
@@ -684,10 +702,7 @@ fn impl_project_file(
     Ok((session, dev, xdc, prj, ips.len()))
 }
 
-fn session_timing_xdc(
-    session: &Session,
-    xdc: &Constraints,
-) -> Result<TimingResult, String> {
+fn session_timing_xdc(session: &Session, xdc: &Constraints) -> Result<TimingResult, String> {
     let d = session.design.as_ref().ok_or("project: no design")?;
     let r = session.routed.as_ref().ok_or("project: not routed")?;
     let mut clks = xdc.clocks.clone();
@@ -798,16 +813,20 @@ fn cmd_project(args: &[String]) {
     }
 }
 
+fn checkpoint_usage() -> ! {
+    eprintln!(
+        "usage:\n  helion project checkpoint write <file.prj> [-o out.hckp]\n  helion project checkpoint open|read <file.hckp> [--part P] [--sdc f.sdc|--prj f.prj]\n  helion project checkpoint eco <file.hckp> --cell u_lut0 --init 0xAAAAAAAAAAAAAAAA [--part P] [-o out.hbits]\n  helion project checkpoint write_bitstream <file.hckp> [--part P] [-o out.hbits]"
+    );
+    std::process::exit(2);
+}
+
 fn cmd_project_checkpoint(args: &[String]) {
     match args.first().map(|s| s.as_str()) {
         Some("write") => cmd_project_checkpoint_write(&args[1..]),
         Some("open") | Some("read") => cmd_project_checkpoint_open(&args[1..]),
-        _ => {
-            eprintln!(
-                "usage:\n  helion project checkpoint write <file.prj> [-o out.hckp]\n  helion project checkpoint open <file.hckp> [--part P]"
-            );
-            std::process::exit(2);
-        }
+        Some("eco") => cmd_project_checkpoint_eco(&args[1..]),
+        Some("write_bitstream") => cmd_project_checkpoint_write_bitstream(&args[1..]),
+        _ => checkpoint_usage(),
     }
 }
 
@@ -864,14 +883,10 @@ fn resolve_checkpoint_dest(prj_path: &Path, dest: &str) -> std::path::PathBuf {
 }
 
 fn cmd_project_checkpoint_open(args: &[String]) {
-    let path = positional(args).unwrap_or("counter.hckp");
-    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
-    let dev = Device::load_part(&part).unwrap_or_else(|e| {
-        eprintln!("open_checkpoint part {part}: {e}");
-        std::process::exit(1);
-    });
-    let session = Session::open_checkpoint(path, &dev).unwrap_or_else(|e| {
-        eprintln!("open_checkpoint {path}: {e}");
+    let (session, dev, path) = load_checkpoint_session(args);
+    refuse_empty_bitstream(&session, "open_checkpoint");
+    let xdc = checkpoint_xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint: {e}");
         std::process::exit(1);
     });
     let lutffs = session
@@ -885,7 +900,7 @@ fn cmd_project_checkpoint_open(args: &[String]) {
         .map(|b| b.frames.len())
         .unwrap_or(0);
     let hash = session.blinky_hash().unwrap_or(0);
-    let timing = session.report_timing(&dev).unwrap_or_else(|e| {
+    let timing = session.report_timing_xdc(&dev, &xdc).unwrap_or_else(|e| {
         eprintln!("report_timing: {e}");
         std::process::exit(1);
     });
@@ -894,6 +909,148 @@ fn cmd_project_checkpoint_open(args: &[String]) {
         dev.part
     );
     println!("{timing}");
+}
+
+fn cmd_project_checkpoint_eco(args: &[String]) {
+    let (mut session, dev, path) = load_checkpoint_session(args);
+    refuse_empty_bitstream(&session, "eco");
+    let cell = take_flag(args, "--cell").unwrap_or_else(|| "u_lut0".into());
+    let init = take_flag(args, "--init").unwrap_or_else(|| "0xAAAAAAAAAAAAAAAA".into());
+    let new_init = parse_lut_init(&init).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    let hash_before = session.blinky_hash().unwrap_or(0);
+    session.eco(&dev, &cell, new_init).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    session.write_bitstream(&dev).unwrap_or_else(|e| {
+        eprintln!("write_bitstream: {e}");
+        std::process::exit(1);
+    });
+    refuse_empty_bitstream(&session, "eco");
+    let frames = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.len())
+        .unwrap_or(0);
+    let hash_after = session.blinky_hash().unwrap_or(0);
+    if hash_after == hash_before {
+        eprintln!("eco {cell}: bitstream hash did not change ({hash_before:#x})");
+        std::process::exit(1);
+    }
+    if let Some(out) = take_flag(args, "-o").or_else(|| take_flag(args, "--output")) {
+        write_session_hbits(&session, &out);
+    }
+    let xdc = checkpoint_xdc_from_args(args).unwrap_or_else(|e| {
+        eprintln!("eco: {e}");
+        std::process::exit(1);
+    });
+    let timing = session.report_timing_xdc(&dev, &xdc).unwrap_or_else(|e| {
+        eprintln!("report_timing: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "open_checkpoint {path} part={} hash_before={hash_before:#x}",
+        dev.part
+    );
+    println!(
+        "eco {cell} INIT {new_init:#x} hash_before={hash_before:#x} hash_after={hash_after:#x} frames={frames}"
+    );
+    println!("{timing}");
+}
+
+fn cmd_project_checkpoint_write_bitstream(args: &[String]) {
+    let (mut session, dev, path) = load_checkpoint_session(args);
+    refuse_empty_bitstream(&session, "write_bitstream");
+    session.write_bitstream(&dev).unwrap_or_else(|e| {
+        eprintln!("write_bitstream: {e}");
+        std::process::exit(1);
+    });
+    refuse_empty_bitstream(&session, "write_bitstream");
+    let frames = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.len())
+        .unwrap_or(0);
+    let bytes = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.packets.len())
+        .unwrap_or(0);
+    let hash = session.blinky_hash().unwrap_or(0);
+    if let Some(out) = take_flag(args, "-o").or_else(|| take_flag(args, "--output")) {
+        write_session_hbits(&session, &out);
+    }
+    println!(
+        "write_bitstream {path} part={} frames={frames} bytes={bytes} hash={hash:#x}",
+        dev.part
+    );
+}
+
+fn load_checkpoint_session(args: &[String]) -> (Session, Device, String) {
+    let path = positional(args).unwrap_or("counter.hckp").to_string();
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint part {part}: {e}");
+        std::process::exit(1);
+    });
+    let session = Session::open_checkpoint(&path, &dev).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint {path}: {e}");
+        std::process::exit(1);
+    });
+    (session, dev, path)
+}
+
+fn checkpoint_xdc_from_args(args: &[String]) -> Result<Constraints, String> {
+    if let Some(prj_path) = take_flag(args, "--prj") {
+        let text =
+            std::fs::read_to_string(&prj_path).map_err(|e| format!("--prj {prj_path}: {e}"))?;
+        let mut prj = load_prj(&text)?;
+        let prj_buf = Path::new(&prj_path);
+        let _ = expand_ip_packages(&mut prj, prj_buf)?;
+        return constraints_from_project(&prj, prj_buf);
+    }
+    if let Some(sdc_path) = take_flag(args, "--sdc") {
+        let text =
+            std::fs::read_to_string(&sdc_path).map_err(|e| format!("--sdc {sdc_path}: {e}"))?;
+        return load_xdc(&text);
+    }
+    Ok(Constraints::default())
+}
+
+fn parse_lut_init(s: &str) -> Result<u64, String> {
+    let t = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    u64::from_str_radix(t, 16).map_err(|e| format!("--init {s}: {e}"))
+}
+
+fn refuse_empty_bitstream(session: &Session, who: &str) {
+    let empty = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.is_empty())
+        .unwrap_or(true);
+    if empty {
+        eprintln!("{who}: empty bitstream refused (no configured frames)");
+        std::process::exit(1);
+    }
+}
+
+fn write_session_hbits(session: &Session, out: &str) {
+    let bits = session.bitstream.as_ref().unwrap_or_else(|| {
+        eprintln!("write_bitstream: empty bitstream refused (write_bitstream first)");
+        std::process::exit(1);
+    });
+    if bits.frames.is_empty() {
+        eprintln!("write_bitstream: empty bitstream refused (no configured frames)");
+        std::process::exit(1);
+    }
+    std::fs::write(out, &bits.packets).unwrap_or_else(|e| {
+        eprintln!("write {out}: {e}");
+        std::process::exit(1);
+    });
+    println!("wrote {out} {} bytes", bits.packets.len());
 }
 
 fn hw(args: Vec<String>) {
@@ -922,9 +1079,7 @@ fn hw(args: Vec<String>) {
         return;
     }
     if sub != "program" && sub != "flash" {
-        eprintln!(
-            "usage: helion hw list|detect|program|flash — unknown subcommand {sub:?}"
-        );
+        eprintln!("usage: helion hw list|detect|program|flash — unknown subcommand {sub:?}");
         std::process::exit(2);
     }
     let mut cable = String::from("auto");
@@ -1005,18 +1160,12 @@ fn hw(args: Vec<String>) {
     }
 }
 
-
 fn cmd_ip(args: &[String]) {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
     match sub {
         "list" | "catalog" => {
             for c in helion_ipxact::catalog() {
-                println!(
-                    "ip {} bus={} vlnv={}",
-                    c.name,
-                    c.bus,
-                    c.vlnv()
-                );
+                println!("ip {} bus={} vlnv={}", c.name, c.bus, c.vlnv());
             }
         }
         "show" => {
@@ -1103,15 +1252,13 @@ fn cmd_gui() {
 fn doctor() {
     println!("helion doctor");
     println!("  target {}", env!("HELION_TARGET"));
-    println!(
-        "  host {}-{}",
-        std::env::consts::ARCH,
-        std::env::consts::OS
-    );
+    println!("  host {}-{}", std::env::consts::ARCH, std::env::consts::OS);
     match std::process::Command::new("rustc").arg("-vV").output() {
         Ok(o) if o.status.success() => {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
-                if line.starts_with("release:") || line.starts_with("host:") || line.starts_with("llvm:")
+                if line.starts_with("release:")
+                    || line.starts_with("host:")
+                    || line.starts_with("llvm:")
                 {
                     println!("  rustc {line}");
                 }
