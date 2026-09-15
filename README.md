@@ -164,7 +164,7 @@ The bundle lands at `dist/Helion.app`:
 | Path | What |
 |---|---|
 | `Contents/MacOS/Helion` | windowed IDE (`helion-ide`) |
-| `Contents/MacOS/helion` | CLI |
+| `Contents/MacOS/helion-cli` | CLI (named `helion-cli` so APFS does not clash with `Helion`) |
 | `Contents/Resources/devices/helion` | HAD (FeatureMap / parts) |
 | `Contents/Resources/examples` | `counter.sv`, `blinky.sv`, … |
 | `Contents/Info.plist` | `fpga.helion.ide`, arm64-only |
@@ -175,8 +175,8 @@ Launch and sanity-check:
 open dist/Helion.app
 dist/Helion.app/Contents/MacOS/Helion --version
 dist/Helion.app/Contents/MacOS/Helion --doctor
-dist/Helion.app/Contents/MacOS/helion doctor
-dist/Helion.app/Contents/MacOS/helion run \
+dist/Helion.app/Contents/MacOS/helion-cli doctor
+dist/Helion.app/Contents/MacOS/helion-cli run \
     dist/Helion.app/Contents/Resources/examples/counter.sv --cycles 16
 ```
 
