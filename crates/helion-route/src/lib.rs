@@ -459,6 +459,7 @@ pub fn route_with_guide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helion_place::hard_heartbeat;
     use helion_device::Device;
     use helion_ir::Design;
     use helion_pack::pack;
@@ -557,33 +558,6 @@ mod tests {
     }
 
     /// ≥8 LUT+FF heartbeat (Ibex pin-wrap class, not 108k P&R).
-    fn hard_heartbeat() -> Design {
-        let mut d = Design::new("hb8");
-        d.add_port("clk", helion_ir::PortDir::In);
-        d.add_port("led", helion_ir::PortDir::Out);
-        for i in 0..8u32 {
-            d.add_cell(
-                format!("u_lut{i}"),
-                helion_ir::CellKind::Lut6 {
-                    init: 0x5555_5555_5555_5555,
-                },
-            );
-            d.add_cell(format!("u_ff{i}"), helion_ir::CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
-            if i > 0 {
-                d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
-            }
-        }
-        d.add_cell("u_iob", helion_ir::CellKind::IobOut);
-        d.connect("q7", "u_iob", "I");
-        d.connect("led", "u_iob", "PAD");
-        d
-    }
-
     fn hops_of(r: &Routed) -> Vec<u32> {
         r.iob_src.iter().map(|io| io.hops).collect()
     }

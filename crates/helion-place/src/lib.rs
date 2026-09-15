@@ -123,6 +123,36 @@ fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
     sites.iter().copied().find(|s| s.x == x && s.y == y)
 }
 
+/// ≥8 LUT+FF heartbeat fixture (Ibex pin-wrap class, not 108k P&R).
+/// Shared by place/route/sta guided-timing tests.
+pub fn hard_heartbeat() -> helion_ir::Design {
+    use helion_ir::{CellKind, PortDir};
+    let mut d = helion_ir::Design::new("hb8");
+    d.add_port("clk", PortDir::In);
+    d.add_port("led", PortDir::Out);
+    for i in 0..8u32 {
+        d.add_cell(
+            format!("u_lut{i}"),
+            CellKind::Lut6 {
+                init: 0x5555_5555_5555_5555,
+            },
+        );
+        d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+        d.connect("clk", format!("u_ff{i}"), "CLK");
+        d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+        d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+        d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+        d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+        if i > 0 {
+            d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
+        }
+    }
+    d.add_cell("u_iob", CellKind::IobOut);
+    d.connect("q7", "u_iob", "I");
+    d.connect("led", "u_iob", "PAD");
+    d
+}
+
 pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
     place_with(packed, dev, PlaceOpts::default())
 }
@@ -1293,33 +1323,7 @@ mod tests {
         assert_eq!(next.lutff_sites, prev.lutff_sites);
     }
 
-    /// ≥8 LUT+FF heartbeat (Ibex pin-wrap class, not 108k P&R).
-    fn hard_heartbeat() -> Design {
-        let mut d = Design::new("hb8");
-        d.add_port("clk", helion_ir::PortDir::In);
-        d.add_port("led", helion_ir::PortDir::Out);
-        for i in 0..8u32 {
-            d.add_cell(
-                format!("u_lut{i}"),
-                CellKind::Lut6 {
-                    init: 0x5555_5555_5555_5555,
-                },
-            );
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
-            if i > 0 {
-                d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
-            }
-        }
-        d.add_cell("u_iob", CellKind::IobOut);
-        d.connect("q7", "u_iob", "I");
-        d.connect("led", "u_iob", "PAD");
-        d
-    }
+    // hard_heartbeat: see crate::hard_heartbeat
 
     fn sites_of(pl: &Placed) -> Vec<(u32, u32, u8)> {
         pl.lutff_sites
