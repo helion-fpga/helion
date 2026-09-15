@@ -101,8 +101,7 @@ impl FtdiBitbangSim {
             self.tap.tick(false, false);
         }
         // From Update-* paths we already land in Idle with TMS=0.
-        while self.tap.state != TapState::RunTestIdle
-            && self.tap.state != TapState::TestLogicReset
+        while self.tap.state != TapState::RunTestIdle && self.tap.state != TapState::TestLogicReset
         {
             // Best-effort: TMS=0 usually drains toward Idle from Update.
             self.tap.tick(false, false);
@@ -335,9 +334,8 @@ impl FtdiBitbangSim {
 
     /// Load `.hbits` from disk and [`Self::program_bitstream`].
     pub fn program_hbits_path(&mut self, path: &std::path::Path) -> Result<Stat, MpsseSimError> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            MpsseSimError::CfgW(format!("read {}: {e}", path.display()))
-        })?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| MpsseSimError::CfgW(format!("read {}: {e}", path.display())))?;
         let bits = Bitstream::from_packets(&bytes).map_err(MpsseSimError::CfgW)?;
         self.program_bitstream(&bits)
     }
@@ -396,7 +394,10 @@ mod tests {
         bb.open().unwrap();
 
         let bits = Bitstream::empty(&dev);
-        assert!(!bits.packets.is_empty(), "empty design still emits .hbits header/body");
+        assert!(
+            !bits.packets.is_empty(),
+            "empty design still emits .hbits header/body"
+        );
 
         let st = bb.program_bitstream(&bits).unwrap();
         assert!(st.done, "sim fabric DONE after CFG_W");
@@ -412,33 +413,33 @@ mod tests {
 
     #[test]
     fn cfg_w_counter_hbits_stat_done_via_bitbang() {
+        use helion_bits::bitgen;
+        use helion_ir::Design;
+        use helion_pack::pack;
+        use helion_place::place;
+        use helion_route::route;
+
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut bb = FtdiBitbangSim::new(&dev);
         bb.open().unwrap();
 
-        // Prefer freshly bitgen'd counter under /tmp; fall back to in-tree project output path.
-        let candidates = [
-            std::path::Path::new("/tmp/counter.hbits"),
-            std::path::Path::new("examples/counter.hbits"),
-            std::path::Path::new("/workspace/helion/examples/counter.hbits"),
-        ];
-        let path = candidates.iter().find(|p| p.is_file()).copied();
-        let path = match path {
-            Some(p) => p,
-            None => {
-                // Build empty+minimal from Bitstream::empty if no counter file — still proves CFG_W.
-                // Prefer failing loudly if neither exists so CI keeps a counter artifact.
-                panic!("no counter.hbits found in {:?} — run `helion project examples/counter.prj`", candidates);
-            }
-        };
+        let packed = pack(&Design::structural_counter(), &dev).unwrap();
+        let placed = place(&packed, &dev).unwrap();
+        let routed = route(&placed, &dev).unwrap();
+        let bits = bitgen(&dev, &routed).unwrap();
+        assert!(
+            !bits.frames.is_empty(),
+            "counter bitstream must have frames"
+        );
 
-        let st = bb.program_hbits_path(path).unwrap();
+        let st = bb.program_bitstream(&bits).unwrap();
         assert!(st.done);
         assert_eq!(st.word(), Stat::STARTUP_WORD);
         assert_eq!(bb.read_idcode().unwrap(), 0x0001_1A1F);
         // Honesty: sim CFG_W ≠ board/USB DONE. Native is NotImplemented (no feature)
         // or Io (usb-native, no FTDI) — never Ok with invented STAT.
-        let err = crate::try_native_usb_program(path, false).unwrap_err();
+        let err =
+            crate::try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -498,12 +499,15 @@ mod tests {
     #[test]
     fn native_path_does_not_claim_done_without_probe() {
         // Honesty: sim harness ≠ native USB MPSSE board DONE.
-        let err = crate::try_native_usb_program(std::path::Path::new("/dev/null"), false)
-            .unwrap_err();
+        let err =
+            crate::try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, crate::NativeUsbError::Io(_)), "{err:?}");
         } else {
-            assert!(matches!(err, crate::NativeUsbError::NotImplemented(_)), "{err:?}");
+            assert!(
+                matches!(err, crate::NativeUsbError::NotImplemented(_)),
+                "{err:?}"
+            );
         }
     }
 }
