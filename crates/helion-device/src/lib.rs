@@ -74,6 +74,13 @@ pub struct BitLoc {
     pub bit: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Board {
+    pub board: String,
+    pub part: String,
+    pub cables: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Site {
     pub x: u32,
@@ -283,6 +290,59 @@ impl Device {
 
     pub fn lut6_count(&self) -> u32 {
         self.interior_cols * self.interior_rows * self.n_ble
+    }
+
+    /// Load a Helion board file (`HB1`) from HAD `boards/`. Not a vendor board SKU.
+    pub fn load_board(name: &str) -> Result<Board, String> {
+        let path = Self::devices_dir()
+            .join("boards")
+            .join(format!("{name}.toml"));
+        Self::load_board_path(&path)
+    }
+
+    pub fn load_board_path(path: &Path) -> Result<Board, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut board = String::new();
+        let mut part = String::new();
+        let mut cables = Vec::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let k = k.trim();
+            let v = v.trim().trim_matches('"');
+            match k {
+                "board" => board = v.to_string(),
+                "part" => part = v.to_string(),
+                "cables" => {
+                    cables = v
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        if board.is_empty() {
+            return Err("missing board".into());
+        }
+        if part.is_empty() {
+            return Err("missing part".into());
+        }
+        if cables.is_empty() {
+            return Err("missing cables".into());
+        }
+        Ok(Board {
+            board,
+            part,
+            cables,
+        })
     }
 
     pub fn n_clb(&self) -> u32 {
@@ -1013,5 +1073,40 @@ mod tests {
         }
         let (s, r, l) = uwilton_sides(0, 8);
         assert_eq!((s, r, l), (0, 1, 7));
+    }
+
+    #[test]
+    fn helion_m_sku_lut6_budget_at_least_100k() {
+        let d = Device::load_part("HL10M-C128-1").expect("load Helion-M");
+        assert!(
+            d.part.starts_with("HL10"),
+            "must be a Helion-named part, not a 7-series/UltraScale name: {}",
+            d.part
+        );
+        assert!(!d.part.to_ascii_lowercase().contains("xc7"));
+        assert!(!d.part.to_ascii_lowercase().contains("xcku"));
+        assert_eq!(d.sku, "M");
+        assert!(
+            d.lut6_count() >= 100_000,
+            "Helion-M LUT6 budget {} < 100000",
+            d.lut6_count()
+        );
+        assert_eq!(d.lut6_count(), 128 * 128 * 8);
+        assert_eq!(d.idcode, 0x0003_1A1F);
+        let s = Device::load_part("HL10S-C64-1").expect("load Helion-S");
+        assert_eq!(s.sku, "S");
+        assert_eq!(s.lut6_count(), 64 * 64 * 8);
+    }
+
+    #[test]
+    fn helion_hb1_board_lists_helion_cables() {
+        let b = Device::load_board("HB1").expect("load HB1");
+        assert_eq!(b.board, "HB1");
+        assert_eq!(b.part, "HL10T-C32-1");
+        for c in ["sim", "ofl", "native", "usb", "mpsse-sim"] {
+            assert!(b.cables.iter().any(|x| x == c), "missing cable {c}: {:?}", b.cables);
+        }
+        let part = Device::load_part(&b.part).unwrap();
+        assert_eq!(part.lut6_count(), 8192);
     }
 }
