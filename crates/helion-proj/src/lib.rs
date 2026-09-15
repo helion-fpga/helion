@@ -1,4 +1,4 @@
-//! Dual-mode Session, checkpoints `.hckp`, object query, opt, ECO.
+//! Dual-mode Session, disk checkpoints `.hckp`, object query, opt, ECO.
 
 use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
 use helion_device::Device;
@@ -159,6 +159,80 @@ impl Session {
             "write_checkpoint lutff={}",
             p.lutff_sites.len()
         ))
+    }
+
+    /// Persist a reopenable `.hckp` (HNF + bitstream hash) so a new process can
+    /// `open_checkpoint` yesterday's run. Refuses an empty/fake bitstream.
+    pub fn write_checkpoint_to(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<String, String> {
+        let placed_msg = self.write_checkpoint()?;
+        let frames = {
+            let bits = self.bitstream.as_ref().ok_or(
+                "write_checkpoint: empty bitstream refused (write_bitstream first)",
+            )?;
+            if bits.frames.is_empty() {
+                return Err(
+                    "write_checkpoint: empty bitstream refused (no configured frames)".into(),
+                );
+            }
+            bits.frames.len()
+        };
+        let path = path.as_ref();
+        let bytes = self.checkpoint();
+        let hash = self.blinky_hash().unwrap_or(0);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("write_checkpoint mkdir: {e}"))?;
+            }
+        }
+        std::fs::write(path, &bytes)
+            .map_err(|e| format!("write_checkpoint {}: {e}", path.display()))?;
+        Ok(format!(
+            "{placed_msg} path={} bytes={} frames={} hash={:#x}",
+            path.display(),
+            bytes.len(),
+            frames,
+            hash
+        ))
+    }
+
+    /// Reopen a `.hckp` written by [`write_checkpoint_to`]. Re-impls from the
+    /// embedded HNF so ECO / `write_bitstream` / incremental place work.
+    pub fn open_checkpoint(
+        path: impl AsRef<std::path::Path>,
+        dev: &Device,
+    ) -> Result<Self, String> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("open_checkpoint {}: {e}", path.display()))?;
+        let mut s = Self::restore_session(&bytes, dev)?;
+        s.impl_checkpoint = s.placed.clone();
+        Ok(s)
+    }
+
+    /// Place/route/bitgen using `.prj` pblock + impl-run strategy (Default = gold).
+    pub fn impl_project(&mut self, dev: &Device, prj: &ProjectFile) -> Result<(), String> {
+        if self.design.is_none() {
+            return Err("impl_project: no design".into());
+        }
+        if let Some(pb) = prj.pblocks.iter().find(|p| p.ranged) {
+            self.place_pblock(dev, pb.x0, pb.y0, pb.x1, pb.y1)?;
+            self.route_design(dev)?;
+            self.write_bitstream(dev)?;
+            return Ok(());
+        }
+        let strategy = prj
+            .impl_runs
+            .iter()
+            .find(|r| r.name.to_ascii_lowercase().starts_with("impl"))
+            .or_else(|| prj.impl_runs.first())
+            .map(|r| ImplStrategy::parse(&r.strategy))
+            .transpose()?
+            .unwrap_or(ImplStrategy::Default);
+        self.impl_with_strategy(dev, strategy)
     }
 
     /// Drop the synth netlist and every impl artifact (Vivado `reset_run synth_1`).
@@ -699,9 +773,37 @@ pub fn get_pins(d: &Design, cell: &str) -> Vec<String> {
         .collect()
 }
 
+/// UG893 Floorplanning rectangle persisted in `.prj` (`create_pblock` / `resize_pblock`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrjPblock {
+    pub name: String,
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+    pub ranged: bool,
+    pub cells: Vec<String>,
+}
+
+impl PrjPblock {
+    pub fn range_text(&self) -> String {
+        if !self.ranged {
+            return "-".into();
+        }
+        format!("CLB_X{}Y{}:CLB_X{}Y{}", self.x0, self.y0, self.x1, self.y1)
+    }
+}
+
+/// UG986 Design Run persisted in `.prj` (`create_run` / `launch_runs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrjImplRun {
+    pub name: String,
+    pub strategy: String,
+}
+
 /// Drop const-0 LUT+FF pairs that do not drive an IOB.
 /// Vivado-like project file: `part`, `read_sv` (multi), `read_xdc`/`read_sdc`,
-/// `create_clock`, `set_property PACKAGE_PIN` / `TOP`.
+/// `create_clock`, `set_property PACKAGE_PIN` / `TOP`, pblock, impl run, `.hckp`.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectFile {
     pub part: String,
@@ -720,6 +822,60 @@ pub struct ProjectFile {
     pub pulltypes: Vec<(String, String)>,
     pub diff_terms: Vec<(String, String)>,
     pub in_terms: Vec<(String, String)>,
+    /// Floorplan pblocks (`create_pblock` / `resize_pblock` / `add_cells_to_pblock`).
+    pub pblocks: Vec<PrjPblock>,
+    /// Implementation runs (`create_run impl_1 -strategy Default`).
+    pub impl_runs: Vec<PrjImplRun>,
+    /// Disk checkpoint path (`write_checkpoint path.hckp`).
+    pub checkpoint_path: Option<String>,
+}
+
+fn parse_clb_xy(spec: &str) -> Option<(u32, u32)> {
+    let s = spec.trim().trim_matches(|c: char| "{}[]".contains(c));
+    let rest = s
+        .strip_prefix("CLB_X")
+        .or_else(|| s.strip_prefix("SLICE_X"))?;
+    let (xs, ys) = rest.split_once('Y')?;
+    Some((xs.parse().ok()?, ys.parse().ok()?))
+}
+
+fn parse_clb_range(spec: &str) -> Option<(u32, u32, u32, u32)> {
+    let s = spec.trim().trim_matches(|c: char| "{}[]".contains(c));
+    let (a, b) = s.split_once(':')?;
+    let (x0, y0) = parse_clb_xy(a)?;
+    let (x1, y1) = parse_clb_xy(b)?;
+    Some((x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)))
+}
+
+fn prj_token_is_helper(s: &str) -> bool {
+    matches!(
+        s,
+        "get_cells" | "get_pblocks" | "get_runs" | "-cells" | "-add" | "-force"
+    )
+}
+
+fn upsert_impl_run(p: &mut ProjectFile, name: &str, strategy: Option<&str>) {
+    if let Some(r) = p.impl_runs.iter_mut().find(|r| r.name == name) {
+        if let Some(s) = strategy {
+            r.strategy = s.to_string();
+        }
+    } else {
+        p.impl_runs.push(PrjImplRun {
+            name: name.to_string(),
+            strategy: strategy.unwrap_or("Default").to_string(),
+        });
+    }
+}
+
+fn pblock_named_mut<'a>(p: &'a mut ProjectFile, name: &str) -> &'a mut PrjPblock {
+    if let Some(i) = p.pblocks.iter().position(|b| b.name == name) {
+        return &mut p.pblocks[i];
+    }
+    p.pblocks.push(PrjPblock {
+        name: name.to_string(),
+        ..Default::default()
+    });
+    p.pblocks.last_mut().unwrap()
 }
 
 pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
@@ -873,6 +1029,121 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     }
                 }
             }
+            "create_pblock" => {
+                let rest: Vec<&str> = toks.collect();
+                let mut name = String::new();
+                let mut add: Option<String> = None;
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i] == "-add" {
+                        i += 1;
+                        if i < rest.len() {
+                            add = Some(rest[i].to_string());
+                        }
+                    } else if name.is_empty() && !rest[i].starts_with('-') {
+                        name = rest[i]
+                            .trim_matches(|c: char| "{}[]".contains(c))
+                            .to_string();
+                    }
+                    i += 1;
+                }
+                if name.is_empty() {
+                    name = format!("pblock_{}", p.pblocks.len());
+                }
+                let _ = pblock_named_mut(&mut p, &name);
+                if let Some(spec) = add {
+                    if let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) {
+                        let pb = pblock_named_mut(&mut p, &name);
+                        pb.x0 = x0;
+                        pb.y0 = y0;
+                        pb.x1 = x1;
+                        pb.y1 = y1;
+                        pb.ranged = true;
+                    }
+                }
+            }
+            "resize_pblock" => {
+                let rest: Vec<&str> = toks.collect();
+                let mut name = String::new();
+                let mut spec = String::new();
+                for tok in rest {
+                    if tok == "-add" {
+                        continue;
+                    }
+                    let t = tok.trim_matches(|c: char| "{}[]".contains(c));
+                    if t.is_empty() || prj_token_is_helper(t) {
+                        continue;
+                    }
+                    if name.is_empty() && !t.contains(':') {
+                        name = t.to_string();
+                    } else if !spec.is_empty() {
+                        spec.push(':');
+                        spec.push_str(t);
+                    } else {
+                        spec = t.to_string();
+                    }
+                }
+                if !name.is_empty() {
+                    if let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) {
+                        let pb = pblock_named_mut(&mut p, &name);
+                        pb.x0 = x0;
+                        pb.y0 = y0;
+                        pb.x1 = x1;
+                        pb.y1 = y1;
+                        pb.ranged = true;
+                    }
+                }
+            }
+            "add_cells_to_pblock" => {
+                let rest: Vec<String> = toks
+                    .map(|t| t.trim_matches(|c: char| "{}[]".contains(c)).to_string())
+                    .filter(|t| !t.is_empty() && !prj_token_is_helper(t))
+                    .collect();
+                if let Some(name) = rest.first() {
+                    let pb = pblock_named_mut(&mut p, name);
+                    for c in rest.iter().skip(1) {
+                        if !pb.cells.contains(c) {
+                            pb.cells.push(c.clone());
+                        }
+                    }
+                }
+            }
+            "create_run" => {
+                let rest: Vec<&str> = toks.collect();
+                let mut name = String::new();
+                let mut strategy = String::from("Default");
+                let mut i = 0;
+                while i < rest.len() {
+                    if rest[i] == "-strategy" || rest[i] == "-strat" {
+                        i += 1;
+                        if i < rest.len() {
+                            strategy = rest[i].to_string();
+                        }
+                    } else if name.is_empty() && !rest[i].starts_with('-') {
+                        name = rest[i]
+                            .trim_matches(|c: char| "{}[]".contains(c))
+                            .to_string();
+                    }
+                    i += 1;
+                }
+                if !name.is_empty() {
+                    upsert_impl_run(&mut p, &name, Some(&strategy));
+                }
+            }
+            "launch_runs" => {
+                if let Some(name) = toks.next() {
+                    let name = name.trim_matches(|c: char| "{}[]".contains(c));
+                    if !name.is_empty() {
+                        upsert_impl_run(&mut p, name, None);
+                    }
+                }
+            }
+            "write_checkpoint" | "open_checkpoint" | "read_checkpoint" | "checkpoint" => {
+                let rest: Vec<&str> = toks.collect();
+                if let Some(v) = rest.iter().rev().find(|t| !t.starts_with('-') && !t.is_empty()) {
+                    p.checkpoint_path = Some((*v).to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -977,6 +1248,30 @@ pub fn format_prj(prj: &ProjectFile) -> String {
         if !line.ends_with('\n') {
             out.push('\n');
         }
+    }
+    for pb in &prj.pblocks {
+        out.push_str(&format!("create_pblock {}\n", pb.name));
+        if pb.ranged {
+            out.push_str(&format!(
+                "resize_pblock {} -add {{{}}}\n",
+                pb.name,
+                pb.range_text()
+            ));
+        }
+        for c in &pb.cells {
+            out.push_str(&format!("add_cells_to_pblock {} {c}\n", pb.name));
+        }
+    }
+    for r in &prj.impl_runs {
+        let strat = if r.strategy.is_empty() {
+            "Default"
+        } else {
+            r.strategy.as_str()
+        };
+        out.push_str(&format!("create_run {} -strategy {strat}\n", r.name));
+    }
+    if let Some(ck) = &prj.checkpoint_path {
+        out.push_str(&format!("write_checkpoint {ck}\n"));
     }
     out
 }
@@ -1356,5 +1651,145 @@ top h_gpio
         );
         def.unroute_net(&led).unwrap();
         assert_eq!(def.routed.as_ref().unwrap().iob_src[0].delay_ps, 0);
+    }
+
+    #[test]
+    fn format_prj_round_trips_pblock_impl_run_checkpoint() {
+        let prj = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/counter.sv
+read_xdc examples/counter.sdc
+create_pblock pblock_0
+resize_pblock pblock_0 -add {CLB_X5Y1:CLB_X8Y8}
+add_cells_to_pblock pblock_0 u_lut0
+create_run impl_1 -strategy Default
+create_run impl_runtime -strategy RuntimeOpt
+write_checkpoint counter.hckp
+"#,
+        )
+        .unwrap();
+        assert_eq!(prj.pblocks.len(), 1);
+        assert_eq!(prj.pblocks[0].name, "pblock_0");
+        assert!(prj.pblocks[0].ranged);
+        assert_eq!(prj.pblocks[0].x0, 5);
+        assert_eq!(prj.pblocks[0].y0, 1);
+        assert_eq!(prj.pblocks[0].x1, 8);
+        assert_eq!(prj.pblocks[0].y1, 8);
+        assert_eq!(prj.pblocks[0].cells, vec!["u_lut0"]);
+        assert_eq!(
+            prj.impl_runs,
+            vec![
+                PrjImplRun {
+                    name: "impl_1".into(),
+                    strategy: "Default".into(),
+                },
+                PrjImplRun {
+                    name: "impl_runtime".into(),
+                    strategy: "RuntimeOpt".into(),
+                },
+            ]
+        );
+        assert_eq!(prj.checkpoint_path.as_deref(), Some("counter.hckp"));
+
+        let text = format_prj(&prj);
+        assert!(text.contains("create_pblock pblock_0"), "{text}");
+        assert!(
+            text.contains("resize_pblock pblock_0 -add {CLB_X5Y1:CLB_X8Y8}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("add_cells_to_pblock pblock_0 u_lut0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("create_run impl_1 -strategy Default"),
+            "{text}"
+        );
+        assert!(
+            text.contains("create_run impl_runtime -strategy RuntimeOpt"),
+            "{text}"
+        );
+        assert!(text.contains("write_checkpoint counter.hckp"), "{text}");
+
+        let again = load_prj(&text).unwrap();
+        assert_eq!(again.pblocks, prj.pblocks);
+        assert_eq!(again.impl_runs, prj.impl_runs);
+        assert_eq!(again.checkpoint_path, prj.checkpoint_path);
+        assert_eq!(again.sources, prj.sources);
+        assert_eq!(again.constraint_files, prj.constraint_files);
+    }
+
+    #[test]
+    fn disk_hckp_restore_eco_changes_bitstream_hash() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::Project);
+        s.impl_design(Design::structural_counter(), &dev).unwrap();
+        let t0 = s.report_timing(&dev).unwrap();
+        assert!(
+            t0.contains("WNS_PS=9640"),
+            "empty-XDC counter gold must hold before checkpoint: {t0}"
+        );
+        let h0 = s.blinky_hash().expect("impl must bitgen");
+        let frames0 = s.bitstream.as_ref().unwrap().frames.len();
+        assert!(frames0 > 0, "impl frames must be non-empty");
+
+        let dir = std::env::temp_dir().join(format!(
+            "helion-hckp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counter.hckp");
+        let wr = s.write_checkpoint_to(&path).unwrap();
+        assert!(wr.contains("bytes="), "{wr}");
+        assert!(path.is_file(), "write_checkpoint must create {}", path.display());
+        drop(s);
+
+        let mut s2 = Session::open_checkpoint(&path, &dev).unwrap();
+        assert!(
+            s2.impl_checkpoint.is_some(),
+            "disk restore must seed impl_checkpoint for incremental place"
+        );
+        let t1 = s2.report_timing(&dev).unwrap();
+        assert!(
+            t1.contains("WNS_PS=9640"),
+            "reopen must hold empty-XDC counter gold: {t1}"
+        );
+        assert_eq!(
+            s2.blinky_hash(),
+            Some(h0),
+            "disk .hckp restore must match bitstream hash"
+        );
+        s2.eco(&dev, "u_lut0", 0xAAAA_AAAA_AAAA_AAAA).unwrap();
+        s2.write_bitstream(&dev).unwrap();
+        let frames1 = s2.bitstream.as_ref().map(|b| b.frames.len()).unwrap_or(0);
+        assert!(
+            frames1 > 0,
+            "ECO write_bitstream must keep non-empty frames"
+        );
+        let h1 = s2.blinky_hash().expect("ECO bitstream");
+        assert_ne!(h1, h0, "ECO LUT must change bitstream hash ({h0:#x} vs {h1:#x})");
+        eprintln!(
+            "disk_hckp restore WNS_PS=9640 hash={h0:#x} ECO hash={h1:#x} frames={frames1}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_checkpoint_to_refuses_empty_bitstream() {
+        let mut s = Session::new(Mode::NonProject);
+        let err = s
+            .write_checkpoint_to("/tmp/helion-empty.hckp")
+            .unwrap_err();
+        assert!(err.contains("not placed") || err.contains("empty bitstream"), "{err}");
+        s.synth_design(Design::structural_counter());
+        let err = s
+            .write_checkpoint_to("/tmp/helion-empty.hckp")
+            .unwrap_err();
+        assert!(err.contains("not placed"), "{err}");
     }
 }
