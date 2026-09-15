@@ -3838,13 +3838,17 @@ fn try_parse_readmem(
             return true;
         }
     };
-    let entry = mem_inits.entry(mem).or_default();
     if words.is_empty() {
-        entry.entry(start).or_insert(0);
-    } else {
-        for (a, v) in words {
-            entry.insert(start.saturating_add(a), v);
-        }
+        // Empty/whitespace-only image is not INIT 0.
+        note_skip(format!(
+            "diagnostic readmem_empty module={} path={path} (readmem image empty; not a silent INIT 0)",
+            cur_mod()
+        ));
+        return true;
+    }
+    let entry = mem_inits.entry(mem).or_default();
+    for (a, v) in words {
+        entry.insert(start.saturating_add(a), v);
     }
     true
 }
@@ -4403,16 +4407,16 @@ fn note_signed(p: &mut P, name: &str) {
     p.signed.insert(name.to_string());
 }
 
-/// `ident >= 0` / `< 0` → ~MSB/MSB only for a tracked signed decl and/or
-/// unsized decimal `0` (token width 0). A sized `Const { val: 0, width: 8 }`
-/// (`8'd0`) is an unsigned Lt, not this rewrite.
+/// `ident >= 0` / `< 0` → ~MSB/MSB only when the decl is tracked **signed**
+/// and the zero is **unsized** (token width 0). Unsigned `in >= 0` stays the
+/// always-true/false unsigned compare; sized `8'd0`/`16'd0` stay `!(Lt)`.
 fn ident_cmp_zero_signbit(p: &P, name: &str, zero: &RExpr) -> bool {
     let RExpr::Const { val: 0, width, .. } = zero else {
         return false;
     };
     let is_unsized = *width == 0;
     let signed = p.signed.contains(name);
-    signed || is_unsized
+    signed && is_unsized
 }
 
 /// Last procedural write wins. Vector assigns become per-bit so a case arm
@@ -11191,8 +11195,6 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
     for name in &mem_names {
-        let cell = format!("u_bram{n_bram}");
-        d.add_cell(&cell, CellKind::Bram18);
         let depth = sig_depth(rtl, name).max(
             rtl.mem_inits
                 .get(name)
@@ -11210,9 +11212,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 "diagnostic bram18_init_truncate module={} mem={} depth={} (INIT addr/depth exceeds 1024; not a silent drop)",
                 rtl.module, name, depth
             ));
-            n_bram += 1;
+            // Do not emit Bram18 with default-zero INIT.
             continue;
         }
+        let cell = format!("u_bram{n_bram}");
+        d.add_cell(&cell, CellKind::Bram18);
         let mut words = vec![0u64; depth.max(1).min(1024)];
         if let Some(init) = rtl.mem_inits.get(name) {
             for (addr, val) in init {
@@ -12364,6 +12368,7 @@ pub fn elaborate_sv(
     opts: &SvCompileOpts,
 ) -> Result<(Design, SvElabReport), String> {
     let _ = opts;
+    clear_function_notes();
     set_readmem_origin(origin);
     let d = synth_from_parsed_top(parse_source(source)?, top, params)?;
     let report = elab_report(&d);
@@ -12389,6 +12394,7 @@ pub fn elaborate_sv_sources(
     if files.is_empty() {
         return Err("no sources".into());
     }
+    clear_function_notes();
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
     clear_readmem_bases();
@@ -13733,6 +13739,44 @@ endmodule
                 );
             }
             other => panic!("expected !(Lt), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsigned_ge0_unsized_is_not_msb_rewrite() {
+        let src = r#"
+module t(input [7:0] in, output o);
+  assign o = in >= 0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => {
+                assert!(
+                    !matches!(inner.as_ref(), RExpr::Bit(_, 7)),
+                    "unsigned >= unsized 0 must not become ~MSB, got {inner:?}"
+                );
+            }
+            other => panic!("expected !(Lt) style, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_ge_sized_zero_is_not_msb_rewrite() {
+        let src = r#"
+module t(input signed [7:0] in, output o);
+  assign o = in >= 8'd0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => {
+                assert!(
+                    !matches!(inner.as_ref(), RExpr::Bit(_, 7)),
+                    "signed >= 8'd0 must not become ~MSB, got {inner:?}"
+                );
+            }
+            other => panic!("expected !(Lt) style, got {other:?}"),
         }
     }
 
