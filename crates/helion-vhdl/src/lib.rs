@@ -171,9 +171,11 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
     // would let a non-selected sequential body force clock→clk on a selected
     // arch that treats `clock` as data. child_clocks uses this same map.
     let mut entity_clocks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut entity_occupied: HashMap<String, HashSet<String>> = HashMap::new();
     for e in &entities {
         if let Some(a) = arch_for(&e.name) {
             entity_clocks.insert(e.name.to_ascii_lowercase(), sta_clocks_of(a));
+            entity_occupied.insert(e.name.to_ascii_lowercase(), occupied_sv_names(e, a));
         }
     }
     let mut out = String::new();
@@ -195,6 +197,7 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
             &consts,
             &known_bodies,
             &entity_clocks,
+            &entity_occupied,
             &entities,
         )?);
     }
@@ -202,6 +205,7 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         .or_else(|| archs.last())
         .unwrap_or(&dummy);
     entity_clocks.insert(top.name.to_ascii_lowercase(), sta_clocks_of(arch));
+    entity_occupied.insert(top.name.to_ascii_lowercase(), occupied_sv_names(top, arch));
     let consts = bind_consts(&pkg_consts, top, arch, true);
     out.push_str(&emit_sv(
         top,
@@ -209,6 +213,7 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         &consts,
         &known_bodies,
         &entity_clocks,
+        &entity_occupied,
         &entities,
     )?);
     Ok(out)
@@ -251,6 +256,17 @@ fn occupied_sv_names(ent: &Entity, arch: &Arch) -> HashSet<String> {
         s.insert(n.to_ascii_lowercase());
     }
     for (n, _) in &arch.signals {
+        s.insert(n.to_ascii_lowercase());
+    }
+    // Top package dump (and clock→clk skip) must not collide with
+    // already-emitted localparams from generics / entity / arch consts.
+    for n in ent.generics.keys() {
+        s.insert(n.to_ascii_lowercase());
+    }
+    for n in ent.consts.keys() {
+        s.insert(n.to_ascii_lowercase());
+    }
+    for n in arch.consts.keys() {
         s.insert(n.to_ascii_lowercase());
     }
     s
@@ -1876,12 +1892,23 @@ fn emit_sv(
     consts: &HashMap<String, i64>,
     known_bodies: &HashSet<String>,
     entity_clocks: &HashMap<String, HashSet<String>>,
+    entity_occupied: &HashMap<String, HashSet<String>>,
     entities: &[Entity],
 ) -> Result<String, String> {
     let empty_clocks = HashSet::new();
     let sta_clocks = entity_clocks
         .get(&ent.name.to_ascii_lowercase())
         .unwrap_or(&empty_clocks);
+    let occupied = entity_occupied
+        .get(&ent.name.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_else(|| occupied_sv_names(ent, arch));
+    // Clash: process/STA clock `clock` would become `clk`, but `clk` is
+    // already a port/signal/generic/const. Skip the rename (keep `clock`),
+    // emit a named diagnostic, do not silent-merge, do not abort synth.
+    if clock_clk_clash(sta_clocks, &occupied) {
+        emit_diag(&clock_clk_clash_line(&ent.name));
+    }
     let mut sv = String::new();
     // Honest hierarchy: never emit_stub empty modules for component decls.
     // Missing bodies surface as named missing_component / unknown_instance.
@@ -1890,7 +1917,7 @@ fn emit_sv(
         .ports
         .iter()
         .map(|(n, d, w)| {
-            let n = sta_clock_name(n, sta_clocks);
+            let n = sta_clock_name(n, sta_clocks, &occupied);
             if *w == 1 {
                 format!("{d} logic {n}")
             } else {
@@ -1907,7 +1934,7 @@ fn emit_sv(
         sv.push_str(&format!("  localparam {k} = {v};\n"));
     }
     for (n, w) in &arch.signals {
-        let n = sta_clock_name(n, sta_clocks);
+        let n = sta_clock_name(n, sta_clocks, &occupied);
         if *w == 1 {
             sv.push_str(&format!("  logic {n};\n"));
         } else {
@@ -1917,20 +1944,21 @@ fn emit_sv(
     for st in &arch.stmts {
         match st {
             CStmt::Assign { lhs, rhs } => {
-                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks);
-                let rhs = rewrite_sta_clock_ident(rhs, sta_clocks);
+                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks, &occupied);
+                let rhs = rewrite_sta_clock_ident(rhs, sta_clocks, &occupied);
                 for line in emit_assign_lines(&lhs, &rhs) {
                     sv.push_str(&format!("  assign {line}\n"));
                 }
             }
             CStmt::CondAssign { lhs, arms } => {
-                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks);
+                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks, &occupied);
                 let arms: Vec<(Option<String>, String)> = arms
                     .iter()
                     .map(|(c, v)| {
                         (
-                            c.as_ref().map(|s| rewrite_sta_clock_ident(s, sta_clocks)),
-                            rewrite_sta_clock_ident(v, sta_clocks),
+                            c.as_ref()
+                                .map(|s| rewrite_sta_clock_ident(s, sta_clocks, &occupied)),
+                            rewrite_sta_clock_ident(v, sta_clocks, &occupied),
                         )
                     })
                     .collect();
@@ -1945,15 +1973,15 @@ fn emit_sv(
                 arms,
                 other,
             } => {
-                let sel = rewrite_sta_clock_ident(sel, sta_clocks);
-                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks);
+                let sel = rewrite_sta_clock_ident(sel, sta_clocks, &occupied);
+                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks, &occupied);
                 let mut rhs = other
                     .clone()
-                    .map(|s| rewrite_sta_clock_ident(&s, sta_clocks))
+                    .map(|s| rewrite_sta_clock_ident(&s, sta_clocks, &occupied))
                     .unwrap_or_else(|| "1'b0".into());
                 for (pat, val) in arms.iter().rev() {
-                    let pat = rewrite_sta_clock_ident(pat, sta_clocks);
-                    let val = rewrite_sta_clock_ident(val, sta_clocks);
+                    let pat = rewrite_sta_clock_ident(pat, sta_clocks, &occupied);
+                    let val = rewrite_sta_clock_ident(val, sta_clocks, &occupied);
                     rhs = format!("(({sel} == {pat}) ? {val} : {rhs})");
                 }
                 for line in emit_assign_lines(&lhs, &rhs) {
@@ -1962,12 +1990,12 @@ fn emit_sv(
             }
             CStmt::Process { clock, body } => {
                 if let Some(clk) = clock {
-                    let clk = sta_clock_name(clk, sta_clocks);
+                    let clk = sta_clock_name(clk, sta_clocks, &occupied);
                     sv.push_str(&format!("  always_ff @(posedge {clk}) begin\n"));
                 } else {
                     sv.push_str("  always_comb begin\n");
                 }
-                emit_seq(&mut sv, body, 2, sta_clocks);
+                emit_seq(&mut sv, body, 2, sta_clocks, &occupied);
                 sv.push_str("  end\n");
             }
             CStmt::Inst {
@@ -1978,25 +2006,34 @@ fn emit_sv(
                 if !known_bodies.contains(&module.to_ascii_lowercase()) {
                     // Named miss — not silent cells=0 via empty emit_stub.
                     // module= is the entity being lowered, not design top_name.
-                    eprintln!("{}", missing_component_line(&ent.name, name, module));
+                    emit_diag(&missing_component_line(&ent.name, name, module));
                 }
                 sv.push_str(&format!("  {} {name}(", sv_ident(module)));
                 let ports = child_ports(module, arch, entities);
                 let child_clocks = entity_clocks
                     .get(&module.to_ascii_lowercase())
                     .unwrap_or(&empty_clocks);
+                let child_ports_occ = ports.map(|ps| {
+                    ps.iter()
+                        .map(|(n, _, _)| n.to_ascii_lowercase())
+                        .collect::<HashSet<String>>()
+                });
+                let child_occupied = entity_occupied
+                    .get(&module.to_ascii_lowercase())
+                    .or(child_ports_occ.as_ref())
+                    .unwrap_or(&empty_clocks);
                 let cs: Vec<String> = conns
                     .iter()
                     .map(|(a, b)| {
-                        let net = sv_inst_net(b, sta_clocks);
+                        let net = sv_inst_net(b, sta_clocks, &occupied);
                         let port = if a.starts_with('#') {
                             a[1..]
                                 .parse::<usize>()
                                 .ok()
                                 .and_then(|i| ports.and_then(|ps| ps.get(i)))
-                                .map(|(n, _, _)| sta_clock_name(n, child_clocks))
+                                .map(|(n, _, _)| sta_clock_name(n, child_clocks, child_occupied))
                         } else {
-                            Some(sta_clock_name(a, child_clocks))
+                            Some(sta_clock_name(a, child_clocks, child_occupied))
                         };
                         match port {
                             Some(p) if !p.starts_with('#') => format!(".{p}({net})"),
@@ -2042,8 +2079,8 @@ fn child_ports<'a>(
 
 /// helion-sv `parse_inst_net` drops `[idx]` on instance ports. Emit the
 /// bit-blasted net name (`a[0]` → `a_0`) so stitch_child can bind bits.
-fn sv_inst_net(s: &str, sta_clocks: &HashSet<String>) -> String {
-    let s = rewrite_sta_clock_ident(s, sta_clocks);
+fn sv_inst_net(s: &str, sta_clocks: &HashSet<String>, occupied: &HashSet<String>) -> String {
+    let s = rewrite_sta_clock_ident(s, sta_clocks, occupied);
     let t = s.trim();
     let t = t
         .strip_prefix('(')
@@ -2080,6 +2117,28 @@ fn missing_component_line(module: &str, inst: &str, child: &str) -> String {
     )
 }
 
+fn clock_clk_clash(sta_clocks: &HashSet<String>, occupied: &HashSet<String>) -> bool {
+    sta_clocks.contains("clock") && occupied.contains("clk")
+}
+
+fn clock_clk_clash_line(entity: &str) -> String {
+    format!(
+        "diagnostic clock_clk_clash module={entity} construct=process_clock clock=clock occupied=clk (rename clock→clk skipped; clk already a port/signal; nets kept distinct; not a silent merge; not a synth abort)"
+    )
+}
+
+fn emit_diag(line: &str) {
+    eprintln!("{line}");
+    #[cfg(test)]
+    TEST_DIAGNOSTICS.with(|d| d.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIAGNOSTICS: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
 fn sta_clocks_of(arch: &Arch) -> HashSet<String> {
     arch.stmts
         .iter()
@@ -2093,15 +2152,24 @@ fn sta_clocks_of(arch: &Arch) -> HashSet<String> {
 /// NARROW clock≡clk: only the process/STA clock net named `clock` becomes `clk`.
 /// Other ports/signals named `clock` (or other clock-named nets) stay as-is.
 /// Do not total-merge every clock/clk ident → clk.
-fn sta_clock_name(name: &str, sta_clocks: &HashSet<String>) -> String {
+/// If `clk` is already occupied, skip the rename and keep `clock`.
+fn sta_clock_name(name: &str, sta_clocks: &HashSet<String>, occupied: &HashSet<String>) -> String {
     if name.eq_ignore_ascii_case("clock") && sta_clocks.contains(&name.to_ascii_lowercase()) {
-        "clk".into()
+        if occupied.contains("clk") {
+            name.to_string()
+        } else {
+            "clk".into()
+        }
     } else {
         name.to_string()
     }
 }
 
-fn rewrite_sta_clock_ident(s: &str, sta_clocks: &HashSet<String>) -> String {
+fn rewrite_sta_clock_ident(
+    s: &str,
+    sta_clocks: &HashSet<String>,
+    occupied: &HashSet<String>,
+) -> String {
     // Word-boundary rewrite of the process/STA clock ident `clock` → `clk`.
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -2114,7 +2182,7 @@ fn rewrite_sta_clock_ident(s: &str, sta_clocks: &HashSet<String>) -> String {
                 i += 1;
             }
             let word = &s[start..i];
-            out.push_str(&sta_clock_name(word, sta_clocks));
+            out.push_str(&sta_clock_name(word, sta_clocks, occupied));
         } else {
             out.push(bytes[i] as char);
             i += 1;
@@ -2151,13 +2219,19 @@ fn parse_sv_range(s: &str) -> Option<(String, i64, i64)> {
     Some((name, hi.max(lo), hi.min(lo)))
 }
 
-fn emit_seq(sv: &mut String, body: &[SStmt], ind: usize, sta_clocks: &HashSet<String>) {
+fn emit_seq(
+    sv: &mut String,
+    body: &[SStmt],
+    ind: usize,
+    sta_clocks: &HashSet<String>,
+    occupied: &HashSet<String>,
+) {
     let pad = "  ".repeat(ind);
     for s in body {
         match s {
             SStmt::Assign { lhs, rhs } => {
-                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks);
-                let rhs = rewrite_sta_clock_ident(rhs, sta_clocks);
+                let lhs = rewrite_sta_clock_ident(lhs, sta_clocks, occupied);
+                let rhs = rewrite_sta_clock_ident(rhs, sta_clocks, occupied);
                 for line in emit_assign_lines(&lhs, &rhs) {
                     sv.push_str(&format!("{pad}{line}\n"));
                 }
@@ -2168,30 +2242,30 @@ fn emit_seq(sv: &mut String, body: &[SStmt], ind: usize, sta_clocks: &HashSet<St
                 else_b,
             } => {
                 if clock_from_cond(cond).is_some() {
-                    emit_seq(sv, then_b, ind, sta_clocks);
+                    emit_seq(sv, then_b, ind, sta_clocks, occupied);
                     continue;
                 }
-                let cond = rewrite_sta_clock_ident(cond, sta_clocks);
+                let cond = rewrite_sta_clock_ident(cond, sta_clocks, occupied);
                 sv.push_str(&format!("{pad}if ({cond}) begin\n"));
-                emit_seq(sv, then_b, ind + 1, sta_clocks);
+                emit_seq(sv, then_b, ind + 1, sta_clocks, occupied);
                 sv.push_str(&format!("{pad}end\n"));
                 if !else_b.is_empty() {
                     sv.push_str(&format!("{pad}else begin\n"));
-                    emit_seq(sv, else_b, ind + 1, sta_clocks);
+                    emit_seq(sv, else_b, ind + 1, sta_clocks, occupied);
                     sv.push_str(&format!("{pad}end\n"));
                 }
             }
             SStmt::Case { sel, arms, other } => {
-                let sel = rewrite_sta_clock_ident(sel, sta_clocks);
+                let sel = rewrite_sta_clock_ident(sel, sta_clocks, occupied);
                 sv.push_str(&format!("{pad}case ({sel})\n"));
                 for (pats, b) in arms {
                     sv.push_str(&format!("{pad}  {}: begin\n", pats.join(", ")));
-                    emit_seq(sv, b, ind + 2, sta_clocks);
+                    emit_seq(sv, b, ind + 2, sta_clocks, occupied);
                     sv.push_str(&format!("{pad}  end\n"));
                 }
                 if !other.is_empty() {
                     sv.push_str(&format!("{pad}  default: begin\n"));
-                    emit_seq(sv, other, ind + 2, sta_clocks);
+                    emit_seq(sv, other, ind + 2, sta_clocks, occupied);
                     sv.push_str(&format!("{pad}  end\n"));
                 }
                 sv.push_str(&format!("{pad}endcase\n"));
@@ -2205,7 +2279,7 @@ fn emit_seq(sv: &mut String, body: &[SStmt], ind: usize, sta_clocks: &HashSet<St
                     }
                     let mut subst = body.clone();
                     subst_var(&mut subst, var, i);
-                    emit_seq(sv, &subst, ind, sta_clocks);
+                    emit_seq(sv, &subst, ind, sta_clocks, occupied);
                     if i == *hi {
                         break;
                     }
@@ -3263,31 +3337,52 @@ end;
 
     #[test]
     fn vhdl_sta_clock_name_is_narrow() {
+        let none = HashSet::new();
         let mut process_clock = HashSet::new();
         process_clock.insert("clock".into());
-        assert_eq!(sta_clock_name("clock", &process_clock), "clk");
-        assert_eq!(sta_clock_name("CLOCK", &process_clock), "clk");
+        assert_eq!(sta_clock_name("clock", &process_clock, &none), "clk");
+        assert_eq!(sta_clock_name("CLOCK", &process_clock, &none), "clk");
         assert_eq!(
-            rewrite_sta_clock_ident("q = clock", &process_clock),
+            rewrite_sta_clock_ident("q = clock", &process_clock, &none),
             "q = clk"
         );
 
         let mut clk_only = HashSet::new();
         clk_only.insert("clk".into());
         assert_eq!(
-            sta_clock_name("clock", &clk_only),
+            sta_clock_name("clock", &clk_only, &none),
             "clock",
             "data/other port named clock is not the process clock"
         );
-        assert_eq!(sta_clock_name("clk", &clk_only), "clk");
+        assert_eq!(sta_clock_name("clk", &clk_only, &none), "clk");
         assert_eq!(
-            rewrite_sta_clock_ident("q = clock", &clk_only),
+            rewrite_sta_clock_ident("q = clock", &clk_only, &none),
             "q = clock",
             "must not total-merge clock→clk"
         );
         assert_eq!(
-            rewrite_sta_clock_ident("posedge clk", &clk_only),
+            rewrite_sta_clock_ident("posedge clk", &clk_only, &none),
             "posedge clk"
+        );
+
+        let mut occupied_clk = HashSet::new();
+        occupied_clk.insert("clk".into());
+        occupied_clk.insert("clock".into());
+        assert!(clock_clk_clash(&process_clock, &occupied_clk));
+        assert_eq!(
+            sta_clock_name("clock", &process_clock, &occupied_clk),
+            "clock",
+            "skip clock→clk when clk is occupied"
+        );
+        assert_eq!(
+            rewrite_sta_clock_ident("posedge clock", &process_clock, &occupied_clk),
+            "posedge clock",
+            "rewrite path must skip on occupied clk"
+        );
+        assert_eq!(
+            sta_clock_name("clk", &process_clock, &occupied_clk),
+            "clk",
+            "occupied data clk stays clk"
         );
     }
 
@@ -3340,6 +3435,135 @@ end;
         assert!(
             sv.contains("q = clock") || sv.contains("q=clock"),
             "selected body treats clock as data: {sv}"
+        );
+    }
+
+    #[test]
+    fn vhdl_clock_clk_clash_skips_rename() {
+        // Process/STA clock is `clock`. A separate data port is already `clk`.
+        // Skip clock→clk (keep distinct nets). Named diagnostic. No synth abort.
+        let src = r#"
+entity clash is
+  port (clk : in std_logic; clock : in std_logic; q : out std_logic);
+end;
+architecture rtl of clash is
+begin
+  process(clock)
+  begin
+    if rising_edge(clock) then
+      q <= clk;
+    end if;
+  end process;
+end;
+"#;
+        TEST_DIAGNOSTICS.with(|d| d.borrow_mut().clear());
+        let sv = vhdl_to_sv(src).expect("clash must not abort lowering");
+        let diags = TEST_DIAGNOSTICS.with(|d| d.borrow().clone());
+        assert!(
+            diags.iter().any(|l| l == &clock_clk_clash_line("clash")),
+            "named diagnostic must be emitted, got {diags:?}"
+        );
+        assert!(
+            sv.contains("input logic clk,"),
+            "data port clk stays: {sv}"
+        );
+        assert!(
+            sv.contains("input logic clock,"),
+            "process clock keeps original name: {sv}"
+        );
+        let clk_port_decls = sv.matches("input logic clk,").count()
+            + sv.matches("input logic clk)").count();
+        assert_eq!(
+            clk_port_decls, 1,
+            "must not emit duplicate clk ports: {sv}"
+        );
+        assert!(
+            sv.contains("posedge clock"),
+            "always_ff uses original process clock: {sv}"
+        );
+        assert!(
+            !sv.contains("posedge clk"),
+            "must not silent-merge process clock onto data clk: {sv}"
+        );
+        assert!(
+            sv.contains("q = clk") || sv.contains("q=clk"),
+            "NBA samples data port clk: {sv}"
+        );
+        let line = clock_clk_clash_line("clash");
+        assert!(
+            line.contains("diagnostic clock_clk_clash"),
+            "named diagnostic: {line}"
+        );
+        assert!(
+            line.contains("module=clash"),
+            "entity context: {line}"
+        );
+        assert!(
+            line.contains("construct=process_clock"),
+            "construct: {line}"
+        );
+        assert!(
+            line.contains("rename clock→clk skipped"),
+            "why: {line}"
+        );
+        assert!(
+            line.contains("not a silent merge") && line.contains("not a synth abort"),
+            "policy: {line}"
+        );
+        let d = synth_vhdl(src).expect("clash must not abort synth");
+        let clk_ports: Vec<_> = d.ports.iter().filter(|p| p.name == "clk").collect();
+        assert_eq!(clk_ports.len(), 1, "no duplicate clk ports: {:?}", d.ports);
+        assert!(
+            d.ports.iter().any(|p| p.name == "clock"),
+            "process clock net kept distinct: {:?}",
+            d.ports
+        );
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "still maps FF, {:?}",
+            d.cells
+        );
+        assert_ne!(
+            d.attrs.get("NO_BODY"),
+            Some("1"),
+            "clash skip is not a missing-body failure"
+        );
+    }
+
+    #[test]
+    fn vhdl_occupied_includes_generics_consts() {
+        // Package dump at top must not collide with entity generics/consts.
+        let src = r#"
+package p is
+  constant W : integer := 8;
+  constant KEEP : integer := 0;
+end;
+entity top is
+  generic (W : integer := 4);
+  port (a : in std_logic; y : out std_logic);
+  constant KEEP : integer := 1;
+end;
+architecture rtl of top is
+begin
+  y <= a;
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(
+            sv.contains("localparam W = 4"),
+            "generic W wins over package: {sv}"
+        );
+        assert!(
+            !sv.contains("localparam W = 8"),
+            "package W must not dump on occupied generic: {sv}"
+        );
+        assert!(
+            sv.contains("localparam KEEP = 1"),
+            "entity const KEEP wins over package: {sv}"
+        );
+        assert!(
+            !sv.contains("localparam KEEP = 0"),
+            "package KEEP must not dump on occupied entity const: {sv}"
         );
     }
 
