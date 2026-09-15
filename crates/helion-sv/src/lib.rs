@@ -430,6 +430,9 @@ thread_local! {
     /// Once per module+function for the process. Re-elaboration must not loop the line.
     static FUNC_NOT_CALLED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// Once per design: a called function that was not inlined is not `function_not_called`.
+    static FUNC_CALLED_NOT_INLINED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
     /// One `width_overflow` line per module. String-param hashes used as a
     /// range used to panic on `diff + 1` (old lib.rs:1052).
     static WIDTH_OVERFLOW_SEEN: std::cell::RefCell<HashSet<String>> =
@@ -650,6 +653,30 @@ fn note_function_not_called(module: &str, function: &str) {
     note_skip(format!(
         "diagnostic function_not_called module={module} function={function} (function is not called; not a LUT)"
     ));
+}
+
+/// Emit `function_called_not_inlined` once per design. A skipped/complex
+/// body that still appears in `collect_calls` is not `function_not_called`.
+fn note_function_called_not_inlined(module: &str, function: &str) {
+    let fresh = FUNC_CALLED_NOT_INLINED_SEEN.with(|s| {
+        let mut g = s.borrow_mut();
+        if !g.is_empty() {
+            g.insert(format!("{module}\0{function}"));
+            return false;
+        }
+        g.insert(format!("{module}\0{function}"))
+    });
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic function_called_not_inlined module={module} function={function} (function is called but not inlined; not a LUT)"
+    ));
+}
+
+fn clear_function_notes() {
+    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    FUNC_CALLED_NOT_INLINED_SEEN.with(|s| s.borrow_mut().clear());
 }
 
 /// `[msb:lsb]` width. A string parameter is hashed above bit 96; the old
@@ -2023,7 +2050,9 @@ fn hash_own(rtl: &Rtl) -> u64 {
             h.feed("br");
         }
     }
-    for (mem, words) in &rtl.mem_inits {
+    let mut mems: Vec<_> = rtl.mem_inits.iter().collect();
+    mems.sort_by(|a, b| a.0.cmp(b.0));
+    for (mem, words) in mems {
         h.feed(mem);
         for (addr, val) in words {
             h.feed_u64(*addr as u64);
@@ -2163,7 +2192,15 @@ fn assemble_module(
                     cd.name = elab.module.clone();
                     cd
                 }
-                Err(_) => assemble_module(mods, &inst.module, visiting)?,
+                Err(e) => {
+                    // Do not assemble the leaf without overrides — that would
+                    // map default parameters as if #(.P(v)) had been applied.
+                    note_skip(format!(
+                        "diagnostic leaf_param_elab module={} inst={} child={} (override re-elab failed; not assembled without overrides; {e})",
+                        name, inst.name, inst.module
+                    ));
+                    continue;
+                }
             }
         };
         let child_has_hff = child.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
@@ -3699,7 +3736,14 @@ fn try_parse_readmem(
     let _ = p.eat_sym(';');
     let words = match std::fs::read_to_string(&path) {
         Ok(t) => parse_mem_image(&t, binary),
-        Err(_) => BTreeMap::new(),
+        Err(_) => {
+            // Missing image is not INIT 0. Do not seed mem_inits.
+            note_skip(format!(
+                "diagnostic readmem_file module={} path={path} (readmem image not loaded; not a silent INIT 0)",
+                cur_mod()
+            ));
+            return true;
+        }
     };
     let entry = mem_inits.entry(mem).or_default();
     if words.is_empty() {
@@ -5344,17 +5388,12 @@ fn collect_calls(e: &RExpr, out: &mut HashSet<String>) {
     });
 }
 
-/// Last assign to the function name, and no other statements. `inv = ~d`.
+/// Exactly one assign to the function name, and no other statements. `inv = ~d`.
 fn simple_return_assign(f: &FuncDef) -> Option<RExpr> {
-    let mut ret = None;
-    for (lhs, bit, rhs) in &f.stmts {
-        if lhs == &f.name && bit.is_none() {
-            ret = Some(rhs.clone());
-        } else {
-            return None;
-        }
+    match f.stmts.as_slice() {
+        [(lhs, None, rhs)] if lhs == &f.name => Some(rhs.clone()),
+        _ => None,
     }
-    ret
 }
 
 fn subst_idents(e: &RExpr, map: &HashMap<String, RExpr>) -> RExpr {
@@ -5421,11 +5460,12 @@ fn inline_rexpr(e: &RExpr, funcs: &[FuncDef], depth: usize) -> RExpr {
     } else {
         ins
     };
+    if args.len() != plist.len() {
+        return e;
+    }
     let mut map = HashMap::new();
     for (i, (pn, _, _)) in plist.iter().enumerate() {
-        if let Some(a) = args.get(i) {
-            map.insert(pn.clone(), a.clone());
-        }
+        map.insert(pn.clone(), args[i].clone());
     }
     let body = subst_idents(&body, &map);
     inline_rexpr(&body, funcs, depth + 1)
@@ -5840,7 +5880,25 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     } else {
         inline_nbas(&mut nbas, &funcs);
         inline_nbas(&mut assigns, &funcs);
+        let mut remaining = HashSet::new();
+        for (_, _, rhs) in nbas.iter().chain(assigns.iter()) {
+            collect_calls(rhs, &mut remaining);
+        }
         let mut seen_fn = HashSet::new();
+        // Skipped/complex bodies that still appear as calls are not uncalled.
+        for name in skipped.iter() {
+            if called.contains(name) && seen_fn.insert(name.clone()) {
+                note_function_called_not_inlined(&module, name);
+            }
+        }
+        for f in &funcs {
+            if called.contains(&f.name)
+                && remaining.contains(&f.name)
+                && seen_fn.insert(f.name.clone())
+            {
+                note_function_called_not_inlined(&module, &f.name);
+            }
+        }
         for f in &funcs {
             if !called.contains(&f.name) && seen_fn.insert(f.name.clone()) {
                 note_function_not_called(&module, &f.name);
@@ -11003,6 +11061,19 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 .map(|a| a + 1)
                 .unwrap_or(0),
         );
+        let init_overflow = rtl
+            .mem_inits
+            .get(name)
+            .map(|m| m.keys().any(|&a| a >= 1024) || (depth > 1024 && !m.is_empty()))
+            .unwrap_or(false);
+        if init_overflow {
+            note_skip(format!(
+                "diagnostic bram18_init_truncate module={} mem={} depth={} (INIT addr/depth exceeds 1024; not a silent drop)",
+                rtl.module, name, depth
+            ));
+            n_bram += 1;
+            continue;
+        }
         let mut words = vec![0u64; depth.max(1).min(1024)];
         if let Some(init) = rtl.mem_inits.get(name) {
             for (addr, val) in init {
@@ -12046,7 +12117,7 @@ fn record_instances_vis(
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
-    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    clear_function_notes();
     pkg_enums_clear();
     let t_parse = std::time::Instant::now();
     let origin_path = Path::new(origin);
@@ -12202,7 +12273,7 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     if files.is_empty() {
         return Err("no sources".into());
     }
-    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    clear_function_notes();
     pkg_enums_clear();
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
@@ -15315,6 +15386,204 @@ endmodule
         assert_eq!(
             hffs, 0,
             "force_bram must not also emit write-side Hffs, hffs={hffs}"
+        );
+    }
+
+    #[test]
+    fn readmemh_missing_file_does_not_seed_bram18() {
+        // fs::read_to_string Err must not insert INIT 0 and invent Bram18.
+        let src = r#"
+module rom_missing(input logic clk, output logic [7:0] q);
+  logic [7:0] mem [0:3];
+  initial $readmemh("/no/such/helion_w1_missing_readmem.hex", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#;
+        let d = synth_sv(src, "rom_missing.sv").expect("rom_missing");
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            "missing $readmemh file must not seed Bram18 INIT 0, cells={:?}",
+            d.cells.iter().map(|c| (&c.name, &c.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn called_complex_function_is_not_function_not_called() {
+        // A skipped/for-loop function that is called is not `function_not_called`.
+        let src = r#"
+module cpx_fn(input clk, input [3:0] a, output reg [3:0] q);
+  function automatic [3:0] walk;
+    input [3:0] x;
+    integer i;
+    begin
+      walk = 4'b0;
+      for (i = 0; i < 4; i = i + 1)
+        walk[i] = x[i];
+    end
+  endfunction
+  always @(posedge clk) q <= walk(a);
+endmodule
+"#;
+        let d = synth_sv(src, "cpx_fn.sv").expect("cpx_fn");
+        assert!(
+            FUNC_CALLED_NOT_INLINED_SEEN.with(|s| !s.borrow().is_empty()),
+            "called complex function must emit function_called_not_inlined"
+        );
+        assert!(
+            FUNC_NOT_CALLED_SEEN.with(|s| s.borrow().is_empty()),
+            "called function must not be function_not_called"
+        );
+        let _ = d;
+    }
+
+    #[test]
+    fn simple_return_assign_requires_exactly_one_assign() {
+        let one = FuncDef {
+            name: "f".into(),
+            ret_w: 1,
+            ports: vec![("x".into(), PortDir::In, 1)],
+            signals: vec![],
+            stmts: vec![(
+                "f".into(),
+                None,
+                RExpr::Not(Box::new(RExpr::Ident("x".into()))),
+            )],
+        };
+        assert!(
+            simple_return_assign(&one).is_some(),
+            "single return-assign must inline"
+        );
+        let two = FuncDef {
+            name: "f".into(),
+            ret_w: 1,
+            ports: vec![("x".into(), PortDir::In, 1)],
+            signals: vec![],
+            stmts: vec![
+                ("f".into(), None, RExpr::Ident("x".into())),
+                (
+                    "f".into(),
+                    None,
+                    RExpr::Not(Box::new(RExpr::Ident("x".into()))),
+                ),
+            ],
+        };
+        assert!(
+            simple_return_assign(&two).is_none(),
+            "two assigns to the function name must refuse inline"
+        );
+        let empty = FuncDef {
+            name: "f".into(),
+            ret_w: 1,
+            ports: vec![("x".into(), PortDir::In, 1)],
+            signals: vec![],
+            stmts: vec![],
+        };
+        assert!(simple_return_assign(&empty).is_none());
+    }
+
+    #[test]
+    fn inline_rexpr_refuses_arity_mismatch() {
+        let f = FuncDef {
+            name: "xor2".into(),
+            ret_w: 1,
+            ports: vec![
+                ("a".into(), PortDir::In, 1),
+                ("b".into(), PortDir::In, 1),
+            ],
+            signals: vec![],
+            stmts: vec![(
+                "xor2".into(),
+                None,
+                RExpr::Xor(
+                    Box::new(RExpr::Ident("a".into())),
+                    Box::new(RExpr::Ident("b".into())),
+                ),
+            )],
+        };
+        let one_arg = RExpr::Call {
+            name: "xor2".into(),
+            args: vec![RExpr::Ident("d".into())],
+        };
+        let out = inline_rexpr(&one_arg, std::slice::from_ref(&f), 0);
+        assert!(
+            matches!(out, RExpr::Call { .. }),
+            "one arg vs two formals must refuse inline, got {out:?}"
+        );
+        let three_args = RExpr::Call {
+            name: "xor2".into(),
+            args: vec![
+                RExpr::Ident("d".into()),
+                RExpr::Ident("e".into()),
+                RExpr::Ident("f".into()),
+            ],
+        };
+        let out3 = inline_rexpr(&three_args, std::slice::from_ref(&f), 0);
+        assert!(
+            matches!(out3, RExpr::Call { .. }),
+            "extra args must refuse inline, got {out3:?}"
+        );
+        let two_args = RExpr::Call {
+            name: "xor2".into(),
+            args: vec![RExpr::Ident("d".into()), RExpr::Ident("e".into())],
+        };
+        let out2 = inline_rexpr(&two_args, &[f], 0);
+        assert!(
+            !matches!(out2, RExpr::Call { .. }),
+            "matching arity must inline, got {out2:?}"
+        );
+    }
+
+    #[test]
+    fn multi_return_assign_function_is_not_inlined() {
+        let src = r#"
+module multi_ret(input logic clk, input logic d, output logic q);
+  function automatic f;
+    input x;
+    f = x;
+    f = ~x;
+  endfunction
+  always_ff @(posedge clk) q <= f(d);
+endmodule
+"#;
+        let d = synth_sv(src, "multi_ret.sv").expect("multi_ret");
+        assert!(
+            FUNC_CALLED_NOT_INLINED_SEEN.with(|s| !s.borrow().is_empty()),
+            "multi-assign function call must be called-not-inlined"
+        );
+        assert!(
+            !d.lut_inits().iter().any(|&i| i == 0x5555_5555_5555_5555),
+            "must not inline last ~x as an inverter LUT, inits={:?}",
+            d.lut_inits()
+        );
+    }
+
+    #[test]
+    fn hash_own_sorts_mem_inits_by_name() {
+        fn rtl_with(mems: &[(&str, u128)]) -> Rtl {
+            let mut mem_inits = HashMap::new();
+            for (n, v) in mems {
+                let mut words = BTreeMap::new();
+                words.insert(0, *v);
+                mem_inits.insert((*n).to_string(), words);
+            }
+            Rtl {
+                module: "t".into(),
+                ports: vec![],
+                signals: vec![],
+                nbas: vec![],
+                assigns: vec![],
+                insts: vec![],
+                params: vec![],
+                toks: vec![],
+                mem_inits,
+            }
+        }
+        let a = rtl_with(&[("m2", 1), ("m1", 2)]);
+        let b = rtl_with(&[("m1", 2), ("m2", 1)]);
+        assert_eq!(
+            hash_own(&a),
+            hash_own(&b),
+            "mem_inits must hash in name order"
         );
     }
 
