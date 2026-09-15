@@ -30,6 +30,13 @@ pub struct Design {
     pub nets: Vec<Net>,
     pub instances: Vec<Instance>,
     pub attrs: Attrs,
+    /// Name → index in `nets`. `connect` / `merge_net` keep this in sync so
+    /// Ibex-scale stitch is O(1) per net, not a linear scan of every net.
+    net_ix: HashMap<String, usize>,
+    /// cell → pin → net index. Makes `net_on` O(1) instead of scanning every net.
+    pin_ix: HashMap<String, HashMap<String, usize>>,
+    /// Name → index in `cells`.
+    cell_ix: HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +129,76 @@ impl Design {
             nets: Vec::new(),
             instances: Vec::new(),
             attrs: Attrs::default(),
+            net_ix: HashMap::new(),
+            pin_ix: HashMap::new(),
+            cell_ix: HashMap::new(),
         }
+    }
+
+    fn rebuild_net_ix(&mut self) {
+        self.net_ix.clear();
+        self.pin_ix.clear();
+        self.net_ix.reserve(self.nets.len());
+        for (i, n) in self.nets.iter().enumerate() {
+            self.net_ix.insert(n.name.clone(), i);
+            for e in &n.endpoints {
+                self.pin_ix
+                    .entry(e.cell.clone())
+                    .or_default()
+                    .insert(e.pin.clone(), i);
+            }
+        }
+    }
+
+    fn rebuild_cell_ix(&mut self) {
+        self.cell_ix.clear();
+        self.cell_ix.reserve(self.cells.len());
+        for (i, c) in self.cells.iter().enumerate() {
+            self.cell_ix.insert(c.name.clone(), i);
+        }
+    }
+
+    /// Rebuild name maps after bulk cell retain/rename. `connect` keeps them in sync.
+    pub fn rebuild_indexes(&mut self) {
+        self.rebuild_net_ix();
+        self.rebuild_cell_ix();
+    }
+
+    fn ensure_net_ix(&mut self) {
+        if self.net_ix.len() != self.nets.len() {
+            self.rebuild_net_ix();
+        }
+    }
+
+    fn ensure_cell_ix(&mut self) {
+        if self.cell_ix.len() != self.cells.len() {
+            self.rebuild_cell_ix();
+        }
+    }
+
+    fn index_pin(&mut self, cell: &str, pin: &str, net_i: usize) {
+        self.pin_ix
+            .entry(cell.to_string())
+            .or_default()
+            .insert(pin.to_string(), net_i);
+    }
+
+    /// Merge `net` into this design by name (O(1) index). Used by hierarchy stitch.
+    pub fn merge_net(&mut self, net: Net) {
+        self.ensure_net_ix();
+        if let Some(&i) = self.net_ix.get(&net.name) {
+            for e in &net.endpoints {
+                self.index_pin(&e.cell, &e.pin, i);
+            }
+            self.nets[i].endpoints.extend(net.endpoints);
+            return;
+        }
+        let i = self.nets.len();
+        self.net_ix.insert(net.name.clone(), i);
+        for e in &net.endpoints {
+            self.index_pin(&e.cell, &e.pin, i);
+        }
+        self.nets.push(net);
     }
 
     pub fn add_port(&mut self, name: impl Into<String>, dir: PortDir) {
@@ -134,11 +210,18 @@ impl Design {
     }
 
     pub fn add_cell(&mut self, name: impl Into<String>, kind: CellKind) {
-        self.cells.push(Cell {
+        self.push_cell(Cell {
             name: name.into(),
             kind,
             attrs: Attrs::default(),
         });
+    }
+
+    /// Append a fully-built cell and keep `cell_ix` in sync (hierarchy stitch).
+    pub fn push_cell(&mut self, cell: Cell) {
+        self.ensure_cell_ix();
+        self.cell_ix.insert(cell.name.clone(), self.cells.len());
+        self.cells.push(cell);
     }
 
     pub fn add_instance(&mut self, name: impl Into<String>, module: impl Into<String>) {
@@ -152,24 +235,28 @@ impl Design {
 
     pub fn connect(&mut self, net: impl Into<String>, cell: impl Into<String>, pin: impl Into<String>) {
         let net_name = net.into();
-        if let Some(existing) = self.nets.iter_mut().find(|n| n.name == net_name) {
-            existing.endpoints.push(Endpoint {
-                cell: cell.into(),
-                pin: pin.into(),
-            });
-        } else {
-            self.nets.push(Net {
-                name: net_name,
-                endpoints: vec![Endpoint {
-                    cell: cell.into(),
-                    pin: pin.into(),
-                }],
-                attrs: Attrs::default(),
-            });
+        self.ensure_net_ix();
+        let cell = cell.into();
+        let pin = pin.into();
+        if let Some(&i) = self.net_ix.get(&net_name) {
+            self.index_pin(&cell, &pin, i);
+            self.nets[i].endpoints.push(Endpoint { cell, pin });
+            return;
         }
+        let i = self.nets.len();
+        self.net_ix.insert(net_name.clone(), i);
+        self.index_pin(&cell, &pin, i);
+        self.nets.push(Net {
+            name: net_name,
+            endpoints: vec![Endpoint { cell, pin }],
+            attrs: Attrs::default(),
+        });
     }
 
     pub fn net_on(&self, cell: &str, pin: &str) -> Option<&str> {
+        if let Some(&i) = self.pin_ix.get(cell).and_then(|m| m.get(pin)) {
+            return self.nets.get(i).map(|n| n.name.as_str());
+        }
         self.nets.iter().find_map(|n| {
             n.endpoints
                 .iter()
@@ -190,19 +277,29 @@ impl Design {
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {
+        if let Some(&i) = self.cell_ix.get(name) {
+            return self.cells.get(i).filter(|c| c.name == name);
+        }
         self.cells.iter().find(|c| c.name == name)
     }
 
     pub fn cell_mut(&mut self, name: &str) -> Option<&mut Cell> {
-        self.cells.iter_mut().find(|c| c.name == name)
+        self.ensure_cell_ix();
+        let i = *self.cell_ix.get(name)?;
+        self.cells.get_mut(i)
     }
 
     pub fn net(&self, name: &str) -> Option<&Net> {
+        if let Some(&i) = self.net_ix.get(name) {
+            return self.nets.get(i).filter(|n| n.name == name);
+        }
         self.nets.iter().find(|n| n.name == name)
     }
 
     pub fn net_mut(&mut self, name: &str) -> Option<&mut Net> {
-        self.nets.iter_mut().find(|n| n.name == name)
+        self.ensure_net_ix();
+        let i = *self.net_ix.get(name)?;
+        self.nets.get_mut(i)
     }
 
     pub fn port_mut(&mut self, name: &str) -> Option<&mut Port> {
@@ -301,6 +398,7 @@ impl Design {
         for i in &mut self.instances {
             i.name = format!("{pfx}{}", i.name);
         }
+        self.rebuild_indexes();
     }
 
     /// Inline `child` as instance `inst`. Port `conns` map child-port → parent-net.
@@ -317,12 +415,9 @@ impl Design {
         }
         self.cells.append(&mut child.cells);
         for n in child.nets {
-            if let Some(ex) = self.nets.iter_mut().find(|x| x.name == n.name) {
-                ex.endpoints.extend(n.endpoints);
-            } else {
-                self.nets.push(n);
-            }
+            self.merge_net(n);
         }
+        self.rebuild_cell_ix();
         self.instances.push(Instance {
             name: inst.into(),
             module: child.name,
@@ -509,8 +604,8 @@ impl Design {
                         let (cell, pin) = ep.split_once('/').ok_or("ep")?;
                         des.connect(&n, cell, pin);
                     }
-                    if des.net_mut(&n).is_none() {
-                        des.nets.push(Net {
+                    if des.net(&n).is_none() {
+                        des.merge_net(Net {
                             name: n,
                             endpoints: vec![],
                             attrs: Attrs::default(),
@@ -551,6 +646,82 @@ impl Design {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_is_subquadratic_on_many_nets() {
+        let mut d = Design::new("wide");
+        let t0 = std::time::Instant::now();
+        for i in 0..20_000u32 {
+            d.add_cell(format!("c{i}"), CellKind::Hff);
+            d.connect(format!("n{i}"), format!("c{i}"), "Q");
+        }
+        let ms = t0.elapsed().as_millis();
+        assert_eq!(d.nets.len(), 20_000);
+        assert_eq!(d.net("n19999").map(|n| n.name.as_str()), Some("n19999"));
+        assert!(
+            ms < 800,
+            "connect must stay O(1) per net (HashMap index), took {ms}ms for 20k"
+        );
+        let t1 = std::time::Instant::now();
+        let mut hits = 0usize;
+        for i in 0..20_000u32 {
+            let cell = format!("c{i}");
+            if d.net_on(&cell, "Q").is_some() {
+                hits += 1;
+            }
+        }
+        let lookup_ms = t1.elapsed().as_millis();
+        assert_eq!(hits, 20_000);
+        assert_eq!(d.net_on("c0", "Q"), Some("n0"));
+        assert_eq!(d.net_on("c19999", "Q"), Some("n19999"));
+        assert!(
+            lookup_ms < 800,
+            "20k net_on lookups must stay O(1), took {lookup_ms}ms"
+        );
+    }
+
+    #[test]
+    fn merge_net_and_instantiate_are_subquadratic() {
+        let mut d = Design::new("merge");
+        let t0 = std::time::Instant::now();
+        for i in 0..20_000u32 {
+            d.add_cell(format!("c{i}"), CellKind::Hff);
+            d.merge_net(Net {
+                name: format!("n{i}"),
+                endpoints: vec![Endpoint {
+                    cell: format!("c{i}"),
+                    pin: "Q".into(),
+                }],
+                attrs: Attrs::default(),
+            });
+        }
+        let merge_ms = t0.elapsed().as_millis();
+        assert_eq!(d.nets.len(), 20_000);
+        assert_eq!(d.net_on("c0", "Q"), Some("n0"));
+        assert_eq!(d.net_on("c19999", "Q"), Some("n19999"));
+        assert_eq!(d.cell("c19999").map(|c| c.name.as_str()), Some("c19999"));
+        assert!(
+            merge_ms < 800,
+            "merge_net must stay O(1) per net, took {merge_ms}ms for 20k"
+        );
+
+        let mut top = Design::new("top");
+        let t1 = std::time::Instant::now();
+        for i in 0..2_000u32 {
+            let mut child = Design::new(format!("m{i}"));
+            child.add_cell("ff", CellKind::Hff);
+            child.connect("q", "ff", "Q");
+            top.instantiate(&format!("u{i}"), child, &[]);
+        }
+        let inst_ms = t1.elapsed().as_millis();
+        assert_eq!(top.cells.len(), 2_000);
+        assert!(top.cell("u1999_ff").is_some());
+        assert_eq!(top.net_on("u1999_ff", "Q"), Some("u1999_q"));
+        assert!(
+            inst_ms < 1500,
+            "instantiate of 2k children must stay subquadratic, took {inst_ms}ms"
+        );
+    }
 
     #[test]
     fn blinky_has_lut_ff_iob() {

@@ -1,0 +1,4 @@
+# Helion bring-up board. Cables are Helion backends, not vendor board SKUs.
+board = "HB1"
+part = "HL10T-C32-1"
+cables = "sim,ofl,native,usb,mpsse-sim"
