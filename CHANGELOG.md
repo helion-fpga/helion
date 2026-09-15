@@ -12,7 +12,20 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.1...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.2...HEAD
+
+## [1.5.2] — 2026-09-15
+
+Soft-clear: `ibex_if_stage` `generate_not_lowered` maps packed-struct field
+selects. Empty-XDC `examples/counter.sv` gold is unchanged (**WNS_PS=9640**).
+Native Apple Silicon `Helion.app` ships on this GitHub Release.
+
+### Fixed
+
+- `generate_not_lowered` **ibex_if_stage** cleared (child_soft_incomplete cascade
+  gone). cells 13559→14484, luts 8491→9340.
+
+[1.5.2]: https://github.com/helion-fpga/helion/releases/tag/v1.5.2
 
 ## [1.5.1] — 2026-09-15
 
