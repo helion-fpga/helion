@@ -438,15 +438,20 @@ mod tests {
         assert_eq!(bb.read_idcode().unwrap(), 0x0001_1A1F);
         // Honesty: sim CFG_W ≠ board/USB DONE. Native is NotImplemented (no feature)
         // or Io (usb-native, no FTDI) — never Ok with invented STAT.
-        let err =
-            crate::try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::NativeUsbError::NotImplemented(_) | crate::NativeUsbError::Io(_)
-            ),
-            "{err:?}"
-        );
+        // Non-empty so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-mpsse-sim-cfg-w-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nonzero.bin");
+        std::fs::write(&path, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = crate::try_native_usb_program(&path, false).unwrap_err();
+        if cfg!(feature = "usb-native") {
+            assert!(matches!(err, crate::NativeUsbError::Io(_)), "{err:?}");
+        } else {
+            assert!(
+                matches!(err, crate::NativeUsbError::NotImplemented(_)),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
