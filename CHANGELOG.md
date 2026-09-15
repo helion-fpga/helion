@@ -12,7 +12,21 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.3...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.4...HEAD
+
+## [1.5.4] — 2026-09-15
+
+Soft-clear: `rvfi_ext_mip` + remaining `generate_not_lowered` (icache/PMP
+package sizes, typed arrays, packed structs, genvar, int'()). Empty-XDC
+`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Native Apple Silicon
+`Helion.app` ships on this GitHub Release.
+
+### Fixed
+
+- Broader generate/assign lowering for Ibex pin-wrap (cells→17027, luts→11845
+  on tip; remaining softs stay named diagnostics, not silent).
+
+[1.5.4]: https://github.com/helion-fpga/helion/releases/tag/v1.5.4
 
 ## [1.5.3] — 2026-09-15
 
