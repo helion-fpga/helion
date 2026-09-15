@@ -8,7 +8,8 @@ Static pages for GitHub Pages (`docs/` → https://helion-fpga.github.io/helion/
 | `start.html` | Download 1.3.0, build, gold, Helion.app layout |
 | `use.html` | User guide (rail, CLI, Device die, Tcl, IP, program honesty) |
 | `wiki.html` | Documentation index with summaries |
-| `architecture.html` | Crate map and labeled HAD |
+| `architecture.html` | Crate map, labeled HAD, `load_xdc` command list |
+| `roadmap.html` | 1.4 → 2.0 (FM-HEL-14); canonical markdown is [`ROADMAP.md`](../ROADMAP.md) |
 | `get-involved.html` | LMMS-style on-ramp |
 | `contribute.html` | Coding path |
 | `legal.html` | Fence |

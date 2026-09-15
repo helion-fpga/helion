@@ -14,6 +14,8 @@ SystemVerilog, STA, IDE tests, or docs, start at
 
 [Download](https://github.com/helion-fpga/helion/releases/latest)
 · [Changelog](CHANGELOG.md)
+· [Roadmap](ROADMAP.md)
+· [Milestones](https://github.com/helion-fpga/helion/milestones)
 · [Docs](https://helion-fpga.github.io/helion/)
 · [Contributing](CONTRIBUTING.md)
 · [Discussions](https://github.com/helion-fpga/helion/discussions)
@@ -33,6 +35,18 @@ cargo run -p helion-cli -- reports examples/counter.sv
 
 Legal fence: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD/Intel/Lattice backends.
 Device facts come from the Helion Architecture Database (HAD), never hardcoded in the CAD.
+
+## Roadmap (1.4 → 2.0)
+
+[ROADMAP.md](ROADMAP.md) · Pages: [roadmap](https://helion-fpga.github.io/helion/roadmap.html)
+
+| Release | What | Milestone |
+|---|---|---|
+| 1.4 | SV elaborator (W1); gold **WNS_PS=9640** | [1.4](https://github.com/helion-fpga/helion/milestone/1) |
+| 1.5 | PNR/STA (W2) + proj/cli (W4) | [1.5](https://github.com/helion-fpga/helion/milestone/2) |
+| 1.6 | IDE (W5) + lab (W3) | [1.6](https://github.com/helion-fpga/helion/milestone/3) |
+| 1.7 | VHDL (W6) + HAD (W8) | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
+| 2.0 | Public OSS CAD bar | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
 
 ## Flow
 

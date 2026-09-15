@@ -23,6 +23,7 @@
       <a href="start.html">Start</a>
       <a href="architecture.html">Architecture</a>
       <a href="wiki.html">Wiki</a>
+      <a href="roadmap.html">Roadmap</a>
       <a href="get-involved.html">Get involved</a>
       <a href="https://github.com/helion-fpga/helion">GitHub</a>
     </nav>
@@ -55,13 +56,29 @@
         rustc 1.85, <code>Helion.app</code> layout, <code>HELION_HAD</code>, and the
         gold commands. <a href="use.html">Use</a> is the user guide: activity rail
         (Files / Device / Timing / Simulate / Program / Reports), More overflow,
-        full <code>helion</code> command list, Tcl Session, IP, ILA, program honesty.
+        full <code>helion</code> command list, Tcl Session, XDC <code>load_xdc</code>,
+        IP, ILA, program honesty.
+      </p>
+
+      <h2>Roadmap</h2>
+      <p>
+        <a href="roadmap.html">Roadmap</a> is 1.4 → 1.5 → 1.6 → 1.7 → 2.0
+        (FM-HEL-14). Gold stays <span class="gold">WNS_PS=9640</span>.
+        Repo: <a href="https://github.com/helion-fpga/helion/blob/master/ROADMAP.md">ROADMAP.md</a>.
+        GitHub:
+        <a href="https://github.com/helion-fpga/helion/milestones">milestones</a>
+        (<a href="https://github.com/helion-fpga/helion/milestone/1">1.4</a>,
+        <a href="https://github.com/helion-fpga/helion/milestone/2">1.5</a>,
+        <a href="https://github.com/helion-fpga/helion/milestone/3">1.6</a>,
+        <a href="https://github.com/helion-fpga/helion/milestone/4">1.7</a>,
+        <a href="https://github.com/helion-fpga/helion/milestone/5">2.0</a>).
       </p>
 
       <h2>How it is built</h2>
       <p>
         <a href="architecture.html">Architecture</a> is the crate map, HAD table,
-        HNF IR, FeatureMap bitstream, and Tcl engines. <a href="legal.html">Legal fence</a>
+        HNF IR, FeatureMap bitstream, <code>load_xdc</code> command list, and Tcl Session CAD.
+        <a href="legal.html">Legal fence</a>
         is the no-vendor rule: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD /
         Intel / Lattice backends, HAD-only device facts, Helion-MM / Helion-ST buses.
       </p>
