@@ -10,8 +10,12 @@ use helion_hw::{overlay_program_led, refuse_empty_bitstream, OverlayReport, COUN
 /// Lab path: empty bitstream is always Err. Never reports DONE=1 on empty.
 pub fn lab_program_empty() -> Result<String, String> {
     let dev = Device::load_part("HL10T-C32-1")?;
-    refuse_empty_bitstream(&Bitstream::empty(&dev))?;
-    Err("lab: empty bitstream refused (no configured frames) — refusing DONE on empty".into())
+    match refuse_empty_bitstream(&Bitstream::empty(&dev)) {
+        Err(e) => Err(format!("lab: {e}")),
+        Ok(()) => Err(
+            "lab: empty bitstream refused (no configured frames) — refusing DONE on empty".into(),
+        ),
+    }
 }
 
 /// Overlay: real bitstream + `step_user` + LED sample. Not board DONE.
@@ -71,6 +75,10 @@ mod tests {
         assert!(s.contains("overlay"), "{s}");
         assert!(s.contains(&format!("LED={COUNTER_OVERLAY_LED}")), "{s}");
         assert!(s.contains("not board DONE"), "{s}");
+        assert!(s.contains("sim_DONE="), "{s}");
+        assert!(s.contains("sim_INIT="), "{s}");
+        assert!(s.contains("sim_GWE="), "{s}");
+        assert!(!s.contains(" DONE="), "{s}");
         assert!(!s.to_ascii_lowercase().contains("board done=1"), "{s}");
     }
 }
