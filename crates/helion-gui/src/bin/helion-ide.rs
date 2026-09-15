@@ -514,8 +514,13 @@ impl HelionIde {
                 if matches!(out.kind, JobKind::Implement) && out.result.is_ok() {
                     self.set_canvas(Canvas::Device);
                 }
-                if matches!(out.kind, JobKind::Open(_)) && out.result.is_ok() {
-                    self.set_activity(Activity::Files);
+                if matches!(out.kind, JobKind::Open(_)) {
+                    match &out.result {
+                        Ok(_) => self.set_activity(Activity::Files),
+                        Err(_) => {
+                            self.model.bottom_tab = BottomTab::Messages;
+                        }
+                    }
                 }
                 if matches!(out.kind, JobKind::SimRun(_)) && out.result.is_ok() {
                     self.set_activity(Activity::Simulate);
@@ -552,7 +557,9 @@ impl HelionIde {
         self.remember(path.to_path_buf());
         match self.model.open_source(path) {
             Ok(_) => self.set_activity(Activity::Files),
-            Err(_) => {}
+            Err(e) => {
+                self.progress = e;
+            }
         }
     }
 
@@ -1577,10 +1584,15 @@ fn paint_status_bar(
                 } else {
                     ""
                 };
-                let progress_bit = if progress.is_empty() {
-                    String::new()
-                } else {
+                let progress_bit = if !progress.is_empty() {
                     format!(" · {progress}")
+                } else if model.status != "idle"
+                    && !model.status.is_empty()
+                    && !model.status.ends_with(": ok")
+                {
+                    format!(" · {}", model.status)
+                } else {
+                    String::new()
                 };
                 ui.label(
                     RichText::new(format!(
@@ -3390,7 +3402,7 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.exec("open_hierarchy_sheet");
         }
     });
-    let drawing = model.hierarchy.drawing();
+    let drawing = model.hierarchy.drawing_arc();
     ui.label(
         RichText::new(format!(
             "{} blocks · {}×{}",
@@ -3427,6 +3439,9 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
                         egui::pos2(o.x + b.x * sx, o.y + b.y * sy),
                         egui::vec2((b.w * sx).max(8.0), (b.h * sy).max(8.0)),
                     );
+                    if !r.intersects(rect) {
+                        continue;
+                    }
                     let on = selected.as_deref() == Some(b.name.as_str());
                     let fill = if b.kind == "module" {
                         Color32::from_rgb(0x1a, 0x22, 0x1c)
@@ -4116,6 +4131,9 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                         egui::pos2(px + 2.0, py + 2.0),
                         egui::vec2((cell_w - 4.0).max(8.0), (cell_h - 4.0).max(8.0)),
                     );
+                    if !cell_rect.intersects(rect) {
+                        continue;
+                    }
                     p.rect_filled(
                         cell_rect,
                         3.0,
