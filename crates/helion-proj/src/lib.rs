@@ -1,12 +1,12 @@
 //! Dual-mode Session, disk checkpoints `.hckp`, object query, opt, ECO.
 
 use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
-use helion_device::Device;
+use helion_device::{Device, Site};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
-use helion_sta::{create_clock, load_xdc, report_timing_routed, Constraints};
+use helion_sta::{apply_xdc, create_clock, load_xdc, report_timing_routed, Constraints};
 use helion_hw::{program_hbits_with_cable, prog_sim, resolve_cable, CableBackend};
 use helion_debug::insert_ila;
 
@@ -64,6 +64,30 @@ impl ImplStrategy {
             _ => RouteOpts::default(),
         }
     }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::TimingExplore => 1,
+            Self::RuntimeOpt => 2,
+            Self::PhysOpt => 3,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::TimingExplore,
+            2 => Self::RuntimeOpt,
+            3 => Self::PhysOpt,
+            _ => Self::Default,
+        }
+    }
+}
+
+impl Default for ImplStrategy {
+    fn default() -> Self {
+        Self::Default
+    }
 }
 
 /// UG986 Lab 2 Incremental Reuse Report (cells/nets/ports from HNF names).
@@ -106,6 +130,19 @@ pub enum Mode {
     NonProject,
 }
 
+/// Parsed `.hckp` payload: HNF plus the impl knobs needed to replay the write hash.
+#[derive(Clone, Debug)]
+pub struct CheckpointIr {
+    pub mode: Mode,
+    pub hash: u32,
+    pub design: Option<Design>,
+    pub strategy: ImplStrategy,
+    pub pblock: Option<PrjPblock>,
+    pub timing_weight: f64,
+    pub route_max_iters: u32,
+    pub route_extra_hops: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub mode: Mode,
@@ -119,6 +156,12 @@ pub struct Session {
     pub hw_open: bool,
     pub programmed: bool,
     pub part: String,
+    /// Last `create_run -strategy` (or Default). Persisted in `.hckp`.
+    pub strategy: ImplStrategy,
+    /// Last ranged pblock used by place (bounds + cells). Persisted in `.hckp`.
+    pub pblock: Option<PrjPblock>,
+    pub place_opts: PlaceOpts,
+    pub route_opts: RouteOpts,
 }
 
 impl Session {
@@ -134,6 +177,10 @@ impl Session {
             hw_open: false,
             programmed: false,
             part: "HL10T-C32-1".into(),
+            strategy: ImplStrategy::Default,
+            pblock: None,
+            place_opts: ImplStrategy::Default.place_opts(),
+            route_opts: ImplStrategy::Default.route_opts(),
         }
     }
 
@@ -215,15 +262,11 @@ impl Session {
     }
 
     /// Place/route/bitgen using `.prj` pblock + impl-run strategy (Default = gold).
+    /// A ranged pblock floorplans matching `pb.cells` (or the whole design if
+    /// that list is empty); `create_run -strategy` still selects place/route knobs.
     pub fn impl_project(&mut self, dev: &Device, prj: &ProjectFile) -> Result<(), String> {
         if self.design.is_none() {
             return Err("impl_project: no design".into());
-        }
-        if let Some(pb) = prj.pblocks.iter().find(|p| p.ranged) {
-            self.place_pblock(dev, pb.x0, pb.y0, pb.x1, pb.y1)?;
-            self.route_design(dev)?;
-            self.write_bitstream(dev)?;
-            return Ok(());
         }
         let strategy = prj
             .impl_runs
@@ -233,6 +276,16 @@ impl Session {
             .map(|r| ImplStrategy::parse(&r.strategy))
             .transpose()?
             .unwrap_or(ImplStrategy::Default);
+        self.strategy = strategy;
+        if let Some(pb) = prj.pblocks.iter().find(|p| p.ranged).cloned() {
+            if strategy == ImplStrategy::PhysOpt {
+                let _ = self.opt_design_step()?;
+            }
+            self.place_pblock_in(dev, &pb, strategy.place_opts())?;
+            self.route_design_with(dev, strategy.route_opts())?;
+            self.write_bitstream(dev)?;
+            return Ok(());
+        }
         self.impl_with_strategy(dev, strategy)
     }
 
@@ -260,10 +313,12 @@ impl Session {
         self.placed = Some(placed);
         self.routed = None;
         self.bitstream = None;
+        self.place_opts = opts;
+        self.pblock = None;
         Ok(())
     }
 
-    /// UG893 `create_pblock`/`resize_pblock`: place into a HAD rectangle.
+    /// UG893 `create_pblock`/`resize_pblock`: place the whole design into a HAD rectangle.
     pub fn place_pblock(
         &mut self,
         dev: &Device,
@@ -272,21 +327,47 @@ impl Session {
         x1: u32,
         y1: u32,
     ) -> Result<(), String> {
-        let d = self.design.as_ref().ok_or("place_pblock: no design")?;
-        let packed = pack(d, dev)?;
-        let placed = place_in_region(
-            &packed,
-            dev,
-            ImplStrategy::Default.place_opts(),
+        let pb = PrjPblock {
+            name: String::new(),
             x0,
             y0,
             x1,
             y1,
-        )?;
+            ranged: true,
+            cells: Vec::new(),
+        };
+        self.place_pblock_in(dev, &pb, ImplStrategy::Default.place_opts())
+    }
+
+    /// Floorplan: empty `pb.cells` → whole design in the rectangle; otherwise only those cells.
+    pub fn place_pblock_in(
+        &mut self,
+        dev: &Device,
+        pb: &PrjPblock,
+        opts: PlaceOpts,
+    ) -> Result<(), String> {
+        let d = self.design.as_ref().ok_or("place_pblock: no design")?;
+        let packed = pack(d, dev)?;
+        let placed = if pb.cells.is_empty() {
+            place_in_region(&packed, dev, opts, pb.x0, pb.y0, pb.x1, pb.y1)?
+        } else {
+            place_named_cells_in_region(
+                &packed,
+                dev,
+                opts,
+                pb.x0,
+                pb.y0,
+                pb.x1,
+                pb.y1,
+                &pb.cells,
+            )?
+        };
         self.packed = Some(packed);
         self.placed = Some(placed);
         self.routed = None;
         self.bitstream = None;
+        self.place_opts = opts;
+        self.pblock = Some(pb.clone());
         Ok(())
     }
 
@@ -309,11 +390,13 @@ impl Session {
         let routed = route_with(placed, dev, opts)?;
         self.routed = Some(routed);
         self.bitstream = None;
+        self.route_opts = opts;
         Ok(())
     }
 
     /// Full impl with a Lab 1 strategy. Assumes `design` is already synthesized.
     pub fn impl_with_strategy(&mut self, dev: &Device, strategy: ImplStrategy) -> Result<(), String> {
+        self.strategy = strategy;
         if strategy == ImplStrategy::PhysOpt {
             let _ = self.opt_design_step()?;
         }
@@ -654,19 +737,57 @@ impl Session {
     }
 
     pub fn restore_session(bytes: &[u8], dev: &Device) -> Result<Self, String> {
-        let (mode, hash, design) = Self::restore_with_ir(bytes)?;
-        let mut s = Self::new(mode);
+        let ck = Self::restore_with_ir(bytes)?;
+        let mut s = Self::new(ck.mode);
         s.part = dev.part.clone();
-        if let Some(d) = design {
-            s.impl_design(d, dev)?;
+        s.strategy = ck.strategy;
+        s.pblock = ck.pblock.clone();
+        s.place_opts = PlaceOpts {
+            timing_weight: ck.timing_weight,
+        };
+        s.route_opts = RouteOpts {
+            max_iters: ck.route_max_iters,
+            extra_hops: ck.route_extra_hops,
+        };
+        if let Some(d) = ck.design {
+            s.synth_design(d);
+            // synth_design → reset_impl must not drop knobs; re-seed after.
+            s.strategy = ck.strategy;
+            s.pblock = ck.pblock.clone();
+            s.place_opts = PlaceOpts {
+                timing_weight: ck.timing_weight,
+            };
+            s.route_opts = RouteOpts {
+                max_iters: ck.route_max_iters,
+                extra_hops: ck.route_extra_hops,
+            };
+            s.replay_impl(dev)?;
         }
         let h2 = s.blinky_hash().unwrap_or(0);
-        if h2 != hash {
+        if h2 != ck.hash {
             return Err(format!(
-                "hckp restore hash mismatch stored {hash:#x} got {h2:#x}"
+                "hckp restore hash mismatch stored {:#x} got {h2:#x}",
+                ck.hash
             ));
         }
         Ok(s)
+    }
+
+    /// Re-place/route/bitgen from stored knobs. Does not re-run PhysOpt `opt_design`
+    /// — the HNF in the checkpoint is already the post-opt netlist.
+    fn replay_impl(&mut self, dev: &Device) -> Result<(), String> {
+        if let Some(pb) = self.pblock.clone() {
+            if pb.ranged {
+                self.place_pblock_in(dev, &pb, self.place_opts)?;
+                self.route_design_with(dev, self.route_opts)?;
+                self.write_bitstream(dev)?;
+                return Ok(());
+            }
+        }
+        self.place_design_with(dev, self.place_opts)?;
+        self.route_design_with(dev, self.route_opts)?;
+        self.write_bitstream(dev)?;
+        Ok(())
     }
 
     pub fn eco(&mut self, dev: &Device, cell: &str, new_init: u64) -> Result<(), String> {
@@ -713,16 +834,24 @@ impl Session {
             let b = hnf.as_bytes();
             v.extend_from_slice(&(b.len() as u32).to_le_bytes());
             v.extend_from_slice(b);
+        } else {
+            v.extend_from_slice(&0u32.to_le_bytes());
         }
+        v.extend_from_slice(&encode_impl_knobs(
+            self.strategy,
+            self.pblock.as_ref(),
+            self.place_opts,
+            self.route_opts,
+        ));
         v
     }
 
     pub fn restore(bytes: &[u8]) -> Result<(Mode, u32), String> {
-        let (m, h, _) = Self::restore_with_ir(bytes)?;
-        Ok((m, h))
+        let ck = Self::restore_with_ir(bytes)?;
+        Ok((ck.mode, ck.hash))
     }
 
-    pub fn restore_with_ir(bytes: &[u8]) -> Result<(Mode, u32, Option<Design>), String> {
+    pub fn restore_with_ir(bytes: &[u8]) -> Result<CheckpointIr, String> {
         if bytes.len() < 9 || &bytes[0..4] != b"HCKP" {
             return Err("bad hckp".into());
         }
@@ -732,19 +861,242 @@ impl Session {
             _ => return Err("bad mode".into()),
         };
         let hash = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-        let design = if bytes.len() >= 13 {
+        let (design, rest) = if bytes.len() >= 13 {
             let n = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
             if bytes.len() >= 13 + n {
                 let text = std::str::from_utf8(&bytes[13..13 + n]).map_err(|e| e.to_string())?;
-                Some(Design::from_hnf(text)?)
+                let design = if n == 0 {
+                    None
+                } else {
+                    Some(Design::from_hnf(text)?)
+                };
+                (design, &bytes[13 + n..])
             } else {
-                None
+                (None, &[][..])
             }
         } else {
-            None
+            (None, &[][..])
         };
-        Ok((mode, hash, design))
+        let (strategy, pblock, place_opts, route_opts) = decode_impl_knobs(rest)?;
+        Ok(CheckpointIr {
+            mode,
+            hash,
+            design,
+            strategy,
+            pblock,
+            timing_weight: place_opts.timing_weight,
+            route_max_iters: route_opts.max_iters,
+            route_extra_hops: route_opts.extra_hops,
+        })
     }
+}
+
+const HKNB: &[u8; 4] = b"HKNB";
+const HKNB_VER: u8 = 1;
+
+fn write_u16_str(v: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    let n = u16::try_from(b.len()).unwrap_or(u16::MAX) as usize;
+    v.extend_from_slice(&(n as u16).to_le_bytes());
+    v.extend_from_slice(&b[..n]);
+}
+
+fn read_u16_str(bytes: &[u8], i: &mut usize) -> Result<String, String> {
+    if *i + 2 > bytes.len() {
+        return Err("truncated hckp knobs string".into());
+    }
+    let n = u16::from_le_bytes(bytes[*i..*i + 2].try_into().unwrap()) as usize;
+    *i += 2;
+    if *i + n > bytes.len() {
+        return Err("truncated hckp knobs string".into());
+    }
+    let s = std::str::from_utf8(&bytes[*i..*i + n]).map_err(|e| e.to_string())?;
+    *i += n;
+    Ok(s.to_string())
+}
+
+fn encode_impl_knobs(
+    strategy: ImplStrategy,
+    pblock: Option<&PrjPblock>,
+    place_opts: PlaceOpts,
+    route_opts: RouteOpts,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(HKNB);
+    v.push(HKNB_VER);
+    v.push(strategy.as_u8());
+    let pb = pblock.filter(|p| p.ranged);
+    v.push(if pb.is_some() { 1 } else { 0 });
+    v.push(0);
+    let milli = (place_opts.timing_weight * 1000.0).round() as u32;
+    v.extend_from_slice(&milli.to_le_bytes());
+    v.extend_from_slice(&route_opts.max_iters.to_le_bytes());
+    v.extend_from_slice(&route_opts.extra_hops.to_le_bytes());
+    if let Some(pb) = pb {
+        write_u16_str(&mut v, &pb.name);
+        v.extend_from_slice(&pb.x0.to_le_bytes());
+        v.extend_from_slice(&pb.y0.to_le_bytes());
+        v.extend_from_slice(&pb.x1.to_le_bytes());
+        v.extend_from_slice(&pb.y1.to_le_bytes());
+        v.push(1);
+        v.push(0);
+        v.extend_from_slice(&(pb.cells.len() as u32).to_le_bytes());
+        for c in &pb.cells {
+            write_u16_str(&mut v, c);
+        }
+    }
+    v
+}
+
+fn decode_impl_knobs(
+    bytes: &[u8],
+) -> Result<(ImplStrategy, Option<PrjPblock>, PlaceOpts, RouteOpts), String> {
+    let default = (
+        ImplStrategy::Default,
+        None,
+        ImplStrategy::Default.place_opts(),
+        ImplStrategy::Default.route_opts(),
+    );
+    if bytes.len() < 20 || &bytes[0..4] != HKNB {
+        return Ok(default);
+    }
+    let ver = bytes[4];
+    if ver != HKNB_VER {
+        return Err(format!("unsupported hckp knobs version {ver}"));
+    }
+    let strategy = ImplStrategy::from_u8(bytes[5]);
+    let flags = bytes[6];
+    let milli = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let max_iters = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let extra_hops = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let place_opts = PlaceOpts {
+        timing_weight: milli as f64 / 1000.0,
+    };
+    let route_opts = RouteOpts {
+        max_iters,
+        extra_hops,
+    };
+    if flags & 1 == 0 {
+        return Ok((strategy, None, place_opts, route_opts));
+    }
+    let mut i = 20;
+    let name = read_u16_str(bytes, &mut i)?;
+    if i + 18 + 4 > bytes.len() {
+        return Err("truncated hckp pblock".into());
+    }
+    let x0 = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    i += 4;
+    let y0 = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    i += 4;
+    let x1 = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    i += 4;
+    let y1 = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    i += 4;
+    let ranged = bytes[i] != 0;
+    i += 2;
+    let n = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+    i += 4;
+    let mut cells = Vec::with_capacity(n);
+    for _ in 0..n {
+        cells.push(read_u16_str(bytes, &mut i)?);
+    }
+    Ok((
+        strategy,
+        Some(PrjPblock {
+            name,
+            x0,
+            y0,
+            x1,
+            y1,
+            ranged,
+            cells,
+        }),
+        place_opts,
+        route_opts,
+    ))
+}
+
+fn cell_listed_in_pblock(cells: &[String], names: &[&str]) -> bool {
+    cells.iter().any(|c| {
+        names
+            .iter()
+            .any(|n| !n.is_empty() && *n == c.as_str())
+    })
+}
+
+/// Relocate only `cells` into the HAD rectangle; everyone else keeps `place_with` sites.
+fn place_named_cells_in_region(
+    packed: &Packed,
+    dev: &Device,
+    opts: PlaceOpts,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    cells: &[String],
+) -> Result<Placed, String> {
+    let (x0, x1) = (x0.min(x1), x0.max(x1));
+    let (y0, y1) = (y0.min(y1), y0.max(y1));
+    let mut placed = place_with(packed, dev, opts)?;
+    let mut clbs: Vec<Site> = dev
+        .clb_sites()
+        .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
+        .collect();
+    if clbs.is_empty() {
+        return Err(format!(
+            "pblock CLB_X{x0}Y{y0}:CLB_X{x1}Y{y1} has no HAD CLB sites"
+        ));
+    }
+    clbs.sort_by_key(|s| (s.x, s.y));
+    let n_ble = dev.n_ble.max(1) as usize;
+    let mut region_i = 0usize;
+    for i in 0..placed.lutff_sites.len() {
+        let lf = &placed.packed.lutffs[i];
+        if !cell_listed_in_pblock(cells, &[lf.lut_cell.as_str(), lf.ff_cell.as_str()]) {
+            continue;
+        }
+        let clb_off = region_i / n_ble;
+        let ble = (region_i % n_ble) as u8;
+        let idx = clb_off.min(clbs.len() - 1);
+        placed.lutff_sites[i] = (clbs[idx], ble);
+        region_i += 1;
+    }
+    let mut iobs: Vec<Site> = dev
+        .iob_sites()
+        .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
+        .collect();
+    if !iobs.is_empty() {
+        iobs.sort_by_key(|s| (s.x, s.y));
+        let mut io_i = 0usize;
+        for (i, slot) in placed.iob_sites.iter_mut().enumerate() {
+            let Some(io) = packed.iobs.get(i) else {
+                continue;
+            };
+            if io.loc.as_ref().is_some() {
+                continue;
+            }
+            if !cell_listed_in_pblock(cells, &[io.cell.as_str()]) {
+                continue;
+            }
+            *slot = iobs[io_i.min(iobs.len() - 1)];
+            io_i += 1;
+        }
+    }
+    placed.cost = if opts.timing_weight > 0.0 {
+        placed
+            .lutff_sites
+            .first()
+            .zip(placed.iob_sites.first())
+            .map(|(l, i)| (l.0.y as f64 - i.y as f64).abs() * opts.timing_weight)
+            .unwrap_or(0.0)
+    } else {
+        placed
+            .lutff_sites
+            .first()
+            .map(|(s, _)| s.y as f64)
+            .unwrap_or(0.0)
+    };
+    Ok(placed)
 }
 
 pub fn get_cells(d: &Design, filter: Option<&str>) -> Vec<String> {
@@ -1294,6 +1646,12 @@ pub fn write_prj(path: &std::path::Path, prj: &ProjectFile) -> Result<(), String
     std::fs::write(path, body).map_err(|e| format!("write_prj {}: {e}", path.display()))
 }
 
+/// Apply PACKAGE_PIN / IOSTANDARD / DRIVE / SLEW / … onto the netlist.
+/// Same step `helion project` / `compile_design_xdc` uses before place.
+pub fn apply_design_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
+    apply_xdc(design, xdc)
+}
+
 /// Flatten inline SDC + `read_xdc` files + `set_property` IO into one XDC blob, then `load_xdc`.
 /// Empty constraints keep the CLI gold WNS path (default 10 ns clk applied by the runner).
 pub fn constraints_from_project(
@@ -1417,10 +1775,11 @@ mod tests {
         assert_eq!(Some(h), proj.blinky_hash());
         let cells = get_cells(proj.design.as_ref().unwrap(), Some("lut"));
         assert_eq!(cells, vec!["u_lut"]);
-        let (_, _, ir) = Session::restore_with_ir(&ck).unwrap();
-        let ir = ir.expect("checkpoint must embed HNF");
+        let ckpt = Session::restore_with_ir(&ck).unwrap();
+        let ir = ckpt.design.expect("checkpoint must embed HNF");
         assert_eq!(ir.name, "blinky");
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
+        assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
         assert!(get_pins(proj.design.as_ref().unwrap(), "u_lut").iter().any(|p| p.ends_with("/I0")));
     }
@@ -1894,5 +2253,197 @@ create_pblock pblock_0
             "disk-write error must not seed impl_checkpoint"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_open_reproduces_runtimeopt_and_pblock_hash() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut rt = Session::new(Mode::Project);
+        rt.synth_design(Design::structural_counter());
+        rt.impl_with_strategy(&dev, ImplStrategy::RuntimeOpt).unwrap();
+        let h_rt = rt.blinky_hash().expect("RuntimeOpt bitstream");
+        let mut def = Session::new(Mode::Project);
+        def.impl_design(Design::structural_counter(), &dev).unwrap();
+        assert_ne!(
+            def.blinky_hash(),
+            Some(h_rt),
+            "RuntimeOpt hash must differ from Default-only impl_design"
+        );
+        let ck = rt.checkpoint();
+        let opened = Session::restore_with_ir(&ck).unwrap();
+        assert_eq!(opened.strategy, ImplStrategy::RuntimeOpt);
+        assert!((opened.timing_weight - 0.0).abs() < f64::EPSILON);
+        assert_eq!(opened.route_max_iters, 1);
+        let rt2 = Session::restore_session(&ck, &dev).unwrap();
+        assert_eq!(
+            rt2.blinky_hash(),
+            Some(h_rt),
+            "open must replay RuntimeOpt knobs, not Default impl_design"
+        );
+
+        let mut pb_s = Session::new(Mode::Project);
+        pb_s.synth_design(Design::structural_counter());
+        let mut prj = ProjectFile::default();
+        prj.pblocks.push(PrjPblock {
+            name: "pblock_0".into(),
+            x0: 5,
+            y0: 1,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: vec![],
+        });
+        pb_s.impl_project(&dev, &prj).unwrap();
+        let h_pb = pb_s.blinky_hash().expect("pblock bitstream");
+        assert_ne!(Some(h_pb), def.blinky_hash(), "pblock must move placement");
+        let ck_pb = pb_s.checkpoint();
+        let meta = Session::restore_with_ir(&ck_pb).unwrap();
+        let pb = meta.pblock.expect("pblock knobs must persist");
+        assert_eq!((pb.x0, pb.y0, pb.x1, pb.y1), (5, 1, 8, 8));
+        assert!(pb.cells.is_empty());
+        let pb2 = Session::restore_session(&ck_pb, &dev).unwrap();
+        assert_eq!(
+            pb2.blinky_hash(),
+            Some(h_pb),
+            "open must replay pblock bounds, not Default impl_design"
+        );
+        let pl = pb2.placed.as_ref().unwrap();
+        for (s, _) in &pl.lutff_sites {
+            assert!(
+                s.x >= 5 && s.x <= 8 && s.y >= 1 && s.y <= 8,
+                "restored LUTFF must sit in the pblock: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_hckp_without_knobs_still_opens_default() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::Project);
+        s.impl_design(Design::structural_counter(), &dev).unwrap();
+        let h0 = s.blinky_hash().expect("impl bitstream");
+        let full = s.checkpoint();
+        let n = u32::from_le_bytes(full[9..13].try_into().unwrap()) as usize;
+        let old = full[..13 + n].to_vec();
+        assert!(
+            old.len() < full.len(),
+            "new .hckp must append knobs after HNF"
+        );
+        let s2 = Session::restore_session(&old, &dev).unwrap();
+        assert_eq!(
+            s2.blinky_hash(),
+            Some(h0),
+            "old HCKP (HNF-only) must still open via Default knobs"
+        );
+        let meta = Session::restore_with_ir(&old).unwrap();
+        assert_eq!(meta.strategy, ImplStrategy::Default);
+        assert!(meta.pblock.is_none());
+    }
+
+    #[test]
+    fn impl_project_honors_create_run_strategy() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut prj = ProjectFile::default();
+        prj.impl_runs.push(PrjImplRun {
+            name: "impl_1".into(),
+            strategy: "RuntimeOpt".into(),
+        });
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        s.impl_project(&dev, &prj).unwrap();
+        assert_eq!(s.strategy, ImplStrategy::RuntimeOpt);
+        let mut def = Session::new(Mode::Project);
+        def.impl_design(Design::structural_counter(), &dev).unwrap();
+        assert_ne!(
+            s.blinky_hash(),
+            def.blinky_hash(),
+            "create_run RuntimeOpt must change the bitstream vs Default"
+        );
+    }
+
+    #[test]
+    fn impl_project_pblock_cells_filter_and_empty_whole_design() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut prj = ProjectFile::default();
+        prj.pblocks.push(PrjPblock {
+            name: "pblock_0".into(),
+            x0: 5,
+            y0: 1,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: vec!["u_lut0".into()],
+        });
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        s.impl_project(&dev, &prj).unwrap();
+        let pl = s.placed.as_ref().unwrap();
+        let mut lut0_in = false;
+        let mut other_out = false;
+        for (i, lf) in pl.packed.lutffs.iter().enumerate() {
+            let (site, _) = pl.lutff_sites[i];
+            let in_rect = site.x >= 5 && site.x <= 8 && site.y >= 1 && site.y <= 8;
+            if lf.lut_cell == "u_lut0" {
+                assert!(in_rect, "u_lut0 must sit in the pblock: {site:?}");
+                lut0_in = true;
+            } else if !in_rect {
+                other_out = true;
+            }
+        }
+        assert!(lut0_in, "u_lut0 must be packed");
+        assert!(
+            other_out,
+            "non-listed cells must not all be forced into the rectangle"
+        );
+
+        let mut prj_all = ProjectFile::default();
+        prj_all.pblocks.push(PrjPblock {
+            name: "pblock_0".into(),
+            x0: 5,
+            y0: 1,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: vec![],
+        });
+        let mut s_all = Session::new(Mode::Project);
+        s_all.synth_design(Design::structural_counter());
+        s_all.impl_project(&dev, &prj_all).unwrap();
+        for (site, _) in &s_all.placed.as_ref().unwrap().lutff_sites {
+            assert!(
+                site.x >= 5 && site.x <= 8 && site.y >= 1 && site.y <= 8,
+                "empty cells = whole design in rectangle: {site:?}"
+            );
+        }
+
+        let ck = s.checkpoint();
+        let meta = Session::restore_with_ir(&ck).unwrap();
+        assert_eq!(
+            meta.pblock.as_ref().map(|p| p.cells.as_slice()),
+            Some(["u_lut0".to_string()].as_slice())
+        );
+        let h0 = s.blinky_hash();
+        let s2 = Session::restore_session(&ck, &dev).unwrap();
+        assert_eq!(s2.blinky_hash(), h0, "cells filter must round-trip hash");
+    }
+
+    #[test]
+    fn apply_xdc_package_pin_moves_iob_and_checkpoint_hash() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let xdc = load_xdc("set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]\n").unwrap();
+        let mut d = Design::structural_counter();
+        apply_design_xdc(&mut d, &xdc).unwrap();
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(d);
+        s.impl_with_strategy(&dev, ImplStrategy::Default).unwrap();
+        assert_eq!(
+            s.placed.as_ref().unwrap().iob_sites[0].x,
+            5,
+            "PACKAGE_PIN must bind the IOB before impl"
+        );
+        let h = s.blinky_hash().expect("pinned bitstream");
+        let s2 = Session::restore_session(&s.checkpoint(), &dev).unwrap();
+        assert_eq!(s2.blinky_hash(), Some(h));
+        assert_eq!(s2.placed.as_ref().unwrap().iob_sites[0].x, 5);
     }
 }
