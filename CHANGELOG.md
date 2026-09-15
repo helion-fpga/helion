@@ -12,7 +12,25 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.4.0...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.0...HEAD
+
+## [1.5.0] — 2026-09-15
+
+FM-HEL-14-W1b mapping density. Empty-XDC `examples/counter.sv` gold is
+unchanged (**WNS_PS=9640**). Native Apple Silicon `Helion.app` ships on this
+GitHub Release.
+
+### Added
+
+- Honest LUT6 packing for ≤6-PI mux/case, shared identical (INIT, pins) across
+  bus bits, and denser XNOR/AND INIT absorption on wide cones.
+
+### Changed
+
+- `ibex_pin_wrap` LUT count **108545 → 8073** (fits affinity SKU 8192);
+  cells 113611→13139. Ibex closed WNS **8100** held (not invented).
+
+[1.5.0]: https://github.com/helion-fpga/helion/releases/tag/v1.5.0
 
 ## [1.4.0] — 2026-09-15
 
