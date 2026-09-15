@@ -12,8 +12,11 @@
 //! Without a device, native returns honest `Io` (never invents STAT). Without the
 //! feature, [`NativeFtdiMpsse`] / stub return `NotImplemented` → OFL fallback.
 //! [`mpsse_sim`] remains the in-process bitbang CFG_W+STAT harness (sim fabric DONE
-//! only — **not** board DONE). HAD board IDs / `HELION_OFL_BOARD` live in
-//! [`HAD_KNOWN_BOARDS`]. OFL verify parse stays honest (`TAP_readback=none`).
+//! only — **not** board DONE). [`refuse_empty_bitstream`] gates **OFL / native /
+//! lab / overlay** honesty paths — it is not a global ban across Sim/`MpsseSim`
+//! fabric programming (sim may still report fabric DONE on empty by design).
+//! HAD board IDs / `HELION_OFL_BOARD` live in [`HAD_KNOWN_BOARDS`]. OFL verify
+//! parse stays honest (`TAP_readback=none`).
 //! No UNISIM/AMD IP — HAD is Helion's story.
 
 use helion_bits::Bitstream;
@@ -595,7 +598,10 @@ pub fn bitstream_is_empty(bits: &Bitstream) -> bool {
     bits.frames.is_empty() || bits.packets.is_empty()
 }
 
-/// Lab / overlay / native honesty gate: empty bitstream is Err, never DONE=1.
+/// OFL / native / lab / overlay honesty gate: empty bitstream is Err, never DONE=1.
+///
+/// Not applied globally to Sim/`MpsseSim` fabric program paths (those may still
+/// surface sim-fabric DONE on empty by design).
 pub fn refuse_empty_bitstream(bits: &Bitstream) -> Result<(), String> {
     if bitstream_is_empty(bits) {
         Err(

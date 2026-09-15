@@ -1,4 +1,9 @@
-//! Lab profile: program + STAT via sim cable. Must not depend on pack/place/route/map.
+//! Lab profile: honesty-facing wrappers over [`helion_hw`] — empty refuse, **overlay**
+//! LED sample, and native/auto cable programs (not only "sim cable STAT").
+//!
+//! Runtime deps stay thin (`helion-hw` / `helion-device` / `helion-bits`). Pack /
+//! place / route are **dev-dependencies** for overlay gold tests only — not crate
+//! runtime deps (lab must not pull the implement stack into products).
 //!
 //! Empty bitstream is refused (never DONE=1). Overlay programs a real bitstream,
 //! `step_user`s the sim fabric, and samples LED — labeled **overlay**, not board DONE.
