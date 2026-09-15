@@ -6,9 +6,19 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ## [Unreleased]
 
-1.4 docs and roadmap (FM-HEL-14-W7 / FM-HEL-ROADMAP-2.0). Empty-XDC
-`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Soft-hold: not merged
-to `master`.
+### Added
+
+### Changed
+
+### Fixed
+
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.1...HEAD
+
+## [1.3.1] — 2026-09-15
+
+FM-HEL-14 parallel landings after the 1.4 baseline. Empty-XDC
+`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Native Apple Silicon
+`Helion.app` ships on this GitHub Release.
 
 ### Added
 
@@ -20,19 +30,31 @@ to `master`.
   [1.6](https://github.com/helion-fpga/helion/milestone/3) /
   [1.7](https://github.com/helion-fpga/helion/milestone/4) /
   [2.0](https://github.com/helion-fpga/helion/milestone/5).
-- Architecture / Use: `helion-sta::load_xdc` command list from
-  `crates/helion-sta/src/lib.rs` only, kept separate from Tcl Session CAD.
-- CI: Ubuntu and `macos-latest` jobs build/run `helion-ide --headless
-  examples/counter.sv` and **require** `WNS_PS=9640` (grep; no continue-on-error
-  on gold). Workspace tests may continue-on-error.
+- HAD load-only parts `HL10M-C128-1` / `HL10S-C64-1` and board `HB1`.
+- Disk `.hckp` checkpoints with strategy / pblock / placement restore; `.prj`
+  keeps pblock + impl run; pblock cell lists and XDC honored on project paths.
+- VHDL elaborator path: real entity bodies, `clock≡clk` for STA (narrow), named
+  `missing_component` diagnostics (no silent `cells=0`).
+- Timing-driven P&R: `timing_weight` / false-path / multicycle move closed WNS
+  on the hard fixture (not report text only).
+- Lab honesty: refuse empty bitstream; overlay counter LED labeled overlay;
+  native/OFL refuse DONE without cable / empty frames.
+- IDE name-contract: surface Open errors; HFF CLK for wave/bits; O(visible)
+  hierarchy drawings; `examples/rng.vhd` / `adder4.vhd` open path.
 
 ### Changed
 
-- Public Pages nav and `llms.txt` point at the roadmap. Release notes keep a
-  standing Unreleased section (Keep a Changelog). Release notes excerpt links
-  ROADMAP.md.
+- CI: Ubuntu and `macos-latest` require headless gold **WNS_PS=9640**; macos
+  release `helion-ide` check parity with ubuntu.
+- Public Pages / llms.txt / architecture docs point at roadmap and `load_xdc`
+  command list only.
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.0...HEAD
+### Fixed
+
+- Pblock occupancy legalization (no duplicate site/ble); IOB checks after LOC
+  reorder; bad pblock range fails closed.
+
+[1.3.1]: https://github.com/helion-fpga/helion/releases/tag/v1.3.1
 
 ## [1.3.0] — 2026-09-10
 
