@@ -2,6 +2,10 @@
 //! -invert / -edges) / set_bus_skew / group_path / set_max_time_borrow /
 //! set_data_check / report_timing_summary / report_cdc / report_clock_networks /
 //! report_power / report_methodology / placed Manhattan.
+//!
+//! `Constraints::timing_guide` feeds IOB-arc exceptions into `place_with_guide`
+//! / `route_with_guide`. helion-cli and helion-proj still call unguided
+//! `place_with` / `route_with` until a later crate lock wires that through.
 
 use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
@@ -1235,13 +1239,36 @@ impl Constraints {
     }
 
     /// Feed `set_false_path` / `set_multicycle_path` into place and route so
-    /// ignored IOB arcs are not delay-optimized (sites/hops change). Empty
-    /// constraints keep gold south pull and gold hops.
+    /// ignored IOB/output arcs are not delay-optimized (sites/hops change).
+    /// Only false paths / multicycle paths that name an output/IOB arc
+    /// (`-to [get_ports led]`, PAD/IOB tokens) set the IOB flags; clock-to-clock
+    /// or register-to-register exceptions keep gold south pull.
+    /// Empty constraints keep gold south pull and gold hops.
+    /// helion-cli / helion-proj still call unguided `place_with` / `route_with`
+    /// until a later crate lock wires this through.
     pub fn timing_guide(&self) -> helion_place::TimingGuide {
         helion_place::TimingGuide {
-            false_path_iob: !self.false_paths.is_empty(),
-            iob_setup_mult: self.setup_mult(),
+            false_path_iob: self.false_paths.iter().any(|fp| false_path_covers_iob(fp)),
+            iob_setup_mult: self
+                .multicycle_paths
+                .iter()
+                .filter(|m| self.mcp_targets_output_iob(m))
+                .map(|m| m.setup_mult)
+                .max()
+                .unwrap_or(1)
+                .max(1),
         }
+    }
+
+    fn mcp_targets_output_iob(&self, m: &MulticyclePath) -> bool {
+        endpoint_is_output_iob(&m.to)
+            || endpoint_is_output_iob(&m.from)
+            || self.output_delay_ps.contains_key(&m.to)
+            || self.output_delay_ps.contains_key(&m.from)
+            || self.package_pins.contains_key(&m.to)
+            || self.package_pins.contains_key(&m.from)
+            || self.iostandards.contains_key(&m.to)
+            || self.iostandards.contains_key(&m.from)
     }
 
     /// Hold path multiplier (Vivado default 0).
@@ -1565,6 +1592,45 @@ fn tcl_case_value(s: &str) -> Option<String> {
 fn sdc_token_eq(hay: &str, name: &str) -> bool {
     hay.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|t| t == name)
+}
+
+fn clock_like_name(name: &str) -> bool {
+    let s = name.to_ascii_lowercase();
+    s == "clk" || s == "clock" || s.contains("clk") || s.ends_with("_ck")
+}
+
+/// Output/IOB endpoint names: PAD/IOB tokens, gold `led`, or similar.
+fn endpoint_is_output_iob(name: &str) -> bool {
+    let s = name.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let l = s.to_ascii_lowercase();
+    if l.contains("iob") || l.contains("pad") {
+        return true;
+    }
+    l == "led" || l.starts_with("led") || l.ends_with("_led")
+}
+
+/// True when a `set_false_path` string covers an output/IOB arc
+/// (`-to [get_ports led]`, PAD/IOB tokens). Clock-to-clock and pin-scoped
+/// register paths do not set `TimingGuide::false_path_iob`.
+fn false_path_covers_iob(fp: &str) -> bool {
+    let l = fp.to_ascii_lowercase();
+    if l.contains("iob") || l.contains("pad") {
+        return true;
+    }
+    let toks: Vec<&str> = fp.split_whitespace().collect();
+    let (from, to) = tcl_from_to(&toks);
+    if endpoint_is_output_iob(&from) || endpoint_is_output_iob(&to) {
+        return true;
+    }
+    if let Some((_, rest)) = l.split_once("-to") {
+        if rest.contains("get_ports") {
+            return !clock_like_name(&to);
+        }
+    }
+    false
 }
 
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
@@ -5614,6 +5680,22 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         )
         .unwrap();
         assert!(fp.timing_guide().false_path_iob);
+        let clk_fp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_false_path -from [get_clocks clk] -to [get_clocks virt]\n",
+        )
+        .unwrap();
+        assert!(
+            !clk_fp.timing_guide().false_path_iob,
+            "clock-to-clock false_path must not set IOB-arc guide"
+        );
+        let pin_fp = load_xdc(
+            "set_false_path -from [get_pins u_ff/Q] -to [get_pins u_ff2/D]\n",
+        )
+        .unwrap();
+        assert!(
+            !pin_fp.timing_guide().false_path_iob,
+            "register pin false_path must not set IOB-arc guide"
+        );
         let (pl0, r0, _t0) = close_guided(&d, 0.75, &unconstrained);
         let (plfp, rfp, _tfp) = close_guided(&d, 0.75, &fp);
         let sites0: Vec<_> = pl0
@@ -5653,6 +5735,26 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         )
         .unwrap();
         assert_eq!(mcp.timing_guide().iob_setup_mult, 2);
+        let reg_mcp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_multicycle_path 4 -from [get_pins u_ff1/Q] -to [get_pins u_ff2/D]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reg_mcp.setup_mult(),
+            4,
+            "STA setup_mult stays global for WNS"
+        );
+        assert_eq!(
+            reg_mcp.timing_guide().iob_setup_mult,
+            1,
+            "register multicycle must not relax IOB search/place"
+        );
+        let mixed = load_xdc(
+            "set_multicycle_path 4 -from [get_pins u_ff1/Q] -to [get_pins u_ff2/D]\nset_multicycle_path 2 -from [get_ports clk] -to [get_ports led]\n",
+        )
+        .unwrap();
+        assert_eq!(mixed.setup_mult(), 4);
+        assert_eq!(mixed.timing_guide().iob_setup_mult, 2);
         let (pl0, r0, t0) = close_guided(&d, 0.75, &unconstrained);
         let (plm, rm, tm) = close_guided(&d, 0.75, &mcp);
         let sites0: Vec<_> = pl0
