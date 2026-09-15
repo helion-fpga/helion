@@ -66,17 +66,51 @@ helion-gui IdeModel paints the Session</code></pre>
         </tbody>
       </table></div>
 
-      <h3>XDC/SDC command subset</h3>
-      <p><code>helion-sta::load_xdc</code> parses <code>create_clock</code>, <code>create_generated_clock</code>,
-        <code>set_input_delay</code>, <code>set_output_delay</code>, <code>set_false_path</code>,
-        <code>set_multicycle_path</code>, <code>set_max_delay</code>, <code>set_min_delay</code>,
-        <code>set_clock_groups</code>, <code>set_clock_uncertainty</code>, <code>set_clock_latency</code>,
-        <code>set_disable_timing</code>, <code>set_case_analysis</code>, <code>set_propagated_clock</code>,
-        <code>set_clock_sense</code>, <code>set_input_jitter</code>, <code>set_system_jitter</code>,
-        <code>set_timing_derate</code>, <code>set_operating_conditions</code>, <code>set_bus_skew</code>,
-        <code>group_path</code>, <code>set_max_time_borrow</code>, <code>set_data_check</code>, and
-        <code>set_property</code> for <code>PACKAGE_PIN</code>, <code>IOSTANDARD</code>, <code>DRIVE</code>,
-        <code>SLEW</code>, <code>PULLTYPE</code>, <code>DIFF_TERM</code>, and <code>IN_TERM</code>.</p>
+      <h2 id="xdc">XDC (<code>load_xdc</code>)</h2>
+      <p>
+        Constraint commands Helion parses are the first-token arms of
+        <code>load_xdc</code> in <code>crates/helion-sta/src/lib.rs</code>.
+        Point at that crate; do not treat this as a vendor constraint product.
+        Object queries (<code>get_ports</code>, <code>get_pins</code>,
+        <code>get_clocks</code>, <code>get_cells</code>) are arguments, not extra
+        commands. Unknown first tokens are ignored. Empty-XDC gold stays
+        <span class="gold">WNS_PS=9640</span>.
+      </p>
+      <p>Commands (only these):</p>
+      <pre><code>create_clock
+create_generated_clock
+set_input_delay
+set_output_delay
+set_false_path
+set_multicycle_path
+set_max_delay
+set_min_delay
+set_clock_groups
+set_clock_uncertainty
+set_clock_latency
+set_disable_timing
+set_case_analysis
+set_propagated_clock
+set_clock_sense
+set_input_jitter
+set_system_jitter
+set_timing_derate
+set_bus_skew
+group_path
+set_max_time_borrow
+set_data_check
+set_operating_conditions
+set_property</code></pre>
+      <p>
+        <code>set_property</code> keys: <code>PACKAGE_PIN</code>,
+        <code>IOSTANDARD</code>, <code>DRIVE</code>, <code>SLEW</code>,
+        <code>PULLTYPE</code>, <code>DIFF_TERM</code>, <code>IN_TERM</code>.
+      </p>
+      <p>
+        Tcl Session CAD commands (<code>synth_design</code>,
+        <code>place_design</code>, …) are a different list, below. They are not
+        <code>load_xdc</code> commands.
+      </p>
 
       <h2>Part HL10T-C32-1</h2>
       <p>
@@ -124,8 +158,9 @@ helion-gui IdeModel paints the Session</code></pre>
         generate unroll into that IR.
       </p>
 
-      <h2>Tcl Session</h2>
+      <h2 id="tcl">Tcl Session</h2>
       <p>
+        CAD Session (not the <a href="#xdc"><code>load_xdc</code></a> list):
         <code>synth_design</code>, <code>opt_design</code>, <code>place_design</code>,
         <code>route_design</code>, <code>write_bitstream</code>, <code>write_hnf</code>,
         <code>get_cells</code> / <code>get_nets</code> / <code>get_pins</code>,
@@ -151,6 +186,10 @@ helion-gui IdeModel paints the Session</code></pre>
         <code>LED[16]=0000000111111110</code>. QoR is gated in
         <code>crates/helion-cli/tests/qor.rs</code>. A LUT / WNS / bitstream-size
         change must update the table in the same commit with a reason.
+      </p>
+      <p class="cta">
+        <a class="btn" href="use.html">Use Helion</a>
+        <a class="btn ghost" href="roadmap.html">Roadmap 1.4 to 2.0</a>
       </p>
     </div>
   </main>

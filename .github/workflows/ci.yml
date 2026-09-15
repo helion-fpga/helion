@@ -15,6 +15,28 @@ jobs:
         run: cargo test --workspace
         continue-on-error: true
       - name: counter gold
-        run: cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+        run: |
+          set -euo pipefail
+          cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv | tee gold-ubuntu.log
+          grep -F 'WNS_PS=9640' gold-ubuntu.log
+      - name: release helion-ide
+        run: cargo check --release -p helion-gui --bin helion-ide
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: workspace tests
+        run: cargo test --workspace
+        continue-on-error: true
+      - name: build helion-ide
+        run: cargo build -p helion-gui --bin helion-ide
+      - name: counter gold
+        run: |
+          set -euo pipefail
+          cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv | tee gold.log
+          grep -F 'WNS_PS=9640' gold.log
       - name: release helion-ide
         run: cargo check --release -p helion-gui --bin helion-ide

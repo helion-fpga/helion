@@ -2,9 +2,9 @@
   <img src="docs/brand/die-flow.gif" width="920" alt="HL10T die: current enters the pads, runs the fabric, and leaves">
 </p>
 
-# Helion Design Suite (1.3)
+# Helion Design Suite
 
-Original FPGA family + CAD. Native `aarch64-apple-darwin`. No vendor bitstream.
+Original FPGA family + CAD (current release **1.3**; **1.4 → 2.0** on the [roadmap](ROADMAP.md)). Native `aarch64-apple-darwin`. No vendor bitstream.
 
 [![Release](https://img.shields.io/github/v/release/helion-fpga/helion)](https://github.com/helion-fpga/helion/releases/latest)
 
@@ -14,6 +14,8 @@ SystemVerilog, STA, IDE tests, or docs, start at
 
 [Download](https://github.com/helion-fpga/helion/releases/latest)
 · [Changelog](CHANGELOG.md)
+· [Roadmap](ROADMAP.md)
+· [Milestones](https://github.com/helion-fpga/helion/milestones)
 · [Docs](https://helion-fpga.github.io/helion/)
 · [Contributing](CONTRIBUTING.md)
 · [Discussions](https://github.com/helion-fpga/helion/discussions)
@@ -31,8 +33,22 @@ cargo run -p helion-cli -- report_timing examples/blinky.sv
 cargo run -p helion-cli -- reports examples/counter.sv
 ```
 
+Headless gold (IDE): `helion-ide --headless examples/counter.sv` must print **WNS_PS=9640**.
+
 Legal fence: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD/Intel/Lattice backends.
 Device facts come from the Helion Architecture Database (HAD), never hardcoded in the CAD.
+
+## Roadmap (1.4 → 2.0)
+
+[ROADMAP.md](ROADMAP.md) · Pages: [roadmap](https://helion-fpga.github.io/helion/roadmap.html)
+
+| Release | What | Milestone |
+|---|---|---|
+| 1.4 | SV elaborator (W1); gold **WNS_PS=9640** | [1.4](https://github.com/helion-fpga/helion/milestone/1) |
+| 1.5 | PNR/STA (W2) + proj/cli (W4) | [1.5](https://github.com/helion-fpga/helion/milestone/2) |
+| 1.6 | IDE (W5) + lab (W3) | [1.6](https://github.com/helion-fpga/helion/milestone/3) |
+| 1.7 | VHDL (W6) + HAD (W8) | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
+| 2.0 | Public OSS CAD bar | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
 
 ## Flow
 
@@ -44,7 +60,7 @@ Device facts come from the Helion Architecture Database (HAD), never hardcoded i
 | pack | helion-pack | LUTFF + IOB + MAC27 + BRAM18 |
 | place | helion-place | timing-driven vs wirelength, BLE overflow |
 | route | helion-route | PathFinder A* with hop delay in the cost |
-| sta | helion-sta | XDC clocks / I-O delay / false path, WNS + hold |
+| sta | helion-sta | XDC via `load_xdc` (see Architecture), WNS + hold |
 | drc | helion-drc | occupancy, unrouted IO, clocks |
 | bits | helion-bits | FeatureMap frames + sparse `.hbits` (encode/decode) + partial (DFX) |
 | sim | helion-fabric | 6-input IMUX LUT + FF + IOB + STAT |
