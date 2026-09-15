@@ -34,3 +34,12 @@ push. GitHub Actions builds the artifacts and opens the GitHub Release.
 Do not invent a version that `Cargo.toml` does not carry. Do not attach vendor
 bitstreams. Do not claim a signed/notarized Mac app until we have an Apple
 Developer identity on the runner.
+
+## Latest stable vs next
+
+- **Latest stable on GitHub Releases:** `v1.3.0` (Helion 1.3.0) — already published
+  with macOS app + Darwin/Linux tarballs. Do not recreate the tag; rebuild via
+  `workflow_dispatch` only if artifacts must be replaced.
+- **Next product tag:** `v1.4.0` when the 1.4 milestone ships. Draft notes live
+  under `## [Unreleased]` in `CHANGELOG.md` until cut day.
+

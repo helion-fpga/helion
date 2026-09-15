@@ -6,9 +6,11 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ## [Unreleased]
 
-1.4 docs and roadmap (FM-HEL-14-W7 / FM-HEL-ROADMAP-2.0). Empty-XDC
-`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Soft-hold: not merged
-to `master`.
+Working toward **1.4.0** (SV elaborator + docs/releases surface). Empty-XDC
+`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Soft-hold: WIP
+branches are not merged to `master` without Firstmate. Public installs stay on
+[GitHub Releases](https://github.com/helion-fpga/helion/releases) for tagged
+`vMAJOR.MINOR.PATCH` builds only.
 
 ### Added
 
@@ -25,12 +27,29 @@ to `master`.
 - CI: Ubuntu and `macos-latest` jobs build/run `helion-ide --headless
   examples/counter.sv` and **require** `WNS_PS=9640` (grep; no continue-on-error
   on gold). Workspace tests may continue-on-error.
+- Tag-push release workflow (`.github/workflows/release.yml`): macOS aarch64
+  `Helion.app` + unix tarballs (CLI / headless `helion-ide`) for Linux x86_64
+  and Darwin aarch64; notes from `CHANGELOG.md` via `scripts/changelog-excerpt.sh`.
+- SV elaborator WIP (`wip/1.4-w1-sv`, soft-hold): called-function inline to cells
+  on the user clock; `$readmemh`/`$readmemb` → Bram18 INIT (origin/`include`
+  relative paths); `(* ram_style="block")` forces BRAM; no silent INIT 0 on
+  missing files; signed/unsized-only `>= 0` / `< 0` → ~MSB/MSB rewrite.
 
 ### Changed
 
 - Public Pages nav and `llms.txt` point at the roadmap. Release notes keep a
   standing Unreleased section (Keep a Changelog). Release notes excerpt links
   ROADMAP.md.
+- README / ROADMAP: GitHub Releases are the **public install surface**; source
+  builds remain for contributors (`RELEASING.md`).
+
+### Draft notes for upcoming 1.4.0 (not tagged yet)
+
+When `workspace.package.version` moves to `1.4.0` and tag `v1.4.0` is cut:
+
+- Ship SV elaborator HARD paths above under `## [1.4.0]`.
+- Keep gold **WNS_PS=9640**; attach the same artifact set as 1.3.0.
+- Point release body at this CHANGELOG section + ROADMAP 1.4 milestone.
 
 [unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.0...HEAD
 
