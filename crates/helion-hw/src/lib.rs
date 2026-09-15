@@ -3085,15 +3085,20 @@ mod tests {
     #[test]
     fn native_and_ofl_done_only_from_live_stat_never_invent_tdo() {
         // Native: no device / feature-off → Err, never Ok(STAT) / invented TDO.
-        let native_err =
-            try_native_mpsse_program_stat(std::path::Path::new("/dev/null"), false).unwrap_err();
-        assert!(
-            matches!(
-                native_err,
-                NativeUsbError::NotImplemented(_) | NativeUsbError::Io(_)
-            ),
-            "{native_err:?}"
-        );
+        // Non-empty so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-ofl-live-stat-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let nonzero = dir.join("nonzero.bin");
+        std::fs::write(&nonzero, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let native_err = try_native_mpsse_program_stat(&nonzero, false).unwrap_err();
+        if cfg!(feature = "usb-native") {
+            assert!(matches!(native_err, NativeUsbError::Io(_)), "{native_err:?}");
+        } else {
+            assert!(
+                matches!(native_err, NativeUsbError::NotImplemented(_)),
+                "{native_err:?}"
+            );
+        }
         let msg = native_err.to_string().to_ascii_lowercase();
         assert!(!msg.contains("done=1"), "{msg}");
         assert!(!msg.contains("tdo=0x"), "{msg}");
