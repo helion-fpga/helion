@@ -499,8 +499,12 @@ mod tests {
     #[test]
     fn native_path_does_not_claim_done_without_probe() {
         // Honesty: sim harness ≠ native USB MPSSE board DONE.
-        let err =
-            crate::try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty path so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-mpsse-sim-native-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nonzero.bin");
+        std::fs::write(&path, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = crate::try_native_usb_program(&path, false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, crate::NativeUsbError::Io(_)), "{err:?}");
         } else {

@@ -774,9 +774,8 @@ impl HadUsbTransport for NativeFtdiStub {
     }
 
     fn program_hbits(&mut self, path: &std::path::Path, flash: bool) -> Result<(), NativeUsbError> {
-        let mut t = NativeFtdiMpsse::new();
-        t.open_probe()?;
-        t.program_hbits(path, flash)
+        // Delegate fully — NativeFtdiMpsse::program_hbits validates empty/HBIT before open_probe.
+        NativeFtdiMpsse::new().program_hbits(path, flash)
     }
 
     fn read_stat(&mut self) -> Result<Option<u32>, NativeUsbError> {
@@ -2301,12 +2300,13 @@ mod tests {
         {
             return;
         }
-        let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
         let (dev, bits) = bitgen_structural_counter();
         let bits_path = dir.join("t.hbits");
         std::fs::write(&bits_path, &bits.packets).unwrap();
         let empty_path = dir.join("empty-frames.hbits");
         std::fs::write(&empty_path, &Bitstream::empty(&dev).packets).unwrap();
+        // Non-empty path: empty-gate must not fire before open_probe / NotImplemented.
+        let err = try_native_usb_program(&bits_path, false).unwrap_err();
         unsafe {
             std::env::set_var("HELION_OPENFPGALOADER", &fake);
         }
@@ -2437,7 +2437,12 @@ mod tests {
                 det.note
             );
         }
-        let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-detect-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let nonzero = dir.join("nonzero.bin");
+        std::fs::write(&nonzero, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = try_native_usb_program(&nonzero, false).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2460,22 +2465,29 @@ mod tests {
         assert!(ops.contains(&MPSSE_CLK_TMS_OUT_NEG_LSB));
         assert!(native_mpsse_status_note().contains("native_mpsse"));
 
-        let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty for open_probe honesty; empty-frame path covered separately below.
+        let dir = std::env::temp_dir().join("helion-native-mpsse-io");
+        let _ = std::fs::create_dir_all(&dir);
+        let nonzero = dir.join("nonzero.bin");
+        std::fs::write(&nonzero, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = try_native_usb_program(&nonzero, false).unwrap_err();
         if usb_native_feature_enabled() {
             assert!(
                 matches!(err, NativeUsbError::Io(_)),
                 "usb-native + no FTDI → Io, got {err:?}"
             );
-            // Explicit --cable native must not invent STAT / soft-succeed.
+            // Explicit --cable native: empty-frame HBIT refuses before open (no invented STAT).
             let dev = Device::load_part("HL10T-C32-1").unwrap();
-            let dir = std::env::temp_dir().join("helion-native-mpsse-io");
-            let _ = std::fs::create_dir_all(&dir);
             let bits_path = dir.join("t.hbits");
             std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
             let cable = resolve_cable("native").unwrap();
             let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
             assert!(
-                e.contains("native MPSSE") || e.contains("I/O") || e.contains("no FTDI"),
+                e.contains("empty bitstream refused")
+                    || e.contains("refusing DONE on empty")
+                    || e.contains("native MPSSE")
+                    || e.contains("I/O")
+                    || e.contains("no FTDI"),
                 "{e}"
             );
             assert!(!e.to_ascii_lowercase().contains("done=1"));
@@ -2761,7 +2773,12 @@ mod tests {
     #[test]
     fn native_mpsse_and_ofl_honesty_coexist_on_box() {
         // usb-native on + 0 FTDI → Io; OFL on PATH + 0 probes → no USB; neither invents STAT.
-        let native_err = try_native_usb_program(std::path::Path::new("/dev/null"), false);
+        // Non-empty so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-ofl-coexist");
+        let _ = std::fs::create_dir_all(&dir);
+        let nonzero = dir.join("nonzero.bin");
+        std::fs::write(&nonzero, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let native_err = try_native_usb_program(&nonzero, false);
         if usb_native_feature_enabled() {
             assert!(
                 matches!(native_err, Err(NativeUsbError::Io(_))),

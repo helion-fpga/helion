@@ -536,8 +536,8 @@ impl HadUsbTransport for NativeFtdiMpsse {
     }
 
     fn program_hbits(&mut self, path: &Path, _flash: bool) -> Result<(), NativeUsbError> {
-        // Open once (persistent session); CFG_W + STAT reuse the same handle.
-        self.open_probe()?;
+        // Validate empty / header-only HBIT BEFORE open_probe so doomed inputs
+        // never claim the FTDI cable (share refuse_empty_bitstream with OFL/lab/overlay).
         let bytes = std::fs::read(path)
             .map_err(|e| NativeUsbError::Io(format!("read {}: {e}", path.display())))?;
         if bytes.is_empty() {
@@ -547,20 +547,18 @@ impl HadUsbTransport for NativeFtdiMpsse {
         }
         if bytes.starts_with(b"HBIT") {
             match Bitstream::from_packets(&bytes) {
-                Ok(bits) if bits.frames.is_empty() => {
-                    return Err(NativeUsbError::Io(
-                        "empty bitstream (no configured frames) — refusing native MPSSE program"
-                            .into(),
-                    ));
+                Ok(bits) => {
+                    crate::refuse_empty_bitstream(&bits).map_err(NativeUsbError::Io)?;
                 }
                 Err(e) => {
                     return Err(NativeUsbError::Io(format!(
                         "native MPSSE: invalid .hbits: {e} — refusing invented STAT"
                     )));
                 }
-                Ok(_) => {}
             }
         }
+        // Open once (persistent session); CFG_W + STAT reuse the same handle.
+        self.open_probe()?;
         let opcodes = Self::encode_cfg_w_and_stat(&bytes);
         #[cfg(feature = "usb-native")]
         {
@@ -858,7 +856,7 @@ pub fn try_native_mpsse_program(path: &Path, flash: bool) -> Result<(), NativeUs
 /// Like [`try_native_mpsse_program`], returning the validated STAT word (DONE=1).
 pub fn try_native_mpsse_program_stat(path: &Path, flash: bool) -> Result<u32, NativeUsbError> {
     let mut t = NativeFtdiMpsse::new();
-    t.open_probe()?;
+    // program_hbits validates empty/HBIT before open_probe — do not claim cable first.
     t.program_hbits(path, flash)?;
     t.last_stat.ok_or_else(|| {
         NativeUsbError::Io(
@@ -972,7 +970,12 @@ mod tests {
 
     #[test]
     fn try_native_mpsse_program_no_device_or_feature() {
-        let err = try_native_mpsse_program(Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-prog-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nonzero.bin");
+        std::fs::write(&path, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = try_native_mpsse_program(&path, false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
         } else {
@@ -1090,8 +1093,43 @@ mod tests {
     }
 
     #[test]
+    fn program_hbits_refuses_empty_before_open_probe() {
+        let dir = std::env::temp_dir().join("helion-native-empty-before-open");
+        let _ = std::fs::create_dir_all(&dir);
+        let zero = dir.join("zero.hbits");
+        std::fs::write(&zero, b"").unwrap();
+        let mut t = NativeFtdiMpsse::new();
+        let err = t.program_hbits(&zero, false).unwrap_err();
+        assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("empty"), "{msg}");
+        assert_eq!(t.usb_open_count, 0, "0-byte must not claim cable");
+        assert!(!t.is_open());
+
+        let empty_hbit = dir.join("empty-frames.hbits");
+        let dev = helion_device::Device::load_part("HL10T-C32-1").unwrap();
+        std::fs::write(&empty_hbit, &Bitstream::empty(&dev).packets).unwrap();
+        let mut t2 = NativeFtdiMpsse::new();
+        let err2 = t2.program_hbits(&empty_hbit, false).unwrap_err();
+        assert!(matches!(err2, NativeUsbError::Io(_)), "{err2:?}");
+        let msg2 = err2.to_string().to_ascii_lowercase();
+        assert!(
+            msg2.contains("empty bitstream refused") || msg2.contains("refusing done on empty"),
+            "{msg2}"
+        );
+        assert_eq!(t2.usb_open_count, 0, "header-only HBIT must not claim cable");
+        assert!(!t2.is_open());
+        assert!(!msg2.contains("done=1"), "{msg2}");
+    }
+
+    #[test]
     fn try_native_mpsse_program_stat_no_device_honesty() {
-        let err = try_native_mpsse_program_stat(Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty path so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-stat-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nonzero.bin");
+        std::fs::write(&path, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = try_native_mpsse_program_stat(&path, false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
         } else {
