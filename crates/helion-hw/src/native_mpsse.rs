@@ -18,6 +18,8 @@
 
 use std::path::Path;
 
+use helion_bits::Bitstream;
+
 use crate::native_usb::enumerate_ftdi;
 #[cfg(feature = "usb-native")]
 use crate::native_usb::{FTDI_PID_FT2232H, FTDI_VID};
@@ -199,7 +201,7 @@ impl MpsseOpcodeBuilder {
     pub fn jtag_enter_shift_ir(&mut self) -> &mut Self {
         // Select-DR, Select-IR, Capture-IR, Shift-IR
         self.tms_out(0x03, 4, false); // 1100 LSB-first = bits 0,1 =1,1 then 0,0 → wait
-        // LSB-first: bit0 first. Want TMS sequence 1,1,0,0 → bits = 0b0011
+                                      // LSB-first: bit0 first. Want TMS sequence 1,1,0,0 → bits = 0b0011
         self
     }
 
@@ -533,20 +535,31 @@ impl HadUsbTransport for NativeFtdiMpsse {
         }
     }
 
-    fn program_hbits(
-        &mut self,
-        path: &Path,
-        _flash: bool,
-    ) -> Result<(), NativeUsbError> {
+    fn program_hbits(&mut self, path: &Path, _flash: bool) -> Result<(), NativeUsbError> {
         // Open once (persistent session); CFG_W + STAT reuse the same handle.
         self.open_probe()?;
-        let bytes = std::fs::read(path).map_err(|e| {
-            NativeUsbError::Io(format!("read {}: {e}", path.display()))
-        })?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| NativeUsbError::Io(format!("read {}: {e}", path.display())))?;
         if bytes.is_empty() {
             return Err(NativeUsbError::Io(
                 "empty bitstream — refusing native MPSSE program".into(),
             ));
+        }
+        if bytes.starts_with(b"HBIT") {
+            match Bitstream::from_packets(&bytes) {
+                Ok(bits) if bits.frames.is_empty() => {
+                    return Err(NativeUsbError::Io(
+                        "empty bitstream (no configured frames) — refusing native MPSSE program"
+                            .into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(NativeUsbError::Io(format!(
+                        "native MPSSE: invalid .hbits: {e} — refusing invented STAT"
+                    )));
+                }
+                Ok(_) => {}
+            }
         }
         let opcodes = Self::encode_cfg_w_and_stat(&bytes);
         #[cfg(feature = "usb-native")]
@@ -889,18 +902,36 @@ mod tests {
         let stat_ops = b.into_bytes();
         assert!(stat_ops.contains(&MPSSE_SET_CLK_DIVISOR));
         assert!(stat_ops.contains(&MPSSE_CLK_TMS_OUT_NEG_LSB));
-        assert!(stat_ops.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB) || stat_ops.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB));
+        assert!(
+            stat_ops.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB)
+                || stat_ops.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB)
+        );
         // IR_STAT = 0b010010 — encoder must emit TMS/TDI activity (non-trivial length).
-        assert!(stat_ops.len() > 16, "stat opcode stream too short: {}", stat_ops.len());
+        assert!(
+            stat_ops.len() > 16,
+            "stat opcode stream too short: {}",
+            stat_ops.len()
+        );
 
         let packets = b"HBIT\x00\x01\x02\x03test-packets";
         let cfg = NativeFtdiMpsse::encode_cfg_w_and_stat(packets);
-        assert!(cfg.len() > stat_ops.len(), "CFG_W stream should dwarf STAT-only");
-        assert!(cfg.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB) || cfg.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB));
+        assert!(
+            cfg.len() > stat_ops.len(),
+            "CFG_W stream should dwarf STAT-only"
+        );
+        assert!(
+            cfg.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB) || cfg.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB)
+        );
         assert!(cfg.ends_with(&[MPSSE_SEND_IMMEDIATE]) || cfg.contains(&MPSSE_SEND_IMMEDIATE));
         // Must include IR_CFG_W path + IR_STAT path markers (TMS opcodes present twice+).
-        let tms_count = cfg.iter().filter(|&&x| x == MPSSE_CLK_TMS_OUT_NEG_LSB).count();
-        assert!(tms_count >= 4, "expected multiple TMS bursts, got {tms_count}");
+        let tms_count = cfg
+            .iter()
+            .filter(|&&x| x == MPSSE_CLK_TMS_OUT_NEG_LSB)
+            .count();
+        assert!(
+            tms_count >= 4,
+            "expected multiple TMS bursts, got {tms_count}"
+        );
     }
 
     #[test]
@@ -954,7 +985,10 @@ mod tests {
         let n = native_mpsse_status_note();
         assert!(n.contains("native_mpsse"));
         assert!(
-            n.contains("OFL") || n.contains("ofl") || n.contains("NotImplemented") || n.contains("FTDI"),
+            n.contains("OFL")
+                || n.contains("ofl")
+                || n.contains("NotImplemented")
+                || n.contains("FTDI"),
             "{n}"
         );
     }
@@ -977,7 +1011,10 @@ mod tests {
             ops.contains(&MPSSE_CLK_BYTES_INOUT_LSB) || ops.contains(&MPSSE_CLK_BITS_INOUT_LSB),
             "STAT capture must request TDO via INOUT"
         );
-        assert!(ops.contains(&MPSSE_CLK_TMS_INOUT_LSB), "last DR bit via TMS INOUT");
+        assert!(
+            ops.contains(&MPSSE_CLK_TMS_INOUT_LSB),
+            "last DR bit via TMS INOUT"
+        );
         assert_eq!(STAT_CAPTURE_TDO_LEN, 5);
     }
 
@@ -1009,7 +1046,10 @@ mod tests {
         let err = parse_stat_tdo_mpsse(&[0, 1, 2]).unwrap_err();
         assert!(err.contains("short") || err.contains("refusing"), "{err}");
         let err0 = parse_stat_tdo_mpsse(&[]).unwrap_err();
-        assert!(err0.contains("refusing") || err0.contains("short"), "{err0}");
+        assert!(
+            err0.contains("refusing") || err0.contains("short"),
+            "{err0}"
+        );
     }
 
     #[test]
@@ -1023,7 +1063,10 @@ mod tests {
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
             assert!(!t.is_open());
-            assert_eq!(t.usb_open_count, 0, "failed open must not count as session open");
+            assert_eq!(
+                t.usb_open_count, 0,
+                "failed open must not count as session open"
+            );
             assert_eq!(t.session_xfer_count(), 0);
         } else {
             assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");

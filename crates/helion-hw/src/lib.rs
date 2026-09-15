@@ -21,16 +21,18 @@ use helion_device::Device;
 use helion_fabric::{Fabric, Stat};
 use std::cell::Cell;
 
-pub mod native_usb;
-pub mod native_mpsse;
 pub mod mpsse_sim;
-pub use native_usb::{enumerate_ftdi, feature_enabled as usb_native_feature_enabled, FtdiDeviceInfo, NativeUsbScan, FTDI_VID};
+pub mod native_mpsse;
+pub mod native_usb;
+pub use mpsse_sim::{FtdiBitbangSim, MpsseSimError};
 pub use native_mpsse::{
     native_mpsse_status_note, try_native_mpsse_program, try_native_mpsse_program_stat,
     MpsseOpcodeBuilder, NativeFtdiMpsse, MPSSE_CLK_TMS_OUT_NEG_LSB, MPSSE_SET_CLK_DIVISOR,
 };
-pub use mpsse_sim::{FtdiBitbangSim, MpsseSimError};
-
+pub use native_usb::{
+    enumerate_ftdi, feature_enabled as usb_native_feature_enabled, FtdiDeviceInfo, NativeUsbScan,
+    FTDI_VID,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TapState {
@@ -588,6 +590,99 @@ pub fn hw_server_program(dev: &Device, bits: &Bitstream) -> Result<Stat, String>
     Ok(c.stat())
 }
 
+/// Header-only / 0-byte / no-frame bitstream — never a program success.
+pub fn bitstream_is_empty(bits: &Bitstream) -> bool {
+    bits.frames.is_empty() || bits.packets.is_empty()
+}
+
+/// Lab / overlay / native honesty gate: empty bitstream is Err, never DONE=1.
+pub fn refuse_empty_bitstream(bits: &Bitstream) -> Result<(), String> {
+    if bitstream_is_empty(bits) {
+        Err(
+            "program: empty bitstream refused (no configured frames) — refusing DONE on empty"
+                .into(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// Gold empty-XDC counter LED waveform (`cnt[3]` over 16 user clocks).
+pub const COUNTER_OVERLAY_LED: &str = "0000000111111110";
+
+/// LED waveform from sim fabric after programming a real bitstream.
+///
+/// Labeled **overlay** — `step_user` + IOB sample, not board DONE / live STAT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayReport {
+    pub led: String,
+    pub cycles: usize,
+    pub frames: usize,
+    pub bytes: usize,
+    pub stat: Stat,
+}
+
+impl OverlayReport {
+    pub fn summary_line(&self) -> String {
+        format!(
+            "overlay LED={} cycles={} frames={} bytes={} STAT INIT={} DONE={} GWE={} (overlay; not board DONE)",
+            self.led,
+            self.cycles,
+            self.frames,
+            self.bytes,
+            self.stat.init as u8,
+            self.stat.done as u8,
+            self.stat.gwe as u8
+        )
+    }
+}
+
+fn overlay_iob_pads(dev: &Device, bits: &Bitstream) -> Vec<(u32, u32)> {
+    let mut pads = Vec::new();
+    for ((block, major, minor), word) in &bits.frames {
+        if *block == helion_device::Far::IOB && *minor == 0 && (*word & 1) == 1 {
+            let ix = dev.clb_x0 + u32::from(*major);
+            let iy = dev.clb_y0.saturating_sub(1);
+            pads.push((ix, iy));
+        }
+    }
+    pads
+}
+
+/// Program `bits` on the sim TAP, `step_user` `cycles` times, sample the first
+/// configured IOB pad. Refuses empty. Result is overlay — not board DONE.
+pub fn overlay_program_led(
+    dev: &Device,
+    bits: &Bitstream,
+    cycles: usize,
+) -> Result<OverlayReport, String> {
+    refuse_empty_bitstream(bits)?;
+    let pads = overlay_iob_pads(dev, bits);
+    if pads.is_empty() {
+        return Err("overlay: bitstream has no configured IOB pad to sample".into());
+    }
+    let (ix, iy) = pads[0];
+    let mut tap = Tap::new(dev);
+    tap.program(bits)?;
+    let stat = tap.read_stat();
+    let mut led = String::with_capacity(cycles);
+    for _ in 0..cycles {
+        tap.fabric_mut().step_user();
+        led.push(if tap.fabric().led_at(ix, iy) {
+            '1'
+        } else {
+            '0'
+        });
+    }
+    Ok(OverlayReport {
+        led,
+        cycles,
+        frames: bits.frames.len(),
+        bytes: bits.packets.len(),
+        stat,
+    })
+}
+
 /// helion-prog API (sim cable).
 pub fn prog_sim(dev: &Device, bits: &Bitstream) -> Result<Stat, String> {
     hw_server_program(dev, bits)
@@ -657,11 +752,7 @@ impl std::fmt::Display for NativeUsbError {
 pub trait HadUsbTransport {
     fn name(&self) -> &'static str;
     fn open_probe(&mut self) -> Result<(), NativeUsbError>;
-    fn program_hbits(
-        &mut self,
-        path: &std::path::Path,
-        flash: bool,
-    ) -> Result<(), NativeUsbError>;
+    fn program_hbits(&mut self, path: &std::path::Path, flash: bool) -> Result<(), NativeUsbError>;
     /// Helion TAP STAT word readback over USB/JTAG, when implemented.
     fn read_stat(&mut self) -> Result<Option<u32>, NativeUsbError>;
 }
@@ -682,11 +773,7 @@ impl HadUsbTransport for NativeFtdiStub {
         NativeFtdiMpsse::new().open_probe()
     }
 
-    fn program_hbits(
-        &mut self,
-        path: &std::path::Path,
-        flash: bool,
-    ) -> Result<(), NativeUsbError> {
+    fn program_hbits(&mut self, path: &std::path::Path, flash: bool) -> Result<(), NativeUsbError> {
         let mut t = NativeFtdiMpsse::new();
         t.open_probe()?;
         t.program_hbits(path, flash)
@@ -702,10 +789,7 @@ impl HadUsbTransport for NativeFtdiStub {
 /// - `usb-native` **off**: `NotImplemented` (callers fall back to OFL).
 /// - `usb-native` **on**, no FTDI: `Io` (honest — never invents STAT).
 /// - device present: persistent MPSSE session; Ok only after live STAT TDO DONE=1.
-pub fn try_native_usb_program(
-    path: &std::path::Path,
-    flash: bool,
-) -> Result<(), NativeUsbError> {
+pub fn try_native_usb_program(path: &std::path::Path, flash: bool) -> Result<(), NativeUsbError> {
     try_native_mpsse_program(path, flash)
 }
 
@@ -894,14 +978,16 @@ impl DetectReport {
             Some(p) => out.push_str(&format!("ofl path {}\n", p.display())),
             None => out.push_str("ofl path (not on PATH)\n"),
         }
-                let ofl_n = self
+        let ofl_n = self
             .usb
             .probes
             .iter()
             .filter(|p| p.source == UsbProbeSource::OpenFpgaLoader)
             .count();
-        out.push_str(&format!("ofl probes {ofl_n}
-"));
+        out.push_str(&format!(
+            "ofl probes {ofl_n}
+"
+        ));
         out.push_str(&format!(
             "native_ftdi probes {} feature={}
 ",
@@ -912,8 +998,11 @@ impl DetectReport {
                 "off"
             }
         ));
-        out.push_str(&format!("native_note {}
-", self.usb.native_note));
+        out.push_str(&format!(
+            "native_note {}
+",
+            self.usb.native_note
+        ));
         for p in &self.usb.probes {
             out.push_str(&format!(
                 "probe {} source={} — {}
@@ -1023,11 +1112,7 @@ pub fn scan_usb_probes() -> UsbScan {
         );
     }
     if !scan.native_probes.is_empty() || native_usb::feature_enabled() {
-        scan.note = format!(
-            "{}; {}",
-            scan.note.trim_end_matches('.'),
-            scan.native_note
-        );
+        scan.note = format!("{}; {}", scan.note.trim_end_matches('.'), scan.native_note);
     }
     scan
 }
@@ -1039,8 +1124,9 @@ fn scan_ofl_only(native_probes: &[UsbProbe], native_note: &str) -> UsbScan {
             probes: Vec::new(),
             native_probes: native_probes.to_vec(),
             raw: String::new(),
-            note: "openFPGALoader not on PATH (set HELION_OPENFPGALOADER or install openFPGALoader)"
-                .into(),
+            note:
+                "openFPGALoader not on PATH (set HELION_OPENFPGALOADER or install openFPGALoader)"
+                    .into(),
             native_note: native_note.to_string(),
         };
     };
@@ -1050,10 +1136,7 @@ fn scan_ofl_only(native_probes: &[UsbProbe], native_note: &str) -> UsbScan {
             probes: Vec::new(),
             native_probes: native_probes.to_vec(),
             raw: String::new(),
-            note: format!(
-                "openFPGALoader path {} is not a file",
-                ofl.display()
-            ),
+            note: format!("openFPGALoader path {} is not a file", ofl.display()),
             native_note: native_note.to_string(),
         };
     }
@@ -1077,10 +1160,7 @@ fn scan_ofl_only(native_probes: &[UsbProbe], native_note: &str) -> UsbScan {
                     )
                 }
             } else {
-                format!(
-                    "openFPGALoader --scan-usb: {} probe(s)",
-                    probes.len()
-                )
+                format!("openFPGALoader --scan-usb: {} probe(s)", probes.len())
             };
             UsbScan {
                 ofl_path: Some(ofl),
@@ -1174,18 +1254,12 @@ fn ofl_cable_info(scan: &UsbScan) -> CableInfo {
     let detail = if scan.ofl_path.is_none() {
         "openFPGALoader backend (binary not on PATH)".into()
     } else if ofl_probes.is_empty() {
-        format!(
-            "openFPGALoader backend — no USB probe ({})",
-            scan.note
-        )
+        format!("openFPGALoader backend — no USB probe ({})", scan.note)
     } else {
         format!(
             "openFPGALoader backend — {} USB probe(s); {}",
             ofl_probes.len(),
-            ofl_probes
-                .first()
-                .map(|p| p.detail.as_str())
-                .unwrap_or("")
+            ofl_probes.first().map(|p| p.detail.as_str()).unwrap_or("")
         )
     };
     CableInfo {
@@ -1389,14 +1463,18 @@ pub fn parse_ofl_verify_output(
                         .into(),
                 )
             } else {
-                (Some(false), "HELION_OFL_VERIFY set but ofl exit non-zero".into())
+                (
+                    Some(false),
+                    "HELION_OFL_VERIFY set but ofl exit non-zero".into(),
+                )
             }
         }
         OflReadbackKind::None => {
             if has_doneish && exit_ok {
                 (
                     None,
-                    "ofl programmer success phrase seen; TAP_readback=none STAT=(no readback)".into(),
+                    "ofl programmer success phrase seen; TAP_readback=none STAT=(no readback)"
+                        .into(),
                 )
             } else if exit_ok {
                 (
@@ -1536,9 +1614,7 @@ pub fn program_via_openfpgaloader_for_part(
              (set HELION_OFL_VERIFY=1 to request flash verify)"
         );
     } else if !flash {
-        eprintln!(
-            "program: no TAP STAT readback over USB (OFL SRAM path has no Helion IR_STAT)"
-        );
+        eprintln!("program: no TAP STAT readback over USB (OFL SRAM path has no Helion IR_STAT)");
     }
     let command = format_command(&ofl, &args);
     eprintln!("program: invoking {command}");
@@ -1574,8 +1650,7 @@ pub fn program_via_openfpgaloader_for_part(
                 .trim()
         ));
     }
-    let (verify_ok, verify_detail) =
-        parse_ofl_verify_output(&stdout, &stderr, readback, true);
+    let (verify_ok, verify_detail) = parse_ofl_verify_output(&stdout, &stderr, readback, true);
     if verify_ok == Some(false) {
         return Err(format!(
             "program: openFPGALoader exit 0 but verify parse failed ({verify_detail});              refusing DONE (no TAP STAT). cmd: {command}"
@@ -1674,14 +1749,13 @@ pub fn program_hbits_with_cable(
             // Ok(stat_word) only after persistent-session live TDO parse with DONE=1.
             match try_native_mpsse_program_stat(path, flash) {
                 Ok(stat_word) => {
-                    let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+                    let bytes = std::fs::metadata(path)
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0);
                     eprintln!(
                         "program: native MPSSE persistent session STAT={stat_word:#010x} DONE=1 (live TDO)"
                     );
-                    Ok(ProgramOutcome::NativeMpsse {
-                        bytes,
-                        stat_word,
-                    })
+                    Ok(ProgramOutcome::NativeMpsse { bytes, stat_word })
                 }
                 Err(NativeUsbError::NotImplemented(msg)) => {
                     eprintln!(
@@ -1779,9 +1853,10 @@ impl ProgramOutcome {
         }
     }
 
-    /// Human summary line for CLI / GUI. Claims DONE only for sim TAP or OFL exit 0.
-    /// OFL path never invents Helion TAP STAT bits — reports `TAP_readback=none`.
-    /// `mpsse-sim` reports real sim-fabric STAT from bitbang readback (still not board DONE).
+    /// Human summary line for CLI / GUI.
+    /// Sim / mpsse-sim report sim-fabric STAT (not board DONE).
+    /// Native reports DONE only from live STAT TDO. OFL never invents TAP STAT
+    /// (`TAP_readback=none`, `DONE=(no TAP STAT)` — programmer-ok is not Helion DONE).
     pub fn summary_line(&self, sub: &str, part: &str) -> String {
         match self {
             ProgramOutcome::Sim { bits, stat } => format!(
@@ -1826,7 +1901,7 @@ impl ProgramOutcome {
                     None => "unknown",
                 };
                 format!(
-                    "hw {sub} backend=ofl part={part} frames={frames} bytes={bytes} ofl_board={board} ofl_exit={} DONE=1 (programmer ok; no TAP readback) TAP_readback=none ofl_verify={} verify_ok={vok} verify_detail={} STAT=(no readback) cmd={}",
+                    "hw {sub} backend=ofl part={part} frames={frames} bytes={bytes} ofl_board={board} ofl_exit={} programmer_ok=1 DONE=(no TAP STAT) (no TAP readback) TAP_readback=none ofl_verify={} verify_ok={vok} verify_detail={} STAT=(no readback) cmd={}",
                     ofl.exit_code.unwrap_or(0),
                     ofl.readback.as_str(),
                     ofl.verify_detail.replace(' ', "_"),
@@ -1836,7 +1911,6 @@ impl ProgramOutcome {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1867,21 +1941,23 @@ mod tests {
 
     #[test]
     fn helion_prog_mpsse_sim_counter_cfg_w() {
-        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let (dev, bits) = bitgen_structural_counter();
         let cable = resolve_cable("mpsse-sim").unwrap();
         assert_eq!(cable.backend, CableBackend::MpsseSim);
-        let path = std::path::Path::new("/tmp/counter.hbits");
-        if !path.is_file() {
-            let bits = Bitstream::empty(&dev);
-            let st = prog_mpsse_sim(&dev, &bits).unwrap();
-            assert!(st.done);
-            return;
-        }
-        let ok = program_hbits_with_cable(&dev, path, &cable, false).unwrap();
+        let dir = std::env::temp_dir().join("helion-mpsse-sim-counter");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("counter.hbits");
+        std::fs::write(&path, &bits.packets).unwrap();
+        let ok = program_hbits_with_cable(&dev, &path, &cable, false).unwrap();
         match ok {
-            ProgramOutcome::MpsseSim { stat, .. } => {
+            ProgramOutcome::MpsseSim {
+                stat,
+                bits: programmed,
+                ..
+            } => {
                 assert!(stat.done);
                 assert_eq!(stat.word(), helion_fabric::Stat::STARTUP_WORD);
+                assert!(!programmed.frames.is_empty());
             }
             other => panic!("expected MpsseSim outcome, got {:?}", other.backend()),
         }
@@ -1923,8 +1999,22 @@ mod tests {
         }
         let pa = pack(&nine(0x5555_5555_5555_5555), &dev).unwrap();
         let pb = pack(&nine(0xAAAA_AAAA_AAAA_AAAA), &dev).unwrap();
-        let pla = place_with(&pa, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
-        let plb = place_with(&pb, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pla = place_with(
+            &pa,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
+        let plb = place_with(
+            &pb,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let ra = route(&pla, &dev).unwrap();
         let rb = route(&plb, &dev).unwrap();
         let full_a = bitgen(&dev, &ra).unwrap();
@@ -1934,14 +2024,18 @@ mod tests {
         let mut cable = SimCable::open(&dev);
         cable.program(&full_a).unwrap();
         let st_maj = dev.clb_major(sx, sy).unwrap();
-        let before = cable.fabric().frame_word(helion_device::Far::CLB_IO_CLK, st_maj, 0);
+        let before = cable
+            .fabric()
+            .frame_word(helion_device::Far::CLB_IO_CLK, st_maj, 0);
         cable.program_partial(&partial).unwrap();
-        let after = cable.fabric().frame_word(helion_device::Far::CLB_IO_CLK, st_maj, 0);
-        assert_eq!(before, after, "sim cable partial must not touch static frames");
+        let after = cable
+            .fabric()
+            .frame_word(helion_device::Far::CLB_IO_CLK, st_maj, 0);
         assert_eq!(
-            cable.fabric().lut_init(rx, ry, 0),
-            0xAAAA_AAAA_AAAA_AAAA
+            before, after,
+            "sim cable partial must not touch static frames"
         );
+        assert_eq!(cable.fabric().lut_init(rx, ry, 0), 0xAAAA_AAAA_AAAA_AAAA);
         assert!(cable.stat().done);
     }
 
@@ -1966,7 +2060,9 @@ mod tests {
             "ofl/usb backend must be advertised"
         );
         assert!(
-            d.cables.iter().any(|c| c.backend == CableBackend::NativeUsb),
+            d.cables
+                .iter()
+                .any(|c| c.backend == CableBackend::NativeUsb),
             "native USB stub must be advertised"
         );
         assert!(
@@ -2029,8 +2125,12 @@ mod tests {
         let bits_path = dir.join("counter.hbits");
         std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
         // Ensure real OFL on PATH is used (or missing → still honest refuse).
-        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
-        unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
         let cable = resolve_cable("auto").unwrap();
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
@@ -2039,7 +2139,10 @@ mod tests {
             "USB=0 must honest-fail, got: {err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
-        assert!(!err.to_ascii_lowercase().contains("soft-hold"), "must not soft-hold: {err}");
+        assert!(
+            !err.to_ascii_lowercase().contains("soft-hold"),
+            "must not soft-hold: {err}"
+        );
     }
 
     #[test]
@@ -2054,14 +2157,18 @@ mod tests {
         std::fs::write(&bits_path, &empty.packets).unwrap();
 
         // Point at a missing binary → PATH-style error (no DONE).
-        unsafe { std::env::set_var("HELION_OPENFPGALOADER", dir.join("missing-openFPGALoader")); }
+        unsafe {
+            std::env::set_var("HELION_OPENFPGALOADER", dir.join("missing-openFPGALoader"));
+        }
         let cable = resolve_cable("ofl").unwrap();
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
         assert!(
             err.contains("openFPGALoader") || err.contains("not a file") || err.contains("no USB"),
             "honest error, got: {err}"
         );
-        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
     }
 
     #[test]
@@ -2089,15 +2196,24 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let bits_path = dir.join("t.hbits");
         std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
-        unsafe { std::env::set_var("HELION_OPENFPGALOADER", &fake); }
-        unsafe { std::env::set_var("HELION_OFL_DRY_RUN", "1"); }
+        unsafe {
+            std::env::set_var("HELION_OPENFPGALOADER", &fake);
+        }
+        unsafe {
+            std::env::set_var("HELION_OFL_DRY_RUN", "1");
+        }
         let cable = resolve_cable("usb").unwrap();
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let det = detect_boards();
         assert!(det.physical_had, "fake --scan-usb must enumerate a probe");
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
-        assert!(err.contains("dry-run") || err.contains("HELION_OFL_DRY_RUN"), "{err}");
-        unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
+        assert!(
+            err.contains("dry-run") || err.contains("HELION_OFL_DRY_RUN"),
+            "{err}"
+        );
+        unsafe {
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
         // Real invoke with fake OFL that succeeds.
         let ok = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap();
         match ok {
@@ -2105,9 +2221,13 @@ mod tests {
                 assert_eq!(ofl.exit_code, Some(0));
                 assert!(ofl.command.contains("fake-ofl") || ofl.command.contains("-m"));
             }
-            ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } | ProgramOutcome::NativeMpsse { .. } => panic!("expected ofl backend"),
+            ProgramOutcome::Sim { .. }
+            | ProgramOutcome::MpsseSim { .. }
+            | ProgramOutcome::NativeMpsse { .. } => panic!("expected ofl backend"),
         }
-        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
     }
 
     #[test]
@@ -2127,19 +2247,27 @@ mod tests {
         assert_eq!(t.ofl_board, "helion_hl10t");
         let dsp = lookup_had_board("HL10T-DSP1").expect("DSP part");
         assert_eq!(dsp.idcode, t.idcode);
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
         assert_eq!(
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
             Some("helion_hl10t")
         );
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "none");
+        }
         assert_eq!(resolve_ofl_board(Some("HL10T-C32-1")), None);
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "custom_had"); }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "custom_had");
+        }
         assert_eq!(
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
             Some("custom_had")
         );
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
         let table = had_board_id_table_text();
         assert!(table.contains("HELION_OFL_BOARD"));
         assert!(table.contains("0x00011a1f") || table.contains("0x00011A1F"));
@@ -2169,8 +2297,12 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let bits_path = dir.join("t.hbits");
         std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
-        unsafe { std::env::set_var("HELION_OPENFPGALOADER", &fake); }
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); } // keep cmd simple for assert
+        unsafe {
+            std::env::set_var("HELION_OPENFPGALOADER", &fake);
+        }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "none");
+        } // keep cmd simple for assert
         let cable = resolve_cable("native").unwrap();
         assert_eq!(cable.backend, CableBackend::NativeUsb);
         if usb_native_feature_enabled() {
@@ -2198,14 +2330,26 @@ mod tests {
                     assert!(line.contains("no TAP readback"), "{line}");
                     assert!(line.contains("TAP_readback=none"), "{line}");
                     assert!(line.contains("STAT=(no readback)"), "{line}");
+                    assert!(
+                        line.contains("DONE=(no TAP STAT)"),
+                        "OFL must not invent TAP DONE: {line}"
+                    );
+                    assert!(
+                        !line.contains("DONE=1"),
+                        "OFL programmer-ok is not live STAT DONE: {line}"
+                    );
                 }
-                ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } | ProgramOutcome::NativeMpsse { .. } => {
+                ProgramOutcome::Sim { .. }
+                | ProgramOutcome::MpsseSim { .. }
+                | ProgramOutcome::NativeMpsse { .. } => {
                     panic!("expected OFL fallback from native NotImplemented")
                 }
             }
         }
         // Flash + HELION_OFL_VERIFY should request --verify (still not TAP readback).
-        unsafe { std::env::set_var("HELION_OFL_VERIFY", "1"); }
+        unsafe {
+            std::env::set_var("HELION_OFL_VERIFY", "1");
+        }
         let ofl_cable = resolve_cable("ofl").unwrap();
         let flash_ok = program_hbits_with_cable(&dev, &bits_path, &ofl_cable, true).unwrap();
         match flash_ok {
@@ -2214,11 +2358,19 @@ mod tests {
                 assert_eq!(ofl.readback, OflReadbackKind::FlashSpiVerify);
                 assert!(!ofl.tap_readback);
             }
-            ProgramOutcome::Sim { .. } | ProgramOutcome::MpsseSim { .. } | ProgramOutcome::NativeMpsse { .. } => panic!("expected ofl"),
+            ProgramOutcome::Sim { .. }
+            | ProgramOutcome::MpsseSim { .. }
+            | ProgramOutcome::NativeMpsse { .. } => panic!("expected ofl"),
         }
-        unsafe { std::env::remove_var("HELION_OFL_VERIFY"); }
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
-        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_VERIFY");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
     }
 
     #[test]
@@ -2240,12 +2392,7 @@ mod tests {
         );
         assert_eq!(bad, Some(false), "{detail}");
 
-        let (none_v, detail) = parse_ofl_verify_output(
-            "Done\n",
-            "",
-            OflReadbackKind::None,
-            true,
-        );
+        let (none_v, detail) = parse_ofl_verify_output("Done\n", "", OflReadbackKind::None, true);
         assert_eq!(none_v, None, "{detail}");
         assert!(detail.contains("TAP_readback=none"), "{detail}");
     }
@@ -2333,7 +2480,11 @@ mod tests {
         assert!(table.contains("HELION_OFL_VERIFY") || table.contains("TAP_readback=none"));
         let det = detect_boards();
         assert!(det.text().contains("helion_hl10t"));
-        assert!(det.text().contains("native_mpsse") || det.text().contains("NativeFtdiMpsse") || det.text().contains("native_usb"));
+        assert!(
+            det.text().contains("native_mpsse")
+                || det.text().contains("NativeFtdiMpsse")
+                || det.text().contains("native_usb")
+        );
     }
 
     #[test]
@@ -2359,16 +2510,24 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let bits_path = dir.join("t.hbits");
         std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
-        unsafe { std::env::set_var("HELION_OPENFPGALOADER", &fake); }
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); }
+        unsafe {
+            std::env::set_var("HELION_OPENFPGALOADER", &fake);
+        }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "none");
+        }
         let cable = resolve_cable("ofl").unwrap();
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
         assert!(
             err.contains("verify") || err.contains("refusing DONE"),
             "{err}"
         );
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
-        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
     }
 
     /// Load fixture OFL logs from `fixtures/ofl/` — honest TAP_readback=none; never invent Helion STAT.
@@ -2394,12 +2553,16 @@ mod tests {
         assert!(detail.to_ascii_lowercase().contains("verify"), "{detail}");
 
         let vfail = load_ofl_fixture("flash_verify_fail.txt");
-        let (v, detail) = parse_ofl_verify_output(&vfail, "", OflReadbackKind::FlashSpiVerify, true);
+        let (v, detail) =
+            parse_ofl_verify_output(&vfail, "", OflReadbackKind::FlashSpiVerify, true);
         assert_eq!(v, Some(false), "{detail}");
 
         let generic = load_ofl_fixture("programmer_ok_generic.txt");
         let (v, detail) = parse_ofl_verify_output(&generic, "", OflReadbackKind::None, true);
-        assert_eq!(v, None, "generic Done must not invent SPI verify or Helion STAT: {detail}");
+        assert_eq!(
+            v, None,
+            "generic Done must not invent SPI verify or Helion STAT: {detail}"
+        );
         assert!(detail.contains("TAP_readback=none"), "{detail}");
 
         let crc = load_ofl_fixture("crc_error.txt");
@@ -2440,16 +2603,31 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let bits_path = dir.join("t.hbits");
         std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
-        unsafe { std::env::set_var("HELION_OPENFPGALOADER", &fake); }
-        unsafe { std::env::set_var("HELION_OFL_DRY_RUN", "1"); }
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); }
+        unsafe {
+            std::env::set_var("HELION_OPENFPGALOADER", &fake);
+        }
+        unsafe {
+            std::env::set_var("HELION_OFL_DRY_RUN", "1");
+        }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "none");
+        }
         let cable = resolve_cable("ofl").unwrap();
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
-        assert!(err.contains("dry-run") || err.contains("HELION_OFL_DRY_RUN"), "{err}");
+        assert!(
+            err.contains("dry-run") || err.contains("HELION_OFL_DRY_RUN"),
+            "{err}"
+        );
         assert!(!err.to_ascii_lowercase().contains("done=1"));
-        unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
-        unsafe { std::env::remove_var("HELION_OPENFPGALOADER"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
     }
 
     #[test]
@@ -2467,7 +2645,8 @@ mod tests {
         assert!(probes[0].detail.contains("0x0403"), "{probes:?}");
         assert_eq!(probes[0].source, UsbProbeSource::OpenFpgaLoader);
         // Fake line without 0x must still be ignored
-        let junk = "Bus device vid:pid       probe type      manufacturer serial               product\n";
+        let junk =
+            "Bus device vid:pid       probe type      manufacturer serial               product\n";
         assert!(parse_scan_usb_output(junk).is_empty());
     }
 
@@ -2524,7 +2703,9 @@ mod tests {
             );
             assert!(!err.to_ascii_lowercase().contains("done=1"));
             // Dry-run with no probe still refuses before spawn (no DONE).
-            unsafe { std::env::set_var("HELION_OFL_DRY_RUN", "1"); }
+            unsafe {
+                std::env::set_var("HELION_OFL_DRY_RUN", "1");
+            }
             let err2 = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
             assert!(
                 err2.contains("no USB")
@@ -2532,7 +2713,9 @@ mod tests {
                     || err2.contains("HELION_OFL_DRY_RUN"),
                 "{err2}"
             );
-            unsafe { std::env::remove_var("HELION_OFL_DRY_RUN"); }
+            unsafe {
+                std::env::remove_var("HELION_OFL_DRY_RUN");
+            }
         }
     }
 
@@ -2562,20 +2745,31 @@ mod tests {
         // usb-native on + 0 FTDI → Io; OFL on PATH + 0 probes → no USB; neither invents STAT.
         let native_err = try_native_usb_program(std::path::Path::new("/dev/null"), false);
         if usb_native_feature_enabled() {
-            assert!(matches!(native_err, Err(NativeUsbError::Io(_))), "{native_err:?}");
+            assert!(
+                matches!(native_err, Err(NativeUsbError::Io(_))),
+                "{native_err:?}"
+            );
         } else {
-            assert!(matches!(native_err, Err(NativeUsbError::NotImplemented(_))), "{native_err:?}");
+            assert!(
+                matches!(native_err, Err(NativeUsbError::NotImplemented(_))),
+                "{native_err:?}"
+            );
         }
         let det = detect_boards();
         assert!(det.text().contains("TAP_readback=none") || det.text().contains("never invent"));
-        assert!(!det.text().to_ascii_lowercase().contains("done=1 from enumerate"));
+        assert!(!det
+            .text()
+            .to_ascii_lowercase()
+            .contains("done=1 from enumerate"));
         let _ = native_err;
     }
 
     #[test]
     fn had_board_lookup_and_ofl_board_resolve() {
         let _guard = OFL_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
         let row = lookup_had_board("hl10t-c32-1").expect("case-insensitive HAD lookup");
         assert_eq!(row.part, "HL10T-C32-1");
         assert_eq!(row.idcode, 0x0001_1A1F);
@@ -2587,14 +2781,20 @@ mod tests {
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
             Some("helion_hl10t")
         );
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "none"); }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "none");
+        }
         assert_eq!(resolve_ofl_board(Some("HL10T-C32-1")), None);
-        unsafe { std::env::set_var("HELION_OFL_BOARD", "custom_board"); }
+        unsafe {
+            std::env::set_var("HELION_OFL_BOARD", "custom_board");
+        }
         assert_eq!(
             resolve_ofl_board(Some("HL10T-C32-1")).as_deref(),
             Some("custom_board")
         );
-        unsafe { std::env::remove_var("HELION_OFL_BOARD"); }
+        unsafe {
+            std::env::remove_var("HELION_OFL_BOARD");
+        }
         let table = had_board_id_table_text();
         assert!(table.contains("helion_hl10t"));
         assert!(table.contains("TAP_readback=none"));
@@ -2624,10 +2824,14 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut tap = Tap::new(&dev);
         // Plant known words in fabric BRAM major 0 (capture RAM stand-in).
-        tap.fabric_mut().bram_write_word(0, 0, 0x0000_0000_0000_0001);
-        tap.fabric_mut().bram_write_word(0, 1, 0x0000_0000_0000_0002);
-        tap.fabric_mut().bram_write_word(0, 2, 0xABCD_EF01_2345_6789);
-        tap.fabric_mut().bram_write_word(0, 3, 0x1111_2222_3333_4444);
+        tap.fabric_mut()
+            .bram_write_word(0, 0, 0x0000_0000_0000_0001);
+        tap.fabric_mut()
+            .bram_write_word(0, 1, 0x0000_0000_0000_0002);
+        tap.fabric_mut()
+            .bram_write_word(0, 2, 0xABCD_EF01_2345_6789);
+        tap.fabric_mut()
+            .bram_write_word(0, 3, 0x1111_2222_3333_4444);
 
         let words = tap.usr1_upload_bram(0, 0, 4, 4);
         assert_eq!(words[0], 0x0000_0000_0000_0001);
@@ -2679,8 +2883,10 @@ mod tests {
     fn usr1_tick_bitbang_matches_high_level_upload() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut tap = Tap::new(&dev);
-        tap.fabric_mut().bram_write_word(1, 0, 0x55AA_55AA_55AA_55AA);
-        tap.fabric_mut().bram_write_word(1, 1, 0xF00D_F00D_F00D_F00D);
+        tap.fabric_mut()
+            .bram_write_word(1, 0, 0x55AA_55AA_55AA_55AA);
+        tap.fabric_mut()
+            .bram_write_word(1, 1, 0xF00D_F00D_F00D_F00D);
 
         // High-level set ptr
         tap.usr1_set_ptr(1, 0, 2);
@@ -2711,7 +2917,10 @@ mod tests {
         }
 
         let w0 = shift_dr_u64_tick(&mut tap, 0);
-        assert_eq!(w0, 0x55AA_55AA_55AA_55AA, "Capture-DR must load BRAM via IR_USR1");
+        assert_eq!(
+            w0, 0x55AA_55AA_55AA_55AA,
+            "Capture-DR must load BRAM via IR_USR1"
+        );
         assert_eq!(tap.usr1_addr, 1, "Update-DR auto-inc");
         let w1 = shift_dr_u64_tick(&mut tap, 0);
         assert_eq!(w1, 0xF00D_F00D_F00D_F00D);
@@ -2735,5 +2944,106 @@ mod tests {
         assert!(parse_scan_usb_output("Usage: openFPGALoader [options]\n").is_empty());
     }
 
+    fn bitgen_structural_counter() -> (Device, Bitstream) {
+        use helion_bits::bitgen;
+        use helion_ir::Design;
+        use helion_pack::pack;
+        use helion_place::place;
+        use helion_route::route;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let packed = pack(&Design::structural_counter(), &dev).unwrap();
+        let placed = place(&packed, &dev).unwrap();
+        let routed = route(&placed, &dev).unwrap();
+        let bits = bitgen(&dev, &routed).unwrap();
+        (dev, bits)
+    }
 
+    #[test]
+    fn overlay_counter_blink_led_gold_not_board_done() {
+        let (dev, bits) = bitgen_structural_counter();
+        refuse_empty_bitstream(&bits).expect("counter bitstream must have frames");
+        assert!(!bitstream_is_empty(&bits));
+        let r = overlay_program_led(&dev, &bits, 16).expect("overlay");
+        assert_eq!(r.led, COUNTER_OVERLAY_LED, "gold counter LED overlay {r:?}");
+        let line = r.summary_line();
+        assert!(line.contains("overlay"), "{line}");
+        assert!(
+            line.contains(&format!("LED={COUNTER_OVERLAY_LED}")),
+            "{line}"
+        );
+        assert!(line.contains("not board DONE"), "{line}");
+        assert!(
+            !line.to_ascii_lowercase().contains("board done=1"),
+            "{line}"
+        );
+        // Sim fabric STAT after a real bitstream is not a board/native TDO claim.
+        assert!(r.stat.done && r.stat.gwe);
+    }
+
+    #[test]
+    fn overlay_and_lab_gate_refuse_empty_bitstream_never_done() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let empty = Bitstream::empty(&dev);
+        let err = refuse_empty_bitstream(&empty).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("empty")
+                || err.to_ascii_lowercase().contains("refus"),
+            "{err}"
+        );
+        assert!(!err.contains("DONE=1"), "{err}");
+        let ov = overlay_program_led(&dev, &empty, 16).unwrap_err();
+        assert!(
+            ov.to_ascii_lowercase().contains("empty") || ov.to_ascii_lowercase().contains("refus"),
+            "{ov}"
+        );
+        assert!(!ov.contains("DONE=1"), "{ov}");
+        assert!(!ov.to_ascii_lowercase().contains("board done"), "{ov}");
+    }
+
+    #[test]
+    fn native_and_ofl_done_only_from_live_stat_never_invent_tdo() {
+        // Native: no device / feature-off → Err, never Ok(STAT) / invented TDO.
+        let native_err =
+            try_native_mpsse_program_stat(std::path::Path::new("/dev/null"), false).unwrap_err();
+        assert!(
+            matches!(
+                native_err,
+                NativeUsbError::NotImplemented(_) | NativeUsbError::Io(_)
+            ),
+            "{native_err:?}"
+        );
+        let msg = native_err.to_string().to_ascii_lowercase();
+        assert!(!msg.contains("done=1"), "{msg}");
+        assert!(!msg.contains("tdo=0x"), "{msg}");
+
+        // OFL parser never returns a Helion STAT word; SRAM Done ≠ TAP DONE.
+        let (v, detail) = parse_ofl_verify_output("Done\n", "", OflReadbackKind::None, true);
+        assert_eq!(v, None, "{detail}");
+        assert!(detail.contains("TAP_readback=none"), "{detail}");
+        assert!(!detail.to_ascii_lowercase().contains("stat=0x"), "{detail}");
+        assert!(!detail.contains("DONE=1"), "{detail}");
+
+        let ofl = OflProgramReport {
+            command: "openFPGALoader -m t.hbits".into(),
+            dry_run: false,
+            exit_code: Some(0),
+            stdout: "Done\n".into(),
+            stderr: String::new(),
+            board: Some("helion_hl10t".into()),
+            tap_readback: false,
+            readback: OflReadbackKind::None,
+            verify_ok: None,
+            verify_detail: "TAP_readback=none STAT=(no readback)".into(),
+        };
+        let line = ProgramOutcome::OpenFpgaLoader {
+            bits: None,
+            ofl,
+            bytes: 0,
+        }
+        .summary_line("program", "HL10T-C32-1");
+        assert!(line.contains("TAP_readback=none"), "{line}");
+        assert!(line.contains("DONE=(no TAP STAT)"), "{line}");
+        assert!(!line.contains("DONE=1"), "{line}");
+        assert!(!line.to_ascii_lowercase().contains("stat=0x"), "{line}");
+    }
 }
