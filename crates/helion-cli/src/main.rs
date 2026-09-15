@@ -824,10 +824,8 @@ fn cmd_project_checkpoint_write(args: &[String]) {
     let dest_path = Path::new(&dest);
     let dest_buf = if dest_path.is_absolute() {
         dest_path.to_path_buf()
-    } else if prj.checkpoint_path.as_deref() == Some(dest.as_str()) {
-        prj_path.parent().unwrap_or_else(|| Path::new(".")).join(dest_path)
     } else {
-        dest_path.to_path_buf()
+        resolve_prj_path(prj_path, &dest)
     };
     let wr = session.write_checkpoint_to(&dest_buf).unwrap_or_else(|e| {
         eprintln!("write_checkpoint: {e}");
