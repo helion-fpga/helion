@@ -2,9 +2,9 @@
   <img src="docs/brand/die-flow.gif" width="920" alt="HL10T die: current enters the pads, runs the fabric, and leaves">
 </p>
 
-# Helion Design Suite (1.3)
+# Helion Design Suite
 
-Original FPGA family + CAD. Native `aarch64-apple-darwin`. No vendor bitstream.
+Original FPGA family + CAD (current release **1.3**; **1.4 → 2.0** on the [roadmap](ROADMAP.md)). Native `aarch64-apple-darwin`. No vendor bitstream.
 
 [![Release](https://img.shields.io/github/v/release/helion-fpga/helion)](https://github.com/helion-fpga/helion/releases/latest)
 
@@ -32,6 +32,8 @@ cargo run -p helion-cli -- run examples/counter.sv --cycles 16
 cargo run -p helion-cli -- report_timing examples/blinky.sv
 cargo run -p helion-cli -- reports examples/counter.sv
 ```
+
+Headless gold (IDE): `helion-ide --headless examples/counter.sv` must print **WNS_PS=9640**.
 
 Legal fence: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD/Intel/Lattice backends.
 Device facts come from the Helion Architecture Database (HAD), never hardcoded in the CAD.
