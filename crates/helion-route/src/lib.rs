@@ -3,6 +3,8 @@
 
 use helion_device::{Device, Site};
 use helion_place::Placed;
+
+pub use helion_place::TimingGuide;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -295,6 +297,17 @@ pub fn route(placed: &Placed, dev: &Device) -> Result<Routed, String> {
 }
 
 pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Routed, String> {
+    route_with_guide(placed, dev, opts, &TimingGuide::default())
+}
+
+/// Route with XDC IOB-arc exceptions. Empty `guide` matches `route_with`.
+/// False-path / multicycle IOB nets are not delay-optimized (extra hops).
+pub fn route_with_guide(
+    placed: &Placed,
+    dev: &Device,
+    opts: RouteOpts,
+    guide: &TimingGuide,
+) -> Result<Routed, String> {
     // Ibex-scale: lutff_of linear scan per pin is O(n^2). Index FF → site once.
     let mut ff_site: HashMap<&str, (Site, u8)> = HashMap::with_capacity(placed.lutff_sites.len());
     for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
@@ -407,7 +420,9 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
         }
     }
     for (i, (src, dst, ble)) in nets.iter().enumerate() {
-        let hops = last_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
+        let hops = last_paths[i].len().saturating_sub(1) as u32
+            + opts.extra_hops
+            + guide.iob_relax_hops();
         let net = placed
             .packed
             .iobs
@@ -447,7 +462,7 @@ mod tests {
     use helion_device::Device;
     use helion_ir::Design;
     use helion_pack::pack;
-    use helion_place::{place, place_with, PlaceOpts};
+    use helion_place::{place, place_with, place_with_guide, PlaceOpts};
 
     #[test]
     fn routes_south_to_iob() {
@@ -539,5 +554,123 @@ mod tests {
         assert!(r.imux.len() >= 1 + 2 + 3 + 4);
         let msb = r.imux.iter().find(|m| m.mux == 3 * 8 + 3).unwrap();
         assert_eq!(msb.sel, 16 + 3);
+    }
+
+    /// ≥8 LUT+FF heartbeat (Ibex pin-wrap class, not 108k P&R).
+    fn hard_heartbeat() -> Design {
+        let mut d = Design::new("hb8");
+        d.add_port("clk", helion_ir::PortDir::In);
+        d.add_port("led", helion_ir::PortDir::Out);
+        for i in 0..8u32 {
+            d.add_cell(
+                format!("u_lut{i}"),
+                helion_ir::CellKind::Lut6 {
+                    init: 0x5555_5555_5555_5555,
+                },
+            );
+            d.add_cell(format!("u_ff{i}"), helion_ir::CellKind::Hff);
+            d.connect("clk", format!("u_ff{i}"), "CLK");
+            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+            if i > 0 {
+                d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
+            }
+        }
+        d.add_cell("u_iob", helion_ir::CellKind::IobOut);
+        d.connect("q7", "u_iob", "I");
+        d.connect("led", "u_iob", "PAD");
+        d
+    }
+
+    fn hops_of(r: &Routed) -> Vec<u32> {
+        r.iob_src.iter().map(|io| io.hops).collect()
+    }
+
+    fn sites_of(r: &Routed) -> Vec<(u32, u32, u8)> {
+        r.placed
+            .lutff_sites
+            .iter()
+            .map(|(s, ble)| (s.x, s.y, *ble))
+            .collect()
+    }
+
+    #[test]
+    fn empty_guide_matches_route_with() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let a = route(&pl, &dev).unwrap();
+        let b = route_with_guide(&pl, &dev, RouteOpts::default(), &TimingGuide::default()).unwrap();
+        assert_eq!(hops_of(&a), hops_of(&b), "empty guide must keep gold hops");
+        assert_eq!(a.iob_src[0].path, b.iob_src[0].path);
+    }
+
+    #[test]
+    fn false_path_guide_changes_hops_or_sites_on_hard_fixture() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        assert!(p.lutffs.len() >= 8);
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let g0 = TimingGuide::default();
+        let gfp = TimingGuide {
+            false_path_iob: true,
+            iob_setup_mult: 1,
+        };
+        let pl0 = place_with_guide(&p, &dev, opts, &g0).unwrap();
+        let plfp = place_with_guide(&p, &dev, opts, &gfp).unwrap();
+        let r0 = route_with_guide(&pl0, &dev, RouteOpts::default(), &g0).unwrap();
+        let rfp = route_with_guide(&plfp, &dev, RouteOpts::default(), &gfp).unwrap();
+        assert!(
+            sites_of(&r0) != sites_of(&rfp) || hops_of(&r0) != hops_of(&rfp),
+            "false_path must change placed sites or routed hops (sites {:?} vs {:?} hops {:?} vs {:?})",
+            sites_of(&r0),
+            sites_of(&rfp),
+            hops_of(&r0),
+            hops_of(&rfp)
+        );
+        assert_ne!(
+            r0.iob_src[0].hops, rfp.iob_src[0].hops,
+            "false_path IOB must not be delay-optimized (hops {} vs {})",
+            r0.iob_src[0].hops, rfp.iob_src[0].hops
+        );
+    }
+
+    #[test]
+    fn multicycle_guide_changes_hops_or_sites_on_hard_fixture() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let g0 = TimingGuide::default();
+        let gm = TimingGuide {
+            false_path_iob: false,
+            iob_setup_mult: 2,
+        };
+        let pl0 = place_with_guide(&p, &dev, opts, &g0).unwrap();
+        let plm = place_with_guide(&p, &dev, opts, &gm).unwrap();
+        let r0 = route_with_guide(&pl0, &dev, RouteOpts::default(), &g0).unwrap();
+        let rm = route_with_guide(&plm, &dev, RouteOpts::default(), &gm).unwrap();
+        assert!(
+            sites_of(&r0) != sites_of(&rm) || hops_of(&r0) != hops_of(&rm),
+            "multicycle must change placed sites or routed hops (sites {:?} vs {:?} hops {:?} vs {:?})",
+            sites_of(&r0),
+            sites_of(&rm),
+            hops_of(&r0),
+            hops_of(&rm)
+        );
+        assert_ne!(r0.iob_src[0].hops, rm.iob_src[0].hops);
+        let gfp = TimingGuide {
+            false_path_iob: true,
+            iob_setup_mult: 2,
+        };
+        let rfp = route_with_guide(
+            &place_with_guide(&p, &dev, opts, &gfp).unwrap(),
+            &dev,
+            RouteOpts::default(),
+            &gfp,
+        )
+        .unwrap();
+        assert_ne!(rm.iob_src[0].hops, rfp.iob_src[0].hops);
     }
 }

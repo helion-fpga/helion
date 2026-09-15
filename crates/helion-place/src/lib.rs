@@ -27,6 +27,46 @@ impl Default for PlaceOpts {
     }
 }
 
+/// IOB-arc exceptions from XDC (`set_false_path` / `set_multicycle_path`).
+/// Empty guide keeps gold south/mid pull from `timing_weight` alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimingGuide {
+    /// `set_false_path` covers an IOB/output arc — do not pull toward IOB.
+    pub false_path_iob: bool,
+    /// Setup multicycle for IOB arcs. 0 or 1 = single cycle (gold).
+    pub iob_setup_mult: u32,
+}
+
+impl TimingGuide {
+    /// Extra PathFinder hops when IOB arcs are excepted (ignored arcs are
+    /// not delay-optimized). False path drops delay pull entirely; multicycle
+    /// N>1 relaxes by 4 hops per extra cycle.
+    pub fn iob_relax_hops(self) -> u32 {
+        if self.false_path_iob {
+            8
+        } else if self.iob_setup_mult > 1 {
+            self.iob_setup_mult.saturating_sub(1) * 4
+        } else {
+            0
+        }
+    }
+}
+
+/// Y used as the affinity base: south (timing), mid (wirelength / false path),
+/// or quarter-from-south (multicycle slack).
+fn affinity_base_y(col: &[Site], opts: PlaceOpts, guide: &TimingGuide) -> u32 {
+    if col.is_empty() {
+        return 0;
+    }
+    if opts.timing_weight <= 0.0 || guide.false_path_iob {
+        col[col.len() / 2].y
+    } else if guide.iob_setup_mult > 1 {
+        col[col.len() / 4].y
+    } else {
+        col[0].y
+    }
+}
+
 /// Bring-up IMUX reach: same CLB, axis ±1..±4, diag ±1/±2, knight
 /// (±2,±1)/(±1,±2) — matches helion-route::imux_sel.
 fn imux_local(from: Site, to: Site) -> bool {
@@ -88,6 +128,16 @@ pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
 }
 
 pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Placed, String> {
+    place_with_guide(packed, dev, opts, &TimingGuide::default())
+}
+
+/// Place with XDC IOB-arc exceptions. Empty `guide` matches `place_with`.
+pub fn place_with_guide(
+    packed: &Packed,
+    dev: &Device,
+    opts: PlaceOpts,
+    guide: &TimingGuide,
+) -> Result<Placed, String> {
     let iob_all: Vec<Site> = dev.iob_sites().collect();
     let iob_take = packed.iobs.len().min(iob_all.len());
     if packed.iobs.len() > iob_all.len() {
@@ -139,7 +189,6 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             .or_else(|| iob_all.first().copied())
             .ok_or_else(|| "need IOB column for LUTFF".to_string())?;
         let n_ble = dev.n_ble.max(1) as usize;
-        let prefer_south = opts.timing_weight > 0.0;
         let mut cols: std::collections::HashMap<u32, Vec<Site>> = std::collections::HashMap::new();
         for s in dev.clb_sites() {
             cols.entry(s.x).or_default().push(s);
@@ -279,11 +328,7 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         }
                     }
                 }
-                let base_y = if prefer_south {
-                    col.first().map(|s| s.y).unwrap_or(0)
-                } else {
-                    col[col.len() / 2].y
-                };
+                let base_y = affinity_base_y(col, opts, guide);
                 y_order.push(base_y);
                 y_seen.clear();
                 y_order.retain(|y| y_seen.insert(*y));
@@ -1246,5 +1291,116 @@ mod tests {
         let (next, reused) = place_incremental(&p, &dev, &prev, PlaceOpts { timing_weight: 0.75 }).unwrap();
         assert_eq!(reused, prev.lutff_sites.len());
         assert_eq!(next.lutff_sites, prev.lutff_sites);
+    }
+
+    /// ≥8 LUT+FF heartbeat (Ibex pin-wrap class, not 108k P&R).
+    fn hard_heartbeat() -> Design {
+        let mut d = Design::new("hb8");
+        d.add_port("clk", helion_ir::PortDir::In);
+        d.add_port("led", helion_ir::PortDir::Out);
+        for i in 0..8u32 {
+            d.add_cell(
+                format!("u_lut{i}"),
+                CellKind::Lut6 {
+                    init: 0x5555_5555_5555_5555,
+                },
+            );
+            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", format!("u_ff{i}"), "CLK");
+            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+            if i > 0 {
+                d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
+            }
+        }
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("q7", "u_iob", "I");
+        d.connect("led", "u_iob", "PAD");
+        d
+    }
+
+    fn sites_of(pl: &Placed) -> Vec<(u32, u32, u8)> {
+        pl.lutff_sites
+            .iter()
+            .map(|(s, ble)| (s.x, s.y, *ble))
+            .collect()
+    }
+
+    #[test]
+    fn empty_guide_matches_place_with() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let a = place_with(&p, &dev, opts).unwrap();
+        let b = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        assert_eq!(sites_of(&a), sites_of(&b), "empty guide must keep gold sites");
+    }
+
+    #[test]
+    fn false_path_guide_moves_sites_on_hard_fixture() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        assert!(p.lutffs.len() >= 8, "fixture must be ≥8 LUT+FF");
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        let fp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: true,
+                iob_setup_mult: 1,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            sites_of(&unconstrained),
+            sites_of(&fp),
+            "set_false_path must stop IOB pull (unconstrained y={} false_path y={})",
+            unconstrained.lutff_sites[0].0.y,
+            fp.lutff_sites[0].0.y
+        );
+    }
+
+    #[test]
+    fn multicycle_guide_moves_sites_on_hard_fixture() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        let mcp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: false,
+                iob_setup_mult: 2,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            sites_of(&unconstrained),
+            sites_of(&mcp),
+            "set_multicycle_path must weaken IOB pull (unconstrained y={} mcp y={})",
+            unconstrained.lutff_sites[0].0.y,
+            mcp.lutff_sites[0].0.y
+        );
+        let fp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: true,
+                iob_setup_mult: 2,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            sites_of(&mcp),
+            sites_of(&fp),
+            "false_path must not match multicycle sites"
+        );
     }
 }
