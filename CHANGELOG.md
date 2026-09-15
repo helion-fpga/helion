@@ -4,6 +4,24 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [Unreleased]
+
+1.4 CI, docs, and roadmap (FM-HEL-14-W7). Empty-XDC `examples/counter.sv` gold is
+unchanged (**WNS_PS=9640**). Soft-hold: not merged to `master`.
+
+### Added
+
+- `macos-latest` CI job: rustc 1.85.0, `cargo test --workspace` (continue-on-error),
+  build `helion-ide`, headless `examples/counter.sv` grepped for `WNS_PS=9640`
+  (gold is required; no continue-on-error). Ubuntu job kept.
+- [`ROADMAP.md`](ROADMAP.md) for 1.4 → 1.5 → 1.6 → 1.7 → 2.0, linked from README
+  and GitHub Pages. Milestones on
+  [helion-fpga/helion](https://github.com/helion-fpga/helion/milestones).
+- Architecture / Use: `helion-sta::load_xdc` command list from
+  `crates/helion-sta/src/lib.rs` only, kept separate from Tcl Session CAD.
+
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.0...HEAD
+
 ## [1.3.0] — 2026-09-10
 
 Pin-wrap suite, deep ILA, CDC methodology, Helion-ST/MM catalog, and hang-class

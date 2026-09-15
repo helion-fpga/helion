@@ -5,7 +5,8 @@ Helion is an original FPGA device family plus the in-repo CAD (synth, pack, plac
 - Home: index.html
 - Using Helion (IDE + CLI): use.html
 - Getting started (download / build): start.html
-- Architecture (crates, HAD, HNF): architecture.html
+- Architecture (crates, HAD, HNF, load_xdc): architecture.html
+- Roadmap (1.4 to 2.0): roadmap.html
 - Wiki index: wiki.html
 - Get involved: get-involved.html
 - Contributing (code): contribute.html
