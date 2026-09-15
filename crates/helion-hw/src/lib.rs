@@ -625,7 +625,7 @@ pub struct OverlayReport {
 impl OverlayReport {
     pub fn summary_line(&self) -> String {
         format!(
-            "overlay LED={} cycles={} frames={} bytes={} STAT INIT={} DONE={} GWE={} (overlay; not board DONE)",
+            "overlay LED={} cycles={} frames={} bytes={} STAT sim_INIT={} sim_DONE={} sim_GWE={} (overlay; not board DONE)",
             self.led,
             self.cycles,
             self.frames,
@@ -2972,6 +2972,11 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("not board DONE"), "{line}");
+        assert!(line.contains("sim_INIT="), "{line}");
+        assert!(line.contains("sim_DONE="), "{line}");
+        assert!(line.contains("sim_GWE="), "{line}");
+        // Bare DONE= (board-style) must not appear; only sim_DONE=.
+        assert!(!line.contains(" DONE="), "{line}");
         assert!(
             !line.to_ascii_lowercase().contains("board done=1"),
             "{line}"
