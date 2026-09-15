@@ -170,6 +170,155 @@ fn project_read_ip_examples_ip_dir_holds_gold() {
 }
 
 #[test]
+fn project_checkpoint_write_applies_package_pin() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    let dir = std::env::temp_dir().join(format!(
+        "helion-ck-xdc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = root.join("examples/counter.sv");
+    let prj_plain = dir.join("plain.prj");
+    let prj_pin = dir.join("pin.prj");
+    std::fs::write(
+        &prj_plain,
+        format!(
+            "part HL10T-C32-1\nread_sv {}\ncreate_clock -period 10.000 [get_ports clk]\n",
+            sv.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &prj_pin,
+        format!(
+            "part HL10T-C32-1\nread_sv {}\ncreate_clock -period 10.000 [get_ports clk]\nset_property PACKAGE_PIN IOB_X5Y0 [get_ports led]\n",
+            sv.display()
+        ),
+    )
+    .unwrap();
+    let out_plain = dir.join("plain.hckp");
+    let out_pin = dir.join("pin.hckp");
+    let run = |prj: &std::path::Path, out: &std::path::Path| {
+        let o = Command::new(bin)
+            .args([
+                "project",
+                "checkpoint",
+                "write",
+                prj.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            o.status.success(),
+            "checkpoint write failed:\n{stdout}\n{stderr}"
+        );
+        stdout.to_string()
+    };
+    let a = run(&prj_plain, &out_plain);
+    let b = run(&prj_pin, &out_pin);
+    let hash = |s: &str| {
+        s.split_whitespace()
+            .find_map(|t| t.strip_prefix("hash=").map(|v| v.to_string()))
+            .unwrap_or_else(|| panic!("no hash= in {s}"))
+    };
+    assert_ne!(
+        hash(&a),
+        hash(&b),
+        "PACKAGE_PIN on checkpoint write must change bitstream hash:\n{a}\n{b}"
+    );
+    assert!(out_plain.is_file() && out_pin.is_file());
+    let open_pin = Command::new(bin)
+        .args(["project", "checkpoint", "open", out_pin.to_str().unwrap()])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let ost = String::from_utf8_lossy(&open_pin.stdout);
+    let oerr = String::from_utf8_lossy(&open_pin.stderr);
+    assert!(
+        open_pin.status.success(),
+        "checkpoint open failed:\n{ost}\n{oerr}"
+    );
+    assert!(
+        ost.contains(&format!("hash={}", hash(&b))),
+        "open must reproduce write hash:\nwrite={b}\nopen={ost}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn project_checkpoint_write_relative_o_joins_prj_parent() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    let dir = std::env::temp_dir().join(format!(
+        "helion-ck-rel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let sv = root.join("examples/counter.sv");
+    let prj = sub.join("c.prj");
+    std::fs::write(
+        &prj,
+        format!(
+            "part HL10T-C32-1\nread_sv {}\ncreate_clock -period 10.000 [get_ports clk]\n",
+            sv.display()
+        ),
+    )
+    .unwrap();
+    // Existence-based resolve_prj_path would find this ancestor and overwrite it.
+    let decoy = dir.join("out.hckp");
+    std::fs::write(&decoy, b"decoy").unwrap();
+    let out = Command::new(bin)
+        .args([
+            "project",
+            "checkpoint",
+            "write",
+            prj.to_str().unwrap(),
+            "-o",
+            "out.hckp",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "checkpoint write failed:\n{stdout}\n{stderr}"
+    );
+    let dest = sub.join("out.hckp");
+    assert!(
+        dest.is_file(),
+        "relative -o must join the .prj parent, got missing {}",
+        dest.display()
+    );
+    assert_eq!(
+        std::fs::read(&decoy).unwrap(),
+        b"decoy",
+        "must not overwrite an existing ancestor out.hckp via resolve_prj_path"
+    );
+    assert!(
+        stdout.contains("path=") && stdout.contains("out.hckp"),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn helion_ip_show_rejects_axi_fence() {
     let bin = env!("CARGO_BIN_EXE_helion");
     let root = root();
