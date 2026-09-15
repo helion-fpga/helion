@@ -12,7 +12,9 @@ use helion_sta::{
     Constraints, OperatingConditions, PowerReport, TimingResult,
 };
 use helion_hls::synth_c_path;
-use helion_proj::{constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path};
+use helion_proj::{
+    constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path, Mode, Session,
+};
 use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
@@ -282,6 +284,8 @@ fn usage() {
   helion qor <file.sv>
   helion project <file.prj>
   helion project run <file.prj> [--cycles N]
+  helion project checkpoint write <file.prj> [-o out.hckp]
+  helion project checkpoint open <file.hckp> [--part P]
   helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
@@ -643,7 +647,61 @@ fn cmd_hnf(args: &[String]) {
     }
 }
 
+/// Synth + apply XDC (PACKAGE_PIN/IOSTANDARD/SDC) + `impl_project` (pblock/runs).
+fn impl_project_file(
+    path: &str,
+) -> Result<(Session, Device, Constraints, helion_proj::ProjectFile, usize), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("project {path}: {e}"))?;
+    let mut prj = load_prj(&text)?;
+    let prj_path = Path::new(path);
+    let ips = expand_ip_packages(&mut prj, prj_path)?;
+    let src_paths: Vec<std::path::PathBuf> = prj
+        .sources
+        .iter()
+        .map(|s| resolve_prj_path(prj_path, s))
+        .collect();
+    for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+        if !resolved.exists() {
+            return Err(format!(
+                "project source {src}: not found (tried {})",
+                resolved.display()
+            ));
+        }
+    }
+    let xdc = constraints_from_project(&prj, prj_path)?;
+    let mut design = synth_project_sources(&src_paths, prj.top.as_deref())?;
+    apply_xdc(&mut design, &xdc)?;
+    let part = if prj.part.is_empty() {
+        "HL10T-C32-1".to_string()
+    } else {
+        prj.part.clone()
+    };
+    let dev = Device::load_part(&part).map_err(|e| format!("HAD {part}: {e}"))?;
+    let mut session = Session::new(Mode::Project);
+    session.part = part;
+    session.synth_design(design);
+    session.impl_project(&dev, &prj)?;
+    Ok((session, dev, xdc, prj, ips.len()))
+}
+
+fn session_timing_xdc(
+    session: &Session,
+    xdc: &Constraints,
+) -> Result<TimingResult, String> {
+    let d = session.design.as_ref().ok_or("project: no design")?;
+    let r = session.routed.as_ref().ok_or("project: not routed")?;
+    let mut clks = xdc.clocks.clone();
+    if clks.is_empty() {
+        create_clock(&mut clks, "clk", 10_000, "clk");
+    }
+    report_timing_routed_xdc(d, r, &clks, xdc)
+}
+
 fn cmd_project(args: &[String]) {
+    if args.first().map(|s| s.as_str()) == Some("checkpoint") {
+        cmd_project_checkpoint(&args[1..]);
+        return;
+    }
     let mut rest = args;
     let mut do_run = false;
     if rest.first().map(|s| s.as_str()) == Some("run") {
@@ -654,64 +712,59 @@ fn cmd_project(args: &[String]) {
     let cycles: u32 = take_flag(rest, "--cycles")
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("project {path}: {e}");
-        std::process::exit(1);
-    });
-    let mut prj = load_prj(&text).unwrap_or_else(|e| {
+    let (session, dev, xdc, prj, ip_n) = impl_project_file(path).unwrap_or_else(|e| {
         eprintln!("project: {e}");
         std::process::exit(1);
     });
-    let prj_path = Path::new(path);
-    let ips = expand_ip_packages(&mut prj, prj_path).unwrap_or_else(|e| {
-        eprintln!("project ip: {e}");
+    let timing = session_timing_xdc(&session, &xdc).unwrap_or_else(|e| {
+        eprintln!("project timing: {e}");
         std::process::exit(1);
     });
-    let src_paths: Vec<std::path::PathBuf> = prj
-        .sources
-        .iter()
-        .map(|s| resolve_prj_path(prj_path, s))
-        .collect();
-    for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
-        if !resolved.exists() {
-            eprintln!("project source {src}: not found (tried {})", resolved.display());
-            std::process::exit(1);
-        }
-    }
-    let xdc = constraints_from_project(&prj, prj_path).unwrap_or_else(|e| {
-        eprintln!("project constraints: {e}");
-        std::process::exit(1);
-    });
-    let design = synth_project_sources(&src_paths, prj.top.as_deref()).unwrap_or_else(|e| {
-        eprintln!("project synth: {e}");
-        std::process::exit(1);
-    });
-    let c = compile_design_xdc(design, &prj.part, 0.75, &xdc).unwrap_or_else(|e| {
-        eprintln!("project impl: {e}");
-        std::process::exit(1);
-    });
+    let lutffs = session
+        .placed
+        .as_ref()
+        .map(|p| p.packed.lutffs.len())
+        .unwrap_or(0);
+    let frames = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.len())
+        .unwrap_or(0);
     println!(
         "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
         path,
         prj.part,
         prj.sources.len(),
-        ips.len(),
+        ip_n,
         prj.top.as_deref().unwrap_or("-"),
         prj.constraint_files.len(),
         xdc.clocks.len(),
         xdc.package_pins.len(),
-        c.routed.placed.packed.lutffs.len(),
-        c.timing.wns_ps,
-        c.bits.frames.len()
+        lutffs,
+        timing.wns_ps,
+        frames
     );
     if do_run {
-        let mut sim = Fabric::new(&c.dev);
-        sim.program(&c.bits).unwrap_or_else(|e| {
+        let bits = session.bitstream.as_ref().unwrap_or_else(|| {
+            eprintln!("project run: no bitstream");
+            std::process::exit(1);
+        });
+        let routed = session.routed.as_ref().unwrap_or_else(|| {
+            eprintln!("project run: not routed");
+            std::process::exit(1);
+        });
+        let dname = session
+            .design
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        let mut sim = Fabric::new(&dev);
+        sim.program(bits).unwrap_or_else(|e| {
             eprintln!("project run program: {e}");
             std::process::exit(1);
         });
         sim.finish_startup();
-        let iob = c.routed.iob_src[0].iob;
+        let iob = routed.iob_src[0].iob;
         let mut wave = Vec::new();
         let mut changes = 0u32;
         let mut last = sim.led_at(iob.0, iob.1);
@@ -727,8 +780,8 @@ fn cmd_project(args: &[String]) {
         let bits: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
         println!(
             "run {} part={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-            c.design.name,
-            c.dev.part,
+            dname,
+            dev.part,
             sim.stat.init as u8,
             sim.stat.done as u8,
             sim.stat.eos as u8,
@@ -739,10 +792,108 @@ fn cmd_project(args: &[String]) {
         );
         println!(
             "WNS_PS={} R2R_PS={} IOB_PS={} LED[{cycles}]={bits} changes={changes}",
-            c.timing.wns_ps, c.timing.r2r_ps, c.timing.iob_ps
+            timing.wns_ps, timing.r2r_ps, timing.iob_ps
         );
         println!("ok");
     }
+}
+
+fn cmd_project_checkpoint(args: &[String]) {
+    match args.first().map(|s| s.as_str()) {
+        Some("write") => cmd_project_checkpoint_write(&args[1..]),
+        Some("open") | Some("read") => cmd_project_checkpoint_open(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage:\n  helion project checkpoint write <file.prj> [-o out.hckp]\n  helion project checkpoint open <file.hckp> [--part P]"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_project_checkpoint_write(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/counter.prj");
+    let out_flag = take_flag(args, "-o").or_else(|| take_flag(args, "--output"));
+    let (mut session, _dev, xdc, prj, _) = impl_project_file(path).unwrap_or_else(|e| {
+        eprintln!("project: {e}");
+        std::process::exit(1);
+    });
+    let dest = out_flag
+        .or_else(|| prj.checkpoint_path.clone())
+        .unwrap_or_else(|| {
+            Path::new(path)
+                .with_extension("hckp")
+                .to_string_lossy()
+                .into_owned()
+        });
+    let dest_buf = resolve_checkpoint_dest(Path::new(path), &dest);
+    let wr = session.write_checkpoint_to(&dest_buf).unwrap_or_else(|e| {
+        eprintln!("write_checkpoint: {e}");
+        std::process::exit(1);
+    });
+    let t = session_timing_xdc(&session, &xdc).unwrap_or_else(|e| {
+        eprintln!("report_timing: {e}");
+        std::process::exit(1);
+    });
+    let dname = session
+        .design
+        .as_ref()
+        .map(|d| d.name.as_str())
+        .unwrap_or("-");
+    let timing = format!(
+        "report_timing {dname} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
+        t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
+    );
+    println!("{wr}");
+    println!("{timing}");
+}
+
+/// Write destination for `-o` / `checkpoint_path`: absolute as-is, relative
+/// next to the `.prj`. Do not use `resolve_prj_path` (existence search would
+/// overwrite a different existing file).
+fn resolve_checkpoint_dest(prj_path: &Path, dest: &str) -> std::path::PathBuf {
+    let dest = Path::new(dest);
+    if dest.is_absolute() {
+        dest.to_path_buf()
+    } else {
+        match prj_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(dest),
+            _ => dest.to_path_buf(),
+        }
+    }
+}
+
+fn cmd_project_checkpoint_open(args: &[String]) {
+    let path = positional(args).unwrap_or("counter.hckp");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint part {part}: {e}");
+        std::process::exit(1);
+    });
+    let session = Session::open_checkpoint(path, &dev).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint {path}: {e}");
+        std::process::exit(1);
+    });
+    let lutffs = session
+        .placed
+        .as_ref()
+        .map(|p| p.lutff_sites.len())
+        .unwrap_or(0);
+    let frames = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.len())
+        .unwrap_or(0);
+    let hash = session.blinky_hash().unwrap_or(0);
+    let timing = session.report_timing(&dev).unwrap_or_else(|e| {
+        eprintln!("report_timing: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "open_checkpoint {path} part={} lutffs={lutffs} frames={frames} hash={hash:#x}",
+        dev.part
+    );
+    println!("{timing}");
 }
 
 fn hw(args: Vec<String>) {
