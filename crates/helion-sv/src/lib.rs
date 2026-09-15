@@ -709,7 +709,19 @@ fn resolve_packed_field(
 
 fn packed_field_select_expr(p: &mut P, name: String) -> Result<RExpr, String> {
     let field = p.ident()?;
-    let (mut lo, mut width, mut nested) = resolve_packed_field(p, &name, &field)?;
+    let (mut lo, mut width, mut nested) = match resolve_packed_field(p, &name, &field) {
+        Ok(hit) => hit,
+        Err(_) => {
+            // Hierarchical instance path `u_child.inner.port` is not a packed
+            // field. Take the last ident so the assign parses; unknown names
+            // stay assign_not_lowered at map, not generate_not_lowered.
+            let mut last = field;
+            while p.eat_sym('.') {
+                last = p.ident()?;
+            }
+            return Ok(RExpr::Ident(last));
+        }
+    };
     while p.eat_sym('.') {
         let f2 = p.ident()?;
         let Some(ty) = nested.as_deref() else {
@@ -744,6 +756,26 @@ fn packed_field_select_expr(p: &mut P, name: String) -> Result<RExpr, String> {
     } else {
         Ok(RExpr::Range(name, lo, lo + width - 1))
     }
+}
+
+/// `arr[word].field` — packed field of one unpacked-array word.
+fn unpacked_word_field_expr(p: &mut P, name: String, word: usize) -> Result<RExpr, String> {
+    let field = p.ident()?;
+    let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+    let w = width.max(1);
+    if word >= 0x1_0000 || lo >= 0x1_0000 {
+        return Err("word field too large".into());
+    }
+    Ok(RExpr::IndexPart {
+        name,
+        base: Box::new(RExpr::Const {
+            val: ((word as u128) << 16) | (lo as u128),
+            width: 32,
+            care: u128::MAX,
+        }),
+        width: w,
+        ascending: true,
+    })
 }
 
 fn find_packed_struct_for_fields(names: &HashSet<String>) -> Option<PackedStruct> {
@@ -785,7 +817,7 @@ fn pack_named_assign_pattern(fields: Vec<(String, RExpr)>) -> Result<RExpr, Stri
             continue;
         };
         match expr {
-            RExpr::Const { val, .. } => {
+            RExpr::Const { val, .. } if f.lo < 128 => {
                 let w = f.width.min(128).max(1);
                 acc |= (*val & care_mask(w)) << f.lo;
             }
@@ -891,7 +923,9 @@ fn harvest_packed_struct(p: &mut P) {
         return;
     }
     let total: usize = order.iter().map(|(_, w, _)| *w).sum();
-    if total == 0 || total > 128 {
+    // Field layout is used for `.field` bit selects (Ibex crash_dump_t is 160).
+    // Named `'{…}` const packing still needs width ≤128 (u128 model).
+    if total == 0 || total > 1024 {
         return;
     }
     let mut lo = total;
@@ -919,10 +953,19 @@ fn harvest_packed_struct(p: &mut P) {
     );
 }
 
-/// CSR bit indices / MuBi constants used as selects. Not ICache/PMP sizes
-/// (those stay skipped so generate bounds do not re-elaborate).
+/// CSR bit indices / MuBi constants used as selects. ICache/PMP sizes are
+/// modest (IC_NUM_WAYS=2, PMP_MAX_REGIONS=16) and seed PKG_ENUMS so
+/// replication `{IC_NUM_WAYS{x}}` and generate-for bounds parse. Not
+/// PRESENT/PRINCE round counts (those stay module params).
 fn pkg_param_is_csr_or_mubi(name: &str) -> bool {
-    name.starts_with("CSR_") || name == "IbexMuBiOn" || name == "IbexMuBiOff"
+    name.starts_with("CSR_")
+        || name == "IbexMuBiOn"
+        || name == "IbexMuBiOff"
+        || name.starts_with("IC_")
+        || name.starts_with("BUS_")
+        || name == "ADDR_W"
+        || name.starts_with("PMP_")
+        || name.starts_with("SCRAMBLE_")
 }
 
 fn rexpr_const_val(e: &RExpr) -> Option<u128> {
@@ -3340,8 +3383,8 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             if let Some(v) = p.params.get(&name).copied() {
                 return Ok(v);
             }
-            // cc_pkg::idx_width(n): clog2, minimum 1. Package function is not a LUT.
-            if name == "idx_width" && p.eat_sym('(') {
+            // cc_pkg::idx_width(n) / prim_util_pkg::vbits(n): clog2, minimum 1.
+            if (name == "idx_width" || name == "vbits") && p.eat_sym('(') {
                 let n = const_u(p)?;
                 let _ = p.eat_sym(')');
                 return Ok(if n > 1 { clog2_u(n) } else { 1 });
@@ -3493,12 +3536,12 @@ fn parse_lor(p: &mut P) -> Result<RExpr, String> {
 }
 
 fn parse_land(p: &mut P) -> Result<RExpr, String> {
-    let mut e = parse_cmp(p)?;
+    let mut e = parse_or_r(p)?;
     loop {
         match p.peek() {
             Some(Tok::Land) => {
                 p.bump();
-                let r = parse_cmp(p)?;
+                let r = parse_or_r(p)?;
                 e = RExpr::And(Box::new(e), Box::new(r));
             }
             _ => break,
@@ -3715,10 +3758,10 @@ fn parse_add(p: &mut P) -> Result<RExpr, String> {
 }
 
 fn parse_mul(p: &mut P) -> Result<RExpr, String> {
-    let mut e = parse_or_r(p)?;
+    let mut e = parse_un_r(p)?;
     loop {
         if p.eat_sym('*') {
-            let r = parse_or_r(p)?;
+            let r = parse_un_r(p)?;
             e = match (&e, &r) {
                 (
                     RExpr::Const { val: a, width: wa, care: ca },
@@ -3733,7 +3776,7 @@ fn parse_mul(p: &mut P) -> Result<RExpr, String> {
             continue;
         }
         if p.eat_sym('/') {
-            let r = parse_or_r(p)?;
+            let r = parse_un_r(p)?;
             e = match (&e, &r) {
                 (
                     RExpr::Const { val: a, width: wa, care: ca },
@@ -3771,9 +3814,9 @@ fn parse_xor_r(p: &mut P) -> Result<RExpr, String> {
 }
 
 fn parse_and_r(p: &mut P) -> Result<RExpr, String> {
-    let mut e = parse_un_r(p)?;
+    let mut e = parse_cmp(p)?;
     while p.eat_sym('&') {
-        let r = parse_un_r(p)?;
+        let r = parse_cmp(p)?;
         e = RExpr::And(Box::new(e), Box::new(r));
     }
     Ok(e)
@@ -3966,10 +4009,38 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             } else {
                 (1u128 << (*w).max(1)) - 1
             };
+            let mut val = *v;
+            let mut width = *w;
+            // Genvar substitution turns `b[W-1:0]` into `0[W-1:0]` (Ibex icache
+            // fill beat compare). Part-select of a constant is the low bits.
+            if p.eat_sym('[') {
+                let a = const_u(p)? as usize;
+                if p.eat_sym(':') {
+                    let b = const_u(p)? as usize;
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    let hi = a.max(b);
+                    let lo = a.min(b);
+                    let sw = hi.saturating_sub(lo).saturating_add(1).max(1).min(128);
+                    val = (val >> lo) & care_mask(sw);
+                    width = sw;
+                } else {
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    val = (val >> a) & 1;
+                    width = 1;
+                }
+            }
             Ok(RExpr::Const {
-                val: *v,
-                width: *w,
-                care,
+                val,
+                width,
+                care: if width == 0 {
+                    care
+                } else {
+                    care_mask(width.max(1))
+                },
             })
         }
         Some(Tok::Pat { val, care, width }) => Ok(RExpr::Const {
@@ -3977,8 +4048,8 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             width: *width,
             care: *care,
         }),
-        Some(Tok::Kw(k)) if k == "unsigned" || k == "signed" => {
-            // `unsigned'(expr)` size cast. Value is the inner expr.
+        Some(Tok::Kw(k)) if k == "unsigned" || k == "signed" || k == "int" || k == "integer" => {
+            // `unsigned'(expr)` / `int'(expr)` size cast. Value is the inner expr.
             // Keyword already consumed by the match.
             if !(p.eat_sym('\'') && p.eat_sym('(')) {
                 return Err("cast".into());
@@ -4169,6 +4240,10 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                                     ascending: true,
                                 });
                             }
+                            // Unpacked array of packed struct: `mip[STAGES].irq_software`.
+                            if p.eat_sym('.') {
+                                return unpacked_word_field_expr(p, name, val as usize);
+                            }
                             Ok(RExpr::Bit(name, val as usize))
                         }
                         other => Ok(RExpr::IndexPart {
@@ -4232,6 +4307,58 @@ enum LhsKind {
     Bit(String, usize),
     /// Inclusive slice `lo .. lo+width-1` (packed field or `+:` / `-:`).
     Slice { name: String, lo: usize, width: usize },
+    /// Packed bits of one unpacked word: `arr[word][lo +: W]` / `arr[word].field`.
+    Unpacked {
+        name: String,
+        word: usize,
+        lo: usize,
+        width: usize,
+    },
+}
+
+/// Encode unpacked word+bit so word 0 is distinct from packed bit 0.
+fn encode_unpacked_bit(word: usize, bit: usize) -> usize {
+    ((word.saturating_add(1)) << 16) | (bit & 0xffff)
+}
+
+fn decode_unpacked_bit(enc: usize) -> Option<(usize, usize)> {
+    if enc < 0x1_0000 {
+        return None;
+    }
+    Some(((enc >> 16).saturating_sub(1), enc & 0xffff))
+}
+
+fn lhs_bit_piece(rhs: &RExpr, i: usize) -> RExpr {
+    match rhs {
+        RExpr::Range(s, rlo, _) => RExpr::Bit(s.clone(), rlo + i),
+        RExpr::Ident(s) => RExpr::Bit(s.clone(), i),
+        RExpr::Bit(s, b) if i == 0 => RExpr::Bit(s.clone(), *b),
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ascending,
+        } if i < *width => {
+            if let RExpr::Const { val, .. } = base.as_ref() {
+                if *val >= 0x1_0000 {
+                    let word = (*val >> 16) as usize;
+                    let lo = (*val & 0xffff) as usize;
+                    return RExpr::IndexPart {
+                        name: name.clone(),
+                        base: Box::new(RExpr::Const {
+                            val: ((word as u128) << 16) | ((lo + i) as u128),
+                            width: 32,
+                            care: u128::MAX,
+                        }),
+                        width: 1,
+                        ascending: *ascending,
+                    };
+                }
+            }
+            bit_extract(rhs.clone(), i)
+        }
+        _ => bit_extract(rhs.clone(), i),
+    }
 }
 
 fn lhs_kind_assigns(kind: LhsKind, rhs: RExpr) -> Vec<(String, Option<usize>, RExpr)> {
@@ -4241,14 +4368,23 @@ fn lhs_kind_assigns(kind: LhsKind, rhs: RExpr) -> Vec<(String, Option<usize>, RE
         LhsKind::Slice { name, lo, width } => {
             let w = width.max(1);
             (0..w)
+                .map(|i| (name.clone(), Some(lo + i), lhs_bit_piece(&rhs, i)))
+                .collect()
+        }
+        LhsKind::Unpacked {
+            name,
+            word,
+            lo,
+            width,
+        } => {
+            let w = width.max(1);
+            (0..w)
                 .map(|i| {
-                    let piece = match &rhs {
-                        RExpr::Range(s, rlo, _) => RExpr::Bit(s.clone(), rlo + i),
-                        RExpr::Ident(s) => RExpr::Bit(s.clone(), i),
-                        RExpr::Bit(s, b) if i == 0 => RExpr::Bit(s.clone(), *b),
-                        _ => bit_extract(rhs.clone(), i),
-                    };
-                    (name.clone(), Some(lo + i), piece)
+                    (
+                        name.clone(),
+                        Some(encode_unpacked_bit(word, lo + i)),
+                        lhs_bit_piece(&rhs, i),
+                    )
                 })
                 .collect()
         }
@@ -4333,6 +4469,43 @@ fn parse_lhs_after_name(p: &mut P, name: String) -> Result<LhsKind, String> {
                 return Ok(LhsKind::Whole(name));
             }
             if p.eat_sym(']') {
+                if p.eat_sym('.') {
+                    let field = p.ident()?;
+                    let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+                    return Ok(LhsKind::Unpacked {
+                        name,
+                        word: base as usize,
+                        lo,
+                        width: width.max(1),
+                    });
+                }
+                if p.eat_sym('[') {
+                    let a = const_u(p)? as usize;
+                    if p.eat_sym(':') {
+                        let b = const_u(p)? as usize;
+                        if !p.eat_sym(']') {
+                            return Err("]".into());
+                        }
+                        let lo = a.min(b);
+                        let hi = a.max(b);
+                        let w = hi.saturating_sub(lo).saturating_add(1).max(1);
+                        return Ok(LhsKind::Unpacked {
+                            name,
+                            word: base as usize,
+                            lo,
+                            width: w,
+                        });
+                    }
+                    if !p.eat_sym(']') {
+                        return Err("]".into());
+                    }
+                    return Ok(LhsKind::Unpacked {
+                        name,
+                        word: base as usize,
+                        lo: a,
+                        width: 1,
+                    });
+                }
                 return Ok(LhsKind::Bit(name, base as usize));
             }
         }
@@ -4548,6 +4721,9 @@ fn parse_nba(p: &mut P) -> Result<Nba, String> {
         LhsKind::Whole(n) => Ok((n, None, rhs)),
         LhsKind::Bit(n, b) => Ok((n, Some(b), rhs)),
         LhsKind::Slice { name, lo, .. } => Ok((name, Some(lo), rhs)),
+        LhsKind::Unpacked { name, word, lo, .. } => {
+            Ok((name, Some(encode_unpacked_bit(word, lo)), rhs))
+        }
     }
 }
 
@@ -5262,6 +5438,59 @@ fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
                 }
                 range = Some((hi as usize, lo));
             } else if p.eat_sym(']') {
+                if p.eat_sym('.') {
+                    let field = p.ident()?;
+                    let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+                    if matches!(p.peek(), Some(Tok::Le)) {
+                        p.bump();
+                    } else if !p.eat_sym('=') {
+                        return Err("nba".into());
+                    }
+                    let rhs = parse_rexpr(p)?;
+                    let _ = p.eat_sym(';');
+                    return Ok(lhs_kind_assigns(
+                        LhsKind::Unpacked {
+                            name,
+                            word: hi as usize,
+                            lo,
+                            width: width.max(1),
+                        },
+                        rhs,
+                    ));
+                }
+                if p.eat_sym('[') {
+                    let a = const_u(p)? as usize;
+                    let (lo, width) = if p.eat_sym(':') {
+                        let b = const_u(p)? as usize;
+                        if !p.eat_sym(']') {
+                            return Err("]".into());
+                        }
+                        let lo = a.min(b);
+                        let hi2 = a.max(b);
+                        (lo, hi2.saturating_sub(lo).saturating_add(1).max(1))
+                    } else {
+                        if !p.eat_sym(']') {
+                            return Err("]".into());
+                        }
+                        (a, 1usize)
+                    };
+                    if matches!(p.peek(), Some(Tok::Le)) {
+                        p.bump();
+                    } else if !p.eat_sym('=') {
+                        return Err("nba".into());
+                    }
+                    let rhs = parse_rexpr(p)?;
+                    let _ = p.eat_sym(';');
+                    return Ok(lhs_kind_assigns(
+                        LhsKind::Unpacked {
+                            name,
+                            word: hi as usize,
+                            lo,
+                            width,
+                        },
+                        rhs,
+                    ));
+                }
                 bit = Some(hi as usize);
             } else {
                 p.i = save;
@@ -7267,6 +7496,16 @@ fn parse_module_items(
                                 parts.push((name.clone(), Some(lo + i)));
                             }
                         }
+                        Ok(LhsKind::Unpacked {
+                            name,
+                            word,
+                            lo,
+                            width,
+                        }) => {
+                            for i in 0..width.max(1) {
+                                parts.push((name.clone(), Some(encode_unpacked_bit(word, lo + i))));
+                            }
+                        }
                         Err(_) => break,
                     }
                     let _ = p.eat_sym(',');
@@ -7495,6 +7734,33 @@ fn parse_module_items(
                 }
                 if w > 0 {
                     if let Ok(n) = p.ident() {
+                        let mut depth = 0usize;
+                        if matches!(p.peek(), Some(Tok::Sym('['))) {
+                            let save_d = p.i;
+                            let _ = p.eat_sym('[');
+                            if let Ok(a) = const_u(p) {
+                                if p.eat_sym(':') {
+                                    if let Ok(b) = const_u(p) {
+                                        if p.eat_sym(']') {
+                                            match range_width(a, b) {
+                                                Ok(dw) => depth = dw.max(1).min(4096),
+                                                Err(_) => note_width_overflow(),
+                                            }
+                                        } else {
+                                            p.i = save_d;
+                                        }
+                                    } else {
+                                        p.i = save_d;
+                                    }
+                                } else if p.eat_sym(']') {
+                                    depth = (a as usize).max(1).min(4096);
+                                } else {
+                                    p.i = save_d;
+                                }
+                            } else {
+                                p.i = save_d;
+                            }
+                        }
                         if matches!(p.peek(), Some(Tok::Sym(';')))
                             || matches!(p.peek(), Some(Tok::Sym('=')))
                             || matches!(p.peek(), Some(Tok::Sym(',')))
@@ -7503,7 +7769,7 @@ fn parse_module_items(
                                 signals.push(Signal {
                                     name: n.clone(),
                                     width: w,
-                                    depth: 0,
+                                    depth,
                                     keep: *pending_keep,
                                     mark_debug: *pending_md,
                                     force_bram: *pending_bram,
@@ -12976,15 +13242,43 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         let rhs = rhs_cmp.as_ref().unwrap_or(rhs);
         let mut failed = false;
         if let Some(b) = bit {
-            match rexpr_to_bit(rhs, rtl, 0) {
-                Ok(e) => {
-                    let bn = bit_name(lhs, w, *b);
-                    if rel_lt {
-                        rel_sig.insert(bn.clone(), lhs.clone());
+            let depth = sig_depth(rtl, lhs);
+            if let Some((word, lo)) = decode_unpacked_bit(*b) {
+                match rexpr_to_bit(rhs, rtl, 0) {
+                    Ok(e) => {
+                        let bn = unpacked_word_q(lhs, word, w, lo);
+                        if rel_lt {
+                            rel_sig.insert(bn.clone(), lhs.clone());
+                        }
+                        comb_bits.push((bn, e));
                     }
-                    comb_bits.push((bn, e));
+                    Err(_) => failed = true,
                 }
-                Err(_) => failed = true,
+            } else if depth > 1 {
+                // `assign mem[word] = expr` — whole unpacked word, not packed bit 0.
+                for i in 0..w.max(1).min(256) {
+                    match rexpr_to_bit(rhs, rtl, i) {
+                        Ok(e) => {
+                            let bn = unpacked_word_q(lhs, *b, w, i);
+                            if rel_lt {
+                                rel_sig.insert(bn.clone(), lhs.clone());
+                            }
+                            comb_bits.push((bn, e));
+                        }
+                        Err(_) => failed = true,
+                    }
+                }
+            } else {
+                match rexpr_to_bit(rhs, rtl, 0) {
+                    Ok(e) => {
+                        let bn = bit_name(lhs, w, *b);
+                        if rel_lt {
+                            rel_sig.insert(bn.clone(), lhs.clone());
+                        }
+                        comb_bits.push((bn, e));
+                    }
+                    Err(_) => failed = true,
+                }
             }
         } else if rexpr_width_checked(rhs, rtl).is_none() {
             // Slice/concat does not fit (`hi - lo + 1` or accum sum). Do not
@@ -17206,6 +17500,208 @@ endmodule
     }
 
     #[test]
+    fn rvfi_ext_mip_unpacked_struct_field_lowers() {
+        // Ibex core: always_comb default-0 then CSR bit/slice from
+        // `rvfi_ext_stage_mip[RVFI_STAGES].irq_*`.
+        let src = r#"
+package ibex_pkg;
+  typedef struct packed {
+    logic        irq_software;
+    logic        irq_timer;
+    logic        irq_external;
+    logic [14:0] irq_fast;
+  } irqs_t;
+  parameter int unsigned CSR_MSIX_BIT = 3;
+  parameter int unsigned CSR_MTIX_BIT = 7;
+  parameter int unsigned CSR_MEIX_BIT = 11;
+  parameter int unsigned CSR_MFIX_BIT_LOW = 16;
+  parameter int unsigned CSR_MFIX_BIT_HIGH = 30;
+endpackage
+module ibex_core(
+  input  logic irq_software,
+  input  logic irq_timer,
+  input  logic irq_external,
+  input  logic [14:0] irq_fast,
+  output logic [31:0] rvfi_ext_mip
+);
+  localparam int RVFI_STAGES = 1;
+  irqs_t rvfi_ext_stage_mip [RVFI_STAGES+1];
+  assign rvfi_ext_stage_mip[RVFI_STAGES].irq_software = irq_software;
+  assign rvfi_ext_stage_mip[RVFI_STAGES].irq_timer    = irq_timer;
+  assign rvfi_ext_stage_mip[RVFI_STAGES].irq_external = irq_external;
+  assign rvfi_ext_stage_mip[RVFI_STAGES].irq_fast     = irq_fast;
+  always_comb begin
+    rvfi_ext_mip                                     = '0;
+    rvfi_ext_mip[CSR_MSIX_BIT]                       = rvfi_ext_stage_mip[RVFI_STAGES].irq_software;
+    rvfi_ext_mip[CSR_MTIX_BIT]                       = rvfi_ext_stage_mip[RVFI_STAGES].irq_timer;
+    rvfi_ext_mip[CSR_MEIX_BIT]                       = rvfi_ext_stage_mip[RVFI_STAGES].irq_external;
+    rvfi_ext_mip[CSR_MFIX_BIT_HIGH:CSR_MFIX_BIT_LOW] = rvfi_ext_stage_mip[RVFI_STAGES].irq_fast;
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "rvfi_ext_mip.sv").expect("rvfi_ext_mip");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "rvfi_ext_mip must lower"
+        );
+        assert_ne!(
+            d.attrs.get("GENERATE_NOT_LOWERED"),
+            Some("1"),
+            "unpacked struct field select must not be generate_not_lowered"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_core", "rvfi_ext_mip"),
+            "rvfi_ext_mip named miss must be gone"
+        );
+        assert!(
+            lut_driven(&d, "rvfi_ext_mip_3")
+                && lut_driven(&d, "rvfi_ext_mip_7")
+                && lut_driven(&d, "rvfi_ext_mip_11"),
+            "CSR irq bits of rvfi_ext_mip must be driven"
+        );
+        assert!(
+            (16..31).all(|i| lut_driven(&d, &format!("rvfi_ext_mip_{i}"))),
+            "irq_fast slice of rvfi_ext_mip must be driven"
+        );
+    }
+
+    #[test]
+    fn icache_replication_and_way_generate_lowers() {
+        let src = r#"
+package ibex_pkg;
+  parameter int unsigned IC_NUM_WAYS = 2;
+  parameter int unsigned IC_TAG_SIZE = 22;
+endpackage
+module ibex_icache(
+  input  logic tag_req_ic0,
+  input  logic [IC_NUM_WAYS-1:0] tag_banks_ic0,
+  input  logic [IC_TAG_SIZE-1:0] tag_rdata_ic1 [IC_NUM_WAYS],
+  input  logic [21:0] lookup_tag,
+  output logic [IC_NUM_WAYS-1:0] ic_tag_req_o,
+  output logic [IC_NUM_WAYS-1:0] tag_match_ic1,
+  output logic tag_hit_ic1
+);
+  assign ic_tag_req_o = {IC_NUM_WAYS{tag_req_ic0}} & tag_banks_ic0;
+  for (genvar way = 0; way < IC_NUM_WAYS; way++) begin : gen_tag_match
+    assign tag_match_ic1[way] = (tag_rdata_ic1[way][IC_TAG_SIZE-1:0] == {1'b1, lookup_tag[20:0]});
+  end
+  assign tag_hit_ic1 = |tag_match_ic1;
+endmodule
+"#;
+        let d = synth_sv(src, "ibex_icache_ways.sv").expect("icache ways");
+        assert_ne!(
+            d.attrs.get("GENERATE_NOT_LOWERED"),
+            Some("1"),
+            "IC_NUM_WAYS replication / way generate must parse"
+        );
+        assert!(
+            lut_driven(&d, "ic_tag_req_o_0") && lut_driven(&d, "ic_tag_req_o_1"),
+            "replicated tag req bits must be driven"
+        );
+        assert!(
+            lut_driven(&d, "tag_hit_ic1"),
+            "tag_hit_ic1 OR of ways must be driven"
+        );
+    }
+
+    #[test]
+    fn multdiv_slow_unpacked_word_assign_lowers() {
+        let src = r#"
+module ibex_multdiv_slow(
+  input  logic [33:0] imd_val_q_i[2],
+  input  logic [32:0] accum_window_d,
+  input  logic multdiv_hold,
+  output logic [33:0] imd_val_d_o[2],
+  output logic [1:0] imd_val_we_o,
+  output logic [32:0] accum_window_q,
+  output logic unused_imd_val0
+);
+  assign imd_val_d_o[0]  = {1'b0, accum_window_d};
+  assign imd_val_we_o[0] = ~multdiv_hold;
+  assign accum_window_q  = imd_val_q_i[0][32:0];
+  assign unused_imd_val0 = imd_val_q_i[0][33];
+endmodule
+"#;
+        let d = synth_sv(src, "multdiv_slow_imd.sv").expect("multdiv_slow");
+        assert_ne!(
+            d.attrs.get("GENERATE_NOT_LOWERED"),
+            Some("1"),
+            "imd_val_d_o[0] unpacked word assign must parse"
+        );
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            lut_driven(&d, "imd_val_we_o_0"),
+            "imd_val_we_o[0] must be driven"
+        );
+        assert!(
+            (0..33).all(|i| lut_driven(&d, &format!("imd_val_d_o_w0_{i}"))),
+            "imd_val_d_o[0] unpacked word must be driven from concat"
+        );
+    }
+
+    #[test]
+    fn eq_or_eq_without_parens_lowers() {
+        // Ibex multdiv_slow valid_o: `==` binds tighter than `|`.
+        let src = r#"
+module ibex_multdiv_slow(input logic [2:0] md_state_q, input logic [1:0] operator_i,
+                         output logic valid_o);
+  localparam logic [2:0] MD_LAST = 3'd4, MD_FINISH = 3'd6;
+  localparam logic [1:0] MD_OP_MULL = 2'd0, MD_OP_MULH = 2'd1;
+  assign valid_o = (md_state_q == MD_FINISH) |
+                   (md_state_q == MD_LAST &
+                   (operator_i == MD_OP_MULL |
+                    operator_i == MD_OP_MULH));
+endmodule
+"#;
+        let d = synth_sv(src, "multdiv_valid.sv").expect("valid_o");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(lut_driven(&d, "valid_o"), "valid_o eq-or-eq must be a LUT");
+    }
+
+    #[test]
+    fn genvar_const_part_select_is_low_bits() {
+        // After generate-for subst, `b[W-1:0]` is `0[W-1:0]` (Ibex icache beats).
+        let src = r#"
+module icache_beat(input logic [1:0] fill_rvd_off, output logic [1:0] match_b);
+  for (genvar b = 0; b < 2; b++) begin : g
+    assign match_b[b] = (fill_rvd_off == b[1:0]);
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "icache_beat.sv").expect("beat");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert!(
+            lut_driven(&d, "match_b_0") && lut_driven(&d, "match_b_1"),
+            "genvar part-select compare must drive both beats"
+        );
+    }
+
+    #[test]
+    fn crash_dump_packed_field_lhs_lowers() {
+        let src = r#"
+package ibex_pkg;
+  typedef struct packed {
+    logic [31:0] current_pc;
+    logic [31:0] next_pc;
+    logic [31:0] last_data_addr;
+    logic [31:0] exception_pc;
+    logic [31:0] exception_addr;
+  } crash_dump_t;
+endpackage
+module ibex_core(input logic [31:0] pc_id, input logic [31:0] pc_if,
+                 output crash_dump_t crash_dump_o);
+  assign crash_dump_o.current_pc = pc_id;
+  assign crash_dump_o.next_pc    = pc_if;
+endmodule
+"#;
+        let d = synth_sv(src, "crash_dump.sv").expect("crash_dump");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+    }
+
+    #[test]
     fn packed_part_select_lhs_plus_colon_lowers() {
         let src = r#"
 module timer_be(input logic [3:0] be, input logic [31:0] wdata,
@@ -17789,6 +18285,30 @@ endmodule
             !assign_not_lowered_named("timer", "mtime_inc")
                 && !assign_not_lowered_named("timer", "interrupt_d"),
             "timer mtime_inc / interrupt_d must lower"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_core", "rvfi_ext_mip"),
+            "ibex_core rvfi_ext_mip CSR-bit packed assigns must lower"
+        );
+        assert!(
+            !generate_not_lowered_for("ibex_multdiv_slow"),
+            "generate_not_lowered ibex_multdiv_slow must be gone"
+        );
+        assert!(
+            !generate_not_lowered_for("ibex_icache"),
+            "generate_not_lowered ibex_icache must be gone"
+        );
+        assert!(
+            !generate_not_lowered_for("ibex_core"),
+            "generate_not_lowered ibex_core must be gone"
+        );
+        assert!(
+            !generate_not_lowered_for("ibex_lockstep"),
+            "generate_not_lowered ibex_lockstep must be gone"
+        );
+        assert!(
+            !generate_not_lowered_for("prim_present"),
+            "generate_not_lowered prim_present must be gone"
         );
     }
 
