@@ -919,10 +919,41 @@ fn harvest_packed_struct(p: &mut P) {
     );
 }
 
+/// CSR bit indices / MuBi constants used as selects. Not ICache/PMP sizes
+/// (those stay skipped so generate bounds do not re-elaborate).
+fn pkg_param_is_csr_or_mubi(name: &str) -> bool {
+    name.starts_with("CSR_") || name == "IbexMuBiOn" || name == "IbexMuBiOff"
+}
+
+fn rexpr_const_val(e: &RExpr) -> Option<u128> {
+    match e {
+        RExpr::Const { val, .. } => Some(*val),
+        RExpr::Concat(parts) => {
+            let mut acc = 0u128;
+            let mut sh = 0usize;
+            for p in parts.iter().rev() {
+                let RExpr::Const { val, width, .. } = p else {
+                    return None;
+                };
+                let w = (*width).max(1).min(128);
+                acc |= (*val & care_mask(w)) << sh;
+                sh = sh.saturating_add(w);
+                if sh >= 128 {
+                    break;
+                }
+            }
+            Some(acc)
+        }
+        RExpr::Not(x) => Some(if rexpr_const_val(x)? != 0 { 0 } else { 1 }),
+        _ => None,
+    }
+}
+
 /// Package `localparam exc_cause_t ExcCauseIrqNm = '{irq_ext: 1'b1, ...};`.
 /// Named packed patterns become consts so `ExcCauseIrqNm.lower_cause` folds
-/// instead of an unknown-name assign_not_lowered. Other package params stay
-/// skipped (do not re-elaborate ICache/PMP sizes).
+/// instead of an unknown-name assign_not_lowered. CSR_* bit indices and
+/// IbexMuBiOn/Off seed PKG_ENUMS only (not `p.params`) so ICache/PMP sizes
+/// stay skipped.
 fn harvest_pkg_packed_param(p: &mut P) {
     skip_sv_type(p);
     let Ok(mut name) = p.ident() else {
@@ -945,6 +976,18 @@ fn harvest_pkg_packed_param(p: &mut P) {
                 }
                 _ => {}
             }
+        } else if pkg_param_is_csr_or_mubi(&name) {
+            let save = p.i;
+            match parse_rexpr(p) {
+                Ok(e) => {
+                    if let Some(val) = rexpr_const_val(&e) {
+                        pkg_enum_insert(name, val);
+                    }
+                }
+                Err(_) => {
+                    p.i = save;
+                }
+            }
         }
     }
     skip_to_semi(p);
@@ -958,6 +1001,30 @@ fn harvest_typedef_enum(p: &mut P) {
         if p.eat_kw("struct") {
             harvest_packed_struct(p);
             return;
+        }
+        // `typedef logic [3:0] ibex_mubi_t;` — width only, not a generate miss.
+        let _ = p.eat_kw("logic")
+            || p.eat_kw("bit")
+            || p.eat_kw("reg")
+            || p.eat_kw("wire");
+        let mut width = 1usize;
+        if matches!(p.peek(), Some(Tok::Sym('['))) {
+            match p.width_opt() {
+                Ok(w) => width = w.max(1),
+                Err(_) => {
+                    let _ = skip_item_or_block(p);
+                    return;
+                }
+            }
+        }
+        if let Ok(tname) = p.ident() {
+            if width > 0 && width <= 128 && matches!(p.peek(), Some(Tok::Sym(';')) | None) {
+                PKG_ENUM_TYPES.with(|m| {
+                    m.borrow_mut().insert(tname, width);
+                });
+                let _ = p.eat_sym(';');
+                return;
+            }
         }
         let _ = skip_item_or_block(p);
         return;
@@ -1244,6 +1311,12 @@ fn note_assign_not_lowered(module: &str, signal: &str) {
 fn assign_not_lowered_for(module: &str) -> bool {
     let prefix = format!("{module}\0");
     ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow().iter().any(|k| k.starts_with(&prefix)))
+}
+
+#[cfg(test)]
+fn assign_not_lowered_named(module: &str, signal: &str) -> bool {
+    let key = format!("{module}\0{signal}");
+    ASSIGN_NOT_LOWERED_SEEN.with(|s| s.borrow().contains(&key))
 }
 
 /// Generate or for-generate assign did not parse. One line per module.
@@ -3175,6 +3248,30 @@ fn clog2_u(n: u128) -> u128 {
     }
 }
 
+/// `$bits(type)` / `$bits(pkg::type)` / `$bits(sig)` — harvested enum,
+/// packed-struct, or tracked signal width. Not a generate miss.
+fn parse_bits_width(p: &mut P) -> Result<u128, String> {
+    if !p.eat_sym('(') {
+        return Err("$bits (".into());
+    }
+    let mut name = p.ident()?;
+    if matches!(p.peek(), Some(Tok::Sym(':')))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+        && matches!(p.t.get(p.i + 2), Some(Tok::Ident(_)))
+    {
+        p.bump();
+        p.bump();
+        name = p.ident()?;
+    }
+    if !p.eat_sym(')') {
+        return Err("$bits )".into());
+    }
+    typed_width(&name)
+        .or_else(|| p.widths.get(&name).copied())
+        .map(|w| w as u128)
+        .ok_or_else(|| format!("$bits unknown {name}"))
+}
+
 fn const_atom(p: &mut P) -> Result<u128, String> {
     // Unary `(-3)+W` / `(-1)+W` are elaboration consts, not a dropped always.
     if p.eat_sym('+') {
@@ -3196,6 +3293,10 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             let n = *v;
             p.bump();
             Ok(n)
+        }
+        Some(Tok::Ident(s)) if s == "$bits" => {
+            p.bump();
+            parse_bits_width(p)
         }
         Some(Tok::Ident(s)) if s == "$clog2" => {
             p.bump();
@@ -3257,9 +3358,18 @@ fn const_u(p: &mut P) -> Result<u128, String> {
     let mut v = const_atom(p)?;
     loop {
         if p.eat_sym('+') {
+            // Do not consume the `+:` of indexed part-select.
+            if matches!(p.peek(), Some(Tok::Sym(':'))) {
+                p.i -= 1;
+                break;
+            }
             // wrapping so `(-1)+W` is W-1, not a saturated width_overflow.
             v = v.wrapping_add(const_atom(p)?);
         } else if p.eat_sym('-') {
+            if matches!(p.peek(), Some(Tok::Sym(':'))) {
+                p.i -= 1;
+                break;
+            }
             v = v.wrapping_sub(const_atom(p)?);
         } else if p.eat_sym('*') {
             if p.eat_sym('*') {
@@ -3904,6 +4014,14 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                     care: u128::MAX,
                 });
             }
+            if name == "$bits" && matches!(p.peek(), Some(Tok::Sym('('))) {
+                let w = parse_bits_width(p)?;
+                return Ok(RExpr::Const {
+                    val: w,
+                    width: 32,
+                    care: u128::MAX,
+                });
+            }
             // `fname(a, b)` — inlined after module parse when a FuncDef exists.
             // `$readmemh`/`$display` are statements, not this path.
             if p.eat_sym('(') {
@@ -4109,8 +4227,40 @@ fn skip_logic(p: &mut P) -> bool {
     signed
 }
 
-fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
+enum LhsKind {
+    Whole(String),
+    Bit(String, usize),
+    /// Inclusive slice `lo .. lo+width-1` (packed field or `+:` / `-:`).
+    Slice { name: String, lo: usize, width: usize },
+}
+
+fn lhs_kind_assigns(kind: LhsKind, rhs: RExpr) -> Vec<(String, Option<usize>, RExpr)> {
+    match kind {
+        LhsKind::Whole(n) => vec![(n, None, rhs)],
+        LhsKind::Bit(n, b) => vec![(n, Some(b), rhs)],
+        LhsKind::Slice { name, lo, width } => {
+            let w = width.max(1);
+            (0..w)
+                .map(|i| {
+                    let piece = match &rhs {
+                        RExpr::Range(s, rlo, _) => RExpr::Bit(s.clone(), rlo + i),
+                        RExpr::Ident(s) => RExpr::Bit(s.clone(), i),
+                        RExpr::Bit(s, b) if i == 0 => RExpr::Bit(s.clone(), *b),
+                        _ => bit_extract(rhs.clone(), i),
+                    };
+                    (name.clone(), Some(lo + i), piece)
+                })
+                .collect()
+        }
+    }
+}
+
+fn parse_lhs(p: &mut P) -> Result<LhsKind, String> {
     let name = p.ident()?;
+    parse_lhs_after_name(p, name)
+}
+
+fn parse_lhs_after_name(p: &mut P, name: String) -> Result<LhsKind, String> {
     if p.eat_sym('.') {
         let field = p.ident()?;
         let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
@@ -4119,27 +4269,71 @@ fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
             if !p.eat_sym(']') {
                 return Err("]".into());
             }
-            return Ok((name, Some(lo + idx)));
+            return Ok(LhsKind::Bit(name, lo + idx));
         }
         if width <= 1 {
-            return Ok((name, Some(lo)));
+            return Ok(LhsKind::Bit(name, lo));
         }
-        return Err("lhs multi-bit field".into());
+        return Ok(LhsKind::Slice {
+            name,
+            lo,
+            width: width.max(1),
+        });
     }
     if p.eat_sym('[') {
-        // Bit, or const range name[hi:lo] (treated as full-vector assign).
+        // Bit, `+:` / `-:`, or const range name[hi:lo] (treated as full-vector).
         let save = p.i;
-        if let Ok(hi) = const_u(p) {
+        if let Ok(base) = const_u(p) {
+            if matches!(p.peek(), Some(Tok::Sym('+')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+            {
+                p.bump();
+                p.bump();
+                let w = (const_u(p)? as usize).max(1);
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                let lo = base as usize;
+                if w == 1 {
+                    return Ok(LhsKind::Bit(name, lo));
+                }
+                return Ok(LhsKind::Slice {
+                    name,
+                    lo,
+                    width: w,
+                });
+            }
+            if matches!(p.peek(), Some(Tok::Sym('-')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+            {
+                p.bump();
+                p.bump();
+                let w = (const_u(p)? as usize).max(1);
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                let hi = base as usize;
+                let lo = hi.saturating_sub(w.saturating_sub(1));
+                let span = hi.saturating_sub(lo).saturating_add(1).max(1);
+                if span == 1 {
+                    return Ok(LhsKind::Bit(name, hi));
+                }
+                return Ok(LhsKind::Slice {
+                    name,
+                    lo,
+                    width: span,
+                });
+            }
             if p.eat_sym(':') {
                 let _lo = const_u(p)?;
                 if !p.eat_sym(']') {
                     return Err("]".into());
                 }
-                let _ = hi;
-                return Ok((name, None));
+                let _ = base;
+                return Ok(LhsKind::Whole(name));
             }
             if p.eat_sym(']') {
-                return Ok((name, Some(hi as usize)));
+                return Ok(LhsKind::Bit(name, base as usize));
             }
         }
         p.i = save;
@@ -4149,18 +4343,18 @@ fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
                 if !p.eat_sym(']') {
                     return Err("]".into());
                 }
-                Ok((name, Some(idx)))
+                Ok(LhsKind::Bit(name, idx))
             }
             Some(Tok::Ident(_)) => {
                 if !p.eat_sym(']') {
                     return Err("]".into());
                 }
-                Ok((name, None))
+                Ok(LhsKind::Whole(name))
             }
             _ => Err("lhs index".into()),
         }
     } else {
-        Ok((name, None))
+        Ok(LhsKind::Whole(name))
     }
 }
 
@@ -4342,7 +4536,7 @@ fn parse_mem_image(text: &str, binary: bool) -> BTreeMap<usize, u128> {
 }
 
 fn parse_nba(p: &mut P) -> Result<Nba, String> {
-    let (lhs, bit) = parse_lhs(p)?;
+    let kind = parse_lhs(p)?;
     if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
     } else if !p.eat_sym('=') {
@@ -4350,7 +4544,11 @@ fn parse_nba(p: &mut P) -> Result<Nba, String> {
     }
     let rhs = parse_rexpr(p)?;
     let _ = p.eat_sym(';');
-    Ok((lhs, bit, rhs))
+    match kind {
+        LhsKind::Whole(n) => Ok((n, None, rhs)),
+        LhsKind::Bit(n, b) => Ok((n, Some(b), rhs)),
+        LhsKind::Slice { name, lo, .. } => Ok((name, Some(lo), rhs)),
+    }
 }
 
 fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
@@ -4989,6 +5187,43 @@ fn normalize_nbas(p: &P, stmts: Vec<Nba>) -> Vec<Nba> {
 /// Blocking assign, including `name[hi:lo] = expr` as per-bit writes.
 fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
     let name = p.ident()?;
+    if p.eat_sym('.') {
+        let field = p.ident()?;
+        let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+        if p.eat_sym('[') {
+            let idx = const_u(p)? as usize;
+            if !p.eat_sym(']') {
+                return Err("]".into());
+            }
+            if matches!(p.peek(), Some(Tok::Le)) {
+                p.bump();
+            } else if !p.eat_sym('=') {
+                return Err("nba".into());
+            }
+            let rhs = parse_rexpr(p)?;
+            let _ = p.eat_sym(';');
+            return Ok(vec![(name, Some(lo + idx), rhs)]);
+        }
+        if matches!(p.peek(), Some(Tok::Le)) {
+            p.bump();
+        } else if !p.eat_sym('=') {
+            return Err("nba".into());
+        }
+        let rhs = parse_rexpr(p)?;
+        let _ = p.eat_sym(';');
+        return Ok(lhs_kind_assigns(
+            if width <= 1 {
+                LhsKind::Bit(name, lo)
+            } else {
+                LhsKind::Slice {
+                    name,
+                    lo,
+                    width: width.max(1),
+                }
+            },
+            rhs,
+        ));
+    }
     let mut range: Option<(usize, usize)> = None;
     let mut bit = None;
     let mut word_addr: Option<RExpr> = None;
@@ -4996,7 +5231,31 @@ fn parse_assign_nbas(p: &mut P) -> Result<Vec<Nba>, String> {
         let save = p.i;
         let const_ok = const_u(p);
         if let Ok(hi) = const_ok {
-            if p.eat_sym(':') {
+            if matches!(p.peek(), Some(Tok::Sym('+')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+            {
+                p.bump();
+                p.bump();
+                let w = (const_u(p)? as usize).max(1);
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                let lo = hi as usize;
+                let hi2 = lo.saturating_add(w.saturating_sub(1));
+                range = Some((hi2, lo));
+            } else if matches!(p.peek(), Some(Tok::Sym('-')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+            {
+                p.bump();
+                p.bump();
+                let w = (const_u(p)? as usize).max(1);
+                if !p.eat_sym(']') {
+                    return Err("]".into());
+                }
+                let hi2 = hi as usize;
+                let lo = hi2.saturating_sub(w.saturating_sub(1));
+                range = Some((hi2, lo));
+            } else if p.eat_sym(':') {
                 let lo = const_u(p)? as usize;
                 if !p.eat_sym(']') {
                     return Err("]".into());
@@ -7001,7 +7260,13 @@ fn parse_module_items(
                         break;
                     }
                     match parse_lhs(p) {
-                        Ok(x) => parts.push(x),
+                        Ok(LhsKind::Whole(n)) => parts.push((n, None)),
+                        Ok(LhsKind::Bit(n, b)) => parts.push((n, Some(b))),
+                        Ok(LhsKind::Slice { name, lo, width }) => {
+                            for i in 0..width.max(1) {
+                                parts.push((name.clone(), Some(lo + i)));
+                            }
+                        }
                         Err(_) => break,
                     }
                     let _ = p.eat_sym(',');
@@ -7060,9 +7325,9 @@ fn parse_module_items(
                 }
             } else {
                 match (parse_lhs(&mut p), p.eat_sym('='), parse_rexpr(&mut p)) {
-                    (Ok((lhs, bit)), true, Ok(rhs)) => {
+                    (Ok(kind), true, Ok(rhs)) => {
                         let _ = p.eat_sym(';');
-                        assigns.push((lhs, bit, rhs));
+                        assigns.extend(lhs_kind_assigns(kind, rhs));
                     }
                     _ => {
                         note_generate_not_lowered(&cur_mod());
@@ -8286,6 +8551,17 @@ fn rexpr_is_rel(e: &RExpr) -> bool {
     }
 }
 
+/// True when the formula contains `<` (including `>=` as `!(a < b)`).
+/// Eq/Ne stay off this path so OR-of-eq can map (Ibex bwlogic_or).
+fn rexpr_has_lt(e: &RExpr) -> bool {
+    match e {
+        RExpr::Lt(_, _) => true,
+        RExpr::Not(x) => rexpr_has_lt(x),
+        RExpr::And(a, b) | RExpr::Or(a, b) => rexpr_has_lt(a) || rexpr_has_lt(b),
+        _ => false,
+    }
+}
+
 /// A constant range is a test of a few bus bits, not a full-width cone.
 /// LUT6 holds at most this many inputs. Wider compares stay `assign_not_lowered`.
 const SMALL_REL_BITS: usize = 6;
@@ -8908,6 +9184,26 @@ fn lut6_from_i012(f: impl Fn(bool, bool, bool) -> bool) -> u64 {
     while sh < 64 {
         acc |= pat << sh;
         sh += 8;
+    }
+    acc
+}
+
+fn lut6_from_i0123(f: impl Fn(bool, bool, bool, bool) -> bool) -> u64 {
+    let mut pat = 0u64;
+    for addr in 0..16u32 {
+        let i0 = addr & 1 == 1;
+        let i1 = addr & 2 == 2;
+        let i2 = addr & 4 == 4;
+        let i3 = addr & 8 == 8;
+        if f(i0, i1, i2, i3) {
+            pat |= 1u64 << addr;
+        }
+    }
+    let mut acc = 0u64;
+    let mut sh = 0;
+    while sh < 64 {
+        acc |= (pat & 0xffff) << sh;
+        sh += 16;
     }
     acc
 }
@@ -10993,6 +11289,11 @@ fn op_bit_net(rtl: &Rtl, name: &str, bit: usize) -> Option<String> {
 /// Max ripple width for named-bus add. Ibex ALU adder_result_ext is 34
 /// (33+33 with carry-out). Wider than this stays unlowered — do not invent.
 const RIPPLE_ADD_MAX: usize = 40;
+/// `bus + 1` / `bus + 64'd1` only (Ibex mtime_inc, CounterWidth=64).
+/// General a+b stays at RIPPLE_ADD_MAX so a 64-PI add is not invented.
+const RIPPLE_INC_MAX: usize = 64;
+/// Unsigned bus-vs-bus `<` / `>=` ripple. Ibex timer interrupt_d is 64.
+const RIPPLE_CMP_MAX: usize = 64;
 
 fn emit_ripple_add(
     d: &mut Design,
@@ -11196,7 +11497,12 @@ fn emit_ripple_add_const(
     bus: &str,
     k: u128,
 ) -> bool {
-    if width == 0 || width > RIPPLE_ADD_MAX || !(1u128..=16).contains(&k) {
+    let max_w = if k == 1 {
+        RIPPLE_INC_MAX
+    } else {
+        RIPPLE_ADD_MAX
+    };
+    if width == 0 || width > max_w || !(1u128..=16).contains(&k) {
         return false;
     }
     // A missing bus bit is a skip, not a zero-extended invented bus.
@@ -11270,6 +11576,212 @@ fn emit_ripple_add_const(
         }
     }
     eprintln!("synth_rtl ripple_add_const signal={sum} bits={width} const={k}");
+    true
+}
+
+fn rel_bus_bit(rtl: &Rtl, bus: &RelBus, i: usize) -> Option<String> {
+    if i >= bus.width {
+        return None;
+    }
+    op_bit_net(rtl, &bus.name, bus.lo + i)
+}
+
+fn as_bus_lt_pair(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Option<(RelBus, RelBus)> {
+    let ba = as_rel_bus(a, rtl)?;
+    let bb = as_rel_bus(b, rtl)?;
+    if const_rel_value(a).is_some() || const_rel_value(b).is_some() {
+        return None;
+    }
+    if ba.width == 0 || bb.width == 0 || ba.width != bb.width {
+        return None;
+    }
+    Some((ba, bb))
+}
+
+fn packed_bus_lt_mix(e: &RExpr, rtl: &Rtl) -> Option<(RelBus, RelBus, bool)> {
+    let mut found: Option<(RelBus, RelBus, bool)> = None;
+    let mut ok = true;
+    fn walk(
+        e: &RExpr,
+        rtl: &Rtl,
+        found: &mut Option<(RelBus, RelBus, bool)>,
+        ok: &mut bool,
+    ) {
+        if !*ok {
+            return;
+        }
+        match e {
+            RExpr::Lt(a, b) => {
+                let Some((ba, bb)) = as_bus_lt_pair(a, b, rtl) else {
+                    *ok = false;
+                    return;
+                };
+                if found.is_some() {
+                    *ok = false;
+                    return;
+                }
+                *found = Some((ba, bb, false));
+            }
+            RExpr::Not(x) => {
+                if let RExpr::Lt(a, b) = x.as_ref() {
+                    if let Some((ba, bb)) = as_bus_lt_pair(a, b, rtl) {
+                        if found.is_some() {
+                            *ok = false;
+                            return;
+                        }
+                        *found = Some((ba, bb, true));
+                        return;
+                    }
+                }
+                walk(x, rtl, found, ok);
+            }
+            RExpr::And(a, b) | RExpr::Or(a, b) => {
+                walk(a, rtl, found, ok);
+                walk(b, rtl, found, ok);
+            }
+            RExpr::Ident(s) | RExpr::Bit(s, _) => {
+                if sig_width(rtl, s) > 1 && matches!(e, RExpr::Ident(_)) {
+                    *ok = false;
+                }
+            }
+            RExpr::Const { width, .. } if *width <= 1 => {}
+            _ => *ok = false,
+        }
+    }
+    walk(e, rtl, &mut found, &mut ok);
+    if ok {
+        found
+    } else {
+        None
+    }
+}
+
+fn replace_one_bus_lt(e: &RExpr, rtl: &Rtl, net: &str) -> RExpr {
+    fn walk(e: &RExpr, rtl: &Rtl, net: &str, done: &mut bool) -> RExpr {
+        if *done {
+            return e.clone();
+        }
+        match e {
+            RExpr::Lt(a, b) if as_bus_lt_pair(a, b, rtl).is_some() => {
+                *done = true;
+                RExpr::Ident(net.to_string())
+            }
+            RExpr::Not(x) => {
+                if let RExpr::Lt(a, b) = x.as_ref() {
+                    if as_bus_lt_pair(a, b, rtl).is_some() {
+                        *done = true;
+                        return RExpr::Ident(net.to_string());
+                    }
+                }
+                RExpr::Not(Box::new(walk(x, rtl, net, done)))
+            }
+            RExpr::And(a, b) => RExpr::And(
+                Box::new(walk(a, rtl, net, done)),
+                Box::new(walk(b, rtl, net, done)),
+            ),
+            RExpr::Or(a, b) => RExpr::Or(
+                Box::new(walk(a, rtl, net, done)),
+                Box::new(walk(b, rtl, net, done)),
+            ),
+            other => other.clone(),
+        }
+    }
+    let mut done = false;
+    walk(e, rtl, net, &mut done)
+}
+
+/// Unsigned `a < b` / `a >= b` as a per-bit ripple, not a 2W-PI AIG.
+/// `ge` drives `a >= b` (`!(a < b)`). Equal widths only; missing bits skip.
+fn emit_ripple_ult(
+    d: &mut Design,
+    rtl: &Rtl,
+    out: &str,
+    a: &RelBus,
+    b: &RelBus,
+    ge: bool,
+) -> bool {
+    if a.width == 0 || a.width != b.width || a.width > RIPPLE_CMP_MAX {
+        return false;
+    }
+    let w = a.width;
+    if (0..w).any(|i| rel_bus_bit(rtl, a, i).is_none() || rel_bus_bit(rtl, b, i).is_none()) {
+        return false;
+    }
+    let mut lt: Option<String> = None;
+    let mut eq: Option<String> = None;
+    for i in (0..w).rev() {
+        let Some(an) = rel_bus_bit(rtl, a, i) else {
+            return false;
+        };
+        let Some(bn) = rel_bus_bit(rtl, b, i) else {
+            return false;
+        };
+        let last = i == 0;
+        let lt_net = if last && !ge {
+            out.to_string()
+        } else {
+            format!("n_ucmp_{out}_{i}l")
+        };
+        let eq_net = format!("n_ucmp_{out}_{i}e");
+        let lt_cell = format!("u_ucmp_{out}_{i}l");
+        let eq_cell = format!("u_ucmp_{out}_{i}e");
+        match (eq.as_deref(), lt.as_deref()) {
+            (None, None) => {
+                // MSB: lt = ~a & b; eq = ~(a^b)
+                emit_lut_pins(
+                    d,
+                    &lt_cell,
+                    &lt_net,
+                    lut6_and2(true, false, false),
+                    &[(&an, "I0"), (&bn, "I1")],
+                );
+                if !last {
+                    emit_lut_pins(d, &eq_cell, &eq_net, lut6_xnor2(), &[(&an, "I0"), (&bn, "I1")]);
+                    eq = Some(eq_net);
+                }
+                lt = Some(lt_net);
+            }
+            (Some(eq_in), Some(lt_in)) => {
+                // lt = lt_in | (eq_in & ~a & b)
+                emit_lut_pins(
+                    d,
+                    &lt_cell,
+                    &lt_net,
+                    lut6_from_i0123(|a_i, b_i, eq_i, lt_i| lt_i || (eq_i && !a_i && b_i)),
+                    &[(&an, "I0"), (&bn, "I1"), (eq_in, "I2"), (lt_in, "I3")],
+                );
+                if !last {
+                    // eq = eq_in & ~(a^b)
+                    emit_lut_pins(
+                        d,
+                        &eq_cell,
+                        &eq_net,
+                        lut6_from_i012(|a_i, b_i, eq_i| eq_i && a_i == b_i),
+                        &[(&an, "I0"), (&bn, "I1"), (eq_in, "I2")],
+                    );
+                    eq = Some(eq_net);
+                }
+                lt = Some(lt_net);
+            }
+            _ => return false,
+        }
+    }
+    let Some(lt_final) = lt else {
+        return false;
+    };
+    if ge {
+        emit_lut_pins(
+            d,
+            &format!("u_ucmp_{out}_g"),
+            out,
+            lut6_inv(),
+            &[(&lt_final, "I0")],
+        );
+    }
+    eprintln!(
+        "synth_rtl ripple_ult signal={out} bits={w} ge={}",
+        ge as u8
+    );
     true
 }
 
@@ -12325,7 +12837,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((bus, k)) = packed_add_const(rhs, rtl) {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
-                    if w > RIPPLE_ADD_MAX || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
+                    let max_w = if k == 1 {
+                        RIPPLE_INC_MAX
+                    } else {
+                        RIPPLE_ADD_MAX
+                    };
+                    if w > max_w || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
                         note_assign_not_lowered(&rtl.module, lhs);
                     }
                     continue;
@@ -12417,10 +12934,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         let rel = rexpr_is_rel(rhs);
+        let mut rel_lt = rexpr_has_lt(rhs);
         let w = sig_width(rtl, lhs);
+        let mut rhs_cmp: Option<RExpr> = None;
         // `bus < const` / `bus >= const` (and their && / ||) is a test of the
         // bits that differ from the bound, not a 16-PI cone. `'h6000 <= x < 'h8000`
         // is bits [15:13]==011. Wider than a LUT6 stays assign_not_lowered.
+        // Eq/Ne (bwlogic_or) are not Lt: they fall through to OR-of-eq.
         if rel && match bit {
             Some(0) => true,
             None => w <= 1,
@@ -12438,13 +12958,28 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 }
                 continue;
             }
+            // Bus-vs-bus `<` / `>=` wider than a LUT6: ripple, not a 2W-PI AIG.
+            if let Some((ba, bb, ge)) = packed_bus_lt_mix(rhs, rtl) {
+                if ba.width.saturating_add(bb.width) > SMALL_REL_BITS {
+                    let net = format!("n_ucmp_{lhs}");
+                    if ba.width.max(bb.width) > RIPPLE_CMP_MAX
+                        || !emit_ripple_ult(&mut d, rtl, &net, &ba, &bb, ge)
+                    {
+                        note_assign_not_lowered(&rtl.module, lhs);
+                        continue;
+                    }
+                    rhs_cmp = Some(replace_one_bus_lt(rhs, rtl, &net));
+                    rel_lt = false;
+                }
+            }
         }
+        let rhs = rhs_cmp.as_ref().unwrap_or(rhs);
         let mut failed = false;
         if let Some(b) = bit {
             match rexpr_to_bit(rhs, rtl, 0) {
                 Ok(e) => {
                     let bn = bit_name(lhs, w, *b);
-                    if rel {
+                    if rel_lt {
                         rel_sig.insert(bn.clone(), lhs.clone());
                     }
                     comb_bits.push((bn, e));
@@ -12462,7 +12997,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 match rexpr_to_bit(rhs, rtl, i) {
                     Ok(e) => {
                         let bn = bit_name(lhs, w, i);
-                        if rel {
+                        if rel_lt {
                             rel_sig.insert(bn.clone(), lhs.clone());
                         }
                         comb_bits.push((bn, e));
@@ -14488,6 +15023,14 @@ endmodule
         let ffs = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Hff)).count();
         eprintln!("timer_full ffs={ffs} cells={}", d.cells.len());
         assert!(ffs >= 64, "timer must map mtime FFs, got {ffs}");
+        assert!(
+            !assign_not_lowered_named("timer", "mtime_inc"),
+            "mtime_inc 64-bit +1 must ripple"
+        );
+        assert!(
+            !assign_not_lowered_named("timer", "interrupt_d"),
+            "interrupt_d bus>=bus must ripple"
+        );
     }
 
     #[test]
@@ -16567,6 +17110,166 @@ endmodule
     }
 
     #[test]
+    fn ibex_mtime_inc_64_plus_one_is_ripple_not_assign_miss() {
+        // timer mtime_inc / ibex_counter CounterWidth=64: + 64'd1, not RIPPLE_ADD_MAX.
+        let src = r#"
+module timer_mtime_inc(input logic [63:0] mtime_q,
+                       output logic [63:0] mtime_inc);
+  assign mtime_inc = mtime_q + 64'd1;
+endmodule
+"#;
+        let d = synth_sv(src, "timer_mtime_inc.sv").expect("mtime_inc");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts >= 64 && luts <= 128,
+            "64-bit +1 ripple must map LUTs under hang cap, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn bwlogic_or_of_enum_eq_maps_not_assign_miss() {
+        // Ibex alu: (operator_i == ALU_OR) | (operator_i == ALU_ORN).
+        // Eq must reach OR-of-eq; Lt honesty must not swallow it.
+        let src = r#"
+package ibex_pkg;
+  typedef enum logic [6:0] { ALU_AND, ALU_OR, ALU_ORN, ALU_ANDN } alu_op_e;
+endpackage
+module ibex_alu(input logic [6:0] operator_i,
+                output logic bwlogic_or, output logic bwlogic_and);
+  assign bwlogic_or  = (operator_i == ALU_OR)  | (operator_i == ALU_ORN);
+  assign bwlogic_and = (operator_i == ALU_AND) | (operator_i == ALU_ANDN);
+endmodule
+"#;
+        let d = synth_sv(src, "ibex_alu_bwlogic.sv").expect("bwlogic");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(lut_driven(&d, "bwlogic_or"), "bwlogic_or must be a LUT");
+        assert!(lut_driven(&d, "bwlogic_and"), "bwlogic_and must be a LUT");
+    }
+
+    #[test]
+    fn csr_bits_and_mie_field_lhs_lowers() {
+        let src = r#"
+package ibex_pkg;
+  typedef enum logic [11:0] { CSR_MSTATUS = 12'h300 } csr_num_e;
+  typedef enum logic [1:0] { PRIV_LVL_U = 2'b00, PRIV_LVL_M = 2'b11 } priv_lvl_e;
+  typedef struct packed {
+    logic        irq_software;
+    logic        irq_timer;
+    logic        irq_external;
+    logic [14:0] irq_fast;
+  } irqs_t;
+  parameter int unsigned CSR_MSIX_BIT = 3;
+  parameter int unsigned CSR_MTIX_BIT = 7;
+  parameter int unsigned CSR_MEIX_BIT = 11;
+  parameter int unsigned CSR_MFIX_BIT_LOW = 16;
+  parameter int unsigned CSR_MFIX_BIT_HIGH = 30;
+endpackage
+module ibex_cs_registers(
+  input  logic [11:0] csr_addr_i,
+  input  logic [1:0]  priv_lvl_q,
+  input  logic        csr_wr,
+  input  logic [31:0] csr_wdata_int,
+  output logic        illegal_csr_priv,
+  output logic        illegal_csr_write,
+  output irqs_t       mie_d
+);
+  logic [$bits(csr_num_e)-1:0] csr_addr;
+  assign csr_addr = {csr_addr_i};
+  assign illegal_csr_priv  = (csr_addr[9:8] > {priv_lvl_q});
+  assign illegal_csr_write = (csr_addr[11:10] == 2'b11) && csr_wr;
+  assign mie_d.irq_software = csr_wdata_int[CSR_MSIX_BIT];
+  assign mie_d.irq_timer    = csr_wdata_int[CSR_MTIX_BIT];
+  assign mie_d.irq_external = csr_wdata_int[CSR_MEIX_BIT];
+  assign mie_d.irq_fast     = csr_wdata_int[CSR_MFIX_BIT_HIGH:CSR_MFIX_BIT_LOW];
+endmodule
+"#;
+        let d = synth_sv(src, "ibex_csr_bits.sv").expect("csr bits");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "illegal_csr_* / mie_d must lower"
+        );
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert!(lut_driven(&d, "illegal_csr_priv"));
+        assert!(lut_driven(&d, "illegal_csr_write"));
+        assert!(
+            !assign_not_lowered_named("ibex_cs_registers", "mie_d"),
+            "mie_d packed-field LHS must not stay assign_not_lowered"
+        );
+    }
+
+    #[test]
+    fn packed_part_select_lhs_plus_colon_lowers() {
+        let src = r#"
+module timer_be(input logic [3:0] be, input logic [31:0] wdata,
+                input logic [31:0] q, output logic [31:0] w);
+  for (genvar b = 0; b < 4; b++) begin : g
+    assign w[(b*8)+:8] = be[b] ? wdata[b*8+:8] : q[(b*8)+:8];
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "timer_be.sv").expect("+: lhs");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            (0..32).all(|i| lut_driven(&d, &format!("w_{i}"))),
+            "byte-strobe +: LHS must drive every bit"
+        );
+    }
+
+    #[test]
+    fn interrupt_d_bus_ge_bus_is_ripple_not_aig() {
+        let src = r#"
+module timer_intr(input logic [63:0] mtime_q, input logic [63:0] mtimecmp_q,
+                  input logic interrupt_q, input logic mtimecmp_we,
+                  input logic mtimecmph_we, output logic interrupt_d);
+  assign interrupt_d = ((mtime_q >= mtimecmp_q) | interrupt_q) & ~(mtimecmp_we | mtimecmph_we);
+endmodule
+"#;
+        let d = synth_sv(src, "timer_intr.sv").expect("interrupt_d");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert!(lut_driven(&d, "interrupt_d"));
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts >= 64 && luts <= 192,
+            "64-bit >= ripple plus mix, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn core_busy_mubi_mux_lowers() {
+        let src = r#"
+package ibex_pkg;
+  typedef logic [3:0] ibex_mubi_t;
+  parameter ibex_mubi_t IbexMuBiOn  = 4'b0101;
+  parameter ibex_mubi_t IbexMuBiOff = 4'b1010;
+endpackage
+module ibex_core(input logic ctrl_busy, input logic if_busy, input logic lsu_busy,
+                 output ibex_mubi_t core_busy_o);
+  assign core_busy_o = (ctrl_busy || if_busy || lsu_busy) ? IbexMuBiOn : IbexMuBiOff;
+endmodule
+"#;
+        let d = synth_sv(src, "ibex_core_busy.sv").expect("core_busy");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            (0..4).all(|i| lut_driven(&d, &format!("core_busy_o_{i}"))),
+            "MuBi mux must drive each core_busy_o bit"
+        );
+    }
+
+    #[test]
     fn fetch_addr_d_mux_zpad_is_ripple_not_wide_cone() {
         // Ibex prefetch_buffer fetch_addr_d: muxed align + {zeros, and, zeros}.
         let src = r#"
@@ -17060,6 +17763,32 @@ endmodule
         assert!(
             !assign_not_lowered_for("ibex_if_stage"),
             "ibex_if_stage irq_vec / packed field assigns must lower"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_alu", "bwlogic_or")
+                && !assign_not_lowered_named("ibex_alu", "bwlogic_and"),
+            "ibex_alu bwlogic_or/and must lower"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_cs_registers", "illegal_csr_priv")
+                && !assign_not_lowered_named("ibex_cs_registers", "illegal_csr_write")
+                && !assign_not_lowered_named("ibex_cs_registers", "illegal_csr_insn_o")
+                && !assign_not_lowered_named("ibex_cs_registers", "csr_rdata_int")
+                && !assign_not_lowered_named("ibex_cs_registers", "mie_d"),
+            "ibex_cs_registers illegal_csr_* / csr_rdata_int / mie_d must lower"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_counter", "counter_upd"),
+            "ibex_counter counter_upd must ripple"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_core", "core_busy_o"),
+            "ibex_core core_busy_o MuBi mux must lower"
+        );
+        assert!(
+            !assign_not_lowered_named("timer", "mtime_inc")
+                && !assign_not_lowered_named("timer", "interrupt_d"),
+            "timer mtime_inc / interrupt_d must lower"
         );
     }
 
