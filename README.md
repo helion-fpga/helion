@@ -60,7 +60,7 @@ Device facts come from the Helion Architecture Database (HAD), never hardcoded i
 | pack | helion-pack | LUTFF + IOB + MAC27 + BRAM18 |
 | place | helion-place | timing-driven vs wirelength, BLE overflow |
 | route | helion-route | PathFinder A* with hop delay in the cost |
-| sta | helion-sta | XDC clocks / I-O delay / false path, WNS + hold |
+| sta | helion-sta | XDC via `load_xdc` (see Architecture), WNS + hold |
 | drc | helion-drc | occupancy, unrouted IO, clocks |
 | bits | helion-bits | FeatureMap frames + sparse `.hbits` (encode/decode) + partial (DFX) |
 | sim | helion-fabric | 6-input IMUX LUT + FF + IOB + STAT |
