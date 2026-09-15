@@ -1,5 +1,9 @@
 //! PathFinder negotiated routing on the Helion tile RR graph.
 //! Intra-CLB IMUX (sel 16+k = local BLE k Q); IOB via A* on the tile grid.
+//!
+//! `route_with_guide` deprioritizes excepted IOB nets inside PathFinder search
+//! cost (false_path / multicycle dogleg). helion-cli and helion-proj still call
+//! unguided `route_with` until a later crate lock wires `TimingGuide` through.
 
 use helion_device::{Device, Site};
 use helion_place::Placed;
@@ -91,6 +95,18 @@ fn manhattan(a: (u32, u32), b: (u32, u32)) -> u32 {
     a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
 }
 
+fn prefer_detour_x(dev: &Device, src: (u32, u32), detour_cols: u32) -> u32 {
+    if detour_cols == 0 {
+        return src.0;
+    }
+    let right = src.0.saturating_add(detour_cols);
+    if on_grid(dev, right, src.1) {
+        right
+    } else {
+        src.0.saturating_sub(detour_cols)
+    }
+}
+
 fn astar(
     dev: &Device,
     src: (u32, u32),
@@ -98,7 +114,9 @@ fn astar(
     hist: &HashMap<(u32, u32), u32>,
     pres: &HashMap<(u32, u32), u32>,
     pres_fac: i64,
+    detour_cols: u32,
 ) -> Result<Vec<(u32, u32)>, String> {
+    let prefer_x = prefer_detour_x(dev, src, detour_cols);
     let mut open = BinaryHeap::new();
     let mut came: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
     let mut g: HashMap<(u32, u32), i64> = HashMap::new();
@@ -127,8 +145,16 @@ fn astar(
         for (nx, ny) in neighbors(dev, x, y) {
             let h = *hist.get(&(nx, ny)).unwrap_or(&0) as i64;
             let p = *pres.get(&(nx, ny)).unwrap_or(&0) as i64;
-            // delay-driven: hop delay dominates, congestion still negotiates
-            let step = HOP_DELAY_PS + h + p * pres_fac;
+            // delay-driven: hop delay dominates, congestion still negotiates.
+            // Excepted IOB nets: penalize the src-column spine so A* doglegs
+            // (routed path/hops change; empty guide keeps gold shortest).
+            let mut step = HOP_DELAY_PS + h + p * pres_fac;
+            if detour_cols > 0 && (nx, ny) != dst {
+                if nx.abs_diff(src.0) < detour_cols {
+                    step += HOP_DELAY_PS * 8;
+                }
+                step += nx.abs_diff(prefer_x) as i64;
+            }
             let ng = gc + step;
             if ng < *g.get(&(nx, ny)).unwrap_or(&i64::MAX) {
                 g.insert((nx, ny), ng);
@@ -301,7 +327,9 @@ pub fn route_with(placed: &Placed, dev: &Device, opts: RouteOpts) -> Result<Rout
 }
 
 /// Route with XDC IOB-arc exceptions. Empty `guide` matches `route_with`.
-/// False-path / multicycle IOB nets are not delay-optimized (extra hops).
+/// False-path / multicycle IOB nets are deprioritized inside PathFinder search
+/// cost so the routed path/hops change (not a post-route hop pad).
+/// helion-cli / helion-proj still call unguided `route_with` until a later lock.
 pub fn route_with_guide(
     placed: &Placed,
     dev: &Device,
@@ -395,6 +423,7 @@ pub fn route_with_guide(
         });
     }
     let max_iters = opts.max_iters.max(1);
+    let detour_cols = guide.iob_detour_cols();
     let mut last_paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
     for iter in 0..max_iters {
         iters = iter + 1;
@@ -402,7 +431,7 @@ pub fn route_with_guide(
         let pres_fac = 1i64 + iter as i64;
         let mut paths = Vec::new();
         for (src, dst, _) in &nets {
-            let path = astar(dev, *src, *dst, &hist, &pres, pres_fac)?;
+            let path = astar(dev, *src, *dst, &hist, &pres, pres_fac, detour_cols)?;
             for tile in &path {
                 *pres.entry(*tile).or_insert(0) += 1;
             }
@@ -420,9 +449,7 @@ pub fn route_with_guide(
         }
     }
     for (i, (src, dst, ble)) in nets.iter().enumerate() {
-        let hops = last_paths[i].len().saturating_sub(1) as u32
-            + opts.extra_hops
-            + guide.iob_relax_hops();
+        let hops = last_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
         let net = placed
             .packed
             .iobs
@@ -609,6 +636,15 @@ mod tests {
             "false_path IOB must not be delay-optimized (hops {} vs {})",
             r0.iob_src[0].hops, rfp.iob_src[0].hops
         );
+        assert_eq!(
+            rfp.iob_src[0].path.len().saturating_sub(1) as u32,
+            rfp.iob_src[0].hops,
+            "false_path hops must be PathFinder tiles, not a post-route pad"
+        );
+        assert_ne!(
+            r0.iob_src[0].path, rfp.iob_src[0].path,
+            "false_path must change the routed path"
+        );
     }
 
     #[test]
@@ -634,6 +670,12 @@ mod tests {
             hops_of(&rm)
         );
         assert_ne!(r0.iob_src[0].hops, rm.iob_src[0].hops);
+        assert_eq!(
+            rm.iob_src[0].path.len().saturating_sub(1) as u32,
+            rm.iob_src[0].hops,
+            "multicycle hops must be PathFinder tiles, not a post-route pad"
+        );
+        assert_ne!(r0.iob_src[0].path, rm.iob_src[0].path);
         let gfp = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 2,
@@ -646,5 +688,6 @@ mod tests {
         )
         .unwrap();
         assert_ne!(rm.iob_src[0].hops, rfp.iob_src[0].hops);
+        assert_ne!(rm.iob_src[0].path, rfp.iob_src[0].path);
     }
 }
