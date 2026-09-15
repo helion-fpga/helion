@@ -4,7 +4,7 @@ use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
 use helion_device::{Device, Site};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{apply_iob_electrical, pack, Packed};
-use helion_place::{place_in_region, place_incremental, place_with, PlaceOpts, Placed};
+use helion_place::{place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
 use helion_sta::{apply_xdc, create_clock, load_xdc, report_timing_routed, Constraints};
 use helion_hw::{program_hbits_with_cable, prog_sim, resolve_cable, CableBackend};
@@ -277,6 +277,7 @@ impl Session {
             .transpose()?
             .unwrap_or(ImplStrategy::Default);
         self.strategy = strategy;
+        // TODO(FM-HEL-14-W4): DRC fail / driven-IOB trim / lutffs>2000 route max_iters=24.
         if let Some(pb) = prj.pblocks.iter().find(|p| p.ranged).cloned() {
             if strategy == ImplStrategy::PhysOpt {
                 let _ = self.opt_design_step()?;
@@ -348,20 +349,19 @@ impl Session {
     ) -> Result<(), String> {
         let d = self.design.as_ref().ok_or("place_pblock: no design")?;
         let packed = pack(d, dev)?;
-        let placed = if pb.cells.is_empty() {
-            place_in_region(&packed, dev, opts, pb.x0, pb.y0, pb.x1, pb.y1)?
-        } else {
-            place_named_cells_in_region(
-                &packed,
-                dev,
-                opts,
-                pb.x0,
-                pb.y0,
-                pb.x1,
-                pb.y1,
-                &pb.cells,
-            )?
-        };
+        // Empty `pb.cells` relocates the whole design. Always go through the
+        // in-proj placer so IOB loc/name checks use `placed.packed.iobs` after
+        // `place_with` LOC reorder (`place_in_region` indexes caller packed).
+        let placed = place_named_cells_in_region(
+            &packed,
+            dev,
+            opts,
+            pb.x0,
+            pb.y0,
+            pb.x1,
+            pb.y1,
+            &pb.cells,
+        )?;
         self.packed = Some(packed);
         self.placed = Some(placed);
         self.routed = None;
@@ -750,17 +750,9 @@ impl Session {
             extra_hops: ck.route_extra_hops,
         };
         if let Some(d) = ck.design {
+            // Knobs are already seeded; `reset_impl` (via synth_design) drops
+            // place/route artifacts only, not strategy / pblock / opts.
             s.synth_design(d);
-            // synth_design → reset_impl must not drop knobs; re-seed after.
-            s.strategy = ck.strategy;
-            s.pblock = ck.pblock.clone();
-            s.place_opts = PlaceOpts {
-                timing_weight: ck.timing_weight,
-            };
-            s.route_opts = RouteOpts {
-                max_iters: ck.route_max_iters,
-                extra_hops: ck.route_extra_hops,
-            };
             s.replay_impl(dev)?;
         }
         let h2 = s.blinky_hash().unwrap_or(0);
@@ -1024,7 +1016,10 @@ fn cell_listed_in_pblock(cells: &[String], names: &[&str]) -> bool {
     })
 }
 
-/// Relocate only `cells` into the HAD rectangle; everyone else keeps `place_with` sites.
+/// Relocate `cells` into the HAD rectangle; everyone else keeps `place_with` sites.
+/// Empty `cells` relocates the whole design (UG893 `create_pblock` with no
+/// `add_cells_to_pblock`). IOB loc/name checks use `placed.packed.iobs` after
+/// `place_with` LOC-preferring reorder — caller `packed.iobs[i]` is the wrong slot.
 fn place_named_cells_in_region(
     packed: &Packed,
     dev: &Device,
@@ -1049,36 +1044,88 @@ fn place_named_cells_in_region(
     }
     clbs.sort_by_key(|s| (s.x, s.y));
     let n_ble = dev.n_ble.max(1) as usize;
-    let mut region_i = 0usize;
+    let relocate_all = cells.is_empty();
+    let lutff_listed = |lf: &helion_pack::PackedLutFf| {
+        relocate_all
+            || cell_listed_in_pblock(cells, &[lf.lut_cell.as_str(), lf.ff_cell.as_str()])
+    };
+
+    // Sites still held by non-listed `place_with` cells must stay occupied.
+    let mut occupied: std::collections::HashSet<(u32, u32, u8)> =
+        std::collections::HashSet::new();
+    for (i, (site, ble)) in placed.lutff_sites.iter().enumerate() {
+        if !lutff_listed(&placed.packed.lutffs[i]) {
+            occupied.insert((site.x, site.y, *ble));
+        }
+    }
+    let mut free: Vec<(Site, u8)> = Vec::new();
+    for clb in &clbs {
+        for ble in 0..n_ble as u8 {
+            if !occupied.contains(&(clb.x, clb.y, ble)) {
+                free.push((*clb, ble));
+            }
+        }
+    }
+    let mut slot_i = 0usize;
+    let mut need = 0usize;
     for i in 0..placed.lutff_sites.len() {
-        let lf = &placed.packed.lutffs[i];
-        if !cell_listed_in_pblock(cells, &[lf.lut_cell.as_str(), lf.ff_cell.as_str()]) {
+        if !lutff_listed(&placed.packed.lutffs[i]) {
             continue;
         }
-        let clb_off = region_i / n_ble;
-        let ble = (region_i % n_ble) as u8;
-        let idx = clb_off.min(clbs.len() - 1);
-        placed.lutff_sites[i] = (clbs[idx], ble);
-        region_i += 1;
+        need += 1;
+        if slot_i >= free.len() {
+            return Err(format!(
+                "pblock CLB_X{x0}Y{y0}:CLB_X{x1}Y{y1} is full ({need} cells, {} free BLE slots)",
+                free.len()
+            ));
+        }
+        placed.lutff_sites[i] = free[slot_i];
+        slot_i += 1;
     }
+
     let mut iobs: Vec<Site> = dev
         .iob_sites()
         .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
         .collect();
     if !iobs.is_empty() {
         iobs.sort_by_key(|s| (s.x, s.y));
-        let mut io_i = 0usize;
-        for (i, slot) in placed.iob_sites.iter_mut().enumerate() {
-            let Some(io) = packed.iobs.get(i) else {
+        // `place_with` reorders packed.iobs to prefer PACKAGE_PIN / LOC; index
+        // the aligned `placed.packed.iobs`, never the caller packed list.
+        let iob_keep = |io: &helion_pack::PackedIob| {
+            io.loc.as_ref().is_some()
+                || !(relocate_all || cell_listed_in_pblock(cells, &[io.cell.as_str()]))
+        };
+        let mut iob_held: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
+        for (i, site) in placed.iob_sites.iter().enumerate() {
+            let Some(io) = placed.packed.iobs.get(i) else {
                 continue;
             };
-            if io.loc.as_ref().is_some() {
+            if iob_keep(io) {
+                iob_held.insert((site.x, site.y));
+            }
+        }
+        let free_iobs: Vec<Site> = iobs
+            .into_iter()
+            .filter(|s| !iob_held.contains(&(s.x, s.y)))
+            .collect();
+        let mut io_i = 0usize;
+        let mut io_need = 0usize;
+        for (i, slot) in placed.iob_sites.iter_mut().enumerate() {
+            let Some(io) = placed.packed.iobs.get(i) else {
+                continue;
+            };
+            if iob_keep(io) {
                 continue;
             }
-            if !cell_listed_in_pblock(cells, &[io.cell.as_str()]) {
-                continue;
+            io_need += 1;
+            if io_i >= free_iobs.len() {
+                return Err(format!(
+                    "pblock CLB_X{x0}Y{y0}:CLB_X{x1}Y{y1} is full ({io_need} IOBs, {} free IOB sites)",
+                    free_iobs.len()
+                ));
             }
-            *slot = iobs[io_i.min(iobs.len() - 1)];
+            *slot = free_iobs[io_i];
             io_i += 1;
         }
     }
@@ -2445,5 +2492,199 @@ create_pblock pblock_0
         let s2 = Session::restore_session(&s.checkpoint(), &dev).unwrap();
         assert_eq!(s2.blinky_hash(), Some(h));
         assert_eq!(s2.placed.as_ref().unwrap().iob_sites[0].x, 5);
+    }
+
+    fn lutff_occupancy_unique(pl: &Placed) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        pl.lutff_sites
+            .iter()
+            .all(|(s, ble)| seen.insert((s.x, s.y, *ble)))
+    }
+
+    fn iob_occupancy_unique(pl: &Placed) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        pl.iob_sites.iter().all(|s| seen.insert((s.x, s.y)))
+    }
+
+    fn iob_site_of(pl: &Placed, cell: &str) -> helion_device::Site {
+        let i = pl
+            .packed
+            .iobs
+            .iter()
+            .position(|io| io.cell == cell)
+            .unwrap_or_else(|| panic!("missing IOB cell {cell}"));
+        pl.iob_sites[i]
+    }
+
+    fn two_iob_counter() -> Design {
+        let mut d = Design::structural_counter();
+        d.add_port("led2", PortDir::Out);
+        d.add_cell("u_iob2", CellKind::IobOut);
+        d.connect("q2", "u_iob2", "I");
+        d.connect("led2", "u_iob2", "PAD");
+        d
+    }
+
+    fn design_n_lutffs(n: usize) -> Design {
+        let mut d = Design::new("nff");
+        d.add_port("clk", PortDir::In);
+        d.add_port("led", PortDir::Out);
+        for i in 0..n {
+            let lut = format!("u_lut{i}");
+            let ff = format!("u_ff{i}");
+            d.add_cell(&lut, CellKind::Lut6 { init: 2 });
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect("clk", &ff, "CLK");
+            d.connect(format!("d{i}"), &lut, "O");
+            d.connect(format!("d{i}"), &ff, "D");
+            d.connect(format!("q{i}"), &ff, "Q");
+            d.connect(format!("q{i}"), &lut, "I0");
+        }
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("q0", "u_iob", "I");
+        d.connect("led", "u_iob", "PAD");
+        d
+    }
+
+    /// Pin the *second* IOB so `place_with` reorders packed.iobs vs caller pack.
+    #[test]
+    fn package_pin_pblock_keeps_pinned_iob_empty_and_named_cells() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let xdc = load_xdc("set_property PACKAGE_PIN IOB_X5Y0 [get_ports led2]\n").unwrap();
+        let mut d = two_iob_counter();
+        apply_design_xdc(&mut d, &xdc).unwrap();
+
+        // Rectangle covers IOB row y=0 so a wrong packed.iobs[i] index would
+        // relocate the pinned site.
+        let pb_all = PrjPblock {
+            name: "pblock_0".into(),
+            x0: 2,
+            y0: 0,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: vec![],
+        };
+        let mut s_all = Session::new(Mode::Project);
+        s_all.synth_design(d.clone());
+        s_all
+            .place_pblock_in(&dev, &pb_all, ImplStrategy::Default.place_opts())
+            .unwrap();
+        let pl_all = s_all.placed.as_ref().unwrap();
+        assert!(
+            iob_occupancy_unique(pl_all),
+            "empty-cells pblock must not duplicate IOB sites"
+        );
+        assert_eq!(
+            iob_site_of(pl_all, "u_iob2").x,
+            5,
+            "PACKAGE_PIN IOB_X5Y0 must survive empty-cells place_in_region workaround"
+        );
+        let led2 = pl_all
+            .packed
+            .iobs
+            .iter()
+            .find(|io| io.cell == "u_iob2")
+            .expect("u_iob2 packed");
+        assert!(led2.loc.is_some(), "pinned IOB must keep loc after reorder");
+        assert_eq!(
+            pl_all
+                .packed
+                .iobs
+                .iter()
+                .position(|io| io.cell == "u_iob2"),
+            Some(0),
+            "place_with must reorder pinned IOB ahead of unpinned"
+        );
+
+        let pb_named = PrjPblock {
+            name: "pblock_0".into(),
+            x0: 2,
+            y0: 0,
+            x1: 8,
+            y1: 8,
+            ranged: true,
+            cells: vec!["u_lut0".into()],
+        };
+        let mut s_named = Session::new(Mode::Project);
+        s_named.synth_design(d);
+        s_named
+            .place_pblock_in(&dev, &pb_named, ImplStrategy::Default.place_opts())
+            .unwrap();
+        let pl_named = s_named.placed.as_ref().unwrap();
+        assert!(
+            iob_occupancy_unique(pl_named),
+            "named-cells pblock must not duplicate IOB sites"
+        );
+        assert_eq!(
+            iob_site_of(pl_named, "u_iob2").x,
+            5,
+            "PACKAGE_PIN must not follow a wrong packed.iobs index on named cells"
+        );
+        assert!(lutff_occupancy_unique(pl_named));
+        let lut0 = pl_named
+            .packed
+            .lutffs
+            .iter()
+            .position(|l| l.lut_cell == "u_lut0")
+            .unwrap();
+        let (site, _) = pl_named.lutff_sites[lut0];
+        assert!(
+            site.x >= 2 && site.x <= 8 && site.y <= 8,
+            "u_lut0 must sit in the named pblock: {site:?}"
+        );
+    }
+
+    #[test]
+    fn add_cells_to_pblock_no_duplicate_occupancy_and_err_when_full() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::Project);
+        s.synth_design(Design::structural_counter());
+        // List a later LUTFF into the CLB that already holds u_lut0 at BLE 0.
+        // Overflow-clamp onto (clb, ble 0) would duplicate occupancy.
+        let pb = PrjPblock {
+            name: "pblock_0".into(),
+            x0: 2,
+            y0: 1,
+            x1: 2,
+            y1: 1,
+            ranged: true,
+            cells: vec!["u_lut3".into()],
+        };
+        s.place_pblock_in(&dev, &pb, ImplStrategy::Default.place_opts())
+            .unwrap();
+        let pl = s.placed.as_ref().unwrap();
+        assert!(
+            lutff_occupancy_unique(pl),
+            "partial add_cells_to_pblock must not duplicate (site,ble): {:?}",
+            pl.lutff_sites
+        );
+        let lut3 = pl
+            .packed
+            .lutffs
+            .iter()
+            .position(|l| l.lut_cell == "u_lut3")
+            .unwrap();
+        let (site, _) = pl.lutff_sites[lut3];
+        assert_eq!((site.x, site.y), (2, 1), "listed cell must sit in the pblock");
+
+        let mut full = Session::new(Mode::Project);
+        full.synth_design(design_n_lutffs(9));
+        let pb_full = PrjPblock {
+            name: "pblock_0".into(),
+            x0: 5,
+            y0: 1,
+            x1: 5,
+            y1: 1,
+            ranged: true,
+            cells: (0..9).map(|i| format!("u_lut{i}")).collect(),
+        };
+        let err = full
+            .place_pblock_in(&dev, &pb_full, ImplStrategy::Default.place_opts())
+            .unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("full"),
+            "9 LUTFFs into 1 CLB (8 BLEs) must Err: {err}"
+        );
     }
 }
