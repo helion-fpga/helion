@@ -5521,18 +5521,41 @@ fn simple_return_assign(f: &FuncDef) -> Option<RExpr> {
     }
 }
 
+/// True when a Bit/Range/IndexPart on a formal would drop the select against a
+/// non-Ident actual — refuse inline instead of silent wrong logic.
+fn subst_select_needs_ident(e: &RExpr, map: &HashMap<String, RExpr>) -> bool {
+    match e {
+        RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
+            matches!(map.get(s), Some(rep) if !matches!(rep, RExpr::Ident(_)))
+        }
+        RExpr::IndexPart { name, base, .. } => {
+            let bad_name = matches!(map.get(name), Some(rep) if !matches!(rep, RExpr::Ident(_)));
+            bad_name || subst_select_needs_ident(base, map)
+        }
+        other => {
+            let mut bad = false;
+            let _ = map_rexpr_children(other, &mut |c| {
+                if subst_select_needs_ident(c, map) {
+                    bad = true;
+                }
+                c.clone()
+            });
+            bad
+        }
+    }
+}
+
 fn subst_idents(e: &RExpr, map: &HashMap<String, RExpr>) -> RExpr {
     match e {
         RExpr::Ident(s) => map.get(s).cloned().unwrap_or_else(|| e.clone()),
         RExpr::Bit(s, i) => match map.get(s) {
             Some(RExpr::Ident(n)) => RExpr::Bit(n.clone(), *i),
-            Some(rep) => rep.clone(),
-            None => e.clone(),
+            // Non-Ident actual: caller must refuse inline (see subst_select_needs_ident).
+            Some(_) | None => e.clone(),
         },
         RExpr::Range(s, lo, hi) => match map.get(s) {
             Some(RExpr::Ident(n)) => RExpr::Range(n.clone(), *lo, *hi),
-            Some(rep) => rep.clone(),
-            None => e.clone(),
+            Some(_) | None => e.clone(),
         },
         RExpr::IndexPart {
             name,
@@ -5591,6 +5614,9 @@ fn inline_rexpr(e: &RExpr, funcs: &[FuncDef], depth: usize) -> RExpr {
     let mut map = HashMap::new();
     for (i, (pn, _, _)) in plist.iter().enumerate() {
         map.insert(pn.clone(), args[i].clone());
+    }
+    if subst_select_needs_ident(&body, &map) {
+        return e;
     }
     let body = subst_idents(&body, &map);
     inline_rexpr(&body, funcs, depth + 1)
@@ -6122,6 +6148,17 @@ fn parse_module_items(
             if k.eq_ignore_ascii_case("ram_style") && v.to_ascii_lowercase().contains("block") {
                 *pending_bram = true;
             }
+        }
+        // ram_style must not stick onto a later unrelated memory after always/assign.
+        let next_decl = matches!(
+            p.peek(),
+            Some(Tok::Kw(k)) if matches!(
+                k.as_str(),
+                "logic" | "wire" | "reg" | "integer" | "input" | "output" | "inout"
+            )
+        );
+        if !next_decl {
+            *pending_bram = false;
         }
         if p.eat_kw("function") {
             parse_or_skip_function(p, funcs);
@@ -13780,7 +13817,64 @@ endmodule
         }
     }
 
+    
     #[test]
+    fn refuse_inline_bit_select_on_non_ident_arg() {
+        let ok = r#"
+module t(input logic clk, input logic [7:0] a, output logic o);
+  function automatic logic bit3(input logic [7:0] x);
+    bit3 = x[3];
+  endfunction
+  always_ff @(posedge clk) o <= bit3(a);
+endmodule
+"#;
+        let d_ok = synth_sv(ok, "ok.sv").expect("synth ident arg");
+        assert!(
+            d_ok.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "bit3(a) Ident actual must inline and clock"
+        );
+
+        let bad = r#"
+module t(input logic clk, input logic [7:0] a, input logic [7:0] b, output logic o);
+  function automatic logic bit3(input logic [7:0] x);
+    bit3 = x[3];
+  endfunction
+  always_ff @(posedge clk) o <= bit3(a | b);
+endmodule
+"#;
+        let _ = synth_sv(bad, "bad.sv").expect("synth non-ident arg");
+        assert!(
+            FUNC_CALLED_NOT_INLINED_SEEN.with(|s| {
+                s.borrow().iter().any(|k| k.contains("bit3"))
+            }),
+            "bit3(a|b) must refuse inline (select on non-Ident actual)"
+        );
+    }
+
+    #[test]
+    fn ram_style_pending_does_not_stick_past_always() {
+        let src = r#"
+module t(input logic clk, input logic [7:0] din, input logic [3:0] addr);
+  (* ram_style = "block" *)
+  always_ff @(posedge clk) begin end
+  logic [7:0] mem [0:15];
+  always_ff @(posedge clk) mem[addr] <= din;
+endmodule
+"#;
+        let d = synth_sv(src, "t.sv").expect("synth");
+        // mem after a dangling ram_style on always must not force Bram18 solely from sticky pending.
+        // (NBA to mem may still infer BRAM via depth — force_bram path is what we guard.)
+        let mods = parse_source(src).expect("parse");
+        let mem = mods[0]
+            .signals
+            .iter()
+            .find(|s| s.name == "mem")
+            .expect("mem");
+        assert!(!mem.force_bram, "sticky pending_bram must not mark later mem");
+        let _ = d;
+    }
+
+#[test]
     fn logikbench_lrelu_ge_ashr_maps_cells() {
         let src = r#"
 module lrelu #(parameter DW = 16, parameter ASHIFT = 7)
