@@ -6350,7 +6350,7 @@ impl IdeModel {
             "elaborate" => WorkspaceTab::Source,
             _ => WorkspaceTab::Wave,
         };
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), row.id.clone()),
             ("TYPE".into(), "sim_log".into()),
@@ -7491,7 +7491,7 @@ impl IdeModel {
         self.layout = LayoutKind::Simulation;
         self.workspace = WorkspaceTab::Wave;
         let time_ps = self.wave.time_ps(marker.sample);
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), marker.name.clone()),
             ("TYPE".into(), "wave_marker".into()),
@@ -7610,7 +7610,7 @@ impl IdeModel {
         let value = t
             .map(|t| t.value_at(self.wave.cursor))
             .unwrap_or_else(|| "-".into());
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), vb.name.clone()),
             ("TYPE".into(), "virtual_bus".into()),
@@ -7796,7 +7796,7 @@ impl IdeModel {
         self.nav = NavSection::Simulation;
         self.layout = LayoutKind::Simulation;
         self.workspace = WorkspaceTab::Wave;
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), row.name.clone()),
             ("TYPE".into(), "wave_cursor".into()),
@@ -14210,7 +14210,7 @@ impl IdeModel {
             "ENGINE_TIME_PS" => {
                 props.push(("SAMPLES".into(), self.wave.sample_len().to_string()));
                 props.push(("TIMESCALE_PS".into(), self.sim_timescale_ps.to_string()));
-                props.push(("LED".into(), self.wave.bits_of("led").unwrap_or_else(|| "-".into())));
+                props.push(("LED".into(), self.primary_out_bits_or_dash()));
             }
             "LOG_ALL_SIGNALS" => {
                 props.push(("TRACES".into(), self.wave.traces.len().to_string()));
@@ -18283,6 +18283,21 @@ impl IdeModel {
         }
     }
 
+    /// Properties / SimLog LED crumb: primary_out_port() then led fallback (same as cursor path).
+    fn primary_out_bits_or_dash(&self) -> String {
+        let out = self.primary_out_port();
+        if out == "led" {
+            return self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        }
+        let s = self.wave_posedge_led_bits();
+        if !s.is_empty() {
+            return s;
+        }
+        self.wave
+            .bits_of("led")
+            .unwrap_or_else(|| "-".into())
+    }
+
     fn sim_step_inner(&mut self) -> Result<(), String> {
         let delay = self.sim_timescale_ps.max(1);
         // Two samples per user cycle: half-period timescale so the ruler stays honest.
@@ -18337,6 +18352,11 @@ impl IdeModel {
 
         // Inactive half-cycle: clock low; output/cnt hold until the active edge.
         Self::push_sample(&mut self.wave, &clk_name, 0, 1, WaveStyle::Digital);
+        // Alias literal "clk" so Waveform::bits_of("led") half-cycle strip works when
+        // HFF CLK net ≠ "clk" (mirrors out_name≠led dual-write).
+        if clk_name != "clk" {
+            Self::push_sample(&mut self.wave, "clk", 0, 1, WaveStyle::Digital);
+        }
         Self::push_sample(&mut self.wave, &out_name, prev_led, 1, WaveStyle::Digital);
         if out_name != "led" && self.wave.has_trace("led") {
             Self::push_sample(&mut self.wave, "led", prev_led, 1, WaveStyle::Digital);
@@ -18351,6 +18371,9 @@ impl IdeModel {
 
         // Active edge sample: clock high; output/cnt update once per user cycle.
         Self::push_sample(&mut self.wave, &clk_name, 1, 1, WaveStyle::Digital);
+        if clk_name != "clk" {
+            Self::push_sample(&mut self.wave, "clk", 1, 1, WaveStyle::Digital);
+        }
         Self::push_sample(&mut self.wave, &out_name, u64::from(led), 1, WaveStyle::Digital);
         if out_name != "led" && self.wave.has_trace("led") {
             Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
@@ -18447,8 +18470,14 @@ impl IdeModel {
             }
         }
         let cur = self.wave.cursor;
-        if let Some(t) = self.wave.trace("led") {
-            push(&mut v, &mut seen, "led".into(), t.value_at(cur));
+        let out = self.primary_out_port();
+        if let Some(t) = self.wave.trace(&out) {
+            push(&mut v, &mut seen, out.clone(), t.value_at(cur));
+        }
+        if out != "led" {
+            if let Some(t) = self.wave.trace("led") {
+                push(&mut v, &mut seen, "led".into(), t.value_at(cur));
+            }
         }
         if let Some(t) = self.wave.trace("cnt") {
             push(&mut v, &mut seen, "cnt".into(), t.value_at(cur));
@@ -20736,7 +20765,7 @@ impl IdeModel {
                 let value = t
                     .map(|t| t.value_at(self.wave.cursor))
                     .unwrap_or_else(|| "-".into());
-                let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), vb.name.clone()),
                     ("TYPE".into(), "virtual_bus".into()),
@@ -20755,7 +20784,7 @@ impl IdeModel {
                 .into_iter()
                 .find(|r| r.name == name)
             {
-                let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), row.name.clone()),
                     ("TYPE".into(), "wave_cursor".into()),
@@ -20772,7 +20801,7 @@ impl IdeModel {
         if let Some(name) = id.strip_prefix("marker:") {
             if let Some(m) = self.wave.marker(name).cloned() {
                 let time_ps = self.wave.time_ps(m.sample);
-                let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), m.name.clone()),
                     ("TYPE".into(), "wave_marker".into()),
@@ -20842,7 +20871,7 @@ impl IdeModel {
         if let Some(rest) = id.strip_prefix("sim_log:") {
             if let Ok(i) = rest.parse::<usize>() {
                 if let Some(row) = self.sim_log.get(i).cloned() {
-                    let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                    let led = self.primary_out_bits_or_dash();
                     let engine_time = self.sim_engine_time_ps();
                     self.properties = vec![
                         ("NAME".into(), row.id.clone()),
