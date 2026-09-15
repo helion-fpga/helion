@@ -12,7 +12,32 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.1...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.4.0...HEAD
+
+## [1.4.0] — 2026-09-15
+
+FM-HEL-14 milestone 1.4: SystemVerilog elaborator depth on the 1.3.1 base.
+Empty-XDC `examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Native
+Apple Silicon `Helion.app` ships on this GitHub Release.
+
+### Added
+
+- Called-function / `$readmemh` → Bram18 INIT / `(* ram_style="block")` forces
+  BRAM; generate/case/always lowering that previously SOFT now maps to real
+  LUT/FF or a named diagnostic (once-per-design; never silent drop).
+- Unit coverage in `helion-sv` for the new inference paths.
+
+### Changed
+
+- Public 1.4 track closed for the elaborator lock; 1.5 density (W1b) starts
+  after this tag.
+
+### Fixed
+
+- Soft-incomplete / function-not-called hang classes finish with a diagnostic
+  instead of walking until kill on the covered cases.
+
+[1.4.0]: https://github.com/helion-fpga/helion/releases/tag/v1.4.0
 
 ## [1.3.1] — 2026-09-15
 
