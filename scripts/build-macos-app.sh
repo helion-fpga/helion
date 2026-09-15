@@ -144,14 +144,9 @@ else
     write_stub "$MACOS/helion-ide" helion-ide
 fi
 if [ -n "$CLI" ]; then
-    # Default APFS is case-insensitive: `helion` would clobber `Helion` (the IDE).
-    if [ "$uname_s" = Darwin ]; then
-        cp "$CLI" "$MACOS/helion-cli"
-        chmod +x "$MACOS/helion-cli"
-    else
-        cp "$CLI" "$MACOS/helion"
-        chmod +x "$MACOS/helion"
-    fi
+    # Always helion-cli in the .app (APFS: Helion vs helion collide on Darwin).
+    cp "$CLI" "$MACOS/helion-cli"
+    chmod +x "$MACOS/helion-cli"
 else
     write_stub "$MACOS/helion-cli" helion
 fi
