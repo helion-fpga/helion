@@ -3439,7 +3439,7 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
                         egui::pos2(o.x + b.x * sx, o.y + b.y * sy),
                         egui::vec2((b.w * sx).max(8.0), (b.h * sy).max(8.0)),
                     );
-                    if !r.intersects(rect) {
+                    if !r.intersects(ui.clip_rect()) {
                         continue;
                     }
                     let on = selected.as_deref() == Some(b.name.as_str());
@@ -4131,7 +4131,7 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel) {
                         egui::pos2(px + 2.0, py + 2.0),
                         egui::vec2((cell_w - 4.0).max(8.0), (cell_h - 4.0).max(8.0)),
                     );
-                    if !cell_rect.intersects(rect) {
+                    if !cell_rect.intersects(ui.clip_rect()) {
                         continue;
                     }
                     p.rect_filled(
