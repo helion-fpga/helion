@@ -1093,6 +1093,9 @@ fn rexpr_is_wire_mux_form(e: &RExpr) -> bool {
             matches!(s.as_ref(), RExpr::Const { .. }) && rexpr_is_wire_mux_form(a)
         }
         RExpr::Concat(parts) => parts.iter().all(rexpr_is_wire_mux_form),
+        // Packed `bus[sel]` (Ibex op_numerator_q[div_counter_d]) is an OR-of-eq
+        // LUT mux, not a Concat leftover. Wide/nested index stays flatten_cap.
+        RExpr::IndexPart { base, .. } => rexpr_is_wire_mux_form(base),
         _ => false,
     }
 }
@@ -7362,8 +7365,16 @@ fn index_part_bit(
             _ => return Err("index mul needs const stride".into()),
         },
         other => {
-            // width-1 dynamic bit: mux over possible indices 0..min(wsrc,16)
-            let n = wsrc.min(16).max(1);
+            // width-1 dynamic bit: mux over indices 0..n. A 5-bit sel into a
+            // 32-bit packed vector (Ibex `op_numerator_q[div_counter_d]`) is a
+            // 32-way OR-of-eq LUT tree, not a 16-arm truncated cone. Wide
+            // selects stay at 16 so a 32-bit address compare does not explode.
+            let sel_w = rexpr_width(other, rtl).max(1);
+            let n = if sel_w <= 6 {
+                wsrc.min(32).max(1)
+            } else {
+                wsrc.min(16).max(1)
+            };
             let mut acc: Option<Expr> = None;
             for k in 0..n {
                 let eq = cmp_eq_bits(
@@ -8759,6 +8770,68 @@ fn lut6_and_n(k: usize) -> u64 {
     init
 }
 
+fn lut6_or_n(k: usize) -> u64 {
+    if k == 0 {
+        return 0;
+    }
+    let k = k.min(6);
+    let used = (1u64 << k) - 1;
+    let mut init = 0u64;
+    for addr in 0..64u64 {
+        if (addr & used) != 0 {
+            init |= 1u64 << addr;
+        }
+    }
+    init
+}
+
+/// AND- or OR-reduce already-mapped nets into LUT6s of up to 6 pins.
+fn emit_lut_reduce(
+    d: &mut Design,
+    prefix: &str,
+    share: &mut LutShare,
+    out: Option<&str>,
+    mut level: Vec<String>,
+    and_not_or: bool,
+) -> Option<String> {
+    if level.is_empty() {
+        return None;
+    }
+    while level.len() > 1 {
+        let mut next = Vec::new();
+        let mut i = 0usize;
+        let last_round = (level.len() + 5) / 6 == 1;
+        while i < level.len() {
+            let chunk = &level[i..level.len().min(i + 6)];
+            i += chunk.len();
+            if chunk.len() == 1 {
+                next.push(chunk[0].clone());
+                continue;
+            }
+            let drive = if last_round && i >= level.len() {
+                out
+            } else {
+                None
+            };
+            let pins: Vec<String> = chunk.to_vec();
+            let init = if and_not_or {
+                lut6_and_n(pins.len())
+            } else {
+                lut6_or_n(pins.len())
+            };
+            next.push(share.lut6(d, prefix, drive, init, &pins));
+        }
+        level = next;
+    }
+    let net = level.pop().unwrap();
+    if let Some(o) = out {
+        if net != o {
+            return Some(share.lut6(d, prefix, Some(o), lut6_buf(), &[net]));
+        }
+    }
+    Some(net)
+}
+
 fn expr_and_chain(leaves: &[&Expr]) -> Option<Expr> {
     if leaves.is_empty() {
         return None;
@@ -8952,6 +9025,113 @@ fn try_map_xnor_and_tree(
     emit_and_reduce(d, prefix, share, out, level)
 }
 
+fn collect_or_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Or(a, b) => {
+            collect_or_leaves(a, out);
+            collect_or_leaves(b, out);
+        }
+        Expr::Const(false) => {}
+        other => out.push(other),
+    }
+}
+
+fn collect_and_leaves_ref<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::And(a, b) => {
+            collect_and_leaves_ref(a, out);
+            collect_and_leaves_ref(b, out);
+        }
+        Expr::Const(true) => {}
+        other => out.push(other),
+    }
+}
+
+/// Small leaf: packed eq/ne (`try_map_xnor_and_tree`) or a ≤6-PI LUT6.
+/// Does not walk AIG and does not recurse into ITE expansion.
+fn try_map_bool_leaf(
+    d: &mut Design,
+    prefix: &str,
+    share: &mut LutShare,
+    out: Option<&str>,
+    leaf: &Expr,
+) -> Option<String> {
+    if let Some(n) = try_map_xnor_and_tree(d, leaf, prefix, out, share) {
+        return Some(n);
+    }
+    if !cone_pi_exceeds(leaf, 6) {
+        return share.lut6_from_expr(d, prefix, out, leaf);
+    }
+    None
+}
+
+/// OR of equality-like (or small) leaves as a LUT reduction.
+/// Ibex `csr_pipe_flush` (OR of 12-bit CSR compares) and variable-index
+/// `bus[sel]` (OR of `sel==k & bus[k]`). Not an AIG; not a hang-class cone.
+fn try_map_or_eq_tree(
+    d: &mut Design,
+    expr: &Expr,
+    prefix: &str,
+    out: Option<&str>,
+    share: &mut LutShare,
+) -> Option<String> {
+    let mut leaves = Vec::new();
+    collect_or_leaves(expr, &mut leaves);
+    if leaves.len() < 2 || leaves.len() > 64 {
+        return None;
+    }
+    let mut level = Vec::new();
+    for leaf in &leaves {
+        level.push(try_map_bool_leaf(d, prefix, share, None, leaf)?);
+    }
+    emit_lut_reduce(d, prefix, share, out, level, false)
+}
+
+/// `small && (eq0 || eq1 || …)` — outer enable gated with an OR-of-eq.
+/// Used when ITE cond is And(op_en, or_of_csr) rather than a lone OR.
+fn try_map_and_or_mix(
+    d: &mut Design,
+    expr: &Expr,
+    prefix: &str,
+    out: Option<&str>,
+    share: &mut LutShare,
+) -> Option<String> {
+    let mut leaves = Vec::new();
+    collect_and_leaves_ref(expr, &mut leaves);
+    if leaves.len() < 2 || leaves.len() > 32 {
+        return None;
+    }
+    let mut has_or = false;
+    let mut level = Vec::new();
+    for leaf in &leaves {
+        if matches!(leaf, Expr::Or(_, _)) {
+            has_or = true;
+            level.push(try_map_or_eq_tree(d, leaf, prefix, None, share)?);
+        } else {
+            level.push(try_map_bool_leaf(d, prefix, share, None, leaf)?);
+        }
+    }
+    if !has_or {
+        return None;
+    }
+    emit_lut_reduce(d, prefix, share, out, level, true)
+}
+
+/// Sequential / leftover comb cone that is too wide for one LUT6 but is an
+/// ITE / OR-of-eq / AND-OR mix. Returns true if `out` is driven.
+fn try_map_wide_bool(
+    d: &mut Design,
+    expr: &Expr,
+    prefix: &str,
+    out: Option<&str>,
+    share: &mut LutShare,
+) -> bool {
+    try_map_xnor_and_tree(d, expr, prefix, out, share).is_some()
+        || try_map_ite_const_tree(d, expr, prefix, out, share).is_some()
+        || try_map_or_eq_tree(d, expr, prefix, out, share).is_some()
+        || try_map_and_or_mix(d, expr, prefix, out, share).is_some()
+}
+
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
 fn match_ite_expr<'a>(e: &'a Expr) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
     fn same_struct(a: &Expr, b: &Expr) -> bool {
@@ -9134,6 +9314,18 @@ fn try_map_ite_const_tree(
                     return Some(MuxSrc::Ite(Box::new(c), Box::new(t), Box::new(f)));
                 }
                 if let Some(net) = try_map_xnor_and_tree(d, other, prefix, None, share) {
+                    return Some(MuxSrc::Wire {
+                        name: net,
+                        inv: false,
+                    });
+                }
+                if let Some(net) = try_map_or_eq_tree(d, other, prefix, None, share) {
+                    return Some(MuxSrc::Wire {
+                        name: net,
+                        inv: false,
+                    });
+                }
+                if let Some(net) = try_map_and_or_mix(d, other, prefix, None, share) {
                     return Some(MuxSrc::Wire {
                         name: net,
                         inv: false,
@@ -11916,15 +12108,49 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // stay unmapped (named). Do not reprint node_count per bit.
     let mut wide_capped = false;
     let mut wide_luts = 0usize;
+    let mut share = LutShare::new();
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
+        let (ff, dnet, qnet) = if single_q {
+            ("u_ff".to_string(), "d".to_string(), "q".to_string())
+        } else {
+            (format!("u_ff{i}"), format!("d{i}"), bitn.clone())
+        };
+        let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
+        let map_seq_wide = |d: &mut Design, e: &Expr, share: &mut LutShare| -> bool {
+            try_map_wide_bool(d, e, &format!("u_sw{i}_"), Some(dnet.as_str()), share)
+        };
+        let emit_mapped_ff = |d: &mut Design| {
+            d.add_cell(&ff, CellKind::Hff);
+            d.connect(&bit_clk, &ff, "CLK");
+            d.connect(&dnet, &ff, "D");
+            d.connect(&qnet, &ff, "Q");
+            if keep_bits.contains(bitn) {
+                let _ = d.dont_touch(&ff);
+            }
+            if md_bits.contains(bitn) {
+                let _ = d.mark_debug(&qnet);
+            }
+        };
         // FM-HEL-HANG: exponential Add/cmp Expr trees explode in Aig::from_expr.
+        // ITE / OR-of-eq / AND-OR mix still lower without the AIG (Ibex r_state).
         // Soft-cone widen: one named wide_cone diagnostic, then keep mapping
         // sibling bits (≤6-PI / ITE / xnor). Do not abort the whole module.
-        if expr_node_count(expr) > 8_000 {
+        let huge = expr_node_count(expr) > 8_000;
+        if huge {
+            if cone_pi_exceeds(expr, 6) && map_seq_wide(&mut d, expr, &mut share) {
+                emit_mapped_ff(&mut d);
+                continue;
+            }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
+            continue;
+        }
+        // >6-PI sequential: prefer packed ITE/OR-of-eq over AIG (FSM next-state
+        // can exceed AND_CAP=96 with few PIs — ibex2axi r_state_1).
+        if cone_pi_exceeds(expr, 6) && map_seq_wide(&mut d, expr, &mut share) {
+            emit_mapped_ff(&mut d);
             continue;
         }
         let aig = Aig::from_expr(expr);
@@ -11936,15 +12162,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
                 continue;
             }
-            let (ff, qnet) = if single_q {
-                ("u_ff".to_string(), "q".to_string())
-            } else {
-                (format!("u_ff{i}"), bitn.clone())
-            };
             let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"), None);
             wide_luts = wide_luts.saturating_add(aig.ands.len());
             d.add_cell(&ff, CellKind::Hff);
-            let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
             d.connect(&bit_clk, &ff, "CLK");
             d.connect(&wide, &ff, "D");
             d.connect(&qnet, &ff, "Q");
@@ -11982,7 +12202,6 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Soft-cone widen: map more assign bits per module (Ibex pin_wrap /
     // ALU / multdiv exceed 256). Named diagnostic when still capped.
     const ASSIGN_BIT_CAP: usize = 2048;
-    let mut share = LutShare::new();
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
         if i >= ASSIGN_BIT_CAP {
             note_skip(format!(
@@ -12015,6 +12234,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             {
                 continue;
             }
+            // Wide Lt/range compares stay assign_not_lowered (not an OR-of-eq
+            // decode). Eq still mapped above via xnor-and-tree.
+            if let Some(sig) = rel_sig.get(bitn) {
+                note_assign_not_lowered(&rtl.module, sig);
+                continue;
+            }
             if try_map_ite_const_tree(
                 &mut d,
                 &expr_rom,
@@ -12026,8 +12251,26 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             {
                 continue;
             }
-            if let Some(sig) = rel_sig.get(bitn) {
-                note_assign_not_lowered(&rtl.module, sig);
+            if try_map_or_eq_tree(
+                &mut d,
+                &expr_rom,
+                &format!("u_or{i}_"),
+                Some(bitn),
+                &mut share,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            if try_map_and_or_mix(
+                &mut d,
+                &expr_rom,
+                &format!("u_ao{i}_"),
+                Some(bitn),
+                &mut share,
+            )
+            .is_some()
+            {
                 continue;
             }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
@@ -12065,11 +12308,39 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         {
             continue;
         }
+        // Wide Lt/range compares: one assign_not_lowered, not an OR-of-eq tree.
+        if let Some(sig) = rel_sig.get(bitn) {
+            note_assign_not_lowered(&rtl.module, sig);
+            continue;
+        }
         // If/else decode (Or/And ITE of eq/ne / Ident arms) → packed LUT mux.
         if try_map_ite_const_tree(
             &mut d,
             &expr_rom,
             &format!("u_ite{i}_"),
+            Some(bitn),
+            &mut share,
+        )
+        .is_some()
+        {
+            continue;
+        }
+        // OR of packed eq / variable-index bit mux (csr_pipe_flush, bus[sel]).
+        if try_map_or_eq_tree(
+            &mut d,
+            &expr_rom,
+            &format!("u_or{i}_"),
+            Some(bitn),
+            &mut share,
+        )
+        .is_some()
+        {
+            continue;
+        }
+        if try_map_and_or_mix(
+            &mut d,
+            &expr_rom,
+            &format!("u_ao{i}_"),
             Some(bitn),
             &mut share,
         )
@@ -16040,6 +16311,209 @@ endmodule
         assert!(
             d.nets.iter().any(|n| n.name == "hit" && n.endpoints.iter().any(|e| e.pin == "O")),
             "hit must be driven"
+        );
+    }
+
+    fn lut_driven(d: &Design, name: &str) -> bool {
+        d.nets.iter().any(|n| {
+            n.name == name && n.endpoints.iter().any(|e| e.pin == "O")
+        })
+    }
+
+    fn hff_on_clk(d: &Design, q: &str, clk: &str) -> bool {
+        d.cells.iter().any(|c| {
+            matches!(c.kind, CellKind::Hff)
+                && d.net_on(&c.name, "Q") == Some(q)
+                && d.net_on(&c.name, "CLK") == Some(clk)
+                && d.net_on(&c.name, "D").is_some()
+        })
+    }
+
+    #[test]
+    fn ibex_csr_pipe_flush_is_or_of_eq_not_wide_cone() {
+        // ibex_id_stage csr_pipeline_flushes: 12-bit CSR decode OR prefix.
+        let src = r#"
+module ibex_id_stage(
+  input  logic        csr_op_en_o,
+  input  logic [1:0]  csr_op_o,
+  input  logic [31:0] instr_rdata_i,
+  output logic        csr_pipe_flush
+);
+  localparam logic [1:0] CSR_OP_READ  = 2'd0;
+  localparam logic [1:0] CSR_OP_WRITE = 2'd1;
+  localparam logic [1:0] CSR_OP_SET   = 2'd2;
+  localparam logic [11:0] CSR_MSTATUS   = 12'h300;
+  localparam logic [11:0] CSR_MIE       = 12'h304;
+  localparam logic [11:0] CSR_MSECCFG   = 12'h747;
+  localparam logic [11:0] CSR_DCSR      = 12'h7b0;
+  localparam logic [11:0] CSR_DPC       = 12'h7b1;
+  localparam logic [11:0] CSR_DSCRATCH0 = 12'h7b2;
+  localparam logic [11:0] CSR_DSCRATCH1 = 12'h7b3;
+  always_comb begin
+    csr_pipe_flush = 1'b0;
+    if (csr_op_en_o == 1'b1 && (csr_op_o == CSR_OP_WRITE || csr_op_o == CSR_OP_SET)) begin
+      if (instr_rdata_i[31:20] == CSR_MSTATUS ||
+          instr_rdata_i[31:20] == CSR_MIE     ||
+          instr_rdata_i[31:20] == CSR_MSECCFG ||
+          instr_rdata_i[31:25] == 7'h1D) begin
+        csr_pipe_flush = 1'b1;
+      end
+    end else if (csr_op_en_o == 1'b1 && csr_op_o != CSR_OP_READ) begin
+      if (instr_rdata_i[31:20] == CSR_DCSR      ||
+          instr_rdata_i[31:20] == CSR_DPC       ||
+          instr_rdata_i[31:20] == CSR_DSCRATCH0 ||
+          instr_rdata_i[31:20] == CSR_DSCRATCH1) begin
+        csr_pipe_flush = 1'b1;
+      end
+    end
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "csr_pipe_flush.sv").expect("csr_pipe_flush");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(lut_driven(&d, "csr_pipe_flush"), "csr_pipe_flush must be a LUT");
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(
+            (4..=64).contains(&luts),
+            "CSR OR-of-eq should be a modest LUT tree, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn ibex_op_remainder_d0_varindex_is_not_wide_cone() {
+        // ibex_multdiv_fast MD_COMP: op_remainder_d[0] = op_numerator_q[div_counter_d].
+        let src = r#"
+module ibex_multdiv_fast(
+  input  logic        clk_i,
+  input  logic        rst_ni,
+  input  logic [2:0]  md_state_q,
+  input  logic [1:0]  operator_i,
+  input  logic [31:0] op_a_i,
+  input  logic [31:0] op_numerator_q,
+  input  logic [4:0]  div_counter_d,
+  input  logic [31:0] next_remainder,
+  input  logic [32:0] next_quotient,
+  input  logic [33:0] imd_val_q_i,
+  input  logic        div_change_sign,
+  input  logic        rem_change_sign,
+  input  logic [31:0] alu_adder_i,
+  output logic [33:0] op_remainder_d
+);
+  logic md_hold;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) md_hold <= 1'b0;
+    else md_hold <= ~md_hold;
+  end
+  localparam logic [2:0] MD_IDLE = 3'd0, MD_ABS_A = 3'd1, MD_ABS_B = 3'd2,
+                         MD_COMP = 3'd3, MD_LAST = 3'd4, MD_CHANGE_SIGN = 3'd5,
+                         MD_FINISH = 3'd6;
+  localparam logic [1:0] MD_OP_DIV = 2'd2;
+  always_comb begin
+    op_remainder_d = imd_val_q_i;
+    unique case (md_state_q)
+      MD_IDLE: begin
+        if (operator_i == MD_OP_DIV) op_remainder_d = '1;
+        else op_remainder_d = {2'b0, op_a_i};
+      end
+      MD_ABS_B: op_remainder_d = {33'h0, op_numerator_q[31]};
+      MD_COMP:  op_remainder_d = {1'b0, next_remainder[31:0], op_numerator_q[div_counter_d]};
+      MD_LAST: begin
+        if (operator_i == MD_OP_DIV) op_remainder_d = {1'b0, next_quotient};
+        else op_remainder_d = {2'b0, next_remainder[31:0]};
+      end
+      MD_CHANGE_SIGN: begin
+        if (operator_i == MD_OP_DIV)
+          op_remainder_d = div_change_sign ? {2'h0, alu_adder_i} : imd_val_q_i;
+        else
+          op_remainder_d = rem_change_sign ? {2'h0, alu_adder_i} : imd_val_q_i;
+      end
+      default: op_remainder_d = imd_val_q_i;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "op_remainder.sv").expect("op_remainder");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+        assert!(
+            lut_driven(&d, "op_remainder_d_0"),
+            "op_remainder_d[0] must be a LUT, not a skipped cone"
+        );
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(
+            luts >= 8 && luts <= 2048,
+            "34-bit case + 32:1 bit mux should map, luts={luts}"
+        );
+    }
+
+    #[test]
+    fn ibex2axi_r_state_is_clocked_ite_not_wide_cone() {
+        // ibex2axi 5-state read FSM. Next-state bit 1 must be Hff on clk_i.
+        let src = r#"
+module ibex2axi(
+  input  logic clk_i,
+  input  logic rst_ni,
+  input  logic instr_req_i,
+  input  logic data_req_i,
+  input  logic data_we_i,
+  input  logic axi_ar_ready_i,
+  input  logic axi_r_valid_i,
+  input  logic axi_r_last_i,
+  output logic axi_ar_valid_o,
+  output logic axi_r_ready_o
+);
+  parameter [2:0] R_STATE_IDLE = 3'b000, R_STATE_ADDR_LOAD = 3'b001,
+                  R_STATE_READ_LOAD = 3'b010, R_STATE_ADDR_INST = 3'b011,
+                  R_STATE_READ_INST = 3'b100;
+  reg [2:0] r_state;
+  wire r_valid_inst = instr_req_i;
+  wire r_valid_load = data_req_i & !data_we_i;
+  wire ar_hs = axi_ar_ready_i & axi_ar_valid_o;
+  wire r_hs  = axi_r_ready_o & axi_r_valid_i;
+  wire r_done = r_hs & axi_r_last_i;
+  always @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) r_state <= R_STATE_IDLE;
+    else begin
+      case (r_state)
+        R_STATE_IDLE:      if (r_valid_load) r_state <= R_STATE_ADDR_LOAD;
+                           else if (r_valid_inst) r_state <= R_STATE_ADDR_INST;
+        R_STATE_ADDR_LOAD: if (ar_hs)  r_state <= R_STATE_READ_LOAD;
+        R_STATE_READ_LOAD: if (r_done) r_state <= R_STATE_IDLE;
+        R_STATE_ADDR_INST: if (ar_hs)  r_state <= R_STATE_READ_INST;
+        R_STATE_READ_INST: if (r_done) r_state <= R_STATE_IDLE;
+        default:;
+      endcase
+    end
+  end
+  assign axi_ar_valid_o = (r_valid_inst & (r_state == R_STATE_ADDR_INST))
+                        | (r_valid_load & (r_state == R_STATE_ADDR_LOAD));
+  assign axi_r_ready_o  = (r_state == R_STATE_READ_INST) | (r_state == R_STATE_READ_LOAD);
+endmodule
+"#;
+        let d = synth_sv(src, "ibex2axi.sv").expect("ibex2axi");
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "must not wide_cone");
+        assert!(
+            hff_on_clk(&d, "r_state_1", "clk_i"),
+            "r_state[1] must be an Hff on clk_i"
+        );
+        assert!(
+            d.net_on(
+                d.cells
+                    .iter()
+                    .find(|c| matches!(c.kind, CellKind::Hff)
+                        && d.net_on(&c.name, "Q") == Some("r_state_1"))
+                    .map(|c| c.name.as_str())
+                    .unwrap_or(""),
+                "D"
+            )
+            .is_some_and(|n| n != "r_state_1"),
+            "r_state[1] D must be driven (LUT), not a self-Q loop"
+        );
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert!(
+            luts >= 3 && luts <= 128,
+            "5-state FSM should be a modest LUT tree, luts={luts}"
         );
     }
 
