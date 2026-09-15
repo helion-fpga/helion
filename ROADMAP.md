@@ -51,7 +51,7 @@ HAD: Architecture Database parts beyond `HL10T-C32-1`. Device facts stay in TOML
 
 ## 2.0 — public OSS CAD bar
 
-A stranger can clone, `cargo test --workspace`, run headless gold **WNS_PS=9640**, and trust the legal fence: no Project X-Ray, no UNISIM, no vendor Tcl as product names, no AMD/Intel/Lattice backends, Helion-MM / Helion-ST only. Docs, CI (Linux + macOS gold), and the desktop IDE describe the same Session.
+**Shipped as [v2.0.0](https://github.com/helion-fpga/helion/releases/tag/v2.0.0).** A stranger can clone, `cargo test --workspace`, run headless gold **WNS_PS=9640**, and trust the legal fence: no Project X-Ray, no UNISIM, no vendor Tcl as product names, no AMD/Intel/Lattice backends, Helion-MM / Helion-ST only. Docs, CI (Linux + macOS gold), and the desktop IDE describe the same Session.
 
 [Milestone 2.0](https://github.com/helion-fpga/helion/milestone/5)
 
