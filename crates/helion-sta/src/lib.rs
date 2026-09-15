@@ -1261,14 +1261,13 @@ impl Constraints {
     }
 
     fn mcp_targets_output_iob(&self, m: &MulticyclePath) -> bool {
-        endpoint_is_output_iob(&m.to)
-            || endpoint_is_output_iob(&m.from)
-            || self.output_delay_ps.contains_key(&m.to)
-            || self.output_delay_ps.contains_key(&m.from)
-            || self.package_pins.contains_key(&m.to)
-            || self.package_pins.contains_key(&m.from)
-            || self.iostandards.contains_key(&m.to)
-            || self.iostandards.contains_key(&m.from)
+        // Do not use package_pins/iostandards: clock/input ports are often pinned.
+        // Prefer explicit output/IOB endpoint names and output_delay bindings.
+        let from_ok = !clock_like_name(&m.from)
+            && (endpoint_is_output_iob(&m.from) || self.output_delay_ps.contains_key(&m.from));
+        let to_ok = !clock_like_name(&m.to)
+            && (endpoint_is_output_iob(&m.to) || self.output_delay_ps.contains_key(&m.to));
+        from_ok || to_ok
     }
 
     /// Hold path multiplier (Vivado default 0).
@@ -1615,6 +1614,8 @@ fn endpoint_is_output_iob(name: &str) -> bool {
 /// True when a `set_false_path` string covers an output/IOB arc
 /// (`-to [get_ports led]`, PAD/IOB tokens). Clock-to-clock and pin-scoped
 /// register paths do not set `TimingGuide::false_path_iob`.
+/// Residual bring-up over-approx: `-to [get_ports <non-clock>]` also matches
+/// input ports (sw/btn) until PortDir-aware mapping exists.
 fn false_path_covers_iob(fp: &str) -> bool {
     let l = fp.to_ascii_lowercase();
     if l.contains("iob") || l.contains("pad") {
