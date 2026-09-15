@@ -12,7 +12,7 @@ pub use preprocess::{expand_includes, preprocess_sv};
 
 use helion_ir::{CellKind, Design, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use sv_parser::{parse_sv_str, Define, DefineText};
 
@@ -410,6 +410,81 @@ struct Rtl {
 
 thread_local! {
     static CUR_MOD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Directories `$readmemh`/`$readmemb` search, same idea as `` `include ``:
+    /// synth origin parent, then `include/` next to it / in the parent.
+    static READMEM_BASES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn clear_readmem_bases() {
+    READMEM_BASES.with(|b| b.borrow_mut().clear());
+}
+
+fn push_readmem_base(origin: &str) {
+    let p = Path::new(origin);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            let pb = parent.to_path_buf();
+            READMEM_BASES.with(|b| {
+                if !b.borrow().iter().any(|x| x == &pb) {
+                    b.borrow_mut().push(pb);
+                }
+            });
+        }
+    }
+}
+
+fn set_readmem_origin(origin: &str) {
+    clear_readmem_bases();
+    push_readmem_base(origin);
+}
+
+/// Same candidate list as `` `include `` (`preprocess::resolve_include`).
+fn resolve_like_include(base: &Path, spec: &str) -> Option<PathBuf> {
+    let mut cands = Vec::new();
+    cands.push(base.join(spec));
+    if let Some(name) = Path::new(spec).file_name() {
+        cands.push(base.join(name));
+        cands.push(base.join("include").join(name));
+        if let Some(parent) = base.parent() {
+            cands.push(parent.join("include").join(name));
+            cands.push(parent.join(spec));
+        }
+    }
+    cands.push(base.join("include").join(spec));
+    cands.into_iter().find(|p| p.is_file())
+}
+
+fn resolve_readmem_path(spec: &str) -> Option<PathBuf> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let p = Path::new(spec);
+    if p.is_absolute() {
+        return if p.is_file() {
+            Some(p.to_path_buf())
+        } else {
+            None
+        };
+    }
+    let mut found = None;
+    READMEM_BASES.with(|bases| {
+        for base in bases.borrow().iter() {
+            if let Some(f) = resolve_like_include(base, spec) {
+                found = Some(f);
+                break;
+            }
+        }
+    });
+    if found.is_some() {
+        return found;
+    }
+    if p.is_file() {
+        Some(p.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn set_cur_mod(name: &str) {
@@ -2330,6 +2405,7 @@ fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result
         }
         let expanded = expand_includes(&text, dir);
         let pre = preprocess_sv(&strip_comments(&expanded));
+        push_readmem_base(&p.display().to_string());
         out.extend(parse_source(&pre)?);
     }
     Ok(out)
@@ -2645,7 +2721,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 }
             } else {
                 let val: u128 = n.parse().unwrap_or(0);
-                out.push(Tok::Number(val, 32));
+                // Width 0 = unsized decimal (Verilog integer). Distinct from `32'd0`.
+                out.push(Tok::Number(val, 0));
             }
             continue;
         }
@@ -2662,6 +2739,8 @@ struct P<'a> {
     params: HashMap<String, u128>,
     /// Signal/port widths seen so far (slice assigns and const if).
     widths: HashMap<String, usize>,
+    /// Names declared `signed` (ANSI/non-ANSI ports and net decls).
+    signed: HashSet<String>,
 }
 
 impl<'a> P<'a> {
@@ -3007,9 +3086,12 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
         p.bump();
         let r = parse_shift(p)?;
         // Unsized `0` is signed in Verilog: `in >= 0` is ~MSB, not a 16-bit Lt.
-        if let (RExpr::Ident(s), RExpr::Const { val: 0, .. }) = (&e, &r) {
-            let w = p.widths.get(s).copied().unwrap_or(1).max(1);
-            return Ok(RExpr::Not(Box::new(RExpr::Bit(s.clone(), w - 1))));
+        // Only a tracked signed decl and/or unsized `0` — not `8'd0` / `16'd0`.
+        if let (RExpr::Ident(s), zero) = (&e, &r) {
+            if ident_cmp_zero_signbit(p, s, zero) {
+                let w = p.widths.get(s).copied().unwrap_or(1).max(1);
+                return Ok(RExpr::Not(Box::new(RExpr::Bit(s.clone(), w - 1))));
+            }
         }
         return Ok(RExpr::Not(Box::new(RExpr::Lt(Box::new(e), Box::new(r)))));
     }
@@ -3020,9 +3102,11 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
             return Ok(e);
         }
         let r = parse_shift(p)?;
-        if let (RExpr::Ident(s), RExpr::Const { val: 0, .. }) = (&e, &r) {
-            let w = p.widths.get(s).copied().unwrap_or(1).max(1);
-            return Ok(RExpr::Bit(s.clone(), w - 1));
+        if let (RExpr::Ident(s), zero) = (&e, &r) {
+            if ident_cmp_zero_signbit(p, s, zero) {
+                let w = p.widths.get(s).copied().unwrap_or(1).max(1);
+                return Ok(RExpr::Bit(s.clone(), w - 1));
+            }
         }
         return Ok(RExpr::Lt(Box::new(e), Box::new(r)));
     }
@@ -3393,7 +3477,15 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             })
         }
         Some(Tok::Number(v, w)) => {
-            let care = if *w >= 128 { u128::MAX } else { (1u128 << (*w).max(1)) - 1 };
+            // Width 0 = unsized decimal. Care is the 32-bit integer default;
+            // the width field stays 0 so `ident >= 0` can tell this from `32'd0`.
+            let care = if *w == 0 {
+                care_mask(32)
+            } else if *w >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << (*w).max(1)) - 1
+            };
             Ok(RExpr::Const {
                 val: *v,
                 width: *w,
@@ -3635,13 +3727,14 @@ fn parse_port_dir(p: &mut P) -> Option<PortDir> {
     }
 }
 
-fn skip_logic(p: &mut P) {
+fn skip_logic(p: &mut P) -> bool {
     let _ = p.eat_kw("logic");
     let _ = p.eat_kw("wire");
     let _ = p.eat_kw("reg");
-    let _ = p.eat_kw("signed");
+    let signed = p.eat_kw("signed");
     let _ = p.eat_kw("unsigned");
     let _ = p.eat_kw("var");
+    signed
 }
 
 fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
@@ -3734,9 +3827,9 @@ fn try_parse_readmem(
     }
     let _ = p.eat_sym(')');
     let _ = p.eat_sym(';');
-    let words = match std::fs::read_to_string(&path) {
-        Ok(t) => parse_mem_image(&t, binary),
-        Err(_) => {
+    let words = match resolve_readmem_path(&path).and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(t) => parse_mem_image(&t, binary),
+        None => {
             // Missing image is not INIT 0. Do not seed mem_inits.
             note_skip(format!(
                 "diagnostic readmem_file module={} path={path} (readmem image not loaded; not a silent INIT 0)",
@@ -4232,7 +4325,13 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
                 other => other.clone(),
             })
             .collect();
-        let mut sp = P { t: &toks, i: 0, params: p.params.clone(), widths: p.widths.clone() };
+        let mut sp = P {
+            t: &toks,
+            i: 0,
+            params: p.params.clone(),
+            widths: p.widths.clone(),
+            signed: p.signed.clone(),
+        };
         out.extend(parse_seq_block(&mut sp, block)?);
         if step_down {
             i = i.saturating_sub(step);
@@ -4298,6 +4397,22 @@ fn bit_extract(e: RExpr, bit: usize) -> RExpr {
 
 fn note_width(p: &mut P, name: &str, w: usize) {
     p.widths.insert(name.to_string(), w.max(1));
+}
+
+fn note_signed(p: &mut P, name: &str) {
+    p.signed.insert(name.to_string());
+}
+
+/// `ident >= 0` / `< 0` → ~MSB/MSB only for a tracked signed decl and/or
+/// unsized decimal `0` (token width 0). A sized `Const { val: 0, width: 8 }`
+/// (`8'd0`) is an unsigned Lt, not this rewrite.
+fn ident_cmp_zero_signbit(p: &P, name: &str, zero: &RExpr) -> bool {
+    let RExpr::Const { val: 0, width, .. } = zero else {
+        return false;
+    };
+    let is_unsized = *width == 0;
+    let signed = p.signed.contains(name);
+    signed || is_unsized
 }
 
 /// Last procedural write wins. Vector assigns become per-bit so a case arm
@@ -4708,7 +4823,13 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     clear_seq_notes();
     let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
-    let mut p = P { t: &toks, i: 0, params: HashMap::new(), widths: HashMap::new() };
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        params: HashMap::new(),
+        widths: HashMap::new(),
+        signed: HashSet::new(),
+    };
     let mut mods = Vec::new();
     while p.peek().is_some() {
         if p.eat_sym(';') {
@@ -5510,6 +5631,7 @@ fn parse_or_skip_function(p: &mut P, funcs: &mut Vec<FuncDef>) {
         i: start,
         params: p.params.clone(),
         widths: p.widths.clone(),
+        signed: p.signed.clone(),
     };
     match parse_function(&mut fp) {
         Ok(f) => funcs.push(f),
@@ -5528,6 +5650,7 @@ fn parse_functions_in_slice(toks: &[Tok]) -> Vec<FuncDef> {
         i: 0,
         params: HashMap::new(),
         widths: HashMap::new(),
+        signed: HashSet::new(),
     };
     let mut funcs = Vec::new();
     while p.peek().is_some() {
@@ -5687,7 +5810,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 break;
             }
             let dir = parse_port_dir(&mut p).unwrap_or(PortDir::In);
-            skip_logic(&mut p);
+            let mut is_signed = skip_logic(&mut p);
             // package::typedef or typedef name before the port ident
             while matches!(p.peek(), Some(Tok::Ident(_)))
                 && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
@@ -5718,7 +5841,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                     p.i = save;
                 }
             }
-            skip_logic(&mut p);
+            is_signed |= skip_logic(&mut p);
             // Packed multi-dim before the port name (Ibex fetch_fifo rdata_q):
             // `input logic [DEPTH-1:0][31:0] rdata_q` → width=32, depth=DEPTH.
             let mut packed_dims: Vec<usize> = Vec::new();
@@ -5792,6 +5915,9 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                     }
                     if let Some(&d0) = dims.first() {
                         unpack_depth = d0.min(4096);
+                    }
+                    if is_signed {
+                        note_signed(p, &n);
                     }
                     signals.push(Signal {
                         name: n,
@@ -6169,7 +6295,7 @@ fn parse_module_items(
         }
         if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output") {
             let dir = parse_port_dir(&mut p).unwrap();
-            skip_logic(&mut p);
+            let is_signed = skip_logic(&mut p);
             let w = p.width_opt()?;
             let n = p.ident()?;
             if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n) {
@@ -6192,6 +6318,9 @@ fn parse_module_items(
                 });
             }
             note_width(p, &n, w);
+            if is_signed {
+                note_signed(p, &n);
+            }
             // `input signed [W-1:0] a,b` — the same range applies to each name.
             while p.eat_sym(',') {
                 let Ok(n2) = p.ident() else {
@@ -6216,6 +6345,9 @@ fn parse_module_items(
                     });
                 }
                 note_width(p, &n2, w);
+                if is_signed {
+                    note_signed(p, &n2);
+                }
             }
             let _ = p.eat_sym(';');
             continue;
@@ -6237,7 +6369,7 @@ fn parse_module_items(
             // `reg signed [W-1:0] mem[N:0]` — signed is a qualifier, not the name.
             // Packed multi-dim before the name (Ibex fetch_fifo):
             // `logic [DEPTH-1:0][31:0] rdata_q` → width=32, depth=DEPTH.
-            skip_logic(p);
+            let is_signed = skip_logic(p);
             let mut packed_dims: Vec<usize> = Vec::new();
             while matches!(p.peek(), Some(Tok::Sym('['))) {
                 let save = p.i;
@@ -6326,6 +6458,9 @@ fn parse_module_items(
                 });
             }
             note_width(p, &n, w);
+            if is_signed {
+                note_signed(p, &n);
+            }
             push_decl_assign(p, assigns, &n, net_assign);
             while p.eat_sym(',') {
                 if let Ok(n2) = p.ident() {
@@ -6344,6 +6479,9 @@ fn parse_module_items(
                         });
                     }
                     note_width(p, &n2, w);
+                    if is_signed {
+                        note_signed(p, &n2);
+                    }
                     if matches!(p.peek(), Some(Tok::Sym('['))) {
                         skip_brackets(p);
                     }
@@ -6779,6 +6917,7 @@ fn parse_for_unroll_module(
             i: 0,
             params: p.params.clone(),
             widths: p.widths.clone(),
+            signed: p.signed.clone(),
         };
         let mut dummy_ports = Vec::new();
         let mut dummy_sigs = Vec::new();
@@ -11816,6 +11955,7 @@ fn elaborate_rtl(src: &Rtl, overrides: &HashMap<String, u128>) -> Result<Rtl, St
         i: 0,
         params: overrides.clone(),
         widths: HashMap::new(),
+        signed: HashSet::new(),
     };
     parse_one_module(&mut p)
 }
@@ -12119,6 +12259,7 @@ fn record_instances_vis(
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     clear_function_notes();
     pkg_enums_clear();
+    set_readmem_origin(origin);
     let t_parse = std::time::Instant::now();
     let origin_path = Path::new(origin);
     let base = origin_path.parent().filter(|d| !d.as_os_str().is_empty() && d.exists());
@@ -12222,7 +12363,8 @@ pub fn elaborate_sv(
     params: &HashMap<String, u128>,
     opts: &SvCompileOpts,
 ) -> Result<(Design, SvElabReport), String> {
-    let _ = (origin, opts);
+    let _ = opts;
+    set_readmem_origin(origin);
     let d = synth_from_parsed_top(parse_source(source)?, top, params)?;
     let report = elab_report(&d);
     Ok((d, report))
@@ -12249,8 +12391,10 @@ pub fn elaborate_sv_sources(
     }
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
+    clear_readmem_bases();
     for (origin, src) in files {
-        let _ = (origin, opts);
+        let _ = opts;
+        push_readmem_base(origin);
         all.push_str(src);
         all.push('\n');
     }
@@ -12277,8 +12421,9 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     pkg_enums_clear();
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
+    clear_readmem_bases();
     for (origin, src) in files {
-        let _ = origin;
+        push_readmem_base(origin);
         all.push_str(src);
         all.push_str("
 ");
@@ -12936,6 +13081,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -12952,6 +13098,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -12967,6 +13114,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         assert_eq!(const_cond(&mut p).unwrap(), false, "A==1 && A==2 with A=1");
 
@@ -12978,6 +13126,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         // left-assoc: (A==2 || A==3) && A==2 → true
         assert_eq!(const_cond(&mut p).unwrap(), true);
@@ -13516,6 +13665,75 @@ endmodule
             !d.cells.is_empty(),
             "ysyx_ibex must map at least one LUT/FF from always_ff/assigns, cells=0"
         );
+    }
+
+    fn assign_rhs<'a>(mods: &'a [Rtl], lhs: &str) -> &'a RExpr {
+        mods.iter()
+            .flat_map(|m| m.assigns.iter())
+            .find(|(n, _, _)| n == lhs)
+            .map(|(_, _, e)| e)
+            .expect("assign")
+    }
+
+    #[test]
+    fn signed_ge0_rewrites_to_not_msb() {
+        let src = r#"
+module t(input signed [7:0] in, output o);
+  assign o = in >= 0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => match inner.as_ref() {
+                RExpr::Bit(n, b) => {
+                    assert_eq!(n, "in");
+                    assert_eq!(*b, 7, "signed >= 0 is ~MSB");
+                }
+                other => panic!("expected ~in[7], got {other:?}"),
+            },
+            other => panic!("signed >= unsized 0 must be ~MSB, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_lt0_rewrites_to_msb() {
+        let src = r#"
+module t(input signed [7:0] in, output o);
+  assign o = in < 0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Bit(n, b) => {
+                assert_eq!(n, "in");
+                assert_eq!(*b, 7, "signed < 0 is MSB");
+            }
+            other => panic!("signed < unsized 0 must be MSB, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sized_zero_ge_is_not_msb_rewrite() {
+        // `8'd0` is a sized Const{val:0, width:8}, not unsized 0.
+        let src = r#"
+module t(input [7:0] in, output o);
+  assign o = in >= 8'd0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => {
+                assert!(
+                    !matches!(inner.as_ref(), RExpr::Bit(_, 7)),
+                    "unsigned >= 8'd0 must not become ~MSB, got {inner:?}"
+                );
+                assert!(
+                    matches!(inner.as_ref(), RExpr::Lt(_, _)),
+                    "unsigned >= 8'd0 is !(Lt), got {inner:?}"
+                );
+            }
+            other => panic!("expected !(Lt), got {other:?}"),
+        }
     }
 
     #[test]
@@ -15405,6 +15623,74 @@ endmodule
             "missing $readmemh file must not seed Bram18 INIT 0, cells={:?}",
             d.cells.iter().map(|c| (&c.name, &c.kind)).collect::<Vec<_>>()
         );
+    }
+
+    fn tmp_sv_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "helion_w1_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir
+    }
+
+    #[test]
+    fn readmemh_relative_to_synth_origin() {
+        let dir = tmp_sv_dir("readmem_origin");
+        std::fs::write(dir.join("origin_rel.hex"), "@0\nA5\n3C\n").expect("write hex");
+        std::fs::write(
+            dir.join("rom_rel.sv"),
+            r#"
+module rom_rel(input logic clk, output logic [7:0] q);
+  logic [7:0] mem [0:1];
+  initial $readmemh("origin_rel.hex", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#,
+        )
+        .expect("write sv");
+        let d = synth_sv_path(&dir.join("rom_rel.sv")).expect("rom_rel");
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("origin-relative $readmemh must infer BRAM18");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
+        assert!(init.contains("3c"), "INIT must carry mem[1]=3C, got {init}");
+    }
+
+    #[test]
+    fn readmemh_relative_to_include_parent() {
+        // Same candidate list as `include: origin/include/<name>.
+        let dir = tmp_sv_dir("readmem_include");
+        let inc = dir.join("include");
+        std::fs::create_dir_all(&inc).expect("include dir");
+        std::fs::write(inc.join("mem.hex"), "@0\nA5\n3C\n").expect("write hex");
+        std::fs::write(
+            dir.join("rom_inc.sv"),
+            r#"
+module rom_inc(input logic clk, output logic [7:0] q);
+  logic [7:0] mem [0:1];
+  initial $readmemh("mem.hex", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#,
+        )
+        .expect("write sv");
+        let d = synth_sv_path(&dir.join("rom_inc.sv")).expect("rom_inc");
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("include-parent $readmemh must infer BRAM18");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
+        assert!(init.contains("3c"), "INIT must carry mem[1]=3C, got {init}");
     }
 
     #[test]
