@@ -123,6 +123,7 @@ jobs:
             sh scripts/changelog-excerpt.sh "$TAG"
             echo
             echo "Gold: empty-XDC \`counter.sv\` WNS_PS=9640, LED[16]=0000000111111110."
+            echo "Roadmap: https://github.com/helion-fpga/helion/blob/master/ROADMAP.md"
           } > dist/RELEASE_NOTES.md
           cat dist/RELEASE_NOTES.md
       - uses: softprops/action-gh-release@v2

@@ -15,7 +15,7 @@ Milestones: [helion-fpga/helion](https://github.com/helion-fpga/helion/milestone
 | **1.7** | W6 + W8 | VHDL + HAD | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
 | **2.0** | — | Public OSS CAD bar | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
 
-CI (W7) is not a product release. It gates gold on Ubuntu and `macos-latest` (macos job lands when the branch can push `.github/workflows` with OAuth `workflow` scope).
+CI (W7) is not a product release. It gates gold on Ubuntu and `macos-latest` (both require `WNS_PS=9640`).
 
 ## 1.4 — SV elaborator (W1)
 

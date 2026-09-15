@@ -22,17 +22,15 @@ to `master`.
   [2.0](https://github.com/helion-fpga/helion/milestone/5).
 - Architecture / Use: `helion-sta::load_xdc` command list from
   `crates/helion-sta/src/lib.rs` only, kept separate from Tcl Session CAD.
+- CI: Ubuntu and `macos-latest` jobs build/run `helion-ide --headless
+  examples/counter.sv` and **require** `WNS_PS=9640` (grep; no continue-on-error
+  on gold). Workspace tests may continue-on-error.
 
 ### Changed
 
 - Public Pages nav and `llms.txt` point at the roadmap. Release notes keep a
-  standing Unreleased section (Keep a Changelog).
-
-### Planned (CI — needs `workflow` scope to land on this branch)
-
-- `macos-latest` job: build `helion-ide`, headless counter grepped for
-  `WNS_PS=9640` (required). Ubuntu gold will use the same assert. Spec lives on
-  the W7 lane until the workflow file can be pushed.
+  standing Unreleased section (Keep a Changelog). Release notes excerpt links
+  ROADMAP.md.
 
 [unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.0...HEAD
 
