@@ -1,0 +1,23 @@
+# Helion-S mid SKU: 64×64 CLB / 32768 LUT6.
+part = "HL10S-C64-1"
+sku = "S"
+part_id = 2
+idcode = 0x00021A1F
+had_version = 1
+interior_cols = 64
+interior_rows = 64
+n_ble = 8
+clb_x0 = 2
+clb_y0 = 1
+io_left = 1
+clk_spine = 1
+w = 80
+user_io = 48
+gclk = 8
+bram18 = 16
+mac27 = 4
+dsp_x = 8
+dsp_y0 = 1
+bram_x = 10
+bram_y0 = 1
+speed = 1
