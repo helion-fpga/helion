@@ -3742,7 +3742,7 @@ mod tests {
     use helion_device::Device;
     use helion_ir::Design;
     use helion_pack::pack;
-    use helion_place::{place, place_with, place_with_guide, PlaceOpts};
+    use helion_place::{hard_heartbeat, place, place_with, place_with_guide, PlaceOpts};
     use helion_route::{route_with_guide, RouteOpts};
 
     #[test]
@@ -5533,33 +5533,6 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
     }
 
     /// ≥8 LUT+FF heartbeat (Ibex pin-wrap class, not 108k P&R).
-    fn hard_heartbeat() -> Design {
-        let mut d = Design::new("hb8");
-        d.add_port("clk", PortDir::In);
-        d.add_port("led", PortDir::Out);
-        for i in 0..8u32 {
-            d.add_cell(
-                format!("u_lut{i}"),
-                CellKind::Lut6 {
-                    init: 0x5555_5555_5555_5555,
-                },
-            );
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-            d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
-            if i > 0 {
-                d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
-            }
-        }
-        d.add_cell("u_iob", CellKind::IobOut);
-        d.connect("q7", "u_iob", "I");
-        d.connect("led", "u_iob", "PAD");
-        d
-    }
-
     fn close_guided(
         d: &Design,
         timing_weight: f64,
