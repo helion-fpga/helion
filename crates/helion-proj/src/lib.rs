@@ -1,14 +1,15 @@
-//! Dual-mode Session, disk checkpoints `.hckp`, object query, opt, ECO.
+//! Dual-mode Session, disk checkpoints `.hckp` (`write_checkpoint_to` /
+//! `open_checkpoint` / `read_checkpoint` alias), object query, opt, ECO.
 
 use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
+use helion_debug::insert_ila;
 use helion_device::{Device, Site};
+use helion_hw::{prog_sim, program_hbits_with_cable, resolve_cable, CableBackend};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
-use helion_sta::{apply_xdc, create_clock, load_xdc, report_timing_routed, Constraints};
-use helion_hw::{program_hbits_with_cable, prog_sim, resolve_cable, CableBackend};
-use helion_debug::insert_ila;
+use helion_sta::{apply_xdc, create_clock, load_xdc, report_timing_routed_xdc, Constraints};
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
@@ -47,7 +48,9 @@ impl ImplStrategy {
     pub fn place_opts(self) -> PlaceOpts {
         match self {
             Self::RuntimeOpt => PlaceOpts { timing_weight: 0.0 },
-            _ => PlaceOpts { timing_weight: 0.75 },
+            _ => PlaceOpts {
+                timing_weight: 0.75,
+            },
         }
     }
 
@@ -202,10 +205,7 @@ impl Session {
     pub fn write_checkpoint(&mut self) -> Result<String, String> {
         let p = self.placed.as_ref().ok_or("write_checkpoint: not placed")?;
         self.impl_checkpoint = Some(p.clone());
-        Ok(format!(
-            "write_checkpoint lutff={}",
-            p.lutff_sites.len()
-        ))
+        Ok(format!("write_checkpoint lutff={}", p.lutff_sites.len()))
     }
 
     /// Persist a reopenable `.hckp` (HNF + bitstream hash) so a new process can
@@ -216,9 +216,10 @@ impl Session {
     ) -> Result<String, String> {
         let _ = self.placed.as_ref().ok_or("write_checkpoint: not placed")?;
         let frames = {
-            let bits = self.bitstream.as_ref().ok_or(
-                "write_checkpoint: empty bitstream refused (write_bitstream first)",
-            )?;
+            let bits = self
+                .bitstream
+                .as_ref()
+                .ok_or("write_checkpoint: empty bitstream refused (write_bitstream first)")?;
             if bits.frames.is_empty() {
                 return Err(
                     "write_checkpoint: empty bitstream refused (no configured frames)".into(),
@@ -249,16 +250,25 @@ impl Session {
 
     /// Reopen a `.hckp` written by [`write_checkpoint_to`]. Re-impls from the
     /// embedded HNF so ECO / `write_bitstream` / incremental place work.
+    /// [`read_checkpoint`] is the Vivado-style alias of this command.
     pub fn open_checkpoint(
         path: impl AsRef<std::path::Path>,
         dev: &Device,
     ) -> Result<Self, String> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("open_checkpoint {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("open_checkpoint {}: {e}", path.display()))?;
         let mut s = Self::restore_session(&bytes, dev)?;
         s.impl_checkpoint = s.placed.clone();
         Ok(s)
+    }
+
+    /// Vivado-style alias of [`open_checkpoint`].
+    pub fn read_checkpoint(
+        path: impl AsRef<std::path::Path>,
+        dev: &Device,
+    ) -> Result<Self, String> {
+        Self::open_checkpoint(path, dev)
     }
 
     /// Place/route/bitgen using `.prj` pblock + impl-run strategy (Default = gold).
@@ -352,16 +362,8 @@ impl Session {
         // Empty `pb.cells` relocates the whole design. Always go through the
         // in-proj placer so IOB loc/name checks use `placed.packed.iobs` after
         // `place_with` LOC reorder (`place_in_region` indexes caller packed).
-        let placed = place_named_cells_in_region(
-            &packed,
-            dev,
-            opts,
-            pb.x0,
-            pb.y0,
-            pb.x1,
-            pb.y1,
-            &pb.cells,
-        )?;
+        let placed =
+            place_named_cells_in_region(&packed, dev, opts, pb.x0, pb.y0, pb.x1, pb.y1, &pb.cells)?;
         self.packed = Some(packed);
         self.placed = Some(placed);
         self.routed = None;
@@ -395,7 +397,11 @@ impl Session {
     }
 
     /// Full impl with a Lab 1 strategy. Assumes `design` is already synthesized.
-    pub fn impl_with_strategy(&mut self, dev: &Device, strategy: ImplStrategy) -> Result<(), String> {
+    pub fn impl_with_strategy(
+        &mut self,
+        dev: &Device,
+        strategy: ImplStrategy,
+    ) -> Result<(), String> {
         self.strategy = strategy;
         if strategy == ImplStrategy::PhysOpt {
             let _ = self.opt_design_step()?;
@@ -418,7 +424,9 @@ impl Session {
             &packed,
             dev,
             prev,
-            PlaceOpts { timing_weight: 0.75 },
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
         )?;
         let prev_cells: std::collections::HashSet<&str> = prev
             .packed
@@ -432,8 +440,12 @@ impl Session {
             .iter()
             .filter(|c| prev_cells.contains(c.name.as_str()))
             .count();
-        let prev_nets: std::collections::HashSet<&str> =
-            prev.packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
+        let prev_nets: std::collections::HashSet<&str> = prev
+            .packed
+            .lutffs
+            .iter()
+            .map(|l| l.q_net.as_str())
+            .collect();
         let reused_nets = d
             .nets
             .iter()
@@ -576,12 +588,20 @@ impl Session {
     }
 
     pub fn report_timing(&self, dev: &Device) -> Result<String, String> {
+        self.report_timing_xdc(dev, &Constraints::default())
+    }
+
+    /// STA using project XDC clocks (empty clocks fall back to 10 ns `clk`,
+    /// the empty-XDC counter gold path).
+    pub fn report_timing_xdc(&self, dev: &Device, xdc: &Constraints) -> Result<String, String> {
         let _ = dev;
         let d = self.design.as_ref().ok_or("report_timing: no design")?;
         let r = self.routed.as_ref().ok_or("report_timing: not routed")?;
-        let mut clks = Vec::new();
-        create_clock(&mut clks, "clk", 10_000, "clk");
-        let t = report_timing_routed(d, r, &clks)?;
+        let mut clks = xdc.clocks.clone();
+        if clks.is_empty() {
+            create_clock(&mut clks, "clk", 10_000, "clk");
+        }
+        let t = report_timing_routed_xdc(d, r, &clks, xdc)?;
         Ok(format!(
             "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
             d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
@@ -676,11 +696,7 @@ impl Session {
                     Ok(outcome) => {
                         self.programmed = true;
                         let line = outcome.summary_line("program", &dev.part);
-                        Ok(format!(
-                            "program_hw cable={} {}",
-                            info.id,
-                            line
-                        ))
+                        Ok(format!("program_hw cable={} {}", info.id, line))
                     }
                     Err(e) => {
                         self.programmed = false;
@@ -1009,11 +1025,9 @@ fn decode_impl_knobs(
 }
 
 fn cell_listed_in_pblock(cells: &[String], names: &[&str]) -> bool {
-    cells.iter().any(|c| {
-        names
-            .iter()
-            .any(|n| !n.is_empty() && *n == c.as_str())
-    })
+    cells
+        .iter()
+        .any(|c| names.iter().any(|n| !n.is_empty() && *n == c.as_str()))
 }
 
 /// Relocate `cells` into the HAD rectangle; everyone else keeps `place_with` sites.
@@ -1046,13 +1060,11 @@ fn place_named_cells_in_region(
     let n_ble = dev.n_ble.max(1) as usize;
     let relocate_all = cells.is_empty();
     let lutff_listed = |lf: &helion_pack::PackedLutFf| {
-        relocate_all
-            || cell_listed_in_pblock(cells, &[lf.lut_cell.as_str(), lf.ff_cell.as_str()])
+        relocate_all || cell_listed_in_pblock(cells, &[lf.lut_cell.as_str(), lf.ff_cell.as_str()])
     };
 
     // Sites still held by non-listed `place_with` cells must stay occupied.
-    let mut occupied: std::collections::HashSet<(u32, u32, u8)> =
-        std::collections::HashSet::new();
+    let mut occupied: std::collections::HashSet<(u32, u32, u8)> = std::collections::HashSet::new();
     for (i, (site, ble)) in placed.lutff_sites.iter().enumerate() {
         if !lutff_listed(&placed.packed.lutffs[i]) {
             occupied.insert((site.x, site.y, *ble));
@@ -1095,8 +1107,7 @@ fn place_named_cells_in_region(
             io.loc.as_ref().is_some()
                 || !(relocate_all || cell_listed_in_pblock(cells, &[io.cell.as_str()]))
         };
-        let mut iob_held: std::collections::HashSet<(u32, u32)> =
-            std::collections::HashSet::new();
+        let mut iob_held: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         for (i, site) in placed.iob_sites.iter().enumerate() {
             let Some(io) = placed.packed.iobs.get(i) else {
                 continue;
@@ -1164,13 +1175,12 @@ pub fn get_nets(d: &Design, filter: Option<&str>) -> Vec<String> {
 
 pub fn get_pins(d: &Design, cell: &str) -> Vec<String> {
     let idx = d.pin_index();
-    ["I0", "I1", "I2", "I3", "I4", "I5", "O", "D", "Q", "CLK", "I", "PAD"]
-        .into_iter()
-        .filter_map(|pin| {
-            idx.net_on(cell, pin)
-                .map(|_| format!("{cell}/{pin}"))
-        })
-        .collect()
+    [
+        "I0", "I1", "I2", "I3", "I4", "I5", "O", "D", "Q", "CLK", "I", "PAD",
+    ]
+    .into_iter()
+    .filter_map(|pin| idx.net_on(cell, pin).map(|_| format!("{cell}/{pin}")))
+    .collect()
 }
 
 /// UG893 Floorplanning rectangle persisted in `.prj` (`create_pblock` / `resize_pblock`).
@@ -1453,9 +1463,7 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                 let _ = pblock_named_mut(&mut p, &name);
                 if let Some(spec) = add {
                     let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) else {
-                        return Err(format!(
-                            "create_pblock -add: cannot parse CLB range {spec}"
-                        ));
+                        return Err(format!("create_pblock -add: cannot parse CLB range {spec}"));
                     };
                     let pb = pblock_named_mut(&mut p, &name);
                     pb.x0 = x0;
@@ -1488,9 +1496,7 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                 }
                 if !name.is_empty() && !spec.is_empty() {
                     let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) else {
-                        return Err(format!(
-                            "resize_pblock: cannot parse CLB range {spec}"
-                        ));
+                        return Err(format!("resize_pblock: cannot parse CLB range {spec}"));
                     };
                     let pb = pblock_named_mut(&mut p, &name);
                     pb.x0 = x0;
@@ -1546,7 +1552,11 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
             }
             "write_checkpoint" | "open_checkpoint" | "read_checkpoint" | "checkpoint" => {
                 let rest: Vec<&str> = toks.collect();
-                if let Some(v) = rest.iter().rev().find(|t| !t.starts_with('-') && !t.is_empty()) {
+                if let Some(v) = rest
+                    .iter()
+                    .rev()
+                    .find(|t| !t.starts_with('-') && !t.is_empty())
+                {
                     p.checkpoint_path = Some((*v).to_string());
                 }
             }
@@ -1591,9 +1601,8 @@ pub fn expand_ip_packages(
     let ips = prj.ip_packages.clone();
     for ip_ref in ips {
         let path = resolve_prj_path(prj_path, &ip_ref);
-        let pkg = helion_ipxact::load_helion(&path).map_err(|e| {
-            format!("read_ip {ip_ref}: {e}")
-        })?;
+        let pkg =
+            helion_ipxact::load_helion(&path).map_err(|e| format!("read_ip {ip_ref}: {e}"))?;
         for f in pkg.resolve_files()? {
             let s = f.display().to_string();
             if !prj.sources.iter().any(|x| x == &s) {
@@ -1736,9 +1745,7 @@ pub fn constraints_from_project(
         blob.push_str(&format!("set_property SLEW {val} [get_ports {port}]\n"));
     }
     for (port, val) in &prj.pulltypes {
-        blob.push_str(&format!(
-            "set_property PULLTYPE {val} [get_ports {port}]\n"
-        ));
+        blob.push_str(&format!("set_property PULLTYPE {val} [get_ports {port}]\n"));
     }
     for (port, val) in &prj.diff_terms {
         blob.push_str(&format!(
@@ -1746,9 +1753,7 @@ pub fn constraints_from_project(
         ));
     }
     for (port, val) in &prj.in_terms {
-        blob.push_str(&format!(
-            "set_property IN_TERM {val} [get_ports {port}]\n"
-        ));
+        blob.push_str(&format!("set_property IN_TERM {val} [get_ports {port}]\n"));
     }
     if blob.trim().is_empty() {
         return Ok(Constraints::default());
@@ -1828,7 +1833,9 @@ mod tests {
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
-        assert!(get_pins(proj.design.as_ref().unwrap(), "u_lut").iter().any(|p| p.ends_with("/I0")));
+        assert!(get_pins(proj.design.as_ref().unwrap(), "u_lut")
+            .iter()
+            .any(|p| p.ends_with("/I0")));
     }
 
     #[test]
@@ -1914,12 +1921,21 @@ mod tests {
         let u = s.report_utilization(&dev).unwrap();
         assert!(u.contains("LUTFF=4/8192"), "{u}");
         s.set_property("DONT_TOUCH", "true", "u_lut0").unwrap();
-        assert!(s.design.as_ref().unwrap().cell("u_lut0").unwrap().attrs.flag("DONT_TOUCH"));
+        assert!(s
+            .design
+            .as_ref()
+            .unwrap()
+            .cell("u_lut0")
+            .unwrap()
+            .attrs
+            .flag("DONT_TOUCH"));
         s.open_hw_manager();
         // USB=0: product program_hw (auto) must refuse DONE — no soft-hold / no sim invent.
         let board_err = s.program_hw(&dev).unwrap_err();
         assert!(
-            board_err.contains("refused DONE") || board_err.contains("no USB") || board_err.contains("programmer"),
+            board_err.contains("refused DONE")
+                || board_err.contains("no USB")
+                || board_err.contains("programmer"),
             "{board_err}"
         );
         assert!(!board_err.contains("soft-hold"), "{board_err}");
@@ -1929,12 +1945,25 @@ mod tests {
         let h0 = s.blinky_hash().unwrap();
         let ck = s.checkpoint();
         let s2 = Session::restore_session(&ck, &dev).unwrap();
-        assert_eq!(s2.blinky_hash(), Some(h0), ".hckp restore must match bitstream hash");
+        assert_eq!(
+            s2.blinky_hash(),
+            Some(h0),
+            ".hckp restore must match bitstream hash"
+        );
         let die = dev.report_die();
         assert!(die.contains("HL10T-C32-1"));
         s.mark_debug("q3").unwrap();
-        assert!(s.design.as_ref().unwrap().net("q3").unwrap().attrs.flag("mark_debug"));
-        assert!(get_cells(s.design.as_ref().unwrap(), None).iter().any(|c| c.contains("lut")));
+        assert!(s
+            .design
+            .as_ref()
+            .unwrap()
+            .net("q3")
+            .unwrap()
+            .attrs
+            .flag("mark_debug"));
+        assert!(get_cells(s.design.as_ref().unwrap(), None)
+            .iter()
+            .any(|c| c.contains("lut")));
         assert!(!get_pins(s.design.as_ref().unwrap(), "u_lut0").is_empty());
     }
 
@@ -2027,14 +2056,22 @@ top h_gpio
         let t_def = def.report_timing(&dev).unwrap();
         let mut rt = Session::new(Mode::NonProject);
         rt.synth_design(Design::structural_counter());
-        rt.impl_with_strategy(&dev, ImplStrategy::RuntimeOpt).unwrap();
+        rt.impl_with_strategy(&dev, ImplStrategy::RuntimeOpt)
+            .unwrap();
         let t_rt = rt.report_timing(&dev).unwrap();
-        assert_ne!(t_def, t_rt, "RuntimeOpt WNS must differ from Default: {t_def} vs {t_rt}");
+        assert_ne!(
+            t_def, t_rt,
+            "RuntimeOpt WNS must differ from Default: {t_def} vs {t_rt}"
+        );
         let mut phys = Session::new(Mode::NonProject);
         phys.synth_design(Design::structural_counter());
-        phys.impl_with_strategy(&dev, ImplStrategy::PhysOpt).unwrap();
+        phys.impl_with_strategy(&dev, ImplStrategy::PhysOpt)
+            .unwrap();
         let t_phys = phys.report_timing(&dev).unwrap();
-        assert_ne!(t_phys, t_def, "PhysOpt extra hops must move WNS: {t_phys} vs {t_def}");
+        assert_ne!(
+            t_phys, t_def,
+            "PhysOpt extra hops must move WNS: {t_phys} vs {t_def}"
+        );
 
         let prev = def.placed.clone().unwrap();
         let reuse = def.incremental_place(&dev, &prev).unwrap();
@@ -2185,7 +2222,10 @@ create_pblock pblock_0
         )
         .unwrap();
         assert_eq!(ok.pblocks.len(), 1);
-        assert!(!ok.pblocks[0].ranged, "create_pblock without -add stays unranged");
+        assert!(
+            !ok.pblocks[0].ranged,
+            "create_pblock without -add stays unranged"
+        );
     }
 
     #[test]
@@ -2214,10 +2254,20 @@ create_pblock pblock_0
         let path = dir.join("counter.hckp");
         let wr = s.write_checkpoint_to(&path).unwrap();
         assert!(wr.contains("bytes="), "{wr}");
-        assert!(path.is_file(), "write_checkpoint must create {}", path.display());
+        assert!(
+            path.is_file(),
+            "write_checkpoint must create {}",
+            path.display()
+        );
         drop(s);
 
         let mut s2 = Session::open_checkpoint(&path, &dev).unwrap();
+        let s_read = Session::read_checkpoint(&path, &dev).unwrap();
+        assert_eq!(
+            s_read.blinky_hash(),
+            Some(h0),
+            "read_checkpoint must alias open_checkpoint hash"
+        );
         assert!(
             s2.impl_checkpoint.is_some(),
             "disk restore must seed impl_checkpoint for incremental place"
@@ -2226,6 +2276,13 @@ create_pblock pblock_0
         assert!(
             t1.contains("WNS_PS=9640"),
             "reopen must hold empty-XDC counter gold: {t1}"
+        );
+        let mut tight = Constraints::default();
+        create_clock(&mut tight.clocks, "clk", 5_000, "clk");
+        let t_tight = s2.report_timing_xdc(&dev, &tight).unwrap();
+        assert!(
+            t_tight.contains("WNS_PS=") && !t_tight.contains("WNS_PS=9640"),
+            "project clocks after checkpoint open must move WNS vs 10 ns gold: {t_tight}"
         );
         assert_eq!(
             s2.blinky_hash(),
@@ -2240,25 +2297,25 @@ create_pblock pblock_0
             "ECO write_bitstream must keep non-empty frames"
         );
         let h1 = s2.blinky_hash().expect("ECO bitstream");
-        assert_ne!(h1, h0, "ECO LUT must change bitstream hash ({h0:#x} vs {h1:#x})");
-        eprintln!(
-            "disk_hckp restore WNS_PS=9640 hash={h0:#x} ECO hash={h1:#x} frames={frames1}"
+        assert_ne!(
+            h1, h0,
+            "ECO LUT must change bitstream hash ({h0:#x} vs {h1:#x})"
         );
+        eprintln!("disk_hckp restore WNS_PS=9640 hash={h0:#x} ECO hash={h1:#x} frames={frames1}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_checkpoint_to_refuses_empty_bitstream() {
         let mut s = Session::new(Mode::NonProject);
-        let err = s
-            .write_checkpoint_to("/tmp/helion-empty.hckp")
-            .unwrap_err();
-        assert!(err.contains("not placed") || err.contains("empty bitstream"), "{err}");
+        let err = s.write_checkpoint_to("/tmp/helion-empty.hckp").unwrap_err();
+        assert!(
+            err.contains("not placed") || err.contains("empty bitstream"),
+            "{err}"
+        );
         assert!(s.impl_checkpoint.is_none());
         s.synth_design(Design::structural_counter());
-        let err = s
-            .write_checkpoint_to("/tmp/helion-empty.hckp")
-            .unwrap_err();
+        let err = s.write_checkpoint_to("/tmp/helion-empty.hckp").unwrap_err();
         assert!(err.contains("not placed"), "{err}");
         assert!(s.impl_checkpoint.is_none());
 
@@ -2266,9 +2323,7 @@ create_pblock pblock_0
         s.place_design(&dev).unwrap();
         assert!(s.placed.is_some());
         assert!(s.bitstream.is_none());
-        let err = s
-            .write_checkpoint_to("/tmp/helion-empty.hckp")
-            .unwrap_err();
+        let err = s.write_checkpoint_to("/tmp/helion-empty.hckp").unwrap_err();
         assert!(err.contains("empty bitstream"), "{err}");
         assert!(
             s.impl_checkpoint.is_none(),
@@ -2307,7 +2362,8 @@ create_pblock pblock_0
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut rt = Session::new(Mode::Project);
         rt.synth_design(Design::structural_counter());
-        rt.impl_with_strategy(&dev, ImplStrategy::RuntimeOpt).unwrap();
+        rt.impl_with_strategy(&dev, ImplStrategy::RuntimeOpt)
+            .unwrap();
         let h_rt = rt.blinky_hash().expect("RuntimeOpt bitstream");
         let mut def = Session::new(Mode::Project);
         def.impl_design(Design::structural_counter(), &dev).unwrap();
@@ -2588,11 +2644,7 @@ create_pblock pblock_0
             .expect("u_iob2 packed");
         assert!(led2.loc.is_some(), "pinned IOB must keep loc after reorder");
         assert_eq!(
-            pl_all
-                .packed
-                .iobs
-                .iter()
-                .position(|io| io.cell == "u_iob2"),
+            pl_all.packed.iobs.iter().position(|io| io.cell == "u_iob2"),
             Some(0),
             "place_with must reorder pinned IOB ahead of unpinned"
         );
@@ -2666,7 +2718,11 @@ create_pblock pblock_0
             .position(|l| l.lut_cell == "u_lut3")
             .unwrap();
         let (site, _) = pl.lutff_sites[lut3];
-        assert_eq!((site.x, site.y), (2, 1), "listed cell must sit in the pblock");
+        assert_eq!(
+            (site.x, site.y),
+            (2, 1),
+            "listed cell must sit in the pblock"
+        );
 
         let mut full = Session::new(Mode::Project);
         full.synth_design(design_n_lutffs(9));

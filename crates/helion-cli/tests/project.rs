@@ -72,14 +72,8 @@ fn project_multi_file_with_sdc_impls() {
         stdout.contains("sources=2"),
         "multi-file sources list: {stdout}"
     );
-    assert!(
-        stdout.contains("top=top"),
-        "top module from prj: {stdout}"
-    );
-    assert!(
-        stdout.contains("xdc_files=1"),
-        "read_xdc wired: {stdout}"
-    );
+    assert!(stdout.contains("top=top"), "top module from prj: {stdout}");
+    assert!(stdout.contains("xdc_files=1"), "read_xdc wired: {stdout}");
     assert!(
         stdout.contains("lutffs=1"),
         "hier-equivalent multi-file should pack 1 LUTFF: {stdout}"
@@ -136,7 +130,10 @@ fn helion_ip_show_gpio_catalog_package() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "ip show failed:\n{stdout}\n{stderr}");
-    assert!(stdout.contains("vlnv=community:helion:h_gpio:1.0"), "{stdout}");
+    assert!(
+        stdout.contains("vlnv=community:helion:h_gpio:1.0"),
+        "{stdout}"
+    );
     assert!(stdout.contains("bus=Helion-MM"), "{stdout}");
     assert!(stdout.contains("h_gpio.v"), "{stdout}");
     assert!(!stdout.to_ascii_lowercase().contains("axi"), "{stdout}");
@@ -159,8 +156,14 @@ fn project_read_ip_examples_ip_dir_holds_gold() {
         "examples/ip read_ip failed:\n{stdout}\n{stderr}"
     );
     assert!(stdout.contains("ip=1"), "expected read_ip expand: {stdout}");
-    assert!(stdout.contains("sources=1"), "dir package SV expand: {stdout}");
-    assert!(stdout.contains("xdc_files=1"), "dir package xdc expand: {stdout}");
+    assert!(
+        stdout.contains("sources=1"),
+        "dir package SV expand: {stdout}"
+    );
+    assert!(
+        stdout.contains("xdc_files=1"),
+        "dir package xdc expand: {stdout}"
+    );
     let wns: i64 = field(&stdout, "WNS_PS=").parse().unwrap();
     assert_eq!(wns, 9640, "examples/ip counter WNS gold: {stdout}");
     assert!(
@@ -343,3 +346,146 @@ fn helion_ip_show_rejects_axi_fence() {
     );
 }
 
+fn hash_field(s: &str, key: &str) -> String {
+    s.split_whitespace()
+        .find_map(|t| t.strip_prefix(key).map(|v| v.to_string()))
+        .unwrap_or_else(|| panic!("no {key} in {s}"))
+}
+
+#[test]
+fn project_checkpoint_read_and_eco_from_hckp_changes_hash() {
+    let bin = env!("CARGO_BIN_EXE_helion");
+    let root = root();
+    let dir = std::env::temp_dir().join(format!(
+        "helion-ck-eco-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hckp = dir.join("counter.hckp");
+    let bits_out = dir.join("eco.hbits");
+    let prj = root.join("examples/counter.prj");
+    let sdc = root.join("examples/counter.sdc");
+
+    let write = Command::new(bin)
+        .args([
+            "project",
+            "checkpoint",
+            "write",
+            prj.to_str().unwrap(),
+            "-o",
+            hckp.to_str().unwrap(),
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let wst = String::from_utf8_lossy(&write.stdout);
+    let werr = String::from_utf8_lossy(&write.stderr);
+    assert!(
+        write.status.success(),
+        "checkpoint write failed:\n{wst}\n{werr}"
+    );
+    assert!(wst.contains("WNS_PS=9640"), "gold WNS on write: {wst}");
+    let hash_w = hash_field(&wst, "hash=");
+    assert!(hckp.is_file());
+
+    let read = Command::new(bin)
+        .args([
+            "project",
+            "checkpoint",
+            "read",
+            hckp.to_str().unwrap(),
+            "--sdc",
+            sdc.to_str().unwrap(),
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let rst = String::from_utf8_lossy(&read.stdout);
+    let rerr = String::from_utf8_lossy(&read.stderr);
+    assert!(
+        read.status.success(),
+        "checkpoint read failed:\n{rst}\n{rerr}"
+    );
+    assert!(
+        rst.contains(&format!("hash={hash_w}")),
+        "read must match write hash:\nwrite={wst}\nread={rst}"
+    );
+    assert!(
+        rst.contains("WNS_PS=9640"),
+        "read --sdc must hold project-clock gold: {rst}"
+    );
+
+    let bits = Command::new(bin)
+        .args([
+            "project",
+            "checkpoint",
+            "write_bitstream",
+            hckp.to_str().unwrap(),
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let bst = String::from_utf8_lossy(&bits.stdout);
+    let berr = String::from_utf8_lossy(&bits.stderr);
+    assert!(
+        bits.status.success(),
+        "checkpoint write_bitstream failed:\n{bst}\n{berr}"
+    );
+    assert!(
+        bst.contains(&format!("hash={hash_w}")),
+        "write_bitstream must keep restore hash:\nwrite={wst}\nbits={bst}"
+    );
+    let frames: u32 = field(&bst, "frames=").parse().unwrap();
+    assert!(
+        frames > 0,
+        "write_bitstream must refuse empty frames: {bst}"
+    );
+
+    let eco = Command::new(bin)
+        .args([
+            "project",
+            "checkpoint",
+            "eco",
+            hckp.to_str().unwrap(),
+            "--cell",
+            "u_lut0",
+            "--init",
+            "0xAAAAAAAAAAAAAAAA",
+            "-o",
+            bits_out.to_str().unwrap(),
+            "--prj",
+            prj.to_str().unwrap(),
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let est = String::from_utf8_lossy(&eco.stdout);
+    let eerr = String::from_utf8_lossy(&eco.stderr);
+    assert!(
+        eco.status.success(),
+        "checkpoint eco failed:\n{est}\n{eerr}"
+    );
+    let before = hash_field(&est, "hash_before=");
+    let after = hash_field(&est, "hash_after=");
+    assert_eq!(
+        before, hash_w,
+        "eco hash_before must match write:\n{wst}\n{est}"
+    );
+    assert_ne!(before, after, "ECO LUT must change bitstream hash:\n{est}");
+    let eco_frames: u32 = field(&est, "frames=").parse().unwrap();
+    assert!(eco_frames > 0, "ECO must keep non-empty frames: {est}");
+    assert!(
+        est.contains("WNS_PS=9640"),
+        "ECO path must still print project-clock gold WNS: {est}"
+    );
+    assert!(
+        bits_out.is_file() && bits_out.metadata().unwrap().len() > 0,
+        "eco -o must write a non-empty .hbits"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
