@@ -1801,6 +1801,12 @@ pub fn program_hbits_with_cable(
                 );
                 None
             };
+            // Empty-frame / header-only Helion HBIT: refuse before OFL spawn (share
+            // refuse_empty_bitstream with overlay/lab). Keep 0-byte check above for
+            // non-HBIT / raw pass-through.
+            if let Some(ref b) = bits {
+                refuse_empty_bitstream(b)?;
+            }
             eprintln!(
                 "program: loading {} ({} bytes) onto {} via openFPGALoader ({})…",
                 path.display(),
@@ -2135,8 +2141,11 @@ mod tests {
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
         assert!(
-            err.contains("no USB") || err.contains("openFPGALoader") || err.contains("programmer"),
-            "USB=0 must honest-fail, got: {err}"
+            err.contains("empty bitstream refused")
+                || err.contains("no USB")
+                || err.contains("openFPGALoader")
+                || err.contains("programmer"),
+            "USB=0 / empty-frame must honest-fail, got: {err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
         assert!(
@@ -2150,11 +2159,10 @@ mod tests {
         let _guard = OFL_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join("helion-ofl-test");
         let _ = std::fs::create_dir_all(&dir);
-        let bits_path = dir.join("empty.hbits");
-        // Minimal invalid so we fail before format if no ofl — use real empty bitstream when possible.
-        let dev = Device::load_part("HL10T-C32-1").unwrap();
-        let empty = Bitstream::empty(&dev);
-        std::fs::write(&bits_path, &empty.packets).unwrap();
+        let bits_path = dir.join("counter.hbits");
+        // Non-empty HBIT so we reach OFL spawn / missing-binary path (empty frames refuse earlier).
+        let (dev, bits) = bitgen_structural_counter();
+        std::fs::write(&bits_path, &bits.packets).unwrap();
 
         // Point at a missing binary → PATH-style error (no DONE).
         unsafe {
@@ -2193,9 +2201,9 @@ mod tests {
             // Skip dry-run spawn test on non-unix CI shapes.
             return;
         }
-        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let (dev, bits) = bitgen_structural_counter();
         let bits_path = dir.join("t.hbits");
-        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        std::fs::write(&bits_path, &bits.packets).unwrap();
         unsafe {
             std::env::set_var("HELION_OPENFPGALOADER", &fake);
         }
@@ -2294,9 +2302,11 @@ mod tests {
             return;
         }
         let err = try_native_usb_program(std::path::Path::new("/dev/null"), false).unwrap_err();
-        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let (dev, bits) = bitgen_structural_counter();
         let bits_path = dir.join("t.hbits");
-        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        std::fs::write(&bits_path, &bits.packets).unwrap();
+        let empty_path = dir.join("empty-frames.hbits");
+        std::fs::write(&empty_path, &Bitstream::empty(&dev).packets).unwrap();
         unsafe {
             std::env::set_var("HELION_OPENFPGALOADER", &fake);
         }
@@ -2315,6 +2325,14 @@ mod tests {
             );
         } else {
             assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
+            // Empty-frame HBIT must refuse before OFL soft-success (even via native→OFL).
+            let empty_err = program_hbits_with_cable(&dev, &empty_path, &cable, false).unwrap_err();
+            assert!(
+                empty_err.contains("empty bitstream refused")
+                    || empty_err.contains("refusing DONE on empty"),
+                "{empty_err}"
+            );
+            assert!(!empty_err.contains("DONE=1"), "{empty_err}");
             let ok = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap();
             match ok {
                 ProgramOutcome::OpenFpgaLoader { ofl, .. } => {
@@ -2507,9 +2525,9 @@ mod tests {
         {
             return;
         }
-        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let (dev, bits) = bitgen_structural_counter();
         let bits_path = dir.join("t.hbits");
-        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        std::fs::write(&bits_path, &bits.packets).unwrap();
         unsafe {
             std::env::set_var("HELION_OPENFPGALOADER", &fake);
         }
@@ -2600,9 +2618,9 @@ mod tests {
         {
             return;
         }
-        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let (dev, bits) = bitgen_structural_counter();
         let bits_path = dir.join("t.hbits");
-        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        std::fs::write(&bits_path, &bits.packets).unwrap();
         unsafe {
             std::env::set_var("HELION_OPENFPGALOADER", &fake);
         }
@@ -2690,11 +2708,11 @@ mod tests {
                 "note={}",
                 scan.note
             );
-            let dev = Device::load_part("HL10T-C32-1").unwrap();
+            let (dev, bits) = bitgen_structural_counter();
             let dir = std::env::temp_dir().join("helion-ofl-real-bin");
             let _ = std::fs::create_dir_all(&dir);
             let bits_path = dir.join("t.hbits");
-            std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+            std::fs::write(&bits_path, &bits.packets).unwrap();
             let cable = resolve_cable("ofl").unwrap();
             let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
             assert!(
@@ -2991,6 +3009,40 @@ mod tests {
         );
         // Sim fabric STAT after a real bitstream is not a board/native TDO claim.
         assert!(r.stat.done && r.stat.gwe);
+    }
+
+    #[test]
+    fn ofl_refuses_empty_frame_hbits_before_spawn_no_done() {
+        // Strongest proof: no fake OFL on PATH — empty-frame HBIT still Err before spawn.
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("helion-ofl-empty-frames");
+        let _ = std::fs::create_dir_all(&dir);
+        let missing = dir.join("missing-openFPGALoader-must-not-matter");
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let bits_path = dir.join("empty-frames.hbits");
+        std::fs::write(&bits_path, &Bitstream::empty(&dev).packets).unwrap();
+        unsafe {
+            std::env::set_var("HELION_OPENFPGALOADER", &missing);
+        }
+        unsafe {
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
+        let cable = resolve_cable("ofl").unwrap();
+        assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
+        let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+        assert!(
+            err.contains("empty bitstream refused") || err.contains("refusing DONE on empty"),
+            "empty-frame HBIT must refuse before OFL spawn: {err}"
+        );
+        assert!(!err.contains("DONE=1"), "{err}");
+        // Missing binary must not be the failure mode — gate is pre-spawn.
+        assert!(
+            !err.contains("not a file") && !err.contains("No such file"),
+            "must refuse before spawn/missing binary: {err}"
+        );
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
     }
 
     #[test]

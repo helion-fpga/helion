@@ -4,12 +4,14 @@
 //! `step_user`s the sim fabric, and samples LED — labeled **overlay**, not board DONE.
 //! Native/auto lab wrappers attempt board cables on this host; with USB=0 they Err
 //! honestly (no DONE=1 / no board DONE claim).
+//! Lab `lab_program_native` never soft-succeeds via OFL fallback (CLI may still
+//! NotImplemented→OFL for `helion-prog --cable native`).
 
 use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_hw::{
     overlay_program_led, program_hbits_with_cable, refuse_empty_bitstream, resolve_cable,
-    CableBackend, OverlayReport, COUNTER_OVERLAY_LED,
+    usb_native_feature_enabled, CableBackend, OverlayReport, COUNTER_OVERLAY_LED,
 };
 use std::path::Path;
 
@@ -65,13 +67,28 @@ fn lab_program_cable(spec: &str, path: &Path, expect: CableBackend) -> Result<St
             expect, cable.backend, cable.id
         ));
     }
+    // (A) Lab native: fail fast when usb-native is off — never spawn OFL soft-fallback.
+    if expect == CableBackend::NativeUsb && !usb_native_feature_enabled() {
+        return Err(
+            "lab: native requires --features usb-native — refusing OFL soft-fallback for lab"
+                .into(),
+        );
+    }
     let outcome = program_hbits_with_cable(&dev, path, &cable, false)
         .map_err(|e| format!("lab: {e}"))?;
+    // (B) Lab native: refuse OFL outcome even if hw soft-fallback somehow Ok'd.
+    if expect == CableBackend::NativeUsb && outcome.backend() != CableBackend::NativeUsb {
+        return Err(
+            "lab: native path fell back to OFL — refusing soft-success".into(),
+        );
+    }
     Ok(outcome.summary_line("lab", &dev.part))
 }
 
 /// Attempt program via `--cable native` ([`CableBackend::NativeUsb`]).
 ///
+/// Requires `--features usb-native` for a real native path. Lab **never** soft-succeeds
+/// via OFL fallback (CLI `helion-prog --cable native` may still NotImplemented→OFL).
 /// On this box with USB=0 / no FTDI session → Err. Never claims DONE=1 or board DONE
 /// without a live validated native STAT path (delegates to helion-hw).
 pub fn lab_program_native(path: &Path) -> Result<String, String> {
@@ -172,14 +189,21 @@ mod tests {
         std::fs::write(&path, &bits.packets).unwrap();
 
         let native_err = lab_program_native(&path).unwrap_err();
+        let native_low = native_err.to_ascii_lowercase();
         assert!(
-            native_err.to_ascii_lowercase().contains("native")
+            native_low.contains("native")
+                || native_low.contains("usb-native")
                 || native_err.contains("no USB")
-                || native_err.contains("openFPGALoader")
                 || native_err.contains("I/O")
-                || native_err.contains("NotImplemented")
-                || native_err.contains("programmer"),
-            "native USB=0 must honest-fail: {native_err}"
+                || native_err.contains("no FTDI")
+                || native_low.contains("ofl soft-fallback")
+                || native_low.contains("refusing soft-success")
+                || native_low.contains("refusing ofl"),
+            "native must honest-fail (no OFL soft-success): {native_err}"
+        );
+        assert!(
+            !native_err.contains("programmer_ok=1"),
+            "lab native must not return OFL soft-success summary: {native_err}"
         );
         assert_no_board_done_claim(&native_err);
 
@@ -231,5 +255,36 @@ mod tests {
         );
         assert_no_board_done_claim(&e);
         assert!(!e.to_ascii_lowercase().contains("stat=0x"), "{e}");
+    }
+
+    #[test]
+    fn lab_native_refuses_ofl_fallback_no_soft_success() {
+        let bits = bitgen_structural_counter();
+        let dir = std::env::temp_dir().join("helion-lab-native-no-ofl");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("counter.hbits");
+        std::fs::write(&path, &bits.packets).unwrap();
+
+        let err = lab_program_native(&path).unwrap_err();
+        let low = err.to_ascii_lowercase();
+        if !usb_native_feature_enabled() {
+            assert!(
+                low.contains("usb-native")
+                    || low.contains("ofl soft-fallback")
+                    || low.contains("refusing ofl"),
+                "feature off → lab must refuse before OFL: {err}"
+            );
+        } else {
+            // Feature on + no FTDI → Io / no device; still never Ok / never OFL summary.
+            assert!(
+                err.contains("I/O")
+                    || err.contains("no FTDI")
+                    || low.contains("native")
+                    || low.contains("refusing soft-success"),
+                "feature on + no FTDI must Err: {err}"
+            );
+        }
+        assert!(!err.contains("programmer_ok=1"), "{err}");
+        assert_no_board_done_claim(&err);
     }
 }
