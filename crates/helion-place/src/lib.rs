@@ -643,10 +643,9 @@ pub fn place_with_guide(
             let mut driver_swapped = 0u32;
             // Cheap early-out: if initial affinity place is already IMUX-legal,
             // skip the 32-pass bileg legalize (reduced Ibex / small designs).
+            // Score real IMUX legality for every cluster, including IOB-excepted
+            // drivers (affinity demotion must not freeze illegal mid-Y sites).
             let already_legal = packed.lutffs.iter().enumerate().take(nplace).all(|(i, lf)| {
-                if excepted_iob.contains(&i) {
-                    return true;
-                }
                 let (site, _) = lutff_sites[i];
                 imux_illegal_pins(lf, site, &ff_at) == 0
             });
@@ -665,9 +664,6 @@ pub fn place_with_guide(
                 let mut pass_drv_swapped = 0u32;
                 // --- Phase A: pull sinks toward drivers (existing) ---
                 for (i, lf) in packed.lutffs.iter().enumerate().take(nplace) {
-                    if excepted_iob.contains(&i) {
-                        continue;
-                    }
                     if lf.lut_pins.is_empty() {
                         continue;
                     }
@@ -750,7 +746,7 @@ pub fn place_with_guide(
                             let Some(&j) = site_of.get(&key) else {
                                 continue;
                             };
-                            if j == i || excepted_iob.contains(&j) {
+                            if j == i {
                                 continue;
                             }
                             let other = &packed.lutffs[j];
@@ -832,9 +828,6 @@ pub fn place_with_guide(
                 // Fanout-primary: accept move if illegal fanout drops (lex), even
                 // when driver inputs briefly worsen — sink-phase repairs next pass.
                 for (i, lf) in packed.lutffs.iter().enumerate().take(nplace) {
-                    if excepted_iob.contains(&i) {
-                        continue;
-                    }
                     if lf.ff_cell.is_empty() {
                         continue;
                     }
@@ -842,11 +835,7 @@ pub fn place_with_guide(
                     let Some(all_sinks) = sinks_of.get(d_ff) else {
                         continue;
                     };
-                    let sink_buf: Vec<usize> = all_sinks
-                        .iter()
-                        .copied()
-                        .filter(|si| !excepted_iob.contains(si))
-                        .collect();
+                    let sink_buf: Vec<usize> = all_sinks.iter().copied().collect();
                     let sink_idxs = sink_buf.as_slice();
                     if sink_idxs.is_empty() {
                         continue;
@@ -936,7 +925,7 @@ pub fn place_with_guide(
                             let Some(&j) = site_of.get(&key) else {
                                 continue;
                             };
-                            if j == i || excepted_iob.contains(&j) {
+                            if j == i {
                                 continue;
                             }
                             let other = &packed.lutffs[j];
