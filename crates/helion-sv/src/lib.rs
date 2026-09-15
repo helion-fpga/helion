@@ -12,7 +12,7 @@ pub use preprocess::{expand_includes, preprocess_sv};
 
 use helion_ir::{CellKind, Design, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use sv_parser::{parse_sv_str, Define, DefineText};
 
@@ -339,6 +339,7 @@ struct Signal {
     depth: usize,
     keep: bool,
     mark_debug: bool,
+    force_bram: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +381,8 @@ enum RExpr {
     Eq(Box<RExpr>, Box<RExpr>),
     Ne(Box<RExpr>, Box<RExpr>),
     Lt(Box<RExpr>, Box<RExpr>),
+    /// Function call `fname(a, b, …)` — inlined after module parse when a matching FuncDef exists.
+    Call { name: String, args: Vec<RExpr> },
 }
 
 #[derive(Clone, Debug)]
@@ -407,6 +410,81 @@ struct Rtl {
 
 thread_local! {
     static CUR_MOD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Directories `$readmemh`/`$readmemb` search, same idea as `` `include ``:
+    /// synth origin parent, then `include/` next to it / in the parent.
+    static READMEM_BASES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn clear_readmem_bases() {
+    READMEM_BASES.with(|b| b.borrow_mut().clear());
+}
+
+fn push_readmem_base(origin: &str) {
+    let p = Path::new(origin);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            let pb = parent.to_path_buf();
+            READMEM_BASES.with(|b| {
+                if !b.borrow().iter().any(|x| x == &pb) {
+                    b.borrow_mut().push(pb);
+                }
+            });
+        }
+    }
+}
+
+fn set_readmem_origin(origin: &str) {
+    clear_readmem_bases();
+    push_readmem_base(origin);
+}
+
+/// Same candidate list as `` `include `` (`preprocess::resolve_include`).
+fn resolve_like_include(base: &Path, spec: &str) -> Option<PathBuf> {
+    let mut cands = Vec::new();
+    cands.push(base.join(spec));
+    if let Some(name) = Path::new(spec).file_name() {
+        cands.push(base.join(name));
+        cands.push(base.join("include").join(name));
+        if let Some(parent) = base.parent() {
+            cands.push(parent.join("include").join(name));
+            cands.push(parent.join(spec));
+        }
+    }
+    cands.push(base.join("include").join(spec));
+    cands.into_iter().find(|p| p.is_file())
+}
+
+fn resolve_readmem_path(spec: &str) -> Option<PathBuf> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let p = Path::new(spec);
+    if p.is_absolute() {
+        return if p.is_file() {
+            Some(p.to_path_buf())
+        } else {
+            None
+        };
+    }
+    let mut found = None;
+    READMEM_BASES.with(|bases| {
+        for base in bases.borrow().iter() {
+            if let Some(f) = resolve_like_include(base, spec) {
+                found = Some(f);
+                break;
+            }
+        }
+    });
+    if found.is_some() {
+        return found;
+    }
+    if p.is_file() {
+        Some(p.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn set_cur_mod(name: &str) {
@@ -426,6 +504,9 @@ thread_local! {
     static SKIPPED_FUNCS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Once per module+function for the process. Re-elaboration must not loop the line.
     static FUNC_NOT_CALLED_SEEN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+    /// Once per design: a called function that was not inlined is not `function_not_called`.
+    static FUNC_CALLED_NOT_INLINED_SEEN: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
     /// One `width_overflow` line per module. String-param hashes used as a
     /// range used to panic on `diff + 1` (old lib.rs:1052).
@@ -647,6 +728,30 @@ fn note_function_not_called(module: &str, function: &str) {
     note_skip(format!(
         "diagnostic function_not_called module={module} function={function} (function is not called; not a LUT)"
     ));
+}
+
+/// Emit `function_called_not_inlined` once per design. A skipped/complex
+/// body that still appears in `collect_calls` is not `function_not_called`.
+fn note_function_called_not_inlined(module: &str, function: &str) {
+    let fresh = FUNC_CALLED_NOT_INLINED_SEEN.with(|s| {
+        let mut g = s.borrow_mut();
+        if !g.is_empty() {
+            g.insert(format!("{module}\0{function}"));
+            return false;
+        }
+        g.insert(format!("{module}\0{function}"))
+    });
+    if !fresh {
+        return;
+    }
+    note_skip(format!(
+        "diagnostic function_called_not_inlined module={module} function={function} (function is called but not inlined; not a LUT)"
+    ));
+}
+
+fn clear_function_notes() {
+    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    FUNC_CALLED_NOT_INLINED_SEEN.with(|s| s.borrow_mut().clear());
 }
 
 /// `[msb:lsb]` width. A string parameter is hashed above bit 96; the old
@@ -1863,6 +1968,14 @@ impl OwnHash {
     }
     fn feed_rexpr(&mut self, e: &RExpr) {
         match e {
+            RExpr::Call { name, args } => {
+                self.feed("call");
+                self.feed(name);
+                self.feed_u64(args.len() as u64);
+                for a in args {
+                    self.feed_rexpr(a);
+                }
+            }
             RExpr::Const { val, width, care } => {
                 self.feed("C");
                 self.feed_u64(*val as u64);
@@ -1998,6 +2111,30 @@ fn hash_own(rtl: &Rtl) -> u64 {
         h.feed(n);
         h.feed(&format!("{dir:?}:{w}"));
     }
+    for s in &rtl.signals {
+        h.feed(&s.name);
+        h.feed_u64(s.width as u64);
+        h.feed_u64(s.depth as u64);
+        if s.keep {
+            h.feed("k");
+        }
+        if s.mark_debug {
+            h.feed("md");
+        }
+        if s.force_bram {
+            h.feed("br");
+        }
+    }
+    let mut mems: Vec<_> = rtl.mem_inits.iter().collect();
+    mems.sort_by(|a, b| a.0.cmp(b.0));
+    for (mem, words) in mems {
+        h.feed(mem);
+        for (addr, val) in words {
+            h.feed_u64(*addr as u64);
+            h.feed_u64(*val as u64);
+            h.feed_u64((*val >> 64) as u64);
+        }
+    }
     for (lhs, bit, rhs) in &rtl.nbas {
         h.feed(lhs);
         if let Some(b) = bit {
@@ -2117,7 +2254,30 @@ fn assemble_module(
         // Pin-wrap mid-suite: parent already has closed FF paths (heartbeat)
         // before stitching the child. Soft child cones stay named misses;
         // prefer closed WNS on wrap heartbeat / mapped fabric.
-        let child = assemble_module(mods, &inst.module, visiting)?;
+        let child_proto = mods.get(&inst.module).expect("child");
+        let ov = inst_overrides(inst, child_proto);
+        let child = if ov.is_empty() || !child_proto.insts.is_empty() {
+            assemble_module(mods, &inst.module, visiting)?
+        } else {
+            // Leaf + #(.N(4)): re-elaborate so the override unrolls. Do not
+            // flatten the parent tree (Ibex skip_flatten still holds).
+            match elaborate_rtl(child_proto, &ov) {
+                Ok(elab) => {
+                    let mut cd = lower_own_cached(&elab)?;
+                    cd.name = elab.module.clone();
+                    cd
+                }
+                Err(e) => {
+                    // Do not assemble the leaf without overrides — that would
+                    // map default parameters as if #(.P(v)) had been applied.
+                    note_skip(format!(
+                        "diagnostic leaf_param_elab module={} inst={} child={} (override re-elab failed; not assembled without overrides; {e})",
+                        name, inst.name, inst.module
+                    ));
+                    continue;
+                }
+            }
+        };
         let child_has_hff = child.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
         // Snapshot: this child's FFs are not a parent wrap for its own soft cones.
         let wrap = parent_has_hff;
@@ -2245,6 +2405,7 @@ fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result
         }
         let expanded = expand_includes(&text, dir);
         let pre = preprocess_sv(&strip_comments(&expanded));
+        push_readmem_base(&p.display().to_string());
         out.extend(parse_source(&pre)?);
     }
     Ok(out)
@@ -2560,7 +2721,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 }
             } else {
                 let val: u128 = n.parse().unwrap_or(0);
-                out.push(Tok::Number(val, 32));
+                // Width 0 = unsized decimal (Verilog integer). Distinct from `32'd0`.
+                out.push(Tok::Number(val, 0));
             }
             continue;
         }
@@ -2577,6 +2739,8 @@ struct P<'a> {
     params: HashMap<String, u128>,
     /// Signal/port widths seen so far (slice assigns and const if).
     widths: HashMap<String, usize>,
+    /// Names declared `signed` (ANSI/non-ANSI ports and net decls).
+    signed: HashSet<String>,
 }
 
 impl<'a> P<'a> {
@@ -2921,6 +3085,14 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
     if matches!(p.peek(), Some(Tok::Ge)) {
         p.bump();
         let r = parse_shift(p)?;
+        // Unsized `0` is signed in Verilog: `in >= 0` is ~MSB, not a 16-bit Lt.
+        // Only a tracked signed decl and/or unsized `0` — not `8'd0` / `16'd0`.
+        if let (RExpr::Ident(s), zero) = (&e, &r) {
+            if ident_cmp_zero_signbit(p, s, zero) {
+                let w = p.widths.get(s).copied().unwrap_or(1).max(1);
+                return Ok(RExpr::Not(Box::new(RExpr::Bit(s.clone(), w - 1))));
+            }
+        }
         return Ok(RExpr::Not(Box::new(RExpr::Lt(Box::new(e), Box::new(r)))));
     }
     if p.eat_sym('<') {
@@ -2929,7 +3101,14 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
             p.i -= 1;
             return Ok(e);
         }
-        return Ok(RExpr::Lt(Box::new(e), Box::new(parse_shift(p)?)));
+        let r = parse_shift(p)?;
+        if let (RExpr::Ident(s), zero) = (&e, &r) {
+            if ident_cmp_zero_signbit(p, s, zero) {
+                let w = p.widths.get(s).copied().unwrap_or(1).max(1);
+                return Ok(RExpr::Bit(s.clone(), w - 1));
+            }
+        }
+        return Ok(RExpr::Lt(Box::new(e), Box::new(r)));
     }
     if matches!(p.peek(), Some(Tok::Sym('>')))
         && matches!(p.t.get(p.i + 1), Some(Tok::Sym('>')))
@@ -3298,7 +3477,15 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             })
         }
         Some(Tok::Number(v, w)) => {
-            let care = if *w >= 128 { u128::MAX } else { (1u128 << (*w).max(1)) - 1 };
+            // Width 0 = unsized decimal. Care is the 32-bit integer default;
+            // the width field stays 0 so `ident >= 0` can tell this from `32'd0`.
+            let care = if *w == 0 {
+                care_mask(32)
+            } else if *w >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << (*w).max(1)) - 1
+            };
             Ok(RExpr::Const {
                 val: *v,
                 width: *w,
@@ -3346,6 +3533,23 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                     width: 32,
                     care: u128::MAX,
                 });
+            }
+            // `fname(a, b)` — inlined after module parse when a FuncDef exists.
+            // `$readmemh`/`$display` are statements, not this path.
+            if p.eat_sym('(') {
+                let mut args = Vec::new();
+                if !p.eat_sym(')') {
+                    loop {
+                        args.push(parse_rexpr(p)?);
+                        if p.eat_sym(')') {
+                            break;
+                        }
+                        if !p.eat_sym(',') {
+                            return Err("call ,".into());
+                        }
+                    }
+                }
+                return Ok(RExpr::Call { name, args });
             }
             // Ident form of a size cast, if the type was not a keyword.
             if matches!(p.peek(), Some(Tok::Sym('\'')))
@@ -3523,13 +3727,14 @@ fn parse_port_dir(p: &mut P) -> Option<PortDir> {
     }
 }
 
-fn skip_logic(p: &mut P) {
+fn skip_logic(p: &mut P) -> bool {
     let _ = p.eat_kw("logic");
     let _ = p.eat_kw("wire");
     let _ = p.eat_kw("reg");
-    let _ = p.eat_kw("signed");
+    let signed = p.eat_kw("signed");
     let _ = p.eat_kw("unsigned");
     let _ = p.eat_kw("var");
+    signed
 }
 
 fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
@@ -3573,6 +3778,181 @@ fn parse_lhs(p: &mut P) -> Result<(String, Option<usize>), String> {
 }
 
 type Nba = (String, Option<usize>, RExpr);
+
+/// `$readmemh("file", mem)` / `$readmemb` in `initial` → mem_inits.
+fn try_parse_readmem(
+    p: &mut P,
+    mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
+) -> bool {
+    let save = p.i;
+    let Some(Tok::Ident(n)) = p.peek() else {
+        return false;
+    };
+    let binary = match n.as_str() {
+        "$readmemb" => true,
+        "$readmemh" => false,
+        _ => return false,
+    };
+    p.bump();
+    if !p.eat_sym('(') {
+        p.i = save;
+        return false;
+    }
+    let path = match p.bump() {
+        Some(Tok::Str(s)) => s.clone(),
+        _ => {
+            p.i = save;
+            return false;
+        }
+    };
+    if !p.eat_sym(',') {
+        p.i = save;
+        return false;
+    }
+    let mem = match p.ident() {
+        Ok(n) => n,
+        Err(_) => {
+            p.i = save;
+            return false;
+        }
+    };
+    let mut start = 0usize;
+    if p.eat_sym(',') {
+        if let Ok(v) = const_u(p) {
+            start = v as usize;
+        }
+        if p.eat_sym(',') {
+            let _ = const_u(p);
+        }
+    }
+    let _ = p.eat_sym(')');
+    let _ = p.eat_sym(';');
+    let words = match resolve_readmem_path(&path).and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(t) => parse_mem_image(&t, binary),
+        None => {
+            // Missing image is not INIT 0. Do not seed mem_inits.
+            note_skip(format!(
+                "diagnostic readmem_file module={} path={path} (readmem image not loaded; not a silent INIT 0)",
+                cur_mod()
+            ));
+            return true;
+        }
+    };
+    if words.is_empty() {
+        // Empty/whitespace-only image is not INIT 0.
+        note_skip(format!(
+            "diagnostic readmem_empty module={} path={path} (readmem image empty; not a silent INIT 0)",
+            cur_mod()
+        ));
+        return true;
+    }
+    let entry = mem_inits.entry(mem).or_default();
+    for (a, v) in words {
+        entry.insert(start.saturating_add(a), v);
+    }
+    true
+}
+
+/// Verilog `$readmemh`/`$readmemb` image: `@addr` plus whitespace-separated words.
+fn parse_mem_image(text: &str, binary: bool) -> BTreeMap<usize, u128> {
+    let mut out = BTreeMap::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut addr = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = i.saturating_add(2);
+            continue;
+        }
+        if c == '@' {
+            i += 1;
+            let mut h = String::new();
+            while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                h.push(chars[i]);
+                i += 1;
+            }
+            addr = usize::from_str_radix(&h, 16).unwrap_or(0);
+            continue;
+        }
+        if binary {
+            if c == '0' || c == '1' || c == '_' || matches!(c, 'x' | 'X' | 'z' | 'Z') {
+                let mut bits = String::new();
+                while i < chars.len() {
+                    let d = chars[i];
+                    if d == '_' {
+                        i += 1;
+                        continue;
+                    }
+                    if d == '0' || d == '1' {
+                        bits.push(d);
+                        i += 1;
+                    } else if matches!(d, 'x' | 'X' | 'z' | 'Z') {
+                        bits.push('0');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !bits.is_empty() {
+                    let val = u128::from_str_radix(&bits, 2).unwrap_or(0);
+                    out.insert(addr, val);
+                    addr = addr.saturating_add(1);
+                }
+                continue;
+            }
+        } else if c.is_ascii_hexdigit() || c == '_' || matches!(c, 'x' | 'X' | 'z' | 'Z') {
+            let mut h = String::new();
+            while i < chars.len() {
+                let d = chars[i];
+                if d == '_' {
+                    i += 1;
+                    continue;
+                }
+                if d.is_ascii_hexdigit() {
+                    h.push(d);
+                    i += 1;
+                } else if matches!(d, 'x' | 'X' | 'z' | 'Z') {
+                    h.push('0');
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if !h.is_empty() {
+                if h.len() > 32 {
+                    h = h[h.len() - 32..].to_string();
+                }
+                let val = u128::from_str_radix(&h, 16).unwrap_or(0);
+                out.insert(addr, val);
+                addr = addr.saturating_add(1);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
 
 fn parse_nba(p: &mut P) -> Result<Nba, String> {
     let (lhs, bit) = parse_lhs(p)?;
@@ -3949,7 +4329,13 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
                 other => other.clone(),
             })
             .collect();
-        let mut sp = P { t: &toks, i: 0, params: p.params.clone(), widths: p.widths.clone() };
+        let mut sp = P {
+            t: &toks,
+            i: 0,
+            params: p.params.clone(),
+            widths: p.widths.clone(),
+            signed: p.signed.clone(),
+        };
         out.extend(parse_seq_block(&mut sp, block)?);
         if step_down {
             i = i.saturating_sub(step);
@@ -4015,6 +4401,22 @@ fn bit_extract(e: RExpr, bit: usize) -> RExpr {
 
 fn note_width(p: &mut P, name: &str, w: usize) {
     p.widths.insert(name.to_string(), w.max(1));
+}
+
+fn note_signed(p: &mut P, name: &str) {
+    p.signed.insert(name.to_string());
+}
+
+/// `ident >= 0` / `< 0` → ~MSB/MSB only when the decl is tracked **signed**
+/// and the zero is **unsized** (token width 0). Unsigned `in >= 0` stays the
+/// always-true/false unsigned compare; sized `8'd0`/`16'd0` stay `!(Lt)`.
+fn ident_cmp_zero_signbit(p: &P, name: &str, zero: &RExpr) -> bool {
+    let RExpr::Const { val: 0, width, .. } = zero else {
+        return false;
+    };
+    let is_unsized = *width == 0;
+    let signed = p.signed.contains(name);
+    signed && is_unsized
 }
 
 /// Last procedural write wins. Vector assigns become per-bit so a case arm
@@ -4425,7 +4827,13 @@ fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
     clear_seq_notes();
     let s = preprocess_sv(&strip_comments(source));
     let toks = tokenize(&s)?;
-    let mut p = P { t: &toks, i: 0, params: HashMap::new(), widths: HashMap::new() };
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        params: HashMap::new(),
+        widths: HashMap::new(),
+        signed: HashSet::new(),
+    };
     let mut mods = Vec::new();
     while p.peek().is_some() {
         if p.eat_sym(';') {
@@ -4909,11 +5317,28 @@ fn parse_function(p: &mut P) -> Result<FuncDef, String> {
             return Err("function name".into());
         }
     };
-    let _ = p.eat_sym(';');
-    note_width(p, &name, ret_w);
     let mut ports = Vec::new();
     let mut signals = Vec::new();
     let mut stmts = Vec::new();
+    // ANSI: `function [3:0] f(input [3:0] x);`
+    if p.eat_sym('(') {
+        while !p.eat_sym(')') {
+            if p.peek().is_none() {
+                return Err("unterminated function ports".into());
+            }
+            let dir = parse_port_dir(p).unwrap_or(PortDir::In);
+            skip_sv_type(p);
+            let w = p.width_opt().unwrap_or(1);
+            if let Ok(n) = p.ident() {
+                ports.push((n.clone(), dir, w));
+                signals.push((n.clone(), w));
+                note_width(p, &n, w);
+            }
+            let _ = p.eat_sym(',');
+        }
+    }
+    let _ = p.eat_sym(';');
+    note_width(p, &name, ret_w);
     while !p.eat_kw("endfunction") {
         if p.peek().is_none()
             || matches!(p.peek(), Some(Tok::Kw(k)) if k == "endmodule" || k == "module")
@@ -5020,7 +5445,227 @@ fn rexpr_names(e: &RExpr, out: &mut HashSet<String>) {
             rexpr_names(t, out);
             rexpr_names(f, out);
         }
+        RExpr::Call { args, .. } => {
+            for a in args {
+                rexpr_names(a, out);
+            }
+        }
         RExpr::Const { .. } => {}
+    }
+}
+
+/// Reconstruct `e` with each immediate child replaced by `f`. Leaves are cloned.
+fn map_rexpr_children(e: &RExpr, f: &mut dyn FnMut(&RExpr) -> RExpr) -> RExpr {
+    match e {
+        RExpr::Const { .. } | RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => {
+            e.clone()
+        }
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ascending,
+        } => RExpr::IndexPart {
+            name: name.clone(),
+            base: Box::new(f(base)),
+            width: *width,
+            ascending: *ascending,
+        },
+        RExpr::WordAt { addr, data } => RExpr::WordAt {
+            addr: Box::new(f(addr)),
+            data: Box::new(f(data)),
+        },
+        RExpr::Concat(parts) => RExpr::Concat(parts.iter().map(|p| f(p)).collect()),
+        RExpr::Shr(a, b) => RExpr::Shr(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Ashr(a, b) => RExpr::Ashr(Box::new(f(a)), Box::new(f(b))),
+        RExpr::RedXor(x) => RExpr::RedXor(Box::new(f(x))),
+        RExpr::RedAnd(x) => RExpr::RedAnd(Box::new(f(x))),
+        RExpr::RedOr(x) => RExpr::RedOr(Box::new(f(x))),
+        RExpr::Not(x) => RExpr::Not(Box::new(f(x))),
+        RExpr::And(a, b) => RExpr::And(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Or(a, b) => RExpr::Or(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Xor(a, b) => RExpr::Xor(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Add(a, b) => RExpr::Add(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Sub(a, b) => RExpr::Sub(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Mul(a, b) => RExpr::Mul(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Mux(c, t, e2) => RExpr::Mux(Box::new(f(c)), Box::new(f(t)), Box::new(f(e2))),
+        RExpr::Eq(a, b) => RExpr::Eq(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Ne(a, b) => RExpr::Ne(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Lt(a, b) => RExpr::Lt(Box::new(f(a)), Box::new(f(b))),
+        RExpr::Call { name, args } => RExpr::Call {
+            name: name.clone(),
+            args: args.iter().map(|a| f(a)).collect(),
+        },
+    }
+}
+
+fn collect_calls(e: &RExpr, out: &mut HashSet<String>) {
+    if let RExpr::Call { name, args } = e {
+        out.insert(name.clone());
+        for a in args {
+            collect_calls(a, out);
+        }
+        return;
+    }
+    let _ = map_rexpr_children(e, &mut |c| {
+        collect_calls(c, out);
+        c.clone()
+    });
+}
+
+/// Exactly one assign to the function name, and no other statements. `inv = ~d`.
+fn simple_return_assign(f: &FuncDef) -> Option<RExpr> {
+    match f.stmts.as_slice() {
+        [(lhs, None, rhs)] if lhs == &f.name => Some(rhs.clone()),
+        _ => None,
+    }
+}
+
+/// True when a Bit/Range/IndexPart on a formal would drop the select against a
+/// non-Ident actual — refuse inline instead of silent wrong logic.
+fn subst_select_needs_ident(e: &RExpr, map: &HashMap<String, RExpr>) -> bool {
+    match e {
+        RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
+            matches!(map.get(s), Some(rep) if !matches!(rep, RExpr::Ident(_)))
+        }
+        RExpr::IndexPart { name, base, .. } => {
+            let bad_name = matches!(map.get(name), Some(rep) if !matches!(rep, RExpr::Ident(_)));
+            bad_name || subst_select_needs_ident(base, map)
+        }
+        other => {
+            let mut bad = false;
+            let _ = map_rexpr_children(other, &mut |c| {
+                if subst_select_needs_ident(c, map) {
+                    bad = true;
+                }
+                c.clone()
+            });
+            bad
+        }
+    }
+}
+
+fn subst_idents(e: &RExpr, map: &HashMap<String, RExpr>) -> RExpr {
+    match e {
+        RExpr::Ident(s) => map.get(s).cloned().unwrap_or_else(|| e.clone()),
+        RExpr::Bit(s, i) => match map.get(s) {
+            Some(RExpr::Ident(n)) => RExpr::Bit(n.clone(), *i),
+            // Non-Ident actual: caller must refuse inline (see subst_select_needs_ident).
+            Some(_) | None => e.clone(),
+        },
+        RExpr::Range(s, lo, hi) => match map.get(s) {
+            Some(RExpr::Ident(n)) => RExpr::Range(n.clone(), *lo, *hi),
+            Some(_) | None => e.clone(),
+        },
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ascending,
+        } => {
+            let base = Box::new(subst_idents(base, map));
+            match map.get(name) {
+                Some(RExpr::Ident(n)) => RExpr::IndexPart {
+                    name: n.clone(),
+                    base,
+                    width: *width,
+                    ascending: *ascending,
+                },
+                _ => RExpr::IndexPart {
+                    name: name.clone(),
+                    base,
+                    width: *width,
+                    ascending: *ascending,
+                },
+            }
+        }
+        other => map_rexpr_children(other, &mut |c| subst_idents(c, map)),
+    }
+}
+
+fn inline_rexpr(e: &RExpr, funcs: &[FuncDef], depth: usize) -> RExpr {
+    if depth > 8 {
+        return e.clone();
+    }
+    let e = map_rexpr_children(e, &mut |c| inline_rexpr(c, funcs, depth));
+    let RExpr::Call { name, args } = &e else {
+        return e;
+    };
+    let Some(f) = funcs.iter().find(|f| f.name == *name) else {
+        return e;
+    };
+    let Some(body) = simple_return_assign(f) else {
+        return e;
+    };
+    let ins: Vec<_> = f
+        .ports
+        .iter()
+        .filter(|(_, d, _)| *d == PortDir::In)
+        .cloned()
+        .collect();
+    let plist = if ins.is_empty() {
+        f.ports.clone()
+    } else {
+        ins
+    };
+    if args.len() != plist.len() {
+        return e;
+    }
+    let mut map = HashMap::new();
+    for (i, (pn, _, _)) in plist.iter().enumerate() {
+        map.insert(pn.clone(), args[i].clone());
+    }
+    if subst_select_needs_ident(&body, &map) {
+        return e;
+    }
+    let body = subst_idents(&body, &map);
+    inline_rexpr(&body, funcs, depth + 1)
+}
+
+fn inline_nbas(nbas: &mut [(String, Option<usize>, RExpr)], funcs: &[FuncDef]) {
+    for (_, _, rhs) in nbas.iter_mut() {
+        *rhs = inline_rexpr(rhs, funcs, 0);
+    }
+}
+
+/// `for`/`if`/`case` inside a function is not re-entered (Ibex mhpmcounter_get).
+fn function_toks_simple(toks: &[Tok]) -> bool {
+    !toks.iter().any(|t| {
+        matches!(
+            t,
+            Tok::Kw(k) if k == "for"
+                || k == "foreach"
+                || k == "while"
+                || k == "forever"
+                || k == "repeat"
+                || k == "if"
+                || k == "case"
+                || k == "casex"
+                || k == "casez"
+                || k == "unique"
+                || k == "priority"
+        )
+    })
+}
+
+/// `function` keyword already eaten. Parse a simple body, or skip without re-entry.
+fn parse_or_skip_function(p: &mut P, funcs: &mut Vec<FuncDef>) {
+    let start = p.i;
+    let name = skip_function_without_reentry(p);
+    if !function_toks_simple(&p.t[start..p.i]) {
+        skipped_funcs_push(name);
+        return;
+    }
+    let mut fp = P {
+        t: p.t,
+        i: start,
+        params: p.params.clone(),
+        widths: p.widths.clone(),
+        signed: p.signed.clone(),
+    };
+    match parse_function(&mut fp) {
+        Ok(f) => funcs.push(f),
+        Err(_) => skipped_funcs_push(name),
     }
 }
 
@@ -5035,6 +5680,7 @@ fn parse_functions_in_slice(toks: &[Tok]) -> Vec<FuncDef> {
         i: 0,
         params: HashMap::new(),
         widths: HashMap::new(),
+        signed: HashSet::new(),
     };
     let mut funcs = Vec::new();
     while p.peek().is_some() {
@@ -5119,6 +5765,7 @@ fn lift_functions_if_no_body(
                         depth: 0,
                         keep: false,
                         mark_debug: false,
+                        force_bram: false,
                     });
                 }
             }
@@ -5132,6 +5779,7 @@ fn lift_functions_if_no_body(
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 });
             }
         }
@@ -5144,6 +5792,7 @@ fn lift_functions_if_no_body(
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 });
             }
         }
@@ -5156,6 +5805,7 @@ fn lift_functions_if_no_body(
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 });
             }
             assigns.push((ln, *bit, rewrite_rexpr(rhs, &subst)));
@@ -5190,7 +5840,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                 break;
             }
             let dir = parse_port_dir(&mut p).unwrap_or(PortDir::In);
-            skip_logic(&mut p);
+            let mut is_signed = skip_logic(&mut p);
             // package::typedef or typedef name before the port ident
             while matches!(p.peek(), Some(Tok::Ident(_)))
                 && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
@@ -5221,7 +5871,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                     p.i = save;
                 }
             }
-            skip_logic(&mut p);
+            is_signed |= skip_logic(&mut p);
             // Packed multi-dim before the port name (Ibex fetch_fifo rdata_q):
             // `input logic [DEPTH-1:0][31:0] rdata_q` → width=32, depth=DEPTH.
             let mut packed_dims: Vec<usize> = Vec::new();
@@ -5296,12 +5946,16 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
                     if let Some(&d0) = dims.first() {
                         unpack_depth = d0.min(4096);
                     }
+                    if is_signed {
+                        note_signed(p, &n);
+                    }
                     signals.push(Signal {
                         name: n,
                         width: w,
                         depth: unpack_depth,
                         keep: false,
                         mark_debug: false,
+                        force_bram: false,
                     });
                 }
                 Err(_) => {
@@ -5339,6 +5993,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     let mut insts = Vec::new();
     let mut pending_keep = false;
     let mut pending_md = false;
+    let mut pending_bram = false;
     let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
     let mut funcs: Vec<FuncDef> = Vec::new();
     skipped_funcs_clear();
@@ -5352,6 +6007,7 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
         &mut param_order,
         &mut pending_keep,
         &mut pending_md,
+        &mut pending_bram,
         &mut mem_inits,
         &mut funcs,
         "endmodule",
@@ -5360,15 +6016,50 @@ fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
     {
         skip_until_kw(&mut p, "endmodule");
     }
-    // Uncalled functions are skipped without re-entering the body.
-    // Lift only a function-only module, and parse those functions once.
+    // Uncalled / skipped functions are not LUTs. Called simple return-assigns
+    // inline into nbas/assigns (`q <= inv(d)`). Complex bodies stay skipped
+    // without re-entry (Ibex mhpmcounter_get / PMP).
     let skipped = skipped_funcs_take();
-    let will_lift = !skipped.is_empty() && nbas.is_empty() && assigns.is_empty() && insts.is_empty();
+    let mut called = HashSet::new();
+    for (_, _, rhs) in nbas.iter().chain(assigns.iter()) {
+        collect_calls(rhs, &mut called);
+    }
+    let will_lift = nbas.is_empty()
+        && assigns.is_empty()
+        && insts.is_empty()
+        && (!funcs.is_empty() || !skipped.is_empty());
     if will_lift {
-        funcs = parse_functions_in_slice(&p.t[tok_start..p.i]);
+        if funcs.is_empty() {
+            funcs = parse_functions_in_slice(&p.t[tok_start..p.i]);
+        }
         lift_functions_if_no_body(&mut ports, &mut signals, &nbas, &mut assigns, &insts, &funcs);
     } else {
+        inline_nbas(&mut nbas, &funcs);
+        inline_nbas(&mut assigns, &funcs);
+        let mut remaining = HashSet::new();
+        for (_, _, rhs) in nbas.iter().chain(assigns.iter()) {
+            collect_calls(rhs, &mut remaining);
+        }
         let mut seen_fn = HashSet::new();
+        // Skipped/complex bodies that still appear as calls are not uncalled.
+        for name in skipped.iter() {
+            if called.contains(name) && seen_fn.insert(name.clone()) {
+                note_function_called_not_inlined(&module, name);
+            }
+        }
+        for f in &funcs {
+            if called.contains(&f.name)
+                && remaining.contains(&f.name)
+                && seen_fn.insert(f.name.clone())
+            {
+                note_function_called_not_inlined(&module, &f.name);
+            }
+        }
+        for f in &funcs {
+            if !called.contains(&f.name) && seen_fn.insert(f.name.clone()) {
+                note_function_not_called(&module, &f.name);
+            }
+        }
         for name in skipped {
             if seen_fn.insert(name.clone()) {
                 note_function_not_called(&module, &name);
@@ -5431,6 +6122,7 @@ fn parse_module_items(
     param_order: &mut Vec<(String, u128)>,
     pending_keep: &mut bool,
     pending_md: &mut bool,
+    pending_bram: &mut bool,
     mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
     funcs: &mut Vec<FuncDef>,
     endkw: &str,
@@ -5453,13 +6145,24 @@ fn parse_module_items(
             if k.eq_ignore_ascii_case("mark_debug") {
                 *pending_md = on;
             }
+            if k.eq_ignore_ascii_case("ram_style") && v.to_ascii_lowercase().contains("block") {
+                *pending_bram = true;
+            }
+        }
+        // Attrs apply only to the next logic/wire/reg decl (the paths that
+        // consume pending_*). input/output/inout/integer are not consumers —
+        // treating them as next_decl left ram_style sticky onto a later memory.
+        let next_net_decl = matches!(
+            p.peek(),
+            Some(Tok::Kw(k)) if matches!(k.as_str(), "logic" | "wire" | "reg")
+        );
+        if !next_net_decl {
+            *pending_bram = false;
+            *pending_keep = false;
+            *pending_md = false;
         }
         if p.eat_kw("function") {
-            // Do not parse the body. Uncalled functions are not LUTs; re-entering
-            // for/if/case inside them loops (Ibex mhpmcounter_get / PMP).
-            let name = skip_function_without_reentry(p);
-            skipped_funcs_push(name);
-            let _ = funcs;
+            parse_or_skip_function(p, funcs);
             continue;
         }
         if p.eat_kw("task") {
@@ -5477,7 +6180,7 @@ fn parse_module_items(
         }
         if p.eat_kw("generate") {
             parse_module_items(
-                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
+                p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, pending_bram, mem_inits, funcs,
                 "endgenerate",
             )?;
             continue;
@@ -5564,13 +6267,13 @@ fn parse_module_items(
                 if yes && !taken {
                     if then_begin {
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, pending_bram, mem_inits, funcs,
                             "end",
                         )?;
                     } else {
                         // one module item; require a following else/endgenerate/endmodule delimiter
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, pending_bram, mem_inits, funcs,
                             "else",
                         )?;
                         // parse_module_items consumed the else keyword — put it back
@@ -5596,7 +6299,7 @@ fn parse_module_items(
                 if !taken {
                     if eb {
                         parse_module_items(
-                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, mem_inits, funcs,
+                            p, ports, signals, nbas, assigns, insts, param_order, pending_keep, pending_md, pending_bram, mem_inits, funcs,
                             "end",
                         )?;
                     } else {
@@ -5634,7 +6337,7 @@ fn parse_module_items(
         }
         if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output") {
             let dir = parse_port_dir(&mut p).unwrap();
-            skip_logic(&mut p);
+            let is_signed = skip_logic(&mut p);
             let w = p.width_opt()?;
             let n = p.ident()?;
             if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n) {
@@ -5653,9 +6356,13 @@ fn parse_module_items(
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 });
             }
             note_width(p, &n, w);
+            if is_signed {
+                note_signed(p, &n);
+            }
             // `input signed [W-1:0] a,b` — the same range applies to each name.
             while p.eat_sym(',') {
                 let Ok(n2) = p.ident() else {
@@ -5676,9 +6383,13 @@ fn parse_module_items(
                         depth: 0,
                         keep: false,
                         mark_debug: false,
+                        force_bram: false,
                     });
                 }
                 note_width(p, &n2, w);
+                if is_signed {
+                    note_signed(p, &n2);
+                }
             }
             let _ = p.eat_sym(';');
             continue;
@@ -5700,7 +6411,7 @@ fn parse_module_items(
             // `reg signed [W-1:0] mem[N:0]` — signed is a qualifier, not the name.
             // Packed multi-dim before the name (Ibex fetch_fifo):
             // `logic [DEPTH-1:0][31:0] rdata_q` → width=32, depth=DEPTH.
-            skip_logic(p);
+            let is_signed = skip_logic(p);
             let mut packed_dims: Vec<usize> = Vec::new();
             while matches!(p.peek(), Some(Tok::Sym('['))) {
                 let save = p.i;
@@ -5769,6 +6480,15 @@ fn parse_module_items(
                 if depth > 0 {
                     sig.depth = depth;
                 }
+                if *pending_keep {
+                    sig.keep = true;
+                }
+                if *pending_md {
+                    sig.mark_debug = true;
+                }
+                if *pending_bram {
+                    sig.force_bram = true;
+                }
             } else {
                 signals.push(Signal {
                     name: n.clone(),
@@ -5776,22 +6496,34 @@ fn parse_module_items(
                     depth,
                     keep: *pending_keep,
                     mark_debug: *pending_md,
+                    force_bram: *pending_bram,
                 });
             }
             note_width(p, &n, w);
+            if is_signed {
+                note_signed(p, &n);
+            }
             push_decl_assign(p, assigns, &n, net_assign);
             while p.eat_sym(',') {
                 if let Ok(n2) = p.ident() {
-                    if !signals.iter().any(|s| s.name == n2) {
+                    if let Some(sig) = signals.iter_mut().find(|s| s.name == n2) {
+                        if *pending_bram {
+                            sig.force_bram = true;
+                        }
+                    } else {
                         signals.push(Signal {
                             name: n2.clone(),
                             width: w,
                             depth,
                             keep: *pending_keep,
                             mark_debug: *pending_md,
+                            force_bram: *pending_bram,
                         });
                     }
                     note_width(p, &n2, w);
+                    if is_signed {
+                        note_signed(p, &n2);
+                    }
                     if matches!(p.peek(), Some(Tok::Sym('['))) {
                         skip_brackets(p);
                     }
@@ -5802,6 +6534,7 @@ fn parse_module_items(
             }
             *pending_keep = false;
             *pending_md = false;
+            *pending_bram = false;
             let _ = p.eat_sym(';');
             continue;
         }
@@ -5813,6 +6546,12 @@ fn parse_module_items(
                 }
                 if p.peek().is_none() {
                     break;
+                }
+                if try_parse_readmem(p, mem_inits) {
+                    if !block {
+                        break;
+                    }
+                    continue;
                 }
                 match parse_nba(p) {
                     Ok((lhs, bit, rhs)) => {
@@ -6018,11 +6757,7 @@ fn parse_module_items(
             continue;
         }
         if p.eat_kw("function") {
-            // Do not parse the body. Uncalled functions are not LUTs; re-entering
-            // for/if/case inside them loops (Ibex mhpmcounter_get / PMP).
-            let name = skip_function_without_reentry(p);
-            skipped_funcs_push(name);
-            let _ = funcs;
+            parse_or_skip_function(p, funcs);
             continue;
         }
         if p.eat_kw("task") {
@@ -6091,11 +6826,17 @@ fn parse_module_items(
                                     depth: 0,
                                     keep: *pending_keep,
                                     mark_debug: *pending_md,
+                                    force_bram: *pending_bram,
                                 });
+                            } else if *pending_bram {
+                                if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
+                                    sig.force_bram = true;
+                                }
                             }
                             note_width(p, &n, w);
                             *pending_keep = false;
                             *pending_md = false;
+                            *pending_bram = false;
                             if p.eat_sym('=') {
                                 match parse_rexpr(p) {
                                     Ok(rhs) => assigns.push((n, None, rhs)),
@@ -6111,6 +6852,7 @@ fn parse_module_items(
                                             depth: 0,
                                             keep: false,
                                             mark_debug: false,
+                                            force_bram: false,
                                         });
                                     }
                                     note_width(p, &n2, w);
@@ -6217,12 +6959,14 @@ fn parse_for_unroll_module(
             i: 0,
             params: p.params.clone(),
             widths: p.widths.clone(),
+            signed: p.signed.clone(),
         };
         let mut dummy_ports = Vec::new();
         let mut dummy_sigs = Vec::new();
         let mut dummy_params = Vec::new();
         let mut pk = false;
         let mut pmd = false;
+        let mut pbram = false;
         let mut local_nbas = Vec::new();
         let mut local_assigns = Vec::new();
         let mut local_insts = Vec::new();
@@ -6238,6 +6982,7 @@ fn parse_for_unroll_module(
                 &mut dummy_params,
                 &mut pk,
                 &mut pmd,
+                &mut pbram,
                 mem_inits,
                 &mut dummy_funcs,
                 "end",
@@ -6883,6 +7628,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             // unsigned: MSB-first: (a_msb < b_msb) | (eq_msb & lower)
             lt_bits(a, b, rtl)
         }
+        RExpr::Call { name, .. } => Err(format!("call {name} not inlined")),
     }
 }
 
@@ -7088,6 +7834,7 @@ fn rexpr_add_depth(e: &RExpr) -> usize {
             .max(rexpr_add_depth(f)),
         RExpr::IndexPart { base, .. } => rexpr_add_depth(base),
         RExpr::WordAt { addr, data } => rexpr_add_depth(addr).max(rexpr_add_depth(data)),
+        RExpr::Call { args, .. } => args.iter().map(rexpr_add_depth).max().unwrap_or(0),
         RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
     }
 }
@@ -7505,6 +8252,13 @@ fn rexpr_width_checked(e: &RExpr, rtl: &Rtl) -> Option<usize> {
             rexpr_width_checked(c, rtl)?;
             Some(rexpr_width_checked(t, rtl)?.max(rexpr_width_checked(f, rtl)?))
         }
+        RExpr::Call { args, .. } => {
+            let mut w = 1usize;
+            for a in args {
+                w = w.max(rexpr_width_checked(a, rtl).unwrap_or(1));
+            }
+            Some(w)
+        }
     }
 }
 
@@ -7524,6 +8278,12 @@ fn sig_depth(rtl: &Rtl, name: &str) -> usize {
         .find(|s| s.name == name)
         .map(|s| s.depth)
         .unwrap_or(0)
+}
+
+fn sig_force_bram(rtl: &Rtl, name: &str) -> bool {
+    rtl.signals
+        .iter()
+        .any(|s| s.name == name && s.force_bram)
 }
 
 
@@ -8398,6 +9158,9 @@ fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<Stri
     let mut out = Vec::new();
     let mut lowered = HashSet::new();
     for mem in names {
+        if sig_force_bram(rtl, &mem) {
+            continue;
+        }
         let depth = sig_depth(rtl, &mem);
         let width = sig_width(rtl, &mem).max(1);
         if depth == 0
@@ -9853,6 +10616,9 @@ fn lower_const_word_adds(
     }
     let mut lowered = HashSet::new();
     for mem in names {
+        if sig_force_bram(rtl, &mem) {
+            continue;
+        }
         let depth = sig_depth(rtl, &mem);
         let width = sig_width(rtl, &mem).max(1);
         if depth == 0 || width > MAX_WIDTH {
@@ -9913,6 +10679,9 @@ fn lower_word_pipeline(
     }
     let mut lowered = HashSet::new();
     for mem in names {
+        if sig_force_bram(rtl, &mem) {
+            continue;
+        }
         let depth = sig_depth(rtl, &mem);
         let width = sig_width(rtl, &mem).max(1);
         if depth == 0 || width > MAX_WIDTH {
@@ -10113,6 +10882,9 @@ fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String
     }
     let mut lowered = HashSet::new();
     for mem in names {
+        if sig_force_bram(rtl, &mem) {
+            continue;
+        }
         let depth = sig_depth(rtl, &mem);
         let width = sig_width(rtl, &mem).max(1);
         if depth == 0 || depth > MAX_DEPTH || width > MAX_WIDTH {
@@ -10283,6 +11055,10 @@ fn subst_net_copies(e: &RExpr, map: &HashMap<(String, usize), RExpr>) -> RExpr {
                 data: Box::new(w(data)),
             },
             RExpr::Const { .. } | RExpr::Ident(_) | RExpr::Range(_, _, _) => e.clone(),
+            RExpr::Call { name, args } => RExpr::Call {
+                name: name.clone(),
+                args: args.iter().map(w).collect(),
+            },
         }
     }
     walk(e, map, 0)
@@ -10451,9 +11227,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     for k in rtl.mem_inits.keys() {
         mem_names.insert(k.clone());
     }
+    for s in &rtl.signals {
+        if s.force_bram {
+            mem_names.insert(s.name.clone());
+        }
+    }
     for name in &mem_names {
-        let cell = format!("u_bram{n_bram}");
-        d.add_cell(&cell, CellKind::Bram18);
         let depth = sig_depth(rtl, name).max(
             rtl.mem_inits
                 .get(name)
@@ -10461,6 +11240,21 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 .map(|a| a + 1)
                 .unwrap_or(0),
         );
+        let init_overflow = rtl
+            .mem_inits
+            .get(name)
+            .map(|m| m.keys().any(|&a| a >= 1024) || (depth > 1024 && !m.is_empty()))
+            .unwrap_or(false);
+        if init_overflow {
+            note_skip(format!(
+                "diagnostic bram18_init_truncate module={} mem={} depth={} (INIT addr/depth exceeds 1024; not a silent drop)",
+                rtl.module, name, depth
+            ));
+            // Do not emit Bram18 with default-zero INIT.
+            continue;
+        }
+        let cell = format!("u_bram{n_bram}");
+        d.add_cell(&cell, CellKind::Bram18);
         let mut words = vec![0u64; depth.max(1).min(1024)];
         if let Some(init) = rtl.mem_inits.get(name) {
             for (addr, val) in init {
@@ -11184,6 +11978,10 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
             Box::new(rewrite_rexpr(a, subst)),
             Box::new(rewrite_rexpr(b, subst)),
         ),
+        RExpr::Call { name, args } => RExpr::Call {
+            name: name.clone(),
+            args: args.iter().map(|a| rewrite_rexpr(a, subst)).collect(),
+        },
     }
 }
 
@@ -11199,6 +11997,7 @@ fn elaborate_rtl(src: &Rtl, overrides: &HashMap<String, u128>) -> Result<Rtl, St
         i: 0,
         params: overrides.clone(),
         widths: HashMap::new(),
+        signed: HashSet::new(),
     };
     parse_one_module(&mut p)
 }
@@ -11292,6 +12091,7 @@ fn flatten_module_ov_vis(
                     depth: s.depth,
                     keep: s.keep,
                     mark_debug: s.mark_debug,
+                    force_bram: s.force_bram,
                 });
             }
         }
@@ -11499,8 +12299,9 @@ fn record_instances_vis(
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
-    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    clear_function_notes();
     pkg_enums_clear();
+    set_readmem_origin(origin);
     let t_parse = std::time::Instant::now();
     let origin_path = Path::new(origin);
     let base = origin_path.parent().filter(|d| !d.as_os_str().is_empty() && d.exists());
@@ -11604,7 +12405,9 @@ pub fn elaborate_sv(
     params: &HashMap<String, u128>,
     opts: &SvCompileOpts,
 ) -> Result<(Design, SvElabReport), String> {
-    let _ = (origin, opts);
+    let _ = opts;
+    clear_function_notes();
+    set_readmem_origin(origin);
     let d = synth_from_parsed_top(parse_source(source)?, top, params)?;
     let report = elab_report(&d);
     Ok((d, report))
@@ -11629,10 +12432,13 @@ pub fn elaborate_sv_sources(
     if files.is_empty() {
         return Err("no sources".into());
     }
+    clear_function_notes();
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
+    clear_readmem_bases();
     for (origin, src) in files {
-        let _ = (origin, opts);
+        let _ = opts;
+        push_readmem_base(origin);
         all.push_str(src);
         all.push('\n');
     }
@@ -11655,12 +12461,13 @@ pub fn synth_sv_sources(files: &[(&str, &str)]) -> Result<Design, String> {
     if files.is_empty() {
         return Err("no sources".into());
     }
-    FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
+    clear_function_notes();
     pkg_enums_clear();
     let t_parse = std::time::Instant::now();
     let mut all = String::new();
+    clear_readmem_bases();
     for (origin, src) in files {
-        let _ = origin;
+        push_readmem_base(origin);
         all.push_str(src);
         all.push_str("
 ");
@@ -12318,6 +13125,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -12334,6 +13142,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         assert_eq!(
             const_cond(&mut p).unwrap(),
@@ -12349,6 +13158,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         assert_eq!(const_cond(&mut p).unwrap(), false, "A==1 && A==2 with A=1");
 
@@ -12360,6 +13170,7 @@ endmodule
             i: 0,
             params,
             widths: HashMap::new(),
+            signed: HashSet::new(),
         };
         // left-assoc: (A==2 || A==3) && A==2 → true
         assert_eq!(const_cond(&mut p).unwrap(), true);
@@ -12633,6 +13444,7 @@ endmodule
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 },
                 Signal {
                     name: "b".into(),
@@ -12640,6 +13452,7 @@ endmodule
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 },
             ],
             nbas: vec![],
@@ -12672,6 +13485,7 @@ endmodule
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 },
                 Signal {
                     name: "b".into(),
@@ -12679,6 +13493,7 @@ endmodule
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 },
             ],
             nbas: vec![],
@@ -12702,6 +13517,7 @@ endmodule
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 },
                 Signal {
                     name: "y".into(),
@@ -12709,6 +13525,7 @@ endmodule
                     depth: 0,
                     keep: false,
                     mark_debug: false,
+                    force_bram: false,
                 },
             ],
             nbas: vec![],
@@ -12891,6 +13708,197 @@ endmodule
         assert!(
             !d.cells.is_empty(),
             "ysyx_ibex must map at least one LUT/FF from always_ff/assigns, cells=0"
+        );
+    }
+
+    fn assign_rhs<'a>(mods: &'a [Rtl], lhs: &str) -> &'a RExpr {
+        mods.iter()
+            .flat_map(|m| m.assigns.iter())
+            .find(|(n, _, _)| n == lhs)
+            .map(|(_, _, e)| e)
+            .expect("assign")
+    }
+
+    #[test]
+    fn signed_ge0_rewrites_to_not_msb() {
+        let src = r#"
+module t(input signed [7:0] in, output o);
+  assign o = in >= 0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => match inner.as_ref() {
+                RExpr::Bit(n, b) => {
+                    assert_eq!(n, "in");
+                    assert_eq!(*b, 7, "signed >= 0 is ~MSB");
+                }
+                other => panic!("expected ~in[7], got {other:?}"),
+            },
+            other => panic!("signed >= unsized 0 must be ~MSB, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_lt0_rewrites_to_msb() {
+        let src = r#"
+module t(input signed [7:0] in, output o);
+  assign o = in < 0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Bit(n, b) => {
+                assert_eq!(n, "in");
+                assert_eq!(*b, 7, "signed < 0 is MSB");
+            }
+            other => panic!("signed < unsized 0 must be MSB, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sized_zero_ge_is_not_msb_rewrite() {
+        // `8'd0` is a sized Const{val:0, width:8}, not unsized 0.
+        let src = r#"
+module t(input [7:0] in, output o);
+  assign o = in >= 8'd0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => {
+                assert!(
+                    !matches!(inner.as_ref(), RExpr::Bit(_, 7)),
+                    "unsigned >= 8'd0 must not become ~MSB, got {inner:?}"
+                );
+                assert!(
+                    matches!(inner.as_ref(), RExpr::Lt(_, _)),
+                    "unsigned >= 8'd0 is !(Lt), got {inner:?}"
+                );
+            }
+            other => panic!("expected !(Lt), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsigned_ge0_unsized_is_not_msb_rewrite() {
+        let src = r#"
+module t(input [7:0] in, output o);
+  assign o = in >= 0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => {
+                assert!(
+                    !matches!(inner.as_ref(), RExpr::Bit(_, 7)),
+                    "unsigned >= unsized 0 must not become ~MSB, got {inner:?}"
+                );
+            }
+            other => panic!("expected !(Lt) style, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_ge_sized_zero_is_not_msb_rewrite() {
+        let src = r#"
+module t(input signed [7:0] in, output o);
+  assign o = in >= 8'd0;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        match assign_rhs(&mods, "o") {
+            RExpr::Not(inner) => {
+                assert!(
+                    !matches!(inner.as_ref(), RExpr::Bit(_, 7)),
+                    "signed >= 8'd0 must not become ~MSB, got {inner:?}"
+                );
+            }
+            other => panic!("expected !(Lt) style, got {other:?}"),
+        }
+    }
+
+    
+    #[test]
+    fn refuse_inline_bit_select_on_non_ident_arg() {
+        let ok = r#"
+module t(input logic clk, input logic [7:0] a, output logic o);
+  function automatic logic bit3(input logic [7:0] x);
+    bit3 = x[3];
+  endfunction
+  always_ff @(posedge clk) o <= bit3(a);
+endmodule
+"#;
+        let d_ok = synth_sv(ok, "ok.sv").expect("synth ident arg");
+        assert!(
+            d_ok.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "bit3(a) Ident actual must inline and clock"
+        );
+
+        let bad = r#"
+module t(input logic clk, input logic [7:0] a, input logic [7:0] b, output logic o);
+  function automatic logic bit3(input logic [7:0] x);
+    bit3 = x[3];
+  endfunction
+  always_ff @(posedge clk) o <= bit3(a | b);
+endmodule
+"#;
+        let _ = synth_sv(bad, "bad.sv").expect("synth non-ident arg");
+        assert!(
+            FUNC_CALLED_NOT_INLINED_SEEN.with(|s| {
+                s.borrow().iter().any(|k| k.contains("bit3"))
+            }),
+            "bit3(a|b) must refuse inline (select on non-Ident actual)"
+        );
+    }
+
+    #[test]
+    fn ram_style_pending_does_not_stick_past_always() {
+        let src = r#"
+module t(input logic clk, input logic [7:0] din, input logic [3:0] addr);
+  (* ram_style = "block" *)
+  always_ff @(posedge clk) begin end
+  logic [7:0] mem [0:15];
+  always_ff @(posedge clk) mem[addr] <= din;
+endmodule
+"#;
+        let d = synth_sv(src, "t.sv").expect("synth");
+        // mem after a dangling ram_style on always must not force Bram18 solely from sticky pending.
+        // (NBA to mem may still infer BRAM via depth — force_bram path is what we guard.)
+        let mods = parse_source(src).expect("parse");
+        let mem = mods[0]
+            .signals
+            .iter()
+            .find(|s| s.name == "mem")
+            .expect("mem");
+        assert!(!mem.force_bram, "sticky pending_bram must not mark later mem");
+        let _ = d;
+    }
+
+    #[test]
+    fn ram_style_pending_does_not_stick_past_input_port() {
+        // input/output used to count as next_decl but never consume pending_bram,
+        // so ram_style on a port stuck onto the next logic memory.
+        let src = r#"
+module t(clk, din, addr);
+  input logic clk;
+  input logic [7:0] din;
+  input logic [3:0] addr;
+  (* ram_style = "block" *)
+  input logic unused;
+  logic [7:0] mem [0:15];
+  always_ff @(posedge clk) mem[addr] <= din;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        let mem = mods[0]
+            .signals
+            .iter()
+            .find(|s| s.name == "mem")
+            .expect("mem");
+        assert!(
+            !mem.force_bram,
+            "sticky pending_bram past input port must not mark later mem"
         );
     }
 
@@ -13100,7 +14108,6 @@ endmodule
         }
     }
 
-    #[test]
     #[test]
     fn dual_clock_cdc_assigns_per_always_clk() {
         let src = r#"
@@ -14644,6 +15651,392 @@ endmodule
         eprintln!("CHILD_CELLS luts={cl} ffs={cf} total={}", c.cells.len());
         assert_eq!(d.name, "ibex_pin_wrap");
         assert!(!d.cells.is_empty());
+    }
+
+    #[test]
+    fn called_function_inlines_into_clocked_nba() {
+        // SOFT→HARD: `q <= inv(d)` inlines the return-assign so the always_ff
+        // maps cells + the user's clock. Uncalled functions stay one diagnostic.
+        let src = r#"
+module inv_ff(input logic clk, input logic d, output logic q);
+  function automatic inv;
+    input x;
+    inv = ~x;
+  endfunction
+  always_ff @(posedge clk) q <= inv(d);
+endmodule
+"#;
+        let d = synth_sv(src, "inv_ff.sv").expect("inv_ff");
+        assert!(
+            !d.cells.is_empty(),
+            "called inv(d) must map cells, cells={}",
+            d.cells.len()
+        );
+        let hffs: Vec<_> = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .collect();
+        assert!(
+            !hffs.is_empty(),
+            "clocked call must map Hff, cells={:?}",
+            d.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            hffs.iter().any(|c| d.net_on(&c.name, "CLK") == Some("clk")),
+            "Hff must sit on clk"
+        );
+        assert!(
+            d.cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "inlined ~d must map a LUT"
+        );
+    }
+
+    #[test]
+    fn readmemh_initial_inits_bram18() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("helion_w1_readmemh.hex");
+        std::fs::write(&path, "@0\nA5\n3C\n00\nFF\n").expect("write hex");
+        let src = format!(
+            r#"
+module romh(input logic clk, input logic [1:0] addr, output logic [7:0] q);
+  logic [7:0] mem [0:3];
+  initial $readmemh("{p}", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#,
+            p = path.display()
+        );
+        let d = synth_sv(&src, "romh.sv").expect("romh");
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("must infer BRAM18 from $readmemh");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
+        assert!(init.contains("3c"), "INIT must carry mem[1]=3C, got {init}");
+    }
+
+    #[test]
+    fn readmemb_initial_inits_bram18() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("helion_w1_readmemb.bin");
+        std::fs::write(&path, "@0\n10100101\n00111100\n").expect("write bin");
+        let src = format!(
+            r#"
+module romb(input logic clk);
+  logic [7:0] mem [0:1];
+  initial begin
+    $readmemb("{p}", mem);
+  end
+endmodule
+"#,
+            p = path.display()
+        );
+        let d = synth_sv(&src, "romb.sv").expect("romb");
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("must infer BRAM18 from $readmemb");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT must carry 10100101, got {init}");
+        assert!(init.contains("3c"), "INIT must carry 00111100, got {init}");
+    }
+
+    #[test]
+    fn ram_style_block_forces_bram18() {
+        // 16×8 would otherwise lower to Hffs. ram_style=block forces Bram18.
+        let src = r#"
+module bram_force(input logic clk, input logic [7:0] din, input logic [3:0] addr);
+  (* ram_style="block" *) logic [7:0] mem [0:15];
+  always_ff @(posedge clk) mem[addr] <= din;
+endmodule
+"#;
+        let d = synth_sv(src, "bram_force.sv").expect("bram_force");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            "ram_style=block must map Bram18, cells={:?}",
+            d.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        let hffs = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Hff))
+            .count();
+        assert_eq!(
+            hffs, 0,
+            "force_bram must not also emit write-side Hffs, hffs={hffs}"
+        );
+    }
+
+    #[test]
+    fn readmemh_missing_file_does_not_seed_bram18() {
+        // fs::read_to_string Err must not insert INIT 0 and invent Bram18.
+        let src = r#"
+module rom_missing(input logic clk, output logic [7:0] q);
+  logic [7:0] mem [0:3];
+  initial $readmemh("/no/such/helion_w1_missing_readmem.hex", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#;
+        let d = synth_sv(src, "rom_missing.sv").expect("rom_missing");
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            "missing $readmemh file must not seed Bram18 INIT 0, cells={:?}",
+            d.cells.iter().map(|c| (&c.name, &c.kind)).collect::<Vec<_>>()
+        );
+    }
+
+    fn tmp_sv_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "helion_w1_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir
+    }
+
+    #[test]
+    fn readmemh_relative_to_synth_origin() {
+        let dir = tmp_sv_dir("readmem_origin");
+        std::fs::write(dir.join("origin_rel.hex"), "@0\nA5\n3C\n").expect("write hex");
+        std::fs::write(
+            dir.join("rom_rel.sv"),
+            r#"
+module rom_rel(input logic clk, output logic [7:0] q);
+  logic [7:0] mem [0:1];
+  initial $readmemh("origin_rel.hex", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#,
+        )
+        .expect("write sv");
+        let d = synth_sv_path(&dir.join("rom_rel.sv")).expect("rom_rel");
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("origin-relative $readmemh must infer BRAM18");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
+        assert!(init.contains("3c"), "INIT must carry mem[1]=3C, got {init}");
+    }
+
+    #[test]
+    fn readmemh_relative_to_include_parent() {
+        // Same candidate list as `include: origin/include/<name>.
+        let dir = tmp_sv_dir("readmem_include");
+        let inc = dir.join("include");
+        std::fs::create_dir_all(&inc).expect("include dir");
+        std::fs::write(inc.join("mem.hex"), "@0\nA5\n3C\n").expect("write hex");
+        std::fs::write(
+            dir.join("rom_inc.sv"),
+            r#"
+module rom_inc(input logic clk, output logic [7:0] q);
+  logic [7:0] mem [0:1];
+  initial $readmemh("mem.hex", mem);
+  always_ff @(posedge clk) q <= mem[0];
+endmodule
+"#,
+        )
+        .expect("write sv");
+        let d = synth_sv_path(&dir.join("rom_inc.sv")).expect("rom_inc");
+        let bram = d
+            .cells
+            .iter()
+            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .expect("include-parent $readmemh must infer BRAM18");
+        let init = bram.attrs.get("INIT").unwrap_or("");
+        assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
+        assert!(init.contains("3c"), "INIT must carry mem[1]=3C, got {init}");
+    }
+
+    #[test]
+    fn called_complex_function_is_not_function_not_called() {
+        // A skipped/for-loop function that is called is not `function_not_called`.
+        let src = r#"
+module cpx_fn(input clk, input [3:0] a, output reg [3:0] q);
+  function automatic [3:0] walk;
+    input [3:0] x;
+    integer i;
+    begin
+      walk = 4'b0;
+      for (i = 0; i < 4; i = i + 1)
+        walk[i] = x[i];
+    end
+  endfunction
+  always @(posedge clk) q <= walk(a);
+endmodule
+"#;
+        let d = synth_sv(src, "cpx_fn.sv").expect("cpx_fn");
+        assert!(
+            FUNC_CALLED_NOT_INLINED_SEEN.with(|s| !s.borrow().is_empty()),
+            "called complex function must emit function_called_not_inlined"
+        );
+        assert!(
+            FUNC_NOT_CALLED_SEEN.with(|s| s.borrow().is_empty()),
+            "called function must not be function_not_called"
+        );
+        let _ = d;
+    }
+
+    #[test]
+    fn simple_return_assign_requires_exactly_one_assign() {
+        let one = FuncDef {
+            name: "f".into(),
+            ret_w: 1,
+            ports: vec![("x".into(), PortDir::In, 1)],
+            signals: vec![],
+            stmts: vec![(
+                "f".into(),
+                None,
+                RExpr::Not(Box::new(RExpr::Ident("x".into()))),
+            )],
+        };
+        assert!(
+            simple_return_assign(&one).is_some(),
+            "single return-assign must inline"
+        );
+        let two = FuncDef {
+            name: "f".into(),
+            ret_w: 1,
+            ports: vec![("x".into(), PortDir::In, 1)],
+            signals: vec![],
+            stmts: vec![
+                ("f".into(), None, RExpr::Ident("x".into())),
+                (
+                    "f".into(),
+                    None,
+                    RExpr::Not(Box::new(RExpr::Ident("x".into()))),
+                ),
+            ],
+        };
+        assert!(
+            simple_return_assign(&two).is_none(),
+            "two assigns to the function name must refuse inline"
+        );
+        let empty = FuncDef {
+            name: "f".into(),
+            ret_w: 1,
+            ports: vec![("x".into(), PortDir::In, 1)],
+            signals: vec![],
+            stmts: vec![],
+        };
+        assert!(simple_return_assign(&empty).is_none());
+    }
+
+    #[test]
+    fn inline_rexpr_refuses_arity_mismatch() {
+        let f = FuncDef {
+            name: "xor2".into(),
+            ret_w: 1,
+            ports: vec![
+                ("a".into(), PortDir::In, 1),
+                ("b".into(), PortDir::In, 1),
+            ],
+            signals: vec![],
+            stmts: vec![(
+                "xor2".into(),
+                None,
+                RExpr::Xor(
+                    Box::new(RExpr::Ident("a".into())),
+                    Box::new(RExpr::Ident("b".into())),
+                ),
+            )],
+        };
+        let one_arg = RExpr::Call {
+            name: "xor2".into(),
+            args: vec![RExpr::Ident("d".into())],
+        };
+        let out = inline_rexpr(&one_arg, std::slice::from_ref(&f), 0);
+        assert!(
+            matches!(out, RExpr::Call { .. }),
+            "one arg vs two formals must refuse inline, got {out:?}"
+        );
+        let three_args = RExpr::Call {
+            name: "xor2".into(),
+            args: vec![
+                RExpr::Ident("d".into()),
+                RExpr::Ident("e".into()),
+                RExpr::Ident("f".into()),
+            ],
+        };
+        let out3 = inline_rexpr(&three_args, std::slice::from_ref(&f), 0);
+        assert!(
+            matches!(out3, RExpr::Call { .. }),
+            "extra args must refuse inline, got {out3:?}"
+        );
+        let two_args = RExpr::Call {
+            name: "xor2".into(),
+            args: vec![RExpr::Ident("d".into()), RExpr::Ident("e".into())],
+        };
+        let out2 = inline_rexpr(&two_args, &[f], 0);
+        assert!(
+            !matches!(out2, RExpr::Call { .. }),
+            "matching arity must inline, got {out2:?}"
+        );
+    }
+
+    #[test]
+    fn multi_return_assign_function_is_not_inlined() {
+        let src = r#"
+module multi_ret(input logic clk, input logic d, output logic q);
+  function automatic f;
+    input x;
+    f = x;
+    f = ~x;
+  endfunction
+  always_ff @(posedge clk) q <= f(d);
+endmodule
+"#;
+        let d = synth_sv(src, "multi_ret.sv").expect("multi_ret");
+        assert!(
+            FUNC_CALLED_NOT_INLINED_SEEN.with(|s| !s.borrow().is_empty()),
+            "multi-assign function call must be called-not-inlined"
+        );
+        assert!(
+            !d.lut_inits().iter().any(|&i| i == 0x5555_5555_5555_5555),
+            "must not inline last ~x as an inverter LUT, inits={:?}",
+            d.lut_inits()
+        );
+    }
+
+    #[test]
+    fn hash_own_sorts_mem_inits_by_name() {
+        fn rtl_with(mems: &[(&str, u128)]) -> Rtl {
+            let mut mem_inits = HashMap::new();
+            for (n, v) in mems {
+                let mut words = BTreeMap::new();
+                words.insert(0, *v);
+                mem_inits.insert((*n).to_string(), words);
+            }
+            Rtl {
+                module: "t".into(),
+                ports: vec![],
+                signals: vec![],
+                nbas: vec![],
+                assigns: vec![],
+                insts: vec![],
+                params: vec![],
+                toks: vec![],
+                mem_inits,
+            }
+        }
+        let a = rtl_with(&[("m2", 1), ("m1", 2)]);
+        let b = rtl_with(&[("m1", 2), ("m2", 1)]);
+        assert_eq!(
+            hash_own(&a),
+            hash_own(&b),
+            "mem_inits must hash in name order"
+        );
     }
 
 }
