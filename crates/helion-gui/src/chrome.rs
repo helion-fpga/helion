@@ -619,9 +619,9 @@ pub fn floorplan_zoom_fits(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoo
 
 /// Fit zoom that keeps the whole schematic sheet, including PORT_OUT, inside the pane.
 pub fn schematic_fit_zoom(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32) -> f32 {
-    let pad = 28.0;
-    let zx = (vw - 8.0).max(1.0) / (sheet_w.max(1.0) + pad);
-    let zy = (vh - 8.0).max(1.0) / (sheet_h.max(1.0) + pad);
+    // Touch a pane edge (no letterbox inset): surface Zoom Fit contract.
+    let zx = vw.max(1.0) / sheet_w.max(1.0);
+    let zy = vh.max(1.0) / sheet_h.max(1.0);
     zx.min(zy).clamp(0.05, 16.0)
 }
 
