@@ -2,6 +2,10 @@
 //! -invert / -edges) / set_bus_skew / group_path / set_max_time_borrow /
 //! set_data_check / report_timing_summary / report_cdc / report_clock_networks /
 //! report_power / report_methodology / placed Manhattan.
+//!
+//! `Constraints::timing_guide` feeds IOB-arc exceptions into `place_with_guide`
+//! / `route_with_guide`. helion-cli and helion-proj still call unguided
+//! `place_with` / `route_with` until a later crate lock wires that through.
 
 use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
@@ -1234,6 +1238,38 @@ impl Constraints {
             .max(1)
     }
 
+    /// Feed `set_false_path` / `set_multicycle_path` into place and route so
+    /// ignored IOB/output arcs are not delay-optimized (sites/hops change).
+    /// Only false paths / multicycle paths that name an output/IOB arc
+    /// (`-to [get_ports led]`, PAD/IOB tokens) set the IOB flags; clock-to-clock
+    /// or register-to-register exceptions keep gold south pull.
+    /// Empty constraints keep gold south pull and gold hops.
+    /// helion-cli / helion-proj still call unguided `place_with` / `route_with`
+    /// until a later crate lock wires this through.
+    pub fn timing_guide(&self) -> helion_place::TimingGuide {
+        helion_place::TimingGuide {
+            false_path_iob: self.false_paths.iter().any(|fp| false_path_covers_iob(fp)),
+            iob_setup_mult: self
+                .multicycle_paths
+                .iter()
+                .filter(|m| self.mcp_targets_output_iob(m))
+                .map(|m| m.setup_mult)
+                .max()
+                .unwrap_or(1)
+                .max(1),
+        }
+    }
+
+    fn mcp_targets_output_iob(&self, m: &MulticyclePath) -> bool {
+        // Do not use package_pins/iostandards: clock/input ports are often pinned.
+        // Prefer explicit output/IOB endpoint names and output_delay bindings.
+        let from_ok = !clock_like_name(&m.from)
+            && (endpoint_is_output_iob(&m.from) || self.output_delay_ps.contains_key(&m.from));
+        let to_ok = !clock_like_name(&m.to)
+            && (endpoint_is_output_iob(&m.to) || self.output_delay_ps.contains_key(&m.to));
+        from_ok || to_ok
+    }
+
     /// Hold path multiplier (Vivado default 0).
     pub fn hold_mult(&self) -> u32 {
         self.multicycle_paths
@@ -1555,6 +1591,47 @@ fn tcl_case_value(s: &str) -> Option<String> {
 fn sdc_token_eq(hay: &str, name: &str) -> bool {
     hay.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|t| t == name)
+}
+
+fn clock_like_name(name: &str) -> bool {
+    let s = name.to_ascii_lowercase();
+    s == "clk" || s == "clock" || s.contains("clk") || s.ends_with("_ck")
+}
+
+/// Output/IOB endpoint names: PAD/IOB tokens, gold `led`, or similar.
+fn endpoint_is_output_iob(name: &str) -> bool {
+    let s = name.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let l = s.to_ascii_lowercase();
+    if l.contains("iob") || l.contains("pad") {
+        return true;
+    }
+    l == "led" || l.starts_with("led") || l.ends_with("_led")
+}
+
+/// True when a `set_false_path` string covers an output/IOB arc
+/// (`-to [get_ports led]`, PAD/IOB tokens). Clock-to-clock and pin-scoped
+/// register paths do not set `TimingGuide::false_path_iob`.
+/// Residual bring-up over-approx: `-to [get_ports <non-clock>]` also matches
+/// input ports (sw/btn) until PortDir-aware mapping exists.
+fn false_path_covers_iob(fp: &str) -> bool {
+    let l = fp.to_ascii_lowercase();
+    if l.contains("iob") || l.contains("pad") {
+        return true;
+    }
+    let toks: Vec<&str> = fp.split_whitespace().collect();
+    let (from, to) = tcl_from_to(&toks);
+    if endpoint_is_output_iob(&from) || endpoint_is_output_iob(&to) {
+        return true;
+    }
+    if let Some((_, rest)) = l.split_once("-to") {
+        if rest.contains("get_ports") {
+            return !clock_like_name(&to);
+        }
+    }
+    false
 }
 
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
@@ -3732,7 +3809,8 @@ mod tests {
     use helion_device::Device;
     use helion_ir::Design;
     use helion_pack::pack;
-    use helion_place::{place, place_with, PlaceOpts};
+    use helion_place::{hard_heartbeat, place, place_with, place_with_guide, PlaceOpts};
+    use helion_route::{route_with_guide, RouteOpts};
 
     #[test]
     fn create_clock_and_generated() {
@@ -5519,5 +5597,191 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
             meth_ms < 800,
             "methodology on {N} shared-clock FFs must stay linear, took {meth_ms}ms"
         );
+    }
+
+    /// ≥8 LUT+FF heartbeat (Ibex pin-wrap class, not 108k P&R).
+    fn close_guided(
+        d: &Design,
+        timing_weight: f64,
+        xdc: &Constraints,
+    ) -> (helion_place::Placed, helion_route::Routed, TimingResult) {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(d, &dev).unwrap();
+        let guide = xdc.timing_guide();
+        let pl = place_with_guide(&p, &dev, PlaceOpts { timing_weight }, &guide).unwrap();
+        let rt = route_with_guide(&pl, &dev, RouteOpts::default(), &guide).unwrap();
+        let mut clks = xdc.clocks.clone();
+        if clks.is_empty() {
+            create_clock(&mut clks, "clk", 10_000, "clk");
+        }
+        let t = report_timing_routed_xdc(d, &rt, &clks, xdc).unwrap();
+        (pl, rt, t)
+    }
+
+    #[test]
+    fn empty_design_cells0_does_not_close_wns() {
+        let d = Design::new("empty");
+        assert!(d.cells.is_empty(), "cells=0 fixture");
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let r = report_timing(&d, &clks).unwrap();
+        assert_eq!(r.endpoints, 0, "no_body must not invent endpoints");
+        assert_eq!(r.wns_ps, 0, "cells=0 / no_body must not close a fake WNS");
+        assert_eq!(r.setup_ps, 0);
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&d, &dev).unwrap();
+        assert!(p.lutffs.is_empty());
+        let pl = place(&p, &dev).unwrap();
+        let rt = helion_route::route(&pl, &dev).unwrap();
+        let routed = report_timing_routed(&d, &rt, &clks).unwrap();
+        assert_eq!(routed.endpoints, 0);
+        assert_eq!(routed.wns_ps, 0, "routed no_body must not close WNS");
+    }
+
+    #[test]
+    fn structural_counter_routed_gold_wns_ps_9640_twice() {
+        let d = Design::structural_counter();
+        let xdc = Constraints::default();
+        let (_, _, a) = close_guided(&d, 0.75, &xdc);
+        let (_, _, b) = close_guided(&d, 0.75, &xdc);
+        assert_eq!(a.wns_ps, 9640, "empty-XDC counter gold WNS_PS");
+        assert_eq!(b.wns_ps, 9640, "gold must hold on a second close");
+        assert_eq!(a.endpoints, 4);
+    }
+
+    #[test]
+    fn timing_weight_moves_closed_wns_on_hard_fixture() {
+        let d = hard_heartbeat();
+        let xdc = Constraints::default();
+        let (pl_wl, r_wl, t_wl) = close_guided(&d, 0.0, &xdc);
+        let (pl_td, r_td, t_td) = close_guided(&d, 0.75, &xdc);
+        assert!(pl_wl.packed.lutffs.len() >= 8);
+        assert!(pl_td.packed.lutffs.len() >= 8);
+        assert_ne!(
+            t_td.wns_ps, t_wl.wns_ps,
+            "timing_weight 0 vs 0.75 must move closed WNS (TD {} WL {})",
+            t_td.wns_ps, t_wl.wns_ps
+        );
+        assert_ne!(
+            r_td.iob_src[0].hops, r_wl.iob_src[0].hops,
+            "TD vs WL must change routed hops"
+        );
+        assert_eq!(t_td.endpoints, 8);
+        assert_eq!(t_wl.endpoints, 8);
+        assert_ne!(t_td.wns_ps, 0);
+        assert_ne!(t_wl.wns_ps, 0);
+    }
+
+    #[test]
+    fn false_path_changes_placed_sites_or_routed_hops() {
+        let d = hard_heartbeat();
+        let unconstrained = Constraints::default();
+        let fp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_false_path -from [get_ports clk] -to [get_ports led]\n",
+        )
+        .unwrap();
+        assert!(fp.timing_guide().false_path_iob);
+        let clk_fp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_false_path -from [get_clocks clk] -to [get_clocks virt]\n",
+        )
+        .unwrap();
+        assert!(
+            !clk_fp.timing_guide().false_path_iob,
+            "clock-to-clock false_path must not set IOB-arc guide"
+        );
+        let pin_fp = load_xdc(
+            "set_false_path -from [get_pins u_ff/Q] -to [get_pins u_ff2/D]\n",
+        )
+        .unwrap();
+        assert!(
+            !pin_fp.timing_guide().false_path_iob,
+            "register pin false_path must not set IOB-arc guide"
+        );
+        let (pl0, r0, _t0) = close_guided(&d, 0.75, &unconstrained);
+        let (plfp, rfp, _tfp) = close_guided(&d, 0.75, &fp);
+        let sites0: Vec<_> = pl0
+            .lutff_sites
+            .iter()
+            .map(|(s, b)| (s.x, s.y, *b))
+            .collect();
+        let sites_fp: Vec<_> = plfp
+            .lutff_sites
+            .iter()
+            .map(|(s, b)| (s.x, s.y, *b))
+            .collect();
+        let hops0: Vec<_> = r0.iob_src.iter().map(|io| io.hops).collect();
+        let hops_fp: Vec<_> = rfp.iob_src.iter().map(|io| io.hops).collect();
+        assert!(
+            sites0 != sites_fp || hops0 != hops_fp,
+            "false_path vs unconstrained must change sites or hops (sites {sites0:?} vs {sites_fp:?} hops {hops0:?} vs {hops_fp:?})"
+        );
+        assert_ne!(hops0, hops_fp, "ignored IOB arc must not keep gold hops");
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        let phys0 = report_timing_routed(&d, &r0, &clks).unwrap();
+        let phys_fp = report_timing_routed(&d, &rfp, &clks).unwrap();
+        assert_ne!(
+            phys0.wns_ps, phys_fp.wns_ps,
+            "closed physical WNS (from hops) must move; XDC-applied report is r2r ({} vs {} hops {:?} vs {:?})",
+            phys0.wns_ps, phys_fp.wns_ps, hops0, hops_fp
+        );
+    }
+
+    #[test]
+    fn multicycle_changes_placed_sites_or_routed_hops() {
+        let d = hard_heartbeat();
+        let unconstrained = Constraints::default();
+        let mcp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_multicycle_path 2 -from [get_ports clk] -to [get_ports led]\n",
+        )
+        .unwrap();
+        assert_eq!(mcp.timing_guide().iob_setup_mult, 2);
+        let reg_mcp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_multicycle_path 4 -from [get_pins u_ff1/Q] -to [get_pins u_ff2/D]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reg_mcp.setup_mult(),
+            4,
+            "STA setup_mult stays global for WNS"
+        );
+        assert_eq!(
+            reg_mcp.timing_guide().iob_setup_mult,
+            1,
+            "register multicycle must not relax IOB search/place"
+        );
+        let mixed = load_xdc(
+            "set_multicycle_path 4 -from [get_pins u_ff1/Q] -to [get_pins u_ff2/D]\nset_multicycle_path 2 -from [get_ports clk] -to [get_ports led]\n",
+        )
+        .unwrap();
+        assert_eq!(mixed.setup_mult(), 4);
+        assert_eq!(mixed.timing_guide().iob_setup_mult, 2);
+        let (pl0, r0, t0) = close_guided(&d, 0.75, &unconstrained);
+        let (plm, rm, tm) = close_guided(&d, 0.75, &mcp);
+        let sites0: Vec<_> = pl0
+            .lutff_sites
+            .iter()
+            .map(|(s, b)| (s.x, s.y, *b))
+            .collect();
+        let sites_m: Vec<_> = plm
+            .lutff_sites
+            .iter()
+            .map(|(s, b)| (s.x, s.y, *b))
+            .collect();
+        let hops0: Vec<_> = r0.iob_src.iter().map(|io| io.hops).collect();
+        let hops_m: Vec<_> = rm.iob_src.iter().map(|io| io.hops).collect();
+        assert!(
+            sites0 != sites_m || hops0 != hops_m,
+            "multicycle vs unconstrained must change sites or hops (sites {sites0:?} vs {sites_m:?} hops {hops0:?} vs {hops_m:?})"
+        );
+        assert_ne!(t0.wns_ps, tm.wns_ps, "closed WNS must move with multicycle");
+        assert_ne!(hops0, hops_m);
+        let fp = load_xdc(
+            "create_clock -period 10.000 [get_ports clk]\nset_false_path -from [get_ports clk] -to [get_ports led]\n",
+        )
+        .unwrap();
+        let (_, rfp, _) = close_guided(&d, 0.75, &fp);
+        let hops_fp: Vec<_> = rfp.iob_src.iter().map(|io| io.hops).collect();
+        assert_ne!(hops_m, hops_fp, "false_path and multicycle must not share hops");
     }
 }

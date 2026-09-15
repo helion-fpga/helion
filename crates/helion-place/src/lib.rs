@@ -1,4 +1,9 @@
 //! Place packed clusters onto Helion sites from the device database.
+//!
+//! `place_with_guide` / `place_in_region_with_guide` / `place_incremental_with_guide`
+//! consume XDC IOB-arc exceptions (`TimingGuide`). helion-cli and helion-proj
+//! still call unguided `place_with` / `place_in_region` / `place_incremental`
+//! until a later crate lock wires `Constraints::timing_guide()` through.
 
 use helion_device::{Device, Site};
 use helion_pack::Packed;
@@ -24,6 +29,62 @@ pub struct PlaceOpts {
 impl Default for PlaceOpts {
     fn default() -> Self {
         Self { timing_weight: 0.0 }
+    }
+}
+
+/// IOB-arc exceptions from XDC (`set_false_path` / `set_multicycle_path`).
+/// Empty guide keeps gold south/mid pull from `timing_weight` alone.
+/// False-path / multicycle flags apply only to clusters that drive an
+/// excepted IOB/output net — internal LUT+FF keep `timing_weight` south pull.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimingGuide {
+    /// `set_false_path` covers an IOB/output arc — do not pull that driver toward IOB.
+    pub false_path_iob: bool,
+    /// Setup multicycle for IOB arcs. 0 or 1 = single cycle (gold).
+    pub iob_setup_mult: u32,
+}
+
+impl TimingGuide {
+    /// PathFinder dogleg width (columns) for excepted IOB nets. 0 = gold
+    /// shortest path. False path takes a wider detour than multicycle so the
+    /// routed path/hops actually change (not a post-route hop pad).
+    pub fn iob_detour_cols(self) -> u32 {
+        if self.false_path_iob {
+            2
+        } else if self.iob_setup_mult > 1 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// True when this cluster's Q net drives an IOB that the guide excepts.
+    pub fn excepts_iob_driver(self, drives_iob: bool) -> bool {
+        drives_iob && (self.false_path_iob || self.iob_setup_mult > 1)
+    }
+}
+
+/// Y used as the affinity base: south (timing), mid (wirelength / false path),
+/// or quarter-from-south (multicycle slack).
+/// `excepted_iob_cluster` is set only for clusters that drive an excepted IOB
+/// net; other clusters keep timing_weight south pull.
+fn affinity_base_y(
+    col: &[Site],
+    opts: PlaceOpts,
+    guide: &TimingGuide,
+    excepted_iob_cluster: bool,
+) -> u32 {
+    if col.is_empty() {
+        return 0;
+    }
+    if opts.timing_weight <= 0.0 {
+        col[col.len() / 2].y
+    } else if excepted_iob_cluster && guide.false_path_iob {
+        col[col.len() / 2].y
+    } else if excepted_iob_cluster && guide.iob_setup_mult > 1 {
+        col[col.len() / 4].y
+    } else {
+        col[0].y
     }
 }
 
@@ -83,11 +144,52 @@ fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
     sites.iter().copied().find(|s| s.x == x && s.y == y)
 }
 
+/// ≥8 LUT+FF heartbeat fixture (Ibex pin-wrap class, not 108k P&R).
+/// Shared by place/route/sta guided-timing tests.
+pub fn hard_heartbeat() -> helion_ir::Design {
+    use helion_ir::{CellKind, PortDir};
+    let mut d = helion_ir::Design::new("hb8");
+    d.add_port("clk", PortDir::In);
+    d.add_port("led", PortDir::Out);
+    for i in 0..8u32 {
+        d.add_cell(
+            format!("u_lut{i}"),
+            CellKind::Lut6 {
+                init: 0x5555_5555_5555_5555,
+            },
+        );
+        d.add_cell(format!("u_ff{i}"), CellKind::Hff);
+        d.connect("clk", format!("u_ff{i}"), "CLK");
+        d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
+        d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
+        d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+        d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+        if i > 0 {
+            d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
+        }
+    }
+    d.add_cell("u_iob", CellKind::IobOut);
+    d.connect("q7", "u_iob", "I");
+    d.connect("led", "u_iob", "PAD");
+    d
+}
+
 pub fn place(packed: &Packed, dev: &Device) -> Result<Placed, String> {
     place_with(packed, dev, PlaceOpts::default())
 }
 
 pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Placed, String> {
+    place_with_guide(packed, dev, opts, &TimingGuide::default())
+}
+
+/// Place with XDC IOB-arc exceptions. Empty `guide` matches `place_with`.
+/// helion-cli / helion-proj still call unguided `place_with` until a later lock.
+pub fn place_with_guide(
+    packed: &Packed,
+    dev: &Device,
+    opts: PlaceOpts,
+    guide: &TimingGuide,
+) -> Result<Placed, String> {
     let iob_all: Vec<Site> = dev.iob_sites().collect();
     let iob_take = packed.iobs.len().min(iob_all.len());
     if packed.iobs.len() > iob_all.len() {
@@ -139,7 +241,6 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             .or_else(|| iob_all.first().copied())
             .ok_or_else(|| "need IOB column for LUTFF".to_string())?;
         let n_ble = dev.n_ble.max(1) as usize;
-        let prefer_south = opts.timing_weight > 0.0;
         let mut cols: std::collections::HashMap<u32, Vec<Site>> = std::collections::HashMap::new();
         for s in dev.clb_sites() {
             cols.entry(s.x).or_default().push(s);
@@ -168,7 +269,10 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
         let mut y_seen: HashSet<u32> = HashSet::new();
         // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
+        let mut excepted_iob: HashSet<usize> = HashSet::new();
         for lf in &packed.lutffs {
+            let drives_iob = iob_for_net.contains_key(lf.q_net.as_str());
+            let excepted_iob_cluster = guide.excepts_iob_driver(drives_iob);
             let preferred_x = iob_for_net
                 .get(lf.q_net.as_str())
                 .map(|s| s.x)
@@ -279,12 +383,14 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         }
                     }
                 }
-                let base_y = if prefer_south {
-                    col.first().map(|s| s.y).unwrap_or(0)
+                let base_y = affinity_base_y(col, opts, guide, excepted_iob_cluster);
+                // Excepted IOB drivers: mid/quarter Y first so they do not inherit
+                // south affinity from internal clusters that keep timing pull.
+                if excepted_iob_cluster {
+                    y_order.insert(0, base_y);
                 } else {
-                    col[col.len() / 2].y
-                };
-                y_order.push(base_y);
+                    y_order.push(base_y);
+                }
                 y_seen.clear();
                 y_order.retain(|y| y_seen.insert(*y));
                 let try_y = |y: u32,
@@ -368,6 +474,9 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             *site_used_n.entry((site_ble.0.x, site_ble.0.y)).or_insert(0) += 1;
             if !lf.ff_cell.is_empty() {
                 ff_at.insert(lf.ff_cell.as_str(), site_ble.0);
+            }
+            if excepted_iob_cluster {
+                excepted_iob.insert(lutff_sites.len());
             }
             lutff_sites.push(site_ble);
         }
@@ -534,6 +643,8 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
             let mut driver_swapped = 0u32;
             // Cheap early-out: if initial affinity place is already IMUX-legal,
             // skip the 32-pass bileg legalize (reduced Ibex / small designs).
+            // Score real IMUX legality for every cluster, including IOB-excepted
+            // drivers (affinity demotion must not freeze illegal mid-Y sites).
             let already_legal = packed.lutffs.iter().enumerate().take(nplace).all(|(i, lf)| {
                 let (site, _) = lutff_sites[i];
                 imux_illegal_pins(lf, site, &ff_at) == 0
@@ -721,9 +832,11 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
                         continue;
                     }
                     let d_ff = lf.ff_cell.as_str();
-                    let Some(sink_idxs) = sinks_of.get(d_ff).map(|v| v.as_slice()) else {
+                    let Some(all_sinks) = sinks_of.get(d_ff) else {
                         continue;
                     };
+                    let sink_buf: Vec<usize> = all_sinks.iter().copied().collect();
+                    let sink_idxs = sink_buf.as_slice();
                     if sink_idxs.is_empty() {
                         continue;
                     }
@@ -975,9 +1088,10 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
 }
 
 /// UG893 floorplanning: place into a Pblock rectangle (CLB_XxYy:CLB_XxYy).
-/// Hits the same site picker as `place_with`, then relocates LUTFF (and IOB if
+/// Hits the same site picker as `place_with_guide`, then relocates LUTFF (and IOB if
 /// the rectangle covers HAD IOB rows) into the region. IOB cells with a LOC /
 /// PACKAGE_PIN keep their pin — fabric pblocks must not displace gold IOBs.
+/// Unguided wrapper — helion-cli / helion-proj still call this until a later lock.
 pub fn place_in_region(
     packed: &Packed,
     dev: &Device,
@@ -987,9 +1101,23 @@ pub fn place_in_region(
     x1: u32,
     y1: u32,
 ) -> Result<Placed, String> {
+    place_in_region_with_guide(packed, dev, opts, x0, y0, x1, y1, &TimingGuide::default())
+}
+
+/// `place_in_region` with XDC IOB-arc exceptions. Empty `guide` matches `place_in_region`.
+pub fn place_in_region_with_guide(
+    packed: &Packed,
+    dev: &Device,
+    opts: PlaceOpts,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    guide: &TimingGuide,
+) -> Result<Placed, String> {
     let (x0, x1) = (x0.min(x1), x0.max(x1));
     let (y0, y1) = (y0.min(y1), y0.max(y1));
-    let mut placed = place_with(packed, dev, opts)?;
+    let mut placed = place_with_guide(packed, dev, opts, guide)?;
     let mut clbs: Vec<Site> = dev
         .clb_sites()
         .filter(|s| s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1)
@@ -1014,7 +1142,7 @@ pub fn place_in_region(
     if !iobs.is_empty() {
         iobs.sort_by_key(|s| (s.x, s.y));
         for (i, slot) in placed.iob_sites.iter_mut().enumerate() {
-            // Keep PACKAGE_PIN / LOC from place_with — pblock fabric move must
+            // Keep PACKAGE_PIN / LOC from place_with_guide — pblock fabric move must
             // not displace gold IOB sites (clk=IOB_X3Y0, led=IOB_X2Y0).
             if packed.iobs.get(i).and_then(|io| io.loc.as_ref()).is_some() {
                 continue;
@@ -1040,13 +1168,25 @@ pub fn place_in_region(
 }
 
 /// UG986 Lab 2: reuse previous LUTFF/IOB sites for cells that kept their names.
+/// Unguided wrapper — helion-cli / helion-proj still call this until a later lock.
 pub fn place_incremental(
     packed: &Packed,
     dev: &Device,
     prev: &Placed,
     opts: PlaceOpts,
 ) -> Result<(Placed, usize), String> {
-    let mut placed = place_with(packed, dev, opts)?;
+    place_incremental_with_guide(packed, dev, prev, opts, &TimingGuide::default())
+}
+
+/// `place_incremental` with XDC IOB-arc exceptions. Empty `guide` matches `place_incremental`.
+pub fn place_incremental_with_guide(
+    packed: &Packed,
+    dev: &Device,
+    prev: &Placed,
+    opts: PlaceOpts,
+    guide: &TimingGuide,
+) -> Result<(Placed, usize), String> {
+    let mut placed = place_with_guide(packed, dev, opts, guide)?;
     let mut reused = 0usize;
     let mut used: HashSet<(u32, u32, u8)> = HashSet::new();
     for (i, lf) in packed.lutffs.iter().enumerate() {
@@ -1167,7 +1307,17 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_counter(), &dev).unwrap();
         let def = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
-        let pl = place_in_region(&p, &dev, PlaceOpts { timing_weight: 0.75 }, 5, 1, 8, 8).unwrap();
+        let pl = place_in_region_with_guide(
+            &p,
+            &dev,
+            PlaceOpts { timing_weight: 0.75 },
+            5,
+            1,
+            8,
+            8,
+            &TimingGuide::default(),
+        )
+        .unwrap();
         assert!(!pl.lutff_sites.is_empty());
         for (s, _) in &pl.lutff_sites {
             assert!(
@@ -1243,7 +1393,158 @@ mod tests {
         let d = Design::structural_counter();
         let p = pack(&d, &dev).unwrap();
         let prev = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
-        let (next, reused) = place_incremental(&p, &dev, &prev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let (next, reused) = place_incremental_with_guide(
+            &p,
+            &dev,
+            &prev,
+            PlaceOpts { timing_weight: 0.75 },
+            &TimingGuide::default(),
+        )
+        .unwrap();
+        assert_eq!(reused, prev.lutff_sites.len());
+        assert_eq!(next.lutff_sites, prev.lutff_sites);
+    }
+
+    // hard_heartbeat: see crate::hard_heartbeat
+
+    fn sites_of(pl: &Placed) -> Vec<(u32, u32, u8)> {
+        pl.lutff_sites
+            .iter()
+            .map(|(s, ble)| (s.x, s.y, *ble))
+            .collect()
+    }
+
+    #[test]
+    fn empty_guide_matches_place_with() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let a = place_with(&p, &dev, opts).unwrap();
+        let b = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        assert_eq!(sites_of(&a), sites_of(&b), "empty guide must keep gold sites");
+    }
+
+    #[test]
+    fn false_path_guide_moves_sites_on_hard_fixture() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        assert!(p.lutffs.len() >= 8, "fixture must be ≥8 LUT+FF");
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        let fp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: true,
+                iob_setup_mult: 1,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            sites_of(&unconstrained),
+            sites_of(&fp),
+            "set_false_path must stop IOB pull (unconstrained y={} false_path y={})",
+            unconstrained.lutff_sites[0].0.y,
+            fp.lutff_sites[0].0.y
+        );
+    }
+
+    #[test]
+    fn multicycle_guide_moves_sites_on_hard_fixture() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        let mcp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: false,
+                iob_setup_mult: 2,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            sites_of(&unconstrained),
+            sites_of(&mcp),
+            "set_multicycle_path must weaken IOB pull (unconstrained y={} mcp y={})",
+            unconstrained.lutff_sites[0].0.y,
+            mcp.lutff_sites[0].0.y
+        );
+        let fp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: true,
+                iob_setup_mult: 2,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            sites_of(&mcp),
+            sites_of(&fp),
+            "false_path must not match multicycle sites"
+        );
+    }
+
+    #[test]
+    fn false_path_mid_y_only_for_iob_driving_cluster() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        assert!(p.lutffs.len() >= 8);
+        let iob_net = &p.iobs[0].from_net;
+        let iob_idx = p
+            .lutffs
+            .iter()
+            .position(|l| l.q_net == *iob_net)
+            .expect("IOB-driving cluster");
+        assert_ne!(iob_idx, 0, "fixture must have an internal cluster");
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
+        let fp = place_with_guide(
+            &p,
+            &dev,
+            opts,
+            &TimingGuide {
+                false_path_iob: true,
+                iob_setup_mult: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unconstrained.lutff_sites[0].0.y, fp.lutff_sites[0].0.y,
+            "internal cluster must keep timing_weight south pull (y={} vs {})",
+            unconstrained.lutff_sites[0].0.y, fp.lutff_sites[0].0.y
+        );
+        assert_ne!(
+            unconstrained.lutff_sites[iob_idx].0.y, fp.lutff_sites[iob_idx].0.y,
+            "IOB-driving cluster must drop south pull (unconstrained y={} false_path y={})",
+            unconstrained.lutff_sites[iob_idx].0.y, fp.lutff_sites[iob_idx].0.y
+        );
+        assert!(
+            fp.lutff_sites[iob_idx].0.y > fp.lutff_sites[0].0.y,
+            "excepted IOB driver must sit north of internal south pull"
+        );
+    }
+
+    #[test]
+    fn pblock_and_incremental_accept_timing_guide() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        let opts = PlaceOpts { timing_weight: 0.75 };
+        let g = TimingGuide {
+            false_path_iob: true,
+            iob_setup_mult: 1,
+        };
+        let pl = place_in_region_with_guide(&p, &dev, opts, 5, 1, 8, 8, &g).unwrap();
+        for (s, _) in &pl.lutff_sites {
+            assert!(s.x >= 5 && s.x <= 8 && s.y >= 1 && s.y <= 8, "pblock {s:?}");
+        }
+        let prev = place_with_guide(&p, &dev, opts, &g).unwrap();
+        let (next, reused) = place_incremental_with_guide(&p, &dev, &prev, opts, &g).unwrap();
         assert_eq!(reused, prev.lutff_sites.len());
         assert_eq!(next.lutff_sites, prev.lutff_sites);
     }
