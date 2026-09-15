@@ -45,7 +45,8 @@ fn macos_app_layout_bundles_had_and_info_plist() {
     assert!(app.join("Contents/Resources/AppIcon.png").is_file());
     assert!(app.join("Contents/MacOS/Helion").is_file());
     assert!(app.join("Contents/MacOS/helion-ide").is_file());
-    assert!(app.join("Contents/MacOS/helion").is_file());
+    // layout-only / Darwin CLI slot is helion-cli (APFS: Helion vs helion collide).
+    assert!(app.join("Contents/MacOS/helion-cli").is_file());
     assert!(
         app.join("Contents/Resources/examples/counter.sv").is_file(),
         "examples must be bundled next to HAD"
