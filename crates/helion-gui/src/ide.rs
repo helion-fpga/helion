@@ -7683,9 +7683,15 @@ impl IdeModel {
 
     /// UG900 A/B cursor pane: clickable Name/Sample/Time_ps/Delta over helion-sim.
     pub fn wave_cursor_rows(&self) -> Vec<WaveCursorRow> {
+        let out = self.primary_out_port();
         let led = |sample: Option<usize>| {
             sample
-                .and_then(|i| self.wave.trace("led").map(|t| t.value_at(i)))
+                .and_then(|i| {
+                    self.wave
+                        .trace(&out)
+                        .or_else(|| self.wave.trace("led"))
+                        .map(|t| t.value_at(i))
+                })
                 .unwrap_or_else(|| "-".into())
         };
         vec![
@@ -17783,7 +17789,8 @@ impl IdeModel {
         cands.into_iter().next().cloned()
     }
 
-    /// Wave/Sim/STA clock name: HFF CLK net, else first input port, else `clk`.
+    /// Wave/Sim/STA clock name: HFF CLK net when present, else literal `clk`
+    /// (non-port placeholder). Never invent a clock from the first In port.
     fn implicit_clock_name(&self) -> String {
         self.shell
             .session
@@ -17791,14 +17798,6 @@ impl IdeModel {
             .as_ref()
             .and_then(Self::hff_clock_net)
             .filter(|n| !n.is_empty())
-            .or_else(|| {
-                self.shell.session.design.as_ref().and_then(|d| {
-                    d.ports
-                        .iter()
-                        .find(|p| p.dir == PortDir::In)
-                        .map(|p| p.name.clone())
-                })
-            })
             .unwrap_or_else(|| "clk".into())
     }
 
@@ -18254,8 +18253,8 @@ impl IdeModel {
         let out = self.primary_out_port();
         let led = self
             .wave
-            .trace("led")
-            .or_else(|| self.wave.trace(&out))
+            .trace(&out)
+            .or_else(|| self.wave.trace("led"))
             .and_then(|t| t.samples.last().copied())
             .unwrap_or(0);
         let cnt_t = self.wave.trace("cnt");
@@ -18266,7 +18265,12 @@ impl IdeModel {
 
     /// Posedge-only LED bitstring (one bit per user cycle) from half-cycle wave samples.
     fn wave_posedge_led_bits(&self) -> String {
-        match self.wave.trace("led") {
+        let out = self.primary_out_port();
+        match self
+            .wave
+            .trace(&out)
+            .or_else(|| self.wave.trace("led"))
+        {
             Some(t) if t.samples.len() >= 2 => t
                 .samples
                 .iter()
