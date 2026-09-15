@@ -1313,6 +1313,10 @@ dependencies = [
  "helion-bits",
  "helion-device",
  "helion-hw",
+ "helion-ir",
+ "helion-pack",
+ "helion-place",
+ "helion-route",
 ]
 
 [[package]]
