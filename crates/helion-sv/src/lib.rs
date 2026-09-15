@@ -6149,16 +6149,17 @@ fn parse_module_items(
                 *pending_bram = true;
             }
         }
-        // ram_style must not stick onto a later unrelated memory after always/assign.
-        let next_decl = matches!(
+        // Attrs apply only to the next logic/wire/reg decl (the paths that
+        // consume pending_*). input/output/inout/integer are not consumers —
+        // treating them as next_decl left ram_style sticky onto a later memory.
+        let next_net_decl = matches!(
             p.peek(),
-            Some(Tok::Kw(k)) if matches!(
-                k.as_str(),
-                "logic" | "wire" | "reg" | "integer" | "input" | "output" | "inout"
-            )
+            Some(Tok::Kw(k)) if matches!(k.as_str(), "logic" | "wire" | "reg")
         );
-        if !next_decl {
+        if !next_net_decl {
             *pending_bram = false;
+            *pending_keep = false;
+            *pending_md = false;
         }
         if p.eat_kw("function") {
             parse_or_skip_function(p, funcs);
@@ -13874,7 +13875,34 @@ endmodule
         let _ = d;
     }
 
-#[test]
+    #[test]
+    fn ram_style_pending_does_not_stick_past_input_port() {
+        // input/output used to count as next_decl but never consume pending_bram,
+        // so ram_style on a port stuck onto the next logic memory.
+        let src = r#"
+module t(clk, din, addr);
+  input logic clk;
+  input logic [7:0] din;
+  input logic [3:0] addr;
+  (* ram_style = "block" *)
+  input logic unused;
+  logic [7:0] mem [0:15];
+  always_ff @(posedge clk) mem[addr] <= din;
+endmodule
+"#;
+        let mods = parse_source(src).expect("parse");
+        let mem = mods[0]
+            .signals
+            .iter()
+            .find(|s| s.name == "mem")
+            .expect("mem");
+        assert!(
+            !mem.force_bram,
+            "sticky pending_bram past input port must not mark later mem"
+        );
+    }
+
+    #[test]
     fn logikbench_lrelu_ge_ashr_maps_cells() {
         let src = r#"
 module lrelu #(parameter DW = 16, parameter ASHIFT = 7)
