@@ -167,7 +167,7 @@ impl Session {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<String, String> {
-        let placed_msg = self.write_checkpoint()?;
+        let _ = self.placed.as_ref().ok_or("write_checkpoint: not placed")?;
         let frames = {
             let bits = self.bitstream.as_ref().ok_or(
                 "write_checkpoint: empty bitstream refused (write_bitstream first)",
@@ -190,6 +190,7 @@ impl Session {
         }
         std::fs::write(path, &bytes)
             .map_err(|e| format!("write_checkpoint {}: {e}", path.display()))?;
+        let placed_msg = self.write_checkpoint()?;
         Ok(format!(
             "{placed_msg} path={} bytes={} frames={} hash={:#x}",
             path.display(),
@@ -1052,14 +1053,17 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                 }
                 let _ = pblock_named_mut(&mut p, &name);
                 if let Some(spec) = add {
-                    if let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) {
-                        let pb = pblock_named_mut(&mut p, &name);
-                        pb.x0 = x0;
-                        pb.y0 = y0;
-                        pb.x1 = x1;
-                        pb.y1 = y1;
-                        pb.ranged = true;
-                    }
+                    let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) else {
+                        return Err(format!(
+                            "create_pblock -add: cannot parse CLB range {spec}"
+                        ));
+                    };
+                    let pb = pblock_named_mut(&mut p, &name);
+                    pb.x0 = x0;
+                    pb.y0 = y0;
+                    pb.x1 = x1;
+                    pb.y1 = y1;
+                    pb.ranged = true;
                 }
             }
             "resize_pblock" => {
@@ -1083,15 +1087,18 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                         spec = t.to_string();
                     }
                 }
-                if !name.is_empty() {
-                    if let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) {
-                        let pb = pblock_named_mut(&mut p, &name);
-                        pb.x0 = x0;
-                        pb.y0 = y0;
-                        pb.x1 = x1;
-                        pb.y1 = y1;
-                        pb.ranged = true;
-                    }
+                if !name.is_empty() && !spec.is_empty() {
+                    let Some((x0, y0, x1, y1)) = parse_clb_range(&spec) else {
+                        return Err(format!(
+                            "resize_pblock: cannot parse CLB range {spec}"
+                        ));
+                    };
+                    let pb = pblock_named_mut(&mut p, &name);
+                    pb.x0 = x0;
+                    pb.y0 = y0;
+                    pb.x1 = x1;
+                    pb.y1 = y1;
+                    pb.ranged = true;
                 }
             }
             "add_cells_to_pblock" => {
@@ -1721,6 +1728,61 @@ write_checkpoint counter.hckp
     }
 
     #[test]
+    fn load_prj_rejects_unparseable_pblock_range() {
+        let err = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/counter.sv
+create_pblock pblock_0
+resize_pblock pblock_0 -add {NOT_A_CLB_RANGE}
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("resize_pblock") && err.contains("NOT_A_CLB_RANGE"),
+            "{err}"
+        );
+
+        let err = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/counter.sv
+create_pblock pblock_0
+resize_pblock pblock_0 -add {FOO_X0Y0:BAR_X1Y1}
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("resize_pblock") && err.contains("FOO_X0Y0:BAR_X1Y1"),
+            "{err}"
+        );
+
+        let err = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/counter.sv
+create_pblock pblock_0 -add {GARBAGE}
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("create_pblock") && err.contains("GARBAGE"),
+            "{err}"
+        );
+
+        let ok = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/counter.sv
+create_pblock pblock_0
+"#,
+        )
+        .unwrap();
+        assert_eq!(ok.pblocks.len(), 1);
+        assert!(!ok.pblocks[0].ranged, "create_pblock without -add stays unranged");
+    }
+
+    #[test]
     fn disk_hckp_restore_eco_changes_bitstream_hash() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut s = Session::new(Mode::Project);
@@ -1786,10 +1848,51 @@ write_checkpoint counter.hckp
             .write_checkpoint_to("/tmp/helion-empty.hckp")
             .unwrap_err();
         assert!(err.contains("not placed") || err.contains("empty bitstream"), "{err}");
+        assert!(s.impl_checkpoint.is_none());
         s.synth_design(Design::structural_counter());
         let err = s
             .write_checkpoint_to("/tmp/helion-empty.hckp")
             .unwrap_err();
         assert!(err.contains("not placed"), "{err}");
+        assert!(s.impl_checkpoint.is_none());
+
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        s.place_design(&dev).unwrap();
+        assert!(s.placed.is_some());
+        assert!(s.bitstream.is_none());
+        let err = s
+            .write_checkpoint_to("/tmp/helion-empty.hckp")
+            .unwrap_err();
+        assert!(err.contains("empty bitstream"), "{err}");
+        assert!(
+            s.impl_checkpoint.is_none(),
+            "empty-bitstream error must not seed impl_checkpoint"
+        );
+    }
+
+    #[test]
+    fn write_checkpoint_to_does_not_mutate_on_disk_error() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::NonProject);
+        s.impl_design(Design::structural_counter(), &dev).unwrap();
+        assert!(s.bitstream.as_ref().is_some_and(|b| !b.frames.is_empty()));
+        assert!(s.impl_checkpoint.is_none());
+
+        let dir = std::env::temp_dir().join(format!(
+            "helion-hckp-isdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = s.write_checkpoint_to(&dir).unwrap_err();
+        assert!(err.contains("write_checkpoint"), "{err}");
+        assert!(
+            s.impl_checkpoint.is_none(),
+            "disk-write error must not seed impl_checkpoint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
