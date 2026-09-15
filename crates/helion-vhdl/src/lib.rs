@@ -4,7 +4,7 @@
 //! IEEE casts all become SV that `helion_sv` maps.
 
 use helion_ir::Design;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn synth_vhdl(source: &str) -> Result<Design, String> {
@@ -143,33 +143,74 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         }
         p.bump();
     }
-    let mut consts: HashMap<String, i64> = HashMap::new();
+    let mut pkg_consts: HashMap<String, i64> = HashMap::new();
     for pkg in &packages {
-        consts.extend(pkg.consts.clone());
+        pkg_consts.extend(pkg.consts.clone());
     }
-    let Some(ent) = entities.last() else {
+    let Some(top) = entities.last() else {
         return Err("vhdl: need entity".into());
     };
+    let arch_for = |name: &str| -> Option<&Arch> {
+        archs
+            .iter()
+            .rev()
+            .find(|a| a.of.eq_ignore_ascii_case(name))
+    };
+    // Entities that have an architecture body (even empty) are real modules.
+    // Component declarations without a matching entity/arch are missing — do
+    // not emit_stub empty shells (that silences unknown_instance / cells=0).
+    let mut known_bodies: HashSet<String> = HashSet::new();
+    for e in &entities {
+        if arch_for(&e.name).is_some() {
+            known_bodies.insert(e.name.to_ascii_lowercase());
+        }
+    }
     let dummy = Arch {
-        of: ent.name.clone(),
+        of: top.name.clone(),
         consts: HashMap::new(),
         signals: Vec::new(),
         components: Vec::new(),
         stmts: Vec::new(),
     };
-    let arch = archs
-        .iter()
-        .rev()
-        .find(|a| a.of.eq_ignore_ascii_case(&ent.name))
+    let mut out = String::new();
+    // Emit non-top entities with bodies first so hierarchy stitch finds them.
+    for e in &entities {
+        if e.name.eq_ignore_ascii_case(&top.name) {
+            continue;
+        }
+        let Some(a) = arch_for(&e.name) else {
+            continue;
+        };
+        let consts = bind_consts(&pkg_consts, e, a);
+        out.push_str(&emit_sv(e, a, &consts, &known_bodies, &top.name, &entities)?);
+    }
+    let arch = arch_for(&top.name)
         .or_else(|| archs.last())
         .unwrap_or(&dummy);
+    let consts = bind_consts(&pkg_consts, top, arch);
+    out.push_str(&emit_sv(
+        top,
+        arch,
+        &consts,
+        &known_bodies,
+        &top.name,
+        &entities,
+    )?);
+    Ok(out)
+}
+
+fn bind_consts(pkg: &HashMap<String, i64>, ent: &Entity, arch: &Arch) -> HashMap<String, i64> {
+    let mut consts = pkg.clone();
     for (k, v) in &ent.generics {
         consts.entry(k.clone()).or_insert(*v);
+    }
+    for (k, v) in &ent.consts {
+        consts.insert(k.clone(), *v);
     }
     for (k, v) in &arch.consts {
         consts.insert(k.clone(), *v);
     }
-    emit_sv(ent, arch, &consts)
+    consts
 }
 
 struct Unit {
@@ -179,6 +220,7 @@ struct Unit {
 struct Entity {
     name: String,
     generics: HashMap<String, i64>,
+    consts: HashMap<String, i64>,
     ports: Vec<(String, &'static str, usize)>,
 }
 
@@ -275,10 +317,29 @@ fn parse_entity(p: &mut P) -> Result<Entity, String> {
     if p.eat("port") {
         ports = parse_port_clause(p, &generics)?;
     }
+    let mut consts: HashMap<String, i64> = HashMap::new();
+    loop {
+        if p.peek().is_none() {
+            break;
+        }
+        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "end" || k == "begin") {
+            break;
+        }
+        if p.eat("constant") {
+            let mut env = generics.clone();
+            env.extend(consts.iter().map(|(k, v)| (k.clone(), *v)));
+            if let Ok((n, v)) = parse_constant(p, &env) {
+                consts.insert(n, v);
+            }
+        } else {
+            eat_decl_item(p);
+        }
+    }
     skip_to_end_unit(p, "entity");
     Ok(Entity {
         name,
         generics,
+        consts,
         ports,
     })
 }
@@ -346,7 +407,7 @@ fn parse_generic_clause(p: &mut P, generics: &mut HashMap<String, i64>) -> Resul
         if p.peek_sym(":=") {
             let save = p.i;
             p.eat(":=");
-            val = parse_int_expr(p).unwrap_or(0);
+            val = parse_int_expr_with(p, generics).unwrap_or(0);
             p.i = save;
             skip_init(p);
         }
@@ -422,6 +483,7 @@ fn parse_component(p: &mut P, consts: &HashMap<String, i64>) -> Result<Entity, S
     Ok(Entity {
         name,
         generics,
+        consts: HashMap::new(),
         ports,
     })
 }
@@ -451,10 +513,9 @@ fn parse_constant(p: &mut P, consts: &HashMap<String, i64>) -> Result<(String, i
     skip_type_tokens(p);
     let mut v = 0i64;
     if p.eat(":=") {
-        v = parse_int_expr(p).unwrap_or(0);
+        v = parse_int_expr_with(p, consts).unwrap_or(0);
     }
     eat_to_semi(p);
-    let _ = consts;
     Ok((n, v))
 }
 
@@ -1157,9 +1218,9 @@ fn parse_target_sv(
 ) -> Result<String, String> {
     let n = p.ident()?;
     if p.eat("(") {
-        if let Some(a) = parse_int_expr(p) {
+        if let Some(a) = parse_int_expr_with(p, consts) {
             if p.eat("downto") || p.eat("to") {
-                let b = parse_int_expr(p).unwrap_or(a);
+                let b = parse_int_expr_with(p, consts).unwrap_or(a);
                 let _ = p.eat(")");
                 let hi = a.max(b);
                 let lo = a.min(b);
@@ -1414,7 +1475,7 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
             }
             return Ok(format!("({})", args.join(" ^ ")));
         }
-        if let Some(v) = c.get(&n) {
+        if let Some(v) = const_get(c, &n) {
             return Ok(v.to_string());
         }
         return Ok(n);
@@ -1491,8 +1552,8 @@ fn parse_int_atom(p: &mut P, c: &HashMap<String, i64>) -> Option<i64> {
     }
     if matches!(p.peek(), Some(Tok::Ident(_)) | Some(Tok::Kw(_))) {
         let n = p.ident().ok()?;
-        if let Some(v) = c.get(&n) {
-            return Some(*v);
+        if let Some(v) = const_get(c, &n) {
+            return Some(v);
         }
         // unknown ident is not an int
         p.i -= 1;
@@ -1746,16 +1807,23 @@ fn lower_cond_arms(arms: &[(Option<String>, String)]) -> String {
     acc
 }
 
-fn emit_sv(ent: &Entity, arch: &Arch, consts: &HashMap<String, i64>) -> Result<String, String> {
+fn emit_sv(
+    ent: &Entity,
+    arch: &Arch,
+    consts: &HashMap<String, i64>,
+    known_bodies: &HashSet<String>,
+    top_name: &str,
+    entities: &[Entity],
+) -> Result<String, String> {
     let mut sv = String::new();
-    for c in &arch.components {
-        sv.push_str(&emit_stub(c));
-    }
+    // Honest hierarchy: never emit_stub empty modules for component decls.
+    // Missing bodies surface as named missing_component / unknown_instance.
     sv.push_str(&format!("module {}(", sv_ident(&ent.name)));
     let plist: Vec<String> = ent
         .ports
         .iter()
         .map(|(n, d, w)| {
+            let n = sta_clock_name(n);
             if *w == 1 {
                 format!("{d} logic {n}")
             } else {
@@ -1765,26 +1833,42 @@ fn emit_sv(ent: &Entity, arch: &Arch, consts: &HashMap<String, i64>) -> Result<S
         .collect();
     sv.push_str(&plist.join(", "));
     sv.push_str(");\n");
-    for (k, v) in consts {
+    let mut keys: Vec<&String> = consts.keys().collect();
+    keys.sort();
+    for k in keys {
+        let v = consts[k];
         sv.push_str(&format!("  localparam {k} = {v};\n"));
     }
     for (n, w) in &arch.signals {
+        let n = sta_clock_name(n);
         if *w == 1 {
             sv.push_str(&format!("  logic {n};\n"));
         } else {
             sv.push_str(&format!("  logic [{}:0] {n};\n", w - 1));
         }
     }
-    for (i, st) in arch.stmts.iter().enumerate() {
+    for st in &arch.stmts {
         match st {
             CStmt::Assign { lhs, rhs } => {
-                for line in emit_assign_lines(lhs, rhs) {
+                let lhs = rewrite_sta_clock_ident(lhs);
+                let rhs = rewrite_sta_clock_ident(rhs);
+                for line in emit_assign_lines(&lhs, &rhs) {
                     sv.push_str(&format!("  assign {line}\n"));
                 }
             }
             CStmt::CondAssign { lhs, arms } => {
-                let rhs = lower_cond_arms(arms);
-                for line in emit_assign_lines(lhs, &rhs) {
+                let lhs = rewrite_sta_clock_ident(lhs);
+                let arms: Vec<(Option<String>, String)> = arms
+                    .iter()
+                    .map(|(c, v)| {
+                        (
+                            c.as_ref().map(|s| rewrite_sta_clock_ident(s)),
+                            rewrite_sta_clock_ident(v),
+                        )
+                    })
+                    .collect();
+                let rhs = lower_cond_arms(&arms);
+                for line in emit_assign_lines(&lhs, &rhs) {
                     sv.push_str(&format!("  assign {line}\n"));
                 }
             }
@@ -1794,16 +1878,24 @@ fn emit_sv(ent: &Entity, arch: &Arch, consts: &HashMap<String, i64>) -> Result<S
                 arms,
                 other,
             } => {
-                let mut rhs = other.clone().unwrap_or_else(|| "1'b0".into());
+                let sel = rewrite_sta_clock_ident(sel);
+                let lhs = rewrite_sta_clock_ident(lhs);
+                let mut rhs = other
+                    .clone()
+                    .map(|s| rewrite_sta_clock_ident(&s))
+                    .unwrap_or_else(|| "1'b0".into());
                 for (pat, val) in arms.iter().rev() {
+                    let pat = rewrite_sta_clock_ident(pat);
+                    let val = rewrite_sta_clock_ident(val);
                     rhs = format!("(({sel} == {pat}) ? {val} : {rhs})");
                 }
-                for line in emit_assign_lines(lhs, &rhs) {
+                for line in emit_assign_lines(&lhs, &rhs) {
                     sv.push_str(&format!("  assign {line}\n"));
                 }
             }
             CStmt::Process { clock, body } => {
                 if let Some(clk) = clock {
+                    let clk = sta_clock_name(clk);
                     sv.push_str(&format!("  always_ff @(posedge {clk}) begin\n"));
                 } else {
                     sv.push_str("  always_comb begin\n");
@@ -1816,15 +1908,31 @@ fn emit_sv(ent: &Entity, arch: &Arch, consts: &HashMap<String, i64>) -> Result<S
                 name,
                 conns,
             } => {
-                let _ = i;
+                if !known_bodies.contains(&module.to_ascii_lowercase()) {
+                    // Named miss — not silent cells=0 via empty emit_stub.
+                    eprintln!(
+                        "diagnostic missing_component module={} inst={} child={} (component body absent; not a LUT; not a closed WNS)",
+                        top_name, name, module
+                    );
+                }
                 sv.push_str(&format!("  {} {name}(", sv_ident(module)));
+                let ports = child_ports(module, arch, entities);
                 let cs: Vec<String> = conns
                     .iter()
                     .map(|(a, b)| {
-                        if a.starts_with('#') {
-                            b.clone()
+                        let net = sv_inst_net(b);
+                        let port = if a.starts_with('#') {
+                            a[1..]
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| ports.and_then(|ps| ps.get(i)))
+                                .map(|(n, _, _)| sta_clock_name(n))
                         } else {
-                            format!(".{a}({b})")
+                            Some(sta_clock_name(a))
+                        };
+                        match port {
+                            Some(p) if !p.starts_with('#') => format!(".{p}({net})"),
+                            _ => net,
                         }
                     })
                     .collect();
@@ -1835,6 +1943,58 @@ fn emit_sv(ent: &Entity, arch: &Arch, consts: &HashMap<String, i64>) -> Result<S
     }
     sv.push_str("endmodule\n");
     Ok(sv)
+}
+
+/// STA primary clock port/net is `clk`. VHDL `clock` is the same net.
+
+fn const_get(c: &HashMap<String, i64>, n: &str) -> Option<i64> {
+    if let Some(v) = c.get(n) {
+        return Some(*v);
+    }
+    c.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(n))
+        .map(|(_, v)| *v)
+}
+
+fn child_ports<'a>(
+    module: &str,
+    arch: &'a Arch,
+    entities: &'a [Entity],
+) -> Option<&'a [(String, &'static str, usize)]> {
+    if let Some(c) = arch
+        .components
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(module))
+    {
+        return Some(c.ports.as_slice());
+    }
+    entities
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(module))
+        .map(|e| e.ports.as_slice())
+}
+
+/// helion-sv `parse_inst_net` drops `[idx]` on instance ports. Emit the
+/// bit-blasted net name (`a[0]` → `a_0`) so stitch_child can bind bits.
+fn sv_inst_net(s: &str) -> String {
+    let s = rewrite_sta_clock_ident(s);
+    let t = s.trim();
+    let t = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(t)
+        .trim();
+    if let Some(b) = t.find('[') {
+        if let Some(e) = t.rfind(']') {
+            let idx = t[b + 1..e].trim();
+            if !idx.contains(':') {
+                if let Ok(n) = idx.parse::<i64>() {
+                    return format!("{}_{n}", t[..b].trim());
+                }
+            }
+        }
+    }
+    t.to_string()
 }
 
 fn sv_ident(n: &str) -> String {
@@ -1848,22 +2008,34 @@ fn sv_ident(n: &str) -> String {
     }
 }
 
-fn emit_stub(c: &Entity) -> String {
-    let mut s = format!("module {}(", sv_ident(&c.name));
-    let plist: Vec<String> = c
-        .ports
-        .iter()
-        .map(|(n, d, w)| {
-            if *w == 1 {
-                format!("{d} logic {n}")
-            } else {
-                format!("{d} logic [{}:0] {n}", w - 1)
+fn sta_clock_name(name: &str) -> String {
+    if name.eq_ignore_ascii_case("clock") || name.eq_ignore_ascii_case("clk") {
+        "clk".into()
+    } else {
+        name.to_string()
+    }
+}
+
+fn rewrite_sta_clock_ident(s: &str) -> String {
+    // Word-boundary rewrite of VHDL `clock` → STA `clk` in emitted SV exprs.
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
             }
-        })
-        .collect();
-    s.push_str(&plist.join(", "));
-    s.push_str(");\nendmodule\n");
-    s
+            let word = &s[start..i];
+            out.push_str(&sta_clock_name(word));
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn emit_assign_lines(lhs: &str, rhs: &str) -> Vec<String> {
@@ -1899,7 +2071,9 @@ fn emit_seq(sv: &mut String, body: &[SStmt], ind: usize) {
     for s in body {
         match s {
             SStmt::Assign { lhs, rhs } => {
-                for line in emit_assign_lines(lhs, rhs) {
+                let lhs = rewrite_sta_clock_ident(lhs);
+                let rhs = rewrite_sta_clock_ident(rhs);
+                for line in emit_assign_lines(&lhs, &rhs) {
                     sv.push_str(&format!("{pad}{line}\n"));
                 }
             }
@@ -1912,6 +2086,7 @@ fn emit_seq(sv: &mut String, body: &[SStmt], ind: usize) {
                     emit_seq(sv, then_b, ind);
                     continue;
                 }
+                let cond = rewrite_sta_clock_ident(cond);
                 sv.push_str(&format!("{pad}if ({cond}) begin\n"));
                 emit_seq(sv, then_b, ind + 1);
                 sv.push_str(&format!("{pad}end\n"));
@@ -1922,6 +2097,7 @@ fn emit_seq(sv: &mut String, body: &[SStmt], ind: usize) {
                 }
             }
             SStmt::Case { sel, arms, other } => {
+                let sel = rewrite_sta_clock_ident(sel);
                 sv.push_str(&format!("{pad}case ({sel})\n"));
                 for (pats, b) in arms {
                     sv.push_str(&format!("{pad}  {}: begin\n", pats.join(", ")));
@@ -2503,6 +2679,11 @@ end architecture;
             CellKind::Lut6 { init } => assert_eq!(init, 0x5555_5555_5555_5555),
             _ => panic!("lut"),
         }
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "blinky.vhd must map an FF on clk, {:?}",
+            d.cells
+        );
     }
 
     #[test]
@@ -2659,4 +2840,268 @@ end;
         assert!(sv.contains("module wrap"), "{sv}");
         let _ = synth_vhdl(src).expect("empty architecture is legal VHDL");
     }
+
+    #[test]
+    fn vhdl_fulladder_maps_luts() {
+        let src = r#"
+entity full_adder is
+  port (a, b, cin : in std_logic; sum, cout : out std_logic);
+end;
+architecture rtl of full_adder is
+begin
+  sum <= a xor b xor cin;
+  cout <= (a and b) or (a and cin) or (b and cin);
+end;
+"#;
+        let d = synth_vhdl(src).expect("full_adder");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 2, "full_adder must map LUTs, luts={luts} {:?}", d.cells);
+        assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn vhdl_fulladder_hierarchy_adder4_maps() {
+        let src = r#"
+entity full_adder is
+  port (a, b, cin : in std_logic; sum, cout : out std_logic);
+end;
+architecture rtl of full_adder is
+begin
+  sum <= a xor b xor cin;
+  cout <= (a and b) or (a and cin) or (b and cin);
+end;
+entity adder4 is
+  port (a, b : in std_logic_vector(3 downto 0); cin : in std_logic;
+        sum : out std_logic_vector(3 downto 0); cout : out std_logic);
+end;
+architecture rtl of adder4 is
+  component full_adder
+    port (a, b, cin : in std_logic; sum, cout : out std_logic);
+  end component;
+  signal c : std_logic_vector(4 downto 0);
+begin
+  c(0) <= cin;
+  u0: full_adder port map (a(0), b(0), c(0), sum(0), c(1));
+  u1: full_adder port map (a(1), b(1), c(1), sum(1), c(2));
+  u2: full_adder port map (a(2), b(2), c(2), sum(2), c(3));
+  u3: full_adder port map (a(3), b(3), c(3), sum(3), c(4));
+  cout <= c(4);
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("adder4 to sv");
+        assert!(
+            sv.contains("module full_adder"),
+            "must emit real full_adder body, not emit_stub: {sv}"
+        );
+        assert!(sv.contains("module adder4"), "{sv}");
+        assert!(
+            sv.contains("assign") || sv.contains("^") || sv.contains("xor"),
+            "full_adder body must carry logic: {sv}"
+        );
+        assert!(
+            sv.contains(".a(a_0)") && sv.contains(".cin(c_0)") && sv.contains(".cout(c_1)"),
+            "positional port maps must bind bit-blasted nets, not a[0] (sv-parser drops [idx]): {sv}"
+        );
+        let d = synth_vhdl(src).expect("adder4");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            luts >= 4,
+            "adder4 hierarchy must map LUTs from full_adder bodies, luts={luts} cells={:?}",
+            d.cells
+        );
+        assert_ne!(
+            d.attrs.get("NO_BODY"),
+            Some("1"),
+            "adder4 must not be silent no_body"
+        );
+    }
+
+    #[test]
+    fn vhdl_missing_component_names_instance() {
+        let src = r#"
+entity wrap is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of wrap is
+  component missing_child
+    port (a : in std_logic; y : out std_logic);
+  end component;
+begin
+  u_miss: missing_child port map (a => a, y => y);
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(
+            !sv.contains("module missing_child"),
+            "must not emit_stub empty missing_child: {sv}"
+        );
+        assert!(sv.contains("u_miss"), "{sv}");
+        let d = synth_vhdl(src).expect("synth");
+        assert!(d.cells.is_empty(), "absent child must not invent gates {:?}", d.cells);
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn vhdl_missing_component_diagnostic_includes_inst() {
+        let src = r#"
+entity top is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of top is
+begin
+  ghost_u: ghost_ent port map (a => a, y => y);
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(!sv.contains("module ghost_ent("), "no empty stub: {sv}");
+        assert!(sv.contains("ghost_u"), "{sv}");
+        let d = synth_vhdl(src).expect("synth");
+        assert!(d.cells.is_empty());
+        assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
+    }
+
+    #[test]
+    fn vhdl_entity_constant_localparam_maps() {
+        let src = r#"
+entity const_or is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of const_or is
+  constant MASK : integer := 1;
+begin
+  y <= not a when MASK = 1 else '0';
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(sv.contains("localparam MASK = 1"), "{sv}");
+        let d = synth_vhdl(src).expect("const");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "entity constant path must still map, {:?}",
+            d.cells
+        );
+    }
+
+    #[test]
+    fn vhdl_entity_constant_in_entity_decl_maps() {
+        let src = r#"
+entity const_and is
+  port (a : in std_logic; y : out std_logic);
+  constant KEEP : integer := 1;
+end;
+architecture rtl of const_and is
+begin
+  y <= not a when KEEP = 1 else '0';
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(sv.contains("localparam KEEP = 1"), "{sv}");
+        let d = synth_vhdl(src).expect("const");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "entity-decl constant must map, {:?}",
+            d.cells
+        );
+    }
+
+    #[test]
+    fn vhdl_entity_constant_generic_width_maps() {
+        let src = r#"
+entity bus_buf is
+  generic (W : integer := 4);
+  port (d : in std_logic_vector(3 downto 0); q : out std_logic_vector(3 downto 0));
+end;
+architecture rtl of bus_buf is
+  constant ZERO : integer := 0;
+begin
+  q <= d;
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(
+            sv.contains("localparam W = 4") || sv.contains("localparam ZERO = 0"),
+            "{sv}"
+        );
+        let d = synth_vhdl(src).expect("buf");
+        assert!(d.ports.iter().any(|p| p.name == "q"));
+    }
+
+    #[test]
+    fn vhdl_rng_clock_is_sta_clk() {
+        let src = r#"
+entity rng is
+  port (clock : in std_logic; rst : in std_logic; r : out std_logic_vector(7 downto 0));
+end;
+architecture rtl of rng is
+  signal lfsr : std_logic_vector(7 downto 0) := "10101010";
+begin
+  process(clock)
+  begin
+    if rising_edge(clock) then
+      if rst = '1' then
+        lfsr <= "10101010";
+      else
+        lfsr <= lfsr(6 downto 0) & (lfsr(7) xor lfsr(5) xor lfsr(4) xor lfsr(3));
+      end if;
+    end if;
+  end process;
+  r <= lfsr;
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("rng sv");
+        assert!(sv.contains("input logic clk"), "clock≡clk ports: {sv}");
+        assert!(sv.contains("posedge clk"), "always_ff must use clk: {sv}");
+        assert!(!sv.contains("posedge clock"), "must not leave VHDL clock name: {sv}");
+        let d = synth_vhdl(src).expect("rng");
+        assert!(
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+            "rng must map FFs, {:?}",
+            d.cells
+        );
+        assert!(
+            d.ports.iter().any(|p| p.name == "clk"),
+            "STA port must be clk: {:?}",
+            d.ports
+        );
+        assert!(
+            !d.ports.iter().any(|p| p.name == "clock"),
+            "clock renamed to clk: {:?}",
+            d.ports
+        );
+    }
+
+    #[test]
+    fn vhdl_no_fake_fd_library() {
+        let src = r#"
+entity wrap is
+  port (clk : in std_logic; d : in std_logic; q : out std_logic);
+end;
+architecture rtl of wrap is
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      q <= d;
+    end if;
+  end process;
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(!sv.to_ascii_lowercase().contains("unisim"), "{sv}");
+        assert!(
+            !sv.contains("FDCE") && !sv.contains("FDRE") && !sv.contains(" module FD"),
+            "{sv}"
+        );
+        let d = synth_vhdl(src).expect("ff");
+        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
+    }
+
 }
