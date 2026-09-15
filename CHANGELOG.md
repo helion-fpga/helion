@@ -12,7 +12,21 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.0...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.5.1...HEAD
+
+## [1.5.1] — 2026-09-15
+
+Soft-clear: named Ibex `wide_cone` softs map to real LUT/FF. Empty-XDC
+`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Native Apple Silicon
+`Helion.app` ships on this GitHub Release.
+
+### Fixed
+
+- `csr_pipe_flush` / `op_remainder_d` / `r_state` wide_cone paths lower with
+  OR-of-eq LUT trees, packed bit mux, and sequential ITE (no hang-cap raise).
+  Ibex pin_wrap LUTs ~8073→8491 (honest map).
+
+[1.5.1]: https://github.com/helion-fpga/helion/releases/tag/v1.5.1
 
 ## [1.5.0] — 2026-09-15
 
