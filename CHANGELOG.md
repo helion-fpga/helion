@@ -12,7 +12,35 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v1.6.0...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.0...HEAD
+
+## [2.0.0] — 2026-09-15
+
+Public OSS CAD bar. A stranger can clone, `cargo test --workspace` (helion-gui
+lib green), run headless gold **WNS_PS=9640**, and trust the legal fence.
+Native Apple Silicon `Helion.app` ships on this GitHub Release.
+
+### Added
+
+- Disk `.hckp` CLI ECO path (`read_checkpoint` alias; open → ECO → bitstream
+  hash change).
+- IDE clock/led-optional contract (VHDL keep-name; HFF add_wave).
+- Soft-clear track: Ibex wide_cone / if_stage generate / assign batches /
+  rvfi+icache generate lowering with named leftovers (SOFT ≠ PASS).
+
+### Fixed
+
+- helion-gui lib: 189 passed (was 14 failing on timing panes, UG900, Zoom Fit,
+  scopes, expand_inside).
+- Lab honesty: empty refuse; no-cable refuse DONE; overlay labeled.
+- PNR issue #16 closed (timing_weight moves closed WNS).
+
+### Legal fence (unchanged)
+
+Original Helion ISA/CAD only. No Project X-Ray, UNISIM, vendor Tcl product
+names, or AMD/Intel/Lattice backends. Helion-MM / Helion-ST only.
+
+[2.0.0]: https://github.com/helion-fpga/helion/releases/tag/v2.0.0
 
 ## [1.6.0] — 2026-09-15
 
