@@ -1903,8 +1903,8 @@ fn emit_sv(
         .get(&ent.name.to_ascii_lowercase())
         .cloned()
         .unwrap_or_else(|| occupied_sv_names(ent, arch));
-    // Clash: process/STA clock `clock` would become `clk`, but `clk` is
-    // already a port/signal/generic/const. Skip the rename (keep `clock`),
+    // Clash: process/STA clock is `clock` and `clk` is already a
+    // port/signal/generic/const. Keep-name already keeps `clock` distinct;
     // emit a named diagnostic, do not silent-merge, do not abort synth.
     if clock_clk_clash(sta_clocks, &occupied) {
         emit_diag(&clock_clk_clash_line(&ent.name));
@@ -2149,20 +2149,17 @@ fn sta_clocks_of(arch: &Arch) -> HashSet<String> {
         .collect()
 }
 
-/// NARROW clock≡clk: only the process/STA clock net named `clock` becomes `clk`.
-/// Other ports/signals named `clock` (or other clock-named nets) stay as-is.
-/// Do not total-merge every clock/clk ident → clk.
-/// If `clk` is already occupied, skip the rename and keep `clock`.
-fn sta_clock_name(name: &str, sta_clocks: &HashSet<String>, occupied: &HashSet<String>) -> String {
-    if name.eq_ignore_ascii_case("clock") && sta_clocks.contains(&name.to_ascii_lowercase()) {
-        if occupied.contains("clk") {
-            name.to_string()
-        } else {
-            "clk".into()
-        }
-    } else {
-        name.to_string()
-    }
+/// Keep-name policy (FM-HEL-2.0-IDE GUI HFF contract): process/STA clock
+/// ports keep the real VHDL name. Do **not** rename `clock` → `clk`.
+///
+/// Narrow (not total-merge): a data port named `clock` that is *not* the
+/// process/STA clock also stays `clock`. When process clock is `clock` and
+/// `clk` is already occupied, keep `clock` (clash-skip; nets stay distinct).
+/// Selected-arch clocks are not unioned (see `entity_clocks` / child maps).
+fn sta_clock_name(name: &str, _sta_clocks: &HashSet<String>, _occupied: &HashSet<String>) -> String {
+    // Identity: never rewrite process/STA `clock` to `clk`. Call sites still
+    // pass sta_clocks/occupied so clash diagnostics and narrow tests stay wired.
+    name.to_string()
 }
 
 fn rewrite_sta_clock_ident(
@@ -2170,7 +2167,7 @@ fn rewrite_sta_clock_ident(
     sta_clocks: &HashSet<String>,
     occupied: &HashSet<String>,
 ) -> String {
-    // Word-boundary rewrite of the process/STA clock ident `clock` → `clk`.
+    // Word-boundary pass over idents; sta_clock_name is keep-name (identity).
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0usize;
@@ -3263,13 +3260,17 @@ end;
 "#;
         let sv = vhdl_to_sv(src).expect("rng sv");
         assert!(
-            sv.contains("input logic clk"),
-            "NARROW: process clock clock→clk: {sv}"
+            sv.contains("input logic clock"),
+            "keep-name: process clock stays clock: {sv}"
         );
-        assert!(sv.contains("posedge clk"), "always_ff must use clk: {sv}");
         assert!(
-            !sv.contains("posedge clock"),
-            "must not leave VHDL clock name: {sv}"
+            !sv.contains("input logic clk"),
+            "must not rename process clock clock→clk: {sv}"
+        );
+        assert!(sv.contains("posedge clock"), "always_ff must use clock: {sv}");
+        assert!(
+            !sv.contains("posedge clk"),
+            "must not rewrite process clock to clk: {sv}"
         );
         let d = synth_vhdl(src).expect("rng");
         assert!(
@@ -3278,13 +3279,13 @@ end;
             d.cells
         );
         assert!(
-            d.ports.iter().any(|p| p.name == "clk"),
-            "STA port must be clk: {:?}",
+            d.ports.iter().any(|p| p.name == "clock"),
+            "STA/Design port must keep real VHDL name clock: {:?}",
             d.ports
         );
         assert!(
-            !d.ports.iter().any(|p| p.name == "clock"),
-            "process/STA clock net renamed to clk: {:?}",
+            !d.ports.iter().any(|p| p.name == "clk"),
+            "process/STA clock must not be renamed to clk: {:?}",
             d.ports
         );
     }
@@ -3340,11 +3341,12 @@ end;
         let none = HashSet::new();
         let mut process_clock = HashSet::new();
         process_clock.insert("clock".into());
-        assert_eq!(sta_clock_name("clock", &process_clock, &none), "clk");
-        assert_eq!(sta_clock_name("CLOCK", &process_clock, &none), "clk");
+        // Keep-name: process/STA clock `clock` stays `clock` (GUI HFF contract).
+        assert_eq!(sta_clock_name("clock", &process_clock, &none), "clock");
+        assert_eq!(sta_clock_name("CLOCK", &process_clock, &none), "CLOCK");
         assert_eq!(
             rewrite_sta_clock_ident("q = clock", &process_clock, &none),
-            "q = clk"
+            "q = clock"
         );
 
         let mut clk_only = HashSet::new();
@@ -3372,12 +3374,12 @@ end;
         assert_eq!(
             sta_clock_name("clock", &process_clock, &occupied_clk),
             "clock",
-            "skip clock→clk when clk is occupied"
+            "clash-skip: keep clock when clk is occupied"
         );
         assert_eq!(
             rewrite_sta_clock_ident("posedge clock", &process_clock, &occupied_clk),
             "posedge clock",
-            "rewrite path must skip on occupied clk"
+            "rewrite path keeps clock on occupied clk"
         );
         assert_eq!(
             sta_clock_name("clk", &process_clock, &occupied_clk),
