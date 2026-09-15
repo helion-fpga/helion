@@ -2700,14 +2700,37 @@ impl Default for Waveform {
 
 impl Waveform {
     pub fn bits_of(&self, name: &str) -> Option<String> {
+        // Default clock probe is literal "clk" (counter gold). Callers with an
+        // HFF CLK net use bits_of_clocked(..., implicit_clock_name()).
+        self.bits_of_clocked(name, "clk")
+    }
+
+    /// Posedge LED strip using the real clock trace name (no phantom "clk" dual-write).
+    pub fn bits_of_clocked(&self, name: &str, clk_name: &str) -> Option<String> {
         // Half-cycle clk grid records two samples per user cycle; LED gold /
         // UG900 bitstrings stay one bit per cycle (posedge / active-edge sample).
         if name == "led" {
-            if let (Some(clk), Some(led)) = (self.trace("clk"), self.trace("led")) {
-                if clk.samples.len() >= 2
-                    && clk.samples.len() % 2 == 0
-                    && led.samples.len() == clk.samples.len()
-                {
+            if let Some(s) = self.led_half_cycle_bits(clk_name) {
+                return Some(s);
+            }
+            if clk_name != "clk" {
+                if let Some(s) = self.led_half_cycle_bits("clk") {
+                    return Some(s);
+                }
+            }
+            // No dual-write: pair led with any equal-length digital clock-like trace.
+            if let Some(led) = self.trace("led") {
+                let paired = self.traces.iter().any(|t| {
+                    t.name != "led"
+                        && t.name != "cnt"
+                        && !t.name.starts_with("ila:")
+                        && t.style == WaveStyle::Digital
+                        && t.width <= 1
+                        && t.samples.len() >= 2
+                        && t.samples.len() % 2 == 0
+                        && t.samples.len() == led.samples.len()
+                });
+                if paired {
                     return Some(
                         led.samples
                             .iter()
@@ -2720,6 +2743,25 @@ impl Waveform {
             }
         }
         self.traces.iter().find(|t| t.name == name).map(|t| t.bit_string())
+    }
+
+    fn led_half_cycle_bits(&self, clk_name: &str) -> Option<String> {
+        let (clk, led) = (self.trace(clk_name)?, self.trace("led")?);
+        if clk.samples.len() >= 2
+            && clk.samples.len() % 2 == 0
+            && led.samples.len() == clk.samples.len()
+        {
+            Some(
+                led.samples
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .map(|v| if v & 1 == 1 { '1' } else { '0' })
+                    .collect(),
+            )
+        } else {
+            None
+        }
     }
 
     pub fn has_trace(&self, name: &str) -> bool {
@@ -4222,6 +4264,7 @@ pub struct HierarchyView {
     pub top: Option<String>,
     /// `(name, kind)` in tree order: module, then instances, then leaf cells.
     pub nodes: Vec<(String, String)>,
+    drawing_cache: RefCell<Option<Arc<HierarchyDrawing>>>,
 }
 
 /// Nested hierarchy box (Fig. 61). `w * h` scales with `cells`.
@@ -4262,6 +4305,20 @@ impl HierarchyView {
 
     /// Fig. 61 Block view: nested boxes whose area tracks HNF cell/resource count.
     pub fn drawing(&self) -> HierarchyDrawing {
+        (*self.drawing_arc()).clone()
+    }
+
+    pub fn drawing_arc(&self) -> Arc<HierarchyDrawing> {
+        if let Some(d) = self.drawing_cache.borrow().as_ref() {
+            return Arc::clone(d);
+        }
+        let d = Arc::new(self.layout_boxes());
+        *self.drawing_cache.borrow_mut() = Some(Arc::clone(&d));
+        d
+    }
+
+    /// O(nodes): assign each leaf to the longest matching instance prefix.
+    fn layout_boxes(&self) -> HierarchyDrawing {
         const PAD: f32 = 10.0;
         const HEADER: f32 = 20.0;
         const LEAF_W: f32 = 72.0;
@@ -4282,19 +4339,32 @@ impl HierarchyView {
             .cloned()
             .collect();
 
+        let mut inst_ix: HashMap<&str, usize> = HashMap::new();
+        let mut inst_kids: Vec<(String, String, Vec<(String, String)>)> = instances
+            .iter()
+            .enumerate()
+            .map(|(i, (n, k))| {
+                inst_ix.insert(n.as_str(), i);
+                (n.clone(), k.clone(), Vec::new())
+            })
+            .collect();
         let mut owned: HashSet<String> = HashSet::new();
-        let mut inst_kids: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
-        for (iname, ikind) in &instances {
-            let pfx = format!("{iname}_");
-            let kids: Vec<(String, String)> = leaves
-                .iter()
-                .filter(|(n, _)| n == iname || n.starts_with(&pfx))
-                .cloned()
-                .collect();
-            for (n, _) in &kids {
-                owned.insert(n.clone());
+        for (name, kind) in &leaves {
+            let mut owner = inst_ix.get(name.as_str()).copied();
+            if owner.is_none() {
+                let mut rest = name.as_str();
+                while let Some((pfx, _)) = rest.rsplit_once('_') {
+                    if let Some(i) = inst_ix.get(pfx).copied() {
+                        owner = Some(i);
+                        break;
+                    }
+                    rest = pfx;
+                }
             }
-            inst_kids.push((iname.clone(), ikind.clone(), kids));
+            if let Some(i) = owner {
+                inst_kids[i].2.push((name.clone(), kind.clone()));
+                owned.insert(name.clone());
+            }
         }
         let top_leaves: Vec<(String, String)> = leaves
             .iter()
@@ -6322,7 +6392,7 @@ impl IdeModel {
             "elaborate" => WorkspaceTab::Source,
             _ => WorkspaceTab::Wave,
         };
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), row.id.clone()),
             ("TYPE".into(), "sim_log".into()),
@@ -6469,8 +6539,38 @@ impl IdeModel {
         Some(self.exec(&cmd))
     }
 
+    /// Status bar + Messages for Open failures (not a silent `Err(_)`).
+    fn surface_open_error(&mut self, id: &str, text: &str) {
+        self.status = format!("{id}: {text}");
+        let already = self.messages.iter().rev().take(4).any(|m| {
+            m.severity == MsgSeverity::Error && m.text == text
+        });
+        if !already {
+            self.messages.push(IdeMessage {
+                severity: MsgSeverity::Error,
+                id: id.to_string(),
+                text: text.to_string(),
+            });
+            self.log.push(format!("helion% {id}\n{text}"));
+            self.console.push(ConsoleLine {
+                cmd: id.to_string(),
+                out: text.to_string(),
+                ok: false,
+            });
+        }
+        self.bottom_tab = BottomTab::Messages;
+    }
+
     /// Add an RTL source and elaborate it (Vivado "Add Sources" + synth).
     pub fn open_source(&mut self, path: &Path) -> Result<String, String> {
+        let r = self.open_source_impl(path);
+        if let Err(e) = &r {
+            self.surface_open_error("open_source", e);
+        }
+        r
+    }
+
+    fn open_source_impl(&mut self, path: &Path) -> Result<String, String> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -7218,7 +7318,8 @@ impl IdeModel {
         Some(ff.cell.clone())
     }
 
-    /// True when `name` is a design Q-net (RTL/ILA probe name) or already in Objects.
+    /// True when `name` is a design Q-net (RTL/ILA probe name), HFF CLK net,
+    /// real port, or already in Objects.
     fn wave_probe_available(&self, name: &str) -> bool {
         if name == "led" || name == "clk" || name == "cnt" {
             return true;
@@ -7230,11 +7331,20 @@ impl IdeModel {
             return true;
         }
         if let Some(d) = self.shell.session.design.as_ref() {
+            if d.ports.iter().any(|p| p.name == name) {
+                return true;
+            }
+            if Self::hff_clock_net(d).as_deref() == Some(name) {
+                return true;
+            }
             if d.marked_debug_nets().iter().any(|n| n == name) {
                 return true;
             }
             if d.nets.iter().any(|n| {
-                n.name == name && n.endpoints.iter().any(|e| e.pin == "Q")
+                n.name == name
+                    && n.endpoints
+                        .iter()
+                        .any(|e| e.pin == "Q" || e.pin == "CLK")
             }) {
                 return true;
             }
@@ -7423,7 +7533,7 @@ impl IdeModel {
         self.layout = LayoutKind::Simulation;
         self.workspace = WorkspaceTab::Wave;
         let time_ps = self.wave.time_ps(marker.sample);
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), marker.name.clone()),
             ("TYPE".into(), "wave_marker".into()),
@@ -7542,7 +7652,7 @@ impl IdeModel {
         let value = t
             .map(|t| t.value_at(self.wave.cursor))
             .unwrap_or_else(|| "-".into());
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), vb.name.clone()),
             ("TYPE".into(), "virtual_bus".into()),
@@ -7615,9 +7725,15 @@ impl IdeModel {
 
     /// UG900 A/B cursor pane: clickable Name/Sample/Time_ps/Delta over helion-sim.
     pub fn wave_cursor_rows(&self) -> Vec<WaveCursorRow> {
+        let out = self.primary_out_port();
         let led = |sample: Option<usize>| {
             sample
-                .and_then(|i| self.wave.trace("led").map(|t| t.value_at(i)))
+                .and_then(|i| {
+                    self.wave
+                        .trace(&out)
+                        .or_else(|| self.wave.trace("led"))
+                        .map(|t| t.value_at(i))
+                })
                 .unwrap_or_else(|| "-".into())
         };
         vec![
@@ -7722,7 +7838,7 @@ impl IdeModel {
         self.nav = NavSection::Simulation;
         self.layout = LayoutKind::Simulation;
         self.workspace = WorkspaceTab::Wave;
-        let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+        let led = self.primary_out_bits_or_dash();
         self.properties = vec![
             ("NAME".into(), row.name.clone()),
             ("TYPE".into(), "wave_cursor".into()),
@@ -10786,28 +10902,30 @@ impl IdeModel {
 
     /// After pblock re-place/route, re-apply PACKAGE_PIN LOCs via `place_design`
     /// so counter gold WNS_PS=9640 holds while the pblocks table stays filled.
+    /// Only `clk` / `led` — extra package pins are not re-placed (gold WNS).
     /// Uses existing constraints when set; otherwise gold led=IOB_X2Y0 / clk=IOB_X3Y0.
     fn reapply_package_pins_after_pblock(&mut self) -> Result<(), String> {
+        let ports: HashSet<String> = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.ports.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
         let mut pins: Vec<(String, String)> = self
             .constraints
             .package_pins
             .iter()
+            .filter(|(port, _)| {
+                (*port == "clk" || *port == "led") && ports.contains(*port)
+            })
             .map(|(port, pin)| (port.clone(), pin.clone()))
             .collect();
-        if pins.is_empty() {
-            let ports: Vec<String> = self
-                .shell
-                .session
-                .design
-                .as_ref()
-                .map(|d| d.ports.iter().map(|p| p.name.clone()).collect())
-                .unwrap_or_default();
-            if ports.iter().any(|p| p == "led") {
-                pins.push(("led".into(), "IOB_X2Y0".into()));
-            }
-            if ports.iter().any(|p| p == "clk") {
-                pins.push(("clk".into(), "IOB_X3Y0".into()));
-            }
+        if !pins.iter().any(|(p, _)| p == "led") && ports.contains("led") {
+            pins.push(("led".into(), "IOB_X2Y0".into()));
+        }
+        if !pins.iter().any(|(p, _)| p == "clk") && ports.contains("clk") {
+            pins.push(("clk".into(), "IOB_X3Y0".into()));
         }
         if pins.is_empty() {
             return Ok(());
@@ -14134,7 +14252,7 @@ impl IdeModel {
             "ENGINE_TIME_PS" => {
                 props.push(("SAMPLES".into(), self.wave.sample_len().to_string()));
                 props.push(("TIMESCALE_PS".into(), self.sim_timescale_ps.to_string()));
-                props.push(("LED".into(), self.wave.bits_of("led").unwrap_or_else(|| "-".into())));
+                props.push(("LED".into(), self.primary_out_bits_or_dash()));
             }
             "LOG_ALL_SIGNALS" => {
                 props.push(("TRACES".into(), self.wave.traces.len().to_string()));
@@ -17713,6 +17831,65 @@ impl IdeModel {
         cands.into_iter().next().cloned()
     }
 
+    /// Wave/Sim/STA clock name: HFF CLK net when present, else literal `clk`
+    /// (non-port placeholder). Never invent a clock from the first In port.
+    fn implicit_clock_name(&self) -> String {
+        self.shell
+            .session
+            .design
+            .as_ref()
+            .and_then(Self::hff_clock_net)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "clk".into())
+    }
+
+    /// Primary output for Wave: `led` port, else sim.led / IOB-driven net.
+    /// Never invent a name from the first PortDir::Out.
+    fn primary_out_port(&self) -> String {
+        let Some(d) = self.shell.session.design.as_ref() else {
+            return "led".into();
+        };
+        if d.ports.iter().any(|p| p.name == "led") {
+            return "led".into();
+        }
+        // Prefer routed/packed IOB-driven net when present.
+        let iob_net = self
+            .shell
+            .session
+            .routed
+            .as_ref()
+            .and_then(|r| r.iob_src.first())
+            .map(|i| i.net.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| {
+                self.shell
+                    .session
+                    .placed
+                    .as_ref()
+                    .and_then(|p| p.packed.iobs.first())
+                    .map(|i| i.from_net.clone())
+                    .filter(|n| !n.is_empty())
+            })
+            .or_else(|| {
+                self.shell
+                    .session
+                    .packed
+                    .as_ref()
+                    .and_then(|p| p.iobs.first())
+                    .map(|i| i.from_net.clone())
+                    .filter(|n| !n.is_empty())
+            });
+        if let Some(net) = iob_net {
+            return net;
+        }
+        // Event/fabric sim always exposes the sim.led probe.
+        if self.event_sim.is_some() || self.fabric_sim.is_some() {
+            return "led".into();
+        }
+        // Require explicit led — do not silently take first Out.
+        "led".into()
+    }
+
     /// Implicit analysis clock (no user SDC) is named after the Hff clock.
     /// Period stays the built-in default. User SDC clocks are not renamed.
     fn name_implicit_analysis_clock(clks: &mut [helion_sta::Clock], d: &helion_ir::Design) {
@@ -17901,6 +18078,8 @@ impl IdeModel {
             ),
         );
         // Keep user add_wave probes (hb_0 / mark_debug Q-nets); rebuild samples.
+        let clk_name = self.implicit_clock_name();
+        let out_name = self.primary_out_port();
         let user_traces: Vec<String> = self
             .wave
             .traces
@@ -17908,7 +18087,9 @@ impl IdeModel {
             .map(|t| t.name.clone())
             .filter(|n| {
                 n != "clk"
+                    && n != clk_name.as_str()
                     && n != "led"
+                    && n != out_name.as_str()
                     && n != "cnt"
                     && !n.starts_with("ila:")
             })
@@ -18052,7 +18233,9 @@ impl IdeModel {
         }
         self.wave.timescale_ps = (self.sim_timescale_ps.max(1) / 2).max(1);
         if self.wave.traces.is_empty() {
-            self.wave.traces.push(WaveTrace::scalar("led"));
+            self.wave
+                .traces
+                .push(WaveTrace::scalar(&self.primary_out_port()));
         }
         self.refresh_sim_debug();
         self.rearm_active_forces();
@@ -18141,9 +18324,11 @@ impl IdeModel {
     }
 
     fn last_wave_outputs(&self) -> (u64, u64, u8) {
+        let out = self.primary_out_port();
         let led = self
             .wave
-            .trace("led")
+            .trace(&out)
+            .or_else(|| self.wave.trace("led"))
             .and_then(|t| t.samples.last().copied())
             .unwrap_or(0);
         let cnt_t = self.wave.trace("cnt");
@@ -18154,7 +18339,12 @@ impl IdeModel {
 
     /// Posedge-only LED bitstring (one bit per user cycle) from half-cycle wave samples.
     fn wave_posedge_led_bits(&self) -> String {
-        match self.wave.trace("led") {
+        let out = self.primary_out_port();
+        match self
+            .wave
+            .trace(&out)
+            .or_else(|| self.wave.trace("led"))
+        {
             Some(t) if t.samples.len() >= 2 => t
                 .samples
                 .iter()
@@ -18167,12 +18357,33 @@ impl IdeModel {
         }
     }
 
+    /// Properties / SimLog LED crumb: primary_out_port() then led fallback (same as cursor path).
+    fn primary_out_bits_or_dash(&self) -> String {
+        let out = self.primary_out_port();
+        let clk = self.implicit_clock_name();
+        if out == "led" {
+            return self
+                .wave
+                .bits_of_clocked("led", &clk)
+                .unwrap_or_else(|| "-".into());
+        }
+        let s = self.wave_posedge_led_bits();
+        if !s.is_empty() {
+            return s;
+        }
+        self.wave
+            .bits_of_clocked("led", &clk)
+            .unwrap_or_else(|| "-".into())
+    }
+
     fn sim_step_inner(&mut self) -> Result<(), String> {
         let delay = self.sim_timescale_ps.max(1);
         // Two samples per user cycle: half-period timescale so the ruler stays honest.
         let half = (delay / 2).max(1);
         self.wave.timescale_ps = half;
 
+        let clk_name = self.implicit_clock_name();
+        let out_name = self.primary_out_port();
         let (prev_led, prev_cnt, prev_w) = self.last_wave_outputs();
         let extra_names: Vec<String> = self
             .wave
@@ -18181,7 +18392,9 @@ impl IdeModel {
             .map(|t| t.name.clone())
             .filter(|n| {
                 n != "clk"
+                    && n != clk_name.as_str()
                     && n != "led"
+                    && n != out_name.as_str()
                     && n != "cnt"
                     && !n.starts_with("ila:")
             })
@@ -18215,9 +18428,12 @@ impl IdeModel {
         self.apply_scheduled_forces();
         let (led, bus, bus_w) = self.current_sim_outputs()?;
 
-        // Inactive half-cycle: clk low; led/cnt hold until the active edge.
-        Self::push_sample(&mut self.wave, "clk", 0, 1, WaveStyle::Digital);
-        Self::push_sample(&mut self.wave, "led", prev_led, 1, WaveStyle::Digital);
+        // Inactive half-cycle: clock low; output/cnt hold until the active edge.
+        Self::push_sample(&mut self.wave, &clk_name, 0, 1, WaveStyle::Digital);
+        Self::push_sample(&mut self.wave, &out_name, prev_led, 1, WaveStyle::Digital);
+        if out_name != "led" && self.wave.has_trace("led") {
+            Self::push_sample(&mut self.wave, "led", prev_led, 1, WaveStyle::Digital);
+        }
         if bus_w > 1 {
             let hold_w = prev_w.max(bus_w);
             Self::push_sample(&mut self.wave, "cnt", prev_cnt, hold_w, WaveStyle::Analog);
@@ -18226,9 +18442,12 @@ impl IdeModel {
             Self::push_sample(&mut self.wave, name, *v, 1, WaveStyle::Digital);
         }
 
-        // Active edge sample: clk high; led/cnt update once per user cycle.
-        Self::push_sample(&mut self.wave, "clk", 1, 1, WaveStyle::Digital);
-        Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
+        // Active edge sample: clock high; output/cnt update once per user cycle.
+        Self::push_sample(&mut self.wave, &clk_name, 1, 1, WaveStyle::Digital);
+        Self::push_sample(&mut self.wave, &out_name, u64::from(led), 1, WaveStyle::Digital);
+        if out_name != "led" && self.wave.has_trace("led") {
+            Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
+        }
         if bus_w > 1 {
             Self::push_sample(&mut self.wave, "cnt", bus, bus_w, WaveStyle::Analog);
         }
@@ -18321,8 +18540,14 @@ impl IdeModel {
             }
         }
         let cur = self.wave.cursor;
-        if let Some(t) = self.wave.trace("led") {
-            push(&mut v, &mut seen, "led".into(), t.value_at(cur));
+        let out = self.primary_out_port();
+        if let Some(t) = self.wave.trace(&out) {
+            push(&mut v, &mut seen, out.clone(), t.value_at(cur));
+        }
+        if out != "led" {
+            if let Some(t) = self.wave.trace("led") {
+                push(&mut v, &mut seen, "led".into(), t.value_at(cur));
+            }
         }
         if let Some(t) = self.wave.trace("cnt") {
             push(&mut v, &mut seen, "cnt".into(), t.value_at(cur));
@@ -18739,11 +18964,20 @@ impl IdeModel {
     }
 
     fn push_log_all_samples(&mut self) {
+        let clk_name = self.implicit_clock_name();
+        let out_name = self.primary_out_port();
+        let skip = |name: &str| {
+            name == "led"
+                || name == "clk"
+                || name == "cnt"
+                || name == clk_name
+                || name == out_name
+        };
         let mut extras: Vec<(String, u64, u8)> = Vec::new();
         if let Some(sim) = &self.event_sim {
             for (name, value) in sim.object_values() {
-                // clk is owned by sim_step_inner half-cycle sampling — never flatten it.
-                if name == "led" || name == "clk" {
+                // clock is owned by sim_step_inner half-cycle sampling — never flatten it.
+                if skip(&name) {
                     continue;
                 }
                 if let Some((v, w)) = Self::parse_wave_bit(&value) {
@@ -18752,7 +18986,7 @@ impl IdeModel {
             }
         } else {
             for l in &self.locals {
-                if l.name == "led" || l.name == "cnt" || l.name == "clk" {
+                if skip(&l.name) {
                     continue;
                 }
                 if let Some((v, w)) = Self::parse_wave_bit(&l.value) {
@@ -18760,7 +18994,7 @@ impl IdeModel {
                 }
             }
             for o in &self.objects {
-                if o.name == "led" || o.name == "cnt" || o.name == "clk" {
+                if skip(&o.name) {
                     continue;
                 }
                 if extras.iter().any(|(n, _, _)| n == &o.name) {
@@ -19499,6 +19733,7 @@ impl IdeModel {
         self.hierarchy = HierarchyView {
             top: Some(d.name.clone()),
             nodes,
+            drawing_cache: RefCell::new(None),
         };
     }
 
@@ -20600,7 +20835,7 @@ impl IdeModel {
                 let value = t
                     .map(|t| t.value_at(self.wave.cursor))
                     .unwrap_or_else(|| "-".into());
-                let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), vb.name.clone()),
                     ("TYPE".into(), "virtual_bus".into()),
@@ -20619,7 +20854,7 @@ impl IdeModel {
                 .into_iter()
                 .find(|r| r.name == name)
             {
-                let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), row.name.clone()),
                     ("TYPE".into(), "wave_cursor".into()),
@@ -20636,7 +20871,7 @@ impl IdeModel {
         if let Some(name) = id.strip_prefix("marker:") {
             if let Some(m) = self.wave.marker(name).cloned() {
                 let time_ps = self.wave.time_ps(m.sample);
-                let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), m.name.clone()),
                     ("TYPE".into(), "wave_marker".into()),
@@ -20706,7 +20941,7 @@ impl IdeModel {
         if let Some(rest) = id.strip_prefix("sim_log:") {
             if let Ok(i) = rest.parse::<usize>() {
                 if let Some(row) = self.sim_log.get(i).cloned() {
-                    let led = self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+                    let led = self.primary_out_bits_or_dash();
                     let engine_time = self.sim_engine_time_ps();
                     self.properties = vec![
                         ("NAME".into(), row.id.clone()),
@@ -21393,6 +21628,14 @@ fn is_hff(design: &Design, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// HFF clock pin is `CLK` (not UNISIM `C`). Fall back to `C` then leftover `clk`.
+fn hff_clk_net<'a>(design: &'a Design, cell: &str) -> &'a str {
+    design
+        .net_on(cell, "CLK")
+        .or_else(|| design.net_on(cell, "C"))
+        .unwrap_or("clk")
+}
+
 /// UG903 r2r pin table: CkQ + LUT fanin×PIN + LUT comb + setup.
 fn r2r_pin_rows(
     design: &Design,
@@ -21403,11 +21646,11 @@ fn r2r_pin_rows(
 ) -> Vec<TimingPathPin> {
     let mut pins = Vec::new();
     if is_hff(design, start) {
-        let clk_net = design.net_on(start, "C").unwrap_or("clk");
+        let clk_net = hff_clk_net(design, start);
         push_timing_pin(
             &mut pins,
             start,
-            "C",
+            "CLK",
             "clk",
             0,
             clk_net,
@@ -21482,11 +21725,11 @@ fn iob_pin_rows(
     let route = if t.iob_ps > 0 { t.route_ps } else { 0 };
     let pad_ps = (t.iob_ps - ckq - route).max(0);
     if has_ff {
-        let clk_net = design.net_on(start, "C").unwrap_or("clk");
+        let clk_net = hff_clk_net(design, start);
         push_timing_pin(
             &mut pins,
             start,
-            "C",
+            "CLK",
             "clk",
             0,
             clk_net,
@@ -21544,7 +21787,7 @@ fn extract_timing_paths(
         }
         let mut cells = vec![c.name.clone()];
         let mut nets = Vec::new();
-        let mut start = "clk".to_string();
+        let mut start = hff_clk_net(design, &c.name).to_string();
         let mut lut = None;
         if let Some(dnet) = design.net_on(&c.name, "D") {
             nets.push(dnet.to_string());
@@ -21764,6 +22007,117 @@ mod tests {
             d.cells
         );
         assert_eq!(ide.step_state(FlowStep::Synthesis), StepState::Done);
+    }
+
+    #[test]
+    fn open_source_missing_file_surfaces_status_and_messages() {
+        let mut ide = IdeModel::new();
+        let p = std::env::temp_dir().join("helion-w5-no-such-source.sv");
+        let _ = std::fs::remove_file(&p);
+        let e = ide.open_source(&p).expect_err("missing RTL must fail");
+        assert!(!e.is_empty(), "open_source error text");
+        assert!(
+            ide.status.contains(&e) || ide.status.starts_with("open_source:"),
+            "status bar crumb: {}",
+            ide.status
+        );
+        assert!(
+            ide.messages.iter().any(|m| {
+                m.severity == MsgSeverity::Error && (m.text == e || m.text.contains(&e))
+            }),
+            "Messages must carry the Open error, not stay silent: {:?}",
+            ide.messages
+        );
+        assert_eq!(ide.bottom_tab, BottomTab::Messages);
+    }
+
+    #[test]
+    fn add_wave_accepts_hff_clock_net_and_real_port_names() {
+        let p = std::env::temp_dir().join("helion_w5_rng.vhd");
+        std::fs::write(
+            &p,
+            r#"
+entity rng is
+  port (
+    clock : in  std_logic;
+    Q     : out std_logic
+  );
+end entity;
+architecture rtl of rng is
+  signal s : std_logic := '0';
+begin
+  process (clock)
+  begin
+    if rising_edge(clock) then
+      s <= not s;
+    end if;
+  end process;
+  Q <= s;
+end architecture;
+"#,
+        )
+        .unwrap();
+        let mut ide = IdeModel::new();
+        let out = ide.open_source(&p).expect("synth rng.vhd");
+        let d = ide.design().expect("design after rng");
+        assert!(
+            d.cells.len() > 0,
+            "rng must map cells: {out} cells={:?}",
+            d.cells
+        );
+        let clk = IdeModel::hff_clock_net(d).unwrap_or_else(|| "clock".into());
+        assert_ne!(clk, "clk", "implicit clock is the HFF CLK net, not leftover clk");
+        let aw_clk = ide.exec("add_wave clock").expect("add_wave clock");
+        assert!(aw_clk.contains("add_wave clock"), "{aw_clk}");
+        let aw_q = ide.exec("add_wave Q").expect("add_wave Q");
+        assert!(aw_q.contains("add_wave Q"), "{aw_q}");
+        assert!(ide.wave.has_trace("clock"), "wave clock port");
+        assert!(ide.wave.has_trace("Q"), "wave Q port");
+        let clks = ide.clocks_for_sta();
+        assert!(
+            clks.iter().any(|c| c.name == "clock" || c.source == "clock"),
+            "STA implicit clock from HFF CLK net: {:?}",
+            clks.iter().map(|c| (&c.name, &c.source)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn adder4_vhdl_implement_has_luts() {
+        let p = std::env::temp_dir().join("helion_w5_adder4.vhd");
+        std::fs::write(
+            &p,
+            r#"
+entity adder4 is
+  port (
+    a0, a1, a2, a3 : in  std_logic;
+    b0, b1, b2, b3 : in  std_logic;
+    s0, s1, s2, s3 : out std_logic
+  );
+end entity;
+architecture rtl of adder4 is
+begin
+  s0 <= a0 xor b0;
+  s1 <= a1 xor b1;
+  s2 <= a2 xor b2;
+  s3 <= a3 xor b3;
+end architecture;
+"#,
+        )
+        .unwrap();
+        let mut ide = IdeModel::new();
+        ide.open_source(&p).expect("synth adder4.vhd");
+        ide.implement().expect("implement adder4");
+        let d = ide.design().expect("adder4 design");
+        let n_lut = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            n_lut > 0,
+            "adder4 implement must map LUTs: cells={:?}",
+            d.cells.iter().map(|c| format!("{}:{:?}", c.name, c.kind)).collect::<Vec<_>>()
+        );
     }
 
     /// The rail is a state machine over the real Session, not a row of lamps.
@@ -25725,6 +26079,38 @@ endmodule
         ide.schematic.set_viewport(900.0, 500.0);
         ide.schematic.zoom_at(0.5, 200.0, 150.0);
         assert!((ide.schematic.camera.zoom - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn hierarchy_ibex_drawing_stays_linear() {
+        let p = example("ysyx_ibex.sv");
+        let mut ide = IdeModel::new();
+        ide.open_source(&p).unwrap();
+        let n = ide.hierarchy.nodes.len();
+        assert!(
+            n >= 6000,
+            "ysyx_ibex HNF must keep the full core: nodes={n}"
+        );
+        let t0 = std::time::Instant::now();
+        let d = ide.hierarchy.drawing();
+        let layout_ms = t0.elapsed().as_millis();
+        assert!(
+            d.boxes.len() <= n + 8,
+            "hierarchy boxes must stay linear in nodes: boxes={} nodes={n}",
+            d.boxes.len()
+        );
+        assert!(
+            layout_ms < 1500,
+            "Ibex hierarchy layout took {layout_ms}ms"
+        );
+        let t1 = std::time::Instant::now();
+        let d2 = ide.hierarchy.drawing();
+        assert_eq!(d2.boxes.len(), d.boxes.len());
+        assert!(
+            t1.elapsed().as_millis() < 80,
+            "cached Ibex hierarchy drawing must be a hit, took {}ms",
+            t1.elapsed().as_millis()
+        );
     }
 
     /// Real flow: mark_debug → (re)implement → ila_arm on counter.sv (no bitstream-unchanged no-op).
