@@ -2700,14 +2700,37 @@ impl Default for Waveform {
 
 impl Waveform {
     pub fn bits_of(&self, name: &str) -> Option<String> {
+        // Default clock probe is literal "clk" (counter gold). Callers with an
+        // HFF CLK net use bits_of_clocked(..., implicit_clock_name()).
+        self.bits_of_clocked(name, "clk")
+    }
+
+    /// Posedge LED strip using the real clock trace name (no phantom "clk" dual-write).
+    pub fn bits_of_clocked(&self, name: &str, clk_name: &str) -> Option<String> {
         // Half-cycle clk grid records two samples per user cycle; LED gold /
         // UG900 bitstrings stay one bit per cycle (posedge / active-edge sample).
         if name == "led" {
-            if let (Some(clk), Some(led)) = (self.trace("clk"), self.trace("led")) {
-                if clk.samples.len() >= 2
-                    && clk.samples.len() % 2 == 0
-                    && led.samples.len() == clk.samples.len()
-                {
+            if let Some(s) = self.led_half_cycle_bits(clk_name) {
+                return Some(s);
+            }
+            if clk_name != "clk" {
+                if let Some(s) = self.led_half_cycle_bits("clk") {
+                    return Some(s);
+                }
+            }
+            // No dual-write: pair led with any equal-length digital clock-like trace.
+            if let Some(led) = self.trace("led") {
+                let paired = self.traces.iter().any(|t| {
+                    t.name != "led"
+                        && t.name != "cnt"
+                        && !t.name.starts_with("ila:")
+                        && t.style == WaveStyle::Digital
+                        && t.width <= 1
+                        && t.samples.len() >= 2
+                        && t.samples.len() % 2 == 0
+                        && t.samples.len() == led.samples.len()
+                });
+                if paired {
                     return Some(
                         led.samples
                             .iter()
@@ -2720,6 +2743,25 @@ impl Waveform {
             }
         }
         self.traces.iter().find(|t| t.name == name).map(|t| t.bit_string())
+    }
+
+    fn led_half_cycle_bits(&self, clk_name: &str) -> Option<String> {
+        let (clk, led) = (self.trace(clk_name)?, self.trace("led")?);
+        if clk.samples.len() >= 2
+            && clk.samples.len() % 2 == 0
+            && led.samples.len() == clk.samples.len()
+        {
+            Some(
+                led.samples
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .map(|v| if v & 1 == 1 { '1' } else { '0' })
+                    .collect(),
+            )
+        } else {
+            None
+        }
     }
 
     pub fn has_trace(&self, name: &str) -> bool {
@@ -17801,7 +17843,8 @@ impl IdeModel {
             .unwrap_or_else(|| "clk".into())
     }
 
-    /// Primary output port for Wave (`led` when present, else first Out).
+    /// Primary output for Wave: `led` port, else sim.led / IOB-driven net.
+    /// Never invent a name from the first PortDir::Out.
     fn primary_out_port(&self) -> String {
         let Some(d) = self.shell.session.design.as_ref() else {
             return "led".into();
@@ -17809,11 +17852,42 @@ impl IdeModel {
         if d.ports.iter().any(|p| p.name == "led") {
             return "led".into();
         }
-        d.ports
-            .iter()
-            .find(|p| p.dir == PortDir::Out)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "led".into())
+        // Prefer routed/packed IOB-driven net when present.
+        let iob_net = self
+            .shell
+            .session
+            .routed
+            .as_ref()
+            .and_then(|r| r.iob_src.first())
+            .map(|i| i.net.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| {
+                self.shell
+                    .session
+                    .placed
+                    .as_ref()
+                    .and_then(|p| p.packed.iobs.first())
+                    .map(|i| i.from_net.clone())
+                    .filter(|n| !n.is_empty())
+            })
+            .or_else(|| {
+                self.shell
+                    .session
+                    .packed
+                    .as_ref()
+                    .and_then(|p| p.iobs.first())
+                    .map(|i| i.from_net.clone())
+                    .filter(|n| !n.is_empty())
+            });
+        if let Some(net) = iob_net {
+            return net;
+        }
+        // Event/fabric sim always exposes the sim.led probe.
+        if self.event_sim.is_some() || self.fabric_sim.is_some() {
+            return "led".into();
+        }
+        // Require explicit led — do not silently take first Out.
+        "led".into()
     }
 
     /// Implicit analysis clock (no user SDC) is named after the Hff clock.
@@ -18286,15 +18360,19 @@ impl IdeModel {
     /// Properties / SimLog LED crumb: primary_out_port() then led fallback (same as cursor path).
     fn primary_out_bits_or_dash(&self) -> String {
         let out = self.primary_out_port();
+        let clk = self.implicit_clock_name();
         if out == "led" {
-            return self.wave.bits_of("led").unwrap_or_else(|| "-".into());
+            return self
+                .wave
+                .bits_of_clocked("led", &clk)
+                .unwrap_or_else(|| "-".into());
         }
         let s = self.wave_posedge_led_bits();
         if !s.is_empty() {
             return s;
         }
         self.wave
-            .bits_of("led")
+            .bits_of_clocked("led", &clk)
             .unwrap_or_else(|| "-".into())
     }
 
@@ -18352,11 +18430,6 @@ impl IdeModel {
 
         // Inactive half-cycle: clock low; output/cnt hold until the active edge.
         Self::push_sample(&mut self.wave, &clk_name, 0, 1, WaveStyle::Digital);
-        // Alias literal "clk" so Waveform::bits_of("led") half-cycle strip works when
-        // HFF CLK net ≠ "clk" (mirrors out_name≠led dual-write).
-        if clk_name != "clk" {
-            Self::push_sample(&mut self.wave, "clk", 0, 1, WaveStyle::Digital);
-        }
         Self::push_sample(&mut self.wave, &out_name, prev_led, 1, WaveStyle::Digital);
         if out_name != "led" && self.wave.has_trace("led") {
             Self::push_sample(&mut self.wave, "led", prev_led, 1, WaveStyle::Digital);
@@ -18371,9 +18444,6 @@ impl IdeModel {
 
         // Active edge sample: clock high; output/cnt update once per user cycle.
         Self::push_sample(&mut self.wave, &clk_name, 1, 1, WaveStyle::Digital);
-        if clk_name != "clk" {
-            Self::push_sample(&mut self.wave, "clk", 1, 1, WaveStyle::Digital);
-        }
         Self::push_sample(&mut self.wave, &out_name, u64::from(led), 1, WaveStyle::Digital);
         if out_name != "led" && self.wave.has_trace("led") {
             Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
