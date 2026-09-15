@@ -38,3 +38,5 @@ jobs:
           set -euo pipefail
           cargo run -q -p helion-gui --bin helion-ide -- --headless examples/counter.sv | tee gold.log
           grep -F 'WNS_PS=9640' gold.log
+      - name: release helion-ide
+        run: cargo check --release -p helion-gui --bin helion-ide
