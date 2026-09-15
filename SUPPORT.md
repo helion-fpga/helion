@@ -7,3 +7,7 @@
 - **Build:** `cargo test --workspace` then `helion-ide --headless examples/counter.sv` (expect `WNS_PS=9640`)
 
 We do not provide vendor-tool support (Vivado, Quartus, …).
+
+## Roadmap
+
+Planned releases 1.4 → 2.0: [`ROADMAP.md`](ROADMAP.md) and [milestones](https://github.com/helion-fpga/helion/milestones).

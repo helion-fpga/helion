@@ -4,6 +4,36 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [Unreleased]
+
+1.4 docs and roadmap (FM-HEL-14-W7 / FM-HEL-ROADMAP-2.0). Empty-XDC
+`examples/counter.sv` gold is unchanged (**WNS_PS=9640**). Soft-hold: not merged
+to `master`.
+
+### Added
+
+- [`ROADMAP.md`](ROADMAP.md) for 1.4 → 1.5 → 1.6 → 1.7 → 2.0, linked from README
+  and GitHub Pages ([roadmap.html](https://helion-fpga.github.io/helion/roadmap.html)).
+  Open milestones
+  [1.4](https://github.com/helion-fpga/helion/milestone/1) /
+  [1.5](https://github.com/helion-fpga/helion/milestone/2) /
+  [1.6](https://github.com/helion-fpga/helion/milestone/3) /
+  [1.7](https://github.com/helion-fpga/helion/milestone/4) /
+  [2.0](https://github.com/helion-fpga/helion/milestone/5).
+- Architecture / Use: `helion-sta::load_xdc` command list from
+  `crates/helion-sta/src/lib.rs` only, kept separate from Tcl Session CAD.
+- CI: Ubuntu and `macos-latest` jobs build/run `helion-ide --headless
+  examples/counter.sv` and **require** `WNS_PS=9640` (grep; no continue-on-error
+  on gold). Workspace tests may continue-on-error.
+
+### Changed
+
+- Public Pages nav and `llms.txt` point at the roadmap. Release notes keep a
+  standing Unreleased section (Keep a Changelog). Release notes excerpt links
+  ROADMAP.md.
+
+[unreleased]: https://github.com/helion-fpga/helion/compare/v1.3.0...HEAD
+
 ## [1.3.0] — 2026-09-10
 
 Pin-wrap suite, deep ILA, CDC methodology, Helion-ST/MM catalog, and hang-class

@@ -44,6 +44,7 @@
         <li><a href="#gold">Gold</a></li>
         <li><a href="#device-die">Device die</a></li>
         <li><a href="#tcl">Tcl Session</a></li>
+        <li><a href="#xdc">XDC (<code>load_xdc</code>)</a></li>
         <li><a href="#ip">IP packages</a></li>
         <li><a href="#ila">ILA</a></li>
         <li><a href="#program">Program / OFL</a></li>
@@ -177,6 +178,7 @@ cargo run -p helion-cli -- qor examples/counter.sv</code></pre>
 
       <h2 id="tcl">Tcl Session</h2>
       <p>
+        CAD Session, separate from <a href="#xdc">XDC <code>load_xdc</code></a>.
         The console in <code>helion-ide</code> and <code>helion-proj</code> run the
         real engines. Commands: <code>synth_design</code>, <code>opt_design</code>,
         <code>place_design</code>, <code>route_design</code>, <code>write_bitstream</code>,
@@ -186,6 +188,15 @@ cargo run -p helion-cli -- qor examples/counter.sv</code></pre>
         <code>program_hw</code>, <code>mark_debug</code>, <code>eco</code>,
         <code>write_checkpoint</code>, <code>report_die</code>.
         <code>.hckp</code> restore must reproduce the same bitstream hash.
+      </p>
+
+      <h2 id="xdc">XDC (<code>load_xdc</code>)</h2>
+      <p>
+        Constraint text is parsed by <code>load_xdc</code> in
+        <code>crates/helion-sta/src/lib.rs</code>. The command list (only those
+        first-token arms) lives on
+        <a href="architecture.html#xdc">Architecture</a>. Not a vendor constraint
+        product. Empty-XDC gold stays <span class="gold">WNS_PS=9640</span>.
       </p>
 
       <h2 id="ip">IP packages (<code>.helion</code>)</h2>
@@ -234,6 +245,7 @@ helion hw program --cable sim --bitstream out.hbits</code></pre>
       <p class="cta">
         <a class="btn" href="start.html">Build from source</a>
         <a class="btn ghost" href="architecture.html">Architecture</a>
+        <a class="btn ghost" href="roadmap.html">Roadmap</a>
       </p>
     </div>
   </main>

@@ -3,8 +3,11 @@
 Same shape as other public CAD trees: bump the version, write the notes, tag,
 push. GitHub Actions builds the artifacts and opens the GitHub Release.
 
-1. Edit `CHANGELOG.md`. Put a new `## [X.Y.Z] — YYYY-MM-DD` section at the top
-   (Keep a Changelog). Gold numbers in the notes must match `helion qor`.
+1. Edit `CHANGELOG.md`. Move items out of `## [Unreleased]` into a new
+   `## [X.Y.Z] — YYYY-MM-DD` section at the top (Keep a Changelog). Gold numbers
+   in the notes must match `helion qor`. Keep an empty Unreleased stub for the
+   next cycle. Align the release story with [`ROADMAP.md`](ROADMAP.md) and the
+   open [milestones](https://github.com/helion-fpga/helion/milestones).
 2. Set `workspace.package.version` in `Cargo.toml` to `X.Y.Z`.
 3. Set `CFBundleShortVersionString` and `CFBundleVersion` in
    `packaging/macos/Info.plist` to the same string.
