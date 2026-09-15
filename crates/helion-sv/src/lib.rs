@@ -713,13 +713,15 @@ fn packed_field_select_expr(p: &mut P, name: String) -> Result<RExpr, String> {
         Ok(hit) => hit,
         Err(_) => {
             // Hierarchical instance path `u_child.inner.port` is not a packed
-            // field. Take the last ident so the assign parses; unknown names
-            // stay assign_not_lowered at map, not generate_not_lowered.
-            let mut last = field;
+            // field. Keep the full path (dots) so a later rewrite can resolve
+            // it against the instance tree (port → connected net, internal →
+            // stitched `{inst}_{sig}`). Unknown last-idents used to stay
+            // assign_not_lowered at map.
+            let mut segs = vec![name, field];
             while p.eat_sym('.') {
-                last = p.ident()?;
+                segs.push(p.ident()?);
             }
-            return Ok(RExpr::Ident(last));
+            return Ok(RExpr::Ident(segs.join(".")));
         }
     };
     while p.eat_sym('.') {
@@ -3550,40 +3552,61 @@ fn parse_land(p: &mut P) -> Result<RExpr, String> {
     Ok(e)
 }
 
+/// Const-to-const compare. Care bit 0 is a don't-care pattern and must not fold.
+/// Used so generate localparam ternaries (`Width - k*DW >= DW ? DW : …`) harvest
+/// as Const (Ibex `prim_ram_1p_scr` LocalWidth) instead of generate_not_lowered.
+fn fold_const_cmp(a: &RExpr, b: &RExpr, pred: impl Fn(u128, u128) -> bool) -> Option<RExpr> {
+    match (a, b) {
+        (
+            RExpr::Const {
+                val: va, care: ca, ..
+            },
+            RExpr::Const {
+                val: vb, care: cb, ..
+            },
+        ) if *ca & 1 == 1 && *cb & 1 == 1 => Some(RExpr::Const {
+            val: u128::from(pred(*va, *vb)),
+            width: 1,
+            care: 1,
+        }),
+        _ => None,
+    }
+}
+
 fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
     let e = parse_shift(p)?;
     if matches!(p.peek(), Some(Tok::Eq)) {
         p.bump();
         let r = parse_shift(p)?;
-        if let (
-            RExpr::Const { val: a, care: ca, .. },
-            RExpr::Const { val: b, care: cb, .. },
-        ) = (&e, &r)
-        {
-            if *ca & 1 == 1 && *cb & 1 == 1 {
-                return Ok(RExpr::Const {
-                    val: if a == b { 1 } else { 0 },
-                    width: 1,
-                    care: 1,
-                });
-            }
+        if let Some(c) = fold_const_cmp(&e, &r, |a, b| a == b) {
+            return Ok(c);
         }
         return Ok(RExpr::Eq(Box::new(e), Box::new(r)));
     }
     if matches!(p.peek(), Some(Tok::Ne)) {
         p.bump();
-        return Ok(RExpr::Ne(Box::new(e), Box::new(parse_shift(p)?)));
+        let r = parse_shift(p)?;
+        if let Some(c) = fold_const_cmp(&e, &r, |a, b| a != b) {
+            return Ok(c);
+        }
+        return Ok(RExpr::Ne(Box::new(e), Box::new(r)));
     }
     // a <= b  ≡  !(b < a)
     if matches!(p.peek(), Some(Tok::Le)) {
         p.bump();
         let r = parse_shift(p)?;
+        if let Some(c) = fold_const_cmp(&e, &r, |a, b| a <= b) {
+            return Ok(c);
+        }
         return Ok(RExpr::Not(Box::new(RExpr::Lt(Box::new(r), Box::new(e)))));
     }
     // a >= b  ≡  !(a < b)
     if matches!(p.peek(), Some(Tok::Ge)) {
         p.bump();
         let r = parse_shift(p)?;
+        if let Some(c) = fold_const_cmp(&e, &r, |a, b| a >= b) {
+            return Ok(c);
+        }
         // Unsized `0` is signed in Verilog: `in >= 0` is ~MSB, not a 16-bit Lt.
         // Only a tracked signed decl and/or unsized `0` — not `8'd0` / `16'd0`.
         if let (RExpr::Ident(s), zero) = (&e, &r) {
@@ -3601,6 +3624,9 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
             return Ok(e);
         }
         let r = parse_shift(p)?;
+        if let Some(c) = fold_const_cmp(&e, &r, |a, b| a < b) {
+            return Ok(c);
+        }
         if let (RExpr::Ident(s), zero) = (&e, &r) {
             if ident_cmp_zero_signbit(p, s, zero) {
                 let w = p.widths.get(s).copied().unwrap_or(1).max(1);
@@ -3617,18 +3643,8 @@ fn parse_cmp(p: &mut P) -> Result<RExpr, String> {
     }
     if p.eat_sym('>') {
         let r = parse_shift(p)?;
-        if let (
-            RExpr::Const { val: a, care: ca, .. },
-            RExpr::Const { val: b, care: cb, .. },
-        ) = (&e, &r)
-        {
-            if ca & 1 == 1 && cb & 1 == 1 {
-                return Ok(RExpr::Const {
-                    val: if a > b { 1 } else { 0 },
-                    width: 1,
-                    care: 1,
-                });
-            }
+        if let Some(c) = fold_const_cmp(&e, &r, |a, b| a > b) {
+            return Ok(c);
         }
         // a > b  ≡  b < a
         return Ok(RExpr::Lt(Box::new(r), Box::new(e)));
@@ -4032,6 +4048,19 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
                     val = (val >> a) & 1;
                     width = 1;
                 }
+            }
+            // `32'(expr)` numeric size cast (Ibex `raddr_o = 32'(raddr_q)`).
+            // Value is the inner expr, same honesty as `int'(expr)` / `Width'(expr)`.
+            if matches!(p.peek(), Some(Tok::Sym('\'')))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Sym('(')))
+            {
+                p.bump();
+                p.bump();
+                let inner = parse_rexpr(p)?;
+                if !p.eat_sym(')') {
+                    return Err("cast )".into());
+                }
+                return Ok(inner);
             }
             Ok(RExpr::Const {
                 val,
@@ -13254,8 +13283,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     }
                     Err(_) => failed = true,
                 }
-            } else if depth > 1 {
+            } else if depth > 0 && *b < depth {
                 // `assign mem[word] = expr` — whole unpacked word, not packed bit 0.
+                // depth=1 (packed multi-dim `[0:0][W-1:0]`, Ibex `data_scr_nonce[k]`)
+                // is still a word, not packed bit 0 of the inner vector.
                 for i in 0..w.max(1).min(256) {
                     match rexpr_to_bit(rhs, rtl, i) {
                         Ok(e) => {
@@ -14016,6 +14047,135 @@ fn tree_has_rtl_body(
     false
 }
 
+/// Hierarchical `inst.signal` / `inst.child.port` kept as dotted Ident at parse.
+/// Resolve against the instance tree: a child port becomes the connected parent
+/// net; a child internal becomes the stitched `{inst}_{sig}` name (same prefix
+/// `stitch_child` applies). Not an instance → last ident (old unknown-name path).
+fn resolve_hier_path(
+    mods: &HashMap<String, Rtl>,
+    module: &str,
+    path: &[&str],
+) -> (String, usize) {
+    if path.is_empty() {
+        return ("hier".into(), 1);
+    }
+    if path.len() == 1 {
+        let w = mods.get(module).map(|r| sig_width(r, path[0])).unwrap_or(1);
+        return (path[0].to_string(), w.max(1));
+    }
+    let Some(rtl) = mods.get(module) else {
+        return (path[path.len() - 1].to_string(), 1);
+    };
+    let Some(inst) = rtl.insts.iter().find(|i| i.name == path[0]) else {
+        return (path[path.len() - 1].to_string(), 1);
+    };
+    let rest = &path[1..];
+    let child = mods.get(&inst.module);
+    if let Some(ch) = child {
+        if ch.insts.iter().any(|i| i.name == rest[0]) {
+            let (inner, w) = resolve_hier_path(mods, &inst.module, rest);
+            if let Some((_, net)) = inst.conns.iter().find(|(p, _)| p == &inner) {
+                return (net.clone(), sig_width(rtl, net).max(1));
+            }
+            return (format!("{}_{inner}", inst.name), w.max(1));
+        }
+    }
+    let sig = rest[0];
+    if rest.len() == 1 {
+        if let Some((_, net)) = inst.conns.iter().find(|(p, _)| p == sig) {
+            let w = child
+                .map(|c| sig_width(c, sig))
+                .unwrap_or_else(|| sig_width(rtl, net));
+            return (net.clone(), w.max(1));
+        }
+        let w = child.map(|c| sig_width(c, sig)).unwrap_or(1);
+        return (format!("{}_{sig}", inst.name), w.max(1));
+    }
+    let inner = rest.join("_");
+    let w = child.map(|c| sig_width(c, sig)).unwrap_or(1);
+    (format!("{}_{inner}", inst.name), w.max(1))
+}
+
+fn rewrite_hier_expr(
+    e: &RExpr,
+    mods: &HashMap<String, Rtl>,
+    module: &str,
+    taps: &mut Vec<(String, usize)>,
+) -> RExpr {
+    let mut rewrite_name = |s: &str| -> String {
+        if !s.contains('.') {
+            return s.to_string();
+        }
+        let path: Vec<&str> = s.split('.').collect();
+        let (n, w) = resolve_hier_path(mods, module, &path);
+        taps.push((n.clone(), w));
+        n
+    };
+    match e {
+        RExpr::Ident(s) => RExpr::Ident(rewrite_name(s)),
+        RExpr::Bit(s, i) => RExpr::Bit(rewrite_name(s), *i),
+        RExpr::Range(s, lo, hi) => RExpr::Range(rewrite_name(s), *lo, *hi),
+        RExpr::IndexPart {
+            name,
+            base,
+            width,
+            ascending,
+        } => RExpr::IndexPart {
+            name: rewrite_name(name),
+            base: Box::new(rewrite_hier_expr(base, mods, module, taps)),
+            width: *width,
+            ascending: *ascending,
+        },
+        other => map_rexpr_children(other, &mut |c| rewrite_hier_expr(c, mods, module, taps)),
+    }
+}
+
+fn rewrite_hier_in_mods(mods: &mut HashMap<String, Rtl>) {
+    let modules: Vec<String> = mods.keys().cloned().collect();
+    let mut pending: Vec<(
+        String,
+        Vec<(String, Option<usize>, RExpr)>,
+        Vec<(String, Option<usize>, RExpr)>,
+        Vec<(String, usize)>,
+    )> = Vec::new();
+    for module in modules {
+        let rtl = &mods[&module];
+        let mut taps = Vec::new();
+        let new_assigns: Vec<_> = rtl
+            .assigns
+            .iter()
+            .map(|(l, b, r)| (l.clone(), *b, rewrite_hier_expr(r, mods, &module, &mut taps)))
+            .collect();
+        let new_nbas: Vec<_> = rtl
+            .nbas
+            .iter()
+            .map(|(l, b, r)| (l.clone(), *b, rewrite_hier_expr(r, mods, &module, &mut taps)))
+            .collect();
+        pending.push((module, new_assigns, new_nbas, taps));
+    }
+    for (module, assigns, nbas, taps) in pending {
+        let Some(rtl) = mods.get_mut(&module) else {
+            continue;
+        };
+        rtl.assigns = assigns;
+        rtl.nbas = nbas;
+        for (n, w) in taps {
+            if rtl.signals.iter().any(|s| s.name == n) || rtl.ports.iter().any(|(p, _, _)| p == &n)
+            {
+                continue;
+            }
+            rtl.signals.push(Signal {
+                name: n,
+                width: w.max(1),
+                depth: 0,
+                keep: false,
+                mark_debug: false,
+                force_bram: false,
+            });
+        }
+    }
+}
+
 fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
     synth_from_parsed_top(mods, None, &HashMap::new())
 }
@@ -14025,7 +14185,8 @@ fn synth_from_parsed_top(
     top: Option<&str>,
     overrides: &HashMap<String, u128>,
 ) -> Result<Design, String> {
-    let map: HashMap<String, Rtl> = mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
+    let mut map: HashMap<String, Rtl> = mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
+    rewrite_hier_in_mods(&mut map);
     let instantiated: HashMap<String, ()> = mods
         .iter()
         .flat_map(|m| m.insts.iter().map(|i| (i.module.clone(), ())))
@@ -17567,6 +17728,127 @@ endmodule
     }
 
     #[test]
+    fn prim_ram_1p_scr_localwidth_generate_lowers() {
+        // Ibex prim_ram_1p_scr: localparam LocalWidth uses `>=` of params, then
+        // `bus[k*DW +: LocalWidth]`. Const-fold >= so the generate parses.
+        let src = r#"
+module prim_ram_1p_scr #(
+  parameter int Width = 32,
+  parameter int DiffWidth = 8
+) (
+  input  logic [Width-1:0] wdata_q,
+  input  logic [Width-1:0] keystream_repl,
+  output logic [Width-1:0] wdata_scr_d,
+  output logic [Width-1:0] rdata
+);
+  for (genvar k = 0; k < (Width + DiffWidth - 1) / DiffWidth; k++) begin : gen_diffuse_data
+    localparam int LocalWidth = (Width - k * DiffWidth >= DiffWidth) ? DiffWidth :
+                                                                       (Width - k * DiffWidth);
+    logic [LocalWidth-1:0] wdata_xor;
+    assign wdata_xor = wdata_q[k*DiffWidth +: LocalWidth] ^
+                       keystream_repl[k*DiffWidth +: LocalWidth];
+    assign wdata_scr_d[k*DiffWidth +: LocalWidth] = wdata_xor ^
+                       keystream_repl[k*DiffWidth +: LocalWidth];
+    assign rdata[k*DiffWidth +: LocalWidth] = wdata_xor ^
+                       keystream_repl[k*DiffWidth +: LocalWidth];
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "prim_ram_1p_scr.sv").expect("prim_ram_1p_scr");
+        assert_ne!(
+            d.attrs.get("GENERATE_NOT_LOWERED"),
+            Some("1"),
+            "LocalWidth >= generate must parse"
+        );
+        assert!(
+            !generate_not_lowered_for("prim_ram_1p_scr"),
+            "generate_not_lowered prim_ram_1p_scr must be gone"
+        );
+        assert!(
+            (0..32).all(|i| lut_driven(&d, &format!("rdata_{i}"))),
+            "diffuse slice XOR must drive every rdata bit"
+        );
+    }
+
+    #[test]
+    fn numeric_width_cast_is_not_generate() {
+        let src = r#"
+module ram_raddr(input logic [13:0] raddr_q, output logic [31:0] raddr_o);
+  assign raddr_o = 32'(raddr_q);
+endmodule
+"#;
+        let d = synth_sv(src, "ram_raddr.sv").expect("32' cast");
+        assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
+        assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
+    }
+
+    #[test]
+    fn hierarchical_instance_tap_lowers() {
+        // Ibex core: outstanding_load_id / new_nmi_int tap child internals
+        // (`id_stage_i.instr_executing`, `id_stage_i.controller_i.irq_nm_int`).
+        let src = r#"
+module controller(input logic x, output logic id_exception_o);
+  logic irq_nm_int;
+  assign irq_nm_int = x;
+  assign id_exception_o = x;
+endmodule
+module id_stage(input logic x, output logic lsu_we_o, output logic id_exception);
+  logic instr_executing;
+  logic lsu_req_dec;
+  logic lsu_we;
+  controller controller_i(.x(x), .id_exception_o(id_exception));
+  assign instr_executing = x;
+  assign lsu_req_dec = x;
+  assign lsu_we = x;
+  assign lsu_we_o = lsu_we;
+endmodule
+module ibex_core(
+  input  logic x,
+  input  logic nmi_mode,
+  output logic outstanding_load_id,
+  output logic outstanding_store_id,
+  output logic rvfi_id_done,
+  output logic rvfi_trap_id,
+  output logic new_nmi_int
+);
+  logic lsu_we_o;
+  logic id_exception;
+  id_stage id_stage_i(.x(x), .lsu_we_o(lsu_we_o), .id_exception(id_exception));
+  assign outstanding_load_id  = id_stage_i.instr_executing & id_stage_i.lsu_req_dec &
+                                ~id_stage_i.lsu_we;
+  assign outstanding_store_id = id_stage_i.instr_executing & id_stage_i.lsu_req_dec &
+                                id_stage_i.lsu_we;
+  assign rvfi_id_done = x | (id_stage_i.controller_i.irq_nm_int &
+                             id_stage_i.controller_i.id_exception_o);
+  assign rvfi_trap_id = id_stage_i.controller_i.id_exception_o & ~id_stage_i.lsu_we;
+  assign new_nmi_int = id_stage_i.controller_i.irq_nm_int & ~nmi_mode;
+endmodule
+"#;
+        let d = synth_sv(src, "hier_tap.sv").expect("hier tap");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "hierarchical instance taps must lower"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_core", "outstanding_load_id")
+                && !assign_not_lowered_named("ibex_core", "outstanding_store_id")
+                && !assign_not_lowered_named("ibex_core", "rvfi_id_done")
+                && !assign_not_lowered_named("ibex_core", "rvfi_trap_id")
+                && !assign_not_lowered_named("ibex_core", "new_nmi_int"),
+            "ibex_core hierarchical taps must not stay assign_not_lowered"
+        );
+        assert!(
+            lut_driven(&d, "outstanding_load_id")
+                && lut_driven(&d, "outstanding_store_id")
+                && lut_driven(&d, "new_nmi_int")
+                && lut_driven(&d, "rvfi_id_done")
+                && lut_driven(&d, "rvfi_trap_id"),
+            "hierarchical tap assigns must be LUTs"
+        );
+    }
+
+    #[test]
     fn icache_replication_and_way_generate_lowers() {
         let src = r#"
 package ibex_pkg;
@@ -18309,6 +18591,18 @@ endmodule
         assert!(
             !generate_not_lowered_for("prim_present"),
             "generate_not_lowered prim_present must be gone"
+        );
+        assert!(
+            !generate_not_lowered_for("prim_ram_1p_scr"),
+            "generate_not_lowered prim_ram_1p_scr must be gone"
+        );
+        assert!(
+            !assign_not_lowered_named("ibex_core", "outstanding_load_id")
+                && !assign_not_lowered_named("ibex_core", "outstanding_store_id")
+                && !assign_not_lowered_named("ibex_core", "rvfi_id_done")
+                && !assign_not_lowered_named("ibex_core", "rvfi_trap_id")
+                && !assign_not_lowered_named("ibex_core", "new_nmi_int"),
+            "ibex_core outstanding_* / rvfi_*_id / new_nmi_int must lower"
         );
     }
 
