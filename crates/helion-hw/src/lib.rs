@@ -2965,6 +2965,14 @@ mod tests {
         assert!(!bitstream_is_empty(&bits));
         let r = overlay_program_led(&dev, &bits, 16).expect("overlay");
         assert_eq!(r.led, COUNTER_OVERLAY_LED, "gold counter LED overlay {r:?}");
+        // Waveform proof: LED changes across cycles (not all-0 / all-1).
+        assert!(
+            r.led.contains('0') && r.led.contains('1'),
+            "blink waveform must include 0 and 1: {}",
+            r.led
+        );
+        assert_ne!(r.led, "0".repeat(r.led.len()), "LED must not be all-0");
+        assert_ne!(r.led, "1".repeat(r.led.len()), "LED must not be all-1");
         let line = r.summary_line();
         assert!(line.contains("overlay"), "{line}");
         assert!(
