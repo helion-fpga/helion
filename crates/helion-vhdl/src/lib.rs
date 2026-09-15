@@ -166,12 +166,15 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         components: Vec::new(),
         stmts: Vec::new(),
     };
+    // STA clocks come from the architecture emit will actually use
+    // (`arch_for` = last matching arch). Unioning every arch of an entity
+    // would let a non-selected sequential body force clock→clk on a selected
+    // arch that treats `clock` as data. child_clocks uses this same map.
     let mut entity_clocks: HashMap<String, HashSet<String>> = HashMap::new();
-    for a in &archs {
-        entity_clocks
-            .entry(a.of.to_ascii_lowercase())
-            .or_default()
-            .extend(sta_clocks_of(a));
+    for e in &entities {
+        if let Some(a) = arch_for(&e.name) {
+            entity_clocks.insert(e.name.to_ascii_lowercase(), sta_clocks_of(a));
+        }
     }
     let mut out = String::new();
     // Emit non-top entities with bodies first so hierarchy stitch finds them.
@@ -182,7 +185,10 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         let Some(a) = arch_for(&e.name) else {
             continue;
         };
-        let consts = bind_consts(&pkg_consts, e, a);
+        // Fold env (parse_arch) already saw pkg_consts. Do not dump package
+        // entries as localparam into hierarchical children — they collide
+        // with child ports/signals.
+        let consts = bind_consts(&pkg_consts, e, a, false);
         out.push_str(&emit_sv(
             e,
             a,
@@ -195,7 +201,8 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
     let arch = arch_for(&top.name)
         .or_else(|| archs.last())
         .unwrap_or(&dummy);
-    let consts = bind_consts(&pkg_consts, top, arch);
+    entity_clocks.insert(top.name.to_ascii_lowercase(), sta_clocks_of(arch));
+    let consts = bind_consts(&pkg_consts, top, arch, true);
     out.push_str(&emit_sv(
         top,
         arch,
@@ -207,8 +214,25 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn bind_consts(pkg: &HashMap<String, i64>, ent: &Entity, arch: &Arch) -> HashMap<String, i64> {
-    let mut consts = pkg.clone();
+/// Localparams to emit. Package consts stay in parse_arch's fold env; they
+/// are dumped as localparam only at top, and never when the name collides
+/// with a port or signal of this unit.
+fn bind_consts(
+    pkg: &HashMap<String, i64>,
+    ent: &Entity,
+    arch: &Arch,
+    include_pkg: bool,
+) -> HashMap<String, i64> {
+    let mut consts = HashMap::new();
+    if include_pkg {
+        let occupied = occupied_sv_names(ent, arch);
+        for (k, v) in pkg {
+            if occupied.contains(&k.to_ascii_lowercase()) {
+                continue;
+            }
+            consts.insert(k.clone(), *v);
+        }
+    }
     for (k, v) in &ent.generics {
         consts.entry(k.clone()).or_insert(*v);
     }
@@ -219,6 +243,17 @@ fn bind_consts(pkg: &HashMap<String, i64>, ent: &Entity, arch: &Arch) -> HashMap
         consts.insert(k.clone(), *v);
     }
     consts
+}
+
+fn occupied_sv_names(ent: &Entity, arch: &Arch) -> HashSet<String> {
+    let mut s = HashSet::new();
+    for (n, _, _) in &ent.ports {
+        s.insert(n.to_ascii_lowercase());
+    }
+    for (n, _) in &arch.signals {
+        s.insert(n.to_ascii_lowercase());
+    }
+    s
 }
 
 struct Unit {
@@ -3254,6 +3289,102 @@ end;
             rewrite_sta_clock_ident("posedge clk", &clk_only),
             "posedge clk"
         );
+    }
+
+    #[test]
+    fn vhdl_selected_arch_clocks_not_unioned() {
+        // Last arch (comb) treats `clock` as data. The non-selected sequential
+        // arch must not force clock→clk on the selected body or on child_clocks.
+        let src = r#"
+entity child is
+  port (clock : in std_logic; q : out std_logic);
+end;
+architecture seq of child is
+begin
+  process(clock)
+  begin
+    if rising_edge(clock) then
+      q <= '1';
+    end if;
+  end process;
+end;
+architecture comb of child is
+begin
+  q <= clock;
+end;
+entity top is
+  port (clock : in std_logic; q : out std_logic);
+end;
+architecture rtl of top is
+begin
+  u: child port map (clock => clock, q => q);
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        assert!(
+            sv.contains("input logic clock"),
+            "selected comb arch keeps data port clock: {sv}"
+        );
+        assert!(
+            !sv.contains("input logic clk"),
+            "non-selected seq arch must not force clock→clk: {sv}"
+        );
+        assert!(
+            sv.contains(".clock(clock)"),
+            "child_clocks must follow selected arch, not union: {sv}"
+        );
+        assert!(
+            !sv.contains(".clk("),
+            "instance port must not be renamed from non-selected arch: {sv}"
+        );
+        assert!(
+            sv.contains("q = clock") || sv.contains("q=clock"),
+            "selected body treats clock as data: {sv}"
+        );
+    }
+
+    #[test]
+    fn vhdl_package_const_not_dumped_into_child() {
+        // Package consts fold at parse; they must not become localparam in
+        // every hierarchical child (names collide with child ports/signals).
+        // Top may still emit unused package params that do not collide.
+        let src = r#"
+package p is
+  constant WIDTH : integer := 1;
+  constant a : integer := 0;
+end;
+entity child is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of child is
+begin
+  y <= a;
+end;
+entity wrap is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of wrap is
+begin
+  u: child port map (a => a, y => y);
+end;
+"#;
+        let sv = vhdl_to_sv(src).expect("sv");
+        let child = sv.split("module wrap").next().unwrap_or(&sv);
+        assert!(child.contains("module child"), "{sv}");
+        assert!(
+            !child.contains("localparam"),
+            "package consts must not dump into hierarchical child: {child}"
+        );
+        assert!(
+            !sv.contains("localparam a"),
+            "package name a must not collide with port a: {sv}"
+        );
+        assert!(
+            sv.contains("localparam WIDTH = 1"),
+            "top-only package params still emit: {sv}"
+        );
+        let d = synth_vhdl(src).expect("hier");
+        assert!(d.ports.iter().any(|p| p.name == "y"), "{:?}", d.ports);
     }
 
     #[test]
