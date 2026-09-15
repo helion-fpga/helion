@@ -8688,17 +8688,101 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
     walk(e, &mut vars, &mut budget, n)
 }
 
-/// Map a >6-PI cone to a LUT2 tree. Output net is the function of `aig`.
-/// PI<=6 stays on the single-LUT6 path so gold INIT patterns do not move.
-/// Caller must refuse `wide_aig_over_cap` before calling; this does not invent
-/// a partial cone past the and/PI cap.
+/// LUT6 identity: same INIT + pin nets → one cell. Intermediates (`out=None`)
+/// share; a required output net always gets its own driver (no pin alias).
+struct LutShare {
+    by_fn: HashMap<(u64, Vec<String>), String>,
+    n: usize,
+}
+
+impl LutShare {
+    fn new() -> Self {
+        Self {
+            by_fn: HashMap::new(),
+            n: 0,
+        }
+    }
+
+    fn lut6(
+        &mut self,
+        d: &mut Design,
+        prefix: &str,
+        out: Option<&str>,
+        init: u64,
+        pins: &[String],
+    ) -> String {
+        let key = (init, pins.to_vec());
+        if out.is_none() {
+            if let Some(existing) = self.by_fn.get(&key) {
+                return existing.clone();
+            }
+        }
+        let cell = format!("{prefix}s{}", self.n);
+        let net = match out {
+            Some(o) => o.to_string(),
+            None => format!("{prefix}n{}", self.n),
+        };
+        self.n += 1;
+        d.add_cell(&cell, CellKind::Lut6 { init });
+        d.connect(&net, &cell, "O");
+        for (i, p) in pins.iter().enumerate() {
+            d.connect(p, &cell, format!("I{i}"));
+        }
+        self.by_fn.entry(key).or_insert_with(|| net.clone());
+        net
+    }
+
+    fn lut6_from_expr(
+        &mut self,
+        d: &mut Design,
+        prefix: &str,
+        out: Option<&str>,
+        expr: &Expr,
+    ) -> Option<String> {
+        let (init, pis) = lut6_from_bool_cone(expr)?;
+        Some(self.lut6(d, prefix, out, init, &pis))
+    }
+}
+
+fn lut6_and_n(k: usize) -> u64 {
+    if k == 0 {
+        return u64::MAX;
+    }
+    let k = k.min(6);
+    let used = (1u64 << k) - 1;
+    let mut init = 0u64;
+    for addr in 0..64u64 {
+        if (addr & used) == used {
+            init |= 1u64 << addr;
+        }
+    }
+    init
+}
+
+fn expr_and_chain(leaves: &[&Expr]) -> Option<Expr> {
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut acc = leaves[0].clone();
+    for leaf in &leaves[1..] {
+        acc = Expr::And(Box::new(acc), Box::new((*leaf).clone()));
+    }
+    Some(acc)
+}
 
 /// AND-tree of small bit-predicates (packed `a == b`, `(a&m)==b`, …) as a LUT
 /// reduction. Each And-leaf must fit one LUT6; the tree avoids one 64-PI AIG
 /// that would hit wide_cone_cap. Returns the output net, or None.
 /// Also maps `!=` as Not(And-of-XNORs) and And-mixes of eq/ne/small leaves
 /// (Ibex bus `sim_en` / address decode).
-fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
+/// XNOR leaves that share a 6-PI budget pack into one LUT6 (3×2-input XNORs).
+fn try_map_xnor_and_tree(
+    d: &mut Design,
+    expr: &Expr,
+    prefix: &str,
+    out: Option<&str>,
+    share: &mut LutShare,
+) -> Option<String> {
     fn is_xnor_leaf(e: &Expr) -> bool {
         matches!(e, Expr::Not(inner) if matches!(inner.as_ref(), Expr::Xor(_, _)))
     }
@@ -8723,13 +8807,20 @@ fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<St
             other => out.push(other),
         }
     }
-    fn emit_and_reduce(d: &mut Design, prefix: &str, n: &mut usize, mut level: Vec<String>) -> Option<String> {
+    fn emit_and_reduce(
+        d: &mut Design,
+        prefix: &str,
+        share: &mut LutShare,
+        out: Option<&str>,
+        mut level: Vec<String>,
+    ) -> Option<String> {
         if level.is_empty() {
             return None;
         }
         while level.len() > 1 {
             let mut next = Vec::new();
             let mut i = 0usize;
+            let last_round = (level.len() + 5) / 6 == 1;
             while i < level.len() {
                 let chunk = &level[i..level.len().min(i + 6)];
                 i += chunk.len();
@@ -8737,82 +8828,88 @@ fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<St
                     next.push(chunk[0].clone());
                     continue;
                 }
-                let cell = format!("{prefix}and{n}");
-                let net = format!("{prefix}andn{n}");
-                *n += 1;
-                let k = chunk.len();
-                let mut init = 0u64;
-                let used = (1u64 << k) - 1;
-                for idx in 0..64u64 {
-                    if (idx & used) == used && (idx >> k) == 0 {
-                        init |= 1u64 << idx;
-                    }
-                }
-                d.add_cell(&cell, CellKind::Lut6 { init });
-                d.connect(&net, &cell, "O");
-                for (pin, src) in chunk.iter().enumerate() {
-                    d.connect(src, &cell, format!("I{pin}"));
-                }
-                next.push(net);
+                let drive = if last_round && i >= level.len() {
+                    out
+                } else {
+                    None
+                };
+                let pins: Vec<String> = chunk.to_vec();
+                next.push(share.lut6(d, prefix, drive, lut6_and_n(pins.len()), &pins));
             }
             level = next;
         }
-        Some(level.pop().unwrap())
+        let net = level.pop().unwrap();
+        if let Some(o) = out {
+            if net != o {
+                return Some(share.lut6(d, prefix, Some(o), lut6_buf(), &[net]));
+            }
+        }
+        Some(net)
     }
     fn map_xnor_leaves(
         d: &mut Design,
         prefix: &str,
-        n: &mut usize,
+        share: &mut LutShare,
+        out: Option<&str>,
         xnors: &[&Expr],
     ) -> Option<String> {
         if xnors.is_empty() || xnors.len() > 128 {
             return None;
         }
         let mut level = Vec::new();
-        for leaf in xnors {
-            let (init, pis) = lut6_from_bool_cone(leaf)?;
-            let cell = format!("{prefix}eq{n}");
-            let net = format!("{prefix}eqn{n}");
-            *n += 1;
-            d.add_cell(&cell, CellKind::Lut6 { init });
-            d.connect(&net, &cell, "O");
-            for (pin, pi) in pis.iter().enumerate() {
-                d.connect(pi, &cell, format!("I{pin}"));
+        let mut i = 0usize;
+        while i < xnors.len() {
+            let mut chunk: Vec<&Expr> = vec![xnors[i]];
+            let mut pis = lut6_from_bool_cone(xnors[i])?.1;
+            i += 1;
+            while i < xnors.len() {
+                let extra = lut6_from_bool_cone(xnors[i])?.1;
+                let mut merged = pis.clone();
+                for p in &extra {
+                    if !merged.iter().any(|m| m == p) {
+                        merged.push(p.clone());
+                    }
+                }
+                if merged.len() > 6 {
+                    break;
+                }
+                chunk.push(xnors[i]);
+                pis = merged;
+                i += 1;
             }
-            level.push(net);
+            let expr = expr_and_chain(&chunk)?;
+            let (init, pins) = lut6_from_bool_cone(&expr)?;
+            // Sole packed leaf can drive `out` — skip a buffer LUT.
+            let drive = if i >= xnors.len() && level.is_empty() {
+                out
+            } else {
+                None
+            };
+            level.push(share.lut6(d, prefix, drive, init, &pins));
         }
-        emit_and_reduce(d, prefix, n, level)
+        emit_and_reduce(d, prefix, share, out, level)
     }
-    fn map_one_leaf(d: &mut Design, prefix: &str, n: &mut usize, leaf: &Expr) -> Option<String> {
+    fn map_one_leaf(
+        d: &mut Design,
+        prefix: &str,
+        share: &mut LutShare,
+        out: Option<&str>,
+        leaf: &Expr,
+    ) -> Option<String> {
         // `!=` → Not(And-of-XNORs)
         if let Expr::Not(inner) = leaf {
             let mut xnors = Vec::new();
             if collect_xnor_and(inner, &mut xnors) && !xnors.is_empty() {
-                let eq = map_xnor_leaves(d, prefix, n, &xnors)?;
-                let cell = format!("{prefix}ne{n}");
-                let net = format!("{prefix}nen{n}");
-                *n += 1;
-                d.add_cell(&cell, CellKind::Lut6 { init: lut6_inv() });
-                d.connect(&eq, &cell, "I0");
-                d.connect(&net, &cell, "O");
-                return Some(net);
+                let eq = map_xnor_leaves(d, prefix, share, None, &xnors)?;
+                return Some(share.lut6(d, prefix, out, lut6_inv(), &[eq]));
             }
         }
         // Nested And-of-XNORs as one leaf of a wider And.
         let mut xnors = Vec::new();
         if collect_xnor_and(leaf, &mut xnors) && xnors.len() >= 2 {
-            return map_xnor_leaves(d, prefix, n, &xnors);
+            return map_xnor_leaves(d, prefix, share, out, &xnors);
         }
-        let (init, pis) = lut6_from_bool_cone(leaf)?;
-        let cell = format!("{prefix}eq{n}");
-        let net = format!("{prefix}eqn{n}");
-        *n += 1;
-        d.add_cell(&cell, CellKind::Lut6 { init });
-        d.connect(&net, &cell, "O");
-        for (pin, pi) in pis.iter().enumerate() {
-            d.connect(pi, &cell, format!("I{pin}"));
-        }
-        Some(net)
+        share.lut6_from_expr(d, prefix, out, leaf)
     }
 
     // Whole expr is a lone Ne / eq tree.
@@ -8820,14 +8917,12 @@ fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<St
         let mut xnors = Vec::new();
         if let Expr::Not(inner) = expr {
             if collect_xnor_and(inner, &mut xnors) && !xnors.is_empty() {
-                let mut n = 0usize;
-                return map_one_leaf(d, prefix, &mut n, expr);
+                return map_one_leaf(d, prefix, share, out, expr);
             }
         }
         xnors.clear();
         if collect_xnor_and(expr, &mut xnors) && xnors.len() >= 2 {
-            let mut n = 0usize;
-            return map_xnor_leaves(d, prefix, &mut n, &xnors);
+            return map_xnor_leaves(d, prefix, share, out, &xnors);
         }
     }
 
@@ -8850,12 +8945,11 @@ fn try_map_xnor_and_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<St
     if !looks_eq {
         return None;
     }
-    let mut n = 0usize;
     let mut level = Vec::new();
     for leaf in &leaves {
-        level.push(map_one_leaf(d, prefix, &mut n, leaf)?);
+        level.push(map_one_leaf(d, prefix, share, None, leaf)?);
     }
-    emit_and_reduce(d, prefix, &mut n, level)
+    emit_and_reduce(d, prefix, share, out, level)
 }
 
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
@@ -8944,139 +9038,414 @@ fn ite_tree_is_case_of_const(e: &Expr) -> bool {
 
 /// `c ? t : f` encoded as Or(And(c,t), And(Not(c),f)) with const/ITE arms —
 /// Ibex bus `device_sel_req` if/else decode. Map cond via eq/ne reduce.
-fn try_map_ite_const_tree(d: &mut Design, expr: &Expr, prefix: &str) -> Option<String> {
+///
+/// Density: ≤6-PI trees (const-ROM or Ident arms) collapse to one LUT6.
+/// Wider trees expand, but Ident/const arms are pins — not identity LUTs —
+/// and identical (INIT, pins) share. Do not skip >6-PI Ident muxes (that
+/// stripped ~77k cells vs ITE-era mapping).
+fn try_map_ite_const_tree(
+    d: &mut Design,
+    expr: &Expr,
+    prefix: &str,
+    out: Option<&str>,
+    share: &mut LutShare,
+) -> Option<String> {
     // Hang-class sha256_k: case-of-const ≤6-PI → one LUT6 ROM. Expanding a
-    // 64-arm const case into mux LUTs was 84k cells / ~45s. Ibex wire/ITE
-    // muxes (Ident arms) must NOT collapse here — that stripped ~77k cells
-    // vs bc3449f ITE-era density; expand the mux tree instead.
+    // 64-arm const case into mux LUTs was 84k cells / ~45s.
     if ite_tree_is_case_of_const(expr) {
-        if let Some((init, pis)) = lut6_from_bool_cone(expr) {
-            let cell = format!("{prefix}rom");
-            let net = format!("{prefix}rom_n");
-            d.add_cell(&cell, CellKind::Lut6 { init });
-            d.connect(&net, &cell, "O");
-            for (pin, pi) in pis.iter().enumerate() {
-                d.connect(pi, &cell, format!("I{pin}"));
+        if let Some(net) = share.lut6_from_expr(d, prefix, out, expr) {
+            return Some(net);
+        }
+    }
+    // Ident-arm muxes with ≤6 PIs are one LUT6 (honest collapse). Failure
+    // (7th PI) falls through to expansion — never drop the cone.
+    if !cone_pi_exceeds(expr, 6) {
+        if let Some(net) = share.lut6_from_expr(d, prefix, out, expr) {
+            return Some(net);
+        }
+    }
+
+    enum MuxSrc {
+        Const(bool),
+        Wire { name: String, inv: bool },
+        Ite(Box<MuxSrc>, Box<MuxSrc>, Box<MuxSrc>),
+    }
+
+    fn negate_mux(s: MuxSrc) -> MuxSrc {
+        match s {
+            MuxSrc::Const(v) => MuxSrc::Const(!v),
+            MuxSrc::Wire { name, inv } => MuxSrc::Wire { name, inv: !inv },
+            MuxSrc::Ite(c, t, f) => MuxSrc::Ite(c, Box::new(negate_mux(*t)), Box::new(negate_mux(*f))),
+        }
+    }
+
+    fn mux_wires(s: &MuxSrc, out: &mut Vec<String>) {
+        match s {
+            MuxSrc::Const(_) => {}
+            MuxSrc::Wire { name, .. } => {
+                if !out.iter().any(|n| n == name) {
+                    out.push(name.clone());
+                }
             }
-            return Some(net);
+            MuxSrc::Ite(c, t, f) => {
+                mux_wires(c, out);
+                mux_wires(t, out);
+                mux_wires(f, out);
+            }
         }
     }
-    fn map_arm(d: &mut Design, e: &Expr, prefix: &str, n: &mut usize) -> Option<String> {
-        if let Expr::Const(v) = e {
-            let cell = format!("{prefix}k{n}");
-            let net = format!("{prefix}kn{n}");
-            *n += 1;
-            d.add_cell(&cell, CellKind::Lut6 { init: lut6_const(*v) });
-            d.connect(&net, &cell, "O");
-            return Some(net);
-        }
-        if let Some(net) = try_map_ite_const_tree(d, e, &format!("{prefix}i{n}_")) {
-            *n += 1;
-            return Some(net);
-        }
-        if let Some(net) = try_map_xnor_and_tree(d, e, &format!("{prefix}e{n}_")) {
-            *n += 1;
-            return Some(net);
-        }
-        let (init, pis) = lut6_from_bool_cone(e)?;
-        let cell = format!("{prefix}a{n}");
-        let net = format!("{prefix}an{n}");
-        *n += 1;
-        d.add_cell(&cell, CellKind::Lut6 { init });
-        d.connect(&net, &cell, "O");
-        for (pin, pi) in pis.iter().enumerate() {
-            d.connect(pi, &cell, format!("I{pin}"));
-        }
-        Some(net)
-    }
-    let (c, t, f) = match_ite_expr(expr)?;
-    let mut n = 0usize;
-    let c_net = map_arm(d, c, prefix, &mut n)?;
-    let t_net = map_arm(d, t, prefix, &mut n)?;
-    let f_net = map_arm(d, f, prefix, &mut n)?;
-    // O = c ? t : f  with I0=c I1=t I2=f → bits where (idx&1)!=0 ? t : f
-    // init[idx] = if idx&1 { (idx>>1)&1 } else { (idx>>2)&1 } for 3 inputs
-    let mut init = 0u64;
-    for idx in 0..8u64 {
-        let cbit = idx & 1;
-        let tbit = (idx >> 1) & 1;
-        let fbit = (idx >> 2) & 1;
-        let o = if cbit != 0 { tbit } else { fbit };
-        if o != 0 {
-            init |= 1u64 << idx;
+
+    fn mux_eval(s: &MuxSrc, env: &HashMap<String, bool>) -> Option<bool> {
+        match s {
+            MuxSrc::Const(v) => Some(*v),
+            MuxSrc::Wire { name, inv } => env.get(name).map(|b| *b ^ *inv),
+            MuxSrc::Ite(c, t, f) => {
+                if mux_eval(c, env)? {
+                    mux_eval(t, env)
+                } else {
+                    mux_eval(f, env)
+                }
+            }
         }
     }
-    let cell = format!("{prefix}mx{n}");
-    let net = format!("{prefix}mxn{n}");
-    d.add_cell(&cell, CellKind::Lut6 { init });
-    d.connect(&net, &cell, "O");
-    d.connect(&c_net, &cell, "I0");
-    d.connect(&t_net, &cell, "I1");
-    d.connect(&f_net, &cell, "I2");
-    Some(net)
+
+    fn lower_mux(
+        d: &mut Design,
+        e: &Expr,
+        prefix: &str,
+        share: &mut LutShare,
+        depth: usize,
+    ) -> Option<MuxSrc> {
+        if depth > 256 {
+            return None;
+        }
+        match e {
+            Expr::Const(v) => Some(MuxSrc::Const(*v)),
+            Expr::Var(name) => Some(MuxSrc::Wire {
+                name: name.clone(),
+                inv: false,
+            }),
+            Expr::Not(x) => Some(negate_mux(lower_mux(d, x, prefix, share, depth + 1)?)),
+            other => {
+                if let Some((c, t, f)) = match_ite_expr(other) {
+                    let c = lower_mux(d, c, prefix, share, depth + 1)?;
+                    let t = lower_mux(d, t, prefix, share, depth + 1)?;
+                    let f = lower_mux(d, f, prefix, share, depth + 1)?;
+                    return Some(MuxSrc::Ite(Box::new(c), Box::new(t), Box::new(f)));
+                }
+                if let Some(net) = try_map_xnor_and_tree(d, other, prefix, None, share) {
+                    return Some(MuxSrc::Wire {
+                        name: net,
+                        inv: false,
+                    });
+                }
+                if !cone_pi_exceeds(other, 6) {
+                    let net = share.lut6_from_expr(d, prefix, None, other)?;
+                    return Some(MuxSrc::Wire {
+                        name: net,
+                        inv: false,
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    fn emit_mux(
+        d: &mut Design,
+        share: &mut LutShare,
+        prefix: &str,
+        out: Option<&str>,
+        src: &MuxSrc,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 256 {
+            return None;
+        }
+        match src {
+            MuxSrc::Const(v) => Some(share.lut6(d, prefix, out, lut6_const(*v), &[])),
+            MuxSrc::Wire { name, inv } => {
+                if *inv {
+                    Some(share.lut6(d, prefix, out, lut6_inv(), &[name.clone()]))
+                } else if let Some(o) = out {
+                    if o == name.as_str() {
+                        Some(name.clone())
+                    } else {
+                        Some(share.lut6(d, prefix, Some(o), lut6_buf(), &[name.clone()]))
+                    }
+                } else {
+                    Some(name.clone())
+                }
+            }
+            MuxSrc::Ite(c, t, f) => {
+                let mut wires = Vec::new();
+                mux_wires(src, &mut wires);
+                if wires.len() <= 6 {
+                    let mut init = 0u64;
+                    for addr in 0..64u64 {
+                        let mut env = HashMap::new();
+                        for (i, w) in wires.iter().enumerate() {
+                            env.insert(w.clone(), (addr >> i) & 1 == 1);
+                        }
+                        if mux_eval(src, &env)? {
+                            init |= 1u64 << addr;
+                        }
+                    }
+                    return Some(share.lut6(d, prefix, out, init, &wires));
+                }
+                // Too many PIs: emit nested ITE children, keep Ident/const as pins.
+                fn force_arm(
+                    d: &mut Design,
+                    share: &mut LutShare,
+                    prefix: &str,
+                    s: &MuxSrc,
+                    depth: usize,
+                ) -> Option<(Option<String>, bool, Option<bool>)> {
+                    match s {
+                        MuxSrc::Const(v) => Some((None, false, Some(*v))),
+                        MuxSrc::Wire { name, inv } => {
+                            Some((Some(name.clone()), *inv, None))
+                        }
+                        MuxSrc::Ite(..) => {
+                            let n = emit_mux(d, share, prefix, None, s, depth)?;
+                            Some((Some(n), false, None))
+                        }
+                    }
+                }
+                let (c_n, c_inv, c_k) = force_arm(d, share, prefix, c, depth + 1)?;
+                let (t_n, t_inv, t_k) = force_arm(d, share, prefix, t, depth + 1)?;
+                let (f_n, f_inv, f_k) = force_arm(d, share, prefix, f, depth + 1)?;
+                let mut pins = Vec::new();
+                for n in [&c_n, &t_n, &f_n] {
+                    if let Some(name) = n {
+                        if !pins.iter().any(|p| p == name) {
+                            pins.push(name.clone());
+                        }
+                    }
+                }
+                let bit_of = |name: &Option<String>, inv: bool, k: Option<bool>, addr: u64| -> bool {
+                    if let Some(v) = k {
+                        return v;
+                    }
+                    let Some(nm) = name else {
+                        return false;
+                    };
+                    let i = pins.iter().position(|p| p == nm).unwrap_or(0);
+                    let v = (addr >> i) & 1 == 1;
+                    v ^ inv
+                };
+                let mut init = 0u64;
+                for addr in 0..64u64 {
+                    let cv = bit_of(&c_n, c_inv, c_k, addr);
+                    let tv = bit_of(&t_n, t_inv, t_k, addr);
+                    let fv = bit_of(&f_n, f_inv, f_k, addr);
+                    if if cv { tv } else { fv } {
+                        init |= 1u64 << addr;
+                    }
+                }
+                Some(share.lut6(d, prefix, out, init, &pins))
+            }
+        }
+    }
+
+    let src = lower_mux(d, expr, prefix, share, 0)?;
+    emit_mux(d, share, prefix, out, &src, 0)
 }
 
-fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str) -> String {
-    use std::collections::HashMap;
-    let mut node_net: HashMap<u32, String> = HashMap::new();
-    let mut n_lut = 0usize;
-    fn emit_lut(d: &mut Design, prefix: &str, n_lut: &mut usize, init: u64, ins: &[(&str, &str)]) -> String {
+/// Map a >6-PI cone to packed LUT6 ANDs. Inverters fold into INIT; fanout-1
+/// AND nodes absorb into the parent (up to 6 inputs). PI≤6 stays on the
+/// single-LUT6 path so gold INIT patterns do not move.
+/// Caller must refuse `wide_aig_over_cap` before calling; this does not invent
+/// a partial cone past the and/PI cap.
+fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> String {
+    let n_pi = aig.pis.len();
+    let n_and = aig.ands.len();
+    let mut fo = vec![0u32; n_and];
+    let mut bump = |lit: Lit| {
+        if lit.node == 0 {
+            return;
+        }
+        if (lit.node as usize) <= n_pi {
+            return;
+        }
+        let ai = (lit.node as usize) - 1 - n_pi;
+        if ai < fo.len() {
+            fo[ai] = fo[ai].saturating_add(1);
+        }
+    };
+    for &(a, b) in &aig.ands {
+        bump(a);
+        bump(b);
+    }
+    bump(aig.output);
+
+    fn lut6_and_invs(invs: &[bool]) -> u64 {
+        let k = invs.len().min(6);
+        if k == 0 {
+            return u64::MAX;
+        }
+        let mut init = 0u64;
+        for addr in 0..64u64 {
+            let mut ok = true;
+            for (i, inv) in invs.iter().take(k).enumerate() {
+                let bit = (addr >> i) & 1 == 1;
+                if bit == *inv {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                init |= 1u64 << addr;
+            }
+        }
+        init
+    }
+
+    fn emit_and(
+        d: &mut Design,
+        prefix: &str,
+        n_lut: &mut usize,
+        pins: &[String],
+        invs: &[bool],
+        o_inv: bool,
+        out_net: Option<&str>,
+    ) -> String {
         let cell = format!("{prefix}l{n_lut}");
-        let out = format!("{prefix}n{n_lut}");
+        let out = match out_net {
+            Some(n) => n.to_string(),
+            None => format!("{prefix}n{n_lut}"),
+        };
         *n_lut += 1;
+        let mut init = lut6_and_invs(invs);
+        if o_inv {
+            init = !init;
+        }
         d.add_cell(&cell, CellKind::Lut6 { init });
         d.connect(&out, &cell, "O");
-        for (net, pin) in ins {
-            d.connect(*net, &cell, *pin);
+        for (i, p) in pins.iter().enumerate() {
+            d.connect(p, &cell, format!("I{i}"));
         }
         out
     }
-    fn lit_net(
-        d: &mut Design,
+
+    fn flatten_and(
         aig: &Aig,
         lit: Lit,
-        prefix: &str,
-        n_lut: &mut usize,
-        node_net: &mut HashMap<u32, String>,
-    ) -> String {
-        let n = node_true(d, aig, lit.node, prefix, n_lut, node_net);
-        if !lit.inv {
-            return n;
+        fo: &[u32],
+        n_pi: usize,
+        leaves: &mut Vec<Lit>,
+        const0: &mut bool,
+    ) {
+        if *const0 {
+            return;
         }
-        emit_lut(d, prefix, n_lut, lut6_inv(), &[(&n, "I0")])
+        if lit.node == 0 {
+            if !lit.inv {
+                *const0 = true;
+            }
+            return;
+        }
+        if (lit.node as usize) <= n_pi {
+            leaves.push(lit);
+            return;
+        }
+        let ai = (lit.node as usize) - 1 - n_pi;
+        if lit.inv || fo.get(ai).copied().unwrap_or(0) > 1 {
+            leaves.push(lit);
+            return;
+        }
+        let (a, b) = aig.ands[ai];
+        flatten_and(aig, a, fo, n_pi, leaves, const0);
+        flatten_and(aig, b, fo, n_pi, leaves, const0);
     }
-    fn node_true(
-        d: &mut Design,
-        aig: &Aig,
-        node: u32,
-        prefix: &str,
-        n_lut: &mut usize,
-        node_net: &mut HashMap<u32, String>,
-    ) -> String {
-        if node == 0 {
-            return emit_lut(d, prefix, n_lut, lut6_const(false), &[]);
-        }
+
+    fn net_of(aig: &Aig, node: u32, node_net: &HashMap<u32, String>) -> String {
         if (node as usize) <= aig.pis.len() {
             return aig.pis[(node as usize) - 1].clone();
         }
-        if let Some(n) = node_net.get(&node) {
-            return n.clone();
-        }
-        let ai = (node as usize) - 1 - aig.pis.len();
-        let (a, b) = aig.ands[ai];
-        let na = lit_net(d, aig, a, prefix, n_lut, node_net);
-        let nb = lit_net(d, aig, b, prefix, n_lut, node_net);
-        let out = emit_lut(
-            d,
-            prefix,
-            n_lut,
-            lut6_and2(false, false, false),
-            &[(&na, "I0"), (&nb, "I1")],
-        );
-        node_net.insert(node, out.clone());
-        out
+        node_net.get(&node).cloned().unwrap_or_default()
     }
-    lit_net(d, aig, aig.output, prefix, &mut n_lut, &mut node_net)
+
+    let mut node_net: HashMap<u32, String> = HashMap::new();
+    let mut n_lut = 0usize;
+    for ai in 0..n_and {
+        let node = 1 + n_pi as u32 + ai as u32;
+        let is_out = aig.output.node == node;
+        if fo[ai] <= 1 && !is_out {
+            continue;
+        }
+        let (a, b) = aig.ands[ai];
+        let mut leaves = Vec::new();
+        let mut const0 = false;
+        flatten_and(aig, a, &fo, n_pi, &mut leaves, &mut const0);
+        flatten_and(aig, b, &fo, n_pi, &mut leaves, &mut const0);
+        let o_inv = is_out && aig.output.inv;
+        let drive = if is_out { out } else { None };
+        if const0 {
+            let net = emit_and(d, prefix, &mut n_lut, &[], &[], !o_inv, drive);
+            node_net.insert(node, net);
+            continue;
+        }
+        let mut uniq: Vec<Lit> = Vec::new();
+        let mut zero = false;
+        for lit in leaves {
+            if let Some(prev) = uniq.iter().find(|p| p.node == lit.node) {
+                if prev.inv != lit.inv {
+                    zero = true;
+                    break;
+                }
+                continue;
+            }
+            uniq.push(lit);
+        }
+        if zero {
+            let net = emit_and(d, prefix, &mut n_lut, &[], &[], !o_inv, drive);
+            node_net.insert(node, net);
+            continue;
+        }
+        let mut level: Vec<(String, bool)> = uniq
+            .iter()
+            .map(|l| (net_of(aig, l.node, &node_net), l.inv))
+            .filter(|(n, _)| !n.is_empty())
+            .collect();
+        while level.len() > 6 {
+            let chunk: Vec<(String, bool)> = level.drain(0..6).collect();
+            let pins: Vec<String> = chunk.iter().map(|(n, _)| n.clone()).collect();
+            let invs: Vec<bool> = chunk.iter().map(|(_, i)| *i).collect();
+            let net = emit_and(d, prefix, &mut n_lut, &pins, &invs, false, None);
+            level.push((net, false));
+        }
+        if level.is_empty() {
+            let net = emit_and(d, prefix, &mut n_lut, &[], &[], o_inv, drive);
+            node_net.insert(node, net);
+            continue;
+        }
+        let pins: Vec<String> = level.iter().map(|(n, _)| n.clone()).collect();
+        let invs: Vec<bool> = level.iter().map(|(_, i)| *i).collect();
+        let net = emit_and(d, prefix, &mut n_lut, &pins, &invs, o_inv, drive);
+        node_net.insert(node, net);
+    }
+
+    let olit = aig.output;
+    if olit.node == 0 {
+        return emit_and(d, prefix, &mut n_lut, &[], &[], !olit.inv, out);
+    }
+    if (olit.node as usize) <= n_pi {
+        let n = aig.pis[(olit.node as usize) - 1].clone();
+        if olit.inv {
+            return emit_and(d, prefix, &mut n_lut, &[n], &[true], false, out);
+        }
+        if let Some(o) = out {
+            if o != n.as_str() {
+                return emit_and(d, prefix, &mut n_lut, &[n], &[false], false, Some(o));
+            }
+        }
+        return n;
+    }
+    if let Some(n) = node_net.get(&olit.node) {
+        return n.clone();
+    }
+    emit_and(d, prefix, &mut n_lut, &[], &[], true, out)
 }
 
 /// Q net of one bit of an unpacked word. Distinct from packed `bit_name`.
@@ -11572,7 +11941,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             } else {
                 (format!("u_ff{i}"), bitn.clone())
             };
-            let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"));
+            let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"), None);
             wide_luts = wide_luts.saturating_add(aig.ands.len());
             d.add_cell(&ff, CellKind::Hff);
             let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
@@ -11613,6 +11982,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Soft-cone widen: map more assign bits per module (Ibex pin_wrap /
     // ALU / multdiv exceed 256). Named diagnostic when still capped.
     const ASSIGN_BIT_CAP: usize = 2048;
+    let mut share = LutShare::new();
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
         if i >= ASSIGN_BIT_CAP {
             note_skip(format!(
@@ -11621,39 +11991,39 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             ));
             break;
         }
-        if expr_node_count(expr) > 2_000 {
-            // ≤6-PI boolean (Problem4) is still a real LUT6. A wider cone is
-            // the VGA node_count storm: one wide_cone line, do not eval.
-            let expr_rom = strip_self_hold(expr, bitn);
-            // Const-ROM (sha256) or tiny cones → LUT6. Large wire/ITE → expand.
-            if !wide_capped
-                && !cone_pi_exceeds(&expr_rom, 6)
-                && (ite_tree_is_case_of_const(&expr_rom) || expr_node_count(expr) <= 64)
-            {
-                match lut6_from_bool_cone(&expr_rom) {
-                    Some((init, pis)) => {
-                        let lut = format!("u_clut{i}");
-                        d.add_cell(&lut, CellKind::Lut6 { init });
-                        d.connect(bitn, &lut, "O");
-                        for (pin, pi) in pis.iter().enumerate() {
-                            d.connect(pi, &lut, format!("I{pin}"));
-                        }
-                        continue;
-                    }
-                    None => {}
+        let expr_rom = strip_self_hold(expr, bitn);
+        let huge = expr_node_count(expr) > 2_000;
+        if huge {
+            // ≤6-PI boolean (Problem4 / sha256_k) is still a real LUT6. A
+            // wider cone is the VGA node_count storm: one wide_cone line.
+            if !wide_capped && !cone_pi_exceeds(&expr_rom, 6) {
+                if share
+                    .lut6_from_expr(&mut d, &format!("u_clut{i}_"), Some(bitn), &expr_rom)
+                    .is_some()
+                {
+                    continue;
                 }
             }
-            // Prefer stripped cone for ITE/xnor too (self-hold is not a real PI).
-            if let Some(eq_net) = try_map_xnor_and_tree(&mut d, &expr_rom, &format!("u_eq{i}_")) {
-                d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
-                d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
-                d.connect(bitn, format!("u_cbuf{i}"), "O");
+            if try_map_xnor_and_tree(
+                &mut d,
+                &expr_rom,
+                &format!("u_eq{i}_"),
+                Some(bitn),
+                &mut share,
+            )
+            .is_some()
+            {
                 continue;
             }
-            if let Some(eq_net) = try_map_ite_const_tree(&mut d, &expr_rom, &format!("u_ite{i}_")) {
-                d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
-                d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
-                d.connect(bitn, format!("u_cbuf{i}"), "O");
+            if try_map_ite_const_tree(
+                &mut d,
+                &expr_rom,
+                &format!("u_ite{i}_"),
+                Some(bitn),
+                &mut share,
+            )
+            .is_some()
+            {
                 continue;
             }
             if let Some(sig) = rel_sig.get(bitn) {
@@ -11669,19 +12039,14 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             continue;
         }
-        // Strip unreachable case-hold self PI (sha256_k). Const-ROM / tiny
-        // cones → one LUT6; large wire/ITE muxes expand below (Ibex density).
-        let expr_rom = strip_self_hold(expr, bitn);
-        if !cone_pi_exceeds(&expr_rom, 6)
-            && (ite_tree_is_case_of_const(&expr_rom) || expr_node_count(expr) <= 64)
-        {
-            if let Some((init, pis)) = lut6_from_bool_cone(&expr_rom) {
-                let lut = format!("u_clut{i}");
-                d.add_cell(&lut, CellKind::Lut6 { init });
-                d.connect(bitn, &lut, "O");
-                for (pin, pi) in pis.iter().enumerate() {
-                    d.connect(pi, &lut, format!("I{pin}"));
-                }
+        // Strip unreachable case-hold self PI (sha256_k). ≤6-PI cones — const
+        // ROM or Ident mux — collapse to one LUT6. Wider Ident/ITE expand
+        // with sharing (not identity/buffer LUTs).
+        if !cone_pi_exceeds(&expr_rom, 6) {
+            if share
+                .lut6_from_expr(&mut d, &format!("u_clut{i}_"), Some(bitn), &expr_rom)
+                .is_some()
+            {
                 if md_bits.contains(bitn) {
                     let _ = d.mark_debug(bitn);
                 }
@@ -11689,17 +12054,27 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
         }
         // Packed `a == b` (AND of XNORs) → LUT reduction, not one 64-PI AIG.
-        if let Some(eq_net) = try_map_xnor_and_tree(&mut d, &expr_rom, &format!("u_eq{i}_")) {
-            d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
-            d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
-            d.connect(bitn, format!("u_cbuf{i}"), "O");
+        if try_map_xnor_and_tree(
+            &mut d,
+            &expr_rom,
+            &format!("u_eq{i}_"),
+            Some(bitn),
+            &mut share,
+        )
+        .is_some()
+        {
             continue;
         }
-        // If/else const decode (Or/And ITE of eq/ne) → LUT mux tree.
-        if let Some(eq_net) = try_map_ite_const_tree(&mut d, &expr_rom, &format!("u_ite{i}_")) {
-            d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
-            d.connect(&eq_net, format!("u_cbuf{i}"), "I0");
-            d.connect(bitn, format!("u_cbuf{i}"), "O");
+        // If/else decode (Or/And ITE of eq/ne / Ident arms) → packed LUT mux.
+        if try_map_ite_const_tree(
+            &mut d,
+            &expr_rom,
+            &format!("u_ite{i}_"),
+            Some(bitn),
+            &mut share,
+        )
+        .is_some()
+        {
             continue;
         }
         // Refuse Aig::from_expr on wide PI cones (arbiter hang-class ~30s).
@@ -11724,12 +12099,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
                 continue;
             }
-            let wide = map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"));
+            map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"), Some(bitn));
             wide_luts = wide_luts.saturating_add(aig.ands.len());
-            // Alias wide cone output onto the assign net name.
-            d.add_cell(format!("u_cbuf{i}"), CellKind::Lut6 { init: 0x2 });
-            d.connect(&wide, format!("u_cbuf{i}"), "I0");
-            d.connect(bitn, format!("u_cbuf{i}"), "O");
             continue;
         }
         let init = aig.flowmap_lut6();
@@ -12680,7 +13051,13 @@ endmodule
         eprintln!("fsm_tiny cells={} luts={luts} ffs={ffs}", d.cells.len());
         assert!(ffs >= 6, "expect state+out regs, ffs={ffs}");
         assert!(luts >= 4, "expect next-state/out LUTs, luts={luts}");
-        assert!(d.cells.len() > 17, "must exceed pre-fix ~17 cell baseline, got {}", d.cells.len());
+        // Pre-density baseline was >17 (identity/buffer LUTs). Packed LUT6
+        // mapping is honest and may sit on that line; keep FFs+LUTs as the bar.
+        assert!(
+            d.cells.len() >= 16,
+            "must keep real FSM fabric, got {}",
+            d.cells.len()
+        );
     }
 
     #[test]
@@ -15412,6 +15789,74 @@ endmodule
     }
 
     #[test]
+    fn bus_mux2_packs_one_lut6_per_bit() {
+        // Ident-arm 2:1: 3 PIs/bit → one LUT6, no identity/buffer LUTs.
+        let src = r#"
+module mux2(input logic sel,
+            input logic [7:0] a,
+            input logic [7:0] b,
+            output logic [7:0] y);
+  always_comb begin
+    unique case (sel)
+      1'b1: y = a;
+      default: y = b;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "mux2.sv").expect("mux2");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            (8..=16).contains(&luts),
+            "8-bit 2:1 Ident mux should be ~1 LUT6/bit, luts={luts}"
+        );
+        for i in 0..8 {
+            let name = format!("y_{i}");
+            let driven = d.nets.iter().any(|n| {
+                n.name == name && n.endpoints.iter().any(|e| e.pin == "O")
+            });
+            assert!(driven, "y[{i}] must be driven");
+        }
+    }
+
+    #[test]
+    fn case_mux_shares_select_across_bits() {
+        // 2-bit opcode + 3 Ident arms: 5 PIs/bit collapse to one LUT6/bit.
+        // Select bits are shared; do not emit 8 copies of the opcode decode.
+        let src = r#"
+module alu8(input logic [1:0] op,
+            input logic [7:0] a,
+            input logic [7:0] b,
+            input logic [7:0] c,
+            output logic [7:0] y);
+  always_comb begin
+    unique case (op)
+      2'd0: y = a;
+      2'd1: y = b;
+      default: y = c;
+    endcase
+  end
+endmodule
+"#;
+        let d = synth_sv(src, "alu8.sv").expect("alu8");
+        let luts = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(
+            (8..=24).contains(&luts),
+            "8-bit 3-arm case mux should share select and pack LUT6s, luts={luts}"
+        );
+        assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
+        assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"));
+    }
+
+    #[test]
     fn ibex_counter_upd_plus_one_zpad_is_ripple_not_wide_cone() {
         // MHPMCounterWidth=40: `counter[39:0] + {{39{1'b0}}, 1'b1}` must ripple
         // (RIPPLE_ADD_MAX=40), not bit-blast into counter_upd_16 wide_cone.
@@ -15590,7 +16035,12 @@ endmodule
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "depth-1 must not wide_cone");
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"), "hit must lower");
         let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
-        assert!(luts >= 8, "eq/and reduce should map LUTs, luts={luts}");
+        // 8-bit == packs 3 XNORs/LUT6 + AND reduce (~5 LUTs), not 8 identity XNORs.
+        assert!(luts >= 3, "eq/and reduce should map LUTs, luts={luts}");
+        assert!(
+            d.nets.iter().any(|n| n.name == "hit" && n.endpoints.iter().any(|e| e.pin == "O")),
+            "hit must be driven"
+        );
     }
 
     #[test]
