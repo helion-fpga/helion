@@ -2,7 +2,7 @@
 
 Helion is original FPGA CAD. Public vendor user guides are a **capability checklist**, not source to copy.
 
-Site (LMMS-style on-ramp): [docs](https://helion-fpga.github.io/helion/) · [get involved](https://helion-fpga.github.io/helion/get-involved.html).
+Site (LMMS-style on-ramp): [docs](https://helion-fpga.github.io/helion/) · [get involved](https://helion-fpga.github.io/helion/get-involved.html) · [roadmap](ROADMAP.md) · [milestones](https://github.com/helion-fpga/helion/milestones).
 
 ## Legal fence
 
@@ -38,6 +38,8 @@ Do not attach vendor bitstreams to a GitHub Release.
 | Place / route / bits | `crates/helion-place`, `helion-route`, `helion-bits` |
 | IDE model + tests | `crates/helion-gui/src/ide.rs` |
 | IDE paint | `crates/helion-gui/src/bin/helion-ide.rs` |
+| Roadmap 1.4→2.0 | [`ROADMAP.md`](ROADMAP.md), Pages `docs/roadmap.html` |
+| Changelog | [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog / Unreleased) |
 | Parts | `devices/helion/` |
 | Examples | `examples/` |
 | IP packages (`.helion`) | `ip/`, `crates/helion-ipxact` |
