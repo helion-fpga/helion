@@ -12,7 +12,9 @@ use helion_sta::{
     Constraints, OperatingConditions, PowerReport, TimingResult,
 };
 use helion_hls::synth_c_path;
-use helion_proj::{constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path};
+use helion_proj::{
+    constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path, Mode, Session,
+};
 use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
 use std::path::Path;
@@ -282,6 +284,8 @@ fn usage() {
   helion qor <file.sv>
   helion project <file.prj>
   helion project run <file.prj> [--cycles N]
+  helion project checkpoint write <file.prj> [-o out.hckp]
+  helion project checkpoint open <file.hckp> [--part P]
   helion ip list|show <file.helion>|pack <name>
   helion hnf <file.sv> [-o out.hnf]
   helion hw list|detect
@@ -644,6 +648,10 @@ fn cmd_hnf(args: &[String]) {
 }
 
 fn cmd_project(args: &[String]) {
+    if args.first().map(|s| s.as_str()) == Some("checkpoint") {
+        cmd_project_checkpoint(&args[1..]);
+        return;
+    }
     let mut rest = args;
     let mut do_run = false;
     if rest.first().map(|s| s.as_str()) == Some("run") {
@@ -743,6 +751,127 @@ fn cmd_project(args: &[String]) {
         );
         println!("ok");
     }
+}
+
+fn cmd_project_checkpoint(args: &[String]) {
+    match args.first().map(|s| s.as_str()) {
+        Some("write") => cmd_project_checkpoint_write(&args[1..]),
+        Some("open") | Some("read") => cmd_project_checkpoint_open(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage:\n  helion project checkpoint write <file.prj> [-o out.hckp]\n  helion project checkpoint open <file.hckp> [--part P]"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_project_checkpoint_write(args: &[String]) {
+    let path = positional(args).unwrap_or("examples/counter.prj");
+    let out_flag = take_flag(args, "-o").or_else(|| take_flag(args, "--output"));
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("project {path}: {e}");
+        std::process::exit(1);
+    });
+    let mut prj = load_prj(&text).unwrap_or_else(|e| {
+        eprintln!("project: {e}");
+        std::process::exit(1);
+    });
+    let prj_path = Path::new(path);
+    let _ips = expand_ip_packages(&mut prj, prj_path).unwrap_or_else(|e| {
+        eprintln!("project ip: {e}");
+        std::process::exit(1);
+    });
+    let src_paths: Vec<std::path::PathBuf> = prj
+        .sources
+        .iter()
+        .map(|s| resolve_prj_path(prj_path, s))
+        .collect();
+    for (src, resolved) in prj.sources.iter().zip(src_paths.iter()) {
+        if !resolved.exists() {
+            eprintln!("project source {src}: not found (tried {})", resolved.display());
+            std::process::exit(1);
+        }
+    }
+    let design = synth_project_sources(&src_paths, prj.top.as_deref()).unwrap_or_else(|e| {
+        eprintln!("project synth: {e}");
+        std::process::exit(1);
+    });
+    let part = if prj.part.is_empty() {
+        "HL10T-C32-1".to_string()
+    } else {
+        prj.part.clone()
+    };
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("project part {part}: {e}");
+        std::process::exit(1);
+    });
+    let mut session = Session::new(Mode::Project);
+    session.part = part.clone();
+    session.synth_design(design);
+    session.impl_project(&dev, &prj).unwrap_or_else(|e| {
+        eprintln!("project impl: {e}");
+        std::process::exit(1);
+    });
+    let dest = out_flag
+        .or_else(|| prj.checkpoint_path.clone())
+        .unwrap_or_else(|| {
+            Path::new(path)
+                .with_extension("hckp")
+                .to_string_lossy()
+                .into_owned()
+        });
+    let dest_path = Path::new(&dest);
+    let dest_buf = if dest_path.is_absolute() {
+        dest_path.to_path_buf()
+    } else if prj.checkpoint_path.as_deref() == Some(dest.as_str()) {
+        prj_path.parent().unwrap_or_else(|| Path::new(".")).join(dest_path)
+    } else {
+        dest_path.to_path_buf()
+    };
+    let wr = session.write_checkpoint_to(&dest_buf).unwrap_or_else(|e| {
+        eprintln!("write_checkpoint: {e}");
+        std::process::exit(1);
+    });
+    let timing = session.report_timing(&dev).unwrap_or_else(|e| {
+        eprintln!("report_timing: {e}");
+        std::process::exit(1);
+    });
+    println!("{wr}");
+    println!("{timing}");
+}
+
+fn cmd_project_checkpoint_open(args: &[String]) {
+    let path = positional(args).unwrap_or("counter.hckp");
+    let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
+    let dev = Device::load_part(&part).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint part {part}: {e}");
+        std::process::exit(1);
+    });
+    let session = Session::open_checkpoint(path, &dev).unwrap_or_else(|e| {
+        eprintln!("open_checkpoint {path}: {e}");
+        std::process::exit(1);
+    });
+    let lutffs = session
+        .placed
+        .as_ref()
+        .map(|p| p.lutff_sites.len())
+        .unwrap_or(0);
+    let frames = session
+        .bitstream
+        .as_ref()
+        .map(|b| b.frames.len())
+        .unwrap_or(0);
+    let hash = session.blinky_hash().unwrap_or(0);
+    let timing = session.report_timing(&dev).unwrap_or_else(|e| {
+        eprintln!("report_timing: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "open_checkpoint {path} part={} lutffs={lutffs} frames={frames} hash={hash:#x}",
+        dev.part
+    );
+    println!("{timing}");
 }
 
 fn hw(args: Vec<String>) {
