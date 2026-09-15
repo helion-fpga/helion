@@ -18,6 +18,8 @@
 
 use std::path::Path;
 
+use helion_bits::Bitstream;
+
 use crate::native_usb::enumerate_ftdi;
 #[cfg(feature = "usb-native")]
 use crate::native_usb::{FTDI_PID_FT2232H, FTDI_VID};
@@ -199,7 +201,7 @@ impl MpsseOpcodeBuilder {
     pub fn jtag_enter_shift_ir(&mut self) -> &mut Self {
         // Select-DR, Select-IR, Capture-IR, Shift-IR
         self.tms_out(0x03, 4, false); // 1100 LSB-first = bits 0,1 =1,1 then 0,0 → wait
-        // LSB-first: bit0 first. Want TMS sequence 1,1,0,0 → bits = 0b0011
+                                      // LSB-first: bit0 first. Want TMS sequence 1,1,0,0 → bits = 0b0011
         self
     }
 
@@ -533,21 +535,30 @@ impl HadUsbTransport for NativeFtdiMpsse {
         }
     }
 
-    fn program_hbits(
-        &mut self,
-        path: &Path,
-        _flash: bool,
-    ) -> Result<(), NativeUsbError> {
-        // Open once (persistent session); CFG_W + STAT reuse the same handle.
-        self.open_probe()?;
-        let bytes = std::fs::read(path).map_err(|e| {
-            NativeUsbError::Io(format!("read {}: {e}", path.display()))
-        })?;
+    fn program_hbits(&mut self, path: &Path, _flash: bool) -> Result<(), NativeUsbError> {
+        // Validate empty / header-only HBIT BEFORE open_probe so doomed inputs
+        // never claim the FTDI cable (share refuse_empty_bitstream with OFL/lab/overlay).
+        let bytes = std::fs::read(path)
+            .map_err(|e| NativeUsbError::Io(format!("read {}: {e}", path.display())))?;
         if bytes.is_empty() {
             return Err(NativeUsbError::Io(
                 "empty bitstream — refusing native MPSSE program".into(),
             ));
         }
+        if bytes.starts_with(b"HBIT") {
+            match Bitstream::from_packets(&bytes) {
+                Ok(bits) => {
+                    crate::refuse_empty_bitstream(&bits).map_err(NativeUsbError::Io)?;
+                }
+                Err(e) => {
+                    return Err(NativeUsbError::Io(format!(
+                        "native MPSSE: invalid .hbits: {e} — refusing invented STAT"
+                    )));
+                }
+            }
+        }
+        // Open once (persistent session); CFG_W + STAT reuse the same handle.
+        self.open_probe()?;
         let opcodes = Self::encode_cfg_w_and_stat(&bytes);
         #[cfg(feature = "usb-native")]
         {
@@ -845,7 +856,7 @@ pub fn try_native_mpsse_program(path: &Path, flash: bool) -> Result<(), NativeUs
 /// Like [`try_native_mpsse_program`], returning the validated STAT word (DONE=1).
 pub fn try_native_mpsse_program_stat(path: &Path, flash: bool) -> Result<u32, NativeUsbError> {
     let mut t = NativeFtdiMpsse::new();
-    t.open_probe()?;
+    // program_hbits validates empty/HBIT before open_probe — do not claim cable first.
     t.program_hbits(path, flash)?;
     t.last_stat.ok_or_else(|| {
         NativeUsbError::Io(
@@ -889,18 +900,36 @@ mod tests {
         let stat_ops = b.into_bytes();
         assert!(stat_ops.contains(&MPSSE_SET_CLK_DIVISOR));
         assert!(stat_ops.contains(&MPSSE_CLK_TMS_OUT_NEG_LSB));
-        assert!(stat_ops.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB) || stat_ops.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB));
+        assert!(
+            stat_ops.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB)
+                || stat_ops.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB)
+        );
         // IR_STAT = 0b010010 — encoder must emit TMS/TDI activity (non-trivial length).
-        assert!(stat_ops.len() > 16, "stat opcode stream too short: {}", stat_ops.len());
+        assert!(
+            stat_ops.len() > 16,
+            "stat opcode stream too short: {}",
+            stat_ops.len()
+        );
 
         let packets = b"HBIT\x00\x01\x02\x03test-packets";
         let cfg = NativeFtdiMpsse::encode_cfg_w_and_stat(packets);
-        assert!(cfg.len() > stat_ops.len(), "CFG_W stream should dwarf STAT-only");
-        assert!(cfg.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB) || cfg.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB));
+        assert!(
+            cfg.len() > stat_ops.len(),
+            "CFG_W stream should dwarf STAT-only"
+        );
+        assert!(
+            cfg.contains(&MPSSE_CLK_BYTES_OUT_NEG_LSB) || cfg.contains(&MPSSE_CLK_BITS_OUT_NEG_LSB)
+        );
         assert!(cfg.ends_with(&[MPSSE_SEND_IMMEDIATE]) || cfg.contains(&MPSSE_SEND_IMMEDIATE));
         // Must include IR_CFG_W path + IR_STAT path markers (TMS opcodes present twice+).
-        let tms_count = cfg.iter().filter(|&&x| x == MPSSE_CLK_TMS_OUT_NEG_LSB).count();
-        assert!(tms_count >= 4, "expected multiple TMS bursts, got {tms_count}");
+        let tms_count = cfg
+            .iter()
+            .filter(|&&x| x == MPSSE_CLK_TMS_OUT_NEG_LSB)
+            .count();
+        assert!(
+            tms_count >= 4,
+            "expected multiple TMS bursts, got {tms_count}"
+        );
     }
 
     #[test]
@@ -941,7 +970,12 @@ mod tests {
 
     #[test]
     fn try_native_mpsse_program_no_device_or_feature() {
-        let err = try_native_mpsse_program(Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-prog-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nonzero.bin");
+        std::fs::write(&path, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = try_native_mpsse_program(&path, false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
         } else {
@@ -954,7 +988,10 @@ mod tests {
         let n = native_mpsse_status_note();
         assert!(n.contains("native_mpsse"));
         assert!(
-            n.contains("OFL") || n.contains("ofl") || n.contains("NotImplemented") || n.contains("FTDI"),
+            n.contains("OFL")
+                || n.contains("ofl")
+                || n.contains("NotImplemented")
+                || n.contains("FTDI"),
             "{n}"
         );
     }
@@ -977,7 +1014,10 @@ mod tests {
             ops.contains(&MPSSE_CLK_BYTES_INOUT_LSB) || ops.contains(&MPSSE_CLK_BITS_INOUT_LSB),
             "STAT capture must request TDO via INOUT"
         );
-        assert!(ops.contains(&MPSSE_CLK_TMS_INOUT_LSB), "last DR bit via TMS INOUT");
+        assert!(
+            ops.contains(&MPSSE_CLK_TMS_INOUT_LSB),
+            "last DR bit via TMS INOUT"
+        );
         assert_eq!(STAT_CAPTURE_TDO_LEN, 5);
     }
 
@@ -1009,7 +1049,10 @@ mod tests {
         let err = parse_stat_tdo_mpsse(&[0, 1, 2]).unwrap_err();
         assert!(err.contains("short") || err.contains("refusing"), "{err}");
         let err0 = parse_stat_tdo_mpsse(&[]).unwrap_err();
-        assert!(err0.contains("refusing") || err0.contains("short"), "{err0}");
+        assert!(
+            err0.contains("refusing") || err0.contains("short"),
+            "{err0}"
+        );
     }
 
     #[test]
@@ -1023,7 +1066,10 @@ mod tests {
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
             assert!(!t.is_open());
-            assert_eq!(t.usb_open_count, 0, "failed open must not count as session open");
+            assert_eq!(
+                t.usb_open_count, 0,
+                "failed open must not count as session open"
+            );
             assert_eq!(t.session_xfer_count(), 0);
         } else {
             assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
@@ -1047,8 +1093,43 @@ mod tests {
     }
 
     #[test]
+    fn program_hbits_refuses_empty_before_open_probe() {
+        let dir = std::env::temp_dir().join("helion-native-empty-before-open");
+        let _ = std::fs::create_dir_all(&dir);
+        let zero = dir.join("zero.hbits");
+        std::fs::write(&zero, b"").unwrap();
+        let mut t = NativeFtdiMpsse::new();
+        let err = t.program_hbits(&zero, false).unwrap_err();
+        assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("empty"), "{msg}");
+        assert_eq!(t.usb_open_count, 0, "0-byte must not claim cable");
+        assert!(!t.is_open());
+
+        let empty_hbit = dir.join("empty-frames.hbits");
+        let dev = helion_device::Device::load_part("HL10T-C32-1").unwrap();
+        std::fs::write(&empty_hbit, &Bitstream::empty(&dev).packets).unwrap();
+        let mut t2 = NativeFtdiMpsse::new();
+        let err2 = t2.program_hbits(&empty_hbit, false).unwrap_err();
+        assert!(matches!(err2, NativeUsbError::Io(_)), "{err2:?}");
+        let msg2 = err2.to_string().to_ascii_lowercase();
+        assert!(
+            msg2.contains("empty bitstream refused") || msg2.contains("refusing done on empty"),
+            "{msg2}"
+        );
+        assert_eq!(t2.usb_open_count, 0, "header-only HBIT must not claim cable");
+        assert!(!t2.is_open());
+        assert!(!msg2.contains("done=1"), "{msg2}");
+    }
+
+    #[test]
     fn try_native_mpsse_program_stat_no_device_honesty() {
-        let err = try_native_mpsse_program_stat(Path::new("/dev/null"), false).unwrap_err();
+        // Non-empty path so empty-gate does not fire before open_probe / NotImplemented.
+        let dir = std::env::temp_dir().join("helion-native-stat-honesty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nonzero.bin");
+        std::fs::write(&path, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
+        let err = try_native_mpsse_program_stat(&path, false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
         } else {
