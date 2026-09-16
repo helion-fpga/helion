@@ -47,7 +47,9 @@ Do not attach vendor bitstreams to a GitHub Release.
 
 ## What we need help with
 
-- SV ingest of large files (`examples/ysyx_ibex.sv`) — preprocess, skip packages, **no hang**, synth without abort
+- Public-widen SOFT: legal `always` / `case` / generate / memory that still skip cones ([#14](https://github.com/helion-fpga/helion/issues/14)). Do not rename SOFT → PASS.
+- Lab: native FTDI / OFL with live STAT TDO **DONE=1** and a LED you can see ([#17](https://github.com/helion-fpga/helion/issues/17)). No invented TAP.
+- Large RTL (`examples/ysyx_ibex.sv`): hang-free synth, honest LUT count. Gold counter stays **WNS_PS=9640**.
 - Tests for engine-backed IDE panes (not dumps)
 - Docs and the `docs/` site
 - macOS / Linux CI
