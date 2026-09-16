@@ -288,6 +288,23 @@ impl Design {
         self.rebuild_cell_ix();
     }
 
+    /// Clone ports/cells/nets without the O(n) name indexes.
+    /// `push_cell` / `merge_net` / `connect` rebuild indexes on the next mutate.
+    /// Used by helion-sv OwnCache so a cache hit does not copy `net_ix`/`pin_ix`/`cell_ix`.
+    pub fn clone_data(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            ports: self.ports.clone(),
+            cells: self.cells.clone(),
+            nets: self.nets.clone(),
+            instances: self.instances.clone(),
+            attrs: self.attrs.clone(),
+            net_ix: HashMap::new(),
+            pin_ix: HashMap::new(),
+            cell_ix: HashMap::new(),
+        }
+    }
+
     fn ensure_net_ix(&mut self) {
         if self.net_ix.len() != self.nets.len() {
             self.rebuild_net_ix();
@@ -346,6 +363,17 @@ impl Design {
         self.ensure_cell_ix();
         self.cell_ix.insert(cell.name.clone(), self.cells.len());
         self.cells.push(cell);
+    }
+
+    /// Move `cells` into this design, updating `cell_ix` in O(new) not O(all).
+    pub fn append_cells(&mut self, cells: &mut Vec<Cell>) {
+        self.ensure_cell_ix();
+        self.cell_ix.reserve(cells.len());
+        self.cells.reserve(cells.len());
+        for c in cells.drain(..) {
+            self.cell_ix.insert(c.name.clone(), self.cells.len());
+            self.cells.push(c);
+        }
     }
 
     pub fn add_instance(&mut self, name: impl Into<String>, module: impl Into<String>) {
@@ -770,6 +798,19 @@ impl Design {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_data_omits_indexes_until_rebuild() {
+        let mut d = Design::new("idx");
+        d.add_cell("ff", CellKind::Hff);
+        d.connect("q", "ff", "Q");
+        let mut c = d.clone_data();
+        assert!(c.cell("ff").is_some());
+        assert_eq!(c.net_on("ff", "Q"), Some("q"));
+        c.rebuild_indexes();
+        assert_eq!(c.cell("ff").map(|x| x.name.as_str()), Some("ff"));
+        assert_eq!(c.net_on("ff", "Q"), Some("q"));
+    }
 
     #[test]
     fn connect_is_subquadratic_on_many_nets() {
