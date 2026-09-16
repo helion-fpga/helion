@@ -4,6 +4,14 @@ use helion_device::{BitLoc, Device, Far};
 use helion_route::Routed;
 use std::collections::BTreeMap;
 
+/// Stable machine-parseable refuse code: empty / header-only bitstream.
+/// Prefixed on bitgen empty-design / no-configured-frames Err strings (keep human text).
+pub const ERR_CODE_EMPTY_BITSTREAM: &str = "HELION_E_EMPTY_BITSTREAM";
+
+/// Stable machine-parseable refuse code: board program with USB=0 / no probe.
+/// Prefixed on OFL / native Io no-device program Err strings (keep human text).
+pub const ERR_CODE_USB_0: &str = "HELION_E_USB_0";
+
 #[derive(Clone, Debug, Default)]
 pub struct FeatureSet {
     /// full feature name -> 0/1
@@ -89,9 +97,9 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
         && packed.macs.is_empty()
         && packed.brams.is_empty()
     {
-        return Err(
-            "bitgen: empty design (no LUTFF/IOB/DSP/BRAM) — refusing empty/fake bitstream".into(),
-        );
+        return Err(format!(
+            "{ERR_CODE_EMPTY_BITSTREAM}: bitgen: empty design (no LUTFF/IOB/DSP/BRAM) — refusing empty/fake bitstream"
+        ));
     }
     let mut feats = FeatureSet::new();
     for (i, lutff) in packed.lutffs.iter().enumerate() {
@@ -143,10 +151,9 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
     // Drop zero frames so emptiness matches the sparse encoder.
     bs.frames.retain(|_, w| *w != 0);
     if bs.frames.is_empty() {
-        return Err(
-            "bitgen: no configured frames — refusing empty/fake bitstream (design set no bits)"
-                .into(),
-        );
+        return Err(format!(
+            "{ERR_CODE_EMPTY_BITSTREAM}: bitgen: no configured frames — refusing empty/fake bitstream (design set no bits)"
+        ));
     }
     bs.packets = encode_packets(dev.idcode, &bs.frames);
     // Header CRC + body hash are always computed in encode_packets. In-stream
@@ -407,7 +414,7 @@ pub fn bitgen_pblock(
         }
     }
     if frames.is_empty() {
-        return Err("pblock produced no frames".into());
+        return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: pblock produced no frames"));
     }
     let mut bs = Bitstream {
         idcode: dev.idcode,
@@ -630,6 +637,21 @@ mod tests {
         assert!(!pb.frames.is_empty(), "pblock must carry the placed major");
     }
 
+    #[test]
+    fn bitgen_pblock_no_sites_refuses_with_empty_code() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let err = bitgen_pblock(&dev, &r, &[]).unwrap_err();
+        assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable code missing: {err}"
+        );
+        assert!(err.contains("pblock produced no frames"), "{err}");
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+    }
+
     /// Gold counter sparse `.hbits` size (README / QoR table). Must stay stable.
     const COUNTER_HBITS_BYTES: usize = 185;
 
@@ -688,9 +710,15 @@ mod tests {
         };
         let err = bitgen(&dev, &empty).unwrap_err();
         assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable code missing: {err}"
+        );
+        assert!(
             err.contains("empty design") || err.contains("refusing"),
             "{err}"
         );
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+        assert!(!err.contains("DONE=1 / TAP STAT"), "{err}");
     }
 
     #[test]
@@ -709,7 +737,9 @@ mod tests {
             let pl = place(&p, &dev).unwrap();
             let r = route(&pl, &dev).unwrap();
             let err = bitgen(&dev, &r).unwrap_err();
+            assert!(err.contains(ERR_CODE_EMPTY_BITSTREAM), "stable code missing: {err}");
             assert!(err.contains("refusing") || err.contains("empty"), "{err}");
+            assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
             return;
         }
         let pl = place(&p, &dev).unwrap();
@@ -725,8 +755,13 @@ mod tests {
         r.placed.packed.iobs.clear();
         let err = bitgen(&dev, &r).unwrap_err();
         assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable code missing: {err}"
+        );
+        assert!(
             err.contains("no configured frames") || err.contains("refusing") || err.contains("empty"),
             "{err}"
         );
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
     }
 }
