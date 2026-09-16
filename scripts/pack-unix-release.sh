@@ -34,12 +34,21 @@ fi
 if [ -f "$BIN_DIR/helion-prog" ]; then
   copy_bin "$BIN_DIR/helion-prog" "$STAGE/helion-prog"
 fi
+# Drop debug symbols so tarballs stay ≪ commercial CAD.
+for b in helion helion-ide helion-prog; do
+  [ -f "$STAGE/$b" ] || continue
+  strip "$STAGE/$b" >/dev/null 2>&1 || true
+done
 
 mkdir -p "$STAGE/devices"
 cp -R "$ROOT/devices/helion" "$STAGE/devices/helion"
 mkdir -p "$STAGE/examples"
 for f in "$ROOT/examples"/*; do
   [ -e "$f" ] || continue
+  # ip_ingest is a CLI test corpus, not a stranger-clone lab.
+  case "$(basename "$f")" in
+    ip_ingest) continue ;;
+  esac
   cp -R "$f" "$STAGE/examples/"
 done
 cp "$ROOT/LICENSE-APACHE" "$ROOT/LICENSE-MIT" "$ROOT/README.md" "$STAGE/"
