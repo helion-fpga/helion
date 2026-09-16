@@ -10,11 +10,24 @@ RTL="${SHA256_RTL:-/workspace/fm-hel-corpus/vendored/logikbench/sha256/rtl/sha25
 if [[ ! -f "$RTL" ]]; then
   RTL="$ROOT/corpus-pass/sha256/rtl/sha256_phase_d.v"
 fi
-HELION="${HELION:-$ROOT/target/debug/helion}"
+# Prefer release binary (FM-HEL-OPT-P2-1). HELION= overrides; else release, debug, cargo.
+if [[ -z "${HELION:-}" ]]; then
+  if [[ -f "$ROOT/target/release/helion" ]]; then
+    HELION="$ROOT/target/release/helion"
+  elif [[ -f "$ROOT/target/debug/helion" ]]; then
+    HELION="$ROOT/target/debug/helion"
+  else
+    HELION=""
+  fi
+fi
+echo "SHA256_SYNTH: cap=${CAP_SEC}s helion=${HELION:-cargo run -p helion-cli --release}" >&2
 exec python3 - "$CAP_SEC" "$HELION" "$RTL" <<'PY'
 import os, signal, subprocess, sys, time
 cap = int(sys.argv[1]); helion = sys.argv[2]; path = sys.argv[3]
-cmd = [helion, "synth", path]
+if helion and os.path.isfile(helion):
+    cmd = [helion, "synth", path]
+else:
+    cmd = ["cargo", "run", "-p", "helion-cli", "--release", "--", "synth", path]
 proc = subprocess.Popen(cmd, preexec_fn=os.setsid if hasattr(os, "setsid") else None)
 t0 = time.time()
 try:

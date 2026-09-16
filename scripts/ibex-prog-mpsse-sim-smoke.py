@@ -15,7 +15,7 @@ BUILD = {
 }
 
 def find_prog():
-    for p in ("target/debug/helion-prog", "target/release/helion-prog"):
+    for p in ("target/release/helion-prog", "target/debug/helion-prog"):  # Prefer release (FM-HEL-OPT-P2-1)
         if os.path.isfile(p):
             return p
     return None
