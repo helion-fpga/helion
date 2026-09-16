@@ -2,7 +2,8 @@
 
 use helion_device::{BitLoc, Device, Far};
 use helion_route::Routed;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 
 /// Stable machine-parseable refuse code: empty / header-only bitstream.
 /// Prefixed on bitgen empty-design / no-configured-frames Err strings (keep human text).
@@ -86,6 +87,145 @@ impl Bitstream {
     }
 }
 
+/// FeatureMap abs for CLB INIT/FF/IMUX. Packer is identical across Helion parts.
+#[derive(Clone, Copy)]
+struct ClbFeat {
+    frame_bits: u32,
+    init0_abs: [u32; 8],
+    ff_used_abs: [u32; 8],
+    imux0_abs: u32,
+    imux5_abs: u32,
+    imux6_abs: u32,
+    imux7_abs: u32,
+}
+
+fn clb_feat(dev: &Device) -> Result<ClbFeat, String> {
+    static CACHED: OnceLock<ClbFeat> = OnceLock::new();
+    let fb = dev.featuremap().frame_bits;
+    if let Some(c) = CACHED.get() {
+        if c.frame_bits == fb {
+            return Ok(*c);
+        }
+        return load_clb_feat(dev);
+    }
+    let built = load_clb_feat(dev)?;
+    Ok(*CACHED.get_or_init(|| built))
+}
+
+fn load_clb_feat(dev: &Device) -> Result<ClbFeat, String> {
+    let fm = dev.featuremap();
+    let mut init0_abs = [0u32; 8];
+    let mut ff_used_abs = [0u32; 8];
+    for ble in 0..8u32 {
+        let k = format!("BLE{ble}.LUT.INIT[0]");
+        init0_abs[ble as usize] = fm
+            .abs_bit(&k)
+            .ok_or_else(|| format!("unknown feature {k}"))?;
+        let k = format!("BLE{ble}.FF.USED");
+        ff_used_abs[ble as usize] = fm
+            .abs_bit(&k)
+            .ok_or_else(|| format!("unknown feature {k}"))?;
+    }
+    let need = |k: &str| fm.abs_bit(k).ok_or_else(|| format!("unknown feature {k}"));
+    let feat = ClbFeat {
+        frame_bits: fm.frame_bits,
+        init0_abs,
+        ff_used_abs,
+        imux0_abs: need("IMUX[0][0]")?,
+        imux5_abs: need("IMUX[0][5]")?,
+        imux6_abs: need("IMUX[0][6]")?,
+        imux7_abs: need("IMUX[0][7]")?,
+    };
+    debug_assert_eq!(
+        fm.abs_bit("BLE0.LUT.INIT[63]"),
+        Some(feat.init0_abs[0] + 63)
+    );
+    debug_assert_eq!(fm.abs_bit("IMUX[1][0]"), Some(feat.imux0_abs + 5));
+    debug_assert_eq!(fm.abs_bit("IMUX[2][5]"), Some(feat.imux5_abs + 2));
+    debug_assert_eq!(fm.abs_bit("IMUX[2][6]"), Some(feat.imux6_abs + 2));
+    debug_assert_eq!(fm.abs_bit("IMUX[2][7]"), Some(feat.imux7_abs + 2));
+    Ok(feat)
+}
+
+#[inline]
+fn or_clb_mask(
+    frames: &mut HashMap<(u8, u16, u8), u128>,
+    major: u16,
+    abs: u32,
+    frame_bits: u32,
+    mask: u128,
+) {
+    if mask == 0 {
+        return;
+    }
+    let minor = (abs / frame_bits) as u8;
+    let bit = abs % frame_bits;
+    *frames.entry((Far::CLB_IO_CLK, major, minor)).or_insert(0) |= mask << bit;
+}
+
+#[inline]
+fn or_clb_bit(frames: &mut HashMap<(u8, u16, u8), u128>, major: u16, abs: u32, frame_bits: u32) {
+    or_clb_mask(frames, major, abs, frame_bits, 1);
+}
+
+/// OR LUT INIT / FF.USED / PathFinder IMUX into frame words (no FeatureSet strings).
+fn program_clb_frames(
+    dev: &Device,
+    routed: &Routed,
+    frames: &mut HashMap<(u8, u16, u8), u128>,
+) -> Result<(), String> {
+    let feat = clb_feat(dev)?;
+    let fb = feat.frame_bits;
+    let packed = &routed.placed.packed;
+    for (i, lutff) in packed.lutffs.iter().enumerate() {
+        let (site, ble) = routed.placed.lutff_sites[i];
+        let major = dev
+            .clb_major(site.x, site.y)
+            .ok_or_else(|| format!("not a CLB site CLB_X{}Y{}", site.x, site.y))?;
+        let bi = ble as usize;
+        if bi >= 8 {
+            return Err(format!("unknown feature BLE{ble}.LUT.INIT[0]"));
+        }
+        let abs0 = feat.init0_abs[bi];
+        let bit0 = abs0 % fb;
+        if bit0 + 64 <= fb {
+            or_clb_mask(frames, major, abs0, fb, lutff.init as u128);
+        } else {
+            for b in 0..64u32 {
+                if (lutff.init >> b) & 1 == 1 {
+                    or_clb_bit(frames, major, abs0 + b, fb);
+                }
+            }
+        }
+        if !lutff.ff_cell.is_empty() {
+            or_clb_bit(frames, major, feat.ff_used_abs[bi], fb);
+        }
+    }
+    for m in &routed.imux {
+        let major = dev
+            .clb_major(m.x, m.y)
+            .ok_or_else(|| format!("not a CLB site CLB_X{}Y{}", m.x, m.y))?;
+        if m.mux >= 64 {
+            return Err(format!("unknown feature IMUX[{}][0]", m.mux));
+        }
+        let sel = m.sel;
+        for b in 0..8u32 {
+            if (sel >> b) & 1 == 0 {
+                continue;
+            }
+            let abs = match b {
+                0..=4 => feat.imux0_abs + m.mux * 5 + b,
+                5 => feat.imux5_abs + m.mux,
+                6 => feat.imux6_abs + m.mux,
+                7 => feat.imux7_abs + m.mux,
+                _ => unreachable!(),
+            };
+            or_clb_bit(frames, major, abs, fb);
+        }
+    }
+    Ok(())
+}
+
 /// Bitgen a routed design: every LUTFF INIT/FF, IMUX from PathFinder, IOB src, DSP/BRAM USED.
 ///
 /// Honesty: refuses an empty/fake success. `Bitstream::empty` remains for explicit
@@ -101,17 +241,17 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             "{ERR_CODE_EMPTY_BITSTREAM}: bitgen: empty design (no LUTFF/IOB/DSP/BRAM) — refusing empty/fake bitstream"
         ));
     }
-    let mut feats = FeatureSet::new();
-    for (i, lutff) in packed.lutffs.iter().enumerate() {
-        let (site, ble) = routed.placed.lutff_sites[i];
-        feats.set_init(site.x, site.y, ble as u32, lutff.init);
-        // Comb packs leave ff_cell empty — do not assert FF.USED.
-        feats.set_ff_used(site.x, site.y, ble as u32, !lutff.ff_cell.is_empty());
-    }
-    for m in &routed.imux {
-        feats.set_imux(m.x, m.y, m.mux, m.sel);
-    }
-    let mut bs = assemble(dev, &feats)?;
+    // Frame buffer: accumulate words in a HashMap, encode once (no FeatureSet / empty packets).
+    let mut acc: HashMap<(u8, u16, u8), u128> = HashMap::with_capacity(
+        packed
+            .lutffs
+            .len()
+            .saturating_add(routed.imux.len())
+            .saturating_add(packed.iobs.len())
+            .saturating_add(packed.macs.len())
+            .saturating_add(packed.brams.len().saturating_mul(2)),
+    );
+    program_clb_frames(dev, routed, &mut acc)?;
     for r in &routed.iob_src {
         let major = dev
             .iob_major(r.iob.0, r.iob.1)
@@ -132,53 +272,60 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             })
             .unwrap_or(0);
         let word = 1u128 | ((r.ble as u128) << 1) | ((r.clb.1 as u128) << 4) | elec;
-        bs.frames.insert((Far::IOB, major, 0), word);
+        acc.insert((Far::IOB, major, 0), word);
     }
     for (i, _m) in packed.macs.iter().enumerate() {
         let site = routed.placed.mac_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
-        bs.frames.insert((Far::DSP, i as u16, 0), word);
+        acc.insert((Far::DSP, i as u16, 0), word);
     }
     for (i, b) in packed.brams.iter().enumerate() {
         let site = routed.placed.bram_sites[i];
         let word = 1u128 | ((site.x as u128) << 8) | ((site.y as u128) << 16);
-        bs.frames.insert((Far::BRAM, i as u16, 0), word);
+        acc.insert((Far::BRAM, i as u16, 0), word);
         for (wi, w) in b.init.iter().enumerate() {
             let minor = 1u8 + (wi as u8);
-            bs.frames.insert((Far::BRAM, i as u16, minor), *w as u128);
+            acc.insert((Far::BRAM, i as u16, minor), *w as u128);
         }
     }
-    // Drop zero frames so emptiness matches the sparse encoder.
-    bs.frames.retain(|_, w| *w != 0);
-    if bs.frames.is_empty() {
+    acc.retain(|_, w| *w != 0);
+    if acc.is_empty() {
         return Err(format!(
             "{ERR_CODE_EMPTY_BITSTREAM}: bitgen: no configured frames — refusing empty/fake bitstream (design set no bits)"
         ));
     }
-    bs.packets = encode_packets(dev.idcode, &bs.frames);
+    let frames: BTreeMap<(u8, u16, u8), u128> = acc.into_iter().collect();
+    let packets = encode_packets(dev.idcode, &frames);
     // Header CRC + body hash are always computed in encode_packets. In-stream
     // CRC_CHECK (0x21) remains a 0 stub (device CRC not modeled); size-stable.
     debug_assert_ne!(
-        bs.packets,
+        packets,
         Bitstream::empty(dev).packets,
         "bitgen must not equal Bitstream::empty"
     );
-    Ok(bs)
+    Ok(Bitstream {
+        idcode: dev.idcode,
+        frames,
+        packets,
+    })
 }
 
 pub fn assemble(dev: &Device, feats: &FeatureSet) -> Result<Bitstream, String> {
-    let mut bs = Bitstream::empty(dev);
+    let mut frames = BTreeMap::new();
     for (name, val) in &feats.bits {
         if !*val {
             continue;
         }
         let loc: BitLoc = dev.locate(name)?;
         let key = (loc.far.block_type, loc.far.major, loc.far.minor);
-        let frame = bs.frames.entry(key).or_insert(0);
-        *frame |= 1u128 << loc.bit;
+        *frames.entry(key).or_insert(0) |= 1u128 << loc.bit;
     }
-    bs.packets = encode_packets(dev.idcode, &bs.frames);
-    Ok(bs)
+    let packets = encode_packets(dev.idcode, &frames);
+    Ok(Bitstream {
+        idcode: dev.idcode,
+        frames,
+        packets,
+    })
 }
 
 /// A WRITE_FDRI length field is 16-bit, so a contiguous run is chunked at
@@ -192,14 +339,19 @@ pub const HBITS_HEADER_BYTES: usize = 4 + 2 + 4 + 4 + 8 + 32 + 4;
 /// written; a frame the stream never addresses keeps its reset value, so a
 /// 4-LUT design does not pay for every frame on the die.
 pub fn encode_packets(idcode: u32, frames: &BTreeMap<(u8, u16, u8), u128>) -> Vec<u8> {
-    let mut body = Vec::new();
+    let n_frames = frames.values().filter(|p| **p != 0).count();
+    // SYNC(7) + worst-case isolated FAR+FDRI (7+3+16) + CRC_CHECK(7) + DESYNC(3).
+    let body_cap = 7 + n_frames.saturating_mul(26) + 10;
+    // Write buffer: one reserved Vec; header slot patched after the body.
+    let mut out = Vec::with_capacity(HBITS_HEADER_BYTES + body_cap);
+    out.resize(HBITS_HEADER_BYTES, 0);
     // SYNC
-    body.push(0x01);
-    body.extend_from_slice(&4u16.to_le_bytes());
-    body.extend_from_slice(b"HELI");
+    out.push(0x01);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(b"HELI");
     let mut run_start: Option<u32> = None;
     let mut last_far: Option<u32> = None;
-    let mut run: Vec<u128> = Vec::new();
+    let mut run: Vec<u128> = Vec::with_capacity(n_frames.min(MAX_RUN_FRAMES));
     // BTreeMap iterates in (block, major, minor) order already.
     for ((block, major, minor), payload) in frames {
         if *payload == 0 {
@@ -216,7 +368,7 @@ pub fn encode_packets(idcode: u32, frames: &BTreeMap<(u8, u16, u8), u128>) -> Ve
         if !contiguous || run.len() >= MAX_RUN_FRAMES {
             if let Some(start) = run_start {
                 if !run.is_empty() {
-                    flush_run(&mut body, start, &run);
+                    flush_run(&mut out, start, &run);
                 }
             }
             run.clear();
@@ -227,28 +379,27 @@ pub fn encode_packets(idcode: u32, frames: &BTreeMap<(u8, u16, u8), u128>) -> Ve
     }
     if let Some(start) = run_start {
         if !run.is_empty() {
-            flush_run(&mut body, start, &run);
+            flush_run(&mut out, start, &run);
         }
     }
     // CRC_CHECK
-    body.push(0x21);
-    body.extend_from_slice(&4u16.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes());
+    out.push(0x21);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
     // DESYNC
-    body.push(0x02);
-    body.extend_from_slice(&0u16.to_le_bytes());
+    out.push(0x02);
+    out.extend_from_slice(&0u16.to_le_bytes());
 
-    let mut out = Vec::new();
-    out.extend_from_slice(b"HBIT");
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&idcode.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // flags
-    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    let hash = sha256_lite(&body);
-    out.extend_from_slice(&hash);
-    let hdr_crc = crc32c(&out);
-    out.extend_from_slice(&hdr_crc.to_le_bytes());
-    out.extend_from_slice(&body);
+    let body_len = (out.len() - HBITS_HEADER_BYTES) as u64;
+    out[0..4].copy_from_slice(b"HBIT");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[6..10].copy_from_slice(&idcode.to_le_bytes());
+    out[10..14].copy_from_slice(&0u32.to_le_bytes()); // flags
+    out[14..22].copy_from_slice(&body_len.to_le_bytes());
+    let hash = sha256_lite(&out[HBITS_HEADER_BYTES..]);
+    out[22..54].copy_from_slice(&hash);
+    let hdr_crc = crc32c(&out[..54]);
+    out[54..58].copy_from_slice(&hdr_crc.to_le_bytes());
     out
 }
 
@@ -332,12 +483,18 @@ fn flush_run(body: &mut Vec<u8>, far: u32, run: &[u128]) {
     body.push(0x10); // WRITE_FAR
     body.extend_from_slice(&4u16.to_le_bytes());
     body.extend_from_slice(&far.to_le_bytes());
-    let bytes = run.len() * 16;
-    debug_assert!(bytes <= u16::MAX as usize, "FDRI run must fit the length field");
+    let nbytes = run.len() * 16;
+    debug_assert!(
+        nbytes <= u16::MAX as usize,
+        "FDRI run must fit the length field"
+    );
     body.push(0x11); // WRITE_FDRI
-    body.extend_from_slice(&(bytes as u16).to_le_bytes());
-    for w in run {
-        body.extend_from_slice(&w.to_le_bytes());
+    body.extend_from_slice(&(nbytes as u16).to_le_bytes());
+    let start = body.len();
+    body.resize(start + nbytes, 0);
+    for (i, w) in run.iter().enumerate() {
+        let off = start + i * 16;
+        body[off..off + 16].copy_from_slice(&w.to_le_bytes());
     }
 }
 
@@ -358,7 +515,13 @@ pub fn crc32c(data: &[u8]) -> u32 {
 }
 
 /// Read LUT INIT back from programmed frames via the HAD FeatureMap.
-pub fn readback_lut_init(dev: &Device, bits: &Bitstream, x: u32, y: u32, ble: u32) -> Result<u64, String> {
+pub fn readback_lut_init(
+    dev: &Device,
+    bits: &Bitstream,
+    x: u32,
+    y: u32,
+    ble: u32,
+) -> Result<u64, String> {
     let mut init = 0u64;
     for i in 0..64u32 {
         let loc = dev.locate(&format!("CLB_X{x}Y{y}.BLE{ble}.LUT.INIT[{i}]"))?;
@@ -375,7 +538,12 @@ pub fn readback_lut_init(dev: &Device, bits: &Bitstream, x: u32, y: u32, ble: u3
 }
 
 /// ECO: change one LUT INIT and rebuild the bitstream (other sites unchanged in intent).
-pub fn eco_lut(dev: &Device, routed: &Routed, cell: &str, new_init: u64) -> Result<Bitstream, String> {
+pub fn eco_lut(
+    dev: &Device,
+    routed: &Routed,
+    cell: &str,
+    new_init: u64,
+) -> Result<Bitstream, String> {
     let mut r = routed.clone();
     let i = r
         .placed
@@ -414,7 +582,9 @@ pub fn bitgen_pblock(
         }
     }
     if frames.is_empty() {
-        return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: pblock produced no frames"));
+        return Err(format!(
+            "{ERR_CODE_EMPTY_BITSTREAM}: pblock produced no frames"
+        ));
     }
     let mut bs = Bitstream {
         idcode: dev.idcode,
@@ -510,7 +680,9 @@ mod tests {
         let (site, ble) = r.placed.lutff_sites[0];
         let major = dev.clb_major(site.x, site.y).unwrap();
         assert!(
-            decoded.keys().any(|(b, maj, _)| *b == Far::CLB_IO_CLK && *maj == major),
+            decoded
+                .keys()
+                .any(|(b, maj, _)| *b == Far::CLB_IO_CLK && *maj == major),
             "the placed CLB major must be in the stream"
         );
         assert_eq!(
@@ -553,7 +725,10 @@ mod tests {
             .filter(|((blk, _, _), _)| *blk == Far::IOB)
             .map(|(k, w)| (*k, *w))
             .collect();
-        assert_ne!(iob_a, iob_b, "DRIVE/SLEW/PULLTYPE must change the IOB frame");
+        assert_ne!(
+            iob_a, iob_b,
+            "DRIVE/SLEW/PULLTYPE must change the IOB frame"
+        );
         let elec = Device::iob_electrical_bits(Some("4"), Some("FAST"), Some("PULLUP"), None, None);
         assert!(
             iob_b.iter().any(|(_, w)| (*w & elec) == elec),
@@ -574,7 +749,8 @@ mod tests {
             .map(|(k, w)| (*k, *w))
             .collect();
         assert_ne!(iob_a, iob_c, "DIFF_TERM/IN_TERM must change the IOB frame");
-        let term = Device::iob_electrical_bits(None, None, None, Some("TRUE"), Some("UNTUNED_SPLIT_50"));
+        let term =
+            Device::iob_electrical_bits(None, None, None, Some("TRUE"), Some("UNTUNED_SPLIT_50"));
         assert!(
             iob_c.iter().any(|(_, w)| (*w & term) == term),
             "IOB word must carry DIFF_TERM/IN_TERM bits {term:#x}: {iob_c:?}"
@@ -589,7 +765,10 @@ mod tests {
         let mut frames = BTreeMap::new();
         for major in 0..dev.n_clb() as u16 {
             for minor in 0..dev.clb_minors as u8 {
-                frames.insert((Far::CLB_IO_CLK, major, minor), (major as u128) << 8 | minor as u128 | 1);
+                frames.insert(
+                    (Far::CLB_IO_CLK, major, minor),
+                    (major as u128) << 8 | minor as u128 | 1,
+                );
             }
         }
         let packets = encode_packets(dev.idcode, &frames);
@@ -685,6 +864,36 @@ mod tests {
     }
 
     #[test]
+    fn bitgen_clb_frames_match_featureset_assemble() {
+        // Frame buffering must be encode-equivalent to the FeatureSet locate path.
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let bs = bitgen(&dev, &r).unwrap();
+        let mut feats = FeatureSet::new();
+        for (i, lutff) in r.placed.packed.lutffs.iter().enumerate() {
+            let (site, ble) = r.placed.lutff_sites[i];
+            feats.set_init(site.x, site.y, ble as u32, lutff.init);
+            feats.set_ff_used(site.x, site.y, ble as u32, !lutff.ff_cell.is_empty());
+        }
+        for m in &r.imux {
+            feats.set_imux(m.x, m.y, m.mux, m.sel);
+        }
+        let assembled = assemble(&dev, &feats).unwrap();
+        for (k, w) in &assembled.frames {
+            assert_eq!(
+                bs.frames.get(k),
+                Some(w),
+                "CLB frame {k:?} must match FeatureSet assemble"
+            );
+        }
+        let (idcode, decoded) = decode_packets(&bs.packets).unwrap();
+        assert_eq!(idcode, dev.idcode);
+        assert_eq!(decoded, bs.frames);
+    }
+
+    #[test]
     fn bitgen_refuses_empty_design() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let empty = Routed {
@@ -737,7 +946,10 @@ mod tests {
             let pl = place(&p, &dev).unwrap();
             let r = route(&pl, &dev).unwrap();
             let err = bitgen(&dev, &r).unwrap_err();
-            assert!(err.contains(ERR_CODE_EMPTY_BITSTREAM), "stable code missing: {err}");
+            assert!(
+                err.contains(ERR_CODE_EMPTY_BITSTREAM),
+                "stable code missing: {err}"
+            );
             assert!(err.contains("refusing") || err.contains("empty"), "{err}");
             assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
             return;
@@ -759,7 +971,9 @@ mod tests {
             "stable code missing: {err}"
         );
         assert!(
-            err.contains("no configured frames") || err.contains("refusing") || err.contains("empty"),
+            err.contains("no configured frames")
+                || err.contains("refusing")
+                || err.contains("empty"),
             "{err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
