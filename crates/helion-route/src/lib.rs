@@ -5,7 +5,7 @@
 //! cost (false_path / multicycle dogleg). helion-cli and helion-proj still call
 //! unguided `route_with` until a later crate lock wires `TimingGuide` through.
 
-use helion_device::{Device, Site};
+use helion_device::{BelId, Device, NetId, Site, SiteKind};
 use helion_place::Placed;
 
 pub use helion_place::TimingGuide;
@@ -36,6 +36,82 @@ pub struct IobRoute {
     pub path: Vec<(u32, u32)>,
     /// Packed IOB `from_net` this route drives (HNF net, not a chrome label).
     pub net: String,
+}
+
+impl IobRoute {
+    pub fn clb_site(&self) -> Site {
+        Site {
+            x: self.clb.0,
+            y: self.clb.1,
+            kind: SiteKind::Clb,
+        }
+    }
+
+    pub fn iob_site(&self) -> Site {
+        Site {
+            x: self.iob.0,
+            y: self.iob.1,
+            kind: SiteKind::Iob,
+        }
+    }
+
+    /// Driving FF BEL at the source CLB (`CLB_XnYm/BLEk.FF`).
+    pub fn clb_bel(&self) -> BelId {
+        BelId::new(self.clb_site(), format!("BLE{}.FF", self.ble))
+    }
+
+    /// Architecture Q stub at the source BLE.
+    pub fn clb_net_id(&self) -> NetId {
+        NetId::new(self.clb_site(), format!("BLE{}.Q", self.ble))
+    }
+}
+
+/// First HAD site at tile (x, y) present in the loaded part.
+pub fn site_at_xy(dev: &Device, x: u32, y: u32) -> Option<Site> {
+    const KINDS: [SiteKind; 5] = [
+        SiteKind::Clb,
+        SiteKind::Iob,
+        SiteKind::Clk,
+        SiteKind::Dsp,
+        SiteKind::Bram,
+    ];
+    KINDS
+        .into_iter()
+        .map(|kind| Site { x, y, kind })
+        .find(|&s| dev.contains_site(s))
+}
+
+impl Routed {
+    /// HAD sites along PathFinder IOB routes (source CLB, hops, sink IOB).
+    pub fn path_sites(&self, dev: &Device) -> Vec<Site> {
+        let mut v = Vec::new();
+        let mut seen = HashSet::new();
+        for r in &self.iob_src {
+            for &(x, y) in &r.path {
+                if let Some(s) = site_at_xy(dev, x, y) {
+                    if seen.insert(s) {
+                        v.push(s);
+                    }
+                }
+            }
+            let clb = r.clb_site();
+            let iob = r.iob_site();
+            if dev.contains_site(clb) && seen.insert(clb) {
+                v.push(clb);
+            }
+            if dev.contains_site(iob) && seen.insert(iob) {
+                v.push(iob);
+            }
+        }
+        v
+    }
+
+    pub fn path_site_ids(&self, dev: &Device) -> Vec<String> {
+        let mut ids: Vec<String> = self.path_sites(dev).iter().map(|s| s.id()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
 }
 
 /// One tile hop delay (ps). Folded into PathFinder negotiated cost.
@@ -295,8 +371,9 @@ fn imux_sel(from: Site, to: Site, dble: u8) -> Result<u8, String> {
         return Ok(248 + dble);
     }
     Err(format!(
-        "IMUX: no local/±2/±3/±4/diag/knight encoding from CLB_X{}Y{} BLE{dble} to CLB_X{}Y{}",
-        from.x, from.y, to.x, to.y
+        "IMUX: no local/±2/±3/±4/diag/knight encoding from {} BLE{dble} to {}",
+        from.id(),
+        to.id()
     ))
 }
 
@@ -486,17 +563,24 @@ pub fn route_with_guide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_place::hard_heartbeat;
     use helion_device::Device;
     use helion_ir::Design;
     use helion_pack::pack;
-    use helion_place::{place, place_with, place_with_guide, PlaceOpts};
+    use helion_place::hard_heartbeat;
+    use helion_place::{PlaceOpts, place, place_with, place_with_guide};
 
     #[test]
     fn routes_south_to_iob() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_blinky(), &dev).unwrap();
-        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let r = route(&pl, &dev).unwrap();
         assert_eq!(r.iob_src.len(), 1);
         assert_eq!(r.iob_src[0].clb.1, pl.lutff_sites[0].0.y);
@@ -510,7 +594,10 @@ mod tests {
             r.iob_src[0].hops,
             "PathFinder hops are tile steps, not a canned count"
         );
-        assert!(!r.iob_src[0].net.is_empty(), "IOB route names the packed net");
+        assert!(
+            !r.iob_src[0].net.is_empty(),
+            "IOB route names the packed net"
+        );
     }
 
     #[test]
@@ -527,7 +614,14 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_blinky(), &dev).unwrap();
         let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
-        let td = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let td = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let r_wl = route(&wl, &dev).unwrap();
         let r_td = route(&td, &dev).unwrap();
         assert!(
@@ -538,7 +632,10 @@ mod tests {
             r_td.iob_src[0].hops,
             r_wl.iob_src[0].hops
         );
-        assert_eq!(r_td.iob_src[0].delay_ps, r_td.iob_src[0].hops as i64 * HOP_DELAY_PS);
+        assert_eq!(
+            r_td.iob_src[0].delay_ps,
+            r_td.iob_src[0].hops as i64 * HOP_DELAY_PS
+        );
         assert!(r_td.iob_src[0].hops >= 1);
     }
 
@@ -546,7 +643,14 @@ mod tests {
     fn extra_hops_add_directed_delay() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_blinky(), &dev).unwrap();
-        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let base = route(&pl, &dev).unwrap();
         let detour = route_with(
             &pl,
@@ -601,7 +705,14 @@ mod tests {
     fn empty_guide_matches_route_with() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_counter(), &dev).unwrap();
-        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let a = route(&pl, &dev).unwrap();
         let b = route_with_guide(&pl, &dev, RouteOpts::default(), &TimingGuide::default()).unwrap();
         assert_eq!(hops_of(&a), hops_of(&b), "empty guide must keep gold hops");
@@ -613,7 +724,9 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&hard_heartbeat(), &dev).unwrap();
         assert!(p.lutffs.len() >= 8);
-        let opts = PlaceOpts { timing_weight: 0.75 };
+        let opts = PlaceOpts {
+            timing_weight: 0.75,
+        };
         let g0 = TimingGuide::default();
         let gfp = TimingGuide {
             false_path_iob: true,
@@ -651,7 +764,9 @@ mod tests {
     fn multicycle_guide_changes_hops_or_sites_on_hard_fixture() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&hard_heartbeat(), &dev).unwrap();
-        let opts = PlaceOpts { timing_weight: 0.75 };
+        let opts = PlaceOpts {
+            timing_weight: 0.75,
+        };
         let g0 = TimingGuide::default();
         let gm = TimingGuide {
             false_path_iob: false,
@@ -689,5 +804,45 @@ mod tests {
         .unwrap();
         assert_ne!(rm.iob_src[0].hops, rfp.iob_src[0].hops);
         assert_ne!(rm.iob_src[0].path, rfp.iob_src[0].path);
+    }
+
+    #[test]
+    fn routed_path_sites_resolve_in_had() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
+        let r = route(&pl, &dev).unwrap();
+        assert!(!r.iob_src.is_empty());
+        let ids = r.path_site_ids(&dev);
+        assert!(!ids.is_empty(), "IOB route must yield HAD sites");
+        for id in &ids {
+            assert!(
+                dev.site_by_id(id).is_some(),
+                "path site {id} must be in HAD"
+            );
+        }
+        let clb = r.iob_src[0].clb_site();
+        let iob = r.iob_src[0].iob_site();
+        assert!(dev.contains_site(clb));
+        assert!(dev.contains_site(iob));
+        assert_eq!(
+            r.iob_src[0].clb_bel().id(),
+            format!("{}/BLE{}.FF", clb.id(), r.iob_src[0].ble)
+        );
+        assert_eq!(
+            r.iob_src[0].clb_net_id().id(),
+            format!("{}/BLE{}.Q", clb.id(), r.iob_src[0].ble)
+        );
+        let endpoints = [("u_ff3", clb), ("u_iob", iob)];
+        let resolved = dev.resolve_path_sites(&endpoints).unwrap();
+        assert!(resolved.contains(&clb.id()));
+        assert!(resolved.contains(&iob.id()));
     }
 }
