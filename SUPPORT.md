@@ -10,4 +10,4 @@ We do not provide vendor-tool support (Vivado, Quartus, …).
 
 ## Roadmap
 
-Planned releases 1.4 → 2.0: [`ROADMAP.md`](ROADMAP.md) and [milestones](https://github.com/helion-fpga/helion/milestones).
+**2.0** shipped; current **[v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4)**. Roadmap (incl. 2.0.x grind): [`ROADMAP.md`](ROADMAP.md) and [milestones](https://github.com/helion-fpga/helion/milestones).
