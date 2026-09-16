@@ -1,6 +1,14 @@
 /target
 **/*.rs.bk
 .DS_Store
+**/.DS_Store
 
 /dist
-fm-hel-ux3-shots/
+suite-shots/
+fm-hel-*/
+fm-hel-*.tgz
+fm-hel-*.json
+gold-*.log
+*.ppm
+docs/mac-bench-2.0.4/
+

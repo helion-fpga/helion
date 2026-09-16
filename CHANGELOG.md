@@ -10,6 +10,8 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Changed
 
+- README is a human on-ramp (try / gold / download / QoR). Session dumps (`suite-shots/`, numbered P5 catalog/gold-wns txt, firstmate notes at repo root) are out of the tree.
+
 ### Fixed
 
 [unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.4...HEAD
