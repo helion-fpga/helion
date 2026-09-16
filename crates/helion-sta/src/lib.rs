@@ -11,7 +11,7 @@ use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
 use helion_route::Routed;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct Clock {
@@ -886,13 +886,20 @@ pub fn report_timing_placed(
     if r.endpoints == 0 {
         return Ok(r);
     }
+    // IOB from_net set once: membership is O(1), not O(lutffs × iobs).
+    let iob_from_nets: HashSet<&str> = placed
+        .packed
+        .iobs
+        .iter()
+        .map(|io| io.from_net.as_str())
+        .collect();
     let iob_ps = placed
         .lutff_sites
         .iter()
         .zip(placed.packed.lutffs.iter())
         .filter_map(|((site, _), lf)| {
             let iob = placed.iob_sites.first()?;
-            if placed.packed.iobs.iter().any(|io| io.from_net == lf.q_net) {
+            if iob_from_nets.contains(lf.q_net.as_str()) {
                 Some(FF_CKQ_PS + site.y.abs_diff(iob.y) as i64 * HOP_PS + iob_pad_ps(design))
             } else {
                 None
