@@ -7,6 +7,8 @@ use helion_ir::{Design, MapResult, SoftDiag, SoftSpan};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Design-only wrapper — SoftDiag API is `map_vhdl` / `map_vhdl_path`.
+/// `synth_*` drops softs by design until callers switch to `map_vhdl*`.
 pub fn synth_vhdl(source: &str) -> Result<Design, String> {
     Ok(map_vhdl(source)?.design)
 }
@@ -17,6 +19,7 @@ pub fn map_vhdl(source: &str) -> Result<MapResult, String> {
     map_vhdl_origin(source, "vhdl.vhd")
 }
 
+/// Design-only wrapper; softs discarded — use `map_vhdl_path` for SoftDiag.
 pub fn synth_vhdl_path(path: &Path) -> Result<Design, String> {
     Ok(map_vhdl_path(path)?.design)
 }
@@ -213,8 +216,10 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         }
     }
     let mut out = String::new();
-    let mut all_softs: Vec<SoftDiag> = Vec::new();
     let mut entity_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
+    // Pass 1: emit every unit with an EMPTY child_softs map so declaration
+    // order cannot omit child_soft_incomplete (parent-before-child gap).
+    let empty_child_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
     // Emit non-top entities with bodies first so hierarchy stitch finds them.
     for e in &entities {
         if e.name.eq_ignore_ascii_case(&top.name) {
@@ -239,10 +244,9 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
             origin,
             source,
             &mut unit_softs,
-            &entity_softs,
+            &empty_child_softs,
         )?);
-        entity_softs.insert(e.name.to_ascii_lowercase(), unit_softs.clone());
-        all_softs.extend(unit_softs);
+        entity_softs.insert(e.name.to_ascii_lowercase(), unit_softs);
     }
     let arch = arch_for(&top.name)
         .or_else(|| archs.last())
@@ -262,10 +266,144 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
         origin,
         source,
         &mut unit_softs,
-        &entity_softs,
+        &empty_child_softs,
     )?);
-    all_softs.extend(unit_softs);
+    entity_softs.insert(top.name.to_ascii_lowercase(), unit_softs);
+
+    // Pass 2: after all base entity_softs are filled, nest child_soft_incomplete
+    // bottom-up. MapResult.softs is a roots-only forest (no flat+nested dupes).
+    let full_softs = build_softs_forest(
+        &entities,
+        &entity_softs,
+        &archs,
+        &known_bodies,
+        origin,
+        source,
+    );
+    let mut nested_as_child: HashSet<String> = HashSet::new();
+    for softs in full_softs.values() {
+        for s in softs {
+            if s.name == "child_soft_incomplete" {
+                if let Some(d) = &s.detail {
+                    nested_as_child.insert(d.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    let mut all_softs: Vec<SoftDiag> = Vec::new();
+    for e in &entities {
+        if e.name.eq_ignore_ascii_case(&top.name) {
+            continue;
+        }
+        let k = e.name.to_ascii_lowercase();
+        if nested_as_child.contains(&k) {
+            continue;
+        }
+        if let Some(s) = full_softs.get(&k) {
+            all_softs.extend(s.iter().cloned());
+        }
+    }
+    let top_k = top.name.to_ascii_lowercase();
+    if !nested_as_child.contains(&top_k) {
+        if let Some(s) = full_softs.get(&top_k) {
+            all_softs.extend(s.iter().cloned());
+        }
+    }
     Ok((out, all_softs))
+}
+
+/// Bottom-up SoftDiag forest: each entity's base softs plus `child_soft_incomplete`
+/// nodes that nest the child's full soft list (memoized; cycle-safe).
+fn build_softs_forest(
+    entities: &[Entity],
+    base: &HashMap<String, Vec<SoftDiag>>,
+    archs: &[Arch],
+    known_bodies: &HashSet<String>,
+    origin: &str,
+    source: &str,
+) -> HashMap<String, Vec<SoftDiag>> {
+    let mut memo: HashMap<String, Vec<SoftDiag>> = HashMap::new();
+    let mut stack: HashSet<String> = HashSet::new();
+    for e in entities {
+        let _ = softs_forest_for(
+            &e.name,
+            base,
+            archs,
+            known_bodies,
+            origin,
+            source,
+            &mut memo,
+            &mut stack,
+        );
+    }
+    memo
+}
+
+fn softs_forest_for(
+    name: &str,
+    base: &HashMap<String, Vec<SoftDiag>>,
+    archs: &[Arch],
+    known_bodies: &HashSet<String>,
+    origin: &str,
+    source: &str,
+    memo: &mut HashMap<String, Vec<SoftDiag>>,
+    stack: &mut HashSet<String>,
+) -> Vec<SoftDiag> {
+    let key = name.to_ascii_lowercase();
+    if let Some(v) = memo.get(&key) {
+        return v.clone();
+    }
+    if !stack.insert(key.clone()) {
+        return base.get(&key).cloned().unwrap_or_default();
+    }
+    let mut softs = base.get(&key).cloned().unwrap_or_default();
+    if let Some(arch) = archs
+        .iter()
+        .rev()
+        .find(|a| a.of.eq_ignore_ascii_case(name))
+    {
+        for st in &arch.stmts {
+            let CStmt::Inst {
+                module,
+                name: iname,
+                ..
+            } = st
+            else {
+                continue;
+            };
+            let mk = module.to_ascii_lowercase();
+            if !known_bodies.contains(&mk) {
+                continue;
+            }
+            let child_full = softs_forest_for(
+                module,
+                base,
+                archs,
+                known_bodies,
+                origin,
+                source,
+                memo,
+                stack,
+            );
+            if child_full.is_empty() {
+                continue;
+            }
+            let mut d = SoftDiag::new("child_soft_incomplete", name)
+                .with_detail(module.clone())
+                .with_span(span_best_effort(
+                    source,
+                    origin,
+                    &[iname.as_str(), module.as_str()],
+                ));
+            for c in &child_full {
+                d.push_child(c.clone());
+            }
+            softs.push(d);
+        }
+    }
+    stack.remove(&key);
+    memo.insert(key, softs.clone());
+    softs
 }
 
 /// Localparams to emit. Package consts stay in parse_arch's fold env; they
@@ -968,6 +1106,21 @@ fn parse_if_generate(
     let toks = if use_else { else_toks } else { then_toks };
     let mut bp = P { t: &toks, i: 0 };
     let stmts = parse_concurrent_list(&mut bp, consts, signals).unwrap_or_default();
+    // Contract: return at most one concurrent stmt. Never silent-drop Insts —
+    // mirror for-generate when Insts are stripped/truncated from the body.
+    let n = stmts.len();
+    let dropped_inst = stmts
+        .iter()
+        .skip(1)
+        .any(|s| matches!(s, CStmt::Inst { .. }));
+    let has_inst = stmts.iter().any(|s| matches!(s, CStmt::Inst { .. }));
+    if dropped_inst || (has_inst && n > 1) {
+        note_parse_soft(
+            "generate_not_lowered",
+            Some("if generate".into()),
+            "generate",
+        );
+    }
     Ok(stmts.into_iter().next())
 }
 
@@ -3382,9 +3535,25 @@ end;
             "must not use design top_name"
         );
         let mr = map_vhdl(src).expect("map");
+        // Roots-only forest: missing_component lives under child_soft_incomplete,
+        // not also as a flat top-level duplicate.
+        assert!(
+            mr.softs
+                .iter()
+                .any(|s| s.name == "child_soft_incomplete" && s.module == "wrap"),
+            "softs={:?}",
+            mr.soft_table_lines()
+        );
+        assert!(
+            !mr.softs.iter().any(|s| s.name == "missing_component"),
+            "roots-only: leaf must not also be a flat root: {:?}",
+            mr.soft_table_lines()
+        );
         let miss: Vec<_> = mr
             .softs
             .iter()
+            .filter(|s| s.name == "child_soft_incomplete")
+            .flat_map(|s| s.children.iter())
             .filter(|s| s.name == "missing_component")
             .collect();
         assert_eq!(miss.len(), 1, "softs={:?}", mr.soft_table_lines());
@@ -3394,10 +3563,14 @@ end;
             "must not use design top_name: {:?}",
             mr.soft_table_lines()
         );
-        assert!(mr
-            .softs
-            .iter()
-            .any(|s| s.name == "child_soft_incomplete" && s.module == "wrap"));
+        let rows = mr.soft_table_lines();
+        assert_eq!(
+            rows.iter()
+                .filter(|l| l.contains("name=missing_component"))
+                .count(),
+            1,
+            "no flat+nested duplicate rows: {rows:?}"
+        );
     }
 
     #[test]
@@ -3610,6 +3783,120 @@ end;
                 .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
             "must not invent LUTs for unlowered generate inst: {:?}",
             mr.design.cells
+        );
+    }
+
+    #[test]
+    fn vhdl_if_generate_inst_not_silent_softdiag() {
+        // if-generate must not silent-drop Insts (for-generate already notes).
+        // Two stmts → `.next()` keeps one and would drop the Inst without a soft.
+        let src = r#"
+entity wrap is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of wrap is
+begin
+  g: if 1 generate
+    y <= a;
+    u_miss: missing_child port map (a => a, y => y);
+  end generate;
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        assert!(
+            mr.softs
+                .iter()
+                .any(|s| s.name == "generate_not_lowered" && s.module == "wrap")
+                || mr.softs.iter().any(|s| s.name == "missing_component"),
+            "if-generate instance must be a named soft, not silent cells=0: {:?}",
+            mr.soft_table_lines()
+        );
+        assert!(
+            mr.has_softs(),
+            "SOFT must be first-class for if-generate Inst"
+        );
+        assert!(
+            !mr.design
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "must not invent LUTs for if-generate inst: {:?}",
+            mr.design.cells
+        );
+    }
+
+    #[test]
+    fn vhdl_parent_before_child_child_soft_incomplete() {
+        // Declaration-order gap: parent entity appears BEFORE child. Pass-1
+        // emit with empty child_softs + pass-2 forest must still nest.
+        let src = r#"
+entity mid is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of mid is
+begin
+  u_inner: inner port map (a => a, y => y);
+end;
+entity inner is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of inner is
+begin
+  u_miss: missing_child port map (a => a, y => y);
+end;
+entity wrap is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of wrap is
+begin
+  u_mid: mid port map (a => a, y => y);
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        assert!(
+            mr.softs
+                .iter()
+                .any(|s| s.name == "child_soft_incomplete" && s.module == "wrap"),
+            "wrap must root the forest: {:?}",
+            mr.soft_table_lines()
+        );
+        // mid was declared before inner — still must carry child_soft_incomplete
+        // nested under wrap (not omitted by parse order).
+        let wrap_csi = mr
+            .softs
+            .iter()
+            .find(|s| s.name == "child_soft_incomplete" && s.module == "wrap")
+            .expect("wrap child_soft_incomplete");
+        let mid_csi = wrap_csi
+            .children
+            .iter()
+            .find(|s| s.name == "child_soft_incomplete" && s.module == "mid")
+            .unwrap_or_else(|| {
+                panic!(
+                    "mid child_soft_incomplete required under wrap despite parent-before-child decl order: {:?}",
+                    mr.soft_table_lines()
+                )
+            });
+        assert!(
+            mid_csi
+                .children
+                .iter()
+                .any(|s| s.name == "missing_component" && s.module == "inner"),
+            "inner missing_component nested under mid: {:?}",
+            mr.soft_table_lines()
+        );
+        assert!(
+            !mr.softs.iter().any(|s| s.name == "missing_component"),
+            "roots-only forest: {:?}",
+            mr.soft_table_lines()
+        );
+        let rows = mr.soft_table_lines();
+        assert_eq!(
+            rows.iter()
+                .filter(|l| l.contains("name=missing_component"))
+                .count(),
+            1,
+            "display flatten once: {rows:?}"
         );
     }
 

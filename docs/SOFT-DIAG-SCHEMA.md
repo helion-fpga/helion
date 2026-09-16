@@ -11,3 +11,6 @@ Do **not** invent a parallel VHDL table — emit `helion_ir::SoftDiag` into `Map
 PASS never includes soft cones. Never invent LUTs for `unused_*` / `fcov_`.
 
 Headless row: `SoftDiag::table_line()` / `MapResult::soft_table_lines()`.
+
+`MapResult.softs` is a **roots-only forest** (nested softs live under `SoftDiag.children`; `soft_table_lines` flattens for display). SoftDiag API is `map_vhdl*` — `synth_vhdl` / `synth_vhdl_path` stay Design-only and drop softs by design.
+
