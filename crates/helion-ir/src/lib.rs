@@ -22,6 +22,130 @@ impl Attrs {
     }
 }
 
+
+/// Source location for a SOFT diagnostic (FM-HEL-L3). Prefer file+line; columns optional.
+/// Elaborators (SV/VHDL) fill what they know; unknown fields stay `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SoftSpan {
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    pub end_line: Option<u32>,
+}
+
+impl SoftSpan {
+    pub fn file_line(file: impl Into<String>, line: u32) -> Self {
+        Self {
+            file: Some(file.into()),
+            line: Some(line),
+            column: None,
+            end_line: None,
+        }
+    }
+}
+
+/// First-class incomplete-map entry. **SOFT ≠ PASS** — never invent Helion cells for these.
+///
+/// `name` is the stable diagnostic id (same strings SV already prints), e.g.
+/// `assign_not_lowered`, `generate_not_lowered`, `child_soft_incomplete`, `wide_cone`,
+/// `function_not_called`, `sequential_not_lowered`, …
+///
+/// `module` is hierarchical context. `detail` is optional signal / function / child /
+/// primitive / path (whatever the diagnostic already carries).
+///
+/// `children` nests child softs (e.g. `child_soft_incomplete` under a parent wrap).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoftDiag {
+    pub name: String,
+    pub module: String,
+    pub detail: Option<String>,
+    pub span: SoftSpan,
+    pub children: Vec<SoftDiag>,
+}
+
+impl SoftDiag {
+    pub fn new(name: impl Into<String>, module: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            module: module.into(),
+            detail: None,
+            span: SoftSpan::default(),
+            children: Vec::new(),
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn with_span(mut self, span: SoftSpan) -> Self {
+        self.span = span;
+        self
+    }
+
+    pub fn push_child(&mut self, child: SoftDiag) {
+        self.children.push(child);
+    }
+
+    /// One-line table row (headless / Reports). Does not claim PASS.
+    pub fn table_line(&self) -> String {
+        let mut s = format!("soft name={} module={}", self.name, self.module);
+        if let Some(d) = &self.detail {
+            s.push_str(&format!(" detail={d}"));
+        }
+        if let (Some(f), Some(l)) = (&self.span.file, self.span.line) {
+            s.push_str(&format!(" span={f}:{l}"));
+            if let Some(c) = self.span.column {
+                s.push_str(&format!(":{c}"));
+            }
+        } else if let Some(l) = self.span.line {
+            s.push_str(&format!(" span=:{l}"));
+        }
+        if !self.children.is_empty() {
+            s.push_str(&format!(" children={}", self.children.len()));
+        }
+        s
+    }
+}
+
+/// Post-map elaborator result: Helion `Design` cells + first-class SOFT table.
+/// PASS / closed-WNS paths must use `design` alone only when `softs` is empty
+/// for the cones under test — soft cones never count as PASS.
+#[derive(Clone, Debug)]
+pub struct MapResult {
+    pub design: Design,
+    pub softs: Vec<SoftDiag>,
+}
+
+impl MapResult {
+    pub fn from_design(design: Design) -> Self {
+        Self {
+            design,
+            softs: Vec::new(),
+        }
+    }
+
+    pub fn soft_table_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(s: &SoftDiag, out: &mut Vec<String>) {
+            out.push(s.table_line());
+            for c in &s.children {
+                walk(c, out);
+            }
+        }
+        for s in &self.softs {
+            walk(s, &mut out);
+        }
+        out
+    }
+
+    /// True when any soft is present (including nested children).
+    pub fn has_softs(&self) -> bool {
+        !self.softs.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Design {
     pub name: String,
@@ -805,5 +929,32 @@ mod tests {
         assert!(top.cell("u_lut").is_none());
         assert_eq!(top.instances[0].module, "blinky");
         assert!(top.cells.len() >= 3);
+    }
+}
+
+
+#[cfg(test)]
+mod soft_diag_tests {
+    use super::*;
+
+    #[test]
+    fn soft_diag_table_line_and_children() {
+        let mut parent = SoftDiag::new("child_soft_incomplete", "ibex_core")
+            .with_detail("ibex_if_stage")
+            .with_span(SoftSpan::file_line("ibex_core.sv", 120));
+        parent.push_child(
+            SoftDiag::new("generate_not_lowered", "ibex_if_stage")
+                .with_span(SoftSpan::file_line("ibex_if_stage.sv", 40)),
+        );
+        let mr = MapResult {
+            design: Design::new("t"),
+            softs: vec![parent],
+        };
+        let lines = mr.soft_table_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("soft name=child_soft_incomplete"));
+        assert!(lines[0].contains("span=ibex_core.sv:120"));
+        assert!(lines[1].contains("soft name=generate_not_lowered"));
+        assert!(mr.has_softs());
     }
 }
