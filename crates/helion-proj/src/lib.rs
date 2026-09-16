@@ -1,5 +1,6 @@
 //! Dual-mode Session, disk checkpoints `.hckp` (`write_checkpoint_to` /
 //! `open_checkpoint` / `read_checkpoint` alias), object query, opt, ECO.
+//! Stage machine + constraint provenance: [`SessionStage`], [`ConstraintProvenance`].
 
 use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
 use helion_debug::insert_ila;
@@ -9,7 +10,14 @@ use helion_ir::{CellKind, Design, PortDir};
 use helion_pack::{apply_iob_electrical, pack, Packed};
 use helion_place::{place_incremental, place_with, PlaceOpts, Placed};
 use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
-use helion_sta::{apply_xdc, create_clock, load_xdc, report_timing_routed_xdc, Constraints};
+use helion_sta::{apply_xdc, load_xdc, Constraints};
+use std::cell::Cell;
+
+mod stage;
+pub use stage::{
+    constraint_provenance, design_has_clock_path, ConstraintProvenance, SessionStage, StageError,
+    StageStatus, TimingReport, STA_FAIL, STAGE_PREREQ,
+};
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
@@ -165,6 +173,10 @@ pub struct Session {
     pub pblock: Option<PrjPblock>,
     pub place_opts: PlaceOpts,
     pub route_opts: RouteOpts,
+    /// Last STA provenance (`Cell` so `report_timing` stays `&self` for the IDE).
+    timing_provenance: Cell<Option<ConstraintProvenance>>,
+    pub sim_done: bool,
+    pub lab_done: bool,
 }
 
 impl Session {
@@ -184,6 +196,9 @@ impl Session {
             pblock: None,
             place_opts: ImplStrategy::Default.place_opts(),
             route_opts: ImplStrategy::Default.route_opts(),
+            timing_provenance: Cell::new(None),
+            sim_done: false,
+            lab_done: false,
         }
     }
 
@@ -200,6 +215,9 @@ impl Session {
         self.bitstream = None;
         self.impl_checkpoint = None;
         self.programmed = false;
+        self.sim_done = false;
+        self.lab_done = false;
+        self.clear_timing();
     }
 
     pub fn write_checkpoint(&mut self) -> Result<String, String> {
@@ -316,14 +334,13 @@ impl Session {
     }
 
     pub fn place_design_with(&mut self, dev: &Device, opts: PlaceOpts) -> Result<(), String> {
-        let d = self.design.as_ref().ok_or("place_design: no design")?;
-        let packed = pack(d, dev)?;
+        self.pack_design(dev)?;
+        self.refuse_stage(crate::SessionStage::Placed)?;
+        let packed = self.packed.as_ref().ok_or("place_design: not packed")?;
         // Default timing_weight 0.75 matches `helion run` / QoR gold (9640 ps).
-        let placed = place_with(&packed, dev, opts)?;
-        self.packed = Some(packed);
+        let placed = place_with(packed, dev, opts)?;
         self.placed = Some(placed);
-        self.routed = None;
-        self.bitstream = None;
+        self.clear_post_place();
         self.place_opts = opts;
         self.pblock = None;
         Ok(())
@@ -357,17 +374,16 @@ impl Session {
         pb: &PrjPblock,
         opts: PlaceOpts,
     ) -> Result<(), String> {
-        let d = self.design.as_ref().ok_or("place_pblock: no design")?;
-        let packed = pack(d, dev)?;
+        self.pack_design(dev)?;
+        self.refuse_stage(crate::SessionStage::Placed)?;
+        let packed = self.packed.as_ref().ok_or("place_pblock: not packed")?;
         // Empty `pb.cells` relocates the whole design. Always go through the
         // in-proj placer so IOB loc/name checks use `placed.packed.iobs` after
         // `place_with` LOC reorder (`place_in_region` indexes caller packed).
         let placed =
-            place_named_cells_in_region(&packed, dev, opts, pb.x0, pb.y0, pb.x1, pb.y1, &pb.cells)?;
-        self.packed = Some(packed);
+            place_named_cells_in_region(packed, dev, opts, pb.x0, pb.y0, pb.x1, pb.y1, &pb.cells)?;
         self.placed = Some(placed);
-        self.routed = None;
-        self.bitstream = None;
+        self.clear_post_place();
         self.place_opts = opts;
         self.pblock = Some(pb.clone());
         Ok(())
@@ -388,10 +404,11 @@ impl Session {
     }
 
     pub fn route_design_with(&mut self, dev: &Device, opts: RouteOpts) -> Result<(), String> {
+        self.refuse_stage(crate::SessionStage::Routed)?;
         let placed = self.placed.as_ref().ok_or("route_design: not placed")?;
         let routed = route_with(placed, dev, opts)?;
         self.routed = Some(routed);
-        self.bitstream = None;
+        self.clear_post_route();
         self.route_opts = opts;
         Ok(())
     }
@@ -462,8 +479,7 @@ impl Session {
         let _ = reused_lutff;
         self.packed = Some(packed);
         self.placed = Some(placed);
-        self.routed = None;
-        self.bitstream = None;
+        self.clear_post_place();
         Ok(report)
     }
 
@@ -481,7 +497,7 @@ impl Session {
             io.hops = 0;
             io.delay_ps = 0;
         }
-        self.bitstream = None;
+        self.clear_post_route();
         Ok(format!("unroute_net {net}"))
     }
 
@@ -495,14 +511,16 @@ impl Session {
             .iter()
             .position(|i| i.from_net == net || i.cell == net)
             .ok_or_else(|| format!("fix_route: no IOB net {net}"))?;
-        if let Some(io) = r.iob_src.get_mut(idx) {
+        let delay_ps = if let Some(io) = r.iob_src.get_mut(idx) {
             io.hops += extra_hops;
             io.delay_ps += extra_hops as i64 * HOP_DELAY_PS;
-        }
-        self.bitstream = None;
+            io.delay_ps
+        } else {
+            0
+        };
+        self.clear_post_route();
         Ok(format!(
-            "fix_route {net} extra_hops={extra_hops} delay_ps={}",
-            r.iob_src.get(idx).map(|i| i.delay_ps).unwrap_or(0)
+            "fix_route {net} extra_hops={extra_hops} delay_ps={delay_ps}"
         ))
     }
 
@@ -551,6 +569,7 @@ impl Session {
     }
 
     pub fn write_bitstream(&mut self, dev: &Device) -> Result<&Bitstream, String> {
+        self.refuse_stage(crate::SessionStage::Bitgen)?;
         if self.design.is_none() {
             return Err("write_bitstream: no design".into());
         }
@@ -592,20 +611,16 @@ impl Session {
     }
 
     /// STA using project XDC clocks (empty clocks fall back to 10 ns `clk`,
-    /// the empty-XDC counter gold path).
+    /// the empty-XDC counter gold path). String form for CLI; GUI prefers
+    /// [`Session::report_timing_report`].
     pub fn report_timing_xdc(&self, dev: &Device, xdc: &Constraints) -> Result<String, String> {
-        let _ = dev;
-        let d = self.design.as_ref().ok_or("report_timing: no design")?;
-        let r = self.routed.as_ref().ok_or("report_timing: not routed")?;
-        let mut clks = xdc.clocks.clone();
-        if clks.is_empty() {
-            create_clock(&mut clks, "clk", 10_000, "clk");
-        }
-        let t = report_timing_routed_xdc(d, r, &clks, xdc)?;
-        Ok(format!(
-            "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-            d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
-        ))
+        self.report_timing_report(dev, xdc)
+            .map(|r| r.text())
+            .map_err(|e| e.to_string())
+    }
+
+    fn refuse_stage(&self, to: crate::SessionStage) -> Result<(), String> {
+        self.can_advance(to).map_err(|e| e.to_string())
     }
 
     pub fn report_utilization(&self, dev: &Device) -> Result<String, String> {
@@ -657,6 +672,7 @@ impl Session {
                 let bytes = bits.packets.len();
                 let st = prog_sim(dev, bits)?;
                 self.programmed = true;
+                self.sim_done = true;
                 Ok(format!(
                     "program_hw cable={} backend=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={} (sim fabric; not board DONE)",
                     info.id,
@@ -673,6 +689,7 @@ impl Session {
                 let bytes = bits.packets.len();
                 let st = helion_hw::prog_mpsse_sim(dev, bits)?;
                 self.programmed = true;
+                self.sim_done = true;
                 Ok(format!(
                     "program_hw cable={} backend=mpsse-sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={} (sim fabric bitbang; not board DONE)",
                     info.id,
@@ -695,6 +712,7 @@ impl Session {
                 match program_hbits_with_cable(dev, &path, &info, false) {
                     Ok(outcome) => {
                         self.programmed = true;
+                        self.lab_done = true;
                         let line = outcome.summary_line("program", &dev.part);
                         Ok(format!("program_hw cable={} {}", info.id, line))
                     }
@@ -1812,6 +1830,7 @@ mod tests {
     use super::*;
     use helion_device::Device;
     use helion_ir::{CellKind, Design, PortDir};
+    use helion_sta::create_clock;
 
     #[test]
     fn dual_mode_same_hash_and_ckpt() {
@@ -1875,6 +1894,127 @@ mod tests {
         s.eco(&dev, "u_lut", 0xAAAA_AAAA_AAAA_AAAA).unwrap();
         assert_ne!(s.blinky_hash(), h0, "ECO must change bitstream hash");
         let _ = PortDir::In;
+    }
+
+    #[test]
+    fn illegal_transitions_refuse_with_stage_prereq() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::NonProject);
+        assert_eq!(s.stage(), SessionStage::Idle);
+        let pack_err = s.pack_design(&dev).unwrap_err();
+        assert!(
+            pack_err.contains("code=STAGE_PREREQ") && pack_err.contains("missing=Elaborated"),
+            "{pack_err}"
+        );
+        let route_err = s.route_design(&dev).unwrap_err();
+        assert!(
+            route_err.contains("code=STAGE_PREREQ") && route_err.contains("missing=Placed"),
+            "{route_err}"
+        );
+        let bits_err = s.write_bitstream(&dev).unwrap_err();
+        assert!(
+            bits_err.contains("code=STAGE_PREREQ") && bits_err.contains("no design"),
+            "{bits_err}"
+        );
+        let sta = s.can_advance(SessionStage::Sta).unwrap_err();
+        assert_eq!(sta.code, STAGE_PREREQ);
+        assert_eq!(sta.attempted, SessionStage::Sta);
+        assert_eq!(sta.missing, SessionStage::Routed);
+
+        s.synth_design(Design::structural_counter());
+        assert_eq!(s.stage(), SessionStage::Elaborated);
+        assert!(s.can_advance(SessionStage::Packed).is_ok());
+        assert!(s.can_advance(SessionStage::Placed).is_err());
+        assert!(s.can_advance(SessionStage::Routed).is_err());
+        let e = s.can_advance(SessionStage::Placed).unwrap_err();
+        assert_eq!(e.code, STAGE_PREREQ);
+        assert_eq!(e.missing, SessionStage::Packed);
+
+        s.pack_design(&dev).unwrap();
+        assert_eq!(s.stage(), SessionStage::Packed);
+        assert!(s.can_advance(SessionStage::Placed).is_ok());
+        assert!(s.can_advance(SessionStage::Routed).is_err());
+
+        s.place_design(&dev).unwrap();
+        assert_eq!(s.stage(), SessionStage::Placed);
+        let bits_err = s.write_bitstream(&dev).unwrap_err();
+        assert!(
+            bits_err.contains("code=STAGE_PREREQ") && bits_err.contains("not routed"),
+            "{bits_err}"
+        );
+
+        s.route_design(&dev).unwrap();
+        assert_eq!(s.stage(), SessionStage::Routed);
+        assert!(s.can_advance(SessionStage::Sta).is_ok());
+        assert!(s.can_advance(SessionStage::Bitgen).is_ok());
+        let ready: Vec<_> = s
+            .stage_status()
+            .into_iter()
+            .filter(|st| st.ready)
+            .map(|st| st.stage)
+            .collect();
+        assert!(ready.contains(&SessionStage::Sta), "{ready:?}");
+        assert!(ready.contains(&SessionStage::Bitgen), "{ready:?}");
+        assert!(!ready.contains(&SessionStage::Sim), "{ready:?}");
+    }
+
+    #[test]
+    fn constraint_provenance_user_default_and_no_clock() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut s = Session::new(Mode::NonProject);
+        s.synth_design(Design::structural_counter());
+        s.place_design(&dev).unwrap();
+        s.route_design(&dev).unwrap();
+
+        let def = s.report_timing_report(&dev, &Constraints::default()).unwrap();
+        assert_eq!(def.provenance, ConstraintProvenance::DefaultPeriod);
+        assert_eq!(def.stage, SessionStage::Sta);
+        assert_eq!(def.wns_ps, 9640, "empty-XDC counter gold: {}", def.text());
+        assert_eq!(
+            s.last_timing_provenance(),
+            Some(ConstraintProvenance::DefaultPeriod)
+        );
+        assert!(
+            def.text().contains("provenance=DefaultPeriod") && def.text().contains("stage=Sta"),
+            "{}",
+            def.text()
+        );
+
+        let mut user = Constraints::default();
+        create_clock(&mut user.clocks, "clk", 10_000, "clk");
+        let u = s.report_timing_report(&dev, &user).unwrap();
+        assert_eq!(u.provenance, ConstraintProvenance::UserXdc);
+        assert_eq!(u.wns_ps, 9640, "user 10 ns create_clock keeps gold: {}", u.text());
+        assert_eq!(
+            s.last_timing_provenance(),
+            Some(ConstraintProvenance::UserXdc)
+        );
+
+        let mut combo = Design::new("combo");
+        combo.add_port("a", PortDir::In);
+        combo.add_port("led", PortDir::Out);
+        combo.add_cell("u_lut", CellKind::Lut6 { init: 2 });
+        combo.add_cell("u_iob", CellKind::IobOut);
+        combo.connect("a", "u_lut", "I0");
+        combo.connect("y", "u_lut", "O");
+        combo.connect("y", "u_iob", "I");
+        combo.connect("led", "u_iob", "PAD");
+        assert!(!design_has_clock_path(&combo));
+        let mut c = Session::new(Mode::NonProject);
+        c.synth_design(combo);
+        c.place_design(&dev).unwrap();
+        c.route_design(&dev).unwrap();
+        let n = c
+            .report_timing_report(&dev, &Constraints::default())
+            .unwrap();
+        assert_eq!(n.provenance, ConstraintProvenance::NoClockPath);
+        assert_eq!(n.endpoints, 0);
+        assert_eq!(n.wns_ps, 0, "NoClockPath must not close a fake WNS");
+        assert_eq!(
+            c.last_timing_provenance(),
+            Some(ConstraintProvenance::NoClockPath)
+        );
+        assert!(n.text().contains("provenance=NoClockPath"), "{}", n.text());
     }
 
     #[test]
