@@ -5,9 +5,11 @@
 //! still call unguided `place_with` / `place_in_region` / `place_incremental`
 //! until a later crate lock wires `Constraints::timing_guide()` through.
 
-use helion_device::{Device, Site};
+use helion_device::{BelId, Device, Site, SiteKind};
 use helion_pack::Packed;
 use std::collections::HashSet;
+
+pub use helion_pack::PackingSummary;
 
 #[derive(Clone, Debug)]
 pub struct Placed {
@@ -18,6 +20,56 @@ pub struct Placed {
     pub bram_sites: Vec<Site>,
     pub timing_weight: f64,
     pub cost: f64,
+}
+
+impl Placed {
+    /// HAD site occupied by a packed HNF cell, if placed.
+    pub fn cell_site(&self, cell: &str) -> Option<Site> {
+        self.cell_bel(cell).map(|b| b.site)
+    }
+
+    /// HAD BEL for a packed HNF cell (`BLE{i}.LUT` / `BLE{i}.FF` / `IOB` / `MAC` / `RAM18`).
+    pub fn cell_bel(&self, cell: &str) -> Option<BelId> {
+        if cell.is_empty() {
+            return None;
+        }
+        for (i, lf) in self.packed.lutffs.iter().enumerate() {
+            let Some(&(site, ble)) = self.lutff_sites.get(i) else {
+                continue;
+            };
+            if lf.lut_cell == cell {
+                return Some(BelId::new(site, format!("BLE{ble}.LUT")));
+            }
+            if lf.ff_cell == cell {
+                return Some(BelId::new(site, format!("BLE{ble}.FF")));
+            }
+        }
+        for (i, iob) in self.packed.iobs.iter().enumerate() {
+            if iob.cell == cell {
+                return self.iob_sites.get(i).copied().map(|s| BelId::new(s, "IOB"));
+            }
+        }
+        for (i, mac) in self.packed.macs.iter().enumerate() {
+            if mac.cell == cell {
+                return self.mac_sites.get(i).copied().map(|s| BelId::new(s, "MAC"));
+            }
+        }
+        for (i, bram) in self.packed.brams.iter().enumerate() {
+            if bram.cell == cell {
+                return self
+                    .bram_sites
+                    .get(i)
+                    .copied()
+                    .map(|s| BelId::new(s, "RAM18"));
+            }
+        }
+        None
+    }
+}
+
+/// LUTFF counts per HAD CLB site ID, derived from placement.
+pub fn packing_summary_from_placed(placed: &Placed) -> PackingSummary {
+    PackingSummary::from_lutff_sites(&placed.lutff_sites)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,11 +189,11 @@ fn imux_score(
 }
 
 fn parse_iob_loc(loc: &str, sites: &[Site]) -> Option<Site> {
-    let rest = loc.strip_prefix("IOB_X")?;
-    let (xs, ys) = rest.split_once('Y')?;
-    let x: u32 = xs.parse().ok()?;
-    let y: u32 = ys.parse().ok()?;
-    sites.iter().copied().find(|s| s.x == x && s.y == y)
+    let site = Site::parse_id(loc)?;
+    if site.kind != SiteKind::Iob {
+        return None;
+    }
+    sites.iter().copied().find(|s| *s == site)
 }
 
 /// ≥8 LUT+FF heartbeat fixture (Ibex pin-wrap class, not 108k P&R).
@@ -1547,5 +1599,56 @@ mod tests {
         let (next, reused) = place_incremental_with_guide(&p, &dev, &prev, opts, &g).unwrap();
         assert_eq!(reused, prev.lutff_sites.len());
         assert_eq!(next.lutff_sites, prev.lutff_sites);
+    }
+
+    #[test]
+    fn packing_summary_matches_placed_lutff_sites_grouping() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let sum = packing_summary_from_placed(&pl);
+        let mut expect: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (s, _) in &pl.lutff_sites {
+            *expect.entry(s.id()).or_insert(0) += 1;
+        }
+        assert_eq!(
+            sum.sites, expect,
+            "summary must be lutff_sites grouped by Site::id"
+        );
+        assert!(!sum.sites.is_empty());
+        let total: usize = sum.sites.values().sum();
+        assert_eq!(total, pl.lutff_sites.len());
+        for id in sum.sites.keys() {
+            assert!(
+                dev.site_by_id(id).is_some(),
+                "packing site {id} must resolve in HAD"
+            );
+        }
+        let first = pl.lutff_sites[0].0;
+        assert_eq!(sum.lutff_in(&first.id()), expect[&first.id()]);
+    }
+
+    #[test]
+    fn placed_cells_map_to_had_bel_ids() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let (site, ble) = pl.lutff_sites[3];
+        let ff = pl.cell_bel("u_ff3").expect("placed FF");
+        assert_eq!(ff.site, site);
+        assert_eq!(ff.bel, format!("BLE{ble}.FF"));
+        assert_eq!(ff.id(), format!("{}/BLE{ble}.FF", site.id()));
+        assert_eq!(dev.site_by_id(&site.id()), Some(site));
+        assert!(dev.contains_site(site));
+        assert_eq!(dev.resolve_cell_site("u_ff3", site).unwrap(), site.id());
+        let lut = pl.cell_bel("u_lut3").unwrap();
+        assert_eq!(lut, BelId::new(site, format!("BLE{ble}.LUT")));
+        let iob = pl.cell_bel("u_iob").unwrap();
+        assert_eq!(iob.bel, "IOB");
+        assert_eq!(iob.site, pl.iob_sites[0]);
+        assert_eq!(dev.site_by_id(&iob.site.id()), Some(iob.site));
+        assert!(pl.cell_bel("ghost").is_none());
+        assert_eq!(pl.cell_site("u_ff3"), Some(site));
     }
 }

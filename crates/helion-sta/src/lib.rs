@@ -3803,6 +3803,230 @@ pub fn report_timing_routed_xdc(
     Ok(r)
 }
 
+/// Timing-path endpoint bound to a HAD site/BEL (`cell → site_id / bel_id`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimingPathEndpoint {
+    pub cell: String,
+    /// HAD site ID via [`helion_device::Site::id`] (`CLB_X2Y1`, `IOB_X5Y0`).
+    pub site_id: String,
+    /// HAD BEL ID via [`helion_device::BelId::id`] (`CLB_X2Y1/BLE0.FF`).
+    pub bel_id: String,
+}
+
+/// Headless timing path with physical endpoints (not a GUI chrome dump).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimingPath {
+    pub name: String,
+    pub startpoint: TimingPathEndpoint,
+    pub endpoint: TimingPathEndpoint,
+    pub cells: Vec<String>,
+    pub nets: Vec<String>,
+    pub delay_ps: i64,
+    pub slack_ps: i64,
+}
+
+/// Device-canvas highlight dump: select a timing path → sites/nets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HighlightSet {
+    pub sites: Vec<String>,
+    pub nets: Vec<String>,
+}
+
+fn endpoint_from_placed(placed: &Placed, cell: &str) -> TimingPathEndpoint {
+    if let Some(bel) = placed.cell_bel(cell) {
+        TimingPathEndpoint {
+            cell: cell.to_string(),
+            site_id: bel.site.id(),
+            bel_id: bel.id(),
+        }
+    } else {
+        TimingPathEndpoint {
+            cell: cell.to_string(),
+            site_id: String::new(),
+            bel_id: String::new(),
+        }
+    }
+}
+
+fn walk_ff_path(design: &Design, ff: &str) -> (String, Vec<String>, Vec<String>) {
+    let mut cells = vec![ff.to_string()];
+    let mut nets = Vec::new();
+    let mut start = design
+        .net_on(ff, "CLK")
+        .or_else(|| design.net_on(ff, "C"))
+        .unwrap_or("clk")
+        .to_string();
+    if let Some(dnet) = design.net_on(ff, "D") {
+        nets.push(dnet.to_string());
+        if let Some(n) = design.net(dnet) {
+            for e in &n.endpoints {
+                if e.pin == "O" && !cells.contains(&e.cell) {
+                    cells.push(e.cell.clone());
+                    for i in 0..6u8 {
+                        let pin = format!("I{i}");
+                        if let Some(inet) = design.net_on(&e.cell, &pin) {
+                            if !nets.iter().any(|x| x == inet) {
+                                nets.push(inet.to_string());
+                            }
+                            if let Some(nn) = design.net(inet) {
+                                for ee in &nn.endpoints {
+                                    if ee.pin == "Q" && !cells.contains(&ee.cell) {
+                                        cells.push(ee.cell.clone());
+                                        start = ee.cell.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (start, cells, nets)
+}
+
+fn walk_iob_path(design: &Design, iob: &str) -> (String, Vec<String>, Vec<String>) {
+    let mut cells = vec![iob.to_string()];
+    let mut nets = Vec::new();
+    let mut start = iob.to_string();
+    if let Some(inet) = design.net_on(iob, "I") {
+        nets.push(inet.to_string());
+        if let Some(n) = design.net(inet) {
+            for e in &n.endpoints {
+                if e.pin == "Q" && !cells.contains(&e.cell) {
+                    cells.push(e.cell.clone());
+                    start = e.cell.clone();
+                }
+            }
+        }
+    }
+    if let Some(pad) = design.net_on(iob, "PAD") {
+        if !nets.iter().any(|x| x == pad) {
+            nets.push(pad.to_string());
+        }
+    }
+    (start, cells, nets)
+}
+
+/// Place/route-backed timing paths with HAD site/BEL IDs on endpoints.
+pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -> Vec<TimingPath> {
+    let placed = &routed.placed;
+    let mut paths = Vec::new();
+    for c in &design.cells {
+        if !matches!(c.kind, CellKind::Hff) {
+            continue;
+        }
+        let endpoint = endpoint_from_placed(placed, &c.name);
+        if endpoint.site_id.is_empty() {
+            continue;
+        }
+        let (start, cells, nets) = walk_ff_path(design, &c.name);
+        paths.push(TimingPath {
+            name: format!("{start}->{}", c.name),
+            startpoint: endpoint_from_placed(placed, &start),
+            endpoint,
+            cells,
+            nets,
+            delay_ps: t.r2r_ps,
+            slack_ps: t.wns_ps,
+        });
+    }
+    for c in &design.cells {
+        if !matches!(c.kind, CellKind::IobOut) {
+            continue;
+        }
+        let endpoint = endpoint_from_placed(placed, &c.name);
+        if endpoint.site_id.is_empty() {
+            continue;
+        }
+        let (start, cells, nets) = walk_iob_path(design, &c.name);
+        paths.push(TimingPath {
+            name: format!("{start}->{}", c.name),
+            startpoint: endpoint_from_placed(placed, &start),
+            endpoint,
+            cells,
+            nets,
+            delay_ps: t.iob_ps,
+            slack_ps: t.wns_ps,
+        });
+    }
+    paths
+}
+
+/// Worst-delay path after place+route (IOB vs r2r).
+pub fn critical_path(design: &Design, routed: &Routed, t: &TimingResult) -> Option<TimingPath> {
+    timing_paths_routed(design, routed, t)
+        .into_iter()
+        .max_by_key(|p| p.delay_ps)
+}
+
+/// Headless Device-canvas highlight from a timing path. Sites are HAD IDs.
+pub fn highlight_set_from_path(
+    dev: &Device,
+    routed: &Routed,
+    path: &TimingPath,
+) -> Result<HighlightSet, String> {
+    let placed = &routed.placed;
+    let mut endpoints: Vec<(String, helion_device::Site)> = Vec::new();
+    let mut sites: Vec<String> = Vec::new();
+    let mut push_cell = |cell: &str| -> Result<(), String> {
+        if cell.is_empty() {
+            return Ok(());
+        }
+        let Some(site) = placed.cell_site(cell) else {
+            return Ok(());
+        };
+        let id = dev.resolve_cell_site(cell, site)?;
+        endpoints.push((cell.to_string(), site));
+        sites.push(id);
+        Ok(())
+    };
+    push_cell(&path.startpoint.cell)?;
+    push_cell(&path.endpoint.cell)?;
+    for c in &path.cells {
+        push_cell(c)?;
+    }
+    let include_route = routed.iob_src.iter().any(|r| {
+        path.nets.iter().any(|n| n == &r.net)
+            || placed
+                .packed
+                .iobs
+                .iter()
+                .any(|io| io.cell == path.endpoint.cell && io.from_net == r.net)
+    });
+    if include_route {
+        for s in routed.path_sites(dev) {
+            sites.push(s.id());
+        }
+    }
+    sites.sort();
+    sites.dedup();
+    if sites.is_empty() {
+        return Err("highlight set has no HAD sites".into());
+    }
+    for id in &sites {
+        if dev.site_by_id(id).is_none() {
+            return Err(format!("site {id} not in HAD part {}", dev.part));
+        }
+    }
+    let _ = dev.resolve_path_sites(&endpoints)?;
+    let mut nets = path.nets.clone();
+    nets.sort();
+    nets.dedup();
+    Ok(HighlightSet { sites, nets })
+}
+
+/// Critical-path helper: dump a non-empty highlight set verified against HAD.
+pub fn critical_path_highlight(
+    dev: &Device,
+    design: &Design,
+    routed: &Routed,
+    t: &TimingResult,
+) -> Result<HighlightSet, String> {
+    let path = critical_path(design, routed, t).ok_or_else(|| "no timing paths".to_string())?;
+    highlight_set_from_path(dev, routed, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5783,5 +6007,100 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let (_, rfp, _) = close_guided(&d, 0.75, &fp);
         let hops_fp: Vec<_> = rfp.iob_src.iter().map(|io| io.hops).collect();
         assert_ne!(hops_m, hops_fp, "false_path and multicycle must not share hops");
+    }
+
+    #[test]
+    fn path_endpoint_cell_site_present_in_had_hl10t() {
+        let d = Design::structural_counter();
+        let xdc = Constraints::default();
+        let (pl, rt, t) = close_guided(&d, 0.75, &xdc);
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let paths = timing_paths_routed(&d, &rt, &t);
+        assert!(!paths.is_empty(), "counter must emit timing paths");
+        let mut endpoints = Vec::new();
+        for p in &paths {
+            assert!(!p.endpoint.cell.is_empty());
+            assert!(
+                !p.endpoint.site_id.is_empty(),
+                "endpoint {} missing HAD site",
+                p.endpoint.cell
+            );
+            let site = dev
+                .site_by_id(&p.endpoint.site_id)
+                .unwrap_or_else(|| panic!("HAD miss {}", p.endpoint.site_id));
+            assert!(dev.contains_site(site));
+            assert_eq!(
+                dev.resolve_cell_site(&p.endpoint.cell, site).unwrap(),
+                p.endpoint.site_id
+            );
+            let bel = pl
+                .cell_bel(&p.endpoint.cell)
+                .expect("placed BEL for endpoint");
+            assert_eq!(p.endpoint.bel_id, bel.id());
+            assert!(
+                p.endpoint
+                    .bel_id
+                    .starts_with(&format!("{}/", p.endpoint.site_id)),
+                "bel_id {} must use BelId under {}",
+                p.endpoint.bel_id,
+                p.endpoint.site_id
+            );
+            endpoints.push((p.endpoint.cell.clone(), site));
+        }
+        let resolved = dev.resolve_path_sites(&endpoints).unwrap();
+        assert!(!resolved.is_empty());
+        assert_eq!(t.wns_ps, 9640);
+    }
+
+    #[test]
+    fn headless_highlight_set_sites_resolve_on_hl10t() {
+        let d = Design::structural_counter();
+        let xdc = Constraints::default();
+        let (_, rt, t) = close_guided(&d, 0.75, &xdc);
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let hl = critical_path_highlight(&dev, &d, &rt, &t).unwrap();
+        assert!(!hl.sites.is_empty(), "highlight sites must be non-empty");
+        assert!(!hl.nets.is_empty(), "highlight nets must be non-empty");
+        for id in &hl.sites {
+            assert!(
+                dev.site_by_id(id).is_some(),
+                "highlight site {id} must resolve via site_by_id"
+            );
+        }
+        let path = critical_path(&d, &rt, &t).unwrap();
+        let mut eps = Vec::new();
+        if let Some(s) = dev.site_by_id(&path.endpoint.site_id) {
+            eps.push((path.endpoint.cell.clone(), s));
+        }
+        if !path.startpoint.site_id.is_empty() {
+            if let Some(s) = dev.site_by_id(&path.startpoint.site_id) {
+                eps.push((path.startpoint.cell.clone(), s));
+            }
+        }
+        let resolved = dev.resolve_path_sites(&eps).unwrap();
+        assert!(!resolved.is_empty());
+        for id in &resolved {
+            assert!(
+                hl.sites.contains(id),
+                "resolved {id} missing from highlight {hl:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packing_summary_matches_placed_lutff_sites_grouping() {
+        let d = Design::structural_counter();
+        let xdc = Constraints::default();
+        let (pl, _, _) = close_guided(&d, 0.75, &xdc);
+        let sum = helion_place::packing_summary_from_placed(&pl);
+        let mut expect: BTreeMap<String, usize> = BTreeMap::new();
+        for (s, _) in &pl.lutff_sites {
+            *expect.entry(s.id()).or_insert(0) += 1;
+        }
+        assert_eq!(sum.sites, expect);
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        for id in sum.sites.keys() {
+            assert!(dev.site_by_id(id).is_some(), "{id}");
+        }
     }
 }
