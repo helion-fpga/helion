@@ -6,9 +6,14 @@ cap = int(os.environ.get("IBEX_IMPL_CAP_SEC", "120"))
 root = os.environ.get("HELION_ROOT", os.getcwd())
 os.chdir(root)
 
-helion = os.path.join(root, "target/debug/helion")
-if not os.path.isfile(helion):
-    helion = os.path.join(root, "target/release/helion")
+# Prefer release binary (FM-HEL-OPT-P2-1).
+helion = os.environ.get("HELION", "")
+if not helion:
+    for _cand in ("target/release/helion", "target/debug/helion"):
+        _p = os.path.join(root, _cand)
+        if os.path.isfile(_p):
+            helion = _p
+            break
 
 rtl = os.path.join(root, "examples/ibex_reduced.sv")
 out_bits = os.path.join(root, "target/ibex-reduced-impl.hbits")
