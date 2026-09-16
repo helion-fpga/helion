@@ -110,66 +110,80 @@ fn resolve_include(base: &Path, spec: &str) -> Option<PathBuf> {
 }
 
 /// Expand `` `define `` / `` `ifdef `` and strip leftover backticks.
+///
+/// Walks UTF-8 bytes (Verilog tokens are ASCII). Avoids a `Vec<char>` of the
+/// whole source — Ibex-scale files paid that 4× copy on every preprocess.
+/// A second pass runs only when the first expansion still contains `` ` ``
+/// (nested object-like macros); callers must not preprocess twice.
 pub fn preprocess_sv(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
+    let once = preprocess_sv_once(source);
+    if once.as_bytes().contains(&b'`') {
+        preprocess_sv_once(&once)
+    } else {
+        once
+    }
+}
+
+fn preprocess_sv_once(source: &str) -> String {
+    let b = source.as_bytes();
     let mut i = 0;
     let mut defines: HashMap<String, Macro> = HashMap::new();
     // (parent_emitting, this_branch_on)
     let mut stack: Vec<(bool, bool)> = vec![(true, true)];
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::with_capacity(source.len());
 
     fn emitting(stack: &[(bool, bool)]) -> bool {
         stack.last().map(|(p, t)| *p && *t).unwrap_or(true)
     }
 
-    while i < chars.len() {
-        if chars[i] == '`' {
+    while i < b.len() {
+        if b[i] == b'`' {
             let start = i;
             i += 1;
-            let name = read_ident(&chars, &mut i);
+            let name = read_ident(b, &mut i);
             if name.is_empty() {
                 continue;
             }
-            skip_ws_not_nl(&chars, &mut i);
+            skip_ws_not_nl(b, &mut i);
             match name.as_str() {
                 "define" => {
-                    let dname = read_ident(&chars, &mut i);
-                    let (args, body) = read_define_body(&chars, &mut i);
+                    let dname = read_ident(b, &mut i);
+                    let (args, body) = read_define_body(b, &mut i);
                     if emitting(&stack) && !dname.is_empty() {
                         defines.insert(dname, Macro { args, body });
                     }
                 }
                 "undef" => {
-                    let dname = read_ident(&chars, &mut i);
-                    skip_to_eol(&chars, &mut i);
+                    let dname = read_ident(b, &mut i);
+                    skip_to_eol(b, &mut i);
                     if emitting(&stack) {
                         defines.remove(&dname);
                     }
                 }
                 "ifdef" | "ifndef" => {
-                    let dname = read_ident(&chars, &mut i);
-                    skip_to_eol(&chars, &mut i);
+                    let dname = read_ident(b, &mut i);
+                    skip_to_eol(b, &mut i);
                     let parent = emitting(&stack);
                     let present = defines.contains_key(&dname);
                     let take = if name == "ifdef" { present } else { !present };
                     stack.push((parent, parent && take));
                 }
                 "elsif" | "elif" => {
-                    let dname = read_ident(&chars, &mut i);
-                    skip_to_eol(&chars, &mut i);
+                    let dname = read_ident(b, &mut i);
+                    skip_to_eol(b, &mut i);
                     if let Some((parent, was)) = stack.pop() {
                         let present = defines.contains_key(&dname);
                         stack.push((parent, parent && !was && present));
                     }
                 }
                 "else" => {
-                    skip_to_eol(&chars, &mut i);
+                    skip_to_eol(b, &mut i);
                     if let Some((parent, was)) = stack.pop() {
                         stack.push((parent, parent && !was));
                     }
                 }
                 "endif" => {
-                    skip_to_eol(&chars, &mut i);
+                    skip_to_eol(b, &mut i);
                     if stack.len() > 1 {
                         stack.pop();
                     }
@@ -177,79 +191,86 @@ pub fn preprocess_sv(source: &str) -> String {
                 "include" | "timescale" | "resetall" | "default_nettype" | "line"
                 | "unconnected_drive" | "nounconnected_drive" | "celldefine"
                 | "endcelldefine" | "pragma" | "begin_keywords" | "end_keywords" => {
-                    skip_to_eol(&chars, &mut i);
+                    skip_to_eol(b, &mut i);
                 }
                 _ => {
                     i = start + 1; // after backtick
-                    let _ = read_ident(&chars, &mut i);
+                    let _ = read_ident(b, &mut i);
                     if emitting(&stack) {
                         if let Some(m) = defines.get(&name).cloned() {
-                            let text = expand_macro(&m, &chars, &mut i);
-                            out.push_str(&text);
+                            let text = expand_macro(&m, b, &mut i);
+                            out.extend_from_slice(text.as_bytes());
                         } else {
-                            skip_opt_args(&chars, &mut i);
+                            skip_opt_args(b, &mut i);
                         }
                     } else {
-                        skip_opt_args(&chars, &mut i);
+                        skip_opt_args(b, &mut i);
                     }
                 }
             }
             continue;
         }
         if emitting(&stack) {
-            out.push(chars[i]);
-        } else if chars[i] == '\n' {
-            out.push('\n');
+            let start = i;
+            while i < b.len() && b[i] != b'`' {
+                i += 1;
+            }
+            out.extend_from_slice(&b[start..i]);
+            continue;
         }
-        i += 1;
+        while i < b.len() && b[i] != b'`' {
+            if b[i] == b'\n' {
+                out.push(b'\n');
+            }
+            i += 1;
+        }
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn read_ident(chars: &[char], i: &mut usize) -> String {
-    let mut s = String::new();
-    while *i < chars.len() && (chars[*i].is_ascii_alphanumeric() || chars[*i] == '_') {
-        s.push(chars[*i]);
+fn read_ident(b: &[u8], i: &mut usize) -> String {
+    let start = *i;
+    while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
         *i += 1;
     }
-    s
+    String::from_utf8_lossy(&b[start..*i]).into_owned()
 }
 
-fn skip_ws_not_nl(chars: &[char], i: &mut usize) {
-    while *i < chars.len() && chars[*i].is_whitespace() && chars[*i] != '\n' {
+fn skip_ws_not_nl(b: &[u8], i: &mut usize) {
+    while *i < b.len() && b[*i].is_ascii_whitespace() && b[*i] != b'\n' {
         *i += 1;
     }
 }
 
-fn skip_to_eol(chars: &[char], i: &mut usize) {
-    while *i < chars.len() && chars[*i] != '\n' {
+fn skip_to_eol(b: &[u8], i: &mut usize) {
+    while *i < b.len() && b[*i] != b'\n' {
         *i += 1;
     }
 }
 
-fn read_define_body(chars: &[char], i: &mut usize) -> (Vec<String>, String) {
+fn read_define_body(b: &[u8], i: &mut usize) -> (Vec<String>, String) {
     let mut args = Vec::new();
-    if *i < chars.len() && chars[*i] == '(' {
+    if *i < b.len() && b[*i] == b'(' {
         *i += 1;
         loop {
             let start = *i;
-            skip_ws_not_nl(chars, i);
-            if *i >= chars.len() || chars[*i] == '\n' {
+            skip_ws_not_nl(b, i);
+            if *i >= b.len() || b[*i] == b'\n' {
                 break;
             }
-            if chars[*i] == ')' {
+            if b[*i] == b')' {
                 *i += 1;
                 break;
             }
-            let a = read_ident(chars, i);
+            let a = read_ident(b, i);
             if a.is_empty() {
                 // Non-ident in the arg list (`define FOO(1+2)`). Consume to the
                 // matching ')' so i never stalls.
                 let mut depth = 1i32;
-                while *i < chars.len() && chars[*i] != '\n' && depth > 0 {
-                    match chars[*i] {
-                        '(' => depth += 1,
-                        ')' => depth -= 1,
+                while *i < b.len() && b[*i] != b'\n' && depth > 0 {
+                    match b[*i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
                         _ => {}
                     }
                     *i += 1;
@@ -257,27 +278,27 @@ fn read_define_body(chars: &[char], i: &mut usize) -> (Vec<String>, String) {
                 break;
             }
             args.push(a);
-            skip_ws_not_nl(chars, i);
-            if *i < chars.len() && chars[*i] == '=' {
+            skip_ws_not_nl(b, i);
+            if *i < b.len() && b[*i] == b'=' {
                 *i += 1;
                 let mut d = 0i32;
-                while *i < chars.len() && chars[*i] != '\n' {
-                    match chars[*i] {
-                        '(' => d += 1,
-                        ')' if d == 0 => break,
-                        ')' => d -= 1,
-                        ',' if d == 0 => break,
+                while *i < b.len() && b[*i] != b'\n' {
+                    match b[*i] {
+                        b'(' => d += 1,
+                        b')' if d == 0 => break,
+                        b')' => d -= 1,
+                        b',' if d == 0 => break,
                         _ => {}
                     }
                     *i += 1;
                 }
             }
-            skip_ws_not_nl(chars, i);
-            if *i < chars.len() && chars[*i] == ',' {
+            skip_ws_not_nl(b, i);
+            if *i < b.len() && b[*i] == b',' {
                 *i += 1;
                 continue;
             }
-            if *i < chars.len() && chars[*i] == ')' {
+            if *i < b.len() && b[*i] == b')' {
                 *i += 1;
                 break;
             }
@@ -286,28 +307,28 @@ fn read_define_body(chars: &[char], i: &mut usize) -> (Vec<String>, String) {
             }
         }
     }
-    skip_ws_not_nl(chars, i);
+    skip_ws_not_nl(b, i);
     let mut body = String::new();
-    while *i < chars.len() && chars[*i] != '\n' {
-        if chars[*i] == '\\' && chars.get(*i + 1) == Some(&'\n') {
+    while *i < b.len() && b[*i] != b'\n' {
+        if b[*i] == b'\\' && b.get(*i + 1) == Some(&b'\n') {
             *i += 2;
             body.push(' ');
             continue;
         }
-        body.push(chars[*i]);
+        body.push(b[*i] as char);
         *i += 1;
     }
     (args, body.trim().to_string())
 }
 
-fn skip_opt_args(chars: &[char], i: &mut usize) {
-    skip_ws_not_nl(chars, i);
-    if *i < chars.len() && chars[*i] == '(' {
+fn skip_opt_args(b: &[u8], i: &mut usize) {
+    skip_ws_not_nl(b, i);
+    if *i < b.len() && b[*i] == b'(' {
         let mut depth = 0i32;
-        while *i < chars.len() {
-            match chars[*i] {
-                '(' => depth += 1,
-                ')' => {
+        while *i < b.len() {
+            match b[*i] {
+                b'(' => depth += 1,
+                b')' => {
                     depth -= 1;
                     *i += 1;
                     if depth <= 0 {
@@ -322,18 +343,18 @@ fn skip_opt_args(chars: &[char], i: &mut usize) {
     }
 }
 
-fn expand_macro(m: &Macro, chars: &[char], i: &mut usize) -> String {
+fn expand_macro(m: &Macro, b: &[u8], i: &mut usize) -> String {
     if m.args.is_empty() {
         return m.body.clone();
     }
-    skip_ws_not_nl(chars, i);
+    skip_ws_not_nl(b, i);
     let mut vals: Vec<String> = Vec::new();
-    if *i < chars.len() && chars[*i] == '(' {
+    if *i < b.len() && b[*i] == b'(' {
         *i += 1;
         let mut cur = String::new();
         let mut depth = 1i32;
-        while *i < chars.len() && depth > 0 {
-            let c = chars[*i];
+        while *i < b.len() && depth > 0 {
+            let c = b[*i] as char;
             *i += 1;
             if c == '(' {
                 depth += 1;
@@ -400,5 +421,22 @@ mod tests {
         let s = preprocess_sv("`define BAR (4)\nlogic [3:0] q;\nassign q = `BAR;\n");
         assert!(s.contains("assign q = (4);") || s.contains("assign q = (4)"), "{s}");
         assert!(!s.contains('`'), "{s}");
+    }
+
+    #[test]
+    fn leftover_backtick_in_expansion_stripped() {
+        // Expansion may inject `` `INNER ``; a second pass (empty define set)
+        // drops leftover backticks the same way parse_source used to.
+        let s = preprocess_sv("`define OUTER `INNER\nlogic [`OUTER:0] q;\n");
+        assert!(!s.contains('`'), "{s}");
+        assert!(s.contains("logic ["), "{s}");
+    }
+
+    #[test]
+    fn ifdef_off_branch_keeps_newlines_only() {
+        let s = preprocess_sv("`ifdef NOPE\nwire a;\nwire b;\n`endif\nwire c;\n");
+        assert!(!s.contains("wire a;"), "{s}");
+        assert!(s.contains("wire c;"), "{s}");
+        assert!(s.contains('\n'), "{s}");
     }
 }

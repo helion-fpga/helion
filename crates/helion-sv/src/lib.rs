@@ -10,10 +10,11 @@
 mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
 
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{Cell, CellKind, Design, Endpoint, Net, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 use sv_parser::{parse_sv_str, Define, DefineText};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,11 +222,28 @@ pub struct SvElabReport {
     pub ffs: usize,
 }
 
-pub fn parse_sv(source: &str, origin: &str) -> Result<sv_parser::SyntaxTree, String> {
+pub fn parse_sv(source: &str, origin: &str) -> Result<Arc<sv_parser::SyntaxTree>, String> {
     parse_sv_opts(source, origin, &SvCompileOpts::default())
 }
 
-pub fn parse_sv_opts(
+fn file_mtime_key(path: &Path) -> Option<(String, u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((path.display().to_string(), mtime, meta.len()))
+}
+
+thread_local! {
+    static SYNTAX_TREE_CACHE: std::cell::RefCell<
+        HashMap<(String, u64, u64), Arc<sv_parser::SyntaxTree>>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
+fn parse_sv_str_opts(
     source: &str,
     origin: &str,
     opts: &SvCompileOpts,
@@ -247,6 +265,38 @@ pub fn parse_sv_opts(
     parse_sv_str(source, origin, &defines, &inc, false, false)
         .map(|(tree, _)| tree)
         .map_err(|e| format!("sv-parser: {e}"))
+}
+
+/// Path+mtime SyntaxTree cache. `parse_sv` still returns an owned tree; file
+/// origins populate an Arc cache so a second parse of the same mtime hits.
+fn parse_sv_cached(
+    source: &str,
+    origin: &str,
+    opts: &SvCompileOpts,
+) -> Result<Arc<sv_parser::SyntaxTree>, String> {
+    let path = Path::new(origin);
+    if let Some(key) = file_mtime_key(path) {
+        if key.2 == source.len() as u64 {
+            if let Some(hit) = SYNTAX_TREE_CACHE.with(|c| c.borrow().get(&key).map(Arc::clone)) {
+                return Ok(hit);
+            }
+            let tree = parse_sv_str_opts(source, origin, opts)?;
+            let arc = Arc::new(tree);
+            SYNTAX_TREE_CACHE.with(|c| {
+                c.borrow_mut().insert(key, Arc::clone(&arc));
+            });
+            return Ok(arc);
+        }
+    }
+    Ok(Arc::new(parse_sv_str_opts(source, origin, opts)?))
+}
+
+pub fn parse_sv_opts(
+    source: &str,
+    origin: &str,
+    opts: &SvCompileOpts,
+) -> Result<Arc<sv_parser::SyntaxTree>, String> {
+    parse_sv_cached(source, origin, opts)
 }
 
 /// Recursive-descent Boolean subset used after AST extraction.
@@ -2383,7 +2433,7 @@ fn skip_function_without_reentry(p: &mut P) -> String {
 
 struct OwnCache {
     /// module:hash → own-logic Design (instances not included)
-    by_key: HashMap<String, Design>,
+    by_key: HashMap<String, Arc<Design>>,
     log: Vec<String>,
 }
 
@@ -2620,7 +2670,7 @@ fn hash_own(rtl: &Rtl) -> u64 {
     h.h
 }
 
-fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
+fn lower_own_arc(rtl: &Rtl) -> Result<Arc<Design>, String> {
     let h = hash_own(rtl);
     let key = format!("{}:{h:x}", rtl.module);
     if let Ok(mut c) = cache().lock() {
@@ -2636,46 +2686,213 @@ fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
     if let Ok(mut c) = cache().lock() {
         c.log.push(line);
     }
-    let mut own = rtl.clone();
-    own.insts.clear();
-    let d = synth_rtl(&own)?;
+    // Leaves have no insts — synth_rtl does not observe them. Hierarchical
+    // modules still drop insts so child instances cannot leak into own-logic.
+    let d = if rtl.insts.is_empty() {
+        synth_rtl(rtl)?
+    } else {
+        let own = Rtl {
+            module: rtl.module.clone(),
+            ports: rtl.ports.clone(),
+            signals: rtl.signals.clone(),
+            nbas: rtl.nbas.clone(),
+            assigns: rtl.assigns.clone(),
+            insts: Vec::new(),
+            params: rtl.params.clone(),
+            toks: Vec::new(),
+            mem_inits: rtl.mem_inits.clone(),
+        };
+        synth_rtl(&own)?
+    };
+    let arc = Arc::new(d);
     if let Ok(mut c) = cache().lock() {
-        c.by_key.insert(key, d.clone());
+        c.by_key.insert(key, Arc::clone(&arc));
     }
-    Ok(d)
+    Ok(arc)
 }
 
+fn design_from_arc(arc: Arc<Design>) -> Design {
+    match Arc::try_unwrap(arc) {
+        Ok(d) => d,
+        Err(a) => {
+            let mut d = a.clone_data();
+            d.rebuild_indexes();
+            d
+        }
+    }
+}
+
+fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
+    Ok(design_from_arc(lower_own_arc(rtl)?))
+}
+
+fn inst_port_map<'a>(
+    child: &'a Design,
+    inst: &'a Inst,
+) -> HashMap<&'a str, &'a str> {
+    let mut by_name: HashMap<&str, &str> = HashMap::with_capacity(inst.conns.len());
+    let mut by_pos: HashMap<usize, &str> = HashMap::new();
+    for (pn, net) in &inst.conns {
+        if let Some(rest) = pn.strip_prefix('#') {
+            if let Ok(i) = rest.parse::<usize>() {
+                by_pos.insert(i, net.as_str());
+                continue;
+            }
+        }
+        by_name.insert(pn.as_str(), net.as_str());
+    }
+    let mut port_map: HashMap<&str, &str> = HashMap::with_capacity(child.ports.len());
+    for (i, p) in child.ports.iter().enumerate() {
+        if let Some(n) = by_name
+            .get(p.name.as_str())
+            .copied()
+            .or_else(|| by_pos.get(&i).copied())
+        {
+            port_map.insert(p.name.as_str(), n);
+        }
+    }
+    port_map
+}
+
+#[allow(dead_code)] // tests + Arc leaf path
 fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
     let prefix = format!("{}_", inst.name);
-    let mut port_map: HashMap<String, String> = HashMap::new();
-    for (i, p) in child.ports.iter().enumerate() {
-        if let Some((_, net)) = inst
-            .conns
-            .iter()
-            .find(|(pn, _)| pn == &p.name)
-            .or_else(|| inst.conns.iter().find(|(pn, _)| pn == &format!("#{i}")))
-        {
-            port_map.insert(p.name.clone(), net.clone());
-        }
-    }
+    let port_map = inst_port_map(child, inst);
     let map_net = |n: &str| -> String {
         if let Some(p) = port_map.get(n) {
-            return p.clone();
+            return (*p).to_string();
         }
-        format!("{prefix}{n}")
+        let mut s = String::with_capacity(prefix.len() + n.len());
+        s.push_str(&prefix);
+        s.push_str(n);
+        s
     };
     for c in &child.cells {
-        let mut cell = c.clone();
-        cell.name = format!("{prefix}{}", c.name);
-        dst.push_cell(cell);
+        let mut name = String::with_capacity(prefix.len() + c.name.len());
+        name.push_str(&prefix);
+        name.push_str(&c.name);
+        dst.push_cell(Cell {
+            name,
+            kind: c.kind.clone(),
+            attrs: c.attrs.clone(),
+        });
     }
     for n in &child.nets {
-        let mut net = n.clone();
-        net.name = map_net(&n.name);
-        for e in &mut net.endpoints {
-            e.cell = format!("{prefix}{}", e.cell);
+        let endpoints = n
+            .endpoints
+            .iter()
+            .map(|e| {
+                let mut cell = String::with_capacity(prefix.len() + e.cell.len());
+                cell.push_str(&prefix);
+                cell.push_str(&e.cell);
+                Endpoint {
+                    cell,
+                    pin: e.pin.clone(),
+                }
+            })
+            .collect();
+        dst.merge_net(Net {
+            name: map_net(&n.name),
+            endpoints,
+            attrs: n.attrs.clone(),
+        });
+    }
+}
+
+/// Hierarchy stitch that consumes `child` (rename in place + append). Avoids
+/// cloning a 13k-cell Ibex core at every wrapper level.
+fn stitch_child_owned(dst: &mut Design, mut child: Design, inst: &Inst) {
+    let prefix = format!("{}_", inst.name);
+    let port_map: HashMap<String, String> = inst_port_map(&child, inst)
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    for c in &mut child.cells {
+        let mut name = String::with_capacity(prefix.len() + c.name.len());
+        name.push_str(&prefix);
+        name.push_str(&c.name);
+        c.name = name;
+    }
+    for n in &mut child.nets {
+        if let Some(p) = port_map.get(n.name.as_str()) {
+            n.name.clone_from(p);
+        } else {
+            let mut name = String::with_capacity(prefix.len() + n.name.len());
+            name.push_str(&prefix);
+            name.push_str(&n.name);
+            n.name = name;
         }
-        dst.merge_net(net);
+        for e in &mut n.endpoints {
+            let mut cell = String::with_capacity(prefix.len() + e.cell.len());
+            cell.push_str(&prefix);
+            cell.push_str(&e.cell);
+            e.cell = cell;
+        }
+    }
+    dst.append_cells(&mut child.cells);
+    for n in child.nets {
+        dst.merge_net(n);
+    }
+}
+
+fn stitch_assembled_child(
+    d: &mut Design,
+    child: Design,
+    inst: &Inst,
+    parent_name: &str,
+    parent_has_hff: &mut bool,
+) {
+    let wrap = *parent_has_hff;
+    let child_has_hff = child.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
+    let soft_keys = [
+        "WIDE_CONE",
+        "ASSIGN_NOT_LOWERED",
+        "GENERATE_NOT_LOWERED",
+        "WIDTH_OVERFLOW",
+        "WORD_PIPELINE_CAP",
+        "FLATTEN_CAP",
+        "GATE_PRIMITIVE",
+    ];
+    let child_soft = soft_keys.iter().any(|k| child.attrs.get(k) == Some("1"));
+    let clock_mux = child.attrs.get("CLOCK_MUX") == Some("1");
+    let clock_gate = child.attrs.get("CLOCK_GATE") == Some("1");
+    let sim_only = child.attrs.get("SIM_ONLY") == Some("1");
+    let mut soft_vals = [false; 7];
+    for (i, key) in soft_keys.iter().enumerate() {
+        soft_vals[i] = child.attrs.get(key) == Some("1");
+    }
+    stitch_child_owned(d, child, inst);
+    if child_has_hff {
+        *parent_has_hff = true;
+    }
+    if clock_mux {
+        d.attrs.set("CLOCK_MUX", "1");
+    }
+    if clock_gate {
+        d.attrs.set("CLOCK_GATE", "1");
+    }
+    if sim_only {
+        if wrap {
+            eprintln!(
+                "diagnostic child_soft_incomplete module={} child={} (sim_only named miss; parent wrap keeps closed WNS on mapped paths)",
+                parent_name, inst.module
+            );
+        } else {
+            d.attrs.set("SIM_ONLY", "1");
+            d.attrs.set("NO_BODY", "1");
+        }
+    }
+    if child_soft && wrap {
+        eprintln!(
+            "diagnostic child_soft_incomplete module={} child={} (named miss; parent wrap keeps closed WNS on mapped paths)",
+            parent_name, inst.module
+        );
+        return;
+    }
+    for (key, on) in soft_keys.iter().zip(soft_vals.iter()) {
+        if *on {
+            d.attrs.set(*key, "1");
+        }
     }
 }
 
@@ -2690,7 +2907,7 @@ fn assemble_module(
     if !visiting.insert(name.to_string()) {
         return lower_own_cached(proto);
     }
-    let mut d = lower_own_cached(proto)?;
+    let mut d = design_from_arc(lower_own_arc(proto)?);
     d.name = proto.module.clone();
     let mut parent_has_hff = d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
     for inst in &proto.insts {
@@ -2720,6 +2937,24 @@ fn assemble_module(
         // prefer closed WNS on wrap heartbeat / mapped fabric.
         let child_proto = mods.get(&inst.module).expect("child");
         let ov = inst_overrides(inst, child_proto);
+        if ov.is_empty() && child_proto.insts.is_empty() {
+            // Leaf, no param override: stitch from the cached Arc (no Design clone).
+            let child_arc = if visiting.insert(inst.module.clone()) {
+                let a = lower_own_arc(child_proto)?;
+                visiting.remove(&inst.module);
+                a
+            } else {
+                lower_own_arc(child_proto)?
+            };
+            stitch_assembled_child(
+                &mut d,
+                design_from_arc(child_arc),
+                inst,
+                name,
+                &mut parent_has_hff,
+            );
+            continue;
+        }
         let child = if ov.is_empty() || !child_proto.insts.is_empty() {
             assemble_module(mods, &inst.module, visiting)?
         } else {
@@ -2742,59 +2977,7 @@ fn assemble_module(
                 }
             }
         };
-        let child_has_hff = child.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
-        // Snapshot: this child's FFs are not a parent wrap for its own soft cones.
-        let wrap = parent_has_hff;
-        stitch_child(&mut d, &child, inst);
-        if child_has_hff {
-            parent_has_hff = true;
-        }
-        let soft_keys = [
-            "WIDE_CONE",
-            "ASSIGN_NOT_LOWERED",
-            "GENERATE_NOT_LOWERED",
-            "WIDTH_OVERFLOW",
-            "WORD_PIPELINE_CAP",
-            "FLATTEN_CAP",
-            "GATE_PRIMITIVE",
-        ];
-        let child_soft = soft_keys.iter().any(|k| child.attrs.get(k) == Some("1"));
-        // Hard clock incompletes always poison (wrong user clock).
-        if child.attrs.get("CLOCK_MUX") == Some("1") {
-            d.attrs.set("CLOCK_MUX", "1");
-        }
-        if child.attrs.get("CLOCK_GATE") == Some("1") {
-            d.attrs.set("CLOCK_GATE", "1");
-        }
-        // Sim-only DPI/X-compare child: under a heartbeat wrap, keep it a named
-        // miss (do not poison NO_BODY / kill wrap WNS). Flat parents still refuse.
-        if child.attrs.get("SIM_ONLY") == Some("1") {
-            if wrap {
-                eprintln!(
-                    "diagnostic child_soft_incomplete module={} child={} (sim_only named miss; parent wrap keeps closed WNS on mapped paths)",
-                    name, inst.module
-                );
-            } else {
-                d.attrs.set("SIM_ONLY", "1");
-                d.attrs.set("NO_BODY", "1");
-            }
-        }
-        if child_soft && wrap {
-            eprintln!(
-                "diagnostic child_soft_incomplete module={} child={} (named miss; parent wrap keeps closed WNS on mapped paths)",
-                name, inst.module
-            );
-            continue;
-        }
-        // Flat / no-wrap parent: soft child cones make this netlist incomplete
-        // (do not invent closed WNS over soft fabric). Keep stitching siblings
-        // so more of the child tree maps to honest cells; one soft child must
-        // not discard the rest (Ibex bus wide_cone used to break before top).
-        for key in soft_keys {
-            if child.attrs.get(key) == Some("1") {
-                d.attrs.set(key, "1");
-            }
-        }
+        stitch_assembled_child(&mut d, child, inst, name, &mut parent_has_hff);
     }
     // Preserve (* mark_debug *) on parent wires driven by instance ports
     // (e.g. complex.x ← xor4.y) — lower_own never sees those as comb_bits.
@@ -2844,6 +3027,15 @@ fn fnv_module_present(text: &str, name: &str) -> bool {
     false
 }
 
+fn parse_file_modules(path: &Path) -> Result<Vec<Rtl>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let dir = path.parent().unwrap_or(path);
+    let expanded = expand_includes(&text, dir);
+    let pre = preprocess_sv(&strip_comments(&expanded));
+    push_readmem_base(&path.display().to_string());
+    parse_preprocessed(&pre)
+}
+
 fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result<Vec<Rtl>, String> {
     let mut out = Vec::new();
     if missing.is_empty() || !dir.is_dir() {
@@ -2867,17 +3059,14 @@ fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result
         if !missing.iter().any(|m| fnv_module_present(&text, m)) {
             continue;
         }
-        let expanded = expand_includes(&text, dir);
-        let pre = preprocess_sv(&strip_comments(&expanded));
-        push_readmem_base(&p.display().to_string());
-        out.extend(parse_source(&pre)?);
+        out.extend(parse_file_modules(&p)?);
     }
     Ok(out)
 }
 
 fn strip_comments(s: &str) -> String {
-    let mut out = String::new();
     let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < b.len() {
         if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'/' {
@@ -2894,10 +3083,10 @@ fn strip_comments(s: &str) -> String {
             i = (i + 2).min(b.len());
             continue;
         }
-        out.push(b[i] as char);
+        out.push(b[i]);
         i += 1;
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2918,9 +3107,10 @@ enum Tok {
 }
 
 fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
-    let chars: Vec<char> = s.chars().collect();
+    let b = s.as_bytes();
     let mut i = 0;
     let mut out = Vec::new();
+    out.reserve(s.len() / 4);
     let kws = [
         "module", "endmodule", "input", "output", "logic", "wire", "reg", "always_ff", "always",
         "begin", "end", "posedge", "negedge", "assign", "inout", "if", "else", "always_comb",
@@ -2932,72 +3122,72 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         "interface", "endinterface", "modport", "clocking", "property", "endproperty",
         "assert", "assume", "cover", "sequence", "endsequence", "inside",
     ];
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
         if c == '"' {
             i += 1;
             let mut s = String::new();
-            while i < chars.len() && chars[i] != '"' {
-                s.push(chars[i]);
+            while i < b.len() && b[i] != b'"' {
+                s.push(b[i] as char);
                 i += 1;
             }
-            if i < chars.len() {
+            if i < b.len() {
                 i += 1;
             }
             out.push(Tok::Str(s));
             continue;
         }
-        if c == '<' && chars.get(i + 1) == Some(&'=') {
+        if c == '<' && b.get(i + 1) == Some(&b'=') {
             out.push(Tok::Le);
             i += 2;
             continue;
         }
-        if c == '>' && chars.get(i + 1) == Some(&'=') {
+        if c == '>' && b.get(i + 1) == Some(&b'=') {
             out.push(Tok::Ge);
             i += 2;
             continue;
         }
-        if c == '=' && chars.get(i + 1) == Some(&'=') {
+        if c == '=' && b.get(i + 1) == Some(&b'=') {
             out.push(Tok::Eq);
             i += 2;
             continue;
         }
-        if c == '!' && chars.get(i + 1) == Some(&'=') {
+        if c == '!' && b.get(i + 1) == Some(&b'=') {
             out.push(Tok::Ne);
             i += 2;
             continue;
         }
-        if c == '|' && chars.get(i + 1) == Some(&'|') {
+        if c == '|' && b.get(i + 1) == Some(&b'|') {
             out.push(Tok::Lor);
             i += 2;
             continue;
         }
-        if c == '&' && chars.get(i + 1) == Some(&'&') {
+        if c == '&' && b.get(i + 1) == Some(&b'&') {
             out.push(Tok::Land);
             i += 2;
             continue;
         }
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
+        if c == '/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
+        if c == '/' && b.get(i + 1) == Some(&b'*') {
             i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
                 i += 1;
             }
-            i = (i + 2).min(chars.len());
+            i = (i + 2).min(b.len());
             continue;
         }
         if c == '\\' {
             i += 1;
-            if i < chars.len() && chars[i] == '\n' {
+            if i < b.len() && b[i] == b'\n' {
                 i += 1;
             }
             continue;
@@ -3006,8 +3196,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             let mut base = 2;
             let mut saw_base = false;
-            if i < chars.len() {
-                match chars[i].to_ascii_lowercase() {
+            if i < b.len() {
+                match (b[i] as char).to_ascii_lowercase() {
                     'b' => {
                         base = 2;
                         saw_base = true;
@@ -3036,8 +3226,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             let mut digits = String::new();
-            while i < chars.len() {
-                let ch = chars[i];
+            while i < b.len() {
+                let ch = b[i] as char;
                 if ch == '_' {
                     i += 1;
                     continue;
@@ -3072,7 +3262,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         }
         if c == '`' {
             i += 1;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
             continue;
@@ -3083,8 +3273,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 n.push(c);
                 i += 1;
             }
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                n.push(chars[i]);
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                n.push(b[i] as char);
                 i += 1;
             }
             if kws.contains(&n.as_str()) {
@@ -3096,16 +3286,16 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         }
         if c.is_ascii_digit() {
             let mut n = String::new();
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                n.push(chars[i]);
+            while i < b.len() && b[i].is_ascii_digit() {
+                n.push(b[i] as char);
                 i += 1;
             }
-            if chars.get(i) == Some(&'\'') {
+            if b.get(i) == Some(&b'\'') {
                 i += 1;
                 let width: usize = n.parse().unwrap_or(1);
                 let mut base = 10;
-                if i < chars.len() {
-                    match chars[i].to_ascii_lowercase() {
+                if i < b.len() {
+                    match (b[i] as char).to_ascii_lowercase() {
                         'b' => {
                             base = 2;
                             i += 1;
@@ -3126,8 +3316,8 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                     }
                 }
                 let mut digits = String::new();
-                while i < chars.len() {
-                    let ch = chars[i];
+                while i < b.len() {
+                    let ch = b[i] as char;
                     if ch == '_' {
                         i += 1;
                         continue;
@@ -5727,10 +5917,13 @@ fn skip_until_kw(p: &mut P, kw: &str) {
 }
 
 fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
+    parse_preprocessed(&preprocess_sv(&strip_comments(source)))
+}
+
+fn parse_preprocessed(s: &str) -> Result<Vec<Rtl>, String> {
     pkg_enums_clear();
     clear_seq_notes();
-    let s = preprocess_sv(&strip_comments(source));
-    let toks = tokenize(&s)?;
+    let toks = tokenize(s)?;
     let mut p = P {
         t: &toks,
         i: 0,
@@ -9654,6 +9847,21 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
 const WIDE_CONE_PI_CAP: usize = 16;
 const WIDE_CONE_AND_CAP: usize = 96;
 const WIDE_CONE_MODULE_LUT_CAP: usize = 128;
+const ASSIGN_BIT_CAP: usize = 2048;
+
+fn comb_accept(comb_bits: &[(String, Expr)], bitn: &str, capped: &mut bool) -> bool {
+    if comb_bits.len() >= ASSIGN_BIT_CAP {
+        if !*capped {
+            note_skip(format!(
+                "diagnostic assign_cap signal={bitn} (assign-cap {ASSIGN_BIT_CAP}; remaining assigns not a LUT)"
+            ));
+            *capped = true;
+        }
+        false
+    } else {
+        true
+    }
+}
 
 fn wide_aig_over_cap(aig: &Aig) -> bool {
     aig.pis.len() > WIDE_CONE_PI_CAP || aig.ands.len() > WIDE_CONE_AND_CAP
@@ -13059,6 +13267,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Ident/Bit/Range stay nets (IOB passthrough) so gold sequential WNS is
     // not broken by buffer LUTs — that is mapping a wire as a wire, not a skip.
     let mut comb_bits: Vec<(String, Expr)> = Vec::new();
+    let mut assign_capped = false;
     // Relational wire-assigns that cannot map must name themselves. Do not
     // spend the one wide_cone line on them — clocked cones still report that.
     let mut rel_sig: HashMap<String, String> = HashMap::new();
@@ -13273,24 +13482,29 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if let Some(b) = bit {
             let depth = sig_depth(rtl, lhs);
             if let Some((word, lo)) = decode_unpacked_bit(*b) {
-                match rexpr_to_bit(rhs, rtl, 0) {
-                    Ok(e) => {
-                        let bn = unpacked_word_q(lhs, word, w, lo);
-                        if rel_lt {
-                            rel_sig.insert(bn.clone(), lhs.clone());
+                let bn = unpacked_word_q(lhs, word, w, lo);
+                if comb_accept(&comb_bits, &bn, &mut assign_capped) {
+                    match rexpr_to_bit(rhs, rtl, 0) {
+                        Ok(e) => {
+                            if rel_lt {
+                                rel_sig.insert(bn.clone(), lhs.clone());
+                            }
+                            comb_bits.push((bn, e));
                         }
-                        comb_bits.push((bn, e));
+                        Err(_) => failed = true,
                     }
-                    Err(_) => failed = true,
                 }
             } else if depth > 0 && *b < depth {
                 // `assign mem[word] = expr` — whole unpacked word, not packed bit 0.
                 // depth=1 (packed multi-dim `[0:0][W-1:0]`, Ibex `data_scr_nonce[k]`)
                 // is still a word, not packed bit 0 of the inner vector.
                 for i in 0..w.max(1).min(256) {
+                    let bn = unpacked_word_q(lhs, *b, w, i);
+                    if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
+                        break;
+                    }
                     match rexpr_to_bit(rhs, rtl, i) {
                         Ok(e) => {
-                            let bn = unpacked_word_q(lhs, *b, w, i);
                             if rel_lt {
                                 rel_sig.insert(bn.clone(), lhs.clone());
                             }
@@ -13300,15 +13514,17 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     }
                 }
             } else {
-                match rexpr_to_bit(rhs, rtl, 0) {
-                    Ok(e) => {
-                        let bn = bit_name(lhs, w, *b);
-                        if rel_lt {
-                            rel_sig.insert(bn.clone(), lhs.clone());
+                let bn = bit_name(lhs, w, *b);
+                if comb_accept(&comb_bits, &bn, &mut assign_capped) {
+                    match rexpr_to_bit(rhs, rtl, 0) {
+                        Ok(e) => {
+                            if rel_lt {
+                                rel_sig.insert(bn.clone(), lhs.clone());
+                            }
+                            comb_bits.push((bn, e));
                         }
-                        comb_bits.push((bn, e));
+                        Err(_) => failed = true,
                     }
-                    Err(_) => failed = true,
                 }
             }
         } else if rexpr_width_checked(rhs, rtl).is_none() {
@@ -13319,9 +13535,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             let rw = rexpr_width(rhs, rtl).min(w).max(1).min(256);
             let before = comb_bits.len();
             for i in 0..rw.min(w) {
+                let bn = bit_name(lhs, w, i);
+                if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
+                    break;
+                }
                 match rexpr_to_bit(rhs, rtl, i) {
                     Ok(e) => {
-                        let bn = bit_name(lhs, w, i);
                         if rel_lt {
                             rel_sig.insert(bn.clone(), lhs.clone());
                         }
@@ -13476,28 +13695,33 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 
     // Soft-cone widen: map more assign bits per module (Ibex pin_wrap /
     // ALU / multdiv exceed 256). Named diagnostic when still capped.
-    const ASSIGN_BIT_CAP: usize = 2048;
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
         if i >= ASSIGN_BIT_CAP {
-            note_skip(format!(
-                "diagnostic assign_cap signal={} (assign-cap {ASSIGN_BIT_CAP}; remaining assigns not a LUT)",
-                bitn
-            ));
+            if !assign_capped {
+                note_skip(format!(
+                    "diagnostic assign_cap signal={} (assign-cap {ASSIGN_BIT_CAP}; remaining assigns not a LUT)",
+                    bitn
+                ));
+            }
             break;
         }
         let expr_rom = strip_self_hold(expr, bitn);
+        // Cheap ≤6-PI LUT6 before expr_node_count (full tree walk). sha256_k
+        // and alu bit cones hit this without the 2k-node scan.
+        if !cone_pi_exceeds(&expr_rom, 6) {
+            if share
+                .lut6_from_expr(&mut d, &format!("u_clut{i}_"), Some(bitn), &expr_rom)
+                .is_some()
+            {
+                if md_bits.contains(bitn) {
+                    let _ = d.mark_debug(bitn);
+                }
+                continue;
+            }
+        }
         let huge = expr_node_count(expr) > 2_000;
         if huge {
-            // ≤6-PI boolean (Problem4 / sha256_k) is still a real LUT6. A
-            // wider cone is the VGA node_count storm: one wide_cone line.
-            if !wide_capped && !cone_pi_exceeds(&expr_rom, 6) {
-                if share
-                    .lut6_from_expr(&mut d, &format!("u_clut{i}_"), Some(bitn), &expr_rom)
-                    .is_some()
-                {
-                    continue;
-                }
-            }
+            // A wider cone is the VGA node_count storm: one wide_cone line.
             if try_map_xnor_and_tree(
                 &mut d,
                 &expr_rom,
@@ -14185,24 +14409,28 @@ fn synth_from_parsed_top(
     top: Option<&str>,
     overrides: &HashMap<String, u128>,
 ) -> Result<Design, String> {
-    let mut map: HashMap<String, Rtl> = mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
-    rewrite_hier_in_mods(&mut map);
+    let order: Vec<String> = mods.iter().map(|m| m.module.clone()).collect();
     let instantiated: HashMap<String, ()> = mods
         .iter()
         .flat_map(|m| m.insts.iter().map(|i| (i.module.clone(), ())))
         .collect();
+    let mut map: HashMap<String, Rtl> = HashMap::with_capacity(mods.len());
+    for m in mods {
+        map.insert(m.module.clone(), m);
+    }
+    rewrite_hier_in_mods(&mut map);
     let top_name = if let Some(name) = top {
         if !map.contains_key(name) {
             return Err(format!("unknown module {name}"));
         }
         name.to_string()
     } else {
-        mods.iter()
+        order
+            .iter()
             .rev()
-            .find(|m| !instantiated.contains_key(&m.module))
-            .or_else(|| mods.last())
+            .find(|m| !instantiated.contains_key(*m))
+            .or_else(|| order.last())
             .ok_or_else(|| "no top module".to_string())?
-            .module
             .clone()
     };
     let t_syn = std::time::Instant::now();
@@ -14358,7 +14586,7 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
         source.to_string()
     };
     let pre = preprocess_sv(&strip_comments(&expanded));
-    let mut mods = parse_source(&pre)?;
+    let mut mods = parse_preprocessed(&pre)?;
     if let Some(dir) = base {
         let have: HashSet<String> = mods.iter().map(|m| m.module.clone()).collect();
         let mut missing: HashSet<String> = HashSet::new();
@@ -14397,7 +14625,7 @@ pub fn list_sv_modules(source: &str) -> Result<Vec<String>, String> {
 pub fn list_sv_modules_origin(source: &str, origin: &str) -> Result<Vec<String>, String> {
     let _ = origin;
     let pre = preprocess_sv(&strip_comments(source));
-    Ok(parse_source(&pre)?
+    Ok(parse_preprocessed(&pre)?
         .into_iter()
         .map(|m| m.module)
         .collect())
@@ -14753,6 +14981,35 @@ endmodule
                 d.cells.len()
             );
         }
+    }
+
+    #[test]
+    fn stitch_child_named_and_positional_ports() {
+        let mut child = Design::new("leaf");
+        child.add_port("a", PortDir::In);
+        child.add_port("q", PortDir::Out);
+        child.add_cell("ff", CellKind::Hff);
+        child.connect("a", "ff", "D");
+        child.connect("q", "ff", "Q");
+        let named = Inst {
+            module: "leaf".into(),
+            name: "u_n".into(),
+            conns: vec![("a".into(), "pa".into()), ("q".into(), "pq".into())],
+            params: vec![],
+        };
+        let mut dst = Design::new("top");
+        super::stitch_child(&mut dst, &child, &named);
+        assert_eq!(dst.net_on("u_n_ff", "D"), Some("pa"));
+        assert_eq!(dst.net_on("u_n_ff", "Q"), Some("pq"));
+        let pos = Inst {
+            module: "leaf".into(),
+            name: "u_p".into(),
+            conns: vec![("#0".into(), "xa".into()), ("#1".into(), "xq".into())],
+            params: vec![],
+        };
+        super::stitch_child(&mut dst, &child, &pos);
+        assert_eq!(dst.net_on("u_p_ff", "D"), Some("xa"));
+        assert_eq!(dst.net_on("u_p_ff", "Q"), Some("xq"));
     }
 
     #[test]
@@ -18991,5 +19248,4 @@ endmodule
             "mem_inits must hash in name order"
         );
     }
-
 }
