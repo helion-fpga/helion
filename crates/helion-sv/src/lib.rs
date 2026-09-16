@@ -237,10 +237,18 @@ fn file_mtime_key(path: &Path) -> Option<(String, u64, u64)> {
     Some((path.display().to_string(), mtime, meta.len()))
 }
 
-thread_local! {
-    static SYNTAX_TREE_CACHE: std::cell::RefCell<
-        HashMap<(String, u64, u64), Arc<sv_parser::SyntaxTree>>,
-    > = std::cell::RefCell::new(HashMap::new());
+/// `sv-parser::SyntaxTree` is !Sync (internal RefCells). Post-parse trees are
+/// treated as immutable; this wrapper lets a process-level Mutex cache Arc trees
+/// so CLI/IDE reuse survives worker threads (TLS died across threads).
+struct SharedSyntaxTree(Arc<sv_parser::SyntaxTree>);
+// SAFETY: trees are immutable after `parse_sv_str`; no further interior mutation.
+unsafe impl Send for SharedSyntaxTree {}
+unsafe impl Sync for SharedSyntaxTree {}
+
+fn syntax_tree_cache() -> &'static Mutex<HashMap<(String, u64, u64), SharedSyntaxTree>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64), SharedSyntaxTree>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn parse_sv_str_opts(
@@ -277,14 +285,16 @@ fn parse_sv_cached(
     let path = Path::new(origin);
     if let Some(key) = file_mtime_key(path) {
         if key.2 == source.len() as u64 {
-            if let Some(hit) = SYNTAX_TREE_CACHE.with(|c| c.borrow().get(&key).map(Arc::clone)) {
-                return Ok(hit);
+            if let Ok(c) = syntax_tree_cache().lock() {
+                if let Some(hit) = c.get(&key) {
+                    return Ok(Arc::clone(&hit.0));
+                }
             }
             let tree = parse_sv_str_opts(source, origin, opts)?;
             let arc = Arc::new(tree);
-            SYNTAX_TREE_CACHE.with(|c| {
-                c.borrow_mut().insert(key, Arc::clone(&arc));
-            });
+            if let Ok(mut c) = syntax_tree_cache().lock() {
+                c.insert(key, SharedSyntaxTree(Arc::clone(&arc)));
+            }
             return Ok(arc);
         }
     }
