@@ -36,6 +36,8 @@ pub struct IobRoute {
     pub path: Vec<(u32, u32)>,
     /// Packed IOB `from_net` this route drives (HNF net, not a chrome label).
     pub net: String,
+    /// True when the driving cluster has an FF (`BLE.FF` / `BLE.Q`); false for comb LUT (`BLE.LUT` / `BLE.O`).
+    pub from_ff: bool,
 }
 
 impl IobRoute {
@@ -55,14 +57,24 @@ impl IobRoute {
         }
     }
 
-    /// Driving FF BEL at the source CLB (`CLB_XnYm/BLEk.FF`).
+    /// Driving BEL at the source CLB (`…/BLEk.FF` or `…/BLEk.LUT` for comb).
     pub fn clb_bel(&self) -> BelId {
-        BelId::new(self.clb_site(), format!("BLE{}.FF", self.ble))
+        let bel = if self.from_ff {
+            format!("BLE{}.FF", self.ble)
+        } else {
+            format!("BLE{}.LUT", self.ble)
+        };
+        BelId::new(self.clb_site(), bel)
     }
 
-    /// Architecture Q stub at the source BLE.
+    /// Architecture stub at the source BLE (`BLEk.Q` or `BLEk.O` for comb).
     pub fn clb_net_id(&self) -> NetId {
-        NetId::new(self.clb_site(), format!("BLE{}.Q", self.ble))
+        let net = if self.from_ff {
+            format!("BLE{}.Q", self.ble)
+        } else {
+            format!("BLE{}.O", self.ble)
+        };
+        NetId::new(self.clb_site(), net)
     }
 }
 
@@ -533,6 +545,13 @@ pub fn route_with_guide(
             .get(i)
             .map(|io| io.from_net.clone())
             .unwrap_or_default();
+        let from_ff = placed
+            .packed
+            .lutffs
+            .iter()
+            .find(|l| l.q_net == net)
+            .map(|l| !l.ff_cell.is_empty())
+            .unwrap_or(true);
         iob_src.push(IobRoute {
             iob: *dst,
             clb: *src,
@@ -541,6 +560,7 @@ pub fn route_with_guide(
             delay_ps: hops as i64 * HOP_DELAY_PS,
             path: last_paths[i].clone(),
             net,
+            from_ff,
         });
     }
     if imux_skip > 0 {
