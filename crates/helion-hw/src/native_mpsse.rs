@@ -23,7 +23,9 @@ use helion_bits::Bitstream;
 use crate::native_usb::enumerate_ftdi;
 #[cfg(feature = "usb-native")]
 use crate::native_usb::{FTDI_PID_FT2232H, FTDI_VID};
-use crate::{HadUsbTransport, NativeUsbError, IR_CFG_W, IR_IDCODE, IR_STAT};
+use crate::{HadUsbTransport, NativeUsbError, ERR_CODE_EMPTY_BITSTREAM, IR_CFG_W, IR_IDCODE, IR_STAT};
+#[cfg(feature = "usb-native")]
+use crate::ERR_CODE_USB_0;
 
 // --- FTDI MPSSE opcodes (subset used for JTAG) --------------------------------
 // Bit flags (FTDI AN_108 / libftdi / OpenOCD):
@@ -541,9 +543,9 @@ impl HadUsbTransport for NativeFtdiMpsse {
         let bytes = std::fs::read(path)
             .map_err(|e| NativeUsbError::Io(format!("read {}: {e}", path.display())))?;
         if bytes.is_empty() {
-            return Err(NativeUsbError::Io(
-                "empty bitstream — refusing native MPSSE program".into(),
-            ));
+            return Err(NativeUsbError::Io(format!(
+                "{ERR_CODE_EMPTY_BITSTREAM}: empty bitstream — refusing native MPSSE program"
+            )));
         }
         if bytes.starts_with(b"HBIT") {
             match Bitstream::from_packets(&bytes) {
@@ -727,7 +729,7 @@ fn open_probe_rusb(this: &mut NativeFtdiMpsse) -> Result<(), NativeUsbError> {
     let scan = enumerate_ftdi();
     if scan.probes.is_empty() {
         return Err(NativeUsbError::Io(format!(
-            "no FTDI (VID {:#06x}) device enumerated — cannot open native MPSSE \
+            "{ERR_CODE_USB_0}: no FTDI (VID {:#06x}) device enumerated — cannot open native MPSSE \
              (honest: no device, no STAT). {}",
             FTDI_VID, scan.note
         )));
@@ -955,6 +957,10 @@ mod tests {
             );
             let msg = err.to_string();
             assert!(
+                msg.contains(crate::ERR_CODE_USB_0),
+                "stable USB=0 code missing: {msg}"
+            );
+            assert!(
                 msg.contains("no FTDI") || msg.contains("open failed") || msg.contains("Io"),
                 "{msg}"
             );
@@ -978,6 +984,12 @@ mod tests {
         let err = try_native_mpsse_program(&path, false).unwrap_err();
         if cfg!(feature = "usb-native") {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(crate::ERR_CODE_USB_0),
+                "stable USB=0 code missing: {msg}"
+            );
+            assert!(!msg.to_ascii_lowercase().contains("done=1"), "{msg}");
         } else {
             assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
         }
@@ -1101,8 +1113,12 @@ mod tests {
         let mut t = NativeFtdiMpsse::new();
         let err = t.program_hbits(&zero, false).unwrap_err();
         assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
-        let msg = err.to_string().to_ascii_lowercase();
-        assert!(msg.contains("empty"), "{msg}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {msg}"
+        );
+        assert!(msg.to_ascii_lowercase().contains("empty"), "{msg}");
         assert_eq!(t.usb_open_count, 0, "0-byte must not claim cable");
         assert!(!t.is_open());
 
@@ -1112,14 +1128,19 @@ mod tests {
         let mut t2 = NativeFtdiMpsse::new();
         let err2 = t2.program_hbits(&empty_hbit, false).unwrap_err();
         assert!(matches!(err2, NativeUsbError::Io(_)), "{err2:?}");
-        let msg2 = err2.to_string().to_ascii_lowercase();
+        let msg2 = err2.to_string();
         assert!(
-            msg2.contains("empty bitstream refused") || msg2.contains("refusing done on empty"),
+            msg2.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {msg2}"
+        );
+        assert!(
+            msg2.to_ascii_lowercase().contains("empty bitstream refused")
+                || msg2.to_ascii_lowercase().contains("refusing done on empty"),
             "{msg2}"
         );
         assert_eq!(t2.usb_open_count, 0, "header-only HBIT must not claim cable");
         assert!(!t2.is_open());
-        assert!(!msg2.contains("done=1"), "{msg2}");
+        assert!(!msg2.to_ascii_lowercase().contains("done=1"), "{msg2}");
     }
 
     #[test]
