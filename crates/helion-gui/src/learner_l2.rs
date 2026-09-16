@@ -1,28 +1,30 @@
 //! FM-HEL-L2-UI — Device/Timing highlight + packing English for the GUI.
 //!
-//! Consumes live `helion-device` Site/Bel/Pip/Net + `resolve_path_sites` /
-//! `resolve_cell_site` (HAD tip). `HighlightSet` / packing English stay GUI-local
-//! until `wip/learner-L2-pnr` tips those helpers. PIP highlight is out of scope
-//! this ship. Soft→RTL span is behind `learner_l2_soft_span` (default off).
+//! Re-exports PNR crate APIs (`helion_sta::HighlightSet`,
+//! `highlight_set_from_path`, `critical_path_highlight`,
+//! `helion_place::packing_summary_from_placed`) and keeps thin GUI wrappers
+//! for DeviceView endpoint resolve + English packing lines. Soft→RTL span is
+//! behind `learner_l2_soft_span` (default off). PIP highlight is out of scope.
 
 use helion_device::{Device, Site, SiteKind};
 use helion_place::Placed;
-use std::collections::BTreeMap;
 
-/// Sites + nets selected for schematic/device paint after a timing-path pick.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HighlightSet {
-    pub sites: Vec<String>,
-    pub nets: Vec<String>,
+pub use helion_place::packing_summary_from_placed;
+pub use helion_sta::{critical_path_highlight, highlight_set_from_path, HighlightSet};
+
+/// Convenience methods on the crate [`HighlightSet`] for headless GUI dumps.
+pub trait HighlightSetExt {
+    fn is_empty(&self) -> bool;
+    /// Headless dump crumb for tests (`SITE=… NET=…`).
+    fn dump(&self) -> String;
 }
 
-impl HighlightSet {
-    pub fn is_empty(&self) -> bool {
+impl HighlightSetExt for HighlightSet {
+    fn is_empty(&self) -> bool {
         self.sites.is_empty() && self.nets.is_empty()
     }
 
-    /// Headless dump crumb for tests (`SITE=… NET=…`).
-    pub fn dump(&self) -> String {
+    fn dump(&self) -> String {
         let mut parts = Vec::new();
         for s in &self.sites {
             parts.push(format!("SITE={s}"));
@@ -34,12 +36,12 @@ impl HighlightSet {
     }
 }
 
-/// Build a HighlightSet from path cells/nets using live HAD resolve.
+/// Build a crate [`HighlightSet`] from DeviceView path cells/nets via live HAD.
 ///
-/// `endpoints` are `(cell_name, placed Site)` pairs from DeviceView occupancy.
-/// Sites are verified via [`Device::resolve_path_sites`]. Nets pass through as
-/// design net names (PNR NetId tip not required for this ship).
-pub fn highlight_set_from_path(
+/// Prefer [`highlight_set_from_path`] / [`critical_path_highlight`] when a
+/// routed [`helion_route::Routed`] + STA [`helion_sta::TimingPath`] are in hand.
+/// This adapter covers the GUI timing-table path (endpoints from occupancy).
+pub fn highlight_set_from_endpoints(
     device: &Device,
     endpoints: &[(String, Site)],
     nets: &[String],
@@ -74,15 +76,11 @@ pub fn resolve_occupant_site(
     device.resolve_cell_site(cell, site)
 }
 
-/// English packing lines from placement: `CLB_XxYy: N LUTFF` per site.
-/// Sum of N over lines == `placed.lutff_sites.len()`.
+/// English packing lines from placement via crate [`packing_summary_from_placed`].
+/// Format: `CLB_XxYy: N LUTFF` per site. Sum of N == `placed.lutff_sites.len()`.
 pub fn packing_summary_english(placed: &Placed) -> Vec<String> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for (site, _ble) in &placed.lutff_sites {
-        // Live HAD Site::id (not a GUI string formatter).
-        *counts.entry(site.id()).or_insert(0) += 1;
-    }
-    counts
+    let sum = packing_summary_from_placed(placed);
+    sum.sites
         .into_iter()
         .map(|(id, n)| format!("{id}: {n} LUTFF"))
         .collect()
@@ -151,6 +149,9 @@ mod tests {
             timing_weight: 0.0,
             cost: 0.0,
         };
+        let crate_sum = packing_summary_from_placed(&placed);
+        assert_eq!(crate_sum.lutff_in("CLB_X2Y1"), 2);
+        assert_eq!(crate_sum.lutff_in("CLB_X3Y0"), 1);
         let lines = packing_summary_english(&placed);
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().any(|l| l == "CLB_X2Y1: 2 LUTFF"), "{lines:?}");
@@ -173,7 +174,8 @@ mod tests {
         };
         assert!(dev.contains_site(site), "fixture site in HAD");
         let endpoints = vec![("u_lut0".into(), site)];
-        let hs = highlight_set_from_path(&dev, &endpoints, &["clk".into(), "q".into()]).unwrap();
+        let hs =
+            highlight_set_from_endpoints(&dev, &endpoints, &["clk".into(), "q".into()]).unwrap();
         assert_eq!(hs.sites, vec!["CLB_X2Y1".to_string()]);
         assert!(!hs.nets.is_empty());
         assert!(looks_like_had_site(&hs.sites[0]));
@@ -181,5 +183,16 @@ mod tests {
         // Bel / Pip / Net IDs exist on the live device API (smoke).
         assert!(!dev.bels_in_site(site).is_empty());
         assert!(dev.site_by_id("CLB_X2Y1") == Some(site));
+    }
+
+    #[test]
+    fn crate_api_reexports_resolve() {
+        // Type-path smoke: GUI re-exports resolve to helion_sta / helion_place.
+        let _hl: HighlightSet = HighlightSet::default();
+        assert!(_hl.sites.is_empty());
+        let _: fn(&Placed) -> helion_pack::PackingSummary = packing_summary_from_placed;
+        // critical_path_highlight / highlight_set_from_path are pub-used from helion_sta.
+        let _ = std::any::type_name_of_val(&critical_path_highlight);
+        let _ = std::any::type_name_of_val(&highlight_set_from_path);
     }
 }
