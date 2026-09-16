@@ -539,17 +539,19 @@ pub fn place_with_guide(
                 nplace,
                 t_aff.elapsed().as_millis()
             );
-            // 1113_5.v: 783 LUTFFs print this line then die -15 (SIGTERM) in
-            // bileg legalize. Keep the affinity placement and name the skip.
-            // Gold counter is far below this cap.
-            if nplace >= 256 {
+            // FM-HEL-OPT-P0-1: 1113_5.v historically SIGTERM'd in *unbounded*
+            // bileg legalize at 783 LUTFFs. Keep affinity; for n≥256 run a
+            // *budgeted* legalize (limited passes + wall) so Ibex imux_skip can
+            // drop honestly. Gold counter (n≪256) keeps the full 32-pass path.
+            // Never invent E-W IMUX without wires; IBEX_IMPL_CAP_SEC=120 stays.
+            let large_place = nplace >= 256;
+            if large_place {
                 eprintln!(
-                    "diagnostic place_affinity_cap lutffs={} (legalize skipped after affinity; placement kept)",
+                    "diagnostic place_affinity_cap lutffs={} (budgeted IMUX legalize after affinity; placement kept)",
                     nplace
                 );
             }
             let t_leg = std::time::Instant::now();
-            let skip_legalize = nplace >= 256;
             // FM-HEL-TOP: bidirectional IMUX legalization — pull sinks toward
             // drivers AND drivers toward sinks onto real HAD reach (same-CLB /
             // N-S±1/±2 / E-W±1/±2 / diag±1 / knight); empty-BLE move then
@@ -701,15 +703,29 @@ pub fn place_with_guide(
                 let (site, _) = lutff_sites[i];
                 imux_illegal_pins(lf, site, &ff_at) == 0
             });
-            let pass_limit = if skip_legalize
-                || already_legal
-                || nplace >= dev.lut6_count() as usize
-            {
+            // Budgeted legalize for large packs (n≥256 / device-full Ibex).
+            // Prior tip also zeroed passes when nplace >= lut6_count (8192 on
+            // HL10T), which silently skipped legalize on every device-full
+            // design — that is the imux_skip≈1208–1360 QoR hole. Small designs
+            // (nplace<256) still get 32 passes with no wall check.
+            const LARGE_PASS_LIMIT: u32 = 8;
+            const LARGE_LEGALIZE_MS: u128 = 5_000;
+            let pass_limit = if already_legal {
                 0
+            } else if large_place {
+                LARGE_PASS_LIMIT
             } else {
                 32
             };
             for _pass in 0..pass_limit {
+                if large_place && t_leg.elapsed().as_millis() >= LARGE_LEGALIZE_MS {
+                    eprintln!(
+                        "diagnostic place_legalize_budget lutffs={} ms={} (wall; affinity+partial legalize kept)",
+                        nplace,
+                        t_leg.elapsed().as_millis()
+                    );
+                    break;
+                }
                 let mut pass_moved = 0u32;
                 let mut pass_swapped = 0u32;
                 let mut pass_drv_moved = 0u32;
@@ -1651,4 +1667,31 @@ mod tests {
         assert!(pl.cell_bel("ghost").is_none());
         assert_eq!(pl.cell_site("u_ff3"), Some(site));
     }
+
+    /// FM-HEL-OPT-P0-1: device-full / n≥256 must not hard-skip legalize.
+    /// Smoke: ≥256 connected LUTFF clusters place without panic (budgeted path).
+    #[test]
+    fn budgeted_legalize_large_place_without_panic() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let proto = p.lutffs[0].clone();
+        // Enough to hit large_place (≥256) but well under device to keep the
+        // unit test fast; wire each cluster to the previous FF so affinity
+        // leaves illegal arcs for budgeted bileg to chew.
+        let n = 280usize;
+        while p.lutffs.len() < n {
+            let i = p.lutffs.len();
+            let mut lf = proto.clone();
+            lf.lut_cell = format!("u_lut{i}");
+            lf.ff_cell = format!("u_ff{i}");
+            lf.q_net = format!("q{i}");
+            let prev_ff = format!("u_ff{}", i - 1);
+            lf.lut_pins = vec![(0u8, prev_ff)];
+            p.lutffs.push(lf);
+        }
+        let pl = place(&p, &dev).expect("budgeted legalize must not panic on n≥256");
+        assert_eq!(pl.lutff_sites.len(), n);
+        assert_eq!(pl.packed.lutffs.len(), n);
+    }
 }
+
