@@ -114,3 +114,43 @@ fn public_html_documents_the_app() {
         "site must carry the legal fence (license + no vendor bitstream / HAD-only facts)"
     );
 }
+
+#[test]
+fn public_html_documents_stages_and_soft_law() {
+    let docs = root().join("docs");
+    let pages = public_html(&docs);
+    let joined: String = pages.iter().map(|(_, b)| b.as_str()).collect();
+    let stages = pages
+        .iter()
+        .find(|(n, _)| n == "stages.html")
+        .map(|(_, b)| b.as_str())
+        .expect("docs/stages.html");
+    for needle in [
+        "elaborate",
+        "pack",
+        "place",
+        "route",
+        "sta",
+        "bitgen",
+        "WNS_PS=9640",
+        "cargo test --workspace",
+    ] {
+        assert!(
+            stages.contains(needle),
+            "stages.html missing {needle}: {stages}"
+        );
+    }
+    assert!(
+        stages.contains("SOFT") && stages.contains('\u{2260}'),
+        "stages.html must state SOFT ≠ PASS"
+    );
+    assert!(
+        joined.contains("SOFT") && joined.contains('\u{2260}'),
+        "site must state SOFT ≠ PASS"
+    );
+    let md = std::fs::read_to_string(docs.join("stages.md")).unwrap();
+    assert!(
+        md.contains("elaborate/map") && md.contains("SOFT") && md.contains('\u{2260}'),
+        "docs/stages.md is the canonical markdown"
+    );
+}
