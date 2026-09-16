@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Roadmap: Helion 1.4 to 2.0</title>
-  <meta name="description" content="Helion FM-HEL-14 roadmap: 1.4 SV elaborator, 1.5 PNR/STA and project, 1.6 IDE and lab, 1.7 VHDL and HAD, 2.0 public OSS CAD bar. Gold WNS_PS=9640." />
+  <title>Roadmap: Helion 2.0 shipped; 2.0.x grind</title>
+  <meta name="description" content="Helion FM-HEL-14 roadmap: 1.4 to 2.0 shipped; 2.0.x post-bar STA/bitgen/place/synth/parse grind. Current v2.0.4. Gold WNS_PS=9640." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -31,48 +31,62 @@
 
   <main id="main" class="page">
     <div class="prose">
-      <h1>Roadmap (1.4 to 2.0)</h1>
+      <h1>Roadmap (1.4 to 2.0 shipped; 2.0.x grind)</h1>
       <p class="lede">
         FM-HEL-14. Original FPGA family plus in-repo CAD. Gold lock: empty-XDC
         <code>examples/counter.sv</code> stays <span class="gold">WNS_PS=9640</span>
-        on every step. Canonical markdown:
+        on every step. Current release:
+        <a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.4">v2.0.4</a>.
+        Canonical markdown:
         <a href="https://github.com/helion-fpga/helion/blob/master/ROADMAP.md">ROADMAP.md</a>.
         GitHub:
         <a href="https://github.com/helion-fpga/helion/milestones">milestones</a>.
       </p>
 
       <div class="table-wrap"><table>
-        <thead><tr><th>Release</th><th>Workers</th><th>What</th><th>Milestone</th></tr></thead>
+        <thead><tr><th>Release</th><th>Status</th><th>Workers</th><th>What</th><th>Milestone</th></tr></thead>
         <tbody>
           <tr>
             <td><strong>1.4</strong></td>
+            <td>shipped</td>
             <td>W1</td>
             <td>SystemVerilog elaborator; gold 9640</td>
             <td><a href="https://github.com/helion-fpga/helion/milestone/1">1.4</a></td>
           </tr>
           <tr>
             <td><strong>1.5</strong></td>
+            <td>shipped</td>
             <td>W2 + W4</td>
             <td>PNR/STA + project/CLI</td>
             <td><a href="https://github.com/helion-fpga/helion/milestone/2">1.5</a></td>
           </tr>
           <tr>
             <td><strong>1.6</strong></td>
+            <td>shipped</td>
             <td>W5 + W3</td>
             <td>IDE + lab</td>
             <td><a href="https://github.com/helion-fpga/helion/milestone/3">1.6</a></td>
           </tr>
           <tr>
             <td><strong>1.7</strong></td>
+            <td>shipped</td>
             <td>W6 + W8</td>
             <td>VHDL + HAD</td>
             <td><a href="https://github.com/helion-fpga/helion/milestone/4">1.7</a></td>
           </tr>
           <tr>
             <td><strong>2.0</strong></td>
+            <td>shipped</td>
             <td></td>
-            <td>Public OSS CAD bar</td>
+            <td>Public OSS CAD bar (<a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.0">v2.0.0</a>)</td>
             <td><a href="https://github.com/helion-fpga/helion/milestone/5">2.0</a></td>
+          </tr>
+          <tr>
+            <td><strong>2.0.x</strong></td>
+            <td>current</td>
+            <td></td>
+            <td>Post-bar STA / bitgen / place-legalize / synth / parse opt; gold lock unchanged</td>
+            <td><a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.4">v2.0.4</a></td>
           </tr>
         </tbody>
       </table></div>
@@ -82,7 +96,7 @@
       <p>
         Lower public-widen SOFT: <code>always</code> / <code>case</code> / functions /
         memories / generates onto Helion LUT/FF. Ports-only shells stay
-        <code>cells=0</code> / <code>no_body</code>. SOFT ≠ PASS. Gold
+        <code>cells=0</code> / <code>no_body</code>. SOFT &ne; PASS. Gold
         <span class="gold">WNS_PS=9640</span>.
       </p>
 
@@ -109,9 +123,22 @@
 
       <h2>2.0: public OSS CAD bar</h2>
       <p>
+        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.0">v2.0.0</a>.</strong>
         A stranger can clone, <code>cargo test --workspace</code>, run headless gold
         <span class="gold">WNS_PS=9640</span>, and trust the
         <a href="legal.html">legal fence</a>.
+      </p>
+
+      <h2>2.0.x: post-bar runtime / QoR grind</h2>
+      <p>
+        <strong>Current tip: <a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.4">v2.0.4</a>.</strong>
+        Patch line after the 2.0 bar: measured STA / bitgen / place-legalize /
+        synth_rtl / parse cuts without moving gold. SOFT &ne; PASS.
+        Empty-XDC counter stays <span class="gold">WNS_PS=9640</span>.
+        Release <code>helion impl examples/ibex_pin_wrap.sv</code> deltas:
+        parse 416→353 ms, synth_rtl 670→524 ms, place legalize 213→23 ms,
+        imux_skip 158→123. Table:
+        <a href="https://github.com/helion-fpga/helion/blob/master/docs/perf-2.0.4.md">docs/perf-2.0.4.md</a>.
       </p>
 
       <p class="cta">
