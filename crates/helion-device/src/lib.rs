@@ -25,6 +25,8 @@ pub struct Device {
     pub n_bram: u32,
     pub bram_x: u32,
     pub bram_y0: u32,
+    /// CLK spine column (HAD `clk_spine`; default clb_x0-1).
+    pub clk_spine: u32,
     featuremap: FeatureMap,
 }
 
@@ -81,20 +83,135 @@ pub struct Board {
     pub cables: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Site {
     pub x: u32,
     pub y: u32,
     pub kind: SiteKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SiteKind {
     Clb,
     Iob,
     Clk,
     Dsp,
     Bram,
+}
+
+impl Site {
+    /// Stable Helion site ID (`CLB_X{x}Y{y}`, `IOB_…`, `DSP_…`, `BRAM_…`, `CLK_…`).
+    pub fn id(&self) -> String {
+        let p = match self.kind {
+            SiteKind::Clb => "CLB",
+            SiteKind::Iob => "IOB",
+            SiteKind::Bram => "BRAM",
+            SiteKind::Dsp => "DSP",
+            SiteKind::Clk => "CLK",
+        };
+        format!("{p}_X{}Y{}", self.x, self.y)
+    }
+
+    /// Parse a Helion site ID into a [`Site`]. Does not check the part geometry.
+    pub fn parse_id(id: &str) -> Option<Self> {
+        let (kind, rest) = if let Some(r) = id.strip_prefix("CLB_X") {
+            (SiteKind::Clb, r)
+        } else if let Some(r) = id.strip_prefix("IOB_X") {
+            (SiteKind::Iob, r)
+        } else if let Some(r) = id.strip_prefix("BRAM_X") {
+            (SiteKind::Bram, r)
+        } else if let Some(r) = id.strip_prefix("DSP_X") {
+            (SiteKind::Dsp, r)
+        } else if let Some(r) = id.strip_prefix("CLK_X") {
+            (SiteKind::Clk, r)
+        } else {
+            return None;
+        };
+        let (xs, ys) = rest.split_once('Y')?;
+        let x: u32 = xs.parse().ok()?;
+        let y: u32 = ys.parse().ok()?;
+        Some(Self { x, y, kind })
+    }
+}
+
+/// Basic element of logic inside a HAD site (Helion-owned Interchange-like ID).
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct BelId {
+    pub site: Site,
+    /// Relative BEL name inside the site, e.g. `BLE0.LUT`, `BLE0.FF`, `IOB`, `MAC`, `RAM18`.
+    pub bel: String,
+}
+
+impl BelId {
+    pub fn new(site: Site, bel: impl Into<String>) -> Self {
+        Self {
+            site,
+            bel: bel.into(),
+        }
+    }
+
+    /// Stable string ID, e.g. `CLB_X2Y1/BLE0.LUT`.
+    pub fn id(&self) -> String {
+        format!("{}/{}", self.site.id(), self.bel)
+    }
+}
+
+/// Programmable interconnect point Helion owns for local IMUX-style hops.
+/// Encodes from→to site (+ optional IMUX sel). Not a full bitstream router.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PipId {
+    pub from: Site,
+    pub to: Site,
+    /// Optional IMUX select encoding when known; omitted for geometric neighbor PIPs.
+    pub sel: Option<u8>,
+}
+
+impl PipId {
+    pub fn between(from: Site, to: Site) -> Self {
+        Self {
+            from,
+            to,
+            sel: None,
+        }
+    }
+
+    pub fn with_sel(from: Site, to: Site, sel: u8) -> Self {
+        Self {
+            from,
+            to,
+            sel: Some(sel),
+        }
+    }
+
+    /// Stable deterministic ID, e.g. `PIP:CLB_X2Y1->CLB_X2Y2` or `…:sel16`.
+    pub fn id(&self) -> String {
+        match self.sel {
+            Some(s) => format!("PIP:{}->{}:sel{s}", self.from.id(), self.to.id()),
+            None => format!("PIP:{}->{}", self.from.id(), self.to.id()),
+        }
+    }
+}
+
+/// HAD-local architecture wire/net name at the site/BEL boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct NetId {
+    pub site: Site,
+    /// Relative net stub, e.g. `BLE0.Q`, `BLE0.O`, `PAD`.
+    pub net: String,
+}
+
+impl NetId {
+    pub fn new(site: Site, net: impl Into<String>) -> Self {
+        Self {
+            site,
+            net: net.into(),
+        }
+    }
+
+    /// Stable string ID, e.g. `CLB_X2Y1/BLE0.Q`.
+    pub fn id(&self) -> String {
+        format!("{}/{}", self.site.id(), self.net)
+    }
 }
 
 impl Device {
@@ -226,6 +343,7 @@ impl Device {
         let mut n_bram = 0u32;
         let mut bram_x = 10u32;
         let mut bram_y0 = 1u32;
+        let mut clk_spine: Option<u32> = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -254,6 +372,7 @@ impl Device {
                 "bram18" => n_bram = parse_u32(v)?,
                 "bram_x" => bram_x = parse_u32(v)?,
                 "bram_y0" => bram_y0 = parse_u32(v)?,
+                "clk_spine" => clk_spine = Some(parse_u32(v)?),
                 _ => {}
             }
         }
@@ -264,6 +383,7 @@ impl Device {
             idcode = idcode_from_part_id(0, part_id);
         }
         let featuremap = FeatureMap::pack_clb(16, 128);
+        let clk_spine = clk_spine.unwrap_or_else(|| clb_x0.saturating_sub(1));
         Ok(Self {
             part,
             sku,
@@ -284,6 +404,7 @@ impl Device {
             n_bram,
             bram_x,
             bram_y0,
+            clk_spine,
             featuremap,
         })
     }
@@ -437,6 +558,27 @@ impl Device {
             y,
             kind: SiteKind::Iob,
         })
+    }
+
+    /// CLK spine sites from HAD (`clk_spine` × interior rows).
+    pub fn clk_sites(&self) -> impl Iterator<Item = Site> + '_ {
+        let x = self.clk_spine;
+        let y0 = self.clb_y0;
+        let rows = self.interior_rows;
+        (0..rows).map(move |dy| Site {
+            x,
+            y: y0 + dy,
+            kind: SiteKind::Clk,
+        })
+    }
+
+    /// All HAD sites for this part (CLB, IOB, CLK, DSP, BRAM).
+    pub fn all_sites(&self) -> impl Iterator<Item = Site> + '_ {
+        self.clb_sites()
+            .chain(self.iob_sites())
+            .chain(self.clk_sites())
+            .chain(self.dsp_sites())
+            .chain(self.bram_sites())
     }
 
     pub fn clb_major(&self, x: u32, y: u32) -> Option<u16> {
@@ -655,6 +797,157 @@ impl Device {
         };
         w |= icode << 23;
         w
+    }
+
+    // --- Stable Helion IDs (Interchange-like; CAD queries HAD, no hardcoded die) ---
+
+    /// True if `site` exists in this part's HAD geometry.
+    pub fn contains_site(&self, site: Site) -> bool {
+        match site.kind {
+            SiteKind::Clb => self.clb_major(site.x, site.y).is_some(),
+            SiteKind::Iob => self.iob_major(site.x, site.y).is_some(),
+            SiteKind::Clk => self
+                .clk_sites()
+                .any(|s| s.x == site.x && s.y == site.y),
+            SiteKind::Dsp => self
+                .dsp_sites()
+                .any(|s| s.x == site.x && s.y == site.y),
+            SiteKind::Bram => self
+                .bram_sites()
+                .any(|s| s.x == site.x && s.y == site.y),
+        }
+    }
+
+    /// Look up a site by its stable ID string. Returns `None` if unknown or not in HAD.
+    pub fn site_by_id(&self, id: &str) -> Option<Site> {
+        let site = Site::parse_id(id)?;
+        if self.contains_site(site) {
+            Some(site)
+        } else {
+            None
+        }
+    }
+
+    /// BELs inside a HAD site. CLB: `BLE{i}.LUT` / `BLE{i}.FF` for `i` in `0..n_ble`.
+    pub fn bels_in_site(&self, site: Site) -> Vec<BelId> {
+        if !self.contains_site(site) {
+            return Vec::new();
+        }
+        match site.kind {
+            SiteKind::Clb => {
+                let mut v = Vec::with_capacity((self.n_ble * 2) as usize);
+                for i in 0..self.n_ble {
+                    v.push(BelId::new(site, format!("BLE{i}.LUT")));
+                    v.push(BelId::new(site, format!("BLE{i}.FF")));
+                }
+                v
+            }
+            SiteKind::Iob => vec![BelId::new(site, "IOB")],
+            SiteKind::Dsp => vec![BelId::new(site, "MAC")],
+            SiteKind::Bram => vec![BelId::new(site, "RAM18")],
+            SiteKind::Clk => vec![BelId::new(site, "GCLK")],
+        }
+    }
+
+    /// Bring-up IMUX geometric reach used by place/route (same-CLB, axis ±1..±4 /
+    /// E-W ≤3, diag ±1/±2, knight). Helion-owned; not a vendor DB import.
+    pub fn imux_reach(from: Site, to: Site) -> bool {
+        if from.kind != SiteKind::Clb || to.kind != SiteKind::Clb {
+            return false;
+        }
+        let dx = from.x.abs_diff(to.x);
+        let dy = from.y.abs_diff(to.y);
+        if dx == 0 && dy <= 4 {
+            return true;
+        }
+        if dy == 0 && dx <= 3 {
+            return true;
+        }
+        (dx == 1 && dy == 1)
+            || (dx == 2 && dy == 2)
+            || (dx == 2 && dy == 1)
+            || (dx == 1 && dy == 2)
+    }
+
+    /// Construct a PIP ID between two HAD sites if they are legal IMUX neighbors.
+    pub fn pip_between(&self, from: Site, to: Site) -> Option<PipId> {
+        if !self.contains_site(from) || !self.contains_site(to) {
+            return None;
+        }
+        if !Self::imux_reach(from, to) {
+            return None;
+        }
+        Some(PipId::between(from, to))
+    }
+
+    /// List deterministic PIP IDs from `from` to every legal IMUX neighbor present in HAD.
+    pub fn pips_from(&self, from: Site) -> Vec<PipId> {
+        if !self.contains_site(from) || from.kind != SiteKind::Clb {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for to in self.clb_sites() {
+            if Self::imux_reach(from, to) {
+                out.push(PipId::between(from, to));
+            }
+        }
+        out.sort_by(|a, b| a.id().cmp(&b.id()));
+        out
+    }
+
+    /// Architecture net stubs at the site/BEL boundary (minimal HAD-local names).
+    pub fn nets_in_site(&self, site: Site) -> Vec<NetId> {
+        if !self.contains_site(site) {
+            return Vec::new();
+        }
+        match site.kind {
+            SiteKind::Clb => {
+                let mut v = Vec::with_capacity((self.n_ble * 2) as usize);
+                for i in 0..self.n_ble {
+                    v.push(NetId::new(site, format!("BLE{i}.Q")));
+                    v.push(NetId::new(site, format!("BLE{i}.O")));
+                }
+                v
+            }
+            SiteKind::Iob => vec![
+                NetId::new(site, "PAD"),
+                NetId::new(site, "I"),
+                NetId::new(site, "O"),
+            ],
+            SiteKind::Dsp => vec![NetId::new(site, "P"), NetId::new(site, "C")],
+            SiteKind::Bram => vec![NetId::new(site, "DO"), NetId::new(site, "DI")],
+            SiteKind::Clk => vec![NetId::new(site, "GCLK")],
+        }
+    }
+
+    /// Resolve one placed cell → verified SiteId present in this part's HAD.
+    pub fn resolve_cell_site(&self, cell: &str, placed: Site) -> Result<String, String> {
+        if cell.trim().is_empty() {
+            return Err("empty cell name".into());
+        }
+        if !self.contains_site(placed) {
+            return Err(format!(
+                "site {} not in HAD part {} (reject hardcoded die coords)",
+                placed.id(),
+                self.part
+            ));
+        }
+        Ok(placed.id())
+    }
+
+    /// Path endpoint cells → sorted unique verified SiteIds from HAD.
+    /// Rejects any Site outside the loaded part geometry.
+    pub fn resolve_path_sites<C: AsRef<str>>(
+        &self,
+        endpoints: &[(C, Site)],
+    ) -> Result<Vec<String>, String> {
+        let mut ids = Vec::with_capacity(endpoints.len());
+        for (cell, site) in endpoints {
+            ids.push(self.resolve_cell_site(cell.as_ref(), *site)?);
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     pub fn featuremap(&self) -> &FeatureMap {
@@ -1185,5 +1478,142 @@ mod tests {
         let mut sorted_b = boards.clone();
         sorted_b.sort();
         assert_eq!(boards, sorted_b, "list_boards must be sorted");
+    }
+
+    #[test]
+    fn site_ids_round_trip_via_site_by_id() {
+        let d = Device::load_part("HL10T-C32-1").expect("load HL10T from HAD");
+        // Round-trip every site kind from HAD iterators — no hardcoded 32×32 outside TOML.
+        let samples: Vec<Site> = d
+            .clb_sites()
+            .take(3)
+            .chain(d.iob_sites().take(2))
+            .chain(d.clk_sites().take(2))
+            .chain(d.bram_sites().take(1))
+            .collect();
+        assert!(!samples.is_empty());
+        for site in samples {
+            let id = site.id();
+            let back = d.site_by_id(&id).unwrap_or_else(|| panic!("site_by_id missed {id}"));
+            assert_eq!(back, site);
+            assert!(d.contains_site(site));
+            assert_eq!(Site::parse_id(&id), Some(site));
+        }
+        // Known first CLB from HAD origins (not a bare 32 constant).
+        let first = Site {
+            x: d.clb_x0,
+            y: d.clb_y0,
+            kind: SiteKind::Clb,
+        };
+        assert_eq!(first.id(), format!("CLB_X{}Y{}", d.clb_x0, d.clb_y0));
+        assert_eq!(d.site_by_id(&first.id()), Some(first));
+        // Fake coords outside HAD must miss.
+        let fake = Site {
+            x: d.clb_x0 + d.interior_cols + 50,
+            y: d.clb_y0 + d.interior_rows + 50,
+            kind: SiteKind::Clb,
+        };
+        assert!(!d.contains_site(fake));
+        assert!(d.site_by_id(&fake.id()).is_none());
+    }
+
+    #[test]
+    fn bel_ids_for_known_clb_cover_n_ble_lut_ff() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        let site = Site {
+            x: d.clb_x0,
+            y: d.clb_y0,
+            kind: SiteKind::Clb,
+        };
+        let bels = d.bels_in_site(site);
+        assert_eq!(bels.len(), (d.n_ble * 2) as usize);
+        for i in 0..d.n_ble {
+            let lut = format!("{}/BLE{i}.LUT", site.id());
+            let ff = format!("{}/BLE{i}.FF", site.id());
+            assert!(bels.iter().any(|b| b.id() == lut), "missing {lut}");
+            assert!(bels.iter().any(|b| b.id() == ff), "missing {ff}");
+        }
+        // Cheap IOB/DSP/BRAM BEL stubs when sites exist.
+        let iob = d.iob_sites().next().unwrap();
+        assert_eq!(d.bels_in_site(iob)[0].id(), format!("{}/IOB", iob.id()));
+        if let Some(bram) = d.bram_sites().next() {
+            assert_eq!(d.bels_in_site(bram)[0].bel, "RAM18");
+        }
+    }
+
+    #[test]
+    fn pip_id_stable_for_known_neighbor_pair() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        let a = Site {
+            x: d.clb_x0,
+            y: d.clb_y0,
+            kind: SiteKind::Clb,
+        };
+        let b = Site {
+            x: d.clb_x0,
+            y: d.clb_y0 + 1,
+            kind: SiteKind::Clb,
+        };
+        assert!(d.contains_site(a) && d.contains_site(b));
+        let pip = d.pip_between(a, b).expect("N-S±1 must be legal IMUX neighbor");
+        let id = pip.id();
+        assert_eq!(id, format!("PIP:{}->{}", a.id(), b.id()));
+        // Deterministic: same call again yields identical string.
+        assert_eq!(d.pip_between(a, b).unwrap().id(), id);
+        let with_sel = PipId::with_sel(a, a, 16);
+        assert_eq!(
+            with_sel.id(),
+            format!("PIP:{}->{}:sel16", a.id(), a.id())
+        );
+        // Far-away pair is not a legal local PIP.
+        let far = Site {
+            x: d.clb_x0 + d.interior_cols.saturating_sub(1),
+            y: d.clb_y0 + d.interior_rows.saturating_sub(1),
+            kind: SiteKind::Clb,
+        };
+        if a.x.abs_diff(far.x) > 3 || a.y.abs_diff(far.y) > 4 {
+            assert!(d.pip_between(a, far).is_none());
+        }
+        let from_list = d.pips_from(a);
+        assert!(from_list.iter().any(|p| p.id() == id));
+        // Net stubs exist for path dumps.
+        let nets = d.nets_in_site(a);
+        assert!(nets.iter().any(|n| n.id() == format!("{}/BLE0.Q", a.id())));
+    }
+
+    #[test]
+    fn resolve_path_sites_verifies_had_geometry() {
+        let d = Device::load_part("HL10T-C32-1").unwrap();
+        let s0 = Site {
+            x: d.clb_x0,
+            y: d.clb_y0,
+            kind: SiteKind::Clb,
+        };
+        let s1 = d.iob_sites().next().unwrap();
+        let ok = d
+            .resolve_path_sites(&[("u_ff0", s0), ("led", s1), ("u_ff0_dup", s0)])
+            .expect("real HAD sites must resolve");
+        assert_eq!(ok, {
+            let mut v = vec![s0.id(), s1.id()];
+            v.sort();
+            v.dedup();
+            v
+        });
+        assert_eq!(d.resolve_cell_site("u_ff0", s0).unwrap(), s0.id());
+
+        let fake = Site {
+            x: d.clb_x0 + d.interior_cols + 99,
+            y: d.clb_y0 + 3,
+            kind: SiteKind::Clb,
+        };
+        let err = d
+            .resolve_path_sites(&[("ghost", fake)])
+            .expect_err("coords outside HAD must fail");
+        assert!(
+            err.contains("not in HAD") || err.contains("reject"),
+            "unexpected err: {err}"
+        );
+        assert!(d.resolve_cell_site("ghost", fake).is_err());
+        assert!(d.resolve_cell_site("", s0).is_err());
     }
 }
