@@ -14,7 +14,10 @@ pub mod surface;
 pub use learner_l1::{
     ConstraintProvenance, SessionStage, StageError, StageStatus,
 };
-pub use learner_l2::HighlightSet;
+pub use learner_l2::{
+    critical_path_highlight, highlight_set_from_path, packing_summary_from_placed, HighlightSet,
+    HighlightSetExt,
+};
 pub use surface::{
     central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
     JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
