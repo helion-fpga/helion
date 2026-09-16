@@ -7,8 +7,14 @@ pub mod chrome;
 pub use chrome::{Activity, Canvas, WorkspacePane, pane_for_workspace};
 pub mod doctor;
 pub mod ide;
+pub mod learner_l1;
+pub mod learner_l2;
 pub mod open_dialog;
 pub mod surface;
+pub use learner_l1::{
+    ConstraintProvenance, SessionStage, StageError, StageStatus,
+};
+pub use learner_l2::HighlightSet;
 pub use surface::{
     central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
     JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
