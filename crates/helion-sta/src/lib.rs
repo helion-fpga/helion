@@ -3851,11 +3851,8 @@ fn endpoint_from_placed(placed: &Placed, cell: &str) -> TimingPathEndpoint {
 fn walk_ff_path(design: &Design, ff: &str) -> (String, Vec<String>, Vec<String>) {
     let mut cells = vec![ff.to_string()];
     let mut nets = Vec::new();
-    let mut start = design
-        .net_on(ff, "CLK")
-        .or_else(|| design.net_on(ff, "C"))
-        .unwrap_or("clk")
-        .to_string();
+    // Startpoint is the FF until a real driving cell is found — never a clock net name.
+    let mut start = ff.to_string();
     if let Some(dnet) = design.net_on(ff, "D") {
         nets.push(dnet.to_string());
         if let Some(n) = design.net(dnet) {
@@ -3893,7 +3890,8 @@ fn walk_iob_path(design: &Design, iob: &str) -> (String, Vec<String>, Vec<String
         nets.push(inet.to_string());
         if let Some(n) = design.net(inet) {
             for e in &n.endpoints {
-                if e.pin == "Q" && !cells.contains(&e.cell) {
+                // Registered Q or comb LUT O may drive the IOB I pin.
+                if (e.pin == "Q" || e.pin == "O") && !cells.contains(&e.cell) {
                     cells.push(e.cell.clone());
                     start = e.cell.clone();
                 }
@@ -3940,13 +3938,26 @@ pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -
             continue;
         }
         let (start, cells, nets) = walk_iob_path(design, &c.name);
+        let delay_ps = routed
+            .iob_src
+            .iter()
+            .find(|r| {
+                nets.iter().any(|n| n == &r.net)
+                    || placed
+                        .packed
+                        .iobs
+                        .iter()
+                        .any(|io| io.cell == c.name && io.from_net == r.net)
+            })
+            .map(|r| r.delay_ps)
+            .unwrap_or(t.iob_ps);
         paths.push(TimingPath {
             name: format!("{start}->{}", c.name),
             startpoint: endpoint_from_placed(placed, &start),
             endpoint,
             cells,
             nets,
-            delay_ps: t.iob_ps,
+            delay_ps,
             slack_ps: t.wns_ps,
         });
     }
@@ -3955,9 +3966,20 @@ pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -
 
 /// Worst-delay path after place+route (IOB vs r2r).
 pub fn critical_path(design: &Design, routed: &Routed, t: &TimingResult) -> Option<TimingPath> {
-    timing_paths_routed(design, routed, t)
-        .into_iter()
-        .max_by_key(|p| p.delay_ps)
+    timing_paths_routed(design, routed, t).into_iter().max_by(|a, b| {
+        a.delay_ps.cmp(&b.delay_ps).then_with(|| {
+            let hops = |p: &TimingPath| {
+                routed
+                    .iob_src
+                    .iter()
+                    .filter(|r| p.nets.iter().any(|n| n == &r.net))
+                    .map(|r| r.hops)
+                    .max()
+                    .unwrap_or(0)
+            };
+            hops(a).cmp(&hops(b))
+        })
+    })
 }
 
 /// Headless Device-canvas highlight from a timing path. Sites are HAD IDs.
@@ -3986,17 +4008,32 @@ pub fn highlight_set_from_path(
     for c in &path.cells {
         push_cell(c)?;
     }
-    let include_route = routed.iob_src.iter().any(|r| {
-        path.nets.iter().any(|n| n == &r.net)
-            || placed
-                .packed
-                .iobs
-                .iter()
-                .any(|io| io.cell == path.endpoint.cell && io.from_net == r.net)
-    });
-    if include_route {
-        for s in routed.path_sites(dev) {
-            sites.push(s.id());
+    // Only tiles from IobRoutes matched to this path — not every IOB route.
+    let matched: Vec<_> = routed
+        .iob_src
+        .iter()
+        .filter(|r| {
+            path.nets.iter().any(|n| n == &r.net)
+                || placed
+                    .packed
+                    .iobs
+                    .iter()
+                    .any(|io| io.cell == path.endpoint.cell && io.from_net == r.net)
+        })
+        .collect();
+    for r in matched {
+        for &(x, y) in &r.path {
+            if let Some(s) = helion_route::site_at_xy(dev, x, y) {
+                sites.push(s.id());
+            }
+        }
+        let clb = r.clb_site();
+        let iob = r.iob_site();
+        if dev.contains_site(clb) {
+            sites.push(clb.id());
+        }
+        if dev.contains_site(iob) {
+            sites.push(iob.id());
         }
     }
     sites.sort();
