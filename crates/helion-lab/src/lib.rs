@@ -11,6 +11,9 @@
 //! honestly (no DONE=1 / no board DONE claim).
 //! Lab `lab_program_native` never soft-succeeds via OFL fallback (CLI may still
 //! NotImplemented→OFL for `helion-prog --cable native`).
+//!
+//! Stable refuse codes (re-export Bits/hw locked tokens):
+//! [`ERR_CODE_EMPTY_BITSTREAM`] / [`ERR_CODE_USB_0`].
 
 use helion_bits::Bitstream;
 use helion_device::Device;
@@ -20,22 +23,51 @@ use helion_hw::{
 };
 use std::path::Path;
 
+/// Locked Bits/hw refuse codes — re-exported (identical `HELION_E_*` tokens; do not rename).
+pub use helion_hw::{ERR_CODE_EMPTY_BITSTREAM, ERR_CODE_USB_0};
+
+fn ensure_err_code(code: &str, msg: impl AsRef<str>) -> String {
+    let m = msg.as_ref();
+    if m.contains(code) {
+        m.to_string()
+    } else {
+        format!("{code}: {m}")
+    }
+}
+
+fn lab_empty_err(msg: impl AsRef<str>) -> String {
+    ensure_err_code(ERR_CODE_EMPTY_BITSTREAM, msg)
+}
+
+fn lab_usb0_err(msg: impl AsRef<str>) -> String {
+    ensure_err_code(ERR_CODE_USB_0, msg)
+}
+
 /// Lab path: empty bitstream is always Err. Never reports DONE=1 on empty.
 pub fn lab_program_empty() -> Result<String, String> {
     let dev = Device::load_part("HL10T-C32-1")?;
     // Bitstream::empty always fails refuse_empty_bitstream — single Err path, no dead Ok arm.
-    Err(refuse_empty_bitstream(&Bitstream::empty(&dev))
-        .err()
-        .map(|e| format!("lab: {e}"))
-        .unwrap_or_else(|| {
-            "lab: empty bitstream refused (no configured frames) — refusing DONE on empty".into()
-        }))
+    Err(lab_empty_err(
+        refuse_empty_bitstream(&Bitstream::empty(&dev))
+            .err()
+            .map(|e| format!("lab: {e}"))
+            .unwrap_or_else(|| {
+                "lab: empty bitstream refused (no configured frames) — refusing DONE on empty".into()
+            }),
+    ))
 }
 
 /// Overlay: real bitstream + `step_user` + LED sample. Not board DONE.
 pub fn lab_overlay(bits: &Bitstream) -> Result<OverlayReport, String> {
     let dev = Device::load_part("HL10T-C32-1")?;
-    overlay_program_led(&dev, bits, 16)
+    overlay_program_led(&dev, bits, 16).map_err(|e| {
+        let low = e.to_ascii_lowercase();
+        if low.contains("empty") || low.contains("refus") {
+            lab_empty_err(format!("lab: {e}"))
+        } else {
+            format!("lab: {e}")
+        }
+    })
 }
 
 pub fn lab_overlay_line(bits: &Bitstream) -> Result<String, String> {
@@ -47,17 +79,18 @@ pub fn lab_overlay_line(bits: &Bitstream) -> Result<String, String> {
 fn lab_gate_bitstream_file(path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("lab: read {}: {e}", path.display()))?;
     if bytes.is_empty() {
-        return Err("lab: empty bitstream (0 bytes) — refusing DONE on empty".into());
+        return Err(lab_empty_err(
+            "lab: empty bitstream (0 bytes) — refusing DONE on empty",
+        ));
     }
     if bytes.iter().all(|&b| b == 0) {
-        return Err(
-            "lab: bogus all-zero bitstream refused (no configured frames) — no STAT invented"
-                .into(),
-        );
+        return Err(lab_empty_err(
+            "lab: bogus all-zero bitstream refused (no configured frames) — no STAT invented",
+        ));
     }
     if bytes.starts_with(b"HBIT") {
         let bits = Bitstream::from_packets(&bytes).map_err(|e| format!("lab: {e}"))?;
-        refuse_empty_bitstream(&bits).map_err(|e| format!("lab: {e}"))?;
+        refuse_empty_bitstream(&bits).map_err(|e| lab_empty_err(format!("lab: {e}")))?;
     }
     Ok(())
 }
@@ -65,27 +98,26 @@ fn lab_gate_bitstream_file(path: &Path) -> Result<(), String> {
 fn lab_program_cable(spec: &str, path: &Path, expect: CableBackend) -> Result<String, String> {
     lab_gate_bitstream_file(path)?;
     let dev = Device::load_part("HL10T-C32-1")?;
-    let cable = resolve_cable(spec).map_err(|e| format!("lab: {e}"))?;
+    let cable = resolve_cable(spec).map_err(|e| lab_usb0_err(format!("lab: {e}")))?;
     if cable.backend != expect {
-        return Err(format!(
+        return Err(lab_usb0_err(format!(
             "lab: cable {spec:?} expected {:?}, got {:?} ({})",
             expect, cable.backend, cable.id
-        ));
+        )));
     }
     // (A) Lab native: fail fast when usb-native is off — never spawn OFL soft-fallback.
     if expect == CableBackend::NativeUsb && !usb_native_feature_enabled() {
-        return Err(
-            "lab: native requires --features usb-native — refusing OFL soft-fallback for lab"
-                .into(),
-        );
+        return Err(lab_usb0_err(
+            "lab: native requires --features usb-native — refusing OFL soft-fallback for lab",
+        ));
     }
     let outcome = program_hbits_with_cable(&dev, path, &cable, false)
-        .map_err(|e| format!("lab: {e}"))?;
+        .map_err(|e| lab_usb0_err(format!("lab: {e}")))?;
     // (B) Lab native: refuse OFL outcome even if hw soft-fallback somehow Ok'd.
     if expect == CableBackend::NativeUsb && outcome.backend() != CableBackend::NativeUsb {
-        return Err(
-            "lab: native path fell back to OFL — refusing soft-success".into(),
-        );
+        return Err(lab_usb0_err(
+            "lab: native path fell back to OFL — refusing soft-success",
+        ));
     }
     Ok(outcome.summary_line("lab", &dev.part))
 }
@@ -141,6 +173,10 @@ mod tests {
         let err = lab_program_empty().unwrap_err();
         let low = err.to_ascii_lowercase();
         assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {err}"
+        );
+        assert!(
             low.contains("empty") || low.contains("refus"),
             "lab must refuse empty bitstream: {err}"
         );
@@ -155,6 +191,10 @@ mod tests {
 
         let empty_ov = lab_overlay(&Bitstream::empty(&Device::load_part("HL10T-C32-1").unwrap()))
             .unwrap_err();
+        assert!(
+            empty_ov.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {empty_ov}"
+        );
         assert!(
             empty_ov.to_ascii_lowercase().contains("empty")
                 || empty_ov.to_ascii_lowercase().contains("refus"),
@@ -196,6 +236,10 @@ mod tests {
         let native_err = lab_program_native(&path).unwrap_err();
         let native_low = native_err.to_ascii_lowercase();
         assert!(
+            native_err.contains(ERR_CODE_USB_0),
+            "stable USB=0 code missing on native: {native_err}"
+        );
+        assert!(
             native_low.contains("native")
                 || native_low.contains("usb-native")
                 || native_err.contains("no USB")
@@ -213,6 +257,10 @@ mod tests {
         assert_no_board_done_claim(&native_err);
 
         let auto_err = lab_program_auto(&path).unwrap_err();
+        assert!(
+            auto_err.contains(ERR_CODE_USB_0),
+            "stable USB=0 code missing on auto: {auto_err}"
+        );
         assert!(
             auto_err.contains("no USB")
                 || auto_err.contains("openFPGALoader")
@@ -233,6 +281,10 @@ mod tests {
         std::fs::write(&zero, []).unwrap();
         let z = lab_program_auto(&zero).unwrap_err();
         assert!(
+            z.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {z}"
+        );
+        assert!(
             z.to_ascii_lowercase().contains("empty") || z.to_ascii_lowercase().contains("refus"),
             "{z}"
         );
@@ -242,6 +294,10 @@ mod tests {
         let all0 = dir.join("allzero.hbits");
         std::fs::write(&all0, vec![0u8; 64]).unwrap();
         let a = lab_program_native(&all0).unwrap_err();
+        assert!(
+            a.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {a}"
+        );
         assert!(
             a.to_ascii_lowercase().contains("bogus")
                 || a.to_ascii_lowercase().contains("refus")
@@ -254,6 +310,10 @@ mod tests {
         let empty_hbit = dir.join("empty-frames.hbits");
         std::fs::write(&empty_hbit, &Bitstream::empty(&dev).packets).unwrap();
         let e = lab_program_auto(&empty_hbit).unwrap_err();
+        assert!(
+            e.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {e}"
+        );
         assert!(
             e.to_ascii_lowercase().contains("empty") || e.to_ascii_lowercase().contains("refus"),
             "{e}"
@@ -272,6 +332,10 @@ mod tests {
 
         let err = lab_program_native(&path).unwrap_err();
         let low = err.to_ascii_lowercase();
+        assert!(
+            err.contains(ERR_CODE_USB_0),
+            "stable USB=0 code missing: {err}"
+        );
         if !usb_native_feature_enabled() {
             assert!(
                 low.contains("usb-native")

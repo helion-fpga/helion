@@ -1,4 +1,7 @@
 //! Event-driven kernel driven by LUT INIT + FF in the netlist (not a hardcoded toggle).
+//!
+//! Overlay / behavioral LED+waveform completion is labeled **`overlay` / `sim_DONE`**
+//! ([`OverlaySimReport`]) — never bare board DONE.
 
 use helion_ir::{CellKind, Design};
 use std::collections::HashMap;
@@ -282,6 +285,49 @@ pub struct SimLocal {
     pub value: String,
 }
 
+/// Gold empty-XDC structural-counter overlay LED (`cnt[3]` over 16 posedges).
+/// Matches lab/hw `COUNTER_OVERLAY_LED` waveform shape — event-sim path, not board.
+pub const COUNTER_OVERLAY_SIM_LED: &str = "0000000111111110";
+
+/// Overlay / behavioral-sim LED waveform completion.
+///
+/// Types and summary strings say **`overlay`** and **`sim_DONE`** — never bare board DONE.
+/// This is the helion-sim surface for W-L4 (CI without USB).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlaySimReport {
+    /// LED samples over `cycles` posedges (`'0'`/`'1'`).
+    pub led: String,
+    pub cycles: u32,
+    /// Always `true` when the overlay run finished — sim completion, not TAP STAT DONE.
+    pub sim_done: bool,
+}
+
+impl OverlaySimReport {
+    /// Machine-readable overlay line. Contains `overlay` + `sim_DONE=` — never ` DONE=`.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "overlay LED={} cycles={} sim_DONE={} (overlay; not board DONE)",
+            self.led,
+            self.cycles,
+            u8::from(self.sim_done),
+        )
+    }
+}
+
+/// Run the event-driven kernel and return an **overlay**-labeled LED waveform.
+///
+/// Completes with `sim_DONE=1` in [`OverlaySimReport::summary_line`] — cannot be
+/// mistaken for board program DONE (no USB / no TAP STAT).
+pub fn run_overlay_led(design: &Design, cycles: u32) -> OverlaySimReport {
+    let wave = run_tb(design, cycles);
+    let led: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
+    OverlaySimReport {
+        led,
+        cycles,
+        sim_done: true,
+    }
+}
+
 pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {
     let mut s = Sim::new(design);
     let mut wave = Vec::new();
@@ -296,6 +342,33 @@ pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {
 mod tests {
     use super::*;
     use helion_ir::{CellKind, Design, PortDir};
+
+    #[test]
+    fn overlay_sim_counter_led_gold_labeled_sim_done() {
+        let r = run_overlay_led(&Design::structural_counter(), 16);
+        assert_eq!(r.led, COUNTER_OVERLAY_SIM_LED, "overlay sim LED gold {r:?}");
+        assert!(r.sim_done, "overlay completion sets sim_done");
+        assert_eq!(r.cycles, 16);
+        assert!(
+            r.led.contains('0') && r.led.contains('1'),
+            "blink waveform must include 0 and 1: {}",
+            r.led
+        );
+
+        let s = r.summary_line();
+        assert!(s.contains("overlay"), "{s}");
+        assert!(s.contains("sim_DONE=1"), "{s}");
+        assert!(s.contains("not board DONE"), "{s}");
+        // Board-style bare DONE= must not appear; sim_DONE= is OK.
+        assert!(!s.contains(" DONE="), "{s}");
+        assert!(!s.to_ascii_lowercase().contains("board done=1"), "{s}");
+        assert!(!s.contains("DONE=1") || s.contains("sim_DONE=1"), "{s}");
+        // Explicit: the only DONE token is sim_DONE=
+        assert!(
+            !s.replace("sim_DONE=", "SIM_DONE_TOKEN=").contains("DONE="),
+            "must not emit bare DONE=: {s}"
+        );
+    }
 
     #[test]
     fn inverter_toggles_const0_does_not() {
