@@ -514,9 +514,13 @@ impl HelionIde {
                 if matches!(out.kind, JobKind::Implement) && out.result.is_ok() {
                     self.set_canvas(Canvas::Device);
                 }
-                if matches!(out.kind, JobKind::Open(_)) {
+                // Open/Implement failures: Messages tab (parity; surface_stage_error also sets it).
+                if matches!(out.kind, JobKind::Implement | JobKind::Open(_)) {
                     match &out.result {
-                        Ok(_) => self.set_activity(Activity::Files),
+                        Ok(_) if matches!(out.kind, JobKind::Open(_)) => {
+                            self.set_activity(Activity::Files);
+                        }
+                        Ok(_) => {}
                         Err(_) => {
                             self.model.bottom_tab = BottomTab::Messages;
                         }
@@ -1547,6 +1551,7 @@ fn paint_status_bar(
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 let honest = model.timing_honesty_label();
+                let provenance = model.constraint_provenance().as_str();
                 let wns = if model.timing_closed_wns() {
                     honest
                 } else if honest.starts_with("no_body") {
@@ -1596,10 +1601,11 @@ fn paint_status_bar(
                 };
                 ui.label(
                     RichText::new(format!(
-                        "{} · {} · {} · LUTFF {} · {}{}{}",
+                        "{} · {} · {} · provenance={} · LUTFF {} · {}{}{}",
                         crumb,
                         model.part(),
                         wns,
+                        provenance,
                         lutff,
                         run,
                         board_crumb,
