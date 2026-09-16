@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Stages and SOFT law</title>
+  <meta name="description" content="Helion CAD stages: elaborate/map, pack, place, route, sta, bitgen. SOFT ≠ PASS. Gold WNS_PS=9640." />
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
+</head>
+<body>
+  <a class="skip" href="#main">Skip to main content</a>
+  <header class="bar">
+    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
+    <nav id="site-nav">
+      <a href="index.html">Home</a>
+      <a href="use.html">Use</a>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="wiki.html">Wiki</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="main" class="page">
+    <div class="prose">
+      <h1>CAD stages and SOFT law</h1>
+      <p class="lede">
+        Not a tutorial. The Session is a stage machine. The IDE paints it. Closing
+        WNS on an unmapped cone is a bug. Canonical markdown:
+        <a href="https://github.com/helion-fpga/helion/blob/master/docs/stages.md">docs/stages.md</a>.
+        Gold lock: empty-XDC <code>examples/counter.sv</code> stays
+        <span class="gold">WNS_PS=9640</span>.
+      </p>
+
+      <h2>Stages</h2>
+      <p>Illegal order refuses. Prerequisites, in this order:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Stage</th><th>Crate</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td>elaborate/map</td><td><code>helion-sv</code> / <code>helion-vhdl</code> / <code>helion-hls</code></td><td>RTL to HNF (LUT/FF/BRAM18/MAC27)</td></tr>
+          <tr><td>pack</td><td><code>helion-pack</code></td><td>LUTFF + IOB + MAC27 + BRAM18</td></tr>
+          <tr><td>place</td><td><code>helion-place</code></td><td>sites from HAD, not a hardcoded die</td></tr>
+          <tr><td>route</td><td><code>helion-route</code></td><td>PathFinder A*</td></tr>
+          <tr><td>sta</td><td><code>helion-sta</code></td><td>WNS/TNS; clock from user XDC/SDC or a default period</td></tr>
+          <tr><td>bitgen</td><td><code>helion-bits</code></td><td>FeatureMap <code>.hbits</code></td></tr>
+        </tbody>
+      </table></div>
+      <p>
+        Optional, after bitgen (or instead of a cable): <code>sim</code>
+        (<code>helion-sim</code> / <code>helion-fabric</code>, labeled overlay) and
+        <code>lab</code> (<code>helion-lab</code>). No DONE without live TDO.
+      </p>
+      <p>
+        Tcl Session commands (<code>synth_design</code>, <code>place_design</code>,
+        <code>route_design</code>, <code>write_bitstream</code>, …) drive these
+        stages. They are not a second CAD.
+      </p>
+
+      <h2>SOFT ≠ PASS</h2>
+      <p>
+        Incomplete mapping is named SOFT (name + span + child softs). Ports-only
+        shells stay <code>cells=0</code> / <code>no_body</code>. PASS never includes
+        soft cones. STA must not print a closed WNS on unmapped logic.
+      </p>
+      <p>
+        Same law in <code>helion-sv</code> / <code>helion-vhdl</code> and the STA
+        gate. The IDE must surface it. Do not invent LUTs for <code>unused_*</code>
+        / <code>fcov_</code>.
+      </p>
+
+      <h2>Stranger clone</h2>
+      <pre><code>git clone https://github.com/helion-fpga/helion.git
+cd helion
+cargo test --workspace
+cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv</code></pre>
+      <p>
+        Headless gold must print <span class="gold">WNS_PS=9640</span>. No board.
+        rustc 1.85. Legal fence: no Project X-Ray, UNISIM, vendor Tcl as product
+        names, AMD/Intel/Lattice backends. Helion-MM / Helion-ST only.
+      </p>
+
+      <p class="cta">
+        <a class="btn" href="architecture.html">Architecture</a>
+        <a class="btn ghost" href="roadmap.html">Roadmap</a>
+        <a class="btn ghost" href="start.html">Start</a>
+      </p>
+    </div>
+  </main>
+
+  <footer>
+    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a></span>
+    <span><a href="legal.html">Legal fence</a></span>
+  </footer>
+  <script src="site.js?v=docs1"></script>
+</body>
+</html>

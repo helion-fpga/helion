@@ -148,6 +148,9 @@ cargo run -p helion-cli -- qor examples/counter.sv</code></pre>
         must still print <span class="gold">WNS_PS=9640</span> unless the same commit
         updates the QoR table in the repository README with a reason.
         <code>helion qor</code> fails above 2000 ms wall time for these examples.
+        Stages: elaborate/map → pack → place → route → sta → bitgen. SOFT ≠ PASS:
+        ports-only / unmapped cones stay <code>cells=0</code> and never close WNS.
+        <a href="stages.html">CAD stages and SOFT law</a>.
       </p>
 
       <h2 id="device-die">Device (the die)</h2>

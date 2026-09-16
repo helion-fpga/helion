@@ -4,7 +4,7 @@
 
 # Helion Design Suite
 
-Original FPGA family + CAD (current release **1.3**; **1.4 → 2.0** on the [roadmap](ROADMAP.md)). Native `aarch64-apple-darwin`. No vendor bitstream.
+Original FPGA family + CAD (current release **2.0.1**). Native `aarch64-apple-darwin`. No vendor bitstream. Gold **WNS_PS=9640**.
 
 [![Release](https://img.shields.io/github/v/release/helion-fpga/helion)](https://github.com/helion-fpga/helion/releases/latest)
 
@@ -22,23 +22,36 @@ SystemVerilog, STA, IDE tests, or docs, start at
 · [Good first issues](https://github.com/helion-fpga/helion/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 · [Sponsor](https://github.com/sponsors/saksham-45)
 
-**1.0 bar:** `cargo test --workspace` (no board). SystemVerilog / VHDL / C subset through
-synth → pack → PathFinder → bitgen → cycle-accurate fabric sim. 4-bit counter LED = cnt[3].
+## Stranger clone
+
+No board. rustc 1.85. This is the whole on-ramp:
 
 ```
+git clone https://github.com/helion-fpga/helion.git
+cd helion
 cargo test --workspace
+cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
+```
+
+Empty-XDC `examples/counter.sv` must print **WNS_PS=9640**. LED = cnt[3] over 16 cycles
+(`0000000111111110`). Stages: elaborate/map → pack → place → route → sta → bitgen.
+Incomplete mapping is SOFT, never PASS. See [`docs/stages.md`](docs/stages.md).
+
+```
 cargo run -p helion-cli -- doctor
 cargo run -p helion-cli -- run examples/counter.sv --cycles 16
 cargo run -p helion-cli -- report_timing examples/blinky.sv
 cargo run -p helion-cli -- reports examples/counter.sv
 ```
 
-Headless gold (IDE): `helion-ide --headless examples/counter.sv` must print **WNS_PS=9640**.
-
 Legal fence: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD/Intel/Lattice backends.
 Device facts come from the Helion Architecture Database (HAD), never hardcoded in the CAD.
 
 ## Roadmap (1.4 → 2.0)
+
+2.0 shipped ([v2.0.0](https://github.com/helion-fpga/helion/releases/tag/v2.0.0) /
+[v2.0.1](https://github.com/helion-fpga/helion/releases/tag/v2.0.1)). Gold still **WNS_PS=9640**.
+Stages and SOFT ≠ PASS: [`docs/stages.md`](docs/stages.md).
 
 [ROADMAP.md](ROADMAP.md) · Pages: [roadmap](https://helion-fpga.github.io/helion/roadmap.html)
 

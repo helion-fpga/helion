@@ -51,7 +51,9 @@ HAD: Architecture Database parts beyond `HL10T-C32-1`. Device facts stay in TOML
 
 ## 2.0 — public OSS CAD bar
 
-**Shipped as [v2.0.0](https://github.com/helion-fpga/helion/releases/tag/v2.0.0).** A stranger can clone, `cargo test --workspace`, run headless gold **WNS_PS=9640**, and trust the legal fence: no Project X-Ray, no UNISIM, no vendor Tcl as product names, no AMD/Intel/Lattice backends, Helion-MM / Helion-ST only. Docs, CI (Linux + macOS gold), and the desktop IDE describe the same Session.
+**Shipped as [v2.0.0](https://github.com/helion-fpga/helion/releases/tag/v2.0.0) / [v2.0.1](https://github.com/helion-fpga/helion/releases/tag/v2.0.1).** A stranger can clone, `cargo test --workspace`, run headless gold **WNS_PS=9640**, and trust the legal fence: no Project X-Ray, no UNISIM, no vendor Tcl as product names, no AMD/Intel/Lattice backends, Helion-MM / Helion-ST only. Docs, CI (Linux + macOS gold), and the desktop IDE describe the same Session.
+
+Stages stay explicit: elaborate/map → pack → place → route → sta → bitgen (+ sim / lab). SOFT ≠ PASS (ports-only / unmapped cones never close WNS). Canonical write-up: [`docs/stages.md`](docs/stages.md). Release assets stay under 100 MiB (≪ commercial CAD); `packaging/macos/Info.plist` version matches `Cargo.toml`.
 
 [Milestone 2.0](https://github.com/helion-fpga/helion/milestone/5)
 
