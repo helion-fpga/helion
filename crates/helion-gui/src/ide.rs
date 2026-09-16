@@ -5077,16 +5077,16 @@ impl IdeModel {
                 }
             }
         }
-        crate::learner_l2::highlight_set_from_path(&dev, &endpoints, &path.nets).unwrap_or_else(
-            |_| crate::learner_l2::HighlightSet {
+        crate::learner_l2::highlight_set_from_endpoints(&dev, &endpoints, &path.nets)
+            .unwrap_or_else(|_| crate::learner_l2::HighlightSet {
                 sites: endpoints.iter().map(|(_, s)| s.id()).collect(),
                 nets: path.nets.clone(),
-            },
-        )
+            })
     }
 
     /// Headless dump of the current HighlightSet.
     pub fn highlight_set_dump(&self) -> String {
+        use crate::learner_l2::HighlightSetExt;
         self.highlight_set().dump()
     }
 
