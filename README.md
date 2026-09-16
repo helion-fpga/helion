@@ -95,6 +95,10 @@ reason**.
 Gold waveform: `helion run examples/counter.sv --cycles 16` → `LED[16]=0000000111111110`
 (LED = cnt[3]), identical in the fabric model and the event simulator.
 
+Example spine (counter → blinky+LOC+user clock → UART → Helion-MM scratch → Helion-original `hcore`):
+[examples/README.md](examples/README.md). Headless: `./scripts/example-spine.sh`.
+Gold counter is still **WNS_PS=9640**.
+
 ### QoR change log
 
 | Commit | Design | Was | Now | Why |

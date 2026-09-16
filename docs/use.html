@@ -42,6 +42,7 @@
         <li><a href="#ide">Desktop IDE</a></li>
         <li><a href="#cli">CLI</a></li>
         <li><a href="#gold">Gold</a></li>
+        <li><a href="#spine">Example spine</a></li>
         <li><a href="#device-die">Device die</a></li>
         <li><a href="#tcl">Tcl Session</a></li>
         <li><a href="#xdc">XDC (<code>load_xdc</code>)</a></li>
@@ -148,6 +149,24 @@ cargo run -p helion-cli -- qor examples/counter.sv</code></pre>
         must still print <span class="gold">WNS_PS=9640</span> unless the same commit
         updates the QoR table in the repository README with a reason.
         <code>helion qor</code> fails above 2000 ms wall time for these examples.
+      </p>
+
+      <h2 id="spine">Example spine</h2>
+      <p>
+        Ordered in-tree labs: gold counter, blinky with user
+        <code>create_clock</code> + <code>PACKAGE_PIN</code>, UART TX, Helion-MM
+        scratch, then a Helion-original accumulator core. Canonical table:
+        repo <code>examples/README.md</code>. One-command headless:
+      </p>
+      <pre><code>./scripts/example-spine.sh
+cargo run -p helion-cli -- report_timing examples/counter.sv
+# WNS_PS=9640 SOFT=0
+cargo run -p helion-cli -- project examples/blinky.prj
+# create_clock=1 PACKAGE_PIN=1 WNS_PS=9700 SOFT=0</code></pre>
+      <p>
+        Labs 3–5 are <code>examples/uart</code>, <code>examples/scratch_mm</code>,
+        <code>examples/hcore</code>. Helion-MM / Helion-ST only. No AXI-as-product.
+        Empty-XDC counter gold stays <span class="gold">WNS_PS=9640</span>.
       </p>
 
       <h2 id="device-die">Device (the die)</h2>

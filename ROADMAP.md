@@ -55,6 +55,10 @@ HAD: Architecture Database parts beyond `HL10T-C32-1`. Device facts stay in TOML
 
 [Milestone 2.0](https://github.com/helion-fpga/helion/milestone/5)
 
+In-tree labs after 2.0: ordered example spine in [`examples/README.md`](examples/README.md)
+(counter gold → blinky + user clock + LOC → UART → Helion-MM scratch → Helion-original
+`hcore`). Soft CPU last. No AXI-as-product. Gold **WNS_PS=9640**.
+
 ## Legal fence (every release)
 
 - Original Helion ISA and CAD only.

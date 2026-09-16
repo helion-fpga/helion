@@ -14,4 +14,5 @@ Helion is an original FPGA device family plus the in-repo CAD (synth, pack, plac
 - Repository: https://github.com/helion-fpga/helion
 - License: Apache-2.0 OR MIT
 - Gold: empty-XDC examples/counter.sv WNS_PS=9640, LED[16]=0000000111111110
+- Example spine: examples/README.md (counter, blinky+LOC+user clock, uart, scratch_mm, hcore). Headless: scripts/example-spine.sh
 - Part: HL10T-C32-1 (HAD)

@@ -4,6 +4,9 @@ See the user guide: [use.html](https://helion-fpga.github.io/helion/use.html)
 
 Gold: empty-XDC `examples/counter.sv` → `WNS_PS=9640`.
 
+Example spine: [examples/README.md](https://github.com/helion-fpga/helion/blob/master/examples/README.md)
+(`./scripts/example-spine.sh`).
+
 ```
 open dist/Helion.app
 # or

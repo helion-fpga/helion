@@ -1761,6 +1761,19 @@ pub fn constraints_from_project(
     load_xdc(&blob)
 }
 
+/// Ordered W-L5 in-tree labs. Gold counter is first and must stay `WNS_PS=9640`.
+pub const EXAMPLE_SPINE: &[&str] = &["counter", "blinky", "uart", "scratch_mm", "hcore"];
+
+/// Light `.prj` template: user `create_clock` lives in the XDC, not a default period.
+pub fn example_spine_prj(sv: &str, xdc: &str) -> String {
+    format!(
+        "# Helion example-spine project — user create_clock + PACKAGE_PIN\n\
+         part HL10T-C32-1\n\
+         read_sv {sv}\n\
+         read_xdc {xdc}\n"
+    )
+}
+
 pub fn opt_design(d: &mut Design) -> usize {
     let pins = d.pin_index();
     let iob_nets: std::collections::HashSet<&str> = d
@@ -2742,5 +2755,22 @@ create_pblock pblock_0
             err.to_ascii_lowercase().contains("full"),
             "9 LUTFFs into 1 CLB (8 BLEs) must Err: {err}"
         );
+    }
+
+    #[test]
+    fn example_spine_prj_is_user_clock_and_xdc() {
+        assert_eq!(EXAMPLE_SPINE[0], "counter");
+        assert_eq!(EXAMPLE_SPINE[4], "hcore");
+        let text = example_spine_prj("examples/blinky.sv", "examples/blinky.sdc");
+        let prj = load_prj(&text).unwrap();
+        assert_eq!(prj.part, "HL10T-C32-1");
+        assert_eq!(prj.sources, vec!["examples/blinky.sv"]);
+        assert_eq!(prj.constraint_files, vec!["examples/blinky.sdc"]);
+        assert!(
+            prj.sdc.is_empty(),
+            "create_clock belongs in the user XDC, not inline: {:?}",
+            prj.sdc
+        );
+        assert!(!text.to_ascii_lowercase().contains("axi"), "{text}");
     }
 }
