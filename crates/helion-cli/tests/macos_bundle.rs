@@ -51,6 +51,15 @@ fn macos_app_layout_bundles_had_and_info_plist() {
         app.join("Contents/Resources/examples/counter.sv").is_file(),
         "examples must be bundled next to HAD"
     );
+    assert!(
+        !app.join("Contents/Resources/examples/ip_ingest").exists(),
+        "release payload must omit examples/ip_ingest"
+    );
+    let ide_wrap = std::fs::read_to_string(app.join("Contents/MacOS/helion-ide")).unwrap();
+    assert!(
+        ide_wrap.starts_with("#!") && ide_wrap.contains("Helion"),
+        "helion-ide must be a wrapper over Helion, not a second IDE copy: {ide_wrap}"
+    );
 
     // Runtime search used by Device::devices_dir: MacOS/../Resources/devices/helion
     let macos = app.join("Contents/MacOS");

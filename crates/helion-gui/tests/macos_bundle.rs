@@ -79,6 +79,15 @@ fn skip_build_assembles_helion_app_layout() {
         app.join("Contents/Resources/examples/counter.sv").is_file(),
         "examples must ship in Resources"
     );
+    assert!(
+        !app.join("Contents/Resources/examples/ip_ingest").exists(),
+        "release payload must omit examples/ip_ingest"
+    );
+    let ide_wrap = std::fs::read_to_string(app.join("Contents/MacOS/helion-ide")).unwrap();
+    assert!(
+        ide_wrap.starts_with("#!") && ide_wrap.contains("Helion"),
+        "helion-ide must wrap Helion (one IDE payload): {ide_wrap}"
+    );
     let plist = std::fs::read_to_string(app.join("Contents/Info.plist")).unwrap();
     assert!(plist.contains("CFBundleExecutable"));
     assert!(plist.contains("Helion"));
