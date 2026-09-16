@@ -18,6 +18,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: symbols
 
 jobs:
   darwin:
@@ -42,10 +43,19 @@ jobs:
             echo "Cargo.toml version $CARGO_VER does not match tag $TAG" >&2
             exit 1
           fi
+          if ! grep -F "<string>$CARGO_VER</string>" packaging/macos/Info.plist >/dev/null; then
+            echo "Info.plist version does not match Cargo.toml $CARGO_VER" >&2
+            exit 1
+          fi
       - name: Helion.app
         run: ./scripts/build-macos-app.sh
       - name: helion-prog
         run: cargo build --release --target aarch64-apple-darwin -p helion-hw
+      - name: gold
+        run: |
+          set -euo pipefail
+          ./target/aarch64-apple-darwin/release/helion-ide --headless examples/counter.sv | tee gold-darwin.log
+          grep -F 'WNS_PS=9640' gold-darwin.log
       - name: zip app
         run: |
           mkdir -p dist/upload
@@ -58,6 +68,8 @@ jobs:
             aarch64-apple-darwin \
             target/aarch64-apple-darwin/release \
             dist/upload
+      - name: artifact size
+        run: ./packaging/check-artifact-size.sh dist/upload/*
       - uses: actions/upload-artifact@v4
         with:
           name: darwin-arm64
@@ -78,6 +90,11 @@ jobs:
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: build
         run: cargo build --release -p helion-cli -p helion-gui -p helion-hw
+      - name: gold
+        run: |
+          set -euo pipefail
+          ./target/release/helion-ide --headless examples/counter.sv | tee gold-linux.log
+          grep -F 'WNS_PS=9640' gold-linux.log
       - name: unix tarball
         run: |
           mkdir -p dist/upload
@@ -86,6 +103,8 @@ jobs:
             x86_64-unknown-linux-gnu \
             target/release \
             dist/upload
+      - name: artifact size
+        run: ./packaging/check-artifact-size.sh dist/upload/*
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64

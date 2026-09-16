@@ -137,18 +137,24 @@ write_stub() {
 if [ -n "$IDE" ]; then
     cp "$IDE" "$MACOS/Helion"
     chmod +x "$MACOS/Helion"
-    cp "$IDE" "$MACOS/helion-ide"
-    chmod +x "$MACOS/helion-ide"
 else
     write_stub "$MACOS/Helion" helion-ide
-    write_stub "$MACOS/helion-ide" helion-ide
 fi
+# One IDE payload. helion-ide execs Helion (APFS-safe name; no second copy).
+printf '%s\n' '#!/bin/sh' 'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)' 'exec "$DIR/Helion" "$@"' \
+    > "$MACOS/helion-ide"
+chmod +x "$MACOS/helion-ide"
 if [ -n "$CLI" ]; then
     # Always helion-cli in the .app (APFS: Helion vs helion collide on Darwin).
     cp "$CLI" "$MACOS/helion-cli"
     chmod +x "$MACOS/helion-cli"
 else
     write_stub "$MACOS/helion-cli" helion
+fi
+# Strip Mach-O on a real Mac release build. Layout-only / Linux smoke keeps the copy as-is.
+if [ "$SKIP_BUILD" != "1" ]; then
+    strip "$MACOS/Helion" >/dev/null 2>&1 || true
+    strip "$MACOS/helion-cli" >/dev/null 2>&1 || true
 fi
 
 # Runtime HAD: Device::devices_dir looks at Contents/MacOS/../Resources/devices/helion
@@ -162,6 +168,10 @@ fi
 if [ -d "$ROOT/examples" ]; then
     for f in "$ROOT/examples"/*; do
         [ -e "$f" ] || continue
+        # ip_ingest is a CLI test corpus, not a stranger-clone lab.
+        case "$(basename "$f")" in
+            ip_ingest) continue ;;
+        esac
         cp -R "$f" "$RES/examples/"
     done
 fi
