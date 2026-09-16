@@ -38,7 +38,7 @@ Do not attach vendor bitstreams to a GitHub Release.
 | Place / route / bits | `crates/helion-place`, `helion-route`, `helion-bits` |
 | IDE model + tests | `crates/helion-gui/src/ide.rs` |
 | IDE paint | `crates/helion-gui/src/bin/helion-ide.rs` |
-| Roadmap 1.4→2.0 | [`ROADMAP.md`](ROADMAP.md), Pages `docs/roadmap.html` |
+| Roadmap (2.0 shipped; 2.0.x) | [`ROADMAP.md`](ROADMAP.md), Pages `docs/roadmap.html` |
 | Changelog | [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog / Unreleased) |
 | Parts | `devices/helion/` |
 | Examples | `examples/` |

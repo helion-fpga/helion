@@ -5,11 +5,11 @@ Static pages for GitHub Pages (`docs/` → https://helion-fpga.github.io/helion/
 | Page | Job |
 |---|---|
 | `index.html` | Goal: original FPGA family + in-repo CAD + IDE, not a vendor wrapper |
-| `start.html` | Download 2.0.1, build, gold, Helion.app layout |
+| `start.html` | Download 2.0.4, build, gold, Helion.app layout |
 | `use.html` | User guide (rail, CLI, Device die, Tcl, IP, program honesty) |
 | `wiki.html` | Documentation index with summaries |
 | `architecture.html` | Crate map, labeled HAD, `load_xdc` command list |
-| `roadmap.html` | 1.4 → 2.0 (FM-HEL-14); canonical markdown is [`ROADMAP.md`](../ROADMAP.md) |
+| `roadmap.html` | 1.4 → 2.0 shipped + 2.0.x grind; canonical markdown is [`ROADMAP.md`](../ROADMAP.md) |
 | `get-involved.html` | LMMS-style on-ramp |
 | `contribute.html` | Coding path |
 | `legal.html` | Fence |
@@ -27,6 +27,7 @@ Branch work notes (not the public on-ramp). Gold hold: **WNS_PS=9640**. Cap hold
 | [`FM-HEL-TOP-tap-ibex-smoke.md`](FM-HEL-TOP-tap-ibex-smoke.md) | Ibex mpsse-sim STAT smoke |
 | [`FM-HEL-TOP-place-legalize-speed.md`](FM-HEL-TOP-place-legalize-speed.md) | Affinity place ~3s→~0.23s |
 | [`FM-HEL-TOP-synth-wall.md`](FM-HEL-TOP-synth-wall.md) | keep/md + STA PinIndex → ~1.40s pin-wrap |
+| [`perf-2.0.4.md`](perf-2.0.4.md) | v2.0.4 ibex_pin_wrap stage ms (parse/synth/legalize/imux_skip) |
 | [`FM-HEL-TOP-aig-flowmap-residual.md`](FM-HEL-TOP-aig-flowmap-residual.md) | AIG/flowmap residual **STOP** (no cheap wall cut) |
 | [`FM-HEL-TOP-air-budgets.md`](FM-HEL-TOP-air-budgets.md) | Air idle budgets |
 | [`ip/README.md`](../ip/README.md) | `.helion` package how-to |
