@@ -163,8 +163,94 @@ fn on_grid(dev: &Device, x: u32, y: u32) -> bool {
     dev.clb_major(x, y).is_some()
 }
 
-fn neighbors(dev: &Device, x: u32, y: u32) -> Vec<(u32, u32)> {
-    let mut v = Vec::new();
+/// Dense tile grid covering CLB interior + bottom IOB row (routing RR).
+#[derive(Clone, Copy, Debug)]
+struct TileGrid {
+    x0: u32,
+    y0: u32,
+    cols: u32,
+    rows: u32,
+}
+
+impl TileGrid {
+    fn from_device(dev: &Device) -> Self {
+        Self {
+            x0: dev.clb_x0,
+            y0: dev.clb_y0.saturating_sub(1),
+            cols: dev.interior_cols,
+            rows: dev.interior_rows.saturating_add(1),
+        }
+    }
+
+    fn len(&self) -> usize {
+        (self.cols as usize).saturating_mul(self.rows as usize)
+    }
+
+    #[inline]
+    fn index(&self, x: u32, y: u32) -> Option<usize> {
+        if x < self.x0 || y < self.y0 {
+            return None;
+        }
+        let dx = x - self.x0;
+        let dy = y - self.y0;
+        if dx >= self.cols || dy >= self.rows {
+            return None;
+        }
+        Some((dy * self.cols + dx) as usize)
+    }
+}
+
+/// Reused A* buffers across nets × PathFinder iters (no per-call HashMap/HashSet).
+struct AstarScratch {
+    open: BinaryHeap<Item>,
+    g: Vec<i64>,
+    came: Vec<(u32, u32)>,
+    g_stamp: Vec<u32>,
+    closed: Vec<u32>,
+    epoch: u32,
+}
+
+impl AstarScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            open: BinaryHeap::new(),
+            g: vec![0; n],
+            came: vec![(0, 0); n],
+            g_stamp: vec![0; n],
+            closed: vec![0; n],
+            epoch: 0,
+        }
+    }
+
+    fn begin(&mut self) {
+        self.open.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.g_stamp.fill(0);
+            self.closed.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    fn g_at(&self, i: usize) -> i64 {
+        if self.g_stamp[i] == self.epoch {
+            self.g[i]
+        } else {
+            i64::MAX
+        }
+    }
+
+    #[inline]
+    fn set_g_came(&mut self, i: usize, g: i64, parent: (u32, u32)) {
+        self.g_stamp[i] = self.epoch;
+        self.g[i] = g;
+        self.came[i] = parent;
+    }
+}
+
+fn neighbors4(dev: &Device, x: u32, y: u32, out: &mut [(u32, u32); 4]) -> usize {
+    let mut n = 0;
     for (dx, dy) in [(0i32, 1), (0, -1), (1, 0), (-1, 0)] {
         let nx = x as i32 + dx;
         let ny = y as i32 + dy;
@@ -173,10 +259,11 @@ fn neighbors(dev: &Device, x: u32, y: u32) -> Vec<(u32, u32)> {
         }
         let (nx, ny) = (nx as u32, ny as u32);
         if on_grid(dev, nx, ny) {
-            v.push((nx, ny));
+            out[n] = (nx, ny);
+            n += 1;
         }
     }
-    v
+    n
 }
 
 fn manhattan(a: (u32, u32), b: (u32, u32)) -> u32 {
@@ -197,42 +284,58 @@ fn prefer_detour_x(dev: &Device, src: (u32, u32), detour_cols: u32) -> u32 {
 
 fn astar(
     dev: &Device,
+    grid: &TileGrid,
+    scratch: &mut AstarScratch,
     src: (u32, u32),
     dst: (u32, u32),
-    hist: &HashMap<(u32, u32), u32>,
-    pres: &HashMap<(u32, u32), u32>,
+    hist: &[u32],
+    pres: &[u32],
     pres_fac: i64,
     detour_cols: u32,
 ) -> Result<Vec<(u32, u32)>, String> {
     let prefer_x = prefer_detour_x(dev, src, detour_cols);
-    let mut open = BinaryHeap::new();
-    let mut came: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
-    let mut g: HashMap<(u32, u32), i64> = HashMap::new();
-    g.insert(src, 0);
-    open.push(Item {
+    scratch.begin();
+    let src_i = grid
+        .index(src.0, src.1)
+        .ok_or_else(|| format!("PathFinder: src off grid {src:?}"))?;
+    scratch.set_g_came(src_i, 0, src);
+    scratch.open.push(Item {
         cost: manhattan(src, dst) as i64,
         x: src.0,
         y: src.1,
     });
-    let mut seen = HashSet::new();
-    while let Some(Item { x, y, .. }) = open.pop() {
-        if !seen.insert((x, y)) {
+    let mut neigh = [(0u32, 0u32); 4];
+    while let Some(Item { x, y, .. }) = scratch.open.pop() {
+        let cur_i = match grid.index(x, y) {
+            Some(i) => i,
+            None => continue,
+        };
+        if scratch.closed[cur_i] == scratch.epoch {
             continue;
         }
+        scratch.closed[cur_i] = scratch.epoch;
         if (x, y) == dst {
             let mut path = vec![(x, y)];
             let mut cur = (x, y);
             while cur != src {
-                cur = *came.get(&cur).ok_or("astar broke")?;
+                let ci = grid.index(cur.0, cur.1).ok_or("astar broke")?;
+                if scratch.g_stamp[ci] != scratch.epoch {
+                    return Err("astar broke".into());
+                }
+                cur = scratch.came[ci];
                 path.push(cur);
             }
             path.reverse();
             return Ok(path);
         }
-        let gc = *g.get(&(x, y)).unwrap_or(&i64::MAX);
-        for (nx, ny) in neighbors(dev, x, y) {
-            let h = *hist.get(&(nx, ny)).unwrap_or(&0) as i64;
-            let p = *pres.get(&(nx, ny)).unwrap_or(&0) as i64;
+        let gc = scratch.g_at(cur_i);
+        let nlen = neighbors4(dev, x, y, &mut neigh);
+        for &(nx, ny) in neigh[..nlen].iter() {
+            let Some(ni) = grid.index(nx, ny) else {
+                continue;
+            };
+            let h = hist.get(ni).copied().unwrap_or(0) as i64;
+            let p = pres.get(ni).copied().unwrap_or(0) as i64;
             // delay-driven: hop delay dominates, congestion still negotiates.
             // Excepted IOB nets: penalize the src-column spine so A* doglegs
             // (routed path/hops change; empty guide keeps gold shortest).
@@ -244,11 +347,10 @@ fn astar(
                 step += nx.abs_diff(prefer_x) as i64;
             }
             let ng = gc + step;
-            if ng < *g.get(&(nx, ny)).unwrap_or(&i64::MAX) {
-                g.insert((nx, ny), ng);
-                came.insert((nx, ny), (x, y));
+            if ng < scratch.g_at(ni) {
+                scratch.set_g_came(ni, ng, (x, y));
                 let f = ng + manhattan((nx, ny), dst) as i64;
-                open.push(Item {
+                scratch.open.push(Item {
                     cost: f,
                     x: nx,
                     y: ny,
@@ -474,19 +576,18 @@ pub fn route_with_guide(
         }
     }
 
+    // IOB→LUTFF by q_net once (was O(iobs×lutffs) .position per IOB).
+    let mut q_net_lutff: HashMap<&str, usize> = HashMap::with_capacity(placed.packed.lutffs.len());
+    for (i, lutff) in placed.packed.lutffs.iter().enumerate() {
+        q_net_lutff.entry(lutff.q_net.as_str()).or_insert(i);
+    }
     // (src, dst, ble, packed_iob_idx) — idx must survive y-skip filtering.
     let mut nets: Vec<((u32, u32), (u32, u32), u8, usize)> = Vec::new();
     if !placed.packed.lutffs.is_empty() {
         for (ii, iob_site) in placed.iob_sites.iter().enumerate() {
             let packed_iob = placed.packed.iobs.get(ii);
             let idx = packed_iob
-                .and_then(|io| {
-                    placed
-                        .packed
-                        .lutffs
-                        .iter()
-                        .position(|l| l.q_net == io.from_net)
-                })
+                .and_then(|io| q_net_lutff.get(io.from_net.as_str()).copied())
                 .unwrap_or(0);
             let Some(&(clb, ble)) = placed.lutff_sites.get(idx) else {
                 continue;
@@ -498,7 +599,8 @@ pub fn route_with_guide(
         }
     }
 
-    let mut hist: HashMap<(u32, u32), u32> = HashMap::new();
+    let grid = TileGrid::from_device(dev);
+    let mut hist = vec![0u32; grid.len()];
     let mut iob_src = Vec::new();
     let mut overused = 0u32;
     let mut iters = 0u32;
@@ -515,29 +617,66 @@ pub fn route_with_guide(
     let max_iters = opts.max_iters.max(1);
     let detour_cols = guide.iob_detour_cols();
     let mut last_paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
+    let mut best_overused = u32::MAX;
+    let mut best_hops = u32::MAX;
+    let mut best_paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
+    let mut scratch = AstarScratch::new(grid.len());
+    let mut pres = vec![0u32; grid.len()];
+    // A net's own driver CLB / IOB sink are pin terminals (distinct BLEs may
+    // share a CLB site). Count only that net's *intermediate* RR tiles toward
+    // present/hist/overused so PathFinder negotiates real channel conflicts.
+    // (Per-net skip — not a global endpoint mask — so one net's src still
+    // congests when another net traverses it as an intermediate.)
     for iter in 0..max_iters {
         iters = iter + 1;
-        let mut pres: HashMap<(u32, u32), u32> = HashMap::new();
+        pres.fill(0);
         let pres_fac = 1i64 + iter as i64;
-        let mut paths = Vec::new();
+        let mut paths = Vec::with_capacity(nets.len());
         for (src, dst, _, _) in &nets {
-            let path = astar(dev, *src, *dst, &hist, &pres, pres_fac, detour_cols)?;
-            for tile in &path {
-                *pres.entry(*tile).or_insert(0) += 1;
+            let path = astar(
+                dev,
+                &grid,
+                &mut scratch,
+                *src,
+                *dst,
+                &hist,
+                &pres,
+                pres_fac,
+                detour_cols,
+            )?;
+            for &(tx, ty) in &path {
+                if (tx, ty) == *src || (tx, ty) == *dst {
+                    continue;
+                }
+                if let Some(ti) = grid.index(tx, ty) {
+                    pres[ti] = pres[ti].saturating_add(1);
+                }
             }
             paths.push(path);
         }
-        overused = pres.values().filter(|c| **c > 1).count() as u32;
+        let ou = pres.iter().filter(|c| **c > 1).count() as u32;
+        let hops_sum: u32 = paths
+            .iter()
+            .map(|p| p.len().saturating_sub(1) as u32)
+            .sum();
+        if ou < best_overused || (ou == best_overused && hops_sum < best_hops) {
+            best_overused = ou;
+            best_hops = hops_sum;
+            best_paths = paths.clone();
+        }
+        overused = ou;
         last_paths = paths;
-        if overused == 0 {
+        if ou == 0 {
             break;
         }
-        for (tile, c) in &pres {
-            if *c > 1 {
-                *hist.entry(*tile).or_insert(0) += 1;
+        for (ti, &c) in pres.iter().enumerate() {
+            if c > 1 {
+                hist[ti] = hist[ti].saturating_add(1);
             }
         }
     }
+    overused = best_overused;
+    last_paths = best_paths;
     for (i, (src, dst, ble, packed_ii)) in nets.iter().enumerate() {
         let hops = last_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
         let net = placed
@@ -865,5 +1004,35 @@ mod tests {
         let resolved = dev.resolve_path_sites(&endpoints).unwrap();
         assert!(resolved.contains(&clb.id()));
         assert!(resolved.contains(&iob.id()));
+    }
+
+    /// Shared CLB driver sites must not inflate PathFinder overused: occupancy
+    /// counts intermediate RR tiles only (per-net terminal skip).
+    #[test]
+    fn overused_ignores_shared_clb_terminals() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&hard_heartbeat(), &dev).unwrap();
+        assert!(p.lutffs.len() >= 8);
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
+        let r = route(&pl, &dev).unwrap();
+        assert!(r.pathfinder_iters >= 1);
+        // hard_heartbeat is a single-IOB fixture after place; still must be clean.
+        assert_eq!(
+            r.overused,
+            0,
+            "terminal-only overlap must not count as overused"
+        );
+        assert!(!r.iob_src.is_empty());
+        assert_eq!(
+            r.iob_src[0].path.len().saturating_sub(1) as u32,
+            r.iob_src[0].hops
+        );
     }
 }
