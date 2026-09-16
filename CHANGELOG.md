@@ -12,7 +12,34 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.3...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.4...HEAD
+
+## [2.0.4] — 2026-09-16
+
+OPT P1-2 STA HashSet (#62), P1-3 bitgen frame buffer (#63), place-legalize
+(#64), residual synth_rtl (#65), residual parse (#66). Empty-XDC
+`examples/counter.sv` gold unchanged (**WNS_PS=9640**). SOFT ≠ PASS held.
+Release `helion impl examples/ibex_pin_wrap.sv`: parse **416→353 ms**,
+synth_rtl **670→524 ms**, place legalize **213→23 ms**, imux_skip **158→123**.
+Native Apple Silicon `Helion.app` ships on this GitHub Release.
+
+### Changed
+
+- `report_timing_placed` uses a HashSet of IOB `from_net` (O(1) membership;
+  kills O(lutffs×iobs)).
+- Bitgen writes through a frame buffer (no `.hbits` format growth).
+- Place legalize: dense occupancy grid, remaining-illegal worklist, pin-index
+  scoring, high-fanout driver sampling.
+- `synth_rtl`: single-pass `emit_module_into`; process-level OwnCache; no Rtl
+  clone before synth.
+- Parse: process-level `SyntaxTree` Arc cache (`OnceLock+Mutex`).
+
+### Fixed
+
+- Ibex pin-wrap wall after #64/#65/#66: legalize −89%, synth_rtl −22%,
+  parse −15% vs post-#64 / post-#65 baselines. Diagnostic depth unchanged.
+
+[2.0.4]: https://github.com/helion-fpga/helion/releases/tag/v2.0.4
 
 ## [2.0.3] — 2026-09-16
 
