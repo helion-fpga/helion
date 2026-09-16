@@ -33,6 +33,7 @@ Do not attach vendor bitstreams to a GitHub Release.
 
 | Want | Path |
 |---|---|
+| Example spine | `examples/README.md` |
 | SV ingest | `crates/helion-sv` |
 | STA / XDC | `crates/helion-sta` |
 | Place / route / bits | `crates/helion-place`, `helion-route`, `helion-bits` |

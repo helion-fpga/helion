@@ -1,0 +1,4 @@
+# Helion UART lab — user create_clock + PACKAGE_PIN (W-L5 spine).
+part HL10T-C32-1
+read_sv examples/uart/uart.sv
+read_xdc examples/uart/uart.sdc

@@ -1,0 +1,5 @@
+# Helion-MM scratch lab — user create_clock + PACKAGE_PIN (W-L5 spine).
+part HL10T-C32-1
+read_sv examples/scratch_mm/scratch_mm.sv
+read_xdc examples/scratch_mm/scratch_mm.sdc
+top scratch_mm

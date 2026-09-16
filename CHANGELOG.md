@@ -8,6 +8,12 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Added
 
+- Example spine in `examples/` (counter gold, blinky + user `create_clock` +
+  `PACKAGE_PIN`, UART TX, Helion-MM scratch, Helion-original `hcore`). Each lab
+  has expected cells/WNS/`SOFT=0` and a one-command headless invoke
+  (`./scripts/example-spine.sh`). Empty-XDC counter gold is unchanged
+  (**WNS_PS=9640**).
+
 ### Changed
 
 ### Fixed

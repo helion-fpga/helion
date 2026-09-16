@@ -324,6 +324,33 @@ fn positional(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Named SOFT attrs on a mapped netlist. Empty means `SOFT=0` (PASS cones only).
+fn soft_token(d: &Design) -> String {
+    const KEYS: &[&str] = &[
+        "WIDE_CONE",
+        "ASSIGN_NOT_LOWERED",
+        "GENERATE_NOT_LOWERED",
+        "WIDTH_OVERFLOW",
+        "WORD_PIPELINE_CAP",
+        "FLATTEN_CAP",
+        "GATE_PRIMITIVE",
+        "CLOCK_MUX",
+        "CLOCK_GATE",
+        "SIM_ONLY",
+        "NO_BODY",
+    ];
+    let named: Vec<&str> = KEYS
+        .iter()
+        .copied()
+        .filter(|k| d.attrs.get(k) == Some("1"))
+        .collect();
+    if named.is_empty() {
+        "SOFT=0".into()
+    } else {
+        format!("SOFT={}", named.join(","))
+    }
+}
+
 fn cmd_synth(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
@@ -333,10 +360,11 @@ fn cmd_synth(args: &[String]) {
     });
     let luts = d.lut_inits();
     println!(
-        "synth {} cells={} luts={} inits={luts:#x?} part={part}",
+        "synth {} cells={} luts={} inits={luts:#x?} part={part} {}",
         d.name,
         d.cells.len(),
-        luts.len()
+        luts.len(),
+        soft_token(&d)
     );
 }
 
@@ -438,8 +466,14 @@ fn cmd_timing(args: &[String]) {
         return;
     }
     println!(
-        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name, timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} {}",
+        c.design.name,
+        timing.wns_ps,
+        timing.tns_ps,
+        timing.endpoints,
+        timing.r2r_ps,
+        timing.iob_ps,
+        soft_token(&c.design)
     );
 }
 
@@ -517,13 +551,14 @@ fn cmd_reports(args: &[String]) {
         std::process::exit(1);
     }
     println!(
-        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
+        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} {}",
         c.design.name,
         c.timing.wns_ps,
         c.timing.tns_ps,
         c.timing.endpoints,
         c.timing.r2r_ps,
-        c.timing.iob_ps
+        c.timing.iob_ps,
+        soft_token(&c.design)
     );
     println!(
         "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
@@ -622,7 +657,7 @@ fn cmd_qor(args: &[String]) {
     let elapsed_ms = t0.elapsed().as_millis();
     let p = &c.routed.placed.packed;
     println!(
-        "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
+        "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={} {}",
         c.design.name,
         c.dev.part,
         p.lutffs.len(),
@@ -634,7 +669,8 @@ fn cmd_qor(args: &[String]) {
         c.timing.iob_ps,
         c.bits.frames.len(),
         c.bits.packets.len(),
-        elapsed_ms
+        elapsed_ms,
+        soft_token(&c.design)
     );
 }
 
@@ -745,8 +781,18 @@ fn cmd_project(args: &[String]) {
         .as_ref()
         .map(|b| b.frames.len())
         .unwrap_or(0);
+    let soft = session
+        .design
+        .as_ref()
+        .map(|d| soft_token(d))
+        .unwrap_or_else(|| "SOFT=0".into());
+    let cells = session
+        .design
+        .as_ref()
+        .map(|d| d.cells.len())
+        .unwrap_or(0);
     println!(
-        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
+        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} cells={} lutffs={} WNS_PS={} frames={} {soft}",
         path,
         prj.part,
         prj.sources.len(),
@@ -755,6 +801,7 @@ fn cmd_project(args: &[String]) {
         prj.constraint_files.len(),
         xdc.clocks.len(),
         xdc.package_pins.len(),
+        cells,
         lutffs,
         timing.wns_ps,
         frames
