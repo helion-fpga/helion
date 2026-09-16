@@ -414,7 +414,7 @@ pub fn bitgen_pblock(
         }
     }
     if frames.is_empty() {
-        return Err("pblock produced no frames".into());
+        return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: pblock produced no frames"));
     }
     let mut bs = Bitstream {
         idcode: dev.idcode,
@@ -635,6 +635,21 @@ mod tests {
             "partial packets must not exceed full"
         );
         assert!(!pb.frames.is_empty(), "pblock must carry the placed major");
+    }
+
+    #[test]
+    fn bitgen_pblock_no_sites_refuses_with_empty_code() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        let err = bitgen_pblock(&dev, &r, &[]).unwrap_err();
+        assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable code missing: {err}"
+        );
+        assert!(err.contains("pblock produced no frames"), "{err}");
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
     }
 
     /// Gold counter sparse `.hbits` size (README / QoR table). Must stay stable.
