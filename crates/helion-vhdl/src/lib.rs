@@ -3,11 +3,30 @@
 //! when/else, generate, process if/elsif/case/for, generics, port maps, and
 //! IEEE casts all become SV that `helion_sv` maps.
 
-use helion_ir::Design;
+use helion_ir::{Design, MapResult, SoftDiag, SoftSpan};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn synth_vhdl(source: &str) -> Result<Design, String> {
+    Ok(map_vhdl(source)?.design)
+}
+
+/// VHDL → map: Helion `Design` plus first-class `helion_ir::SoftDiag` (FM-HEL-L3).
+/// SOFT ≠ PASS — callers must not treat `softs` as a closed WNS / cells=0 success.
+pub fn map_vhdl(source: &str) -> Result<MapResult, String> {
+    map_vhdl_origin(source, "vhdl.vhd")
+}
+
+pub fn synth_vhdl_path(path: &Path) -> Result<Design, String> {
+    Ok(map_vhdl_path(path)?.design)
+}
+
+pub fn map_vhdl_path(path: &Path) -> Result<MapResult, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    map_vhdl_origin(&src, &path.display().to_string())
+}
+
+fn map_vhdl_origin(source: &str, origin: &str) -> Result<MapResult, String> {
     if let Some(name) = osvvm_harness_module(source) {
         // OSVVM / PoC test harness (CreateClock, library.entity). The
         // body is a simulator model, not a netlist. Do not elaborate it.
@@ -15,7 +34,14 @@ pub fn synth_vhdl(source: &str) -> Result<Design, String> {
         eprintln!(
             "diagnostic sim_only module={name} (OSVVM test harness; external entity not ingested; not a LUT; not a closed WNS)"
         );
-        return Ok(empty_named(name));
+        let soft = SoftDiag::new("sim_only", &name)
+            .with_detail("OSVVM test harness; external entity not ingested")
+            .with_span(span_best_effort(source, origin, &[&name]));
+        emit_diag(&soft.table_line());
+        return Ok(MapResult {
+            design: empty_named(name),
+            softs: vec![soft],
+        });
     }
     if let Some((kind, name)) = banner_hang_module(source) {
         // Banner-only 90s kills: vendor IP wrapper, or a record/package
@@ -26,10 +52,18 @@ pub fn synth_vhdl(source: &str) -> Result<Design, String> {
             _ => "record or package type; not bit-blasted; not a LUT; not a closed WNS",
         };
         eprintln!("diagnostic {kind} module={name} ({why})");
-        return Ok(empty_named(name));
+        let soft = SoftDiag::new(kind, &name)
+            .with_detail(why)
+            .with_span(span_best_effort(source, origin, &[&name]));
+        emit_diag(&soft.table_line());
+        return Ok(MapResult {
+            design: empty_named(name),
+            softs: vec![soft],
+        });
     }
-    let sv = vhdl_to_sv(source)?;
-    helion_sv::synth_sv(&sv, "vhdl.sv")
+    let (sv, softs) = vhdl_to_sv_with_softs(source, origin)?;
+    let design = helion_sv::synth_sv(&sv, "vhdl.sv")?;
+    Ok(MapResult { design, softs })
 }
 
 /// OSVVM clock/reset harness or library-qualified AXI testbench. Not synth RTL.
@@ -108,12 +142,11 @@ fn last_entity_is(source: &str) -> Option<String> {
     best
 }
 
-pub fn synth_vhdl_path(path: &Path) -> Result<Design, String> {
-    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    synth_vhdl(&src)
+fn vhdl_to_sv(source: &str) -> Result<String, String> {
+    Ok(vhdl_to_sv_with_softs(source, "vhdl.vhd")?.0)
 }
 
-fn vhdl_to_sv(source: &str) -> Result<String, String> {
+fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<SoftDiag>), String> {
     let t = tokenize(source);
     let mut p = P { t: &t, i: 0 };
     let mut entities: Vec<Entity> = Vec::new();
@@ -165,6 +198,7 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         signals: Vec::new(),
         components: Vec::new(),
         stmts: Vec::new(),
+        parse_softs: Vec::new(),
     };
     // STA clocks come from the architecture emit will actually use
     // (`arch_for` = last matching arch). Unioning every arch of an entity
@@ -179,6 +213,8 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         }
     }
     let mut out = String::new();
+    let mut all_softs: Vec<SoftDiag> = Vec::new();
+    let mut entity_softs: HashMap<String, Vec<SoftDiag>> = HashMap::new();
     // Emit non-top entities with bodies first so hierarchy stitch finds them.
     for e in &entities {
         if e.name.eq_ignore_ascii_case(&top.name) {
@@ -191,6 +227,7 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         // entries as localparam into hierarchical children — they collide
         // with child ports/signals.
         let consts = bind_consts(&pkg_consts, e, a, false);
+        let mut unit_softs = Vec::new();
         out.push_str(&emit_sv(
             e,
             a,
@@ -199,7 +236,13 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
             &entity_clocks,
             &entity_occupied,
             &entities,
+            origin,
+            source,
+            &mut unit_softs,
+            &entity_softs,
         )?);
+        entity_softs.insert(e.name.to_ascii_lowercase(), unit_softs.clone());
+        all_softs.extend(unit_softs);
     }
     let arch = arch_for(&top.name)
         .or_else(|| archs.last())
@@ -207,6 +250,7 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
     entity_clocks.insert(top.name.to_ascii_lowercase(), sta_clocks_of(arch));
     entity_occupied.insert(top.name.to_ascii_lowercase(), occupied_sv_names(top, arch));
     let consts = bind_consts(&pkg_consts, top, arch, true);
+    let mut unit_softs = Vec::new();
     out.push_str(&emit_sv(
         top,
         arch,
@@ -215,8 +259,13 @@ fn vhdl_to_sv(source: &str) -> Result<String, String> {
         &entity_clocks,
         &entity_occupied,
         &entities,
+        origin,
+        source,
+        &mut unit_softs,
+        &entity_softs,
     )?);
-    Ok(out)
+    all_softs.extend(unit_softs);
+    Ok((out, all_softs))
 }
 
 /// Localparams to emit. Package consts stay in parse_arch's fold env; they
@@ -289,6 +338,8 @@ struct Arch {
     signals: Vec<(String, usize)>,
     components: Vec<Entity>,
     stmts: Vec<CStmt>,
+    /// Parse-time softs (generate_not_lowered, …) attached to this architecture.
+    parse_softs: Vec<(String, Option<String>, String)>,
 }
 
 #[derive(Clone)]
@@ -403,6 +454,15 @@ fn parse_entity(p: &mut P) -> Result<Entity, String> {
     })
 }
 
+thread_local! {
+    static PARSE_SOFTS: std::cell::RefCell<Vec<(String, Option<String>, String)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn note_parse_soft(name: impl Into<String>, detail: Option<String>, hint: impl Into<String>) {
+    PARSE_SOFTS.with(|s| s.borrow_mut().push((name.into(), detail, hint.into())));
+}
+
 fn parse_arch(
     p: &mut P,
     entities: &[Entity],
@@ -453,7 +513,9 @@ fn parse_arch(
             p.bump();
         }
     }
+    PARSE_SOFTS.with(|s| s.borrow_mut().clear());
     let stmts = parse_concurrent_list(p, &consts, &signals)?;
+    let parse_softs = PARSE_SOFTS.with(|s| s.borrow_mut().drain(..).collect());
     // parse_concurrent_list already consumed `end`.
     let _ = p.eat("architecture");
     let _ = p.eat_ident();
@@ -464,6 +526,7 @@ fn parse_arch(
         signals,
         components,
         stmts,
+        parse_softs,
     })
 }
 
@@ -793,11 +856,7 @@ fn parse_for_generate(
     } else {
         p.i = save;
     }
-    let (a, b) = if downto {
-        (hi, lo)
-    } else {
-        (lo, hi)
-    };
+    let (a, b) = if downto { (hi, lo) } else { (lo, hi) };
     let mut all = Vec::new();
     let body_toks_start = p.i;
     // Capture body tokens until end generate.
@@ -841,6 +900,13 @@ fn parse_for_generate(
     }
     if all.is_empty() {
         return Ok(None);
+    }
+    if all.iter().any(|s| matches!(s, CStmt::Inst { .. })) {
+        note_parse_soft(
+            "generate_not_lowered",
+            Some(format!("for {var}")),
+            var.clone(),
+        );
     }
     // Flatten generate into sequential concurrent stmts by returning the first and
     // splicing the rest via a dummy process-free list — caller only takes one.
@@ -1185,7 +1251,11 @@ fn take_clock(p: &mut P) -> Option<(String, bool)> {
 fn find_clock(body: &[SStmt]) -> Option<String> {
     for s in body {
         match s {
-            SStmt::If { cond, then_b, else_b } => {
+            SStmt::If {
+                cond,
+                then_b,
+                else_b,
+            } => {
                 if let Some(c) = clock_from_cond(cond) {
                     return Some(c);
                 }
@@ -1225,17 +1295,31 @@ fn clock_from_cond(cond: &str) -> Option<String> {
 
 fn strip_clock_if(body: Vec<SStmt>) -> Vec<SStmt> {
     if body.len() == 1 {
-        if let SStmt::If { cond, then_b, else_b } = &body[0] {
+        if let SStmt::If {
+            cond,
+            then_b,
+            else_b,
+        } = &body[0]
+        {
             if clock_from_cond(cond).is_some() {
                 return then_b.clone();
             }
             // async: if rst then ... elsif posedge then ...
-            if let Some(SStmt::If { cond: c2, then_b: t2, else_b: e2 }) = else_b.first() {
+            if let Some(SStmt::If {
+                cond: c2,
+                then_b: t2,
+                else_b: e2,
+            }) = else_b.first()
+            {
                 if clock_from_cond(c2).is_some() {
                     return vec![SStmt::If {
                         cond: cond.clone(),
                         then_b: then_b.clone(),
-                        else_b: if e2.is_empty() { t2.clone() } else { e2.clone() },
+                        else_b: if e2.is_empty() {
+                            t2.clone()
+                        } else {
+                            e2.clone()
+                        },
                     }];
                 }
             }
@@ -1244,7 +1328,10 @@ fn strip_clock_if(body: Vec<SStmt>) -> Vec<SStmt> {
     body
 }
 
-fn parse_port_map(p: &mut P, consts: &HashMap<String, i64>) -> Result<Vec<(String, String)>, String> {
+fn parse_port_map(
+    p: &mut P,
+    consts: &HashMap<String, i64>,
+) -> Result<Vec<(String, String)>, String> {
     let _ = p.eat("port");
     let _ = p.eat("map");
     let _ = p.eat("(");
@@ -1493,7 +1580,10 @@ fn parse_primary_sv(p: &mut P, c: &HashMap<String, i64>) -> Result<String, Strin
         let bits = bits.clone();
         p.i += 1;
         let w = bits.len().max(1);
-        if bits.chars().all(|ch| matches!(ch, '0' | '1' | 'z' | 'Z' | 'x' | 'X')) {
+        if bits
+            .chars()
+            .all(|ch| matches!(ch, '0' | '1' | 'z' | 'Z' | 'x' | 'X'))
+        {
             return Ok(format!("{w}'b{bits}"));
         }
         // hex already converted in tokenizer
@@ -1894,6 +1984,10 @@ fn emit_sv(
     entity_clocks: &HashMap<String, HashSet<String>>,
     entity_occupied: &HashMap<String, HashSet<String>>,
     entities: &[Entity],
+    origin: &str,
+    source: &str,
+    softs: &mut Vec<SoftDiag>,
+    child_softs: &HashMap<String, Vec<SoftDiag>>,
 ) -> Result<String, String> {
     let empty_clocks = HashSet::new();
     let sta_clocks = entity_clocks
@@ -1908,6 +2002,23 @@ fn emit_sv(
     // emit a named diagnostic, do not silent-merge, do not abort synth.
     if clock_clk_clash(sta_clocks, &occupied) {
         emit_diag(&clock_clk_clash_line(&ent.name));
+        push_soft(
+            softs,
+            SoftDiag::new("clock_clk_clash", &ent.name)
+                .with_detail("construct=process_clock clock=clock occupied=clk")
+                .with_span(span_best_effort(source, origin, &["clock", "process"])),
+        );
+    }
+    for (name, detail, hint) in &arch.parse_softs {
+        let mut d = SoftDiag::new(name, &ent.name).with_span(span_best_effort(
+            source,
+            origin,
+            &[hint.as_str(), "generate"],
+        ));
+        if let Some(det) = detail {
+            d = d.with_detail(det.clone());
+        }
+        push_soft(softs, d);
     }
     let mut sv = String::new();
     // Honest hierarchy: never emit_stub empty modules for component decls.
@@ -2007,6 +2118,30 @@ fn emit_sv(
                     // Named miss — not silent cells=0 via empty emit_stub.
                     // module= is the entity being lowered, not design top_name.
                     emit_diag(&missing_component_line(&ent.name, name, module));
+                    push_soft(
+                        softs,
+                        SoftDiag::new("missing_component", &ent.name)
+                            .with_detail(format!("inst={name} child={module}"))
+                            .with_span(span_best_effort(
+                                source,
+                                origin,
+                                &[name.as_str(), module.as_str()],
+                            )),
+                    );
+                } else if let Some(cs) = child_softs.get(&module.to_ascii_lowercase()) {
+                    if !cs.is_empty() {
+                        let mut d = SoftDiag::new("child_soft_incomplete", &ent.name)
+                            .with_detail(module.clone())
+                            .with_span(span_best_effort(
+                                source,
+                                origin,
+                                &[name.as_str(), module.as_str()],
+                            ));
+                        for c in cs {
+                            d.push_child(c.clone());
+                        }
+                        push_soft(softs, d);
+                    }
                 }
                 sv.push_str(&format!("  {} {name}(", sv_ident(module)));
                 let ports = child_ports(module, arch, entities);
@@ -2133,6 +2268,66 @@ fn emit_diag(line: &str) {
     TEST_DIAGNOSTICS.with(|d| d.borrow_mut().push(line.to_string()));
 }
 
+fn push_soft(softs: &mut Vec<SoftDiag>, d: SoftDiag) {
+    emit_diag(&d.table_line());
+    softs.push(d);
+}
+
+/// Best-effort file/line/column from original VHDL. First needle that appears
+/// as a whole ident on a non-comment line wins; unknown fields stay `None`.
+fn span_best_effort(source: &str, file: &str, needles: &[&str]) -> SoftSpan {
+    let mut span = SoftSpan {
+        file: Some(file.to_string()),
+        line: None,
+        column: None,
+        end_line: None,
+    };
+    for needle in needles {
+        if needle.is_empty() {
+            continue;
+        }
+        if let Some((line, col)) = find_ident_line_col(source, needle) {
+            span.line = Some(line);
+            span.column = Some(col);
+            return span;
+        }
+    }
+    span
+}
+
+fn find_ident_line_col(source: &str, ident: &str) -> Option<(u32, u32)> {
+    let want = ident.to_ascii_lowercase();
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--") {
+            continue;
+        }
+        let low = line.to_ascii_lowercase();
+        let mut from = 0usize;
+        while from < low.len() {
+            let rest = &low[from..];
+            let Some(rel) = rest.find(&want) else {
+                break;
+            };
+            let at = from + rel;
+            let before_ok =
+                at == 0 || !ident_char(low.as_bytes().get(at - 1).copied().unwrap_or(0));
+            let after = at + want.len();
+            let after_ok =
+                after >= low.len() || !ident_char(low.as_bytes().get(after).copied().unwrap_or(0));
+            if before_ok && after_ok {
+                return Some(((i + 1) as u32, (at + 1) as u32));
+            }
+            from = at + 1;
+        }
+    }
+    None
+}
+
+fn ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_DIAGNOSTICS: std::cell::RefCell<Vec<String>> =
@@ -2156,7 +2351,11 @@ fn sta_clocks_of(arch: &Arch) -> HashSet<String> {
 /// process/STA clock also stays `clock`. When process clock is `clock` and
 /// `clk` is already occupied, keep `clock` (clash-skip; nets stay distinct).
 /// Selected-arch clocks are not unioned (see `entity_clocks` / child maps).
-fn sta_clock_name(name: &str, _sta_clocks: &HashSet<String>, _occupied: &HashSet<String>) -> String {
+fn sta_clock_name(
+    name: &str,
+    _sta_clocks: &HashSet<String>,
+    _occupied: &HashSet<String>,
+) -> String {
     // Identity: never rewrite process/STA `clock` to `clk`. Call sites still
     // pass sta_clocks/occupied so clash diagnostics and narrow tests stay wired.
     name.to_string()
@@ -2529,7 +2728,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
     let mut s = String::new();
     let chars_raw: Vec<char> = src.chars().collect();
     let mut i = 0;
-    // strip -- comments and /* */ 
+    // strip -- comments and /* */
     while i < chars_raw.len() {
         if chars_raw[i] == '-' && chars_raw.get(i + 1) == Some(&'-') {
             while i < chars_raw.len() && chars_raw[i] != '\n' {
@@ -2600,9 +2799,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
         }
         if c == '\'' && i + 2 < chars.len() && chars[i + 2] == '\'' {
             let ch = chars[i + 1];
-            out.push(Tok::BitStr(
-                if ch == '1' { "1".into() } else { "0".into() },
-            ));
+            out.push(Tok::BitStr(if ch == '1' { "1".into() } else { "0".into() }));
             i += 3;
             continue;
         }
@@ -2831,7 +3028,16 @@ end architecture;
     #[test]
     fn vhdl_blinky_is_inverter_ff() {
         let d = synth_vhdl(BLINKY).unwrap();
-        match d.cell("u_lut").or_else(|| d.cells.iter().find(|c| matches!(c.kind, CellKind::Lut6 { .. }))).unwrap().kind {
+        match d
+            .cell("u_lut")
+            .or_else(|| {
+                d.cells
+                    .iter()
+                    .find(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            })
+            .unwrap()
+            .kind
+        {
             CellKind::Lut6 { init } => assert_eq!(init, 0x5555_5555_5555_5555),
             _ => panic!("lut"),
         }
@@ -2860,8 +3066,17 @@ end architecture;
     fn vhdl_width_is_not_string_match() {
         let d3 = synth_vhdl(INC3).unwrap();
         let d4 = synth_vhdl(INC4).unwrap();
-        assert_eq!(d3.lut_inits().len(), 3, "3-bit VHDL incrementer must be 3 LUTs {:?}", d3.lut_inits());
-        assert_eq!(d4.lut_inits(), INC4_INIT.to_vec(), "4-bit must match gold incrementer");
+        assert_eq!(
+            d3.lut_inits().len(),
+            3,
+            "3-bit VHDL incrementer must be 3 LUTs {:?}",
+            d3.lut_inits()
+        );
+        assert_eq!(
+            d4.lut_inits(),
+            INC4_INIT.to_vec(),
+            "4-bit must match gold incrementer"
+        );
         assert_ne!(d3.lut_inits().len(), d4.lut_inits().len());
     }
 
@@ -2947,7 +3162,9 @@ end architecture;
 "#;
         let d = synth_vhdl(src).expect("when/else");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            d.cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
             "when/else compare must be a LUT {:?}",
             d.cells
         );
@@ -3015,7 +3232,11 @@ end;
             .iter()
             .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
             .count();
-        assert!(luts >= 2, "full_adder must map LUTs, luts={luts} {:?}", d.cells);
+        assert!(
+            luts >= 2,
+            "full_adder must map LUTs, luts={luts} {:?}",
+            d.cells
+        );
         assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
     }
 
@@ -3101,7 +3322,11 @@ end;
         );
         assert!(sv.contains("u_miss"), "{sv}");
         let d = synth_vhdl(src).expect("synth");
-        assert!(d.cells.is_empty(), "absent child must not invent gates {:?}", d.cells);
+        assert!(
+            d.cells.is_empty(),
+            "absent child must not invent gates {:?}",
+            d.cells
+        );
         assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
     }
 
@@ -3156,6 +3381,236 @@ end;
             !missing_component_line("inner", "u_miss", "missing_child").contains("module=wrap"),
             "must not use design top_name"
         );
+        let mr = map_vhdl(src).expect("map");
+        let miss: Vec<_> = mr
+            .softs
+            .iter()
+            .filter(|s| s.name == "missing_component")
+            .collect();
+        assert_eq!(miss.len(), 1, "softs={:?}", mr.soft_table_lines());
+        assert_eq!(miss[0].module, "inner");
+        assert!(
+            !miss.iter().any(|s| s.module == "wrap"),
+            "must not use design top_name: {:?}",
+            mr.soft_table_lines()
+        );
+        assert!(mr
+            .softs
+            .iter()
+            .any(|s| s.name == "child_soft_incomplete" && s.module == "wrap"));
+    }
+
+    #[test]
+    fn vhdl_missing_component_softdiag_fields() {
+        let src = r#"
+entity wrap is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of wrap is
+  component missing_child
+    port (a : in std_logic; y : out std_logic);
+  end component;
+begin
+  u_miss: missing_child port map (a => a, y => y);
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        let miss = mr
+            .softs
+            .iter()
+            .find(|s| s.name == "missing_component")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing_component SoftDiag required, got {:?}",
+                    mr.soft_table_lines()
+                )
+            });
+        assert_eq!(miss.name, "missing_component");
+        assert_eq!(miss.module, "wrap");
+        let detail = miss.detail.as_deref().unwrap_or("");
+        assert!(detail.contains("inst=u_miss"), "inst in detail: {detail}");
+        assert!(
+            detail.contains("child=missing_child"),
+            "child in detail: {detail}"
+        );
+        assert_eq!(miss.span.file.as_deref(), Some("vhdl.vhd"));
+        assert!(
+            miss.span.line.is_some(),
+            "best-effort line from source: {:?}",
+            miss.span
+        );
+        let line_no = miss.span.line.unwrap() as usize;
+        let src_line = src.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
+        assert!(
+            src_line.to_ascii_lowercase().contains("u_miss"),
+            "span line must point at instance, got {line_no}: {src_line}"
+        );
+        let rows = mr.soft_table_lines();
+        assert!(
+            rows.iter()
+                .any(|l| l.contains("soft name=missing_component")
+                    && l.contains("module=wrap")
+                    && l.contains("detail=inst=u_miss")
+                    && l.contains("span=vhdl.vhd:")),
+            "table_line schema row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|l| l.contains("PASS")),
+            "SOFT ≠ PASS: {rows:?}"
+        );
+        assert!(mr.has_softs());
+        assert!(
+            mr.design.cells.is_empty(),
+            "absent child must not invent gates {:?}",
+            mr.design.cells
+        );
+        assert_eq!(mr.design.attrs.get("NO_BODY"), Some("1"));
+        assert!(
+            !mr.design
+                .cells
+                .iter()
+                .any(|c| c.name.contains("unused_") || c.name.contains("fcov_")),
+            "never invent LUTs for unused_*/fcov_: {:?}",
+            mr.design.cells
+        );
+        let kinds = format!("{:?}", mr.design.cells);
+        assert!(
+            !kinds.contains("FDCE") && !kinds.contains("FDRE") && !kinds.contains("FD "),
+            "no fake FD library: {kinds}"
+        );
+    }
+
+    #[test]
+    fn vhdl_missing_component_not_silent_pass() {
+        let src = r#"
+entity top is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of top is
+begin
+  ghost_u: ghost_ent port map (a => a, y => y);
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        assert!(
+            mr.has_softs(),
+            "SOFT must be first-class, not silent cells=0"
+        );
+        assert!(mr
+            .softs
+            .iter()
+            .any(|s| s.name == "missing_component" && s.module == "top"));
+        let detail = mr
+            .softs
+            .iter()
+            .find(|s| s.name == "missing_component")
+            .and_then(|s| s.detail.as_deref())
+            .unwrap_or("");
+        assert!(detail.contains("inst=ghost_u"), "{detail}");
+        assert!(detail.contains("child=ghost_ent"), "{detail}");
+        assert_eq!(mr.design.attrs.get("NO_BODY"), Some("1"));
+        assert!(mr.design.cells.is_empty());
+        assert!(!mr
+            .soft_table_lines()
+            .iter()
+            .any(|l| l.to_ascii_uppercase().contains("PASS")));
+    }
+
+    #[test]
+    fn vhdl_map_closed_cone_has_no_softs() {
+        let src = r#"
+entity full_adder is
+  port (a, b, cin : in std_logic; sum, cout : out std_logic);
+end;
+architecture rtl of full_adder is
+begin
+  sum <= a xor b xor cin;
+  cout <= (a and b) or (a and cin) or (b and cin);
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        assert!(
+            mr.softs.is_empty(),
+            "closed LUT cone must not carry SOFT: {:?}",
+            mr.soft_table_lines()
+        );
+        assert!(!mr.has_softs());
+        let luts = mr
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+            .count();
+        assert!(luts >= 2, "full_adder must map LUTs, luts={luts}");
+    }
+
+    #[test]
+    fn vhdl_clock_clk_clash_softdiag() {
+        let src = r#"
+entity clash is
+  port (clk : in std_logic; clock : in std_logic; q : out std_logic);
+end;
+architecture rtl of clash is
+begin
+  process(clock)
+  begin
+    if rising_edge(clock) then
+      q <= clk;
+    end if;
+  end process;
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        let clash = mr
+            .softs
+            .iter()
+            .find(|s| s.name == "clock_clk_clash")
+            .unwrap_or_else(|| panic!("clock_clk_clash SoftDiag, got {:?}", mr.soft_table_lines()));
+        assert_eq!(clash.module, "clash");
+        assert!(clash
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("occupied=clk"));
+        assert_eq!(clash.span.file.as_deref(), Some("vhdl.vhd"));
+        assert!(clash.span.line.is_some());
+        assert!(mr
+            .design
+            .cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Hff)));
+    }
+
+    #[test]
+    fn vhdl_generate_inst_not_lowered_softdiag() {
+        let src = r#"
+entity wrap is
+  port (a : in std_logic; y : out std_logic);
+end;
+architecture rtl of wrap is
+begin
+  g: for i in 0 to 0 generate
+    u_miss: missing_child port map (a => a, y => y);
+  end generate;
+end;
+"#;
+        let mr = map_vhdl(src).expect("map");
+        assert!(
+            mr.softs
+                .iter()
+                .any(|s| s.name == "generate_not_lowered" && s.module == "wrap")
+                || mr.softs.iter().any(|s| s.name == "missing_component"),
+            "generate instance must be a named soft, got {:?}",
+            mr.soft_table_lines()
+        );
+        assert!(
+            !mr.design
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            "must not invent LUTs for unlowered generate inst: {:?}",
+            mr.design.cells
+        );
     }
 
     #[test]
@@ -3174,7 +3629,9 @@ end;
         assert!(sv.contains("localparam MASK = 1"), "{sv}");
         let d = synth_vhdl(src).expect("const");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            d.cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
             "entity constant path must still map, {:?}",
             d.cells
         );
@@ -3202,7 +3659,9 @@ end;
         );
         let d = synth_vhdl(src).expect("const");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
+            d.cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
             "entity-decl constant must map, {:?}",
             d.cells
         );
@@ -3267,7 +3726,10 @@ end;
             !sv.contains("input logic clk"),
             "must not rename process clock clock→clk: {sv}"
         );
-        assert!(sv.contains("posedge clock"), "always_ff must use clock: {sv}");
+        assert!(
+            sv.contains("posedge clock"),
+            "always_ff must use clock: {sv}"
+        );
         assert!(
             !sv.contains("posedge clk"),
             "must not rewrite process clock to clk: {sv}"
@@ -3465,20 +3927,14 @@ end;
             diags.iter().any(|l| l == &clock_clk_clash_line("clash")),
             "named diagnostic must be emitted, got {diags:?}"
         );
-        assert!(
-            sv.contains("input logic clk,"),
-            "data port clk stays: {sv}"
-        );
+        assert!(sv.contains("input logic clk,"), "data port clk stays: {sv}");
         assert!(
             sv.contains("input logic clock,"),
             "process clock keeps original name: {sv}"
         );
-        let clk_port_decls = sv.matches("input logic clk,").count()
-            + sv.matches("input logic clk)").count();
-        assert_eq!(
-            clk_port_decls, 1,
-            "must not emit duplicate clk ports: {sv}"
-        );
+        let clk_port_decls =
+            sv.matches("input logic clk,").count() + sv.matches("input logic clk)").count();
+        assert_eq!(clk_port_decls, 1, "must not emit duplicate clk ports: {sv}");
         assert!(
             sv.contains("posedge clock"),
             "always_ff uses original process clock: {sv}"
@@ -3496,18 +3952,12 @@ end;
             line.contains("diagnostic clock_clk_clash"),
             "named diagnostic: {line}"
         );
-        assert!(
-            line.contains("module=clash"),
-            "entity context: {line}"
-        );
+        assert!(line.contains("module=clash"), "entity context: {line}");
         assert!(
             line.contains("construct=process_clock"),
             "construct: {line}"
         );
-        assert!(
-            line.contains("rename clock→clk skipped"),
-            "why: {line}"
-        );
+        assert!(line.contains("rename clock→clk skipped"), "why: {line}");
         assert!(
             line.contains("not a silent merge") && line.contains("not a synth abort"),
             "policy: {line}"
@@ -3638,5 +4088,4 @@ end;
         let d = synth_vhdl(src).expect("ff");
         assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
     }
-
 }
