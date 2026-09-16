@@ -2148,17 +2148,45 @@ mod tests {
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
         assert!(
-            err.contains(ERR_CODE_EMPTY_BITSTREAM)
-                || err.contains(ERR_CODE_USB_0)
-                || err.contains("empty bitstream refused")
-                || err.contains("no USB")
-                || err.contains("openFPGALoader")
-                || err.contains("programmer"),
-            "USB=0 / empty-frame must honest-fail, got: {err}"
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "empty Bitstream fixture must refuse EMPTY only, got: {err}"
         );
         assert!(
-            err.contains(ERR_CODE_EMPTY_BITSTREAM) || err.contains(ERR_CODE_USB_0),
-            "stable refuse code required: {err}"
+            err.contains("empty bitstream refused") || err.contains("refusing DONE on empty"),
+            "empty-frame must honest-fail, got: {err}"
+        );
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+        assert!(
+            !err.to_ascii_lowercase().contains("soft-hold"),
+            "must not soft-hold: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_usb0_nonempty_structural_counter_refuses_usb_0() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("helion-auto-usb0-counter");
+        let _ = std::fs::create_dir_all(&dir);
+        let (dev, bits) = bitgen_structural_counter();
+        assert!(!bitstream_is_empty(&bits), "counter must be non-empty");
+        let bits_path = dir.join("counter.hbits");
+        std::fs::write(&bits_path, &bits.packets).unwrap();
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
+        let cable = resolve_cable("auto").unwrap();
+        assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
+        let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+        assert!(
+            err.contains(ERR_CODE_USB_0),
+            "non-empty + USB=0 must refuse USB_0 only, got: {err}"
+        );
+        assert!(
+            !err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "must not mis-tag non-empty as EMPTY: {err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
         assert!(
@@ -2506,18 +2534,12 @@ mod tests {
             let cable = resolve_cable("native").unwrap();
             let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
             assert!(
-                e.contains(ERR_CODE_EMPTY_BITSTREAM)
-                    || e.contains(ERR_CODE_USB_0)
-                    || e.contains("empty bitstream refused")
-                    || e.contains("refusing DONE on empty")
-                    || e.contains("native MPSSE")
-                    || e.contains("I/O")
-                    || e.contains("no FTDI"),
-                "{e}"
+                e.contains(ERR_CODE_EMPTY_BITSTREAM),
+                "empty-frame HBIT must refuse EMPTY only, got: {e}"
             );
             assert!(
-                e.contains(ERR_CODE_EMPTY_BITSTREAM) || e.contains(ERR_CODE_USB_0),
-                "stable refuse code required: {e}"
+                e.contains("empty bitstream refused") || e.contains("refusing DONE on empty"),
+                "{e}"
             );
             assert!(!e.to_ascii_lowercase().contains("done=1"));
         } else {
