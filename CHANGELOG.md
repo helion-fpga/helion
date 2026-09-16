@@ -12,7 +12,34 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.1...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.2...HEAD
+
+## [2.0.2] — 2026-09-15
+
+Learner L1–L4 surfaces + OPT P2-1 / P0-1 / P1-1. Empty-XDC `examples/counter.sv`
+gold matches `helion qor`: **WNS_PS=9640**, LUTFF=4, IOB=1, BYTES=185. Native
+Apple Silicon `Helion.app` ships on this GitHub Release.
+
+### Added
+
+- SoftDiag / MapResult IR schema (L3); VHDL emit into `MapResult.softs` (no
+  parallel table). SOFT ≠ PASS.
+- L2 HAD stable Site/BEL/PIP/Net IDs; PNR highlight set + GUI HighlightSet /
+  packing wire-up (L2-UI).
+- L1 GUI status rail provenance; L4 overlay `sim_DONE` + stable
+  `HELION_E_EMPTY_BITSTREAM` / `HELION_E_USB_0` refuse codes.
+
+### Changed
+
+- Cap/QA scripts prefer release `helion` when present (OPT P2-1).
+
+### Fixed
+
+- Budgeted IMUX legalize under affinity_cap (OPT P0-1).
+- PathFinder A* buffer reuse, denser congestion, IOB→lutff index (OPT P1-1).
+- Multi-IOB path delay / highlight indexing in STA/route (L2-PNR).
+
+[2.0.2]: https://github.com/helion-fpga/helion/releases/tag/v2.0.2
 
 ## [2.0.1] — 2026-09-15
 
