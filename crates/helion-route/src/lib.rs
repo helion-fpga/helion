@@ -474,7 +474,8 @@ pub fn route_with_guide(
         }
     }
 
-    let mut nets: Vec<((u32, u32), (u32, u32), u8)> = Vec::new();
+    // (src, dst, ble, packed_iob_idx) — idx must survive y-skip filtering.
+    let mut nets: Vec<((u32, u32), (u32, u32), u8, usize)> = Vec::new();
     if !placed.packed.lutffs.is_empty() {
         for (ii, iob_site) in placed.iob_sites.iter().enumerate() {
             let packed_iob = placed.packed.iobs.get(ii);
@@ -493,7 +494,7 @@ pub fn route_with_guide(
             if clb.y <= iob_site.y {
                 continue;
             }
-            nets.push(((clb.x, clb.y), (iob_site.x, iob_site.y), ble));
+            nets.push(((clb.x, clb.y), (iob_site.x, iob_site.y), ble, ii));
         }
     }
 
@@ -519,7 +520,7 @@ pub fn route_with_guide(
         let mut pres: HashMap<(u32, u32), u32> = HashMap::new();
         let pres_fac = 1i64 + iter as i64;
         let mut paths = Vec::new();
-        for (src, dst, _) in &nets {
+        for (src, dst, _, _) in &nets {
             let path = astar(dev, *src, *dst, &hist, &pres, pres_fac, detour_cols)?;
             for tile in &path {
                 *pres.entry(*tile).or_insert(0) += 1;
@@ -537,12 +538,12 @@ pub fn route_with_guide(
             }
         }
     }
-    for (i, (src, dst, ble)) in nets.iter().enumerate() {
+    for (i, (src, dst, ble, packed_ii)) in nets.iter().enumerate() {
         let hops = last_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
         let net = placed
             .packed
             .iobs
-            .get(i)
+            .get(*packed_ii)
             .map(|io| io.from_net.clone())
             .unwrap_or_default();
         let from_ff = placed

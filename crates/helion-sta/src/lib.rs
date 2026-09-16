@@ -3938,6 +3938,7 @@ pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -
             continue;
         }
         let (start, cells, nets) = walk_iob_path(design, &c.name);
+        // Same scale as report_timing_routed: CkQ (if FF) + hop route + pad.
         let delay_ps = routed
             .iob_src
             .iter()
@@ -3949,7 +3950,10 @@ pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -
                         .iter()
                         .any(|io| io.cell == c.name && io.from_net == r.net)
             })
-            .map(|r| r.delay_ps)
+            .map(|r| {
+                let ckq = if r.from_ff { FF_CKQ_PS } else { 0 };
+                ckq + r.delay_ps + iob_pad_ps(design)
+            })
             .unwrap_or(t.iob_ps);
         paths.push(TimingPath {
             name: format!("{start}->{}", c.name),
