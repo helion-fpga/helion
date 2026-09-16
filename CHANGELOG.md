@@ -8,9 +8,21 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Added
 
+- Docs: CAD stages (elaborate/map → pack → place → route → sta → bitgen) and
+  SOFT ≠ PASS (`docs/stages.md`, `docs/stages.html`).
+- Release: 100 MiB artifact size gate; gold **WNS_PS=9640** on the built IDE
+  before packing; `helion-ide` wrapper so `Helion.app` does not store the IDE twice.
+
 ### Changed
 
+- README stranger path is clone → `cargo test --workspace` → headless gold
+  **WNS_PS=9640**. Current release line is 2.0.1 (was stale 1.3).
+- `packaging/macos/Info.plist` version matches Cargo.toml **2.0.1**.
+- App and unix tarballs omit `examples/ip_ingest` (ingest corpus, not a lab).
+
 ### Fixed
+
+- `helion-ide --version` gate tracks `Cargo.toml` (was hardcoded 1.0.0).
 
 [unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.1...HEAD
 

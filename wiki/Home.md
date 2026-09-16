@@ -16,6 +16,7 @@ Living copy: [helion-fpga.github.io/helion/wiki.html](https://helion-fpga.github
 ## Architecture and legal
 
 - [Architecture](https://helion-fpga.github.io/helion/architecture.html)
+- [Stages and SOFT ≠ PASS](https://helion-fpga.github.io/helion/stages.html)
 - [Legal fence](https://helion-fpga.github.io/helion/legal.html)
 
 Repo: https://github.com/helion-fpga/helion

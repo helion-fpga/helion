@@ -37,11 +37,15 @@
       </p>
 
       <h2>Pipeline</h2>
-      <pre><code>helion-sv / vhdl / hls  →  HNF
-helion-pack → place → route (PathFinder)
-helion-sta (XDC) → helion-drc → helion-bits
-helion-fabric / helion-sim / helion-hw
+      <pre><code>elaborate/map (helion-sv / vhdl / hls)  →  HNF
+pack → place → route → sta → bitgen
+(+ sim / lab)
 helion-gui IdeModel paints the Session</code></pre>
+      <p>
+        Illegal order refuses. Incomplete mapping is SOFT, never PASS
+        (<code>cells=0</code> / <code>no_body</code> never closes WNS).
+        <a href="stages.html">CAD stages and SOFT law</a>.
+      </p>
 
       <h2>Crates</h2>
       <div class="table-wrap"><table>
@@ -189,6 +193,7 @@ set_property</code></pre>
       </p>
       <p class="cta">
         <a class="btn" href="use.html">Use Helion</a>
+        <a class="btn ghost" href="stages.html">Stages and SOFT ≠ PASS</a>
         <a class="btn ghost" href="roadmap.html">Roadmap 1.4 to 2.0</a>
       </p>
     </div>

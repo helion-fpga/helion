@@ -78,6 +78,8 @@ cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv</code
         <code>LED[16]=0000000111111110</code> (LED = cnt[3]).
         <code>helion doctor</code> must print the HAD path, <code>sites_clb=1024</code>,
         <code>sites_iob=32</code>, and FeatureMap lines for <code>HL10T-C32-1</code>.
+        Stages: elaborate/map → pack → place → route → sta → bitgen. SOFT ≠ PASS.
+        <a href="stages.html">CAD stages and SOFT law</a>.
       </p>
 
       <h2>Desktop IDE (macOS)</h2>
