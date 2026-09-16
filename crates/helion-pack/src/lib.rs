@@ -1,7 +1,8 @@
 //! Pack logical cells into Helion site primitives (LUTFF + IOB + MAC27 + BRAM18 + ILA).
 
-use helion_device::Device;
+use helion_device::{Device, Site};
 use helion_ir::{CellKind, Design};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Packed {
@@ -52,6 +53,28 @@ pub struct PackedMac {
     pub cell: String,
 }
 
+/// LUTFF occupancy per HAD CLB site ID (`CLB_X2Y1` → N). Derived from
+/// placement sites, not a decorative pie.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackingSummary {
+    pub sites: BTreeMap<String, usize>,
+}
+
+impl PackingSummary {
+    /// Group placed LUTFF clusters by [`Site::id`].
+    pub fn from_lutff_sites(sites: &[(Site, u8)]) -> Self {
+        let mut m = BTreeMap::new();
+        for (site, _) in sites {
+            *m.entry(site.id()).or_insert(0) += 1;
+        }
+        Self { sites: m }
+    }
+
+    pub fn lutff_in(&self, site_id: &str) -> usize {
+        self.sites.get(site_id).copied().unwrap_or(0)
+    }
+}
+
 pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     // Ibex-scale: linear scans via Design::net_on are O(n^3). Index once.
     let pins = design.pin_index();
@@ -78,7 +101,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         };
         // Comb LUTs (no FF on O) pack as LUT-only: empty ff_cell, q_net = O so
         // IOB/route match the LUT output. Registered LUTs keep the FF cluster.
-        let ff_name = d_driver.get(o_net).copied().filter(|n| !used_ff.contains(*n));
+        let ff_name = d_driver
+            .get(o_net)
+            .copied()
+            .filter(|n| !used_ff.contains(*n));
         if let Some(n) = ff_name {
             used_ff.insert(n.to_string());
         }
@@ -92,10 +118,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             }
         }
         let (ff_cell, q_net) = if let Some(n) = ff_name {
-            (
-                n.to_string(),
-                pins.net_on(n, "Q").unwrap_or("").to_string(),
-            )
+            (n.to_string(), pins.net_on(n, "Q").unwrap_or("").to_string())
         } else {
             (String::new(), o_net.to_string())
         };
@@ -229,7 +252,12 @@ mod tests {
         let mut d = Design::new("comb");
         d.add_port("a", helion_ir::PortDir::In);
         d.add_port("y", helion_ir::PortDir::Out);
-        d.add_cell("u_lut", CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+        d.add_cell(
+            "u_lut",
+            CellKind::Lut6 {
+                init: 0x5555_5555_5555_5555,
+            },
+        );
         d.add_cell("u_iob", CellKind::IobOut);
         d.connect("a", "u_lut", "I0");
         d.connect("n", "u_lut", "O");
@@ -237,7 +265,10 @@ mod tests {
         d.connect("y", "u_iob", "PAD");
         let p = pack(&d, &dev).unwrap();
         assert_eq!(p.lutffs.len(), 1);
-        assert!(p.lutffs[0].ff_cell.is_empty(), "comb LUT must not invent an FF");
+        assert!(
+            p.lutffs[0].ff_cell.is_empty(),
+            "comb LUT must not invent an FF"
+        );
         assert_eq!(p.lutffs[0].q_net, "n");
         assert_eq!(p.iobs[0].from_net, "n");
     }
@@ -261,7 +292,12 @@ mod tests {
         for i in 0..N {
             let lut = format!("lut{i}");
             let ff = format!("ff{i}");
-            d.add_cell(&lut, CellKind::Lut6 { init: 0x5555_5555_5555_5555 });
+            d.add_cell(
+                &lut,
+                CellKind::Lut6 {
+                    init: 0x5555_5555_5555_5555,
+                },
+            );
             d.add_cell(&ff, CellKind::Hff);
             d.connect("clk", &ff, "CLK");
             d.connect(format!("d{i}"), &lut, "O");
@@ -274,7 +310,9 @@ mod tests {
         let ms = t0.elapsed().as_millis();
         assert_eq!(p.lutffs.len(), N as usize, "every LUT/FF pair packs");
         assert!(
-            p.lutffs.iter().all(|l| !l.ff_cell.is_empty() && !l.q_net.is_empty()),
+            p.lutffs
+                .iter()
+                .all(|l| !l.ff_cell.is_empty() && !l.q_net.is_empty()),
             "clusters keep FF and Q net"
         );
         assert!(
@@ -290,5 +328,29 @@ mod tests {
         d.add_cell("u_bram", CellKind::Bram18);
         let p = pack(&d, &dev).unwrap();
         assert_eq!(p.brams.len(), 1);
+    }
+
+    #[test]
+    fn packing_summary_groups_lutff_sites_by_had_id() {
+        use helion_device::SiteKind;
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let s0 = Site {
+            x: dev.clb_x0,
+            y: dev.clb_y0,
+            kind: SiteKind::Clb,
+        };
+        let s1 = Site {
+            x: dev.clb_x0,
+            y: dev.clb_y0 + 1,
+            kind: SiteKind::Clb,
+        };
+        assert!(dev.contains_site(s0) && dev.contains_site(s1));
+        let sites = vec![(s0, 0), (s0, 1), (s0, 2), (s1, 0)];
+        let sum = PackingSummary::from_lutff_sites(&sites);
+        assert_eq!(sum.lutff_in(&s0.id()), 3);
+        assert_eq!(sum.lutff_in(&s1.id()), 1);
+        assert_eq!(dev.site_by_id(&s0.id()), Some(s0));
+        assert_eq!(dev.site_by_id(&s1.id()), Some(s1));
+        assert_eq!(sum.sites.len(), 2);
     }
 }
