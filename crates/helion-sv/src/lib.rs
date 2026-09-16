@@ -2437,6 +2437,29 @@ struct OwnCache {
     log: Vec<String>,
 }
 
+thread_local! {
+    /// FM-HEL-OPT-SYNTH-P0b: own_lower / stitch / hash subphase ms accumulators.
+    static SYNTH_SUB_MS: std::cell::RefCell<(u128, u128, u128)> =
+        const { std::cell::RefCell::new((0, 0, 0)) };
+}
+
+fn synth_sub_reset() {
+    SYNTH_SUB_MS.with(|c| *c.borrow_mut() = (0, 0, 0));
+}
+
+fn synth_sub_add(own: u128, stitch: u128, hash: u128) {
+    SYNTH_SUB_MS.with(|c| {
+        let mut t = c.borrow_mut();
+        t.0 = t.0.saturating_add(own);
+        t.1 = t.1.saturating_add(stitch);
+        t.2 = t.2.saturating_add(hash);
+    });
+}
+
+fn synth_sub_snapshot() -> (u128, u128, u128) {
+    SYNTH_SUB_MS.with(|c| *c.borrow())
+}
+
 fn cache() -> &'static Mutex<OwnCache> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Mutex<OwnCache>> = OnceLock::new();
@@ -2623,7 +2646,26 @@ fn hash_own(rtl: &Rtl) -> u64 {
     h.feed(&rtl.module);
     for (n, dir, w) in &rtl.ports {
         h.feed(n);
-        h.feed(&format!("{dir:?}:{w}"));
+        // Same bytes as `{dir:?}:{w}` without allocating a String per port.
+        h.feed(match dir {
+            PortDir::In => "In",
+            PortDir::Out => "Out",
+            PortDir::Inout => "Inout",
+        });
+        h.feed(":");
+        let mut buf = [0u8; 20];
+        let mut x = *w;
+        if x == 0 {
+            h.feed("0");
+        } else {
+            let mut i = buf.len();
+            while x > 0 {
+                i -= 1;
+                buf[i] = b'0' + (x % 10) as u8;
+                x /= 10;
+            }
+            h.feed(std::str::from_utf8(&buf[i..]).unwrap());
+        }
     }
     for s in &rtl.signals {
         h.feed(&s.name);
@@ -2670,47 +2712,76 @@ fn hash_own(rtl: &Rtl) -> u64 {
     h.h
 }
 
-fn lower_own_arc(rtl: &Rtl) -> Result<Arc<Design>, String> {
+fn own_cache_key(rtl: &Rtl) -> String {
+    let t0 = std::time::Instant::now();
     let h = hash_own(rtl);
-    let key = format!("{}:{h:x}", rtl.module);
-    if let Ok(mut c) = cache().lock() {
-        if let Some(hit) = c.by_key.get(&key).cloned() {
-            let line = format!("incremental reused module={}", rtl.module);
-            eprintln!("{line}");
-            c.log.push(line);
-            return Ok(hit);
-        }
-    }
-    let line = format!("incremental rebuilt module={}", rtl.module);
+    synth_sub_add(0, 0, t0.elapsed().as_millis());
+    format!("{}:{h:x}", rtl.module)
+}
+
+fn own_cache_get(key: &str, module: &str) -> Option<Arc<Design>> {
+    let Ok(mut c) = cache().lock() else {
+        return None;
+    };
+    let hit = c.by_key.get(key).cloned()?;
+    let line = format!("incremental reused module={module}");
+    eprintln!("{line}");
+    c.log.push(line);
+    Some(hit)
+}
+
+fn own_cache_note_rebuilt(module: &str) {
+    let line = format!("incremental rebuilt module={module}");
     eprintln!("{line}");
     if let Ok(mut c) = cache().lock() {
         c.log.push(line);
     }
-    // Leaves have no insts — synth_rtl does not observe them. Hierarchical
-    // modules still drop insts so child instances cannot leak into own-logic.
-    let d = if rtl.insts.is_empty() {
-        synth_rtl(rtl)?
-    } else {
-        let own = Rtl {
-            module: rtl.module.clone(),
-            ports: rtl.ports.clone(),
-            signals: rtl.signals.clone(),
-            nbas: rtl.nbas.clone(),
-            assigns: rtl.assigns.clone(),
-            insts: Vec::new(),
-            params: rtl.params.clone(),
-            toks: Vec::new(),
-            mem_inits: rtl.mem_inits.clone(),
-        };
-        synth_rtl(&own)?
-    };
-    let arc = Arc::new(d);
-    if let Ok(mut c) = cache().lock() {
-        c.by_key.insert(key, Arc::clone(&arc));
-    }
-    Ok(arc)
 }
 
+fn own_cache_insert(key: String, arc: Arc<Design>) {
+    if let Ok(mut c) = cache().lock() {
+        c.by_key.insert(key, arc);
+    }
+}
+
+enum OwnForStitch {
+    /// Cache hit: stitch by shared ref (one-pass prefix copy).
+    Cached(Arc<Design>),
+    /// Cache miss: move-stitch in place; slim clone already stored in OwnCache.
+    Fresh(Design),
+}
+
+/// Lower own-logic for hierarchy stitch. Fresh misses return an owned Design so
+/// the common single-instantiation path can rename+append without recloning
+/// every cell into the parent. `synth_rtl` ignores `insts`.
+///
+/// Large Fresh designs (typical single-instantiation Ibex leaves) skip the
+/// OwnCache `clone_data` — re-instantiation of >512-cell own-logic is rare and
+/// would re-synth; small cells (csr/buf/counter) stay cached for reuse.
+fn lower_own_for_stitch(rtl: &Rtl) -> Result<OwnForStitch, String> {
+    let key = own_cache_key(rtl);
+    if let Some(hit) = own_cache_get(&key, &rtl.module) {
+        return Ok(OwnForStitch::Cached(hit));
+    }
+    own_cache_note_rebuilt(&rtl.module);
+    let t0 = std::time::Instant::now();
+    let d = synth_rtl(rtl)?;
+    synth_sub_add(t0.elapsed().as_millis(), 0, 0);
+    if d.cells.len() <= 512 {
+        own_cache_insert(key, Arc::new(d.clone_data()));
+    }
+    Ok(OwnForStitch::Fresh(d))
+}
+
+#[allow(dead_code)] // tests / leftover Arc leaf helpers
+fn lower_own_arc(rtl: &Rtl) -> Result<Arc<Design>, String> {
+    match lower_own_for_stitch(rtl)? {
+        OwnForStitch::Cached(a) => Ok(a),
+        OwnForStitch::Fresh(d) => Ok(Arc::new(d)),
+    }
+}
+
+#[allow(dead_code)]
 fn design_from_arc(arc: Arc<Design>) -> Design {
     match Arc::try_unwrap(arc) {
         Ok(d) => d,
@@ -2722,8 +2793,24 @@ fn design_from_arc(arc: Arc<Design>) -> Design {
     }
 }
 
+/// First-use keeps the indexed Design; only a slim `clone_data` goes into the
+/// process OwnCache. Cache hits rebuild indexes once. Avoids the old path where
+/// inserting Arc before `try_unwrap` forced clone+rebuild on every miss.
 fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
-    Ok(design_from_arc(lower_own_arc(rtl)?))
+    let key = own_cache_key(rtl);
+    if let Some(hit) = own_cache_get(&key, &rtl.module) {
+        let mut d = hit.clone_data();
+        d.rebuild_indexes();
+        return Ok(d);
+    }
+    own_cache_note_rebuilt(&rtl.module);
+    let t0 = std::time::Instant::now();
+    let d = synth_rtl(rtl)?;
+    synth_sub_add(t0.elapsed().as_millis(), 0, 0);
+    if d.cells.len() <= 512 {
+        own_cache_insert(key, Arc::new(d.clone_data()));
+    }
+    Ok(d)
 }
 
 fn inst_port_map<'a>(
@@ -2801,8 +2888,11 @@ fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
 
 /// Hierarchy stitch that consumes `child` (rename in place + append). Avoids
 /// cloning a 13k-cell Ibex core at every wrapper level.
+#[allow(dead_code)]
 fn stitch_child_owned(dst: &mut Design, mut child: Design, inst: &Inst) {
     let prefix = format!("{}_", inst.name);
+    // Resolve port map before mutably renaming child (borrowck). Parent already
+    // keyed the instance conns; this is one small map per stitch, not per-net.
     let port_map: HashMap<String, String> = inst_port_map(&child, inst)
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2835,9 +2925,9 @@ fn stitch_child_owned(dst: &mut Design, mut child: Design, inst: &Inst) {
     }
 }
 
-fn stitch_assembled_child(
+fn stitch_propagate_attrs(
     d: &mut Design,
-    child: Design,
+    child: &Design,
     inst: &Inst,
     parent_name: &str,
     parent_has_hff: &mut bool,
@@ -2861,7 +2951,6 @@ fn stitch_assembled_child(
     for (i, key) in soft_keys.iter().enumerate() {
         soft_vals[i] = child.attrs.get(key) == Some("1");
     }
-    stitch_child_owned(d, child, inst);
     if child_has_hff {
         *parent_has_hff = true;
     }
@@ -2896,20 +2985,282 @@ fn stitch_assembled_child(
     }
 }
 
-fn assemble_module(
+#[allow(dead_code)]
+fn stitch_assembled_child(
+    d: &mut Design,
+    child: Design,
+    inst: &Inst,
+    parent_name: &str,
+    parent_has_hff: &mut bool,
+) {
+    stitch_propagate_attrs(d, &child, inst, parent_name, parent_has_hff);
+    let t0 = std::time::Instant::now();
+    stitch_child_owned(d, child, inst);
+    synth_sub_add(0, t0.elapsed().as_millis(), 0);
+}
+
+/// Cache-hit / Arc leaf path: one-pass prefix copy, no clone_data+rebuild+rename.
+#[allow(dead_code)]
+fn stitch_assembled_child_ref(
+    d: &mut Design,
+    child: &Design,
+    inst: &Inst,
+    parent_name: &str,
+    parent_has_hff: &mut bool,
+) {
+    stitch_propagate_attrs(d, child, inst, parent_name, parent_has_hff);
+    let t0 = std::time::Instant::now();
+    stitch_child(d, child, inst);
+    synth_sub_add(0, t0.elapsed().as_millis(), 0);
+}
+
+/// Map instance connections to absolute net names already present (or about to
+/// be present) in `dst`. `parent_prefix` is the hierarchical prefix of the
+/// parent module's locals; `parent_ports` maps parent port → dst net.
+fn abs_inst_port_map(
+    child: &Design,
+    inst: &Inst,
+    parent_prefix: &str,
+    parent_ports: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let raw = inst_port_map(child, inst);
+    let mut out: HashMap<String, String> = HashMap::with_capacity(raw.len());
+    for (port, net) in raw {
+        let abs = if let Some(p) = parent_ports.get(net) {
+            p.clone()
+        } else if parent_prefix.is_empty() {
+            net.to_string()
+        } else {
+            let mut s = String::with_capacity(parent_prefix.len() + net.len());
+            s.push_str(parent_prefix);
+            s.push_str(net);
+            s
+        };
+        out.insert(port.to_string(), abs);
+    }
+    out
+}
+
+fn stitch_own_into(
+    dst: &mut Design,
+    own: &Design,
+    prefix: &str,
+    port_map: &HashMap<String, String>,
+) {
+    let t0 = std::time::Instant::now();
+    for c in &own.cells {
+        let mut name = String::with_capacity(prefix.len() + c.name.len());
+        name.push_str(prefix);
+        name.push_str(&c.name);
+        dst.push_cell(Cell {
+            name,
+            kind: c.kind.clone(),
+            attrs: c.attrs.clone(),
+        });
+    }
+    for n in &own.nets {
+        let abs_name = if let Some(p) = port_map.get(n.name.as_str()) {
+            p.clone()
+        } else if prefix.is_empty() {
+            n.name.clone()
+        } else {
+            let mut s = String::with_capacity(prefix.len() + n.name.len());
+            s.push_str(prefix);
+            s.push_str(&n.name);
+            s
+        };
+        let endpoints = n
+            .endpoints
+            .iter()
+            .map(|e| {
+                let mut cell = String::with_capacity(prefix.len() + e.cell.len());
+                cell.push_str(prefix);
+                cell.push_str(&e.cell);
+                Endpoint {
+                    cell,
+                    pin: e.pin.clone(),
+                }
+            })
+            .collect();
+        dst.merge_net(Net {
+            name: abs_name,
+            endpoints,
+            attrs: n.attrs.clone(),
+        });
+    }
+    synth_sub_add(0, t0.elapsed().as_millis(), 0);
+}
+
+fn mark_debug_prefixed(dst: &mut Design, proto: &Rtl, prefix: &str) {
+    for s in &proto.signals {
+        if !s.mark_debug {
+            continue;
+        }
+        let n = if prefix.is_empty() {
+            s.name.clone()
+        } else {
+            format!("{prefix}{}", s.name)
+        };
+        if dst.net(&n).is_some() {
+            let _ = dst.mark_debug(&n);
+        }
+        if s.width > 1 {
+            for b in 0..s.width {
+                let bn = bit_name(&s.name, s.width, b);
+                let abs = if prefix.is_empty() {
+                    bn
+                } else {
+                    format!("{prefix}{bn}")
+                };
+                if dst.net(&abs).is_some() {
+                    let _ = dst.mark_debug(&abs);
+                }
+            }
+        }
+    }
+}
+
+/// Single-pass hierarchy emit: each own-logic cell is named once with its final
+/// hierarchical prefix and appended into `dst`. Avoids the old O(depth) restitch
+/// that re-prefixed every descendant at each ancestor level.
+fn soft_keys() -> [&'static str; 7] {
+    [
+        "WIDE_CONE",
+        "ASSIGN_NOT_LOWERED",
+        "GENERATE_NOT_LOWERED",
+        "WIDTH_OVERFLOW",
+        "WORD_PIPELINE_CAP",
+        "FLATTEN_CAP",
+        "GATE_PRIMITIVE",
+    ]
+}
+
+#[derive(Clone, Copy, Default)]
+struct SoftSummary {
+    hff: bool,
+    soft: [bool; 7],
+    clock_mux: bool,
+    clock_gate: bool,
+    sim_only: bool,
+}
+
+fn soft_from_design(d: &Design) -> SoftSummary {
+    let keys = soft_keys();
+    let mut soft = [false; 7];
+    for (i, k) in keys.iter().enumerate() {
+        soft[i] = d.attrs.get(k) == Some("1");
+    }
+    SoftSummary {
+        hff: d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
+        soft,
+        clock_mux: d.attrs.get("CLOCK_MUX") == Some("1"),
+        clock_gate: d.attrs.get("CLOCK_GATE") == Some("1"),
+        sim_only: d.attrs.get("SIM_ONLY") == Some("1"),
+    }
+}
+
+/// Merge child soft into parent summary (old stitch_propagate_attrs semantics).
+fn merge_child_soft(
+    parent: &mut SoftSummary,
+    child: SoftSummary,
+    parent_name: &str,
+    inst: &Inst,
+) {
+    let wrap = parent.hff;
+    if child.hff {
+        parent.hff = true;
+    }
+    if child.clock_mux {
+        parent.clock_mux = true;
+    }
+    if child.clock_gate {
+        parent.clock_gate = true;
+    }
+    if child.sim_only {
+        if wrap {
+            eprintln!(
+                "diagnostic child_soft_incomplete module={} child={} (sim_only named miss; parent wrap keeps closed WNS on mapped paths)",
+                parent_name, inst.module
+            );
+        } else {
+            parent.sim_only = true;
+        }
+    }
+    let child_soft = child.soft.iter().any(|b| *b);
+    if child_soft && wrap {
+        eprintln!(
+            "diagnostic child_soft_incomplete module={} child={} (named miss; parent wrap keeps closed WNS on mapped paths)",
+            parent_name, inst.module
+        );
+        return;
+    }
+    for i in 0..7 {
+        if child.soft[i] {
+            parent.soft[i] = true;
+        }
+    }
+}
+
+fn apply_soft_to_design(d: &mut Design, s: &SoftSummary) {
+    let keys = soft_keys();
+    for (k, on) in keys.iter().zip(s.soft.iter()) {
+        if *on {
+            d.attrs.set(*k, "1");
+        }
+    }
+    if s.clock_mux {
+        d.attrs.set("CLOCK_MUX", "1");
+    }
+    if s.clock_gate {
+        d.attrs.set("CLOCK_GATE", "1");
+    }
+    if s.sim_only {
+        d.attrs.set("SIM_ONLY", "1");
+        d.attrs.set("NO_BODY", "1");
+    }
+}
+
+/// Single-pass hierarchy emit: each own-logic cell is named once with its final
+/// hierarchical prefix and appended into `dst`. Avoids the old O(depth) restitch
+/// that re-prefixed every descendant at each ancestor level.
+fn emit_module_into(
     mods: &HashMap<String, Rtl>,
     name: &str,
+    prefix: &str,
+    port_map: &HashMap<String, String>,
+    dst: &mut Design,
     visiting: &mut HashSet<String>,
-) -> Result<Design, String> {
+) -> Result<SoftSummary, String> {
     let proto = mods
         .get(name)
         .ok_or_else(|| format!("unknown module {name}"))?;
     if !visiting.insert(name.to_string()) {
-        return lower_own_cached(proto);
+        let own = lower_own_cached(proto)?;
+        let summary = soft_from_design(&own);
+        stitch_own_into(dst, &own, prefix, port_map);
+        visiting.remove(name);
+        return Ok(summary);
     }
-    let mut d = design_from_arc(lower_own_arc(proto)?);
-    d.name = proto.module.clone();
-    let mut parent_has_hff = d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff));
+    let own_hit = lower_own_for_stitch(proto)?;
+    let own_ref: &Design = match &own_hit {
+        OwnForStitch::Fresh(d) => d,
+        OwnForStitch::Cached(a) => a.as_ref(),
+    };
+    let mut summary = soft_from_design(own_ref);
+    stitch_own_into(dst, own_ref, prefix, port_map);
+    mark_debug_prefixed(dst, proto, prefix);
+
+    let mut self_ports: HashMap<String, String> = HashMap::new();
+    for (pname, _, _) in &proto.ports {
+        if let Some(p) = port_map.get(pname) {
+            self_ports.insert(pname.clone(), p.clone());
+        } else if prefix.is_empty() {
+            self_ports.insert(pname.clone(), pname.clone());
+        } else {
+            self_ports.insert(pname.clone(), format!("{prefix}{pname}"));
+        }
+    }
+
     for inst in &proto.insts {
         if !mods.contains_key(&inst.module) {
             note_skip(format!(
@@ -2918,57 +3269,43 @@ fn assemble_module(
             ));
             continue;
         }
-        // Ibex-scale trees: keep already-lowered cells, do not copy the rest.
-        // Cap is hierarchy stitch budget (not die/LUTFF capacity). Affinity still
-        // soft-holds place at 8192; raising this lets deeper core children stitch
-        // after if_stage/decode cones grow — prefer lowering over skipping them.
-        // Raised with wire-mux concat lowers (ALU result_o / compressed instr_o)
-        // after inside + scoped enum + const-minus. Affinity soft-hold stays
-        // 8192; this is stitch budget only — not die/LUTFF capacity.
-        if d.cells.len() >= 160_000 {
+        if dst.cells.len() >= 160_000 {
             note_skip(format!(
                 "diagnostic assemble_cap module={} inst={} child={} (hierarchy cap; not a LUT)",
                 name, inst.name, inst.module
             ));
             continue;
         }
-        // Pin-wrap mid-suite: parent already has closed FF paths (heartbeat)
-        // before stitching the child. Soft child cones stay named misses;
-        // prefer closed WNS on wrap heartbeat / mapped fabric.
         let child_proto = mods.get(&inst.module).expect("child");
         let ov = inst_overrides(inst, child_proto);
-        if ov.is_empty() && child_proto.insts.is_empty() {
-            // Leaf, no param override: stitch from the cached Arc (no Design clone).
-            let child_arc = if visiting.insert(inst.module.clone()) {
-                let a = lower_own_arc(child_proto)?;
-                visiting.remove(&inst.module);
-                a
-            } else {
-                lower_own_arc(child_proto)?
+        let child_prefix = {
+            let mut s = String::with_capacity(prefix.len() + inst.name.len() + 1);
+            s.push_str(prefix);
+            s.push_str(&inst.name);
+            s.push('_');
+            s
+        };
+
+        let child_sum = if ov.is_empty() && child_proto.insts.is_empty() {
+            let child = lower_own_for_stitch(child_proto)?;
+            let child_ref: &Design = match &child {
+                OwnForStitch::Fresh(d) => d,
+                OwnForStitch::Cached(a) => a.as_ref(),
             };
-            stitch_assembled_child(
-                &mut d,
-                design_from_arc(child_arc),
-                inst,
-                name,
-                &mut parent_has_hff,
-            );
-            continue;
-        }
-        let child = if ov.is_empty() || !child_proto.insts.is_empty() {
-            assemble_module(mods, &inst.module, visiting)?
-        } else {
-            // Leaf + #(.N(4)): re-elaborate so the override unrolls. Do not
-            // flatten the parent tree (Ibex skip_flatten still holds).
+            let cmap = abs_inst_port_map(child_ref, inst, prefix, &self_ports);
+            let cs = soft_from_design(child_ref);
+            stitch_own_into(dst, child_ref, &child_prefix, &cmap);
+            cs
+        } else if !ov.is_empty() && child_proto.insts.is_empty() {
             match elaborate_rtl(child_proto, &ov) {
                 Ok(elab) => {
-                    let mut cd = lower_own_cached(&elab)?;
-                    cd.name = elab.module.clone();
-                    cd
+                    let cd = lower_own_cached(&elab)?;
+                    let cmap = abs_inst_port_map(&cd, inst, prefix, &self_ports);
+                    let cs = soft_from_design(&cd);
+                    stitch_own_into(dst, &cd, &child_prefix, &cmap);
+                    cs
                 }
                 Err(e) => {
-                    // Do not assemble the leaf without overrides — that would
-                    // map default parameters as if #(.P(v)) had been applied.
                     note_skip(format!(
                         "diagnostic leaf_param_elab module={} inst={} child={} (override re-elab failed; not assembled without overrides; {e})",
                         name, inst.name, inst.module
@@ -2976,28 +3313,55 @@ fn assemble_module(
                     continue;
                 }
             }
-        };
-        stitch_assembled_child(&mut d, child, inst, name, &mut parent_has_hff);
-    }
-    // Preserve (* mark_debug *) on parent wires driven by instance ports
-    // (e.g. complex.x ← xor4.y) — lower_own never sees those as comb_bits.
-    for s in &proto.signals {
-        if !s.mark_debug {
-            continue;
-        }
-        if d.net(&s.name).is_some() {
-            let _ = d.mark_debug(&s.name);
-        }
-        if s.width > 1 {
-            for b in 0..s.width {
-                let bn = bit_name(&s.name, s.width, b);
-                if d.net(&bn).is_some() {
-                    let _ = d.mark_debug(&bn);
+        } else {
+            let port_shell = {
+                let mut shell = Design::new(&child_proto.module);
+                for (n, dir, _) in &child_proto.ports {
+                    shell.add_port(n, *dir);
                 }
-            }
-        }
+                shell
+            };
+            let cmap = abs_inst_port_map(&port_shell, inst, prefix, &self_ports);
+            emit_module_into(
+                mods,
+                &inst.module,
+                &child_prefix,
+                &cmap,
+                dst,
+                visiting,
+            )?
+        };
+        merge_child_soft(&mut summary, child_sum, name, inst);
     }
     visiting.remove(name);
+    Ok(summary)
+}
+
+fn assemble_module(
+    mods: &HashMap<String, Rtl>,
+    name: &str,
+    visiting: &mut HashSet<String>,
+) -> Result<Design, String> {
+    let proto = mods
+        .get(name)
+        .ok_or_else(|| format!("unknown module {name}"))?;
+    // Root: identity port map; empty prefix. Single-pass emit into one Design.
+    let mut port_map: HashMap<String, String> = HashMap::new();
+    for (n, _, _) in &proto.ports {
+        port_map.insert(n.clone(), n.clone());
+    }
+    let mut d = Design::new(&proto.module);
+    for (n, dir, _) in &proto.ports {
+        let dir = if matches!(dir, PortDir::Inout) {
+            PortDir::In
+        } else {
+            *dir
+        };
+        d.add_port(n, dir);
+    }
+    let summary = emit_module_into(mods, name, "", &port_map, &mut d, visiting)?;
+    apply_soft_to_design(&mut d, &summary);
+    d.name = proto.module.clone();
     Ok(d)
 }
 
@@ -14435,6 +14799,7 @@ fn synth_from_parsed_top(
     };
     let t_syn = std::time::Instant::now();
     let t_flat = std::time::Instant::now();
+    synth_sub_reset();
     // Leaf designs (no instances) still flatten + synth_rtl, so gold counter
     // mapping is the same call. Fat instance trees must not flatten: that
     // re-enters uncalled functions and copies every child into one Rtl.
@@ -14471,10 +14836,14 @@ fn synth_from_parsed_top(
         (nbas, assigns, d)
     };
     d.name = top_name.clone();
+    let (own_ms, stitch_ms, hash_ms) = synth_sub_snapshot();
     eprintln!(
         "hang_diag synth_rtl cells={} ms={}",
         d.cells.len(),
         t_syn.elapsed().as_millis()
+    );
+    eprintln!(
+        "hang_diag synth_sub own_ms={own_ms} stitch_ms={stitch_ms} hash_ms={hash_ms}"
     );
     let n_logic = d
         .cells
