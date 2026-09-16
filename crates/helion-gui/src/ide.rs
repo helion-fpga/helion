@@ -10,7 +10,7 @@
 use crate::{tcl_eval, GpuiShell};
 use helion_bd::{emit_sv, validate, BlockDesign};
 use helion_debug::{insert_arm_capture, insert_arm_capture_deep, IlaArmConfig, IlaCapture, IlaCaptureDeep, IlaTriggerKind};
-use helion_device::{Device, Far, SiteKind};
+use helion_device::{Device, Far, Site, SiteKind};
 use helion_drc::{check_placed, check_routed, Drc, DrcSeverity};
 use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ir::{CellKind, Design, PortDir};
@@ -2209,7 +2209,13 @@ pub struct DeviceSiteView {
 impl DeviceSiteView {
     /// HAD site name as painted on the Device drawing (`CLB_X2Y1`, `IOB_X5Y0`).
     pub fn site_name(&self) -> String {
-        DeviceView::site_name(self.kind, self.x, self.y)
+        // Live HAD Site::id (FM-HEL-L2-UI) — same CLB_/IOB_ form as DeviceView::site_name.
+        Site {
+            x: self.x,
+            y: self.y,
+            kind: self.kind,
+        }
+        .id()
     }
 
     /// Occupancy glyph for the Device floorplan map (not a pin-name dump).
@@ -2508,14 +2514,7 @@ impl DeviceView {
     }
 
     pub fn site_name(kind: SiteKind, x: u32, y: u32) -> String {
-        let p = match kind {
-            SiteKind::Clb => "CLB",
-            SiteKind::Iob => "IOB",
-            SiteKind::Bram => "BRAM",
-            SiteKind::Dsp => "DSP",
-            SiteKind::Clk => "CLK",
-        };
-        format!("{p}_X{x}Y{y}")
+        Site { x, y, kind }.id()
     }
 }
 
@@ -5020,6 +5019,85 @@ impl IdeModel {
         self.steps[step.index()]
     }
 
+    /// FM-HEL-L1: highest completed Session stage (local mirror until Proj tips).
+    pub fn session_stage(&self) -> crate::learner_l1::SessionStage {
+        crate::learner_l1::session_stage_of(&self.shell.session, self.timing.is_some())
+    }
+
+    /// FM-HEL-L1: stage ready strip (local mirror).
+    pub fn stage_status(&self) -> Vec<crate::learner_l1::StageStatus> {
+        crate::learner_l1::stage_status_of(&self.shell.session, self.timing.is_some())
+    }
+
+    /// FM-HEL-L1: constraint provenance token for the status rail.
+    pub fn constraint_provenance(&self) -> crate::learner_l1::ConstraintProvenance {
+        crate::learner_l1::constraint_provenance_of(self.user_sdc, &self.timing_honesty_label())
+    }
+
+    /// FM-HEL-L2: HighlightSet after path select (HAD resolve_path_sites + nets).
+    pub fn highlight_set(&self) -> crate::learner_l2::HighlightSet {
+        let Some(idx) = self.selected_timing_path else {
+            // Fall back to current schematic/device highlights.
+            let mut sites: Vec<String> = self
+                .device
+                .sites
+                .iter()
+                .filter(|s| s.highlighted)
+                .map(|s| s.site_name())
+                .collect();
+            sites.sort();
+            sites.dedup();
+            let mut nets: Vec<String> = self.schematic.highlight_nets.iter().cloned().collect();
+            nets.sort();
+            return crate::learner_l2::HighlightSet { sites, nets };
+        };
+        let Some(path) = self.timing_paths.get(idx) else {
+            return crate::learner_l2::HighlightSet::default();
+        };
+        let Ok(dev) = self.device() else {
+            return crate::learner_l2::HighlightSet::default();
+        };
+        let mut endpoints = Vec::new();
+        for cell in &path.cells {
+            if let Some(sv) = self.device.occupant_of(cell) {
+                endpoints.push((
+                    cell.clone(),
+                    Site {
+                        x: sv.x,
+                        y: sv.y,
+                        kind: sv.kind,
+                    },
+                ));
+            } else if !path.pins.is_empty() {
+                // Location filled by fill_timing_path_locations (HAD Site::id string).
+                if let Some(pin) = path.pins.iter().find(|p| p.cell == *cell) {
+                    if let Some(site) = Site::parse_id(&pin.location) {
+                        endpoints.push((cell.clone(), site));
+                    }
+                }
+            }
+        }
+        crate::learner_l2::highlight_set_from_path(&dev, &endpoints, &path.nets).unwrap_or_else(
+            |_| crate::learner_l2::HighlightSet {
+                sites: endpoints.iter().map(|(_, s)| s.id()).collect(),
+                nets: path.nets.clone(),
+            },
+        )
+    }
+
+    /// Headless dump of the current HighlightSet.
+    pub fn highlight_set_dump(&self) -> String {
+        self.highlight_set().dump()
+    }
+
+    /// FM-HEL-L2: English packing lines from placed LUTFF sites (`CLB_XxYy: N LUTFF`).
+    pub fn packing_summary_english(&self) -> Vec<String> {
+        match self.shell.session.placed.as_ref() {
+            Some(p) => crate::learner_l2::packing_summary_english(p),
+            None => Vec::new(),
+        }
+    }
+
     /// Real bitstream hash — `None` until `write_bitstream` actually ran.
     pub fn bitstream_hash(&self) -> Option<u32> {
         self.shell.session.blinky_hash()
@@ -6558,8 +6636,9 @@ impl IdeModel {
         Some(self.exec(&cmd))
     }
 
-    /// Status bar + Messages for Open failures (not a silent `Err(_)`).
-    fn surface_open_error(&mut self, id: &str, text: &str) {
+    /// Status bar + Messages for Open/Implement/stage failures (never silent).
+    /// Shared surface so Implement matches Open parity (Messages tab + Failed chip).
+    fn surface_stage_error(&mut self, id: &str, text: &str) {
         self.status = format!("{id}: {text}");
         let already = self.messages.iter().rev().take(4).any(|m| {
             m.severity == MsgSeverity::Error && m.text == text
@@ -6578,6 +6657,11 @@ impl IdeModel {
             });
         }
         self.bottom_tab = BottomTab::Messages;
+    }
+
+    /// Alias kept for Open call sites / older tests.
+    fn surface_open_error(&mut self, id: &str, text: &str) {
+        self.surface_stage_error(id, text);
     }
 
     /// Add an RTL source and elaborate it (Vivado "Add Sources" + synth).
@@ -7025,31 +7109,33 @@ impl IdeModel {
 
     /// Why a flow step is illegal right now (`Place first`). None = enabled.
     pub fn step_blocked(&self, step: FlowStep) -> Option<&'static str> {
+        // Prerequisite tips for dimmed chips. Substrings "Place first" / "Synthesize first" /
+        // "Route first" stay stable for tests; STAGE_PREREQ mirrors Proj L1 StageError.code.
         match step {
             FlowStep::Synthesis => {
                 if self.tree.sources.is_empty() {
-                    Some("Open a source first")
+                    Some("Open a source first (prerequisite)")
                 } else {
                     None
                 }
             }
             FlowStep::Opt | FlowStep::Place => {
                 if self.shell.session.design.is_none() {
-                    Some("Synthesize first")
+                    Some("Synthesize first (prerequisite: Elaborated; code=STAGE_PREREQ)")
                 } else {
                     None
                 }
             }
             FlowStep::Route => {
                 if self.shell.session.placed.is_none() {
-                    Some("Place first")
+                    Some("Place first (prerequisite: Placed; code=STAGE_PREREQ)")
                 } else {
                     None
                 }
             }
             FlowStep::Bitstream => {
                 if self.shell.session.routed.is_none() {
-                    Some("Route first")
+                    Some("Route first (prerequisite: Routed; code=STAGE_PREREQ)")
                 } else {
                     None
                 }
@@ -7059,6 +7145,15 @@ impl IdeModel {
 
     /// Primary Implement: Synthesis → Opt → Place → Route. Bitstream is secondary.
     pub fn implement(&mut self) -> Result<String, String> {
+        let r = self.implement_inner();
+        if let Err(e) = &r {
+            // Open parity: status + Messages tab + Failed chip (never silent).
+            self.surface_stage_error("implement", e);
+        }
+        r
+    }
+
+    fn implement_inner(&mut self) -> Result<String, String> {
         let mut last = String::new();
         for step in [FlowStep::Synthesis, FlowStep::Opt, FlowStep::Place, FlowStep::Route] {
             if self.step_state(step) != StepState::Done {
@@ -8763,15 +8858,23 @@ impl IdeModel {
         } else {
             self.highlight_device_routes();
         }
+        // FM-HEL-L2: verify path sites through live HAD resolve (sites/nets only; PIP later).
+        let hs = self.highlight_set();
+        let hl_note = if hs.sites.is_empty() {
+            String::new()
+        } else {
+            format!(" hl_sites={} hl_nets={}", hs.sites.len(), hs.nets.len())
+        };
         Ok(format!(
-            "timing_path {} start={} end={} cells={} nets={} slack_ps={} {}",
+            "timing_path {} start={} end={} cells={} nets={} slack_ps={} {}{}",
             path.name,
             path.startpoint,
             path.endpoint,
             path.cells.join(","),
             path.nets.join(","),
             path.slack_ps,
-            self.schematic_drawing_text()
+            self.schematic_drawing_text(),
+            hl_note
         ))
     }
 
@@ -13266,6 +13369,12 @@ impl IdeModel {
         for r in &rows {
             s.push('\n');
             s.push_str(&r.row_text());
+        }
+        // FM-HEL-L2: English packing from Placed.lutff_sites (HAD Site::id).
+        for line in self.packing_summary_english() {
+            s.push('\n');
+            s.push_str("packing ");
+            s.push_str(&line);
         }
         s
     }
@@ -36877,4 +36986,126 @@ endmodule
             ide.tree.sources
         );
     }
+
+    // --- FM-HEL-L1-GUI + FM-HEL-L2-UI ---
+
+    #[test]
+    fn learner_l1_stage_mirrors_session_after_open_implement_counter_rtl_only() {
+        let mut ide = IdeModel::new();
+        assert_eq!(ide.session_stage(), crate::learner_l1::SessionStage::Idle);
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        // Implement runs through Route; report_timing / sync fills timing → Sta (or Routed+).
+        let stage = ide.session_stage();
+        assert!(
+            matches!(
+                stage,
+                crate::learner_l1::SessionStage::Routed
+                    | crate::learner_l1::SessionStage::Sta
+                    | crate::learner_l1::SessionStage::Bitgen
+            ),
+            "expected Routed/Sta/Bitgen after implement, got {stage}"
+        );
+        assert_eq!(
+            ide.constraint_provenance(),
+            crate::learner_l1::ConstraintProvenance::DefaultPeriod,
+            "rtl-only temp has no sibling SDC"
+        );
+        // Gold empty-XDC: honesty carries WNS_PS=9640 once timing has run.
+        if ide.timing.is_none() {
+            let _ = ide.exec("report_timing");
+        }
+        let honest = ide.timing_honesty_label();
+        assert!(
+            honest.contains("9640"),
+            "empty-XDC counter gold WNS_PS=9640: {honest}"
+        );
+        assert!(
+            honest.starts_with("WNS_PS=9640") || honest.contains("WNS_PS=9640"),
+            "{honest}"
+        );
+        assert_eq!(ide.wns_ps(), Some(9640));
+        assert_eq!(ide.step_state(FlowStep::Route), StepState::Done);
+        assert_eq!(ide.step_state(FlowStep::Place), StepState::Done);
+    }
+
+    #[test]
+    fn learner_l1_illegal_route_before_place_failed_prereq() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
+        let tip = ide.step_blocked(FlowStep::Route).expect("Route blocked before Place");
+        assert!(tip.contains("Place first"), "{tip}");
+        assert!(tip.contains("STAGE_PREREQ"), "{tip}");
+        let e = ide.run_step(FlowStep::Route).unwrap_err();
+        assert!(e.contains("Place first"), "{e}");
+        assert_eq!(ide.step_state(FlowStep::Route), StepState::Failed);
+        assert!(
+            ide.messages.iter().any(|m| {
+                m.severity == MsgSeverity::Error && m.text.contains("Place first")
+            }),
+            "Messages must surface prereq: {:?}",
+            ide.messages
+        );
+    }
+
+    #[test]
+    fn learner_l2_highlight_set_after_implement_select_path() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        if ide.timing.is_none() {
+            let _ = ide.exec("report_timing");
+        }
+        let out = ide.select_timing_path("0").expect("select path 0");
+        assert!(out.contains("timing_path"), "{out}");
+        let hs = ide.highlight_set();
+        assert!(!hs.sites.is_empty(), "sites: {hs:?}");
+        assert!(!hs.nets.is_empty(), "nets: {hs:?}");
+        for s in &hs.sites {
+            assert!(
+                crate::learner_l2::looks_like_had_site(s),
+                "HAD site id: {s}"
+            );
+            assert!(
+                s.starts_with("CLB_") || s.starts_with("IOB_"),
+                "CLB_/IOB_ pattern: {s}"
+            );
+            // Live HAD: site must exist on loaded part.
+            let dev = ide.device().unwrap();
+            assert!(dev.site_by_id(s).is_some(), "{s} in HAD");
+        }
+        let dump = ide.highlight_set_dump();
+        assert!(dump.contains("SITE="), "{dump}");
+        assert!(
+            ide.schematic_drawing_text().contains(":hl")
+                || ide.device.sites.iter().any(|s| s.highlighted),
+            "schematic or device must highlight"
+        );
+    }
+
+    #[test]
+    fn learner_l2_packing_summary_english_sums_to_lutff_sites() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example_rtl_only("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        let placed = ide.session().placed.as_ref().expect("placed");
+        let n = placed.lutff_sites.len();
+        assert!(n > 0, "counter places LUTFF");
+        let lines = ide.packing_summary_english();
+        assert!(!lines.is_empty(), "packing lines");
+        assert!(
+            lines.iter().all(|l| l.contains("CLB_X") && l.contains("LUTFF")),
+            "{lines:?}"
+        );
+        let sum: usize = lines
+            .iter()
+            .filter_map(|l| {
+                l.split_once(": ")
+                    .and_then(|(_, r)| r.strip_suffix(" LUTFF"))
+                    .and_then(|n| n.parse::<usize>().ok())
+            })
+            .sum();
+        assert_eq!(sum, n, "sum counts == lutff_sites.len(); lines={lines:?}");
+    }
+
 }

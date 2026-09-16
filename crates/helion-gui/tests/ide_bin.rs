@@ -16,8 +16,12 @@ fn helion_ide_version_and_doctor_are_headless() {
     );
     let stdout = String::from_utf8_lossy(&v.stdout);
     assert!(
-        stdout.starts_with("helion-ide 1.0.0"),
+        stdout.starts_with("helion-ide "),
         "version must identify the GUI binary: {stdout}"
+    );
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "version must match package: {stdout}"
     );
     assert!(
         !stdout.to_lowercase().contains("error"),
