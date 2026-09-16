@@ -12,7 +12,30 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.2...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.3...HEAD
+
+## [2.0.3] — 2026-09-16
+
+OPT P0-2 stitch/cache + P0-3 parse preprocess (`wip/opt-sv-wall` / #60). Empty-XDC
+`examples/counter.sv` gold unchanged (**WNS_PS=9640**). SOFT ≠ PASS held. On
+release `helion impl examples/ibex_pin_wrap.sv` after rebase: parse ~**347 ms**,
+synth_rtl ~**644 ms** (cells=16756 luts=11572). Native Apple Silicon `Helion.app`
+ships on this GitHub Release.
+
+### Changed
+
+- `OwnCache` holds `Arc<Design>`; hierarchy stitch appends cells with a port
+  HashMap (no 13k-cell clone per wrapper); assign_cap / early LUT6 before
+  `expr_node_count`. No AIG/flowmap rewrite.
+- Parse: byte preprocess (no `Vec<char>`), leftover-backtick pass; path+mtime
+  `SyntaxTree` cache (thread-local `Arc`).
+
+### Fixed
+
+- Ibex pin-wrap wall: synth_rtl first-run cut ~16% vs pre-opt scout pair;
+  parse ms down. Diagnostic depth unchanged.
+
+[2.0.3]: https://github.com/helion-fpga/helion/releases/tag/v2.0.3
 
 ## [2.0.2] — 2026-09-15
 
