@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["learner_l1_stage"]
+# L1 stage/provenance adapters (always-on preference for this ship).
+learner_l1_stage = []
+# Soft diagnostic → RTL file:line (off until SV soft IR carries spans; never fake).
+learner_l2_soft_span = []
+
 [dependencies]
 helion-proj = { workspace = true }
 helion-device = { workspace = true }
@@ -21,6 +28,7 @@ helion-drc = { workspace = true }
 helion-bd = { workspace = true }
 helion-ipxact = { workspace = true }
 helion-place = { workspace = true }
+helion-pack = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 rfd = "0.15"
 # rfd's Linux xdg-portal path pulls ashpd → zbus. zbus ≥5.14 / zvariant ≥5.10
