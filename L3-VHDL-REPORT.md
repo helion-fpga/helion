@@ -15,7 +15,7 @@
 | Schema (IR) | `d12c326a509bc48c13af48f55dedeca230c3ccd7` |
 | VHDL SoftDiag | `de1b940d4c3fc4b3ae951c2637b6372779f23cca` |
 | Autofix (code) | `d1df9823f82dbeb1f779ffee6dd8e3fc11b503f8` |
-| Branch tip | `e8149d535a07f400cdbf3eef1d64129870da192c` |
+| Branch tip | `wip/learner-L3-vhdl` HEAD |
 
 ```
 vhdl(L3): SoftDiag autofix — two-pass child softs + if-generate
