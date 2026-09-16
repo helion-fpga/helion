@@ -11,7 +11,8 @@ use helion_ir::Design;
 use helion_pack::pack;
 use helion_place::{place, place_with, PlaceOpts};
 use helion_proj::{
-    constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path, Mode, Session,
+    constraint_provenance, constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path,
+    ConstraintProvenance, Mode, Session, TimingReport,
 };
 use helion_route::{route_with, RouteOpts, Routed};
 use helion_sta::{
@@ -286,7 +287,7 @@ fn usage() {
   helion synth <file.sv> [--part P]
   helion impl <file.sv> [--part P]
   helion run <file.sv> [--cycles N] [--part P]
-  helion report_timing <file.sv|.vhd> [--sdc f.sdc]
+  helion report_timing <file.sv|.vhd> [--sdc f.sdc] [--print-stages]
   helion report_utilization <file.sv|.vhd>
   helion report_power <file.sv|.vhd>
   helion reports <file.sv|.vhd>
@@ -294,8 +295,8 @@ fn usage() {
   helion eco <file.sv> --cell u_lut --init 0xAAAAAAAAAAAAAAAA
   helion pblock <file.sv>
   helion qor <file.sv>
-  helion project <file.prj>
-  helion project run <file.prj> [--cycles N]
+  helion project <file.prj> [--print-stages]
+  helion project run <file.prj> [--cycles N] [--print-stages]
   helion project checkpoint write <file.prj> [-o out.hckp]
   helion project checkpoint open|read <file.hckp> [--part P] [--sdc f.sdc|--prj f.prj]
   helion project checkpoint eco <file.hckp> --cell u_lut0 --init 0xAAAAAAAAAAAAAAAA [--part P] [-o out.hbits]
@@ -312,9 +313,17 @@ fn take_flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
 }
 
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
 fn positional(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--print-stages" {
+            i += 1;
+            continue;
+        }
         if args[i] == "-o" || args[i].starts_with("--") {
             i += 2;
             continue;
@@ -322,6 +331,12 @@ fn positional(args: &[String]) -> Option<&str> {
         return Some(args[i].as_str());
     }
     None
+}
+
+fn print_stages_if_requested(args: &[String], session: &Session) {
+    if has_flag(args, "--print-stages") {
+        println!("{}", session.print_stages_text());
+    }
 }
 
 fn cmd_synth(args: &[String]) {
@@ -414,6 +429,7 @@ fn cmd_timing(args: &[String]) {
         std::process::exit(1);
     });
     let mut timing = c.timing.clone();
+    let mut xdc = Constraints::default();
     if let Some(sdc) = take_flag(args, "--sdc") {
         let text = std::fs::read_to_string(&sdc).unwrap_or_else(|e| {
             eprintln!("sdc {sdc}: {e}");
@@ -424,23 +440,49 @@ fn cmd_timing(args: &[String]) {
             eprintln!("sdc: {e}");
             std::process::exit(1);
         });
+        xdc.clocks = clks.clone();
         timing = report_timing_routed(&c.design, &c.routed, &clks).unwrap_or_else(|e| {
             eprintln!("report_timing: {e}");
             std::process::exit(1);
         });
     }
+    let prov = constraint_provenance(&xdc, &c.design);
+    let session = session_from_compiled(&c, prov);
     if c.routed.placed.packed.lutffs.is_empty() || timing.endpoints == 0 {
         println!(
-            "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
+            "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS) provenance={} stage=Sta",
             c.design.name,
-            c.design.cells.len()
+            c.design.cells.len(),
+            prov.as_str()
         );
+        print_stages_if_requested(args, &session);
         return;
     }
     println!(
-        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name, timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} provenance={} stage=Sta",
+        c.design.name,
+        timing.wns_ps,
+        timing.tns_ps,
+        timing.endpoints,
+        timing.r2r_ps,
+        timing.iob_ps,
+        prov.as_str()
     );
+    print_stages_if_requested(args, &session);
+}
+
+fn session_from_compiled(c: &Compiled, prov: ConstraintProvenance) -> Session {
+    let mut s = Session::new(Mode::NonProject);
+    s.part = c.dev.part.clone();
+    s.design = Some(c.design.clone());
+    s.packed = Some(c.routed.placed.packed.clone());
+    s.placed = Some(c.routed.placed.clone());
+    s.routed = Some(c.routed.clone());
+    if !c.bits.frames.is_empty() {
+        s.bitstream = Some(c.bits.clone());
+    }
+    s.record_timing_provenance(prov);
+    s
 }
 
 fn cmd_util(args: &[String]) {
@@ -516,14 +558,16 @@ fn cmd_reports(args: &[String]) {
         );
         std::process::exit(1);
     }
+    let prov = constraint_provenance(&Constraints::default(), &c.design);
     println!(
-        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
+        "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={} provenance={} stage=Sta",
         c.design.name,
         c.timing.wns_ps,
         c.timing.tns_ps,
         c.timing.endpoints,
         c.timing.r2r_ps,
-        c.timing.iob_ps
+        c.timing.iob_ps,
+        prov.as_str()
     );
     println!(
         "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
@@ -702,14 +746,10 @@ fn impl_project_file(
     Ok((session, dev, xdc, prj, ips.len()))
 }
 
-fn session_timing_xdc(session: &Session, xdc: &Constraints) -> Result<TimingResult, String> {
-    let d = session.design.as_ref().ok_or("project: no design")?;
-    let r = session.routed.as_ref().ok_or("project: not routed")?;
-    let mut clks = xdc.clocks.clone();
-    if clks.is_empty() {
-        create_clock(&mut clks, "clk", 10_000, "clk");
-    }
-    report_timing_routed_xdc(d, r, &clks, xdc)
+fn session_timing_xdc(session: &Session, dev: &Device, xdc: &Constraints) -> Result<TimingReport, String> {
+    session
+        .report_timing_report(dev, xdc)
+        .map_err(|e| e.to_string())
 }
 
 fn cmd_project(args: &[String]) {
@@ -731,7 +771,7 @@ fn cmd_project(args: &[String]) {
         eprintln!("project: {e}");
         std::process::exit(1);
     });
-    let timing = session_timing_xdc(&session, &xdc).unwrap_or_else(|e| {
+    let timing = session_timing_xdc(&session, &dev, &xdc).unwrap_or_else(|e| {
         eprintln!("project timing: {e}");
         std::process::exit(1);
     });
@@ -746,7 +786,7 @@ fn cmd_project(args: &[String]) {
         .map(|b| b.frames.len())
         .unwrap_or(0);
     println!(
-        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={}",
+        "project {} part={} sources={} ip={} top={} xdc_files={} create_clock={} PACKAGE_PIN={} lutffs={} WNS_PS={} frames={} stage={} provenance={}",
         path,
         prj.part,
         prj.sources.len(),
@@ -757,8 +797,11 @@ fn cmd_project(args: &[String]) {
         xdc.package_pins.len(),
         lutffs,
         timing.wns_ps,
-        frames
+        frames,
+        session.stage().as_str(),
+        timing.provenance.as_str()
     );
+    print_stages_if_requested(rest, &session);
     if do_run {
         let bits = session.bitstream.as_ref().unwrap_or_else(|| {
             eprintln!("project run: no bitstream");
@@ -850,21 +893,12 @@ fn cmd_project_checkpoint_write(args: &[String]) {
         eprintln!("write_checkpoint: {e}");
         std::process::exit(1);
     });
-    let t = session_timing_xdc(&session, &xdc).unwrap_or_else(|e| {
+    let t = session_timing_xdc(&session, &_dev, &xdc).unwrap_or_else(|e| {
         eprintln!("report_timing: {e}");
         std::process::exit(1);
     });
-    let dname = session
-        .design
-        .as_ref()
-        .map(|d| d.name.as_str())
-        .unwrap_or("-");
-    let timing = format!(
-        "report_timing {dname} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-        t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
-    );
     println!("{wr}");
-    println!("{timing}");
+    println!("{}", t.text());
 }
 
 /// Write destination for `-o` / `checkpoint_path`: absolute as-is, relative
