@@ -20,6 +20,9 @@
 //! No UNISIM/AMD IP — HAD is Helion's story.
 
 use helion_bits::Bitstream;
+
+/// Stable refuse codes — identical literals to [`helion_bits`] (CI/lab-assertable).
+pub use helion_bits::{ERR_CODE_EMPTY_BITSTREAM, ERR_CODE_USB_0};
 use helion_device::Device;
 use helion_fabric::{Fabric, Stat};
 use std::cell::Cell;
@@ -604,10 +607,9 @@ pub fn bitstream_is_empty(bits: &Bitstream) -> bool {
 /// surface sim-fabric DONE on empty by design).
 pub fn refuse_empty_bitstream(bits: &Bitstream) -> Result<(), String> {
     if bitstream_is_empty(bits) {
-        Err(
-            "program: empty bitstream refused (no configured frames) — refusing DONE on empty"
-                .into(),
-        )
+        Err(format!(
+            "{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream refused (no configured frames) — refusing DONE on empty"
+        ))
     } else {
         Ok(())
     }
@@ -1589,7 +1591,7 @@ pub fn program_via_openfpgaloader_for_part(
     let scan = scan_usb_probes();
     if scan.probes.is_empty() {
         return Err(format!(
-            "program: no USB programmer detected — {}\n  \
+            "{ERR_CODE_USB_0}: program: no USB programmer detected — {}\n  \
              Attach HAD / JTAG cable and re-run detect, or use --cable sim",
             scan.note
         ));
@@ -1678,7 +1680,7 @@ pub fn program_via_openfpgaloader_for_part(
 /// Load `.hbits` packets and program the sim cable for `dev`.
 pub fn program_packets(dev: &Device, packets: &[u8]) -> Result<(Bitstream, Stat), String> {
     if packets.is_empty() {
-        return Err("program: empty bitstream (0 bytes)".into());
+        return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream (0 bytes)"));
     }
     let bits = Bitstream::from_packets(packets)?;
     if bits.idcode != dev.idcode {
@@ -1787,7 +1789,7 @@ pub fn program_hbits_with_cable(
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("program: read {}: {e}", path.display()))?;
             if bytes.is_empty() {
-                return Err("program: empty bitstream (0 bytes)".into());
+                return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream (0 bytes)"));
             }
             // Validate Helion .hbits when magic matches; still pass file to OFL as-is.
             let bits = if bytes.starts_with(b"HBIT") {
@@ -2146,11 +2148,45 @@ mod tests {
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
         assert!(
-            err.contains("empty bitstream refused")
-                || err.contains("no USB")
-                || err.contains("openFPGALoader")
-                || err.contains("programmer"),
-            "USB=0 / empty-frame must honest-fail, got: {err}"
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "empty Bitstream fixture must refuse EMPTY only, got: {err}"
+        );
+        assert!(
+            err.contains("empty bitstream refused") || err.contains("refusing DONE on empty"),
+            "empty-frame must honest-fail, got: {err}"
+        );
+        assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
+        assert!(
+            !err.to_ascii_lowercase().contains("soft-hold"),
+            "must not soft-hold: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_usb0_nonempty_structural_counter_refuses_usb_0() {
+        let _guard = OFL_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("helion-auto-usb0-counter");
+        let _ = std::fs::create_dir_all(&dir);
+        let (dev, bits) = bitgen_structural_counter();
+        assert!(!bitstream_is_empty(&bits), "counter must be non-empty");
+        let bits_path = dir.join("counter.hbits");
+        std::fs::write(&bits_path, &bits.packets).unwrap();
+        unsafe {
+            std::env::remove_var("HELION_OPENFPGALOADER");
+        }
+        unsafe {
+            std::env::remove_var("HELION_OFL_DRY_RUN");
+        }
+        let cable = resolve_cable("auto").unwrap();
+        assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
+        let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+        assert!(
+            err.contains(ERR_CODE_USB_0),
+            "non-empty + USB=0 must refuse USB_0 only, got: {err}"
+        );
+        assert!(
+            !err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "must not mis-tag non-empty as EMPTY: {err}"
         );
         assert!(!err.contains("DONE=1"), "must not invent DONE: {err}");
         assert!(
@@ -2326,13 +2362,22 @@ mod tests {
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
             let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
             assert!(
+                e.contains(ERR_CODE_USB_0),
+                "stable USB=0 code missing: {e}"
+            );
+            assert!(
                 e.contains("native MPSSE") || e.contains("I/O") || e.contains("no FTDI"),
                 "{e}"
             );
+            assert!(!e.contains("DONE=1"), "{e}");
         } else {
             assert!(matches!(err, NativeUsbError::NotImplemented(_)), "{err:?}");
             // Empty-frame HBIT must refuse before OFL soft-success (even via native→OFL).
             let empty_err = program_hbits_with_cable(&dev, &empty_path, &cable, false).unwrap_err();
+            assert!(
+                empty_err.contains(ERR_CODE_EMPTY_BITSTREAM),
+                "stable empty code missing: {empty_err}"
+            );
             assert!(
                 empty_err.contains("empty bitstream refused")
                     || empty_err.contains("refusing DONE on empty"),
@@ -2489,11 +2534,11 @@ mod tests {
             let cable = resolve_cable("native").unwrap();
             let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
             assert!(
-                e.contains("empty bitstream refused")
-                    || e.contains("refusing DONE on empty")
-                    || e.contains("native MPSSE")
-                    || e.contains("I/O")
-                    || e.contains("no FTDI"),
+                e.contains(ERR_CODE_EMPTY_BITSTREAM),
+                "empty-frame HBIT must refuse EMPTY only, got: {e}"
+            );
+            assert!(
+                e.contains("empty bitstream refused") || e.contains("refusing DONE on empty"),
                 "{e}"
             );
             assert!(!e.to_ascii_lowercase().contains("done=1"));
@@ -2733,6 +2778,10 @@ mod tests {
             std::fs::write(&bits_path, &bits.packets).unwrap();
             let cable = resolve_cable("ofl").unwrap();
             let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
+            assert!(
+                err.contains(ERR_CODE_USB_0),
+                "stable USB=0 code missing: {err}"
+            );
             assert!(
                 err.contains("no USB") || err.contains("programmer"),
                 "honest refuse without probe: {err}"
@@ -3054,6 +3103,10 @@ mod tests {
         assert_eq!(cable.backend, CableBackend::OpenFpgaLoader);
         let err = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
         assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {err}"
+        );
+        assert!(
             err.contains("empty bitstream refused") || err.contains("refusing DONE on empty"),
             "empty-frame HBIT must refuse before OFL spawn: {err}"
         );
@@ -3074,12 +3127,20 @@ mod tests {
         let empty = Bitstream::empty(&dev);
         let err = refuse_empty_bitstream(&empty).unwrap_err();
         assert!(
+            err.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {err}"
+        );
+        assert!(
             err.to_ascii_lowercase().contains("empty")
                 || err.to_ascii_lowercase().contains("refus"),
             "{err}"
         );
         assert!(!err.contains("DONE=1"), "{err}");
         let ov = overlay_program_led(&dev, &empty, 16).unwrap_err();
+        assert!(
+            ov.contains(ERR_CODE_EMPTY_BITSTREAM),
+            "stable empty code missing: {ov}"
+        );
         assert!(
             ov.to_ascii_lowercase().contains("empty") || ov.to_ascii_lowercase().contains("refus"),
             "{ov}"
