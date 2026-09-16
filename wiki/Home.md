@@ -4,6 +4,8 @@ Living copy: [helion-fpga.github.io/helion/wiki.html](https://helion-fpga.github
 
 ## Getting started
 
+Current release: **[v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4)** (facts in [README](https://github.com/helion-fpga/helion/blob/master/README.md)).
+
 - [Build](https://helion-fpga.github.io/helion/start.html)
 - [Using Helion](https://helion-fpga.github.io/helion/use.html) — IDE, CLI, Device die, gold `WNS_PS=9640`
 

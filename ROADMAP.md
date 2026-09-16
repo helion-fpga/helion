@@ -1,4 +1,4 @@
-# Helion roadmap (1.4 → 2.0)
+# Helion roadmap (1.4 → 2.0 shipped; 2.0.x grind)
 
 FM-HEL-14. Original FPGA family + in-repo CAD. Not a vendor-tool wrapper.
 
@@ -6,14 +6,16 @@ FM-HEL-14. Original FPGA family + in-repo CAD. Not a vendor-tool wrapper.
 
 Canonical markdown is this file. GitHub Pages: [docs/roadmap.html](https://helion-fpga.github.io/helion/roadmap.html).
 Milestones: [helion-fpga/helion](https://github.com/helion-fpga/helion/milestones).
+Current release: [v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4).
 
-| Release | Workers | What | Milestone |
-|---|---|---|---|
-| **1.4** | W1 | SystemVerilog elaborator; gold 9640 | [1.4](https://github.com/helion-fpga/helion/milestone/1) |
-| **1.5** | W2 + W4 | PNR/STA + project/CLI | [1.5](https://github.com/helion-fpga/helion/milestone/2) |
-| **1.6** | W5 + W3 | IDE + lab | [1.6](https://github.com/helion-fpga/helion/milestone/3) |
-| **1.7** | W6 + W8 | VHDL + HAD | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
-| **2.0** | — | Public OSS CAD bar | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
+| Release | Status | Workers | What | Milestone |
+|---|---|---|---|---|
+| **1.4** | shipped | W1 | SystemVerilog elaborator; gold 9640 | [1.4](https://github.com/helion-fpga/helion/milestone/1) |
+| **1.5** | shipped | W2 + W4 | PNR/STA + project/CLI | [1.5](https://github.com/helion-fpga/helion/milestone/2) |
+| **1.6** | shipped | W5 + W3 | IDE + lab | [1.6](https://github.com/helion-fpga/helion/milestone/3) |
+| **1.7** | shipped | W6 + W8 | VHDL + HAD | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
+| **2.0** | shipped | — | Public OSS CAD bar | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
+| **2.0.x** | current | — | Post-bar STA / bitgen / place-legalize / synth / parse opt ships; gold lock unchanged | [v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4) |
 
 CI (W7) is not a product release. It gates gold on Ubuntu and `macos-latest` (both require `WNS_PS=9640`).
 
@@ -54,6 +56,22 @@ HAD: Architecture Database parts beyond `HL10T-C32-1`. Device facts stay in TOML
 **Shipped as [v2.0.0](https://github.com/helion-fpga/helion/releases/tag/v2.0.0).** A stranger can clone, `cargo test --workspace`, run headless gold **WNS_PS=9640**, and trust the legal fence: no Project X-Ray, no UNISIM, no vendor Tcl as product names, no AMD/Intel/Lattice backends, Helion-MM / Helion-ST only. Docs, CI (Linux + macOS gold), and the desktop IDE describe the same Session.
 
 [Milestone 2.0](https://github.com/helion-fpga/helion/milestone/5)
+
+## 2.0.x — post-bar runtime / QoR grind
+
+**Current tip: [v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4).** Patch line after the 2.0 bar: ship measured STA / bitgen / place-legalize / synth_rtl / parse cuts without moving gold. SOFT ≠ PASS held. Empty-XDC counter stays **WNS_PS=9640**.
+
+Axes landed through 2.0.4 (see [CHANGELOG](CHANGELOG.md) and [docs/perf-2.0.4.md](docs/perf-2.0.4.md)):
+
+- STA: `report_timing_placed` IOB `from_net` HashSet (O(1) membership).
+- Bitgen: frame buffer write path (no `.hbits` format growth).
+- Place legalize: dense occupancy grid, remaining-illegal worklist, pin-index scoring.
+- `synth_rtl`: single-pass `emit_module_into`; process-level OwnCache.
+- Parse: process-level `SyntaxTree` Arc cache.
+
+Release `helion impl examples/ibex_pin_wrap.sv` deltas on the 2.0.4 notes: parse **416→353 ms**, synth_rtl **670→524 ms**, place legalize **213→23 ms**, imux_skip **158→123**.
+
+Do not invent future marketing pillars here; next work is further measured grind on the same axes, or a new ROADMAP line when a real bar exists.
 
 ## Legal fence (every release)
 

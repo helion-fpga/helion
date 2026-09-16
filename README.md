@@ -4,7 +4,7 @@
 
 # Helion Design Suite
 
-Original FPGA family + CAD (current release **1.3**; **1.4 → 2.0** on the [roadmap](ROADMAP.md)). Native `aarch64-apple-darwin`. No vendor bitstream.
+Original FPGA family + CAD (current release **[2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4)**). Native `aarch64-apple-darwin`. No vendor bitstream. **2.0** is shipped; **2.0.x** is post-bar runtime/QoR grind (STA / bitgen / place-legalize / synth / parse) with gold lock unchanged — see [CHANGELOG](CHANGELOG.md) and [perf-2.0.4](docs/perf-2.0.4.md).
 
 [![Release](https://img.shields.io/github/v/release/helion-fpga/helion)](https://github.com/helion-fpga/helion/releases/latest)
 
@@ -38,17 +38,18 @@ Headless gold (IDE): `helion-ide --headless examples/counter.sv` must print **WN
 Legal fence: no Project X-Ray, no UNISIM, no vendor Tcl, no AMD/Intel/Lattice backends.
 Device facts come from the Helion Architecture Database (HAD), never hardcoded in the CAD.
 
-## Roadmap (1.4 → 2.0)
+## Roadmap (1.4 → 2.0 shipped; 2.0.x grind)
 
-[ROADMAP.md](ROADMAP.md) · Pages: [roadmap](https://helion-fpga.github.io/helion/roadmap.html)
+[ROADMAP.md](ROADMAP.md) · Pages: [roadmap](https://helion-fpga.github.io/helion/roadmap.html) · Latest: [v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4)
 
-| Release | What | Milestone |
-|---|---|---|
-| 1.4 | SV elaborator (W1); gold **WNS_PS=9640** | [1.4](https://github.com/helion-fpga/helion/milestone/1) |
-| 1.5 | PNR/STA (W2) + proj/cli (W4) | [1.5](https://github.com/helion-fpga/helion/milestone/2) |
-| 1.6 | IDE (W5) + lab (W3) | [1.6](https://github.com/helion-fpga/helion/milestone/3) |
-| 1.7 | VHDL (W6) + HAD (W8) | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
-| 2.0 | Public OSS CAD bar | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
+| Release | Status | What | Milestone |
+|---|---|---|---|
+| 1.4 | shipped | SV elaborator (W1); gold **WNS_PS=9640** | [1.4](https://github.com/helion-fpga/helion/milestone/1) |
+| 1.5 | shipped | PNR/STA (W2) + proj/cli (W4) | [1.5](https://github.com/helion-fpga/helion/milestone/2) |
+| 1.6 | shipped | IDE (W5) + lab (W3) | [1.6](https://github.com/helion-fpga/helion/milestone/3) |
+| 1.7 | shipped | VHDL (W6) + HAD (W8) | [1.7](https://github.com/helion-fpga/helion/milestone/4) |
+| 2.0 | shipped | Public OSS CAD bar ([v2.0.0](https://github.com/helion-fpga/helion/releases/tag/v2.0.0)) | [2.0](https://github.com/helion-fpga/helion/milestone/5) |
+| **2.0.x** | current | Post-bar opt ships (STA HashSet, bitgen frame buffer, place-legalize, synth_rtl, parse cache); gold lock unchanged | [v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4) |
 
 ## Flow
 
@@ -110,14 +111,16 @@ route → STA → bitgen flow (~30 ms per example here); the gate fails above
 ## Download
 
 [GitHub Releases](https://github.com/helion-fpga/helion/releases/latest) publish
-versioned builds for each `vX.Y.Z` tag:
+versioned builds for each `vX.Y.Z` tag. Current: **[v2.0.4](https://github.com/helion-fpga/helion/releases/tag/v2.0.4)**.
 
 | File | What |
 |---|---|
-| `Helion-*-macos-arm64.zip` | `Helion.app` (Apple Silicon). Unsigned — Gatekeeper will warn. |
-| `helion-*-aarch64-apple-darwin.tar.gz` | CLI + IDE + HAD + examples |
-| `helion-*-x86_64-unknown-linux-gnu.tar.gz` | Linux CLI + headless IDE |
+| `Helion-2.0.4-macos-arm64.zip` | `Helion.app` (Apple Silicon). Unsigned — Gatekeeper will warn. |
+| `helion-2.0.4-aarch64-apple-darwin.tar.gz` | CLI + IDE + HAD + examples |
+| `helion-2.0.4-x86_64-unknown-linux-gnu.tar.gz` | Linux CLI + headless IDE |
 | `SHA256SUMS.txt` | hashes |
+
+Wildcard `Helion-*-macos-arm64.zip` / `helion-*-…` names also match on [latest](https://github.com/helion-fpga/helion/releases/latest).
 
 How we cut a tag: [`RELEASING.md`](RELEASING.md). Notes: [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -221,5 +224,7 @@ helion-prog --detect                    # OFL on PATH → physical_had=0 when em
 
 ## Cap holds (Ibex / pin-wrap)
 
-Under `IBEX_IMPL_CAP_SEC=120` (never uncapped): **imux_skip=0**, **IOB=1**, counter gold **WNS_PS=9640**.
+Under `IBEX_IMPL_CAP_SEC=120` (never uncapped): **imux_skip=0**, **IOB=1**, counter gold **WNS_PS=9640**. SOFT ≠ PASS.
 Pin-wrap wall after keep/md + STA index (`4b14490`): **~1.40s**; residual AIG/flowmap **STOP** (no cheap cut) — [`docs/FM-HEL-TOP-aig-flowmap-residual.md`](docs/FM-HEL-TOP-aig-flowmap-residual.md). Place affinity cut: [`docs/FM-HEL-TOP-place-legalize-speed.md`](docs/FM-HEL-TOP-place-legalize-speed.md).
+
+**2.0.4** release `helion impl examples/ibex_pin_wrap.sv` stage ms (vs prior baselines on the release notes axes): parse **416→353**, synth_rtl **670→524**, place legalize **213→23**, imux_skip **158→123**. Full table: [`docs/perf-2.0.4.md`](docs/perf-2.0.4.md).
