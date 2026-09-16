@@ -32,4 +32,4 @@ Branch work notes (not the public on-ramp). Gold hold: **WNS_PS=9640**. Cap hold
 | [`FM-HEL-TOP-air-budgets.md`](FM-HEL-TOP-air-budgets.md) | Air idle budgets |
 | [`ip/README.md`](../ip/README.md) | `.helion` package how-to |
 
-Also: native/live FTDI/OFL, IMUX reach, soft Helion-ahead — same `FM-HEL-TOP-*.md` prefix.
+Also: native/live FTDI/OFL, IMUX reach, soft Helion-ahead — same `FM-HEL-TOP-*.md` prefix. Run logs and screenshot dumps (`suite-shots/`, numbered `FM-HEL-VIVADO-P5-catalog*.txt`) stay out of git.
