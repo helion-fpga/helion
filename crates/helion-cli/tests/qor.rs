@@ -178,18 +178,33 @@ fn qor_table_matches_readme() {
         );
 
         // README must publish the same numbers.
-        let name = src.rsplit('/').next().unwrap();
         let row = readme
             .lines()
-            .find(|l| l.contains(name) && l.starts_with('|'))
-            .unwrap_or_else(|| panic!("README QoR table has no row for {name}"));
-        assert!(
-            row.contains(&format!(" {luts} ")),
-            "README row for {name} must publish LUTFF {luts}: {row}"
+            .find(|l| {
+                let cols: Vec<&str> = l.split('|').map(|c| c.trim()).collect();
+                cols.len() >= 9 && cols[2].contains(src)
+            })
+            .unwrap_or_else(|| panic!("README QoR table has no row for {src}"));
+        let cols: Vec<String> = row
+            .split('|')
+            .map(|c| c.trim().trim_matches('*').to_string())
+            .collect();
+        // Col 0: "", Col 1: Design, Col 2: Source, Col 3: LUTFF, Col 4: IOB, Col 5: WNS_PS, Col 6: r2r_ps, Col 7: iob_ps, Col 8: .hbits B
+        let table_lut: u32 = cols
+            .get(3)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("failed to parse LUTFF from row {row}"));
+        let table_wns: i64 = cols
+            .get(5)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("failed to parse WNS_PS from row {row}"));
+        assert_eq!(
+            table_lut, *luts,
+            "README row for {src} must publish LUTFF {luts}: {row}"
         );
-        assert!(
-            row.contains(&wns.to_string()),
-            "README row for {name} must publish WNS_PS {wns}: {row}"
+        assert_eq!(
+            table_wns, *wns,
+            "README row for {src} must publish WNS_PS {wns}: {row}"
         );
     }
 
@@ -252,18 +267,29 @@ fn qor_beats_previous_commit() {
         );
 
         // README publishes the size that was just measured.
-        let name = src.rsplit('/').next().unwrap();
         let row = readme
             .lines()
-            .find(|l| l.contains(name) && l.starts_with('|'))
-            .unwrap_or_else(|| panic!("README QoR table has no row for {name}"));
-        assert!(
-            row.contains(&format!(" {bytes} ")),
-            "README row for {name} must publish .hbits {bytes} B: {row}"
+            .find(|l| {
+                let cols: Vec<&str> = l.split('|').map(|c| c.trim()).collect();
+                cols.len() >= 9 && cols[2].contains(src)
+            })
+            .unwrap_or_else(|| panic!("README QoR table has no row for {src}"));
+        let cols: Vec<String> = row
+            .split('|')
+            .map(|c| c.trim().trim_matches('*').to_string())
+            .collect();
+        let table_bytes: usize = cols
+            .get(8)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("failed to parse .hbits B from row {row}"));
+        assert_eq!(
+            table_bytes, bytes,
+            "README row for {src} must publish .hbits {bytes} B: {row}"
         );
     }
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap_or_default();
     assert!(
-        readme.contains("272485 B"),
-        "README change log must record the previous-commit bitstream size"
+        readme.contains("272485 B") || changelog.contains("272485 B"),
+        "README or CHANGELOG must record the previous-commit bitstream size"
     );
 }
