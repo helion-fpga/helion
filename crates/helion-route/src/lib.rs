@@ -300,7 +300,7 @@ fn astar(
         .ok_or_else(|| format!("PathFinder: src off grid {src:?}"))?;
     scratch.set_g_came(src_i, 0, src);
     scratch.open.push(Item {
-        cost: manhattan(src, dst) as i64,
+        cost: (manhattan(src, dst) as i64) * HOP_DELAY_PS,
         x: src.0,
         y: src.1,
     });
@@ -349,7 +349,7 @@ fn astar(
             let ng = gc + step;
             if ng < scratch.g_at(ni) {
                 scratch.set_g_came(ni, ng, (x, y));
-                let f = ng + manhattan((nx, ny), dst) as i64;
+                let f = ng + (manhattan((nx, ny), dst) as i64) * HOP_DELAY_PS;
                 scratch.open.push(Item {
                     cost: f,
                     x: nx,
@@ -602,7 +602,6 @@ pub fn route_with_guide(
     let grid = TileGrid::from_device(dev);
     let mut hist = vec![0u32; grid.len()];
     let mut iob_src = Vec::new();
-    let mut overused = 0u32;
     let mut iters = 0u32;
     if nets.is_empty() {
         return Ok(Routed {
@@ -616,7 +615,6 @@ pub fn route_with_guide(
     }
     let max_iters = opts.max_iters.max(1);
     let detour_cols = guide.iob_detour_cols();
-    let mut last_paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
     let mut best_overused = u32::MAX;
     let mut best_hops = u32::MAX;
     let mut best_paths: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nets.len()];
@@ -664,8 +662,6 @@ pub fn route_with_guide(
             best_hops = hops_sum;
             best_paths = paths.clone();
         }
-        overused = ou;
-        last_paths = paths;
         if ou == 0 {
             break;
         }
@@ -675,10 +671,8 @@ pub fn route_with_guide(
             }
         }
     }
-    overused = best_overused;
-    last_paths = best_paths;
     for (i, (src, dst, ble, packed_ii)) in nets.iter().enumerate() {
-        let hops = last_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
+        let hops = best_paths[i].len().saturating_sub(1) as u32 + opts.extra_hops;
         let net = placed
             .packed
             .iobs
@@ -698,7 +692,7 @@ pub fn route_with_guide(
             ble: *ble,
             hops,
             delay_ps: hops as i64 * HOP_DELAY_PS,
-            path: last_paths[i].clone(),
+            path: best_paths[i].clone(),
             net,
             from_ff,
         });
@@ -715,7 +709,7 @@ pub fn route_with_guide(
         iob_src,
         imux,
         pathfinder_iters: iters,
-        overused,
+        overused: best_overused,
         imux_skip,
     })
 }

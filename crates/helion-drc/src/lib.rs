@@ -368,14 +368,15 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
             format!("PathFinder overused {} tiles", routed.overused),
         );
     }
+    let driver_nets: std::collections::HashSet<&str> = routed
+        .placed
+        .packed
+        .lutffs
+        .iter()
+        .map(|l| l.q_net.as_str())
+        .collect();
     for iob in &routed.placed.packed.iobs {
-        if !routed
-            .placed
-            .packed
-            .lutffs
-            .iter()
-            .any(|l| l.q_net == iob.from_net)
-        {
+        if !driver_nets.contains(iob.from_net.as_str()) {
             d.add_warn(
                 "ROUTE-3",
                 &iob.cell,
