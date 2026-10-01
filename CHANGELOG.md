@@ -10,12 +10,30 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Changed
 
-- README is a human on-ramp (try / gold / download / QoR). Session dumps (`suite-shots/`, numbered P5 catalog/gold-wns txt, firstmate notes at repo root) are out of the tree.
+### Fixed
+
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.5...HEAD
+
+## [2.0.5] — 2026-10-01
+
+School-schedule catch-up release with critical PNR, DRC, GUI, and SV fixes.
+*Note from maintainer: Updates have been slightly delayed recently due to demanding school commitments.*
+
+### Changed
+
+- Scaled Pathfinder A* heuristic by `HOP_DELAY_PS` (40 ps) in `helion-route`, preventing search degradation into unguided Dijkstra exploration.
+- Pre-indexed driver nets into a `HashSet` in `helion-drc` for `ROUTE-3`, reducing check complexity from O(I×N) to O(I+N).
+- Added 50ms polling backoff to GUI background task receiver (`TryRecvError::Empty`), eliminating 100% CPU core busy-spinning during CAD runs.
+- Historical baseline: 9b864af all 272485 B dense bitstream.
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.4...HEAD
+- Fixed dead stores in `crates/helion-route/src/lib.rs` (`overused`, `last_paths`).
+- Restored missing `#[test]` attributes on 3 dead tests in `crates/helion-sv/src/lib.rs` (`bufif1_mux_is_one_gate_primitive_not_a_lut`, `clock_mux_posedge_is_not_a_user_clock`, `string_param_width_does_not_panic`).
+- Resolved QoR test assertions in `crates/helion-cli/tests/qor.rs` by adding semantic markdown table column parsing.
+- Fixed unused mutability and deprecated `SelectableLabel` compiler warnings across `helion-sv`, `helion-gui`, `helion-vhdl`, and `helion-lab`.
 
+[2.0.5]: https://github.com/helion-fpga/helion/compare/v2.0.4...v2.0.5
 ## [2.0.4] — 2026-09-16
 
 OPT P1-2 STA HashSet (#62), P1-3 bitgen frame buffer (#63), place-legalize

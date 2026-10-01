@@ -19,7 +19,7 @@ use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_hw::{
     overlay_program_led, program_hbits_with_cable, refuse_empty_bitstream, resolve_cable,
-    usb_native_feature_enabled, CableBackend, OverlayReport, COUNTER_OVERLAY_LED,
+    usb_native_feature_enabled, CableBackend, OverlayReport,
 };
 use std::path::Path;
 
@@ -142,6 +142,7 @@ pub fn lab_program_auto(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helion_hw::COUNTER_OVERLAY_LED;
     use helion_bits::bitgen;
     use helion_ir::Design;
     use helion_pack::pack;
