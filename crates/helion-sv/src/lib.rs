@@ -5912,7 +5912,7 @@ fn fold_blocking_assigns(stmts: Vec<Nba>) -> Vec<Nba> {
 fn normalize_nbas(p: &P, stmts: Vec<Nba>) -> Vec<Nba> {
     let mut order: Vec<(String, Option<usize>)> = Vec::new();
     let mut map: HashMap<(String, Option<usize>), RExpr> = HashMap::new();
-    let mut put = |order: &mut Vec<(String, Option<usize>)>,
+    let put = |order: &mut Vec<(String, Option<usize>)>,
                    map: &mut HashMap<(String, Option<usize>), RExpr>,
                    key: (String, Option<usize>),
                    rhs: RExpr| {
@@ -15252,6 +15252,7 @@ endmodule
         );
     }
 
+    #[test]
     fn bufif1_mux_is_one_gate_primitive_not_a_lut() {
         let src = r#"
 module sky130_fd_sc_hdll__muxb16to1(Z,D,S);
@@ -16842,6 +16843,7 @@ endmodule
         );
     }
 
+    #[test]
     fn clock_mux_posedge_is_not_a_user_clock() {
         let src = r#"
 module clk_mux_q(input csr_clk, input csr_ena, input ram_clk, input d, output reg q);
@@ -17083,6 +17085,7 @@ endmodule
         assert_eq!(logic, 0, "must not invent gates from a range that does not fit, cells={:?}", d.cells);
     }
 
+    #[test]
     fn string_param_width_does_not_panic() {
         // `parameter DATA_WIDTH = ""` hashed past usize and panicked on
         // range `+ 1` (old lib.rs:1052). Named diagnostic, no invented bus.

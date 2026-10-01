@@ -532,7 +532,7 @@ impl HelionIde {
                 self.job = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint();
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.busy = false;
@@ -5951,7 +5951,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel) {
                             .clamp(0.0, 1.0);
                             let px = ax + tseg * dx;
                             let py = ay + tseg * dy;
-                            let dist = ((lx - px).hypot(ly - py));
+                            let dist = (lx - px).hypot(ly - py);
                             if dist <= thresh {
                                 if best.as_ref().map(|(bd, _)| dist < *bd).unwrap_or(true) {
                                     best = Some((dist, w.net.clone()));
@@ -6507,7 +6507,7 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
                     if ui
                         .add_sized(
                             [row_w, chrome::DEVICE_CR_ROW_H],
-                            egui::SelectableLabel::new(on, line),
+                            egui::Button::selectable(on, line),
                         )
                         .clicked()
                     {
@@ -6568,6 +6568,7 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
+#[allow(dead_code)] // intentional: retained for upcoming device routing inspection panel
 fn paint_device_routes(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Device Routing").strong());
     let routes = model.device.routes.clone();
@@ -8132,7 +8133,7 @@ fn paint_ip_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
             let resp = ui
                 .add_sized(
                     [w, chrome::HIT_SIDEBAR],
-                    egui::SelectableLabel::new(on, &r.name),
+                    egui::Button::selectable(on, &r.name),
                 )
                 .on_hover_text(format!("{}\n{}\n{}", r.vlnv, r.bus, r.status));
             if resp.clicked() {
