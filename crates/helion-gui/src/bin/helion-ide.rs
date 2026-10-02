@@ -187,6 +187,63 @@ fn run_stdin() {
     }
 }
 
+fn apply_helion_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+
+    // Surfaces & Depth Hierarchy (poteto: "Shadows over borders, subtle translucent depth")
+    visuals.panel_fill = egui::Color32::from_rgb(15, 17, 23);
+    visuals.window_fill = egui::Color32::from_rgb(20, 23, 31);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(10, 12, 16);
+    visuals.faint_bg_color = egui::Color32::from_rgb(18, 21, 28);
+
+    // Concentric Border Radius (poteto: "outer = inner + padding")
+    visuals.window_corner_radius = egui::CornerRadius::same(10);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+
+    // Widget resting, hovered, and active tactile feel (poteto: "clear hit feedback, depth on press")
+    let border_subtle = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 14));
+    let border_hover = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(88, 166, 255, 80));
+    let border_active = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(88, 166, 255, 160));
+
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(18, 21, 28);
+    visuals.widgets.noninteractive.bg_stroke = border_subtle;
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(148, 158, 172));
+
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(25, 29, 39);
+    visuals.widgets.inactive.bg_stroke = border_subtle;
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 228, 238));
+
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 40, 54);
+    visuals.widgets.hovered.bg_stroke = border_hover;
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(20, 24, 34);
+    visuals.widgets.active.bg_stroke = border_active;
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 166, 255));
+
+    visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(46, 115, 230, 85);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 166, 255));
+    visuals.window_stroke = border_subtle;
+
+    ctx.set_visuals(visuals);
+
+    // Optical spacing & comfort hit areas (poteto: "interactive elements need comfortable hit areas")
+    ctx.style_mut(|s| {
+        s.spacing.button_padding = egui::vec2(10.0, 6.0);
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.window_margin = egui::Margin::same(10);
+        s.spacing.menu_margin = egui::Margin::same(6);
+        s.spacing.scroll.bar_width = 7.0;
+        s.spacing.scroll.bar_inner_margin = 2.0;
+        s.interaction.resize_grab_radius_side = chrome::SPLITTER_GRAB_PX;
+        s.interaction.resize_grab_radius_corner = chrome::SPLITTER_GRAB_PX + 4.0;
+    });
+}
+
 fn run_gui() -> eframe::Result {
     let (iw, ih) = std::env::var("HELION_INNER_SIZE")
         .ok()
@@ -206,11 +263,7 @@ fn run_gui() -> eframe::Result {
         "Helion",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            cc.egui_ctx.style_mut(|s| {
-                s.interaction.resize_grab_radius_side = chrome::SPLITTER_GRAB_PX;
-                s.interaction.resize_grab_radius_corner = chrome::SPLITTER_GRAB_PX + 4.0;
-            });
+            apply_helion_theme(&cc.egui_ctx);
             Ok(Box::new(HelionIde::new()))
         }),
     )
