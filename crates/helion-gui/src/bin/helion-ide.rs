@@ -200,39 +200,50 @@ fn apply_helion_theme(ctx: &egui::Context) {
     visuals.window_corner_radius = egui::CornerRadius::same(10);
     visuals.menu_corner_radius = egui::CornerRadius::same(8);
 
-    // Widget resting, hovered, and active tactile feel (poteto: "clear hit feedback, depth on press")
-    let border_subtle = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 14));
-    let border_hover = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(88, 166, 255, 80));
-    let border_active = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(88, 166, 255, 160));
+    // Hairline subtle borders with luminous hover/active states
+    let border_subtle = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 18));
+    let border_hover = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(88, 166, 255, 110));
+    let border_active = egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(88, 166, 255, 180));
+
+    // Crisp, readable typography colors (Vivado-level high contrast, no muddy gray)
+    let text_primary = egui::Color32::from_rgb(238, 242, 250);
 
     visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(18, 21, 28);
     visuals.widgets.noninteractive.bg_stroke = border_subtle;
     visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(148, 158, 172));
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_primary);
 
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(25, 29, 39);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(26, 31, 42);
     visuals.widgets.inactive.bg_stroke = border_subtle;
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 228, 238));
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_primary);
 
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 40, 54);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 44, 60);
     visuals.widgets.hovered.bg_stroke = border_hover;
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(20, 24, 34);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(22, 28, 38);
     visuals.widgets.active.bg_stroke = border_active;
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 166, 255));
 
-    visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(46, 115, 230, 85);
+    visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(46, 115, 230, 95);
     visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 166, 255));
     visuals.window_stroke = border_subtle;
 
     ctx.set_visuals(visuals);
 
-    // Optical spacing & comfort hit areas (poteto: "interactive elements need comfortable hit areas")
+    // High-readability font styles and comfort spacing
     ctx.style_mut(|s| {
+        let mut text_styles = std::collections::BTreeMap::new();
+        text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+        text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+        text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+        text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+        text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
+        s.text_styles = text_styles;
+
         s.spacing.button_padding = egui::vec2(10.0, 6.0);
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.window_margin = egui::Margin::same(10);
@@ -1127,19 +1138,19 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
             let blocked = app.model.step_blocked(step);
             let (fill, stroke, text) = match state {
                 StepState::Pending => (
-                    Color32::from_rgb(0x2b, 0x32, 0x3a),
-                    Color32::from_rgb(0x5a, 0x64, 0x6e),
-                    Color32::from_rgb(0xdc, 0xe0, 0xe4),
+                    Color32::from_rgb(26, 31, 42),
+                    Color32::from_rgb(52, 62, 82),
+                    Color32::from_rgb(228, 235, 248),
                 ),
                 StepState::Done => (
-                    Color32::from_rgb(0x1f, 0x4a, 0x38),
-                    Color32::from_rgb(0x3d, 0xb8, 0x7a),
-                    Color32::from_rgb(0xc8, 0xf0, 0xd8),
+                    Color32::from_rgb(20, 52, 35),
+                    Color32::from_rgb(46, 170, 92),
+                    Color32::from_rgb(215, 250, 230),
                 ),
                 StepState::Failed => (
-                    Color32::from_rgb(0x4a, 0x22, 0x28),
-                    Color32::from_rgb(0xe0, 0x6c, 0x75),
-                    Color32::from_rgb(0xff, 0xd0, 0xd4),
+                    Color32::from_rgb(54, 24, 28),
+                    Color32::from_rgb(220, 70, 80),
+                    Color32::from_rgb(255, 225, 230),
                 ),
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
@@ -1149,7 +1160,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
                 if ui.is_rect_visible(rect) {
                     ui.painter().rect(
                         rect,
-                        2.0,
+                        egui::CornerRadius::same(5),
                         fill,
                         Stroke::new(1.0_f32, stroke),
                         egui::StrokeKind::Inside,
@@ -1158,7 +1169,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         step.label(),
-                        egui::FontId::proportional(11.0),
+                        egui::FontId::proportional(12.5),
                         text,
                     );
                 }
@@ -1189,49 +1200,69 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
             let mut pick = None;
             for act in Activity::ALL {
                 let on = app.activity == act;
-                let fill = if on {
-                    Color32::from_rgb(0x1f, 0x4a, 0x38)
-                } else {
-                    Color32::TRANSPARENT
-                };
                 let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(chrome::RAIL_WIDTH - 4.0, chrome::HIT_RAIL),
                     Sense::click(),
                 );
+                let hovered = resp.hovered();
+                let fill = if on {
+                    Color32::from_rgb(26, 33, 48)
+                } else if hovered {
+                    Color32::from_rgb(22, 26, 36)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let border_stroke = if on {
+                    Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(88, 166, 255, 90))
+                } else {
+                    Stroke::NONE
+                };
                 if ui.is_rect_visible(rect) {
                     ui.painter().rect(
                         rect,
-                        3.0,
+                        egui::CornerRadius::same(6),
                         fill,
-                        Stroke::new(
-                            if on { 1.0_f32 } else { 0.0_f32 },
-                            Color32::from_rgb(0x3d, 0xb8, 0x7a),
-                        ),
+                        border_stroke,
                         egui::StrokeKind::Inside,
                     );
+                    if on {
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                rect.left_top(),
+                                egui::pos2(rect.left() + 3.0, rect.bottom()),
+                            ),
+                            egui::CornerRadius::same(1),
+                            Color32::from_rgb(88, 166, 255),
+                        );
+                    }
                     let c = rect.center();
-                    // Word is the primary label (MUST 3). Letter is a small index, not the name.
+                    let icon_color = if on {
+                        Color32::from_rgb(88, 166, 255)
+                    } else if hovered {
+                        Color32::from_rgb(200, 212, 230)
+                    } else {
+                        Color32::from_rgb(150, 162, 180)
+                    };
+                    let label_color = if on {
+                        Color32::WHITE
+                    } else if hovered {
+                        Color32::from_rgb(240, 245, 255)
+                    } else {
+                        Color32::from_rgb(205, 215, 230)
+                    };
                     ui.painter().text(
-                        egui::pos2(c.x, c.y - 12.0),
+                        egui::pos2(c.x, c.y - 11.0),
                         egui::Align2::CENTER_CENTER,
                         act.icon(),
-                        egui::FontId::proportional(10.0),
-                        if on {
-                            Color32::from_rgb(0x8a, 0xc4, 0xa4)
-                        } else {
-                            Color32::from_rgb(0x7a, 0x84, 0x8c)
-                        },
+                        egui::FontId::proportional(12.5),
+                        icon_color,
                     );
                     ui.painter().text(
-                        egui::pos2(c.x, c.y + 8.0),
+                        egui::pos2(c.x, c.y + 9.0),
                         egui::Align2::CENTER_CENTER,
                         act.short_label(),
-                        egui::FontId::proportional(12.0),
-                        if on {
-                            Color32::from_rgb(0xc8, 0xf0, 0xd8)
-                        } else {
-                            Color32::from_rgb(0xdc, 0xe0, 0xe4)
-                        },
+                        egui::FontId::proportional(12.5),
+                        label_color,
                     );
                 }
                 let resp = resp.on_hover_text(act.hover());
@@ -1652,22 +1683,35 @@ fn paint_status_bar(
                 } else {
                     String::new()
                 };
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {} · {} · provenance={} · LUTFF {} · {}{}{}",
-                        crumb,
-                        model.part(),
-                        wns,
-                        provenance,
-                        lutff,
-                        run,
-                        board_crumb,
-                        progress_bit
-                    ))
-                    .monospace()
-                    .size(12.0)
-                    .color(Color32::from_rgb(0x9a, 0xa4, 0xae)),
-                );
+                ui.label(RichText::new(&crumb).strong().size(12.5).color(Color32::from_rgb(88, 166, 255)));
+                ui.label(RichText::new("·").weak());
+                ui.label(RichText::new(model.part()).size(12.5).color(Color32::from_rgb(235, 240, 250)));
+                ui.label(RichText::new("·").weak());
+                let wns_color = if wns.starts_with('+') || wns == "0.000" {
+                    Color32::from_rgb(86, 211, 100)
+                } else if wns.starts_with('-') {
+                    Color32::from_rgb(240, 80, 80)
+                } else {
+                    Color32::from_rgb(200, 210, 225)
+                };
+                ui.label(RichText::new(&wns).monospace().size(12.5).color(wns_color));
+                ui.label(RichText::new("·").weak());
+                ui.label(RichText::new(format!("provenance={provenance}")).size(12.0).color(Color32::from_rgb(175, 185, 200)));
+                ui.label(RichText::new("·").weak());
+                ui.label(RichText::new(format!("LUTFF {lutff}")).monospace().size(12.5).color(Color32::from_rgb(215, 225, 240)));
+                ui.label(RichText::new("·").weak());
+                let run_color = if run == "idle" {
+                    Color32::from_rgb(170, 180, 195)
+                } else {
+                    Color32::from_rgb(245, 185, 60)
+                };
+                ui.label(RichText::new(run).size(12.5).color(run_color));
+                if !board_crumb.is_empty() {
+                    ui.label(RichText::new(board_crumb).size(12.0).color(Color32::from_rgb(240, 160, 60)));
+                }
+                if !progress_bit.is_empty() {
+                    ui.label(RichText::new(&progress_bit).size(12.0).color(Color32::from_rgb(88, 166, 255)));
+                }
             });
         });
 }
@@ -1755,49 +1799,29 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                let console_on = app.model.bottom_tab == BottomTab::Tcl
-                    || app.model.bottom_tab == BottomTab::Log;
-                let c = ui.add_sized(
-                    [88.0, chrome::HIT_SIDEBAR],
-                    egui::Button::selectable(console_on, "Console"),
-                );
-                if c.clicked() {
+                let tcl_on = app.model.bottom_tab == BottomTab::Tcl;
+                if ui.add(egui::Button::new(RichText::new("Tcl Console").strong()).selected(tcl_on)).clicked() {
                     app.model.bottom_tab = BottomTab::Tcl;
+                    app.tcl_focus = true;
                 }
-                let m = ui.add_sized(
-                    [96.0, chrome::HIT_SIDEBAR],
-                    egui::Button::selectable(
-                        app.model.bottom_tab == BottomTab::Messages,
-                        "Messages",
-                    ),
-                );
-                if m.clicked() {
+                let msg_on = app.model.bottom_tab == BottomTab::Messages;
+                if ui.add(egui::Button::new(RichText::new("Messages").strong()).selected(msg_on)).clicked() {
                     app.model.bottom_tab = BottomTab::Messages;
                 }
-                let tcl = ui.add_sized(
-                    [56.0, chrome::HIT_SIDEBAR],
-                    egui::Button::selectable(app.show_tcl, "Tcl"),
-                );
-                if tcl.clicked() {
-                    app.show_tcl = true;
-                    app.tcl_focus = true;
-                    app.model.bottom_tab = BottomTab::Tcl;
+                let log_on = app.model.bottom_tab == BottomTab::Log;
+                if ui.add(egui::Button::new(RichText::new("Log").strong()).selected(log_on)).clicked() {
+                    app.model.bottom_tab = BottomTab::Log;
                 }
                 if app.activity == Activity::Simulate {
-                    let s = ui.add_sized(
-                        [88.0, chrome::HIT_SIDEBAR],
-                        egui::Button::selectable(
-                            app.model.bottom_tab == BottomTab::SimLog,
-                            "Sim log",
-                        ),
-                    );
-                    if s.clicked() {
+                    let sim_on = app.model.bottom_tab == BottomTab::SimLog;
+                    if ui.add(egui::Button::new(RichText::new("Sim Log").strong()).selected(sim_on)).clicked() {
                         app.model.bottom_tab = BottomTab::SimLog;
                     }
                 }
             });
             match app.model.bottom_tab {
-                BottomTab::Tcl | BottomTab::Log => paint_tcl_console(ui, app),
+                BottomTab::Tcl => paint_tcl_console(ui, app),
+                BottomTab::Log => paint_log(ui, &mut app.model),
                 BottomTab::Messages => paint_messages(ui, &mut app.model),
                 BottomTab::SimLog => paint_sim_log(ui, &mut app.model),
             }
@@ -1809,19 +1833,8 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         .clamp(share.console_floor, share.console_cap);
 }
 
-fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
-    if !app.show_tcl {
-        return;
-    }
-    let mut open = app.show_tcl;
-    egui::Window::new("Tcl")
-        .open(&mut open)
-        .default_width(520.0)
-        .default_height(240.0)
-        .show(ctx, |ui| {
-            paint_tcl_console(ui, app);
-        });
-    app.show_tcl = open;
+fn paint_tcl_window(_ctx: &egui::Context, app: &mut HelionIde) {
+    app.show_tcl = false;
 }
 
 fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
@@ -2258,7 +2271,7 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             // Full-width vertical stack. No SidePanel twin, no set_min_size (that created a tall black hole).
             egui::ScrollArea::vertical()
                 .id_salt("timing_canvas_v6")
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .hscroll(false)
                 .show(ui, |ui| {
                     match app.activity {
@@ -2358,7 +2371,14 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::ReportsCatalog => paint_reports_detail(ui, app),
         WorkspacePane::Editor => paint_text_editor(ui, &mut app.model),
         WorkspacePane::Device => paint_device(ui, &mut app.model),
-        WorkspacePane::Timing => paint_timing_only(ui, &mut app.model),
+        WorkspacePane::Timing => {
+            egui::ScrollArea::vertical()
+                .id_salt("more_timing_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    paint_timing_only(ui, &mut app.model);
+                });
+        }
     }
 }
 
@@ -3494,57 +3514,66 @@ fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel) {
                 let mut ordered: Vec<_> = drawing.boxes.iter().collect();
                 ordered.sort_by(|a, b| (b.w * b.h).partial_cmp(&(a.w * a.h)).unwrap());
                 for b in ordered {
+                    let rw = b.w * sx;
+                    let rh = b.h * sy;
+                    let is_module = b.kind == "module" || b.kind.starts_with("instance:") || b.kind == "leaves";
+                    // Level-of-detail: skip sub-pixel leaf cells when zoomed out
+                    if !is_module && (rw < 3.0 || rh < 3.0) {
+                        continue;
+                    }
                     let r = egui::Rect::from_min_size(
                         egui::pos2(o.x + b.x * sx, o.y + b.y * sy),
-                        egui::vec2((b.w * sx).max(8.0), (b.h * sy).max(8.0)),
+                        egui::vec2(rw.max(1.0), rh.max(1.0)),
                     );
                     if !r.intersects(ui.clip_rect()) {
                         continue;
                     }
                     let on = selected.as_deref() == Some(b.name.as_str());
                     let fill = if b.kind == "module" {
-                        Color32::from_rgb(0x1a, 0x22, 0x1c)
+                        Color32::from_rgb(24, 32, 46)
                     } else if b.kind.starts_with("instance:") || b.kind == "leaves" {
-                        Color32::from_rgb(0x2a, 0x32, 0x24)
+                        Color32::from_rgb(30, 40, 56)
                     } else {
-                        Color32::from_rgb(0x3a, 0x42, 0x28)
+                        Color32::from_rgb(40, 52, 70)
                     };
                     p.rect_filled(r, 2.0, fill);
+                    let border_color = if on {
+                        Color32::from_rgb(88, 166, 255)
+                    } else if is_module {
+                        Color32::from_rgba_premultiplied(120, 150, 190, 80)
+                    } else {
+                        Color32::from_rgba_premultiplied(80, 100, 130, 40)
+                    };
                     p.rect_stroke(
                         r,
                         2.0,
-                        Stroke::new(
-                            if on { 2.0_f32 } else { 1.0_f32 },
-                            if on {
-                                Color32::from_rgb(0xe5, 0xc0, 0x7b)
-                            } else {
-                                Color32::from_rgb(0x7a, 0x84, 0x8e)
-                            },
-                        ),
+                        Stroke::new(if on { 2.0_f32 } else { 1.0_f32 }, border_color),
                         egui::StrokeKind::Inside,
                     );
-                    p.text(
-                        egui::pos2(r.left() + 6.0, r.top() + 3.0),
-                        egui::Align2::LEFT_TOP,
-                        &b.name,
-                        egui::FontId::monospace(10.0),
-                        Color32::from_rgb(0xdc, 0xe0, 0xe4),
-                    );
-                    p.text(
-                        egui::pos2(r.right() - 6.0, r.top() + 3.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{}", b.cells),
-                        egui::FontId::monospace(10.0),
-                        Color32::from_rgb(0x9a, 0xa4, 0xae),
-                    );
-                    if !b.kind.starts_with("instance:") && b.kind != "module" && b.kind != "leaves"
-                    {
+                    // Only draw text if box is large enough to legibly fit it
+                    if r.width() >= 48.0 && r.height() >= 18.0 {
+                        p.text(
+                            egui::pos2(r.left() + 6.0, r.top() + 3.0),
+                            egui::Align2::LEFT_TOP,
+                            &b.name,
+                            egui::FontId::monospace(10.5),
+                            Color32::from_rgb(230, 238, 248),
+                        );
+                        p.text(
+                            egui::pos2(r.right() - 6.0, r.top() + 3.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{}", b.cells),
+                            egui::FontId::monospace(10.5),
+                            Color32::from_rgb(160, 175, 195),
+                        );
+                    }
+                    if !is_module && r.width() >= 64.0 && r.height() >= 28.0 {
                         p.text(
                             r.center() + egui::vec2(0.0, 6.0),
                             egui::Align2::CENTER_CENTER,
                             &b.kind,
-                            egui::FontId::monospace(9.0),
-                            Color32::from_rgb(0x7e, 0xc8, 0xe3),
+                            egui::FontId::monospace(9.5),
+                            Color32::from_rgb(88, 166, 255),
                         );
                     }
                 }
@@ -4472,7 +4501,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     ));
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
-    egui::ScrollArea::vertical().max_height(280.0).hscroll(true).show(ui, |ui| {
+    egui::ScrollArea::horizontal().show(ui, |ui| {
         let pin_col = chrome::stretched_col_w_gap(7, ui.available_width(), 8.0);
         egui::Grid::new("timing_pin_delay")
             .spacing([8.0, 4.0])
