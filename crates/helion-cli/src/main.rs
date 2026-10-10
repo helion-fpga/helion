@@ -1,4 +1,5 @@
-use helion_bits::{bitgen, bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
+use helion_backend::{Backend, Hl10tBackend, Routed};
+use helion_bits::{bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
 use helion_device::Device;
 use helion_drc::check_routed;
 use helion_fabric::Fabric;
@@ -8,12 +9,10 @@ use helion_hw::{
     ProgramOutcome, Tap,
 };
 use helion_ir::Design;
-use helion_pack::pack;
-use helion_place::{place, place_with, PlaceOpts};
+use helion_place::place;
 use helion_proj::{
     constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path, Mode, Session,
 };
-use helion_route::{route_with, RouteOpts, Routed};
 use helion_sta::{
     apply_xdc, create_clock, load_sdc, load_xdc, report_power, report_timing_routed,
     report_timing_routed_xdc, Constraints, OperatingConditions, PowerReport, TimingResult,
@@ -83,88 +82,20 @@ fn compile_design_xdc(
         part,
         t_dev.elapsed().as_millis()
     );
-    let t0 = std::time::Instant::now();
-    let mut packed = pack(&design, &dev)?;
-    let iob_budget = dev.iob_sites().count();
-    // Prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
-    // device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32 IOBs.
-    let q_nets: std::collections::HashSet<&str> =
-        packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
-    let driven: Vec<_> = packed
-        .iobs
-        .iter()
-        .filter(|io| q_nets.contains(io.from_net.as_str()))
-        .cloned()
-        .collect();
-    let undriven = packed.iobs.len().saturating_sub(driven.len());
-    if packed.iobs.len() > iob_budget || undriven > 0 {
-        let keep = driven.len().min(iob_budget);
-        let keep = if packed.lutffs.len() > 2000 {
-            keep.min(4)
-        } else {
-            keep
-        };
-        eprintln!(
-            "hang_diag iob_trim {} -> {} (driven={} undriven={} budget={})",
-            packed.iobs.len(),
-            keep,
-            driven.len(),
-            undriven,
-            iob_budget
-        );
-        packed.iobs = driven.into_iter().take(keep).collect();
-    }
-    eprintln!(
-        "hang_diag pack lutffs={} iobs={} ms={}",
-        packed.lutffs.len(),
-        packed.iobs.len(),
-        t0.elapsed().as_millis()
-    );
-    let t1 = std::time::Instant::now();
-    let placed = place_with(&packed, &dev, PlaceOpts { timing_weight })?;
-    eprintln!(
-        "hang_diag place lutff_sites={} ms={}",
-        placed.lutff_sites.len(),
-        t1.elapsed().as_millis()
-    );
-    let t2 = std::time::Instant::now();
-    let route_opts = RouteOpts {
-        max_iters: if packed.lutffs.len() > 2000 { 24 } else { 8 },
-        extra_hops: 0,
-    };
-    let routed = route_with(&placed, &dev, route_opts)?;
-    eprintln!(
-        "hang_diag route imux={} imux_skip={} pathfinder_iters={} overused={} ms={}",
-        routed.imux.len(),
-        routed.imux_skip,
-        routed.pathfinder_iters,
-        routed.overused,
-        t2.elapsed().as_millis()
-    );
-    let drc = check_routed(&design, &routed, &dev);
+    // M1: the implement flow runs through the Backend trait. Hl10tBackend ports
+    // the exact HL10T free-function flow (same functions, options, order,
+    // diagnostics) — zero QoR movement.
+    let hl10t = Hl10tBackend::new(dev).with_timing_weight(timing_weight);
+    let backend: &dyn Backend = &hl10t;
+    let packed = backend.pack(&design)?;
+    let placed = backend.place(&packed)?;
+    let routed = backend.route(&placed)?;
+    let drc = check_routed(&design, &routed, hl10t.device());
     if !drc.ok() {
         eprintln!("hang_diag drc {}", drc.text().replace('\n', " | "));
     }
     drc.fail()?;
-    let t3 = std::time::Instant::now();
-    let bits = match bitgen(&dev, &routed) {
-        Ok(b) => b,
-        Err(e) if e.contains("empty design") => {
-            // 0-LUT identity / no_body: reports still match occupancy.
-            // write_bitstream / `helion bitstream` keep refusing empty frames.
-            eprintln!(
-                "hang_diag bitgen empty/honest ms={}",
-                t3.elapsed().as_millis()
-            );
-            helion_bits::Bitstream::empty(&dev)
-        }
-        Err(e) => return Err(e),
-    };
-    eprintln!(
-        "hang_diag bitgen bytes={} ms={}",
-        bits.packets.len(),
-        t3.elapsed().as_millis()
-    );
+    let bits = backend.bitstream(&routed)?;
     let mut clks = xdc.clocks.clone();
     if clks.is_empty() {
         create_clock(&mut clks, "clk", 10_000, "clk");
@@ -190,7 +121,7 @@ fn compile_design_xdc(
         );
     }
     Ok(Compiled {
-        dev,
+        dev: hl10t.device().clone(),
         design,
         routed,
         bits,

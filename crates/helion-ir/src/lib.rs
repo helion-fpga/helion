@@ -146,6 +146,61 @@ impl MapResult {
     }
 }
 
+/// FROZEN NetlistIR boundary (roadmap milestone M1, Helion 2.0.5+).
+///
+/// `NetlistIr` is the technology-mapped netlist every backend consumes: `pack →
+/// place → route → bitstream` (see the `Backend` trait in `helion-backend`).
+/// It is a plain alias for [`Design`]: nothing in the IR itself changes at M1,
+/// only the *contract* around it is now written down and versioned.
+///
+/// # Stability contract (M1)
+///
+/// 1. **Arch-neutral primitive set.** Backends may assume every [`Cell`] uses one
+///    of the arch-neutral [`CellKind`] variants:
+///    - `Lut6 { init }` — combinational LUT6; `init[addr]` is the output for
+///      inputs `{I5..I0}` as addr.
+///    - `Hff` — D flip-flop (HELIONLIB HFF semantics).
+///    - `IobOut` — output IOB driving a top-level port.
+///    - `Mac27` — DSP multiply-accumulate (pre-add × mul + acc).
+///    - `Bram18` — 18 Kb true dual-port block RAM.
+/// 2. **Nets/ports are the only interconnect.** Cells connect through [`Net`]
+///    endpoints (`cell`, `pin`); [`Port`]s define the top-level boundary with
+///    [`PortDir::In`] / `PortDir::Out`.
+/// 3. **Attrs are advisory.** Backend behavior must not *require* a cell/port/net
+///    attr to be correct; attrs carry hints (`soft` flags, source spans via
+///    [`SoftDiag`], device annotations).
+///
+/// # Known gaps (deliberately out of scope at M1 — do NOT "fix" here)
+///
+/// - **No `Carry` variant.** Carry chains currently fold into `Lut6` `init`
+///   words or stay in attrs; a first-class carry primitive is a future IR
+///   change under the policy below.
+/// - **IO asymmetry: `IobOut` exists, `IobIn` does not.** Input pads arrive via
+///   a different lowering path; until unified, backends must not assume every
+///   top-level input port has a matching input-pad cell kind.
+/// - **`Ila` is not arch-neutral.** The inserted ILA debug core is a Helion
+///   harness construct; foreign backends are free to reject it.
+/// - **`BlackBox { module }` is an escape hatch**, not a portable primitive.
+///   It marks unelaborated IP / DFX partitions; lowering it is backend-specific.
+/// - **`Mac27` / `Bram18` names are HL10T-flavored.** Their semantics (pre-add
+///   MAC, true dual-port 18 Kb) are documented here so future backends map
+///   them deliberately, not by accident.
+///
+/// # Change policy
+///
+/// The contract changes **only** via a semver minor bump of the workspace
+/// (`helion-ir` follows the workspace version) with an entry in `CHANGELOG.md`
+/// under `[Unreleased]`. Rules of thumb:
+/// - *Adding* a `CellKind` variant = minor bump + CHANGELOG entry + update the
+///   primitive list in this doc.
+/// - *Removing* or *redefining* a variant = major bump (breaking).
+/// - Adding optional fields or attrs = patch-level, no contract change.
+///
+/// Backends that match exhaustively on [`CellKind`] will fail to compile on
+/// additive changes — that is intentional: it forces the author to decide how
+/// the new primitive maps instead of silently miscompiling.
+pub type NetlistIr = Design;
+
 #[derive(Clone, Debug)]
 pub struct Design {
     pub name: String,
