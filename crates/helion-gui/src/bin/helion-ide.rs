@@ -19,6 +19,25 @@ use helion_gui::{
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "helion-ide/theme.rs"]
+mod theme;
+#[path = "helion-ide/icons.rs"]
+mod icons;
+#[path = "helion-ide/commands.rs"]
+mod commands;
+#[path = "helion-ide/flow_nav.rs"]
+mod flow_nav;
+#[path = "helion-ide/layouts.rs"]
+mod layouts;
+#[path = "helion-ide/highlight.rs"]
+mod highlight;
+#[path = "helion-ide/dashboard.rs"]
+mod dashboard;
+#[path = "helion-ide/welcome.rs"]
+mod welcome;
+#[path = "helion-ide/toasts.rs"]
+mod toasts;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -207,6 +226,7 @@ fn run_gui() -> eframe::Result {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            theme::install_fonts(&cc.egui_ctx);
             cc.egui_ctx.style_mut(|s| {
                 s.interaction.resize_grab_radius_side = chrome::SPLITTER_GRAB_PX;
                 s.interaction.resize_grab_radius_corner = chrome::SPLITTER_GRAB_PX + 4.0;
@@ -276,7 +296,8 @@ struct HelionIde {
     activity: Activity,
     canvas: Canvas,
     show_tcl: bool,
-    show_palette: bool,
+    palette: commands::PaletteState,
+    show_cheatsheet: bool,
     show_examples: bool,
     show_create_project: bool,
     create_wizard: CreateProjectWizard,
@@ -301,6 +322,15 @@ struct HelionIde {
     /// Last window size we shared chrome against.
     last_share: [f32; 2],
     force_share: bool,
+    /// Design tokens (P0-4). All paint code reads these; no raw hex in the shell.
+    theme: theme::Theme,
+    theme_dirty: bool,
+    /// Toast notifications (P1-5).
+    toasts: toasts::ToastQueue,
+    /// Layout preset + persisted chrome (P1-1).
+    layout_state: layouts::LayoutState,
+    /// Welcome page dismissed this session.
+    welcome_dismissed: bool,
 }
 
 impl HelionIde {
@@ -325,7 +355,8 @@ impl HelionIde {
             activity,
             canvas,
             show_tcl: false,
-            show_palette: false,
+            palette: commands::PaletteState::default(),
+            show_cheatsheet: false,
             show_examples: false,
             show_create_project: false,
             create_wizard: CreateProjectWizard::default(),
@@ -345,6 +376,11 @@ impl HelionIde {
             progress: String::new(),
             last_share: [0.0, 0.0],
             force_share: true,
+            theme: theme::Theme::dark(),
+            theme_dirty: true,
+            toasts: toasts::ToastQueue::default(),
+            layout_state: layouts::LayoutState::default(),
+            welcome_dismissed: false,
         };
         if let Ok(w) = std::env::var("HELION_SIDEBAR_WIDTH") {
             if let Ok(v) = w.parse::<f32>() {
@@ -414,6 +450,7 @@ impl HelionIde {
                 app.model.device_zoom = v.clamp(0.40, 6.0);
             }
         }
+        layouts::load_chrome_state(&mut app);
         app
     }
 
@@ -511,6 +548,14 @@ impl HelionIde {
                     Ok(s) => s.clone(),
                     Err(e) => e.clone(),
                 };
+                self.toasts.push(
+                    if out.result.is_ok() {
+                        toasts::ToastKind::Ok
+                    } else {
+                        toasts::ToastKind::Error
+                    },
+                    format!("{} — {}", out.kind.widget(), self.progress),
+                );
                 if matches!(out.kind, JobKind::Implement) && out.result.is_ok() {
                     self.set_canvas(Canvas::Device);
                 }
@@ -654,6 +699,10 @@ impl eframe::App for HelionIde {
     /// Synth/implement run on the engine thread via submit_job / queue_flow.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         handle_shortcuts(ctx, self);
+        if self.theme_dirty {
+            self.theme.apply(ctx);
+            self.theme_dirty = false;
+        }
         for kind in surface::take_jobs() {
             self.submit_job(kind);
         }
@@ -680,10 +729,17 @@ impl eframe::App for HelionIde {
             paint_sidebar(ctx, self);
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            paint_workspace(ui, self);
+            let theme = self.theme;
+            if welcome::should_show(self) {
+                welcome::paint_welcome(ui, self, &theme);
+            } else {
+                paint_workspace(ui, self);
+            }
         });
         paint_tcl_window(ctx, self);
-        paint_palette(ctx, self);
+        commands::paint_palette(ctx, self);
+        commands::paint_shortcut_cheatsheet(ctx, self);
+        self.toasts.paint(ctx, &self.theme);
         paint_examples_popup(ctx, self);
         paint_create_project_wizard(ctx, self);
         capture_shot(ctx, self);
@@ -804,7 +860,19 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
         }
     }
     if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::P)) {
-        app.show_palette = !app.show_palette;
+        app.palette.open = !app.palette.open;
+        app.palette.mode = commands::PaletteMode::Files;
+        app.palette.selected = 0;
+        app.palette.query.clear();
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd | egui::Modifiers::SHIFT, egui::Key::P)) {
+        app.palette.open = true;
+        app.palette.mode = commands::PaletteMode::Commands;
+        app.palette.selected = 0;
+        app.palette.query.clear();
+    }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::K)) {
+        app.show_cheatsheet = !app.show_cheatsheet;
     }
 }
 
@@ -1133,11 +1201,12 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.spacing_mut().item_spacing.y = 4.0;
+            let theme = app.theme;
             let mut pick = None;
             for act in Activity::ALL {
                 let on = app.activity == act;
                 let fill = if on {
-                    Color32::from_rgb(0x1f, 0x4a, 0x38)
+                    theme.sel
                 } else {
                     Color32::TRANSPARENT
                 };
@@ -1150,35 +1219,27 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                         rect,
                         3.0,
                         fill,
-                        Stroke::new(
-                            if on { 1.0_f32 } else { 0.0_f32 },
-                            Color32::from_rgb(0x3d, 0xb8, 0x7a),
-                        ),
+                        Stroke::new(if on { 1.0_f32 } else { 0.0_f32 }, theme.accent),
                         egui::StrokeKind::Inside,
                     );
                     let c = rect.center();
-                    // Word is the primary label (MUST 3). Letter is a small index, not the name.
-                    ui.painter().text(
-                        egui::pos2(c.x, c.y - 12.0),
-                        egui::Align2::CENTER_CENTER,
-                        act.icon(),
-                        egui::FontId::proportional(10.0),
-                        if on {
-                            Color32::from_rgb(0x8a, 0xc4, 0xa4)
-                        } else {
-                            Color32::from_rgb(0x7a, 0x84, 0x8c)
-                        },
+                    // Vector glyph (icons.rs) — no letter glyphs, no emoji.
+                    let icon_color = if on { theme.accent } else { theme.dim };
+                    icons::paint_activity(
+                        ui.painter(),
+                        egui::Rect::from_center_size(
+                            egui::pos2(c.x, c.y - 10.0),
+                            egui::vec2(26.0, 26.0),
+                        ),
+                        act,
+                        icon_color,
                     );
                     ui.painter().text(
-                        egui::pos2(c.x, c.y + 8.0),
+                        egui::pos2(c.x, c.y + 12.0),
                         egui::Align2::CENTER_CENTER,
                         act.short_label(),
-                        egui::FontId::proportional(12.0),
-                        if on {
-                            Color32::from_rgb(0xc8, 0xf0, 0xd8)
-                        } else {
-                            Color32::from_rgb(0xdc, 0xe0, 0xe4)
-                        },
+                        theme::font_ui(12.0),
+                        if on { theme.text } else { theme.dim },
                     );
                 }
                 let resp = resp.on_hover_text(act.hover());
@@ -1240,7 +1301,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     paint_timing_paths(ui, &mut app.model);
                 }
                 Activity::Reports => {
-                    paint_report_catalog(ui, &mut app.model, "sidebar_reports_catalog");
+                    paint_report_catalog(ui, &mut app.model, "sidebar_reports_catalog", &app.theme);
                 }
                 Activity::Program => {
                     paint_program_side(ui, app);
@@ -1745,8 +1806,8 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
             });
             match app.model.bottom_tab {
                 BottomTab::Tcl | BottomTab::Log => paint_tcl_console(ui, app),
-                BottomTab::Messages => paint_messages(ui, &mut app.model),
-                BottomTab::SimLog => paint_sim_log(ui, &mut app.model),
+                BottomTab::Messages => paint_messages(ui, &mut app.model, &app.theme),
+                BottomTab::SimLog => paint_sim_log(ui, &mut app.model, &app.theme),
             }
         });
     app.console_height = inner
@@ -1769,62 +1830,6 @@ fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
             paint_tcl_console(ui, app);
         });
     app.show_tcl = open;
-}
-
-fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
-    if !app.show_palette {
-        return;
-    }
-    let mut open = app.show_palette;
-    let mut run = None;
-    egui::Window::new("Commands")
-        .open(&mut open)
-        .default_width(420.0)
-        .show(ctx, |ui| {
-            ui.label("Recipes — run from here or the console.");
-            let recipes: &[(&str, &str)] = &[
-                ("Implement", "impl_design"),
-                ("Report timing", "report_timing"),
-                ("Report utilization", "report_utilization"),
-                ("Launch selected run", "launch_runs"),
-                ("New run", "create_run impl_2 -strategy Default"),
-                ("create_clock 10ns", "create_clock -period 10 clk"),
-                ("read_xdc examples/counter.sdc", "read_xdc"),
-            ];
-            for (name, tcl) in recipes {
-                if ui
-                    .add_sized(
-                        [ui.available_width(), chrome::HIT_SIDEBAR],
-                        egui::Button::new(*name),
-                    )
-                    .on_hover_text(*tcl)
-                    .clicked()
-                {
-                    run = Some(*tcl);
-                }
-            }
-        });
-    app.show_palette = open;
-    if let Some(tcl) = run {
-        if tcl == "impl_design" {
-            run_implement(app);
-        } else if tcl == "launch_runs" {
-            if let Some(name) = app
-                .model
-                .selected
-                .as_deref()
-                .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string())
-            {
-                let _ = app.model.exec(&format!("launch_runs {name}"));
-            }
-        } else if tcl == "read_xdc" {
-            let p = helion_device::Device::examples_dir().join("counter.sdc");
-            let _ = app.model.exec(&format!("read_xdc {}", p.display()));
-        } else {
-            let _ = app.model.exec(tcl);
-        }
-        app.show_palette = false;
-    }
 }
 
 
@@ -2280,21 +2285,21 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Schematic => paint_schematic(ui, &mut app.model),
         WorkspacePane::Package => paint_package(ui, &mut app.model),
         WorkspacePane::Hierarchy => paint_hierarchy(ui, &mut app.model),
-        WorkspacePane::Bitstream => paint_bitstream(ui, &mut app.model),
+        WorkspacePane::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
         WorkspacePane::Hardware => paint_hw(ui, app),
         WorkspacePane::Ip => paint_ip(ui, &mut app.model),
         WorkspacePane::Find => paint_find(ui, &mut app.model),
         WorkspacePane::Settings => paint_project_settings(ui, &mut app.model),
-        WorkspacePane::Summary => paint_project_summary(ui, &mut app.model),
+        WorkspacePane::Summary => paint_project_summary(ui, &mut app.model, &app.theme),
         WorkspacePane::Constraints => paint_constraints(ui, &mut app.model),
-        WorkspacePane::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
-        WorkspacePane::Cdc => paint_cdc(ui, &mut app.model),
+        WorkspacePane::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
+        WorkspacePane::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
         WorkspacePane::ClockNetworks => paint_clock_networks(ui, &mut app.model),
         WorkspacePane::Power => paint_power(ui, &mut app.model),
-        WorkspacePane::Methodology => paint_methodology(ui, &mut app.model),
-        WorkspacePane::Drc => paint_drc(ui, &mut app.model),
+        WorkspacePane::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model),
-        WorkspacePane::Runs => paint_runs(ui, &mut app.model),
+        WorkspacePane::Runs => paint_runs(ui, &mut app.model, &app.theme),
         WorkspacePane::Wave
         | WorkspacePane::Source
         | WorkspacePane::Memory
@@ -2321,15 +2326,15 @@ fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel) {
 fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
     match app.model.workspace {
         WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
-        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
         WorkspaceTab::Power => paint_power(ui, &mut app.model),
-        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model),
-        WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
+        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
-        WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
-        WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model),
+        WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model, &app.theme),
         WorkspaceTab::Reports => {
             // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
             paint_timing_summary(ui, &mut app.model);
@@ -2345,23 +2350,23 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
 fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
     match app.model.workspace {
         WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model),
-        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
         WorkspaceTab::Power => paint_power(ui, &mut app.model),
-        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model),
-        WorkspaceTab::Drc => paint_drc(ui, &mut app.model),
+        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model),
-        WorkspaceTab::Runs => paint_runs(ui, &mut app.model),
+        WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
         WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model),
         WorkspaceTab::Package => paint_package(ui, &mut app.model),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model),
-        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model),
+        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
         WorkspaceTab::Hardware => paint_hw(ui, app),
         WorkspaceTab::Ip => paint_ip(ui, &mut app.model),
         WorkspaceTab::Find => paint_find(ui, &mut app.model),
         WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model),
-        WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model),
+        WorkspaceTab::Summary => paint_project_summary(ui, &mut app.model, &app.theme),
         _ => {
             paint_timing_summary(ui, &mut app.model);
             ui.add_space(8.0);
@@ -2529,15 +2534,15 @@ fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 
-fn msg_severity_color(sev: MsgSeverity) -> Color32 {
+fn msg_severity_color(theme: &theme::Theme, sev: MsgSeverity) -> Color32 {
     match sev {
-        MsgSeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
-        MsgSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        MsgSeverity::Info => Color32::from_rgb(0x6a, 0xb0, 0xd8),
+        MsgSeverity::Error => theme.danger,
+        MsgSeverity::Warning => theme.warn,
+        MsgSeverity::Info => theme.info,
     }
 }
 
-fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let n_err = model
         .messages
         .iter()
@@ -2630,7 +2635,7 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
                     } else {
                         for (i, m, obj) in &rows {
                             let on = selected == Some(*i);
-                            let fill = msg_severity_color(m.severity);
+                            let fill = msg_severity_color(theme, m.severity);
                             ui.monospace(i.to_string());
                             let btn = egui::Button::new(
                                 RichText::new(m.severity.tag()).color(Color32::BLACK),
@@ -2665,11 +2670,11 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn log_status_color(ok: bool) -> Color32 {
+fn log_status_color(theme: &theme::Theme, ok: bool) -> Color32 {
     if ok {
-        Color32::from_rgb(0x50, 0xc0, 0x70)
+        theme.ok
     } else {
-        Color32::from_rgb(0xe0, 0x50, 0x50)
+        theme.danger
     }
 }
 
@@ -2725,7 +2730,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
                             let btn = egui::Button::new(
                                 RichText::new(line.status()).color(Color32::BLACK),
                             )
-                            .fill(log_status_color(line.ok))
+                            .fill(log_status_color(&app.theme, line.ok))
                             .selected(on);
                             if ui.add(btn).clicked() {
                                 pick_line = Some(*i);
@@ -2776,7 +2781,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
-fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let selected = model.selected_log;
     let rows: Vec<(usize, helion_gui::ConsoleLine)> = model
         .log_rows()
@@ -2810,7 +2815,7 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
                             let btn = egui::Button::new(
                                 RichText::new(status).color(Color32::BLACK),
                             )
-                            .fill(log_status_color(line.ok))
+                            .fill(log_status_color(theme, line.ok))
                             .selected(on);
                             if ui.add(btn).clicked() {
                                 pick = Some(*i);
@@ -2838,7 +2843,7 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let _n_err = model
         .sim_log
         .iter()
@@ -2882,7 +2887,7 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
                             let btn = egui::Button::new(
                                 RichText::new(row.severity.tag()).color(Color32::BLACK),
                             )
-                            .fill(msg_severity_color(row.severity))
+                            .fill(msg_severity_color(theme, row.severity))
                             .selected(on);
                             if ui.add(btn).clicked() {
                                 pick = Some(i);
@@ -2904,7 +2909,7 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 
-fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Project Summary");
     let rows = model.project_summary_gadgets();
     let _wns = model
@@ -2957,7 +2962,7 @@ fn paint_project_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
                         if ui.selectable_label(on, &r.name).clicked() {
                             pick = Some(i.to_string());
                         }
-                        let fill = run_status_color(&r.status);
+                        let fill = run_status_color(theme, &r.status);
                         let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
                             .fill(fill)
                             .selected(on);
@@ -3099,16 +3104,16 @@ fn paint_sim_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn run_status_color(status: &str) -> Color32 {
+fn run_status_color(theme: &theme::Theme, status: &str) -> Color32 {
     match status {
-        "Complete" => Color32::from_rgb(0x50, 0xc0, 0x70),
-        "Running" | "Warnings" => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        "Failed" => Color32::from_rgb(0xe0, 0x50, 0x50),
-        _ => Color32::from_rgb(0x6a, 0x70, 0x78),
+        "Complete" => theme.ok,
+        "Running" | "Warnings" => theme.warn,
+        "Failed" => theme.danger,
+        _ => theme.faint,
     }
 }
 
-fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Runs");
     ui.horizontal(|ui| {
         if ui
@@ -3164,7 +3169,7 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
                             pick = Some(r.name.clone());
                         }
                         ui.label(r.strategy_cell());
-                        let fill = run_status_color(&r.status);
+                        let fill = run_status_color(theme, &r.status);
                         let btn = egui::Button::new(
                             RichText::new(&r.status).color(Color32::BLACK),
                         )
@@ -3218,21 +3223,21 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel) {
         let _ = model.select_run(&name);
     }
     ui.add_space(8.0);
-    paint_incremental_report(ui, model);
+    paint_incremental_report(ui, model, theme);
     ui.add_space(8.0);
-    paint_eco_changes(ui, model);
+    paint_eco_changes(ui, model, theme);
 }
 
-fn incremental_status_color(status: &str) -> Color32 {
+fn incremental_status_color(theme: &theme::Theme, status: &str) -> Color32 {
     match status {
-        "Reused" => Color32::from_rgb(0x50, 0xc0, 0x70),
-        "New" => Color32::from_rgb(0x6a, 0xb0, 0xd8),
-        "Partial" => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        _ => Color32::from_rgb(0x6a, 0x70, 0x78),
+        "Reused" => theme.ok,
+        "New" => theme.info,
+        "Partial" => theme.warn,
+        _ => theme.faint,
     }
 }
 
-fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.label(RichText::new("Incremental Compile").strong());
     let rows = model.incremental_rows.clone();
     let _n_new = rows
@@ -3284,7 +3289,7 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel) {
                         if ui.selectable_label(on, r.kind_cell()).clicked() {
                             pick = Some(i.to_string());
                         }
-                        let fill = incremental_status_color(&r.status);
+                        let fill = incremental_status_color(theme, &r.status);
                         let btn = egui::Button::new(
                             RichText::new(r.status_cell()).color(Color32::BLACK),
                         )
@@ -3323,15 +3328,15 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn eco_status_color(status: &str) -> Color32 {
+fn eco_status_color(theme: &theme::Theme, status: &str) -> Color32 {
     match status {
-        "Placed" => Color32::from_rgb(0x50, 0xc0, 0x70),
-        "Missing" => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        _ => Color32::from_rgb(0x6a, 0x70, 0x78),
+        "Placed" => theme.ok,
+        "Missing" => theme.warn,
+        _ => theme.faint,
     }
 }
 
-fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.label(RichText::new("ECO Changes").strong());
     let rows = model.eco_rows();
     let _n_missing = rows.iter().filter(|r| r.status == "Missing").count();
@@ -3370,7 +3375,7 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel) {
                         if ui.selectable_label(on, r.kind_cell()).clicked() {
                             pick = Some(i.to_string());
                         }
-                        let fill = eco_status_color(&r.status);
+                        let fill = eco_status_color(theme, &r.status);
                         let btn = egui::Button::new(
                             RichText::new(r.status_cell()).color(Color32::BLACK),
                         )
@@ -4461,7 +4466,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static str) {
+fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static str, theme: &theme::Theme) {
     let rows = model.report_catalog();
     let selected = model.selected_report.clone();
     let mut pick: Option<String> = None;
@@ -4481,7 +4486,7 @@ fn paint_report_catalog(ui: &mut egui::Ui, model: &mut IdeModel, salt: &'static 
                 if ui.add(name).clicked() {
                     pick = Some(r.id.clone());
                 }
-                let status_fill = run_status_color(&r.status);
+                let status_fill = run_status_color(theme, &r.status);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&r.category).small());
                     let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
@@ -4664,21 +4669,21 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn clock_relation_color(rel: ClockRelation) -> Color32 {
+fn clock_relation_color(theme: &theme::Theme, rel: ClockRelation) -> Color32 {
     match rel {
-        ClockRelation::Timed => Color32::from_rgb(0x3c, 0xb3, 0x71),
-        ClockRelation::TimedGenerated => Color32::from_rgb(0x6b, 0xc9, 0x6b),
-        ClockRelation::TimedUnsafe => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        ClockRelation::TimedDatapath => Color32::from_rgb(0xf0, 0x80, 0x40),
-        ClockRelation::FalsePath => Color32::from_rgb(0x90, 0x90, 0x90),
-        ClockRelation::PartialFalsePath => Color32::from_rgb(0xc0, 0x70, 0x40),
-        ClockRelation::Asynchronous => Color32::from_rgb(0x90, 0x60, 0xc0),
-        ClockRelation::Exclusive => Color32::from_rgb(0x50, 0x80, 0xc0),
-        ClockRelation::NoPaths => Color32::from_rgb(0x40, 0x40, 0x40),
+        ClockRelation::Timed => theme.ok,
+        ClockRelation::TimedGenerated => theme.info,
+        ClockRelation::TimedUnsafe => theme.warn,
+        ClockRelation::TimedDatapath => theme.warn,
+        ClockRelation::FalsePath => theme.faint,
+        ClockRelation::PartialFalsePath => theme.warn,
+        ClockRelation::Asynchronous => theme.violet,
+        ClockRelation::Exclusive => theme.info,
+        ClockRelation::NoPaths => theme.faint,
     }
 }
 
-fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Clock Interaction");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -4729,7 +4734,7 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
                         if let Some(cell) = report.cell(&from.name, &to.name) {
                             let key = format!("{}->{}", cell.from, cell.to);
                             let on = selected_ci.as_deref() == Some(key.as_str());
-                            let fill = clock_relation_color(cell.relation);
+                            let fill = clock_relation_color(theme, cell.relation);
                             let wns = cell
                                 .wns_ps
                                 .map(|w| format!(" WNS_PS={w}"))
@@ -4767,16 +4772,16 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn cdc_severity_color(sev: CdcSeverity) -> Color32 {
+fn cdc_severity_color(theme: &theme::Theme, sev: CdcSeverity) -> Color32 {
     match sev {
-        CdcSeverity::Critical => Color32::from_rgb(0xe0, 0x50, 0x50),
-        CdcSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        CdcSeverity::Info => Color32::from_rgb(0x90, 0x60, 0xc0),
-        CdcSeverity::Safe => Color32::from_rgb(0x3c, 0xb3, 0x71),
+        CdcSeverity::Critical => theme.danger,
+        CdcSeverity::Warning => theme.warn,
+        CdcSeverity::Info => theme.violet,
+        CdcSeverity::Safe => theme.ok,
     }
 }
 
-fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("CDC");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -4821,7 +4826,7 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel) {
                 for v in &report.violations {
                     let key = format!("{}->{}", v.from, v.to);
                     let on = selected_cdc.as_deref() == Some(key.as_str());
-                    let fill = cdc_severity_color(v.severity);
+                    let fill = cdc_severity_color(theme, v.severity);
                     let btn = egui::Button::new(
                         RichText::new(&v.from).color(Color32::BLACK),
                     )
@@ -5066,16 +5071,16 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn methodology_severity_color(sev: MethodologySeverity) -> Color32 {
+fn methodology_severity_color(theme: &theme::Theme, sev: MethodologySeverity) -> Color32 {
     match sev {
-        MethodologySeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
-        MethodologySeverity::CriticalWarning => Color32::from_rgb(0xf0, 0x80, 0x40),
-        MethodologySeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        MethodologySeverity::Advisory => Color32::from_rgb(0x90, 0x60, 0xc0),
+        MethodologySeverity::Error => theme.danger,
+        MethodologySeverity::CriticalWarning => theme.warn,
+        MethodologySeverity::Warning => theme.warn,
+        MethodologySeverity::Advisory => theme.violet,
     }
 }
 
-fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Methodology");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -5147,7 +5152,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.end_row();
                 for v in &report.checks {
                     let on = selected_meth.as_deref() == Some(v.id.as_str());
-                    let fill = methodology_severity_color(v.severity);
+                    let fill = methodology_severity_color(theme, v.severity);
                     let btn = egui::Button::new(RichText::new(&v.id).color(Color32::BLACK))
                         .fill(fill)
                         .selected(on);
@@ -5185,27 +5190,27 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn drc_severity_color(sev: DrcSeverity) -> Color32 {
+fn drc_severity_color(theme: &theme::Theme, sev: DrcSeverity) -> Color32 {
     match sev {
-        DrcSeverity::Error => Color32::from_rgb(0xe0, 0x50, 0x50),
-        DrcSeverity::Warning => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        DrcSeverity::Advisory => Color32::from_rgb(0x90, 0x60, 0xc0),
+        DrcSeverity::Error => theme.danger,
+        DrcSeverity::Warning => theme.warn,
+        DrcSeverity::Advisory => theme.violet,
     }
 }
 
 #[allow(dead_code)] // intentional: helper for WIP bitstream panel
-fn bitstream_block_color(block: &str) -> Color32 {
+fn bitstream_block_color(theme: &theme::Theme, block: &str) -> Color32 {
     match block {
-        "CLB_IO_CLK" => Color32::from_rgb(0x3d, 0xb8, 0x7a),
-        "DSP" => Color32::from_rgb(0x90, 0x60, 0xc0),
-        "BRAM" => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        "IOB" => Color32::from_rgb(0x5a, 0xb0, 0xe0),
-        _ => Color32::from_rgb(0x9a, 0xa4, 0xae),
+        "CLB_IO_CLK" => theme.ok,
+        "DSP" => theme.violet,
+        "BRAM" => theme.warn,
+        "IOB" => theme.info,
+        _ => theme.dim,
     }
 }
 
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
-fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Bitstream");
     ui.add_space(6.0);
     let report = model.bitstream_report();
@@ -5248,7 +5253,7 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
                 for row in &report.rows {
                     let far = row.far_hex();
                     let on = selected.as_deref() == Some(far.as_str());
-                    let fill = bitstream_block_color(row.block_name());
+                    let fill = bitstream_block_color(theme, row.block_name());
                     let btn = egui::Button::new(RichText::new(&far).color(Color32::BLACK))
                         .fill(fill)
                         .selected(on);
@@ -5270,7 +5275,7 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("DRC");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -5325,7 +5330,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel) {
                 } else {
                     for v in &report.items {
                         let on = selected_drc.as_deref() == Some(v.id.as_str());
-                        let fill = drc_severity_color(v.severity);
+                        let fill = drc_severity_color(theme, v.severity);
                         let btn = egui::Button::new(RichText::new(&v.id).color(Color32::BLACK))
                             .fill(fill)
                             .selected(on);
@@ -7642,14 +7647,14 @@ fn paint_trace_shape(
     let _ = ns;
 }
 
-fn hw_stat_bit_color(name: &str, value: bool) -> Color32 {
+fn hw_stat_bit_color(theme: &theme::Theme, name: &str, value: bool) -> Color32 {
     if !value {
-        return Color32::from_rgb(0x6a, 0x74, 0x7e);
+        return theme.faint;
     }
     match name {
-        "CRC_ERR" => Color32::from_rgb(0xe0, 0x50, 0x50),
-        "GTS" | "GSR" => Color32::from_rgb(0xf0, 0xc0, 0x40),
-        _ => Color32::from_rgb(0x3d, 0xb8, 0x7a),
+        "CRC_ERR" => theme.danger,
+        "GTS" | "GSR" => theme.warn,
+        _ => theme.ok,
     }
 }
 
@@ -7728,7 +7733,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
                     (
                         b.name.clone(),
                         b.value,
-                        hw_stat_bit_color(&b.name, b.value),
+                        hw_stat_bit_color(&app.theme, &b.name, b.value),
                     )
                 })
                 .collect()
