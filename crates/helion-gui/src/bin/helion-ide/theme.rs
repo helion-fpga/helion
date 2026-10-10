@@ -39,6 +39,16 @@ pub struct Theme {
     pub info: Color32,
     /// Secondary categorical color (charts, advisory severities).
     pub violet: Color32,
+    /// Device / waveform canvas background (darker than `--bg`).
+    pub die_bg: Color32,
+    /// Categorical blue: IOB sites, categorical data blue.
+    pub cat_blue: Color32,
+    /// Waveform trace / cursor B (cyan). Trace A uses `--danger`.
+    pub trace_b: Color32,
+    /// Selected-net highlight, pblock-adjacent gold.
+    pub gold: Color32,
+    /// Pblock outlines, categorical amber.
+    pub amber: Color32,
     pub density: Density,
 }
 
@@ -62,6 +72,11 @@ impl Theme {
             danger: Color32::from_rgb(0xe0, 0x6c, 0x75),
             info: Color32::from_rgb(0x7e, 0xc8, 0xe3),
             violet: Color32::from_rgb(0x90, 0x60, 0xc0),
+            die_bg: Color32::from_rgb(0x12, 0x16, 0x1a),
+            cat_blue: Color32::from_rgb(0x5b, 0x9b, 0xd5),
+            trace_b: Color32::from_rgb(0x56, 0xb6, 0xc2),
+            gold: Color32::from_rgb(0xe5, 0xc0, 0x7b),
+            amber: Color32::from_rgb(0xe5, 0x9a, 0x3c),
             density: Density::Comfortable,
         }
     }
@@ -86,6 +101,11 @@ impl Theme {
             danger: Color32::from_rgb(0xb0, 0x30, 0x38),
             info: Color32::from_rgb(0x1a, 0x6f, 0xa8),
             violet: Color32::from_rgb(0x6a, 0x3f, 0xb0),
+            die_bg: Color32::from_rgb(0xe2, 0xe6, 0xec),
+            cat_blue: Color32::from_rgb(0x2a, 0x6c, 0xb4),
+            trace_b: Color32::from_rgb(0x1f, 0x8a, 0xa8),
+            gold: Color32::from_rgb(0x96, 0x69, 0x0f),
+            amber: Color32::from_rgb(0xa8, 0x6a, 0x10),
             density: Density::Comfortable,
         }
     }
@@ -129,11 +149,11 @@ impl Theme {
             s.text_styles.insert(TS::Button, font_ui(13.0));
             s.text_styles.insert(TS::Small, font_ui(11.0));
             s.text_styles.insert(TS::Heading, font_ui_medium(16.0));
-            s.text_styles.insert(TS::Name("caption".into()), font_ui(11.0));
+            s.text_styles
+                .insert(TS::Name("caption".into()), font_ui(11.0));
             s.text_styles
                 .insert(TS::Name("wordmark".into()), font_ui_medium(20.0));
-            s.text_styles
-                .insert(TS::Monospace, font_code(12.0));
+            s.text_styles.insert(TS::Monospace, font_code(12.0));
             let (row, pad) = match self.density {
                 Density::Compact => (24.0, 4.0),
                 Density::Comfortable => (28.0, 8.0),
