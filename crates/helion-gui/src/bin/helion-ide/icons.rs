@@ -57,7 +57,12 @@ pub fn paint_activity(painter: &egui::Painter, rect: Rect, act: Activity, color:
             let b = Rect::from_center_size(c, egui::vec2(12.0, 12.0));
             painter.rect_stroke(b, 1.5, stroke(color), egui::StrokeKind::Inside);
             let inner = Rect::from_center_size(c, egui::vec2(6.0, 6.0));
-            painter.rect_stroke(inner, 1.0, Stroke::new(1.2, color), egui::StrokeKind::Inside);
+            painter.rect_stroke(
+                inner,
+                1.0,
+                Stroke::new(1.2, color),
+                egui::StrokeKind::Inside,
+            );
             for t in [-4.0, 0.0, 4.0] {
                 // Top / bottom pins.
                 painter.line_segment(
@@ -122,22 +127,34 @@ pub fn paint_activity(painter: &egui::Painter, rect: Rect, act: Activity, color:
             ];
             painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
             painter.line_segment(
-                [Pos2::new(c.x - 8.0, c.y + 7.0), Pos2::new(c.x + 8.0, c.y + 7.0)],
+                [
+                    Pos2::new(c.x - 8.0, c.y + 7.0),
+                    Pos2::new(c.x + 8.0, c.y + 7.0),
+                ],
                 stroke(color),
             );
             painter.line_segment(
-                [Pos2::new(c.x - 8.0, c.y + 7.0), Pos2::new(c.x - 8.0, c.y + 4.0)],
+                [
+                    Pos2::new(c.x - 8.0, c.y + 7.0),
+                    Pos2::new(c.x - 8.0, c.y + 4.0),
+                ],
                 stroke(color),
             );
             painter.line_segment(
-                [Pos2::new(c.x + 8.0, c.y + 7.0), Pos2::new(c.x + 8.0, c.y + 4.0)],
+                [
+                    Pos2::new(c.x + 8.0, c.y + 7.0),
+                    Pos2::new(c.x + 8.0, c.y + 4.0),
+                ],
                 stroke(color),
             );
         }
         // Bar chart: three bars + axis.
         Activity::Reports => {
             painter.line_segment(
-                [Pos2::new(c.x - 8.0, c.y + 7.0), Pos2::new(c.x + 8.0, c.y + 7.0)],
+                [
+                    Pos2::new(c.x - 8.0, c.y + 7.0),
+                    Pos2::new(c.x + 8.0, c.y + 7.0),
+                ],
                 Stroke::new(1.4, color),
             );
             for (i, h) in [6.0, 11.0, 8.0].iter().enumerate() {
@@ -190,7 +207,10 @@ pub fn paint_stage(painter: &egui::Painter, rect: Rect, stage: FlowStep, color: 
         // Opt: magic-wand spark — diagonal line with sparkles.
         FlowStep::Opt => {
             painter.line_segment(
-                [Pos2::new(c.x - 5.0, c.y + 5.0), Pos2::new(c.x + 3.0, c.y - 3.0)],
+                [
+                    Pos2::new(c.x - 5.0, c.y + 5.0),
+                    Pos2::new(c.x + 3.0, c.y - 3.0),
+                ],
                 stroke,
             );
             for p in [
