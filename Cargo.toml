@@ -8,6 +8,7 @@ members = [
     "crates/helion-pack",
     "crates/helion-place",
     "crates/helion-route",
+    "crates/helion-backend",
     "crates/helion-cli",
     "crates/helion-sv",
     "crates/helion-sta",
@@ -40,6 +41,7 @@ helion-fabric = { path = "crates/helion-fabric" }
 helion-pack = { path = "crates/helion-pack" }
 helion-place = { path = "crates/helion-place" }
 helion-route = { path = "crates/helion-route" }
+helion-backend = { path = "crates/helion-backend" }
 helion-sv = { path = "crates/helion-sv" }
 helion-sta = { path = "crates/helion-sta" }
 helion-hw = { path = "crates/helion-hw" }

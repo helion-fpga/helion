@@ -8,6 +8,14 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Added
 
+- M1: frozen `NetlistIr` boundary (`pub type NetlistIr = Design` in `helion-ir`,
+  with a documented stability contract, arch-neutral primitive set, known gaps,
+  and semver change policy) plus a new `helion-backend` crate defining the
+  `Backend` trait (`pack → place → route → bitstream`). `Hl10tBackend` ports the
+  existing HL10T flow to the trait; the CLI implement/reports flow now drives
+  through `&dyn Backend`. Zero QoR movement (gold counter WNS_PS=9640
+  unchanged).
+
 ### Changed
 
 ### Fixed

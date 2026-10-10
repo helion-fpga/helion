@@ -17,6 +17,7 @@ helion-ir = { workspace = true }
 helion-pack = { workspace = true }
 helion-place = { workspace = true }
 helion-route = { workspace = true }
+helion-backend = { workspace = true }
 helion-sv = { workspace = true }
 helion-sta = { workspace = true }
 helion-hw = { workspace = true }
