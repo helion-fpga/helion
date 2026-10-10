@@ -133,11 +133,36 @@ fn stage_dot_colors(theme: theme::Theme, state: StepState) -> (Color32, Option<C
     }
 }
 
+/// One full-width row button in an expanded stage body. Returns true on click.
+fn stage_row(ui: &mut egui::Ui, label: &str, hover: &str, enabled: bool) -> bool {
+    let mut clicked = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        if ui
+            .add_sized([ui.available_width(), 22.0], egui::Button::new(label))
+            .on_hover_text(hover)
+            .clicked()
+        {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
 /// Expanded body: Run / Settings / Open-results rows, full width so they fit
 /// narrow sidebars. Actions are collected first, applied after painting.
 fn paint_stage_body(ui: &mut egui::Ui, app: &mut HelionIde, step: FlowStep) {
     let state = app.model.step_state(step);
     let blocked = app.model.step_blocked(step);
+    let run_label = if state == StepState::Done {
+        "Re-run"
+    } else {
+        "Run"
+    };
+    let run_hover = match blocked {
+        Some(why) => why.to_string(),
+        None => format!("Queue {} on the engine thread", step.tcl()),
+    };
+    let tab = results_tab(step);
     let mut run = false;
     let mut settings = false;
     let mut results = false;
@@ -145,45 +170,9 @@ fn paint_stage_body(ui: &mut egui::Ui, app: &mut HelionIde, step: FlowStep) {
         ui.add_space(38.0);
         ui.vertical(|ui| {
             ui.add_space(2.0);
-            ui.add_enabled_ui(!app.busy && blocked.is_none(), |ui| {
-                let label = if state == StepState::Done {
-                    "Re-run"
-                } else {
-                    "Run"
-                };
-                let hover = match blocked {
-                    Some(why) => why.to_string(),
-                    None => format!("Queue {} on the engine thread", step.tcl()),
-                };
-                if ui
-                    .add_sized([ui.available_width(), 22.0], egui::Button::new(label))
-                    .on_hover_text(hover)
-                    .clicked()
-                {
-                    run = true;
-                }
-            });
-            if ui
-                .add_sized(
-                    [ui.available_width(), 22.0],
-                    egui::Button::new("Settings"),
-                )
-                .on_hover_text("Open Project Settings")
-                .clicked()
-            {
-                settings = true;
-            }
-            let tab = results_tab(step);
-            if ui
-                .add_sized(
-                    [ui.available_width(), 22.0],
-                    egui::Button::new("Open results"),
-                )
-                .on_hover_text(format!("Open {}", tab.label()))
-                .clicked()
-            {
-                results = true;
-            }
+            run = stage_row(ui, run_label, &run_hover, !app.busy && blocked.is_none());
+            settings = stage_row(ui, "Settings", "Open Project Settings", true);
+            results = stage_row(ui, "Open results", &format!("Open {}", tab.label()), true);
             ui.add_space(4.0);
         });
     });

@@ -149,6 +149,44 @@ fn theme_is_dark(theme: &Theme) -> bool {
     (r * 299 + g * 587 + b * 114) / 1000 < 128
 }
 
+/// Parsed `chrome.ini` values. Every field is optional so a missing or
+/// corrupt file degrades to "keep the defaults" instead of failing.
+#[derive(Default)]
+struct ChromeIni {
+    preset: Option<LayoutPreset>,
+    sidebar_width: Option<f32>,
+    console_height: Option<f32>,
+    dark: Option<bool>,
+    density: Option<Density>,
+}
+
+/// Parse the ini body; unknown keys and bad values are skipped silently.
+fn parse_chrome_ini(text: &str) -> ChromeIni {
+    let mut ini = ChromeIni::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "preset" => ini.preset = parse_preset(value),
+            "sidebar_width" => ini.sidebar_width = value.trim().parse::<f32>().ok(),
+            "console_height" => ini.console_height = value.trim().parse::<f32>().ok(),
+            "theme" => match value.trim() {
+                "dark" => ini.dark = Some(true),
+                "light" => ini.dark = Some(false),
+                _ => {}
+            },
+            "density" => match value.trim() {
+                "compact" => ini.density = Some(Density::Compact),
+                "comfortable" => ini.density = Some(Density::Comfortable),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    ini
+}
+
 /// Persist sidebar width, console height, layout preset, theme and density.
 /// Call only on user action — never per frame.
 pub fn save_chrome_state(app: &HelionIde) {
@@ -189,58 +227,33 @@ pub fn load_chrome_state(app: &mut HelionIde) {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
-    let mut preset: Option<LayoutPreset> = None;
-    let mut width: Option<f32> = None;
-    let mut height: Option<f32> = None;
-    let mut dark: Option<bool> = None;
-    let mut density: Option<Density> = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "preset" => preset = parse_preset(value),
-            "sidebar_width" => width = value.trim().parse::<f32>().ok(),
-            "console_height" => height = value.trim().parse::<f32>().ok(),
-            "theme" => match value.trim() {
-                "dark" => dark = Some(true),
-                "light" => dark = Some(false),
-                _ => {}
-            },
-            "density" => match value.trim() {
-                "compact" => density = Some(Density::Compact),
-                "comfortable" => density = Some(Density::Comfortable),
-                _ => {}
-            },
-            _ => {}
-        }
-    }
+    let ini = parse_chrome_ini(&text);
     if std::env::var("HELION_WORKSPACE").is_err()
         && std::env::var("HELION_ACTIVITY").is_err()
         && std::env::var("HELION_FLOW").is_err()
     {
-        if let Some(p) = preset {
+        if let Some(p) = ini.preset {
             apply_preset(app, p);
         }
     }
     if std::env::var("HELION_SIDEBAR_WIDTH").is_err() {
-        if let Some(w) = width {
+        if let Some(w) = ini.sidebar_width {
             app.sidebar_width = w.clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
         }
     }
     if std::env::var("HELION_CONSOLE_HEIGHT").is_err() {
-        if let Some(h) = height {
+        if let Some(h) = ini.console_height {
             app.console_height = h.clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
         }
     }
     let mut theme = app.theme;
-    if let Some(d) = dark {
+    if let Some(d) = ini.dark {
         theme = if d { Theme::dark() } else { Theme::light() };
     }
-    if let Some(dy) = density {
+    if let Some(dy) = ini.density {
         theme.density = dy;
     }
-    if dark.is_some() || density.is_some() {
+    if ini.dark.is_some() || ini.density.is_some() {
         app.theme = theme;
         app.theme_dirty = true;
     }
