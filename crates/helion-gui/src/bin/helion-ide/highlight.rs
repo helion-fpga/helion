@@ -70,64 +70,304 @@ pub fn highlight(lang: Lang, text: &str, theme: &Theme) -> Vec<(Range<usize>, Co
 }
 
 const SV_KEYWORDS: &[&str] = &[
-    "module", "endmodule", "always", "always_ff", "always_comb", "always_latch",
-    "logic", "reg", "wire", "tri", "input", "output", "inout",
-    "parameter", "localparam", "specparam", "defparam",
-    "assign", "deassign", "force", "release",
-    "if", "else", "case", "endcase", "casex", "casez", "default",
-    "for", "while", "do", "foreach", "repeat", "forever",
-    "generate", "endgenerate", "genvar",
-    "posedge", "negedge", "edge",
-    "function", "endfunction", "task", "endtask",
-    "begin", "end", "fork", "join", "join_any", "join_none", "initial",
-    "import", "export", "package", "endpackage",
-    "interface", "endinterface", "modport", "clocking", "endclocking",
-    "typedef", "enum", "struct", "union", "class", "endclass", "extends",
-    "virtual", "new", "null", "this", "super",
-    "rand", "randc", "constraint", "covergroup", "endgroup",
-    "property", "endproperty", "assert", "assume", "cover", "restrict",
-    "int", "integer", "bit", "byte", "shortint", "longint",
-    "time", "realtime", "real", "shortreal", "string", "event",
-    "void", "const", "automatic", "static", "ref", "signed", "unsigned",
-    "unique", "unique0", "priority", "inside", "with", "matches", "dist",
-    "break", "continue", "return", "wait", "disable", "iff",
+    "module",
+    "endmodule",
+    "always",
+    "always_ff",
+    "always_comb",
+    "always_latch",
+    "logic",
+    "reg",
+    "wire",
+    "tri",
+    "input",
+    "output",
+    "inout",
+    "parameter",
+    "localparam",
+    "specparam",
+    "defparam",
+    "assign",
+    "deassign",
+    "force",
+    "release",
+    "if",
+    "else",
+    "case",
+    "endcase",
+    "casex",
+    "casez",
+    "default",
+    "for",
+    "while",
+    "do",
+    "foreach",
+    "repeat",
+    "forever",
+    "generate",
+    "endgenerate",
+    "genvar",
+    "posedge",
+    "negedge",
+    "edge",
+    "function",
+    "endfunction",
+    "task",
+    "endtask",
+    "begin",
+    "end",
+    "fork",
+    "join",
+    "join_any",
+    "join_none",
+    "initial",
+    "import",
+    "export",
+    "package",
+    "endpackage",
+    "interface",
+    "endinterface",
+    "modport",
+    "clocking",
+    "endclocking",
+    "typedef",
+    "enum",
+    "struct",
+    "union",
+    "class",
+    "endclass",
+    "extends",
+    "virtual",
+    "new",
+    "null",
+    "this",
+    "super",
+    "rand",
+    "randc",
+    "constraint",
+    "covergroup",
+    "endgroup",
+    "property",
+    "endproperty",
+    "assert",
+    "assume",
+    "cover",
+    "restrict",
+    "int",
+    "integer",
+    "bit",
+    "byte",
+    "shortint",
+    "longint",
+    "time",
+    "realtime",
+    "real",
+    "shortreal",
+    "string",
+    "event",
+    "void",
+    "const",
+    "automatic",
+    "static",
+    "ref",
+    "signed",
+    "unsigned",
+    "unique",
+    "unique0",
+    "priority",
+    "inside",
+    "with",
+    "matches",
+    "dist",
+    "break",
+    "continue",
+    "return",
+    "wait",
+    "disable",
+    "iff",
 ];
 
 const VHDL_KEYWORDS: &[&str] = &[
-    "entity", "architecture", "begin", "end", "signal", "process", "port", "map",
-    "library", "use", "is", "of", "component", "generic", "constant", "variable",
-    "type", "subtype", "array", "record", "file", "access",
-    "function", "procedure", "return", "package", "body",
-    "if", "then", "elsif", "else", "case", "when", "others",
-    "for", "loop", "while", "generate",
-    "and", "or", "not", "nand", "nor", "xor", "xnor",
-    "in", "out", "inout", "buffer", "linkage",
-    "downto", "to", "range", "reverse",
-    "std_logic", "std_logic_vector", "std_ulogic", "std_ulogic_vector",
-    "integer", "natural", "positive", "boolean", "bit", "bit_vector",
-    "character", "string", "time", "real", "severity",
-    "true", "false", "null",
-    "wait", "until", "after", "transport", "inertial", "reject",
-    "assert", "report", "note", "warning", "error", "failure",
-    "next", "exit", "postponed", "pure", "impure", "shared", "protected",
-    "new", "alias", "attribute",
-    "abs", "mod", "rem", "sll", "srl", "sla", "sra", "rol", "ror",
-    "select", "unaffected", "with", "on", "open",
-    "configuration", "context", "block", "guarded",
+    "entity",
+    "architecture",
+    "begin",
+    "end",
+    "signal",
+    "process",
+    "port",
+    "map",
+    "library",
+    "use",
+    "is",
+    "of",
+    "component",
+    "generic",
+    "constant",
+    "variable",
+    "type",
+    "subtype",
+    "array",
+    "record",
+    "file",
+    "access",
+    "function",
+    "procedure",
+    "return",
+    "package",
+    "body",
+    "if",
+    "then",
+    "elsif",
+    "else",
+    "case",
+    "when",
+    "others",
+    "for",
+    "loop",
+    "while",
+    "generate",
+    "and",
+    "or",
+    "not",
+    "nand",
+    "nor",
+    "xor",
+    "xnor",
+    "in",
+    "out",
+    "inout",
+    "buffer",
+    "linkage",
+    "downto",
+    "to",
+    "range",
+    "reverse",
+    "std_logic",
+    "std_logic_vector",
+    "std_ulogic",
+    "std_ulogic_vector",
+    "integer",
+    "natural",
+    "positive",
+    "boolean",
+    "bit",
+    "bit_vector",
+    "character",
+    "string",
+    "time",
+    "real",
+    "severity",
+    "true",
+    "false",
+    "null",
+    "wait",
+    "until",
+    "after",
+    "transport",
+    "inertial",
+    "reject",
+    "assert",
+    "report",
+    "note",
+    "warning",
+    "error",
+    "failure",
+    "next",
+    "exit",
+    "postponed",
+    "pure",
+    "impure",
+    "shared",
+    "protected",
+    "new",
+    "alias",
+    "attribute",
+    "abs",
+    "mod",
+    "rem",
+    "sll",
+    "srl",
+    "sla",
+    "sra",
+    "rol",
+    "ror",
+    "select",
+    "unaffected",
+    "with",
+    "on",
+    "open",
+    "configuration",
+    "context",
+    "block",
+    "guarded",
 ];
 
 const TCL_KEYWORDS: &[&str] = &[
-    "proc", "set", "puts", "foreach", "if", "return",
-    "else", "elseif", "while", "for", "break", "continue", "switch",
-    "expr", "list", "lappend", "lindex", "llength", "lrange", "lsort",
-    "lsearch", "lreplace", "linsert", "lassign", "lmap",
-    "dict", "string", "namespace", "variable", "global", "upvar", "uplevel",
-    "eval", "source", "package", "require",
-    "catch", "try", "throw", "finally", "error",
-    "incr", "append", "unset", "format", "subst", "regsub", "regexp",
-    "split", "join", "concat",
-    "after", "update", "vwait", "trace", "rename", "info", "array",
-    "apply", "lambda", "coroutine", "yield", "tailcall", "on", "exit",
+    "proc",
+    "set",
+    "puts",
+    "foreach",
+    "if",
+    "return",
+    "else",
+    "elseif",
+    "while",
+    "for",
+    "break",
+    "continue",
+    "switch",
+    "expr",
+    "list",
+    "lappend",
+    "lindex",
+    "llength",
+    "lrange",
+    "lsort",
+    "lsearch",
+    "lreplace",
+    "linsert",
+    "lassign",
+    "lmap",
+    "dict",
+    "string",
+    "namespace",
+    "variable",
+    "global",
+    "upvar",
+    "uplevel",
+    "eval",
+    "source",
+    "package",
+    "require",
+    "catch",
+    "try",
+    "throw",
+    "finally",
+    "error",
+    "incr",
+    "append",
+    "unset",
+    "format",
+    "subst",
+    "regsub",
+    "regexp",
+    "split",
+    "join",
+    "concat",
+    "after",
+    "update",
+    "vwait",
+    "trace",
+    "rename",
+    "info",
+    "array",
+    "apply",
+    "lambda",
+    "coroutine",
+    "yield",
+    "tailcall",
+    "on",
+    "exit",
 ];
 
 /// Byte-scanner state for one [`highlight`] call.
@@ -385,8 +625,14 @@ impl Scan<'_> {
     }
 
     /// Maximal run of non-token bytes (whitespace, operators, `;`, ...).
-    /// Never swallows a comment opener or token starter.
+    /// Never swallows a comment opener or token starter, and never stalls:
+    /// a stray Tcl `}` at top level is emitted as its own span.
     fn scan_punct(&mut self) {
+        if self.lang == Lang::Tcl && self.peek(0) == b'}' {
+            self.push(self.i, self.i + 1, self.plain);
+            self.i += 1;
+            return;
+        }
         let from = self.i;
         while self.i < self.b.len() {
             let c = self.b[self.i];
@@ -394,7 +640,8 @@ impl Scan<'_> {
                 break;
             }
             let (d0, d1) = (c, self.peek(1));
-            let comment_opens = (d0 == b'/' && (d1 == b'/' || d1 == b'*')) || (d0 == b'-' && d1 == b'-');
+            let comment_opens =
+                (d0 == b'/' && (d1 == b'/' || d1 == b'*')) || (d0 == b'-' && d1 == b'-');
             if comment_opens {
                 break;
             }
@@ -431,14 +678,26 @@ mod tests {
     #[test]
     fn sv_keywords_comments_strings_numbers() {
         let t = theme();
-        let src = "module top; // comment\n  logic [7:0] cnt = 'hFF;\n  `timescale 1ns/1ps\nendmodule";
+        let src =
+            "module top; // comment\n  logic [7:0] cnt = 'hFF;\n  `timescale 1ns/1ps\nendmodule";
         let spans = highlight(Lang::SystemVerilog, src, &t);
-        let at = |pos: usize| spans.iter().find(|(r, _)| r.contains(&pos)).map(|(_, c)| *c);
-        assert_eq!(at(src.find("module").unwrap_or(usize::MAX)), Some(t.accent_dim));
+        let at = |pos: usize| {
+            spans
+                .iter()
+                .find(|(r, _)| r.contains(&pos))
+                .map(|(_, c)| *c)
+        };
+        assert_eq!(
+            at(src.find("module").unwrap_or(usize::MAX)),
+            Some(t.accent_dim)
+        );
         assert_eq!(at(src.find("//").unwrap_or(usize::MAX)), Some(t.faint));
         assert_eq!(at(src.find("'h").unwrap_or(usize::MAX)), Some(t.warn));
         assert_eq!(at(src.find('`').unwrap_or(usize::MAX)), Some(t.info));
-        assert_eq!(at(src.find("endmodule").unwrap_or(usize::MAX)), Some(t.accent_dim));
+        assert_eq!(
+            at(src.find("endmodule").unwrap_or(usize::MAX)),
+            Some(t.accent_dim)
+        );
         // Spans are ordered and non-overlapping.
         for w in spans.windows(2) {
             assert!(w[0].0.end <= w[1].0.start);
@@ -452,7 +711,10 @@ mod tests {
         let spans = highlight(Lang::Vhdl, src, &t);
         let color_at = |needle: &str| {
             let pos = src.find(needle).unwrap_or(usize::MAX);
-            spans.iter().find(|(r, _)| r.contains(&pos)).map(|(_, c)| *c)
+            spans
+                .iter()
+                .find(|(r, _)| r.contains(&pos))
+                .map(|(_, c)| *c)
         };
         assert_eq!(color_at("ENTITY"), Some(t.violet));
         assert_eq!(color_at("std_logic"), Some(t.violet));
@@ -467,7 +729,10 @@ mod tests {
         let spans = highlight(Lang::Tcl, src, &t);
         let color_at = |needle: &str| {
             let pos = src.find(needle).unwrap_or(usize::MAX);
-            spans.iter().find(|(r, _)| r.contains(&pos)).map(|(_, c)| *c)
+            spans
+                .iter()
+                .find(|(r, _)| r.contains(&pos))
+                .map(|(_, c)| *c)
         };
         assert_eq!(color_at("#"), Some(t.faint));
         assert_eq!(color_at("proc"), Some(t.accent_dim));
