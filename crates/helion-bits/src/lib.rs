@@ -241,6 +241,18 @@ pub fn bitgen(dev: &Device, routed: &Routed) -> Result<Bitstream, String> {
             "{ERR_CODE_EMPTY_BITSTREAM}: bitgen: empty design (no LUTFF/IOB/DSP/BRAM) — refusing empty/fake bitstream"
         ));
     }
+    // Unresolved PathFinder congestion is not shippable: a bitstream with
+    // overused routing nodes is non-functional. Fail loudly here — the
+    // bitstream-emission boundary — instead of encoding it with a warning
+    // (the old Ibex behavior: overused=1 and a clipped bitstream went out).
+    // Routing itself still returns `Routed` so STA/DRC/congestion views can
+    // analyze the congested result; only the bitstream is refused.
+    if routed.overused > 0 {
+        return Err(format!(
+            "bitgen: refusing bitstream: {} overused routing node(s) on {} — design does not route cleanly",
+            routed.overused, dev.part
+        ));
+    }
     // Frame buffer: accumulate words in a HashMap, encode once (no FeatureSet / empty packets).
     let mut acc: HashMap<(u8, u16, u8), u128> = HashMap::with_capacity(
         packed
@@ -641,6 +653,25 @@ mod tests {
         assert!(
             bs.frames.keys().any(|(b, _, _)| *b == Far::BRAM),
             "BRAM frame missing"
+        );
+    }
+
+    /// Regression: the old flow encoded bitstreams from congested routes with
+    /// only a diagnostic (Ibex shipped overused=1). bitgen must refuse —
+    /// a bitstream with overused nodes is non-functional.
+    #[test]
+    fn bitgen_refuses_congested_route() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let mut r = route(&pl, &dev).unwrap();
+        assert_eq!(r.overused, 0, "blinky must route clean");
+        // Simulate PathFinder's unresolved-congestion outcome.
+        r.overused = 42;
+        let err = bitgen(&dev, &r).expect_err("congested route must not produce a bitstream");
+        assert!(
+            err.contains("refusing bitstream") && err.contains("42"),
+            "error must name the refusal and the overused count, got: {err}"
         );
     }
 

@@ -7,108 +7,21 @@ fn example(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// FM-HEL-LOUD (10-design benchmark, 2026-10-10): Ibex packs ~11.6k LUTFFs
+/// and 36 BRAMs against HL10T-C32-1's 8,192 LUT6 / 8 BRAM18. The old flow
+/// silently clipped it into a non-functional bitstream; implement must now
+/// fail loudly at the pack→place boundary instead — never clip, never ship.
 #[test]
-fn ibex_pin_wrap_user_sdc_closed_wns_or_named_miss() {
+fn ibex_pin_wrap_over_capacity_fails_loud() {
     let mut ide = IdeModel::new();
     ide.open_source(&example("ibex_pin_wrap.prj"))
         .expect("open ibex_pin_wrap.prj");
     let impl_r = ide.implement();
     eprintln!("ibex implement={impl_r:?}");
-    impl_r.expect("implement ibex_pin_wrap");
-    assert!(ide.user_sdc, "ibex.sdc must load (user clock)");
-
-    let cells = ide.tree.cells.len();
-    let util = ide.utilization_report();
-    let lutff = util
-        .occupancy
-        .iter()
-        .find(|r| r.resource == "LUTFF")
-        .map(|r| r.used)
-        .unwrap_or(0);
-    let wns = ide.wns_ps();
-    eprintln!("IBEX cells={cells} LUTFF={lutff} WNS_PS={wns:?}");
-
-    // Honest: wrap heartbeat path should close WNS, or surface a named miss — never fake WNS on cells=0.
-    assert!(cells > 0, "fabric cells (not empty / not fake WNS)");
-    assert!(lutff > 8, "mid-core LUTFF, not counter clone: {lutff}");
-    let wns = wns.expect("WNS present after implement with user SDC");
-    assert!(wns > 0, "closed honest WNS on wrap heartbeat / user clock");
-
-    let clk = ide
-        .io_port_rows()
-        .iter()
-        .find(|p| p.name == "clk")
-        .cloned()
-        .expect("clk port");
-    assert_eq!(clk.package_pin.as_deref(), Some("IOB_X3Y0"), "{clk:?}");
-
-    let led = ide
-        .io_port_rows()
-        .iter()
-        .find(|p| p.name == "led")
-        .cloned()
-        .expect("led");
-    assert_eq!(led.package_pin.as_deref(), Some("IOB_X2Y0"), "{led:?}");
-
-    let probe = ide.default_ila_probe();
-    eprintln!("default_ila_probe={probe}");
-    assert!(!probe.is_empty(), "mark_debug hb should yield a probe");
-    assert_eq!(probe, "hb_0", "ILA probe is bit-blasted hb_0");
-
-    // add_wave must accept the ILA/RTL Q-net name (not only sim FF cell u_ff0).
-    let aw = ide.exec("add_wave hb_0").expect("add_wave hb_0 after implement");
-    assert!(aw.contains("add_wave hb_0"), "{aw}");
-    assert!(ide.wave.has_trace("hb_0"), "wave has hb_0");
-    let bus_miss = ide.exec("add_wave hb").expect_err("bus root must diagnose bit-blast");
+    let err =
+        impl_r.expect_err("over-capacity Ibex must fail loudly, never clip silently");
     assert!(
-        bus_miss.contains("bit-blast") && bus_miss.contains("hb_0"),
-        "{bus_miss}"
+        err.contains("over capacity") && err.contains("LUT6"),
+        "implement must name the over-capacity resource with counts, got: {err}"
     );
-
-    // Pattern after pico/SERV: Simulate + Mark/Probe + Program sim + ILA filled bits.
-    ide.exec("sim_run 16").unwrap();
-    assert!(
-        ide.objects.iter().any(|o| o.name == "hb_0"),
-        "Objects must list hb_0 after sim: {:?}",
-        ide.objects.iter().map(|o| o.name.clone()).collect::<Vec<_>>()
-    );
-    let bits = ide.wave.bits_of("hb_0").expect("hb_0 samples after sim_run");
-    eprintln!("hb_0 wave bits={bits}");
-    assert!(
-        bits.contains('0') && bits.contains('1'),
-        "hb_0 must toggle on Simulate: {bits}"
-    );
-
-    ide.exec(&format!("mark_debug {probe}")).unwrap();
-    ide.exec("add_probe").unwrap();
-    let prog = ide.exec("program_hw cable=sim").unwrap();
-    assert!(
-        prog.contains("DONE=1") || prog.contains("backend=sim"),
-        "{prog}"
-    );
-    ide.exec("ila_window 16").unwrap();
-    ide.exec("ila_trigger rising").unwrap();
-    // Soft-hold when ILA ECO cannot grow the bitstream (HL10T affinity full after
-    // deeper ysyx_ibex child fabric). Closed wrap WNS above still holds; do not
-    // invent ILA samples.
-    match ide.exec("ila_arm") {
-        Ok(arm) => {
-            eprintln!("ila_arm={arm}");
-            eprintln!("ila_bits={}", ide.ila.bits);
-            assert!(
-                ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
-                "filled ILA bits: {}",
-                ide.ila.bits
-            );
-        }
-        Err(e) if e.contains("no-op") || e.contains("soft-hold") || e.contains("affinity") => {
-            eprintln!("ila_arm soft-hold (named miss; wrap WNS kept): {e}");
-        }
-        Err(e) => panic!("ila_arm: {e}"),
-    }
-
-    let mut c = IdeModel::new();
-    c.open_source(&example("counter.sv")).unwrap();
-    c.implement().unwrap();
-    assert_eq!(c.wns_ps(), Some(9640), "counter gold WNS");
 }

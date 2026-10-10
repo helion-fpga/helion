@@ -26408,16 +26408,20 @@ endmodule
     }
 
     /// FM-HEL-CONT: complex mid-net x → Simulate + Mark/Add Probe → Program sim → ILA Arm filled bits.
-    /// complex.sv carries (* mark_debug = "true" *) on x; honest WNS ~8740 (counter gold 9640).
+    /// complex.sv carries (* mark_debug = "true" *) on x; honest WNS 9640
+    /// (4-bit counter critical path, same as counter gold).
     #[test]
     fn complex_mid_net_sim_mark_probe_ila_arm() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("complex.prj")).unwrap();
         ide.implement().unwrap();
         let wns = ide.wns_ps().expect("complex STA WNS after implement");
-        assert!(
-            (8000..=9500).contains(&wns),
-            "complex honest WNS ~8740, got {wns} (counter gold stays 9640)"
+        // Honest WNS is 9640: the critical path is the 4-bit counter increment,
+        // same as counter.sv gold. (Pre-trim designs measured ~8740 because
+        // hundreds of submodule-port IOBs polluted placement/routing.)
+        assert_eq!(
+            wns, 9640,
+            "complex honest WNS (counter gold stays 9640)"
         );
 
         // RTL mark_debug on mid-net x must survive synth → default probe.
@@ -26458,6 +26462,9 @@ endmodule
         assert_eq!(ide.ila.net, "x");
         assert_eq!(ide.workspace, WorkspaceTab::Hardware);
 
+        // (Submodule-port IOBs trim cleanly now; the route is congestion-free
+        // so program_hw succeeds — the loud-refusal gate only fires on
+        // genuinely congested routes, covered by bitgen_refuses_congested_route.)
         let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(
             prog.contains("DONE=1") || prog.contains("backend=sim"),
