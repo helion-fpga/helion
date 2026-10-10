@@ -75,47 +75,13 @@ impl Backend for Hl10tBackend {
     }
 
     fn place(&self, packed: &Packed) -> Result<Placed, String> {
-        // IOB-trim policy moved verbatim from the helion-cli implement flow:
-        // prefer IOBs driven by a packed LUTFF q_net (DRC ROUTE-3), then cap to
-        // the device budget. Full Ibex emits ~250 AXI outs; HL10T-C32-1 has 32.
-        let t0 = std::time::Instant::now();
-        let mut packed = packed.clone();
-        let iob_budget = self.dev.iob_sites().count();
-        let q_nets: std::collections::HashSet<&str> =
-            packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
-        let driven: Vec<_> = packed
-            .iobs
-            .iter()
-            .filter(|io| q_nets.contains(io.from_net.as_str()))
-            .cloned()
-            .collect();
-        let undriven = packed.iobs.len().saturating_sub(driven.len());
-        if packed.iobs.len() > iob_budget || undriven > 0 {
-            let keep = driven.len().min(iob_budget);
-            let keep = if packed.lutffs.len() > 2000 {
-                keep.min(4)
-            } else {
-                keep
-            };
-            eprintln!(
-                "hang_diag iob_trim {} -> {} (driven={} undriven={} budget={})",
-                packed.iobs.len(),
-                keep,
-                driven.len(),
-                undriven,
-                iob_budget
-            );
-            packed.iobs = driven.into_iter().take(keep).collect();
-        }
-        eprintln!(
-            "hang_diag pack lutffs={} iobs={} ms={}",
-            packed.lutffs.len(),
-            packed.iobs.len(),
-            t0.elapsed().as_millis()
-        );
+        // IOB trim (drop tied/undriven outputs) and the die-capacity gate
+        // live in helion_place::place_with_guide — the single choke point for
+        // the CLI, GUI engine thread, and Tcl session alike. Driven IOBs
+        // beyond the pin budget fail loudly there instead of being capped.
         let t1 = std::time::Instant::now();
         let placed = helion_place::place_with(
-            &packed,
+            packed,
             &self.dev,
             PlaceOpts {
                 timing_weight: self.timing_weight,

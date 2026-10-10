@@ -46,6 +46,11 @@ pub struct PackedIob {
     pub diff_term: Option<String>,
     /// UG893 I/O Ports `IN_TERM`.
     pub in_term: Option<String>,
+    /// True iff the IOB's PAD names a top-level output port — i.e. real pin
+    /// demand. The elaborator also emits IobOut cells for submodule ports
+    /// (e.g. `u_serv_*`); those are not board pins and must not count
+    /// against the die's IOB budget.
+    pub is_top_port: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +144,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
             let pad = pins.net_on(&c.name, "PAD").unwrap_or("");
             let port = design.ports.iter().find(|p| p.name == pad);
             let loc = port.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
+            // Real pin demand = PAD names a top-level output port. IobOut
+            // cells for submodule ports (PAD is an internal net) are
+            // elaborator exhaust, not board pins.
+            let is_top_port = port.is_some_and(|p| p.dir == helion_ir::PortDir::Out);
             iobs.push(PackedIob {
                 cell: c.name.clone(),
                 from_net: net.to_string(),
@@ -148,6 +157,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 pulltype: port.and_then(|p| p.attrs.get("PULLTYPE").map(|s| s.to_string())),
                 diff_term: port.and_then(|p| p.attrs.get("DIFF_TERM").map(|s| s.to_string())),
                 in_term: port.and_then(|p| p.attrs.get("IN_TERM").map(|s| s.to_string())),
+                is_top_port,
             });
         }
     }

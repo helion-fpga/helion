@@ -704,6 +704,11 @@ pub fn route_with_guide(
             imux.len()
         );
     }
+    // NOTE: unresolved congestion (overused > 0) is NOT an error here.
+    // `Routed` with overused nodes is a legitimate analysis artifact (STA,
+    // DRC, GUI congestion views all run on it). The shippability gate lives
+    // in `helion_bits::bitgen`, which refuses to encode such a route — a
+    // bitstream with overused nodes is non-functional and must never ship.
     Ok(Routed {
         placed: placed.clone(),
         iob_src,

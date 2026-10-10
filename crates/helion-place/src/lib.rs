@@ -424,6 +424,85 @@ pub fn place_with(packed: &Packed, dev: &Device, opts: PlaceOpts) -> Result<Plac
     place_with_guide(packed, dev, opts, &TimingGuide::default())
 }
 
+/// IOB trim policy — single home for every entry point (CLI via the Backend
+/// trait, helion-proj sessions driving the GUI engine thread and Tcl).
+///
+/// Keeps an IOB only if it is real pin demand: its PAD names a top-level
+/// output port AND it is driven by packed logic. The elaborator emits IobOut
+/// cells for submodule ports too (e.g. `u_serv_*`); those are not board pins.
+/// Dropping a non-top or undriven (tied) output is not a functional change.
+/// Driven top-level outputs beyond the pin budget are NOT trimmed — they fail
+/// loudly in `check_capacity` instead (silently dropping them shipped broken
+/// bitstreams).
+fn trim_undriven_iobs(packed: &Packed, dev: &Device) -> Packed {
+    let budget = dev.iob_sites().count();
+    // O(lutffs) build, O(1) per IOB lookup — same driven definition the CLI
+    // flow has used (DRC ROUTE-3: IOBs driven by a packed LUTFF q_net).
+    let q_nets: HashSet<&str> = packed.lutffs.iter().map(|l| l.q_net.as_str()).collect();
+    let mut kept = Vec::new();
+    let mut dropped = 0usize;
+    for io in &packed.iobs {
+        if io.is_top_port && q_nets.contains(io.from_net.as_str()) {
+            kept.push(io.clone());
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        eprintln!(
+            "hang_diag iob_trim {} -> {} (dropped {} non-pin/undriven; budget={})",
+            packed.iobs.len(),
+            kept.len(),
+            dropped,
+            budget
+        );
+    }
+    let mut trimmed = packed.clone();
+    trimmed.iobs = kept;
+    trimmed
+}
+
+/// Die-capacity gate: the pack→place boundary. Every entry point funnels
+/// through `place_with_guide` — the CLI via the `Backend` trait,
+/// `helion-proj` sessions driving the GUI engine thread and Tcl — so a design
+/// that does not fit the die fails here, loudly, instead of being silently
+/// clipped into a non-functional bitstream. (Ibex packed 11,572 LUTFFs and
+/// 36 BRAMs against HL10T-C32-1's 8,192 LUT6 / 8 BRAM18; the old flow capped
+/// each resource quiet and emitted the clipped result.)
+///
+/// IOBs are counted post-trim (`trim_undriven_iobs` runs first): only live,
+/// driven top-level outputs count against the pin budget.
+///
+/// # Errors
+/// One `Err` naming every overused resource with required vs available
+/// counts, e.g. `over capacity on HL10T-C32-1: design needs 11572 LUT6 but
+/// the die has 8192`.
+fn check_capacity(packed: &Packed, dev: &Device) -> Result<(), String> {
+    // CLB capacity: one LUTFF cluster per BLE slot. O(sites) iterators, run
+    // once per place call — negligible next to the annealer.
+    let ble_capacity = dev.lut6_count() as usize;
+    let checks = [
+        ("LUT6", packed.lutffs.len(), ble_capacity),
+        ("DSP", packed.macs.len(), dev.dsp_sites().count()),
+        ("BRAM18", packed.brams.len(), dev.bram_sites().count()),
+        ("IOB", packed.iobs.len(), dev.iob_sites().count()),
+    ];
+    let violations: Vec<String> = checks
+        .iter()
+        .filter(|(_, need, have)| need > have)
+        .map(|(res, need, have)| format!("design needs {need} {res} but the die has {have}"))
+        .collect();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "over capacity on {}: {}",
+            dev.part,
+            violations.join("; ")
+        ))
+    }
+}
+
 /// Place with XDC IOB-arc exceptions. Empty `guide` matches `place_with`.
 /// helion-cli / helion-proj still call unguided `place_with` until a later lock.
 pub fn place_with_guide(
@@ -432,20 +511,17 @@ pub fn place_with_guide(
     opts: PlaceOpts,
     guide: &TimingGuide,
 ) -> Result<Placed, String> {
+    // Trim-then-gate: non-pin and tied-off IOBs are not pin demand (dropped
+    // with a diagnostic); live driven outputs beyond the budget fail loudly.
+    let mut packed = trim_undriven_iobs(packed, dev);
+    check_capacity(&packed, dev)?;
     let iob_all: Vec<Site> = dev.iob_sites().collect();
-    let iob_take = packed.iobs.len().min(iob_all.len());
-    if packed.iobs.len() > iob_all.len() {
-        eprintln!(
-            "hang_diag place_iob_cap {} -> {} (device IOB sites)",
-            packed.iobs.len(),
-            iob_take
-        );
-    }
-    // Prefer PACKAGE_PIN / LOC IOBs when capping to the device budget so board
-    // pins (led) survive mid-size fabrics that emit hundreds of tied IOBs.
+    // check_capacity guarantees packed.iobs.len() <= iob_all.len(), so the
+    // LOC-preferring order below only decides *which* site each IOB gets —
+    // nothing is dropped silently anymore.
+    // Prefer PACKAGE_PIN / LOC IOBs so board pins (led) win the best sites.
     let mut order: Vec<usize> = (0..packed.iobs.len()).collect();
     order.sort_by_key(|&i| if packed.iobs[i].loc.is_some() { 0 } else { 1 });
-    order.truncate(iob_take);
     let mut iob_sites = Vec::with_capacity(order.len());
     let mut claimed: HashSet<(u32, u32)> = HashSet::new();
     for &i in &order {
@@ -467,9 +543,10 @@ pub fn place_with_guide(
         claimed.insert((s.x, s.y));
         iob_sites.push(s);
     }
-    // Keep packed.iobs aligned with iob_sites after the LOC-preferring cap.
-    let mut packed = packed.clone();
-    packed.iobs = order.iter().map(|&i| packed.iobs[i].clone()).collect();
+    // Keep packed.iobs aligned with iob_sites after the LOC-preferring order.
+    // (packed is already owned — the trim above cloned it.)
+    let reordered: Vec<_> = order.iter().map(|&i| packed.iobs[i].clone()).collect();
+    packed.iobs = reordered;
 
     let mut lutff_sites = Vec::new();
     if !packed.lutffs.is_empty() {
@@ -721,6 +798,17 @@ pub fn place_with_guide(
         }
 
         let nplace = lutff_sites.len();
+        // The capacity gate above guarantees enough BLE slots die-wide, so a
+        // shortfall here is a placer bug, not over-capacity — fail loudly
+        // rather than silently dropping clusters (the old `break` behavior).
+        if nplace != packed.lutffs.len() {
+            return Err(format!(
+                "internal error: placer placed {} of {} LUTFF clusters on {} (capacity check passed)",
+                nplace,
+                packed.lutffs.len(),
+                dev.part
+            ));
+        }
         eprintln!(
             "hang_diag place affinity lutffs={} ms={}",
             nplace,
@@ -1268,27 +1356,17 @@ pub fn place_with_guide(
 
     let mut mac_sites = Vec::new();
     let dsps: Vec<_> = dev.dsp_sites().collect();
-    if packed.macs.len() > dsps.len() {
-        eprintln!(
-            "hang_diag place_dsp_cap {} -> {}",
-            packed.macs.len(),
-            dsps.len()
-        );
-    }
-    for (i, _) in packed.macs.iter().enumerate().take(dsps.len()) {
+    // check_capacity above guarantees packed.macs.len() <= dsps.len(): a
+    // design needing DSP on a die with none fails loudly instead of having
+    // its MACs silently dropped here.
+    for (i, _) in packed.macs.iter().enumerate() {
         mac_sites.push(dsps[i]);
     }
 
     let mut bram_sites = Vec::new();
     let brams: Vec<_> = dev.bram_sites().collect();
-    if packed.brams.len() > brams.len() {
-        eprintln!(
-            "hang_diag place_bram_cap {} -> {}",
-            packed.brams.len(),
-            brams.len()
-        );
-    }
-    for (i, _) in packed.brams.iter().enumerate().take(brams.len()) {
+    // Same guarantee as DSP above: over-BRAM designs error at the gate.
+    for (i, _) in packed.brams.iter().enumerate() {
         bram_sites.push(brams[i]);
     }
 
@@ -1457,8 +1535,11 @@ mod tests {
     use helion_ir::{CellKind, Design};
     use helion_pack::pack;
 
+    /// Regression: Ibex packed 11,572 LUTFFs against HL10T-C32-1's 8,192 and
+    /// the old flow silently clipped it into a non-functional bitstream.
+    /// Over-capacity must now fail loudly at the pack→place boundary.
     #[test]
-    fn place_caps_lutffs_over_device_without_panic() {
+    fn place_fails_loud_on_lutff_over_capacity() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
         let proto = p.lutffs[0].clone();
@@ -1470,29 +1551,102 @@ mod tests {
             lf.q_net = format!("q{}", p.lutffs.len());
             p.lutffs.push(lf);
         }
-        let pl = place(&p, &dev).expect("over-capacity LUTFF must cap, not panic");
-        assert_eq!(pl.lutff_sites.len(), dev.lut6_count() as usize);
-        assert_eq!(pl.packed.lutffs.len(), pl.lutff_sites.len());
+        let err = place(&p, &dev).expect_err("over-capacity LUTFF must fail loudly");
+        assert!(
+            err.contains("over capacity") && err.contains("LUT6"),
+            "error must name the resource and counts, got: {err}"
+        );
     }
 
+    /// Same gate for live IOBs: the old flow silently truncated to the site
+    /// budget. A design needing more driven top-level outputs than pins is
+    /// over capacity — say so.
     #[test]
-    fn place_caps_iobs_to_device_budget() {
+    fn place_fails_loud_on_iob_over_capacity() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
         let proto = p.iobs[0].clone();
+        // Blinky's IOB is a top-level driven output (led) — clones stay live.
+        assert!(proto.is_top_port, "blinky proto must be a top-port IOB");
         let n_dev = dev.iob_sites().count();
         while p.iobs.len() < n_dev + 8 {
             let mut io = proto.clone();
             io.cell = format!("u_iob{}", p.iobs.len());
             p.iobs.push(io);
         }
-        let pl = place(&p, &dev).expect("over-width I/O must place on the device budget");
-        assert_eq!(
-            pl.iob_sites.len(),
-            n_dev,
-            "place must cap IOBs to HAD sites, got {}",
-            pl.iob_sites.len()
+        let err = place(&p, &dev).expect_err("over-width I/O must fail loudly");
+        assert!(
+            err.contains("over capacity") && err.contains("IOB"),
+            "error must name the resource and counts, got: {err}"
         );
+    }
+
+    /// Submodule-port IOBs (elaborator exhaust, e.g. `u_serv_*`) are not
+    /// board pins: they trim silently and must never trip the gate.
+    #[test]
+    fn place_trims_non_top_port_iobs_silently() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let proto = p.iobs[0].clone();
+        let n_dev = dev.iob_sites().count();
+        while p.iobs.len() < n_dev + 8 {
+            let mut io = proto.clone();
+            io.cell = format!("u_sub_iob{}", p.iobs.len());
+            io.is_top_port = false;
+            p.iobs.push(io);
+        }
+        let pl = place(&p, &dev).expect("non-top IOBs must trim, not fail");
+        assert_eq!(
+            pl.packed.iobs.len(),
+            1,
+            "only the top-port IOB survives the trim"
+        );
+    }
+
+    /// Ibex's other half: 36 BRAMs against 8 BRAM18. Same loud gate.
+    #[test]
+    fn place_fails_loud_on_bram_over_capacity() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let n_dev = dev.bram_sites().count();
+        while p.brams.len() < n_dev + 1 {
+            p.brams.push(helion_pack::PackedBram {
+                cell: format!("u_bram{}", p.brams.len()),
+                init: Vec::new(),
+            });
+        }
+        let err = place(&p, &dev).expect_err("over-capacity BRAM must fail loudly");
+        assert!(
+            err.contains("over capacity") && err.contains("BRAM18"),
+            "error must name the resource and counts, got: {err}"
+        );
+    }
+
+    /// HL10T-C32-1 has zero DSP blocks: any MAC is over capacity, and the
+    /// old flow silently dropped it.
+    #[test]
+    fn place_fails_loud_on_dsp_over_capacity() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        p.macs.push(helion_pack::PackedMac {
+            cell: "u_mac0".to_string(),
+        });
+        let err = place(&p, &dev).expect_err("DSP on a DSP-less die must fail loudly");
+        assert!(
+            err.contains("over capacity") && err.contains("DSP"),
+            "error must name the resource and counts, got: {err}"
+        );
+    }
+
+    /// Fitting designs are untouched by the gate (gold blinky/counter/hier
+    /// stay green — the QoR lock depends on it).
+    #[test]
+    fn place_accepts_designs_within_capacity() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place(&p, &dev).expect("fitting design must place");
+        assert_eq!(pl.lutff_sites.len(), p.lutffs.len());
+        assert_eq!(pl.iob_sites.len(), p.iobs.len());
     }
 
     #[test]
