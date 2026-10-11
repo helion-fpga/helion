@@ -18794,6 +18794,7 @@ impl IdeModel {
         self.tb_manual = done.tb_manual.clone();
         self.tb_run_active = false;
         self.tb_run_name = done.tb_run_name.clone();
+        self.tb_cancel = None; // the engine copy consumed its flag
         self.tb_last_summary = done.tb_last_summary.clone();
         self.tb_last_dut_module = done.tb_last_dut_module.clone();
         self.tb_last_dut_instance = done.tb_last_dut_instance.clone();

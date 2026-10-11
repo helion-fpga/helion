@@ -598,6 +598,7 @@ impl HelionIde {
                 // Running state so the badge/spinner cannot stick.
                 self.tb_rx = None;
                 self.model.tb_run_active = false;
+                self.model.tb_cancel = None;
                 if let Some(i) = self.model.tb_selected {
                     if self.model.tb_status.get(i) == Some(&TbStatus::Running) {
                         self.model.tb_status[i] = TbStatus::Idle;
