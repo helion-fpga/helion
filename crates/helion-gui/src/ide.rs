@@ -1148,15 +1148,28 @@ pub struct DesignRun {
     pub step: String,
     pub status: String,
     pub wns_ps: Option<i64>,
+    pub tns_ps: Option<i64>,
     pub cells: Option<usize>,
     pub lutff: Option<usize>,
+    pub luts: Option<usize>,
+    pub ffs: Option<usize>,
+    pub brams: Option<usize>,
+    pub dsps: Option<usize>,
     pub part: String,
     pub top: Option<String>,
     pub bitstream_hash: Option<u32>,
     /// UG986 Lab 1 Helion strategy (Default / TimingExplore / RuntimeOpt / PhysOpt).
     pub strategy: String,
+    /// Full [`helion_proj::RunStrategy`] spec (`Preset:opt=…,…`). Empty =
+    /// derive from the legacy `strategy` label. Persisted in the `.prj`.
+    pub spec: String,
+    /// Seed-sweep member seed (None = standalone run).
+    pub seed: Option<u64>,
     pub runtime_ms: Option<u64>,
     pub reuse_pct: Option<u32>,
+    /// Full result session, kept so a finished run can become the active
+    /// design ("make active"). Boxed: sessions are heavy.
+    pub result_session: Option<Box<Session>>,
 }
 
 impl DesignRun {
@@ -1166,14 +1179,35 @@ impl DesignRun {
             step: step.into(),
             status: "Not started".into(),
             wns_ps: None,
+            tns_ps: None,
             cells: None,
             lutff: None,
+            luts: None,
+            ffs: None,
+            brams: None,
+            dsps: None,
             part: "HL10T-C32-1".into(),
             top: None,
             bitstream_hash: None,
             strategy: "Default".into(),
+            spec: String::new(),
+            seed: None,
             runtime_ms: None,
             reuse_pct: None,
+            result_session: None,
+        }
+    }
+
+    /// Effective strategy: full spec when present, else the legacy label.
+    pub fn run_strategy(&self) -> helion_proj::RunStrategy {
+        if self.spec.trim().is_empty() {
+            helion_proj::RunStrategy::preset(&self.strategy).unwrap_or_else(|_| {
+                helion_proj::RunStrategy::preset("Custom").expect("Custom preset exists")
+            })
+        } else {
+            helion_proj::RunStrategy::parse_spec(&self.spec).unwrap_or_else(|_| {
+                helion_proj::RunStrategy::preset("Custom").expect("Custom preset exists")
+            })
         }
     }
 
@@ -1190,6 +1224,32 @@ impl DesignRun {
         self.wns_ps
             .map(|n| n.to_string())
             .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn tns_cell(&self) -> String {
+        self.tns_ps
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    fn opt_cell(v: Option<usize>) -> String {
+        v.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
+    }
+
+    pub fn luts_cell(&self) -> String {
+        Self::opt_cell(self.luts)
+    }
+
+    pub fn ffs_cell(&self) -> String {
+        Self::opt_cell(self.ffs)
+    }
+
+    pub fn brams_cell(&self) -> String {
+        Self::opt_cell(self.brams)
+    }
+
+    pub fn dsps_cell(&self) -> String {
+        Self::opt_cell(self.dsps)
     }
 
     pub fn runtime_cell(&self) -> String {
@@ -1268,6 +1328,140 @@ impl DesignRun {
         }
         s
     }
+}
+
+/// Sortable Design Runs result-table column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunCol {
+    Name,
+    Strategy,
+    Status,
+    Luts,
+    Ffs,
+    Bram,
+    Dsp,
+    Wns,
+    Tns,
+    Runtime,
+}
+
+impl RunCol {
+    /// Header label, in table order.
+    pub const ALL: [RunCol; 10] = [
+        RunCol::Name,
+        RunCol::Strategy,
+        RunCol::Status,
+        RunCol::Luts,
+        RunCol::Ffs,
+        RunCol::Bram,
+        RunCol::Dsp,
+        RunCol::Wns,
+        RunCol::Tns,
+        RunCol::Runtime,
+    ];
+
+    pub fn header(self) -> &'static str {
+        match self {
+            RunCol::Name => "Run",
+            RunCol::Strategy => "Strategy",
+            RunCol::Status => "Status",
+            RunCol::Luts => "LUTs",
+            RunCol::Ffs => "FFs",
+            RunCol::Bram => "BRAM",
+            RunCol::Dsp => "DSP",
+            RunCol::Wns => "WNS",
+            RunCol::Tns => "TNS",
+            RunCol::Runtime => "Runtime",
+        }
+    }
+
+    /// Lower-is-better columns (area, runtime). WNS/TNS: higher-is-better
+    /// (TNS is ≤ 0; the best TNS is closest to zero).
+    pub fn lower_is_better(self) -> bool {
+        matches!(
+            self,
+            RunCol::Luts | RunCol::Ffs | RunCol::Bram | RunCol::Dsp | RunCol::Runtime
+        )
+    }
+}
+
+/// Sort runs in place. Rows with no value for the column sort last,
+/// regardless of direction; ties break by name for a stable order.
+pub fn sort_design_runs(runs: &mut [DesignRun], col: RunCol, asc: bool) {
+    runs.sort_by(|a, b| {
+        let ord = match col {
+            RunCol::Name => a.name.cmp(&b.name),
+            RunCol::Strategy => a.strategy.cmp(&b.strategy),
+            RunCol::Status => a.status.cmp(&b.status),
+            RunCol::Luts => cmp_opt(a.luts, b.luts),
+            RunCol::Ffs => cmp_opt(a.ffs, b.ffs),
+            RunCol::Bram => cmp_opt(a.brams, b.brams),
+            RunCol::Dsp => cmp_opt(a.dsps, b.dsps),
+            RunCol::Wns => cmp_opt(a.wns_ps, b.wns_ps),
+            RunCol::Tns => cmp_opt(a.tns_ps, b.tns_ps),
+            RunCol::Runtime => cmp_opt(a.runtime_ms, b.runtime_ms),
+        };
+        let ord = if asc { ord } else { ord.reverse() };
+        ord.then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        // Present values always beat missing ones, either direction.
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Index of the best finished run for a column, if any value is present.
+/// Honors [`RunCol::lower_is_better`].
+pub fn best_run_index(runs: &[DesignRun], col: RunCol) -> Option<usize> {
+    let val = |r: &DesignRun| -> Option<i128> {
+        match col {
+            RunCol::Luts => r.luts.map(|v| v as i128),
+            RunCol::Ffs => r.ffs.map(|v| v as i128),
+            RunCol::Bram => r.brams.map(|v| v as i128),
+            RunCol::Dsp => r.dsps.map(|v| v as i128),
+            RunCol::Wns => r.wns_ps.map(|v| v as i128),
+            RunCol::Tns => r.tns_ps.map(|v| v as i128),
+            RunCol::Runtime => r.runtime_ms.map(|v| v as i128),
+            _ => None,
+        }
+    };
+    let mut best: Option<(usize, i128)> = None;
+    for (i, r) in runs.iter().enumerate() {
+        let Some(v) = val(r) else { continue };
+        let better = match best {
+            None => true,
+            Some((_, b)) => {
+                if col.lower_is_better() {
+                    v < b
+                } else {
+                    v > b
+                }
+            }
+        };
+        if better {
+            best = Some((i, v));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Seed-sweep aggregate: (best, worst, mean) WNS over finished sweep members.
+pub fn sweep_wns_stats(runs: &[DesignRun]) -> Option<(i64, i64, i64)> {
+    let mut vals: Vec<i64> = runs.iter().filter_map(|r| r.wns_ps).collect();
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_unstable();
+    let best = vals[vals.len() - 1];
+    let worst = vals[0];
+    let mean = vals.iter().sum::<i64>() / vals.len() as i64;
+    Some((best, worst, mean))
 }
 
 /// HNF pin on a schematic symbol (UG893 Fig. 56/57: stub inside and outside the box).
