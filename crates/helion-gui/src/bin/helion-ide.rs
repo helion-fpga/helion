@@ -8392,6 +8392,7 @@ fn paint_ila(
         Arm,
         Save,
         Load,
+        ExportVcd,
         ClearError,
     }
     let mut intents: Vec<Intent> = Vec::new();
@@ -8414,6 +8415,12 @@ fn paint_ila(
             ui.ctx().request_repaint();
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if sidebar_button(ui, "Export VCD")
+                .on_hover_text("Save the current capture as a VCD file (GTKWave)")
+                .clicked()
+            {
+                intents.push(Intent::ExportVcd);
+            }
             if sidebar_button(ui, "Load session").clicked() {
                 intents.push(Intent::Load);
             }
@@ -8736,11 +8743,37 @@ fn paint_ila(
                 }
             }
             Intent::ClearError => model.sim_ila.last_error = None,
+            Intent::ExportVcd => {
+                // Default next to the session path (or project dir / cwd).
+                let pp = model.last_project_path.clone();
+                let base = if !model.sim_ila.session_path.trim().is_empty() {
+                    std::path::PathBuf::from(model.sim_ila.session_path.trim())
+                } else if let Some(p) = pp.as_deref().and_then(|p| p.parent()) {
+                    p.join("ila_capture.json")
+                } else {
+                    std::path::PathBuf::from("ila_capture.json")
+                };
+                let path = base.with_extension("vcd");
+                match model.sim_ila.capture.clone() {
+                    Some(cap) => match ila::export_vcd(&path, &cap) {
+                        Ok(()) => toasts.push(
+                            toasts::ToastKind::Ok,
+                            format!("ILA VCD saved {}", path.display()),
+                        ),
+                        Err(e) => model.sim_ila.last_error = Some(e),
+                    },
+                    None => {
+                        model.sim_ila.last_error = Some("ila: no capture to export".into());
+                    }
+                }
+            }
         }
     }
 
     ui.separator();
-    paint_ila_wave(ui, model, theme);
+    if let Some(msg) = paint_ila_wave(ui, model, theme) {
+        toasts.push(toasts::ToastKind::Ok, msg);
+    }
 }
 
 fn ila_fmt_time(sample: u64, ts_ps: u64) -> String {
@@ -8754,14 +8787,19 @@ fn ila_fmt_time(sample: u64, ts_ps: u64) -> String {
 
 /// GTKWave-grade viewer: signal pane (name + value at cursor), time ruler,
 /// zoom (wheel) + pan (drag), click cursor, Shift-A / Alt-B, trigger marker.
-fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+/// Returns a toast message when the trigger was set from the waveform.
+fn paint_ila_wave(
+    ui: &mut egui::Ui,
+    model: &mut IdeModel,
+    theme: &theme::Theme,
+) -> Option<String> {
     let n = model.sim_ila.capture.as_ref().map(|c| c.len()).unwrap_or(0);
     if n == 0 {
         ui.label(
             RichText::new("No capture yet — add probes, set the trigger, press Arm Capture.")
                 .weak(),
         );
-        return;
+        return None;
     }
     let nprobes = model
         .sim_ila
@@ -8770,7 +8808,7 @@ fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
         .map(|c| c.probes.len())
         .unwrap_or(0);
     if nprobes == 0 {
-        return;
+        return None;
     }
     let ts = model
         .sim_ila
@@ -8779,7 +8817,8 @@ fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
         .map(|c| c.timescale_ps)
         .unwrap_or(10_000);
 
-    // Toolbar: zoom, fit, From/To, cursor readouts.
+    // Toolbar: zoom, fit, From/To, cursor readouts, trigger-from-cursor.
+    let mut trig_msg: Option<String> = None;
     ui.horizontal(|ui| {
         if sidebar_button(ui, "−").on_hover_text("Zoom in").clicked() {
             model.sim_ila.viewer.zoom_center(0.5, n);
@@ -8853,9 +8892,24 @@ fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
                     .color(theme.warn),
             );
         }
+        ui.separator();
+        // Click-an-edge trigger: set the trigger from the cursor sample.
+        if sidebar_button(ui, "⚡ Trigger at cursor")
+            .on_hover_text("Set the trigger from the edge/value under the cursor")
+            .clicked()
+        {
+            if let Some(c) = model.sim_ila.viewer.cursor {
+                match model.sim_ila.suggest_trigger_at_cursor(c) {
+                    Ok(msg) => trig_msg = Some(msg),
+                    Err(e) => model.sim_ila.last_error = Some(e),
+                }
+            } else {
+                model.sim_ila.last_error = Some("ila: place the cursor first".into());
+            }
+        }
     });
     ui.label(
-        RichText::new("wheel zoom · drag pan · click cursor · Shift-click A · Alt-click B")
+        RichText::new("wheel zoom · drag pan · click cursor · Shift-click A · Alt-click B · Ctrl-click edge = trigger")
             .small()
             .weak(),
     );
@@ -8916,12 +8970,23 @@ fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
             let dx = resp.drag_delta().x as f64 * model.sim_ila.viewer.spp;
             model.sim_ila.viewer.pan_samples(-dx, n);
         }
-        if resp.clicked() {
+        if resp.clicked() || resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let s = model.sim_ila.viewer.sample_at(pos.x, rect.left()).round() as usize;
                 let s = s.min(n - 1);
                 let mods = ui.input(|i| i.modifiers);
-                if mods.shift {
+                if mods.ctrl || mods.command || resp.double_clicked() {
+                    // Click-an-edge: set the trigger from the row's probe.
+                    let row =
+                        ((pos.y - rect.top() - ruler_h) / row_h).floor() as usize;
+                    model.sim_ila.viewer.cursor = Some(s);
+                    if row < nprobes {
+                        match model.sim_ila.set_trigger_from_wave(row, s) {
+                            Ok(msg) => trig_msg = Some(msg),
+                            Err(e) => model.sim_ila.last_error = Some(e),
+                        }
+                    }
+                } else if mods.shift {
                     model.sim_ila.viewer.cursor_a = Some(s);
                 } else if mods.alt {
                     model.sim_ila.viewer.cursor_b = Some(s);
@@ -8934,6 +8999,7 @@ fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
             paint_ila_traces(ui, rect, model, n, nprobes, row_h, ruler_h, ts, theme);
         }
     });
+    trig_msg
 }
 
 #[allow(clippy::too_many_arguments)]
