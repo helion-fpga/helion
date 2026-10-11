@@ -3,7 +3,7 @@
 //! Overlay / behavioral LED+waveform completion is labeled **`overlay` / `sim_DONE`**
 //! ([`OverlaySimReport`]) — never bare board DONE.
 
-use helion_ir::{CellKind, Design};
+use helion_ir::{CellKind, Design, PortDir};
 use std::collections::HashMap;
 
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
@@ -25,13 +25,25 @@ pub struct SimForce {
 pub struct Sim {
     pub time: u64,
     lut_init: HashMap<String, u64>,
-    lut_pins: HashMap<String, Vec<(u8, String)>>,
     ff_d_lut: HashMap<String, String>,
     iob_from_ff: Option<String>,
     pub ff_q: HashMap<String, bool>,
     pub led: bool,
     /// Continuous UG900 forces (name → value). Re-applied after each posedge.
     forces: HashMap<String, u64>,
+    /// LUT → [(input pin, net on that pin)] for all 6 pins (built for every
+    /// LUT I-pin, not just FF-driven ones like the old `lut_pins`).
+    lut_pin_nets: HashMap<String, Vec<(u8, String)>>,
+    /// Net → cell whose Q drives it (combinational resolution root).
+    net_ff: HashMap<String, String>,
+    /// Net → LUT whose O drives it (multi-level LUT chains evaluate exactly).
+    net_lut_o: HashMap<String, String>,
+    /// Testbench stimulus: top-level input port name (= its net) → driven bit.
+    input_values: HashMap<String, bool>,
+    /// Top-level port name → direction, for [`Sim::drive_input`] validation.
+    ports: HashMap<String, PortDir>,
+    /// Output IOB PAD net → net on the IOB's I pin (output-port sampling).
+    iob_pad_to_i: HashMap<String, String>,
 }
 
 impl Sim {
@@ -42,22 +54,25 @@ impl Sim {
                 lut_init.insert(c.name.clone(), init);
             }
         }
-        let mut lut_pins: HashMap<String, Vec<(u8, String)>> = HashMap::new();
+        let mut lut_pin_nets: HashMap<String, Vec<(u8, String)>> = HashMap::new();
+        let mut net_ff: HashMap<String, String> = HashMap::new();
+        let mut net_lut_o: HashMap<String, String> = HashMap::new();
         let mut ff_d_lut = HashMap::new();
         for n in &d.nets {
-            let ff_q = n
-                .endpoints
-                .iter()
-                .find(|e| e.pin == "Q")
-                .map(|e| e.cell.clone());
+            if let Some(q) = n.endpoints.iter().find(|e| e.pin == "Q") {
+                net_ff.insert(n.name.clone(), q.cell.clone());
+            }
+            if let Some(o) = n.endpoints.iter().find(|e| e.pin == "O") {
+                net_lut_o.insert(n.name.clone(), o.cell.clone());
+            }
             for e in &n.endpoints {
                 if let Some(rest) = e.pin.strip_prefix('I') {
-                    if let (Ok(pin), Some(ff)) = (rest.parse::<u8>(), ff_q.as_ref()) {
+                    if let Ok(pin) = rest.parse::<u8>() {
                         if pin < 6 {
-                            lut_pins
+                            lut_pin_nets
                                 .entry(e.cell.clone())
                                 .or_default()
-                                .push((pin, ff.clone()));
+                                .push((pin, n.name.clone()));
                         }
                     }
                 }
@@ -86,16 +101,163 @@ impl Sim {
                 ff_q.insert(c.name.clone(), false);
             }
         }
+        let mut ports = HashMap::new();
+        for p in &d.ports {
+            ports.insert(p.name.clone(), p.dir);
+        }
+        let mut iob_pad_to_i = HashMap::new();
+        for c in &d.cells {
+            if matches!(c.kind, CellKind::IobOut) {
+                if let (Some(pad), Some(i)) =
+                    (pin_ix.net_on(&c.name, "PAD"), pin_ix.net_on(&c.name, "I"))
+                {
+                    iob_pad_to_i.insert(pad.to_string(), i.to_string());
+                }
+            }
+        }
         Self {
             time: 0,
             lut_init,
-            lut_pins,
             ff_d_lut,
             iob_from_ff,
             ff_q,
             led: false,
             forces: HashMap::new(),
+            lut_pin_nets,
+            net_ff,
+            net_lut_o,
+            input_values: HashMap::new(),
+            ports,
+            iob_pad_to_i,
         }
+    }
+
+    /// Combinational value of a net: driven input → FF Q → LUT chain → false.
+    /// `memo`/`stack` guard combinational loops (read as 0, as before).
+    fn pin_net_value(
+        &self,
+        net: &str,
+        memo: &mut HashMap<String, bool>,
+        stack: &mut Vec<String>,
+    ) -> bool {
+        if let Some(&v) = memo.get(net) {
+            return v;
+        }
+        if let Some(&v) = self.input_values.get(net) {
+            memo.insert(net.to_string(), v);
+            return v;
+        }
+        if let Some(ff) = self.net_ff.get(net) {
+            let v = self.ff_q.get(ff).copied().unwrap_or(false);
+            memo.insert(net.to_string(), v);
+            return v;
+        }
+        if stack.iter().any(|s| s == net) {
+            return false;
+        }
+        if let Some(lut) = self.net_lut_o.get(net).cloned() {
+            stack.push(net.to_string());
+            let v = self.lut_output_live(&lut, memo, stack);
+            stack.pop();
+            memo.insert(net.to_string(), v);
+            return v;
+        }
+        memo.insert(net.to_string(), false);
+        false
+    }
+
+    /// Live LUT output with driven inputs and multi-level chains resolved.
+    fn lut_output_live(
+        &self,
+        lut: &str,
+        memo: &mut HashMap<String, bool>,
+        stack: &mut Vec<String>,
+    ) -> bool {
+        let init = self.lut_init.get(lut).copied().unwrap_or(0);
+        let mut addr = 0u64;
+        if let Some(pins) = self.lut_pin_nets.get(lut) {
+            for (pin, net) in pins {
+                if self.pin_net_value(net, memo, stack) {
+                    addr |= 1 << pin;
+                }
+            }
+        }
+        (init >> addr) & 1 == 1
+    }
+
+    /// Drive a top-level input (or inout) port. The value flows through
+    /// combinational LUT chains on the next [`Sim::step_posedge`], and
+    /// [`Sim::sample`] reads it back immediately.
+    pub fn drive_input(&mut self, port: &str, value: bool) -> Result<(), String> {
+        match self.ports.get(port) {
+            Some(PortDir::In) | Some(PortDir::Inout) => {
+                self.input_values.insert(port.to_string(), value);
+                Ok(())
+            }
+            Some(_) => Err(format!("drive_input: port {port} is not an input")),
+            None => {
+                let mut names: Vec<&str> =
+                    self.ports.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                Err(format!(
+                    "drive_input: no port {port} (ports: {})",
+                    names.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// Top-level input (or inout) port names, sorted.
+    pub fn input_ports(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .ports
+            .iter()
+            .filter(|(_, d)| matches!(d, PortDir::In | PortDir::Inout))
+            .map(|(n, _)| n.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Top-level output port names, sorted.
+    pub fn output_ports(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .ports
+            .iter()
+            .filter(|(_, d)| matches!(d, PortDir::Out))
+            .map(|(n, _)| n.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Sample a signal by name: `led`, an FF Q, a driven input port, or any
+    /// net / output port (output IOBs are followed PAD → I). Returns `None`
+    /// for undriven/unknown names instead of panicking.
+    pub fn sample(&self, name: &str) -> Option<u64> {
+        if name.eq_ignore_ascii_case("led") {
+            return Some(u64::from(self.led));
+        }
+        if let Some(q) = self.ff_q.get(name) {
+            return Some(u64::from(*q));
+        }
+        if let Some(&v) = self.input_values.get(name) {
+            return Some(u64::from(v));
+        }
+        let net = self
+            .iob_pad_to_i
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name);
+        let driven = self.net_ff.contains_key(net)
+            || self.net_lut_o.contains_key(net)
+            || self.input_values.contains_key(net);
+        if !driven {
+            return None;
+        }
+        let mut memo = HashMap::new();
+        let mut stack = Vec::new();
+        Some(u64::from(self.pin_net_value(net, &mut memo, &mut stack)))
     }
 
     fn resolve_signal(&self, name: &str) -> Option<String> {
@@ -174,18 +336,16 @@ impl Sim {
     pub fn step_posedge(&mut self, delay: u64) {
         self.time += delay;
         let mut next_q = HashMap::new();
-        for (ff, lut) in &self.ff_d_lut {
-            let init = self.lut_init.get(lut).copied().unwrap_or(0);
-            let mut addr = 0u8;
-            if let Some(pins) = self.lut_pins.get(lut) {
-                for (pin, src) in pins {
-                    let bit = self.ff_q.get(src).copied().unwrap_or(false);
-                    if bit {
-                        addr |= 1 << pin;
-                    }
-                }
-            }
-            let o = (init >> (addr as u64)) & 1 == 1;
+        // One memo per step: net values are stable across this edge.
+        let mut memo: HashMap<String, bool> = HashMap::new();
+        let mut stack: Vec<String> = Vec::new();
+        let luts: Vec<(String, String)> = self
+            .ff_d_lut
+            .iter()
+            .map(|(f, l)| (f.clone(), l.clone()))
+            .collect();
+        for (ff, lut) in &luts {
+            let o = self.lut_output_live(lut, &mut memo, &mut stack);
             next_q.insert(ff.clone(), o);
         }
         for (k, v) in next_q {
@@ -610,5 +770,110 @@ endmodule
             evh.contains(&true) && evh.contains(&false),
             "hier must toggle {evh:?}"
         );
+    }
+
+    /// DUT with driven input ports: `y = reg(a & b)` through one LUT.
+    fn and_dut() -> Design {
+        let mut d = Design::new("and_dut");
+        d.add_port("clk", PortDir::In);
+        d.add_port("a", PortDir::In);
+        d.add_port("b", PortDir::In);
+        d.add_port("y", PortDir::Out);
+        d.add_cell("u_lut", CellKind::Lut6 { init: 0x8 }); // I1 & I0
+        d.add_cell("u_ff", CellKind::Hff);
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("a", "u_lut", "I0");
+        d.connect("b", "u_lut", "I1");
+        d.connect("d", "u_lut", "O");
+        d.connect("d", "u_ff", "D");
+        d.connect("clk", "u_ff", "CLK");
+        d.connect("q", "u_ff", "Q");
+        d.connect("q", "u_iob", "I");
+        d.connect("y", "u_iob", "PAD");
+        d
+    }
+
+    #[test]
+    fn drive_input_flows_through_lut_to_ff_and_sample_reads_output_port() {
+        let mut s = Sim::new(&and_dut());
+        assert_eq!(s.input_ports(), vec!["a", "b", "clk"]);
+        assert_eq!(s.output_ports(), vec!["y"]);
+        // Undriven inputs read back as driven-0 only after drive; sampling an
+        // output before any clock is fine (Q=0).
+        assert_eq!(s.sample("y"), Some(0));
+        s.drive_input("a", true).unwrap();
+        s.drive_input("b", true).unwrap();
+        assert_eq!(s.sample("a"), Some(1));
+        s.step_posedge(10);
+        assert_eq!(s.sample("y"), Some(1), "1&1 must clock into the FF");
+        s.drive_input("b", false).unwrap();
+        s.step_posedge(10);
+        assert_eq!(s.sample("y"), Some(0), "1&0 must clock in as 0");
+        // Driving is sticky until changed.
+        s.step_posedge(10);
+        assert_eq!(s.sample("y"), Some(0));
+        s.drive_input("b", true).unwrap();
+        s.step_posedge(10);
+        assert_eq!(s.sample("y"), Some(1));
+    }
+
+    #[test]
+    fn drive_input_rejects_unknown_and_output_ports() {
+        let mut s = Sim::new(&and_dut());
+        let e = s.drive_input("nope", true).unwrap_err();
+        assert!(e.contains("no port nope"), "{e}");
+        assert!(e.contains('a'), "error lists available ports: {e}");
+        let e2 = s.drive_input("y", true).unwrap_err();
+        assert!(e2.contains("not an input"), "{e2}");
+        assert_eq!(s.sample("nope"), None, "unknown signal samples as None");
+    }
+
+    /// Two-level LUT chain: `q <= (a & b) & c`. The old pin→FF-only step
+    /// read the chained pin as 0; live resolution must evaluate the chain.
+    #[test]
+    fn step_posedge_evaluates_multi_level_lut_chains() {
+        let mut d = Design::new("chain_dut");
+        d.add_port("clk", PortDir::In);
+        d.add_port("a", PortDir::In);
+        d.add_port("b", PortDir::In);
+        d.add_port("c", PortDir::In);
+        d.add_port("y", PortDir::Out);
+        d.add_cell("u_l1", CellKind::Lut6 { init: 0x8 }); // a & b
+        d.add_cell("u_l2", CellKind::Lut6 { init: 0x8 }); // n1 & c
+        d.add_cell("u_ff", CellKind::Hff);
+        d.add_cell("u_iob", CellKind::IobOut);
+        d.connect("a", "u_l1", "I0");
+        d.connect("b", "u_l1", "I1");
+        d.connect("n1", "u_l1", "O");
+        d.connect("n1", "u_l2", "I0");
+        d.connect("c", "u_l2", "I1");
+        d.connect("d", "u_l2", "O");
+        d.connect("d", "u_ff", "D");
+        d.connect("clk", "u_ff", "CLK");
+        d.connect("q", "u_ff", "Q");
+        d.connect("q", "u_iob", "I");
+        d.connect("y", "u_iob", "PAD");
+        let mut s = Sim::new(&d);
+        for (a, b, c) in [(true, true, true), (true, true, false), (false, true, true)] {
+            s.drive_input("a", a).unwrap();
+            s.drive_input("b", b).unwrap();
+            s.drive_input("c", c).unwrap();
+            s.step_posedge(10);
+            let want = u64::from(a && b && c);
+            assert_eq!(s.sample("y"), Some(want), "a={a} b={b} c={c}");
+        }
+    }
+
+    #[test]
+    fn sample_reads_ff_q_and_driven_inputs_directly() {
+        let mut s = Sim::new(&and_dut());
+        s.drive_input("a", true).unwrap();
+        assert_eq!(s.sample("a"), Some(1));
+        assert_eq!(s.sample("b"), None, "undriven input samples as None (X)");
+        s.step_posedge(10);
+        assert_eq!(s.sample("u_ff"), Some(0));
+        s.drive_input("b", true).unwrap();
+        s.step_posedge(10);
+        assert_eq!(s.sample("u_ff"), Some(1));
     }
 }

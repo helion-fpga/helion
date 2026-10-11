@@ -1121,6 +1121,7 @@ pub enum WorkspacePane {
     Drc,
     Utilization,
     Runs,
+    Testbench,
 }
 
 /// Map every WorkspaceTab onto a real pane. None of these is a stub / popup / Timing dump.
@@ -1154,6 +1155,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::Drc => WorkspacePane::Drc,
         WorkspaceTab::Utilization => WorkspacePane::Utilization,
         WorkspaceTab::Runs => WorkspacePane::Runs,
+        WorkspaceTab::Testbench => WorkspacePane::Testbench,
     }
 }
 
@@ -1201,7 +1203,7 @@ mod tests {
         let labels = workspace_tab_labels();
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
@@ -1662,7 +1664,7 @@ mod tests {
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Schematic),
             WorkspacePane::Schematic
@@ -1697,6 +1699,10 @@ mod tests {
         );
         assert_eq!(pane_for_workspace(WorkspaceTab::Ip), WorkspacePane::Ip);
         assert_eq!(pane_for_workspace(WorkspaceTab::Find), WorkspacePane::Find);
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Testbench),
+            WorkspacePane::Testbench
+        );
         let mut more = 0usize;
         for tab in WorkspaceTab::ALL {
             let pane = pane_for_workspace(tab);
@@ -1714,7 +1720,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(more, 25, "28 tabs − 3 canvases");
+        assert_eq!(more, 26, "29 tabs − 3 canvases");
         assert!(is_report_detail(WorkspaceTab::Utilization));
         assert!(!is_report_detail(WorkspaceTab::Schematic));
         assert_eq!(

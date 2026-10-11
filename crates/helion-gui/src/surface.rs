@@ -314,6 +314,7 @@ pub enum JobKind {
     Implement,
     Step(FlowStep),
     SimRun(u32),
+    TbRun(crate::tb::TbRunRequest),
 }
 
 impl JobKind {
@@ -327,6 +328,7 @@ impl JobKind {
             JobKind::Step(FlowStep::Route) => "Route",
             JobKind::Step(FlowStep::Bitstream) => "Bitstream",
             JobKind::SimRun(_) => "Simulate",
+            JobKind::TbRun(_) => "Testbench",
         }
     }
 
@@ -341,6 +343,7 @@ impl JobKind {
             JobKind::Implement => "Implementing — synthesis, opt, place, route…".into(),
             JobKind::Step(s) => format!("Running {}…", s.label()),
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
+            JobKind::TbRun(r) => format!("Running testbench {}…", r.sel),
         }
     }
 }
@@ -367,6 +370,7 @@ fn run_kind(model: &mut IdeModel, kind: &JobKind) -> Result<String, String> {
         JobKind::Implement => model.implement(),
         JobKind::Step(s) => model.run_step(*s),
         JobKind::SimRun(n) => model.sim_run(*n),
+        JobKind::TbRun(req) => model.tb_run_job(req),
     }
 }
 
