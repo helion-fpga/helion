@@ -1228,12 +1228,12 @@ fn cmd_create_clock(i: &mut TclInterp, argv: &[String], line: usize) -> Ctl {
             "-period" => {
                 k += 1;
                 let v: f64 = match argv.get(k) {
-                    Some(s) => match s.parse() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return err(line, format!("create_clock: bad -period \"{s}\""));
+                    Some(s) => s.parse().map_err(|_| {
+                        TclError {
+                            msg: format!("create_clock: bad -period \"{s}\""),
+                            line,
                         }
-                    },
+                    })?,
                     None => {
                         return err(line, "create_clock: -period needs an argument");
                     }
