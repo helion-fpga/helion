@@ -11799,7 +11799,8 @@ fn map_wide_cones(
     let (aig, outs) = if aig_rewrite_on() {
         aig_opt::rewrite_aig_multi(&merged, &merged_outs)
     } else {
-        (merged, merged_outs)
+        // Clone: `merged` is still borrowed below for HELION_AREA_STATS.
+        (merged.clone(), merged_outs)
     };
     let n_pi = aig.pis.len();
     let n_and = aig.ands.len();

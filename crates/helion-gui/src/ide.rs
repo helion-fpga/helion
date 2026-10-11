@@ -1330,7 +1330,7 @@ impl DesignRun {
 }
 
 /// Sortable Design Runs result-table column.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RunCol {
     Name,
     Strategy,
@@ -12324,10 +12324,17 @@ impl IdeModel {
                 _ => (None, None),
             };
             let ms = t0.elapsed().as_millis() as u64;
+            // Gather everything needing `&self` before the mutable run update.
+            let part = self.part().to_string();
+            let cells = side.design.as_ref().map(|d| d.cells.len());
+            let bitstream_hash = side.blinky_hash();
+            let top = side.design.as_ref().map(|d| d.name.clone());
+            let strategy_label = strategy.preset.clone();
+            let spec = strategy.to_spec();
             let r = &mut self.runs[idx];
             r.status = "Complete".into();
-            r.strategy = strategy.preset.clone();
-            r.spec = strategy.to_spec();
+            r.strategy = strategy_label;
+            r.spec = spec;
             r.runtime_ms = Some(ms);
             r.wns_ps = wns;
             r.tns_ps = tns;
@@ -12336,10 +12343,10 @@ impl IdeModel {
             r.brams = Some(brams);
             r.dsps = Some(dsps);
             r.lutff = Some(luts);
-            r.cells = side.design.as_ref().map(|d| d.cells.len());
-            r.bitstream_hash = side.blinky_hash();
-            r.part = self.part().to_string();
-            r.top = side.design.as_ref().map(|d| d.name.clone());
+            r.cells = cells;
+            r.bitstream_hash = bitstream_hash;
+            r.part = part;
+            r.top = top;
             r.result_session = Some(Box::new(side));
             Ok(())
         })();
