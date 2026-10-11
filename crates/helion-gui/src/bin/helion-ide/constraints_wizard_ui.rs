@@ -315,6 +315,13 @@ impl WizardUi {
     /// Full validate: parse errors + semantic validation. Returns true when
     /// the given step (or all steps for Review) is clean.
     fn revalidate(&mut self, model: &IdeModel, only: Option<wiz::WizardStep>) -> bool {
+        // Drafts changed and re-validated: previously written file / timing
+        // results no longer correspond to this input.
+        if only.is_some() {
+            self.written_path = None;
+            self.timing = None;
+            self.preview = None;
+        }
         let (input, mut errs) = self.build_input();
         // Only externally-defined clocks here: validate() adds the wizard's
         // own clock names on top for reference checks (passing them in would
