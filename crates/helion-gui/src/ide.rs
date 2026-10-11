@@ -9135,6 +9135,22 @@ impl IdeModel {
         Ok(out)
     }
 
+    /// Cross-probe: probe a timing path by index without changing the
+    /// workspace/canvas (for screenshot/demo hooks like HELION_PROBE_PATH).
+    pub fn probe_timing_path(&mut self, idx: usize) -> Result<(), String> {
+        self.ensure_timing_paths()?;
+        let path = self
+            .timing_paths
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| format!("probe_timing_path: index {idx} out of range"))?;
+        if path.cells.is_empty() {
+            return Err("probe_timing_path: path has no cells".into());
+        }
+        self.set_probe(ProbeSelection::Path(idx));
+        Ok(())
+    }
+
     fn ensure_timing_paths(&mut self) -> Result<(), String> {
         if self.timing_paths.is_empty() {
             let _ = self.report_timing_now();
@@ -28202,6 +28218,32 @@ endmodule
         let vy1 = y1 * z + cam.pan_y;
         assert!(vx0 >= -1.0 && vx1 <= 901.0, "path fits horizontally");
         assert!(vy0 >= -1.0 && vy1 <= 501.0, "path fits vertically");
+    }
+
+    /// Cross-probe: probe_timing_path (HELION_PROBE_PATH hook) probes by
+    /// index without moving the workspace, and rejects bad indices.
+    #[test]
+    fn probe_timing_path_by_index_keeps_workspace() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2, "need 2+ paths");
+        ide.workspace = WorkspaceTab::Device;
+        ide.probe_timing_path(1).unwrap();
+        assert_eq!(ide.probe(), ProbeSelection::Path(1));
+        assert_eq!(
+            ide.workspace,
+            WorkspaceTab::Device,
+            "probe hook must not move the workspace"
+        );
+        assert!(ide.schematic.zoom_to_path_pending);
+        assert!(ide
+            .device
+            .sites
+            .iter()
+            .any(|s| s.highlighted), "device sites light up");
+        assert!(ide.probe_timing_path(999).is_err(), "bad index rejected");
     }
 
     /// UG893 Fig. 55 schematic path picker is Name/From/To/Slack_ps, not `endpoint slack=` chips.

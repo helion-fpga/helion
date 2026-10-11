@@ -477,6 +477,15 @@ impl HelionIde {
                 app.set_activity(act);
             }
         }
+        // Cross-probe demo/screenshot hook: probe a timing path by index
+        // after the flow and workspace are set up. Unlike select_timing_path,
+        // this does not move the workspace, so it composes with
+        // HELION_WORKSPACE (Timing/Device/Schematic views).
+        if let Ok(spec) = std::env::var("HELION_PROBE_PATH") {
+            if let Ok(idx) = spec.trim().parse::<usize>() {
+                let _ = app.model.probe_timing_path(idx);
+            }
+        }
         if let Ok(cmds) = std::env::var("HELION_EXEC") {
             for cmd in cmds.split(';') {
                 let t = cmd.trim();
