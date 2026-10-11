@@ -11,36 +11,40 @@ pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
 pub mod surface;
+pub use learner_l1::{
+    ConstraintProvenance, SessionStage, StageError, StageStatus,
+};
+pub use learner_l2::{
+    critical_path_highlight, highlight_set_from_path, packing_summary_from_placed, HighlightSet,
+    HighlightSetExt,
+};
+pub use surface::{
+    central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
+    JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
+};
+pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
+pub use ide::{
+    BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
+    DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
+    HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
+    IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
+    MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
+    ConstraintRow, ConstraintSection,
+    Pblock, ProjectSummaryGadget, PropertyRow, ReportCatalogRow,
+    NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
+    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
+    schematic_kind_label, schematic_short_name,
+    TimingPathPin, TimingPathSortCol,
+    UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
+    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
+};
 pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{
     CdcReport, CdcSeverity, CdcViolation, ClockInteraction, ClockInteractionCell, ClockNetwork,
     ClockNetworkReport, ClockRelation, MethodologyReport, MethodologySeverity,
     MethodologyViolation, PathGroupKind, PowerReport, TimingSummary, TimingSummaryGroup,
 };
-pub use ide::{
-    BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab,
-    BreakpointRow, ClockRegion, ConsoleLine, ConstraintRow, ConstraintSection, DesignRun,
-    DeviceRoute, DeviceSiteView, DeviceView, EcoRow, EditorMarker, FindHit, FlowStep, ForceRow,
-    HierBox, HierOccupancy, HierarchyDrawing, HierarchyView, HwManager, HwStatReport, HwStatRow,
-    IdeMessage, IdeModel, IlaDashboard, IlaSampleRow, IlaTrigger, IncrementalRow, IoPortView,
-    IpCatalogRow, LayoutKind, LocalRow, MemoryBlock, MemoryWordRow, MsgSeverity, NavAction,
-    NavSection, NetlistRow, NetlistTree, PackageDrawing, PackagePin, Pblock, ProjectSummaryGadget,
-    PropertyRow, ReportCatalogRow, SchematicCamera, SchematicDrawing, SchematicPin,
-    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, SourceLine,
-    StepState, TimingPath, TimingPathPin, UltraFastStage, UtilOccupancy, Utilization,
-    UtilizationReport, VirtualBus, WaveCursorRow, WaveMarker, WaveRadix, WaveStyle, WaveTrace,
-    Waveform, WorkspaceTab, schematic_kind_label, schematic_short_name,
-};
-pub use learner_l1::{ConstraintProvenance, SessionStage, StageError, StageStatus};
-pub use learner_l2::{
-    HighlightSet, HighlightSetExt, critical_path_highlight, highlight_set_from_path,
-    packing_summary_from_placed,
-};
-pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
-pub use surface::{
-    ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind, JobOutcome, UiTrace,
-    apply_activity, apply_canvas, apply_more, central_pane, geometry_at, queue_flow, spawn_job,
-};
+
 
 use helion_device::Device;
 use helion_ir::Design;
