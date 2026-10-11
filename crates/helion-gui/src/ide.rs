@@ -4010,11 +4010,23 @@ impl SimIla {
         self.progress = None;
     }
 
+    /// Stop a capture in flight: the worker thread sees the flag at its next
+    /// progress tick and returns the partial ring as a missed trigger.
+    pub fn disarm(&mut self) -> Result<String, String> {
+        match (&self.status, &self.progress) {
+            (SimIlaStatus::Capturing, Some(p)) => {
+                p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok("ila capture stopping…".into())
+            }
+            _ => Err("ila: no capture in flight".into()),
+        }
+    }
+
     /// Synchronous capture (headless / exec path). Prefer `start_capture` in UI.
     pub fn capture_sync(&mut self, design: &helion_ir::Design) -> Result<String, String> {
         self.apply_trigger_value_if_needed()?;
         let d = design.clone();
-        let cap = ila::run_sim_ila_capture(&d, &self.config, &|_| {})?;
+        let cap = ila::run_sim_ila_capture(&d, &self.config, &|_| false)?;
         let msg = format!(
             "ila capture probes={} samples={} trigger={} cycles={}",
             cap.probes.len(),
@@ -6361,6 +6373,8 @@ impl IdeModel {
             let r = self.sim_ila.capture_sync(&d);
             self.workspace = WorkspaceTab::Ila;
             r
+        } else if t == "ila_sim_disarm" {
+            self.sim_ila.disarm()
         } else if let Some(rest) = t.strip_prefix("ila_sim_trigger_at ") {
             let mut parts = rest.split_whitespace();
             let probe: usize = parts
@@ -22854,6 +22868,31 @@ mod tests {
         // Export with no capture fails loud.
         ide.sim_ila.capture = None;
         assert!(ide.exec("ila_sim_export_vcd /tmp/nowhere.vcd").is_err());
+    }
+
+    /// Sim ILA: disarm stops a capture in flight; disarm at idle fails loud.
+    #[test]
+    fn sim_ila_disarm_stops_background_capture() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.exec("ila_sim_add cnt_3").unwrap();
+        ide.exec("ila_sim_add clk").unwrap();
+        // clk reads 1 at every posedge sample: value 0 never fires, so the
+        // disarm deterministically wins the race.
+        ide.exec("ila_sim_trigger value 1 0 1").unwrap();
+        ide.exec("ila_sim_depth 1024").unwrap();
+        assert!(ide.exec("ila_sim_disarm").is_err(), "idle disarm fails loud");
+        let d = ide.shell.session.design.clone().expect("design");
+        let rx = ide.sim_ila.start_capture(&d).expect("arm");
+        ide.exec("ila_sim_disarm").unwrap();
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("capture done");
+        ide.sim_ila.finish_capture(r);
+        let cap = ide.sim_ila.capture.as_ref().expect("partial capture");
+        assert!(!cap.found_trigger, "cancelled capture reports missed trigger");
+        assert_eq!(ide.sim_ila.status, SimIlaStatus::Done);
     }
 
     /// The console widget must be a pipe onto the real engines: `report_timing` has to

@@ -384,11 +384,13 @@ pub fn pack_probe(nets: &[String], sim: &Sim) -> (u64, bool) {
 /// Run the event kernel, sampling every probe once per posedge, and keep a
 /// `depth`-sample window around the trigger (`pre` before, `post` after).
 /// Single pass: a bounded ring holds pre-trigger history; the search breaks
-/// early on the first firing sample. `progress(cycles_done)` streams progress.
+/// early on the first firing sample. `progress(cycles_done)` streams progress
+/// and returns `true` to cancel (the partial ring is returned as a missed
+/// trigger, honestly marked).
 pub fn run_sim_ila_capture(
     design: &Design,
     config: &IlaConfig,
-    progress: &dyn Fn(u32),
+    progress: &dyn Fn(u32) -> bool,
 ) -> Result<IlaCapture, String> {
     config.validate(design)?;
     let depth = config.depth;
@@ -459,8 +461,8 @@ pub fn run_sim_ila_capture(
         while ring.len() > depth {
             ring.pop_front();
         }
-        if cycle % 512 == 0 {
-            progress(cycles_run);
+        if cycle % 512 == 0 && progress(cycles_run) {
+            break; // cancelled: fall through to the missed-trigger return
         }
     }
     // No trigger: hand back the last `depth` samples honestly marked.
@@ -491,6 +493,8 @@ pub fn run_sim_ila_capture(
 pub struct IlaRunProgress {
     pub cycles: AtomicU32,
     pub done: AtomicU32,
+    /// Set by the UI to stop a capture in flight.
+    pub cancel: std::sync::atomic::AtomicBool,
 }
 
 pub struct IlaRunHandle {
@@ -503,6 +507,7 @@ pub fn spawn_sim_ila_capture(design: Design, config: IlaConfig) -> IlaRunHandle 
     let progress = Arc::new(IlaRunProgress {
         cycles: AtomicU32::new(0),
         done: AtomicU32::new(0),
+        cancel: std::sync::atomic::AtomicBool::new(false),
     });
     let p = Arc::clone(&progress);
     std::thread::Builder::new()
@@ -510,6 +515,7 @@ pub fn spawn_sim_ila_capture(design: Design, config: IlaConfig) -> IlaRunHandle 
         .spawn(move || {
             let r = run_sim_ila_capture(&design, &config, &|c| {
                 p.cycles.store(c, Ordering::Relaxed);
+                p.cancel.load(Ordering::Relaxed)
             });
             p.done.store(1, Ordering::Relaxed);
             let _ = tx.send(r);
@@ -897,7 +903,7 @@ mod tests {
             kind: IlaTriggerKind::Rising,
         };
         cfg.max_cycles = 1024;
-        let cap = run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture");
+        let cap = run_sim_ila_capture(&d, &cfg, &|_| false).expect("capture");
         assert!(cap.found_trigger, "q3 rises at count 8");
         assert_eq!(cap.samples.len(), 2);
         let ti = cap.trigger_sample.expect("trigger idx");
@@ -931,7 +937,7 @@ mod tests {
                 mask: 0xF,
             },
         };
-        let cap = run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture");
+        let cap = run_sim_ila_capture(&d, &cfg, &|_| false).expect("capture");
         assert!(cap.found_trigger);
         let ti = cap.trigger_sample.unwrap();
         assert_eq!(cap.samples[0][ti], 5);
@@ -945,7 +951,7 @@ mod tests {
             kind: IlaTriggerKind::ValueMatch { value: 0, mask: 1 },
         };
         cfg.max_cycles = 40;
-        let miss = run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture");
+        let miss = run_sim_ila_capture(&d, &cfg, &|_| false).expect("capture");
         assert!(!miss.found_trigger);
         assert_eq!(miss.trigger_sample, None);
         assert_eq!(miss.len(), 16, "last depth samples kept");
@@ -959,7 +965,7 @@ mod tests {
         cfg.probes.push(IlaProbeCfg::scalar("q0", "q0"));
         cfg.depth = 16;
         cfg.pre_ratio = 0.0; // immediate trigger at cycle 0 keeps all 16
-        let cap = run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture");
+        let cap = run_sim_ila_capture(&d, &cfg, &|_| false).expect("capture");
         let s = IlaSession::new(cfg, Some(cap));
         let dir = std::env::temp_dir().join("helion-ila-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1013,7 +1019,7 @@ mod tests {
         cfg.probes.push(IlaProbeCfg::scalar("e", "e"));
         cfg.depth = 8;
         cfg.pre_ratio = 0.0; // immediate trigger at cycle 0: no pre samples
-        let cap = run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture");
+        let cap = run_sim_ila_capture(&d, &cfg, &|_| false).expect("capture");
         // e = d0 & q1 with d0 = ~q0 combinational on the CURRENT count:
         // counts 1..8 → 0,1,0,0,0,1,0,0.
         let vals: Vec<u64> = cap.samples[0].clone();
@@ -1037,6 +1043,26 @@ mod tests {
         let ti = cap.trigger_sample.expect("trigger idx");
         assert_eq!(cap.len(), ti + 1 + cfg.post());
         assert_eq!(h.progress.done.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn capture_cancel_returns_partial_ring_honestly() {
+        let d = Design::structural_counter();
+        let mut cfg = IlaConfig::default();
+        cfg.probes.push(IlaProbeCfg::scalar("q0", "q0"));
+        cfg.depth = 64;
+        cfg.max_cycles = 100_000;
+        cfg.trigger = IlaTrigger {
+            probe: 0,
+            kind: IlaTriggerKind::Rising,
+        };
+        // Rising can't fire on the very first sample (no previous edge), so
+        // the immediate cancel wins the race deterministically.
+        let cap = run_sim_ila_capture(&d, &cfg, &|c| c >= 1).expect("capture");
+        assert!(!cap.found_trigger);
+        assert_eq!(cap.trigger_sample, None);
+        assert!(cap.cycles_run < 100_000, "stopped early at {}", cap.cycles_run);
+        assert!(cap.len() <= 64);
     }
 
     #[test]
@@ -1068,7 +1094,7 @@ mod tests {
             probe: 0,
             kind: IlaTriggerKind::Rising,
         };
-        run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture")
+        run_sim_ila_capture(&d, &cfg, &|_| false).expect("capture")
     }
 
     #[test]
@@ -1077,11 +1103,8 @@ mod tests {
         let ti = cap.trigger_sample.expect("trigger");
         // q0 rises at the trigger sample.
         assert_eq!(edge_kind_at(&cap, 0, ti), Some(IlaTriggerKind::Rising));
-        // No edge one sample later.
-        assert!(matches!(
-            edge_kind_at(&cap, 0, ti + 1),
-            Some(IlaTriggerKind::ValueMatch { .. })
-        ));
+        // q0 toggles every cycle, so the next sample is a falling edge.
+        assert_eq!(edge_kind_at(&cap, 0, ti + 1), Some(IlaTriggerKind::Falling));
         // Bus probe gives a value match with the current value.
         match edge_kind_at(&cap, 1, ti) {
             Some(IlaTriggerKind::ValueMatch { value, mask }) => {
@@ -1128,8 +1151,8 @@ mod tests {
         // Values: q0's id is '!' — both 0! and 1! transitions must appear.
         assert!(text.contains("0!\n"));
         assert!(text.contains("1!\n"));
-        // Timestamps: ts=10ns is 1 timescale unit per sample, so #1 exists.
-        assert!(text.contains("#1\n"));
+        // Timestamps: timescale is "10 ns", so sample s lands on #(10*s).
+        assert!(text.contains("#10\n"));
         // Empty capture fails loud.
         let empty = IlaCapture {
             probes: vec![],

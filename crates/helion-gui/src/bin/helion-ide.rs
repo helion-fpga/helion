@@ -8390,6 +8390,7 @@ fn paint_ila(
         SetTrigKind(ila::IlaTriggerKind),
         SetTrigProbe(usize),
         Arm,
+        Disarm,
         Save,
         Load,
         ExportVcd,
@@ -8428,14 +8429,22 @@ fn paint_ila(
                 intents.push(Intent::Save);
             }
             let armed = model.sim_ila.status == SimIlaStatus::Capturing;
-            ui.set_enabled(!armed && has_design);
-            if primary_button(ui, if armed { "Capturing…" } else { "Arm Capture" })
-                .on_hover_text("Run the event kernel with probes instrumented (helion-sim)")
-                .clicked()
-            {
-                intents.push(Intent::Arm);
+            if armed {
+                if sidebar_button(ui, "Stop")
+                    .on_hover_text("Stop the capture in flight (keeps partial samples)")
+                    .clicked()
+                {
+                    intents.push(Intent::Disarm);
+                }
             }
-            ui.set_enabled(true);
+            ui.add_enabled_ui(!armed && has_design, |ui| {
+                if primary_button(ui, if armed { "Capturing…" } else { "Arm Capture" })
+                    .on_hover_text("Run the event kernel with probes instrumented (helion-sim)")
+                    .clicked()
+                {
+                    intents.push(Intent::Arm);
+                }
+            });
         });
     });
     if let Some(e) = model.sim_ila.last_error.clone() {
@@ -8717,6 +8726,11 @@ fn paint_ila(
                     }
                 }
             }
+            Intent::Disarm => {
+                if let Err(e) = model.sim_ila.disarm() {
+                    model.sim_ila.last_error = Some(e);
+                }
+            }
             Intent::Save => {
                 let pp = model.last_project_path.clone();
                 let r = model.sim_ila.save_session(pp.as_deref(), "");
@@ -8915,7 +8929,7 @@ fn paint_ila_wave(
     );
 
     let avail_h = ui.available_height().max(120.0);
-    let row_h = (avail_h / nprobes as f32).clamp(22.0, 44.0);
+    let row_h = (avail_h / nprobes as f32).clamp(22.0, 200.0);
     let ruler_h = 20.0;
     let pane_w = 300.0f32;
 
