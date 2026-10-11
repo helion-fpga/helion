@@ -1439,6 +1439,38 @@ impl TimingPath {
     }
 }
 
+/// Cross-probe selection: one selection reflected across the timing report,
+/// device view, and schematic (Vivado §8 "Cross-probing everywhere").
+///
+/// The timing report, device view, and schematic all route selection changes
+/// through [`IdeModel::set_probe`], which keeps `selected`, `selected_timing_path`,
+/// and the schematic/device highlight sets consistent. Paint code reads
+/// `selected_timing_path.is_some()` to tell a path probe (gold) apart from a
+/// single-object probe (accent).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ProbeSelection {
+    /// Nothing selected.
+    #[default]
+    None,
+    /// Single netlist object (cell, net, or site name).
+    Object(String),
+    /// Timing path probe: index into [`IdeModel::timing_paths`].
+    Path(usize),
+}
+
+/// One element of a probed timing path, in dataflow order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeElement {
+    /// Cell or net name.
+    pub id: String,
+    /// `"cell"` or `"net"`.
+    pub kind: &'static str,
+    /// Cumulative arrival at this element, ps.
+    pub arrival_ps: i64,
+    /// Whole-path slack, ps (same for every element of the path).
+    pub slack_ps: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct SchematicView {
     pub nodes: Vec<SchematicNode>,
@@ -1456,6 +1488,12 @@ pub struct SchematicView {
     pub highlight_nets: HashSet<String>,
     /// When true, the sheet shows only the highlighted STA path.
     pub path_only: bool,
+    /// Cross-probe: auto zoom/pan to fit the probed path on selection.
+    /// Toolbar toggle; consumed with `zoom_to_path_pending`.
+    pub auto_fit_on_probe: bool,
+    /// Set by [`IdeModel::set_probe`] for a path probe; consumed by the
+    /// schematic painter after the drawing is rebuilt.
+    pub zoom_to_path_pending: bool,
     /// Fig. 55 camera the painter applies.
     pub camera: SchematicCamera,
     pub view_history: Vec<SchematicCamera>,
@@ -1478,6 +1516,8 @@ impl Default for SchematicView {
             highlight_cells: HashSet::new(),
             highlight_nets: HashSet::new(),
             path_only: false,
+            auto_fit_on_probe: true,
+            zoom_to_path_pending: false,
             camera: SchematicCamera::default(),
             view_history: vec![SchematicCamera::default()],
             view_index: 0,
@@ -1797,6 +1837,23 @@ impl SchematicView {
     pub fn zoom_fit(&mut self) {
         let d = self.drawing_arc();
         self.apply_zoom_fit(d.width, d.height);
+    }
+
+    /// Cross-probe: zoom/pan so the drawing-space rect `(x0,y0)-(x1,y1)`
+    /// fills the viewport, with a small margin. Used to frame a probed
+    /// timing path after selection.
+    pub fn zoom_to_region(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let w = (x1 - x0).max(1.0);
+        let h = (y1 - y0).max(1.0);
+        let vw = self.viewport_w.max(1.0);
+        let vh = self.viewport_h.max(1.0);
+        // Margin so highlighted symbols are not glued to the pane edge.
+        let zoom = crate::chrome::schematic_fit_zoom(w, h, vw, vh).min(4.0);
+        let cx = (x0 + x1) * 0.5;
+        let cy = (y0 + y1) * 0.5;
+        let pan_x = vw * 0.5 - cx * zoom;
+        let pan_y = vh * 0.5 - cy * zoom;
+        self.commit_camera(SchematicCamera { zoom, pan_x, pan_y });
     }
 
     pub fn apply_zoom_fit(&mut self, width: f32, height: f32) {
@@ -8884,6 +8941,158 @@ impl IdeModel {
         Ok(self.schematic_drawing_text())
     }
 
+    /// Current cross-probe selection, derived from model state.
+    ///
+    /// Invariant: `probe() == ProbeSelection::Path(_)` exactly when
+    /// `selected_timing_path` is `Some` — only [`IdeModel::set_probe`] sets
+    /// the field, and resets clear it.
+    pub fn probe(&self) -> ProbeSelection {
+        if let Some(idx) = self.selected_timing_path {
+            if idx < self.timing_paths.len() {
+                return ProbeSelection::Path(idx);
+            }
+        }
+        match self.selected.clone() {
+            Some(id) => ProbeSelection::Object(id),
+            None => ProbeSelection::None,
+        }
+    }
+
+    /// Single choke point for cross-probe selection: the timing report,
+    /// device view, and schematic all route selection changes through here
+    /// so one selection is reflected in every view.
+    ///
+    /// - `Path(idx)`: highlights the path's cells/nets on the schematic
+    ///   (isolated via `path_only`), marks the placed sites and routed nets
+    ///   on the device view, and arms schematic auto-fit on next paint.
+    /// - `Object(id)`: single cell/net/site selection; clears any path
+    ///   probe and syncs the schematic highlight to the one object.
+    /// - `None`: clears every selection in every view.
+    ///
+    /// A stale path index is ignored (selection left untouched) so paint
+    /// code can call this unconditionally after list rebuilds.
+    pub fn set_probe(&mut self, sel: ProbeSelection) {
+        match sel {
+            ProbeSelection::None => self.clear_probe(),
+            ProbeSelection::Object(id) => {
+                self.selected_timing_path = None;
+                self.selected_timing_pin = None;
+                self.schematic.path_only = false;
+                self.schematic.zoom_to_path_pending = false;
+                self.schematic.highlight_cells.clear();
+                // Cells render through `selected` (`on` styling) on the
+                // schematic; nets additionally join the wire highlight set
+                // so device routes light up.
+                if self.tree.has_net(&id) && !self.tree.has_cell(&id) {
+                    self.schematic.highlight_nets = [id.clone()].into_iter().collect();
+                } else {
+                    self.schematic.highlight_nets.clear();
+                }
+                self.select(&id);
+            }
+            ProbeSelection::Path(idx) => {
+                let Some(path) = self.timing_paths.get(idx).cloned() else {
+                    return;
+                };
+                if path.cells.is_empty() {
+                    return;
+                }
+                self.selected_timing_path = Some(idx);
+                self.selected_timing_pin = None;
+                self.schematic.highlight_cells = path.cells.iter().cloned().collect();
+                self.schematic.highlight_nets = path.nets.iter().cloned().collect();
+                self.schematic.path_only = true;
+                self.schematic.cone_root = None;
+                self.schematic.expand_inside = None;
+                self.schematic.zoom_to_path_pending = true;
+                if let Some(end) = path.cells.first() {
+                    self.select(end);
+                } else {
+                    self.highlight_device_routes();
+                }
+            }
+        }
+    }
+
+    /// Clear every selection: timing path, object, and schematic/device
+    /// highlights. Paint code calls this on Esc / empty-space click.
+    pub fn clear_probe(&mut self) {
+        self.selected_timing_path = None;
+        self.selected_timing_pin = None;
+        self.schematic.highlight_cells.clear();
+        self.schematic.highlight_nets.clear();
+        self.schematic.path_only = false;
+        self.schematic.zoom_to_path_pending = false;
+        self.select("");
+        self.highlight_device_routes();
+    }
+
+    /// Ordered (cell, net) elements of the probed path with per-element
+    /// arrival and whole-path slack, for the timing details pane.
+    /// Empty unless a path is currently probed.
+    pub fn probe_elements(&self) -> Vec<ProbeElement> {
+        let Some(idx) = self.selected_timing_path else {
+            return Vec::new();
+        };
+        let Some(path) = self.timing_paths.get(idx) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ProbeElement> = Vec::new();
+        let mut last_net = String::new();
+        for pin in &path.pins {
+            // Dataflow order: the net feeding a pin arrives before the cell.
+            if !pin.net.is_empty() && pin.net != last_net {
+                let arr = pin.path_ps.saturating_sub(pin.incr_ps.max(0));
+                out.push(ProbeElement {
+                    id: pin.net.clone(),
+                    kind: "net",
+                    arrival_ps: arr,
+                    slack_ps: path.slack_ps,
+                });
+                last_net = pin.net.clone();
+            }
+            if !pin.cell.is_empty() {
+                out.push(ProbeElement {
+                    id: pin.cell.clone(),
+                    kind: "cell",
+                    arrival_ps: pin.path_ps,
+                    slack_ps: path.slack_ps,
+                });
+            }
+        }
+        // Merge repeats of the same element (cell input pin then output
+        // pin), keeping the latest arrival.
+        let mut merged: Vec<ProbeElement> = Vec::with_capacity(out.len());
+        for el in out {
+            if let Some(prev) = merged.last_mut() {
+                if prev.id == el.id && prev.kind == el.kind {
+                    prev.arrival_ps = prev.arrival_ps.max(el.arrival_ps);
+                    continue;
+                }
+            }
+            merged.push(el);
+        }
+        merged
+    }
+
+    /// Indices of timing paths containing the given cell or net, worst
+    /// slack first. Powers reverse cross-probing: selecting an object in
+    /// the device/schematic surfaces the paths through it in the timing
+    /// report.
+    pub fn paths_through(&self, id: &str) -> Vec<usize> {
+        let mut hits: Vec<usize> = self
+            .timing_paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.cells.iter().any(|c| c == id) || p.nets.iter().any(|n| n == id)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        hits.sort_by_key(|&i| self.timing_paths[i].slack_ps);
+        hits
+    }
+
     /// Fig. 59: isolate/highlight the STA path's cells and nets on the schematic.
     /// Also marks Device die sites/routes for the same path (paint-ready).
     pub fn select_timing_path(&mut self, spec: &str) -> Result<String, String> {
@@ -8897,19 +9106,8 @@ impl IdeModel {
         if path.cells.is_empty() {
             return Err("select_timing_path: path has no cells".into());
         }
-        self.selected_timing_path = Some(idx);
-        self.selected_timing_pin = None;
-        self.schematic.highlight_cells = path.cells.iter().cloned().collect();
-        self.schematic.highlight_nets = path.nets.iter().cloned().collect();
-        self.schematic.path_only = true;
-        self.schematic.cone_root = None;
-        self.schematic.expand_inside = None;
+        self.set_probe(ProbeSelection::Path(idx));
         self.workspace = WorkspaceTab::Schematic;
-        if let Some(end) = path.cells.first() {
-            self.select(end);
-        } else {
-            self.highlight_device_routes();
-        }
         // FM-HEL-L2: verify path sites through live HAD resolve (sites/nets only; PIP later).
         let hs = self.highlight_set();
         let hl_note = if hs.sites.is_empty() {
@@ -8979,13 +9177,9 @@ impl IdeModel {
         if path.cells.is_empty() {
             return Err("select_timing_path: path has no cells".into());
         }
-        self.selected_timing_path = Some(idx);
-        self.selected_timing_pin = None;
+        self.set_probe(ProbeSelection::Path(idx));
         self.selected_report = Some("report_timing".into());
         self.workspace = WorkspaceTab::Reports;
-        if let Some(end) = path.cells.first() {
-            self.select(end);
-        }
         Ok(self.timing_path_table_text())
     }
 
@@ -12964,7 +13158,9 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Device;
         match found.occupant.clone() {
             Some(cell) => {
-                self.select(&cell);
+                // Cross-probe: the picked cell highlights in the
+                // schematic and surfaces its timing paths.
+                self.set_probe(ProbeSelection::Object(cell.clone()));
                 Ok(format!(
                     "device_site {} occupant={cell} X{}Y{}",
                     found.site_name(),
@@ -12974,7 +13170,7 @@ impl IdeModel {
             }
             None => {
                 if let Some(rt) = self.device.route_at(x, y).cloned() {
-                    self.select(&rt.net);
+                    self.set_probe(ProbeSelection::Object(rt.net.clone()));
                     return Ok(format!(
                         "device_site {} route={} hops={} delay_ps={} X{}Y{}",
                         found.site_name(),
@@ -12986,7 +13182,7 @@ impl IdeModel {
                     ));
                 }
                 let name = found.site_name();
-                self.select(&name);
+                self.set_probe(ProbeSelection::Object(name.clone()));
                 Ok(format!(
                     "device_site {name} unoccupied X{}Y{}",
                     found.x, found.y
@@ -13041,7 +13237,7 @@ impl IdeModel {
         };
         self.nav = NavSection::BoardDevice;
         self.workspace = WorkspaceTab::Device;
-        self.select(&found.net);
+        self.set_probe(ProbeSelection::Object(found.net.clone()));
         Ok(format!(
             "device_route net={} hops={} delay_ps={} tiles={}",
             found.net,
@@ -27764,6 +27960,243 @@ endmodule
             "Device alias keeps site highlights"
         );
         assert_eq!(ide.wns_ps(), Some(9640));
+    }
+
+    /// Cross-probe: set_probe(Path) is the single choke point — one call
+    /// must update the selection model, schematic highlights, and device
+    /// highlights together.
+    #[test]
+    fn probe_path_syncs_selection_model_schematic_and_device() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2, "need 2+ paths");
+        let p1 = ide.timing_paths[1].clone();
+        assert!(!p1.cells.is_empty());
+
+        ide.set_probe(ProbeSelection::Path(1));
+        assert_eq!(ide.probe(), ProbeSelection::Path(1));
+        assert_eq!(ide.selected_timing_path, Some(1));
+        // Schematic: path cells/nets isolated.
+        assert!(ide.schematic.path_only);
+        for c in &p1.cells {
+            assert!(
+                ide.schematic.highlight_cells.contains(c),
+                "path cell {c} in highlight_cells"
+            );
+        }
+        for n in &p1.nets {
+            assert!(
+                ide.schematic.highlight_nets.contains(n),
+                "path net {n} in highlight_nets"
+            );
+        }
+        // Device: placed path sites highlight.
+        assert!(
+            ide.device.sites.iter().any(|s| s.highlighted),
+            "path sites must highlight on the die"
+        );
+        // Auto-fit armed for the schematic painter.
+        assert!(ide.schematic.zoom_to_path_pending);
+    }
+
+    /// Cross-probe: probe_elements returns the path's cells/nets in
+    /// dataflow order with per-element arrival and whole-path slack.
+    #[test]
+    fn probe_elements_are_ordered_with_arrival_and_slack() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2);
+
+        // No probe → no elements.
+        assert!(ide.probe_elements().is_empty());
+
+        ide.set_probe(ProbeSelection::Path(1));
+        let els = ide.probe_elements();
+        assert!(!els.is_empty(), "probed path must list elements");
+        let slack = ide.timing_paths[1].slack_ps;
+        for el in &els {
+            assert!(
+                el.kind == "cell" || el.kind == "net",
+                "kind is cell|net: {el:?}"
+            );
+            assert_eq!(el.slack_ps, slack, "every element carries path slack");
+            assert!(!el.id.is_empty());
+        }
+        // Dataflow order: arrivals are non-decreasing.
+        for w in els.windows(2) {
+            assert!(
+                w[0].arrival_ps <= w[1].arrival_ps,
+                "arrivals in path order: {}@{} then {}@{}",
+                w[0].id,
+                w[0].arrival_ps,
+                w[1].id,
+                w[1].arrival_ps
+            );
+        }
+        // Path cells are all covered.
+        for c in &ide.timing_paths[1].cells {
+            assert!(
+                els.iter().any(|e| e.kind == "cell" && &e.id == c),
+                "path cell {c} covered by elements"
+            );
+        }
+    }
+
+    /// Cross-probe: selecting a single object clears the path probe and
+    /// syncs schematic/device to the one object.
+    #[test]
+    fn probe_object_clears_path_and_syncs_views() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2);
+        let cell = ide.timing_paths[1].cells[0].clone();
+
+        ide.set_probe(ProbeSelection::Path(1));
+        assert_eq!(ide.probe(), ProbeSelection::Path(1));
+
+        ide.set_probe(ProbeSelection::Object(cell.clone()));
+        assert_eq!(ide.probe(), ProbeSelection::Object(cell.clone()));
+        assert_eq!(ide.selected_timing_path, None, "path probe cleared");
+        assert_eq!(ide.selected.as_deref(), Some(cell.as_str()));
+        assert!(
+            !ide.schematic.path_only,
+            "single object restores the full sheet"
+        );
+        // The object's site still highlights on the die.
+        assert!(
+            ide.device
+                .sites
+                .iter()
+                .any(|s| s.highlighted
+                    && s.occupant.as_deref() == Some(cell.as_str())),
+            "selected cell site highlights"
+        );
+    }
+
+    /// Cross-probe: clear_probe resets every view's selection state.
+    #[test]
+    fn probe_clear_resets_all_views() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2);
+
+        ide.set_probe(ProbeSelection::Path(1));
+        ide.clear_probe();
+        assert_eq!(ide.probe(), ProbeSelection::None);
+        assert_eq!(ide.selected, None);
+        assert_eq!(ide.selected_timing_path, None);
+        assert!(ide.schematic.highlight_cells.is_empty());
+        assert!(ide.schematic.highlight_nets.is_empty());
+        assert!(!ide.schematic.path_only);
+        assert!(
+            ide.device.sites.iter().all(|s| !s.highlighted),
+            "no die sites highlighted after clear"
+        );
+        assert!(
+            ide.device.routes.iter().all(|r| !r.highlighted),
+            "no routes highlighted after clear"
+        );
+        assert!(ide.probe_elements().is_empty());
+    }
+
+    /// Cross-probe: paths_through finds every timing path containing a
+    /// cell or net, worst slack first (reverse probe: Device → Timing).
+    #[test]
+    fn probe_paths_through_finds_covering_paths_worst_first() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2);
+        let cell = ide.timing_paths[1].cells[0].clone();
+
+        let hits = ide.paths_through(&cell);
+        assert!(
+            hits.contains(&1),
+            "path 1 passes through {cell}: {hits:?}"
+        );
+        for w in hits.windows(2) {
+            assert!(
+                ide.timing_paths[w[0]].slack_ps <= ide.timing_paths[w[1]].slack_ps,
+                "worst slack first: {hits:?}"
+            );
+        }
+        assert!(
+            ide.paths_through("no_such_cell_xyz").is_empty(),
+            "unknown id matches nothing"
+        );
+    }
+
+    /// Cross-probe: a stale path index is ignored, never clobbers the
+    /// live selection (paint code calls set_probe unconditionally).
+    #[test]
+    fn probe_stale_path_index_leaves_selection_untouched() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+
+        ide.set_probe(ProbeSelection::Path(999_999));
+        assert_eq!(ide.probe(), ProbeSelection::None);
+
+        ide.set_probe(ProbeSelection::Path(0));
+        assert_eq!(ide.probe(), ProbeSelection::Path(0));
+        ide.set_probe(ProbeSelection::Path(999_999));
+        assert_eq!(
+            ide.probe(),
+            ProbeSelection::Path(0),
+            "stale index must not clobber the live probe"
+        );
+    }
+
+    /// Cross-probe: schematic auto-fit frames the probed path's bbox.
+    #[test]
+    fn probe_schematic_auto_fit_frames_path_bbox() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(ide.timing_paths.len() >= 2);
+
+        ide.schematic.set_viewport(900.0, 500.0);
+        ide.set_probe(ProbeSelection::Path(1));
+        assert!(ide.schematic.zoom_to_path_pending);
+
+        // Emulate the painter consuming the pending flag.
+        let drawing = ide.schematic.drawing_arc();
+        let mut bb: Option<(f32, f32, f32, f32)> = None;
+        for sy in drawing.symbols.iter() {
+            if ide.schematic.highlight_cells.contains(&sy.name) {
+                let (x0, y0, x1, y1) = (sy.x, sy.y, sy.x + sy.w, sy.y + sy.h);
+                bb = Some(match bb {
+                    Some((ax0, ay0, ax1, ay1)) => {
+                        (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1))
+                    }
+                    None => (x0, y0, x1, y1),
+                });
+            }
+        }
+        let (x0, y0, x1, y1) = bb.expect("path cells on the sheet");
+        ide.schematic.zoom_to_path_pending = false;
+        ide.schematic.zoom_to_region(x0, y0, x1, y1);
+
+        // The framed bbox maps inside the viewport.
+        let cam = ide.schematic.camera;
+        let z = cam.zoom;
+        let vx0 = x0 * z + cam.pan_x;
+        let vy0 = y0 * z + cam.pan_y;
+        let vx1 = x1 * z + cam.pan_x;
+        let vy1 = y1 * z + cam.pan_y;
+        assert!(vx0 >= -1.0 && vx1 <= 901.0, "path fits horizontally");
+        assert!(vy0 >= -1.0 && vy1 <= 501.0, "path fits vertically");
     }
 
     /// UG893 Fig. 55 schematic path picker is Name/From/To/Slack_ps, not `endpoint slack=` chips.
