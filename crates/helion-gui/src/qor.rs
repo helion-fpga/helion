@@ -819,27 +819,7 @@ mod tests {
     use helion_ir::{CellKind, PortDir};
 
     fn empty_constraints() -> Constraints {
-        Constraints {
-            clocks: Vec::new(),
-            input_delay_ps: Default::default(),
-            output_delay_ps: Default::default(),
-            false_paths: Vec::new(),
-            multicycle_paths: Vec::new(),
-            max_delays: Vec::new(),
-            min_delays: Vec::new(),
-            clock_groups: Vec::new(),
-            clock_uncertainties: Vec::new(),
-            clock_latencies: Vec::new(),
-            disable_timings: Vec::new(),
-            case_analyses: Vec::new(),
-            propagated_clocks: Vec::new(),
-            clock_senses: Vec::new(),
-            input_jitters: Vec::new(),
-            system_jitter_ps: 0,
-            timing_derates: Vec::new(),
-            operating_conditions: Default::default(),
-            bus_skews: Vec::new(),
-        }
+        Constraints::default()
     }
 
     fn empty_timing() -> TimingResult {
