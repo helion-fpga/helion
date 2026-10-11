@@ -35,23 +35,80 @@ const REWRITE_PASSES: usize = 4;
 /// Rewrite `aig`, returning an equivalent AIG with no more AND nodes
 /// (usually fewer). Deterministic: no result depends on hash iteration order.
 pub fn rewrite_aig(aig: &Aig) -> Aig {
+    let (mut new, outs) = rewrite_aig_multi(aig, &[aig.output]);
+    debug_assert_eq!(outs.len(), 1);
+    new.output = outs[0];
+    new
+}
+
+/// Merge per-cone AIGs into one global hashed AIG (FM-HEL-AREA-05).
+///
+/// PIs are unioned by name FIRST (all PI ids allocated before any AND id —
+/// the same invariant `from_expr` maintains; violating it lets AND ids
+/// collide with later PI ids). Each cone's AND DAG is then re-inserted via
+/// `and_lit`, whose structural hashing makes identical subfunctions across
+/// cones share one node automatically. Returns the global AIG and each
+/// cone's output literal, in input order.
+///
+/// Correctness: re-insertion is function-preserving (`and_lit` only folds
+/// constants and shares structurally identical pairs — same inputs, same
+/// function). Deterministic: cone order and PI first-seen order are fixed.
+pub fn merge_cones(cones: &[Aig]) -> (Aig, Vec<Lit>) {
+    let mut global = Aig::with_pis(Vec::new());
+    for cone in cones {
+        for pi_name in &cone.pis {
+            global.pi_lit(pi_name);
+        }
+    }
+    let mut outputs = Vec::with_capacity(cones.len());
+    for cone in cones {
+        // old node id -> new Lit. Ids are dense: 0, PIs 1..=n_pi,
+        // ANDs 1+n_pi+i — pushed in the same order.
+        let mut map: Vec<Lit> = Vec::with_capacity(1 + cone.pis.len() + cone.ands.len());
+        map.push(Lit::c0());
+        for pi_name in &cone.pis {
+            map.push(global.pi_lit(pi_name));
+        }
+        for (a, b) in &cone.ands {
+            let ma = map[a.node as usize];
+            let mb = map[b.node as usize];
+            let la = if a.inv { ma.not() } else { ma };
+            let lb = if b.inv { mb.not() } else { mb };
+            map.push(global.and_lit(la, lb));
+        }
+        let o = cone.output;
+        let mo = map[o.node as usize];
+        outputs.push(if o.inv { mo.not() } else { mo });
+    }
+    (global, outputs)
+}
+
+/// Multi-output cut rewriting (FM-HEL-AREA-05): same per-node exact
+/// resynthesis as [`rewrite_aig`], but the demand-driven rebuild starts from
+/// ALL outputs, so shared subfunctions are rebuilt (and shared) once.
+/// Returns the rewritten AIG and the remapped output literals, in input
+/// order. `rewrite_aig` is the single-output specialization.
+pub fn rewrite_aig_multi(aig: &Aig, outputs: &[Lit]) -> (Aig, Vec<Lit>) {
     if aig.ands.len() < 2 {
-        return aig.clone();
+        return (aig.clone(), outputs.to_vec());
     }
     let mut cur = aig.clone();
+    let mut cur_outs = outputs.to_vec();
     for _ in 0..REWRITE_PASSES {
-        let next = rewrite_pass(&cur);
+        let (next, next_outs) = rewrite_pass_multi(&cur, &cur_outs);
         if next.ands.len() >= cur.ands.len() {
             break;
         }
         cur = next;
+        cur_outs = next_outs;
     }
-    cur
+    (cur, cur_outs)
 }
 
-/// One rewriting pass: pick the cheapest exact resynthesis per AND node,
-/// rebuild demand-driven from the output, keep iff the AND count shrank.
-fn rewrite_pass(aig: &Aig) -> Aig {
+/// One rewriting pass over `outputs`: pick the cheapest exact resynthesis
+/// per AND node, rebuild demand-driven from all outputs, keep iff the total
+/// AND count shrank.
+fn rewrite_pass_multi(aig: &Aig, outputs: &[Lit]) -> (Aig, Vec<Lit>) {
     let n_pi = aig.pis.len();
     let n = aig.ands.len();
     let mut cut_memo: HashMap<u32, Vec<Vec<u32>>> = HashMap::new();
@@ -107,9 +164,9 @@ fn rewrite_pass(aig: &Aig) -> Aig {
         memo: HashMap::new(),
         new: Aig::with_pis(aig.pis.clone()),
     };
-    let out = rb.lit(aig.output);
-    rb.new.output = out;
-    rb.new
+    let outs: Vec<Lit> = outputs.iter().map(|&o| rb.lit(o)).collect();
+    let new = rb.new;
+    (new, outs)
 }
 
 /// Cuts of AND-node `node`: sorted leaf-node-id vecs, smallest first,
@@ -612,5 +669,87 @@ mod tests {
         let r2 = rewrite_aig(&a);
         assert_eq!(r1.ands, r2.ands);
         assert_eq!(r1.output, r2.output);
+    }
+
+    /// FM-HEL-AREA-05: merge_cones must share structurally identical
+    /// subfunctions across cones.
+    #[test]
+    fn merge_cones_shares_subfunctions() {
+        let c1 = Aig::from_expr(&parse_expr("(a&b)|(c&d)").unwrap());
+        let c2 = Aig::from_expr(&parse_expr("(a&b)|(e&f)").unwrap());
+        let sum: usize = c1.ands.len() + c2.ands.len();
+        let (g, outs) = merge_cones(&[c1, c2]);
+        assert_eq!(outs.len(), 2);
+        // (a&b) is shared: merged graph is strictly smaller than the sum.
+        assert!(
+            g.ands.len() < sum,
+            "merge must share (a&b): {} < {}",
+            g.ands.len(),
+            sum
+        );
+        // PIs unioned by name: a,b,c,d,e,f = 6.
+        assert_eq!(g.pis.len(), 6);
+    }
+
+    /// Exhaustive multi-output miter: merged + rewritten cones must agree
+    /// with the originals on every PI assignment, per output.
+    fn assert_multi_miter(cones: &[Aig]) {
+        let (g, outs) = merge_cones(cones);
+        let (rw, rw_outs) = rewrite_aig_multi(&g, &outs);
+        assert_eq!(outs.len(), rw_outs.len());
+        let k = g.pis.len();
+        assert!(k <= 12, "miter battery keeps PI counts small");
+        // PI order may differ between cone-local and global; map by name.
+        for (ci, cone) in cones.iter().enumerate() {
+            for bits in 0..(1u64 << k) {
+                // global assignment -> cone-local assignment
+                let mut cbits = 0u64;
+                for (i, pi) in cone.pis.iter().enumerate() {
+                    let gi = g.pis.iter().position(|p| p == pi).unwrap();
+                    if (bits >> gi) & 1 == 1 {
+                        cbits |= 1 << i;
+                    }
+                }
+                let expected = cone.eval_lit(cone.output, cbits);
+                // global output -> rewritten output, same global assignment
+                let mut rbits = 0u64;
+                for (i, pi) in g.pis.iter().enumerate() {
+                    let ri = rw.pis.iter().position(|p| p == pi).unwrap();
+                    if (bits >> i) & 1 == 1 {
+                        rbits |= 1 << ri;
+                    }
+                }
+                let got = rw.eval_lit(rw_outs[ci], rbits);
+                assert_eq!(expected, got, "multi miter mismatch cone {ci} at {bits:b}");
+            }
+        }
+    }
+
+    #[test]
+    fn merge_rewrite_multi_miter() {
+        let mk = |s: &str| Aig::from_expr(&parse_expr(s).unwrap());
+        let cases: &[&[&str]] = &[
+            &["(a&b)|(c&d)", "(a&b)|(e&f)"],
+            &["(a&b)|(c&d)", "(a&b)|(c&d)"], // identical cones
+            &["~((a&b)|(c&d))", "(a&b)|(c&d)"], // polarity-shared output
+            &["(a&b&c)|(d&e)", "(a&b)|(d&e&f)", "(a&b&c&d)|(e&f)"],
+        ];
+        for (i, group) in cases.iter().enumerate() {
+            let cones: Vec<Aig> = group.iter().map(|s| mk(s)).collect();
+            assert_multi_miter(&cones);
+            eprintln!("multi miter group {i} ok");
+        }
+    }
+
+    #[test]
+    fn rewrite_multi_matches_single() {
+        // Single-output multi rewrite must equal the legacy single path.
+        let a = Aig::from_expr(&parse_expr("((a&b)|(c&d))&((a|c)&(b|d))").unwrap());
+        let (g, outs) = merge_cones(std::slice::from_ref(&a));
+        let (rw, rw_outs) = rewrite_aig_multi(&g, &outs);
+        let single = rewrite_aig(&a);
+        assert_eq!(rw.ands.len(), single.ands.len(), "multi must match single on one cone");
+        assert_multi_miter(&[a]);
+        let _ = rw_outs;
     }
 }
