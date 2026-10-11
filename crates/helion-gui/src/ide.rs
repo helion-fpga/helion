@@ -106,6 +106,22 @@ impl ConsoleLine {
         if self.ok { "ok" } else { "error" }
     }
 
+    /// Session-boundary marker (D10): one per launch, so repeated commands
+    /// never read as accidental duplicates ("did that just run twice?").
+    /// The cmd is a control-char sentinel that can never collide with a real
+    /// command and stays invisible if it ever leaks into a dump.
+    pub fn session_separator() -> Self {
+        Self {
+            cmd: "\u{1e}session".into(),
+            out: String::new(),
+            ok: true,
+        }
+    }
+
+    pub fn is_session_separator(&self) -> bool {
+        self.cmd == "\u{1e}session"
+    }
+
     /// Clickable-grid dump row: UG893 Tcl Console Status/Cmd/Out, not `helion% cmd`.
     pub fn row_text(&self) -> String {
         format!("STATUS={} CMD={} OUT={}", self.status(), self.cmd, self.out)
@@ -5004,7 +5020,11 @@ impl IdeModel {
             event_sim: None,
             fabric_sim: None,
         };
-        // Vivado shows the part floorplan before sources exist — HAD sites, not empty chrome.
+        // Vivado shows the part floorplan before sources exist — HAD
+        // sites, not empty chrome.
+        // D10: every launch's journal opens with a session boundary, so
+        // repeated commands never read as accidental duplicates.
+        m.console.push(ConsoleLine::session_separator());
         m.refresh_device();
         m.refresh_package();
         m
@@ -6365,12 +6385,20 @@ impl IdeModel {
 
     /// UG893 Log pane: clickable Tcl transcript (status / cmd / engine out).
     pub fn log_text(&self) -> String {
-        if self.console.is_empty() {
+        // Session separators are UI chrome, not log content: exclude them
+        // from the empty check and the count (D10).
+        let rows: Vec<(usize, &ConsoleLine)> = self
+            .console
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.is_session_separator())
+            .collect();
+        if rows.is_empty() {
             return "log empty".into();
         }
-        let n_err = self.console.iter().filter(|l| !l.ok).count();
-        let mut s = format!("log n={} errors={n_err}", self.console.len());
-        for (i, line) in self.console.iter().enumerate() {
+        let n_err = rows.iter().filter(|(_, l)| !l.ok).count();
+        let mut s = format!("log n={} errors={n_err}", rows.len());
+        for (i, line) in rows {
             s.push_str(&format!("\n{i} {}", line.row_text()));
             s.push_str(&format!("\nhelion% {}\n{}", line.cmd, line.out));
         }
@@ -6388,7 +6416,8 @@ impl IdeModel {
         if spec.is_empty() {
             return Err("select_log: missing id".into());
         }
-        if self.console.is_empty() {
+        // Session separators are UI chrome, not selectable commands (D10).
+        if self.console.iter().all(|l| l.is_session_separator()) {
             return Err("select_log: log empty".into());
         }
         let spec_l = spec.to_ascii_lowercase();
@@ -6419,6 +6448,9 @@ impl IdeModel {
                 .map(|(i, l)| (i, l.clone()))
                 .ok_or_else(|| format!("select_log: no row {spec}"))?
         };
+        if line.is_session_separator() {
+            return Err(format!("select_log: no row {spec}"));
+        }
         let status = if line.ok { "ok" } else { "error" };
         let id = line
             .cmd
@@ -6558,12 +6590,19 @@ impl IdeModel {
     /// UG893 Tcl Console: clickable Status/Cmd/Out table over the Session journal
     /// (not a `helion% cmd` + monospace-out dump). Same rows as Log.
     pub fn console_text(&self) -> String {
-        if self.console.is_empty() {
+        // Session separators are UI chrome, not console content (D10).
+        let rows: Vec<(usize, &ConsoleLine)> = self
+            .console
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.is_session_separator())
+            .collect();
+        if rows.is_empty() {
             return "tcl_console empty".into();
         }
-        let n_err = self.console.iter().filter(|l| !l.ok).count();
-        let mut s = format!("tcl_console n={} errors={n_err}", self.console.len());
-        for (i, line) in self.console.iter().enumerate() {
+        let n_err = rows.iter().filter(|(_, l)| !l.ok).count();
+        let mut s = format!("tcl_console n={} errors={n_err}", rows.len());
+        for (i, line) in rows {
             s.push_str(&format!("\n{i} {}", line.row_text()));
         }
         s
@@ -9273,6 +9312,18 @@ impl IdeModel {
         self.editor_line_focus = false;
     }
 
+    /// Reload source lines from disk after an editor save, preserving
+    /// bookmarks, line selection and sim PC (which `load_rtl_source` resets).
+    pub fn refresh_source_text(&mut self, path: &str) {
+        let marks = self.editor_bookmarks.clone();
+        let sel = self.selected_source_line;
+        let pc = self.sim_pc_line;
+        self.load_rtl_source(path);
+        self.editor_bookmarks = marks;
+        self.selected_source_line = sel;
+        self.sim_pc_line = pc;
+    }
+
     fn ensure_rtl_source(&mut self) -> Result<String, String> {
         if !self.source_lines.is_empty() {
             return Ok(self
@@ -10723,7 +10774,8 @@ impl IdeModel {
         if spec.is_empty() {
             return Err("select_console: missing id".into());
         }
-        if self.console.is_empty() {
+        // Session separators are UI chrome, not selectable commands (D10).
+        if self.console.iter().all(|l| l.is_session_separator()) {
             return Err("select_console: console empty".into());
         }
         let spec_l = spec.to_ascii_lowercase();
@@ -10755,6 +10807,9 @@ impl IdeModel {
                 .map(|(i, l)| (i, l.clone()))
                 .ok_or_else(|| format!("select_console: no row {spec}"))?
         };
+        if line.is_session_separator() {
+            return Err("select_console: no row {spec}".into());
+        }
         let status = line.status();
         let id = line
             .cmd
@@ -21638,7 +21693,11 @@ impl IdeModel {
         let cells = self.shell.session.design.as_ref().map(|d| d.cells.len());
         let lutff = self.utilization.map(|u| u.lutff);
         let synth_done = self.shell.session.design.is_some();
-        let impl_done = self.shell.session.bitstream.is_some();
+        // D9: "Complete" means the implementation flow finished (routed), not
+        // merely that a bitstream was written — bitstream is a separate step
+        // with its own card row. Gating on bitstream left "▶ Running" stuck on
+        // the card after a fully completed implement.
+        let impl_done = self.shell.session.routed.is_some();
         let placed = self.shell.session.placed.is_some();
         let wns = self.wns_ps();
         let hash = self.bitstream_hash();
@@ -28870,7 +28929,11 @@ endmodule
     #[test]
     fn tcl_console_clickable_status_cmd_out_table() {
         let mut ide = IdeModel::new();
-        assert!(ide.console_rows().is_empty());
+        // Fresh model: only the D10 session separator, no commands.
+        assert!(ide
+            .console_rows()
+            .iter()
+            .all(|(_, l)| l.is_session_separator()));
         assert!(
             ide.select_console_line("0")
                 .unwrap_err()
@@ -33581,7 +33644,8 @@ endmodule
     #[test]
     fn log_pane_clickable_command_result_table() {
         let mut ide = IdeModel::new();
-        assert!(ide.log_rows().is_empty());
+        // Fresh model: only the D10 session separator, no commands.
+        assert!(ide.log_rows().iter().all(|(_, l)| l.is_session_separator()));
         assert!(
             ide.select_log("0").unwrap_err().contains("log empty"),
             "empty table must refuse a click"
