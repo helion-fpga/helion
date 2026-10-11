@@ -20317,6 +20317,9 @@ impl IdeModel {
             })
             .collect();
         let instances = d.instances.iter().map(|i| i.name.clone()).collect();
+        // Preserve the cross-probe auto-fit preference across rebuilds.
+        let auto_fit_on_probe = self.schematic.auto_fit_on_probe;
+        let zoom_to_path_pending = self.schematic.zoom_to_path_pending;
         self.schematic = SchematicView {
             nodes,
             edges,
@@ -20328,6 +20331,8 @@ impl IdeModel {
             highlight_cells: hl_cells,
             highlight_nets: hl_nets,
             path_only,
+            auto_fit_on_probe,
+            zoom_to_path_pending,
             camera,
             view_history: if view_history.is_empty() {
                 vec![camera]
