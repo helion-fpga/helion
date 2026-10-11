@@ -947,7 +947,7 @@ pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme:
         ui.label(egui::RichText::new("No timing paths — run Implement").color(theme.faint));
         return;
     }
-    const BINS: usize = 12;
+    const BINS: usize = 20;
     let min = model
         .timing_paths
         .iter()
@@ -984,7 +984,8 @@ pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme:
         let color = if bin_min[i] < 0 {
             theme.danger
         } else {
-            theme.accent
+            // Muted accent per §3.3: the histogram is context, not brand.
+            theme.accent_dim
         };
         ui.painter().rect_filled(bar, 2.0, color);
     }
