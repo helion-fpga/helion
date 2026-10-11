@@ -3345,17 +3345,19 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         {
             model.cancel_run_queue();
         }
-        let make_active = ui.add_sized(
-            [110.0, chrome::HIT_COMFORT],
-            egui::Button::new("Make active"),
-        );
+        // Disabled until the selected run has a result to activate.
+        let make_active = ui
+            .add_enabled_ui(selected_has_result, |ui| {
+                ui.add_sized(
+                    [110.0, chrome::HIT_COMFORT],
+                    egui::Button::new("Make active"),
+                )
+            })
+            .inner;
         if make_active.clicked() {
             if let Some(name) = selected_name.clone() {
                 let _ = model.make_run_active(&name);
             }
-        }
-        if !selected_has_result {
-            // Hint only; the button stays clickable for discoverability.
         }
     });
     if pending > 0 {
