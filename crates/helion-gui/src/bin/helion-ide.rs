@@ -6935,6 +6935,9 @@ fn paint_device(
             );
             let p = ui.painter();
             p.rect_filled(rect, 0.0, theme.die_bg);
+            // Cross-probe: while a timing path is probed, its sites paint
+            // gold and everything else dims (Vivado-style focus).
+            let path_probe = matches!(model.probe(), ProbeSelection::Path(_));
             for dx in 0..cols {
                 let x = x0 + dx;
                 let px = origin.x + dx as f32 * cell_w;
