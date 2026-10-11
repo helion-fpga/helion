@@ -152,6 +152,12 @@ impl RunStrategy {
         }
     }
 
+    /// Infallible Custom knobs: safe fallback when a stored preset/spec fails
+    /// to parse (never panics; [`preset`] is the fallible entry point).
+    pub fn fallback() -> Self {
+        Self::knobs("Custom", 1, true, true, 0, 8, false)
+    }
+
     /// Legacy [`ImplStrategy`] → knob set (keeps old `launch_runs` semantics).
     pub fn from_impl_strategy(s: ImplStrategy) -> Self {
         match s {

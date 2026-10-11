@@ -635,7 +635,17 @@ impl HelionIde {
                 if matches!(out.kind, JobKind::SimRun(_)) && out.result.is_ok() {
                     self.set_activity(Activity::Simulate);
                 }
+                // Design-run queue: chain the next queued run. `submit_job`
+                // refuses while a job is live, so drop the handle first.
+                let chained = if matches!(out.kind, JobKind::DesignRun { .. }) {
+                    self.model.run_queue.pop_front()
+                } else {
+                    None
+                };
                 self.job = None;
+                if let Some(name) = chained {
+                    self.submit_job(JobKind::DesignRun { name });
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
