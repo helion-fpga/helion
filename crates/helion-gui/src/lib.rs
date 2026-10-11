@@ -11,6 +11,11 @@ pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
 pub mod surface;
+pub mod tb;
+pub use tb::{
+    TbFailure, TbFile, TbHistoryEntry, TbLogLine, TbRunConfig, TbRunRequest, TbSev, TbStatus,
+    TbStreamEvent, discover_testbenches, is_testbench_file, run_testbench,
+};
 pub use learner_l1::{
     ConstraintProvenance, SessionStage, StageError, StageStatus,
 };

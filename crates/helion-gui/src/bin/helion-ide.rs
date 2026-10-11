@@ -13,11 +13,13 @@ use helion_gui::surface::{
 use helion_gui::{
     doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TimingPathSortCol,
-    WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
+    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TbFailure,
+    TbLogLine, TbRunRequest, TbSev, TbStatus, TbStreamEvent, TimingPathSortCol, WaveRadix,
+    WaveStyle, WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 #[path = "helion-ide/commands.rs"]
 mod commands;
@@ -322,6 +324,11 @@ struct HelionIde {
     job: Option<JobHandle>,
     busy: bool,
     progress: String,
+    /// Live testbench stream for the in-flight `JobKind::TbRun` (kept on the
+    /// app, not the model: the model is cloned onto the engine thread).
+    tb_rx: Option<mpsc::Receiver<TbStreamEvent>>,
+    /// Remaining testbenches for "Run all" (started one per job completion).
+    tb_queue: Vec<String>,
     /// Last window size we shared chrome against.
     last_share: [f32; 2],
     force_share: bool,
@@ -407,6 +414,8 @@ impl HelionIde {
             job: None,
             busy: false,
             progress: String::new(),
+            tb_rx: None,
+            tb_queue: Vec::new(),
             last_share: [0.0, 0.0],
             force_share: true,
             theme: theme::Theme::dark(),
@@ -487,6 +496,13 @@ impl HelionIde {
             // Save Project As / open_project push the .prj onto Recent.
             if let Some(prj) = app.model.last_project_path.clone() {
                 app.remember(prj);
+            }
+        }
+        // Screenshot/demo hook: queue an async testbench run at startup
+        // (HELION_EXEC runs `tb_rescan <dir>` first).
+        if let Ok(sel) = std::env::var("HELION_TB_AUTORUN") {
+            if !sel.trim().is_empty() {
+                tb_start_run(&mut app, sel.trim().to_string());
             }
         }
         if let Ok(name) = std::env::var("HELION_BOTTOM") {
@@ -577,6 +593,17 @@ impl HelionIde {
     fn submit_job(&mut self, kind: JobKind) {
         if self.job.is_some() {
             self.progress = "Busy — wait for the current run to finish.".into();
+            if matches!(kind, JobKind::TbRun(_)) {
+                // The run never started: roll back tb_start_run's optimistic
+                // Running state so the badge/spinner cannot stick.
+                self.tb_rx = None;
+                self.model.tb_run_active = false;
+                if let Some(i) = self.model.tb_selected {
+                    if self.model.tb_status.get(i) == Some(&TbStatus::Running) {
+                        self.model.tb_status[i] = TbStatus::Idle;
+                    }
+                }
+            }
             return;
         }
         self.busy = true;
@@ -596,12 +623,68 @@ impl HelionIde {
             .push(toasts::ToastKind::Info, format!("Started: {started_label}"));
     }
 
+    /// Drain live testbench events into the panel (log lines, failures).
+    fn drain_tb_stream(&mut self) {
+        let mut progress_tick: Option<u64> = None;
+        if let Some(rx) = self.tb_rx.as_ref() {
+            for ev in rx.try_iter() {
+                match ev {
+                    TbStreamEvent::Log { time_ns, sev, text } => {
+                        self.model.tb_log.push(TbLogLine { time_ns, sev, text });
+                    }
+                    TbStreamEvent::Failure { file, line, message, time_ns } => {
+                        let f = TbFailure { file, line, message, time_ns };
+                        if !self.model.tb_failures.contains(&f) {
+                            self.model.tb_failures.push(f);
+                        }
+                    }
+                    TbStreamEvent::Progress { time_ns } => {
+                        progress_tick = Some(time_ns);
+                    }
+                }
+            }
+        }
+        if let Some(t) = progress_tick {
+            self.progress = format!("Testbench {} — {t} ns", self.model.tb_run_name);
+        }
+    }
+
     fn poll_job(&mut self, ctx: &egui::Context) {
+        self.drain_tb_stream();
         let Some(job) = self.job.as_ref() else {
             return;
         };
         match job.try_recv() {
             Ok(out) => {
+                if matches!(out.kind, JobKind::TbRun(_)) {
+                    // Merge — the streamed log is already live; only
+                    // status/history/summary merge in.
+                    self.drain_tb_stream();
+                    self.model.tb_merge_finished(&out.model);
+                    self.tb_rx = None;
+                    self.busy = false;
+                    self.progress = match &out.result {
+                        Ok(s) if s.is_empty() => "Testbench finished.".into(),
+                        Ok(s) => s.clone(),
+                        Err(e) => e.clone(),
+                    };
+                    self.model.tb_last_summary = self.progress.clone();
+                    self.toasts.push(
+                        if out.result.is_ok() {
+                            toasts::ToastKind::Ok
+                        } else {
+                            toasts::ToastKind::Error
+                        },
+                        format!("Testbench — {}", self.progress),
+                    );
+                    self.job = None;
+                    // "Run all": chain the next queued testbench.
+                    if !self.tb_queue.is_empty() {
+                        let next = self.tb_queue.remove(0);
+                        tb_start_run(self, next);
+                    }
+                    return;
+                }
                 self.model = out.model;
                 self.busy = false;
                 self.progress = match &out.result {
@@ -643,6 +726,8 @@ impl HelionIde {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.busy = false;
                 self.progress = "Engine thread stopped.".into();
+                self.tb_rx = None;
+                self.model.tb_run_active = false;
                 self.job = None;
             }
         }
@@ -2502,6 +2587,7 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             WorkspacePane::Forces => paint_forces(ui, &mut app.model),
             WorkspacePane::SimSettings => paint_sim_settings(ui, &mut app.model),
             WorkspacePane::Source => paint_source(ui, &mut app.model),
+            WorkspacePane::Testbench => paint_testbench(ui, app),
             _ => paint_wave(ui, &mut app.model, &app.theme),
         }
     });
@@ -2543,6 +2629,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspacePane::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspacePane::Testbench => paint_testbench(ui, app),
         WorkspacePane::Wave
         | WorkspacePane::Source
         | WorkspacePane::Memory
@@ -2681,6 +2768,15 @@ fn paint_clipped_select(
 
 fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.add_space(4.0);
+    let on_tb = model.workspace == WorkspaceTab::Testbench;
+    if ui
+        .selectable_label(on_tb, RichText::new("Testbenches").strong())
+        .on_hover_text("Integrated testbench runner")
+        .clicked()
+    {
+        model.workspace = WorkspaceTab::Testbench;
+    }
+    ui.separator();
     ui.label(RichText::new("Scopes").strong());
     ui.horizontal_wrapped(|ui| {
         let n = model.sim_runtime_cycles.max(1);
@@ -9150,4 +9246,333 @@ mod recent_tests {
         assert_eq!(loaded, vec![prj]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+fn tb_status_color(theme: &theme::Theme, s: TbStatus) -> Color32 {
+    match s {
+        TbStatus::Passed => theme.ok,
+        TbStatus::Failed => theme.danger,
+        TbStatus::Running => theme.warn,
+        TbStatus::Idle => theme.faint,
+    }
+}
+
+fn tb_sev_color(theme: &theme::Theme, sev: TbSev) -> Color32 {
+    match sev {
+        TbSev::Info => theme.text,
+        TbSev::Warning => theme.warn,
+        TbSev::Error => theme.danger,
+    }
+}
+
+/// Queue one async testbench run on the engine thread with live streaming.
+fn tb_start_run(app: &mut HelionIde, sel: String) {
+    if app.job.is_some() || app.model.tb_run_active {
+        app.progress = "Busy — wait for the current run to finish.".into();
+        return;
+    }
+    let vcd = app.model.tb_vcd_enabled;
+    if let Some(i) = app.model.tb_files.iter().position(|f| f.name == sel) {
+        app.model.tb_selected = Some(i);
+        app.model.tb_status[i] = TbStatus::Running;
+        app.model.tb_run_active = true;
+        app.model.tb_run_name = sel.clone();
+        app.model.tb_log.clear();
+        app.model.tb_failures.clear();
+    } else {
+        app.progress = format!("No testbench `{sel}`.");
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    app.tb_rx = Some(rx);
+    surface::request_job(JobKind::TbRun(TbRunRequest { sel, vcd, tx }));
+}
+
+/// Integrated testbench runner panel (VS Code test-explorer layout):
+/// testbench list left, live log + failures + history right.
+fn paint_testbench(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let theme = app.theme;
+    // First open: discover immediately so the panel is never an empty stub.
+    if app.model.tb_files.is_empty() && app.model.tb_project_dir.is_none() {
+        let msg = app.model.tb_rescan(None);
+        app.progress = msg;
+    }
+    let busy = app.job.is_some() || app.model.tb_run_active;
+
+    ui.heading("Testbench");
+    ui.horizontal(|ui| {
+        if ui
+            .add_sized([96.0, chrome::HIT_COMFORT], egui::Button::new("Rescan"))
+            .on_hover_text("Re-discover *_tb.sv / tb_*.sv in the project dir")
+            .clicked()
+        {
+            let msg = app.model.tb_rescan(None);
+            app.progress = msg;
+        }
+        let run_all = ui
+            .add_enabled(
+                !busy && !app.model.tb_files.is_empty(),
+                egui::Button::new("Run all"),
+            )
+            .on_hover_text("Run every testbench in order");
+        if run_all.clicked() {
+            let names: Vec<String> = app.model.tb_files.iter().map(|f| f.name.clone()).collect();
+            app.tb_queue = names;
+            if app.tb_queue.first().cloned().is_some() {
+                let first = app.tb_queue.remove(0);
+                tb_start_run(app, first);
+            }
+        }
+        let mut vcd = app.model.tb_vcd_enabled;
+        if ui
+            .checkbox(&mut vcd, "VCD dump")
+            .on_hover_text("Write run.vcd next to each run's log (feeds VCD power later)")
+            .changed()
+        {
+            app.model.tb_vcd_enabled = vcd;
+        }
+        if busy {
+            ui.spinner();
+            ui.label(RichText::new(format!("Running {}…", app.model.tb_run_name)).color(theme.warn));
+        }
+    });
+    let proj = app
+        .model
+        .tb_project_dir
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".into());
+    ui.label(
+        RichText::new(format!("{} · {} testbench(s)", proj, app.model.tb_files.len()))
+            .color(theme.faint)
+            .small(),
+    );
+    if !app.model.tb_last_summary.is_empty() {
+        ui.label(RichText::new(&app.model.tb_last_summary).color(theme.dim).small());
+    }
+    ui.separator();
+
+    if app.model.tb_files.is_empty() {
+        ui.add_space(12.0);
+        ui.label(RichText::new("No testbenches found.").strong());
+        ui.label(
+            RichText::new(
+                "Name a SystemVerilog file *_tb.sv or tb_*.sv and put it next to its DUT \
+                 (single synthesizable .sv), then Rescan. Or use tb_add <path>.",
+            )
+            .color(theme.dim),
+        );
+        ui.add_space(8.0);
+        paint_tb_help(ui, &theme);
+        return;
+    }
+
+    // Left: testbench list. Right: detail.
+    let full_h = ui.available_height().max(200.0);
+    ui.columns(2, |cols| {
+        let list_w = 280.0f32.min(cols[0].available_width());
+        cols[0].set_max_width(list_w);
+        paint_tb_list(&mut cols[0], app, busy);
+        paint_tb_detail(&mut cols[1], app, busy, full_h);
+    });
+    ui.separator();
+    paint_tb_history(ui, app);
+    ui.separator();
+    paint_tb_help(ui, &theme);
+}
+
+fn paint_tb_list(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool) {
+    let theme = app.theme;
+    ui.label(RichText::new("Testbenches").strong().small());
+    let mut pick: Option<usize> = None;
+    let mut run: Option<String> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("tb_list")
+        .show(ui, |ui| {
+            for (i, f) in app.model.tb_files.iter().enumerate() {
+                let status = app.model.tb_status.get(i).copied().unwrap_or(TbStatus::Idle);
+                let on = app.model.tb_selected == Some(i);
+                ui.horizontal(|ui| {
+                    let resp = ui.selectable_label(on, &f.name);
+                    if resp.clicked() {
+                        pick = Some(i);
+                    }
+                    resp.on_hover_text(f.path.display().to_string());
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(RichText::new(status.label()).color(Color32::BLACK).small())
+                            .fill(tb_status_color(&theme, status))
+                            .small(),
+                    );
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Run").small())
+                        .on_hover_text(format!("Run {}", f.name))
+                        .clicked()
+                    {
+                        run = Some(f.name.clone());
+                    }
+                });
+            }
+        });
+    if let Some(i) = pick {
+        app.model.tb_selected = Some(i);
+    }
+    if let Some(name) = run {
+        tb_start_run(app, name);
+    }
+}
+
+fn paint_tb_detail(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool, full_h: f32) {
+    let theme = app.theme;
+    let sel = app.model.tb_selected.filter(|&i| i < app.model.tb_files.len());
+    let Some(i) = sel else {
+        ui.label(RichText::new("Select a testbench.").color(theme.faint));
+        return;
+    };
+    let name = app.model.tb_files[i].name.clone();
+    let path = app.model.tb_files[i].path.display().to_string();
+    let status = app.model.tb_status.get(i).copied().unwrap_or(TbStatus::Idle);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&name).strong());
+        ui.label(
+            RichText::new(status.label())
+                .color(tb_status_color(&theme, status))
+                .small(),
+        );
+        ui.label(RichText::new(&path).color(theme.faint).small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Run"))
+                .on_hover_text(format!("Run {name}"))
+                .clicked()
+            {
+                tb_start_run(app, name.clone());
+            }
+        });
+    });
+    ui.separator();
+
+    // Failures first (clickable → editor), then the live log.
+    let mut jump: Option<usize> = None;
+    if !app.model.tb_failures.is_empty() {
+        ui.label(
+            RichText::new(format!("Failures ({})", app.model.tb_failures.len()))
+                .strong()
+                .color(theme.danger)
+                .small(),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("tb_failures")
+            .max_height(110.0)
+            .show(ui, |ui| {
+                for (fi, f) in app.model.tb_failures.iter().enumerate() {
+                    let label = format!(
+                        "{}:{}: {}",
+                        f.file.rsplit('/').next().unwrap_or(&f.file),
+                        f.line,
+                        f.message
+                    );
+                    if ui
+                        .button(RichText::new(label).color(theme.danger).small())
+                        .on_hover_text(format!("Open {}:{}", f.file, f.line))
+                        .clicked()
+                    {
+                        jump = Some(fi);
+                    }
+                }
+            });
+        ui.separator();
+    }
+    if let Some(fi) = jump {
+        let msg = app.model.tb_jump_to_failure(fi).unwrap_or_else(|e| e);
+        app.progress = msg;
+        return;
+    }
+
+    ui.label(RichText::new("Log").strong().small());
+    let log_h = (full_h - 210.0).clamp(120.0, 420.0);
+    egui::ScrollArea::vertical()
+        .id_salt("tb_log")
+        .max_height(log_h)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            if app.model.tb_log.is_empty() {
+                ui.label(RichText::new("No output yet — press Run.").color(theme.faint).small());
+                return;
+            }
+            for l in &app.model.tb_log {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("[{:>8} ns]", l.time_ns))
+                            .color(theme.faint)
+                            .small()
+                            .monospace(),
+                    );
+                    ui.label(
+                        RichText::new(l.sev.tag()).color(tb_sev_color(&theme, l.sev)).small().monospace(),
+                    );
+                    ui.label(RichText::new(&l.text).small().monospace());
+                });
+            }
+        });
+}
+
+fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let theme = app.theme;
+    ui.label(RichText::new("Run history").strong().small());
+    if app.model.tb_history.is_empty() {
+        ui.label(
+            RichText::new("No runs yet — history persists per project.")
+                .color(theme.faint)
+                .small(),
+        );
+        return;
+    }
+    let col_w = chrome::stretched_col_w(6, ui.available_width());
+    egui::ScrollArea::vertical()
+        .id_salt("tb_history")
+        .max_height(150.0)
+        .show(ui, |ui| {
+            egui::Grid::new("tb_history_grid")
+                .spacing([8.0, 4.0])
+                .min_col_width(col_w.min(150.0))
+                .show(ui, |ui| {
+                    for h in ["Testbench", "Result", "Sim time", "Wall", "Errors", "VCD"] {
+                        ui.label(RichText::new(h).strong().small());
+                    }
+                    ui.end_row();
+                    for e in app.model.tb_history.iter().rev().take(20) {
+                        ui.label(RichText::new(&e.tb_name).small());
+                        let (txt, col) = if e.passed { ("Passed", theme.ok) } else { ("Failed", theme.danger) };
+                        ui.label(RichText::new(txt).color(col).small());
+                        ui.label(RichText::new(format!("{} ns", e.sim_time_ns)).small());
+                        ui.label(RichText::new(format!("{} ms", e.runtime_ms)).small());
+                        ui.label(RichText::new(format!("{}", e.errors)).small());
+                        ui.label(RichText::new(if e.vcd_path.is_some() { "yes" } else { "—" }).small());
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn paint_tb_help(ui: &mut egui::Ui, theme: &theme::Theme) {
+    ui.collapsing(
+        RichText::new("Supported testbench subset").color(theme.faint).small(),
+        |ui| {
+            ui.label(
+                RichText::new(
+                    "module tb (no ports) · logic/reg/wire with [msb:lsb] · one DUT \
+                     instantiation with named .port(sig) connections · initial blocks · \
+                     always #N sig = ~sig clocks (#1 = 1 ns) · #delays · @(posedge/negedge sig) · \
+                     blocking = assignments · if/else · repeat · assert (e) else $error(\"…\") · \
+                     $display/$write/$error/$fatal/$warning with %d %b %h %t %% and $time · $finish.\n\
+                     The DUT is synthesized with helion-sv and driven on the helion-sim event \
+                     kernel; VCD dumps use a 1 ns timescale. Anything outside the subset is a \
+                     parse error naming the file and line.",
+                )
+                .color(theme.dim)
+                .small(),
+            );
+        },
+    );
 }

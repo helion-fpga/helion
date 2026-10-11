@@ -34,6 +34,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc;
 
 /// One stage of the implementation rail. Order is the dependency order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -4128,10 +4129,11 @@ pub enum WorkspaceTab {
     Package,
     Runs,
     Bitstream,
+    Testbench,
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 28] = [
+    pub const ALL: [WorkspaceTab; 29] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -4160,6 +4162,7 @@ impl WorkspaceTab {
         WorkspaceTab::Package,
         WorkspaceTab::Runs,
         WorkspaceTab::Bitstream,
+        WorkspaceTab::Testbench,
     ];
 
     /// On-screen canvases (MUST 1). Internal ALL remains for routing.
@@ -4254,6 +4257,7 @@ impl WorkspaceTab {
             WorkspaceTab::Package => "Package",
             WorkspaceTab::Runs => "Design Runs",
             WorkspaceTab::Bitstream => "Bitstream",
+            WorkspaceTab::Testbench => "Testbench",
         }
     }
 }
@@ -4843,6 +4847,30 @@ pub struct IdeModel {
     pub sim_log: Vec<SimLogRow>,
     /// UG900 Simulation Log selected row.
     pub selected_sim_log: Option<usize>,
+    /// Integrated testbench runner: discovered `*_tb.sv` / `tb_*.sv` files.
+    pub tb_files: Vec<crate::tb::TbFile>,
+    /// Per-file run status, parallel to `tb_files` (`Idle`/`Running`/`Passed`/`Failed(msg)`).
+    pub tb_status: Vec<crate::tb::TbStatus>,
+    /// Selected testbench index into `tb_files`.
+    pub tb_selected: Option<usize>,
+    /// Live log of the selected (or running) testbench run.
+    pub tb_log: Vec<crate::tb::TbLogLine>,
+    /// Clickable assertion / `$error` failures of the last run.
+    pub tb_failures: Vec<crate::tb::TbFailure>,
+    /// A testbench run is in flight on the engine thread.
+    pub tb_run_active: bool,
+    /// Name of the running / last-run testbench.
+    pub tb_run_name: String,
+    /// One-line summary of the last finished run.
+    pub tb_last_summary: String,
+    /// Last N run records, persisted per project.
+    pub tb_history: Vec<crate::tb::TbHistoryEntry>,
+    /// Manually added testbench files (persisted with history).
+    pub tb_manual: Vec<std::path::PathBuf>,
+    /// Write a VCD next to each run's log.
+    pub tb_vcd_enabled: bool,
+    /// Project dir for discovery + history (`<dir>/.helion/tb_history.json`).
+    pub tb_project_dir: Option<std::path::PathBuf>,
     /// UG893/UG986 ECO Changes selected cell name.
     pub selected_eco: Option<String>,
     /// UG986 Incremental Compile rows (HNF vs checkpoint).
@@ -4990,6 +5018,18 @@ impl IdeModel {
             selected_log: None,
             sim_log: Vec::new(),
             selected_sim_log: None,
+            tb_files: Vec::new(),
+            tb_status: Vec::new(),
+            tb_selected: None,
+            tb_log: Vec::new(),
+            tb_failures: Vec::new(),
+            tb_run_active: false,
+            tb_run_name: String::new(),
+            tb_last_summary: String::new(),
+            tb_history: Vec::new(),
+            tb_manual: Vec::new(),
+            tb_vcd_enabled: false,
+            tb_project_dir: None,
             selected_eco: None,
             incremental_rows: Vec::new(),
             selected_incremental: None,
@@ -5280,6 +5320,29 @@ impl IdeModel {
             self.sim_step()
         } else if t == "sim_restart" {
             self.sim_restart()
+        } else if t == "tb_rescan" || t.starts_with("tb_rescan ") {
+            let dir = t.strip_prefix("tb_rescan").unwrap_or("").trim();
+            let dir = if dir.is_empty() { None } else { Some(Path::new(dir)) };
+            Ok(self.tb_rescan(dir))
+        } else if t == "tb_run" || t.starts_with("tb_run ") {
+            let sel = t.strip_prefix("tb_run").unwrap_or("").trim();
+            self.tb_run_sync(sel, self.tb_vcd_enabled, None)
+        } else if t == "tb_run_all" {
+            self.tb_run_all_sync(self.tb_vcd_enabled)
+        } else if let Some(rest) = t.strip_prefix("tb_add ") {
+            self.tb_add(Path::new(rest.trim()))
+        } else if t == "tb_vcd" || t.starts_with("tb_vcd ") {
+            let v = t.strip_prefix("tb_vcd").unwrap_or("").trim();
+            if !v.is_empty() {
+                self.tb_vcd_enabled = matches!(v, "on" | "1" | "true" | "yes");
+            }
+            Ok(format!("tb_vcd {}", self.tb_vcd_enabled))
+        } else if let Some(rest) = t.strip_prefix("tb_jump ") {
+            let i: usize = rest
+                .trim()
+                .parse()
+                .map_err(|_| "tb_jump: need a failure index".to_string())?;
+            self.tb_jump_to_failure(i)
         } else if let Some(rest) = t.strip_prefix("ultrafast ") {
             self.open_ultrafast(rest)
         } else if let Some(name) = t.strip_prefix("add_wave ") {
@@ -18406,6 +18469,298 @@ impl IdeModel {
         self.push_sim_log(MsgSeverity::Info, "sim_restart", "sim_restart".into());
         self.bottom_tab = BottomTab::SimLog;
         Ok("sim_restart".into())
+    }
+
+    // ------------------------------------------------------------------
+    // Integrated testbench runner
+    // ------------------------------------------------------------------
+
+    /// Project dir for TB discovery/history: explicit override, else the open
+    /// source's parent, else the current directory.
+    fn tb_dir(&self) -> PathBuf {
+        if let Some(d) = &self.tb_project_dir {
+            return d.clone();
+        }
+        let src = self
+            .selected_source
+            .as_deref()
+            .or_else(|| self.tree.sources.first().map(String::as_str));
+        if let Some(s) = src {
+            if let Some(p) = Path::new(s).parent() {
+                if !p.as_os_str().is_empty() {
+                    return p.to_path_buf();
+                }
+            }
+        }
+        PathBuf::from(".")
+    }
+
+    /// (Re)discover `*_tb.sv` / `tb_*.sv` in `dir` (default: [`Self::tb_dir`])
+    /// plus manually added files. Preserves badges for files still present and
+    /// reloads run history.
+    pub fn tb_rescan(&mut self, dir: Option<&Path>) -> String {
+        let dir = dir.map(Path::to_path_buf).unwrap_or_else(|| self.tb_dir());
+        let mut files = crate::tb::discover_testbenches(&dir);
+        let manual: Vec<PathBuf> = self.tb_manual.clone();
+        for m in &manual {
+            if m.is_file() && !files.iter().any(|f| f.path == *m) {
+                let name = m
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("tb")
+                    .to_string();
+                files.push(crate::tb::TbFile { path: m.clone(), name });
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+        let old: HashMap<PathBuf, crate::tb::TbStatus> = self
+            .tb_files
+            .iter()
+            .zip(self.tb_status.iter())
+            .map(|(f, s)| (f.path.clone(), *s))
+            .collect();
+        self.tb_status = files
+            .iter()
+            .map(|f| old.get(&f.path).copied().unwrap_or(crate::tb::TbStatus::Idle))
+            .collect();
+        self.tb_files = files;
+        if !self.tb_selected.map(|i| i < self.tb_files.len()).unwrap_or(false) {
+            self.tb_selected = None;
+        }
+        self.tb_project_dir = Some(dir.clone());
+        let h = crate::tb::load_history(&dir);
+        if self.tb_manual.is_empty() {
+            self.tb_manual = h.manual.clone();
+            // Re-run discovery once so persisted manual adds show up.
+            for m in &self.tb_manual {
+                if m.is_file() && !self.tb_files.iter().any(|f| f.path == *m) {
+                    let name = m
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("tb")
+                        .to_string();
+                    self.tb_files.push(crate::tb::TbFile { path: m.clone(), name });
+                    self.tb_status.push(crate::tb::TbStatus::Idle);
+                }
+            }
+            self.tb_files
+                .sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+        }
+        self.tb_history = h.runs;
+        format!(
+            "tb_rescan {}: {} testbench(s), {} historic run(s)",
+            dir.display(),
+            self.tb_files.len(),
+            self.tb_history.len()
+        )
+    }
+
+    /// Manually add a testbench file (e.g. outside the project dir).
+    pub fn tb_add(&mut self, path: &Path) -> Result<String, String> {
+        if !path.is_file() {
+            return Err(format!("tb_add: not a file: {}", path.display()));
+        }
+        if !self.tb_manual.iter().any(|m| m == path) {
+            self.tb_manual.push(path.to_path_buf());
+        }
+        let dir = self.tb_dir();
+        let _ = crate::tb::save_history(
+            &dir,
+            &crate::tb::TbHistory {
+                runs: self.tb_history.clone(),
+                manual: self.tb_manual.clone(),
+            },
+        );
+        Ok(self.tb_rescan(None))
+    }
+
+    fn tb_select(&self, sel: &str) -> Result<usize, String> {
+        let t = sel.trim();
+        if t.is_empty() {
+            return self
+                .tb_selected
+                .filter(|&i| i < self.tb_files.len())
+                .ok_or_else(|| "tb_run: no testbench selected (pass a name or index)".to_string());
+        }
+        if let Ok(i) = t.parse::<usize>() {
+            if i < self.tb_files.len() {
+                return Ok(i);
+            }
+        }
+        self.tb_files
+            .iter()
+            .position(|f| f.name == t || f.path.to_string_lossy() == t)
+            .ok_or_else(|| {
+                let names: Vec<&str> = self.tb_files.iter().map(|f| f.name.as_str()).collect();
+                format!("tb_run: no testbench `{t}` (have: {})", names.join(", "))
+            })
+    }
+
+    /// Run one testbench synchronously on the calling thread (HELION_EXEC /
+    /// unit tests). `tx` streams live events; the outcome always lands in the
+    /// model's log/failures/history too.
+    pub fn tb_run_sync(
+        &mut self,
+        sel: &str,
+        vcd: bool,
+        tx: Option<&mpsc::Sender<crate::tb::TbStreamEvent>>,
+    ) -> Result<String, String> {
+        if self.tb_files.is_empty() {
+            self.tb_rescan(None);
+        }
+        let idx = self.tb_select(sel)?;
+        let tb = self.tb_files[idx].clone();
+        self.tb_selected = Some(idx);
+        self.tb_status[idx] = crate::tb::TbStatus::Running;
+        self.tb_run_active = true;
+        self.tb_run_name = tb.name.clone();
+        self.tb_log.clear();
+        self.tb_failures.clear();
+        let cfg = crate::tb::TbRunConfig {
+            tb_path: tb.path.clone(),
+            vcd,
+            max_units: crate::tb::TB_DEFAULT_MAX_UNITS,
+        };
+        let started_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let wall = std::time::Instant::now();
+        let result = crate::tb::run_testbench(&cfg, tx);
+        let runtime_ms = wall.elapsed().as_millis() as u64;
+        self.tb_run_active = false;
+        match result {
+            Ok(out) => {
+                self.tb_status[idx] = if out.passed {
+                    crate::tb::TbStatus::Passed
+                } else {
+                    crate::tb::TbStatus::Failed
+                };
+                self.tb_log = out.log.clone();
+                self.tb_failures = out.failures.clone();
+                self.tb_last_summary = out.summary.clone();
+                let project_dir = tb
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let entry = crate::tb::TbHistoryEntry {
+                    tb_name: tb.name.clone(),
+                    tb_path: tb.path.clone(),
+                    started_unix,
+                    passed: out.passed,
+                    sim_time_ns: out.sim_time_ns,
+                    runtime_ms: out.runtime_ms.max(runtime_ms),
+                    errors: out.failures.len() as u32,
+                    vcd_path: out.vcd_path.clone(),
+                };
+                match crate::tb::record_history(&project_dir, entry, &self.tb_manual) {
+                    Ok(h) => self.tb_history = h.runs,
+                    Err(e) => {
+                        self.tb_log.push(crate::tb::TbLogLine {
+                            time_ns: out.sim_time_ns,
+                            sev: crate::tb::TbSev::Warning,
+                            text: format!("history not persisted: {e}"),
+                        });
+                    }
+                }
+                Ok(out.summary)
+            }
+            Err(e) => {
+                self.tb_status[idx] = crate::tb::TbStatus::Failed;
+                let msg = e.to_string();
+                self.tb_log.push(crate::tb::TbLogLine {
+                    time_ns: 0,
+                    sev: crate::tb::TbSev::Error,
+                    text: msg.clone(),
+                });
+                self.tb_last_summary = format!("{} FAILED: {msg}", tb.name);
+                Err(msg)
+            }
+        }
+    }
+
+    /// Engine-thread entry point for `JobKind::TbRun`.
+    pub fn tb_run_job(&mut self, req: &crate::tb::TbRunRequest) -> Result<String, String> {
+        self.tb_run_sync(&req.sel, req.vcd, Some(&req.tx))
+    }
+
+    /// Merge a finished engine-thread run into the live model. Log lines and
+    /// failures already arrived via the stream; status/history/summary merge
+    /// here so nothing is lost or duplicated.
+    pub fn tb_merge_finished(&mut self, done: &IdeModel) {
+        self.tb_files = done.tb_files.clone();
+        self.tb_status = done.tb_status.clone();
+        self.tb_selected = done.tb_selected;
+        self.tb_failures = done.tb_failures.clone();
+        self.tb_history = done.tb_history.clone();
+        self.tb_manual = done.tb_manual.clone();
+        self.tb_run_active = false;
+        self.tb_run_name = done.tb_run_name.clone();
+        self.tb_last_summary = done.tb_last_summary.clone();
+        // The streamed log is authoritative for the live view; the finished
+        // model's copy is identical, so keep whichever is longer.
+        if done.tb_log.len() > self.tb_log.len() {
+            self.tb_log = done.tb_log.clone();
+        }
+    }
+
+    /// Run every discovered testbench, in order. Synchronous (exec/tests).
+    pub fn tb_run_all_sync(&mut self, vcd: bool) -> Result<String, String> {
+        if self.tb_files.is_empty() {
+            self.tb_rescan(None);
+        }
+        let names: Vec<String> = self.tb_files.iter().map(|f| f.name.clone()).collect();
+        if names.is_empty() {
+            return Err("tb_run_all: no testbenches found".to_string());
+        }
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        let mut last_err = String::new();
+        for n in &names {
+            match self.tb_run_sync(n, vcd, None) {
+                Ok(s) => {
+                    if s.contains("PASSED") {
+                        pass += 1;
+                    } else {
+                        fail += 1;
+                    }
+                }
+                Err(e) => {
+                    fail += 1;
+                    last_err = e;
+                }
+            }
+        }
+        // Show the last run's detail; the summary covers the sweep.
+        self.tb_last_summary = format!(
+            "tb_run_all: {pass} passed, {fail} failed{}",
+            if last_err.is_empty() {
+                String::new()
+            } else {
+                format!(" (last error: {last_err})")
+            }
+        );
+        Ok(self.tb_last_summary.clone())
+    }
+
+    /// Click a failure: open its file in the text editor at the failing line.
+    pub fn tb_jump_to_failure(&mut self, idx: usize) -> Result<String, String> {
+        let f = self
+            .tb_failures
+            .get(idx)
+            .ok_or_else(|| "no such failure".to_string())?
+            .clone();
+        let p = f.file.clone();
+        if !self.tree.sources.iter().any(|s| s == &p) {
+            self.tree.sources.push(p.clone());
+        }
+        self.selected_source = Some(p.clone());
+        self.load_rtl_source(&p);
+        self.selected_source_line = Some(f.line.max(1));
+        self.editor_line_focus = true;
+        self.workspace = WorkspaceTab::TextEditor;
+        Ok(format!("{}:{}", p, f.line))
     }
 
     fn prepare_sim(&mut self) -> Result<(), String> {
@@ -37279,7 +37634,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(
@@ -37931,5 +38286,138 @@ endmodule
             })
             .sum();
         assert_eq!(sum, n, "sum counts == lutff_sites.len(); lines={lines:?}");
+    }
+}
+
+#[cfg(test)]
+mod tb_model_tests {
+    use super::*;
+
+    const AND_DUT: &str = r#"module and_dut(input logic clk, input logic a, input logic b, output logic y);
+    logic q;
+    always_ff @(posedge clk) q <= a & b;
+    assign y = q;
+endmodule
+"#;
+
+    const AND_TB_PASS: &str = r#"module and_dut_tb;
+    logic clk, a, b, y;
+    and_dut dut (.clk(clk), .a(a), .b(b), .y(y));
+    always #5 clk = ~clk;
+    initial begin
+        a = 0; b = 0;
+        #10;
+        a = 1; b = 1;
+        @(posedge clk); @(posedge clk);
+        assert (y == 1) else $error("y should be 1");
+        $display("and_dut_tb ok");
+        $finish;
+    end
+endmodule
+"#;
+
+    const AND_TB_FAIL: &str = r#"module and_dut_tb_fail;
+    logic clk, a, b, y;
+    and_dut dut (.clk(clk), .a(a), .b(b), .y(y));
+    always #5 clk = ~clk;
+    initial begin
+        a = 0; b = 0;
+        @(posedge clk); @(posedge clk);
+        assert (y == 1) else $error("y should be 1 after zeros");
+        $finish;
+    end
+endmodule
+"#;
+
+    fn tb_project() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "helion-tb-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("and_dut.sv"), AND_DUT).unwrap();
+        std::fs::write(dir.join("and_dut_tb.sv"), AND_TB_PASS).unwrap();
+        std::fs::write(dir.join("and_dut_tb_fail.sv"), AND_TB_FAIL).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tb_exec_rescan_discovers_and_runs() {
+        let dir = tb_project();
+        let mut m = IdeModel::new();
+        let msg = m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
+        assert!(msg.contains("2 testbench"), "msg={msg}");
+        assert_eq!(m.tb_files.len(), 2);
+        assert_eq!(m.tb_history.len(), 0);
+
+        // Run the passing one by name.
+        let summary = m.exec("tb_run and_dut_tb").unwrap();
+        assert!(summary.contains("PASSED"), "summary={summary}");
+        assert_eq!(m.tb_status, vec![crate::tb::TbStatus::Passed, crate::tb::TbStatus::Idle]);
+        assert!(m.tb_failures.is_empty());
+        assert_eq!(m.tb_history.len(), 1);
+        assert!(m.tb_history[0].passed);
+
+        // History persisted: a fresh model sees it.
+        let mut m2 = IdeModel::new();
+        m2.exec(&format!("tb_rescan {}", dir.display())).unwrap();
+        assert_eq!(m2.tb_history.len(), 1);
+        assert_eq!(m2.tb_history[0].tb_name, "and_dut_tb");
+    }
+
+    #[test]
+    fn tb_exec_run_failing_reports_failure_and_jumps() {
+        let dir = tb_project();
+        let mut m = IdeModel::new();
+        m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
+        let summary = m.exec("tb_run and_dut_tb_fail").unwrap();
+        assert!(summary.contains("FAILED"), "summary={summary}");
+        assert_eq!(m.tb_failures.len(), 1);
+        let f = &m.tb_failures[0];
+        assert_eq!(f.line, 8);
+        assert!(f.message.contains("y should be 1 after zeros"));
+
+        // Clicking the failure jumps the editor to the file:line.
+        let jump = m.exec("tb_jump 0").unwrap();
+        assert!(jump.contains("and_dut_tb_fail.sv:8"), "jump={jump}");
+        assert_eq!(m.selected_source_line, Some(8));
+        assert_eq!(m.workspace, WorkspaceTab::TextEditor);
+        assert!(m.editor_line_focus);
+        assert!(m
+            .selected_source
+            .as_deref()
+            .unwrap_or("")
+            .ends_with("and_dut_tb_fail.sv"));
+    }
+
+    #[test]
+    fn tb_run_all_sweeps_pass_and_fail() {
+        let dir = tb_project();
+        let mut m = IdeModel::new();
+        m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
+        let summary = m.exec("tb_run_all").unwrap();
+        assert!(summary.contains("1 passed, 1 failed"), "summary={summary}");
+        assert_eq!(m.tb_history.len(), 2);
+        assert!(m
+            .tb_history
+            .iter()
+            .any(|e| e.tb_name == "and_dut_tb" && e.passed));
+        assert!(m
+            .tb_history
+            .iter()
+            .any(|e| e.tb_name == "and_dut_tb_fail" && !e.passed));
+    }
+
+    #[test]
+    fn tb_run_unknown_name_is_honest() {
+        let dir = tb_project();
+        let mut m = IdeModel::new();
+        m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
+        let err = m.exec("tb_run nope").unwrap_err();
+        assert!(err.contains("no testbench"), "err={err}");
     }
 }
