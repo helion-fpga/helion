@@ -205,11 +205,22 @@ pub fn install_fonts(ctx: &egui::Context) {
         )
         .into(),
     );
+    // CJK fallback for source comments (e.g. Chinese in ysyx_ibex.sv).
+    // DroidSansFallback subset to CJK blocks (~2.8MB); wired as a per-glyph
+    // fallback after the primary faces so missing glyphs render instead of
+    // tofu. egui tries family fonts in order per glyph.
+    fonts.font_data.insert(
+        "cjk-fallback".into(),
+        egui::FontData::from_owned(
+            include_bytes!("../../../fonts/DroidSansFallback.ttf").to_vec(),
+        )
+        .into(),
+    );
     if let Some(fams) = fonts.families.get_mut(&FontFamily::Proportional) {
-        *fams = vec!["inter-regular".into()];
+        *fams = vec!["inter-regular".into(), "cjk-fallback".into()];
     }
     if let Some(fams) = fonts.families.get_mut(&FontFamily::Monospace) {
-        *fams = vec!["jbmono-regular".into()];
+        *fams = vec!["jbmono-regular".into(), "cjk-fallback".into()];
     }
     fonts.families.insert(
         FontFamily::Name("ui-medium".into()),

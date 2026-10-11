@@ -43,7 +43,15 @@ pub fn detect_lang(path: &str) -> Lang {
 /// VHDL). [`Lang::Unknown`] (or empty input) returns an empty vec.
 /// Complexity: O(n) in the input length; keyword lookup is a linear scan over
 /// a small table per word (bounded, no allocation).
-pub fn highlight(lang: Lang, text: &str, theme: &Theme) -> Vec<(Range<usize>, Color32)> {
+/// One highlighted span. `italic` is set for comments (dim italic per the
+/// editor spec); everything else renders upright.
+pub struct HlSpan {
+    pub range: Range<usize>,
+    pub color: Color32,
+    pub italic: bool,
+}
+
+pub fn highlight(lang: Lang, text: &str, theme: &Theme) -> Vec<HlSpan> {
     if lang == Lang::Unknown || text.is_empty() {
         return Vec::new();
     }
@@ -374,7 +382,7 @@ const TCL_KEYWORDS: &[&str] = &[
 struct Scan<'a> {
     b: &'a [u8],
     i: usize,
-    out: Vec<(Range<usize>, Color32)>,
+    out: Vec<HlSpan>,
     lang: Lang,
     kw: Color32,
     comment: Color32,
@@ -398,9 +406,13 @@ fn eq_fold(word: &[u8], kw: &str) -> bool {
 }
 
 impl Scan<'_> {
-    fn push(&mut self, from: usize, to: usize, color: Color32) {
+    fn push(&mut self, from: usize, to: usize, color: Color32, italic: bool) {
         if to > from {
-            self.out.push((from..to, color));
+            self.out.push(HlSpan {
+                range: from..to,
+                color,
+                italic,
+            });
         }
     }
 
@@ -463,7 +475,7 @@ impl Scan<'_> {
         while self.i < self.b.len() && self.b[self.i] != b'\n' {
             self.i += 1;
         }
-        self.push(from, self.i, self.comment);
+        self.push(from, self.i, self.comment, true);
         true
     }
 
@@ -477,7 +489,7 @@ impl Scan<'_> {
             self.i += 1;
         }
         self.i = (self.i + 2).min(self.b.len());
-        self.push(from, self.i, self.comment);
+        self.push(from, self.i, self.comment, true);
         true
     }
 
@@ -498,20 +510,20 @@ impl Scan<'_> {
                 self.i += 1;
             }
         }
-        self.push(from, self.i.min(self.b.len()), self.string);
+        self.push(from, self.i.min(self.b.len()), self.string, false);
     }
 
     /// Tcl `{...}` group: braces nest; the group is lexed recursively so
     /// keywords inside proc bodies still highlight.
     fn scan_brace(&mut self) {
-        self.push(self.i, self.i + 1, self.plain);
+        self.push(self.i, self.i + 1, self.plain, false);
         self.i += 1;
         while self.i < self.b.len() {
             let c = self.b[self.i];
             if c == b'{' {
                 self.scan_brace();
             } else if c == b'}' {
-                self.push(self.i, self.i + 1, self.plain);
+                self.push(self.i, self.i + 1, self.plain, false);
                 self.i += 1;
                 return;
             } else if c == b'\\' {
@@ -529,7 +541,7 @@ impl Scan<'_> {
         while self.i < self.b.len() && is_word_byte(self.b[self.i]) {
             self.i += 1;
         }
-        self.push(from, self.i, self.directive);
+        self.push(from, self.i, self.directive, false);
     }
 
     /// `'` starts an SV base literal (`'hFF`), a VHDL attribute (`'event`),
@@ -546,9 +558,9 @@ impl Scan<'_> {
             while self.i < self.b.len() && is_word_byte(self.b[self.i]) {
                 self.i += 1;
             }
-            self.push(from, self.i, self.directive);
+            self.push(from, self.i, self.directive, false);
         } else {
-            self.push(self.i, self.i + 1, self.plain);
+            self.push(self.i, self.i + 1, self.plain, false);
             self.i += 1;
         }
     }
@@ -565,7 +577,7 @@ impl Scan<'_> {
                 break;
             }
         }
-        self.push(from, self.i, self.number);
+        self.push(from, self.i, self.number, false);
     }
 
     fn scan_number(&mut self) {
@@ -596,7 +608,7 @@ impl Scan<'_> {
                 break;
             }
         }
-        self.push(from, self.i, self.number);
+        self.push(from, self.i, self.number, false);
     }
 
     fn scan_word(&mut self) {
@@ -620,7 +632,7 @@ impl Scan<'_> {
             }
         });
         if hit {
-            self.push(from, self.i, self.kw);
+            self.push(from, self.i, self.kw, false);
         }
     }
 
@@ -629,7 +641,7 @@ impl Scan<'_> {
     /// a stray Tcl `}` at top level is emitted as its own span.
     fn scan_punct(&mut self) {
         if self.lang == Lang::Tcl && self.peek(0) == b'}' {
-            self.push(self.i, self.i + 1, self.plain);
+            self.push(self.i, self.i + 1, self.plain, false);
             self.i += 1;
             return;
         }
@@ -650,7 +662,7 @@ impl Scan<'_> {
             }
             self.i += 1;
         }
-        self.push(from, self.i, self.plain);
+        self.push(from, self.i, self.plain, false);
     }
 }
 
@@ -682,16 +694,24 @@ mod tests {
             "module top; // comment\n  logic [7:0] cnt = 'hFF;\n  `timescale 1ns/1ps\nendmodule";
         let spans = highlight(Lang::SystemVerilog, src, &t);
         let at = |pos: usize| {
-            spans
-                .iter()
-                .find(|(r, _)| r.contains(&pos))
-                .map(|(_, c)| *c)
+            spans.iter().find(|s| s.range.contains(&pos)).map(|s| s.color)
         };
         assert_eq!(
             at(src.find("module").unwrap_or(usize::MAX)),
             Some(t.accent_dim)
         );
         assert_eq!(at(src.find("//").unwrap_or(usize::MAX)), Some(t.faint));
+        let italic_at = |pos: usize| {
+            spans
+                .iter()
+                .find(|s| s.range.contains(&pos))
+                .map(|s| s.italic)
+        };
+        assert_eq!(italic_at(src.find("//").unwrap_or(usize::MAX)), Some(true));
+        assert_eq!(
+            italic_at(src.find("module").unwrap_or(usize::MAX)),
+            Some(false)
+        );
         assert_eq!(at(src.find("'h").unwrap_or(usize::MAX)), Some(t.warn));
         assert_eq!(at(src.find('`').unwrap_or(usize::MAX)), Some(t.info));
         assert_eq!(
@@ -700,7 +720,7 @@ mod tests {
         );
         // Spans are ordered and non-overlapping.
         for w in spans.windows(2) {
-            assert!(w[0].0.end <= w[1].0.start);
+            assert!(w[0].range.end <= w[1].range.start);
         }
     }
 
@@ -711,10 +731,7 @@ mod tests {
         let spans = highlight(Lang::Vhdl, src, &t);
         let color_at = |needle: &str| {
             let pos = src.find(needle).unwrap_or(usize::MAX);
-            spans
-                .iter()
-                .find(|(r, _)| r.contains(&pos))
-                .map(|(_, c)| *c)
+            spans.iter().find(|s| s.range.contains(&pos)).map(|s| s.color)
         };
         assert_eq!(color_at("ENTITY"), Some(t.violet));
         assert_eq!(color_at("std_logic"), Some(t.violet));
@@ -729,17 +746,14 @@ mod tests {
         let spans = highlight(Lang::Tcl, src, &t);
         let color_at = |needle: &str| {
             let pos = src.find(needle).unwrap_or(usize::MAX);
-            spans
-                .iter()
-                .find(|(r, _)| r.contains(&pos))
-                .map(|(_, c)| *c)
+            spans.iter().find(|s| s.range.contains(&pos)).map(|s| s.color)
         };
         assert_eq!(color_at("#"), Some(t.faint));
         assert_eq!(color_at("proc"), Some(t.accent_dim));
         assert_eq!(color_at("return"), Some(t.accent_dim));
         assert_eq!(color_at("\"hi\""), Some(t.ok));
         for w in spans.windows(2) {
-            assert!(w[0].0.end <= w[1].0.start);
+            assert!(w[0].range.end <= w[1].range.start);
         }
     }
 

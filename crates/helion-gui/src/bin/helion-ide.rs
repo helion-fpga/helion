@@ -6825,6 +6825,7 @@ fn highlight_line_job(
     };
     let comment_fmt = egui::TextFormat {
         color: theme.faint,
+        italics: true,
         ..base.clone()
     };
     // Block-comment prefix, if the line starts inside one.
@@ -6850,7 +6851,8 @@ fn highlight_line_job(
     }
     let spans = highlight::highlight(lang, rest, theme);
     let mut cursor = 0usize;
-    for (range, color) in spans {
+    for span in spans {
+        let (range, color) = (span.range, span.color);
         if range.start < cursor || range.end > rest.len() {
             continue; // defensive: spans are ordered and non-overlapping
         }
@@ -6862,14 +6864,13 @@ fn highlight_line_job(
         }
         match rest.get(range.clone()) {
             Some(tok) => {
-                job.append(
-                    tok,
-                    0.0,
-                    egui::TextFormat {
-                        color,
-                        ..base.clone()
-                    },
-                );
+                let mut fmt = egui::TextFormat {
+                    color,
+                    ..base.clone()
+                };
+                // Comment spans render dim italic per the editor spec.
+                fmt.italics = span.italic;
+                job.append(tok, 0.0, fmt);
                 cursor = range.end;
             }
             None => break, // non-char-boundary span: tail append below covers it
@@ -6883,99 +6884,360 @@ fn highlight_line_job(
     job
 }
 
+/// Breadcrumb context for the editor: enclosing module/entity and innermost
+/// block for a 1-based line. Heuristic upward scan with closed-scope depth
+/// tracking (good enough for navigation; not a parser).
+struct EditorCrumbs {
+    module: Option<(String, usize)>,
+    block: Option<(String, usize)>,
+}
+
+fn crumb_name(trimmed: &str, kw: &str) -> String {
+    let rest = trimmed[kw.len().min(trimmed.len())..].trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    let name: String = rest[..end].chars().take(40).collect();
+    if name.is_empty() {
+        kw.to_string()
+    } else {
+        name
+    }
+}
+
+/// Block label: `label : always_ff @(…)` -> `label`; else the keyword itself.
+fn block_label(trimmed: &str, kw: &str) -> String {
+    if let Some(i) = trimmed.find(" : ") {
+        let before = trimmed[..i].trim();
+        let after: String = trimmed[i + 3..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        // `label : always_ff ...` → `label`.
+        if !before.is_empty()
+            && before
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            return before.chars().take(32).collect();
+        }
+        // `always_comb begin : we_a_decoder` → `always_comb : we_a_decoder`.
+        if !after.is_empty() {
+            return format!("{kw} : {after}");
+        }
+        if !before.is_empty() {
+            return before.chars().take(32).collect();
+        }
+    }
+    kw.to_string()
+}
+
+fn kw_at(tl: &str, k: &str) -> bool {
+    tl.starts_with(k)
+        && tl[k.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_' && c != '$')
+}
+
+fn editor_crumbs(rows: &[SourceLine], cursor: usize, lang: highlight::Lang) -> EditorCrumbs {
+    let mut out = EditorCrumbs {
+        module: None,
+        block: None,
+    };
+    if rows.is_empty() {
+        return out;
+    }
+    let vhdl = lang == highlight::Lang::Vhdl;
+    let idx = rows
+        .iter()
+        .position(|r| r.line == cursor)
+        .unwrap_or(0)
+        .min(rows.len() - 1);
+    let mut closed = 0usize;
+    for r in rows[..=idx].iter().rev() {
+        let t = r.text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let tl = t.to_ascii_lowercase();
+        // Closed scopes seen while scanning upward.
+        let is_end = tl.starts_with("endmodule")
+            || tl.starts_with("endfunction")
+            || tl.starts_with("endtask")
+            || tl.starts_with("endgenerate")
+            || tl.starts_with("endclass")
+            || tl.starts_with("endinterface")
+            || tl.starts_with("endpackage")
+            || tl.starts_with("endarchitecture")
+            || tl == "end"
+            || tl.starts_with("end ")
+            || tl.starts_with("end;")
+            || tl.starts_with("end:");
+        if is_end {
+            closed += 1;
+            continue;
+        }
+        let mod_kw = if vhdl { "entity" } else { "module" };
+        if kw_at(&tl, mod_kw) {
+            if closed > 0 {
+                closed -= 1;
+            } else if out.module.is_none() {
+                out.module = Some((crumb_name(t, mod_kw), r.line));
+            }
+            continue;
+        }
+        if out.block.is_none() {
+            let found: Option<&'static str> = if vhdl {
+                if tl.starts_with("process") {
+                    Some("process")
+                } else if kw_at(&tl, "architecture") {
+                    Some("architecture")
+                } else {
+                    None
+                }
+            } else {
+                // Longest-first so `always` never shadows `always_ff`.
+                [
+                    "always_ff",
+                    "always_comb",
+                    "always_latch",
+                    "always @",
+                    "always",
+                    "initial",
+                    "function",
+                    "task",
+                    "generate",
+                ]
+                .iter()
+                .find(|k| {
+                    kw_at(&tl, k) || tl.split(" : ").nth(1).map_or(false, |rest| kw_at(rest, k))
+                })
+                .copied()
+            };
+            if let Some(k) = found {
+                if closed > 0 {
+                    closed -= 1;
+                } else {
+                    out.block = Some((block_label(t, k), r.line));
+                }
+            }
+        }
+        if out.module.is_some() && out.block.is_some() {
+            break;
+        }
+    }
+    out
+}
+
 fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.heading("Text Editor");
-    ui.horizontal(|ui| {
-        if ui.button("Open").clicked() {
-            let _ = model.open_text_editor();
-        }
-        if ui.button("Goto Source").clicked() {
-            let _ = model.goto_editor("");
-        }
-    });
-    let selected = model.selected_source_line;
-    let markers = model.editor_markers();
-    let n = model.source_line_rows().len();
-    let mut pick_line: Option<String> = None;
-    let mut pick_mark: Option<String> = None;
-    // Syntax highlighting (P1-7): language from the open source path; block
-    // comments tracked across lines so /* … */ spans color correctly.
+    // Header + breadcrumb (no rows borrow held; actions deferred).
     let lang = model
         .selected_source
         .as_deref()
         .or_else(|| model.tree.sources.first().map(String::as_str))
         .map(highlight::detect_lang)
         .unwrap_or(highlight::Lang::Unknown);
+    let file_name = model
+        .selected_source
+        .as_deref()
+        .or_else(|| model.tree.sources.first().map(String::as_str))
+        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+        .unwrap_or_else(|| "no file".to_string());
+    let n = model.source_line_rows().len();
+    let selected = model.selected_source_line;
+    let cursor = selected.unwrap_or(1).min(n.max(1));
+    let crumbs = editor_crumbs(model.source_line_rows(), cursor, lang);
+
+    // One-shot scroll target from a breadcrumb click last frame.
+    let scroll_id = egui::Id::new("text_editor_scroll_to");
+    let scroll_to: Option<usize> = ui.ctx().memory(|m| m.data.get_temp(scroll_id));
+    if scroll_to.is_some() {
+        ui.ctx().memory_mut(|m| m.data.remove::<usize>(scroll_id));
+    }
+
+    let mut pick_line: Option<usize> = None;
+    let mut pick_mark: Option<usize> = None;
+    let mut nav_line: Option<usize> = None;
+    let mut do_open = false;
+    let mut do_goto = false;
+
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(&file_name)
+                .color(theme.faint)
+                .font(theme::font_ui(12.0)),
+        );
+        if let Some((name, line)) = &crumbs.module {
+            ui.label(RichText::new("›").color(theme.faint).font(theme::font_ui(12.0)));
+            if ui
+                .link(RichText::new(name).color(theme.text).font(theme::font_ui(12.0)))
+                .on_hover_text(format!("Go to line {line}"))
+                .clicked()
+            {
+                pick_line = Some(*line);
+                nav_line = Some(*line);
+            }
+        }
+        if let Some((name, line)) = &crumbs.block {
+            ui.label(RichText::new("›").color(theme.faint).font(theme::font_ui(12.0)));
+            if ui
+                .link(RichText::new(name).color(theme.text).font(theme::font_ui(12.0)))
+                .on_hover_text(format!("Go to line {line}"))
+                .clicked()
+            {
+                pick_line = Some(*line);
+                nav_line = Some(*line);
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Goto Source").clicked() {
+                do_goto = true;
+            }
+            if ui.small_button("Open").clicked() {
+                do_open = true;
+            }
+        });
+    });
+    ui.separator();
+
+    if do_open {
+        let _ = model.open_text_editor();
+    }
+    if do_goto {
+        let _ = model.goto_editor("");
+    }
+
+    // Code pane: gutter (diagnostic ticks + right-aligned line numbers) and
+    // syntax-highlighted source. Indentation is preserved; the old table
+    // trimmed every line.
+    let markers = model.editor_markers();
     let rows = model.source_line_rows();
     let in_block: Vec<bool> = block_comment_starts(rows, lang);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Marker").strong());
-        ui.add_space(12.0);
-        ui.label(RichText::new("Line").strong());
-        ui.add_space(12.0);
-        ui.label(RichText::new("Kind").strong());
-        ui.add_space(12.0);
-        ui.label(RichText::new("Text").strong());
-    });
-    let row_h = 22.0;
-    egui::ScrollArea::both()
-        .id_salt("ug893_text_editor")
-        .show_rows(ui, row_h, n.max(1), |ui, range| {
+    let row_h = 13.0 * 1.5;
+    let gutter_w = 56.0;
+    let mut scroll = egui::ScrollArea::both().id_salt("ug893_text_editor");
+    if let Some(tline) = scroll_to {
+        if let Some(pos) = rows.iter().position(|r| r.line == tline) {
+            let view_h = ui.available_height().max(row_h * 4.0);
+            let y = (pos as f32 * row_h - view_h / 2.0).max(0.0);
+            scroll = scroll.vertical_scroll_offset(y);
+        }
+    }
+    scroll.show_rows(ui, row_h, n.max(1), |ui, range| {
             if n == 0 {
-                ui.label("No sources yet.");
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("No sources yet. Open a file to edit.")
+                            .color(theme.faint)
+                            .font(theme::font_ui(13.0)),
+                    );
+                });
                 return;
             }
-            let rows = model.source_line_rows();
             let end = range.end.min(n);
             for (ri, r) in rows[range.start..end].iter().enumerate() {
                 let starts_in_block = in_block.get(range.start + ri).copied().unwrap_or(false);
+                let on = selected == Some(r.line);
+                let mk = markers.iter().filter(|m| m.line == r.line).min_by_key(|m| {
+                    match m.kind.as_str() {
+                        "error" => 0u8,
+                        "warning" => 1,
+                        "advisory" => 2,
+                        "probe" => 3,
+                        "bookmark" => 4,
+                        _ => 9,
+                    }
+                });
+                let (tick_color, tick_tip): (Option<Color32>, Option<String>) =
+                    match mk.map(|m| m.kind.as_str()) {
+                        Some("error") => (
+                            Some(theme.danger),
+                            mk.map(|m| format!("{}: {}", m.id, m.text)),
+                        ),
+                        Some("warning") => (
+                            Some(theme.warn),
+                            mk.map(|m| format!("{}: {}", m.id, m.text)),
+                        ),
+                        Some("advisory") => (
+                            Some(theme.info),
+                            mk.map(|m| format!("{}: {}", m.id, m.text)),
+                        ),
+                        Some("bookmark") => (
+                            Some(theme.accent),
+                            Some("bookmark — click to remove".to_string()),
+                        ),
+                        _ => (None, None),
+                    };
+                // Selection wash behind the visible row.
+                let bg_rect = egui::Rect::from_min_size(
+                    ui.available_rect_before_wrap().min,
+                    egui::vec2(ui.available_width(), row_h),
+                );
+                if on {
+                    ui.painter().rect_filled(bg_rect, 2.0, theme.sel);
+                }
+                let mut tick_hit = false;
                 ui.horizontal(|ui| {
                     ui.set_min_height(row_h);
-                    let on = selected == Some(r.line);
-                    let mk = markers.iter().filter(|m| m.line == r.line).min_by_key(|m| {
-                        match m.kind.as_str() {
-                            "error" => 0u8,
-                            "warning" => 1,
-                            "advisory" => 2,
-                            "probe" => 3,
-                            "bookmark" => 4,
-                            _ => 9,
-                        }
-                    });
-                    let mark = mk.map(|m| m.marker_cell()).unwrap_or("-");
-                    if ui.selectable_label(on && mk.is_some(), mark).clicked() {
-                        if mk.map(|m| m.kind.as_str()) == Some("bookmark") || mk.is_none() {
-                            pick_mark = Some(r.line.to_string());
-                        } else {
-                            pick_line = Some(r.line.to_string());
-                        }
-                    }
+                    // Gutter: diagnostic/bookmark tick, then right-aligned number.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(gutter_w, row_h),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(r.line.to_string())
+                                            .font(theme::font_code(12.0))
+                                            .color(if on { theme.text } else { theme.faint }),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .clicked()
+                            {
+                                pick_line = Some(r.line);
+                            }
+                            ui.add_space(6.0);
+                            if tick_color.is_some() {
+                                let (tr, tr_resp) =
+                                    ui.allocate_exact_size(egui::vec2(8.0, 12.0), Sense::click());
+                                if let Some(c) = tick_color {
+                                    ui.painter().rect_filled(tr, 1.0, c);
+                                }
+                                let hit = tr_resp.clicked();
+                                if let Some(tip) = tick_tip {
+                                    tr_resp.on_hover_text(tip);
+                                }
+                                if hit {
+                                    tick_hit = true;
+                                    pick_mark = Some(r.line);
+                                }
+                            }
+                        },
+                    );
+                    // Highlighted source text; indentation preserved.
+                    let job = highlight_line_job(&r.text, lang, starts_in_block, theme);
                     if ui
-                        .selectable_label(on, RichText::new(r.line.to_string()).monospace())
+                        .add(egui::Label::new(job).sense(Sense::click()))
                         .clicked()
+                        && !tick_hit
                     {
-                        pick_line = Some(r.line.to_string());
-                    }
-                    if ui.selectable_label(on, r.type_cell()).clicked() {
-                        pick_line = Some(r.line.to_string());
-                    }
-                    // Highlighted source text (P1-7): LayoutJob from the
-                    // tokenizer spans; falls back to plain text per line.
-                    let job = highlight_line_job(r.text.trim(), lang, starts_in_block, theme);
-                    if ui
-                        .add(egui::Button::selectable(on, egui::WidgetText::from(job)))
-                        .clicked()
-                    {
-                        pick_line = Some(r.line.to_string());
+                        pick_line = Some(r.line);
                     }
                 });
             }
         });
-    if let Some(spec) = pick_mark {
-        let _ = model.toggle_editor_bookmark(&spec);
+    if let Some(line) = pick_mark {
+        let _ = model.toggle_editor_bookmark(&line.to_string());
     }
-    if let Some(spec) = pick_line {
-        let _ = model.select_editor_line(&spec);
+    if let Some(line) = pick_line {
+        let _ = model.select_editor_line(&line.to_string());
+        if nav_line == Some(line) {
+            ui.ctx()
+                .memory_mut(|m| m.data.insert_temp(scroll_id, line));
+        }
     }
 }
 
