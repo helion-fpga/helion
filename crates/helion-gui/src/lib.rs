@@ -10,9 +10,13 @@ pub mod ide;
 pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
+pub mod qor;
 pub mod surface;
 pub use learner_l1::{
     ConstraintProvenance, SessionStage, StageError, StageStatus,
+};
+pub use qor::{
+    QorAction, QorInputs, QorReport, QorRule, QorSeverity, QorSuggestion, analyze_qor, qor_rules,
 };
 pub use learner_l2::{
     critical_path_highlight, highlight_set_from_path, packing_summary_from_placed, HighlightSet,

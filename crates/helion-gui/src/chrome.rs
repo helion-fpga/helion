@@ -1118,6 +1118,7 @@ pub enum WorkspacePane {
     ClockNetworks,
     Power,
     Methodology,
+    Qor,
     Drc,
     Utilization,
     Runs,
@@ -1151,6 +1152,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::ClockNetworks => WorkspacePane::ClockNetworks,
         WorkspaceTab::Power => WorkspacePane::Power,
         WorkspaceTab::Methodology => WorkspacePane::Methodology,
+        WorkspaceTab::Qor => WorkspacePane::Qor,
         WorkspaceTab::Drc => WorkspacePane::Drc,
         WorkspaceTab::Utilization => WorkspacePane::Utilization,
         WorkspaceTab::Runs => WorkspacePane::Runs,
@@ -1172,6 +1174,7 @@ pub fn is_report_detail(tab: WorkspaceTab) -> bool {
             | WorkspaceTab::ClockNetworks
             | WorkspaceTab::Power
             | WorkspaceTab::Methodology
+            | WorkspaceTab::Qor
             | WorkspaceTab::Drc
             | WorkspaceTab::Utilization
             | WorkspaceTab::Runs
@@ -1201,7 +1204,7 @@ mod tests {
         let labels = workspace_tab_labels();
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
@@ -1662,7 +1665,7 @@ mod tests {
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Schematic),
             WorkspacePane::Schematic
@@ -1714,7 +1717,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(more, 25, "28 tabs − 3 canvases");
+        assert_eq!(more, 26, "29 tabs − 3 canvases");
         assert!(is_report_detail(WorkspaceTab::Utilization));
         assert!(!is_report_detail(WorkspaceTab::Schematic));
         assert_eq!(

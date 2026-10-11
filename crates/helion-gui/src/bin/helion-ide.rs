@@ -13,8 +13,8 @@ use helion_gui::surface::{
 use helion_gui::{
     doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TimingPathSortCol,
-    WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
+    MethodologySeverity, MsgSeverity, PathGroupKind, QorAction, QorSeverity, SourceLine, StepState,
+    TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -2540,6 +2540,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::ClockNetworks => paint_clock_networks(ui, &mut app.model),
         WorkspacePane::Power => paint_power(ui, &mut app.model, &app.theme),
         WorkspacePane::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspacePane::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspacePane::Runs => paint_runs(ui, &mut app.model, &app.theme),
@@ -2579,6 +2580,7 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
         WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
         WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
@@ -2603,6 +2605,7 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
         WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
         WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
@@ -5556,6 +5559,146 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         let _ = model.select_methodology_object(&id);
     } else if let Some(id) = pick {
         let _ = model.select_methodology(&id);
+    }
+}
+
+fn qor_severity_color(theme: &theme::Theme, sev: QorSeverity) -> Color32 {
+    match sev {
+        QorSeverity::Critical => theme.danger,
+        QorSeverity::Warning => theme.warn,
+        QorSeverity::Info => theme.info,
+    }
+}
+
+/// QoR Suggestions panel: the rule-registry report as an actionable table.
+/// Selecting a row shows the full explanation + fix; Locate cross-probes the
+/// cited objects via the master selection API.
+fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+    ui.heading("QoR Suggestions");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Re-run analysis").clicked() {
+            let msg = model.refresh_qor();
+            model.log.push(msg);
+        }
+        ui.label(
+            RichText::new("rule-based, measured — no generic advice")
+                .size(11.0)
+                .color(theme.dim),
+        );
+    });
+    ui.add_space(6.0);
+    if model.tree.top.is_none() {
+        if paint_remaining_cta(ui, "No design yet.", "Run Synthesis", theme) {
+            queue_flow(FlowStep::Synthesis);
+        }
+        return;
+    }
+    let report = model.qor_report();
+    ui.label(format!(
+        "suggestions={} critical={} warning={} info={}",
+        report.suggestions.len(),
+        report.critical_count(),
+        report.warning_count(),
+        report.info_count()
+    ));
+    ui.add_space(4.0);
+    if report.suggestions.is_empty() {
+        ui.label(
+            RichText::new("No suggestions — the design meets every QoR check.")
+                .color(theme.ok),
+        );
+        return;
+    }
+    let selected_qor = model.selected_qor.clone();
+    let selected = model.selected.clone();
+    let mut pick: Option<String> = None;
+    let mut locate: Option<String> = None;
+    let n = report.suggestions.len().max(1);
+    let remain = ui.available_size();
+    let bbox = chrome::nv_table_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
+        Sense::hover(),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
+        let n_f = n as f32;
+        let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
+        let col_w = chrome::stretched_col_w_gap(6, ui.available_width(), 8.0);
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("qor_table")
+                .spacing([8.0, row_gap])
+                .min_col_width(col_w)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("ID").strong());
+                    ui.label(RichText::new("Severity").strong());
+                    ui.label(RichText::new("Category").strong());
+                    ui.label(RichText::new("Suggestion").strong());
+                    ui.label(RichText::new("Est. gain").strong());
+                    ui.label(RichText::new("Objects").strong());
+                    ui.end_row();
+                    for s in &report.suggestions {
+                        let on = selected_qor.as_deref() == Some(s.id);
+                        let fill = qor_severity_color(theme, s.severity);
+                        let btn = egui::Button::new(RichText::new(s.id).color(Color32::BLACK))
+                            .fill(fill)
+                            .selected(on);
+                        if ui.add(btn).clicked() {
+                            pick = Some(s.id.to_string());
+                        }
+                        ui.label(s.severity.as_str());
+                        ui.label(s.category);
+                        ui.label(&s.title);
+                        ui.label(
+                            s.gain_ps
+                                .map(|g| format!("+{g} ps"))
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                        let objs = if s.objects.is_empty() {
+                            "-".to_string()
+                        } else {
+                            s.objects.join(", ")
+                        };
+                        ui.horizontal(|ui| {
+                            let on_obj = selected.as_deref().is_some_and(|sel| {
+                                !s.objects.is_empty() && s.objects.iter().any(|o| o == sel)
+                            });
+                            if ui.selectable_label(on || on_obj, &objs).clicked() {
+                                pick = Some(s.id.to_string());
+                            }
+                            if !s.objects.is_empty() && ui.button("Locate").clicked() {
+                                locate = Some(s.objects[0].clone());
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+        });
+    });
+    // Detail of the selected suggestion: full explanation + fix hint.
+    if let Some(id) = selected_qor.as_deref().and_then(|id| report.suggestion(id)) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("{} — {}", id.id, id.title)).strong());
+        ui.add_space(2.0);
+        ui.label(RichText::new(&id.explanation).color(theme.text));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Fix:").strong());
+            ui.label(RichText::new(&id.fix_hint).color(theme.dim));
+        });
+        if id.action == Some(QorAction::OpenRuns) {
+            ui.add_space(4.0);
+            if ui.button("Open Design Runs").clicked() {
+                model.workspace = WorkspaceTab::Runs;
+            }
+        }
+    }
+    if let Some(obj) = locate {
+        let _ = model.select_qor_object(&obj);
+    } else if let Some(id) = pick {
+        let _ = model.select_qor(&id);
     }
 }
 
