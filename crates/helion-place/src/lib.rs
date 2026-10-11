@@ -76,12 +76,45 @@ pub fn packing_summary_from_placed(placed: &Placed) -> PackingSummary {
 pub struct PlaceOpts {
     /// 0 = wirelength toward array center. >0 = timing: pull toward IOB.
     pub timing_weight: f64,
+    /// Deterministic perturbation seed for design-run seed sweeps.
+    /// 0 = legacy processing order (bit-identical to previous releases).
+    /// Non-zero = seeded Fisher-Yates shuffle of the initial LUTFF
+    /// processing order, so different seeds explore different placements.
+    pub seed: u64,
 }
 
 impl Default for PlaceOpts {
     fn default() -> Self {
-        Self { timing_weight: 0.0 }
+        Self {
+            timing_weight: 0.0,
+            seed: 0,
+        }
     }
+}
+
+/// SplitMix64: tiny deterministic PRNG for seeded placement perturbation.
+/// Hand-rolled so `helion-place` gains no new dependencies.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic Fisher-Yates shuffle of `0..n` driven by `seed`.
+/// Exported for unit tests (seed sweep determinism).
+pub fn seeded_order(n: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if seed == 0 {
+        return order;
+    }
+    let mut state = seed;
+    for i in (1..n).rev() {
+        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
 }
 
 /// IOB-arc exceptions from XDC (`set_false_path` / `set_multicycle_path`).
@@ -512,7 +545,11 @@ pub fn place_with_guide(
         // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
         let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
         let mut excepted_iob: HashSet<usize> = HashSet::new();
-        for lf in &packed.lutffs {
+        // Seed sweeps: process LUTFFs in a seeded order so different seeds
+        // explore genuinely different placements. Seed 0 = legacy order.
+        let lutff_order = seeded_order(packed.lutffs.len(), opts.seed);
+        for &li in &lutff_order {
+            let lf = &packed.lutffs[li];
             let drives_iob = iob_for_net.contains_key(lf.q_net.as_str());
             let excepted_iob_cluster = guide.excepts_iob_driver(drives_iob);
             let preferred_x = iob_for_net
@@ -1510,13 +1547,12 @@ mod tests {
     fn timing_driven_differs_from_wirelength() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_blinky(), &dev).unwrap();
-        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
+        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0, seed: 0 }).unwrap();
         let td = place_with(
             &p,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         assert_ne!(
@@ -1547,16 +1583,14 @@ mod tests {
             &p,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         let pl = place_in_region_with_guide(
             &p,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
             5,
             1,
             8,
@@ -1636,8 +1670,7 @@ mod tests {
             &p,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         assert_eq!(pl.lutff_sites.len(), 9);
@@ -1657,8 +1690,7 @@ mod tests {
             &p,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         let (next, reused) = place_incremental_with_guide(
@@ -1666,8 +1698,7 @@ mod tests {
             &dev,
             &prev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
             &TimingGuide::default(),
         )
         .unwrap();
@@ -1689,8 +1720,7 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_counter(), &dev).unwrap();
         let opts = PlaceOpts {
-            timing_weight: 0.75,
-        };
+            timing_weight: 0.75, seed: 0 };
         let a = place_with(&p, &dev, opts).unwrap();
         let b = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
         assert_eq!(
@@ -1706,8 +1736,7 @@ mod tests {
         let p = pack(&hard_heartbeat(), &dev).unwrap();
         assert!(p.lutffs.len() >= 8, "fixture must be ≥8 LUT+FF");
         let opts = PlaceOpts {
-            timing_weight: 0.75,
-        };
+            timing_weight: 0.75, seed: 0 };
         let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
         let fp = place_with_guide(
             &p,
@@ -1733,8 +1762,7 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&hard_heartbeat(), &dev).unwrap();
         let opts = PlaceOpts {
-            timing_weight: 0.75,
-        };
+            timing_weight: 0.75, seed: 0 };
         let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
         let mcp = place_with_guide(
             &p,
@@ -1783,8 +1811,7 @@ mod tests {
             .expect("IOB-driving cluster");
         assert_ne!(iob_idx, 0, "fixture must have an internal cluster");
         let opts = PlaceOpts {
-            timing_weight: 0.75,
-        };
+            timing_weight: 0.75, seed: 0 };
         let unconstrained = place_with_guide(&p, &dev, opts, &TimingGuide::default()).unwrap();
         let fp = place_with_guide(
             &p,
@@ -1817,8 +1844,7 @@ mod tests {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&hard_heartbeat(), &dev).unwrap();
         let opts = PlaceOpts {
-            timing_weight: 0.75,
-        };
+            timing_weight: 0.75, seed: 0 };
         let g = TimingGuide {
             false_path_iob: true,
             iob_setup_mult: 1,
@@ -1908,5 +1934,22 @@ mod tests {
         let pl = place(&p, &dev).expect("budgeted legalize must not panic on n≥256");
         assert_eq!(pl.lutff_sites.len(), n);
         assert_eq!(pl.packed.lutffs.len(), n);
+    }
+
+    #[test]
+    fn seeded_order_zero_is_identity() {
+        assert_eq!(seeded_order(16, 0), (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seeded_order_is_deterministic_permutation() {
+        let a = seeded_order(64, 12345);
+        let b = seeded_order(64, 12345);
+        assert_eq!(a, b);
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..64).collect::<Vec<_>>());
+        // Different seeds (almost surely) shuffle differently.
+        assert_ne!(a, seeded_order(64, 999));
     }
 }

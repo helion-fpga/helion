@@ -879,8 +879,7 @@ mod tests {
             &p,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         let r = route(&pl, &dev).unwrap();
@@ -952,16 +951,14 @@ mod tests {
             &pa,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         let plb = place_with(
             &pbk,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         assert_ne!(
