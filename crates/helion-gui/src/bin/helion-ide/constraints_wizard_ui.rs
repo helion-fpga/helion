@@ -316,7 +316,11 @@ impl WizardUi {
     /// the given step (or all steps for Review) is clean.
     fn revalidate(&mut self, model: &IdeModel, only: Option<wiz::WizardStep>) -> bool {
         let (input, mut errs) = self.build_input();
-        let known = self.known_clocks(model);
+        // Only externally-defined clocks here: validate() adds the wizard's
+        // own clock names on top for reference checks (passing them in would
+        // flag every wizard clock as a duplicate).
+        let known: Vec<String> =
+            model.constraints.clocks.iter().map(|c| c.name.clone()).collect();
         let design = match model.design() {
             Some(d) => d,
             None => {

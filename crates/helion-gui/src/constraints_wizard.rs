@@ -566,6 +566,20 @@ set_max_delay 8.000 -from [get_ports ena] -to [get_ports led] -datapath_only\n";
     }
 
     #[test]
+    fn validate_allows_reference_to_wizard_and_known_clocks() {
+        let d = sample_design();
+        // known_clocks holds only externally-defined clocks; the wizard's own
+        // "clk" must not be flagged as a duplicate of itself.
+        let errs = validate(&sample_input(), &d, &["sys_clk".to_string()]);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        // Referencing the external clock is fine too.
+        let mut input = sample_input();
+        input.input_delays[0].clock = "sys_clk".into();
+        let errs = validate(&input, &d, &["sys_clk".to_string()]);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
     fn validation_rejects_bad_input() {
         let d = sample_design();
         // Negative period.
