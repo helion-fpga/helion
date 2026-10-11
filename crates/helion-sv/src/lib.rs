@@ -10218,9 +10218,16 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
 /// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
 /// printed `node_count` once per bit then spun in `map_wide_cone` until the
 /// 90s kill. Modest cones still lower; over this, one diagnostic and stop.
-const WIDE_CONE_PI_CAP: usize = 16;
+// FM-HEL-AREA-03: module cap raised 128->4096. The per-cone caps (PI/AND)
+/// are the real hang guard (map_wide_cone is O(ANDs) per cone). The module
+// backstop at 128 dropped bit 15 of a plain 16-bit counter: carry cones
+// accumulate ~N^2/2 ANDs across bits (16b needs ~135). 4096 fits 64-bit
+// counters with headroom while still catching pathological modules.
+// (PI cap also raised 16->32: a 16b counter MSB needs 17 PIs with ~20 ANDs;
+// narrow-but-wide cones are not a hang risk.)
+const WIDE_CONE_PI_CAP: usize = 32;
 const WIDE_CONE_AND_CAP: usize = 96;
-const WIDE_CONE_MODULE_LUT_CAP: usize = 128;
+const WIDE_CONE_MODULE_LUT_CAP: usize = 4096;
 const ASSIGN_BIT_CAP: usize = 2048;
 
 fn comb_accept(comb_bits: &[(String, Expr)], bitn: &str, capped: &mut bool) -> bool {
