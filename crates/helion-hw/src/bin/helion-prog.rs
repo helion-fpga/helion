@@ -2,7 +2,7 @@
 use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_hw::{
-    detect_boards, program_hbits_with_cable, prog_sim, resolve_cable, CableBackend, ProgramOutcome,
+    CableBackend, ProgramOutcome, detect_boards, prog_sim, program_hbits_with_cable, resolve_cable,
 };
 use std::env;
 use std::path::PathBuf;

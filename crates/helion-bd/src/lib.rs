@@ -35,7 +35,10 @@ pub fn emit_sv(bd: &BlockDesign) -> Result<String, String> {
     if !v.ok {
         return Err(v.errors.join("; "));
     }
-    let mut s = format!("module {} (\n  input logic clk,\n  input logic resetn\n);\n", bd.name);
+    let mut s = format!(
+        "module {} (\n  input logic clk,\n  input logic resetn\n);\n",
+        bd.name
+    );
     for c in &bd.cores {
         s.push_str(&format!(
             "  {} #() u_{} (.clk(clk), .resetn(resetn));\n",

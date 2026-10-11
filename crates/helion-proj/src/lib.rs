@@ -1,15 +1,15 @@
 //! Dual-mode Session, disk checkpoints `.hckp` (`write_checkpoint_to` /
 //! `open_checkpoint` / `read_checkpoint` alias), object query, opt, ECO.
 
-use helion_bits::{bitgen, bitgen_pblock, eco_lut, Bitstream};
+use helion_bits::{Bitstream, bitgen, bitgen_pblock, eco_lut};
 use helion_debug::insert_ila;
 use helion_device::{Device, Site};
-use helion_hw::{prog_sim, program_hbits_with_cable, resolve_cable, CableBackend};
+use helion_hw::{CableBackend, prog_sim, program_hbits_with_cable, resolve_cable};
 use helion_ir::{CellKind, Design, PortDir};
-use helion_pack::{apply_iob_electrical, pack, Packed};
-use helion_place::{place_incremental, place_with, PlaceOpts, Placed};
-use helion_route::{route_with, RouteOpts, Routed, HOP_DELAY_PS};
-use helion_sta::{apply_xdc, create_clock, load_xdc, report_timing_routed_xdc, Constraints};
+use helion_pack::{Packed, apply_iob_electrical, pack};
+use helion_place::{PlaceOpts, Placed, place_incremental, place_with};
+use helion_route::{HOP_DELAY_PS, RouteOpts, Routed, route_with};
+use helion_sta::{Constraints, apply_xdc, create_clock, load_xdc, report_timing_routed_xdc};
 
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
@@ -604,7 +604,16 @@ impl Session {
         let t = report_timing_routed_xdc(d, r, &clks, xdc)?;
         Ok(format!(
             "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-            d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
+            d.name,
+            t.wns_ps,
+            t.tns_ps,
+            t.setup_ps,
+            t.hold_ps,
+            t.hold_slack_ps,
+            t.endpoints,
+            t.r2r_ps,
+            t.iob_ps,
+            t.route_ps
         ))
     }
 
@@ -659,13 +668,7 @@ impl Session {
                 self.programmed = true;
                 Ok(format!(
                     "program_hw cable={} backend=sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={} (sim fabric; not board DONE)",
-                    info.id,
-                    dev.part,
-                    frames,
-                    bytes,
-                    st.done as u8,
-                    st.gwe as u8,
-                    st.crc_err as u8
+                    info.id, dev.part, frames, bytes, st.done as u8, st.gwe as u8, st.crc_err as u8
                 ))
             }
             CableBackend::MpsseSim => {
@@ -675,13 +678,7 @@ impl Session {
                 self.programmed = true;
                 Ok(format!(
                     "program_hw cable={} backend=mpsse-sim part={} frames={} bytes={} DONE={} GWE={} CRC_ERR={} (sim fabric bitbang; not board DONE)",
-                    info.id,
-                    dev.part,
-                    frames,
-                    bytes,
-                    st.done as u8,
-                    st.gwe as u8,
-                    st.crc_err as u8
+                    info.id, dev.part, frames, bytes, st.done as u8, st.gwe as u8, st.crc_err as u8
                 ))
             }
             CableBackend::OpenFpgaLoader | CableBackend::NativeUsb => {
@@ -1833,9 +1830,11 @@ mod tests {
         assert_eq!(ir.lut_inits(), Design::structural_blinky().lut_inits());
         assert_eq!(ckpt.strategy, ImplStrategy::Default);
         assert!(get_nets(proj.design.as_ref().unwrap(), Some("q")).contains(&"q".into()));
-        assert!(get_pins(proj.design.as_ref().unwrap(), "u_lut")
-            .iter()
-            .any(|p| p.ends_with("/I0")));
+        assert!(
+            get_pins(proj.design.as_ref().unwrap(), "u_lut")
+                .iter()
+                .any(|p| p.ends_with("/I0"))
+        );
     }
 
     #[test]
@@ -1921,14 +1920,15 @@ mod tests {
         let u = s.report_utilization(&dev).unwrap();
         assert!(u.contains("LUTFF=4/8192"), "{u}");
         s.set_property("DONT_TOUCH", "true", "u_lut0").unwrap();
-        assert!(s
-            .design
-            .as_ref()
-            .unwrap()
-            .cell("u_lut0")
-            .unwrap()
-            .attrs
-            .flag("DONT_TOUCH"));
+        assert!(
+            s.design
+                .as_ref()
+                .unwrap()
+                .cell("u_lut0")
+                .unwrap()
+                .attrs
+                .flag("DONT_TOUCH")
+        );
         s.open_hw_manager();
         // USB=0: product program_hw (auto) must refuse DONE — no soft-hold / no sim invent.
         let board_err = s.program_hw(&dev).unwrap_err();
@@ -1953,17 +1953,20 @@ mod tests {
         let die = dev.report_die();
         assert!(die.contains("HL10T-C32-1"));
         s.mark_debug("q3").unwrap();
-        assert!(s
-            .design
-            .as_ref()
-            .unwrap()
-            .net("q3")
-            .unwrap()
-            .attrs
-            .flag("mark_debug"));
-        assert!(get_cells(s.design.as_ref().unwrap(), None)
-            .iter()
-            .any(|c| c.contains("lut")));
+        assert!(
+            s.design
+                .as_ref()
+                .unwrap()
+                .net("q3")
+                .unwrap()
+                .attrs
+                .flag("mark_debug")
+        );
+        assert!(
+            get_cells(s.design.as_ref().unwrap(), None)
+                .iter()
+                .any(|c| c.contains("lut"))
+        );
         assert!(!get_pins(s.design.as_ref().unwrap(), "u_lut0").is_empty());
     }
 

@@ -21,7 +21,9 @@ endmodule
 "#;
 
 pub fn cell_names() -> &'static [&'static str] {
-    &["LUT6", "HFF", "HCARRY", "MAC27", "BRAM18", "HIDDR", "HODDR", "HBUFQ", "HSTARTUP"]
+    &[
+        "LUT6", "HFF", "HCARRY", "MAC27", "BRAM18", "HIDDR", "HODDR", "HBUFQ", "HSTARTUP",
+    ]
 }
 
 /// Map `p <= a * b + c` onto HELIONLIB MAC27 (site primitive).
@@ -47,10 +49,7 @@ mod tests {
         assert!(names.contains(&"MAC27"));
         assert!(!names.iter().any(|n| n.contains("FDRE") || *n == "LUT6_2"));
         assert!(LUT6.contains("module LUT6"));
-        assert!(matches!(
-            map_muladd_to_mac27(),
-            helion_ir::CellKind::Mac27
-        ));
+        assert!(matches!(map_muladd_to_mac27(), helion_ir::CellKind::Mac27));
         let hb1 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../ip/h_rv32_hb1/h_rv32_hb1.v");
         let src = std::fs::read_to_string(&hb1).expect("HB1 wrap");
@@ -83,6 +82,12 @@ mod tests {
         assert_eq!(p.macs.len(), 1);
         let pl = place(&p, &dev).unwrap();
         assert_eq!(pl.mac_sites[0].kind, helion_device::SiteKind::Dsp);
-        assert!(Device::load_part("HL10T-C32-1").unwrap().dsp_sites().next().is_none());
+        assert!(
+            Device::load_part("HL10T-C32-1")
+                .unwrap()
+                .dsp_sites()
+                .next()
+                .is_none()
+        );
     }
 }

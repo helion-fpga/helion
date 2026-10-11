@@ -8,7 +8,8 @@ use helion_sv::synth_sv_path;
 
 #[test]
 fn sv_blinky_through_pnr_toggles_led() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/blinky.sv");
+    let root =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/blinky.sv");
     let design = synth_sv_path(&root).expect("sv-parser synth");
     let dev = Device::load_part("HL10T-C32-1").unwrap();
     let packed = pack(&design, &dev).unwrap();
@@ -34,7 +35,8 @@ fn sv_blinky_through_pnr_toggles_led() {
 
 #[test]
 fn sv_counter_through_pnr_is_cnt3() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
+    let root =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
     let design = synth_sv_path(&root).expect("sv-parser synth counter");
     assert_eq!(design.lut_inits().len(), 4);
     let dev = Device::load_part("HL10T-C32-1").unwrap();
@@ -81,5 +83,8 @@ fn sv_hierarchy_toggles() {
             last = now;
         }
     }
-    assert!(changes >= 1, "hierarchical blinky must toggle, changes={changes}");
+    assert!(
+        changes >= 1,
+        "hierarchical blinky must toggle, changes={changes}"
+    );
 }

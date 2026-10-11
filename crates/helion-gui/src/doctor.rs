@@ -85,7 +85,10 @@ mod tests {
             "{d}"
         );
         assert!(d.contains("target "), "{d}");
-        assert!(d.contains("rustc release:") || d.contains("rustc not"), "{d}");
+        assert!(
+            d.contains("rustc release:") || d.contains("rustc not"),
+            "{d}"
+        );
         assert!(
             d.contains("HAD HL10T-C32-1"),
             "doctor must load the HAD part: {d}"

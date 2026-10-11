@@ -242,15 +242,15 @@ pub fn apply_more(s: &mut ChromeState, tab: WorkspaceTab) {
 /// Drag a splitter; size is kept. Returns false if the travel is below the bar.
 pub fn drag_sidebar(s: &mut ChromeState, delta: f32) -> bool {
     let before = s.sidebar_width;
-    s.sidebar_width = (s.sidebar_width + delta)
-        .clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
+    s.sidebar_width =
+        (s.sidebar_width + delta).clamp(chrome::SIDEBAR_MIN_WIDTH, chrome::SIDEBAR_MAX_WIDTH);
     (s.sidebar_width - before).abs() + 0.5 >= delta.abs().min(chrome::SPLITTER_MIN_DELTA_PX)
 }
 
 pub fn drag_console(s: &mut ChromeState, delta: f32) -> bool {
     let before = s.console_height;
-    s.console_height = (s.console_height + delta)
-        .clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
+    s.console_height =
+        (s.console_height + delta).clamp(chrome::CONSOLE_MIN_HEIGHT, chrome::CONSOLE_MAX_HEIGHT);
     (s.console_height - before).abs() + 0.5 >= delta.abs().min(chrome::SPLITTER_MIN_DELTA_PX)
 }
 
@@ -378,7 +378,11 @@ pub fn spawn_job(model: IdeModel, kind: JobKind) -> JobHandle {
         .spawn(move || {
             let mut model = model;
             let result = run_kind(&mut model, &kind);
-            let _ = tx.send(JobOutcome { model, kind, result });
+            let _ = tx.send(JobOutcome {
+                model,
+                kind,
+                result,
+            });
         });
     JobHandle { rx }
 }
@@ -467,7 +471,12 @@ impl ChromeDriver {
             &format!("{pane:?}"),
             class,
         );
-        debug_assert_eq!(pane, expected, "canvas {} click painted {pane:?}", c.label());
+        debug_assert_eq!(
+            pane,
+            expected,
+            "canvas {} click painted {pane:?}",
+            c.label()
+        );
     }
 
     pub fn click_more(&mut self, tab: WorkspaceTab) {
@@ -488,7 +497,8 @@ impl ChromeDriver {
             class,
         );
         debug_assert_eq!(
-            pane, expected,
+            pane,
+            expected,
             "More {} set workspace={:?} but pane={pane:?}",
             tab.label(),
             self.chrome.workspace
@@ -665,7 +675,11 @@ mod tests {
         d.click_open(&example("counter.sv")).unwrap();
         assert_eq!(d.pane(), WorkspacePane::Editor);
         assert!(
-            d.model.tree.sources.iter().any(|s| s.ends_with("counter.sv")),
+            d.model
+                .tree
+                .sources
+                .iter()
+                .any(|s| s.ends_with("counter.sv")),
             "{:?}",
             d.model.tree.sources
         );
@@ -739,7 +753,12 @@ mod tests {
                 "More {} swallowed by Timing",
                 tab.label()
             );
-            assert_eq!(d.trace.last_class(), Some(EventClass::Ok), "{}", tab.label());
+            assert_eq!(
+                d.trace.last_class(),
+                Some(EventClass::Ok),
+                "{}",
+                tab.label()
+            );
         }
     }
 
@@ -800,11 +819,7 @@ mod tests {
                 g.clipped_rail
             );
             assert!(g.more_or_tabs_visible, "{w}x{h} dropped a canvas tab");
-            assert!(
-                g.die_fill >= 0.80,
-                "{w}x{h} die fill {:.3}",
-                g.die_fill
-            );
+            assert!(g.die_fill >= 0.80, "{w}x{h} die fill {:.3}", g.die_fill);
             assert!(g.die_gap_px <= 80.0, "{w}x{h} die gap {}", g.die_gap_px);
             assert!(g.splitter_can_travel);
             assert!(g.table_declares_scroll || w > 1200.0);
@@ -909,7 +924,10 @@ mod tests {
         d.click_more(WorkspaceTab::Hierarchy);
         assert_eq!(d.pane(), WorkspacePane::Hierarchy);
         let hier = d.model.hierarchy.drawing();
-        assert!(!hier.boxes.is_empty(), "hierarchy after Implement must have boxes");
+        assert!(
+            !hier.boxes.is_empty(),
+            "hierarchy after Implement must have boxes"
+        );
         let native = chrome::native_drawing_fill(hier.width, hier.height, 1000.0, 400.0);
         assert!(
             native < chrome::PANE_FILL_MIN,
@@ -947,7 +965,10 @@ mod tests {
         assert_eq!(d.pane(), WorkspacePane::Summary);
         let g = d.model.project_summary_gadgets().len();
         let sb = chrome::nv_table_bbox(g.max(1), 1000.0, 400.0);
-        assert!(sb.fills() || sb.fill >= chrome::PANE_FILL_MIN, "summary {sb:?}");
+        assert!(
+            sb.fills() || sb.fill >= chrome::PANE_FILL_MIN,
+            "summary {sb:?}"
+        );
         assert!(chrome::occupancy_bar_w(820.0) > 160.0);
         d.click_more(WorkspaceTab::Power);
         assert_eq!(d.pane(), WorkspacePane::Power);
@@ -1068,7 +1089,9 @@ mod tests {
     #[test]
     fn open_counter_prj_then_implement_gold_wns_9640() {
         let mut d = ChromeDriver::new();
-        let out = d.click_open(&example("counter.prj")).expect("open counter.prj");
+        let out = d
+            .click_open(&example("counter.prj"))
+            .expect("open counter.prj");
         assert!(
             out.contains("open_project") || d.model.user_sdc,
             "expected project open: {out}"

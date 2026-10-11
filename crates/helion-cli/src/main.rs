@@ -1,22 +1,22 @@
-use helion_bits::{bitgen, bitgen_pblock, eco_lut, readback_lut_init, Bitstream};
+use helion_bits::{Bitstream, bitgen, bitgen_pblock, eco_lut, readback_lut_init};
 use helion_device::Device;
 use helion_drc::check_routed;
 use helion_fabric::Fabric;
 use helion_hls::synth_c_path;
 use helion_hw::{
-    detect_boards, list_cables, prog_sim, program_hbits_with_cable, resolve_cable, CableBackend,
-    ProgramOutcome, Tap,
+    CableBackend, ProgramOutcome, Tap, detect_boards, list_cables, prog_sim,
+    program_hbits_with_cable, resolve_cable,
 };
 use helion_ir::Design;
 use helion_pack::pack;
-use helion_place::{place, place_with, PlaceOpts};
+use helion_place::{PlaceOpts, place, place_with};
 use helion_proj::{
-    constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path, Mode, Session,
+    Mode, Session, constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path,
 };
-use helion_route::{route_with, RouteOpts, Routed};
+use helion_route::{RouteOpts, Routed, route_with};
 use helion_sta::{
-    apply_xdc, create_clock, load_sdc, load_xdc, report_power, report_timing_routed,
-    report_timing_routed_xdc, Constraints, OperatingConditions, PowerReport, TimingResult,
+    Constraints, OperatingConditions, PowerReport, TimingResult, apply_xdc, create_clock, load_sdc,
+    load_xdc, report_power, report_timing_routed, report_timing_routed_xdc,
 };
 use helion_sv::{elaborate_sv_sources, synth_sv_files, synth_sv_path};
 use helion_vhdl::synth_vhdl_path;
@@ -861,7 +861,15 @@ fn cmd_project_checkpoint_write(args: &[String]) {
         .unwrap_or("-");
     let timing = format!(
         "report_timing {dname} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-        t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
+        t.wns_ps,
+        t.tns_ps,
+        t.setup_ps,
+        t.hold_ps,
+        t.hold_slack_ps,
+        t.endpoints,
+        t.r2r_ps,
+        t.iob_ps,
+        t.route_ps
     );
     println!("{wr}");
     println!("{timing}");

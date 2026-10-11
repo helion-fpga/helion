@@ -210,7 +210,14 @@ pub fn can_advance(
         SessionStage::Elaborated => "Synthesize first",
         SessionStage::Placed => "Place first",
         SessionStage::Routed => "Route first",
-        other => return Err(StageError::prereq(from, to, other, format!("{other} first"))),
+        other => {
+            return Err(StageError::prereq(
+                from,
+                to,
+                other,
+                format!("{other} first"),
+            ));
+        }
     };
     Err(StageError::prereq(from, to, missing, tip))
 }

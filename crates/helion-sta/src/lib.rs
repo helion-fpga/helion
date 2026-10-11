@@ -929,12 +929,7 @@ pub fn report_timing_routed(
     if r.endpoints == 0 {
         return Ok(r);
     }
-    let route_ps = routed
-        .iob_src
-        .iter()
-        .map(|x| x.delay_ps)
-        .max()
-        .unwrap_or(0);
+    let route_ps = routed.iob_src.iter().map(|x| x.delay_ps).max().unwrap_or(0);
     r.route_ps = route_ps;
     r.clk_net_ps = clock_network_delay_ps(&routed.placed);
     r.iob_ps = FF_CKQ_PS + route_ps + iob_pad_ps(design);
@@ -984,7 +979,6 @@ pub fn load_sdc(text: &str, clocks: &mut Vec<Clock>) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 fn tcl_name(joined: &str, key: &str) -> Option<String> {
     joined.split_once(key).and_then(|(_, r)| {
@@ -1331,9 +1325,8 @@ impl Constraints {
             return false;
         }
         self.false_paths.iter().any(|fp| {
-            let pin_scoped = fp.contains("get_pins")
-                || fp.contains("get_cells")
-                || fp.contains('/');
+            let pin_scoped =
+                fp.contains("get_pins") || fp.contains("get_cells") || fp.contains('/');
             if !pin_scoped {
                 return false;
             }
@@ -1375,12 +1368,20 @@ impl Constraints {
 
     /// Largest late `set_clock_latency` in ps (0 if none).
     pub fn latency_late_ps(&self) -> i64 {
-        self.clock_latencies.iter().map(|l| l.late_ps).max().unwrap_or(0)
+        self.clock_latencies
+            .iter()
+            .map(|l| l.late_ps)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Largest early `set_clock_latency` in ps (0 if none).
     pub fn latency_early_ps(&self) -> i64 {
-        self.clock_latencies.iter().map(|l| l.early_ps).max().unwrap_or(0)
+        self.clock_latencies
+            .iter()
+            .map(|l| l.early_ps)
+            .max()
+            .unwrap_or(0)
     }
 
     /// UG903: disable_timing arcs or case_analysis constants drop I/O paths like false path.
@@ -1515,7 +1516,10 @@ impl Constraints {
 
     /// Early (hold) path scale: derate × operating-conditions. 1000 keeps gold hold.
     pub fn path_early_milli(&self) -> i64 {
-        combine_milli(self.early_derate_milli(), self.operating_conditions.scale_milli())
+        combine_milli(
+            self.early_derate_milli(),
+            self.operating_conditions.scale_milli(),
+        )
     }
 
     /// Routed clock insertion applied to STA. Ideal or stopped clocks keep 0 (gold WNS).
@@ -1682,7 +1686,12 @@ fn clock_root<'a>(clocks: &'a [Clock], c: &'a Clock) -> &'a str {
     &cur.name
 }
 
-fn classify_clock_pair(from: &Clock, to: &Clock, clocks: &[Clock], xdc: &Constraints) -> ClockRelation {
+fn classify_clock_pair(
+    from: &Clock,
+    to: &Clock,
+    clocks: &[Clock],
+    xdc: &Constraints,
+) -> ClockRelation {
     if from.name != to.name {
         if let Some(g) = xdc.clock_groups_for_pair(&from.name, &to.name) {
             if g.exclusive {
@@ -1698,7 +1707,10 @@ fn classify_clock_pair(from: &Clock, to: &Clock, clocks: &[Clock], xdc: &Constra
         if xdc.false_path_partial_covers_clocks(&from.name, &to.name) {
             return ClockRelation::PartialFalsePath;
         }
-        if xdc.datapath_max_delay_covers(&from.name, &to.name).is_some() {
+        if xdc
+            .datapath_max_delay_covers(&from.name, &to.name)
+            .is_some()
+        {
             return ClockRelation::TimedDatapath;
         }
     }
@@ -1764,11 +1776,7 @@ pub fn report_clock_interaction(
                 let delay = analysis_req - t.wns_ps;
                 (
                     Some(requirement_ps - delay),
-                    if from.name == to.name {
-                        t.endpoints
-                    } else {
-                        1
-                    },
+                    if from.name == to.name { t.endpoints } else { 1 },
                 )
             } else {
                 (None, usize::from(from.name != to.name))
@@ -1790,7 +1798,11 @@ pub fn report_clock_interaction(
     }
 }
 
-fn slack_from_requirement(timing: Option<&TimingResult>, analysis_req: i64, requirement_ps: i64) -> Option<i64> {
+fn slack_from_requirement(
+    timing: Option<&TimingResult>,
+    analysis_req: i64,
+    requirement_ps: i64,
+) -> Option<i64> {
     timing.map(|t| requirement_ps - (analysis_req - t.wns_ps))
 }
 
@@ -1890,7 +1902,10 @@ pub fn report_timing_summary(
         }
     }
     let current_weight = xdc.group_path_weight_milli();
-    let default_req = clocks.first().map(|c| c.period_ps as i64).unwrap_or(analysis_req);
+    let default_req = clocks
+        .first()
+        .map(|c| c.period_ps as i64)
+        .unwrap_or(analysis_req);
     for g in &xdc.path_groups {
         let req = if g.to.is_empty() {
             default_req
@@ -1901,9 +1916,8 @@ pub fn report_timing_summary(
                 .map(|c| c.period_ps as i64)
                 .unwrap_or(default_req)
         };
-        let wns_ps = timing.map(|t| {
-            weighted_setup_slack(t, analysis_req, req, g.weight_milli, current_weight)
-        });
+        let wns_ps = timing
+            .map(|t| weighted_setup_slack(t, analysis_req, req, g.weight_milli, current_weight));
         let from = if g.from.is_empty() {
             clocks[0].name.clone()
         } else {
@@ -1979,9 +1993,7 @@ fn clock_ff_loads(design: &Design, net: &str) -> usize {
     design
         .cells
         .iter()
-        .filter(|c| {
-            matches!(c.kind, CellKind::Hff) && design.net_on(&c.name, "CLK") == Some(net)
-        })
+        .filter(|c| matches!(c.kind, CellKind::Hff) && design.net_on(&c.name, "CLK") == Some(net))
         .count()
 }
 
@@ -1994,7 +2006,11 @@ fn ff_d_source_ff(design: &Design, ff: &str) -> Option<String> {
         .endpoints
         .iter()
         .filter(|e| e.pin == "Q")
-        .filter(|e| design.cell(&e.cell).is_some_and(|c| matches!(c.kind, CellKind::Hff)))
+        .filter(|e| {
+            design
+                .cell(&e.cell)
+                .is_some_and(|c| matches!(c.kind, CellKind::Hff))
+        })
         .map(|e| e.cell.clone())
         .collect();
     if q_drivers.len() == 1 {
@@ -2197,9 +2213,14 @@ pub fn report_clock_networks(
     }
 }
 
-fn occupancy_counts(design: Option<&Design>, placed: Option<&Placed>) -> (usize, usize, usize, usize, usize, usize) {
+fn occupancy_counts(
+    design: Option<&Design>,
+    placed: Option<&Placed>,
+) -> (usize, usize, usize, usize, usize, usize) {
     if let Some(p) = placed {
-        let nets = design.map(|d| d.nets.len()).unwrap_or(p.packed.lutffs.len());
+        let nets = design
+            .map(|d| d.nets.len())
+            .unwrap_or(p.packed.lutffs.len());
         (
             p.packed.lutffs.len(),
             p.packed.iobs.len(),
@@ -2298,7 +2319,8 @@ pub fn report_power(
     let dynamic_base = clocks_dyn + logic_dyn + signals_dyn + io_dyn + bram_dyn + dsp_dyn;
     // P ~ V^2 (dynamic), leakage ~ V * (1 + k·ΔT). Gold 1.00 V / 25 °C = 1000 milli.
     let dyn_milli = voltage_mv.saturating_mul(voltage_mv) / 1000;
-    let leak_milli = voltage_mv.saturating_mul(1000 + (temperature_c - 25).saturating_mul(8)) / 1000;
+    let leak_milli =
+        voltage_mv.saturating_mul(1000 + (temperature_c - 25).saturating_mul(8)) / 1000;
     let scale = |uw: i64, milli: i64| uw.saturating_mul(milli.max(1)) / 1000;
     let static_uw = scale(static_base, leak_milli);
     let clocks_uw = scale(clocks_dyn, dyn_milli);
@@ -2551,9 +2573,8 @@ pub fn report_methodology(
     let clock_pins = clock_pin_names(clocks, xdc);
     let implicit_clk = clock_pins.is_empty();
     for p in &d.ports {
-        let is_clk = clock_pins.contains(&p.name)
-            || (implicit_clk && p.name == "clk")
-            || p.name == "clk";
+        let is_clk =
+            clock_pins.contains(&p.name) || (implicit_clk && p.name == "clk") || p.name == "clk";
         match p.dir {
             PortDir::In | PortDir::Inout if !is_clk => {
                 if !xdc.input_delay_ps.contains_key(&p.name) {
@@ -2662,11 +2683,7 @@ pub fn report_methodology(
             pending.push((cell.from.clone(), cell.to.clone(), sync));
         }
         for (from, to, sync) in pending {
-            if !sync
-                && synced_pairs
-                    .iter()
-                    .any(|(f, t)| f == &to && t == &from)
-            {
+            if !sync && synced_pairs.iter().any(|(f, t)| f == &to && t == &from) {
                 // Covered by the reverse 2FF sync; do not CriticalWarning.
                 continue;
             }
@@ -2677,9 +2694,7 @@ pub fn report_methodology(
                     MethodologySeverity::Warning,
                     "CDC",
                     format!("{from}->{to}"),
-                    format!(
-                        "Timed (unsafe) CDC {from} → {to} with synchronizer (UG906 CDC-1)"
-                    ),
+                    format!("Timed (unsafe) CDC {from} → {to} with synchronizer (UG906 CDC-1)"),
                 );
             } else {
                 methodology_push(
@@ -2785,7 +2800,8 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                     }
                     i += 1;
                 }
-                let ns = period_ns.ok_or_else(|| format!("create_clock missing -period: {line}"))?;
+                let ns =
+                    period_ns.ok_or_else(|| format!("create_clock missing -period: {line}"))?;
                 let ps = (ns * 1000.0).round() as u64;
                 if name.is_empty() {
                     name = source.clone();
@@ -2794,7 +2810,11 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
             }
             "create_generated_clock" => {
                 let mut name = "genclk".to_string();
-                let mut master = c.clocks.first().map(|k| k.name.clone()).unwrap_or_else(|| "clk".into());
+                let mut master = c
+                    .clocks
+                    .first()
+                    .map(|k| k.name.clone())
+                    .unwrap_or_else(|| "clk".into());
                 let mut divide_by: Option<u32> = None;
                 let mut multiply_by: Option<u32> = None;
                 let mut invert = false;
@@ -2830,14 +2850,18 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                     }
                     if toks[i] == "-source" {
                         let joined = toks[i..].join(" ");
-                        if let Some(n) = tcl_name(&joined, "get_ports").or_else(|| tcl_name(&joined, "get_pins")) {
+                        if let Some(n) =
+                            tcl_name(&joined, "get_ports").or_else(|| tcl_name(&joined, "get_pins"))
+                        {
                             master = n;
                         }
                         i += 1;
                         continue;
                     }
                     let joined = toks[i..].join(" ");
-                    if let Some(n) = tcl_name(&joined, "get_pins").or_else(|| tcl_name(&joined, "get_ports")) {
+                    if let Some(n) =
+                        tcl_name(&joined, "get_pins").or_else(|| tcl_name(&joined, "get_ports"))
+                    {
                         source = n;
                     }
                     i += 1;
@@ -2851,11 +2875,12 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                         master = k.name.clone();
                     }
                 }
-                let divide_by = divide_by.unwrap_or(if multiply_by.is_some() || !edges.is_empty() {
-                    1
-                } else {
-                    2
-                });
+                let divide_by =
+                    divide_by.unwrap_or(if multiply_by.is_some() || !edges.is_empty() {
+                        1
+                    } else {
+                        2
+                    });
                 let multiply_by = multiply_by.unwrap_or(1);
                 create_generated_clock_with(
                     &mut c.clocks,
@@ -3202,7 +3227,9 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                 let (from, to) = tcl_from_to(&toks);
                 let object = tcl_object_name(&toks.join(" ")).unwrap_or_default();
                 if from.is_empty() && to.is_empty() && object.is_empty() {
-                    return Err(format!("{line}: set_disable_timing needs -from/-to or a cell/pin"));
+                    return Err(format!(
+                        "{line}: set_disable_timing needs -from/-to or a cell/pin"
+                    ));
                 }
                 c.disable_timings.push(DisableTiming { from, to, object });
             }
@@ -3302,9 +3329,7 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                                 }
                             } else if clock.is_empty() {
                                 let cleaned = other
-                                    .trim_matches(|c: char| {
-                                        !c.is_ascii_alphanumeric() && c != '_'
-                                    })
+                                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                                     .to_string();
                                 if !cleaned.is_empty() && cleaned != "get_clocks" {
                                     clock = cleaned;
@@ -3484,9 +3509,7 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                             name = toks
                                 .get(i + 1)
                                 .unwrap_or(&"default")
-                                .trim_matches(|ch: char| {
-                                    ch == '{' || ch == '}' || ch == '"'
-                                })
+                                .trim_matches(|ch: char| ch == '{' || ch == '}' || ch == '"')
                                 .to_string();
                             i += 2;
                         }
@@ -3582,9 +3605,7 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                                 clock = n;
                             } else if let Some(n) = toks.get(i + 1) {
                                 clock = n
-                                    .trim_matches(|c: char| {
-                                        !c.is_ascii_alphanumeric() && c != '_'
-                                    })
+                                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                                     .to_string();
                             }
                             i += 2;
@@ -3678,11 +3699,12 @@ pub fn load_xdc(text: &str) -> Result<Constraints, String> {
                     let joined = toks[3..].join(" ");
                     let port = tcl_name(&joined, "get_ports")
                         .or_else(|| {
-                            toks.get(3).map(|s| {
-                                s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                    .to_string()
-                            })
-                            .filter(|s| !s.is_empty())
+                            toks.get(3)
+                                .map(|s| {
+                                    s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                        .to_string()
+                                })
+                                .filter(|s| !s.is_empty())
                         })
                         .unwrap_or_default();
                     if !port.is_empty() {
@@ -3731,9 +3753,8 @@ pub fn apply_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
 /// `create_generated_clock -invert` are a half-cycle setup; `-stop_propagation`
 /// keeps ideal (0) insertion. Empty constraints keep gold WNS.
 pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64) {
-    let false_out = !xdc.false_paths.is_empty()
-        || xdc.clock_groups_false_path()
-        || xdc.arcs_disabled();
+    let false_out =
+        !xdc.false_paths.is_empty() || xdc.clock_groups_false_path() || xdc.arcs_disabled();
     let out_d = xdc.output_delay_ps.values().copied().max().unwrap_or(0);
     let in_d = xdc.input_delay_ps.values().copied().max().unwrap_or(0);
     if false_out {
@@ -3977,20 +3998,22 @@ pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -
 
 /// Worst-delay path after place+route (IOB vs r2r).
 pub fn critical_path(design: &Design, routed: &Routed, t: &TimingResult) -> Option<TimingPath> {
-    timing_paths_routed(design, routed, t).into_iter().max_by(|a, b| {
-        a.delay_ps.cmp(&b.delay_ps).then_with(|| {
-            let hops = |p: &TimingPath| {
-                routed
-                    .iob_src
-                    .iter()
-                    .filter(|r| p.nets.iter().any(|n| n == &r.net))
-                    .map(|r| r.hops)
-                    .max()
-                    .unwrap_or(0)
-            };
-            hops(a).cmp(&hops(b))
+    timing_paths_routed(design, routed, t)
+        .into_iter()
+        .max_by(|a, b| {
+            a.delay_ps.cmp(&b.delay_ps).then_with(|| {
+                let hops = |p: &TimingPath| {
+                    routed
+                        .iob_src
+                        .iter()
+                        .filter(|r| p.nets.iter().any(|n| n == &r.net))
+                        .map(|r| r.hops)
+                        .max()
+                        .unwrap_or(0)
+                };
+                hops(a).cmp(&hops(b))
+            })
         })
-    })
 }
 
 /// Headless Device-canvas highlight from a timing path. Sites are HAD IDs.
@@ -4081,8 +4104,8 @@ mod tests {
     use helion_device::Device;
     use helion_ir::Design;
     use helion_pack::pack;
-    use helion_place::{hard_heartbeat, place, place_with, place_with_guide, PlaceOpts};
-    use helion_route::{route_with_guide, RouteOpts};
+    use helion_place::{PlaceOpts, hard_heartbeat, place, place_with, place_with_guide};
+    use helion_route::{RouteOpts, route_with_guide};
 
     #[test]
     fn create_clock_and_generated() {
@@ -4103,23 +4126,12 @@ mod tests {
     fn create_generated_clock_multiply_by_invert_edges() {
         let mut clks = Vec::new();
         create_clock(&mut clks, "clk", 10_000, "clk");
-        create_generated_clock_with(&mut clks, "clk2x", "clk", 1, 2, false, &[], "u_ff/Q")
-            .unwrap();
+        create_generated_clock_with(&mut clks, "clk2x", "clk", 1, 2, false, &[], "u_ff/Q").unwrap();
         assert!(clks[1].generated);
         assert_eq!(clks[1].period_ps, 5_000);
         assert_eq!(clks[1].multiply_by, 2);
         assert!(!clks[1].invert);
-        create_generated_clock_with(
-            &mut clks,
-            "clkinv",
-            "clk",
-            1,
-            1,
-            true,
-            &[],
-            "u_ff/Q",
-        )
-        .unwrap();
+        create_generated_clock_with(&mut clks, "clkinv", "clk", 1, 1, true, &[], "u_ff/Q").unwrap();
         assert!(clks[2].invert);
         assert_eq!(clks[2].period_ps, 10_000);
         create_generated_clock_with(
@@ -4135,17 +4147,10 @@ mod tests {
         .unwrap();
         assert_eq!(clks[3].period_ps, 20_000);
         assert_eq!(clks[3].edges, vec![1, 3, 5]);
-        assert!(create_generated_clock_with(
-            &mut clks,
-            "bad",
-            "clk",
-            1,
-            1,
-            false,
-            &[1, 3],
-            "u_ff/Q"
-        )
-        .is_err());
+        assert!(
+            create_generated_clock_with(&mut clks, "bad", "clk", 1, 1, false, &[1, 3], "u_ff/Q")
+                .is_err()
+        );
 
         let xdc = load_xdc(
             r#"
@@ -4165,7 +4170,11 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let edg = xdc.clocks.iter().find(|c| c.name == "clkedg").unwrap();
         assert_eq!(edg.period_ps, 20_000);
         assert_eq!(edg.edges, vec![1, 3, 5]);
-        assert_eq!(xdc.invert_setup_ps(20_000), 0, "max-period generated is not inverted");
+        assert_eq!(
+            xdc.invert_setup_ps(20_000),
+            0,
+            "max-period generated is not inverted"
+        );
         let mut only_inv = Constraints::default();
         only_inv.clocks.push(inv.clone());
         assert_eq!(only_inv.invert_setup_ps(10_000), 5_000);
@@ -4183,8 +4192,8 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let mut gold_clks = Vec::new();
         create_clock(&mut gold_clks, "clk", 10_000, "clk");
         let gold = report_timing_routed(&d, &routed, &gold_clks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &gold_clks, &Constraints::default())
-            .unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &gold_clks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, gold.wns_ps, "empty XDC must keep gold WNS");
 
         let mut mul_xdc = Constraints::default();
@@ -4242,7 +4251,14 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let d = Design::structural_blinky();
         let p = pack(&d, &dev).unwrap();
         let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
-        let td = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let td = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let mut clks = Vec::new();
         create_clock(&mut clks, "clk", 10_000, "clk");
         let a = report_timing_placed(&d, &wl, &clks).unwrap();
@@ -4262,17 +4278,33 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let d = Design::structural_blinky();
         let p = pack(&d, &dev).unwrap();
         let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
-        let td = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let td = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let r_wl = helion_route::route(&wl, &dev).unwrap();
         let r_td = helion_route::route(&td, &dev).unwrap();
         let mut clks = Vec::new();
         create_clock(&mut clks, "clk", 10_000, "clk");
         let a = report_timing_routed(&d, &r_wl, &clks).unwrap();
         let b = report_timing_routed(&d, &r_td, &clks).unwrap();
-        assert_ne!(a.wns_ps, b.wns_ps, "WNS must move with placement (WL {} TD {})", a.wns_ps, b.wns_ps);
+        assert_ne!(
+            a.wns_ps, b.wns_ps,
+            "WNS must move with placement (WL {} TD {})",
+            a.wns_ps, b.wns_ps
+        );
         assert_ne!(a.hold_ps, b.hold_ps, "hold must move with placement");
         assert_ne!(a.setup_ps, b.setup_ps, "setup must move with placement");
-        assert!(b.wns_ps > a.wns_ps, "timing-driven must improve WNS (TD {} WL {})", b.wns_ps, a.wns_ps);
+        assert!(
+            b.wns_ps > a.wns_ps,
+            "timing-driven must improve WNS (TD {} WL {})",
+            b.wns_ps,
+            a.wns_ps
+        );
         assert!(b.setup_ps < a.setup_ps);
         assert!(b.hold_ps < a.hold_ps, "shorter route → less hold delay");
         assert!(a.route_ps > 0 && b.route_ps > 0);
@@ -4326,7 +4358,9 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(c.output_delay_ps["led"], 2000);
         assert_eq!(c.input_delay_ps["clk"], 1500);
         assert!(
-            c.false_paths.iter().any(|p| sdc_token_eq(p, "clk") && sdc_token_eq(p, "led")),
+            c.false_paths
+                .iter()
+                .any(|p| sdc_token_eq(p, "clk") && sdc_token_eq(p, "led")),
             "false_path must retain both ports: {:?}",
             c.false_paths
         );
@@ -4334,7 +4368,15 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
 
         let mut d = Design::structural_blinky();
         apply_xdc(&mut d, &c).unwrap();
-        assert_eq!(d.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("LOC"), Some("IOB_X5Y0"));
+        assert_eq!(
+            d.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("LOC"),
+            Some("IOB_X5Y0")
+        );
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
@@ -4352,7 +4394,10 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
             base.wns_ps
         );
         let falsep = report_timing_xdc(&d, &c.clocks, &c).unwrap();
-        assert_eq!(falsep.setup_ps, falsep.r2r_ps, "false path must drop IOB from setup");
+        assert_eq!(
+            falsep.setup_ps, falsep.r2r_ps,
+            "false path must drop IOB from setup"
+        );
         assert_ne!(with_d.wns_ps, falsep.wns_ps);
 
         let routed = helion_route::route(&pl, &dev).unwrap();
@@ -4378,7 +4423,12 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
         assert_eq!(xdc.iostandards["led"], "LVCMOS33");
         apply_xdc(&mut d, &xdc).unwrap();
         assert_eq!(
-            d.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("IOSTANDARD"),
+            d.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("IOSTANDARD"),
             Some("LVCMOS33")
         );
 
@@ -4405,7 +4455,10 @@ set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]
             a.wns_ps
         );
         assert_eq!(a.iob_ps, FF_CKQ_PS + a.route_ps + IOB_PS);
-        assert_eq!(b.iob_ps, FF_CKQ_PS + b.route_ps + iostandard_pad_ps(Some("LVCMOS33")));
+        assert_eq!(
+            b.iob_ps,
+            FF_CKQ_PS + b.route_ps + iostandard_pad_ps(Some("LVCMOS33"))
+        );
     }
 
     #[test]
@@ -4531,7 +4584,8 @@ set_max_delay -datapath_only 2.5 -from [get_pins u_ff/Q] -to [get_ports led]
         let pl = place(&p, &dev).unwrap();
         let routed = helion_route::route(&pl, &dev).unwrap();
         let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
         assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
 
@@ -4554,7 +4608,10 @@ set_max_delay -datapath_only 2.5 -from [get_pins u_ff/Q] -to [get_ports led]
         let mut hold = mcp.clone();
         hold.multicycle_paths.push(xdc.multicycle_paths[1].clone());
         let with_hold = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &hold).unwrap();
-        assert_eq!(with_hold.wns_ps, with_mcp.wns_ps, "hold MCP must not move setup WNS");
+        assert_eq!(
+            with_hold.wns_ps, with_mcp.wns_ps,
+            "hold MCP must not move setup WNS"
+        );
         assert_eq!(
             with_hold.hold_slack_ps,
             base.hold_slack_ps - 10_000,
@@ -4600,7 +4657,10 @@ set_clock_groups -physically_exclusive -group [get_clocks sys] -group [get_clock
         assert_eq!(xdc.clock_groups.len(), 2);
         assert!(xdc.clock_groups[0].asynchronous);
         assert!(!xdc.clock_groups[0].exclusive);
-        assert_eq!(xdc.clock_groups[0].groups, vec![vec!["clk".to_string()], vec!["virt".to_string()]]);
+        assert_eq!(
+            xdc.clock_groups[0].groups,
+            vec![vec!["clk".to_string()], vec!["virt".to_string()]]
+        );
         assert!(xdc.clock_groups[1].exclusive);
         assert!(!xdc.clock_groups[1].asynchronous);
         assert!(xdc.clock_groups_false_path());
@@ -4611,7 +4671,8 @@ set_clock_groups -physically_exclusive -group [get_clocks sys] -group [get_clock
         let pl = place(&p, &dev).unwrap();
         let routed = helion_route::route(&pl, &dev).unwrap();
         let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
         assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
 
@@ -4625,7 +4686,10 @@ set_clock_groups -physically_exclusive -group [get_clocks sys] -group [get_clock
             with_min.hold_slack_ps,
             base.hold_ps
         );
-        assert_eq!(with_min.wns_ps, base.wns_ps, "min_delay must not move setup WNS");
+        assert_eq!(
+            with_min.wns_ps, base.wns_ps,
+            "min_delay must not move setup WNS"
+        );
         assert_ne!(with_min.hold_slack_ps, base.hold_slack_ps);
 
         let mut od = Constraints::default();
@@ -4636,7 +4700,10 @@ set_clock_groups -physically_exclusive -group [get_clocks sys] -group [get_clock
         let mut cg = od.clone();
         cg.clock_groups.push(xdc.clock_groups[0].clone());
         let with_cg = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &cg).unwrap();
-        assert_eq!(with_cg.iob_ps, 0, "clock groups must drop IOB like false path");
+        assert_eq!(
+            with_cg.iob_ps, 0,
+            "clock groups must drop IOB like false path"
+        );
         assert_eq!(with_cg.setup_ps, with_cg.r2r_ps);
         assert_ne!(
             with_cg.wns_ps, with_od.wns_ps,
@@ -4679,12 +4746,14 @@ set_clock_latency -source -early 0.1 [get_clocks clk]
         let pl = place(&p, &dev).unwrap();
         let routed = helion_route::route(&pl, &dev).unwrap();
         let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
         assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
 
         let mut su = Constraints::default();
-        su.clock_uncertainties.push(xdc.clock_uncertainties[0].clone());
+        su.clock_uncertainties
+            .push(xdc.clock_uncertainties[0].clone());
         let with_su = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &su).unwrap();
         assert_eq!(
             with_su.wns_ps,
@@ -4699,9 +4768,13 @@ set_clock_latency -source -early 0.1 [get_clocks clk]
         );
 
         let mut hu = su.clone();
-        hu.clock_uncertainties.push(xdc.clock_uncertainties[1].clone());
+        hu.clock_uncertainties
+            .push(xdc.clock_uncertainties[1].clone());
         let with_hu = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &hu).unwrap();
-        assert_eq!(with_hu.wns_ps, with_su.wns_ps, "hold uncertainty must not move setup WNS");
+        assert_eq!(
+            with_hu.wns_ps, with_su.wns_ps,
+            "hold uncertainty must not move setup WNS"
+        );
         assert_eq!(
             with_hu.hold_slack_ps,
             base.hold_slack_ps - 200,
@@ -4725,7 +4798,10 @@ set_clock_latency -source -early 0.1 [get_clocks clk]
         let mut early = late.clone();
         early.clock_latencies.push(xdc.clock_latencies[1].clone());
         let with_early = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &early).unwrap();
-        assert_eq!(with_early.wns_ps, with_late.wns_ps, "early latency must not move setup WNS");
+        assert_eq!(
+            with_early.wns_ps, with_late.wns_ps,
+            "early latency must not move setup WNS"
+        );
         assert_eq!(
             with_early.hold_slack_ps,
             base.hold_slack_ps - 100,
@@ -4767,7 +4843,8 @@ set_case_analysis 1 [get_pins u_lut0/I0]
         let pl = place(&p, &dev).unwrap();
         let routed = helion_route::route(&pl, &dev).unwrap();
         let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
         assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
 
@@ -4779,7 +4856,10 @@ set_case_analysis 1 [get_pins u_lut0/I0]
         let mut dt = od.clone();
         dt.disable_timings.push(xdc.disable_timings[0].clone());
         let with_dt = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &dt).unwrap();
-        assert_eq!(with_dt.iob_ps, 0, "disable_timing must drop IOB like false path");
+        assert_eq!(
+            with_dt.iob_ps, 0,
+            "disable_timing must drop IOB like false path"
+        );
         assert_eq!(with_dt.setup_ps, with_dt.r2r_ps);
         assert_ne!(
             with_dt.wns_ps, with_od.wns_ps,
@@ -4789,7 +4869,10 @@ set_case_analysis 1 [get_pins u_lut0/I0]
         let mut ca = od.clone();
         ca.case_analyses.push(xdc.case_analyses[0].clone());
         let with_ca = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &ca).unwrap();
-        assert_eq!(with_ca.iob_ps, 0, "case_analysis must drop IOB like false path");
+        assert_eq!(
+            with_ca.iob_ps, 0,
+            "case_analysis must drop IOB like false path"
+        );
         assert_eq!(with_ca.setup_ps, with_ca.r2r_ps);
         assert_ne!(
             with_ca.wns_ps, with_od.wns_ps,
@@ -4811,7 +4894,10 @@ set_clock_sense -stop_propagation [get_pins clk_buf/O]
 "#,
         )
         .unwrap();
-        assert_eq!(xdc.propagated_clocks, vec!["clk".to_string(), "*".to_string()]);
+        assert_eq!(
+            xdc.propagated_clocks,
+            vec!["clk".to_string(), "*".to_string()]
+        );
         assert!(xdc.clocks_propagated());
         assert_eq!(xdc.clock_senses.len(), 3);
         assert_eq!(xdc.clock_senses[0].sense, "positive");
@@ -4830,7 +4916,8 @@ set_clock_sense -stop_propagation [get_pins clk_buf/O]
         let pl = place(&p, &dev).unwrap();
         let routed = helion_route::route(&pl, &dev).unwrap();
         let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
         assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
         assert!(
@@ -4838,10 +4925,12 @@ set_clock_sense -stop_propagation [get_pins clk_buf/O]
             "placed clock network must have hop delay, got {}",
             base.clk_net_ps
         );
-        assert_eq!(empty.clk_net_ps, base.clk_net_ps, "ideal clocks still measure insertion");
         assert_eq!(
-            empty.wns_ps,
-            base.wns_ps,
+            empty.clk_net_ps, base.clk_net_ps,
+            "ideal clocks still measure insertion"
+        );
+        assert_eq!(
+            empty.wns_ps, base.wns_ps,
             "ideal clocks must not apply clk_net_ps to WNS"
         );
 
@@ -4890,7 +4979,10 @@ set_clock_sense -stop_propagation [get_pins clk_buf/O]
         let mut pos = Constraints::default();
         pos.clock_senses.push(xdc.clock_senses[0].clone());
         let with_pos = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &pos).unwrap();
-        assert_eq!(with_pos.wns_ps, base.wns_ps, "positive sense is the default edge");
+        assert_eq!(
+            with_pos.wns_ps, base.wns_ps,
+            "positive sense is the default edge"
+        );
 
         let mut both = prop.clone();
         both.clock_senses.push(xdc.clock_senses[1].clone());
@@ -4928,7 +5020,8 @@ set_system_jitter 0.1
         let pl = place(&p, &dev).unwrap();
         let routed = helion_route::route(&pl, &dev).unwrap();
         let base = report_timing_routed(&d, &routed, &xdc.clocks).unwrap();
-        let empty = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
+        let empty =
+            report_timing_routed_xdc(&d, &routed, &xdc.clocks, &Constraints::default()).unwrap();
         assert_eq!(empty.wns_ps, base.wns_ps, "empty XDC must keep gold WNS");
         assert_eq!(empty.hold_slack_ps, base.hold_slack_ps);
 
@@ -5149,7 +5242,10 @@ group_path -name holdg -critical_range 0.4 -from [get_ports clk] -to [get_ports 
         let mut bh = Constraints::default();
         bh.bus_skews.push(xdc.bus_skews[2].clone());
         let with_bh = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &bh).unwrap();
-        assert_eq!(with_bh.wns_ps, base.wns_ps, "hold bus skew must not move WNS");
+        assert_eq!(
+            with_bh.wns_ps, base.wns_ps,
+            "hold bus skew must not move WNS"
+        );
         assert_eq!(
             with_bh.hold_slack_ps,
             base.hold_slack_ps - 200,
@@ -5251,7 +5347,10 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let mut dh = Constraints::default();
         dh.data_checks.push(xdc.data_checks[1].clone());
         let with_dh = report_timing_routed_xdc(&d, &routed, &xdc.clocks, &dh).unwrap();
-        assert_eq!(with_dh.wns_ps, base.wns_ps, "hold data check must not move WNS");
+        assert_eq!(
+            with_dh.wns_ps, base.wns_ps,
+            "hold data check must not move WNS"
+        );
         assert_eq!(
             with_dh.hold_slack_ps,
             base.hold_slack_ps - 200,
@@ -5310,7 +5409,10 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
             ClockRelation::Asynchronous
         );
         assert!(ra.cell("clk", "virt").unwrap().wns_ps.is_none());
-        assert_eq!(ra.cell("clk", "clk").unwrap().relation, ClockRelation::Timed);
+        assert_eq!(
+            ra.cell("clk", "clk").unwrap().relation,
+            ClockRelation::Timed
+        );
 
         let mut ex = Constraints::default();
         ex.clock_groups.push(ClockGroups {
@@ -5334,9 +5436,9 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         );
 
         let mut partial = Constraints::default();
-        partial.false_paths.push(
-            "set_false_path -from [get_clocks clk] -to [get_pins u_ff/D]".into(),
-        );
+        partial
+            .false_paths
+            .push("set_false_path -from [get_clocks clk] -to [get_pins u_ff/D]".into());
         assert!(
             partial.false_path_partial_covers_clocks("clk", "virt"),
             "mixed clock↔pin FP must be partial"
@@ -5399,7 +5501,10 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         assert_eq!(r.inter_count(), 6);
         assert_eq!(r.other_count(), 0);
         assert!(r.group("clk", "clk").unwrap().wns_ps.is_none());
-        assert_eq!(r.group("clk", "clk").unwrap().kind, PathGroupKind::IntraClock);
+        assert_eq!(
+            r.group("clk", "clk").unwrap().kind,
+            PathGroupKind::IntraClock
+        );
         assert_eq!(
             r.group("clk", "virt").unwrap().kind,
             PathGroupKind::InterClock
@@ -5427,8 +5532,7 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let inter = ri.group("clk", "virt").unwrap();
         assert_eq!(inter.kind, PathGroupKind::InterClock);
         assert_ne!(
-            inter.wns_ps,
-            intra.wns_ps,
+            inter.wns_ps, intra.wns_ps,
             "inter-clock WNS uses dest period, not a canned copy"
         );
         assert_eq!(inter.wns_ps, Some(8_000 - (10_000 - t.wns_ps)));
@@ -5476,8 +5580,7 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let blinky = report_timing(&Design::structural_blinky(), &sta_clks).unwrap();
         let rb = report_timing_summary(&sta_clks, &Constraints::default(), Some(&blinky));
         assert_ne!(
-            rb.wns_ps,
-            rs.wns_ps,
+            rb.wns_ps, rs.wns_ps,
             "timing summary WNS is per-design STA, not canned"
         );
     }
@@ -5596,7 +5699,12 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         assert!(div.generated);
         assert_eq!(div.n_buffers, 0, "generated clocks are local, not gclk");
         assert_eq!(div.insertion_ps, 0);
-        assert_eq!(div.net, "q0", "generated source pin maps to HNF net: {}", rg.text());
+        assert_eq!(
+            div.net,
+            "q0",
+            "generated source pin maps to HNF net: {}",
+            rg.text()
+        );
         assert_eq!(div.n_loads, 0, "no FF is clocked by q0");
         assert_eq!(rg.network("clk").unwrap().n_loads, 4);
 
@@ -5641,7 +5749,13 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let placed = place(&packed, &dev).unwrap();
         let mut clks = Vec::new();
         create_clock(&mut clks, "clk", 10_000, "clk");
-        let p = report_power(&dev, Some(&d), Some(&placed), &clks, &OperatingConditions::default());
+        let p = report_power(
+            &dev,
+            Some(&d),
+            Some(&placed),
+            &clks,
+            &OperatingConditions::default(),
+        );
         assert_eq!(p.part, "HL10T-C32-1");
         assert_eq!(p.voltage_mv, 1000);
         assert_eq!(p.temperature_c, 25);
@@ -5727,7 +5841,13 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let placed = place(&packed, &dev).unwrap();
         let mut clks = Vec::new();
         create_clock(&mut clks, "clk", 10_000, "clk");
-        let p = report_power(&dev, Some(&d), Some(&placed), &clks, &OperatingConditions::default());
+        let p = report_power(
+            &dev,
+            Some(&d),
+            Some(&placed),
+            &clks,
+            &OperatingConditions::default(),
+        );
         assert_eq!(p.lutff, 4, "{}", p.text());
         assert_eq!(p.lutff_cap, 8192);
         assert!(
@@ -5742,7 +5862,11 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
 
         let mut hot = p.clone();
         hot.lutff = (hot.lutff_cap as usize * 80).div_ceil(100);
-        assert!(hot.power2_high_occupancy(), "pct={}", hot.lutff_occupancy_pct());
+        assert!(
+            hot.power2_high_occupancy(),
+            "pct={}",
+            hot.lutff_occupancy_pct()
+        );
         assert!(
             hot.text().contains("POWER-2=high_occupancy"),
             "{}",
@@ -5828,10 +5952,18 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let blinky = Design::structural_blinky();
         let tb = report_timing(&blinky, &clks[..1]).unwrap();
         assert_ne!(tb.wns_ps, gold, "methodology companion STA is per-design");
-        let rb = report_methodology(&clks[..1], &Constraints::default(), Some(&tb), Some(&blinky));
+        let rb = report_methodology(
+            &clks[..1],
+            &Constraints::default(),
+            Some(&tb),
+            Some(&blinky),
+        );
         assert!(rb.check("TIMING-1").is_some(), "{}", rb.text());
         assert_eq!(rb.check("TIMING-7").unwrap().objects, "led");
-        assert_eq!(tb.wns_ps, report_timing(&blinky, &clks[..1]).unwrap().wns_ps);
+        assert_eq!(
+            tb.wns_ps,
+            report_timing(&blinky, &clks[..1]).unwrap().wns_ps
+        );
     }
 
     #[test]
@@ -5848,9 +5980,14 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let t0 = std::time::Instant::now();
         let hits = lut_drives_clock(&d);
         let scan_ms = t0.elapsed().as_millis();
-        assert_eq!(hits.len(), N as usize, "one LUT-O on shared clk hits every FF");
+        assert_eq!(
+            hits.len(),
+            N as usize,
+            "one LUT-O on shared clk hits every FF"
+        );
         assert!(
-            hits.iter().all(|(lut, _, net)| lut == "u_lut" && net == "clk"),
+            hits.iter()
+                .all(|(lut, _, net)| lut == "u_lut" && net == "clk"),
             "hits must name the clock LUT"
         );
         assert!(
@@ -5961,10 +6098,8 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
             !clk_fp.timing_guide().false_path_iob,
             "clock-to-clock false_path must not set IOB-arc guide"
         );
-        let pin_fp = load_xdc(
-            "set_false_path -from [get_pins u_ff/Q] -to [get_pins u_ff2/D]\n",
-        )
-        .unwrap();
+        let pin_fp =
+            load_xdc("set_false_path -from [get_pins u_ff/Q] -to [get_pins u_ff2/D]\n").unwrap();
         assert!(
             !pin_fp.timing_guide().false_path_iob,
             "register pin false_path must not set IOB-arc guide"
@@ -6054,7 +6189,10 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         .unwrap();
         let (_, rfp, _) = close_guided(&d, 0.75, &fp);
         let hops_fp: Vec<_> = rfp.iob_src.iter().map(|io| io.hops).collect();
-        assert_ne!(hops_m, hops_fp, "false_path and multicycle must not share hops");
+        assert_ne!(
+            hops_m, hops_fp,
+            "false_path and multicycle must not share hops"
+        );
     }
 
     #[test]
