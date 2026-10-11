@@ -1383,6 +1383,15 @@ pub struct TimingPathPin {
 
 /// Fig. 59 STA path (cells/nets from endpoints), not a restyle of the full sheet.
 /// `pins` is the UG903 pin-delay table (incr/path from helion-sta arcs).
+/// Sortable column of the Timing Paths table (click a header to sort; ▲▼ indicator).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimingPathSortCol {
+    From,
+    To,
+    Slack,
+    Levels,
+}
+
 #[derive(Clone, Debug)]
 pub struct TimingPath {
     pub name: String,
@@ -1393,6 +1402,8 @@ pub struct TimingPath {
     pub delay_ps: i64,
     pub slack_ps: i64,
     pub pins: Vec<TimingPathPin>,
+    /// Path group: "register" (FF→FF) or "output" (FF→port), assigned at extraction.
+    pub group: String,
 }
 
 impl TimingPath {
@@ -4714,6 +4725,10 @@ pub struct IdeModel {
     pub wave: Waveform,
     pub timing_paths: Vec<TimingPath>,
     pub selected_timing_path: Option<usize>,
+    /// Timing Paths table sort: (column, ascending). Click a header to sort.
+    pub timing_path_sort: Option<(TimingPathSortCol, bool)>,
+    /// Timing Paths table filter text (matches From/To/group, case-insensitive).
+    pub timing_path_filter: String,
     /// UG903 pin-delay table selected Name (`cell/pin`).
     pub selected_timing_pin: Option<String>,
     pub console_find: String,
@@ -4904,6 +4919,8 @@ impl IdeModel {
             wave: Waveform::default(),
             timing_paths: Vec::new(),
             selected_timing_path: None,
+            timing_path_sort: None,
+            timing_path_filter: String::new(),
             selected_timing_pin: None,
             console_find: String::new(),
             console_selected: None,
@@ -18051,6 +18068,14 @@ impl IdeModel {
         }
     }
 
+    /// STA clock names for the Timing Paths table (launch/capture clock columns).
+    pub fn sta_clock_names(&self) -> Vec<String> {
+        self.clocks_for_sta()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
     fn clocks_for_sta(&self) -> Vec<helion_sta::Clock> {
         let mut clks = self.constraints.clocks.clone();
         if clks.is_empty() {
@@ -21968,6 +21993,7 @@ fn extract_timing_paths(
             delay_ps,
             slack_ps: t.wns_ps,
             pins,
+            group: "register".into(),
         });
     }
     for c in &design.cells {
@@ -22004,6 +22030,7 @@ fn extract_timing_paths(
             delay_ps,
             slack_ps: t.wns_ps,
             pins,
+            group: "output".into(),
         });
     }
     paths

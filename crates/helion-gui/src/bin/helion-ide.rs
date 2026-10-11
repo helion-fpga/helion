@@ -13,8 +13,8 @@ use helion_gui::surface::{
 use helion_gui::{
     doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, WaveRadix, WaveStyle,
-    WorkspacePane, WorkspaceTab,
+    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TimingPathSortCol,
+    WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1344,7 +1344,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     paint_io_ports_table(ui, &mut app.model, "sidebar_io");
                 }
                 Activity::Timing => {
-                    paint_timing_paths(ui, &mut app.model);
+                    paint_timing_paths(ui, &mut app.model, &app.theme);
                 }
                 Activity::Reports => {
                     // Timing Analysis report catalog (P1-4): regroups the
@@ -1645,6 +1645,61 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
 /// breadcrumb → Files, WNS chip → Timing canvas, error/warning counts →
 /// Messages panel, LUTFF → Utilization, run name → Runs tab. Background jobs
 /// show a spinner; job completion also toasts (see `toasts.rs`).
+/// One status-bar segment (§3.7): 12px mono text, 8px side padding, 1px left
+/// divider (except the first segment), hover highlight when clickable.
+#[allow(clippy::too_many_arguments)]
+fn status_seg(
+    ui: &mut egui::Ui,
+    theme: &theme::Theme,
+    bar: egui::Rect,
+    x: &mut f32,
+    first: &mut bool,
+    idx: usize,
+    label: &str,
+    color: Color32,
+    hover: &str,
+    clickable: bool,
+) -> egui::Response {
+    let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    let sw = galley.size().x + 16.0;
+    let rect =
+        egui::Rect::from_min_size(egui::pos2(*x, bar.top()), egui::vec2(sw, bar.height()));
+    *x += sw;
+    if !*first {
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left(), bar.top() + 5.0),
+                egui::pos2(rect.left(), bar.bottom() - 5.0),
+            ],
+            egui::Stroke::new(1.0, theme.line),
+        );
+    }
+    *first = false;
+    let sense = if clickable {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let resp = ui.interact(rect, egui::Id::new(("statusseg", idx)), sense);
+    if clickable && resp.hovered() {
+        ui.painter().rect_filled(rect, 0.0, theme.surface_hover);
+    }
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + 8.0,
+            bar.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+    if hover.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(hover)
+    }
+}
+
 fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
     let theme = app.theme;
     let model = &app.model;
@@ -1661,8 +1716,15 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
     } else {
         honest.clone()
     };
+    // Red when negative (§3.7); green only for genuinely closed timing (status
+    // semantics), warn when there is no closed WNS to show.
+    let wns_num = model.timing.as_ref().map(|t| t.wns_ps);
     let wns_color = if model.timing_closed_wns() {
-        theme.ok
+        if wns_num.is_some_and(|v| v < 0) {
+            theme.danger
+        } else {
+            theme.ok
+        }
     } else {
         theme.warn
     };
@@ -1694,7 +1756,7 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             .map(|d| !d.physical_had)
             .unwrap_or(true);
     let board_crumb = if board_soft_hold {
-        " · board:no-cable"
+        "board:no-cable"
     } else {
         ""
     };
@@ -1724,104 +1786,127 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         .exact_height(chrome::STATUS_HEIGHT)
         .show_separator_line(true)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                if busy {
-                    ui.spinner();
-                    ui.add_space(2.0);
-                }
-                let seg = |ui: &mut egui::Ui,
+            let w = ui.available_width();
+            let (bar, _) = ui.allocate_exact_size(
+                egui::vec2(w, chrome::STATUS_HEIGHT),
+                egui::Sense::hover(),
+            );
+            let mut x = bar.left() + 8.0;
+            let mut first = true;
+            let mut idx = 0usize;
+            let mut seg = |ui: &mut egui::Ui,
                            label: &str,
                            color: Color32,
-                           hover: &str|
-                 -> egui::Response {
-                    ui.add(
-                        egui::Label::new(RichText::new(label).monospace().size(12.0).color(color))
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(hover)
-                };
-                if seg(ui, &crumb, theme.dim, "Go to Files (project view)").clicked() {
-                    go = Some(Go::Activity(Activity::Files));
-                }
-                ui.label(RichText::new("·").color(theme.faint));
-                ui.label(
-                    RichText::new(model.part())
-                        .monospace()
-                        .size(12.0)
-                        .color(theme.dim),
-                );
-                ui.label(RichText::new("·").color(theme.faint));
-                if seg(
-                    ui,
-                    &wns,
-                    wns_color,
-                    "Open Timing canvas (timing summary + paths)",
-                )
-                .clicked()
+                           hover: &str,
+                           g: Option<Go>| {
+                idx += 1;
+                if status_seg(ui, &theme, bar, &mut x, &mut first, idx, label, color, hover, g.is_some())
+                    .clicked()
                 {
-                    go = Some(Go::Activity(Activity::Timing));
+                    go = g;
                 }
-                ui.label(
-                    RichText::new(format!("provenance={provenance}"))
-                        .monospace()
-                        .size(12.0)
-                        .color(theme.faint),
-                );
-                ui.label(RichText::new("·").color(theme.faint));
-                let issue_label = if errors + warnings == 0 {
-                    "0 problems".to_string()
-                } else {
-                    format!("{errors}E {warnings}W")
-                };
-                let issue_color = if errors > 0 {
-                    theme.danger
-                } else if warnings > 0 {
-                    theme.warn
-                } else {
-                    theme.dim
-                };
-                if seg(ui, &issue_label, issue_color, "Open Messages panel").clicked() {
-                    go = Some(Go::Bottom(BottomTab::Messages));
-                }
-                ui.label(RichText::new("·").color(theme.faint));
-                if seg(
-                    ui,
-                    &format!("LUTFF {lutff}"),
-                    theme.dim,
-                    "Open Utilization report",
-                )
-                .clicked()
-                {
-                    go = Some(Go::Tab(WorkspaceTab::Utilization));
-                }
-                ui.label(RichText::new("·").color(theme.faint));
-                if seg(ui, &run, theme.dim, "Open Runs tab").clicked() {
-                    go = Some(Go::Tab(WorkspaceTab::Runs));
-                }
-                if !board_crumb.is_empty() {
-                    ui.label(
-                        RichText::new(board_crumb)
-                            .monospace()
-                            .size(12.0)
-                            .color(theme.faint),
-                    );
-                }
-                if !progress.is_empty() {
-                    ui.label(
-                        RichText::new(format!("· {progress}"))
-                            .monospace()
-                            .size(12.0)
-                            .color(theme.accent_dim),
-                    );
-                } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
-                    ui.label(
-                        RichText::new(format!("· {status}"))
-                            .monospace()
-                            .size(12.0)
-                            .color(theme.dim),
-                    );
-                }
+            };
+            seg(
+                ui,
+                &crumb,
+                theme.dim,
+                "Go to Files (project view)",
+                Some(Go::Activity(Activity::Files)),
+            );
+            // No standalone part picker exists; the Device view is the honest
+            // target for the part segment.
+            seg(
+                ui,
+                &model.part(),
+                theme.dim,
+                "Open Device view",
+                Some(Go::Activity(Activity::Device)),
+            );
+            seg(
+                ui,
+                &wns,
+                wns_color,
+                "Open Timing canvas (timing summary + paths)",
+                Some(Go::Activity(Activity::Timing)),
+            );
+            seg(
+                ui,
+                &format!("provenance={provenance}"),
+                theme.faint,
+                "",
+                None,
+            );
+            let issue_label = if errors + warnings == 0 {
+                "0 problems".to_string()
+            } else {
+                format!("{errors}E {warnings}W")
+            };
+            let issue_color = if errors > 0 {
+                theme.danger
+            } else if warnings > 0 {
+                theme.warn
+            } else {
+                theme.dim
+            };
+            seg(
+                ui,
+                &issue_label,
+                issue_color,
+                "Open Messages panel",
+                Some(Go::Bottom(BottomTab::Messages)),
+            );
+            seg(
+                ui,
+                &format!("LUTFF {lutff}"),
+                theme.dim,
+                "Open Utilization report",
+                Some(Go::Tab(WorkspaceTab::Utilization)),
+            );
+            seg(
+                ui,
+                &run,
+                theme.dim,
+                "Open Runs tab",
+                Some(Go::Tab(WorkspaceTab::Runs)),
+            );
+            if !board_crumb.is_empty() {
+                seg(ui, board_crumb, theme.faint, "", None);
+            }
+            if !progress.is_empty() {
+                seg(ui, &progress, theme.accent_dim, "", None);
+            } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
+                seg(ui, &status, theme.dim, "", None);
+            }
+            // Right side: background-job spinner + progress, or idle indicator.
+            let right_w = 190.0;
+            let right_rect = egui::Rect::from_min_size(
+                egui::pos2(bar.right() - right_w - 8.0, bar.top()),
+                egui::vec2(right_w, bar.height()),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if busy {
+                        let ptxt = if progress.is_empty() {
+                            "working".to_string()
+                        } else {
+                            progress.clone()
+                        };
+                        ui.label(
+                            RichText::new(ptxt)
+                                .monospace()
+                                .size(12.0)
+                                .color(theme.accent_dim),
+                        );
+                        ui.spinner();
+                    } else {
+                        ui.label(
+                            RichText::new("✓ idle")
+                                .monospace()
+                                .size(12.0)
+                                .color(theme.faint),
+                        );
+                    }
+                });
             });
         });
 
@@ -1832,7 +1917,6 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         None => {}
     }
 }
-
 fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.separator();
     ui.label(RichText::new("Properties").strong());
@@ -2479,12 +2563,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
 fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     paint_timing_summary(ui, model, theme);
     ui.add_space(8.0);
-    paint_timing_paths(ui, model);
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(4.0);
-    // Endpoint slack distribution (P1-4): honest empty state when no paths.
-    dashboard::paint_slack_histogram(ui, model, theme);
+    paint_timing_paths(ui, model, theme);
 }
 
 /// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
@@ -2536,7 +2615,7 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
             paint_timing_summary(ui, &mut app.model, &app.theme);
             ui.add_space(8.0);
             // Paths stay reachable: Timing nav lists them; detail still shows pin delay table.
-            paint_timing_paths(ui, &mut app.model);
+            paint_timing_paths(ui, &mut app.model, &app.theme);
         }
     }
 }
@@ -4330,9 +4409,30 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
                 }
             }
         });
-        if ui.button("Open counter.sdc").clicked() {
-            let p = helion_device::Device::examples_dir().join("counter.sdc");
-            let _ = model.open_sdc_editor(&p);
+        // Label + target follow the actual file: the editor's current path,
+        // else a sibling .sdc/.xdc on the sources list (same fallback as
+        // ensure_sdc_editor_populated), else the counter example.
+        let sdc_path = model
+            .sdc_editor_path
+            .clone()
+            .or_else(|| {
+                model.tree.sources.iter().find_map(|src| {
+                    let q = PathBuf::from(src);
+                    let ext = q
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    ((ext == "sdc" || ext == "xdc") && q.is_file()).then(|| q)
+                })
+            })
+            .unwrap_or_else(|| helion_device::Device::examples_dir().join("counter.sdc"));
+        let sdc_name = sdc_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("counter.sdc");
+        if ui.button(format!("Open {sdc_name}")).clicked() {
+            let _ = model.open_sdc_editor(&sdc_path);
         }
         if ui.button("Save").clicked() {
             let _ = model.save_sdc_editor();
@@ -4436,64 +4536,344 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.label(RichText::new("Timing Paths").strong());
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
+// ---------------------------------------------------------------------------
+// §3.8 spec tables: 11px dim semibold 28px headers, 27px rows, 1px dividers,
+// hover highlight. Cells are painted with `painter.text` at explicit anchors
+// because `ui.put`+`Label` re-sizes the label to its text, which defeats
+// column alignment (numeric columns must right-align in tabular figures).
+// ---------------------------------------------------------------------------
+
+/// One cell of a §3.8 spec table.
+struct SpecCell {
+    text: String,
+    color: Color32,
+    right: bool,
+    mono: bool,
+}
+
+impl SpecCell {
+    fn text(s: impl Into<String>, color: Color32) -> Self {
+        Self {
+            text: s.into(),
+            color,
+            right: false,
+            mono: false,
+        }
+    }
+    fn num(s: impl Into<String>, color: Color32) -> Self {
+        Self {
+            text: s.into(),
+            color,
+            right: true,
+            mono: true,
+        }
+    }
+}
+
+fn spec_paint_cells(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    widths: &[f32],
+    cells: &[SpecCell],
+    header: bool,
+) {
+    let mut x = rect.left();
+    for (i, cell) in cells.iter().enumerate() {
+        let cw = widths.get(i).copied().unwrap_or(60.0);
+        let font = if header {
+            theme::font_ui_semibold(11.0)
+        } else if cell.mono {
+            theme::font_code(13.0)
+        } else {
+            theme::font_ui(13.0)
+        };
+        let (anchor, px) = if cell.right {
+            (egui::Align2::RIGHT_CENTER, x + cw - 8.0)
+        } else {
+            (egui::Align2::LEFT_CENTER, x + 8.0)
+        };
+        ui.painter()
+            .text(egui::pos2(px, rect.center().y), anchor, &cell.text, font, cell.color);
+        x += cw;
+    }
+}
+
+/// 1px divider under a row rect.
+fn spec_divider(ui: &mut egui::Ui, theme: &theme::Theme, rect: egui::Rect) {
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        egui::Stroke::new(1.0, theme.line),
+    );
+}
+
+/// §3.3 slack color rule: negative = danger, <10% of the clock period = warn,
+/// otherwise plain text. Green is status-only — never for "good slack".
+fn slack_color(theme: &theme::Theme, slack_ps: i64, period_ps: u64) -> Color32 {
+    if slack_ps < 0 {
+        theme.danger
+    } else if (slack_ps as f64) < 0.10 * period_ps as f64 {
+        theme.warn
+    } else {
+        theme.text
+    }
+}
+
+/// Section header bar (§3.1 pattern): 32px tall, 13px semibold title left,
+/// actions right-aligned, 1px bottom divider.
+fn section_bar(
+    ui: &mut egui::Ui,
+    theme: &theme::Theme,
+    title: &str,
+    actions: impl FnOnce(&mut egui::Ui),
+) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 32.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        theme::font_ui_semibold(13.0),
+        theme.text,
+    );
+    let act_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top()),
+        egui::pos2(rect.right() - 4.0, rect.bottom()),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(act_rect), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
+    });
+    spec_divider(ui, theme, rect);
+}
+
+fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+    let mut do_report = false;
+    let mut do_schematic = false;
+    section_bar(ui, theme, "Timing Paths", |ui| {
+        // Quartus-pattern filter field on dense tables (§3.8.6).
+        ui.add(
+            egui::TextEdit::singleline(&mut model.timing_path_filter)
+                .hint_text("Filter...")
+                .desired_width(170.0),
+        );
         if ui.button("Report timing").clicked() {
-            let _ = model.exec("report_timing");
+            do_report = true;
         }
         if ui.button("Show in Schematic").clicked() {
-            let spec = model
-                .selected_timing_path
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| "0".into());
-            let _ = model.exec(&format!("select_timing_path {spec}"));
+            do_schematic = true;
         }
     });
-    if model.timing_paths.is_empty() {
-        ui.label("No timing paths yet.");
-        if primary_button(ui, "Report timing").clicked() {
-            let _ = model.exec("report_timing");
-        }
-        return;
+    if do_report {
+        let _ = model.exec("report_timing");
     }
-    ui.add_space(4.0);
-    ui.label(RichText::new("Path Summary").strong());
-    let mut pick_path = None;
-    let selected_path = model.selected_timing_path;
-    let path_sum_col = chrome::stretched_col_w_gap(8, ui.available_width(), 8.0);
-    egui::Grid::new("timing_path_summary")
-        .spacing([8.0, 4.0])
-        .min_col_width(path_sum_col)
-        .show(ui, |ui| {
-            ui.label(RichText::new("Name").strong());
-            ui.label(RichText::new("From").strong());
-            ui.label(RichText::new("To").strong());
-            ui.label(RichText::new("Slack_ps").strong());
-            ui.label(RichText::new("Delay_ps").strong());
-            ui.label(RichText::new("Logic_ps").strong());
-            ui.label(RichText::new("Net_ps").strong());
-            ui.label(RichText::new("Pins").strong());
-            ui.end_row();
-            for (i, p) in model.timing_paths.iter().enumerate() {
-                let on = selected_path == Some(i);
-                if ui.selectable_label(on, &p.name).clicked() {
-                    pick_path = Some(i);
-                }
-                ui.label(&p.startpoint);
-                ui.label(&p.endpoint);
-                ui.label(p.slack_ps.to_string());
-                ui.label(p.delay_ps.to_string());
-                ui.label(p.logic_ps().to_string());
-                ui.label(p.net_ps().to_string());
-                ui.label(p.pins.len().to_string());
-                ui.end_row();
+    if do_schematic {
+        let spec = model
+            .selected_timing_path
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "0".into());
+        let _ = model.exec(&format!("select_timing_path {spec}"));
+    }
+
+    if model.timing_paths.is_empty() {
+        // Designed empty state (§3.8): centered dim text + action, never a bare rect.
+        ui.add_space(28.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No timing paths yet.")
+                    .size(13.0)
+                    .color(theme.dim),
+            );
+            ui.add_space(6.0);
+            if primary_button(ui, "Report timing").clicked() {
+                let _ = model.exec("report_timing");
             }
         });
-    if let Some(i) = pick_path {
-        let _ = model.select_timing_path_report(&i.to_string());
+        return;
     }
+
+    // Endpoint slack histogram (§3.3.3) sits above the path table.
+    ui.add_space(6.0);
+    dashboard::paint_slack_histogram(ui, model, theme);
+    ui.add_space(10.0);
+
+    // Filter (From / To / group, case-insensitive) then sort.
+    let filt = model.timing_path_filter.trim().to_lowercase();
+    let mut order: Vec<usize> = (0..model.timing_paths.len()).collect();
+    if !filt.is_empty() {
+        order.retain(|&i| {
+            let p = &model.timing_paths[i];
+            p.startpoint.to_lowercase().contains(&filt)
+                || p.endpoint.to_lowercase().contains(&filt)
+                || p.group.to_lowercase().contains(&filt)
+        });
+    }
+    if let Some((col, asc)) = model.timing_path_sort {
+        order.sort_by(|&a, &b| {
+            let (pa, pb) = (&model.timing_paths[a], &model.timing_paths[b]);
+            let ord = match col {
+                TimingPathSortCol::From => pa.startpoint.cmp(&pb.startpoint),
+                TimingPathSortCol::To => pa.endpoint.cmp(&pb.endpoint),
+                TimingPathSortCol::Slack => pa.slack_ps.cmp(&pb.slack_ps),
+                TimingPathSortCol::Levels => pa.pins.len().cmp(&pb.pins.len()),
+            };
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+    }
+
+    if order.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No paths match the current filters.")
+                    .size(13.0)
+                    .color(theme.dim),
+            );
+        });
+    } else {
+        paint_timing_path_table(ui, model, theme, &order);
+    }
+
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("Double-click a row to cross-probe Device + Source.")
+            .size(11.0)
+            .color(theme.faint),
+    );
+
+    paint_timing_pin_detail(ui, model, theme);
+}
+
+/// §3.3 path table: # | From | To | Launch clock | Capture clock | Slack |
+/// Levels | Path group. Sortable headers (▲▼), 27px rows, 1px dividers,
+/// right-aligned tabular numerics.
+#[allow(clippy::too_many_lines)]
+fn paint_timing_path_table(
+    ui: &mut egui::Ui,
+    model: &mut IdeModel,
+    theme: &theme::Theme,
+    order: &[usize],
+) {
+    // (title, fixed width | None = fill, numeric, sort column)
+    let cols: &[(&str, Option<f32>, bool, Option<TimingPathSortCol>)] = &[
+        ("#", Some(40.0), true, None),
+        ("From", None, false, Some(TimingPathSortCol::From)),
+        ("To", None, false, Some(TimingPathSortCol::To)),
+        ("Launch clock", Some(110.0), false, None),
+        ("Capture clock", Some(110.0), false, None),
+        ("Slack", Some(96.0), true, Some(TimingPathSortCol::Slack)),
+        ("Levels", Some(64.0), true, Some(TimingPathSortCol::Levels)),
+        ("Path group", Some(96.0), false, None),
+    ];
+    let w = ui.available_width();
+    let fixed: f32 = cols.iter().filter_map(|c| c.1).sum();
+    let n_fill = cols.iter().filter(|c| c.1.is_none()).count().max(1) as f32;
+    let fill_w = ((w - fixed) / n_fill).max(80.0);
+    let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
+
+    // Header row: 28px, 11px dim semibold, click to sort.
+    let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+    let mut x = hrect.left();
+    let mut sort_click: Option<TimingPathSortCol> = None;
+    for (i, (title, _, numeric, scol)) in cols.iter().enumerate() {
+        let cw = widths[i];
+        let crect =
+            egui::Rect::from_min_size(egui::pos2(x, hrect.top()), egui::vec2(cw, 28.0));
+        let mut label = (*title).to_string();
+        if let Some(sc) = scol {
+            if let Some((cur, asc)) = model.timing_path_sort {
+                if cur == *sc {
+                    label.push_str(if asc { " ▲" } else { " ▼" });
+                }
+            }
+            let resp = ui.interact(crect, egui::Id::new(("tpathh", i)), egui::Sense::click());
+            if resp.clicked() {
+                sort_click = Some(*sc);
+            }
+            if resp.hovered() {
+                ui.painter().rect_filled(crect, 0.0, theme.surface_hover);
+            }
+        }
+        let (anchor, px) = if *numeric {
+            (egui::Align2::RIGHT_CENTER, x + cw - 8.0)
+        } else {
+            (egui::Align2::LEFT_CENTER, x + 8.0)
+        };
+        ui.painter().text(
+            egui::pos2(px, hrect.center().y),
+            anchor,
+            label,
+            theme::font_ui_semibold(11.0),
+            theme.dim,
+        );
+        x += cw;
+    }
+    spec_divider(ui, theme, hrect);
+    if let Some(sc) = sort_click {
+        model.timing_path_sort = Some(match model.timing_path_sort {
+            Some((cur, asc)) if cur == sc => (sc, !asc),
+            _ => (sc, true),
+        });
+    }
+
+    // Rows.
+    let clk = model
+        .sta_clock_names()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "—".into());
+    let period = model.clock_period_ps;
+    let selected = model.selected_timing_path;
+    let mut pick: Option<usize> = None;
+    let mut dbl: Option<usize> = None;
+    for (ri, &mi) in order.iter().enumerate() {
+        let (from, to, slack, levels, group) = {
+            let p = &model.timing_paths[mi];
+            (
+                p.startpoint.clone(),
+                p.endpoint.clone(),
+                p.slack_ps,
+                p.pins.len(),
+                p.group.clone(),
+            )
+        };
+        let (rrect, _) = ui.allocate_exact_size(egui::vec2(w, 27.0), egui::Sense::hover());
+        if selected == Some(mi) {
+            ui.painter().rect_filled(rrect, 0.0, theme.sel);
+        } else if ui.rect_contains_pointer(rrect) {
+            ui.painter().rect_filled(rrect, 0.0, theme.surface_hover);
+        }
+        let resp = ui.interact(rrect, egui::Id::new(("tpathr", mi)), egui::Sense::click());
+        if resp.clicked() {
+            pick = Some(mi);
+        }
+        if resp.double_clicked() {
+            dbl = Some(mi);
+        }
+        let cells = vec![
+            SpecCell::num((ri + 1).to_string(), theme.faint),
+            SpecCell::text(from, theme.text),
+            SpecCell::text(to, theme.text),
+            SpecCell::text(clk.clone(), theme.dim),
+            SpecCell::text(clk.clone(), theme.dim),
+            SpecCell::num(slack.to_string(), slack_color(theme, slack, period)),
+            SpecCell::num(levels.to_string(), theme.text),
+            SpecCell::text(group, theme.dim),
+        ];
+        spec_paint_cells(ui, rrect, &widths, &cells, false);
+        spec_divider(ui, theme, rrect);
+    }
+    if let Some(mi) = pick {
+        let _ = model.select_timing_path_report(&mi.to_string());
+    }
+    if let Some(mi) = dbl {
+        let _ = model.exec(&format!("select_timing_path {mi}"));
+    }
+}
+
+/// Pin-delay detail for the selected path, §3.8 styled.
+fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let path = model
         .selected_timing_path
         .and_then(|i| model.timing_paths.get(i))
@@ -4503,56 +4883,92 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel) {
         return;
     };
     ui.add_space(6.0);
-    ui.label(RichText::new("Pin Delay").strong());
-    ui.label(format!(
-        "{}  slack_ps={} delay_ps={} logic_ps={} net_ps={}",
-        path.name,
-        path.slack_ps,
-        path.delay_ps,
-        path.logic_ps(),
-        path.net_ps()
-    ));
+    ui.label(
+        egui::RichText::new("Pin Delay")
+            .font(theme::font_ui_semibold(13.0))
+            .color(theme.text),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "{} — slack {} ps, delay {} ps (logic {} ps, net {} ps)",
+            path.name,
+            path.slack_ps,
+            path.delay_ps,
+            path.logic_ps(),
+            path.net_ps()
+        ))
+        .size(12.0)
+        .color(theme.dim),
+    );
+    ui.add_space(4.0);
+
+    // (title, fixed width | None = fill, numeric)
+    let cols: &[(&str, Option<f32>, bool)] = &[
+        ("Name", None, false),
+        ("Type", Some(110.0), false),
+        ("Incr (ps)", Some(90.0), true),
+        ("Path (ps)", Some(90.0), true),
+        ("Net", None, false),
+        ("Fanout", Some(70.0), true),
+        ("Location", Some(150.0), false),
+    ];
+    let w = ui.available_width();
+    let fixed: f32 = cols.iter().filter_map(|c| c.1).sum();
+    let n_fill = cols.iter().filter(|c| c.1.is_none()).count().max(1) as f32;
+    let fill_w = ((w - fixed) / n_fill).max(80.0);
+    let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
+
+    let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+    let cells: Vec<SpecCell> = cols
+        .iter()
+        .map(|(t, _, num)| SpecCell {
+            text: (*t).to_string(),
+            color: theme.dim,
+            right: *num,
+            mono: false,
+        })
+        .collect();
+    spec_paint_cells(ui, hrect, &widths, &cells, true);
+    spec_divider(ui, theme, hrect);
+
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
     egui::ScrollArea::vertical()
         .max_height(280.0)
         .hscroll(true)
         .show(ui, |ui| {
-            let pin_col = chrome::stretched_col_w_gap(7, ui.available_width(), 8.0);
-            egui::Grid::new("timing_pin_delay")
-                .spacing([8.0, 4.0])
-                .min_col_width(pin_col)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Name").strong());
-                    ui.label(RichText::new("Type").strong());
-                    ui.label(RichText::new("Incr_ps").strong());
-                    ui.label(RichText::new("Path_ps").strong());
-                    ui.label(RichText::new("Net").strong());
-                    ui.label(RichText::new("Fanout").strong());
-                    ui.label(RichText::new("Location").strong());
-                    ui.end_row();
-                    for pin in &path.pins {
-                        let on = selected_pin.as_deref() == Some(pin.pin.as_str());
-                        if ui.selectable_label(on, &pin.pin).clicked() {
-                            pick_pin = Some(pin.pin.clone());
-                        }
-                        ui.label(&pin.delay_type);
-                        ui.label(pin.incr_ps.to_string());
-                        ui.label(pin.path_ps.to_string());
-                        ui.label(if pin.net.is_empty() {
-                            "-"
-                        } else {
-                            pin.net.as_str()
-                        });
-                        ui.label(pin.fanout.to_string());
-                        ui.label(if pin.location.is_empty() {
-                            "-"
-                        } else {
-                            pin.location.as_str()
-                        });
-                        ui.end_row();
-                    }
-                });
+            for pin in &path.pins {
+                let on = selected_pin.as_deref() == Some(pin.pin.as_str());
+                let (rrect, _) =
+                    ui.allocate_exact_size(egui::vec2(w, 27.0), egui::Sense::hover());
+                if on {
+                    ui.painter().rect_filled(rrect, 0.0, theme.sel);
+                } else if ui.rect_contains_pointer(rrect) {
+                    ui.painter().rect_filled(rrect, 0.0, theme.surface_hover);
+                }
+                let resp =
+                    ui.interact(rrect, egui::Id::new(("tpathp", &pin.pin)), egui::Sense::click());
+                if resp.clicked() {
+                    pick_pin = Some(pin.pin.clone());
+                }
+                let net = if pin.net.is_empty() { "-" } else { pin.net.as_str() };
+                let loc = if pin.location.is_empty() {
+                    "-"
+                } else {
+                    pin.location.as_str()
+                };
+                let cells = vec![
+                    SpecCell::text(pin.pin.clone(), theme.text),
+                    SpecCell::text(pin.delay_type.clone(), theme.dim),
+                    SpecCell::num(pin.incr_ps.to_string(), theme.text),
+                    SpecCell::num(pin.path_ps.to_string(), theme.text),
+                    SpecCell::text(net, theme.dim),
+                    SpecCell::num(pin.fanout.to_string(), theme.text),
+                    SpecCell::text(loc, theme.dim),
+                ];
+                spec_paint_cells(ui, rrect, &widths, &cells, false);
+                spec_divider(ui, theme, rrect);
+            }
         });
     if let Some(pin) = pick_pin {
         let _ = model.select_timing_pin(&pin);
@@ -4610,29 +5026,63 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
         return;
     }
     ui.add_space(4.0);
-    ui.label(RichText::new("Design Timing Summary").strong());
-    let col_w = chrome::stretched_col_w(7, ui.available_width());
-    egui::Grid::new("timing_summary_design")
-        .spacing([12.0, 4.0])
-        .min_col_width(col_w)
-        .show(ui, |ui| {
-            ui.label(RichText::new("WNS_PS").strong());
-            ui.label(RichText::new("TNS_PS").strong());
-            ui.label(RichText::new("WHS_PS").strong());
-            ui.label(RichText::new("THS_PS").strong());
-            ui.label(RichText::new("FAILING_SETUP").strong());
-            ui.label(RichText::new("FAILING_HOLD").strong());
-            ui.label(RichText::new("ENDPOINTS").strong());
-            ui.end_row();
-            ui.label(slack_label(report.wns_ps));
-            ui.label(report.tns_ps.to_string());
-            ui.label(slack_label(report.whs_ps));
-            ui.label(report.ths_ps.to_string());
-            ui.label(report.failing_setup.to_string());
-            ui.label(report.failing_hold.to_string());
-            ui.label(report.endpoints.to_string());
-            ui.end_row();
+    ui.label(
+        egui::RichText::new("Design Timing Summary")
+            .font(theme::font_ui_semibold(13.0))
+            .color(theme.text),
+    );
+    // Full-word labels (§3.3.5) — never bare codes like WNS_PS.
+    {
+        let headers = [
+            "Worst Negative Slack (WNS)",
+            "Total Negative Slack (TNS)",
+            "Worst Hold Slack (WHS)",
+            "Total Hold Slack (THS)",
+            "Failing Setup",
+            "Failing Hold",
+            "Endpoints",
+        ];
+        let widths = [220.0f32, 210.0, 200.0, 190.0, 130.0, 130.0, 110.0];
+        let total: f32 = widths.iter().sum();
+        let w = ui.available_width().max(total);
+        let period = model.clock_period_ps;
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            let (hrect, _) =
+                ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+            let hcells: Vec<SpecCell> = headers
+                .iter()
+                .map(|t| SpecCell {
+                    text: (*t).to_string(),
+                    color: theme.dim,
+                    right: true,
+                    mono: false,
+                })
+                .collect();
+            spec_paint_cells(ui, hrect, &widths, &hcells, true);
+            spec_divider(ui, theme, hrect);
+            let (rrect, _) =
+                ui.allocate_exact_size(egui::vec2(w, 27.0), egui::Sense::hover());
+            let wns_c = report
+                .wns_ps
+                .map(|v| slack_color(theme, v, period))
+                .unwrap_or(theme.dim);
+            let whs_c = report
+                .whs_ps
+                .map(|v| slack_color(theme, v, period))
+                .unwrap_or(theme.dim);
+            let rcells = vec![
+                SpecCell::num(slack_label(report.wns_ps), wns_c),
+                SpecCell::num(report.tns_ps.to_string(), theme.text),
+                SpecCell::num(slack_label(report.whs_ps), whs_c),
+                SpecCell::num(report.ths_ps.to_string(), theme.text),
+                SpecCell::num(report.failing_setup.to_string(), theme.text),
+                SpecCell::num(report.failing_hold.to_string(), theme.text),
+                SpecCell::num(report.endpoints.to_string(), theme.text),
+            ];
+            spec_paint_cells(ui, rrect, &widths, &rcells, false);
+            spec_divider(ui, theme, rrect);
         });
+    }
     let selected_ts = model.selected_timing_summary.clone();
     let selected = model.selected.clone();
     let mut pick: Option<(String, Option<String>)> = None;
@@ -4657,11 +5107,11 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("From").strong());
                 ui.label(RichText::new("To").strong());
-                ui.label(RichText::new("WNS_PS").strong());
-                ui.label(RichText::new("TNS_PS").strong());
-                ui.label(RichText::new("WHS_PS").strong());
-                ui.label(RichText::new("THS_PS").strong());
-                ui.label(RichText::new("ENDPOINTS").strong());
+                ui.label(RichText::new("Worst Negative Slack (WNS)").strong());
+                ui.label(RichText::new("Total Negative Slack (TNS)").strong());
+                ui.label(RichText::new("Worst Hold Slack (WHS)").strong());
+                ui.label(RichText::new("Total Hold Slack (THS)").strong());
+                ui.label(RichText::new("Endpoints").strong());
                 ui.end_row();
                 for g in rows {
                     let key = if kind == PathGroupKind::Other {
@@ -4862,7 +5312,7 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 ui.label(RichText::new("Sync").strong());
                 ui.label(RichText::new("Endpoints").strong());
                 ui.label(RichText::new("Objects").strong());
-                ui.label(RichText::new("WNS_PS").strong());
+                ui.label(RichText::new("Worst Slack (ps)").strong());
                 ui.label(RichText::new("Relation").strong());
                 ui.end_row();
                 for v in &report.violations {
@@ -5313,89 +5763,161 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
 }
 
 fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.heading("DRC");
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
+    let mut do_report = false;
+    section_bar(ui, theme, "DRC", |ui| {
         if ui.button("Report DRC").clicked() {
-            let _ = model.exec("report_drc");
+            do_report = true;
         }
     });
-    ui.add_space(6.0);
+    if do_report {
+        let _ = model.exec("report_drc");
+    }
     if model.utilization.is_none() && model.drc.is_none() {
-        if paint_remaining_cta(ui, "No DRC results yet.", "Report DRC", theme) {
-            let _ = model.exec("report_drc");
-        }
+        // Designed empty state (§3.8): centered dim text + action.
+        ui.add_space(28.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No DRC results yet.")
+                    .size(13.0)
+                    .color(theme.dim),
+            );
+            ui.add_space(6.0);
+            if primary_button(ui, "Report DRC").clicked() {
+                let _ = model.exec("report_drc");
+            }
+        });
         return;
     }
     let report = model.drc.clone().unwrap_or_else(|| model.drc_report());
-    ui.label(format!(
-        "{} violations · {} errors",
-        report.violations.len(),
-        report.error_count()
-    ));
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(format!(
+            "{} violations · {} errors",
+            report.violations.len(),
+            report.error_count()
+        ))
+        .size(12.0)
+        .color(theme.dim),
+    );
+    ui.add_space(4.0);
+
+    if report.ok() {
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No violations.")
+                    .size(13.0)
+                    .color(theme.dim),
+            );
+        });
+        return;
+    }
+
+    // ID | Severity | Objects | Message. The message column wraps inside its
+    // own column width — it never clips at the right edge. Header and rows
+    // live in the same scroll area so their widths always agree.
     let selected_drc = model.selected_drc.clone();
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
-    let n = report.items.len().max(1);
-    let remain = ui.available_size();
-    let bbox = chrome::nv_table_bbox(n, remain.x.max(80.0), remain.y.max(120.0));
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(bbox.drawn_w.max(remain.x), bbox.drawn_h.max(remain.y)),
-        Sense::hover(),
-    );
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
-        let n_f = n as f32;
-        let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
-        let col_w = chrome::stretched_col_w_gap(4, ui.available_width(), 8.0);
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("drc_table")
-                .spacing([8.0, row_gap])
-                .min_col_width(col_w)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("ID").strong());
-                    ui.label(RichText::new("Severity").strong());
-                    ui.label(RichText::new("Objects").strong());
-                    ui.label(RichText::new("Message").strong());
-                    ui.end_row();
-                    if report.ok() {
-                        ui.label("—");
-                        ui.label("ok");
-                        ui.label("-");
-                        ui.label("No violations.");
-                        ui.end_row();
-                    } else {
-                        for v in &report.items {
-                            let on = selected_drc.as_deref() == Some(v.id.as_str());
-                            let fill = drc_severity_color(theme, v.severity);
-                            let btn = egui::Button::new(RichText::new(&v.id).color(Color32::BLACK))
-                                .fill(fill)
-                                .selected(on);
-                            if ui.add(btn).clicked() {
-                                pick = Some(v.id.clone());
-                            }
-                            ui.label(v.severity.as_str());
-                            let obj = if v.objects.is_empty() {
-                                "-"
-                            } else {
-                                v.objects.as_str()
-                            };
-                            let on_obj = selected.as_deref() == Some(obj)
-                                || (!v.objects.is_empty()
-                                    && selected.as_deref().is_some_and(|s| v.objects.contains(s)));
-                            if ui.selectable_label(on || on_obj, obj).clicked() {
-                                if obj == "-" {
-                                    pick = Some(v.id.clone());
-                                } else {
-                                    pick_obj = Some(v.id.clone());
-                                }
-                            }
-                            ui.label(&v.message);
-                            ui.end_row();
-                        }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let w = ui.available_width();
+        let obj_w = ((w - 170.0) * 0.35).max(90.0);
+        let msg_w = (w - 170.0 - obj_w).max(90.0);
+        let widths = [80.0f32, 90.0, obj_w, msg_w];
+
+        let (hrect, _) =
+            ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+        spec_paint_cells(
+            ui,
+            hrect,
+            &widths,
+            &[
+                SpecCell::text("ID", theme.dim),
+                SpecCell::text("Severity", theme.dim),
+                SpecCell::text("Objects", theme.dim),
+                SpecCell::text("Message", theme.dim),
+            ],
+            true,
+        );
+        spec_divider(ui, theme, hrect);
+
+        for (i, v) in report.items.iter().enumerate() {
+            let on = selected_drc.as_deref() == Some(v.id.as_str());
+            let on_obj = selected.as_deref().is_some_and(|s| {
+                !v.objects.is_empty() && v.objects.contains(s)
+            });
+            // Wrap the message inside its column; the row grows to fit it.
+            let msg = ui.painter().layout(
+                v.message.clone(),
+                theme::font_ui(13.0),
+                theme.text,
+                msg_w - 16.0,
+            );
+            let rh = (msg.size().y + 12.0).max(27.0);
+            let (rrect, _) =
+                ui.allocate_exact_size(egui::vec2(w, rh), egui::Sense::hover());
+            if on {
+                ui.painter().rect_filled(rrect, 0.0, theme.sel);
+            } else if ui.rect_contains_pointer(rrect) {
+                ui.painter().rect_filled(rrect, 0.0, theme.surface_hover);
+            }
+            let resp = ui.interact(
+                rrect,
+                egui::Id::new(("drcrow", i)),
+                egui::Sense::click(),
+            );
+            if resp.clicked() {
+                pick = Some(v.id.clone());
+                // Clicking the Objects cell also cross-probes the object.
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let ox0 = rrect.left() + widths[0] + widths[1];
+                    if pos.x >= ox0 && pos.x < ox0 + widths[2] {
+                        pick_obj = Some(v.id.clone());
                     }
-                });
-        });
+                }
+            }
+            let p = ui.painter();
+            let cy = rrect.center().y;
+            // ID badge in the severity color.
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(rrect.left() + 8.0, cy - 9.0),
+                egui::vec2(widths[0] - 16.0, 18.0),
+            );
+            p.rect_filled(badge, 4.0, drc_severity_color(theme, v.severity));
+            p.text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                &v.id,
+                theme::font_ui_semibold(11.0),
+                Color32::BLACK,
+            );
+            let mut sx = rrect.left() + widths[0];
+            p.text(
+                egui::pos2(sx + 8.0, cy),
+                egui::Align2::LEFT_CENTER,
+                v.severity.as_str(),
+                theme::font_ui(13.0),
+                theme.text,
+            );
+            sx += widths[1];
+            let obj = if v.objects.is_empty() {
+                "-"
+            } else {
+                v.objects.as_str()
+            };
+            p.text(
+                egui::pos2(sx + 8.0, cy),
+                egui::Align2::LEFT_CENTER,
+                obj,
+                theme::font_ui(13.0),
+                if on_obj { theme.text } else { theme.dim },
+            );
+            // Wrapped message, top-aligned within the row.
+            let mx = rrect.left() + widths[0] + widths[1] + widths[2];
+            p.galley(egui::pos2(mx + 8.0, rrect.top() + 6.0), msg, theme.text);
+            spec_divider(ui, theme, rrect);
+        }
     });
     if let Some(id) = pick_obj {
         let _ = model.select_drc(&id);
@@ -5404,7 +5926,6 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         let _ = model.select_drc(&id);
     }
 }
-
 fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Utilization");
     ui.add_space(6.0);
