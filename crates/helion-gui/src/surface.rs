@@ -314,6 +314,8 @@ pub enum JobKind {
     Implement,
     Step(FlowStep),
     SimRun(u32),
+    /// Re-run STA (`report_timing_now`) against the current constraints.
+    ReportTiming,
 }
 
 impl JobKind {
@@ -327,6 +329,7 @@ impl JobKind {
             JobKind::Step(FlowStep::Route) => "Route",
             JobKind::Step(FlowStep::Bitstream) => "Bitstream",
             JobKind::SimRun(_) => "Simulate",
+            JobKind::ReportTiming => "Timing",
         }
     }
 
@@ -341,6 +344,7 @@ impl JobKind {
             JobKind::Implement => "Implementing — synthesis, opt, place, route…".into(),
             JobKind::Step(s) => format!("Running {}…", s.label()),
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
+            JobKind::ReportTiming => "Re-running timing analysis…".into(),
         }
     }
 }
@@ -367,6 +371,7 @@ fn run_kind(model: &mut IdeModel, kind: &JobKind) -> Result<String, String> {
         JobKind::Implement => model.implement(),
         JobKind::Step(s) => model.run_step(*s),
         JobKind::SimRun(n) => model.sim_run(*n),
+        JobKind::ReportTiming => model.report_timing_now(),
     }
 }
 
