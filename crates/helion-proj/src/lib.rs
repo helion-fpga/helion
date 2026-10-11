@@ -11,6 +11,13 @@ use helion_place::{PlaceOpts, Placed, place_incremental, place_with};
 use helion_route::{HOP_DELAY_PS, RouteOpts, Routed, route_with};
 use helion_sta::{Constraints, apply_xdc, create_clock, load_xdc, report_timing_routed_xdc};
 
+mod checkpoint2;
+pub use checkpoint2::{
+    CheckpointDiff, CheckpointMeta, CheckpointStage, CheckpointSummary, RestoredCheckpoint,
+    delete_checkpoint, diff_metas, list_checkpoints, load_checkpoint, read_meta, save_checkpoint,
+    stage_of,
+};
+
 /// UG986 Lab 1 Helion equivalents of implementation strategies.
 /// Not Vivado strategy trademarks: same *kind* of lever (timing vs runtime vs phys).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
