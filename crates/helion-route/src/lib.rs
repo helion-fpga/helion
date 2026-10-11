@@ -653,10 +653,7 @@ pub fn route_with_guide(
             paths.push(path);
         }
         let ou = pres.iter().filter(|c| **c > 1).count() as u32;
-        let hops_sum: u32 = paths
-            .iter()
-            .map(|p| p.len().saturating_sub(1) as u32)
-            .sum();
+        let hops_sum: u32 = paths.iter().map(|p| p.len().saturating_sub(1) as u32).sum();
         if ou < best_overused || (ou == best_overused && hops_sum < best_hops) {
             best_overused = ou;
             best_hops = hops_sum;
@@ -1019,8 +1016,7 @@ mod tests {
         assert!(r.pathfinder_iters >= 1);
         // hard_heartbeat is a single-IOB fixture after place; still must be clean.
         assert_eq!(
-            r.overused,
-            0,
+            r.overused, 0,
             "terminal-only overlap must not count as overused"
         );
         assert!(!r.iob_src.is_empty());

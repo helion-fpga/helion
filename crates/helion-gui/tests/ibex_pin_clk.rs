@@ -56,10 +56,14 @@ fn ibex_pin_wrap_user_sdc_closed_wns_or_named_miss() {
     assert_eq!(probe, "hb_0", "ILA probe is bit-blasted hb_0");
 
     // add_wave must accept the ILA/RTL Q-net name (not only sim FF cell u_ff0).
-    let aw = ide.exec("add_wave hb_0").expect("add_wave hb_0 after implement");
+    let aw = ide
+        .exec("add_wave hb_0")
+        .expect("add_wave hb_0 after implement");
     assert!(aw.contains("add_wave hb_0"), "{aw}");
     assert!(ide.wave.has_trace("hb_0"), "wave has hb_0");
-    let bus_miss = ide.exec("add_wave hb").expect_err("bus root must diagnose bit-blast");
+    let bus_miss = ide
+        .exec("add_wave hb")
+        .expect_err("bus root must diagnose bit-blast");
     assert!(
         bus_miss.contains("bit-blast") && bus_miss.contains("hb_0"),
         "{bus_miss}"
@@ -70,9 +74,15 @@ fn ibex_pin_wrap_user_sdc_closed_wns_or_named_miss() {
     assert!(
         ide.objects.iter().any(|o| o.name == "hb_0"),
         "Objects must list hb_0 after sim: {:?}",
-        ide.objects.iter().map(|o| o.name.clone()).collect::<Vec<_>>()
+        ide.objects
+            .iter()
+            .map(|o| o.name.clone())
+            .collect::<Vec<_>>()
     );
-    let bits = ide.wave.bits_of("hb_0").expect("hb_0 samples after sim_run");
+    let bits = ide
+        .wave
+        .bits_of("hb_0")
+        .expect("hb_0 samples after sim_run");
     eprintln!("hb_0 wave bits={bits}");
     assert!(
         bits.contains('0') && bits.contains('1'),

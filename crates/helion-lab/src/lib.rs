@@ -18,8 +18,8 @@
 use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_hw::{
-    overlay_program_led, program_hbits_with_cable, refuse_empty_bitstream, resolve_cable,
-    usb_native_feature_enabled, CableBackend, OverlayReport,
+    CableBackend, OverlayReport, overlay_program_led, program_hbits_with_cable,
+    refuse_empty_bitstream, resolve_cable, usb_native_feature_enabled,
 };
 use std::path::Path;
 
@@ -52,7 +52,8 @@ pub fn lab_program_empty() -> Result<String, String> {
             .err()
             .map(|e| format!("lab: {e}"))
             .unwrap_or_else(|| {
-                "lab: empty bitstream refused (no configured frames) — refusing DONE on empty".into()
+                "lab: empty bitstream refused (no configured frames) — refusing DONE on empty"
+                    .into()
             }),
     ))
 }
@@ -142,8 +143,8 @@ pub fn lab_program_auto(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_hw::COUNTER_OVERLAY_LED;
     use helion_bits::bitgen;
+    use helion_hw::COUNTER_OVERLAY_LED;
     use helion_ir::Design;
     use helion_pack::pack;
     use helion_place::place;
@@ -190,8 +191,10 @@ mod tests {
         let bits = bitgen_structural_counter();
         assert!(!bits.frames.is_empty());
 
-        let empty_ov = lab_overlay(&Bitstream::empty(&Device::load_part("HL10T-C32-1").unwrap()))
-            .unwrap_err();
+        let empty_ov = lab_overlay(&Bitstream::empty(
+            &Device::load_part("HL10T-C32-1").unwrap(),
+        ))
+        .unwrap_err();
         assert!(
             empty_ov.contains(ERR_CODE_EMPTY_BITSTREAM),
             "stable empty code missing: {empty_ov}"

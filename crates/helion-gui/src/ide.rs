@@ -7,22 +7,28 @@
 //! output anywhere in this file, so the widget layer (`helion-ide`) is a thin painter
 //! over this model and can be tested without a display.
 
-use crate::{tcl_eval, GpuiShell};
-use helion_bd::{emit_sv, validate, BlockDesign};
-use helion_debug::{insert_arm_capture, insert_arm_capture_deep, IlaArmConfig, IlaCapture, IlaCaptureDeep, IlaTriggerKind};
+use crate::{GpuiShell, tcl_eval};
+use helion_bd::{BlockDesign, emit_sv, validate};
+use helion_debug::{
+    IlaArmConfig, IlaCapture, IlaCaptureDeep, IlaTriggerKind, insert_arm_capture,
+    insert_arm_capture_deep,
+};
 use helion_device::{Device, Far, Site, SiteKind};
-use helion_drc::{check_placed, check_routed, Drc, DrcSeverity};
+use helion_drc::{Drc, DrcSeverity, check_placed, check_routed};
 use helion_fabric::{Fabric, Stat, StatBit};
+use helion_ipxact::{IpCore, catalog as ipxact_catalog, to_xml};
 use helion_ir::{CellKind, Design, PortDir};
-use helion_ipxact::{catalog as ipxact_catalog, to_xml, IpCore};
-use helion_proj::{expand_ip_packages, format_prj, get_cells, get_nets, load_prj, resolve_prj_path, ImplStrategy, Mode, ProjectFile, ReuseReport, Session};
+use helion_proj::{
+    ImplStrategy, Mode, ProjectFile, ReuseReport, Session, expand_ip_packages, format_prj,
+    get_cells, get_nets, load_prj, resolve_prj_path,
+};
 use helion_sim::{Sim, SimLocal};
 use helion_sta::{
-    clock_network_delay_ps, create_clock, iostandard_pad_ps, port_pad_ps, load_xdc,
-    report_cdc, report_clock_interaction, report_clock_networks, report_methodology,
-    report_power, report_timing_routed_xdc, report_timing_summary, CdcReport,
-    ClockInteraction, ClockNetworkReport, Constraints, MethodologyReport, MethodologySeverity,
-    PowerReport, TimingResult, TimingSummary, FF_CKQ_PS, LUT_PS, PIN_PS, SETUP_PS,
+    CdcReport, ClockInteraction, ClockNetworkReport, Constraints, FF_CKQ_PS, LUT_PS,
+    MethodologyReport, MethodologySeverity, PIN_PS, PowerReport, SETUP_PS, TimingResult,
+    TimingSummary, clock_network_delay_ps, create_clock, iostandard_pad_ps, load_xdc, port_pad_ps,
+    report_cdc, report_clock_interaction, report_clock_networks, report_methodology, report_power,
+    report_timing_routed_xdc, report_timing_summary,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -97,11 +103,7 @@ pub struct ConsoleLine {
 
 impl ConsoleLine {
     pub fn status(&self) -> &'static str {
-        if self.ok {
-            "ok"
-        } else {
-            "error"
-        }
+        if self.ok { "ok" } else { "error" }
     }
 
     /// Clickable-grid dump row: UG893 Tcl Console Status/Cmd/Out, not `helion% cmd`.
@@ -1082,7 +1084,10 @@ impl BitstreamReport {
                 return Some(r);
             }
         }
-        let hex = spec.strip_prefix("0x").or_else(|| spec.strip_prefix("0X")).unwrap_or(spec);
+        let hex = spec
+            .strip_prefix("0x")
+            .or_else(|| spec.strip_prefix("0X"))
+            .unwrap_or(spec);
         if hex.chars().all(|c| c.is_ascii_hexdigit()) {
             if let Ok(far) = u32::from_str_radix(hex, 16) {
                 if let Some(r) = self.rows.iter().find(|f| f.far == far) {
@@ -1408,9 +1413,7 @@ impl TimingPath {
     pub fn logic_ps(&self) -> i64 {
         self.pins
             .iter()
-            .filter(|p| {
-                p.delay_type == "cell" || p.delay_type == "setup" || p.delay_type == "iob"
-            })
+            .filter(|p| p.delay_type == "cell" || p.delay_type == "setup" || p.delay_type == "iob")
             .map(|p| p.incr_ps)
             .sum()
     }
@@ -1486,18 +1489,19 @@ pub fn schematic_star_edges(net: &str, endpoints: &[helion_ir::Endpoint]) -> Vec
         }
     }
     let mut edges = Vec::new();
-    let push = |edges: &mut Vec<SchematicEdge>, a: &helion_ir::Endpoint, b: &helion_ir::Endpoint| {
-        if a.cell == b.cell {
-            return;
-        }
-        edges.push(SchematicEdge {
-            src: a.cell.clone(),
-            src_pin: a.pin.clone(),
-            dst: b.cell.clone(),
-            dst_pin: b.pin.clone(),
-            net: net.to_string(),
-        });
-    };
+    let push =
+        |edges: &mut Vec<SchematicEdge>, a: &helion_ir::Endpoint, b: &helion_ir::Endpoint| {
+            if a.cell == b.cell {
+                return;
+            }
+            edges.push(SchematicEdge {
+                src: a.cell.clone(),
+                src_pin: a.pin.clone(),
+                dst: b.cell.clone(),
+                dst_pin: b.pin.clone(),
+                net: net.to_string(),
+            });
+        };
     if drivers.is_empty() {
         let Some(drv) = loads.first() else {
             return edges;
@@ -1668,8 +1672,7 @@ impl SchematicView {
             .nodes
             .iter()
             .filter(|n| {
-                !n.kind.starts_with("instance")
-                    && (n.name == inst || n.name.starts_with(&pfx))
+                !n.kind.starts_with("instance") && (n.name == inst || n.name.starts_with(&pfx))
             })
             .map(|n| n.name.clone())
             .collect();
@@ -1704,9 +1707,7 @@ impl SchematicView {
             let logic: Vec<&str> = self
                 .nodes
                 .iter()
-                .filter(|n| {
-                    !n.kind.starts_with("instance") && !n.kind.starts_with("PORT")
-                })
+                .filter(|n| !n.kind.starts_with("instance") && !n.kind.starts_with("PORT"))
                 .map(|n| n.name.as_str())
                 .collect();
             if !logic.is_empty() && logic.iter().all(|n| members.contains(*n)) {
@@ -1733,8 +1734,14 @@ impl SchematicView {
                 if p.net.is_empty() {
                     continue;
                 }
-                nets_of.entry(n.name.as_str()).or_default().push(p.net.as_str());
-                cells_of.entry(p.net.as_str()).or_default().push(n.name.as_str());
+                nets_of
+                    .entry(n.name.as_str())
+                    .or_default()
+                    .push(p.net.as_str());
+                cells_of
+                    .entry(p.net.as_str())
+                    .or_default()
+                    .push(n.name.as_str());
             }
         }
         let mut seen = HashSet::new();
@@ -1843,7 +1850,10 @@ impl SchematicView {
 
     pub fn visible_nodes(&self) -> Vec<&SchematicNode> {
         let keep = self.cone_cell_names();
-        self.nodes.iter().filter(|n| keep.contains(&n.name)).collect()
+        self.nodes
+            .iter()
+            .filter(|n| keep.contains(&n.name))
+            .collect()
     }
 
     pub fn visible_edges(&self) -> Vec<&SchematicEdge> {
@@ -1902,7 +1912,11 @@ impl SchematicView {
             if self.cone_root.is_some() && !visible_nets.contains(&p.name) {
                 continue;
             }
-            let kind = if p.dir == "OUT" { "PORT_OUT" } else { "PORT_IN" };
+            let kind = if p.dir == "OUT" {
+                "PORT_OUT"
+            } else {
+                "PORT_IN"
+            };
             let pin = SchematicPin {
                 name: p.name.clone(),
                 net: p.name.clone(),
@@ -1997,7 +2011,10 @@ impl SchematicView {
             for n in &self.nodes {
                 for p in &n.pins {
                     if !p.net.is_empty() {
-                        net_cells.entry(p.net.clone()).or_default().insert(n.name.clone());
+                        net_cells
+                            .entry(p.net.clone())
+                            .or_default()
+                            .insert(n.name.clone());
                     }
                 }
             }
@@ -2026,11 +2043,7 @@ impl SchematicView {
             let blast = if let Some((pfx, idx)) = net.rsplit_once('_') {
                 if idx.bytes().all(|b| b.is_ascii_digit()) {
                     let c = prefix_count.get(pfx).copied().unwrap_or(1);
-                    if c >= 2 {
-                        c as u8
-                    } else {
-                        1
-                    }
+                    if c >= 2 { c as u8 } else { 1 }
                 } else {
                     1
                 }
@@ -2064,8 +2077,14 @@ impl SchematicView {
                 continue;
             }
             let track = *net_track.get(net.as_str()).unwrap_or(&0);
-            let drivers = drivers_of.get(net.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
-            let loads = loads_of.get(net.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            let drivers = drivers_of
+                .get(net.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let loads = loads_of
+                .get(net.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             for &(sc, sp) in drivers {
                 for &(dc, dp) in loads {
                     if sc == dc {
@@ -2161,11 +2180,7 @@ impl SchematicView {
             .iter()
             .map(|s| {
                 // Include a pin name that hangs below the box, not just the stroke.
-                let pin_below = s
-                    .pins
-                    .iter()
-                    .map(|p| p.y + 12.0)
-                    .fold(s.y + s.h, f32::max);
+                let pin_below = s.pins.iter().map(|p| p.y + 12.0).fold(s.y + s.h, f32::max);
                 pin_below + MARGIN
             })
             .fold(240.0f32, f32::max)
@@ -2220,12 +2235,19 @@ impl DeviceSiteView {
 
     /// Occupancy glyph for the Device floorplan map (not a pin-name dump).
     pub fn occupancy_char(&self) -> char {
-        let has_lut = self.bels.iter().any(|n| n.to_ascii_lowercase().contains("lut"))
+        let has_lut = self
+            .bels
+            .iter()
+            .any(|n| n.to_ascii_lowercase().contains("lut"))
             || self
                 .occupant
                 .as_deref()
                 .is_some_and(|n| n.to_ascii_lowercase().contains("lut"));
-        match (self.occupant.is_some() || !self.bels.is_empty(), self.kind, has_lut) {
+        match (
+            self.occupant.is_some() || !self.bels.is_empty(),
+            self.kind,
+            has_lut,
+        ) {
             (true, SiteKind::Iob, _) => 'O',
             (true, _, true) => 'L',
             (true, SiteKind::Clb, _) => 'C',
@@ -2474,9 +2496,9 @@ fn had_clock_regions(x0: u32, y0: u32, cols: u32, rows: u32) -> Vec<ClockRegion>
 
 impl DeviceView {
     pub fn occupant_of(&self, cell: &str) -> Option<&DeviceSiteView> {
-        self.sites.iter().find(|s| {
-            s.occupant.as_deref() == Some(cell) || s.bels.iter().any(|b| b == cell)
-        })
+        self.sites
+            .iter()
+            .find(|s| s.occupant.as_deref() == Some(cell) || s.bels.iter().any(|b| b == cell))
     }
 
     pub fn site_at(&self, x: u32, y: u32) -> Option<&DeviceSiteView> {
@@ -2760,7 +2782,10 @@ impl Waveform {
                 }
             }
         }
-        self.traces.iter().find(|t| t.name == name).map(|t| t.bit_string())
+        self.traces
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.bit_string())
     }
 
     fn led_half_cycle_bits(&self, clk_name: &str) -> Option<String> {
@@ -2828,7 +2853,11 @@ impl Waveform {
     }
 
     pub fn sample_len(&self) -> usize {
-        self.traces.iter().map(|t| t.samples.len()).max().unwrap_or(0)
+        self.traces
+            .iter()
+            .map(|t| t.samples.len())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn marker(&self, name: &str) -> Option<&WaveMarker> {
@@ -2853,11 +2882,7 @@ impl Waveform {
             if members.len() != vb.members.len() {
                 continue;
             }
-            let n = members
-                .iter()
-                .map(|t| t.samples.len())
-                .min()
-                .unwrap_or(0);
+            let n = members.iter().map(|t| t.samples.len()).min().unwrap_or(0);
             let width: u8 = members
                 .iter()
                 .map(|m| m.width.max(1))
@@ -3203,11 +3228,7 @@ pub struct BreakpointRow {
 
 impl BreakpointRow {
     pub fn enabled_cell(&self) -> &'static str {
-        if self.enabled {
-            "1"
-        } else {
-            "0"
-        }
+        if self.enabled { "1" } else { "0" }
     }
 
     pub fn kind_cell(&self) -> &str {
@@ -3342,31 +3363,22 @@ impl SourceLine {
     }
 
     pub fn signal_cell(&self) -> &str {
-        self.signal.as_deref().filter(|s| !s.is_empty()).unwrap_or("-")
+        self.signal
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("-")
     }
 
     pub fn exec_cell(&self) -> &'static str {
-        if self.executable {
-            "1"
-        } else {
-            "0"
-        }
+        if self.executable { "1" } else { "0" }
     }
 
     pub fn bp_cell(&self, armed: bool) -> &'static str {
-        if armed {
-            "1"
-        } else {
-            "0"
-        }
+        if armed { "1" } else { "0" }
     }
 
     pub fn pc_cell(&self, pc: Option<usize>) -> &'static str {
-        if pc == Some(self.line) {
-            ">"
-        } else {
-            "-"
-        }
+        if pc == Some(self.line) { ">" } else { "-" }
     }
 
     /// Clickable-grid dump row: UG900 Source Line/BP/Kind/Text, not a file dump.
@@ -3719,9 +3731,7 @@ impl HwStatReport {
                 return Some(b);
             }
         }
-        self.bits
-            .iter()
-            .find(|b| b.name.eq_ignore_ascii_case(spec))
+        self.bits.iter().find(|b| b.name.eq_ignore_ascii_case(spec))
     }
 
     pub fn word_hex(&self) -> String {
@@ -3913,7 +3923,8 @@ impl BdView {
             h: HUB_H,
             pins: Vec::new(),
         };
-        hub.pins.push(pin("clk", "clk", false, false, hub.x - STUB, hub.y + 18.0));
+        hub.pins
+            .push(pin("clk", "clk", false, false, hub.x - STUB, hub.y + 18.0));
         hub.pins.push(pin(
             "resetn",
             "resetn",
@@ -3966,7 +3977,8 @@ impl BdView {
                 h: CORE_H,
                 pins: Vec::new(),
             };
-            c.pins.push(pin("clk", "clk", false, false, c.x - STUB, c.y + 18.0));
+            c.pins
+                .push(pin("clk", "clk", false, false, c.x - STUB, c.y + 18.0));
             c.pins.push(pin(
                 "resetn",
                 "resetn",
@@ -4039,8 +4051,7 @@ impl BdView {
                     points: manhattan(a.0, a.1, b.0, b.1),
                 });
             }
-            if let (Some(a), Some(b)) = (pin_xy(&hub, "resetn", true), pin_xy(c, "resetn", false))
-            {
+            if let (Some(a), Some(b)) = (pin_xy(&hub, "resetn", true), pin_xy(c, "resetn", false)) {
                 wires.push(BdWire {
                     net: "resetn".into(),
                     src: hub.name.clone(),
@@ -4395,35 +4406,32 @@ impl HierarchyView {
         let mut row_h = 0.0_f32;
         let origin_y = HEADER + PAD;
 
-        let place_leaves = |kids: &[(String, String)],
-                            ox: f32,
-                            oy: f32,
-                            boxes: &mut Vec<HierBox>|
-         -> (f32, f32) {
-            let n = kids.len().max(1);
-            let cols = (n as f32).sqrt().ceil().max(1.0) as usize;
-            let rows = (n + cols - 1) / cols;
-            for (i, (name, kind)) in kids.iter().enumerate() {
-                let c = i % cols;
-                let r = i / cols;
-                let units = Self::resource_weight(kind).max(1);
-                let w = LEAF_W * (units as f32).sqrt().max(1.0);
-                let h = LEAF_H * (units as f32).sqrt().max(1.0);
-                boxes.push(HierBox {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    x: ox + c as f32 * (LEAF_W + PAD),
-                    y: oy + r as f32 * (LEAF_H + PAD),
-                    w,
-                    h,
-                    cells: units,
-                });
-            }
-            (
-                cols as f32 * (LEAF_W + PAD) + PAD,
-                rows as f32 * (LEAF_H + PAD) + PAD,
-            )
-        };
+        let place_leaves =
+            |kids: &[(String, String)], ox: f32, oy: f32, boxes: &mut Vec<HierBox>| -> (f32, f32) {
+                let n = kids.len().max(1);
+                let cols = (n as f32).sqrt().ceil().max(1.0) as usize;
+                let rows = (n + cols - 1) / cols;
+                for (i, (name, kind)) in kids.iter().enumerate() {
+                    let c = i % cols;
+                    let r = i / cols;
+                    let units = Self::resource_weight(kind).max(1);
+                    let w = LEAF_W * (units as f32).sqrt().max(1.0);
+                    let h = LEAF_H * (units as f32).sqrt().max(1.0);
+                    boxes.push(HierBox {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        x: ox + c as f32 * (LEAF_W + PAD),
+                        y: oy + r as f32 * (LEAF_H + PAD),
+                        w,
+                        h,
+                        cells: units,
+                    });
+                }
+                (
+                    cols as f32 * (LEAF_W + PAD) + PAD,
+                    rows as f32 * (LEAF_H + PAD) + PAD,
+                )
+            };
 
         for (iname, ikind, kids) in &inst_kids {
             let units = kids
@@ -5112,7 +5120,11 @@ impl IdeModel {
     }
 
     pub fn bitstream_frames(&self) -> Option<usize> {
-        self.shell.session.bitstream.as_ref().map(|b| b.frames.len())
+        self.shell
+            .session
+            .bitstream
+            .as_ref()
+            .map(|b| b.frames.len())
     }
 
     /// helion-bits FAR table: configured (nonzero) frames from the Session bitstream.
@@ -5299,10 +5311,16 @@ impl IdeModel {
         } else if t == "project_summary" || t == "summary" {
             self.open_project_summary()
         } else if t == "select_project_summary" || t.starts_with("select_project_summary ") {
-            let spec = t.strip_prefix("select_project_summary").unwrap_or("").trim();
+            let spec = t
+                .strip_prefix("select_project_summary")
+                .unwrap_or("")
+                .trim();
             self.select_project_summary(spec)
         } else if t == "select_project_setting" || t.starts_with("select_project_setting ") {
-            let spec = t.strip_prefix("select_project_setting").unwrap_or("").trim();
+            let spec = t
+                .strip_prefix("select_project_setting")
+                .unwrap_or("")
+                .trim();
             self.select_project_setting(spec)
         } else if t == "simulation_settings" || t == "sim_settings" {
             self.open_sim_settings()
@@ -5424,10 +5442,7 @@ impl IdeModel {
         } else if t.starts_with("assign_package_pin ") {
             self.apply_package_pin(t)
         } else if t.starts_with("set_property ") {
-            let key = t
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("");
+            let key = t.split_whitespace().nth(1).unwrap_or("");
             if key.eq_ignore_ascii_case("PACKAGE_PIN") || key.eq_ignore_ascii_case("LOC") {
                 self.apply_package_pin(t)
             } else if key.eq_ignore_ascii_case("PART")
@@ -5490,7 +5505,11 @@ impl IdeModel {
         } else if t == "launch_runs" || t.starts_with("launch_runs ") {
             let name = t.split_whitespace().nth(1).unwrap_or("impl_1");
             self.launch_runs(name)
-        } else if t == "reset_runs" || t.starts_with("reset_runs ") || t == "reset_run" || t.starts_with("reset_run ") {
+        } else if t == "reset_runs"
+            || t.starts_with("reset_runs ")
+            || t == "reset_run"
+            || t.starts_with("reset_run ")
+        {
             let name = t.split_whitespace().nth(1).unwrap_or("impl_1");
             self.reset_runs(name)
         } else if t == "write_checkpoint" {
@@ -5504,7 +5523,10 @@ impl IdeModel {
         } else if t == "incremental_report" {
             self.open_incremental_report()
         } else if t == "select_incremental_object" || t.starts_with("select_incremental_object ") {
-            let spec = t.strip_prefix("select_incremental_object").unwrap_or("").trim();
+            let spec = t
+                .strip_prefix("select_incremental_object")
+                .unwrap_or("")
+                .trim();
             self.select_incremental_object(spec)
         } else if t == "select_incremental" || t.starts_with("select_incremental ") {
             let spec = t.strip_prefix("select_incremental").unwrap_or("").trim();
@@ -5562,12 +5584,16 @@ impl IdeModel {
             Ok(text)
         } else if t == "close_project" || t == "close" {
             self.close_project()
-        } else if t == "save_project_as" || t.starts_with("save_project_as ")
-            || t == "write_project" || t.starts_with("write_project ")
+        } else if t == "save_project_as"
+            || t.starts_with("save_project_as ")
+            || t == "write_project"
+            || t.starts_with("write_project ")
         {
             self.save_project_as_cmd(t)
-        } else if t == "write_report" || t.starts_with("write_report ")
-            || t == "export_report" || t.starts_with("export_report ")
+        } else if t == "write_report"
+            || t.starts_with("write_report ")
+            || t == "export_report"
+            || t.starts_with("export_report ")
         {
             self.write_report_cmd(t)
         } else if t == "report_utilization" || t == "utilization" {
@@ -5656,18 +5682,12 @@ impl IdeModel {
         } else if let Some(id) = t.strip_prefix("fix_methodology ") {
             self.fix_methodology(id.trim())
         } else if t == "fix_methodology" {
-            let id = self
-                .selected_methodology
-                .clone()
-                .unwrap_or_default();
+            let id = self.selected_methodology.clone().unwrap_or_default();
             self.fix_methodology(&id)
         } else if let Some(id) = t.strip_prefix("goto_methodology_constraints ") {
             self.goto_methodology_constraints(id.trim())
         } else if t == "goto_methodology_constraints" {
-            let id = self
-                .selected_methodology
-                .clone()
-                .unwrap_or_default();
+            let id = self.selected_methodology.clone().unwrap_or_default();
             self.goto_methodology_constraints(&id)
         } else if let Some(id) = t.strip_prefix("select_drc ") {
             self.select_drc(id.trim())
@@ -5928,8 +5948,12 @@ impl IdeModel {
             self.delete_breakpoint(spec)
         } else if t == "clock_regions" {
             self.open_clock_regions()
-        } else if t == "select_clock_region_object" || t.starts_with("select_clock_region_object ") {
-            let spec = t.strip_prefix("select_clock_region_object").unwrap_or("").trim();
+        } else if t == "select_clock_region_object" || t.starts_with("select_clock_region_object ")
+        {
+            let spec = t
+                .strip_prefix("select_clock_region_object")
+                .unwrap_or("")
+                .trim();
             self.select_clock_region(spec)
         } else if t == "select_clock_region" || t.starts_with("select_clock_region ") {
             let spec = t.strip_prefix("select_clock_region").unwrap_or("").trim();
@@ -6011,7 +6035,8 @@ impl IdeModel {
             Some(MsgSeverity::Warning) => "warning",
             Some(MsgSeverity::Info) => "info",
         };
-        let mut s = format!("messages errors={n_err} warnings={n_warn} info={n_info} filter={filter}");
+        let mut s =
+            format!("messages errors={n_err} warnings={n_warn} info={n_info} filter={filter}");
         let rows = self.message_rows();
         if rows.is_empty() {
             s.push_str("\nno messages");
@@ -6088,8 +6113,7 @@ impl IdeModel {
         } else {
             pick(&filtered)
                 .or_else(|| {
-                    let all: Vec<(usize, &IdeMessage)> =
-                        self.messages.iter().enumerate().collect();
+                    let all: Vec<(usize, &IdeMessage)> = self.messages.iter().enumerate().collect();
                     pick(&all)
                 })
                 .ok_or_else(|| format!("select_message: no row {spec}"))?
@@ -6128,8 +6152,13 @@ impl IdeModel {
             "timing_constraints" | "report_timing_constraints" => {
                 self.workspace = WorkspaceTab::Constraints;
             }
-            "place_design" | "route_design" | "device" | "clock_regions"
-            | "select_clock_region" | "device_routes" | "select_device_route" => {
+            "place_design"
+            | "route_design"
+            | "device"
+            | "clock_regions"
+            | "select_clock_region"
+            | "device_routes"
+            | "select_device_route" => {
                 self.workspace = WorkspaceTab::Device;
             }
             "synth_design" | "opt_design" | "schematic" => {
@@ -6540,11 +6569,7 @@ impl IdeModel {
         } else {
             MsgSeverity::Info
         };
-        let id = cmd
-            .split_whitespace()
-            .next()
-            .unwrap_or(cmd)
-            .to_string();
+        let id = cmd.split_whitespace().next().unwrap_or(cmd).to_string();
         self.messages.push(IdeMessage {
             severity: sev,
             id,
@@ -6600,11 +6625,7 @@ impl IdeModel {
             } else {
                 format!("{} {}", c.objects, c.message)
             };
-            self.upsert_ide_message(
-                Self::msg_severity_from_methodology(c.severity),
-                &c.id,
-                text,
-            );
+            self.upsert_ide_message(Self::msg_severity_from_methodology(c.severity), &c.id, text);
         }
     }
 
@@ -6640,9 +6661,12 @@ impl IdeModel {
     /// Shared surface so Implement matches Open parity (Messages tab + Failed chip).
     fn surface_stage_error(&mut self, id: &str, text: &str) {
         self.status = format!("{id}: {text}");
-        let already = self.messages.iter().rev().take(4).any(|m| {
-            m.severity == MsgSeverity::Error && m.text == text
-        });
+        let already = self
+            .messages
+            .iter()
+            .rev()
+            .take(4)
+            .any(|m| m.severity == MsgSeverity::Error && m.text == text);
         if !already {
             self.messages.push(IdeMessage {
                 severity: MsgSeverity::Error,
@@ -6759,8 +6783,10 @@ impl IdeModel {
         }
         // Inline create_clock lines from the .prj itself.
         if !prj.sdc.is_empty() {
-            let blob = prj.sdc.join("
-");
+            let blob = prj.sdc.join(
+                "
+",
+            );
             if let Ok(extra) = load_xdc(&blob) {
                 let n = extra.clocks.len();
                 self.merge_constraints(extra);
@@ -6838,8 +6864,7 @@ impl IdeModel {
                 ));
             }
             let abs = std::fs::canonicalize(c).unwrap_or_else(|_| c.clone());
-            pf.constraint_files
-                .push(abs.to_string_lossy().into_owned());
+            pf.constraint_files.push(abs.to_string_lossy().into_owned());
         }
 
         let mut commented = String::new();
@@ -6849,10 +6874,7 @@ impl IdeModel {
             .map_err(|e| format!("create_project write {}: {e}", prj_path.display()))?;
 
         let opened = self.open_project(&prj_path)?;
-        Ok(format!(
-            "create_project {} {opened}",
-            prj_path.display()
-        ))
+        Ok(format!("create_project {} {opened}", prj_path.display()))
     }
 
     /// Vivado-shaped Close Project: drop the open design/session and return the
@@ -6950,9 +6972,7 @@ impl IdeModel {
             }
         }
         if rtl.is_empty() {
-            return Err(
-                "save_project_as: open a design with at least one RTL source first".into(),
-            );
+            return Err("save_project_as: open a design with at least one RTL source first".into());
         }
         if self.shell.session.design.is_none() {
             return Err("save_project_as: no open design — synthesize first".into());
@@ -6976,9 +6996,8 @@ impl IdeModel {
         }
 
         let proj_dir = dest_dir.join(name);
-        std::fs::create_dir_all(&proj_dir).map_err(|e| {
-            format!("save_project_as mkdir {}: {e}", proj_dir.display())
-        })?;
+        std::fs::create_dir_all(&proj_dir)
+            .map_err(|e| format!("save_project_as mkdir {}: {e}", proj_dir.display()))?;
         let prj_path = proj_dir.join(format!("{name}.prj"));
 
         let mut pf = ProjectFile {
@@ -7072,9 +7091,8 @@ impl IdeModel {
         let mut commented = String::new();
         commented.push_str(&format!("# Helion project — {name} (Save Project As)\n"));
         commented.push_str(&format_prj(&pf));
-        std::fs::write(&prj_path, &commented).map_err(|e| {
-            format!("save_project_as write {}: {e}", prj_path.display())
-        })?;
+        std::fs::write(&prj_path, &commented)
+            .map_err(|e| format!("save_project_as write {}: {e}", prj_path.display()))?;
 
         let opened = self.open_project(&prj_path)?;
         let summary = format!(
@@ -7155,7 +7173,12 @@ impl IdeModel {
 
     fn implement_inner(&mut self) -> Result<String, String> {
         let mut last = String::new();
-        for step in [FlowStep::Synthesis, FlowStep::Opt, FlowStep::Place, FlowStep::Route] {
+        for step in [
+            FlowStep::Synthesis,
+            FlowStep::Opt,
+            FlowStep::Place,
+            FlowStep::Route,
+        ] {
             if self.step_state(step) != StepState::Done {
                 last = self.run_step(step)?;
             }
@@ -7385,7 +7408,11 @@ impl IdeModel {
                 }
                 Ok(format!(
                     "implementation occupied={}",
-                    self.device.sites.iter().filter(|s| s.occupant.is_some()).count()
+                    self.device
+                        .sites
+                        .iter()
+                        .filter(|s| s.occupant.is_some())
+                        .count()
                 ))
             }
             UltraFastStage::TimingAnalysis => {
@@ -7455,10 +7482,7 @@ impl IdeModel {
                 return true;
             }
             if d.nets.iter().any(|n| {
-                n.name == name
-                    && n.endpoints
-                        .iter()
-                        .any(|e| e.pin == "Q" || e.pin == "CLK")
+                n.name == name && n.endpoints.iter().any(|e| e.pin == "Q" || e.pin == "CLK")
             }) {
                 return true;
             }
@@ -7473,10 +7497,7 @@ impl IdeModel {
         let mut bits: Vec<String> = d
             .nets
             .iter()
-            .filter(|n| {
-                n.name.starts_with(&pfx)
-                    && n.endpoints.iter().any(|e| e.pin == "Q")
-            })
+            .filter(|n| n.name.starts_with(&pfx) && n.endpoints.iter().any(|e| e.pin == "Q"))
             .map(|n| n.name.clone())
             .collect();
         if bits.is_empty() {
@@ -7539,7 +7560,9 @@ impl IdeModel {
 
     pub fn set_wave_style(&mut self, spec: &str) -> Result<String, String> {
         let mut parts = spec.split_whitespace();
-        let name = parts.next().ok_or("wave_style: need <name> digital|analog")?;
+        let name = parts
+            .next()
+            .ok_or("wave_style: need <name> digital|analog")?;
         let s = parts.next().unwrap_or("digital");
         let style = match s.to_ascii_lowercase().as_str() {
             "digital" => WaveStyle::Digital,
@@ -7602,7 +7625,10 @@ impl IdeModel {
             self.wave.timescale_ps
         );
         for (i, m) in self.wave.markers.iter().enumerate() {
-            s.push_str(&format!("\n{i} {}", m.row_text(self.wave.time_ps(m.sample))));
+            s.push_str(&format!(
+                "\n{i} {}",
+                m.row_text(self.wave.time_ps(m.sample))
+            ));
         }
         s
     }
@@ -7941,8 +7967,7 @@ impl IdeModel {
             rows.iter()
                 .enumerate()
                 .find(|(_, r)| {
-                    r.name.eq_ignore_ascii_case(spec)
-                        || (spec_l == "delta" && r.name == "B-A")
+                    r.name.eq_ignore_ascii_case(spec) || (spec_l == "delta" && r.name == "B-A")
                 })
                 .map(|(i, r)| (i, r.clone()))
                 .ok_or_else(|| format!("select_wave_cursor: no row {spec}"))?
@@ -8366,17 +8391,22 @@ impl IdeModel {
                 .find(|r| r.name.eq_ignore_ascii_case(key))
                 .cloned()
                 .or_else(|| {
-                    self.runs.iter().find(|r| {
-                        r.step == "Implementation"
-                            && r.strategy.eq_ignore_ascii_case(key)
-                    }).cloned()
+                    self.runs
+                        .iter()
+                        .find(|r| {
+                            r.step == "Implementation" && r.strategy.eq_ignore_ascii_case(key)
+                        })
+                        .cloned()
                 })
                 .or_else(|| {
-                    self.runs.iter().find(|r| {
-                        r.step.eq_ignore_ascii_case(key)
-                            || r.status.eq_ignore_ascii_case(key)
-                            || r.name.to_ascii_lowercase().contains(&spec_l)
-                    }).cloned()
+                    self.runs
+                        .iter()
+                        .find(|r| {
+                            r.step.eq_ignore_ascii_case(key)
+                                || r.status.eq_ignore_ascii_case(key)
+                                || r.name.to_ascii_lowercase().contains(&spec_l)
+                        })
+                        .cloned()
                 })
                 .ok_or_else(|| format!("select_run: no row {spec}"))?
         };
@@ -8574,9 +8604,9 @@ impl IdeModel {
             if !s.is_empty() {
                 s.to_string()
             } else {
-                self.selected
-                    .clone()
-                    .ok_or_else(|| "open_hierarchy_sheet: select a hierarchy instance first".to_string())?
+                self.selected.clone().ok_or_else(|| {
+                    "open_hierarchy_sheet: select a hierarchy instance first".to_string()
+                })?
             }
         };
         self.workspace = WorkspaceTab::Schematic;
@@ -8588,7 +8618,10 @@ impl IdeModel {
         } else {
             return Err(format!("open_hierarchy_sheet: unknown instance {name}"));
         }
-        Ok(format!("open_hierarchy_sheet {name} {}", self.schematic_drawing_text()))
+        Ok(format!(
+            "open_hierarchy_sheet {name} {}",
+            self.schematic_drawing_text()
+        ))
     }
 
     /// Expand the schematic cone from a cell along HNF nets (UG893 Expand Cone).
@@ -8682,7 +8715,9 @@ impl IdeModel {
             return Some("inout load enable not mapped; not a closed WNS");
         }
         if d.attrs.get("GENERATE_NOT_LOWERED") == Some("1") {
-            return Some("generate_not_lowered; generate body not mapped; not a LUT; not a closed WNS");
+            return Some(
+                "generate_not_lowered; generate body not mapped; not a LUT; not a closed WNS",
+            );
         }
         if d.attrs.get("ASSIGN_NOT_LOWERED") == Some("1") {
             return Some("assign not lowered; not a closed WNS");
@@ -8943,7 +8978,8 @@ impl IdeModel {
         if let Some(p) = self.selected_timing_path {
             order.push(p);
         }
-        order.extend((0..self.timing_paths.len()).filter(|i| Some(*i) != self.selected_timing_path));
+        order
+            .extend((0..self.timing_paths.len()).filter(|i| Some(*i) != self.selected_timing_path));
         let as_idx = spec.parse::<usize>().ok();
         for pi in order {
             let path = &self.timing_paths[pi];
@@ -9041,9 +9077,17 @@ impl IdeModel {
                     pin.delay_type,
                     pin.incr_ps,
                     pin.path_ps,
-                    if pin.net.is_empty() { "-" } else { pin.net.as_str() },
+                    if pin.net.is_empty() {
+                        "-"
+                    } else {
+                        pin.net.as_str()
+                    },
                     pin.fanout,
-                    if pin.location.is_empty() { "-" } else { pin.location.as_str() }
+                    if pin.location.is_empty() {
+                        "-"
+                    } else {
+                        pin.location.as_str()
+                    }
                 ));
             }
         }
@@ -9482,7 +9526,11 @@ impl IdeModel {
         } else {
             self.source_lines
                 .iter()
-                .position(|l| l.signal.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(spec)))
+                .position(|l| {
+                    l.signal
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(spec))
+                })
                 .ok_or_else(|| format!("select_editor_line: no line {spec}"))?
         };
         let row = self.source_lines[idx].clone();
@@ -9593,9 +9641,7 @@ impl IdeModel {
                 }
             })
         });
-        let obj = from_check
-            .or(from_drc)
-            .unwrap_or(target);
+        let obj = from_check.or(from_drc).unwrap_or(target);
         let line = self
             .line_for_object(&obj)
             .ok_or_else(|| format!("goto_editor: no line for {obj}"))?;
@@ -9627,7 +9673,14 @@ impl IdeModel {
         self.layout = LayoutKind::Simulation;
         let armed = self.source_bp_armed(row.line);
         self.properties = vec![
-            ("NAME".into(), format!("{}:{}", source_basename(self.selected_source.as_deref().unwrap_or("")), row.line)),
+            (
+                "NAME".into(),
+                format!(
+                    "{}:{}",
+                    source_basename(self.selected_source.as_deref().unwrap_or("")),
+                    row.line
+                ),
+            ),
             ("TYPE".into(), "source_line".into()),
             ("LINE".into(), row.line.to_string()),
             ("KIND".into(), row.type_cell().to_string()),
@@ -9709,7 +9762,14 @@ impl IdeModel {
             ("ENABLED".into(), "1".into()),
             ("KIND".into(), "line".into()),
             ("LINE".into(), line.to_string()),
-            ("SIGNAL".into(), if signal.is_empty() { "-".into() } else { signal }),
+            (
+                "SIGNAL".into(),
+                if signal.is_empty() {
+                    "-".into()
+                } else {
+                    signal
+                },
+            ),
             ("CONDITION".into(), bp.condition.clone()),
             ("HITS".into(), "0".into()),
         ];
@@ -9867,16 +9927,13 @@ impl IdeModel {
         }
         let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
         if let Some(h) = hex {
-            return u64::from_str_radix(h, 16)
-                .map_err(|_| format!("add_force: bad hex {raw}"));
+            return u64::from_str_radix(h, 16).map_err(|_| format!("add_force: bad hex {raw}"));
         }
         if let Some(b) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-            return u64::from_str_radix(b, 2)
-                .map_err(|_| format!("add_force: bad bin {raw}"));
+            return u64::from_str_radix(b, 2).map_err(|_| format!("add_force: bad bin {raw}"));
         }
         match radix {
-            "hex" => u64::from_str_radix(s, 16)
-                .map_err(|_| format!("add_force: bad hex {raw}")),
+            "hex" => u64::from_str_radix(s, 16).map_err(|_| format!("add_force: bad hex {raw}")),
             "bin" => {
                 if s.chars().all(|c| c == '0' || c == '1') {
                     u64::from_str_radix(s, 2).map_err(|_| format!("add_force: bad bin {raw}"))
@@ -9891,9 +9948,7 @@ impl IdeModel {
         }
     }
 
-    fn parse_force_spec(
-        spec: &str,
-    ) -> Result<(bool, String, u64, String, u64, u64), String> {
+    fn parse_force_spec(spec: &str) -> Result<(bool, String, u64, String, u64, u64), String> {
         let mut toks: Vec<&str> = spec.split_whitespace().collect();
         if toks.is_empty() {
             return Err("add_force: need <signal> <value>".into());
@@ -9917,28 +9972,20 @@ impl IdeModel {
         while i < toks.len() {
             let t = toks[i];
             if t.eq_ignore_ascii_case("-radix") {
-                let r = toks
-                    .get(i + 1)
-                    .ok_or("add_force: -radix needs bin|hex")?;
+                let r = toks.get(i + 1).ok_or("add_force: -radix needs bin|hex")?;
                 radix = r.to_ascii_lowercase();
                 if radix != "bin" && radix != "hex" {
                     return Err(format!("add_force: bad radix {r}"));
                 }
                 i += 2;
-            } else if t.eq_ignore_ascii_case("-start_time")
-                || t.eq_ignore_ascii_case("-start_ps")
-            {
-                let v = toks
-                    .get(i + 1)
-                    .ok_or("add_force: -start_time needs ps")?;
+            } else if t.eq_ignore_ascii_case("-start_time") || t.eq_ignore_ascii_case("-start_ps") {
+                let v = toks.get(i + 1).ok_or("add_force: -start_time needs ps")?;
                 start_ps = Self::parse_sim_ps(v)?;
                 i += 2;
             } else if t.eq_ignore_ascii_case("-cancel_after")
                 || t.eq_ignore_ascii_case("-cancel_ps")
             {
-                let v = toks
-                    .get(i + 1)
-                    .ok_or("add_force: -cancel_after needs ps")?;
+                let v = toks.get(i + 1).ok_or("add_force: -cancel_after needs ps")?;
                 cancel_ps = Self::parse_sim_ps(v)?;
                 i += 2;
             } else {
@@ -10148,7 +10195,12 @@ impl IdeModel {
                     .enumerate()
                     .map(|(i, lf)| {
                         let site = pl.lutff_sites.get(i).cloned();
-                        (lf.ff_cell.clone(), lf.lut_cell.clone(), lf.q_net.clone(), site)
+                        (
+                            lf.ff_cell.clone(),
+                            lf.lut_cell.clone(),
+                            lf.q_net.clone(),
+                            site,
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -10435,9 +10487,7 @@ impl IdeModel {
 
     pub fn set_breakpoint_enabled(&mut self, spec: &str, enabled: bool) -> Result<String, String> {
         if spec.trim().is_empty() {
-            let id = self
-                .selected_breakpoint
-                .ok_or("enable_bp: need id")?;
+            let id = self.selected_breakpoint.ok_or("enable_bp: need id")?;
             return self.set_breakpoint_enabled(&id.to_string(), enabled);
         }
         self.select_breakpoint(spec)?;
@@ -10454,9 +10504,7 @@ impl IdeModel {
 
     pub fn delete_breakpoint(&mut self, spec: &str) -> Result<String, String> {
         if spec.trim().is_empty() {
-            let id = self
-                .selected_breakpoint
-                .ok_or("delete_bp: need id")?;
+            let id = self.selected_breakpoint.ok_or("delete_bp: need id")?;
             return self.delete_breakpoint(&id.to_string());
         }
         self.select_breakpoint(spec)?;
@@ -10552,8 +10600,13 @@ impl IdeModel {
             "timing_constraints" | "report_timing_constraints" => {
                 self.workspace = WorkspaceTab::Constraints;
             }
-            "place_design" | "route_design" | "device" | "clock_regions"
-            | "select_clock_region" | "device_routes" | "select_device_route" => {
+            "place_design"
+            | "route_design"
+            | "device"
+            | "clock_regions"
+            | "select_clock_region"
+            | "device_routes"
+            | "select_device_route" => {
                 self.workspace = WorkspaceTab::Device;
             }
             "synth_design" | "opt_design" | "schematic" => {
@@ -10561,9 +10614,8 @@ impl IdeModel {
             }
             "write_bitstream" | "report_bitstream" => self.workspace = WorkspaceTab::Bitstream,
             "memory" | "memories" | "select_memory" => self.workspace = WorkspaceTab::Memory,
-            "source" | "source_window" | "select_source_line" | "toggle_bp_line" | "add_bp_line" => {
-                self.workspace = WorkspaceTab::Source
-            }
+            "source" | "source_window" | "select_source_line" | "toggle_bp_line"
+            | "add_bp_line" => self.workspace = WorkspaceTab::Source,
             "text_editor" | "open_text_editor" | "select_editor_line" | "toggle_bookmark"
             | "goto_editor" => self.workspace = WorkspaceTab::TextEditor,
             "breakpoints" | "add_bp" | "select_breakpoint" => {
@@ -10572,14 +10624,32 @@ impl IdeModel {
             "forces" | "force_table" | "force_constants" | "add_force" | "deposit"
             | "remove_force" | "select_force" => self.workspace = WorkspaceTab::Forces,
             "locals" | "select_local" => self.workspace = WorkspaceTab::Locals,
-            "simulation_settings" | "sim_settings" | "select_sim_setting" | "set_timescale"
-            | "set_runtime" | "compile" | "compile_sim" | "elaborate" | "elaborate_sim" => {
-                self.workspace = WorkspaceTab::SimSettings
-            }
-            "sim_run" | "run_simulation" | "sim_log" | "simulation_log" | "select_sim_log"
-            | "wave_markers" | "select_wave_marker" | "add_wave_marker" | "wave_cursors"
-            | "select_wave_cursor" | "wave_cursor" | "wave_cursor_a" | "wave_cursor_b"
-            | "virtual_buses" | "virtual_bus" | "select_virtual_bus" | "add_wave_virtual_bus" => {
+            "simulation_settings"
+            | "sim_settings"
+            | "select_sim_setting"
+            | "set_timescale"
+            | "set_runtime"
+            | "compile"
+            | "compile_sim"
+            | "elaborate"
+            | "elaborate_sim" => self.workspace = WorkspaceTab::SimSettings,
+            "sim_run"
+            | "run_simulation"
+            | "sim_log"
+            | "simulation_log"
+            | "select_sim_log"
+            | "wave_markers"
+            | "select_wave_marker"
+            | "add_wave_marker"
+            | "wave_cursors"
+            | "select_wave_cursor"
+            | "wave_cursor"
+            | "wave_cursor_a"
+            | "wave_cursor_b"
+            | "virtual_buses"
+            | "virtual_bus"
+            | "select_virtual_bus"
+            | "add_wave_virtual_bus" => {
                 self.workspace = WorkspaceTab::Wave;
                 self.layout = LayoutKind::Simulation;
             }
@@ -10953,10 +11023,7 @@ impl IdeModel {
         for p in &self.pblocks {
             s.push('\n');
             s.push_str(&p.row_text());
-            s.push_str(&format!(
-                " sites={}",
-                p.site_count(&self.device.sites)
-            ));
+            s.push_str(&format!(" sites={}", p.site_count(&self.device.sites)));
         }
         s
     }
@@ -11021,7 +11088,6 @@ impl IdeModel {
         self.resize_pblock(name, &spec)
     }
 
-
     /// After pblock re-place/route, re-apply PACKAGE_PIN LOCs via `place_design`
     /// so counter gold WNS_PS=9640 holds while the pblocks table stays filled.
     /// Only `clk` / `led` — extra package pins are not re-placed (gold WNS).
@@ -11038,9 +11104,7 @@ impl IdeModel {
             .constraints
             .package_pins
             .iter()
-            .filter(|(port, _)| {
-                (*port == "clk" || *port == "led") && ports.contains(*port)
-            })
+            .filter(|(port, _)| (*port == "clk" || *port == "led") && ports.contains(*port))
             .map(|(port, pin)| (port.clone(), pin.clone()))
             .collect();
         if !pins.iter().any(|(p, _)| p == "led") && ports.contains("led") {
@@ -11417,9 +11481,8 @@ impl IdeModel {
         if port.is_empty() || pin.is_empty() {
             return Err("set_property PACKAGE_PIN: need <pin> [get_ports <port>]".into());
         }
-        let (x, y) = parse_site_xy(pin).map_err(|e| {
-            format!("set_property PACKAGE_PIN: bad pin {pin} ({e})")
-        })?;
+        let (x, y) = parse_site_xy(pin)
+            .map_err(|e| format!("set_property PACKAGE_PIN: bad pin {pin} ({e})"))?;
         let dev = self.device()?;
         if dev.iob_major(x, y).is_none() {
             return Err(format!(
@@ -11546,7 +11609,9 @@ impl IdeModel {
             return Err("set_property DRIVE: need <ma> [get_ports <port>]".into());
         }
         let Some(parsed) = Device::parse_drive(ma) else {
-            return Err(format!("set_property DRIVE: {ma} is not a HAD drive strength"));
+            return Err(format!(
+                "set_property DRIVE: {ma} is not a HAD drive strength"
+            ));
         };
         let drive = parsed.to_string();
         {
@@ -11561,7 +11626,9 @@ impl IdeModel {
             }
             d.set_drive(port, &drive)?;
         }
-        self.constraints.drives.insert(port.to_string(), drive.clone());
+        self.constraints
+            .drives
+            .insert(port.to_string(), drive.clone());
         self.nav = NavSection::BoardDevice;
         self.workspace = WorkspaceTab::Package;
         self.select(port);
@@ -11581,7 +11648,9 @@ impl IdeModel {
             return Err("set_property SLEW: need <SLOW|FAST> [get_ports <port>]".into());
         }
         if !Device::legal_slew(slew) {
-            return Err(format!("set_property SLEW: {slew} is not a HAD slew (SLOW|FAST)"));
+            return Err(format!(
+                "set_property SLEW: {slew} is not a HAD slew (SLOW|FAST)"
+            ));
         }
         let slew_up = slew.to_ascii_uppercase();
         {
@@ -11596,7 +11665,9 @@ impl IdeModel {
             }
             d.set_slew(port, &slew_up)?;
         }
-        self.constraints.slews.insert(port.to_string(), slew_up.clone());
+        self.constraints
+            .slews
+            .insert(port.to_string(), slew_up.clone());
         self.nav = NavSection::BoardDevice;
         self.workspace = WorkspaceTab::Package;
         self.select(port);
@@ -11762,7 +11833,10 @@ impl IdeModel {
         match found.port {
             Some(port) => {
                 self.select(&port);
-                Ok(format!("package_pin {} port={port} X{}Y{}", found.pin, found.x, found.y))
+                Ok(format!(
+                    "package_pin {} port={port} X{}Y{}",
+                    found.pin, found.x, found.y
+                ))
             }
             None => {
                 self.select(&found.pin);
@@ -11847,11 +11921,9 @@ impl IdeModel {
         let ms = t0.elapsed().as_millis() as u64;
         let clks = self.clocks_for_sta();
         let wns = match (side.design.as_ref(), side.routed.as_ref()) {
-            (Some(d), Some(r)) => {
-                report_timing_routed_xdc(d, r, &clks, &self.constraints)
-                    .ok()
-                    .map(|t| t.wns_ps)
-            }
+            (Some(d), Some(r)) => report_timing_routed_xdc(d, r, &clks, &self.constraints)
+                .ok()
+                .map(|t| t.wns_ps),
             _ => None,
         };
         let lutff = side.placed.as_ref().map(|p| p.packed.lutffs.len());
@@ -12055,7 +12127,11 @@ impl IdeModel {
                     IncrementalRow {
                         name: c.name.clone(),
                         kind: kind.into(),
-                        status: if reused { "Reused".into() } else { "New".into() },
+                        status: if reused {
+                            "Reused".into()
+                        } else {
+                            "New".into()
+                        },
                         site: sites.get(&c.name).cloned().unwrap_or_else(|| "-".into()),
                         reused: usize::from(reused),
                         total: 1,
@@ -12558,13 +12634,7 @@ impl IdeModel {
             .top
             .clone()
             .or_else(|| self.tree.top.clone())
-            .or_else(|| {
-                self.shell
-                    .session
-                    .design
-                    .as_ref()
-                    .map(|d| d.name.clone())
-            })
+            .or_else(|| self.shell.session.design.as_ref().map(|d| d.name.clone()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".into())
     }
@@ -13398,9 +13468,7 @@ impl IdeModel {
                 .ok_or_else(|| format!("select_project_summary: no row {spec}"))?
         } else {
             rows.iter()
-                .find(|r| {
-                    r.id.eq_ignore_ascii_case(spec) || r.name.eq_ignore_ascii_case(spec)
-                })
+                .find(|r| r.id.eq_ignore_ascii_case(spec) || r.name.eq_ignore_ascii_case(spec))
                 .cloned()
                 .ok_or_else(|| format!("select_project_summary: no row {spec}"))?
         };
@@ -13513,11 +13581,7 @@ impl IdeModel {
             .find(|r| r.name == "impl_1" && r.step == "Implementation")
         {
             r.strategy = strategy.label().into();
-        } else if let Some(r) = self
-            .runs
-            .iter_mut()
-            .find(|r| r.step == "Implementation")
-        {
+        } else if let Some(r) = self.runs.iter_mut().find(|r| r.step == "Implementation") {
             r.strategy = strategy.label().into();
         }
         self.workspace = WorkspaceTab::Settings;
@@ -13527,9 +13591,8 @@ impl IdeModel {
     }
 
     fn set_active_fileset(&mut self, name: &str) -> Result<String, String> {
-        let canon = Self::canon_fileset(name).map_err(|e| {
-            e.replace("select_project_setting:", "set_property FILESET:")
-        })?;
+        let canon = Self::canon_fileset(name)
+            .map_err(|e| e.replace("select_project_setting:", "set_property FILESET:"))?;
         self.active_fileset = canon.into();
         self.workspace = WorkspaceTab::Settings;
         self.selected_setting = Some("FILESET".into());
@@ -13579,7 +13642,8 @@ impl IdeModel {
                     .or_else(|| self.runs.iter().find(|r| r.step == "Implementation"));
                 props.push((
                     "RUN".into(),
-                    run.map(|r| r.name.clone()).unwrap_or_else(|| "impl_1".into()),
+                    run.map(|r| r.name.clone())
+                        .unwrap_or_else(|| "impl_1".into()),
                 ));
                 props.push((
                     "STATUS".into(),
@@ -13637,7 +13701,10 @@ impl IdeModel {
         self.workspace = WorkspaceTab::Settings;
         self.selected_setting = Some(row.name.clone());
         self.refresh_project_setting_properties(&row.name);
-        Ok(format!("project_setting NAME={} VALUE={}", row.name, row.value))
+        Ok(format!(
+            "project_setting NAME={} VALUE={}",
+            row.name, row.value
+        ))
     }
 
     fn parse_sim_ps(raw: &str) -> Result<u64, String> {
@@ -13654,9 +13721,7 @@ impl IdeModel {
         } else {
             (s.as_str(), 1u64)
         };
-        let v: u64 = num
-            .parse()
-            .map_err(|_| format!("not a time: {raw}"))?;
+        let v: u64 = num.parse().map_err(|_| format!("not a time: {raw}"))?;
         Ok(v.saturating_mul(mul).max(1))
     }
 
@@ -13918,10 +13983,7 @@ impl IdeModel {
         self.layout = LayoutKind::Simulation;
         self.selected_sim_setting = Some("LOG_ALL_SIGNALS".into());
         self.refresh_sim_setting_properties("LOG_ALL_SIGNALS");
-        Ok(format!(
-            "set_property LOG_ALL_SIGNALS {}",
-            u8::from(on)
-        ))
+        Ok(format!("set_property LOG_ALL_SIGNALS {}", u8::from(on)))
     }
 
     fn set_sim_fileset(&mut self, name: &str) -> Result<String, String> {
@@ -13931,7 +13993,7 @@ impl IdeModel {
             other => {
                 return Err(format!(
                     "set_property SIMSET: only sim_1 (helion-sim fileset), not {other}"
-                ))
+                ));
             }
         };
         self.sim_fileset = canon.into();
@@ -13987,11 +14049,7 @@ impl IdeModel {
         let s = self.sim_elab_snapshot.trim();
         if s.is_empty() || s == "-" {
             let top = self.sim_top_value();
-            if top == "-" {
-                "-".into()
-            } else {
-                top
-            }
+            if top == "-" { "-".into() } else { top }
         } else {
             s.to_string()
         }
@@ -14143,7 +14201,7 @@ impl IdeModel {
             other => {
                 return Err(format!(
                     "set_property ELAB_DEBUG: typical|off (helion-sv), not {other}"
-                ))
+                ));
             }
         };
         self.sim_elab_debug = canon.into();
@@ -14204,10 +14262,7 @@ impl IdeModel {
         } else {
             mods.join(",")
         };
-        let text = format!(
-            "compile n={} MODULES={joined} engine=helion-sv",
-            mods.len()
-        );
+        let text = format!("compile n={} MODULES={joined} engine=helion-sv", mods.len());
         self.push_sim_log(MsgSeverity::Info, "compile", text.clone());
         Ok(text)
     }
@@ -14366,8 +14421,14 @@ impl IdeModel {
             }
             "TIMESCALE_PS" => {
                 props.push(("UNIT".into(), "ps".into()));
-                props.push(("WAVE_TIMESCALE_PS".into(), self.wave.timescale_ps.to_string()));
-                props.push(("ENGINE_TIME_PS".into(), self.sim_engine_time_ps().to_string()));
+                props.push((
+                    "WAVE_TIMESCALE_PS".into(),
+                    self.wave.timescale_ps.to_string(),
+                ));
+                props.push((
+                    "ENGINE_TIME_PS".into(),
+                    self.sim_engine_time_ps().to_string(),
+                ));
             }
             "RUNTIME_CYCLES" => {
                 props.push(("RUNTIME_PS".into(), self.sim_runtime_ps().to_string()));
@@ -14470,10 +14531,7 @@ impl IdeModel {
         self.layout = LayoutKind::Simulation;
         self.selected_sim_setting = Some(row.name.clone());
         self.refresh_sim_setting_properties(&row.name);
-        Ok(format!(
-            "sim_setting NAME={} VALUE={}",
-            row.name, row.value
-        ))
+        Ok(format!("sim_setting NAME={} VALUE={}", row.name, row.value))
     }
 
     pub fn refresh_ip_catalog(&mut self) {
@@ -14489,16 +14547,9 @@ impl IdeModel {
     }
 
     fn commit_block_design(&mut self, name: String, cores: Vec<IpCore>) -> Result<String, String> {
-        let bd = BlockDesign {
-            name,
-            cores,
-        };
+        let bd = BlockDesign { name, cores };
         let v = validate(&bd);
-        let sv = if v.ok {
-            emit_sv(&bd)?
-        } else {
-            String::new()
-        };
+        let sv = if v.ok { emit_sv(&bd)? } else { String::new() };
         let names: Vec<String> = bd.cores.iter().map(|c| c.name.clone()).collect();
         let msg = if v.ok {
             format!("create_bd_design {} cores={}", bd.name, names.join(","))
@@ -14512,11 +14563,7 @@ impl IdeModel {
             ok: v.ok,
         });
         self.workspace = WorkspaceTab::Ip;
-        if v.ok {
-            Ok(msg)
-        } else {
-            Err(msg)
-        }
+        if v.ok { Ok(msg) } else { Err(msg) }
     }
 
     pub fn create_block_design(&mut self) -> Result<String, String> {
@@ -14576,10 +14623,7 @@ impl IdeModel {
         }
         self.ip_catalog
             .iter()
-            .find(|c| {
-                c.name.eq_ignore_ascii_case(spec)
-                    || c.vlnv().eq_ignore_ascii_case(spec)
-            })
+            .find(|c| c.name.eq_ignore_ascii_case(spec) || c.vlnv().eq_ignore_ascii_case(spec))
             .cloned()
             .ok_or_else(|| format!("select_ip: no IP {spec}"))
     }
@@ -14602,7 +14646,10 @@ impl IdeModel {
         self.refresh_ip_catalog();
         let core = self.find_ip_core(spec)?;
         if core.bus == "AXI" {
-            return Err(format!("select_ip: {} bus AXI is not Helion-MM/ST", core.name));
+            return Err(format!(
+                "select_ip: {} bus AXI is not Helion-MM/ST",
+                core.name
+            ));
         }
         let status = self
             .ip_catalog_rows()
@@ -14635,7 +14682,10 @@ impl IdeModel {
         }
         let core = self.find_ip_core(&spec)?;
         if core.bus == "AXI" {
-            return Err(format!("generate_ip: {} bus AXI is not Helion-MM/ST", core.name));
+            return Err(format!(
+                "generate_ip: {} bus AXI is not Helion-MM/ST",
+                core.name
+            ));
         }
         let xml = to_xml(&core);
         if xml.contains("AXI") {
@@ -14756,13 +14806,7 @@ impl IdeModel {
         for sy in &d.symbols {
             s.push_str(&format!(
                 " {}:{}:box={},{},{},{}:bus={}",
-                sy.name,
-                sy.kind,
-                sy.x as i32,
-                sy.y as i32,
-                sy.w as i32,
-                sy.h as i32,
-                sy.bus
+                sy.name, sy.kind, sy.x as i32, sy.y as i32, sy.w as i32, sy.h as i32, sy.bus
             ));
             for p in &sy.pins {
                 s.push_str(&format!(
@@ -14786,10 +14830,7 @@ impl IdeModel {
             ));
         }
         for a in &d.addresses {
-            s.push_str(&format!(
-                " addr={}:0x{:x}:0x{:x}",
-                a.slave, a.base, a.range
-            ));
+            s.push_str(&format!(" addr={}:0x{:x}:0x{:x}", a.slave, a.base, a.range));
         }
         s
     }
@@ -14852,9 +14893,7 @@ impl IdeModel {
         self.selected = Some(format!("{from}->{to}"));
         let hay = self.clock_interaction_object_hay(&cell.from, &cell.to);
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if objs.is_empty() {
             "-".into()
         } else {
@@ -14913,10 +14952,10 @@ impl IdeModel {
                 let mut p = spec.split_whitespace();
                 let from = p.next().unwrap_or("");
                 let to = p.next().unwrap_or(from);
-                report.cell(from, to).map(|c| {
-                    self.clock_interaction_object_hay(&c.from, &c.to)
-                })
-                .and_then(|h| self.extract_design_objects(&h).into_iter().next())
+                report
+                    .cell(from, to)
+                    .map(|c| self.clock_interaction_object_hay(&c.from, &c.to))
+                    .and_then(|h| self.extract_design_objects(&h).into_iter().next())
             })
             .ok_or_else(|| format!("select_clock_interaction_object: no object {spec}"))?;
         if let Some(c) = report.cells.iter().find(|c| {
@@ -15041,11 +15080,7 @@ impl IdeModel {
     }
 
     /// Click a path-group row: properties + object cross-probe (UG906 schematic/netlist).
-    pub fn select_timing_summary(
-        &mut self,
-        a: &str,
-        b: Option<&str>,
-    ) -> Result<String, String> {
+    pub fn select_timing_summary(&mut self, a: &str, b: Option<&str>) -> Result<String, String> {
         let a = a.trim();
         if a.is_empty() {
             return Err("select_timing_summary: missing group".into());
@@ -15078,9 +15113,7 @@ impl IdeModel {
         self.selected = Some(key.clone());
         let hay = self.timing_summary_object_hay(&group);
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if objs.is_empty() {
             "-".into()
         } else {
@@ -15238,8 +15271,16 @@ impl IdeModel {
             pwr.static_uw,
             pwr.dynamic_uw,
             pwr.voltage_mv,
-            if pwr_assumed_f { " POWER-1=assumed_f" } else { "" },
-            if pwr_high_occ { " POWER-2=high_occupancy" } else { "" }
+            if pwr_assumed_f {
+                " POWER-1=assumed_f"
+            } else {
+                ""
+            },
+            if pwr_high_occ {
+                " POWER-2=high_occupancy"
+            } else {
+                ""
+            }
         );
 
         let meth = self.methodology_report();
@@ -15528,9 +15569,7 @@ impl IdeModel {
         self.selected = Some(format!("{from}->{to}"));
         let hay = self.cdc_object_hay(&v);
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if objs.is_empty() {
             "-".into()
         } else {
@@ -15669,9 +15708,7 @@ impl IdeModel {
         self.selected = Some(n.name.clone());
         let hay = self.clock_network_object_hay(&n);
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if objs.is_empty() {
             "-".into()
         } else {
@@ -15864,12 +15901,7 @@ impl IdeModel {
             return Vec::new();
         }
         vec![
-            (
-                "LUTFF".into(),
-                p.lutff,
-                p.lutff_cap as usize,
-                "logic",
-            ),
+            ("LUTFF".into(), p.lutff, p.lutff_cap as usize, "logic"),
             ("IOB".into(), p.iob, p.iob_cap, "io"),
             ("BRAM".into(), p.bram, p.bram_cap as usize, "bram"),
             ("DSP".into(), p.dsp, p.dsp_cap as usize, "dsp"),
@@ -15906,9 +15938,7 @@ impl IdeModel {
         self.selected = Some(name.into());
         let hay = self.power_object_hay(name);
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if objs.is_empty() {
             "-".into()
         } else {
@@ -15936,7 +15966,12 @@ impl IdeModel {
         }
         Ok(format!(
             "power RAIL={name} UW={uw} TOTAL_UW={} STATIC_UW={} DYNAMIC_UW={} VOLTAGE_MV={} TEMP_C={} F_MHZ={} OBJECTS={obj_cell} OBJECT={}",
-            p.total_uw, p.static_uw, p.dynamic_uw, p.voltage_mv, p.temperature_c, p.f_mhz,
+            p.total_uw,
+            p.static_uw,
+            p.dynamic_uw,
+            p.voltage_mv,
+            p.temperature_c,
+            p.f_mhz,
             probed.as_deref().unwrap_or("-")
         ))
     }
@@ -15951,9 +15986,7 @@ impl IdeModel {
         if p.part.is_empty() {
             return Err("select_power_object: no design".into());
         }
-        let rails = [
-            "clocks", "logic", "signals", "io", "bram", "dsp", "total",
-        ];
+        let rails = ["clocks", "logic", "signals", "io", "bram", "dsp", "total"];
         let mut hay = String::new();
         for r in rails {
             hay.push_str(&self.power_object_hay(r));
@@ -16111,9 +16144,7 @@ impl IdeModel {
         self.selected = Some(row.resource.into());
         let hay = self.utilization_object_hay(row.resource);
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if objs.is_empty() {
             "-".into()
         } else {
@@ -16169,17 +16200,15 @@ impl IdeModel {
         self.selected_drc = None;
         self.selected_methodology = None;
         self.selected = Some(h.name.clone());
-        let probed = self
-            .apply_object_crossprobe(&h.name)
-            .or_else(|| {
-                let pfx = format!("{}_", h.name);
-                self.tree
-                    .cells
-                    .iter()
-                    .find(|(n, _)| n == &h.name || n.starts_with(&pfx))
-                    .map(|(n, _)| n.clone())
-                    .and_then(|n| self.apply_object_crossprobe(&n))
-            });
+        let probed = self.apply_object_crossprobe(&h.name).or_else(|| {
+            let pfx = format!("{}_", h.name);
+            self.tree
+                .cells
+                .iter()
+                .find(|(n, _)| n == &h.name || n.starts_with(&pfx))
+                .map(|(n, _)| n.clone())
+                .and_then(|n| self.apply_object_crossprobe(&n))
+        });
         self.properties = vec![
             ("NAME".into(), h.name.clone()),
             ("TYPE".into(), "utilization_hier".into()),
@@ -16254,8 +16283,10 @@ impl IdeModel {
     }
 
     pub fn drc_text(&self) -> String {
-        match (&self.drc, self.shell.session.placed.is_some() || self.shell.session.routed.is_some())
-        {
+        match (
+            &self.drc,
+            self.shell.session.placed.is_some() || self.shell.session.routed.is_some(),
+        ) {
             (Some(d), _) => d.text(),
             (None, true) => self.drc_report().text(),
             (None, false) => "no DRC — run Place/Route".into(),
@@ -16303,9 +16334,7 @@ impl IdeModel {
             format!("{} {}", v.objects, v.message)
         };
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if v.objects.is_empty() {
             "-".into()
         } else {
@@ -16370,7 +16399,9 @@ impl IdeModel {
             })
             .ok_or_else(|| format!("select_drc_object: no object {spec}"))?;
         if let Some(v) = report.items.iter().find(|v| {
-            v.objects.split(|c: char| c == ',' || c == ' ').any(|t| t == named)
+            v.objects
+                .split(|c: char| c == ',' || c == ' ')
+                .any(|t| t == named)
                 || v.message.contains(&named)
         }) {
             self.selected_drc = Some(v.id.clone());
@@ -16459,9 +16490,7 @@ impl IdeModel {
             format!("{} {}", v.objects, v.message)
         };
         let objs = self.extract_design_objects(&hay);
-        let probed = objs
-            .first()
-            .and_then(|o| self.apply_object_crossprobe(o));
+        let probed = objs.first().and_then(|o| self.apply_object_crossprobe(o));
         let obj_cell = if v.objects.is_empty() {
             "-".into()
         } else {
@@ -16522,7 +16551,9 @@ impl IdeModel {
             })
             .ok_or_else(|| format!("select_methodology_object: no object {spec}"))?;
         if let Some(v) = report.checks.iter().find(|v| {
-            v.objects.split(|c: char| c == ',' || c == ' ').any(|t| t == named)
+            v.objects
+                .split(|c: char| c == ',' || c == ' ')
+                .any(|t| t == named)
                 || v.message.contains(&named)
         }) {
             self.selected_methodology = Some(v.id.clone());
@@ -16542,12 +16573,7 @@ impl IdeModel {
         let report = self.methodology_report();
         let v = report
             .check(id)
-            .or_else(|| {
-                report
-                    .checks
-                    .iter()
-                    .find(|c| c.id.eq_ignore_ascii_case(id))
-            })?;
+            .or_else(|| report.checks.iter().find(|c| c.id.eq_ignore_ascii_case(id)))?;
         let clk = self
             .constraints
             .clocks
@@ -16883,7 +16909,11 @@ impl IdeModel {
             } else {
                 "groups"
             };
-            let from = g.groups.first().map(|grp| grp.join(",")).unwrap_or_default();
+            let from = g
+                .groups
+                .first()
+                .map(|grp| grp.join(","))
+                .unwrap_or_default();
             let to = g.groups.get(1).map(|grp| grp.join(",")).unwrap_or_default();
             push(
                 ConstraintSection::Exception,
@@ -17146,7 +17176,11 @@ impl IdeModel {
             .count();
         let mut s = format!("constraints clocks={n_clk} io_delay={n_io} exceptions={n_ex}");
         for r in &rows {
-            let from = if r.from.is_empty() { "-" } else { r.from.as_str() };
+            let from = if r.from.is_empty() {
+                "-"
+            } else {
+                r.from.as_str()
+            };
             let to = if r.to.is_empty() { "-" } else { r.to.as_str() };
             s.push_str(&format!(
                 "\n{} ID={} KIND={} NAME={} FROM={from} TO={to} VALUE={}",
@@ -17227,7 +17261,8 @@ impl IdeModel {
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
         if self.constraint_rows().is_empty() {
-            return "no timing constraints — create_clock / create_generated_clock / read_xdc".into();
+            return "no timing constraints — create_clock / create_generated_clock / read_xdc"
+                .into();
         }
         let mut lines = Vec::new();
         for c in &self.constraints.clocks {
@@ -17295,13 +17330,19 @@ impl IdeModel {
         for m in &self.constraints.max_delays {
             lines.push(format!(
                 "set_max_delay -from {} -to {} DELAY_PS={} datapath_only={}",
-                m.from, m.to, m.delay_ps, u8::from(m.datapath_only)
+                m.from,
+                m.to,
+                m.delay_ps,
+                u8::from(m.datapath_only)
             ));
         }
         for m in &self.constraints.min_delays {
             lines.push(format!(
                 "set_min_delay -from {} -to {} DELAY_PS={} datapath_only={}",
-                m.from, m.to, m.delay_ps, u8::from(m.datapath_only)
+                m.from,
+                m.to,
+                m.delay_ps,
+                u8::from(m.datapath_only)
             ));
         }
         for b in &self.constraints.bus_skews {
@@ -17362,7 +17403,10 @@ impl IdeModel {
         for l in &self.constraints.clock_latencies {
             lines.push(format!(
                 "set_clock_latency {} LATE_PS={} EARLY_PS={} source={}",
-                l.clock, l.late_ps, l.early_ps, u8::from(l.source)
+                l.clock,
+                l.late_ps,
+                l.early_ps,
+                u8::from(l.source)
             ));
         }
         for d in &self.constraints.disable_timings {
@@ -17436,7 +17480,11 @@ impl IdeModel {
         for pb in &self.pblocks {
             lines.push(format!("create_pblock {}", pb.name));
             if pb.ranged {
-                lines.push(format!("resize_pblock {} -add {{{}}}", pb.name, pb.range_text()));
+                lines.push(format!(
+                    "resize_pblock {} -add {{{}}}",
+                    pb.name,
+                    pb.range_text()
+                ));
             }
             for c in &pb.cells {
                 lines.push(format!("add_cells_to_pblock {} {c}", pb.name));
@@ -17451,7 +17499,9 @@ impl IdeModel {
             self.constraints.clocks.push(c);
         }
         self.constraints.input_delay_ps.extend(extra.input_delay_ps);
-        self.constraints.output_delay_ps.extend(extra.output_delay_ps);
+        self.constraints
+            .output_delay_ps
+            .extend(extra.output_delay_ps);
         for fp in extra.false_paths {
             if !self.constraints.false_paths.contains(&fp) {
                 self.constraints.false_paths.push(fp);
@@ -17466,7 +17516,9 @@ impl IdeModel {
         self.constraints
             .clock_uncertainties
             .extend(extra.clock_uncertainties);
-        self.constraints.clock_latencies.extend(extra.clock_latencies);
+        self.constraints
+            .clock_latencies
+            .extend(extra.clock_latencies);
         self.constraints
             .disable_timings
             .extend(extra.disable_timings);
@@ -17478,15 +17530,15 @@ impl IdeModel {
         }
         self.constraints.clock_senses.extend(extra.clock_senses);
         for j in extra.input_jitters {
-            self.constraints.input_jitters.retain(|k| k.clock != j.clock);
+            self.constraints
+                .input_jitters
+                .retain(|k| k.clock != j.clock);
             self.constraints.input_jitters.push(j);
         }
         if extra.system_jitter_ps != 0 {
             self.constraints.system_jitter_ps = extra.system_jitter_ps;
         }
-        self.constraints
-            .timing_derates
-            .extend(extra.timing_derates);
+        self.constraints.timing_derates.extend(extra.timing_derates);
         self.constraints.bus_skews.extend(extra.bus_skews);
         self.constraints.path_groups.extend(extra.path_groups);
         self.constraints
@@ -17577,14 +17629,10 @@ impl IdeModel {
             xdc
         };
         let extra = load_xdc(&xdc)?;
-        let gclk = extra
-            .clocks
-            .iter()
-            .find(|c| c.generated)
-            .ok_or_else(|| {
-                "create_generated_clock: missing -divide_by/-multiply_by/-edges or unknown master"
-                    .to_string()
-            })?;
+        let gclk = extra.clocks.iter().find(|c| c.generated).ok_or_else(|| {
+            "create_generated_clock: missing -divide_by/-multiply_by/-edges or unknown master"
+                .to_string()
+        })?;
         let n = extra.clocks.len();
         let period = gclk.period_ps;
         let name = gclk.name.clone();
@@ -17826,7 +17874,8 @@ impl IdeModel {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
             }
-            let stock = "# Helion SDC — 100 MHz on clk\ncreate_clock -period 10.000 [get_ports clk]\n";
+            let stock =
+                "# Helion SDC — 100 MHz on clk\ncreate_clock -period 10.000 [get_ports clk]\n";
             std::fs::write(&path, stock)
                 .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
         }
@@ -17919,15 +17968,19 @@ impl IdeModel {
         if d.attrs.get("FLATTEN_CAP") == Some("1") {
             return false;
         }
-        let n_logic = d.cells.iter().filter(|c| {
-            matches!(
-                c.kind,
-                helion_ir::CellKind::Lut6 { .. }
-                    | helion_ir::CellKind::Hff
-                    | helion_ir::CellKind::Mac27
-                    | helion_ir::CellKind::Bram18
-            )
-        }).count();
+        let n_logic = d
+            .cells
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    helion_ir::CellKind::Lut6 { .. }
+                        | helion_ir::CellKind::Hff
+                        | helion_ir::CellKind::Mac27
+                        | helion_ir::CellKind::Bram18
+                )
+            })
+            .count();
         let clock_path = d
             .cells
             .iter()
@@ -17938,7 +17991,8 @@ impl IdeModel {
     /// Net that actually clocks Hffs. If several nets clock FFs, a leftover
     /// net called `clk` does not win over the user's posedge clock.
     fn hff_clock_net(d: &helion_ir::Design) -> Option<String> {
-        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         for c in &d.cells {
             if !matches!(c.kind, helion_ir::CellKind::Hff) {
                 continue;
@@ -18030,10 +18084,7 @@ impl IdeModel {
         let Some(net) = Self::hff_clock_net(d) else {
             return;
         };
-        if let Some(i) = clks
-            .iter()
-            .position(|c| c.name == net || c.source == net)
-        {
+        if let Some(i) = clks.iter().position(|c| c.name == net || c.source == net) {
             // Keep the analysis period: only bring a same-period matching
             // clock to the front so the reported name is the Hff clock.
             if i != 0 && clks[i].period_ps == clks[0].period_ps {
@@ -18095,15 +18146,19 @@ impl IdeModel {
         }
         {
             let d = self.shell.session.design.as_ref().unwrap();
-            let n_logic = d.cells.iter().filter(|c| {
-                matches!(
-                    c.kind,
-                    helion_ir::CellKind::Lut6 { .. }
-                        | helion_ir::CellKind::Hff
-                        | helion_ir::CellKind::Mac27
-                        | helion_ir::CellKind::Bram18
-                )
-            }).count();
+            let n_logic = d
+                .cells
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.kind,
+                        helion_ir::CellKind::Lut6 { .. }
+                            | helion_ir::CellKind::Hff
+                            | helion_ir::CellKind::Mac27
+                            | helion_ir::CellKind::Bram18
+                    )
+                })
+                .count();
             // sim_only stays no_body. A skipped cone is timing_incomplete even
             // with no Hff — leftover LUTs are not a mapped design with no clock.
             if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
@@ -18177,7 +18232,17 @@ impl IdeModel {
         };
         Ok(format!(
             "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}{period_note}{path}",
-            d.name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps, t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps, t.clk_net_ps
+            d.name,
+            t.wns_ps,
+            t.tns_ps,
+            t.setup_ps,
+            t.hold_ps,
+            t.hold_slack_ps,
+            t.endpoints,
+            t.r2r_ps,
+            t.iob_ps,
+            t.route_ps,
+            t.clk_net_ps
         ))
     }
 
@@ -18266,9 +18331,7 @@ impl IdeModel {
             self.push_sim_log(
                 MsgSeverity::Warning,
                 "breakpoint",
-                format!(
-                    "HIT {h} cycles={ran}/{cycles} LED[{ran}]={led} ENGINE_TIME_PS={time_ps}"
-                ),
+                format!("HIT {h} cycles={ran}/{cycles} LED[{ran}]={led} ENGINE_TIME_PS={time_ps}"),
             );
             return Ok(format!(
                 "sim_run HIT {h} cycles={ran}/{cycles} LED[{ran}]={led}"
@@ -18277,9 +18340,7 @@ impl IdeModel {
         self.push_sim_log(
             MsgSeverity::Info,
             "sim_run",
-            format!(
-                "sim_run cycles={cycles} LED[{cycles}]={led} ENGINE_TIME_PS={time_ps}"
-            ),
+            format!("sim_run cycles={cycles} LED[{cycles}]={led} ENGINE_TIME_PS={time_ps}"),
         );
         Ok(format!("sim_run cycles={cycles} LED[{cycles}]={led}"))
     }
@@ -18390,15 +18451,10 @@ impl IdeModel {
             ("-".into(), 0, 0, 0)
         };
         let kernel = self.sim_kernel();
-        let mut text = format!(
-            "elaborated {name} cells={cells} luts={luts} ffs={ffs} kernel={kernel}"
-        );
+        let mut text =
+            format!("elaborated {name} cells={cells} luts={luts} ffs={ffs} kernel={kernel}");
         if let Some(sim) = &self.event_sim {
-            text.push_str(&format!(
-                " led={} time_ps={}",
-                u8::from(sim.led),
-                sim.time
-            ));
+            text.push_str(&format!(" led={} time_ps={}", u8::from(sim.led), sim.time));
         }
         self.push_sim_log(MsgSeverity::Info, "elaborate", text);
         Ok(())
@@ -18474,11 +18530,7 @@ impl IdeModel {
     /// Posedge-only LED bitstring (one bit per user cycle) from half-cycle wave samples.
     fn wave_posedge_led_bits(&self) -> String {
         let out = self.primary_out_port();
-        match self
-            .wave
-            .trace(&out)
-            .or_else(|| self.wave.trace("led"))
-        {
+        match self.wave.trace(&out).or_else(|| self.wave.trace("led")) {
             Some(t) if t.samples.len() >= 2 => t
                 .samples
                 .iter()
@@ -18584,7 +18636,13 @@ impl IdeModel {
 
         // Active edge sample: clock high; output/cnt update once per user cycle.
         Self::push_sample(&mut self.wave, &clk_name, 1, 1, WaveStyle::Digital);
-        Self::push_sample(&mut self.wave, &out_name, u64::from(led), 1, WaveStyle::Digital);
+        Self::push_sample(
+            &mut self.wave,
+            &out_name,
+            u64::from(led),
+            1,
+            WaveStyle::Digital,
+        );
         if out_name != "led" && self.wave.has_trace("led") {
             Self::push_sample(&mut self.wave, "led", u64::from(led), 1, WaveStyle::Digital);
         }
@@ -18645,12 +18703,13 @@ impl IdeModel {
     fn collect_sim_objects(&self) -> Vec<SimObject> {
         let mut v = Vec::new();
         let mut seen = HashSet::new();
-        let push = |v: &mut Vec<SimObject>, seen: &mut HashSet<String>, name: String, value: String| {
-            if seen.insert(name.clone()) {
-                let kind = self.sim_object_kind(&name);
-                v.push(SimObject { name, kind, value });
-            }
-        };
+        let push =
+            |v: &mut Vec<SimObject>, seen: &mut HashSet<String>, name: String, value: String| {
+                if seen.insert(name.clone()) {
+                    let kind = self.sim_object_kind(&name);
+                    v.push(SimObject { name, kind, value });
+                }
+            };
         if let Some(sim) = &self.event_sim {
             for (name, value) in sim.object_values() {
                 push(&mut v, &mut seen, name, value);
@@ -18740,9 +18799,7 @@ impl IdeModel {
             }
             // Flattened child (hier.sv): sequential probes live in the instance scope.
             (name.starts_with("u_ff") || name.starts_with("u_lut"))
-                && !instances
-                    .iter()
-                    .any(|i| name.starts_with(&format!("{i}_")))
+                && !instances.iter().any(|i| name.starts_with(&format!("{i}_")))
         }
     }
 
@@ -18942,7 +18999,11 @@ impl IdeModel {
                 .and_then(|r| r.iob_src.first());
             if let Some(iob) = iob {
                 let led = fab.led_at(iob.iob.0, iob.iob.1);
-                push("led".into(), "port".into(), if led { "1" } else { "0" }.into());
+                push(
+                    "led".into(),
+                    "port".into(),
+                    if led { "1" } else { "0" }.into(),
+                );
             }
             for (i, lf) in pl.packed.lutffs.iter().enumerate() {
                 if let Some((site, ble)) = pl.lutff_sites.get(i) {
@@ -18977,22 +19038,37 @@ impl IdeModel {
                 return Some(v);
             }
         }
-        if let Some(m) = self.memories.iter().find(|m| m.name.eq_ignore_ascii_case(name)) {
+        if let Some(m) = self
+            .memories
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
+        {
             return Some(m.packed_word());
         }
-        if let Some(l) = self.locals.iter().find(|l| l.name.eq_ignore_ascii_case(name)) {
+        if let Some(l) = self
+            .locals
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(name))
+        {
             return match l.value.as_str() {
                 "1" => Some(1),
                 "0" => Some(0),
                 other => {
                     let t = other.trim_start_matches("0x").trim_start_matches("0X");
-                    u64::from_str_radix(t, 16).ok().or_else(|| other.parse().ok())
+                    u64::from_str_radix(t, 16)
+                        .ok()
+                        .or_else(|| other.parse().ok())
                 }
             };
         }
         if let (Some(fab), Some(pl)) = (&self.fabric_sim, self.shell.session.placed.as_ref()) {
             if name.eq_ignore_ascii_case("led") {
-                if let Some(iob) = self.shell.session.routed.as_ref().and_then(|r| r.iob_src.first())
+                if let Some(iob) = self
+                    .shell
+                    .session
+                    .routed
+                    .as_ref()
+                    .and_then(|r| r.iob_src.first())
                 {
                     return Some(u64::from(fab.led_at(iob.iob.0, iob.iob.1)));
                 }
@@ -19108,11 +19184,7 @@ impl IdeModel {
         let clk_name = self.implicit_clock_name();
         let out_name = self.primary_out_port();
         let skip = |name: &str| {
-            name == "led"
-                || name == "clk"
-                || name == "cnt"
-                || name == clk_name
-                || name == out_name
+            name == "led" || name == "clk" || name == "cnt" || name == clk_name || name == out_name
         };
         let mut extras: Vec<(String, u64, u8)> = Vec::new();
         if let Some(sim) = &self.event_sim {
@@ -19501,7 +19573,13 @@ impl IdeModel {
         let bits: String = cap
             .samples
             .iter()
-            .map(|s| if s.get(trig_idx).copied().unwrap_or(false) { '1' } else { '0' })
+            .map(|s| {
+                if s.get(trig_idx).copied().unwrap_or(false) {
+                    '1'
+                } else {
+                    '0'
+                }
+            })
             .collect();
         // Primary trigger probe on wave; extra probes as ila:<net>.
         for (pi, pname) in cap.probes.iter().enumerate() {
@@ -20094,16 +20172,21 @@ impl IdeModel {
             if p.dir != PortDir::In || !names.contains(&p.name) {
                 continue;
             }
-            let packed = pl.packed.iobs.iter().any(|iob| {
-                iob.cell == p.name || iob.cell.contains(&p.name)
-            });
+            let packed = pl
+                .packed
+                .iobs
+                .iter()
+                .any(|iob| iob.cell == p.name || iob.cell.contains(&p.name));
             if packed {
                 continue;
             }
             // PACKAGE_PIN / LOC wins — mid-size fabrics can fill every HAD IOB
             // via place_iob_cap; clk must still land on the user pin.
             let pin = p.attrs.get("LOC").or_else(|| {
-                self.constraints.package_pins.get(&p.name).map(|s| s.as_str())
+                self.constraints
+                    .package_pins
+                    .get(&p.name)
+                    .map(|s| s.as_str())
             });
             if let Some(pin) = pin {
                 if let Ok((x, y)) = parse_site_xy(pin) {
@@ -20147,11 +20230,7 @@ impl IdeModel {
         for (name, x, y) in self.clock_port_view_sites() {
             // PACKAGE_PIN clocks replace a capped fabric IOB occupant so Device
             // shows clk on the real HAD site (Firstmate: clk must not stay bare).
-            let pin_forced = self
-                .constraints
-                .package_pins
-                .get(&name)
-                .is_some()
+            let pin_forced = self.constraints.package_pins.get(&name).is_some()
                 || self
                     .shell
                     .session
@@ -20269,10 +20348,7 @@ impl IdeModel {
                     || s.site_name() == id
                     || s.bels.iter().any(|b| b == id)
             });
-            let by_path = s
-                .occupant
-                .as_ref()
-                .is_some_and(|o| path_cells.contains(o))
+            let by_path = s.occupant.as_ref().is_some_and(|o| path_cells.contains(o))
                 || s.bels.iter().any(|b| path_cells.contains(b));
             s.highlighted = by_sel || by_path;
             if s.highlighted {
@@ -20354,22 +20430,24 @@ impl IdeModel {
                     .get("IN_TERM")
                     .map(|s| s.to_string())
                     .or_else(|| interms.get(&p.name).cloned());
-                let site = placed_iobs.as_ref().and_then(|v| {
-                    // Match output port to IOB cell by net name or first IOB for `led`.
-                    v.iter().find(|(cell, _)| {
-                        cell.contains(&p.name)
-                            || (p.name == "led" && cell.contains("iob"))
+                let site = placed_iobs
+                    .as_ref()
+                    .and_then(|v| {
+                        // Match output port to IOB cell by net name or first IOB for `led`.
+                        v.iter()
+                            .find(|(cell, _)| {
+                                cell.contains(&p.name) || (p.name == "led" && cell.contains("iob"))
+                            })
+                            .map(|(_, s)| s.clone())
+                            .or_else(|| {
+                                if p.dir == PortDir::Out {
+                                    v.first().map(|(_, s)| s.clone())
+                                } else {
+                                    None
+                                }
+                            })
                     })
-                    .map(|(_, s)| s.clone())
-                    .or_else(|| {
-                        if p.dir == PortDir::Out {
-                            v.first().map(|(_, s)| s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .or_else(|| clock_sites.get(&p.name).cloned());
+                    .or_else(|| clock_sites.get(&p.name).cloned());
                 IoPortView {
                     name: p.name.clone(),
                     dir: dir.into(),
@@ -20484,10 +20562,7 @@ impl IdeModel {
             let r = self.utilization_report();
             if let Some(name) = key.strip_prefix("hier:") {
                 if let Some(h) = r.hier(name).cloned() {
-                    let obj = self
-                        .selected
-                        .clone()
-                        .unwrap_or_else(|| h.name.clone());
+                    let obj = self.selected.clone().unwrap_or_else(|| h.name.clone());
                     self.properties = vec![
                         ("NAME".into(), h.name.clone()),
                         ("TYPE".into(), "utilization_hier".into()),
@@ -20590,8 +20665,14 @@ impl IdeModel {
                 } else {
                     objs.join(",")
                 };
-                let wns = g.wns_ps.map(|w| w.to_string()).unwrap_or_else(|| "n/a".into());
-                let whs = g.whs_ps.map(|w| w.to_string()).unwrap_or_else(|| "n/a".into());
+                let wns = g
+                    .wns_ps
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "n/a".into());
+                let whs = g
+                    .whs_ps
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "n/a".into());
                 self.properties = vec![
                     ("NAME".into(), g.name.clone()),
                     ("TYPE".into(), "timing_summary".into()),
@@ -20775,10 +20856,7 @@ impl IdeModel {
         }
         if let Some(idx) = self.selected_find {
             if let Some(h) = self.find_results.get(idx).cloned() {
-                let obj = self
-                    .selected
-                    .clone()
-                    .unwrap_or_else(|| h.name.clone());
+                let obj = self.selected.clone().unwrap_or_else(|| h.name.clone());
                 self.properties = vec![
                     ("NAME".into(), h.name.clone()),
                     ("TYPE".into(), h.type_cell().to_string()),
@@ -20806,10 +20884,7 @@ impl IdeModel {
                     objs.join(",")
                 };
                 let obj = match self.selected.as_deref() {
-                    Some(s) if s == prefix => objs
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "-".into()),
+                    Some(s) if s == prefix => objs.first().cloned().unwrap_or_else(|| "-".into()),
                     Some(s) => s.to_string(),
                     None => objs.first().cloned().unwrap_or_else(|| "-".into()),
                 };
@@ -20839,10 +20914,7 @@ impl IdeModel {
                     objs.join(",")
                 };
                 let obj = match self.selected.as_deref() {
-                    Some(s) if s == prefix => objs
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "-".into()),
+                    Some(s) if s == prefix => objs.first().cloned().unwrap_or_else(|| "-".into()),
                     Some(s) => s.to_string(),
                     None => objs.first().cloned().unwrap_or_else(|| "-".into()),
                 };
@@ -20862,10 +20934,7 @@ impl IdeModel {
         if self.netlist_object_click {
             if let Some(name) = self.selected_netlist.clone() {
                 if let Some(row) = self.netlist_rows().into_iter().find(|r| r.name == name) {
-                    let obj = self
-                        .selected
-                        .clone()
-                        .unwrap_or_else(|| row.name.clone());
+                    let obj = self.selected.clone().unwrap_or_else(|| row.name.clone());
                     self.properties = vec![
                         ("NAME".into(), row.name.clone()),
                         ("TYPE".into(), row.type_cell().to_string()),
@@ -20889,10 +20958,7 @@ impl IdeModel {
                     } else {
                         objs.join(",")
                     };
-                    let obj = self
-                        .selected
-                        .clone()
-                        .unwrap_or_else(|| p.name.clone());
+                    let obj = self.selected.clone().unwrap_or_else(|| p.name.clone());
                     self.properties = vec![
                         ("NAME".into(), p.name.clone()),
                         ("TYPE".into(), "io_port".into()),
@@ -20922,10 +20988,7 @@ impl IdeModel {
                     } else {
                         objs.join(",")
                     };
-                    let obj = self
-                        .selected
-                        .clone()
-                        .unwrap_or_else(|| pb.name.clone());
+                    let obj = self.selected.clone().unwrap_or_else(|| pb.name.clone());
                     let sites = pb.site_count(&self.device.sites);
                     self.properties = vec![
                         ("NAME".into(), pb.name.clone()),
@@ -20990,11 +21053,7 @@ impl IdeModel {
             }
         }
         if let Some(name) = id.strip_prefix("cursor:") {
-            if let Some(row) = self
-                .wave_cursor_rows()
-                .into_iter()
-                .find(|r| r.name == name)
-            {
+            if let Some(row) = self.wave_cursor_rows().into_iter().find(|r| r.name == name) {
                 let led = self.primary_out_bits_or_dash();
                 self.properties = vec![
                     ("NAME".into(), row.name.clone()),
@@ -21058,12 +21117,7 @@ impl IdeModel {
             }
         }
         if let Some(name) = id.strip_prefix("force:") {
-            if let Some(row) = self
-                .forces
-                .iter()
-                .find(|r| r.name == name)
-                .cloned()
-            {
+            if let Some(row) = self.forces.iter().find(|r| r.name == name).cloned() {
                 self.properties = vec![
                     ("NAME".into(), row.name.clone()),
                     ("TYPE".into(), "force".into()),
@@ -21210,12 +21264,7 @@ impl IdeModel {
             ));
             props.push(("SITE".into(), site.site_name()));
         }
-        if let Some(site) = self
-            .device
-            .sites
-            .iter()
-            .find(|s| s.site_name() == id)
-        {
+        if let Some(site) = self.device.sites.iter().find(|s| s.site_name() == id) {
             props.push(("TYPE".into(), "site".into()));
             props.push(("KIND".into(), format!("{:?}", site.kind)));
             props.push((
@@ -21386,10 +21435,7 @@ impl IdeModel {
                 props.push(("SOURCE".into(), n.source));
                 props.push(("NET".into(), n.net));
                 props.push(("GENERATED".into(), u8::from(n.generated).to_string()));
-                props.push((
-                    "MASTER".into(),
-                    n.master.unwrap_or_else(|| "-".into()),
-                ));
+                props.push(("MASTER".into(), n.master.unwrap_or_else(|| "-".into())));
                 props.push(("LOADS".into(), n.n_loads.to_string()));
                 props.push(("BUFFERS".into(), n.n_buffers.to_string()));
                 props.push(("FANOUT".into(), n.fanout.to_string()));
@@ -21483,10 +21529,7 @@ impl IdeModel {
                 props.push(("WORD".into(), report.word_hex()));
                 props.push(("IDCODE".into(), format!("{:#010x}", report.idcode)));
                 props.push(("IR".into(), format!("{:#04x}", report.ir)));
-                props.push((
-                    "PROGRAMMED".into(),
-                    u8::from(report.programmed).to_string(),
-                ));
+                props.push(("PROGRAMMED".into(), u8::from(report.programmed).to_string()));
             }
             if let Some(net) = id.strip_prefix("ila:") {
                 if net == self.ila.net {
@@ -21617,12 +21660,8 @@ fn parse_package_pin_cmd(cmd: &str) -> Result<(String, String), String> {
     let t = cmd.trim();
     if let Some(rest) = t.strip_prefix("assign_package_pin ") {
         let mut p = rest.split_whitespace();
-        let port = p
-            .next()
-            .ok_or("assign_package_pin: need <port> <pin>")?;
-        let pin = p
-            .next()
-            .ok_or("assign_package_pin: need <port> <pin>")?;
+        let port = p.next().ok_or("assign_package_pin: need <port> <pin>")?;
+        let pin = p.next().ok_or("assign_package_pin: need <port> <pin>")?;
         return Ok((port.to_string(), pin.to_string()));
     }
     let toks: Vec<&str> = t.split_whitespace().collect();
@@ -21640,15 +21679,14 @@ fn parse_package_pin_cmd(cmd: &str) -> Result<(String, String), String> {
     let joined = toks.get(3..).unwrap_or(&[]).join(" ");
     let port = tcl_ident(&joined, "get_ports")
         .or_else(|| {
-            toks.get(3).map(|s| {
-                s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
+            toks.get(3)
+                .map(|s| {
+                    s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
         })
-        .ok_or_else(|| {
-            "set_property PACKAGE_PIN: missing [get_ports <port>]".to_string()
-        })?;
+        .ok_or_else(|| "set_property PACKAGE_PIN: missing [get_ports <port>]".to_string())?;
     Ok((port, pin))
 }
 
@@ -21682,7 +21720,10 @@ fn parse_port_prop_cmd(cmd: &str, want: &str) -> Result<(String, String), String
 }
 
 fn parse_pblock_range(spec: &str) -> Result<(u32, u32, u32, u32), String> {
-    let t = spec.trim().trim_matches(|c: char| "{}[]".contains(c)).trim();
+    let t = spec
+        .trim()
+        .trim_matches(|c: char| "{}[]".contains(c))
+        .trim();
     if t.is_empty() {
         return Err("resize_pblock: empty range".into());
     }
@@ -21916,11 +21957,7 @@ fn iob_pin_rows(
 
 /// STA endpoint paths: each FF and IOB, cells/nets walked off the HNF (Fig. 59).
 /// Pin rows are UG903 incr/path delays from helion-sta arcs, not a name list.
-fn extract_timing_paths(
-    design: &Design,
-    t: &TimingResult,
-    device: &DeviceView,
-) -> Vec<TimingPath> {
+fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) -> Vec<TimingPath> {
     let mut paths = Vec::new();
     for c in &design.cells {
         if !matches!(c.kind, CellKind::Hff) {
@@ -22066,7 +22103,10 @@ mod tests {
         );
         assert_eq!(ide.wns_ps(), Some(wns), "pane must agree with the console");
         let engine = ide.session().report_timing(&ide.device().unwrap()).unwrap();
-        assert!(engine.contains(&format!("WNS_PS={wns}")), "console is the Session: {engine}");
+        assert!(
+            engine.contains(&format!("WNS_PS={wns}")),
+            "console is the Session: {engine}"
+        );
 
         let util = ide.exec("report_utilization").unwrap();
         assert!(util.contains("LUTFF=4/8192"), "{util}");
@@ -22108,10 +22148,7 @@ mod tests {
         let out = ide
             .exec(&format!("write_report timing {}", timing_path.display()))
             .expect("write_report timing");
-        assert!(
-            out.contains("kind=timing"),
-            "write_report summary: {out}"
-        );
+        assert!(out.contains("kind=timing"), "write_report summary: {out}");
         assert!(
             out.contains(&format!("path={}", timing_path.display())),
             "{out}"
@@ -22138,7 +22175,10 @@ mod tests {
         );
         let util_path = dir.join("counter-utilization.rpt");
         let uout = ide
-            .exec(&format!("export_report utilization {}", util_path.display()))
+            .exec(&format!(
+                "export_report utilization {}",
+                util_path.display()
+            ))
             .expect("export_report utilization");
         assert!(uout.contains("kind=utilization"), "{uout}");
         let ubody = std::fs::read_to_string(&util_path).expect("util rpt");
@@ -22230,7 +22270,10 @@ end architecture;
             d.cells
         );
         let clk = IdeModel::hff_clock_net(d).unwrap_or_else(|| "clock".into());
-        assert_ne!(clk, "clk", "implicit clock is the HFF CLK net, not leftover clk");
+        assert_ne!(
+            clk, "clk",
+            "implicit clock is the HFF CLK net, not leftover clk"
+        );
         let aw_clk = ide.exec("add_wave clock").expect("add_wave clock");
         assert!(aw_clk.contains("add_wave clock"), "{aw_clk}");
         let aw_q = ide.exec("add_wave Q").expect("add_wave Q");
@@ -22239,9 +22282,12 @@ end architecture;
         assert!(ide.wave.has_trace("Q"), "wave Q port");
         let clks = ide.clocks_for_sta();
         assert!(
-            clks.iter().any(|c| c.name == "clock" || c.source == "clock"),
+            clks.iter()
+                .any(|c| c.name == "clock" || c.source == "clock"),
             "STA implicit clock from HFF CLK net: {:?}",
-            clks.iter().map(|c| (&c.name, &c.source)).collect::<Vec<_>>()
+            clks.iter()
+                .map(|c| (&c.name, &c.source))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -22280,7 +22326,10 @@ end architecture;
         assert!(
             n_lut > 0,
             "adder4 implement must map LUTs: cells={:?}",
-            d.cells.iter().map(|c| format!("{}:{:?}", c.name, c.kind)).collect::<Vec<_>>()
+            d.cells
+                .iter()
+                .map(|c| format!("{}:{:?}", c.name, c.kind))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -22399,12 +22448,17 @@ end architecture;
         assert!(ide.console.iter().any(|l| l.cmd.contains("layout default")));
 
         ide.set_nav(NavSection::ProgramDebug).unwrap();
-        assert!(ide.session().hw_open, "Program and Debug opens the sim cable");
+        assert!(
+            ide.session().hw_open,
+            "Program and Debug opens the sim cable"
+        );
         assert!(ide.hw.open);
 
         ide.set_nav(NavSection::IpIntegrator).unwrap();
         assert!(
-            ide.ip_catalog.iter().any(|c| c.name == "h_uart" && c.bus == "Helion-MM"),
+            ide.ip_catalog
+                .iter()
+                .any(|c| c.name == "h_uart" && c.bus == "Helion-MM"),
             "{:?}",
             ide.ip_catalog
         );
@@ -22421,9 +22475,16 @@ end architecture;
         assert!(
             ide.schematic.has_cell("u_lut0"),
             "schematic is HNF, not empty: {:?}",
-            ide.schematic.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+            ide.schematic
+                .nodes
+                .iter()
+                .map(|n| &n.name)
+                .collect::<Vec<_>>()
         );
-        assert!(!ide.schematic.edges.is_empty(), "schematic nets are real HNF edges");
+        assert!(
+            !ide.schematic.edges.is_empty(),
+            "schematic nets are real HNF edges"
+        );
         ide.select("u_lut0");
         assert_eq!(ide.selected_cell(), Some("u_lut0"));
         assert!(ide.netlist_has_selected(), "netlist must see u_lut0");
@@ -22433,14 +22494,18 @@ end architecture;
         assert_eq!(ide.hierarchy.top.as_deref(), Some("counter"));
         assert!(ide.hierarchy_has_selected());
         assert!(
-            ide.properties.iter().any(|(k, v)| k == "PRIMITIVE" && v == "LUT6"),
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "PRIMITIVE" && v == "LUT6"),
             "{:?}",
             ide.properties
         );
         let found = ide.exec("find u_lut0").unwrap();
         assert!(found.contains("cell:u_lut0"), "{found}");
         assert!(
-            ide.find_results.iter().any(|h| h.kind == "cell" && h.name == "u_lut0"),
+            ide.find_results
+                .iter()
+                .any(|h| h.kind == "cell" && h.name == "u_lut0"),
             "{:?}",
             ide.find_results
         );
@@ -22457,14 +22522,19 @@ end architecture;
                 .map(|s| (s.x, s.y, s.occupant.clone()))
                 .collect::<Vec<_>>()
         );
-        assert!(ide.device_has_selected(), "device view shares the same selected cell");
+        assert!(
+            ide.device_has_selected(),
+            "device view shares the same selected cell"
+        );
         assert!(
             !ide.device.sites.is_empty(),
             "device sites come from HAD, not a dummy graph"
         );
         assert!(ide.io_ports.iter().any(|p| p.name == "led"));
         assert!(
-            ide.io_ports.iter().any(|p| p.name == "led" && p.site.is_some()),
+            ide.io_ports
+                .iter()
+                .any(|p| p.name == "led" && p.site.is_some()),
             "I/O Ports list a real IOB site after place: {:?}",
             ide.io_ports
         );
@@ -22473,14 +22543,22 @@ end architecture;
             "package pins are HAD IOB sites"
         );
         assert!(
-            ide.package_pins.iter().any(|p| p.port.as_deref() == Some("led")),
+            ide.package_pins
+                .iter()
+                .any(|p| p.port.as_deref() == Some("led")),
             "led must map to a package pin: {:?}",
-            ide.package_pins.iter().filter(|p| p.port.is_some()).collect::<Vec<_>>()
+            ide.package_pins
+                .iter()
+                .filter(|p| p.port.is_some())
+                .collect::<Vec<_>>()
         );
 
         let drc = ide.exec("report_drc").unwrap();
         assert!(drc.contains("violations=0") || drc.contains("ok"), "{drc}");
-        assert!(ide.drc.as_ref().map(|d| d.ok()).unwrap_or(false), "DRC is helion-drc");
+        assert!(
+            ide.drc.as_ref().map(|d| d.ok()).unwrap_or(false),
+            "DRC is helion-drc"
+        );
     }
 
     #[test]
@@ -22492,7 +22570,9 @@ end architecture;
         ide.run_step(FlowStep::Route).unwrap();
         ide.run_step(FlowStep::Bitstream).unwrap();
 
-        let gold = ide.fabric_led_bits(16).expect("independent fabric LED bits");
+        let gold = ide
+            .fabric_led_bits(16)
+            .expect("independent fabric LED bits");
         assert_eq!(gold.len(), 16, "{gold}");
         // Must be the engine string, not a canned constant: a second design differs.
         let mut blinky = IdeModel::new();
@@ -22507,18 +22587,32 @@ end architecture;
         let out = ide.sim_run(16).unwrap();
         assert!(out.contains("LED[16]="), "{out}");
         let wave = ide.wave_posedge_led_bits();
-        assert_eq!(wave, gold, "UG900 wave samples the fabric LED net on posedge");
+        assert_eq!(
+            wave, gold,
+            "UG900 wave samples the fabric LED net on posedge"
+        );
         assert!(ide.wave.has_trace("clk"), "sim records toggling clk");
         assert!(
             ide.wave.trace("clk").unwrap().has_digital_transition(),
             "clk must toggle 0↔1 across half-cycles"
         );
-        assert!(ide.scopes.iter().any(|s| s.name == "counter"), "{:?}", ide.scopes);
-        assert!(ide.objects.iter().any(|o| o.name == "led"), "{:?}", ide.objects);
+        assert!(
+            ide.scopes.iter().any(|s| s.name == "counter"),
+            "{:?}",
+            ide.scopes
+        );
+        assert!(
+            ide.objects.iter().any(|o| o.name == "led"),
+            "{:?}",
+            ide.objects
+        );
 
         ide.sim_restart().unwrap();
         assert!(
-            ide.wave.bits_of("led").map(|s| s.is_empty()).unwrap_or(true),
+            ide.wave
+                .bits_of("led")
+                .map(|s| s.is_empty())
+                .unwrap_or(true),
             "restart clears samples"
         );
         ide.sim_step().unwrap();
@@ -22584,7 +22678,11 @@ end architecture;
         assert_eq!(posedge.len(), 16);
         for (i, y) in posedge.iter().enumerate() {
             let bit = gold.as_bytes()[i] == b'1';
-            assert_eq!(*y, if bit { 1.0 } else { 0.0 }, "analog Y is the engine bit");
+            assert_eq!(
+                *y,
+                if bit { 1.0 } else { 0.0 },
+                "analog Y is the engine bit"
+            );
         }
         assert!(
             led.has_digital_transition(),
@@ -22606,7 +22704,10 @@ end architecture;
         let bin = ide.wave.trace("led").unwrap().value_at(ide.wave.cursor);
         ide.exec("wave_radix led hex").unwrap();
         let hex = ide.wave.trace("led").unwrap().value_at(ide.wave.cursor);
-        assert_ne!(bin, hex, "Binary vs Hex format the same bits differently: {bin} {hex}");
+        assert_ne!(
+            bin, hex,
+            "Binary vs Hex format the same bits differently: {bin} {hex}"
+        );
         assert_eq!(
             ide.wave.trace("led").unwrap().samples,
             before,
@@ -22622,7 +22723,10 @@ end architecture;
         assert!(cnt.width > 1, "cnt is a bus, not a scalar dump");
         assert_eq!(cnt.analog_series().len(), 32);
         let ymax = cnt.analog_series().iter().cloned().fold(0.0, f64::max);
-        assert!(ymax > 1.0, "analog bus is the integer series, not a canned sine: {ymax}");
+        assert!(
+            ymax > 1.0,
+            "analog bus is the integer series, not a canned sine: {ymax}"
+        );
 
         ide.exec("add_wave led").unwrap();
         assert!(ide.scopes.iter().any(|s| s.name == "counter"));
@@ -22724,7 +22828,10 @@ end architecture;
 
         let mut fresh = IdeModel::new();
         assert!(
-            fresh.exec("add_wave_marker x").unwrap_err().contains("no wave samples"),
+            fresh
+                .exec("add_wave_marker x")
+                .unwrap_err()
+                .contains("no wave samples"),
             "marker needs engine samples"
         );
         assert!(
@@ -22741,11 +22848,15 @@ end architecture;
     fn wave_ab_cursors_time_delta_from_engine_samples() {
         let mut ide = IdeModel::new();
         assert!(
-            ide.exec("wave_cursor_a").unwrap_err().contains("no wave samples"),
+            ide.exec("wave_cursor_a")
+                .unwrap_err()
+                .contains("no wave samples"),
             "A needs engine samples"
         );
         assert!(
-            ide.exec("wave_cursor B 1").unwrap_err().contains("no wave samples"),
+            ide.exec("wave_cursor B 1")
+                .unwrap_err()
+                .contains("no wave samples"),
             "B needs engine samples"
         );
         let empty = ide.wave_cursors_text();
@@ -22763,7 +22874,10 @@ end architecture;
         ide.sim_run(16).unwrap();
         assert_eq!(ide.wave.bits_of("led").as_deref(), Some(gold.as_str()));
         let main = ide.wave.cursor;
-        assert_eq!(main, 31, "sim_run parks the main cursor on the last half-cycle sample");
+        assert_eq!(
+            main, 31,
+            "sim_run parks the main cursor on the last half-cycle sample"
+        );
 
         // Half-cycle timescale 5ns: sample 4 → 20ns, sample 16 → 80ns.
         let a = ide.exec("wave_cursor_a 4").unwrap();
@@ -22772,7 +22886,10 @@ end architecture;
         assert!(a.contains("DELTA_PS=n/a"), "{a}");
         assert_eq!(ide.wave.cursor_a, Some(4));
         assert_eq!(ide.wave.time_ps(4), 20_000);
-        assert_eq!(ide.wave.cursor, main, "placing A must not move the main cursor");
+        assert_eq!(
+            ide.wave.cursor, main,
+            "placing A must not move the main cursor"
+        );
         assert_eq!(ide.workspace, WorkspaceTab::Wave);
         assert!(
             ide.properties
@@ -22789,7 +22906,10 @@ end architecture;
         assert_eq!(ide.wave.cursor_b, Some(16));
         assert_eq!(ide.wave.time_ps(16), 80_000);
         assert_eq!(ide.wave.time_delta_ps(), Some(60_000));
-        assert_eq!(ide.wave.cursor, main, "placing B must not move the main cursor");
+        assert_eq!(
+            ide.wave.cursor, main,
+            "placing B must not move the main cursor"
+        );
 
         let pane = ide.exec("wave_cursors").unwrap();
         assert!(pane.contains("A_SAMPLE=4 A_TIME_PS=20000"), "{pane}");
@@ -22872,7 +22992,11 @@ end architecture;
                     assert!(pane.contains("sites="), "{pane}");
                     assert!(pane.contains("pins="), "{pane}");
                     assert!(ide.device.sites.len() > 0);
-                    assert!(ide.io_ports.iter().any(|p| p.site.is_some()), "{:?}", ide.io_ports);
+                    assert!(
+                        ide.io_ports.iter().any(|p| p.site.is_some()),
+                        "{:?}",
+                        ide.io_ports
+                    );
                     assert!(!ide.package_pins.is_empty());
                 }
                 UltraFastStage::DesignEntry => {
@@ -22903,10 +23027,7 @@ end architecture;
                     assert_eq!(ide.wns_ps(), Some(wns));
                 }
                 UltraFastStage::ProgramDebug => {
-                    assert!(
-                        pane.contains("hash=") || pane.contains("DONE="),
-                        "{pane}"
-                    );
+                    assert!(pane.contains("hash=") || pane.contains("DONE="), "{pane}");
                     assert!(ide.hw.open);
                 }
             }
@@ -22934,7 +23055,9 @@ end architecture;
         // USB=0: bare program_hw refuses board DONE; sim cable for fabric STAT.
         let board_err = ide.exec("program_hw").unwrap_err();
         assert!(
-            board_err.contains("refused DONE") || board_err.contains("no USB") || board_err.contains("programmer"),
+            board_err.contains("refused DONE")
+                || board_err.contains("no USB")
+                || board_err.contains("programmer"),
             "{board_err}"
         );
         let prog = ide.exec("program_hw cable=sim").unwrap();
@@ -22974,19 +23097,21 @@ end architecture;
         );
         let canvas = ide.exec("bd_drawing").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Ip);
-        assert!(canvas.contains("box="), "BD is boxes, not a catalog list: {canvas}");
+        assert!(
+            canvas.contains("box="),
+            "BD is boxes, not a catalog list: {canvas}"
+        );
         assert!(canvas.contains("u_h_uart:h_uart:box="), "{canvas}");
         assert!(canvas.contains("u_h_gpio:h_gpio:box="), "{canvas}");
         assert!(canvas.contains("mm_interconnect:INTERCONNECT"), "{canvas}");
         assert!(canvas.contains("bus=Helion-MM"), "{canvas}");
-        assert!(canvas.contains("wire:Helion-MM:mm_interconnect->u_h_uart"), "{canvas}");
+        assert!(
+            canvas.contains("wire:Helion-MM:mm_interconnect->u_h_uart"),
+            "{canvas}"
+        );
         assert!(canvas.contains("wire:clk:"), "{canvas}");
         assert!(!canvas.contains("AXI"), "{canvas}");
-        let d = ide
-            .block_design
-            .as_ref()
-            .unwrap()
-            .drawing(&ide.ip_catalog);
+        let d = ide.block_design.as_ref().unwrap().drawing(&ide.ip_catalog);
         assert!(d.symbols.iter().all(|s| s.w > 8.0 && s.h > 8.0));
         assert!(d.wires.iter().any(|w| w.points.len() >= 2));
         assert!(d.wires.iter().all(|w| w.net != "AXI"));
@@ -23001,19 +23126,38 @@ end architecture;
         assert!(canvas.contains("box="), "{canvas}");
         assert!(canvas.contains("u_h_uart:h_uart:box="), "{canvas}");
         assert!(canvas.contains("u_h_gpio:h_gpio:box="), "{canvas}");
-        assert!(canvas.contains("mm_interconnect:INTERCONNECT:box="), "{canvas}");
+        assert!(
+            canvas.contains("mm_interconnect:INTERCONNECT:box="),
+            "{canvas}"
+        );
         assert!(canvas.contains("clk:PORT_IN:box="), "{canvas}");
         assert!(canvas.contains("bus=Helion-MM"), "{canvas}");
-        assert!(canvas.contains("wire:Helion-MM:mm_interconnect->u_h_uart"), "{canvas}");
-        assert!(canvas.contains("wire:Helion-MM:mm_interconnect->u_h_gpio"), "{canvas}");
+        assert!(
+            canvas.contains("wire:Helion-MM:mm_interconnect->u_h_uart"),
+            "{canvas}"
+        );
+        assert!(
+            canvas.contains("wire:Helion-MM:mm_interconnect->u_h_gpio"),
+            "{canvas}"
+        );
         assert!(!canvas.contains("AXI"), "{canvas}");
         let d = ide.block_design.as_ref().unwrap().drawing(&ide.ip_catalog);
         let uart = d.symbols.iter().find(|s| s.kind == "h_uart").unwrap();
         let gpio = d.symbols.iter().find(|s| s.kind == "h_gpio").unwrap();
         let hub = d.symbols.iter().find(|s| s.kind == "INTERCONNECT").unwrap();
-        assert!(uart.x > hub.x + hub.w, "IP to the right of the interconnect");
-        assert!((uart.y - gpio.y).abs() > 8.0, "UART and GPIO are separate boxes");
-        assert!(d.wires.iter().any(|w| w.net == "Helion-MM" && w.points.len() >= 2));
+        assert!(
+            uart.x > hub.x + hub.w,
+            "IP to the right of the interconnect"
+        );
+        assert!(
+            (uart.y - gpio.y).abs() > 8.0,
+            "UART and GPIO are separate boxes"
+        );
+        assert!(
+            d.wires
+                .iter()
+                .any(|w| w.net == "Helion-MM" && w.points.len() >= 2)
+        );
     }
 
     /// UG893 IP Catalog is a clickable VLNV table from helion-ipxact, not a collapsing dump.
@@ -23030,11 +23174,17 @@ end architecture;
         let table = ide.exec("ip_catalog").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Ip);
         assert!(table.contains("ip_catalog n="), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("NAME=h_uart"), "{table}");
         assert!(table.contains("NAME=h_gpio"), "{table}");
         assert!(table.contains("NAME=h_rv32_hb1"), "{table}");
-        assert!(table.contains("VLNV=community:helion:h_uart:1.0"), "{table}");
+        assert!(
+            table.contains("VLNV=community:helion:h_uart:1.0"),
+            "{table}"
+        );
         assert!(table.contains("BUS=Helion-MM"), "{table}");
         assert!(table.contains("STATUS=Available"), "{table}");
         assert!(!table.contains("AXI"), "{table}");
@@ -23044,7 +23194,10 @@ end architecture;
             ide.ip_catalog
         );
         let rows = ide.ip_catalog_rows();
-        assert!(rows.len() >= 3, "catalog is helion-ipxact pack, not two dump lines");
+        assert!(
+            rows.len() >= 3,
+            "catalog is helion-ipxact pack, not two dump lines"
+        );
         assert!(
             rows.iter().all(|r| r.vlnv.contains(&r.name)
                 && (r.bus == "Helion-MM" || r.bus == "Helion-ST" || r.bus == "Helion-DBG")
@@ -23082,8 +23235,14 @@ end architecture;
 
         let generated = ide.exec("generate_ip h_uart").unwrap();
         assert!(generated.contains("xml_bytes="), "{generated}");
-        assert!(generated.contains("VLNV=community:helion:h_uart:1.0"), "{generated}");
-        let xml = ide.generated_ip_xml.as_deref().expect("generate_ip stores IP-XACT");
+        assert!(
+            generated.contains("VLNV=community:helion:h_uart:1.0"),
+            "{generated}"
+        );
+        let xml = ide
+            .generated_ip_xml
+            .as_deref()
+            .expect("generate_ip stores IP-XACT");
         assert!(xml.contains("<ipxact:name>h_uart</ipxact:name>"), "{xml}");
         assert!(xml.contains("Helion-MM"), "{xml}");
         assert!(!xml.contains("AXI"), "{xml}");
@@ -23092,7 +23251,9 @@ end architecture;
             "generate_ip with selection uses selected core"
         );
         assert!(
-            ide.exec("generate_ip no_such").unwrap_err().contains("no IP"),
+            ide.exec("generate_ip no_such")
+                .unwrap_err()
+                .contains("no IP"),
             "unknown generate must refuse"
         );
 
@@ -23128,7 +23289,10 @@ end architecture;
         assert!(hdl.contains("MODULE=h_rv32_hb1"), "{hdl}");
         assert!(hdl.contains("BUS=Helion-MM"), "{hdl}");
         assert!(hdl.contains("PORTS=clk,resetn"), "{hdl}");
-        assert!(!hdl.contains("module system"), "HDL pane is an instance table, not a SV dump: {hdl}");
+        assert!(
+            !hdl.contains("module system"),
+            "HDL pane is an instance table, not a SV dump: {hdl}"
+        );
         assert!(
             ide.exec("create_bd_cell no_such")
                 .unwrap_err()
@@ -23137,11 +23301,17 @@ end architecture;
         );
         let mut empty = IdeModel::new();
         assert!(
-            empty.exec("create_bd_cell").unwrap_err().contains("missing name"),
+            empty
+                .exec("create_bd_cell")
+                .unwrap_err()
+                .contains("missing name"),
             "empty add must refuse"
         );
         assert!(
-            empty.exec("generate_ip").unwrap_err().contains("missing name"),
+            empty
+                .exec("generate_ip")
+                .unwrap_err()
+                .contains("missing name"),
             "empty generate must refuse"
         );
     }
@@ -23203,7 +23373,9 @@ end architecture;
             "{:?}",
             ide.constraints.clocks
         );
-        let pane = ide.ultrafast_pane_engine(UltraFastStage::TimingAnalysis).unwrap();
+        let pane = ide
+            .ultrafast_pane_engine(UltraFastStage::TimingAnalysis)
+            .unwrap();
         assert!(pane.contains(&format!("WNS_PS={wns20}")), "{pane}");
         assert!(pane.contains("clocks=1"), "{pane}");
         let rt = ide.exec("report_timing").unwrap();
@@ -23324,13 +23496,13 @@ end architecture;
             .unwrap();
         let rows = ide.constraint_rows();
         assert!(
-            rows.iter().any(|r| r.section == ConstraintSection::Exception
-                && r.kind == "set_false_path"),
+            rows.iter()
+                .any(|r| r.section == ConstraintSection::Exception && r.kind == "set_false_path"),
             "{rows:?}"
         );
         assert!(
-            rows.iter().any(|r| r.kind == "set_multicycle_path"
-                && r.value.contains("SETUP_MULT=2")),
+            rows.iter()
+                .any(|r| r.kind == "set_multicycle_path" && r.value.contains("SETUP_MULT=2")),
             "{rows:?}"
         );
         let fp = ide.exec("select_constraint false_path:clk").unwrap();
@@ -23374,7 +23546,9 @@ end architecture;
             .unwrap();
         let brows = blinky.constraint_rows();
         assert!(
-            brows.iter().any(|r| r.kind == "set_output_delay" && r.name == "led"),
+            brows
+                .iter()
+                .any(|r| r.kind == "set_output_delay" && r.name == "led"),
             "{brows:?}"
         );
         let b1 = blinky.wns_ps().unwrap();
@@ -23422,10 +23596,10 @@ end architecture;
         assert_eq!(ide.workspace, WorkspaceTab::Constraints);
         assert_eq!(ide.clock_period_ps, 20_000);
         assert!(
-            ide.constraints
-                .clocks
-                .iter()
-                .any(|c| c.generated && c.name == "clkdiv" && c.period_ps == 20_000 && c.divide_by == 2),
+            ide.constraints.clocks.iter().any(|c| c.generated
+                && c.name == "clkdiv"
+                && c.period_ps == 20_000
+                && c.divide_by == 2),
             "{:?}",
             ide.constraints.clocks
         );
@@ -23484,7 +23658,10 @@ end architecture;
             .unwrap();
         let b1 = blinky.wns_ps().expect("blinky after divide_by 2");
         assert_eq!(b1, b0 + 10_000);
-        assert_ne!(b1, wns20, "generated-clock WNS is per-design STA, not canned");
+        assert_ne!(
+            b1, wns20,
+            "generated-clock WNS is per-design STA, not canned"
+        );
     }
 
     /// UG893/UG903 create_generated_clock -multiply_by / -invert / -edges
@@ -23579,7 +23756,10 @@ end architecture;
         assert!(out_edg.contains("EDGES=1,3,5"), "{out_edg}");
         assert!(
             edg.constraints.clocks.iter().any(|c| {
-                c.generated && c.name == "clkedg" && c.edges == vec![1, 3, 5] && c.period_ps == 20_000
+                c.generated
+                    && c.name == "clkedg"
+                    && c.edges == vec![1, 3, 5]
+                    && c.period_ps == 20_000
             }),
             "{:?}",
             edg.constraints.clocks
@@ -23670,8 +23850,16 @@ end architecture;
             .unwrap();
         assert!(bh.contains("BUS_SKEW_PS=200"), "{bh}");
         assert_eq!(ide.constraints.bus_skew_hold_ps(), 200);
-        let hold_bs = ide.timing.as_ref().expect("STA after hold bus skew").hold_slack_ps;
-        assert_eq!(ide.wns_ps().unwrap(), wns_bs, "hold bus skew must not move setup WNS");
+        let hold_bs = ide
+            .timing
+            .as_ref()
+            .expect("STA after hold bus skew")
+            .hold_slack_ps;
+        assert_eq!(
+            ide.wns_ps().unwrap(),
+            wns_bs,
+            "hold bus skew must not move setup WNS"
+        );
         assert_eq!(
             hold_bs,
             hold0 - 200,
@@ -23812,8 +24000,16 @@ end architecture;
             .unwrap();
         assert!(dh.contains("DATA_CHECK_HOLD_PS=200"), "{dh}");
         assert_eq!(ide.constraints.data_check_hold_ps(), 200);
-        let hold_dc = ide.timing.as_ref().expect("STA after hold data check").hold_slack_ps;
-        assert_eq!(ide.wns_ps().unwrap(), wns_dc, "hold data check must not move setup WNS");
+        let hold_dc = ide
+            .timing
+            .as_ref()
+            .expect("STA after hold data check")
+            .hold_slack_ps;
+        assert_eq!(
+            ide.wns_ps().unwrap(),
+            wns_dc,
+            "hold data check must not move setup WNS"
+        );
         assert_eq!(
             hold_dc,
             hold0 - 200,
@@ -24012,7 +24208,11 @@ end architecture;
             "{}",
             ide.constraints_text()
         );
-        let hold_slack = ide.timing.as_ref().expect("STA after hold MCP").hold_slack_ps;
+        let hold_slack = ide
+            .timing
+            .as_ref()
+            .expect("STA after hold MCP")
+            .hold_slack_ps;
         let wns_hold = ide.timing.as_ref().unwrap().wns_ps;
         assert_eq!(wns_hold, wns_mcp, "hold MCP must not move setup WNS");
         assert_eq!(
@@ -24041,7 +24241,10 @@ end architecture;
             5000 - setup0,
             "set_max_delay 5 ns replaces the period/MCP requirement: {wns_md} vs setup {setup0}"
         );
-        assert_ne!(wns_md, wns_mcp, "max_delay must move WNS off the MCP result");
+        assert_ne!(
+            wns_md, wns_mcp,
+            "max_delay must move WNS off the MCP result"
+        );
         let rt = ide.exec("report_timing").unwrap();
         assert!(rt.contains(&format!("WNS_PS={wns_md}")), "{rt}");
 
@@ -24180,8 +24383,14 @@ end architecture;
             .exec("set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks virt]")
             .unwrap();
         let b_cg = blinky.wns_ps().unwrap();
-        assert_ne!(b_cg, b_od, "clock groups must move blinky WNS off I/O delay");
-        assert_ne!(b_cg, wns_cg, "clock groups WNS is per-design STA, not canned");
+        assert_ne!(
+            b_cg, b_od,
+            "clock groups must move blinky WNS off I/O delay"
+        );
+        assert_ne!(
+            b_cg, wns_cg,
+            "clock groups WNS is per-design STA, not canned"
+        );
     }
 
     /// UG893 Timing Constraints Apply: set_clock_uncertainty / set_clock_latency
@@ -24213,8 +24422,7 @@ end architecture;
         assert_eq!(ide.constraints.uncertainty_setup_ps(), 500);
         assert_eq!(ide.constraints.uncertainty_hold_ps(), 0);
         assert!(
-            ide.constraints_text()
-                .contains("set_clock_uncertainty")
+            ide.constraints_text().contains("set_clock_uncertainty")
                 && ide.constraints_text().contains("SETUP_PS=500"),
             "{}",
             ide.constraints_text()
@@ -24241,8 +24449,16 @@ end architecture;
             .unwrap();
         assert!(hu.contains("UNCERT_HOLD_PS=200"), "{hu}");
         assert_eq!(ide.constraints.uncertainty_hold_ps(), 200);
-        let hold_u = ide.timing.as_ref().expect("STA after hold uncertainty").hold_slack_ps;
-        assert_eq!(ide.wns_ps().unwrap(), wns_su, "hold uncertainty must not move setup WNS");
+        let hold_u = ide
+            .timing
+            .as_ref()
+            .expect("STA after hold uncertainty")
+            .hold_slack_ps;
+        assert_eq!(
+            ide.wns_ps().unwrap(),
+            wns_su,
+            "hold uncertainty must not move setup WNS"
+        );
         assert_eq!(
             hold_u,
             hold0 - 200,
@@ -24283,8 +24499,16 @@ end architecture;
             "{}",
             ide.constraints_text()
         );
-        let hold_e = ide.timing.as_ref().expect("STA after early latency").hold_slack_ps;
-        assert_eq!(ide.wns_ps().unwrap(), wns_late, "early latency must not move setup WNS");
+        let hold_e = ide
+            .timing
+            .as_ref()
+            .expect("STA after early latency")
+            .hold_slack_ps;
+        assert_eq!(
+            ide.wns_ps().unwrap(),
+            wns_late,
+            "early latency must not move setup WNS"
+        );
         assert_eq!(
             hold_e,
             hold_u - 100,
@@ -24329,9 +24553,7 @@ end architecture;
             ide.constraints
         );
 
-        let ij = ide
-            .exec("set_input_jitter [get_clocks clk] 0.2")
-            .unwrap();
+        let ij = ide.exec("set_input_jitter [get_clocks clk] 0.2").unwrap();
         assert!(ij.contains("input_jitter=1"), "{ij}");
         assert!(ij.contains("INPUT_JITTER_PS=200"), "{ij}");
         assert_eq!(ide.workspace, WorkspaceTab::Constraints);
@@ -24349,7 +24571,11 @@ end architecture;
             wns0 - 200,
             "input jitter 0.2 ns must worsen WNS: {wns0} vs {wns_ij}"
         );
-        let hold_ij = ide.timing.as_ref().expect("STA after input jitter").hold_slack_ps;
+        let hold_ij = ide
+            .timing
+            .as_ref()
+            .expect("STA after input jitter")
+            .hold_slack_ps;
         assert_eq!(
             hold_ij,
             hold0 - 200,
@@ -24379,7 +24605,11 @@ end architecture;
             wns_ij - 100,
             "system jitter 0.1 ns must stack on WNS: {wns_ij} vs {wns_sj}"
         );
-        let hold_sj = ide.timing.as_ref().expect("STA after system jitter").hold_slack_ps;
+        let hold_sj = ide
+            .timing
+            .as_ref()
+            .expect("STA after system jitter")
+            .hold_slack_ps;
         assert_eq!(
             hold_sj,
             hold_ij - 100,
@@ -24402,14 +24632,14 @@ end architecture;
         let b1 = blinky.wns_ps().unwrap();
         assert_eq!(b1, b0 - 200);
         assert_ne!(b1, wns_ij, "input jitter WNS is per-design STA, not canned");
-        assert_eq!(
-            blinky.timing.as_ref().unwrap().hold_slack_ps,
-            bhold0 - 200
-        );
+        assert_eq!(blinky.timing.as_ref().unwrap().hold_slack_ps, bhold0 - 200);
         blinky.exec("set_system_jitter 0.1").unwrap();
         let b2 = blinky.wns_ps().unwrap();
         assert_eq!(b2, b1 - 100);
-        assert_ne!(b2, wns_sj, "system jitter WNS is per-design STA, not canned");
+        assert_ne!(
+            b2, wns_sj,
+            "system jitter WNS is per-design STA, not canned"
+        );
     }
 
     /// UG893 Timing Constraints Apply: set_timing_derate / set_operating_conditions
@@ -24475,7 +24705,11 @@ end architecture;
         let hold_early = hold0 * 900 / 1000;
         let wns_early = ide.wns_ps().expect("STA after early derate");
         assert_eq!(wns_early, wns_late, "early derate must not move setup WNS");
-        let hold_e = ide.timing.as_ref().expect("STA after early derate").hold_slack_ps;
+        let hold_e = ide
+            .timing
+            .as_ref()
+            .expect("STA after early derate")
+            .hold_slack_ps;
         assert_eq!(
             hold_e,
             hold_slack0 - (hold0 - hold_early),
@@ -24607,16 +24841,16 @@ end architecture;
             .unwrap();
         let c_od = ca_ide.wns_ps().unwrap();
         assert_eq!(c_od, c0 - 2000);
-        let ca = ca_ide
-            .exec("set_case_analysis 0 [get_ports clk]")
-            .unwrap();
+        let ca = ca_ide.exec("set_case_analysis 0 [get_ports clk]").unwrap();
         assert!(ca.contains("case_analysis=1"), "{ca}");
         assert!(ca.contains("CASE=0"), "{ca}");
         assert_eq!(ca_ide.constraints.case_analyses.len(), 1);
         assert_eq!(ca_ide.constraints.case_analyses[0].value, "0");
         assert_eq!(ca_ide.constraints.case_analyses[0].object, "clk");
         assert!(
-            ca_ide.constraints_text().contains("set_case_analysis 0 clk"),
+            ca_ide
+                .constraints_text()
+                .contains("set_case_analysis 0 clk"),
             "{}",
             ca_ide.constraints_text()
         );
@@ -24628,7 +24862,10 @@ end architecture;
             wns_ca, c_od,
             "case_analysis must force-drop WNS off the I/O-delay result"
         );
-        assert_eq!(wns_ca, wns_dt, "case_analysis and disable_timing drop the same IOB path");
+        assert_eq!(
+            wns_ca, wns_dt,
+            "case_analysis and disable_timing drop the same IOB path"
+        );
         let rt = ca_ide.exec("report_timing").unwrap();
         assert!(rt.contains(&format!("WNS_PS={wns_ca}")), "{rt}");
         assert!(rt.contains("iob_ps=0"), "{rt}");
@@ -24649,8 +24886,14 @@ end architecture;
             .exec("set_disable_timing -from [get_ports clk] -to [get_ports led]")
             .unwrap();
         let b_dt = blinky.wns_ps().unwrap();
-        assert_ne!(b_dt, b_od, "disable_timing must move blinky WNS off I/O delay");
-        assert_ne!(b_dt, wns_dt, "disable_timing WNS is per-design STA, not canned");
+        assert_ne!(
+            b_dt, b_od,
+            "disable_timing must move blinky WNS off I/O delay"
+        );
+        assert_ne!(
+            b_dt, wns_dt,
+            "disable_timing WNS is per-design STA, not canned"
+        );
         blinky
             .exec("set_case_analysis 1 [get_pins u_lut0/I0]")
             .unwrap();
@@ -24681,7 +24924,10 @@ end architecture;
         let hold0 = ide.timing.as_ref().unwrap().hold_slack_ps;
         let clk_net = ide.timing.as_ref().unwrap().clk_net_ps;
         assert_ne!(wns0, 0);
-        assert!(clk_net > 0, "routed clock network must have hop delay, got {clk_net}");
+        assert!(
+            clk_net > 0,
+            "routed clock network must have hop delay, got {clk_net}"
+        );
         assert!(
             ide.constraints.propagated_clocks.is_empty() && ide.constraints.clock_senses.is_empty(),
             "{:?}",
@@ -24705,13 +24951,15 @@ end architecture;
             "positive sense is the default edge and must keep gold WNS"
         );
 
-        let prop = ide
-            .exec("set_propagated_clock [get_clocks clk]")
-            .unwrap();
+        let prop = ide.exec("set_propagated_clock [get_clocks clk]").unwrap();
         assert!(prop.contains("propagated_clock=1"), "{prop}");
         assert!(prop.contains(&format!("CLK_NET_PS={clk_net}")), "{prop}");
         assert_eq!(ide.workspace, WorkspaceTab::Constraints);
-        assert!(ide.constraints.clocks_propagated(), "{:?}", ide.constraints.propagated_clocks);
+        assert!(
+            ide.constraints.clocks_propagated(),
+            "{:?}",
+            ide.constraints.propagated_clocks
+        );
         assert!(
             ide.constraints_text().contains("set_propagated_clock clk"),
             "{}",
@@ -24817,7 +25065,9 @@ end architecture;
         let d = ide.design().expect("hier synth");
         assert_eq!(d.name, "hier");
         assert!(
-            d.instances.iter().any(|i| i.name == "u0" && i.module == "tog"),
+            d.instances
+                .iter()
+                .any(|i| i.name == "u0" && i.module == "tog"),
             "synth must keep the instance tree on HNF: {:?}",
             d.instances
         );
@@ -24883,7 +25133,11 @@ end architecture;
         assert!(out.contains("impl_1 Implementation Complete"), "{out}");
         let impl_r = ide.runs.iter().find(|r| r.name == "impl_1").unwrap();
         assert_eq!(impl_r.status, "Complete");
-        assert_eq!(impl_r.lutff, Some(4), "counter packed LUTFF from the util engine");
+        assert_eq!(
+            impl_r.lutff,
+            Some(4),
+            "counter packed LUTFF from the util engine"
+        );
         let wns = ide.wns_ps().expect("STA after launch_runs");
         assert_eq!(impl_r.wns_ps, Some(wns));
         assert_ne!(wns, 0);
@@ -24917,20 +25171,29 @@ end architecture;
 
         let out = ide.exec("reset_runs impl_1").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert!(out.contains("impl_1 Implementation Not started"), "{out}");
         assert!(
-            out.contains("impl_1 Implementation Not started"),
-            "{out}"
+            ide.session().bitstream.is_none(),
+            "reset_run must drop bitstream"
         );
-        assert!(ide.session().bitstream.is_none(), "reset_run must drop bitstream");
-        assert!(ide.session().placed.is_none(), "reset_run must drop placement");
-        assert!(ide.session().routed.is_none(), "reset_run must drop routing");
+        assert!(
+            ide.session().placed.is_none(),
+            "reset_run must drop placement"
+        );
+        assert!(
+            ide.session().routed.is_none(),
+            "reset_run must drop routing"
+        );
         assert!(
             ide.design().is_some(),
             "reset impl_1 keeps the synth netlist"
         );
         assert_eq!(ide.design().unwrap().cells.len(), cells);
         assert!(ide.bitstream_hash().is_none());
-        assert!(ide.wns_ps().is_none(), "timing pane follows Session, not a lamp");
+        assert!(
+            ide.wns_ps().is_none(),
+            "timing pane follows Session, not a lamp"
+        );
         assert_eq!(ide.step_state(FlowStep::Place), StepState::Pending);
         assert_eq!(ide.step_state(FlowStep::Route), StepState::Pending);
         assert_eq!(ide.step_state(FlowStep::Bitstream), StepState::Pending);
@@ -24940,7 +25203,11 @@ end architecture;
         assert!(impl_r.wns_ps.is_none());
         assert!(impl_r.bitstream_hash.is_none());
         assert_eq!(
-            ide.runs.iter().find(|r| r.name == "synth_1").unwrap().status,
+            ide.runs
+                .iter()
+                .find(|r| r.name == "synth_1")
+                .unwrap()
+                .status,
             "Complete"
         );
 
@@ -24957,7 +25224,11 @@ end architecture;
         assert!(ide.design().is_none(), "reset synth_1 drops HNF");
         assert_eq!(ide.step_state(FlowStep::Synthesis), StepState::Pending);
         assert_eq!(
-            ide.runs.iter().find(|r| r.name == "synth_1").unwrap().status,
+            ide.runs
+                .iter()
+                .find(|r| r.name == "synth_1")
+                .unwrap()
+                .status,
             "Not started"
         );
         assert_eq!(
@@ -24978,7 +25249,12 @@ end architecture;
         blinky.exec("launch_runs impl_1").unwrap();
         assert_eq!(blinky.bitstream_hash(), Some(bh));
         assert_eq!(
-            blinky.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff,
+            blinky
+                .runs
+                .iter()
+                .find(|r| r.name == "impl_1")
+                .unwrap()
+                .lutff,
             Some(1),
             "blinky LUTFF after relaunch is the pack engine, not counter's 4"
         );
@@ -24992,7 +25268,8 @@ end architecture;
         ide.exec("launch_runs impl_1").unwrap();
         let wns_def = ide.wns_ps().expect("default WNS");
         let hash_def = ide.bitstream_hash().expect("default hash");
-        ide.exec("create_run impl_runtime -strategy RuntimeOpt").unwrap();
+        ide.exec("create_run impl_runtime -strategy RuntimeOpt")
+            .unwrap();
         ide.exec("launch_runs impl_runtime").unwrap();
         ide.exec("create_run impl_phys -strategy PhysOpt").unwrap();
         ide.exec("launch_runs impl_phys").unwrap();
@@ -25002,10 +25279,22 @@ end architecture;
         assert!(cmp.contains("impl_phys strategy=PhysOpt"), "{cmp}");
         let rt = ide.runs.iter().find(|r| r.name == "impl_runtime").unwrap();
         let phys = ide.runs.iter().find(|r| r.name == "impl_phys").unwrap();
-        assert_ne!(rt.wns_ps, Some(wns_def), "RuntimeOpt WL place must move WNS");
-        assert_ne!(phys.wns_ps, Some(wns_def), "PhysOpt extra hops must move WNS");
+        assert_ne!(
+            rt.wns_ps,
+            Some(wns_def),
+            "RuntimeOpt WL place must move WNS"
+        );
+        assert_ne!(
+            phys.wns_ps,
+            Some(wns_def),
+            "PhysOpt extra hops must move WNS"
+        );
         assert_ne!(rt.wns_ps, phys.wns_ps);
-        assert_eq!(ide.wns_ps(), Some(wns_def), "side runs must not clobber impl_1");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns_def),
+            "side runs must not clobber impl_1"
+        );
         assert_eq!(ide.bitstream_hash(), Some(hash_def));
         assert!(!cmp.contains("Performance_Explore") && !cmp.contains("AXI"));
     }
@@ -25037,7 +25326,10 @@ end architecture;
         let table = ide.exec("design_runs").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Runs);
         assert!(table.contains("design_runs n="), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("NAME=synth_1"), "{table}");
         assert!(table.contains("NAME=impl_1"), "{table}");
         assert!(table.contains("STRATEGY=Default"), "{table}");
@@ -25090,11 +25382,7 @@ end architecture;
         assert!(sel.contains(&format!("HASH={hash:#010x}")), "{sel}");
         assert!(sel.contains("STRATEGY=Default"), "{sel}");
         assert!(sel.contains("LUTFF=4"), "{sel}");
-        assert_eq!(
-            ide.wns_ps(),
-            Some(wns),
-            "select_run must not move gold WNS"
-        );
+        assert_eq!(ide.wns_ps(), Some(wns), "select_run must not move gold WNS");
         assert!(
             ide.properties
                 .iter()
@@ -25113,8 +25401,7 @@ end architecture;
         ide.exec("create_run impl_runtime -strategy RuntimeOpt")
             .unwrap();
         ide.exec("launch_runs impl_runtime").unwrap();
-        ide.exec("create_run impl_phys -strategy PhysOpt")
-            .unwrap();
+        ide.exec("create_run impl_phys -strategy PhysOpt").unwrap();
         ide.exec("launch_runs impl_phys").unwrap();
         let cmp = ide.exec("compare_runs").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Runs);
@@ -25124,7 +25411,10 @@ end architecture;
         assert!(cmp.contains("NAME=impl_phys"), "{cmp}");
         assert!(cmp.contains("STRATEGY=RuntimeOpt"), "{cmp}");
         assert!(cmp.contains("STRATEGY=PhysOpt"), "{cmp}");
-        assert!(cmp.contains('\n'), "compare_runs is a grid, not a dump: {cmp}");
+        assert!(
+            cmp.contains('\n'),
+            "compare_runs is a grid, not a dump: {cmp}"
+        );
         let rt_wns = ide
             .runs
             .iter()
@@ -25184,7 +25474,10 @@ end architecture;
         ide.exec("launch_runs impl_1").unwrap();
         let out = ide.exec("incremental_impl").unwrap();
         assert!(out.contains("reuse cells="), "{out}");
-        assert!(out.contains("100%") || out.contains("reuse cells="), "{out}");
+        assert!(
+            out.contains("100%") || out.contains("reuse cells="),
+            "{out}"
+        );
         let impl_r = ide.runs.iter().find(|r| r.name == "impl_1").unwrap();
         assert_eq!(impl_r.reuse_pct, Some(100), "{out}");
         assert!(ide.bitstream_hash().is_some());
@@ -25197,13 +25490,7 @@ end architecture;
         ide.open_source(&example("counter.sv")).unwrap();
         ide.exec("launch_runs impl_1").unwrap();
         let wns0 = ide.wns_ps().expect("WNS");
-        let net = ide
-            .session()
-            .placed
-            .as_ref()
-            .unwrap()
-            .packed
-            .iobs[0]
+        let net = ide.session().placed.as_ref().unwrap().packed.iobs[0]
             .from_net
             .clone();
         let out = ide.exec(&format!("fix_route {net} 8")).unwrap();
@@ -25258,7 +25545,10 @@ end architecture;
             "drawing cells are the HAD IOB bounding box, not a 1-column list"
         );
         assert!(dump.contains(&format!("pins={n}")), "{dump}");
-        assert!(dump.contains(&format!("cols={}", ide.package.cols)), "{dump}");
+        assert!(
+            dump.contains(&format!("cols={}", ide.package.cols)),
+            "{dump}"
+        );
         assert!(dump.contains("map="), "drawing occupancy map: {dump}");
         assert!(
             dump.contains("assigned=0"),
@@ -25277,15 +25567,14 @@ end architecture;
         ide.run_step(FlowStep::Place).unwrap();
         let dump = ide.exec("package").unwrap();
         assert!(
-            ide.package_pins.iter().any(|p| p.port.as_deref() == Some("led")),
+            ide.package_pins
+                .iter()
+                .any(|p| p.port.as_deref() == Some("led")),
             "placed led must occupy a drawing cell: {dump}"
         );
         assert!(dump.contains("assigned="), "{dump}");
         assert!(!dump.contains("assigned=0"), "place assigns I/O: {dump}");
-        let map = dump
-            .split("map=")
-            .nth(1)
-            .expect("drawing occupancy map");
+        let map = dump.split("map=").nth(1).expect("drawing occupancy map");
         assert!(
             map.contains('L'),
             "placed led must mark the HAD occupancy map (not the part name): {dump}"
@@ -25301,13 +25590,19 @@ end architecture;
             .iter()
             .find(|p| p.name == "led")
             .and_then(|p| p.site.clone());
-        assert_eq!(site.as_deref(), Some(led.pin.as_str()), "drawing matches placed IOB");
+        assert_eq!(
+            site.as_deref(),
+            Some(led.pin.as_str()),
+            "drawing matches placed IOB"
+        );
         assert!(
             dump.contains(&format!("{}=led", led.pin)),
             "drawing names the HAD pin, not a canned BGA ball: {dump}"
         );
 
-        let sel = ide.exec(&format!("select_package_pin {}", led.pin)).unwrap();
+        let sel = ide
+            .exec(&format!("select_package_pin {}", led.pin))
+            .unwrap();
         assert!(sel.contains("port=led"), "{sel}");
         assert_eq!(ide.selected_cell(), Some("led"));
         assert!(ide.package_has_selected());
@@ -25357,9 +25652,7 @@ end architecture;
         assert!(e.contains("source") || e.contains("synth"), "{e}");
         assert!(
             ide.messages.iter().any(|m| {
-                m.severity == MsgSeverity::Error
-                    && m.id == "synth_design"
-                    && m.text == e
+                m.severity == MsgSeverity::Error && m.id == "synth_design" && m.text == e
             }),
             "rail must journal Errors: {:?}",
             ide.messages
@@ -25372,9 +25665,9 @@ end architecture;
 
         ide.open_source(&example("counter.sv")).unwrap();
         assert!(
-            ide.messages.iter().any(|m| {
-                m.severity == MsgSeverity::Info && m.text.contains("cells=")
-            }),
+            ide.messages
+                .iter()
+                .any(|m| { m.severity == MsgSeverity::Info && m.text.contains("cells=") }),
             "synth cells must land in Messages: {:?}",
             ide.messages
         );
@@ -25437,9 +25730,7 @@ end architecture;
         assert!(ide.messages.is_empty());
         assert!(ide.message_rows().is_empty());
         assert!(
-            ide.select_message("0")
-                .unwrap_err()
-                .contains("no messages"),
+            ide.select_message("0").unwrap_err().contains("no messages"),
             "empty table must refuse a click"
         );
         let empty = ide.exec("messages").unwrap();
@@ -25636,7 +25927,10 @@ end architecture;
             .and_then(|t| t.strip_prefix("OBJECT="))
             .unwrap_or("-");
         assert!(
-            mname == "led" || mname == "clk" || mname.starts_with("BANK") || mname.starts_with("IOB_"),
+            mname == "led"
+                || mname == "clk"
+                || mname.starts_with("BANK")
+                || mname.starts_with("IOB_"),
             "message object link must cross-probe HNF/HAD: {mobj}"
         );
         assert_eq!(ide.selected.as_deref(), Some(mname));
@@ -25751,7 +26045,10 @@ end architecture;
         ide.open_source(&example("counter.sv")).unwrap();
         let dump = ide.exec("schematic_drawing").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(dump.contains("box="), "must report symbol boxes, not a list: {dump}");
+        assert!(
+            dump.contains("box="),
+            "must report symbol boxes, not a list: {dump}"
+        );
         assert!(dump.contains("u_lut0:LUT6:box="), "{dump}");
         assert!(dump.contains("u_lut0.O:out@"), "{dump}");
         assert!(dump.contains("u_lut0.I0:in@"), "{dump}");
@@ -25783,22 +26080,24 @@ end architecture;
         );
         let o = lut.pins.iter().find(|p| p.name == "O").unwrap();
         let i0 = lut.pins.iter().find(|p| p.name == "I0").unwrap();
-        assert!(
-            o.x > lut.x + lut.w,
-            "output stub is outside the right edge"
-        );
+        assert!(o.x > lut.x + lut.w, "output stub is outside the right edge");
         assert!(i0.x < lut.x, "input stub is outside the left edge");
         assert!(
             i0.y > lut.y && i0.y < lut.y + lut.h,
             "pin stub is vertically on the symbol"
         );
-        let i_pins: Vec<_> = lut.pins.iter().filter(|p| p.name.starts_with('I')).collect();
-        assert_eq!(i_pins.len(), 6, "LUT6 schematic symbol has I0–I5: {:?}", lut.pins);
-        assert!(
-            !i0.net.is_empty(),
-            "u_lut0 I0 is on an HNF net: {:?}",
-            i0
+        let i_pins: Vec<_> = lut
+            .pins
+            .iter()
+            .filter(|p| p.name.starts_with('I'))
+            .collect();
+        assert_eq!(
+            i_pins.len(),
+            6,
+            "LUT6 schematic symbol has I0–I5: {:?}",
+            lut.pins
         );
+        assert!(!i0.net.is_empty(), "u_lut0 I0 is on an HNF net: {:?}", i0);
         let i5 = lut.pins.iter().find(|p| p.name == "I5").expect("I5");
         assert!(
             i5.net.is_empty(),
@@ -25829,21 +26128,25 @@ end architecture;
             "nets are polylines"
         );
         assert!(
-            d.wires.iter().any(|w| w.src == "u_lut0" || w.dst == "u_lut0"),
+            d.wires
+                .iter()
+                .any(|w| w.src == "u_lut0" || w.dst == "u_lut0"),
             "u_lut0 is on a net polyline: {:?}",
-            d.wires.iter().map(|w| format!("{}->{}", w.src, w.dst)).collect::<Vec<_>>()
+            d.wires
+                .iter()
+                .map(|w| format!("{}->{}", w.src, w.dst))
+                .collect::<Vec<_>>()
         );
         let ff = d
             .symbols
             .iter()
             .find(|s| s.kind == "HFF")
             .expect("HFF symbol");
+        assert!(ff.x > lut.x, "UG893 dataflow: LUT column left of FF column");
         assert!(
-            ff.x > lut.x,
-            "UG893 dataflow: LUT column left of FF column"
-        );
-        assert!(
-            d.symbols.iter().any(|s| s.kind == "PORT_IN" || s.kind == "PORT_OUT"),
+            d.symbols
+                .iter()
+                .any(|s| s.kind == "PORT_IN" || s.kind == "PORT_OUT"),
             "top-level ports are schematic terminators"
         );
 
@@ -25886,10 +26189,8 @@ end architecture;
             let a = &d.symbols[i];
             assert!(a.w >= 72.0 && a.h >= 20.0, "box {} {}x{}", a.name, a.w, a.h);
             for b in d.symbols.iter().skip(i + 1) {
-                let overlap = a.x < b.x + b.w
-                    && a.x + a.w > b.x
-                    && a.y < b.y + b.h
-                    && a.y + a.h > b.y;
+                let overlap =
+                    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
                 assert!(
                     !overlap,
                     "{} @({},{},{},{}) overlaps {} @({},{},{},{})",
@@ -25937,10 +26238,8 @@ end architecture;
         for i in 0..d.symbols.len() {
             let a = &d.symbols[i];
             for b in d.symbols.iter().skip(i + 1) {
-                let overlap = a.x < b.x + b.w
-                    && a.x + a.w > b.x
-                    && a.y < b.y + b.h
-                    && a.y + a.h > b.y;
+                let overlap =
+                    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
                 assert!(
                     !overlap,
                     "{} @({},{},{},{}) overlaps {} @({},{},{},{})",
@@ -26035,7 +26334,10 @@ end architecture;
     fn schematic_many_io_ports_do_not_overlap_or_clip() {
         let d = axi_like_sheet(24).drawing();
         assert_eq!(
-            d.symbols.iter().filter(|s| s.kind.starts_with("PORT")).count(),
+            d.symbols
+                .iter()
+                .filter(|s| s.kind.starts_with("PORT"))
+                .count(),
             48,
             "every I/O port is on the sheet"
         );
@@ -26152,7 +26454,11 @@ end architecture;
             });
         }
         let e = schematic_star_edges("clk", &eps);
-        assert_eq!(e.len(), 400, "1 driver × 400 loads is 400 edges, not a clique");
+        assert_eq!(
+            e.len(),
+            400,
+            "1 driver × 400 loads is 400 edges, not a clique"
+        );
         assert!(
             e.iter().all(|x| x.src == "clkbuf" && x.src_pin == "O"),
             "star from the driver"
@@ -26184,14 +26490,15 @@ endmodule
         let d = ide.schematic.drawing();
         let layout_ms = t0.elapsed().as_millis();
         assert!(
-            d.symbols.iter().filter(|s| !s.kind.starts_with("PORT")).count() >= n,
+            d.symbols
+                .iter()
+                .filter(|s| !s.kind.starts_with("PORT"))
+                .count()
+                >= n,
             "every cell is on the drawing"
         );
         assert_symbols_do_not_overlap(&d);
-        assert!(
-            layout_ms < 2000,
-            "fanout64 layout took {layout_ms}ms"
-        );
+        assert!(layout_ms < 2000, "fanout64 layout took {layout_ms}ms");
         let t1 = std::time::Instant::now();
         let _ = ide.schematic.drawing();
         assert!(
@@ -26228,10 +26535,7 @@ endmodule
             d.symbols.iter().any(|s| s.kind.starts_with("PORT")),
             "I/O ports stay on the sheet"
         );
-        assert!(
-            layout_ms < 1500,
-            "Ibex schematic layout took {layout_ms}ms"
-        );
+        assert!(layout_ms < 1500, "Ibex schematic layout took {layout_ms}ms");
         let t1 = std::time::Instant::now();
         let d2 = ide.schematic.drawing();
         assert_eq!(d2.symbols.len(), d.symbols.len());
@@ -26263,10 +26567,7 @@ endmodule
             "hierarchy boxes must stay linear in nodes: boxes={} nodes={n}",
             d.boxes.len()
         );
-        assert!(
-            layout_ms < 1500,
-            "Ibex hierarchy layout took {layout_ms}ms"
-        );
+        assert!(layout_ms < 1500, "Ibex hierarchy layout took {layout_ms}ms");
         let t1 = std::time::Instant::now();
         let d2 = ide.hierarchy.drawing();
         assert_eq!(d2.boxes.len(), d.boxes.len());
@@ -26362,7 +26663,10 @@ endmodule
         ide.open_source(&example("counter.sv")).unwrap();
         // Same as HELION_FLOW=implement: synth→opt→place→route, no bitstream yet.
         ide.implement().unwrap();
-        assert!(ide.shell.session.bitstream.is_none(), "implement leaves bitstream for Program");
+        assert!(
+            ide.shell.session.bitstream.is_none(),
+            "implement leaves bitstream for Program"
+        );
 
         let r = ide.exec("select_device_route cnt_3").unwrap();
         assert!(r.contains("net=cnt_3"), "{r}");
@@ -26379,13 +26683,19 @@ endmodule
             prog.contains("DONE=1") || prog.contains("backend=sim"),
             "Program sim must leave fabric ready: {prog}"
         );
-        assert!(ide.hw.programmed || ide.shell.session.programmed, "programmed after sim");
+        assert!(
+            ide.hw.programmed || ide.shell.session.programmed,
+            "programmed after sim"
+        );
         assert!(ide.hw.open || ide.shell.session.hw_open, "hw manager open");
 
         ide.exec("ila_window 16").unwrap();
         ide.exec("ila_trigger rising").unwrap();
         let arm = ide.exec("ila_arm").unwrap();
-        assert!(arm.contains("net=cnt_3"), "Add Probe must bind Arm default: {arm}");
+        assert!(
+            arm.contains("net=cnt_3"),
+            "Add Probe must bind Arm default: {arm}"
+        );
         assert!(arm.contains("samples=16"), "{arm}");
         assert_eq!(ide.ila.bits.len(), 16);
         assert!(
@@ -26577,15 +26887,34 @@ endmodule
         blinky.exec("ila_window 8").unwrap();
         blinky.exec("ila_arm led").unwrap();
         assert_eq!(blinky.ila.net, "led");
-        assert_ne!(blinky.ila.net, ide.ila.net, "probe net is the armed HNF net");
+        assert_ne!(
+            blinky.ila.net, ide.ila.net,
+            "probe net is the armed HNF net"
+        );
         assert!(
             blinky.wave.has_trace("ila:led"),
             "{:?}",
-            blinky.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
+            blinky
+                .wave
+                .traces
+                .iter()
+                .map(|t| &t.name)
+                .collect::<Vec<_>>()
         );
         assert!(!blinky.wave.has_trace("ila:cnt_3"));
-        assert_eq!(blinky.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff, Some(1));
-        assert_eq!(ide.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff, Some(4));
+        assert_eq!(
+            blinky
+                .runs
+                .iter()
+                .find(|r| r.name == "impl_1")
+                .unwrap()
+                .lutff,
+            Some(1)
+        );
+        assert_eq!(
+            ide.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff,
+            Some(4)
+        );
     }
 
     /// Deep path: match-unit/FSM + IR_USR1 RLE upload + pre-trigger + multi-probe (soft ila_arm unchanged).
@@ -26607,7 +26936,10 @@ endmodule
         assert!(out.contains("upload_dr="), "{out}");
         assert!(out.contains("upload_raw=16"), "{out}");
         assert!(out.contains("pre_trigger=4"), "{out}");
-        assert!(out.contains("probes=cnt_3,cnt_0") || out.contains("probes=cnt_3"), "{out}");
+        assert!(
+            out.contains("probes=cnt_3,cnt_0") || out.contains("probes=cnt_3"),
+            "{out}"
+        );
         assert_eq!(ide.ila.backend, "jtag_usr1_match_fsm_rle");
         assert_eq!(ide.ila.bits.len(), 16);
         let at = ide.ila.trigger_at.expect("deep rising trigger_at");
@@ -26620,11 +26952,17 @@ endmodule
         // Multiprobe with toggling LSB often has no RLE runs; still report honest DR counts.
         let dr = out
             .split_whitespace()
-            .find_map(|t| t.strip_prefix("upload_dr=").and_then(|s| s.parse::<usize>().ok()))
+            .find_map(|t| {
+                t.strip_prefix("upload_dr=")
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
             .expect("upload_dr");
         let raw = out
             .split_whitespace()
-            .find_map(|t| t.strip_prefix("upload_raw=").and_then(|s| s.parse::<usize>().ok()))
+            .find_map(|t| {
+                t.strip_prefix("upload_raw=")
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
             .expect("upload_raw");
         assert_eq!(raw, 16, "{out}");
         assert!(dr >= 1, "header+tokens: {out}");
@@ -26644,11 +26982,19 @@ endmodule
         let dump = ide.exec("device").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Device);
         let n = ide.device.sites.len();
-        assert!(n > 32, "HAD die must list CLB+IOB sites, not a dummy tile: {n}");
+        assert!(
+            n > 32,
+            "HAD die must list CLB+IOB sites, not a dummy tile: {n}"
+        );
         assert!(
             ide.device.cols > 1 && ide.device.rows > 1,
             "drawing is a 2-D bounding box: {:?}",
-            (ide.device.cols, ide.device.rows, ide.device.x0, ide.device.y0)
+            (
+                ide.device.cols,
+                ide.device.rows,
+                ide.device.x0,
+                ide.device.y0
+            )
         );
         assert_eq!(
             ide.device.cols * ide.device.rows,
@@ -26657,7 +27003,10 @@ endmodule
         );
         assert_eq!(ide.device.occupied_count(), 0, "empty until Place");
         assert!(dump.contains(&format!("sites={n}")), "{dump}");
-        assert!(dump.contains(&format!("cols={}", ide.device.cols)), "{dump}");
+        assert!(
+            dump.contains(&format!("cols={}", ide.device.cols)),
+            "{dump}"
+        );
         assert!(dump.contains("occupied=0"), "{dump}");
         assert!(dump.contains("map="), "floorplan occupancy map: {dump}");
         assert!(
@@ -26695,7 +27044,9 @@ endmodule
         assert!(ide.device_has_selected());
         assert_eq!(ide.properties_name(), Some(empty_name.as_str()));
         assert!(
-            ide.properties.iter().any(|(k, v)| k == "TYPE" && v == "site"),
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "site"),
             "{:?}",
             ide.properties
         );
@@ -26774,7 +27125,11 @@ endmodule
         blinky.run_step(FlowStep::Opt).unwrap();
         blinky.run_step(FlowStep::Place).unwrap();
         let bdump = blinky.exec("device").unwrap();
-        assert_eq!(blinky.device.sites.len(), n, "same HAD, different occupancy");
+        assert_eq!(
+            blinky.device.sites.len(),
+            n,
+            "same HAD, different occupancy"
+        );
         assert_eq!(blinky.device.cols, ide.device.cols);
         assert_eq!(ide.utilization.unwrap().lutff, 4, "counter packed LUTFF");
         assert_eq!(blinky.utilization.unwrap().lutff, 1, "blinky packed LUTFF");
@@ -26822,7 +27177,9 @@ endmodule
             "cone hides cells so nets can go off-sheet"
         );
         assert!(
-            cone.wires.iter().any(|w| w.off_sheet && w.dst == "offsheet"),
+            cone.wires
+                .iter()
+                .any(|w| w.off_sheet && w.dst == "offsheet"),
             "Fig. 55 dotted off-sheet stubs: {:?}",
             cone.wires
                 .iter()
@@ -26842,15 +27199,14 @@ endmodule
         );
         let ports = ide.exec("sheet_find ports").unwrap();
         assert!(
-            ide.find_results.iter().any(|h| h.kind.starts_with("port") && h.name == "clk"),
+            ide.find_results
+                .iter()
+                .any(|h| h.kind.starts_with("port") && h.name == "clk"),
             "{ports} {:?}",
             ide.find_results
         );
         let nets = ide.exec("sheet_find nets").unwrap();
-        assert!(
-            ide.find_results.iter().any(|h| h.kind == "net"),
-            "{nets}"
-        );
+        assert!(ide.find_results.iter().any(|h| h.kind == "net"), "{nets}");
     }
 
     /// Fig. 57: buses are thick wires (width > 1).
@@ -26874,7 +27230,8 @@ endmodule
                 .collect::<Vec<_>>()
         );
         assert!(
-            bus.iter().any(|w| w.net.starts_with("cnt_") && w.width >= 4),
+            bus.iter()
+                .any(|w| w.net.starts_with("cnt_") && w.width >= 4),
             "counter bus width tracks the 4-bit cnt: {:?}",
             bus.iter().map(|w| (&w.net, w.width)).collect::<Vec<_>>()
         );
@@ -26893,14 +27250,21 @@ endmodule
         hier.open_source(&example("hier.sv")).unwrap();
         let dump = hier.exec("hierarchy_drawing").unwrap();
         assert_eq!(hier.workspace, WorkspaceTab::Hierarchy);
-        assert!(dump.contains("box="), "block view is boxes, not a list: {dump}");
+        assert!(
+            dump.contains("box="),
+            "block view is boxes, not a list: {dump}"
+        );
         let d = hier.hierarchy.drawing();
         let top = d
             .boxes
             .iter()
             .find(|b| b.kind == "module")
             .expect("top module box");
-        assert!(top.w * top.h > 64.0 * 32.0, "top is a real rectangle {:?}", top);
+        assert!(
+            top.w * top.h > 64.0 * 32.0,
+            "top is a real rectangle {:?}",
+            top
+        );
         let u0 = d
             .boxes
             .iter()
@@ -27011,7 +27375,10 @@ endmodule
         assert!(dump.contains("cr=X0Y0:"), "{dump}");
         assert!(dump.contains("cr=X1Y1:"), "{dump}");
         for cr in &ide.device.clock_regions {
-            assert!(cr.x1 > cr.x0 && cr.y1 > cr.y0, "region is a rectangle {cr:?}");
+            assert!(
+                cr.x1 > cr.x0 && cr.y1 > cr.y0,
+                "region is a rectangle {cr:?}"
+            );
             assert!(
                 cr.x0 >= ide.device.x0 && cr.y0 >= ide.device.y0,
                 "region stays on the die {cr:?}"
@@ -27035,7 +27402,8 @@ endmodule
     fn package_io_bank_colored_regions() {
         let mut ide = IdeModel::new();
         let dump = ide.exec("package").unwrap();
-        let banks: std::collections::HashSet<u32> = ide.package_pins.iter().map(|p| p.bank).collect();
+        let banks: std::collections::HashSet<u32> =
+            ide.package_pins.iter().map(|p| p.bank).collect();
         assert!(
             banks.len() >= 2,
             "HAD IOB is split into banks, not one grey slab: {banks:?} {dump}"
@@ -27081,7 +27449,10 @@ endmodule
         assert!(sch.contains("u_lut0:LUT6:box="), "{sch}");
 
         let impl_out = ide.exec("run_implementation").unwrap();
-        assert!(impl_out.contains("Complete") || ide.bitstream_hash().is_some(), "{impl_out}");
+        assert!(
+            impl_out.contains("Complete") || ide.bitstream_hash().is_some(),
+            "{impl_out}"
+        );
         assert_eq!(ide.step_state(FlowStep::Bitstream), StepState::Done);
         let wns = ide.wns_ps().expect("STA after Run Implementation");
         assert_ne!(wns, 0);
@@ -27093,20 +27464,21 @@ endmodule
         let mut ide = IdeModel::new();
         let canvas = ide.exec("bd_drawing").unwrap();
         assert!(canvas.contains("pin:"), "IP boxes have pin stubs: {canvas}");
-        assert!(canvas.contains(":iface"), "Helion-MM interface bars: {canvas}");
+        assert!(
+            canvas.contains(":iface"),
+            "Helion-MM interface bars: {canvas}"
+        );
         assert!(canvas.contains("pin:u_h_uart:s_mm"), "{canvas}");
         assert!(canvas.contains("pin:mm_interconnect:m_mm"), "{canvas}");
         assert!(canvas.contains("addr=u_h_uart:0x0:0x1000"), "{canvas}");
         assert!(canvas.contains("addr=u_h_gpio:0x1000:0x1000"), "{canvas}");
         assert!(!canvas.contains("AXI"), "{canvas}");
-        let d = ide
-            .block_design
-            .as_ref()
-            .unwrap()
-            .drawing(&ide.ip_catalog);
+        let d = ide.block_design.as_ref().unwrap().drawing(&ide.ip_catalog);
         let uart = d.symbols.iter().find(|s| s.kind == "h_uart").unwrap();
         assert!(
-            uart.pins.iter().any(|p| p.name == "s_mm" && p.iface && !p.output),
+            uart.pins
+                .iter()
+                .any(|p| p.name == "s_mm" && p.iface && !p.output),
             "slave interface stub on the IP box: {:?}",
             uart.pins
         );
@@ -27127,7 +27499,11 @@ endmodule
             .iter()
             .find(|p| p.name == "m_mm")
             .unwrap();
-        assert_eq!(mm.points[0], (m_mm.x, m_mm.y), "MM wire starts at the interface pin");
+        assert_eq!(
+            mm.points[0],
+            (m_mm.x, m_mm.y),
+            "MM wire starts at the interface pin"
+        );
     }
 
     /// Fig. 55 toolbar: Previous/Next/Zoom Fit change the schematic camera paint uses.
@@ -27143,7 +27519,10 @@ endmodule
         let zin = ide.exec("schematic_zoom_in").unwrap();
         assert!(zin.contains("camera zoom="), "{zin}");
         let cam_in = ide.schematic.camera;
-        assert!(cam_in.zoom > cam0.zoom, "zoom in must raise zoom: {cam_in:?}");
+        assert!(
+            cam_in.zoom > cam0.zoom,
+            "zoom in must raise zoom: {cam_in:?}"
+        );
         assert_ne!(cam_in, cam0);
 
         let fit = ide.exec("zoom_fit").unwrap();
@@ -27152,12 +27531,24 @@ endmodule
         assert_ne!(cam_fit, cam_in, "Zoom Fit must commit a new camera");
         assert_ne!(cam_fit.zoom, cam_in.zoom);
         let dump = ide.exec("schematic_drawing").unwrap();
-        assert!(dump.contains(&format!("camera={},{},{}", cam_fit.zoom, cam_fit.pan_x as i32, cam_fit.pan_y as i32)), "{dump}");
+        assert!(
+            dump.contains(&format!(
+                "camera={},{},{}",
+                cam_fit.zoom, cam_fit.pan_x as i32, cam_fit.pan_y as i32
+            )),
+            "{dump}"
+        );
 
         let prev = ide.exec("schematic_previous").unwrap();
-        assert_eq!(ide.schematic.camera, cam_in, "Previous restores zoom-in camera: {prev}");
+        assert_eq!(
+            ide.schematic.camera, cam_in,
+            "Previous restores zoom-in camera: {prev}"
+        );
         let next = ide.exec("schematic_next").unwrap();
-        assert_eq!(ide.schematic.camera, cam_fit, "Next walks forward to Zoom Fit: {next}");
+        assert_eq!(
+            ide.schematic.camera, cam_fit,
+            "Next walks forward to Zoom Fit: {next}"
+        );
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
     }
 
@@ -27167,7 +27558,11 @@ endmodule
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         let full = ide.schematic.drawing();
-        let n_full = full.symbols.iter().filter(|s| !s.kind.starts_with("PORT")).count();
+        let n_full = full
+            .symbols
+            .iter()
+            .filter(|s| !s.kind.starts_with("PORT"))
+            .count();
         assert!(n_full > 2);
         assert!(full.symbols.iter().all(|s| !s.highlighted));
 
@@ -27178,7 +27573,10 @@ endmodule
             ide.timing.as_ref().map(|t| t.endpoints)
         );
         let p0 = ide.timing_paths[0].clone();
-        assert!(!p0.cells.is_empty(), "path cells come from STA endpoints: {p0:?}");
+        assert!(
+            !p0.cells.is_empty(),
+            "path cells come from STA endpoints: {p0:?}"
+        );
         let d = ide.design().unwrap();
         for c in &p0.cells {
             assert!(
@@ -27204,7 +27602,8 @@ endmodule
             n_full
         );
         assert!(
-            vis.iter().all(|s| s.highlighted && p0.cells.contains(&s.name)),
+            vis.iter()
+                .all(|s| s.highlighted && p0.cells.contains(&s.name)),
             "highlighted symbols are the STA path cells: {:?} path={:?}",
             vis.iter().map(|s| &s.name).collect::<Vec<_>>(),
             p0.cells
@@ -27212,9 +27611,16 @@ endmodule
         assert!(sheet.symbols.iter().any(|s| s.highlighted), "{out}");
         if !p0.nets.is_empty() {
             assert!(
-                sheet.wires.iter().any(|w| w.highlighted && p0.nets.contains(&w.net)),
+                sheet
+                    .wires
+                    .iter()
+                    .any(|w| w.highlighted && p0.nets.contains(&w.net)),
                 "path nets highlighted: {:?}",
-                sheet.wires.iter().map(|w| (&w.net, w.highlighted)).collect::<Vec<_>>()
+                sheet
+                    .wires
+                    .iter()
+                    .map(|w| (&w.net, w.highlighted))
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -27229,7 +27635,11 @@ endmodule
                 .map(|s| s.name.clone())
                 .collect();
             for n in &names {
-                assert!(p1.cells.contains(n), "path 1 cells only: {n} not in {:?}", p1.cells);
+                assert!(
+                    p1.cells.contains(n),
+                    "path 1 cells only: {n} not in {:?}",
+                    p1.cells
+                );
             }
         }
     }
@@ -27245,7 +27655,10 @@ endmodule
         assert!(
             ide.timing_paths.len() >= 2,
             "need path 1 (u_ff0→u_ff1): {:?}",
-            ide.timing_paths.iter().map(|p| (&p.startpoint, &p.endpoint)).collect::<Vec<_>>()
+            ide.timing_paths
+                .iter()
+                .map(|p| (&p.startpoint, &p.endpoint))
+                .collect::<Vec<_>>()
         );
         let p1 = ide.timing_paths[1].clone();
         assert!(!p1.cells.is_empty(), "path 1 cells: {p1:?}");
@@ -27257,12 +27670,7 @@ endmodule
                 "path cell {c} in highlight_cells"
             );
         }
-        let path_sites: Vec<_> = ide
-            .device
-            .sites
-            .iter()
-            .filter(|s| s.highlighted)
-            .collect();
+        let path_sites: Vec<_> = ide.device.sites.iter().filter(|s| s.highlighted).collect();
         assert!(
             !path_sites.is_empty(),
             "placed path sites must highlight on Device: cells={:?} sites={:?}",
@@ -27271,14 +27679,16 @@ endmodule
                 .sites
                 .iter()
                 .filter(|s| s.occupant.is_some() || !s.bels.is_empty())
-                .map(|s| (s.site_name(), s.occupant.clone(), s.bels.clone(), s.highlighted))
+                .map(|s| (
+                    s.site_name(),
+                    s.occupant.clone(),
+                    s.bels.clone(),
+                    s.highlighted
+                ))
                 .collect::<Vec<_>>()
         );
         for s in &path_sites {
-            let hit = s
-                .occupant
-                .as_ref()
-                .is_some_and(|o| p1.cells.contains(o))
+            let hit = s.occupant.as_ref().is_some_and(|o| p1.cells.contains(o))
                 || s.bels.iter().any(|b| p1.cells.contains(b))
                 || ide.selected.as_deref() == Some(s.site_name().as_str());
             assert!(hit, "highlighted site must be a path cell site: {s:?}");
@@ -27288,9 +27698,7 @@ endmodule
             .sites
             .iter()
             .filter(|s| {
-                s.occupant
-                    .as_ref()
-                    .is_some_and(|o| p1.cells.contains(o))
+                s.occupant.as_ref().is_some_and(|o| p1.cells.contains(o))
                     || s.bels.iter().any(|b| p1.cells.contains(b))
             })
             .count();
@@ -27337,7 +27745,10 @@ endmodule
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.exec("report_timing").unwrap();
-        assert!(!ide.timing_paths.is_empty(), "STA endpoints become timing paths");
+        assert!(
+            !ide.timing_paths.is_empty(),
+            "STA endpoints become timing paths"
+        );
         let wns = ide.wns_ps().expect("STA WNS");
         for p in &ide.timing_paths {
             let row = p.row_text();
@@ -27459,10 +27870,10 @@ endmodule
             "LUT comb arc is helion-sta LUT_PS"
         );
         assert!(
-            ide.timing_paths
+            ide.timing_paths.iter().any(|p| p
+                .pins
                 .iter()
-                .any(|p| p.pins.iter().any(|r| r.location.starts_with("CLB_")
-                    || r.location.starts_with("IOB_"))),
+                .any(|r| r.location.starts_with("CLB_") || r.location.starts_with("IOB_"))),
             "Place fills HAD Location, not empty chrome: {:?}",
             ide.timing_paths
                 .iter()
@@ -27477,7 +27888,10 @@ endmodule
         assert!(table.contains("incr_ps="), "{table}");
         assert!(table.contains("path_ps="), "{table}");
         assert!(table.contains("type=cell"), "{table}");
-        assert!(table.contains("type=setup") || table.contains("type=iob"), "{table}");
+        assert!(
+            table.contains("type=setup") || table.contains("type=iob"),
+            "{table}"
+        );
         assert!(!table.contains("AXI"), "{table}");
 
         let r0 = ide.exec("select_timing_path_report 0").unwrap();
@@ -27556,9 +27970,16 @@ endmodule
         );
         let collapsed = ide.schematic.drawing();
         assert!(
-            collapsed.symbols.iter().any(|s| s.name == "u0" && s.kind.starts_with("instance")),
+            collapsed
+                .symbols
+                .iter()
+                .any(|s| s.name == "u0" && s.kind.starts_with("instance")),
             "collapsed sheet shows the instance box: {:?}",
-            collapsed.symbols.iter().map(|s| format!("{}:{}", s.name, s.kind)).collect::<Vec<_>>()
+            collapsed
+                .symbols
+                .iter()
+                .map(|s| format!("{}:{}", s.name, s.kind))
+                .collect::<Vec<_>>()
         );
         let nested = ide.schematic.instance_member_cells("u0");
         assert!(!nested.is_empty(), "u0 has nested HNF cells");
@@ -27597,7 +28018,10 @@ endmodule
             opened.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
         assert!(
-            opened.symbols.iter().all(|s| s.name != "u0" || !s.kind.starts_with("instance")),
+            opened
+                .symbols
+                .iter()
+                .all(|s| s.name != "u0" || !s.kind.starts_with("instance")),
             "instance box is replaced by nested cells"
         );
         assert!(
@@ -27621,9 +28045,15 @@ endmodule
         let mut ide = IdeModel::new();
         ide.open_source(&example("hier.sv")).unwrap();
         ide.sim_run(4).unwrap();
-        assert!(ide.scopes.iter().any(|s| s.name == "hier" && s.kind == "module"));
         assert!(
-            ide.scopes.iter().any(|s| s.name == "u0" && s.kind.contains("tog")),
+            ide.scopes
+                .iter()
+                .any(|s| s.name == "hier" && s.kind == "module")
+        );
+        assert!(
+            ide.scopes
+                .iter()
+                .any(|s| s.name == "u0" && s.kind.contains("tog")),
             "{:?}",
             ide.scopes
         );
@@ -27635,7 +28065,9 @@ endmodule
             "top scope has the LED probe from helion-sim: {top_names:?}"
         );
         assert!(
-            ide.objects.iter().all(|o| !o.name.starts_with("u_ff") && !o.name.starts_with("u_lut")),
+            ide.objects
+                .iter()
+                .all(|o| !o.name.starts_with("u_ff") && !o.name.starts_with("u_lut")),
             "top scope must not dump child sequential objects: {top_names:?}"
         );
 
@@ -27647,7 +28079,9 @@ endmodule
             "Scopes must filter Objects, not keep a static list"
         );
         assert!(
-            ide.objects.iter().any(|o| o.name.starts_with("u_ff") || o.name.starts_with("u0")),
+            ide.objects
+                .iter()
+                .any(|o| o.name.starts_with("u_ff") || o.name.starts_with("u0")),
             "instance scope objects come from helion-sim FFs: {child_names:?}"
         );
         assert!(
@@ -27658,12 +28092,14 @@ endmodule
             .objects
             .iter()
             .find(|o| {
-                o.name.starts_with("u_ff")
-                    || o.name.contains("_u_ff")
-                    || o.name.starts_with("u0")
+                o.name.starts_with("u_ff") || o.name.contains("_u_ff") || o.name.starts_with("u0")
             })
             .map(|o| o.value.clone());
-        assert!(led_top.is_some(), "child scope must expose FF probes: {:?}", ide.objects);
+        assert!(
+            led_top.is_some(),
+            "child scope must expose FF probes: {:?}",
+            ide.objects
+        );
         // Values are engine bits, not placeholders.
         assert!(
             ide.objects.iter().any(|o| o.value == "0" || o.value == "1"),
@@ -27722,10 +28158,7 @@ endmodule
         assert!(objs.contains("NAME=led"), "{objs}");
         assert!(objs.contains("TYPE=port"), "{objs}");
         assert!(objs.contains("VALUE="), "{objs}");
-        assert!(
-            !objs.contains("led = "),
-            "not a name = value dump: {objs}"
-        );
+        assert!(!objs.contains("led = "), "not a name = value dump: {objs}");
         let led = ide
             .object_rows()
             .iter()
@@ -27762,7 +28195,10 @@ endmodule
 
         let by_idx = ide.exec("select_object 0").unwrap();
         assert!(by_idx.contains("NAME="), "{by_idx}");
-        assert_eq!(ide.selected_object.as_deref(), Some(ide.objects[0].name.as_str()));
+        assert_eq!(
+            ide.selected_object.as_deref(),
+            Some(ide.objects[0].name.as_str())
+        );
 
         let child = ide.exec("select_scope u0").unwrap();
         assert!(child.contains("scope u0"), "{child}");
@@ -27877,10 +28313,7 @@ endmodule
         assert!(loc.contains("NAME=led"), "{loc}");
         assert!(loc.contains("TYPE=port"), "{loc}");
         assert!(loc.contains("VALUE="), "{loc}");
-        assert!(
-            !loc.contains("led = "),
-            "not a name = value dump: {loc}"
-        );
+        assert!(!loc.contains("led = "), "not a name = value dump: {loc}");
         assert!(
             ide.local_rows()
                 .iter()
@@ -27914,12 +28347,18 @@ endmodule
             .find(|m| m.name == "seq")
             .map(|m| m.packed_word())
             .expect("seq after 8");
-        assert_ne!(seq1, seq8, "seq memory is live helion-sim Q, not a static dump");
+        assert_ne!(
+            seq1, seq8,
+            "seq memory is live helion-sim Q, not a static dump"
+        );
 
         let bp = ide.exec("add_bp led 1").unwrap();
         assert!(bp.contains("ID="), "{bp}");
         assert!(bp.contains("SIGNAL=led"), "{bp}");
-        assert!(bp.contains("CONDITION===1") || bp.contains("CONDITION===1"), "{bp}");
+        assert!(
+            bp.contains("CONDITION===1") || bp.contains("CONDITION===1"),
+            "{bp}"
+        );
         assert!(bp.contains("ENABLED=1"), "{bp}");
         let table = ide.exec("breakpoints").unwrap();
         assert!(table.contains('\n'), "Breakpoints must be a table: {table}");
@@ -27930,13 +28369,18 @@ endmodule
         assert!(hit.contains("SIGNAL=led"), "{hit}");
         assert!(hit.contains("CYCLE=8") || hit.contains("CYCLE=8"), "{hit}");
         assert!(
-            ide.breakpoints.iter().any(|b| b.signal == "led" && b.hits >= 1),
+            ide.breakpoints
+                .iter()
+                .any(|b| b.signal == "led" && b.hits >= 1),
             "hit count from engine: {:?}",
             ide.breakpoints
         );
         let n = ide.wave.sample_len();
         // Half-cycle wave: 16 user cycles → 32 samples; stop at led=1 is 8 cycles → 16.
-        assert!(n < 32, "sim_run must stop at the breakpoint, not run to completion: n={n}");
+        assert!(
+            n < 32,
+            "sim_run must stop at the breakpoint, not run to completion: n={n}"
+        );
         let click = ide.exec("select_breakpoint 1").unwrap();
         assert!(click.contains("SIGNAL=led"), "{click}");
         assert_eq!(ide.selected_breakpoint, Some(1));
@@ -27955,7 +28399,10 @@ endmodule
         blinky.open_source(&example("blinky.sv")).unwrap();
         let bmem = blinky.exec("memory").unwrap();
         assert!(bmem.contains("NAME=u_lut"), "{bmem}");
-        assert!(!bmem.contains("NAME=u_lut0"), "blinky is not counter: {bmem}");
+        assert!(
+            !bmem.contains("NAME=u_lut0"),
+            "blinky is not counter: {bmem}"
+        );
         assert!(
             blinky
                 .memory_rows()
@@ -27975,7 +28422,10 @@ endmodule
             blinky.local_rows()
         );
         assert!(
-            blinky.local_rows().iter().all(|l| !l.name.starts_with("u_ff0")),
+            blinky
+                .local_rows()
+                .iter()
+                .all(|l| !l.name.starts_with("u_ff0")),
             "{:?}",
             blinky.local_rows()
         );
@@ -27991,7 +28441,10 @@ endmodule
         );
         hier.exec("select_scope u0").unwrap();
         let child_loc: Vec<String> = hier.local_rows().iter().map(|l| l.name.clone()).collect();
-        assert_ne!(child_loc, top_loc, "Locals filter by Scope, not a static dump");
+        assert_ne!(
+            child_loc, top_loc,
+            "Locals filter by Scope, not a static dump"
+        );
         assert!(
             hier.local_rows()
                 .iter()
@@ -28025,7 +28478,9 @@ endmodule
             "fabric LUT INIT is programmed bitstream, not a placeholder"
         );
         assert!(
-            fab.memory_rows().iter().any(|m| m.name == "seq" && m.kind == "seq"),
+            fab.memory_rows()
+                .iter()
+                .any(|m| m.name == "seq" && m.kind == "seq"),
             "fabric sequential Q is a Memory row: {:?}",
             fab.memory_rows()
         );
@@ -28041,7 +28496,10 @@ endmodule
         fab.exec("add_bp led 1").unwrap();
         let fhit = fab.exec("sim_run 16").unwrap();
         assert!(fhit.contains("HIT"), "fabric breakpoint: {fhit}");
-        assert!(fhit.contains("CYCLE=8") || fhit.contains("CYCLE=8"), "{fhit}");
+        assert!(
+            fhit.contains("CYCLE=8") || fhit.contains("CYCLE=8"),
+            "{fhit}"
+        );
         assert_eq!(
             fab.wns_ps(),
             gold_wns,
@@ -28080,9 +28538,7 @@ endmodule
             "empty line click must refuse"
         );
         assert!(
-            idle.exec("toggle_bp_line")
-                .unwrap_err()
-                .contains("empty"),
+            idle.exec("toggle_bp_line").unwrap_err().contains("empty"),
             "empty gutter click must refuse"
         );
         assert!(
@@ -28173,14 +28629,20 @@ endmodule
         assert!(bpt.contains("LINE=8"), "{bpt}");
         assert!(bpt.contains("KIND=line"), "{bpt}");
         let hit = ide.exec("sim_run 16").unwrap();
-        assert!(hit.contains("HIT"), "seq line BP must stop helion-sim: {hit}");
+        assert!(
+            hit.contains("HIT"),
+            "seq line BP must stop helion-sim: {hit}"
+        );
         assert!(hit.contains("LINE=8"), "{hit}");
         assert!(hit.contains("CYCLE=1"), "{hit}");
         assert_eq!(ide.sim_pc_line, Some(8));
         assert_eq!(ide.workspace, WorkspaceTab::Source);
         let n = ide.wave.sample_len();
         // Half-cycle wave: stop at first seq edge is 1 cycle → 2 samples (<< 32).
-        assert!(n < 32, "sim_run must stop at the line BP, not run out: n={n}");
+        assert!(
+            n < 32,
+            "sim_run must stop at the line BP, not run out: n={n}"
+        );
         assert!(
             ide.breakpoints
                 .iter()
@@ -28189,7 +28651,10 @@ endmodule
             ide.breakpoints
         );
         let src_pc = ide.exec("source").unwrap();
-        assert!(src_pc.contains("PC=>") || src_pc.contains("pc=8"), "{src_pc}");
+        assert!(
+            src_pc.contains("PC=>") || src_pc.contains("pc=8"),
+            "{src_pc}"
+        );
         assert!(src_pc.contains("LINE=8 BP=1"), "{src_pc}");
 
         ide.exec("disable_bp 1").unwrap();
@@ -28213,7 +28678,10 @@ endmodule
         assert!(asg_bp.contains("LINE=10"), "{asg_bp}");
         assert!(asg_bp.contains("SIGNAL=led"), "{asg_bp}");
         let ahit = ide.exec("sim_run 16").unwrap();
-        assert!(ahit.contains("HIT"), "assign line BP tracks helion-sim led: {ahit}");
+        assert!(
+            ahit.contains("HIT"),
+            "assign line BP tracks helion-sim led: {ahit}"
+        );
         assert!(ahit.contains("LINE=10"), "{ahit}");
         assert!(
             ahit.contains("CYCLE=8") || ahit.contains("CYCLE=8"),
@@ -28290,7 +28758,9 @@ endmodule
         assert_eq!(ide.selected.as_deref(), Some("X0Y0"));
         assert_eq!(ide.properties_name(), Some("X0Y0"));
         assert!(
-            ide.properties.iter().any(|(k, v)| k == "TYPE" && v == "clock_region"),
+            ide.properties
+                .iter()
+                .any(|(k, v)| k == "TYPE" && v == "clock_region"),
             "{:?}",
             ide.properties
         );
@@ -28302,7 +28772,11 @@ endmodule
             ide.properties
         );
 
-        let cr2 = ide.device.clock_region_named("X1Y1").cloned().expect("X1Y1");
+        let cr2 = ide
+            .device
+            .clock_region_named("X1Y1")
+            .cloned()
+            .expect("X1Y1");
         let n2 = cr2.site_count(&ide.device.sites);
         ide.exec("select_clock_region X1Y1").unwrap();
         assert_eq!(ide.properties_name(), Some("X1Y1"));
@@ -28329,7 +28803,11 @@ endmodule
         ide.exec("report_timing").unwrap();
 
         assert!(ide.console.iter().any(|l| l.cmd == "report_timing" && l.ok));
-        assert!(ide.console.iter().any(|l| !l.ok && l.cmd.contains("no_such_command")));
+        assert!(
+            ide.console
+                .iter()
+                .any(|l| !l.ok && l.cmd.contains("no_such_command"))
+        );
 
         let found = ide.exec("console_find report_timing").unwrap();
         assert_eq!(ide.bottom_tab, BottomTab::Tcl);
@@ -28337,12 +28815,22 @@ endmodule
         assert!(ide.console_selected.is_some(), "{found}");
         let idx = ide.console_selected.unwrap();
         assert_eq!(ide.console[idx].cmd, "report_timing");
-        assert!(ide.console[idx].ok, "Find lands on the real Session ok line");
-        assert!(ide.console[idx].out.contains("WNS_PS="), "{}", ide.console[idx].out);
+        assert!(
+            ide.console[idx].ok,
+            "Find lands on the real Session ok line"
+        );
+        assert!(
+            ide.console[idx].out.contains("WNS_PS="),
+            "{}",
+            ide.console[idx].out
+        );
 
         let err = ide.exec("console_find no_such_command").unwrap();
         let ei = ide.console_selected.unwrap();
-        assert!(!ide.console[ei].ok, "errors stay journaled from Session: {err}");
+        assert!(
+            !ide.console[ei].ok,
+            "errors stay journaled from Session: {err}"
+        );
 
         let sel = ide.exec(&format!("select_console {idx}")).unwrap();
         assert_eq!(ide.console_selected, Some(idx));
@@ -28387,7 +28875,10 @@ endmodule
         assert_eq!(ide.bottom_tab, BottomTab::Tcl);
         assert!(table.contains("STATUS=error"), "{table}");
         assert!(table.contains("CMD=synth_design"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("helion%"),
             "must not dump helion% lines: {table}"
@@ -28526,12 +29017,18 @@ endmodule
             .map(|(x, y)| format!("X{x}Y{y}"))
             .collect::<Vec<_>>()
             .join(",");
-        assert!(dump.contains(&format!("routes={}", ide.device.routes.len())), "{dump}");
+        assert!(
+            dump.contains(&format!("routes={}", ide.device.routes.len())),
+            "{dump}"
+        );
         assert!(
             dump.contains(&format!("route net={} hops={}", route.net, route.hops)),
             "{dump}"
         );
-        assert!(dump.contains(&format!("delay_ps={}", route.delay_ps)), "{dump}");
+        assert!(
+            dump.contains(&format!("delay_ps={}", route.delay_ps)),
+            "{dump}"
+        );
         assert!(dump.contains(&format!("tiles={tiles}")), "{dump}");
 
         let net = route.net.clone();
@@ -28544,7 +29041,10 @@ endmodule
         assert_eq!(ide.selected.as_deref(), Some(net.as_str()));
         assert!(ide.device_has_selected());
         assert!(
-            ide.device.routes.iter().any(|r| r.net == net && r.highlighted),
+            ide.device
+                .routes
+                .iter()
+                .any(|r| r.net == net && r.highlighted),
             "selecting the net highlights THAT PathFinder route: {:?}",
             ide.device.routes
         );
@@ -28579,7 +29079,10 @@ endmodule
 
         ide.exec(&format!("unroute_net {net}")).unwrap();
         let u = ide.exec("device").unwrap();
-        let ur = ide.device.route_named(&net).expect("unrouted net stays on overlay");
+        let ur = ide
+            .device
+            .route_named(&net)
+            .expect("unrouted net stays on overlay");
         assert_eq!(ur.hops, 0, "unroute_net zeros engine hops");
         assert_eq!(ur.delay_ps, 0);
         assert!(u.contains(&format!("route net={net} hops=0")), "{u}");
@@ -28599,10 +29102,7 @@ endmodule
         assert!(!blinky.device.routes.is_empty());
         let (b_net, b_path) = {
             let be = blinky.session().routed.as_ref().unwrap();
-            (
-                be.iob_src[0].net.clone(),
-                be.iob_src[0].path.clone(),
-            )
+            (be.iob_src[0].net.clone(), be.iob_src[0].path.clone())
         };
         let b = &blinky.device.routes[0];
         assert_eq!(b.tiles, b_path);
@@ -28613,7 +29113,12 @@ endmodule
             b.net
         );
         assert_eq!(
-            blinky.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff,
+            blinky
+                .runs
+                .iter()
+                .find(|r| r.name == "impl_1")
+                .unwrap()
+                .lutff,
             Some(1)
         );
         assert_eq!(blinky.utilization.unwrap().lutff, 1);
@@ -28649,7 +29154,10 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Package);
         assert_eq!(ide.nav, NavSection::BoardDevice);
         assert!(dump.contains("led"), "{dump}");
-        assert!(dump.contains("PACKAGE_PIN=-") || dump.contains("placed=IOB_X2Y0"), "{dump}");
+        assert!(
+            dump.contains("PACKAGE_PIN=-") || dump.contains("placed=IOB_X2Y0"),
+            "{dump}"
+        );
         let led0 = ide
             .io_ports
             .iter()
@@ -28657,15 +29165,24 @@ endmodule
             .cloned()
             .expect("led port");
         assert_eq!(led0.site.as_deref(), Some("IOB_X2Y0"), "{:?}", ide.io_ports);
-        assert!(led0.package_pin.is_none(), "no LOC until set_property: {led0:?}");
+        assert!(
+            led0.package_pin.is_none(),
+            "no LOC until set_property: {led0:?}"
+        );
 
         let out = ide
             .exec("set_property PACKAGE_PIN IOB_X5Y0 [get_ports led]")
             .unwrap();
         assert!(out.contains("PACKAGE_PIN IOB_X5Y0"), "{out}");
         assert!(out.contains("led"), "{out}");
-        assert!(out.contains("replaced=1"), "must re-place, not stash a pin: {out}");
-        assert!(out.contains("rerouted=1"), "must re-route so STA sees the loc: {out}");
+        assert!(
+            out.contains("replaced=1"),
+            "must re-place, not stash a pin: {out}"
+        );
+        assert!(
+            out.contains("rerouted=1"),
+            "must re-route so STA sees the loc: {out}"
+        );
         assert_eq!(ide.workspace, WorkspaceTab::Package);
 
         let pl = ide.session().placed.as_ref().expect("re-placed");
@@ -28692,7 +29209,10 @@ endmodule
                 .iter()
                 .any(|p| p.pin == "IOB_X5Y0" && p.port.as_deref() == Some("led")),
             "package drawing occupancy must move: {:?}",
-            ide.package_pins.iter().filter(|p| p.port.is_some()).collect::<Vec<_>>()
+            ide.package_pins
+                .iter()
+                .filter(|p| p.port.is_some())
+                .collect::<Vec<_>>()
         );
         assert!(
             !ide.package_pins
@@ -28731,7 +29251,10 @@ endmodule
             ide.properties
         );
 
-        let lut = ide.device.occupant_of("u_lut0").expect("LUTFF after re-place");
+        let lut = ide
+            .device
+            .occupant_of("u_lut0")
+            .expect("LUTFF after re-place");
         assert_eq!(lut.x, 5, "device floorplan must follow PACKAGE_PIN column");
         let wns1 = ide.wns_ps().expect("STA after PACKAGE_PIN re-place/route");
         assert_ne!(wns1, 0);
@@ -28931,9 +29454,7 @@ endmodule
         assert!(led0.slew.is_none(), "{led0:?}");
         assert!(led0.pulltype.is_none(), "{led0:?}");
 
-        let out = ide
-            .exec("set_property DRIVE 4 [get_ports led]")
-            .unwrap();
+        let out = ide.exec("set_property DRIVE 4 [get_ports led]").unwrap();
         assert!(out.contains("DRIVE 4"), "{out}");
         assert!(out.contains("pad_ps="), "must report STA pad delay: {out}");
         assert!(out.contains("bitgen=1"), "must re-bitgen: {out}");
@@ -28969,14 +29490,13 @@ endmodule
             ide.properties
         );
         let iob1 = ide.timing.as_ref().expect("STA after DRIVE").iob_ps;
-        assert!(
-            iob1 > iob0,
-            "DRIVE 4 must slow IOB STA ({iob1} vs {iob0})"
-        );
+        assert!(iob1 > iob0, "DRIVE 4 must slow IOB STA ({iob1} vs {iob0})");
         let hash1 = ide.bitstream_hash().expect("bitgen after DRIVE");
         assert_ne!(hash1, hash0, "DRIVE must change the IOB bitstream");
 
-        let e = ide.exec("set_property DRIVE 99 [get_ports led]").unwrap_err();
+        let e = ide
+            .exec("set_property DRIVE 99 [get_ports led]")
+            .unwrap_err();
         assert!(
             e.contains("not a HAD"),
             "illegal DRIVE must fail against HAD: {e}"
@@ -29006,7 +29526,9 @@ endmodule
             iob2 < iob1,
             "FAST slew must speed IOB STA ({iob2} vs {iob1})"
         );
-        let e = ide.exec("set_property SLEW MEDIUM [get_ports led]").unwrap_err();
+        let e = ide
+            .exec("set_property SLEW MEDIUM [get_ports led]")
+            .unwrap_err();
         assert!(e.contains("HAD") || e.contains("SLOW"), "{e}");
 
         let pull = ide
@@ -29021,10 +29543,7 @@ endmodule
             .expect("led after PULLTYPE");
         assert_eq!(led.pulltype.as_deref(), Some("PULLUP"), "{led:?}");
         let iob3 = ide.timing.as_ref().expect("STA after PULLTYPE").iob_ps;
-        assert!(
-            iob3 > iob2,
-            "PULLUP must add pad load ({iob3} vs {iob2})"
-        );
+        assert!(iob3 > iob2, "PULLUP must add pad load ({iob3} vs {iob2})");
         let e = ide
             .exec("set_property PULLTYPE PULL [get_ports led]")
             .unwrap_err();
@@ -29052,7 +29571,10 @@ endmodule
             "DRIVE 12 / SLOW / NONE must restore gold pad ({wns_back} vs {wns0})"
         );
         let iob_back = ide.timing.as_ref().unwrap().iob_ps;
-        assert_eq!(iob_back, iob0, "gold IOB pad must return ({iob_back} vs {iob0})");
+        assert_eq!(
+            iob_back, iob0,
+            "gold IOB pad must return ({iob_back} vs {iob0})"
+        );
         let hash_back = ide.bitstream_hash().expect("bitgen after defaults");
         assert_eq!(
             hash_back, hash0,
@@ -29105,10 +29627,7 @@ endmodule
 
         let wns_set = ide.wns_ps().expect("STA after LVCMOS33");
         // LVCMOS33 pad slows IOB; closed WNS moves 9640 → 9600 (usable, honest).
-        assert_eq!(
-            wns_set, 9600,
-            "LVCMOS33+DRIVE12 closed WNS ({wns_set})"
-        );
+        assert_eq!(wns_set, 9600, "LVCMOS33+DRIVE12 closed WNS ({wns_set})");
         let clean = ide.exec("report_drc").unwrap();
         assert!(
             clean.contains("violations=0") || clean.contains("ok"),
@@ -29315,7 +29834,10 @@ endmodule
             "FALSE / NONE / LVCMOS18 must restore gold pad ({wns_back} vs {wns0})"
         );
         let iob_back = ide.timing.as_ref().unwrap().iob_ps;
-        assert_eq!(iob_back, iob0, "gold IOB pad must return ({iob_back} vs {iob0})");
+        assert_eq!(
+            iob_back, iob0,
+            "gold IOB pad must return ({iob_back} vs {iob0})"
+        );
         let hash_back = ide.bitstream_hash().expect("bitgen after defaults");
         assert_eq!(
             hash_back, hash0,
@@ -29350,7 +29872,10 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Package);
         assert_eq!(ide.nav, NavSection::BoardDevice);
         assert!(empty.contains("io_ports n=0"), "{empty}");
-        assert!(!empty.contains("NAME="), "idle pane has no canned rows: {empty}");
+        assert!(
+            !empty.contains("NAME="),
+            "idle pane has no canned rows: {empty}"
+        );
         assert!(
             NavSection::BoardDevice
                 .actions()
@@ -29361,7 +29886,10 @@ endmodule
 
         ide.open_source(&example("counter.sv")).unwrap();
         let table = ide.exec("io_ports").unwrap();
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("NAME=clk"), "{table}");
         assert!(table.contains("NAME=led"), "{table}");
         assert!(table.contains("DIR=IN"), "{table}");
@@ -29412,7 +29940,10 @@ endmodule
             .find(|p| p.name == "led")
             .cloned()
             .expect("led");
-        assert!(led.site.as_deref().unwrap_or("").starts_with("IOB_"), "{led:?}");
+        assert!(
+            led.site.as_deref().unwrap_or("").starts_with("IOB_"),
+            "{led:?}"
+        );
         let clk = ide
             .io_port_rows()
             .iter()
@@ -29424,7 +29955,11 @@ endmodule
             clk_site.starts_with("IOB_"),
             "clk must not stay unplaced: {clk:?}"
         );
-        assert_ne!(Some(clk_site.as_str()), led.site.as_deref(), "clk must not steal led");
+        assert_ne!(
+            Some(clk_site.as_str()),
+            led.site.as_deref(),
+            "clk must not steal led"
+        );
         assert!(
             ide.device
                 .sites
@@ -29589,13 +30124,21 @@ endmodule
             .unwrap();
         assert!(out.contains("resize_pblock pblock_0"), "{out}");
         assert!(out.contains("CLB_X5Y1:CLB_X8Y8"), "{out}");
-        assert!(out.contains("placed=1"), "must re-place into the pblock: {out}");
-        assert!(out.contains("routed=1"), "must re-route so bitgen_pblock sees the loc: {out}");
+        assert!(
+            out.contains("placed=1"),
+            "must re-place into the pblock: {out}"
+        );
+        assert!(
+            out.contains("routed=1"),
+            "must re-route so bitgen_pblock sees the loc: {out}"
+        );
         assert!(out.contains("frames="), "must hit bitgen_pblock: {out}");
         // loc= is captured from the fabric place_pblock step (before gold pin restore).
         assert!(
-            out.contains("loc=CLB_X5Y") || out.contains("loc=CLB_X6Y")
-                || out.contains("loc=CLB_X7Y") || out.contains("loc=CLB_X8Y"),
+            out.contains("loc=CLB_X5Y")
+                || out.contains("loc=CLB_X6Y")
+                || out.contains("loc=CLB_X7Y")
+                || out.contains("loc=CLB_X8Y"),
             "place_pblock loc must land in the rectangle: {out}"
         );
 
@@ -29617,7 +30160,11 @@ endmodule
         assert!(ide.device.pblock_named("pblock_0").is_some());
 
         // Gold PACKAGE_PIN restore keeps WNS_PS=9640; fabric rectangle stays filled.
-        assert_eq!(ide.wns_ps(), Some(9640), "gold pins restore WNS after resize");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(9640),
+            "gold pins restore WNS after resize"
+        );
         assert_eq!(
             ide.constraints.package_pins.get("led").map(String::as_str),
             Some("IOB_X2Y0")
@@ -29627,7 +30174,10 @@ endmodule
         let dump = ide.exec("device").unwrap();
         assert!(dump.contains("pblocks=1"), "{dump}");
         assert!(dump.contains("pb=pblock_0:5,1,8,8:"), "{dump}");
-        assert!(ide.device.occupant_of("u_lut0").is_some(), "LUTFF still on die");
+        assert!(
+            ide.device.occupant_of("u_lut0").is_some(),
+            "LUTFF still on die"
+        );
 
         let sel = ide.exec("select_pblock pblock_0").unwrap();
         assert!(sel.contains("pblock pblock_0"), "{sel}");
@@ -29701,7 +30251,10 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Device);
         assert_eq!(ide.nav, NavSection::BoardDevice);
         assert!(empty.contains("pblocks n=0"), "{empty}");
-        assert!(!empty.contains("NAME="), "idle pane has no canned rows: {empty}");
+        assert!(
+            !empty.contains("NAME="),
+            "idle pane has no canned rows: {empty}"
+        );
         assert!(
             NavSection::BoardDevice
                 .actions()
@@ -29719,7 +30272,10 @@ endmodule
 
         ide.exec("create_pblock pblock_0").unwrap();
         let table = ide.exec("pblocks").unwrap();
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("pblocks n=1"), "{table}");
         assert!(table.contains("NAME=pblock_0"), "{table}");
         assert!(table.contains("RANGE=-"), "{table}");
@@ -29753,7 +30309,10 @@ endmodule
         let pb = ide.pblock_rows()[0].clone();
         assert!(pb.ranged);
         assert!(pb.frames > 0, "bitgen_pblock fills Frames: {pb:?}");
-        assert!(ranged.contains(&format!("FRAMES={}", pb.frames)), "{ranged}");
+        assert!(
+            ranged.contains(&format!("FRAMES={}", pb.frames)),
+            "{ranged}"
+        );
         let click = ide.exec("select_pblock pblock_0").unwrap();
         assert!(click.contains("RANGE=CLB_X5Y1:CLB_X8Y8"), "{click}");
         assert!(
@@ -29768,7 +30327,10 @@ endmodule
         blinky.exec("create_pblock pblock_blinky").unwrap();
         let btable = blinky.exec("pblocks").unwrap();
         assert!(btable.contains("NAME=pblock_blinky"), "{btable}");
-        assert!(!btable.contains("NAME=pblock_0"), "pblocks are per-session: {btable}");
+        assert!(
+            !btable.contains("NAME=pblock_0"),
+            "pblocks are per-session: {btable}"
+        );
         assert!(btable.contains('\n'), "{btable}");
     }
 
@@ -29874,7 +30436,11 @@ endmodule
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
-        assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold before pblock");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(9640),
+            "empty XDC counter gold before pblock"
+        );
         assert!(ide.pblock_rows().is_empty());
 
         ide.exec("create_pblock pblock_0").unwrap();
@@ -29882,7 +30448,11 @@ endmodule
             .unwrap();
         ide.exec("add_cells_to_pblock pblock_0").unwrap();
 
-        let pb = ide.pblock_rows().first().cloned().expect("pblocks table must list the created pblock");
+        let pb = ide
+            .pblock_rows()
+            .first()
+            .cloned()
+            .expect("pblocks table must list the created pblock");
         assert_eq!(pb.name, "pblock_0");
         assert!(pb.ranged, "resize must set a CLB/CLOCKREGION range");
         assert!(
@@ -29899,10 +30469,7 @@ endmodule
         let table = ide.exec("pblocks").unwrap();
         assert!(table.contains("NAME=pblock_0"), "{table}");
         assert!(table.contains("RANGE=CLB_"), "{table}");
-        assert!(
-            table.contains(&format!("CELLS={n_cells}")),
-            "{table}"
-        );
+        assert!(table.contains(&format!("CELLS={n_cells}")), "{table}");
 
         // Engine re-applies gold PACKAGE_PIN (led=IOB_X2Y0, clk=IOB_X3Y0) after
         // resize/add_cells so the Device demo keeps WNS_PS=9640 with a filled table.
@@ -30069,16 +30636,16 @@ endmodule
         ex.exec("create_clock -name virt -period 8.000 [get_ports virt]")
             .unwrap();
         let gold2 = ex.wns_ps().expect("STA with virt clock still on clk");
-        assert_eq!(gold2, gold, "virtual clock must not steal the analysis period");
+        assert_eq!(
+            gold2, gold,
+            "virtual clock must not steal the analysis period"
+        );
         let fp = ex
             .exec("set_false_path -from [get_clocks clk] -to [get_clocks virt]")
             .unwrap();
         assert!(fp.contains("false_path=1"), "{fp}");
         assert_eq!(
-            ex.clock_interaction()
-                .cell("clk", "virt")
-                .unwrap()
-                .relation,
+            ex.clock_interaction().cell("clk", "virt").unwrap().relation,
             helion_sta::ClockRelation::FalsePath
         );
 
@@ -30093,12 +30660,11 @@ endmodule
         let md = dp
             .exec("set_max_delay -datapath_only 2.0 -from [get_clocks clk] -to [get_clocks virt]")
             .unwrap();
-        assert!(md.contains("max_delay=1") || md.contains("MAX_DELAY_PS=2000"), "{md}");
-        let cell = dp
-            .clock_interaction()
-            .cell("clk", "virt")
-            .unwrap()
-            .clone();
+        assert!(
+            md.contains("max_delay=1") || md.contains("MAX_DELAY_PS=2000"),
+            "{md}"
+        );
+        let cell = dp.clock_interaction().cell("clk", "virt").unwrap().clone();
         assert_eq!(cell.relation, helion_sta::ClockRelation::TimedDatapath);
         assert_eq!(cell.requirement_ps, 2_000);
 
@@ -30134,7 +30700,11 @@ endmodule
             "clock-interaction WNS is per-design STA, not a canned pane"
         );
         assert_eq!(
-            blinky.clock_interaction().cell("clk", "clk").unwrap().wns_ps,
+            blinky
+                .clock_interaction()
+                .cell("clk", "clk")
+                .unwrap()
+                .wns_ps,
             Some(bwns)
         );
     }
@@ -30393,10 +30963,7 @@ endmodule
             blinky.timing_summary().group("clk", "clk").unwrap().wns_ps,
             Some(bwns)
         );
-        assert_eq!(
-            blinky.timing_summary().wns_ps,
-            Some(bwns)
-        );
+        assert_eq!(blinky.timing_summary().wns_ps, Some(bwns));
     }
 
     /// UG906 Timing Summary From/To links cross-probe HNF clock sources (clk),
@@ -30720,9 +31287,7 @@ endmodule
             ide.properties
         );
         assert!(
-            ide.properties
-                .iter()
-                .any(|(k, v)| k == "LOADS" && v == "4"),
+            ide.properties.iter().any(|(k, v)| k == "LOADS" && v == "4"),
             "{:?}",
             ide.properties
         );
@@ -30772,8 +31337,15 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold WNS");
         let pane = ide.exec("report_clock_networks").unwrap();
-        assert!(pane.contains("NAME=clk") || pane.contains("loads=4"), "{pane}");
-        let clk = ide.clock_networks().network("clk").expect("clk tree").clone();
+        assert!(
+            pane.contains("NAME=clk") || pane.contains("loads=4"),
+            "{pane}"
+        );
+        let clk = ide
+            .clock_networks()
+            .network("clk")
+            .expect("clk tree")
+            .clone();
         assert_eq!(clk.net, "clk");
         assert_eq!(clk.source, "clk");
 
@@ -30799,9 +31371,7 @@ endmodule
             ide.properties
         );
         assert!(
-            ide.properties
-                .iter()
-                .any(|(k, v)| k == "LOADS" && v == "4"),
+            ide.properties.iter().any(|(k, v)| k == "LOADS" && v == "4"),
             "{:?}",
             ide.properties
         );
@@ -30944,11 +31514,15 @@ endmodule
         ide.exec("report_power").unwrap();
         let blocks = ide.power_block_rows();
         assert!(
-            blocks.iter().any(|(n, u, _, r)| n == "LUTFF" && *u == 4 && *r == "logic"),
+            blocks
+                .iter()
+                .any(|(n, u, _, r)| n == "LUTFF" && *u == 4 && *r == "logic"),
             "{blocks:?}"
         );
         assert!(
-            blocks.iter().any(|(n, u, _, r)| n == "IOB" && *u >= 1 && *r == "io"),
+            blocks
+                .iter()
+                .any(|(n, u, _, r)| n == "IOB" && *u >= 1 && *r == "io"),
             "{blocks:?}"
         );
 
@@ -30971,9 +31545,7 @@ endmodule
         let io = ide.exec("select_power io").unwrap();
         assert!(io.contains("RAIL=io"), "{io}");
         assert!(
-            io.contains("OBJECT=led")
-                || io.contains("OBJECT=clk")
-                || io.contains("OBJECT=u_iob"),
+            io.contains("OBJECT=led") || io.contains("OBJECT=clk") || io.contains("OBJECT=u_iob"),
             "{io}"
         );
         let logic = ide.exec("select_power logic").unwrap();
@@ -31094,7 +31666,9 @@ endmodule
         hier_ide.exec("report_utilization").unwrap();
         let hr = hier_ide.utilization_report();
         assert!(
-            hr.hierarchy.iter().any(|h| h.name != "hier" && h.name != "counter"),
+            hr.hierarchy
+                .iter()
+                .any(|h| h.name != "hier" && h.name != "counter"),
             "child instances must appear in occupancy, not only the top dump: {:?}",
             hr.hierarchy
         );
@@ -31105,7 +31679,9 @@ endmodule
             .expect("child row")
             .name
             .clone();
-        let csel = hier_ide.exec(&format!("select_utilization_hier {child}")).unwrap();
+        let csel = hier_ide
+            .exec(&format!("select_utilization_hier {child}"))
+            .unwrap();
         assert!(csel.contains(&format!("NAME={child}")), "{csel}");
         assert_eq!(hier_ide.selected.as_deref(), Some(child.as_str()));
         assert_ne!(
@@ -31127,9 +31703,9 @@ endmodule
 
         ide.exec("report_methodology").unwrap();
         assert!(
-            ide.messages.iter().any(|m| {
-                m.id == "TIMING-7" && m.severity == MsgSeverity::Warning
-            }),
+            ide.messages
+                .iter()
+                .any(|m| { m.id == "TIMING-7" && m.severity == MsgSeverity::Warning }),
             "TIMING-7 must journal as MsgSeverity::Warning: {:?}",
             ide.messages
                 .iter()
@@ -31153,9 +31729,7 @@ endmodule
         let err = ide.exec("filter_messages error").unwrap();
         assert!(err.contains("filter=error"), "{err}");
         assert!(
-            ide.message_rows()
-                .iter()
-                .all(|(_, m)| m.id != "TIMING-7"),
+            ide.message_rows().iter().all(|(_, m)| m.id != "TIMING-7"),
             "Errors filter must hide TIMING-7 Warning: {:?}",
             ide.message_rows()
                 .iter()
@@ -31176,10 +31750,7 @@ endmodule
         );
 
         let dout = ide.exec("report_drc").unwrap();
-        assert!(
-            dout.contains("violations=0"),
-            "clean counter DRC: {dout}"
-        );
+        assert!(dout.contains("violations=0"), "clean counter DRC: {dout}");
         let drc = ide.drc.as_ref().expect("DRC after report_drc");
         assert!(
             drc.items.is_empty() && drc.violations.is_empty(),
@@ -31345,7 +31916,11 @@ endmodule
         assert!(m.check("TIMING-1").is_none(), "{}", m.text());
         assert!(m.check("TIMING-7").is_some(), "{}", m.text());
         assert!(m.check("TIMING-24").is_some(), "{}", m.text());
-        assert_eq!(ide.wns_ps(), Some(gold), "create_clock 10 ns keeps gold WNS");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "create_clock 10 ns keeps gold WNS"
+        );
 
         ide.exec("set_output_delay -clock clk 0.0 [get_ports led]")
             .unwrap();
@@ -31371,7 +31946,9 @@ endmodule
         );
 
         let mut util_ide = IdeModel::new();
-        util_ide.open_source(&example_rtl_only("counter.sv")).unwrap();
+        util_ide
+            .open_source(&example_rtl_only("counter.sv"))
+            .unwrap();
         util_ide.run_step(FlowStep::Place).unwrap();
         util_ide.run_step(FlowStep::Route).unwrap();
         let gold_u = util_ide.wns_ps().expect("STA");
@@ -31593,7 +32170,10 @@ endmodule
         ide.exec("report_methodology").unwrap();
         let sel = ide.exec("select_methodology TIMING-7").unwrap();
         assert!(sel.contains("ID=TIMING-7"), "{sel}");
-        assert!(sel.contains("OBJECTS=led") || sel.contains("OBJECT=led"), "{sel}");
+        assert!(
+            sel.contains("OBJECTS=led") || sel.contains("OBJECT=led"),
+            "{sel}"
+        );
 
         let tmpl = ide
             .methodology_fix_template("TIMING-7")
@@ -31747,12 +32327,12 @@ endmodule
             ide.session().bitstream.as_ref().unwrap().idcode
         );
         let bits = ide.session().bitstream.as_ref().unwrap();
-        let engine_cfg: Vec<_> = bits
-            .frames
-            .iter()
-            .filter(|(_, w)| **w != 0)
-            .collect();
-        assert_eq!(engine_cfg.len(), report.rows.len(), "rows are helion-bits frames");
+        let engine_cfg: Vec<_> = bits.frames.iter().filter(|(_, w)| **w != 0).collect();
+        assert_eq!(
+            engine_cfg.len(),
+            report.rows.len(),
+            "rows are helion-bits frames"
+        );
         for (row, ((block, major, minor), word)) in report.rows.iter().zip(engine_cfg.iter()) {
             let far = helion_device::Far {
                 block_type: *block,
@@ -31766,7 +32346,11 @@ endmodule
             assert_eq!(row.minor, *minor);
             assert_eq!(row.word, **word);
             assert_eq!(helion_device::Far::decode(row.far), far);
-            assert!(row.ones() > 0, "configured FAR {} has payload", row.far_hex());
+            assert!(
+                row.ones() > 0,
+                "configured FAR {} has payload",
+                row.far_hex()
+            );
         }
         assert!(
             report.rows.iter().any(|r| r.block_name() == "CLB_IO_CLK"),
@@ -31791,9 +32375,14 @@ endmodule
         );
 
         let first = report.rows[0].clone();
-        let sel = ide.exec(&format!("select_bitstream_frame {}", first.far_hex())).unwrap();
+        let sel = ide
+            .exec(&format!("select_bitstream_frame {}", first.far_hex()))
+            .unwrap();
         assert!(sel.contains(&format!("FAR={}", first.far_hex())), "{sel}");
-        assert!(sel.contains(&format!("BLOCK={}", first.block_name())), "{sel}");
+        assert!(
+            sel.contains(&format!("BLOCK={}", first.block_name())),
+            "{sel}"
+        );
         assert!(sel.contains(&format!("ONES={}", first.ones())), "{sel}");
         assert!(
             ide.properties
@@ -31810,7 +32399,10 @@ endmodule
             ide.properties
         );
         let by_idx = ide.exec("select_bitstream_frame 0").unwrap();
-        assert!(by_idx.contains(&format!("FAR={}", first.far_hex())), "{by_idx}");
+        assert!(
+            by_idx.contains(&format!("FAR={}", first.far_hex())),
+            "{by_idx}"
+        );
         let by_blk = ide
             .exec(&format!(
                 "select_bitstream_frame {} {} {}",
@@ -31819,7 +32411,10 @@ endmodule
                 first.minor
             ))
             .unwrap();
-        assert!(by_blk.contains(&format!("FAR={}", first.far_hex())), "{by_blk}");
+        assert!(
+            by_blk.contains(&format!("FAR={}", first.far_hex())),
+            "{by_blk}"
+        );
 
         let mut blinky = IdeModel::new();
         blinky.open_source(&example("blinky.sv")).unwrap();
@@ -31833,11 +32428,10 @@ endmodule
             br.hash, report.hash,
             "FAR table hash is per-design bitgen, not canned"
         );
-        let same_word = report.rows.iter().any(|c| {
-            br.rows
-                .iter()
-                .any(|b| b.far == c.far && b.word == c.word)
-        });
+        let same_word = report
+            .rows
+            .iter()
+            .any(|c| br.rows.iter().any(|b| b.far == c.far && b.word == c.word));
         assert!(
             !same_word
                 || br.configured != report.configured
@@ -31887,7 +32481,11 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         let wns_route = ide.wns_ps().expect("STA after route");
         ide.run_step(FlowStep::Bitstream).unwrap();
-        assert_eq!(ide.wns_ps(), Some(wns_route), "bitgen must not move gold WNS");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(wns_route),
+            "bitgen must not move gold WNS"
+        );
 
         let open = ide.exec("open_hw_manager").unwrap();
         assert!(open.contains("sim"), "{open}");
@@ -31907,7 +32505,10 @@ endmodule
         let gsr = reset.bit("GSR").expect("GSR row");
         let gts = reset.bit("GTS").expect("GTS row");
         let done = reset.bit("DONE").expect("DONE row");
-        assert!(gsr.value && gts.value, "unconfigured holds GSR/GTS: {table}");
+        assert!(
+            gsr.value && gts.value,
+            "unconfigured holds GSR/GTS: {table}"
+        );
         assert!(!done.value && !reset.bit("INIT").unwrap().value);
         assert!(!reset.bit("GWE").unwrap().value);
         assert!(!reset.bit("EOS").unwrap().value);
@@ -31930,9 +32531,7 @@ endmodule
             ide.properties
         );
         assert!(
-            ide.properties
-                .iter()
-                .any(|(k, v)| k == "VALUE" && v == "1"),
+            ide.properties.iter().any(|(k, v)| k == "VALUE" && v == "1"),
             "{:?}",
             ide.properties
         );
@@ -31983,7 +32582,9 @@ endmodule
         assert!(dash.contains(&format!("bits={}", ide.ila.bits)), "{dash}");
         let trig = samples.iter().find(|r| r.trigger);
         if let Some(t) = trig {
-            let hit = ide.exec(&format!("select_ila_sample {}", t.sample)).unwrap();
+            let hit = ide
+                .exec(&format!("select_ila_sample {}", t.sample))
+                .unwrap();
             assert!(hit.contains("MARKER=TRIGGER"), "{hit}");
             assert_eq!(ide.wave.cursor, t.sample);
             assert!(
@@ -32015,7 +32616,10 @@ endmodule
         blinky.exec("ila_window 8").unwrap();
         blinky.exec("ila_arm led").unwrap();
         assert_eq!(blinky.ila.net, "led");
-        assert_ne!(blinky.ila.net, ide.ila.net, "probe net is the armed HNF net");
+        assert_ne!(
+            blinky.ila.net, ide.ila.net,
+            "probe net is the armed HNF net"
+        );
         let b_rows = blinky.ila_sample_rows();
         assert_eq!(b_rows.len(), blinky.ila.bits.len());
         assert_eq!(
@@ -32044,7 +32648,11 @@ endmodule
     #[test]
     fn reports_workspace_clickable_catalog_not_a_dump() {
         let mut ide = IdeModel::new();
-        assert!(ide.report_catalog().iter().all(|r| r.status == "Not generated"));
+        assert!(
+            ide.report_catalog()
+                .iter()
+                .all(|r| r.status == "Not generated")
+        );
         assert!(
             ide.report_catalog().iter().all(|r| r.summary == "-"),
             "idle catalog has no canned summaries: {:?}",
@@ -32077,7 +32685,10 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Reports);
         assert!(table.contains("reports n=9"), "{table}");
         assert!(table.contains("complete=0"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("NAME=report_timing_summary"), "{table}");
         assert!(table.contains("NAME=report_clock_interaction"), "{table}");
         assert!(table.contains("NAME=report_cdc"), "{table}");
@@ -32113,7 +32724,11 @@ endmodule
             .find(|r| r.id == "report_timing_summary")
             .expect("timing summary row");
         assert_eq!(ts.status, "Complete");
-        assert!(ts.summary.contains(&format!("WNS_PS={gold}")), "{}", ts.summary);
+        assert!(
+            ts.summary.contains(&format!("WNS_PS={gold}")),
+            "{}",
+            ts.summary
+        );
         let ci = rows
             .iter()
             .find(|r| r.id == "report_clock_interaction")
@@ -32132,16 +32747,10 @@ endmodule
         let pwr = rows.iter().find(|r| r.id == "report_power").unwrap();
         assert_eq!(pwr.status, "Complete");
         assert!(pwr.summary.contains("TOTAL_UW="), "{}", pwr.summary);
-        let util = rows
-            .iter()
-            .find(|r| r.id == "report_utilization")
-            .unwrap();
+        let util = rows.iter().find(|r| r.id == "report_utilization").unwrap();
         assert_eq!(util.status, "Complete");
         assert!(util.summary.contains("LUTFF="), "{}", util.summary);
-        let bits = rows
-            .iter()
-            .find(|r| r.id == "report_bitstream")
-            .unwrap();
+        let bits = rows.iter().find(|r| r.id == "report_bitstream").unwrap();
         assert_eq!(bits.status, "Not generated");
         assert_eq!(bits.summary, "-");
         assert_eq!(
@@ -32152,7 +32761,10 @@ endmodule
 
         let sel = ide.exec("select_report report_cdc").unwrap();
         assert!(sel.contains("NAME=report_cdc"), "{sel}");
-        assert!(sel.contains("TYPE") || sel.contains("CATEGORY=Timing"), "{sel}");
+        assert!(
+            sel.contains("TYPE") || sel.contains("CATEGORY=Timing"),
+            "{sel}"
+        );
         assert_eq!(ide.workspace, WorkspaceTab::Cdc);
         assert_eq!(ide.selected.as_deref(), Some("report:report_cdc"));
         assert_eq!(ide.selected_report.as_deref(), Some("report_cdc"));
@@ -32280,7 +32892,10 @@ endmodule
             cdc_fail
         );
         // Second create_clock retimes STA; gold checked pre-virt above.
-        assert!(ide.wns_ps().is_some(), "STA still present after CDC Failed catalog");
+        assert!(
+            ide.wns_ps().is_some(),
+            "STA still present after CDC Failed catalog"
+        );
         let _ = gold;
     }
 
@@ -32301,7 +32916,12 @@ endmodule
             .find(|r| r.id == "report_cdc")
             .expect("cdc row");
         assert_eq!(cdc_clean.status, "Complete", "{cdc_clean:?}");
-        assert_eq!(clean.cdc_report().critical_count(), 0, "{}", clean.cdc_text());
+        assert_eq!(
+            clean.cdc_report().critical_count(),
+            0,
+            "{}",
+            clean.cdc_text()
+        );
 
         let mut ide = IdeModel::new();
         ide.open_source(&example("cdc_cross.sv")).unwrap();
@@ -32311,7 +32931,10 @@ endmodule
         assert!(
             ide.pane_clocks().len() >= 2,
             "sibling SDC must create clk_a/clk_b: {:?}",
-            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            ide.pane_clocks()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         let out = ide.exec("report_cdc").unwrap();
         assert!(out.contains("report_cdc"), "{out}");
@@ -32387,20 +33010,22 @@ endmodule
         assert!(
             ide.pane_clocks().len() >= 2,
             "sibling SDC must create clk_a/clk_b: {:?}",
-            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            ide.pane_clocks()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         let out = ide.exec("report_cdc").unwrap();
         assert!(out.contains("report_cdc"), "{out}");
         let r = ide.cdc_report();
-        assert_eq!(r.critical_count(), 0, "2FF sync must not Critical: {}", r.text());
-        assert!(
-            r.warning_count() > 0,
-            "2FF sync must Warning: {}",
+        assert_eq!(
+            r.critical_count(),
+            0,
+            "2FF sync must not Critical: {}",
             r.text()
         );
-        let row = r
-            .violation("clk_a", "clk_b")
-            .expect("clk_a→clk_b CDC row");
+        assert!(r.warning_count() > 0, "2FF sync must Warning: {}", r.text());
+        let row = r.violation("clk_a", "clk_b").expect("clk_a→clk_b CDC row");
         assert_eq!(row.check, "CDC-1", "{row:?}");
         assert_eq!(row.severity, helion_sta::CdcSeverity::Warning, "{row:?}");
         assert!(row.synchronizer, "2FF must set synchronizer: {row:?}");
@@ -32466,7 +33091,10 @@ endmodule
         assert!(
             ide.pane_clocks().len() >= 2,
             "sibling SDC must create clk_a/clk_b: {:?}",
-            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            ide.pane_clocks()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         assert!(
             ide.constraints.clock_groups.iter().any(|g| g.asynchronous),
@@ -32476,20 +33104,30 @@ endmodule
         let out = ide.exec("report_cdc").unwrap();
         assert!(out.contains("report_cdc"), "{out}");
         let r = ide.cdc_report();
-        assert_eq!(r.critical_count(), 0, "async groups must not Critical: {}", r.text());
-        assert_eq!(r.warning_count(), 0, "async groups must not Warning: {}", r.text());
-        assert!(
-            r.info_count() > 0,
-            "async groups must Info: {}",
+        assert_eq!(
+            r.critical_count(),
+            0,
+            "async groups must not Critical: {}",
             r.text()
         );
+        assert_eq!(
+            r.warning_count(),
+            0,
+            "async groups must not Warning: {}",
+            r.text()
+        );
+        assert!(r.info_count() > 0, "async groups must Info: {}", r.text());
         let row = r
             .violation("clk_a", "clk_b")
             .or_else(|| r.violation("clk_b", "clk_a"))
             .expect("clk_a↔clk_b CDC row");
         assert_eq!(row.check, "CDC-15", "{row:?}");
         assert_eq!(row.severity, helion_sta::CdcSeverity::Info, "{row:?}");
-        assert_eq!(row.relation, helion_sta::ClockRelation::Asynchronous, "{row:?}");
+        assert_eq!(
+            row.relation,
+            helion_sta::ClockRelation::Asynchronous,
+            "{row:?}"
+        );
         let cat = ide
             .report_catalog()
             .into_iter()
@@ -32521,7 +33159,6 @@ endmodule
         assert_eq!(again.wns_ps(), Some(9640));
     }
 
-
     /// examples/cdc_datapath.sv+.sdc: set_max_delay -datapath_only → CDC-13 Warning /
     /// catalog Warnings (TimedDatapath). Unsync cdc_cross without exception stays Failed.
     /// Counter gold WNS_PS=9640 unchanged.
@@ -32535,20 +33172,25 @@ endmodule
         assert!(
             ide.pane_clocks().len() >= 2,
             "sibling SDC must create clk_a/clk_b: {:?}",
-            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            ide.pane_clocks()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         assert!(
-            ide.constraints
-                .max_delays
-                .iter()
-                .any(|m| m.datapath_only),
+            ide.constraints.max_delays.iter().any(|m| m.datapath_only),
             "sibling SDC must set_max_delay -datapath_only: {:?}",
             ide.constraints.max_delays
         );
         let out = ide.exec("report_cdc").unwrap();
         assert!(out.contains("report_cdc"), "{out}");
         let r = ide.cdc_report();
-        assert_eq!(r.critical_count(), 0, "datapath_only must not Critical: {}", r.text());
+        assert_eq!(
+            r.critical_count(),
+            0,
+            "datapath_only must not Critical: {}",
+            r.text()
+        );
         assert!(
             r.warning_count() > 0,
             "datapath_only must Warning: {}",
@@ -32560,7 +33202,11 @@ endmodule
             .expect("clk_a↔clk_b CDC row");
         assert_eq!(row.check, "CDC-13", "{row:?}");
         assert_eq!(row.severity, helion_sta::CdcSeverity::Warning, "{row:?}");
-        assert_eq!(row.relation, helion_sta::ClockRelation::TimedDatapath, "{row:?}");
+        assert_eq!(
+            row.relation,
+            helion_sta::ClockRelation::TimedDatapath,
+            "{row:?}"
+        );
         let cat = ide
             .report_catalog()
             .into_iter()
@@ -32607,14 +33253,18 @@ endmodule
     #[test]
     fn cdc_exclusive_groups_cdc16_info_catalog_complete() {
         let mut ide = IdeModel::new();
-        ide.open_source(&example("cdc_exclusive_groups.sv")).unwrap();
+        ide.open_source(&example("cdc_exclusive_groups.sv"))
+            .unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
         assert!(
             ide.pane_clocks().len() >= 2,
             "sibling SDC must create clk_a/clk_b: {:?}",
-            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            ide.pane_clocks()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         assert!(
             ide.constraints.clock_groups.iter().any(|g| g.exclusive),
@@ -32624,8 +33274,18 @@ endmodule
         let out = ide.exec("report_cdc").unwrap();
         assert!(out.contains("report_cdc"), "{out}");
         let r = ide.cdc_report();
-        assert_eq!(r.critical_count(), 0, "exclusive groups must not Critical: {}", r.text());
-        assert_eq!(r.warning_count(), 0, "exclusive groups must not Warning: {}", r.text());
+        assert_eq!(
+            r.critical_count(),
+            0,
+            "exclusive groups must not Critical: {}",
+            r.text()
+        );
+        assert_eq!(
+            r.warning_count(),
+            0,
+            "exclusive groups must not Warning: {}",
+            r.text()
+        );
         assert!(
             r.info_count() > 0,
             "exclusive groups must Info: {}",
@@ -32637,7 +33297,11 @@ endmodule
             .expect("clk_a↔clk_b CDC row");
         assert_eq!(row.check, "CDC-16", "{row:?}");
         assert_eq!(row.severity, helion_sta::CdcSeverity::Info, "{row:?}");
-        assert_eq!(row.relation, helion_sta::ClockRelation::Exclusive, "{row:?}");
+        assert_eq!(
+            row.relation,
+            helion_sta::ClockRelation::Exclusive,
+            "{row:?}"
+        );
         let cat = ide
             .report_catalog()
             .into_iter()
@@ -32682,7 +33346,10 @@ endmodule
         assert!(
             ide.pane_clocks().len() >= 2,
             "sibling SDC must create clk_a/clk_b: {:?}",
-            ide.pane_clocks().iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            ide.pane_clocks()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
         );
         assert!(
             ide.constraints
@@ -32706,7 +33373,12 @@ endmodule
         let out = ide.exec("report_cdc").unwrap();
         assert!(out.contains("report_cdc"), "{out}");
         let r = ide.cdc_report();
-        assert_eq!(r.critical_count(), 0, "partial FP must not Critical: {}", r.text());
+        assert_eq!(
+            r.critical_count(),
+            0,
+            "partial FP must not Critical: {}",
+            r.text()
+        );
         assert!(
             r.warning_count() > 0,
             "partial FP must Warning: {}",
@@ -32779,9 +33451,9 @@ endmodule
                     design.net(clk_net).is_some_and(|n| {
                         n.endpoints.iter().any(|e| {
                             e.pin == "O"
-                                && design.cell(&e.cell).is_some_and(|lc| {
-                                    matches!(lc.kind, CellKind::Lut6 { .. })
-                                })
+                                && design
+                                    .cell(&e.cell)
+                                    .is_some_and(|lc| matches!(lc.kind, CellKind::Lut6 { .. }))
                         })
                     })
                 })
@@ -32796,7 +33468,10 @@ endmodule
                 .collect::<Vec<_>>()
         );
         let out = ide.exec("report_methodology").unwrap();
-        assert!(out.contains("report_methodology") || out.contains("TIMING"), "{out}");
+        assert!(
+            out.contains("report_methodology") || out.contains("TIMING"),
+            "{out}"
+        );
         let meth = ide.methodology_report();
         let row = meth
             .check("TIMING-10")
@@ -32867,7 +33542,11 @@ endmodule
         let mut hot = p.clone();
         hot.lutff = (hot.lutff_cap as usize * 80).div_ceil(100);
         assert!(hot.power2_high_occupancy());
-        assert!(hot.text().contains("POWER-2=high_occupancy"), "{}", hot.text());
+        assert!(
+            hot.text().contains("POWER-2=high_occupancy"),
+            "{}",
+            hot.text()
+        );
         assert_eq!(ide.wns_ps(), Some(gold), "POWER-2 path must not move WNS");
     }
 
@@ -32882,7 +33561,10 @@ endmodule
         );
         let empty = ide.exec("log").unwrap();
         assert_eq!(ide.bottom_tab, BottomTab::Log);
-        assert!(empty.contains("log n=1") || empty.contains("log empty") || empty.contains("CMD=log"), "{empty}");
+        assert!(
+            empty.contains("log n=1") || empty.contains("log empty") || empty.contains("CMD=log"),
+            "{empty}"
+        );
 
         let e = ide.run_step(FlowStep::Synthesis).unwrap_err();
         assert!(e.contains("source") || e.contains("synth"), "{e}");
@@ -32890,7 +33572,10 @@ endmodule
         assert_eq!(ide.bottom_tab, BottomTab::Log);
         assert!(table.contains("STATUS=error"), "{table}");
         assert!(table.contains("CMD=synth_design"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         let sel = ide.exec("select_log synth_design").unwrap();
         assert!(sel.contains("STATUS=error"), "{sel}");
         assert!(sel.contains("CMD=synth_design"), "{sel}");
@@ -32978,7 +33663,10 @@ endmodule
         let table = ide.exec("find u_lut0").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Find);
         assert!(table.contains("cell:u_lut0"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("find_results n="), "{table}");
         assert!(table.contains("NAME=u_lut0"), "{table}");
         assert!(table.contains("TYPE=cell"), "{table}");
@@ -32986,8 +33674,9 @@ endmodule
         assert!(table.contains("PARENT=counter"), "{table}");
         let rows = ide.find_rows();
         assert!(
-            rows.iter()
-                .any(|h| h.name == "u_lut0" && h.type_cell() == "cell" && h.primitive_cell() == "LUT6"),
+            rows.iter().any(|h| h.name == "u_lut0"
+                && h.type_cell() == "cell"
+                && h.primitive_cell() == "LUT6"),
             "{rows:?}"
         );
         assert!(
@@ -33081,10 +33770,7 @@ endmodule
             "Find Results are per-session, not canned: {btable}"
         );
         assert!(
-            blinky
-                .exec("find u_lut0")
-                .unwrap_err()
-                .contains("0 hits"),
+            blinky.exec("find u_lut0").unwrap_err().contains("0 hits"),
             "blinky has no counter LUT"
         );
         blinky.exec("sheet_find cells").unwrap();
@@ -33135,10 +33821,7 @@ endmodule
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
         assert_eq!(ide.selected_find, Some(0));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(
-            ide.netlist_has_selected(),
-            "netlist must highlight u_lut0"
-        );
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
@@ -33230,14 +33913,16 @@ endmodule
         ide.select("u_lut0");
         let table = ide.exec("properties").unwrap();
         assert!(table.contains("properties n="), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("NAME=NAME VALUE=u_lut0"), "{table}");
         assert!(table.contains("NAME=PRIMITIVE VALUE=LUT6"), "{table}");
         assert!(table.contains("NAME=INIT"), "{table}");
         let rows = ide.property_rows();
         assert!(
-            rows.iter()
-                .any(|r| r.name == "NAME" && r.value == "u_lut0"),
+            rows.iter().any(|r| r.name == "NAME" && r.value == "u_lut0"),
             "{rows:?}"
         );
         assert!(
@@ -33277,7 +33962,10 @@ endmodule
         );
         let site_click = ide.exec("select_property SITE").unwrap();
         assert!(site_click.contains("NAME=SITE"), "{site_click}");
-        assert!(site_click.contains(&format!("VALUE={site}")), "{site_click}");
+        assert!(
+            site_click.contains(&format!("VALUE={site}")),
+            "{site_click}"
+        );
         ide.select(&site);
         let had = ide.exec("properties").unwrap();
         assert!(had.contains("NAME=TYPE VALUE=site"), "{had}");
@@ -33306,9 +33994,7 @@ endmodule
                 .cloned()
                 .expect("STA pin delay")
         };
-        let pin_out = ide
-            .exec(&format!("select_timing_pin {}", pin.pin))
-            .unwrap();
+        let pin_out = ide.exec(&format!("select_timing_pin {}", pin.pin)).unwrap();
         assert!(pin_out.contains("incr_ps="), "{pin_out}");
         let sta = ide.exec("properties").unwrap();
         assert!(sta.contains("NAME=TYPE VALUE=timing_pin"), "{sta}");
@@ -33432,7 +34118,10 @@ endmodule
         ide.open_source(&example("counter.sv")).unwrap();
         let sources = ide.exec("sources").unwrap();
         assert_eq!(ide.layout, LayoutKind::Default);
-        assert!(sources.contains('\n'), "must not be a one-liner dump: {sources}");
+        assert!(
+            sources.contains('\n'),
+            "must not be a one-liner dump: {sources}"
+        );
         assert!(sources.contains("sources n="), "{sources}");
         assert!(sources.contains("NAME=counter.sv"), "{sources}");
         assert!(sources.contains("TYPE=sv"), "{sources}");
@@ -33461,9 +34150,7 @@ endmodule
         );
         assert_eq!(ide.selected.as_deref(), Some("counter.sv"));
         assert!(
-            ide.properties
-                .iter()
-                .any(|(k, v)| k == "TYPE" && v == "sv"),
+            ide.properties.iter().any(|(k, v)| k == "TYPE" && v == "sv"),
             "{:?}",
             ide.properties
         );
@@ -33486,7 +34173,10 @@ endmodule
 
         let table = ide.exec("netlist").unwrap();
         assert_eq!(ide.layout, LayoutKind::Default);
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("netlist n="), "{table}");
         assert!(table.contains("top=counter"), "{table}");
         assert!(table.contains("NAME=u_lut0"), "{table}");
@@ -33665,10 +34355,7 @@ endmodule
         assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(
-            ide.netlist_has_selected(),
-            "netlist must highlight u_lut0"
-        );
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
@@ -33815,7 +34502,10 @@ endmodule
         assert_eq!(ide.part(), "HL10T-DSP1");
         assert_eq!(ide.session().part, "HL10T-DSP1");
         let dsp_table = ide.exec("project_settings").unwrap();
-        assert!(dsp_table.contains("NAME=PART VALUE=HL10T-DSP1"), "{dsp_table}");
+        assert!(
+            dsp_table.contains("NAME=PART VALUE=HL10T-DSP1"),
+            "{dsp_table}"
+        );
         assert!(
             !dsp_table.contains("NAME=PART VALUE=HL10T-C32-1"),
             "PART is Session-backed, not canned: {dsp_table}"
@@ -33840,9 +34530,7 @@ endmodule
         assert!(top.contains("VALUE=counter"), "{top}");
         assert_eq!(ide.selected_setting.as_deref(), Some("TOP"));
         assert!(
-            ide.properties
-                .iter()
-                .any(|(k, v)| k == "CELLS" && v != "0"),
+            ide.properties.iter().any(|(k, v)| k == "CELLS" && v != "0"),
             "TOP is HNF-backed: {:?}",
             ide.properties
         );
@@ -33886,7 +34574,10 @@ endmodule
             ide.properties
         );
         let after_fs = ide.exec("project_settings").unwrap();
-        assert!(after_fs.contains("NAME=FILESET VALUE=constrs_1"), "{after_fs}");
+        assert!(
+            after_fs.contains("NAME=FILESET VALUE=constrs_1"),
+            "{after_fs}"
+        );
         ide.exec("set_property FILESET sources_1").unwrap();
         assert_eq!(ide.active_fileset, "sources_1");
 
@@ -34055,7 +34746,10 @@ endmodule
         );
         assert!(table.contains(&format!("WNS_PS={gold}")), "{table}");
         assert!(table.contains("NAME=timing STATUS=Complete"), "{table}");
-        assert!(table.contains("NAME=utilization STATUS=Complete"), "{table}");
+        assert!(
+            table.contains("NAME=utilization STATUS=Complete"),
+            "{table}"
+        );
         assert!(table.contains("LUTFF="), "{table}");
         assert!(table.contains("NAME=run STATUS=Complete"), "{table}");
         assert!(table.contains("impl_1=Complete"), "{table}");
@@ -34182,9 +34876,7 @@ endmodule
             "empty line click must refuse"
         );
         assert!(
-            idle.exec("toggle_bookmark")
-                .unwrap_err()
-                .contains("empty"),
+            idle.exec("toggle_bookmark").unwrap_err().contains("empty"),
             "empty bookmark click must refuse"
         );
         assert!(
@@ -34454,7 +35146,10 @@ endmodule
         assert!(idle.contains("timescale_ps=10000"), "{idle}");
         assert!(idle.contains("runtime_cycles=16"), "{idle}");
         assert!(idle.contains("engine_time_ps=0"), "{idle}");
-        assert!(idle.contains("NAME=TARGET_SIMULATOR VALUE=helion-sim"), "{idle}");
+        assert!(
+            idle.contains("NAME=TARGET_SIMULATOR VALUE=helion-sim"),
+            "{idle}"
+        );
         assert!(idle.contains("NAME=SIMSET VALUE=sim_1"), "{idle}");
         assert!(idle.contains("NAME=SIM_TOP VALUE=-"), "{idle}");
         assert!(idle.contains("NAME=TIMESCALE_PS VALUE=10000"), "{idle}");
@@ -34477,7 +35172,10 @@ endmodule
         let tgt = ide.exec("select_sim_setting TARGET_SIMULATOR").unwrap();
         assert!(tgt.contains("NAME=TARGET_SIMULATOR"), "{tgt}");
         assert!(tgt.contains("VALUE=helion-sim"), "{tgt}");
-        assert_eq!(ide.selected_sim_setting.as_deref(), Some("TARGET_SIMULATOR"));
+        assert_eq!(
+            ide.selected_sim_setting.as_deref(),
+            Some("TARGET_SIMULATOR")
+        );
         assert!(
             ide.properties
                 .iter()
@@ -34505,17 +35203,27 @@ endmodule
                 .unwrap_err()
                 .contains("helion-sim")
         );
-        ide.exec("set_property TARGET_SIMULATOR helion-sim").unwrap();
+        ide.exec("set_property TARGET_SIMULATOR helion-sim")
+            .unwrap();
 
         ide.open_source(&example("counter.sv")).unwrap();
         let ts = ide.exec("set_property TIMESCALE_PS 1000").unwrap();
         assert!(ts.contains("TIMESCALE_PS 1000"), "{ts}");
         assert_eq!(ide.sim_timescale_ps, 1_000);
         assert_eq!(ide.wave.timescale_ps, 1_000);
-        assert_eq!(ide.clock_period_ps, 10_000, "sim timescale is not STA period");
+        assert_eq!(
+            ide.clock_period_ps, 10_000,
+            "sim timescale is not STA period"
+        );
         let after_ts = ide.exec("simulation_settings").unwrap();
-        assert!(after_ts.contains("NAME=TIMESCALE_PS VALUE=1000"), "{after_ts}");
-        assert!(after_ts.contains("NAME=RUNTIME_PS VALUE=16000"), "{after_ts}");
+        assert!(
+            after_ts.contains("NAME=TIMESCALE_PS VALUE=1000"),
+            "{after_ts}"
+        );
+        assert!(
+            after_ts.contains("NAME=RUNTIME_PS VALUE=16000"),
+            "{after_ts}"
+        );
         assert!(
             !after_ts.contains("NAME=TIMESCALE_PS VALUE=10000"),
             "timescale is Session-backed, not canned: {after_ts}"
@@ -34546,14 +35254,21 @@ endmodule
         assert_eq!(ide.selected_sim_setting.as_deref(), Some("LOG_ALL_SIGNALS"));
 
         let run = ide.exec("run_simulation").unwrap();
-        assert!(run.contains("cycles=4"), "run_simulation uses RUNTIME_CYCLES: {run}");
+        assert!(
+            run.contains("cycles=4"),
+            "run_simulation uses RUNTIME_CYCLES: {run}"
+        );
         assert_eq!(ide.wave.sample_len(), 8);
         assert_eq!(ide.wave.timescale_ps, 2_500);
         assert_eq!(ide.wave.time_ps(1), 2_500);
         assert!(
             ide.wave.traces.len() > 1,
             "LOG_ALL_SIGNALS samples helion-sim objects, not only LED: {:?}",
-            ide.wave.traces.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+            ide.wave
+                .traces
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
         );
         ide.exec("select_sim_setting LOG_ALL_SIGNALS").unwrap();
         assert!(
@@ -34912,7 +35627,10 @@ endmodule
         );
         let after = ide.exec("simulation_settings").unwrap();
         assert!(after.contains("elab_cells="), "{after}");
-        assert!(after.contains(&format!("elab_cells={gold_cells}")), "{after}");
+        assert!(
+            after.contains(&format!("elab_cells={gold_cells}")),
+            "{after}"
+        );
         ide.exec("select_sim_setting ELAB_SNAPSHOT").unwrap();
         assert!(
             ide.properties
@@ -34948,11 +35666,7 @@ endmodule
         let helab = hier.exec("elaborate").unwrap();
         assert!(helab.contains("TOP=hier"), "{helab}");
         assert!(helab.contains("engine=helion-sv"), "{helab}");
-        let hcells = hier
-            .sim_elab
-            .as_ref()
-            .map(|r| r.cells)
-            .expect("hier elab");
+        let hcells = hier.sim_elab.as_ref().map(|r| r.cells).expect("hier elab");
         assert_ne!(
             hcells, gold_cells,
             "elaborate cells are per-design from helion-sv, not canned"
@@ -35020,7 +35734,10 @@ endmodule
         assert!(row.contains("STATUS=Active"), "{row}");
         assert_eq!(ide.workspace, WorkspaceTab::Forces);
         let table = ide.exec("forces").unwrap();
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(table.contains("forces n=1"), "{table}");
         assert!(table.contains("NAME=led KIND=force VALUE=1"), "{table}");
         assert!(
@@ -35050,7 +35767,10 @@ endmodule
         let held = ide.exec("sim_run 16").unwrap();
         assert!(held.contains("LED[16]="), "{held}");
         let forced = ide.wave.bits_of("led").expect("forced LED wave");
-        assert_eq!(forced, "1111111111111111", "force holds LED across 16 cycles: {forced}");
+        assert_eq!(
+            forced, "1111111111111111",
+            "force holds LED across 16 cycles: {forced}"
+        );
         assert_eq!(
             ide.force_rows()
                 .iter()
@@ -35066,7 +35786,10 @@ endmodule
         let gold = ide.wave.bits_of("led").expect("HDL LED");
         assert_ne!(gold, forced, "remove_force returns HDL drivers");
         assert_eq!(gold.len(), 16, "{gold}");
-        assert!(gold.contains('0') && gold.contains('1'), "counter LED toggles: {gold}");
+        assert!(
+            gold.contains('0') && gold.contains('1'),
+            "counter LED toggles: {gold}"
+        );
 
         let dep = ide.exec("deposit led 1").unwrap();
         assert!(dep.contains("KIND=deposit"), "{dep}");
@@ -35090,7 +35813,11 @@ endmodule
         assert!(timed.contains("LED[16]="), "{timed}");
         let bits = ide.wave.bits_of("led").expect("cancel_after wave");
         assert_eq!(&bits[..4], "1111", "force holds until cancel_after: {bits}");
-        assert_eq!(&bits[4..], &gold[4..], "HDL resumes after cancel: {bits} vs {gold}");
+        assert_eq!(
+            &bits[4..],
+            &gold[4..],
+            "HDL resumes after cancel: {bits} vs {gold}"
+        );
         assert_eq!(
             ide.force_rows()
                 .iter()
@@ -35123,10 +35850,16 @@ endmodule
             Some("1111111111111111"),
             "fabric kernel honors helion-sim force"
         );
-        assert_ne!(fab_gold, "1111111111111111", "gold fabric LED is not a forced constant");
+        assert_ne!(
+            fab_gold, "1111111111111111",
+            "gold fabric LED is not a forced constant"
+        );
         ide.exec("remove_force led").unwrap();
         let fab_free = ide.exec("sim_run 16").unwrap();
-        assert!(fab_free.contains(&format!("LED[16]={fab_gold}")), "{fab_free}");
+        assert!(
+            fab_free.contains(&format!("LED[16]={fab_gold}")),
+            "{fab_free}"
+        );
         assert_eq!(ide.wns_ps(), Some(9640));
 
         let mut blinky = IdeModel::new();
@@ -35184,7 +35917,10 @@ endmodule
         assert_eq!(ide.bottom_tab, BottomTab::SimLog);
         assert!(err_table.contains("SEVERITY=ERROR"), "{err_table}");
         assert!(err_table.contains("ID=sim_run"), "{err_table}");
-        assert!(err_table.contains('\n'), "must not be a one-liner dump: {err_table}");
+        assert!(
+            err_table.contains('\n'),
+            "must not be a one-liner dump: {err_table}"
+        );
         assert!(
             !err_table.contains("helion%"),
             "must not dump helion% lines: {err_table}"
@@ -35212,8 +35948,14 @@ endmodule
         assert!(table.contains("TIME_PS=0"), "{table}");
         assert!(table.contains(&format!("TIME_PS={time_ps}")), "{table}");
         assert!(table.contains(&format!("LED[16]={led}")), "{table}");
-        assert!(table.contains(&format!("ENGINE_TIME_PS={time_ps}")), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains(&format!("ENGINE_TIME_PS={time_ps}")),
+            "{table}"
+        );
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("helion%"),
             "Simulation Log is not a Tcl transcript: {table}"
@@ -35223,10 +35965,7 @@ endmodule
             "helion-sim only: {table}"
         );
         let log = ide.exec("log").unwrap();
-        assert!(
-            log.contains("helion%"),
-            "Log stays a Tcl transcript: {log}"
-        );
+        assert!(log.contains("helion%"), "Log stays a Tcl transcript: {log}");
         let sim_again = ide.exec("sim_log").unwrap();
         assert!(
             !sim_again.contains("helion%"),
@@ -35234,7 +35973,10 @@ endmodule
         );
 
         let sel = ide.exec("select_sim_log sim_run").unwrap();
-        assert!(sel.contains("STATUS=INFO") || sel.contains("SEVERITY=INFO"), "{sel}");
+        assert!(
+            sel.contains("STATUS=INFO") || sel.contains("SEVERITY=INFO"),
+            "{sel}"
+        );
         assert!(sel.contains("ID=sim_run"), "{sel}");
         assert!(sel.contains(&format!("LED[16]={led}")), "{sel}");
         assert!(sel.contains(&format!("TIME_PS={time_ps}")), "{sel}");
@@ -35255,9 +35997,7 @@ endmodule
             ide.properties
         );
         assert!(
-            ide.properties
-                .iter()
-                .any(|(k, v)| k == "LED" && v == &led),
+            ide.properties.iter().any(|(k, v)| k == "LED" && v == &led),
             "{:?}",
             ide.properties
         );
@@ -35322,7 +36062,9 @@ endmodule
         let mut ide = IdeModel::new();
         assert!(ide.eco_rows().is_empty());
         assert!(
-            ide.select_eco("0").unwrap_err().contains("eco_changes empty"),
+            ide.select_eco("0")
+                .unwrap_err()
+                .contains("eco_changes empty"),
             "empty table must refuse a click"
         );
         assert!(
@@ -35357,7 +36099,10 @@ endmodule
         assert!(table.contains("KIND=LUT"), "{table}");
         assert!(table.contains("STATUS=Placed"), "{table}");
         assert!(table.contains("SITE=CLB_"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("check_eco missing="),
             "table is Name/Kind/Status, not check_eco dump: {table}"
@@ -35371,7 +36116,11 @@ endmodule
             .iter()
             .filter(|r| r.status == "Placed")
             .count();
-        assert_eq!(placed, ide.eco_rows().len(), "placed counter has no ECO holes");
+        assert_eq!(
+            placed,
+            ide.eco_rows().len(),
+            "placed counter has no ECO holes"
+        );
         assert!(
             ide.eco_rows().iter().any(|r| r.name == "u_lut0"
                 && r.kind == "LUT"
@@ -35490,10 +36239,7 @@ endmodule
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
         assert_eq!(ide.selected_eco.as_deref(), Some("u_lut0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(
-            ide.netlist_has_selected(),
-            "netlist must highlight u_lut0"
-        );
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
@@ -35546,9 +36292,7 @@ endmodule
             .find(|r| r.kind == "LUT" || r.kind == "FF" || r.kind == "IOB")
             .map(|r| r.name.clone())
             .expect("blinky HNF cell row");
-        let bsel = blinky
-            .exec(&format!("select_eco_object {bled}"))
-            .unwrap();
+        let bsel = blinky.exec(&format!("select_eco_object {bled}")).unwrap();
         assert!(bsel.contains(&format!("OBJECT={bled}")), "{bsel}");
         assert_eq!(blinky.selected.as_deref(), Some(bled.as_str()));
         assert_eq!(blinky.workspace, WorkspaceTab::Schematic);
@@ -35610,7 +36354,10 @@ endmodule
         assert!(table.contains("STATUS=Reused"), "{table}");
         assert!(table.contains("SITE=CLB_"), "{table}");
         assert!(table.contains("PCT=100"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("reuse cells="),
             "table is Name/Kind/Status, not reuse dump: {table}"
@@ -35620,17 +36367,19 @@ endmodule
             "Incremental Compile is not a Tcl transcript: {table}"
         );
         assert!(
-            ide.incremental_rows
-                .iter()
-                .any(|r| r.name == "u_lut0"
-                    && r.kind == "LUT"
-                    && r.status == "Reused"
-                    && r.site.starts_with("CLB_")
-                    && r.pct == 100),
+            ide.incremental_rows.iter().any(|r| r.name == "u_lut0"
+                && r.kind == "LUT"
+                && r.status == "Reused"
+                && r.site.starts_with("CLB_")
+                && r.pct == 100),
             "LUT row is checkpoint-reused: {:?}",
             ide.incremental_rows
         );
-        assert_eq!(ide.wns_ps(), Some(gold), "same-netlist incremental keeps gold WNS");
+        assert_eq!(
+            ide.wns_ps(),
+            Some(gold),
+            "same-netlist incremental keeps gold WNS"
+        );
 
         let cells = ide.exec("select_incremental cells").unwrap();
         assert!(cells.contains("KIND=resource"), "{cells}");
@@ -35701,7 +36450,10 @@ endmodule
             "blinky rows are blinky HNF, not counter: {btable}"
         );
         let bsel = blinky.exec("select_incremental 0").unwrap();
-        assert!(bsel.contains("KIND=resource") || bsel.contains("STATUS=Reused"), "{bsel}");
+        assert!(
+            bsel.contains("KIND=resource") || bsel.contains("STATUS=Reused"),
+            "{bsel}"
+        );
         assert!(
             !bsel.contains("WNS_PS="),
             "Incremental Compile is not a timing dump: {bsel}"
@@ -35741,10 +36493,7 @@ endmodule
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
         assert_eq!(ide.selected_incremental.as_deref(), Some("u_lut0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(
-            ide.netlist_has_selected(),
-            "netlist must highlight u_lut0"
-        );
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
@@ -35880,7 +36629,10 @@ endmodule
         assert!(table.contains("NAME=M8"), "{table}");
         assert!(table.contains("SAMPLE=16"), "{table}");
         assert!(table.contains("TIME_PS=80000"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("helion%"),
             "Wave Markers is not a Tcl transcript: {table}"
@@ -36025,14 +36777,20 @@ endmodule
         assert!(table.contains("TIME_PS=80000"), "{table}");
         assert!(table.contains("NAME=B-A"), "{table}");
         assert!(table.contains("DELTA_PS=60000"), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("xsim") && !table.contains("questa") && !table.contains("vcs"),
             "helion-sim only: {table}"
         );
         let va = ide.wave.trace("led").unwrap().value_at(4);
         let vb = ide.wave.trace("led").unwrap().value_at(16);
-        assert!(table.contains(&format!("VALUE={va}")) || table.contains(&format!("led A={va}")), "{table}");
+        assert!(
+            table.contains(&format!("VALUE={va}")) || table.contains(&format!("led A={va}")),
+            "{table}"
+        );
         assert!(
             ide.wave_cursor_rows()
                 .iter()
@@ -36175,7 +36933,10 @@ endmodule
         assert!(table.contains("MEMBERS=led,cnt"), "{table}");
         assert!(table.contains(&format!("WIDTH={}", 1 + cnt_w)), "{table}");
         assert!(table.contains("VALUE="), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("helion%"),
             "Virtual Bus is not a Tcl transcript: {table}"
@@ -36264,7 +37025,10 @@ endmodule
         assert!(table.contains("engine=HAD"), "{table}");
         assert!(table.contains("NAME=X0Y0"), "{table}");
         assert!(table.contains("SITES="), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("helion%"),
             "Clock Regions is not a Tcl transcript: {table}"
@@ -36392,21 +37156,32 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         let gold = ide.wns_ps().expect("STA after route");
         assert_eq!(gold, 9640, "empty XDC counter gold WNS");
-        assert!(!ide.device.routes.is_empty(), "PathFinder IOB routes after Route");
+        assert!(
+            !ide.device.routes.is_empty(),
+            "PathFinder IOB routes after Route"
+        );
         let table = ide.exec("device_routes").unwrap();
         assert!(table.contains("device_routes n="), "{table}");
         assert!(table.contains("engine=helion-route"), "{table}");
         let r0 = ide.device.routes[0].clone();
         assert!(table.contains(&format!("NAME={}", r0.net)), "{table}");
         assert!(table.contains(&format!("HOPS={}", r0.hops)), "{table}");
-        assert!(table.contains(&format!("DELAY_PS={}", r0.delay_ps)), "{table}");
-        assert!(table.contains('\n'), "must not be a one-liner dump: {table}");
+        assert!(
+            table.contains(&format!("DELAY_PS={}", r0.delay_ps)),
+            "{table}"
+        );
+        assert!(
+            table.contains('\n'),
+            "must not be a one-liner dump: {table}"
+        );
         assert!(
             !table.contains("helion%"),
             "Device Routing is not a Tcl transcript: {table}"
         );
 
-        let sel = ide.exec(&format!("select_device_route {}", r0.net)).unwrap();
+        let sel = ide
+            .exec(&format!("select_device_route {}", r0.net))
+            .unwrap();
         assert!(sel.contains(&format!("net={}", r0.net)), "{sel}");
         assert!(sel.contains(&format!("hops={}", r0.hops)), "{sel}");
         assert!(sel.contains(&format!("delay_ps={}", r0.delay_ps)), "{sel}");
@@ -36451,7 +37226,6 @@ endmodule
         assert_eq!(ide.wns_ps(), Some(9640));
     }
 
-
     /// CAD chrome at ~1440×900: three canvases fit; More ⋯ if needed;
     /// wrap must not steal canvas; examples stay off the rail; side chrome
     /// is rail + sidebar, not 680.
@@ -36495,7 +37269,11 @@ endmodule
         let plan = chrome::chrome_at(chrome::DESKTOP_WIDTH);
         assert_eq!(plan.window_w, 1440.0);
         assert_eq!(plan.workspace_mode, OverflowMode::Fit);
-        assert_eq!(plan.tab_rows.len(), 1, "one tab row; wrap must not steal canvas");
+        assert_eq!(
+            plan.tab_rows.len(),
+            1,
+            "one tab row; wrap must not steal canvas"
+        );
         assert_eq!(plan.workspace_tabs, vec!["Editor", "Device", "Timing"]);
         for lab in ["Editor", "Device", "Timing"] {
             assert!(
@@ -36505,11 +37283,17 @@ endmodule
             );
         }
         assert_eq!(plan.dropped_workspace(), 0);
-        assert!(plan.more_items.is_empty(), "More not needed at 1440: {:?}", plan.more_items);
+        assert!(
+            plan.more_items.is_empty(),
+            "More not needed at 1440: {:?}",
+            plan.more_items
+        );
 
         assert_eq!(
             plan.rail_actions,
-            vec!["Files", "Device", "Timing", "Simulate", "Program", "Reports"]
+            vec![
+                "Files", "Device", "Timing", "Simulate", "Program", "Reports"
+            ]
         );
         for a in Activity::ALL {
             assert!(
@@ -36542,7 +37326,9 @@ endmodule
 
         assert_eq!(
             plan.nav_sections,
-            vec!["Files", "Device", "Timing", "Simulate", "Program", "Reports"]
+            vec![
+                "Files", "Device", "Timing", "Simulate", "Program", "Reports"
+            ]
         );
         assert_eq!(plan.nav_sections.len(), 6);
         assert_ne!(plan.nav_sections.len(), 9);
@@ -36551,7 +37337,10 @@ endmodule
         assert!(!chrome::grid_clips_last_column(2, 80.0, 400.0));
         let table = chrome::table_scroll_policy(10, 400.0);
         assert!(table.last_column_would_clip, "10×80 cols clip at 400px");
-        assert!(table.x && table.y, "clipped last column requires both-axis scroll");
+        assert!(
+            table.x && table.y,
+            "clipped last column requires both-axis scroll"
+        );
         assert_eq!(table.max_height, chrome::TABLE_MAX_HEIGHT);
         assert!(
             table.max_height > 0.0 && table.max_height < chrome::DESKTOP_HEIGHT / 2.0,
@@ -36618,7 +37407,7 @@ endmodule
 
     #[test]
     fn schematic_after_implement_has_cells_and_more_does_not_map_to_timing() {
-        use crate::{pane_for_workspace, WorkspacePane};
+        use crate::{WorkspacePane, pane_for_workspace};
 
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
@@ -36656,11 +37445,7 @@ endmodule
         );
         for tab in WorkspaceTab::ALL {
             if crate::chrome::is_more_destination(tab) {
-                assert_ne!(
-                    pane_for_workspace(tab),
-                    WorkspacePane::Timing,
-                    "{tab:?}"
-                );
+                assert_ne!(pane_for_workspace(tab), WorkspacePane::Timing, "{tab:?}");
             }
         }
     }
@@ -36703,7 +37488,10 @@ endmodule
             "{}",
             pb.english_range()
         );
-        assert!(pb.range_text().starts_with("CLB_X"), "Tcl console keeps CLB_X");
+        assert!(
+            pb.range_text().starts_with("CLB_X"),
+            "Tcl console keeps CLB_X"
+        );
     }
 
     #[test]
@@ -36717,13 +37505,7 @@ endmodule
         std::fs::create_dir_all(&dir).unwrap();
         let mut ide = IdeModel::new();
         let out = ide
-            .create_project(
-                "counter_wiz",
-                &dir,
-                "HL10T-C32-1",
-                &[sv],
-                &[sdc],
-            )
+            .create_project("counter_wiz", &dir, "HL10T-C32-1", &[sv], &[sdc])
             .expect("create_project");
         assert!(out.contains("create_project"), "{out}");
         let prj = dir.join("counter_wiz/counter_wiz.prj");
@@ -36752,7 +37534,10 @@ endmodule
             .expect("WNS_PS=")
             .parse()
             .expect("numeric WNS");
-        assert_eq!(wns, 9640, "create_project counter must hold gold WNS: {timing}");
+        assert_eq!(
+            wns, 9640,
+            "create_project counter must hold gold WNS: {timing}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -36834,7 +37619,10 @@ endmodule
             .expect("WNS_PS=")
             .parse()
             .expect("numeric WNS");
-        assert_eq!(wns, 9640, "save_project_as reopen must hold gold WNS: {timing}");
+        assert_eq!(
+            wns, 9640,
+            "save_project_as reopen must hold gold WNS: {timing}"
+        );
 
         let gold_bytes_after = std::fs::read(&gold_sdc).expect("re-read gold sdc");
         assert_eq!(
@@ -36904,7 +37692,10 @@ endmodule
             .expect("WNS_PS=")
             .parse()
             .expect("numeric WNS");
-        assert_eq!(wns, 9640, "close→reopen implement must hold gold WNS: {timing}");
+        assert_eq!(
+            wns, 9640,
+            "close→reopen implement must hold gold WNS: {timing}"
+        );
 
         let gold_bytes_after = std::fs::read(&gold_sdc).expect("re-read gold sdc");
         assert_eq!(
@@ -36969,7 +37760,10 @@ endmodule
             .expect("WNS_PS=")
             .parse()
             .expect("numeric WNS");
-        assert_eq!(wns, 9640, "Recent reopen counter.prj must hold gold WNS: {timing}");
+        assert_eq!(
+            wns, 9640,
+            "Recent reopen counter.prj must hold gold WNS: {timing}"
+        );
     }
 
     #[test]
@@ -37033,16 +37827,18 @@ endmodule
     fn learner_l1_illegal_route_before_place_failed_prereq() {
         let mut ide = IdeModel::new();
         ide.open_source(&example_rtl_only("counter.sv")).unwrap();
-        let tip = ide.step_blocked(FlowStep::Route).expect("Route blocked before Place");
+        let tip = ide
+            .step_blocked(FlowStep::Route)
+            .expect("Route blocked before Place");
         assert!(tip.contains("Place first"), "{tip}");
         assert!(tip.contains("STAGE_PREREQ"), "{tip}");
         let e = ide.run_step(FlowStep::Route).unwrap_err();
         assert!(e.contains("Place first"), "{e}");
         assert_eq!(ide.step_state(FlowStep::Route), StepState::Failed);
         assert!(
-            ide.messages.iter().any(|m| {
-                m.severity == MsgSeverity::Error && m.text.contains("Place first")
-            }),
+            ide.messages
+                .iter()
+                .any(|m| { m.severity == MsgSeverity::Error && m.text.contains("Place first") }),
             "Messages must surface prereq: {:?}",
             ide.messages
         );
@@ -37094,7 +37890,9 @@ endmodule
         let lines = ide.packing_summary_english();
         assert!(!lines.is_empty(), "packing lines");
         assert!(
-            lines.iter().all(|l| l.contains("CLB_X") && l.contains("LUTFF")),
+            lines
+                .iter()
+                .all(|l| l.contains("CLB_X") && l.contains("LUTFF")),
             "{lines:?}"
         );
         let sum: usize = lines
@@ -37107,5 +37905,4 @@ endmodule
             .sum();
         assert_eq!(sum, n, "sum counts == lutff_sites.len(); lines={lines:?}");
     }
-
 }

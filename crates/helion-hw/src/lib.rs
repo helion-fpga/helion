@@ -32,12 +32,12 @@ pub mod native_mpsse;
 pub mod native_usb;
 pub use mpsse_sim::{FtdiBitbangSim, MpsseSimError};
 pub use native_mpsse::{
+    MPSSE_CLK_TMS_OUT_NEG_LSB, MPSSE_SET_CLK_DIVISOR, MpsseOpcodeBuilder, NativeFtdiMpsse,
     native_mpsse_status_note, try_native_mpsse_program, try_native_mpsse_program_stat,
-    MpsseOpcodeBuilder, NativeFtdiMpsse, MPSSE_CLK_TMS_OUT_NEG_LSB, MPSSE_SET_CLK_DIVISOR,
 };
 pub use native_usb::{
-    enumerate_ftdi, feature_enabled as usb_native_feature_enabled, FtdiDeviceInfo, NativeUsbScan,
-    FTDI_VID,
+    FTDI_VID, FtdiDeviceInfo, NativeUsbScan, enumerate_ftdi,
+    feature_enabled as usb_native_feature_enabled,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1680,7 +1680,9 @@ pub fn program_via_openfpgaloader_for_part(
 /// Load `.hbits` packets and program the sim cable for `dev`.
 pub fn program_packets(dev: &Device, packets: &[u8]) -> Result<(Bitstream, Stat), String> {
     if packets.is_empty() {
-        return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream (0 bytes)"));
+        return Err(format!(
+            "{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream (0 bytes)"
+        ));
     }
     let bits = Bitstream::from_packets(packets)?;
     if bits.idcode != dev.idcode {
@@ -1789,7 +1791,9 @@ pub fn program_hbits_with_cable(
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("program: read {}: {e}", path.display()))?;
             if bytes.is_empty() {
-                return Err(format!("{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream (0 bytes)"));
+                return Err(format!(
+                    "{ERR_CODE_EMPTY_BITSTREAM}: program: empty bitstream (0 bytes)"
+                ));
             }
             // Validate Helion .hbits when magic matches; still pass file to OFL as-is.
             let bits = if bytes.starts_with(b"HBIT") {
@@ -1904,10 +1908,7 @@ impl ProgramOutcome {
             }
             ProgramOutcome::OpenFpgaLoader { bits, ofl, bytes } => {
                 let frames = bits.as_ref().map(|b| b.frames.len()).unwrap_or(0);
-                let board = ofl
-                    .board
-                    .as_deref()
-                    .unwrap_or("-");
+                let board = ofl.board.as_deref().unwrap_or("-");
                 let vok = match ofl.verify_ok {
                     Some(true) => "1",
                     Some(false) => "0",
@@ -1988,7 +1989,7 @@ mod tests {
         use helion_bits::{bitgen, bitgen_pblock};
         use helion_ir::{CellKind, Design, PortDir};
         use helion_pack::pack;
-        use helion_place::{place_with, PlaceOpts};
+        use helion_place::{PlaceOpts, place_with};
         use helion_route::route;
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         fn nine(last: u64) -> Design {
@@ -2361,10 +2362,7 @@ mod tests {
             // Feature on + no FTDI → honest Io (no OFL fallback, no invented STAT).
             assert!(matches!(err, NativeUsbError::Io(_)), "{err:?}");
             let e = program_hbits_with_cable(&dev, &bits_path, &cable, false).unwrap_err();
-            assert!(
-                e.contains(ERR_CODE_USB_0),
-                "stable USB=0 code missing: {e}"
-            );
+            assert!(e.contains(ERR_CODE_USB_0), "stable USB=0 code missing: {e}");
             assert!(
                 e.contains("native MPSSE") || e.contains("I/O") || e.contains("no FTDI"),
                 "{e}"
@@ -2847,10 +2845,11 @@ mod tests {
         }
         let det = detect_boards();
         assert!(det.text().contains("TAP_readback=none") || det.text().contains("never invent"));
-        assert!(!det
-            .text()
-            .to_ascii_lowercase()
-            .contains("done=1 from enumerate"));
+        assert!(
+            !det.text()
+                .to_ascii_lowercase()
+                .contains("done=1 from enumerate")
+        );
         let _ = native_err;
     }
 
@@ -3159,7 +3158,10 @@ mod tests {
         std::fs::write(&nonzero, b"not-hbit-but-non-empty-for-open-honesty").unwrap();
         let native_err = try_native_mpsse_program_stat(&nonzero, false).unwrap_err();
         if cfg!(feature = "usb-native") {
-            assert!(matches!(native_err, NativeUsbError::Io(_)), "{native_err:?}");
+            assert!(
+                matches!(native_err, NativeUsbError::Io(_)),
+                "{native_err:?}"
+            );
         } else {
             assert!(
                 matches!(native_err, NativeUsbError::NotImplemented(_)),

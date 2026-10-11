@@ -7,11 +7,18 @@ license.workspace = true
 [dependencies]
 helion-ir = { workspace = true }
 sv-parser = "0.13"
+# Bump arena for elaborated boolean Expr trees (standards §2: arenas for
+# phase-lived data). Pinned to the version already in Cargo.lock.
+bumpalo = "=3.20.3"
 
 [dev-dependencies]
+criterion = { workspace = true }
 helion-device = { workspace = true }
 helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
 helion-pack = { workspace = true }
 helion-place = { workspace = true }
 helion-route = { workspace = true }
+[[bench]]
+name = "synth"
+harness = false

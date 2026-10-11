@@ -75,7 +75,6 @@ pub fn pack_timer() -> IpCore {
     }
 }
 
-
 /// Helion-MM PWM period/duty/compare (ip/h_pwm). Not AXI PWM.
 pub fn pack_pwm() -> IpCore {
     IpCore {
@@ -98,7 +97,6 @@ pub fn pack_spi_mm() -> IpCore {
     }
 }
 
-
 /// Helion-ST N-stage shift-reg debounce (ip/h_debounce). Not AXI.
 pub fn pack_debounce() -> IpCore {
     IpCore {
@@ -120,7 +118,6 @@ pub fn pack_clkdiv() -> IpCore {
         bus: "Helion-ST".into(),
     }
 }
-
 
 /// Helion-ST rising/falling edge detect with sticky status (ip/h_edge_det). Not AXI.
 pub fn pack_edge_det() -> IpCore {
@@ -166,7 +163,6 @@ pub fn pack_lfsr() -> IpCore {
     }
 }
 
-
 /// Helion-ST binary↔gray counter with enable/load (ip/h_gray_cnt). Not AXI.
 pub fn pack_gray_cnt() -> IpCore {
     IpCore {
@@ -188,7 +184,6 @@ pub fn pack_scratch_mm() -> IpCore {
         bus: "Helion-MM".into(),
     }
 }
-
 
 /// Helion-ST registered 32b population count (ip/h_popcount). Not AXI.
 pub fn pack_popcount() -> IpCore {
@@ -212,7 +207,6 @@ pub fn pack_saturate() -> IpCore {
     }
 }
 
-
 /// Helion-ST loadable N-bit shift register with dir/serial (ip/h_shift_reg). Not AXI.
 pub fn pack_shift_reg() -> IpCore {
     IpCore {
@@ -234,7 +228,6 @@ pub fn pack_compare_mm() -> IpCore {
         bus: "Helion-MM".into(),
     }
 }
-
 
 /// Helion-ST registered 32b count-leading-zeros (ip/h_clz). Not AXI.
 pub fn pack_clz() -> IpCore {
@@ -258,7 +251,6 @@ pub fn pack_byte_rev() -> IpCore {
     }
 }
 
-
 /// Helion-ST 4-request round-robin arbiter with grant + sticky mask (ip/h_arb_rr). Not AXI.
 pub fn pack_arb_rr() -> IpCore {
     IpCore {
@@ -281,7 +273,6 @@ pub fn pack_ctz() -> IpCore {
     }
 }
 
-
 /// Helion-ST registered min/max of two 32b + mode (ip/h_minmax). Not AXI.
 pub fn pack_minmax() -> IpCore {
     IpCore {
@@ -303,7 +294,6 @@ pub fn pack_accum_mm() -> IpCore {
         bus: "Helion-MM".into(),
     }
 }
-
 
 /// Helion-ST registered even/odd parity + sticky error over 32b (ip/h_parity). Not AXI.
 pub fn pack_parity() -> IpCore {
@@ -349,7 +339,6 @@ pub fn pack_mask_gen() -> IpCore {
     }
 }
 
-
 /// Helion-ST registered absolute difference |a-b| on 32b (ip/h_absdiff). Not AXI.
 pub fn pack_absdiff() -> IpCore {
     IpCore {
@@ -393,7 +382,6 @@ pub fn pack_timer_cap() -> IpCore {
         bus: "Helion-MM".into(),
     }
 }
-
 
 /// Helion-ST registered 4:1 mux 32b + sel (ip/h_mux4). Not AXI.
 pub fn pack_mux4() -> IpCore {
@@ -439,7 +427,6 @@ pub fn pack_pulse_ext() -> IpCore {
     }
 }
 
-
 /// Helion-ST registered xorshift32 PRNG with seed/enable (ip/h_rng_xorshift). Not AXI.
 pub fn pack_rng_xorshift() -> IpCore {
     IpCore {
@@ -483,7 +470,6 @@ pub fn pack_bcd_inc() -> IpCore {
         bus: "Helion-ST".into(),
     }
 }
-
 
 /// Helion-MM single-slot mailbox write/read + sticky full/empty (ip/h_mailbox_mm). Not AXI.
 pub fn pack_mailbox_mm() -> IpCore {
@@ -529,7 +515,6 @@ pub fn pack_edge_cnt() -> IpCore {
     }
 }
 
-
 /// Helion-MM UART RX bit sampler start/data/stop + sticky byte (ip/h_uart_rx). Not AXI UART.
 pub fn pack_uart_rx() -> IpCore {
     IpCore {
@@ -573,7 +558,6 @@ pub fn pack_cordic_step() -> IpCore {
         bus: "Helion-ST".into(),
     }
 }
-
 
 /// Helion-ST NCO phase accumulator with freq word + MSB carrier (ip/h_phase_accum). Not AXI.
 pub fn pack_phase_accum() -> IpCore {
@@ -619,7 +603,6 @@ pub fn pack_cdc_pulse() -> IpCore {
     }
 }
 
-
 /// Helion-ST registered CRC-8 poly 0x07 byte-serial (ip/h_crc8). Not AXI.
 pub fn pack_crc8() -> IpCore {
     IpCore {
@@ -663,7 +646,6 @@ pub fn pack_pwm_center() -> IpCore {
         bus: "Helion-ST".into(),
     }
 }
-
 
 /// Helion-ST Manchester encoder from bit stream + enable (ip/h_manchester_enc). Not AXI.
 pub fn pack_manchester_enc() -> IpCore {
@@ -709,7 +691,6 @@ pub fn pack_majority3() -> IpCore {
     }
 }
 
-
 /// Helion-ST registered CRC-16 poly 0x1021 byte-serial (ip/h_crc16). Not AXI.
 pub fn pack_crc16() -> IpCore {
     IpCore {
@@ -753,7 +734,6 @@ pub fn pack_cam_slot() -> IpCore {
         bus: "Helion-MM".into(),
     }
 }
-
 
 /// Helion-ST serial-in parallel-out shift register WIDTH=16 (ip/h_sipo). Not AXI.
 pub fn pack_sipo() -> IpCore {
@@ -878,7 +858,10 @@ pub fn catalog() -> Vec<IpCore> {
 impl IpCore {
     /// IEEE 1685 VLNV (`vendor:library:name:version`).
     pub fn vlnv(&self) -> String {
-        format!("{}:{}:{}:{}", self.vendor, self.library, self.name, self.version)
+        format!(
+            "{}:{}:{}:{}",
+            self.vendor, self.library, self.name, self.version
+        )
     }
 }
 
@@ -985,7 +968,10 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_debounce"));
         assert!(cat.iter().any(|c| c.name == "h_clkdiv"));
         assert!(cat.iter().all(|c| c.bus != "AXI"));
-        assert!(cat.iter().all(|c| !c.bus.to_ascii_lowercase().contains("axi")));
+        assert!(
+            cat.iter()
+                .all(|c| !c.bus.to_ascii_lowercase().contains("axi"))
+        );
         assert_eq!(pack_uart().vlnv(), "community:helion:h_uart:1.0");
         assert_eq!(pack_sync_fifo().vlnv(), "community:helion:h_sync_fifo:1.0");
         assert_eq!(pack_timer().vlnv(), "community:helion:h_timer:1.0");
@@ -1028,7 +1014,10 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_gray_cnt"));
         assert!(cat.iter().any(|c| c.name == "h_scratch_mm"));
         assert_eq!(pack_gray_cnt().vlnv(), "community:helion:h_gray_cnt:1.0");
-        assert_eq!(pack_scratch_mm().vlnv(), "community:helion:h_scratch_mm:1.0");
+        assert_eq!(
+            pack_scratch_mm().vlnv(),
+            "community:helion:h_scratch_mm:1.0"
+        );
         let pop = pack_popcount();
         assert_eq!(pop.name, "h_popcount");
         assert_eq!(pop.bus, "Helion-ST");
@@ -1052,7 +1041,10 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_shift_reg"));
         assert!(cat.iter().any(|c| c.name == "h_compare_mm"));
         assert_eq!(pack_shift_reg().vlnv(), "community:helion:h_shift_reg:1.0");
-        assert_eq!(pack_compare_mm().vlnv(), "community:helion:h_compare_mm:1.0");
+        assert_eq!(
+            pack_compare_mm().vlnv(),
+            "community:helion:h_compare_mm:1.0"
+        );
         let clz = pack_clz();
         assert_eq!(clz.name, "h_clz");
         assert_eq!(clz.bus, "Helion-ST");
@@ -1181,7 +1173,10 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_prio_enc"));
         assert!(cat.iter().any(|c| c.name == "h_skid_buf"));
         assert!(cat.iter().any(|c| c.name == "h_bcd_inc"));
-        assert_eq!(pack_rng_xorshift().vlnv(), "community:helion:h_rng_xorshift:1.0");
+        assert_eq!(
+            pack_rng_xorshift().vlnv(),
+            "community:helion:h_rng_xorshift:1.0"
+        );
         assert_eq!(pack_prio_enc().vlnv(), "community:helion:h_prio_enc:1.0");
         assert_eq!(pack_skid_buf().vlnv(), "community:helion:h_skid_buf:1.0");
         assert_eq!(pack_bcd_inc().vlnv(), "community:helion:h_bcd_inc:1.0");
@@ -1205,8 +1200,14 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_pwm_deadtime"));
         assert!(cat.iter().any(|c| c.name == "h_lfsr16"));
         assert!(cat.iter().any(|c| c.name == "h_edge_cnt"));
-        assert_eq!(pack_mailbox_mm().vlnv(), "community:helion:h_mailbox_mm:1.0");
-        assert_eq!(pack_pwm_deadtime().vlnv(), "community:helion:h_pwm_deadtime:1.0");
+        assert_eq!(
+            pack_mailbox_mm().vlnv(),
+            "community:helion:h_mailbox_mm:1.0"
+        );
+        assert_eq!(
+            pack_pwm_deadtime().vlnv(),
+            "community:helion:h_pwm_deadtime:1.0"
+        );
         assert_eq!(pack_lfsr16().vlnv(), "community:helion:h_lfsr16:1.0");
         assert_eq!(pack_edge_cnt().vlnv(), "community:helion:h_edge_cnt:1.0");
         let urx = pack_uart_rx();
@@ -1230,9 +1231,18 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_sqrt_digit"));
         assert!(cat.iter().any(|c| c.name == "h_cordic_step"));
         assert_eq!(pack_uart_rx().vlnv(), "community:helion:h_uart_rx:1.0");
-        assert_eq!(pack_div_restoring().vlnv(), "community:helion:h_div_restoring:1.0");
-        assert_eq!(pack_sqrt_digit().vlnv(), "community:helion:h_sqrt_digit:1.0");
-        assert_eq!(pack_cordic_step().vlnv(), "community:helion:h_cordic_step:1.0");
+        assert_eq!(
+            pack_div_restoring().vlnv(),
+            "community:helion:h_div_restoring:1.0"
+        );
+        assert_eq!(
+            pack_sqrt_digit().vlnv(),
+            "community:helion:h_sqrt_digit:1.0"
+        );
+        assert_eq!(
+            pack_cordic_step().vlnv(),
+            "community:helion:h_cordic_step:1.0"
+        );
         let pa = pack_phase_accum();
         assert_eq!(pa.name, "h_phase_accum");
         assert_eq!(pa.bus, "Helion-ST");
@@ -1253,9 +1263,15 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_fir_tap"));
         assert!(cat.iter().any(|c| c.name == "h_iir_biquad"));
         assert!(cat.iter().any(|c| c.name == "h_cdc_pulse"));
-        assert_eq!(pack_phase_accum().vlnv(), "community:helion:h_phase_accum:1.0");
+        assert_eq!(
+            pack_phase_accum().vlnv(),
+            "community:helion:h_phase_accum:1.0"
+        );
         assert_eq!(pack_fir_tap().vlnv(), "community:helion:h_fir_tap:1.0");
-        assert_eq!(pack_iir_biquad().vlnv(), "community:helion:h_iir_biquad:1.0");
+        assert_eq!(
+            pack_iir_biquad().vlnv(),
+            "community:helion:h_iir_biquad:1.0"
+        );
         assert_eq!(pack_cdc_pulse().vlnv(), "community:helion:h_cdc_pulse:1.0");
         let c8 = pack_crc8();
         assert_eq!(c8.name, "h_crc8");
@@ -1280,7 +1296,10 @@ mod tests {
         assert_eq!(pack_crc8().vlnv(), "community:helion:h_crc8:1.0");
         assert_eq!(pack_spi_slave().vlnv(), "community:helion:h_spi_slave:1.0");
         assert_eq!(pack_quad_enc().vlnv(), "community:helion:h_quad_enc:1.0");
-        assert_eq!(pack_pwm_center().vlnv(), "community:helion:h_pwm_center:1.0");
+        assert_eq!(
+            pack_pwm_center().vlnv(),
+            "community:helion:h_pwm_center:1.0"
+        );
         let me = pack_manchester_enc();
         assert_eq!(me.name, "h_manchester_enc");
         assert_eq!(me.bus, "Helion-ST");
@@ -1301,7 +1320,10 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_gray2bin"));
         assert!(cat.iter().any(|c| c.name == "h_bin2gray"));
         assert!(cat.iter().any(|c| c.name == "h_majority3"));
-        assert_eq!(pack_manchester_enc().vlnv(), "community:helion:h_manchester_enc:1.0");
+        assert_eq!(
+            pack_manchester_enc().vlnv(),
+            "community:helion:h_manchester_enc:1.0"
+        );
         assert_eq!(pack_gray2bin().vlnv(), "community:helion:h_gray2bin:1.0");
         assert_eq!(pack_bin2gray().vlnv(), "community:helion:h_bin2gray:1.0");
         assert_eq!(pack_majority3().vlnv(), "community:helion:h_majority3:1.0");
@@ -1351,8 +1373,14 @@ mod tests {
         assert!(cat.iter().any(|c| c.name == "h_scoreboard"));
         assert_eq!(pack_sipo().vlnv(), "community:helion:h_sipo:1.0");
         assert_eq!(pack_piso().vlnv(), "community:helion:h_piso:1.0");
-        assert_eq!(pack_traffic_light().vlnv(), "community:helion:h_traffic_light:1.0");
-        assert_eq!(pack_scoreboard().vlnv(), "community:helion:h_scoreboard:1.0");
+        assert_eq!(
+            pack_traffic_light().vlnv(),
+            "community:helion:h_traffic_light:1.0"
+        );
+        assert_eq!(
+            pack_scoreboard().vlnv(),
+            "community:helion:h_scoreboard:1.0"
+        );
     }
 }
 
@@ -1474,9 +1502,7 @@ pub fn parse_helion(text: &str) -> Result<HelionPackage, String> {
                 let v = toks
                     .next()
                     .ok_or_else(|| "format: missing version".to_string())?;
-                pkg.format = v
-                    .parse()
-                    .map_err(|_| format!("format: bad version {v}"))?;
+                pkg.format = v.parse().map_err(|_| format!("format: bad version {v}"))?;
                 if pkg.format != 1 {
                     return Err(format!("unsupported .helion format {}", pkg.format));
                 }
@@ -1513,7 +1539,9 @@ pub fn parse_helion(text: &str) -> Result<HelionPackage, String> {
                     .ok_or_else(|| "vlnv: missing value".to_string())?;
                 let parts: Vec<&str> = v.split(':').collect();
                 if parts.len() != 4 {
-                    return Err(format!("vlnv: expected vendor:library:name:version, got {v}"));
+                    return Err(format!(
+                        "vlnv: expected vendor:library:name:version, got {v}"
+                    ));
                 }
                 pkg.vendor = parts[0].to_string();
                 pkg.library = parts[1].to_string();
@@ -1617,16 +1645,18 @@ file h_gpio.v
         assert_eq!(pkg.vlnv(), "community:helion:h_gpio:1.0");
         assert_eq!(pkg.files, vec!["h_gpio.v"]);
         assert_eq!(pkg.to_ip_core().unwrap().bus, "Helion-MM");
-        assert!(parse_helion(
-            r#"
+        assert!(
+            parse_helion(
+                r#"
 format 1
 name bad
 bus AXI
 file a.v
 "#
-        )
-        .unwrap_err()
-        .contains("not AXI"));
+            )
+            .unwrap_err()
+            .contains("not AXI")
+        );
     }
 
     #[test]

@@ -734,9 +734,9 @@ pub fn place_with_guide(
         let large_place = nplace >= 256;
         if large_place {
             eprintln!(
-                    "diagnostic place_affinity_cap lutffs={} (budgeted IMUX legalize after affinity; placement kept)",
-                    nplace
-                );
+                "diagnostic place_affinity_cap lutffs={} (budgeted IMUX legalize after affinity; placement kept)",
+                nplace
+            );
         }
         let t_leg = std::time::Instant::now();
         // FM-HEL-TOP: bidirectional IMUX legalization — pull sinks toward
@@ -924,10 +924,10 @@ pub fn place_with_guide(
         for _pass in 0..pass_limit {
             if large_place && t_leg.elapsed().as_millis() >= LARGE_LEGALIZE_MS {
                 eprintln!(
-                        "diagnostic place_legalize_budget lutffs={} ms={} (wall; affinity+partial legalize kept)",
-                        nplace,
-                        t_leg.elapsed().as_millis()
-                    );
+                    "diagnostic place_legalize_budget lutffs={} ms={} (wall; affinity+partial legalize kept)",
+                    nplace,
+                    t_leg.elapsed().as_millis()
+                );
                 break;
             }
             // Rebuild remaining illegal arcs; empty set → done (no full re-scan work).
@@ -1053,7 +1053,7 @@ pub fn place_with_guide(
                             }
                         }
                     }
-                    if best_swap.as_ref().map(|b| b.3 .0) == Some(0) {
+                    if best_swap.as_ref().map(|b| b.3.0) == Some(0) {
                         break;
                     }
                 }
@@ -1225,7 +1225,7 @@ pub fn place_with_guide(
                             }
                         }
                     }
-                    if best_swap.as_ref().map(|b| b.3 .0) == Some(0) {
+                    if best_swap.as_ref().map(|b| b.3.0) == Some(0) {
                         break;
                     }
                 }
@@ -1257,8 +1257,8 @@ pub fn place_with_guide(
         }
         if moved > 0 || swapped > 0 || driver_moved > 0 || driver_swapped > 0 {
             eprintln!(
-                    "hang_bileg place imux_legalize sink_moved={moved} sink_swapped={swapped} drv_moved={driver_moved} drv_swapped={driver_swapped}"
-                );
+                "hang_bileg place imux_legalize sink_moved={moved} sink_swapped={swapped} drv_moved={driver_moved} drv_swapped={driver_swapped}"
+            );
         }
         eprintln!(
             "hang_diag place legalize ms={}",

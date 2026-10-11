@@ -10,7 +10,8 @@ fn example(name: &str) -> PathBuf {
 #[test]
 fn serv_pin_wrap_clk_package_pin_and_ila() {
     let mut ide = IdeModel::new();
-    ide.open_source(&example("serv.prj")).expect("open serv.prj");
+    ide.open_source(&example("serv.prj"))
+        .expect("open serv.prj");
     ide.implement().expect("implement serv");
     let wns = ide.wns_ps().expect("WNS");
     eprintln!("SERV WNS_PS={wns}");

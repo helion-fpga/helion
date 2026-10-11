@@ -114,8 +114,7 @@ pub fn strip_ila(design: &mut Design, net: &str) {
     design.cells.retain(|c| !cells.iter().any(|n| n == &c.name));
     design.nets.retain(|n| !aux.iter().any(|a| a == &n.name));
     for n in &mut design.nets {
-        n.endpoints
-            .retain(|e| !cells.iter().any(|c| c == &e.cell));
+        n.endpoints.retain(|e| !cells.iter().any(|c| c == &e.cell));
     }
 }
 
@@ -131,10 +130,7 @@ pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    design.add_cell(
-        format!("ila_{net}"),
-        CellKind::Ila { net: net.into() },
-    );
+    design.add_cell(format!("ila_{net}"), CellKind::Ila { net: net.into() });
     // Buffer LUT: O = I0 → INIT 0xAAAA… so capture tracks the marked net.
     design.add_cell(
         format!("ila_{net}_lut"),
@@ -160,7 +156,10 @@ pub fn insert_marked(design: &mut Design) -> Result<usize, String> {
     Ok(nets.len())
 }
 
-pub fn compile(dev: &Device, design: &Design) -> Result<(helion_route::Routed, helion_bits::Bitstream), String> {
+pub fn compile(
+    dev: &Device,
+    design: &Design,
+) -> Result<(helion_route::Routed, helion_bits::Bitstream), String> {
     let packed = pack(design, dev)?;
     let placed = place(&packed, dev)?;
     let routed = route(&placed, dev)?;
@@ -236,7 +235,6 @@ pub fn insert_capture_bram(design: &mut Design, words: usize) -> Result<(), Stri
     Ok(())
 }
 
-
 /// LUT6 INIT for match unit: I0=probe, I1=prev (unused inputs assumed 0).
 /// Rising = I0 & ~I1 → 0x2222…; Falling = ~I0 & I1 → 0x4444…; Immediate = 1.
 pub fn match_unit_init(kind: IlaTriggerKind) -> u64 {
@@ -259,10 +257,11 @@ fn match_unit_cell_names() -> [&'static str; 4] {
 pub fn strip_match_unit(design: &mut Design) {
     let names = match_unit_cell_names();
     design.cells.retain(|c| !names.iter().any(|n| *n == c.name));
-    design.nets.retain(|n| n.name != MATCH_HIT_NET && n.name != MATCH_PREV_NET && n.name != "ila_match_delay_d");
+    design.nets.retain(|n| {
+        n.name != MATCH_HIT_NET && n.name != MATCH_PREV_NET && n.name != "ila_match_delay_d"
+    });
     for n in &mut design.nets {
-        n.endpoints
-            .retain(|e| !names.iter().any(|c| *c == e.cell));
+        n.endpoints.retain(|e| !names.iter().any(|c| *c == e.cell));
     }
 }
 
@@ -414,11 +413,7 @@ pub fn insert_arm_capture_deep(
     {
         return Err("ILA deep did not pack match-unit LUT".into());
     }
-    if !d
-        .cells
-        .iter()
-        .any(|c| c.name == TRIG_FSM_CELL)
-    {
+    if !d.cells.iter().any(|c| c.name == TRIG_FSM_CELL) {
         return Err("ILA deep missing ila_trig_fsm IP marker".into());
     }
     let bram_major = routed
@@ -440,11 +435,7 @@ pub fn insert_arm_capture_deep(
     for n in &cfg.nets {
         sites.push(probe_site(&routed.placed, design, n)?);
     }
-    let trig_idx = cfg
-        .nets
-        .iter()
-        .position(|n| n == &cfg.trigger_net)
-        .unwrap();
+    let trig_idx = cfg.nets.iter().position(|n| n == &cfg.trigger_net).unwrap();
 
     // Capture + upload share one TAP fabric so IR_USR1 DR sees the same BRAM bank.
     let mut tap = Tap::new(dev);
@@ -592,9 +583,11 @@ fn probe_site(
             .ok_or_else(|| format!("ILA: no site for q_net {net}"));
     }
     // PAD / port net: follow IOB I ← from_net → that LUTFF's Q.
-    if let Some(iob) = packed.iobs.iter().find(|iob| {
-        design.net_on(&iob.cell, "PAD") == Some(net)
-    }) {
+    if let Some(iob) = packed
+        .iobs
+        .iter()
+        .find(|iob| design.net_on(&iob.cell, "PAD") == Some(net))
+    {
         if let Some(i) = packed.lutffs.iter().position(|l| l.q_net == iob.from_net) {
             return placed
                 .lutff_sites
@@ -649,7 +642,11 @@ mod tests {
         let mut d = Design::structural_blinky();
         d.mark_debug("q").unwrap();
         assert_eq!(insert_marked(&mut d).unwrap(), 1);
-        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Ila { .. })));
+        assert!(
+            d.cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Ila { .. }))
+        );
     }
 
     #[test]
@@ -659,9 +656,21 @@ mod tests {
         let c0 = insert_arm_capture(&dev, &d, "q0", 16).unwrap();
         let c3 = insert_arm_capture(&dev, &d, "q3", 16).unwrap();
         let led = insert_arm_capture(&dev, &d, "led", 16).unwrap();
-        let b0: String = c0.samples.iter().map(|b| if *b { '1' } else { '0' }).collect();
-        let b3: String = c3.samples.iter().map(|b| if *b { '1' } else { '0' }).collect();
-        let bl: String = led.samples.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        let b0: String = c0
+            .samples
+            .iter()
+            .map(|b| if *b { '1' } else { '0' })
+            .collect();
+        let b3: String = c3
+            .samples
+            .iter()
+            .map(|b| if *b { '1' } else { '0' })
+            .collect();
+        let bl: String = led
+            .samples
+            .iter()
+            .map(|b| if *b { '1' } else { '0' })
+            .collect();
         assert_eq!(b0, "1010101010101010", "LSB toggles every cycle: {b0}");
         assert_eq!(b3, "0000000111111110", "MSB matches gold LED stream: {b3}");
         assert_eq!(bl, b3, "PAD led follows q3 driver");
@@ -680,11 +689,17 @@ mod tests {
                 .iter()
                 .any(|c| matches!(&c.kind, CellKind::Ila { net } if net == "q3"))
         );
-        let cap = insert_arm_capture(&dev, &d, "q3", 16).expect(
-            "mark_debug → arm must capture; must not Err(bitstream unchanged)",
+        let cap = insert_arm_capture(&dev, &d, "q3", 16)
+            .expect("mark_debug → arm must capture; must not Err(bitstream unchanged)");
+        let bits: String = cap
+            .samples
+            .iter()
+            .map(|b| if *b { '1' } else { '0' })
+            .collect();
+        assert_eq!(
+            bits, "0000000111111110",
+            "MSB gold after pre-insert: {bits}"
         );
-        let bits: String = cap.samples.iter().map(|b| if *b { '1' } else { '0' }).collect();
-        assert_eq!(bits, "0000000111111110", "MSB gold after pre-insert: {bits}");
     }
 
     #[test]
@@ -717,8 +732,15 @@ mod tests {
         assert_eq!(deep.backend, "jtag_usr1_match_fsm_rle");
         assert_eq!(deep.probes, vec!["q3".to_string()]);
         assert_eq!(deep.trigger_at, Some(0));
-        let deep_bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
-        assert_eq!(deep_bits, soft_bits, "deep immediate must match soft ble_out gold");
+        let deep_bits: String = deep
+            .samples
+            .iter()
+            .map(|s| if s[0] { '1' } else { '0' })
+            .collect();
+        assert_eq!(
+            deep_bits, soft_bits,
+            "deep immediate must match soft ble_out gold"
+        );
     }
 
     #[test]
@@ -734,8 +756,16 @@ mod tests {
         };
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
         assert_eq!(deep.probes.len(), 2);
-        let b0: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
-        let b3: String = deep.samples.iter().map(|s| if s[1] { '1' } else { '0' }).collect();
+        let b0: String = deep
+            .samples
+            .iter()
+            .map(|s| if s[0] { '1' } else { '0' })
+            .collect();
+        let b3: String = deep
+            .samples
+            .iter()
+            .map(|s| if s[1] { '1' } else { '0' })
+            .collect();
         assert_eq!(b0, "1010101010101010", "LSB: {b0}");
         assert_eq!(b3, "0000000111111110", "MSB: {b3}");
         // Bitstream-backed: capture BRAM major is programmed.
@@ -756,12 +786,13 @@ mod tests {
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
         assert_eq!(deep.pre_trigger, 4);
         assert_eq!(deep.samples.len(), 16);
-        let bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
+        let bits: String = deep
+            .samples
+            .iter()
+            .map(|s| if s[0] { '1' } else { '0' })
+            .collect();
         let at = deep.trigger_at.expect("rising trigger_at");
-        assert!(
-            at >= 1 && at < bits.len(),
-            "trigger_at={at} bits={bits}"
-        );
+        assert!(at >= 1 && at < bits.len(), "trigger_at={at} bits={bits}");
         assert_eq!(&bits[at - 1..at + 1], "01", "edge at trigger_at: {bits}");
         // Pre-trigger samples should be mostly 0s leading into the rise.
         let pre = &bits[..at];
@@ -783,7 +814,11 @@ mod tests {
         let cfg = IlaArmConfig::single("q3", 16);
         let deep = insert_arm_capture_deep(&dev, &d, &cfg).unwrap();
         assert_eq!(deep.backend, "jtag_usr1_match_fsm_rle");
-        let bits: String = deep.samples.iter().map(|s| if s[0] { '1' } else { '0' }).collect();
+        let bits: String = deep
+            .samples
+            .iter()
+            .map(|s| if s[0] { '1' } else { '0' })
+            .collect();
         assert_eq!(bits, "0000000111111110");
         assert!(
             deep.upload_dr_scans < deep.upload_raw_scans,
@@ -815,7 +850,10 @@ mod tests {
         assert!(d.cells.iter().any(|c| {
             matches!(&c.kind, CellKind::BlackBox { module } if module == "h_ila_trig")
         }));
-        assert_eq!(match_unit_init(IlaTriggerKind::Rising), 0x2222_2222_2222_2222);
+        assert_eq!(
+            match_unit_init(IlaTriggerKind::Rising),
+            0x2222_2222_2222_2222
+        );
         strip_match_unit(&mut d);
         assert!(!d.cells.iter().any(|c| c.name == "ila_match_lut"));
     }

@@ -43,7 +43,11 @@ fn field(out: &str, key: &str) -> String {
 fn reports_timing_util_power_bitstream_match_on_gold() {
     let bin = env!("CARGO_BIN_EXE_helion");
     let root = root();
-    for src in ["examples/counter.sv", "examples/blinky.sv", "examples/blinky.vhd"] {
+    for src in [
+        "examples/counter.sv",
+        "examples/blinky.sv",
+        "examples/blinky.vhd",
+    ] {
         let path = root.join(src);
         let out = Command::new(bin)
             .args(["reports", path.to_str().unwrap()])
@@ -69,7 +73,10 @@ fn reports_timing_util_power_bitstream_match_on_gold() {
             .split_whitespace()
             .filter_map(|t| t.strip_prefix("LUTFF="))
             .collect();
-        assert!(lut_used.len() >= 2, "util and power both print LUTFF: {text}");
+        assert!(
+            lut_used.len() >= 2,
+            "util and power both print LUTFF: {text}"
+        );
         let u0 = lut_used[0].split('/').next().unwrap();
         for u in &lut_used {
             assert_eq!(
@@ -135,7 +142,11 @@ end Behavioral;
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(out.status.success(), "{} reports failed: {text}", src.display());
+        assert!(
+            out.status.success(),
+            "{} reports failed: {text}",
+            src.display()
+        );
         assert!(
             text.contains("match=LUTFF,IOB,BRAM,DSP,TOTAL_UW"),
             "constructs must match reports: {text}"
@@ -220,7 +231,10 @@ fn qor_table_matches_readme() {
         .unwrap();
     let ro = String::from_utf8_lossy(&run.stdout);
     assert!(ro.contains("0000000111111110"), "counter LED gold: {ro}");
-    assert!(readme.contains("0000000111111110"), "README must publish the gold waveform");
+    assert!(
+        readme.contains("0000000111111110"),
+        "README must publish the gold waveform"
+    );
 }
 
 #[test]
@@ -234,7 +248,11 @@ fn qor_beats_previous_commit() {
             .args(["qor", path.to_str().unwrap()])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let o = String::from_utf8_lossy(&out.stdout);
 
         let luts: u32 = field(&o, "LUTFF=").parse().unwrap();

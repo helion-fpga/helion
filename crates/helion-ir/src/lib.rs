@@ -22,7 +22,6 @@ impl Attrs {
     }
 }
 
-
 /// Source location for a SOFT diagnostic (FM-HEL-L3). Prefer file+line; columns optional.
 /// Elaborators (SV/VHDL) fill what they know; unknown fields stay `None`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -232,7 +231,6 @@ pub const INC4_INIT: [u64; 4] = [
     0x7F80_7F80_7F80_7F80,
 ];
 
-
 /// Fast (cell, pin) → net lookup built by [`Design::pin_index`].
 pub struct PinIndex<'a> {
     pin_to_net: HashMap<(&'a str, &'a str), &'a str>,
@@ -385,7 +383,12 @@ impl Design {
         });
     }
 
-    pub fn connect(&mut self, net: impl Into<String>, cell: impl Into<String>, pin: impl Into<String>) {
+    pub fn connect(
+        &mut self,
+        net: impl Into<String>,
+        cell: impl Into<String>,
+        pin: impl Into<String>,
+    ) {
         let net_name = net.into();
         self.ensure_net_ix();
         let cell = cell.into();
@@ -419,7 +422,8 @@ impl Design {
 
     /// O(|endpoints|) index for repeated `net_on` (Ibex-scale pack).
     pub fn pin_index(&self) -> PinIndex<'_> {
-        let mut pin_to_net = HashMap::with_capacity(self.nets.iter().map(|n| n.endpoints.len()).sum());
+        let mut pin_to_net =
+            HashMap::with_capacity(self.nets.iter().map(|n| n.endpoints.len()).sum());
         for n in &self.nets {
             for e in &n.endpoints {
                 pin_to_net.insert((e.cell.as_str(), e.pin.as_str()), n.name.as_str());
@@ -458,7 +462,12 @@ impl Design {
         self.ports.iter_mut().find(|p| p.name == name)
     }
 
-    pub fn set_cell_attr(&mut self, cell: &str, k: &str, v: impl Into<String>) -> Result<(), String> {
+    pub fn set_cell_attr(
+        &mut self,
+        cell: &str,
+        k: &str,
+        v: impl Into<String>,
+    ) -> Result<(), String> {
         self.cell_mut(cell)
             .ok_or_else(|| format!("no cell {cell}"))?
             .attrs
@@ -474,7 +483,12 @@ impl Design {
         Ok(())
     }
 
-    pub fn set_port_attr(&mut self, port: &str, k: &str, v: impl Into<String>) -> Result<(), String> {
+    pub fn set_port_attr(
+        &mut self,
+        port: &str,
+        k: &str,
+        v: impl Into<String>,
+    ) -> Result<(), String> {
         self.port_mut(port)
             .ok_or_else(|| format!("no port {port}"))?
             .attrs
@@ -608,12 +622,7 @@ impl Design {
         d.add_port("clk", PortDir::In);
         d.add_port("led", PortDir::Out);
         for i in 0..4 {
-            d.add_cell(
-                format!("u_lut{i}"),
-                CellKind::Lut6 {
-                    init: INC4_INIT[i],
-                },
-            );
+            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init: INC4_INIT[i] });
             d.add_cell(format!("u_ff{i}"), CellKind::Hff);
             d.connect("clk", format!("u_ff{i}"), "CLK");
             d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
@@ -892,7 +901,10 @@ mod tests {
     fn blinky_has_lut_ff_iob() {
         let d = Design::structural_blinky();
         assert_eq!(d.cells.len(), 3);
-        assert!(matches!(d.cell("u_lut").unwrap().kind, CellKind::Lut6 { .. }));
+        assert!(matches!(
+            d.cell("u_lut").unwrap().kind,
+            CellKind::Lut6 { .. }
+        ));
         assert!(matches!(d.cell("u_ff").unwrap().kind, CellKind::Hff));
     }
 
@@ -931,29 +943,67 @@ mod tests {
         assert_eq!(back.lut_inits(), d.lut_inits());
         assert!(back.net("q").unwrap().attrs.flag("mark_debug"));
         assert!(back.cell("u_lut").unwrap().attrs.flag("DONT_TOUCH"));
-        assert_eq!(back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("LOC"), Some("IOB_X2Y0"));
         assert_eq!(
-            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("IOSTANDARD"),
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("LOC"),
+            Some("IOB_X2Y0")
+        );
+        assert_eq!(
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("IOSTANDARD"),
             Some("LVCMOS18")
         );
         assert_eq!(
-            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("DRIVE"),
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("DRIVE"),
             Some("12")
         );
         assert_eq!(
-            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("SLEW"),
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("SLEW"),
             Some("SLOW")
         );
         assert_eq!(
-            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("PULLTYPE"),
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("PULLTYPE"),
             Some("NONE")
         );
         assert_eq!(
-            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("DIFF_TERM"),
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("DIFF_TERM"),
             Some("FALSE")
         );
         assert_eq!(
-            back.ports.iter().find(|p| p.name == "led").unwrap().attrs.get("IN_TERM"),
+            back.ports
+                .iter()
+                .find(|p| p.name == "led")
+                .unwrap()
+                .attrs
+                .get("IN_TERM"),
             Some("NONE")
         );
         assert_eq!(back.net_on("u_lut", "I0"), Some("q"));
@@ -965,14 +1015,17 @@ mod tests {
         let mut top = Design::new("top");
         top.add_port("clk", PortDir::In);
         top.add_port("led", PortDir::Out);
-        top.instantiate("u0", child, &[("clk".into(), "clk".into()), ("led".into(), "led".into())]);
+        top.instantiate(
+            "u0",
+            child,
+            &[("clk".into(), "clk".into()), ("led".into(), "led".into())],
+        );
         assert!(top.cell("u0_u_lut").is_some());
         assert!(top.cell("u_lut").is_none());
         assert_eq!(top.instances[0].module, "blinky");
         assert!(top.cells.len() >= 3);
     }
 }
-
 
 #[cfg(test)]
 mod soft_diag_tests {

@@ -45,7 +45,11 @@ impl Sim {
         let mut lut_pins: HashMap<String, Vec<(u8, String)>> = HashMap::new();
         let mut ff_d_lut = HashMap::new();
         for n in &d.nets {
-            let ff_q = n.endpoints.iter().find(|e| e.pin == "Q").map(|e| e.cell.clone());
+            let ff_q = n
+                .endpoints
+                .iter()
+                .find(|e| e.pin == "Q")
+                .map(|e| e.cell.clone());
             for e in &n.endpoints {
                 if let Some(rest) = e.pin.strip_prefix('I') {
                     if let (Ok(pin), Some(ff)) = (rest.parse::<u8>(), ff_q.as_ref()) {
@@ -387,7 +391,10 @@ mod tests {
         z.connect("q", "u_lut", "I0");
         z.connect("q", "u_iob", "I");
         let w = run_tb(&z, 4);
-        assert!(w.iter().all(|&b| !b), "const0 LUT must not toggle LED: {w:?}");
+        assert!(
+            w.iter().all(|&b| !b),
+            "const0 LUT must not toggle LED: {w:?}"
+        );
     }
 
     #[test]
@@ -421,11 +428,13 @@ mod tests {
         s.step_posedge(10);
         let loc = s.locals();
         assert!(
-            loc.iter().any(|l| l.name == "led" && l.kind == "port" && (l.value == "0" || l.value == "1")),
+            loc.iter()
+                .any(|l| l.name == "led" && l.kind == "port" && (l.value == "0" || l.value == "1")),
             "{loc:?}"
         );
         assert!(
-            loc.iter().any(|l| l.kind == "reg" && (l.value == "0" || l.value == "1")),
+            loc.iter()
+                .any(|l| l.kind == "reg" && (l.value == "0" || l.value == "1")),
             "{loc:?}"
         );
         assert_eq!(s.signal_value("led"), Some(u64::from(s.led)));
@@ -537,9 +546,15 @@ mod tests {
         let pins: Vec<_> = (0..6u8)
             .filter(|p| d.net_on("u_lut5", &format!("I{p}")).is_some())
             .collect();
-        assert_eq!(pins, vec![0, 1, 2, 3, 4, 5], "MSB incrementer must use all 6 LUT pins");
+        assert_eq!(
+            pins,
+            vec![0, 1, 2, 3, 4, 5],
+            "MSB incrementer must use all 6 LUT pins"
+        );
         match lut5.kind {
-            CellKind::Lut6 { init } => assert_ne!(init, 0x5555_5555_5555_5555, "not a 1-pin inverter"),
+            CellKind::Lut6 { init } => {
+                assert_ne!(init, 0x5555_5555_5555_5555, "not a 1-pin inverter")
+            }
             _ => panic!("lut"),
         }
         let ev = run_tb(&d, 64);
@@ -557,12 +572,16 @@ mod tests {
         let fab = fabric_wave(&c, 16);
         assert_eq!(ev, fab, "counter event vs fabric {ev:?} {fab:?}");
 
-        let hier = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/hier.sv");
+        let hier =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/hier.sv");
         let src = std::fs::read_to_string(&hier).unwrap();
         let d = helion_sv::synth_sv(&src, "hier.sv").unwrap();
         let evh = run_tb(&d, 8);
         let fabh = fabric_wave(&d, 8);
         assert_eq!(evh, fabh, "hier event vs fabric {evh:?} {fabh:?}");
-        assert!(evh.contains(&true) && evh.contains(&false), "hier must toggle {evh:?}");
+        assert!(
+            evh.contains(&true) && evh.contains(&false),
+            "hier must toggle {evh:?}"
+        );
     }
 }

@@ -7,3 +7,10 @@ license.workspace = true
 [dependencies]
 helion-ir = { workspace = true }
 helion-device = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+helion-sv = { workspace = true }
+[[bench]]
+name = "pack"
+harness = false
