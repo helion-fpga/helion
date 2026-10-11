@@ -121,7 +121,7 @@ fn compile_design_xdc(
         t0.elapsed().as_millis()
     );
     let t1 = std::time::Instant::now();
-    let placed = place_with(&packed, &dev, PlaceOpts { timing_weight })?;
+    let placed = place_with(&packed, &dev, PlaceOpts { timing_weight, seed: 0 })?;
     eprintln!(
         "hang_diag place lutff_sites={} ms={}",
         placed.lutff_sites.len(),

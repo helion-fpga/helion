@@ -11,6 +11,22 @@ mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
 mod aig_opt;
 
+thread_local! {
+    /// ABC-style AIG rewriting during LUT mapping (area campaign, v2.1).
+    /// Default on. Design runs toggle this per run via [`set_aig_rewrite`].
+    static AIG_REWRITE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Enable/disable AIG cut rewriting for synthesis on this thread.
+/// Thread-local: the design-runs worker sets it around its own synth call.
+pub fn set_aig_rewrite(on: bool) {
+    AIG_REWRITE_ON.with(|c| c.set(on));
+}
+
+fn aig_rewrite_on() -> bool {
+    AIG_REWRITE_ON.with(|c| c.get())
+}
+
 use helion_ir::{Cell, CellKind, Design, Endpoint, Net, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::borrow::Borrow;
@@ -11691,8 +11707,13 @@ fn emit_aig_node(
 fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> String {
     // FM-HEL-AREA-04: ABC-style cut rewriting before mapping. This emitter
     // turns AND nodes into LUT6s, so fewer ANDs means fewer LUTs.
-    let rewritten = aig_opt::rewrite_aig(aig);
-    let aig = &rewritten;
+    // Toggleable via set_aig_rewrite (design runs); default on.
+    let rewritten = if aig_rewrite_on() {
+        Some(aig_opt::rewrite_aig(aig))
+    } else {
+        None
+    };
+    let aig: &Aig = rewritten.as_ref().unwrap_or(aig);
     let n_pi = aig.pis.len();
     let n_and = aig.ands.len();
     let (fo, used_inv) = aig_fanout(aig, &[aig.output]);
@@ -11775,7 +11796,11 @@ fn map_wide_cones(
 ) -> Vec<String> {
     assert_eq!(cones.len(), req_names.len());
     let (merged, merged_outs) = aig_opt::merge_cones(cones);
-    let (aig, outs) = aig_opt::rewrite_aig_multi(&merged, &merged_outs);
+    let (aig, outs) = if aig_rewrite_on() {
+        aig_opt::rewrite_aig_multi(&merged, &merged_outs)
+    } else {
+        (merged, merged_outs)
+    };
     let n_pi = aig.pis.len();
     let n_and = aig.ands.len();
     let (fo, used_inv) = aig_fanout(&aig, &outs);

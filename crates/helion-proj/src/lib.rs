@@ -47,10 +47,9 @@ impl ImplStrategy {
 
     pub fn place_opts(self) -> PlaceOpts {
         match self {
-            Self::RuntimeOpt => PlaceOpts { timing_weight: 0.0 },
+            Self::RuntimeOpt => PlaceOpts { timing_weight: 0.0, seed: 0 },
             _ => PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         }
     }
 
@@ -90,6 +89,173 @@ impl ImplStrategy {
 impl Default for ImplStrategy {
     fn default() -> Self {
         Self::Default
+    }
+}
+
+/// Design-run strategy: the full knob set for one implementation run.
+///
+/// Presets mirror the legacy [`ImplStrategy`] labels; every knob is also
+/// individually settable ("Custom"). Serializes to a compact spec string
+/// for `.prj` persistence (`RunStrategy::to_spec` / `parse_spec`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunStrategy {
+    /// Preset label: Default | TimingExplore | RuntimeOpt | PhysOpt | Custom.
+    pub preset: String,
+    /// 0 = skip `opt_design` (peephole LUT opts); >=1 = run it.
+    pub opt_level: u8,
+    /// Re-synthesize this run with ABC-style AIG rewriting.
+    pub aig_rewrite: bool,
+    /// Placer `timing_weight` 0.75 (on) / 0.0 (off).
+    pub timing_driven: bool,
+    /// Placer perturbation seed (0 = legacy deterministic order).
+    pub placer_seed: u64,
+    /// Router PathFinder iterations (`RouteOpts.max_iters`).
+    pub router_iters: u32,
+    /// Router extra IOB hops — phys-opt detours (`RouteOpts.extra_hops` 8/0).
+    pub phys_opt: bool,
+}
+
+impl RunStrategy {
+    fn knobs(
+        preset: &str,
+        opt_level: u8,
+        aig_rewrite: bool,
+        timing_driven: bool,
+        placer_seed: u64,
+        router_iters: u32,
+        phys_opt: bool,
+    ) -> Self {
+        Self {
+            preset: preset.into(),
+            opt_level,
+            aig_rewrite,
+            timing_driven,
+            placer_seed,
+            router_iters,
+            phys_opt,
+        }
+    }
+
+    /// Named preset. Unknown names are an error (use "Custom" + edits).
+    pub fn preset(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" | "impl_1" => Ok(Self::knobs("Default", 1, true, true, 0, 8, false)),
+            "timingexplore" | "timing_explore" | "explore" => {
+                Ok(Self::knobs("TimingExplore", 1, true, true, 0, 16, false))
+            }
+            "runtimeopt" | "runtime_opt" | "runtime" => {
+                Ok(Self::knobs("RuntimeOpt", 0, false, false, 0, 1, false))
+            }
+            "physopt" | "phys_opt" | "phys" => Ok(Self::knobs("PhysOpt", 1, true, true, 0, 8, true)),
+            "custom" => Ok(Self::knobs("Custom", 1, true, true, 0, 8, false)),
+            other => Err(format!("unknown run strategy preset {other}")),
+        }
+    }
+
+    /// Legacy [`ImplStrategy`] → knob set (keeps old `launch_runs` semantics).
+    pub fn from_impl_strategy(s: ImplStrategy) -> Self {
+        match s {
+            ImplStrategy::Default | ImplStrategy::TimingExplore => {
+                Self::knobs(s.label(), 1, true, true, 0, 8, false)
+            }
+            ImplStrategy::RuntimeOpt => Self::knobs(s.label(), 0, false, false, 0, 1, false),
+            ImplStrategy::PhysOpt => Self::knobs(s.label(), 1, true, true, 0, 8, true),
+        }
+    }
+
+    pub fn place_opts(&self) -> helion_place::PlaceOpts {
+        helion_place::PlaceOpts {
+            timing_weight: if self.timing_driven { 0.75 } else { 0.0 },
+            seed: self.placer_seed,
+        }
+    }
+
+    pub fn route_opts(&self) -> helion_route::RouteOpts {
+        helion_route::RouteOpts {
+            max_iters: self.router_iters,
+            extra_hops: if self.phys_opt { 8 } else { 0 },
+        }
+    }
+
+    /// Compact spec: `Preset:opt=1,aig=on,timing=on,seed=0,route_iters=8,phys=off`.
+    pub fn to_spec(&self) -> String {
+        let onoff = |b: bool| if b { "on" } else { "off" };
+        format!(
+            "{}:opt={},aig={},timing={},seed={},route_iters={},phys={}",
+            self.preset,
+            self.opt_level,
+            onoff(self.aig_rewrite),
+            onoff(self.timing_driven),
+            self.placer_seed,
+            self.router_iters,
+            onoff(self.phys_opt),
+        )
+    }
+
+    /// Parse [`to_spec`](Self::to_spec); a bare preset name also parses.
+    /// Unknown keys are an error — specs must round-trip exactly.
+    pub fn parse_spec(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty strategy spec".into());
+        }
+        if !s.contains(':') && !s.contains('=') {
+            return Self::preset(s);
+        }
+        let (preset, rest) = s
+            .split_once(':')
+            .ok_or_else(|| format!("bad strategy spec {s}"))?;
+        let mut out = Self::preset(preset)?;
+        out.preset = preset.trim().to_string();
+        if out.preset.eq_ignore_ascii_case("custom") {
+            out.preset = "Custom".into();
+        }
+        for kv in rest.split(',') {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| format!("bad strategy spec pair {kv}"))?;
+            match k.trim() {
+                "opt" => {
+                    out.opt_level = v
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("bad opt level {v}"))?
+                }
+                "aig" => out.aig_rewrite = parse_onoff(v)?,
+                "timing" => out.timing_driven = parse_onoff(v)?,
+                "seed" => {
+                    out.placer_seed =
+                        v.trim().parse().map_err(|_| format!("bad seed {v}"))?
+                }
+                "route_iters" => {
+                    out.router_iters =
+                        v.trim().parse().map_err(|_| format!("bad route_iters {v}"))?
+                }
+                "phys" => out.phys_opt = parse_onoff(v)?,
+                other => return Err(format!("unknown strategy spec key {other}")),
+            }
+        }
+        // Edited knobs stop being the preset.
+        let canonical = Self::preset(&out.preset).map(|p| {
+            p.opt_level == out.opt_level
+                && p.aig_rewrite == out.aig_rewrite
+                && p.timing_driven == out.timing_driven
+                && p.placer_seed == out.placer_seed
+                && p.router_iters == out.router_iters
+                && p.phys_opt == out.phys_opt
+        });
+        if canonical != Ok(true) {
+            out.preset = "Custom".into();
+        }
+        Ok(out)
+    }
+}
+
+fn parse_onoff(v: &str) -> Result<bool, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Ok(true),
+        "off" | "0" | "false" | "no" => Ok(false),
+        other => Err(format!("bad on/off value {other}")),
     }
 }
 
@@ -412,6 +578,27 @@ impl Session {
         Ok(())
     }
 
+    /// Full implementation honoring every [`RunStrategy`] knob.
+    ///
+    /// Assumes `design` is already synthesized; the caller (design-runs worker)
+    /// sets the thread-local AIG-rewrite flag around synthesis itself, since
+    /// AIG rewriting happens during LUT mapping. `opt_level == 0` skips the
+    /// peephole `opt_design` pass; `placer_seed` perturbs the placement order
+    /// for seed sweeps.
+    pub fn impl_with_run_strategy(
+        &mut self,
+        dev: &Device,
+        strategy: &RunStrategy,
+    ) -> Result<(), String> {
+        if strategy.opt_level >= 1 {
+            let _ = self.opt_design_step()?;
+        }
+        self.place_design_with(dev, strategy.place_opts())?;
+        self.route_design_with(dev, strategy.route_opts())?;
+        self.write_bitstream(dev)?;
+        Ok(())
+    }
+
     /// UG986 Lab 2: place the current netlist reusing `prev` sites for named cells.
     pub fn incremental_place(
         &mut self,
@@ -425,8 +612,7 @@ impl Session {
             dev,
             prev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )?;
         let prev_cells: std::collections::HashSet<&str> = prev
             .packed
@@ -756,8 +942,7 @@ impl Session {
         s.strategy = ck.strategy;
         s.pblock = ck.pblock.clone();
         s.place_opts = PlaceOpts {
-            timing_weight: ck.timing_weight,
-        };
+            timing_weight: ck.timing_weight, seed: 0 };
         s.route_opts = RouteOpts {
             max_iters: ck.route_max_iters,
             extra_hops: ck.route_extra_hops,
@@ -975,8 +1160,7 @@ fn decode_impl_knobs(
     let max_iters = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
     let extra_hops = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
     let place_opts = PlaceOpts {
-        timing_weight: milli as f64 / 1000.0,
-    };
+        timing_weight: milli as f64 / 1000.0, seed: 0 };
     let route_opts = RouteOpts {
         max_iters,
         extra_hops,
@@ -1206,6 +1390,24 @@ impl PrjPblock {
 pub struct PrjImplRun {
     pub name: String,
     pub strategy: String,
+    /// Full [`RunStrategy`] spec (`Preset:opt=…,aig=…,…`). Empty = derive
+    /// from the legacy `strategy` preset name (pre-v2.2 project files).
+    pub spec: String,
+}
+
+impl PrjImplRun {
+    /// Effective strategy: full spec when present, else legacy preset name.
+    pub fn run_strategy(&self) -> RunStrategy {
+        if self.spec.trim().is_empty() {
+            RunStrategy::preset(&self.strategy).unwrap_or_else(|_| {
+                RunStrategy::knobs("Custom", 1, true, true, 0, 8, false)
+            })
+        } else {
+            RunStrategy::parse_spec(&self.spec).unwrap_or_else(|_| {
+                RunStrategy::knobs("Custom", 1, true, true, 0, 8, false)
+            })
+        }
+    }
 }
 
 /// Drop const-0 LUT+FF pairs that do not drive an IOB.
@@ -1261,17 +1463,26 @@ fn prj_token_is_helper(s: &str) -> bool {
     )
 }
 
-fn upsert_impl_run(p: &mut ProjectFile, name: &str, strategy: Option<&str>) {
+fn upsert_impl_run(p: &mut ProjectFile, name: &str, strategy: Option<&str>, spec: Option<&str>) {
     if let Some(r) = p.impl_runs.iter_mut().find(|r| r.name == name) {
         if let Some(s) = strategy {
             r.strategy = s.to_string();
+        }
+        if let Some(sp) = spec {
+            r.spec = sp.to_string();
         }
     } else {
         p.impl_runs.push(PrjImplRun {
             name: name.to_string(),
             strategy: strategy.unwrap_or("Default").to_string(),
+            spec: spec.unwrap_or("").to_string(),
         });
     }
+}
+
+/// Back-compat wrapper: legacy `create_run <name> -strategy <preset>`.
+fn upsert_impl_run_legacy(p: &mut ProjectFile, name: &str, strategy: Option<&str>) {
+    upsert_impl_run(p, name, strategy, None);
 }
 
 fn pblock_named_mut<'a>(p: &'a mut ProjectFile, name: &str) -> &'a mut PrjPblock {
@@ -1521,12 +1732,18 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                 let rest: Vec<&str> = toks.collect();
                 let mut name = String::new();
                 let mut strategy = String::from("Default");
+                let mut spec: Option<String> = None;
                 let mut i = 0;
                 while i < rest.len() {
                     if rest[i] == "-strategy" || rest[i] == "-strat" {
                         i += 1;
                         if i < rest.len() {
                             strategy = rest[i].to_string();
+                        }
+                    } else if rest[i] == "-spec" {
+                        i += 1;
+                        if i < rest.len() {
+                            spec = Some(rest[i].to_string());
                         }
                     } else if name.is_empty() && !rest[i].starts_with('-') {
                         name = rest[i]
@@ -1536,14 +1753,14 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     i += 1;
                 }
                 if !name.is_empty() {
-                    upsert_impl_run(&mut p, &name, Some(&strategy));
+                    upsert_impl_run(&mut p, &name, Some(&strategy), spec.as_deref());
                 }
             }
             "launch_runs" => {
                 if let Some(name) = toks.next() {
                     let name = name.trim_matches(|c: char| "{}[]".contains(c));
                     if !name.is_empty() {
-                        upsert_impl_run(&mut p, name, None);
+                        upsert_impl_run_legacy(&mut p, name, None);
                     }
                 }
             }
@@ -1680,7 +1897,14 @@ pub fn format_prj(prj: &ProjectFile) -> String {
         } else {
             r.strategy.as_str()
         };
-        out.push_str(&format!("create_run {} -strategy {strat}\n", r.name));
+        if r.spec.trim().is_empty() {
+            out.push_str(&format!("create_run {} -strategy {strat}\n", r.name));
+        } else {
+            out.push_str(&format!(
+                "create_run {} -strategy {strat} -spec {}\n",
+                r.name, r.spec
+            ));
+        }
     }
     if let Some(ck) = &prj.checkpoint_path {
         out.push_str(&format!("write_checkpoint {ck}\n"));
@@ -2136,10 +2360,12 @@ write_checkpoint counter.hckp
                 PrjImplRun {
                     name: "impl_1".into(),
                     strategy: "Default".into(),
+                    spec: String::new(),
                 },
                 PrjImplRun {
                     name: "impl_runtime".into(),
                     strategy: "RuntimeOpt".into(),
+                    spec: String::new(),
                 },
             ]
         );
@@ -2453,7 +2679,8 @@ create_pblock pblock_0
         prj.impl_runs.push(PrjImplRun {
             name: "impl_1".into(),
             strategy: "RuntimeOpt".into(),
-        });
+                    spec: String::new(),
+                });
         let mut s = Session::new(Mode::Project);
         s.synth_design(Design::structural_counter());
         s.impl_project(&dev, &prj).unwrap();
