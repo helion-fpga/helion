@@ -7,7 +7,7 @@
 //! output anywhere in this file, so the widget layer (`helion-ide`) is a thin painter
 //! over this model and can be tested without a display.
 
-use crate::{GpuiShell, tcl_eval};
+use crate::{GpuiShell, ila, tcl_eval};
 use helion_bd::{BlockDesign, emit_sv, validate};
 use helion_debug::{
     IlaArmConfig, IlaCapture, IlaCaptureDeep, IlaTriggerKind, insert_arm_capture,
@@ -3655,6 +3655,421 @@ impl Default for IlaDashboard {
     }
 }
 
+/// Capture lifecycle for the simulation-based ILA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimIlaStatus {
+    Idle,
+    Capturing,
+    Done,
+    Error,
+}
+
+/// Simulation-based ILA (logic analyzer) state: probe setup, trigger config,
+/// background capture progress, last capture, and viewer state. The capture
+/// thread's result channel lives in the binary (`HelionIde::ila_rx`); only the
+/// progress atomics live here so `IdeModel` stays `Clone`.
+#[derive(Clone, Debug)]
+pub struct SimIla {
+    pub config: ila::IlaConfig,
+    pub capture: Option<ila::IlaCapture>,
+    pub status: SimIlaStatus,
+    pub progress: Option<std::sync::Arc<ila::IlaRunProgress>>,
+    /// Net search text in the probe picker.
+    pub search: String,
+    /// Per-probe checkbox for bus grouping.
+    pub group: Vec<bool>,
+    /// Trigger value/mask text fields (hex or decimal).
+    pub trig_value_text: String,
+    pub trig_mask_text: String,
+    /// Session path text field.
+    pub session_path: String,
+    /// New bus name text field for group-checked-as-bus.
+    pub bus_name: String,
+    pub viewer: ila::IlaViewer,
+    pub last_error: Option<String>,
+}
+
+impl Default for SimIla {
+    fn default() -> Self {
+        Self {
+            config: ila::IlaConfig::default(),
+            capture: None,
+            status: SimIlaStatus::Idle,
+            progress: None,
+            search: String::new(),
+            group: Vec::new(),
+            trig_value_text: "1".into(),
+            trig_mask_text: "0xFFFFFFFFFFFFFFFF".into(),
+            session_path: String::new(),
+            bus_name: String::new(),
+            viewer: ila::IlaViewer::fit(1024, 800.0),
+            last_error: None,
+        }
+    }
+}
+
+impl SimIla {
+    /// Nets available as probes: real net names, mark_debug first, then all.
+    pub fn probe_net_list(&self, design: &helion_ir::Design) -> Vec<String> {
+        let d = design;
+        let mut marked = d.marked_debug_nets();
+        marked.sort();
+        let mut rest: Vec<String> = d
+            .nets
+            .iter()
+            .map(|n| n.name.clone())
+            .filter(|n| !marked.contains(n))
+            .collect();
+        rest.sort();
+        marked.extend(rest);
+        let q = self.search.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            marked
+        } else {
+            marked
+                .into_iter()
+                .filter(|n| n.to_ascii_lowercase().contains(&q))
+                .collect()
+        }
+    }
+
+    /// Clock-domain candidates: ports/clocks plus HFF CLK nets.
+    pub fn clock_net_list(&self, design: &helion_ir::Design) -> Vec<String> {
+        let d = design;
+        let mut out: Vec<String> = d
+            .ports
+            .iter()
+            .filter(|p| p.name.to_ascii_lowercase().contains("clk"))
+            .map(|p| p.name.clone())
+            .collect();
+        let pin_ix = d.pin_index();
+        for c in &d.cells {
+            if matches!(c.kind, helion_ir::CellKind::Hff) {
+                if let Some(net) = pin_ix.net_on(&c.name, "CLK") {
+                    if !out.iter().any(|n| n == net) {
+                        out.push(net.to_string());
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push("clk".into());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    pub fn add_probe(&mut self, design: &helion_ir::Design, net: &str) -> Result<String, String> {
+        let net = net.trim();
+        if net.is_empty() {
+            return Err("ila_sim_add: empty net".into());
+        }
+        let d = design;
+        if self.config.probes.iter().any(|p| p.nets == [net]) {
+            return Ok(format!("ila probe {net} (already)"));
+        }
+        let probe = ila::IlaProbeCfg::scalar(net, net);
+        let mut cfg = self.config.clone();
+        cfg.probes.push(probe);
+        cfg.validate(&d)?;
+        self.config = cfg;
+        self.group.push(false);
+        Ok(format!("ila probe {net}"))
+    }
+
+    pub fn add_bus(&mut self, design: &helion_ir::Design, name: &str, nets: &[String]) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("ila_sim_bus: empty name".into());
+        }
+        if nets.is_empty() {
+            return Err("ila_sim_bus: no nets".into());
+        }
+        let d = design;
+        let probe = ila::IlaProbeCfg {
+            name: name.into(),
+            nets: nets.to_vec(),
+            radix: ila::IlaRadix::Hex,
+        };
+        let mut cfg = self.config.clone();
+        cfg.probes.push(probe);
+        cfg.validate(&d)?;
+        self.config = cfg;
+        self.group.push(false);
+        Ok(format!("ila bus {name} width={}", nets.len()))
+    }
+
+    pub fn remove_probe(&mut self, idx: usize) -> Result<String, String> {
+        if idx >= self.config.probes.len() {
+            return Err(format!("ila: no probe {idx}"));
+        }
+        let name = self.config.probes.remove(idx).name.clone();
+        if idx < self.group.len() {
+            self.group.remove(idx);
+        }
+        if self.config.trigger.probe >= self.config.probes.len() {
+            self.config.trigger.probe = 0;
+        }
+        Ok(format!("ila probe {name} removed"))
+    }
+
+    /// Group the checked probes into one bus (MSB = first checked).
+    pub fn group_checked_as_bus(&mut self, design: &helion_ir::Design, name: &str) -> Result<String, String> {
+        let picked: Vec<usize> = self
+            .group
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| **g)
+            .map(|(i, _)| i)
+            .collect();
+        if picked.len() < 2 {
+            return Err("ila: check at least 2 probes to group".into());
+        }
+        let name = if name.trim().is_empty() {
+            self.config.probes[picked[0]].name.clone()
+        } else {
+            name.trim().to_string()
+        };
+        let mut nets = Vec::new();
+        for &i in &picked {
+            nets.extend(self.config.probes[i].nets.iter().cloned());
+        }
+        let d = design;
+        let bus = ila::IlaProbeCfg {
+            name: name.clone(),
+            nets,
+            radix: ila::IlaRadix::Hex,
+        };
+        let mut cfg = self.config.clone();
+        for &i in picked.iter().rev() {
+            cfg.probes.remove(i);
+        }
+        cfg.probes.push(bus);
+        cfg.validate(&d)?;
+        self.config = cfg;
+        self.group = vec![false; self.config.probes.len()];
+        Ok(format!("ila bus {name}"))
+    }
+
+    pub fn set_trigger_kind(&mut self, kind: ila::IlaTriggerKind) -> Result<String, String> {
+        // The value/mask text fields stay the source of truth for value match;
+        // apply_trigger_value() parses them at arm/capture time. Never clobber
+        // user-entered text here.
+        self.config.trigger.kind = kind;
+        Ok(format!("ila trigger {}", kind.label()))
+    }
+
+    fn parse_u64(s: &str) -> Result<u64, String> {
+        let t = s.trim();
+        if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            u64::from_str_radix(h, 16).map_err(|_| format!("ila: bad hex {s}"))
+        } else {
+            t.parse::<u64>().map_err(|_| format!("ila: bad number {s}"))
+        }
+    }
+
+    /// Apply the trigger value/mask text fields to a value-match trigger.
+    pub fn apply_trigger_value(&mut self) -> Result<String, String> {
+        let value = Self::parse_u64(&self.trig_value_text)?;
+        let mask = Self::parse_u64(&self.trig_mask_text)?;
+        self.config.trigger.kind = ila::IlaTriggerKind::ValueMatch { value, mask };
+        Ok(format!("ila trigger value={value} mask=0x{mask:X}"))
+    }
+
+    pub fn set_trigger_probe(&mut self, idx: usize) -> Result<String, String> {
+        if idx >= self.config.probes.len() {
+            return Err(format!("ila: no probe {idx}"));
+        }
+        self.config.trigger.probe = idx;
+        Ok(format!("ila trigger probe {}", self.config.probes[idx].name))
+    }
+
+    pub fn status_text(&self) -> String {
+        let n = self.config.probes.len();
+        let trig = &self.config.trigger;
+        let tname = self
+            .config
+            .probes
+            .get(trig.probe)
+            .map(|p| p.name.as_str())
+            .unwrap_or("-");
+        let cap = match &self.capture {
+            Some(c) => format!(
+                "samples={} trigger={} cycles={}",
+                c.len(),
+                c.trigger_sample
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                c.cycles_run
+            ),
+            None => "samples=0".into(),
+        };
+        let prog = match (&self.status, &self.progress) {
+            (SimIlaStatus::Capturing, Some(p)) => {
+                use std::sync::atomic::Ordering;
+                format!(" progress_cycles={}", p.cycles.load(Ordering::Relaxed))
+            }
+            _ => String::new(),
+        };
+        format!(
+            "ila status={:?} probes={n} trigger={}@{tname} depth={} pre={}% clock={}{cap}{prog}{}",
+            self.status,
+            self.config.trigger.kind.label(),
+            self.config.depth,
+            (self.config.pre_ratio * 100.0).round() as u32,
+            self.config.clock_net,
+            match &self.last_error {
+                Some(e) => format!(" error={e}"),
+                None => String::new(),
+            }
+        )
+    }
+
+    /// Start a background capture. Returns the result receiver for the binary
+    /// to poll; progress atomics stay in `self.progress`.
+    pub fn start_capture(
+        &mut self,
+        design: &helion_ir::Design,
+    ) -> Result<std::sync::mpsc::Receiver<Result<ila::IlaCapture, String>>, String> {
+        self.apply_trigger_value_if_needed()?;
+        let d = design.clone();
+        self.config.validate(&d)?;
+        let handle = ila::spawn_sim_ila_capture(d, self.config.clone());
+        self.progress = Some(handle.progress);
+        self.status = SimIlaStatus::Capturing;
+        self.last_error = None;
+        Ok(handle.rx)
+    }
+
+    fn apply_trigger_value_if_needed(&mut self) -> Result<(), String> {
+        if matches!(
+            self.config.trigger.kind,
+            ila::IlaTriggerKind::ValueMatch { .. }
+        ) {
+            self.apply_trigger_value()?;
+        }
+        Ok(())
+    }
+
+    /// Merge a finished background capture (called by the binary's poll).
+    pub fn finish_capture(&mut self, r: Result<ila::IlaCapture, String>) {
+        match r {
+            Ok(cap) => {
+                self.viewer = ila::IlaViewer::fit(cap.len().max(1), 800.0);
+                if let Some(ti) = cap.trigger_sample {
+                    self.viewer.cursor = Some(ti);
+                }
+                self.capture = Some(cap);
+                self.status = SimIlaStatus::Done;
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.status = SimIlaStatus::Error;
+                self.last_error = Some(e);
+            }
+        }
+        self.progress = None;
+    }
+
+    /// Synchronous capture (headless / exec path). Prefer `start_capture` in UI.
+    pub fn capture_sync(&mut self, design: &helion_ir::Design) -> Result<String, String> {
+        self.apply_trigger_value_if_needed()?;
+        let d = design.clone();
+        let cap = ila::run_sim_ila_capture(&d, &self.config, &|_| {})?;
+        let msg = format!(
+            "ila capture probes={} samples={} trigger={} cycles={}",
+            cap.probes.len(),
+            cap.len(),
+            cap.trigger_sample
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into()),
+            cap.cycles_run
+        );
+        self.viewer = ila::IlaViewer::fit(cap.len().max(1), 800.0);
+        if let Some(ti) = cap.trigger_sample {
+            self.viewer.cursor = Some(ti);
+        }
+        self.capture = Some(cap);
+        self.status = SimIlaStatus::Done;
+        self.last_error = None;
+        Ok(msg)
+    }
+
+    pub fn default_session_path(&self, project_path: Option<&std::path::Path>) -> String {
+        if !self.session_path.trim().is_empty() {
+            return self.session_path.trim().to_string();
+        }
+        if let Some(p) = project_path {
+            if let Some(dir) = p.parent() {
+                return dir.join("ila_session.json").to_string_lossy().into_owned();
+            }
+        }
+        "ila_session.json".to_string()
+    }
+
+    pub fn save_session(
+        &mut self,
+        project_path: Option<&std::path::Path>,
+        path: &str,
+    ) -> Result<String, String> {
+        let path = if path.trim().is_empty() {
+            self.default_session_path(project_path)
+        } else {
+            path.trim().to_string()
+        };
+        let s = ila::IlaSession::new(self.config.clone(), self.capture.clone());
+        ila::save_session(std::path::Path::new(&path), &s)?;
+        self.session_path = path.clone();
+        Ok(format!("ila session saved {path}"))
+    }
+
+    pub fn load_session(
+        &mut self,
+        design: Option<&helion_ir::Design>,
+        project_path: Option<&std::path::Path>,
+        path: &str,
+    ) -> Result<String, String> {
+        let path = if path.trim().is_empty() {
+            self.default_session_path(project_path)
+        } else {
+            path.trim().to_string()
+        };
+        let s = ila::load_session(std::path::Path::new(&path))?;
+        // Re-validate probes against the current design; keep the session's
+        // capture for viewing even if the design changed.
+        if let Some(d) = design {
+            if let Err(e) = s.config.validate(d) {
+                self.config = s.config.clone();
+                self.group = vec![false; self.config.probes.len()];
+                self.viewer = ila::IlaViewer::fit(
+                    s.capture.as_ref().map(|c| c.len()).unwrap_or(1).max(1),
+                    800.0,
+                );
+                self.capture = s.capture;
+                self.status = SimIlaStatus::Done;
+                self.session_path = path.clone();
+                return Err(format!("ila session loaded with warnings: {e}"));
+            }
+        }
+        self.config = s.config;
+        self.group = vec![false; self.config.probes.len()];
+        self.viewer = ila::IlaViewer::fit(
+            s.capture.as_ref().map(|c| c.len()).unwrap_or(1).max(1),
+            800.0,
+        );
+        self.capture = s.capture;
+        self.status = if self.capture.is_some() {
+            SimIlaStatus::Done
+        } else {
+            SimIlaStatus::Idle
+        };
+        self.last_error = None;
+        self.session_path = path.clone();
+        Ok(format!("ila session loaded {path}"))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HwManager {
     pub open: bool,
@@ -4106,6 +4521,7 @@ pub enum WorkspaceTab {
     Schematic,
     Device,
     Wave,
+    Ila,
     Source,
     TextEditor,
     Memory,
@@ -4131,13 +4547,14 @@ pub enum WorkspaceTab {
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 28] = [
+    pub const ALL: [WorkspaceTab; 29] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
         WorkspaceTab::Schematic,
         WorkspaceTab::Device,
         WorkspaceTab::Wave,
+        WorkspaceTab::Ila,
         WorkspaceTab::Source,
         WorkspaceTab::TextEditor,
         WorkspaceTab::Memory,
@@ -4215,6 +4632,7 @@ impl WorkspaceTab {
         matches!(
             self,
             WorkspaceTab::Wave
+                | WorkspaceTab::Ila
                 | WorkspaceTab::Source
                 | WorkspaceTab::Memory
                 | WorkspaceTab::Breakpoints
@@ -4232,6 +4650,7 @@ impl WorkspaceTab {
             WorkspaceTab::Schematic => "Schematic",
             WorkspaceTab::Device => "Device",
             WorkspaceTab::Wave => "Waveform",
+            WorkspaceTab::Ila => "Logic Analyzer",
             WorkspaceTab::Source => "Source",
             WorkspaceTab::TextEditor => "Text Editor",
             WorkspaceTab::Memory => "Memory",
@@ -4867,6 +5286,8 @@ pub struct IdeModel {
     pub last_project_path: Option<PathBuf>,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
+    /// Simulation-based ILA (logic analyzer): probes, trigger, capture, viewer.
+    pub sim_ila: SimIla,
 }
 
 impl Default for IdeModel {
@@ -5003,6 +5424,7 @@ impl IdeModel {
             last_project_path: None,
             event_sim: None,
             fabric_sim: None,
+            sim_ila: SimIla::default(),
         };
         // Vivado shows the part floorplan before sources exist — HAD sites, not empty chrome.
         m.refresh_device();
@@ -5811,6 +6233,120 @@ impl IdeModel {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(self.ila.window);
             self.capture_ila(net, n)
+        } else if let Some(rest) = t.strip_prefix("ila_sim_add ") {
+            let net = rest.trim().to_string();
+            let d = self
+                .shell
+                .session
+                .design
+                .clone()
+                .ok_or_else(|| "ila: no design".to_string())?;
+            let r = self.sim_ila.add_probe(&d, &net);
+            self.workspace = WorkspaceTab::Ila;
+            r
+        } else if let Some(rest) = t.strip_prefix("ila_sim_bus ") {
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().unwrap_or("").to_string();
+            let nets: Vec<String> = parts.map(|s| s.to_string()).collect();
+            let d = self
+                .shell
+                .session
+                .design
+                .clone()
+                .ok_or_else(|| "ila: no design".to_string())?;
+            let r = self.sim_ila.add_bus(&d, &name, &nets);
+            self.workspace = WorkspaceTab::Ila;
+            r
+        } else if let Some(rest) = t.strip_prefix("ila_sim_remove ") {
+            let idx: usize = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("ila_sim_remove: bad index {rest}"))?;
+            self.sim_ila.remove_probe(idx)
+        } else if let Some(rest) = t.strip_prefix("ila_sim_trigger ") {
+            let mut parts = rest.split_whitespace();
+            let kind = parts.next().unwrap_or("immediate");
+            let probe = parts
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            self.sim_ila.set_trigger_probe(probe)?;
+            let k = ila::IlaTriggerKind::parse(kind)?;
+            if let ila::IlaTriggerKind::ValueMatch { .. } = k {
+                if let Some(v) = parts.next() {
+                    self.sim_ila.trig_value_text = v.to_string();
+                }
+                if let Some(m) = parts.next() {
+                    self.sim_ila.trig_mask_text = m.to_string();
+                }
+            }
+            self.sim_ila.set_trigger_kind(k)
+        } else if let Some(rest) = t.strip_prefix("ila_sim_depth ") {
+            let n: usize = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("ila_sim_depth: bad depth {rest}"))?;
+            self.sim_ila.config.depth = n;
+            Ok(format!("ila depth {n}"))
+        } else if let Some(rest) = t.strip_prefix("ila_sim_preratio ") {
+            let r: f32 = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("ila_sim_preratio: bad ratio {rest}"))?;
+            self.sim_ila.config.pre_ratio = r;
+            Ok(format!("ila pre_ratio {r}"))
+        } else if let Some(rest) = t.strip_prefix("ila_sim_clock ") {
+            self.sim_ila.config.clock_net = rest.trim().to_string();
+            Ok(format!("ila clock {}", rest.trim()))
+        } else if let Some(rest) = t.strip_prefix("ila_sim_radix ") {
+            let mut parts = rest.split_whitespace();
+            let idx: usize = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or("ila_sim_radix: need <probe> <bin|hex|dec>")?;
+            let radix = ila::IlaRadix::parse(parts.next().unwrap_or("bin"))?;
+            let p = self
+                .sim_ila
+                .config
+                .probes
+                .get_mut(idx)
+                .ok_or_else(|| format!("ila_sim_radix: no probe {idx}"))?;
+            p.radix = radix;
+            Ok(format!("ila radix {} {}", p.name, radix.label()))
+        } else if t == "ila_sim_capture" {
+            let d = self
+                .shell
+                .session
+                .design
+                .clone()
+                .ok_or_else(|| "ila: no design".to_string())?;
+            let r = self.sim_ila.capture_sync(&d);
+            self.workspace = WorkspaceTab::Ila;
+            r
+        } else if t == "ila_sim_status" {
+            Ok(self.sim_ila.status_text())
+        } else if let Some(rest) = t.strip_prefix("ila_sim_save ") {
+            let path = rest.trim().to_string();
+            let pp = self.last_project_path.clone();
+            self.sim_ila.save_session(pp.as_deref(), &path)
+        } else if t == "ila_sim_save" {
+            let pp = self.last_project_path.clone();
+            let path = self.sim_ila.default_session_path(pp.as_deref());
+            self.sim_ila.save_session(pp.as_deref(), &path)
+        } else if let Some(rest) = t.strip_prefix("ila_sim_load ") {
+            let path = rest.trim().to_string();
+            let d = self.shell.session.design.clone();
+            let pp = self.last_project_path.clone();
+            let r = self.sim_ila.load_session(d.as_ref(), pp.as_deref(), &path);
+            self.workspace = WorkspaceTab::Ila;
+            r
+        } else if t == "ila_sim_load" {
+            let pp = self.last_project_path.clone();
+            let path = self.sim_ila.default_session_path(pp.as_deref());
+            let d = self.shell.session.design.clone();
+            let r = self.sim_ila.load_session(d.as_ref(), pp.as_deref(), &path);
+            self.workspace = WorkspaceTab::Ila;
+            r
         } else if t == "ila_arm_deep" || t.starts_with("ila_arm_deep ") {
             self.ila_arm_deep(t.strip_prefix("ila_arm_deep").unwrap_or("").trim())
         } else if t == "ila_arm" || t.starts_with("ila_arm ") {
@@ -22106,6 +22642,110 @@ mod tests {
         dest
     }
 
+    /// Sim ILA: exec-driven probe setup, trigger config, sync capture, and
+    /// session save/load round-trip on the real synthesized counter design.
+    #[test]
+    fn sim_ila_exec_flow_captures_trigger_and_roundtrips_session() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        assert!(
+            ide.shell.session.design.is_some(),
+            "synth must populate the design"
+        );
+
+        // Probe setup: scalar + bus.
+        ide.exec("ila_sim_add cnt_3").unwrap();
+        assert!(ide.exec("ila_sim_add cnt_3").unwrap().contains("(already)"));
+        ide.exec("ila_sim_bus cntbus cnt_3 cnt_2 cnt_1 cnt_0").unwrap();
+        assert_eq!(ide.sim_ila.config.probes.len(), 2);
+        assert_eq!(ide.sim_ila.config.probes[1].width(), 4);
+
+        // Trigger: rising edge on probe 0 (q3).
+        ide.exec("ila_sim_trigger rising 0").unwrap();
+        ide.exec("ila_sim_depth 32").unwrap();
+        ide.exec("ila_sim_preratio 0.25").unwrap();
+        ide.exec("ila_sim_radix 1 hex").unwrap();
+        assert_eq!(
+            ide.sim_ila.config.probes[1].radix,
+            crate::ila::IlaRadix::Hex
+        );
+
+        // Capture (synchronous in the exec path).
+        let msg = ide.exec("ila_sim_capture").unwrap();
+        assert!(msg.contains("samples="), "{msg}");
+        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        assert!(cap.found_trigger, "cnt_3 must rise within max_cycles");
+        let ti = cap.trigger_sample.expect("trigger index");
+        // Trigger at sample 7 < pre=8: window is 7 + 1 + 23.
+        assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+        assert_eq!(cap.samples[0][ti - 1], 0);
+        assert_eq!(cap.samples[0][ti], 1);
+        assert_eq!(cap.samples[1][ti], 8, "bus counts, trigger at count 8");
+        assert_eq!(ide.sim_ila.status, SimIlaStatus::Done);
+        assert_eq!(ide.sim_ila.viewer.cursor, Some(ti));
+
+        let st = ide.exec("ila_sim_status").unwrap();
+        assert!(st.contains("probes=2"), "{st}");
+        assert!(st.contains("status=Done"), "{st}");
+
+        // Value-match trigger via text fields.
+        ide.exec("ila_sim_trigger value 1 5 0xF").unwrap();
+        let msg = ide.exec("ila_sim_capture").unwrap();
+        assert!(msg.contains("samples="), "{msg}");
+        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        let ti = cap.trigger_sample.expect("value trigger");
+        assert_eq!(cap.samples[1][ti], 5);
+        assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+
+        // Session round-trip.
+        let dir = std::env::temp_dir().join(format!(
+            "helion-ila-exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        ide.exec(&format!("ila_sim_save {}", path.display())).unwrap();
+        ide.sim_ila.config.probes.clear();
+        ide.sim_ila.capture = None;
+        ide.exec(&format!("ila_sim_load {}", path.display())).unwrap();
+        assert_eq!(ide.sim_ila.config.probes.len(), 2);
+        let reloaded = ide.sim_ila.capture.as_ref().expect("reloaded capture");
+        assert_eq!(reloaded.len(), reloaded.trigger_sample.unwrap() + 1 + ide.sim_ila.config.post());
+
+        // Fail loud, never half-configured.
+        assert!(ide.exec("ila_sim_add no_such_net").is_err());
+        assert!(ide.exec("ila_sim_trigger banana 0").is_err());
+        assert!(ide.exec("ila_sim_remove 9").is_err());
+        assert!(ide.exec("ila_sim_radix 0 oct").is_err());
+    }
+
+    /// Sim ILA: background (threaded) capture merges through finish_capture.
+    #[test]
+    fn sim_ila_background_capture_merges() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.exec("ila_sim_add cnt_3").unwrap();
+        ide.exec("ila_sim_trigger rising 0").unwrap();
+        ide.exec("ila_sim_depth 64").unwrap();
+        let d = ide.shell.session.design.clone().expect("design");
+        let rx = ide.sim_ila.start_capture(&d).expect("arm");
+        assert_eq!(ide.sim_ila.status, SimIlaStatus::Capturing);
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("capture done");
+        ide.sim_ila.finish_capture(r);
+        assert_eq!(ide.sim_ila.status, SimIlaStatus::Done);
+        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        assert!(cap.found_trigger);
+        let ti = cap.trigger_sample.expect("trigger index");
+        assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+    }
+
     /// The console widget must be a pipe onto the real engines: `report_timing` has to
     /// come back with a *numeric* WNS that differs per design, not a canned string.
     #[test]
@@ -37279,7 +37919,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(
