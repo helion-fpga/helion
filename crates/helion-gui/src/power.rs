@@ -504,7 +504,7 @@ pub fn analyze_power(
     let mut hier_mw: HashMap<String, (f64, usize)> = HashMap::new();
     let mut dyn_logic = 0.0f64; // LUT+FF internal + routing, watts
     let mut dyn_io = 0.0f64;
-    let mut dyn_clk; // assigned in the clock-tree block below
+    let dyn_clk; // assigned in the clock-tree block below
 
     // Clock tree first (independent of per-net loop).
     {
@@ -813,9 +813,9 @@ endmodule
         d.add_cell("u_lut", CellKind::Lut6 { init: 0 });
         d.connect("q", "u_ff", "Q");
         d.connect("q", "u_lut", "I0");
-        // 5ns timescale, 4 cycles of 10ns: clk toggles every 5ns (2×/cycle),
+        // 1ns timescale, 4 cycles of 10ns: clk toggles every 5ns (2×/cycle),
         // q toggles every other cycle.
-        let vcd = "$timescale 5ns $end\n$scope module t $end\n$var wire 1 ! q $end\n$var wire 1 \" clk $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n0\"\n$end\n#1\n1\"\n#2\n1!\n0\"\n#3\n1\"\n#4\n0!\n0\"\n#5\n1\"\n#6\n1!\n0\"\n#7\n1\"\n#8\n0!\n0\"\n";
+        let vcd = "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! q $end\n$var wire 1 \" clk $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n0\"\n$end\n#5\n1\"\n#10\n1!\n0\"\n#15\n1\"\n#20\n0!\n0\"\n#25\n1\"\n#30\n1!\n0\"\n#35\n1\"\n#40\n0!\n0\"\n";
         let a = parse_vcd(vcd).expect("parse");
         let r = analyze_power(&d, &cfg_100mhz(), Some(&a), None);
         assert!(!r.vectorless);

@@ -31,28 +31,15 @@ fn vcd_id(mut n: usize) -> String {
     chars.iter().rev().map(|&b| b as char).collect()
 }
 
-/// `$timescale` token for a period in picoseconds, e.g. `10ps`, `1ns`.
-fn timescale_token(period_ps: u64) -> String {
-    const UNITS: [(u64, &str); 5] = [
-        (1_000_000_000_000, "s"),
-        (1_000_000_000, "ms"),
-        (1_000_000, "us"),
-        (1_000, "ns"),
-        (1, "ps"),
-    ];
-    for (factor, unit) in UNITS {
-        if period_ps >= factor && period_ps % factor == 0 {
-            return format!("{}{}", period_ps / factor, unit);
-        }
-    }
-    format!("{period_ps}ps")
-}
-
 /// Run the event kernel and dump a VCD of every driven net.
 ///
 /// * `cycles` — number of clock posedges to simulate.
-/// * `timescale_ps` — full clock period in picoseconds; also the VCD
-///   `$timescale` when it divides evenly, else the raw ps value.
+/// * `timescale_ps` — full clock period in picoseconds.
+///
+/// The VCD `$timescale` is always 1ps and timestamps are picoseconds, so the
+/// declared timescale and the timestamp values can never disagree (a
+/// coarser timescale could not represent the mid-cycle clock negedge as an
+/// integer tick).
 ///
 /// The dump contains one `$var wire 1` per driven net (named by net), plus a
 /// synthetic `clk` that rises on each posedge and falls mid-cycle. Time 0
@@ -79,7 +66,10 @@ pub fn dump_vcd(design: &Design, cycles: u32, timescale_ps: u64) -> String {
     let mut out = String::new();
     out.push_str("$date\n    helion-sim\n$end\n");
     out.push_str("$version\n    helion-sim VCD dumper\n$end\n");
-    out.push_str(&format!("$timescale {} $end\n", timescale_token(period)));
+    // Fixed 1ps timescale: timestamps below are picoseconds (period and
+    // half-period are already in ps), so no tick-unit conversion exists to
+    // get wrong.
+    out.push_str("$timescale 1ps $end\n");
     out.push_str(&format!("$scope module {} $end\n", design.name));
     for (name, id) in names.iter().zip(ids.iter()) {
         out.push_str(&format!("$var wire 1 {id} {name} $end\n"));
@@ -170,7 +160,8 @@ endmodule
     fn dump_vcd_header_and_timescale() {
         let d = counter_design();
         let vcd = dump_vcd(&d, 4, 10);
-        assert!(vcd.contains("$timescale 10ps $end"), "timescale");
+        // Fixed 1ps timescale; timestamps are picoseconds.
+        assert!(vcd.contains("$timescale 1ps $end"), "timescale");
         assert!(vcd.contains("$scope module counter $end"), "scope");
         assert!(vcd.contains("$enddefinitions $end"), "enddefinitions");
         assert!(vcd.contains("$dumpvars"), "dumpvars");
@@ -191,8 +182,17 @@ endmodule
             .find(|l| l.starts_with("$var wire 1 ") && l.ends_with(" clk $end"))
             .expect("clk var");
         let id = clk_line.split_whitespace().nth(3).expect("clk id");
-        let rises = vcd.lines().filter(|l| *l == format!("1{id}")).count();
-        let falls = vcd.lines().filter(|l| *l == format!("0{id}")).count();
+        // Only count changes that follow a `#t` timestamp: the `$dumpvars`
+        // initial values (`0!` etc.) are not toggles.
+        let lines: Vec<&str> = vcd.lines().collect();
+        let rises = lines
+            .windows(2)
+            .filter(|w| w[0].starts_with('#') && w[1] == format!("1{id}"))
+            .count();
+        let falls = lines
+            .windows(2)
+            .filter(|w| w[0].starts_with('#') && w[1] == format!("0{id}"))
+            .count();
         assert_eq!(rises, 4, "clk rises once per cycle");
         assert_eq!(falls, 4, "clk falls once per cycle");
     }
@@ -227,12 +227,17 @@ endmodule
         z.connect("q", "u_lut", "I0");
         z.connect("q", "u_iob", "I");
         let vcd = dump_vcd(&z, 4, 10);
-        // Only clk changes: 4 rises + 4 falls = 8 change lines.
-        let changes = vcd
-            .lines()
-            .filter(|l| {
-                let b = l.as_bytes();
-                b.len() > 1 && (b[0] == b'0' || b[0] == b'1') && !l.starts_with("$")
+        // Only clk changes: 4 rises + 4 falls = 8 change lines. Count only
+        // changes that follow a `#t` timestamp so the `$dumpvars` initial
+        // values are not mistaken for toggles.
+        let lines: Vec<&str> = vcd.lines().collect();
+        let changes = lines
+            .windows(2)
+            .filter(|w| {
+                w[0].starts_with('#') && {
+                    let b = w[1].as_bytes();
+                    b.len() > 1 && (b[0] == b'0' || b[0] == b'1')
+                }
             })
             .count();
         assert_eq!(changes, 8, "const design: only clk moves: {changes}");
