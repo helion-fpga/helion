@@ -509,8 +509,8 @@ endmodule
         let d = helion_sv::synth_sv(src, "counter.sv").expect("synth");
         let vcd = helion_sim::vcd::dump_vcd(&d, 16, 10);
         let a = parse_vcd(&vcd).expect("parse sim dump");
-        assert_eq!(a.timescale_ps, 10);
-        assert_eq!(a.duration_ps, 155, "16 cycles × 10ps, last negedge at 155");
+        assert_eq!(a.timescale_ps, 1, "dumper uses a fixed 1ps timescale");
+        assert_eq!(a.duration_ps, 155, "16 cycles × 10ps, last negedge at 155ps");
         let clk = a.signals.iter().find(|s| s.name.ends_with(".clk") || s.name == "clk").expect("clk signal");
         assert_eq!(clk.toggles, 32, "clk toggles 2× per cycle");
         // At least one counter net toggles.
