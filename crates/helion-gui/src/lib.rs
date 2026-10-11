@@ -7,6 +7,7 @@ pub mod chrome;
 pub use chrome::{Activity, Canvas, WorkspacePane, pane_for_workspace};
 pub mod doctor;
 pub mod ide;
+pub mod ila;
 pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
@@ -28,6 +29,7 @@ pub use ide::{
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
     HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
+    SimIla, SimIlaStatus,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection,
     Pblock, ProjectSummaryGadget, PropertyRow, ReportCatalogRow,

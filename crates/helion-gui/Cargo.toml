@@ -31,6 +31,8 @@ helion-place = { workspace = true }
 helion-pack = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # rfd's Linux xdg-portal path pulls ashpd → zbus. zbus ≥5.14 / zvariant ≥5.10
 # need rustc 1.87; Helion CI and rust-version are 1.85.0. Pin the last 1.85
 # MSRV line so Open HDL stays a native picker on Linux.

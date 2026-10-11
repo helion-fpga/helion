@@ -11,10 +11,10 @@ use helion_gui::surface::{
     ChromeState, EventClass, JobHandle, JobKind, UiEvent, UiTrace,
 };
 use helion_gui::{
-    doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
+    doctor, ila, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TimingPathSortCol,
-    WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
+    MethodologySeverity, MsgSeverity, PathGroupKind, SimIlaStatus, SourceLine, StepState,
+    TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -320,6 +320,8 @@ struct HelionIde {
     board_detect: Option<helion_hw::DetectReport>,
     trace: UiTrace,
     job: Option<JobHandle>,
+    /// Simulation-ILA background capture result channel (progress atomics live in the model).
+    ila_rx: Option<std::sync::mpsc::Receiver<Result<ila::IlaCapture, String>>>,
     busy: bool,
     progress: String,
     /// Last window size we shared chrome against.
@@ -405,6 +407,7 @@ impl HelionIde {
             board_detect: None,
             trace: UiTrace::from_env(),
             job: None,
+            ila_rx: None,
             busy: false,
             progress: String::new(),
             last_share: [0.0, 0.0],
@@ -648,6 +651,48 @@ impl HelionIde {
         }
     }
 
+    /// Poll the simulation-ILA background capture without blocking the frame.
+    fn poll_ila(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.ila_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(r) => {
+                let ok = r.is_ok();
+                let summary = match &r {
+                    Ok(cap) => format!(
+                        "ILA capture: {} probes, {} samples, trigger {}",
+                        cap.probes.len(),
+                        cap.len(),
+                        cap.trigger_sample
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    ),
+                    Err(e) => e.clone(),
+                };
+                self.model.sim_ila.finish_capture(r);
+                self.ila_rx = None;
+                self.toasts.push(
+                    if ok {
+                        toasts::ToastKind::Ok
+                    } else {
+                        toasts::ToastKind::Error
+                    },
+                    summary,
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.model.sim_ila.status = SimIlaStatus::Error;
+                self.model.sim_ila.last_error = Some("ila: capture thread died".into());
+                self.model.sim_ila.progress = None;
+                self.ila_rx = None;
+            }
+        }
+    }
+
     fn boards(&mut self, refresh: bool) -> &helion_hw::DetectReport {
         if refresh || self.board_detect.is_none() {
             self.board_detect = Some(helion_hw::detect_boards());
@@ -768,6 +813,7 @@ impl eframe::App for HelionIde {
             self.submit_job(kind);
         }
         self.poll_job(ctx);
+        self.poll_ila(ctx);
         // Menu bar (P1-6): standard File/Edit/View/Flow/Tools/Help, driven by
         // the same command registry as the palette.
         egui::TopBottomPanel::top("menu_bar")
@@ -2496,6 +2542,9 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.set_min_size(wave_rect.size());
         match pane_for_workspace(app.model.workspace) {
             WorkspacePane::Wave => paint_wave(ui, &mut app.model, &app.theme),
+            WorkspacePane::Ila => {
+                paint_ila(ui, &mut app.model, &mut app.ila_rx, &mut app.toasts, &app.theme)
+            }
             WorkspacePane::Memory => paint_memory(ui, &mut app.model, &app.theme),
             WorkspacePane::Breakpoints => paint_breakpoints(ui, &mut app.model),
             WorkspacePane::Locals => paint_locals(ui, &mut app.model),
@@ -2544,6 +2593,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspacePane::Runs => paint_runs(ui, &mut app.model, &app.theme),
         WorkspacePane::Wave
+        | WorkspacePane::Ila
         | WorkspacePane::Source
         | WorkspacePane::Memory
         | WorkspacePane::Breakpoints
@@ -8322,6 +8372,772 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     if let Some(b) = place_b {
         let _ = model.set_wave_ab_cursor(&format!("B {b}"));
     }
+}
+
+/// Simulation-based ILA (logic analyzer): probe setup, trigger, capture, viewer.
+fn paint_ila(
+    ui: &mut egui::Ui,
+    model: &mut IdeModel,
+    ila_rx: &mut Option<std::sync::mpsc::Receiver<Result<ila::IlaCapture, String>>>,
+    toasts: &mut toasts::ToastQueue,
+    theme: &theme::Theme,
+) {
+    enum Intent {
+        AddProbe(String),
+        RemoveProbe(usize),
+        SetRadix(usize, ila::IlaRadix),
+        GroupBus,
+        SetTrigKind(ila::IlaTriggerKind),
+        SetTrigProbe(usize),
+        Arm,
+        Save,
+        Load,
+        ClearError,
+    }
+    let mut intents: Vec<Intent> = Vec::new();
+    let has_design = model.shell.session.design.is_some();
+
+    // Header: title, status, progress, arm + session buttons.
+    ui.horizontal(|ui| {
+        ui.heading("Logic Analyzer");
+        ui.label(
+            RichText::new(model.sim_ila.status_text())
+                .weak()
+                .monospace()
+                .small(),
+        );
+        if model.sim_ila.status == SimIlaStatus::Capturing {
+            if let Some(p) = model.sim_ila.progress.as_ref() {
+                let c = p.cycles.load(std::sync::atomic::Ordering::Relaxed);
+                ui.label(RichText::new(format!("capturing… {c} cycles")).color(theme.info));
+            }
+            ui.ctx().request_repaint();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if sidebar_button(ui, "Load session").clicked() {
+                intents.push(Intent::Load);
+            }
+            if sidebar_button(ui, "Save session").clicked() {
+                intents.push(Intent::Save);
+            }
+            let armed = model.sim_ila.status == SimIlaStatus::Capturing;
+            ui.set_enabled(!armed && has_design);
+            if primary_button(ui, if armed { "Capturing…" } else { "Arm Capture" })
+                .on_hover_text("Run the event kernel with probes instrumented (helion-sim)")
+                .clicked()
+            {
+                intents.push(Intent::Arm);
+            }
+            ui.set_enabled(true);
+        });
+    });
+    if let Some(e) = model.sim_ila.last_error.clone() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("error: {e}")).color(theme.danger));
+            if ui.small_button("clear").clicked() {
+                intents.push(Intent::ClearError);
+            }
+        });
+    }
+    if !has_design {
+        ui.label(
+            RichText::new("Open HDL and synthesize to use the Logic Analyzer.")
+                .weak(),
+        );
+    }
+
+    // Setup: probes (left) + trigger (right).
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_min_width(340.0);
+            ui.set_max_width(340.0);
+            ui.label(RichText::new("Probes").strong());
+            ui.horizontal(|ui| {
+                ui.label("Search");
+                ui.text_edit_singleline(&mut model.sim_ila.search);
+            });
+            let nets: Vec<String> = model
+                .shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| model.sim_ila.probe_net_list(d))
+                .unwrap_or_default();
+            egui::ScrollArea::vertical()
+                .id_salt("ila_net_list")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for net in nets.iter().take(500) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(net).monospace());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("+").on_hover_text("Add as probe").clicked() {
+                                        intents.push(Intent::AddProbe(net.clone()));
+                                    }
+                                },
+                            );
+                        });
+                    }
+                    if nets.len() > 500 {
+                        ui.label(
+                            RichText::new(format!("…{} more (refine search)", nets.len() - 500))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+            ui.separator();
+            let rows: Vec<(String, usize, ila::IlaRadix)> = model
+                .sim_ila
+                .config
+                .probes
+                .iter()
+                .map(|p| (p.name.clone(), p.width(), p.radix))
+                .collect();
+            if model.sim_ila.group.len() != rows.len() {
+                model.sim_ila.group = vec![false; rows.len()];
+            }
+            ui.label(RichText::new(format!("Probe list ({})", rows.len())).strong());
+            egui::ScrollArea::vertical()
+                .id_salt("ila_probe_list")
+                .max_height(150.0)
+                .show(ui, |ui| {
+                    for (i, (name, width, radix)) in rows.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let mut g = model.sim_ila.group[i];
+                            if ui.checkbox(&mut g, "").on_hover_text("Check to group into a bus").changed() {
+                                model.sim_ila.group[i] = g;
+                            }
+                            ui.label(RichText::new(name).monospace().strong());
+                            ui.label(
+                                RichText::new(format!("[{width}]")).weak().monospace().small(),
+                            );
+                            egui::ComboBox::from_id_salt(format!("ila_radix_{i}"))
+                                .selected_text(radix.label())
+                                .width(56.0)
+                                .show_ui(ui, |ui| {
+                                    for r in [ila::IlaRadix::Bin, ila::IlaRadix::Hex, ila::IlaRadix::Dec] {
+                                        if ui.selectable_label(*radix == r, r.label()).clicked() {
+                                            intents.push(Intent::SetRadix(i, r));
+                                        }
+                                    }
+                                });
+                            if ui.small_button("✕").clicked() {
+                                intents.push(Intent::RemoveProbe(i));
+                            }
+                        });
+                    }
+                    if rows.is_empty() {
+                        ui.label(RichText::new("No probes — add nets above.").weak().small());
+                    }
+                });
+            ui.horizontal(|ui| {
+                if sidebar_button(ui, "Group checked as bus").clicked() {
+                    intents.push(Intent::GroupBus);
+                }
+                ui.text_edit_singleline(&mut model.sim_ila.bus_name)
+                    .on_hover_text("Bus name (empty = first probe's name)");
+            });
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Trigger & Capture").strong());
+            // Trigger probe picker.
+            let names: Vec<String> = model
+                .sim_ila
+                .config
+                .probes
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            let tp = model.sim_ila.config.trigger.probe.min(names.len().saturating_sub(1));
+            ui.horizontal(|ui| {
+                ui.label("Probe");
+                egui::ComboBox::from_id_salt("ila_trig_probe")
+                    .selected_text(names.get(tp).cloned().unwrap_or_else(|| "-".into()))
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            if ui.selectable_label(tp == i, n).clicked() {
+                                intents.push(Intent::SetTrigProbe(i));
+                            }
+                        }
+                    });
+                ui.label("Kind");
+                let kind = model.sim_ila.config.trigger.kind;
+                egui::ComboBox::from_id_salt("ila_trig_kind")
+                    .selected_text(kind.label())
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for k in [
+                            ila::IlaTriggerKind::Immediate,
+                            ila::IlaTriggerKind::Rising,
+                            ila::IlaTriggerKind::Falling,
+                            ila::IlaTriggerKind::ValueMatch { value: 0, mask: u64::MAX },
+                        ] {
+                            if ui.selectable_label(kind.label() == k.label(), k.label()).clicked() {
+                                intents.push(Intent::SetTrigKind(k));
+                            }
+                        }
+                    });
+            });
+            if matches!(
+                model.sim_ila.config.trigger.kind,
+                ila::IlaTriggerKind::ValueMatch { .. }
+            ) {
+                ui.horizontal(|ui| {
+                    ui.label("Value");
+                    ui.text_edit_singleline(&mut model.sim_ila.trig_value_text);
+                    ui.label("Mask");
+                    ui.text_edit_singleline(&mut model.sim_ila.trig_mask_text);
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Depth");
+                ui.add(
+                    egui::DragValue::new(&mut model.sim_ila.config.depth)
+                        .range(1.0..=ila::MAX_DEPTH as f64),
+                );
+                ui.label("Pre-trigger");
+                ui.add(
+                    egui::Slider::new(&mut model.sim_ila.config.pre_ratio, 0.0..=1.0)
+                        .show_value(true),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Clock");
+                let clocks: Vec<String> = model
+                    .shell
+                    .session
+                    .design
+                    .as_ref()
+                    .map(|d| model.sim_ila.clock_net_list(d))
+                    .unwrap_or_default();
+                let cur = model.sim_ila.config.clock_net.clone();
+                egui::ComboBox::from_id_salt("ila_clock")
+                    .selected_text(&cur)
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for c in &clocks {
+                            if ui.selectable_label(&cur == c, c).clicked() {
+                                model.sim_ila.config.clock_net = c.clone();
+                            }
+                        }
+                    });
+                ui.label("Max cycles");
+                ui.add(
+                    egui::DragValue::new(&mut model.sim_ila.config.max_cycles)
+                        .range(1.0..=ila::MAX_CYCLES as f64),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Timescale ps");
+                ui.add(
+                    egui::DragValue::new(&mut model.sim_ila.config.timescale_ps)
+                        .range(1.0..=1_000_000_000.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Session");
+                ui.text_edit_singleline(&mut model.sim_ila.session_path)
+                    .on_hover_text("Session JSON path (empty = project dir / cwd)");
+            });
+            ui.label(
+                RichText::new("helion-sim is single-clock: probes sample once per posedge of the design clock.")
+                    .weak()
+                    .small(),
+            );
+        });
+    });
+
+    // Apply intents (design borrows end before the &mut model.sim_ila calls).
+    for intent in intents {
+        match intent {
+            Intent::AddProbe(net) => {
+                if let Some(d) = model.shell.session.design.as_ref() {
+                    if let Err(e) = model.sim_ila.add_probe(d, &net) {
+                        model.sim_ila.last_error = Some(e);
+                    } else {
+                        model.sim_ila.last_error = None;
+                    }
+                }
+            }
+            Intent::RemoveProbe(i) => {
+                if let Err(e) = model.sim_ila.remove_probe(i) {
+                    model.sim_ila.last_error = Some(e);
+                }
+            }
+            Intent::SetRadix(i, r) => {
+                if let Some(p) = model.sim_ila.config.probes.get_mut(i) {
+                    p.radix = r;
+                }
+            }
+            Intent::GroupBus => {
+                let name = model.sim_ila.bus_name.clone();
+                if let Some(d) = model.shell.session.design.as_ref() {
+                    match model.sim_ila.group_checked_as_bus(d, &name) {
+                        Ok(_) => {
+                            model.sim_ila.bus_name.clear();
+                            model.sim_ila.last_error = None;
+                        }
+                        Err(e) => model.sim_ila.last_error = Some(e),
+                    }
+                }
+            }
+            Intent::SetTrigKind(k) => {
+                if let Err(e) = model.sim_ila.set_trigger_kind(k) {
+                    model.sim_ila.last_error = Some(e);
+                }
+            }
+            Intent::SetTrigProbe(i) => {
+                if let Err(e) = model.sim_ila.set_trigger_probe(i) {
+                    model.sim_ila.last_error = Some(e);
+                }
+            }
+            Intent::Arm => {
+                // Design moves to the capture thread; never on the egui frame.
+                if let Some(d) = model.shell.session.design.clone() {
+                    match model.sim_ila.start_capture(&d) {
+                        Ok(rx) => {
+                            *ila_rx = Some(rx);
+                        }
+                        Err(e) => {
+                            model.sim_ila.last_error = Some(e);
+                            model.sim_ila.status = SimIlaStatus::Error;
+                        }
+                    }
+                }
+            }
+            Intent::Save => {
+                let pp = model.last_project_path.clone();
+                let r = model.sim_ila.save_session(pp.as_deref(), "");
+                match r {
+                    Ok(msg) => {
+                        model.sim_ila.last_error = None;
+                        toasts.push(toasts::ToastKind::Ok, msg);
+                    }
+                    Err(e) => model.sim_ila.last_error = Some(e),
+                }
+            }
+            Intent::Load => {
+                let pp = model.last_project_path.clone();
+                let d = model.shell.session.design.clone();
+                let r = model
+                    .sim_ila
+                    .load_session(d.as_ref(), pp.as_deref(), "");
+                match r {
+                    Ok(msg) => {
+                        model.sim_ila.last_error = None;
+                        toasts.push(toasts::ToastKind::Ok, msg);
+                    }
+                    Err(e) => model.sim_ila.last_error = Some(e),
+                }
+            }
+            Intent::ClearError => model.sim_ila.last_error = None,
+        }
+    }
+
+    ui.separator();
+    paint_ila_wave(ui, model, theme);
+}
+
+fn ila_fmt_time(sample: u64, ts_ps: u64) -> String {
+    let ps = sample.saturating_mul(ts_ps.max(1));
+    if ps % 1000 == 0 {
+        format!("{} ns", ps / 1000)
+    } else {
+        format!("{ps} ps")
+    }
+}
+
+/// GTKWave-grade viewer: signal pane (name + value at cursor), time ruler,
+/// zoom (wheel) + pan (drag), click cursor, Shift-A / Alt-B, trigger marker.
+fn paint_ila_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+    let n = model.sim_ila.capture.as_ref().map(|c| c.len()).unwrap_or(0);
+    if n == 0 {
+        ui.label(
+            RichText::new("No capture yet — add probes, set the trigger, press Arm Capture.")
+                .weak(),
+        );
+        return;
+    }
+    let nprobes = model
+        .sim_ila
+        .capture
+        .as_ref()
+        .map(|c| c.probes.len())
+        .unwrap_or(0);
+    if nprobes == 0 {
+        return;
+    }
+    let ts = model
+        .sim_ila
+        .capture
+        .as_ref()
+        .map(|c| c.timescale_ps)
+        .unwrap_or(10_000);
+
+    // Toolbar: zoom, fit, From/To, cursor readouts.
+    ui.horizontal(|ui| {
+        if sidebar_button(ui, "−").on_hover_text("Zoom in").clicked() {
+            model.sim_ila.viewer.zoom_center(0.5, n);
+        }
+        if sidebar_button(ui, "+").on_hover_text("Zoom out").clicked() {
+            model.sim_ila.viewer.zoom_center(2.0, n);
+        }
+        if sidebar_button(ui, "Fit").on_hover_text("Fit capture").clicked() {
+            let w = model.sim_ila.viewer.view_w;
+            let (c, ca, cb) = (
+                model.sim_ila.viewer.cursor,
+                model.sim_ila.viewer.cursor_a,
+                model.sim_ila.viewer.cursor_b,
+            );
+            model.sim_ila.viewer = ila::IlaViewer::fit(n, w);
+            model.sim_ila.viewer.cursor = c;
+            model.sim_ila.viewer.cursor_a = ca;
+            model.sim_ila.viewer.cursor_b = cb;
+        }
+        let mut from = model.sim_ila.viewer.first.max(0.0) as usize;
+        ui.label("From");
+        if ui
+            .add(egui::DragValue::new(&mut from).range(0.0..=n.saturating_sub(1) as f64))
+            .changed()
+        {
+            model.sim_ila.viewer.first = from as f64;
+            model.sim_ila.viewer.clamp(n);
+        }
+        let to = (model.sim_ila.viewer.first
+            + model.sim_ila.viewer.view_w as f64 * model.sim_ila.viewer.spp)
+            as usize;
+        ui.label(format!("To {}", to.min(n.saturating_sub(1))));
+        ui.separator();
+        let cur_txt = match model.sim_ila.viewer.cursor {
+            Some(c) => format!("t={} ({})", c, ila_fmt_time(c as u64, ts)),
+            None => "t=-".into(),
+        };
+        ui.label(RichText::new(cur_txt).monospace().small());
+        let (a_txt, b_txt, d_txt) = match model.sim_ila.viewer.delta_samples() {
+            Some((a, b, d)) => (
+                format!("A={}", ila_fmt_time(a as u64, ts)),
+                format!("B={}", ila_fmt_time(b as u64, ts)),
+                format!("Δt={d} ({} )", ila_fmt_time(d as u64, ts)),
+            ),
+            _ => {
+                let a = match model.sim_ila.viewer.cursor_a {
+                    Some(a) => format!("A={}", ila_fmt_time(a as u64, ts)),
+                    None => "A=-".into(),
+                };
+                let b = match model.sim_ila.viewer.cursor_b {
+                    Some(b) => format!("B={}", ila_fmt_time(b as u64, ts)),
+                    None => "B=-".into(),
+                };
+                (a, b, "Δt=n/a".into())
+            }
+        };
+        ui.label(RichText::new(a_txt).monospace().small().color(theme.danger));
+        ui.label(RichText::new(b_txt).monospace().small().color(theme.trace_b));
+        ui.label(RichText::new(d_txt).monospace().small());
+        if let Some(ti) = model.sim_ila.capture.as_ref().and_then(|c| c.trigger_sample) {
+            ui.label(
+                RichText::new(format!("TRIG @{} ({})", ti, ila_fmt_time(ti as u64, ts)))
+                    .monospace()
+                    .small()
+                    .color(theme.warn),
+            );
+        } else if model.sim_ila.capture.as_ref().is_some_and(|c| !c.found_trigger) {
+            ui.label(
+                RichText::new("trigger not found in window")
+                    .small()
+                    .color(theme.warn),
+            );
+        }
+    });
+    ui.label(
+        RichText::new("wheel zoom · drag pan · click cursor · Shift-click A · Alt-click B")
+            .small()
+            .weak(),
+    );
+
+    let avail_h = ui.available_height().max(120.0);
+    let row_h = (avail_h / nprobes as f32).clamp(22.0, 44.0);
+    let ruler_h = 20.0;
+    let pane_w = 300.0f32;
+
+    ui.horizontal(|ui| {
+        // Signal pane: GTKWave two columns — name + value at cursor.
+        ui.vertical(|ui| {
+            ui.set_min_width(pane_w);
+            ui.set_max_width(pane_w);
+            ui.horizontal(|ui| {
+                ui.set_min_height(ruler_h);
+                ui.label(RichText::new("Name").strong().monospace().small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Value").strong().monospace().small());
+                });
+            });
+            let cursor = model.sim_ila.viewer.cursor.unwrap_or(0).min(n - 1);
+            for i in 0..nprobes {
+                let (name, val) = {
+                    let cap = model.sim_ila.capture.as_ref().expect("ila capture");
+                    (cap.probes[i].name.clone(), cap.formatted_at(i, cursor))
+                };
+                ui.horizontal(|ui| {
+                    ui.set_min_height(row_h);
+                    ui.set_max_height(row_h);
+                    ui.label(RichText::new(&name).monospace());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(val).monospace().color(theme.dim));
+                    });
+                });
+            }
+        });
+        // Trace canvas.
+        let canvas_w = (ui.available_width() - 8.0).max(80.0);
+        let canvas_h = ruler_h + row_h * nprobes as f32;
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(canvas_w, canvas_h),
+            egui::Sense::click_and_drag(),
+        );
+        model.sim_ila.viewer.view_w = rect.width();
+        // Interactions.
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll.abs() > 0.5 {
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let anchor = model.sim_ila.viewer.sample_at(pos.x, rect.left());
+                model
+                    .sim_ila
+                    .viewer
+                    .zoom(2f64.powf(-scroll as f64 / 240.0), anchor, n);
+            }
+        }
+        if resp.dragged() {
+            let dx = resp.drag_delta().x as f64 * model.sim_ila.viewer.spp;
+            model.sim_ila.viewer.pan_samples(-dx, n);
+        }
+        if resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let s = model.sim_ila.viewer.sample_at(pos.x, rect.left()).round() as usize;
+                let s = s.min(n - 1);
+                let mods = ui.input(|i| i.modifiers);
+                if mods.shift {
+                    model.sim_ila.viewer.cursor_a = Some(s);
+                } else if mods.alt {
+                    model.sim_ila.viewer.cursor_b = Some(s);
+                } else {
+                    model.sim_ila.viewer.cursor = Some(s);
+                }
+            }
+        }
+        if ui.is_rect_visible(rect) {
+            paint_ila_traces(ui, rect, model, n, nprobes, row_h, ruler_h, ts, theme);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_ila_traces(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    model: &IdeModel,
+    n: usize,
+    nprobes: usize,
+    row_h: f32,
+    ruler_h: f32,
+    ts: u64,
+    theme: &theme::Theme,
+) {
+    let p = ui.painter();
+    let cap = model.sim_ila.capture.as_ref().expect("ila capture");
+    let v = &model.sim_ila.viewer;
+    let wave_x0 = rect.left();
+    let wave_w = rect.width().max(1.0);
+    let top = rect.top();
+
+    // Canvas background.
+    p.rect_filled(rect, 4.0, theme.die_bg);
+
+    // Ruler with 1/2/5 ticks.
+    let target_px = 80.0f64;
+    let mut step = 10f64.powf((v.spp * target_px).log10().floor());
+    for m in [1.0, 2.0, 5.0, 10.0] {
+        if step * m / v.spp >= target_px {
+            step *= m;
+            break;
+        }
+    }
+    let first_tick = (v.first / step).ceil() as usize * step as usize;
+    let mut s = first_tick;
+    while (s as f64) < v.first + v.spp * wave_w as f64 {
+        let x = v.x_of(s as f64, wave_x0);
+        p.line_segment(
+            [egui::pos2(x, top + ruler_h - 6.0), egui::pos2(x, top + ruler_h)],
+            Stroke::new(1.0, theme.faint),
+        );
+        p.text(
+            egui::pos2(x + 2.0, top + 2.0),
+            egui::Align2::LEFT_TOP,
+            ila_fmt_time(s as u64, ts),
+            egui::FontId::monospace(9.0),
+            theme.dim,
+        );
+        s += step as usize;
+        if s > n + step as usize {
+            break;
+        }
+    }
+    p.line_segment(
+        [egui::pos2(rect.left(), top + ruler_h), egui::pos2(rect.right(), top + ruler_h)],
+        Stroke::new(1.0, theme.line),
+    );
+
+    let vis_first = v.first.max(0.0) as usize;
+    let vis_last = (v.first + v.spp * wave_w as f64).ceil() as usize + 1;
+    let vis_last = vis_last.min(n.saturating_sub(1)).max(vis_first);
+
+    for i in 0..nprobes {
+        let row_top = top + ruler_h + i as f32 * row_h;
+        let row = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), row_top),
+            egui::vec2(rect.width(), row_h),
+        );
+        if i % 2 == 1 {
+            p.rect_filled(row, 0.0, theme.panel.gamma_multiply(0.35));
+        }
+        let probe = &cap.probes[i];
+        let mid = row_top + row_h * 0.5;
+        let hi = row_top + row_h * 0.18;
+        let lo = row_top + row_h * 0.82;
+        if probe.width() == 1 {
+            // Digital trace.
+            let mut prev_x = v.x_of(vis_first as f64, wave_x0);
+            let mut prev_v = cap.value_at(i, vis_first).unwrap_or(0);
+            let y_of = |b: u64| if b == 1 { hi } else { lo };
+            for s in (vis_first + 1)..=vis_last {
+                let x = v.x_of(s as f64, wave_x0);
+                let cur = cap.value_at(i, s).unwrap_or(0);
+                let valid = cap.valid.get(i).and_then(|vv| vv.get(s)).copied().unwrap_or(false);
+                if !valid {
+                    // X: red middle band.
+                    p.line_segment(
+                        [egui::pos2(prev_x, mid), egui::pos2(x, mid)],
+                        Stroke::new(1.6, theme.danger),
+                    );
+                } else {
+                    if cur != prev_v {
+                        p.line_segment(
+                            [egui::pos2(x, y_of(prev_v)), egui::pos2(x, y_of(cur))],
+                            Stroke::new(1.6, theme.ok),
+                        );
+                    }
+                    p.line_segment(
+                        [egui::pos2(prev_x, y_of(prev_v)), egui::pos2(x, y_of(cur))],
+                        Stroke::new(1.6, theme.ok),
+                    );
+                }
+                prev_x = x;
+                prev_v = cur;
+            }
+        } else {
+            // Bus trace: segments between transitions, value labels when room.
+            let mut seg_start = vis_first;
+            let mut idx = vis_first;
+            while idx <= vis_last {
+                let cur = cap.value_at(i, idx);
+                let nxt = if idx + 1 <= vis_last { cap.value_at(i, idx + 1) } else { cur };
+                let valid = cap.valid.get(i).and_then(|vv| vv.get(idx)).copied().unwrap_or(false);
+                if nxt != cur || idx == vis_last {
+                    let x0 = v.x_of(seg_start as f64, wave_x0);
+                    let x1 = v.x_of((idx + 1) as f64, wave_x0).min(rect.right());
+                    if valid {
+                        // GTKWave sausage: top/bottom rails with crossing diagonals.
+                        p.line_segment(
+                            [egui::pos2(x0, hi), egui::pos2(x1, hi)],
+                            Stroke::new(1.4, theme.trace_b),
+                        );
+                        p.line_segment(
+                            [egui::pos2(x0, lo), egui::pos2(x1, lo)],
+                            Stroke::new(1.4, theme.trace_b),
+                        );
+                        if seg_start > vis_first {
+                            p.line_segment(
+                                [egui::pos2(x0, hi), egui::pos2(x0 + 5.0, mid)],
+                                Stroke::new(1.4, theme.trace_b),
+                            );
+                            p.line_segment(
+                                [egui::pos2(x0, lo), egui::pos2(x0 + 5.0, mid)],
+                                Stroke::new(1.4, theme.trace_b),
+                            );
+                        }
+                        if x1 - x0 > 34.0 {
+                            if let Some(val) = cur {
+                                p.text(
+                                    egui::pos2((x0 + x1) / 2.0, mid - 6.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    probe_radix_text(probe, val),
+                                    egui::FontId::monospace(10.0),
+                                    theme.text,
+                                );
+                            }
+                        }
+                    } else {
+                        p.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x0, mid - 2.0),
+                                egui::pos2(x1, mid + 2.0),
+                            ),
+                            1.0,
+                            theme.danger.gamma_multiply(0.55),
+                        );
+                    }
+                    seg_start = idx + 1;
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    // Trigger marker.
+    if let Some(ti) = cap.trigger_sample {
+        let x = v.x_of(ti as f64, wave_x0);
+        if x >= rect.left() && x <= rect.right() {
+            p.line_segment(
+                [egui::pos2(x, top), egui::pos2(x, rect.bottom())],
+                Stroke::new(1.6, theme.warn),
+            );
+            p.text(
+                egui::pos2(x + 3.0, top + 2.0),
+                egui::Align2::LEFT_TOP,
+                "TRIG",
+                egui::FontId::monospace(9.0),
+                theme.warn,
+            );
+        }
+    }
+    // Cursors span the full canvas height (GTKWave pattern).
+    let draw_cursor = |sample: usize, color: egui::Color32| {
+        let x = v.x_of(sample as f64, wave_x0);
+        if x >= rect.left() && x <= rect.right() {
+            p.line_segment(
+                [egui::pos2(x, top), egui::pos2(x, rect.bottom())],
+                Stroke::new(1.2, color),
+            );
+        }
+    };
+    if let Some(c) = v.cursor {
+        draw_cursor(c, theme.text);
+    }
+    if let Some(a) = v.cursor_a {
+        draw_cursor(a, theme.danger);
+    }
+    if let Some(b) = v.cursor_b {
+        draw_cursor(b, theme.trace_b);
+    }
+}
+
+fn probe_radix_text(probe: &ila::IlaProbeCfg, val: u64) -> String {
+    ila::format_value(val, probe.width(), probe.radix)
 }
 
 fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
