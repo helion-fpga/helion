@@ -848,6 +848,12 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::LParen)?;
                 let mut port_map = Vec::new();
                 loop {
+                    if !matches!(self.peek(), Some(Tok::Dot)) {
+                        return Err(self.err(
+                            "port connections must be named `.port(sig)`; \
+                             positional `(sig)` is not supported",
+                        ));
+                    }
                     self.expect(&Tok::Dot)?;
                     let (port, _) = self.eat_ident()?;
                     self.expect(&Tok::LParen)?;
@@ -972,6 +978,11 @@ impl<'a> Parser<'a> {
 
     fn parse_clock_gen(&mut self) -> Result<ClockGen, TbError> {
         let line = self.peek_line();
+        if !matches!(self.peek(), Some(Tok::Hash)) {
+            return Err(self.err(
+                "only `always #N sig = ~sig;` clock generators are supported",
+            ));
+        }
         self.expect(&Tok::Hash)?;
         let half = self.parse_const_u64()?;
         if half == 0 {
@@ -3226,9 +3237,10 @@ endmodule
     #[test]
     fn history_round_trip_and_keep_limit() {
         let d = tmp_dir("hist");
-        let mut h = TbHistory::default();
+        // record_history is the only writer: the on-disk history is the
+        // source of truth, and it trims to TB_HISTORY_KEEP.
         for i in 0..25 {
-            h.runs.push(TbHistoryEntry {
+            let e = TbHistoryEntry {
                 tb_name: format!("tb{i}"),
                 tb_path: PathBuf::from(format!("/x/tb{i}.sv")),
                 started_unix: 1000 + i as u64,
@@ -3237,18 +3249,17 @@ endmodule
                 runtime_ms: 5,
                 errors: if i % 2 == 0 { 0 } else { 1 },
                 vcd_path: None,
-            });
+            };
+            let manual = vec![PathBuf::from("/y/custom_tb.sv")];
+            record_history(&d, e, &manual).unwrap();
         }
-        h.manual.push(PathBuf::from("/y/custom_tb.sv"));
-        // record_history trims to TB_HISTORY_KEEP
-        let e = h.runs.last().cloned().unwrap();
-        let h2 = record_history(&d, e, &h.manual).unwrap();
+        let h2 = load_history(&d);
         assert_eq!(h2.runs.len(), TB_HISTORY_KEEP);
+        // Kept the newest 20: tb5..tb24.
+        assert_eq!(h2.runs[0].tb_name, "tb5");
+        assert_eq!(h2.runs.last().unwrap().tb_name, "tb24");
+        assert!(h2.runs.last().unwrap().passed);
         assert_eq!(h2.manual, vec![PathBuf::from("/y/custom_tb.sv")]);
-        let h3 = load_history(&d);
-        assert_eq!(h3.runs.len(), TB_HISTORY_KEEP);
-        assert_eq!(h3.runs[0].tb_name, "tb6");
-        assert!(h3.runs.last().unwrap().passed);
         // corrupt file → empty history, never a panic
         std::fs::write(history_path(&d), "{oops").unwrap();
         assert!(load_history(&d).runs.is_empty());
