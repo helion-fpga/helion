@@ -12,6 +12,8 @@ pub use preprocess::{expand_includes, preprocess_sv};
 
 use helion_ir::{Cell, CellKind, Design, Endpoint, Net, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -411,8 +413,11 @@ pub fn parse_expr<'a>(s: &str, arena: &'a Bump) -> Result<Expr<'a>, String> {
 }
 
 #[derive(Clone, Debug)]
-struct Signal {
-    name: String,
+struct Signal<'a> {
+    /// Borrows the token's `&str` span — no allocation per declaration.
+    /// (Same rationale as `RExpr::Ident`: spans point into the leaked
+    /// preprocessed source.)
+    name: &'a str,
     width: usize,
     depth: usize,
     keep: bool,
@@ -477,25 +482,25 @@ enum RExpr<'a> {
 }
 
 #[derive(Clone, Debug)]
-struct Inst {
-    module: String,
-    name: String,
+struct Inst<'a> {
+    module: &'a str,
+    name: &'a str,
     /// child port → parent net (ident)
-    conns: Vec<(String, String)>,
+    conns: Vec<(&'a str, &'a str)>,
     params: Vec<(String, u128)>,
 }
 
 #[derive(Clone, Debug)]
 struct Rtl<'a> {
-    module: String,
-    ports: Vec<(String, PortDir, usize)>,
-    signals: Vec<Signal>,
-    nbas: Vec<(String, Option<usize>, RExpr<'a>)>, // lhs name, optional bit, rhs
-    assigns: Vec<(String, Option<usize>, RExpr<'a>)>,
-    insts: Vec<Inst>,
+    module: &'a str,
+    ports: Vec<(&'a str, PortDir, usize)>,
+    signals: Vec<Signal<'a>>,
+    nbas: Vec<Nba<'a>>, // lhs name, optional bit, rhs
+    assigns: Vec<Nba<'a>>,
+    insts: Vec<Inst<'a>>,
     params: Vec<(String, u128)>,
     toks: Vec<Tok<'a>>,
-    mem_inits: HashMap<String, BTreeMap<usize, u128>>,
+    mem_inits: HashMap<&'a str, BTreeMap<usize, u128>>,
     /// Negedge-only always writes noted during parse (replaces the old
     /// NEGEDGE_WRITES thread-local; per-module data belongs on the module).
     negedge_writes: Vec<NegedgeWrite<'a>>,
@@ -794,7 +799,7 @@ fn resolve_packed_field(
 
 fn packed_field_select_expr<'a>(p: &mut P<'a>, name: &'a str) -> Result<RExpr<'a>, String> {
     let field = p.ident()?;
-    let (mut lo, mut width, mut nested) = match resolve_packed_field(p, &name, &field) {
+    let (mut lo, mut width, mut nested) = match resolve_packed_field(p, name, field) {
         Ok(hit) => hit,
         Err(_) => {
             // Hierarchical instance path `u_child.inner.port` is not a packed
@@ -802,7 +807,7 @@ fn packed_field_select_expr<'a>(p: &mut P<'a>, name: &'a str) -> Result<RExpr<'a
             // it against the instance tree (port → connected net, internal →
             // stitched `{inst}_{sig}`). Unknown last-idents used to stay
             // assign_not_lowered at map.
-            let mut segs = vec![name.to_string(), field];
+            let mut segs = vec![name, field];
             while p.eat_sym('.') {
                 segs.push(p.ident()?);
             }
@@ -817,7 +822,7 @@ fn packed_field_select_expr<'a>(p: &mut P<'a>, name: &'a str) -> Result<RExpr<'a
         let Some(st) = packed_struct_get(ty) else {
             return Err("nested packed type".into());
         };
-        let Some(fld) = st.fields.get(&f2) else {
+        let Some(fld) = st.fields.get(f2) else {
             return Err("unknown nested field".into());
         };
         lo = lo.saturating_add(fld.lo);
@@ -843,7 +848,7 @@ fn packed_field_select_expr<'a>(p: &mut P<'a>, name: &'a str) -> Result<RExpr<'a
 /// `arr[word].field` — packed field of one unpacked-array word.
 fn unpacked_word_field_expr<'a>(p: &mut P<'a>, name: &'a str, word: usize) -> Result<RExpr<'a>, String> {
     let field = p.ident()?;
-    let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+    let (lo, width, _) = resolve_packed_field(p, name, field)?;
     let w = width.max(1);
     if word >= 0x1_0000 || lo >= 0x1_0000 {
         return Err("word field too large".into());
@@ -860,14 +865,14 @@ fn unpacked_word_field_expr<'a>(p: &mut P<'a>, name: &'a str, word: usize) -> Re
     })
 }
 
-fn find_packed_struct_for_fields(names: &HashSet<String>) -> Option<PackedStruct> {
+fn find_packed_struct_for_fields(names: &HashSet<&str>) -> Option<PackedStruct> {
     if names.is_empty() {
         return None;
     }
     let mut hits: Vec<PackedStruct> = Vec::new();
     PKG_PACKED.with(|m| {
         for st in m.borrow().values() {
-            if names.iter().all(|n| st.fields.contains_key(n)) {
+            if names.iter().all(|n| st.fields.contains_key(*n)) {
                 hits.push(st.clone());
             }
         }
@@ -887,15 +892,15 @@ fn find_packed_struct_for_fields(names: &HashSet<String>) -> Option<PackedStruct
     None
 }
 
-fn pack_named_assign_pattern<'a>(fields: Vec<(String, RExpr<'a>)>) -> Result<RExpr<'a>, String> {
-    let names: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+fn pack_named_assign_pattern<'a>(fields: Vec<(&'a str, RExpr<'a>)>) -> Result<RExpr<'a>, String> {
+    let names: HashSet<&str> = fields.iter().map(|(n, _)| *n).collect();
     let Some(st) = find_packed_struct_for_fields(&names) else {
         return Err("named pattern unknown struct".into());
     };
     let mut acc = 0u128;
     let mut all_const = true;
     for (fname, expr) in &fields {
-        let Some(f) = st.fields.get(fname) else {
+        let Some(f) = st.fields.get(*fname) else {
             continue;
         };
         match expr {
@@ -966,7 +971,9 @@ fn harvest_struct_field<'a>(p: &mut P<'a>) -> Result<(String, usize, Option<Stri
     }
     let fname = p.ident()?;
     let _ = p.eat_sym(';');
-    Ok((fname, width.max(1), ty))
+    // Struct field definitions are cold (type-level, not per-occurrence);
+    // owned Strings here are fine.
+    Ok((fname.to_string(), width.max(1), ty.map(|s| s.to_string())))
 }
 
 /// `typedef` + `struct packed { fields } name;` — first field is MSB.
@@ -1026,7 +1033,7 @@ fn harvest_packed_struct<'a>(p: &mut P<'a>) {
         names.push(fname.clone());
     }
     packed_struct_insert(
-        tname,
+        tname.to_string(),
         PackedStruct {
             width: total,
             fields,
@@ -1096,8 +1103,8 @@ fn harvest_pkg_packed_param<'a>(p: &mut P<'a>) {
         if named {
             match parse_rexpr(p) {
                 Ok(RExpr::Const { val, .. }) => {
-                    p.params.entry(name.clone()).or_insert(val);
-                    pkg_enum_insert(name, val);
+                    p.params.entry(name.to_string()).or_insert(val);
+                    pkg_enum_insert(name.to_string(), val);
                 }
                 _ => {}
             }
@@ -1106,7 +1113,7 @@ fn harvest_pkg_packed_param<'a>(p: &mut P<'a>) {
             match parse_rexpr(p) {
                 Ok(e) => {
                     if let Some(val) = rexpr_const_val(&e) {
-                        pkg_enum_insert(name, val);
+                        pkg_enum_insert(name.to_string(), val);
                     }
                 }
                 Err(_) => {
@@ -1142,7 +1149,7 @@ fn harvest_typedef_enum<'a>(p: &mut P<'a>) {
         if let Ok(tname) = p.ident() {
             if width > 0 && width <= 128 && matches!(p.peek(), Some(Tok::Sym(';')) | None) {
                 PKG_ENUM_TYPES.with(|m| {
-                    m.borrow_mut().insert(tname, width);
+                    m.borrow_mut().insert(tname.to_string(), width);
                 });
                 let _ = p.eat_sym(';');
                 return;
@@ -1229,13 +1236,13 @@ fn harvest_typedef_enum<'a>(p: &mut P<'a>) {
         } else {
             next
         };
-        pkg_enum_insert(name, val);
+        pkg_enum_insert(name.to_string(), val);
         next = val.wrapping_add(1);
         let _ = p.eat_sym(',');
     }
     if let Ok(tname) = p.ident() {
         PKG_ENUM_TYPES.with(|m| {
-            m.borrow_mut().insert(tname, width.max(1));
+            m.borrow_mut().insert(tname.to_string(), width.max(1));
         });
     }
     let _ = p.eat_sym(';');
@@ -1659,7 +1666,7 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
                 {
                     continue;
                 }
-                return Some(lhs.clone());
+                return Some(lhs.to_string());
             }
         }
     }
@@ -1667,12 +1674,12 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
     // reg bits after `hang_diag flatten` and never returns. Name one
     // signal and stop. Not a LUT. Not a closed WNS.
     if rtl.nbas.len() >= 2048 {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut counts: HashMap<&str, usize> = HashMap::new();
         for (lhs, _, _) in &rtl.nbas {
-            *counts.entry(lhs.clone()).or_insert(0) += 1;
+            *counts.entry(lhs).or_insert(0) += 1;
         }
         if let Some((name, _)) = counts.into_iter().max_by_key(|(_, n)| *n) {
-            return Some(name);
+            return Some(name.to_string());
         }
         return Some("flatten".into());
     }
@@ -1686,14 +1693,14 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
             .filter(|(_, bit, _)| bit.is_some())
             .count();
         if per_bit >= 32 && rtl.assigns.iter().any(|(_, _, rhs)| rexpr_has_mux(rhs)) {
-            let mut counts: HashMap<String, usize> = HashMap::new();
+            let mut counts: HashMap<&str, usize> = HashMap::new();
             for (lhs, bit, rhs) in &rtl.assigns {
                 if bit.is_some() && rexpr_has_mux(rhs) && !rexpr_is_wire_mux_form(rhs) {
-                    *counts.entry(lhs.clone()).or_insert(0) += 1;
+                    *counts.entry(lhs).or_insert(0) += 1;
                 }
             }
             if let Some((name, _)) = counts.into_iter().max_by_key(|(_, n)| *n) {
-                return Some(name);
+                return Some(name.to_string());
             }
         }
     }
@@ -1710,10 +1717,10 @@ fn flatten_leftover_signal(rtl: &Rtl) -> Option<String> {
         }
         let mut names = HashSet::new();
         rexpr_names(rhs, &mut names);
-        names.contains(&mem.name)
+        names.contains(mem.name)
     });
     if mentions {
-        Some(mem.name.clone())
+        Some(mem.name.to_string())
     } else {
         None
     }
@@ -1859,6 +1866,7 @@ fn note_inout_enable_not_lowered(module: &str, signal: &str) {
 }
 
 fn note_negedge_write<'a>(
+    arena: &'a Bump,
     out: &mut Vec<NegedgeWrite<'a>>,
     module: &str,
     clk: &str,
@@ -1866,20 +1874,16 @@ fn note_negedge_write<'a>(
     bit: Option<usize>,
     rhs: Option<RExpr<'a>>,
 ) {
-    let module = if module.is_empty() { "?" } else { module };
-    let clk = if clk.is_empty() { "clk" } else { clk };
-    let signal = if signal.is_empty() { "always" } else { signal };
+    // Borrowed names: arena-copy the (rare) generated/default strings so the
+    // note holds `&'a str` without per-note malloc (same arena rationale).
+    let module = arena.alloc_str(if module.is_empty() { "?" } else { module });
+    let clk = arena.alloc_str(if clk.is_empty() { "clk" } else { clk });
+    let signal = arena.alloc_str(if signal.is_empty() { "always" } else { signal });
     if !out
         .iter()
-        .any(|(m, _, sig, _, _)| m == module && sig == signal)
+        .any(|(m, _, sig, _, _)| m == &module && sig == &signal)
     {
-        out.push((
-            module.to_string(),
-            clk.to_string(),
-            signal.to_string(),
-            bit,
-            rhs,
-        ));
+        out.push((module, clk, signal, bit, rhs));
     }
 }
 
@@ -1954,23 +1958,23 @@ fn lower_negedge_hffs(d: &mut Design, rtl: &Rtl) {
         if hff_q_is(d, signal) && is_input_port(rtl, clk) {
             if let Some(ff) = d.cells.iter().find(|c| {
                 matches!(c.kind, CellKind::Hff)
-                    && d.net_on(&c.name, "Q") == Some(signal.as_str())
-                    && d.net_on(&c.name, "CLK") == Some(clk.as_str())
+                    && d.net_on(&c.name, "Q") == Some(signal)
+                    && d.net_on(&c.name, "CLK") == Some(clk)
             }) {
                 eprintln!("hff_path cell={} CLK={} Q={}", ff.name, clk, signal);
                 continue;
             }
         }
         let Some(rhs) = rhs else {
-            note_negedge_not_lowered(&rtl.module, signal);
+            note_negedge_not_lowered(rtl.module, signal);
             continue;
         };
         if !is_input_port(rtl, clk) {
-            note_negedge_not_lowered(&rtl.module, signal);
+            note_negedge_not_lowered(rtl.module, signal);
             continue;
         }
         let Some(dnet) = negedge_d_net(rtl, signal, *bit, rhs) else {
-            note_negedge_not_lowered(&rtl.module, signal);
+            note_negedge_not_lowered(rtl.module, signal);
             continue;
         };
         let qnet = if bit.is_none() {
@@ -1980,7 +1984,7 @@ fn lower_negedge_hffs(d: &mut Design, rtl: &Rtl) {
         };
         let ff = format!("u_nff_{signal}");
         d.add_cell(&ff, CellKind::Hff);
-        d.connect(clk.as_str(), &ff, "CLK");
+        d.connect(*clk, &ff, "CLK");
         d.connect(&dnet, &ff, "D");
         d.connect(&qnet, &ff, "Q");
         eprintln!("hff_path cell={ff} CLK={clk} D={dnet} Q={qnet}");
@@ -2002,7 +2006,7 @@ fn seq_clocks_of(module: &str) -> Vec<String> {
 fn is_input_port(rtl: &Rtl, name: &str) -> bool {
     rtl.ports
         .iter()
-        .any(|(n, dir, _)| n == name && *dir == PortDir::In)
+        .any(|(n, dir, _)| *n == name && *dir == PortDir::In)
 }
 
 /// Data arm of a clock mux: a plain input-port ident (a user clock).
@@ -2175,8 +2179,8 @@ fn mux_cond_mentions(e: &RExpr<'_>, name: &str) -> bool {
 }
 
 fn signal_is_driven(rtl: &Rtl, name: &str) -> bool {
-    rtl.nbas.iter().any(|(lhs, _, _)| lhs == name)
-        || rtl.assigns.iter().any(|(lhs, _, _)| lhs == name)
+    rtl.nbas.iter().any(|(lhs, _, _)| *lhs == name)
+        || rtl.assigns.iter().any(|(lhs, _, _)| *lhs == name)
 }
 
 /// Read-only inout ports that gate a clocked load. Not a driven bidirectional bus.
@@ -2188,7 +2192,7 @@ fn inout_load_enables(rtl: &Rtl) -> Vec<String> {
         }
         let used = rtl.nbas.iter().any(|(_, _, rhs)| mux_cond_mentions(rhs, n));
         if used {
-            out.push(n.clone());
+            out.push(n.to_string());
         }
     }
     out
@@ -2428,7 +2432,7 @@ fn function_name_after_kw<'a>(p: &mut P<'a>) -> String {
     skip_sv_type(p);
     let _ = p.width_opt();
     match p.ident() {
-        Ok(n) => n,
+        Ok(n) => n.to_string(),
         Err(_) => {
             p.i = save;
             String::new()
@@ -2832,11 +2836,11 @@ fn inst_port_map<'a>(child: &'a Design, inst: &'a Inst) -> HashMap<&'a str, &'a 
     for (pn, net) in &inst.conns {
         if let Some(rest) = pn.strip_prefix('#') {
             if let Ok(i) = rest.parse::<usize>() {
-                by_pos.insert(i, net.as_str());
+                by_pos.insert(i, *net);
                 continue;
             }
         }
-        by_name.insert(pn.as_str(), net.as_str());
+        by_name.insert(*pn, *net);
     }
     let mut port_map: HashMap<&str, &str> = HashMap::with_capacity(child.ports.len());
     for (i, p) in child.ports.iter().enumerate() {
@@ -3107,7 +3111,7 @@ fn mark_debug_prefixed(dst: &mut Design, proto: &Rtl, prefix: &str) {
             continue;
         }
         let n = if prefix.is_empty() {
-            s.name.clone()
+            s.name.to_string()
         } else {
             format!("{prefix}{}", s.name)
         };
@@ -3257,17 +3261,17 @@ fn emit_module_into(
 
     let mut self_ports: HashMap<String, String> = HashMap::new();
     for (pname, _, _) in &proto.ports {
-        if let Some(p) = port_map.get(pname) {
-            self_ports.insert(pname.clone(), p.clone());
+        if let Some(p) = port_map.get(*pname) {
+            self_ports.insert(pname.to_string(), p.clone());
         } else if prefix.is_empty() {
-            self_ports.insert(pname.clone(), pname.clone());
+            self_ports.insert(pname.to_string(), pname.to_string());
         } else {
-            self_ports.insert(pname.clone(), format!("{prefix}{pname}"));
+            self_ports.insert(pname.to_string(), format!("{prefix}{pname}"));
         }
     }
 
     for inst in &proto.insts {
-        if !mods.contains_key(&inst.module) {
+        if !mods.contains_key(inst.module) {
             note_skip(format!(
                 "diagnostic unknown_instance module={} inst={} child={} (child body absent; not a LUT)",
                 name, inst.name, inst.module
@@ -3281,7 +3285,7 @@ fn emit_module_into(
             ));
             continue;
         }
-        let child_proto = mods.get(&inst.module).expect("child");
+        let child_proto = mods.get(inst.module).expect("child");
         let ov = inst_overrides(inst, child_proto);
         let child_prefix = {
             let mut s = String::with_capacity(prefix.len() + inst.name.len() + 1);
@@ -3320,14 +3324,14 @@ fn emit_module_into(
             }
         } else {
             let port_shell = {
-                let mut shell = Design::new(&child_proto.module);
+                let mut shell = Design::new(child_proto.module);
                 for (n, dir, _) in &child_proto.ports {
-                    shell.add_port(n, *dir);
+                    shell.add_port(*n, *dir);
                 }
                 shell
             };
             let cmap = abs_inst_port_map(&port_shell, inst, prefix, &self_ports);
-            emit_module_into(mods, &inst.module, &child_prefix, &cmap, dst, visiting)?
+            emit_module_into(mods, inst.module, &child_prefix, &cmap, dst, visiting)?
         };
         merge_child_soft(&mut summary, child_sum, name, inst);
     }
@@ -3346,10 +3350,11 @@ fn assemble_module(
     // Root: identity port map; empty prefix. Single-pass emit into one Design.
     let mut port_map: HashMap<String, String> = HashMap::new();
     for (n, _, _) in &proto.ports {
-        port_map.insert(n.clone(), n.clone());
+        port_map.insert(n.to_string(), n.to_string());
     }
-    let mut d = Design::new(&proto.module);
+    let mut d = Design::new(proto.module);
     for (n, dir, _) in &proto.ports {
+        let n: &str = n;
         let dir = if matches!(dir, PortDir::Inout) {
             PortDir::In
         } else {
@@ -3359,7 +3364,7 @@ fn assemble_module(
     }
     let summary = emit_module_into(mods, name, "", &port_map, &mut d, visiting)?;
     apply_soft_to_design(&mut d, &summary);
-    d.name = proto.module.clone();
+    d.name = proto.module.to_string();
     Ok(d)
 }
 
@@ -3874,9 +3879,10 @@ struct P<'a> {
     arena: &'a Bump,
     params: HashMap<String, u128>,
     /// Signal/port widths seen so far (slice assigns and const if).
-    widths: HashMap<String, usize>,
+    /// Keys borrow token spans — no allocation per declaration.
+    widths: HashMap<&'a str, usize>,
     /// Names declared `signed` (ANSI/non-ANSI ports and net decls).
-    signed: HashSet<String>,
+    signed: HashSet<&'a str>,
 }
 
 impl<'a> P<'a> {
@@ -3906,9 +3912,12 @@ impl<'a> P<'a> {
             _ => false,
         }
     }
-    fn ident(&mut self) -> Result<String, String> {
+    /// Borrow the identifier's token span directly — zero allocation.
+    /// Callers needing an owned name (rare; generated names go through the
+    /// arena) convert explicitly.
+    fn ident(&mut self) -> Result<&'a str, String> {
         match self.bump() {
-            Some(Tok::Ident(s)) => Ok(s.to_string()),
+            Some(Tok::Ident(s)) => Ok(s),
             other => Err(format!("expected ident, got {other:?}")),
         }
     }
@@ -4059,7 +4068,7 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
             {
                 p.bump();
                 p.bump();
-                name = p.ident()?;
+                name = p.ident()?.to_string();
             }
             if let Some(v) = p.params.get(&name).copied() {
                 return Ok(v);
@@ -4645,7 +4654,7 @@ fn parse_atom_r<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
         if matches!(p.peek(), Some(Tok::Ident(_)))
             && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
         {
-            let mut fields: Vec<(String, RExpr<'a>)> = Vec::new();
+            let mut fields: Vec<(&'a str, RExpr<'a>)> = Vec::new();
             loop {
                 let fname = p.ident()?;
                 if !p.eat_sym(':') {
@@ -5047,18 +5056,18 @@ fn skip_logic<'a>(p: &mut P<'a>) -> bool {
     signed
 }
 
-enum LhsKind {
-    Whole(String),
-    Bit(String, usize),
+enum LhsKind<'a> {
+    Whole(&'a str),
+    Bit(&'a str, usize),
     /// Inclusive slice `lo .. lo+width-1` (packed field or `+:` / `-:`).
     Slice {
-        name: String,
+        name: &'a str,
         lo: usize,
         width: usize,
     },
     /// Packed bits of one unpacked word: `arr[word][lo +: W]` / `arr[word].field`.
     Unpacked {
-        name: String,
+        name: &'a str,
         word: usize,
         lo: usize,
         width: usize,
@@ -5111,17 +5120,17 @@ fn lhs_bit_piece<'a>(rhs: &RExpr<'a>, i: usize, arena: &'a Bump) -> RExpr<'a> {
 }
 
 fn lhs_kind_assigns<'a>(
-    kind: LhsKind,
+    kind: LhsKind<'a>,
     rhs: RExpr<'a>,
     arena: &'a Bump,
-) -> Vec<(String, Option<usize>, RExpr<'a>)> {
+) -> Vec<Nba<'a>> {
     match kind {
         LhsKind::Whole(n) => vec![(n, None, rhs)],
         LhsKind::Bit(n, b) => vec![(n, Some(b), rhs)],
         LhsKind::Slice { name, lo, width } => {
             let w = width.max(1);
             (0..w)
-                .map(|i| (name.clone(), Some(lo + i), lhs_bit_piece(&rhs, i, arena)))
+                .map(|i| (name, Some(lo + i), lhs_bit_piece(&rhs, i, arena)))
                 .collect()
         }
         LhsKind::Unpacked {
@@ -5134,7 +5143,7 @@ fn lhs_kind_assigns<'a>(
             (0..w)
                 .map(|i| {
                     (
-                        name.clone(),
+                        name,
                         Some(encode_unpacked_bit(word, lo + i)),
                         lhs_bit_piece(&rhs, i, arena),
                     )
@@ -5144,15 +5153,15 @@ fn lhs_kind_assigns<'a>(
     }
 }
 
-fn parse_lhs<'a>(p: &mut P<'a>) -> Result<LhsKind, String> {
+fn parse_lhs<'a>(p: &mut P<'a>) -> Result<LhsKind<'a>, String> {
     let name = p.ident()?;
     parse_lhs_after_name(p, name)
 }
 
-fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: String) -> Result<LhsKind, String> {
+fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: &'a str) -> Result<LhsKind<'a>, String> {
     if p.eat_sym('.') {
         let field = p.ident()?;
-        let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+        let (lo, width, _) = resolve_packed_field(p, name, field)?;
         if p.eat_sym('[') {
             let idx = const_u(p)? as usize;
             if !p.eat_sym(']') {
@@ -5220,7 +5229,7 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: String) -> Result<LhsKind, Stri
             if p.eat_sym(']') {
                 if p.eat_sym('.') {
                     let field = p.ident()?;
-                    let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+                    let (lo, width, _) = resolve_packed_field(p, name, field)?;
                     return Ok(LhsKind::Unpacked {
                         name,
                         word: base as usize,
@@ -5280,12 +5289,12 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: String) -> Result<LhsKind, Stri
     }
 }
 
-type Nba<'a> = (String, Option<usize>, RExpr<'a>);
+type Nba<'a> = (&'a str, Option<usize>, RExpr<'a>);
 /// One negedge-only always write: (module, clk, signal, bit, optional RHS).
-type NegedgeWrite<'a> = (String, String, String, Option<usize>, Option<RExpr<'a>>);
+type NegedgeWrite<'a> = (&'a str, &'a str, &'a str, Option<usize>, Option<RExpr<'a>>);
 
 /// `$readmemh("file", mem)` / `$readmemb` in `initial` → mem_inits.
-fn try_parse_readmem<'a>(p: &mut P<'a>, mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>) -> bool {
+fn try_parse_readmem<'a>(p: &mut P<'a>, mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>) -> bool {
     let save = p.i;
     let Some(Tok::Ident(n)) = p.peek() else {
         return false;
@@ -5920,12 +5929,12 @@ fn bit_extract<'a>(e: RExpr<'a>, bit: usize, arena: &'a Bump) -> RExpr<'a> {
     }
 }
 
-fn note_width<'a>(p: &mut P<'a>, name: &str, w: usize) {
-    p.widths.insert(name.to_string(), w.max(1));
+fn note_width<'a>(p: &mut P<'a>, name: &'a str, w: usize) {
+    p.widths.insert(name, w.max(1));
 }
 
-fn note_signed<'a>(p: &mut P<'a>, name: &str) {
-    p.signed.insert(name.to_string());
+fn note_signed<'a>(p: &mut P<'a>, name: &'a str) {
+    p.signed.insert(name);
 }
 
 /// `ident >= 0` / `< 0` → ~MSB/MSB only when the decl is tracked **signed**
@@ -5959,19 +5968,19 @@ fn rhs_looks_like_priority_bit_set(e: &RExpr<'_>) -> bool {
 }
 
 fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>> {
-    let mut bits_per: HashMap<String, usize> = HashMap::new();
-    let mut prio_sets: HashMap<String, usize> = HashMap::new();
-    let mut scalar_writes: HashSet<String> = HashSet::new();
+    let mut bits_per: HashMap<&'a str, usize> = HashMap::new();
+    let mut prio_sets: HashMap<&'a str, usize> = HashMap::new();
+    let mut scalar_writes: HashSet<&'a str> = HashSet::new();
     for (lhs, bit, rhs) in stmts {
         match bit {
             Some(_) => {
-                *bits_per.entry(lhs.clone()).or_default() += 1;
+                *bits_per.entry(lhs).or_default() += 1;
                 if rhs_looks_like_priority_bit_set(rhs) {
-                    *prio_sets.entry(lhs.clone()).or_default() += 1;
+                    *prio_sets.entry(lhs).or_default() += 1;
                 }
             }
             None => {
-                scalar_writes.insert(lhs.clone());
+                scalar_writes.insert(lhs);
             }
         }
     }
@@ -5996,7 +6005,7 @@ fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>>
         "synth_rtl compact_priority_onehot signal={bus} bit_writes={nbits} (skip hang-class fold)"
     );
     let mut out = vec![(
-        bus.clone(),
+        bus,
         None,
         RExpr::Const {
             val: 0,
@@ -6026,14 +6035,14 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a
     }
     fn subst<'a>(
         e: &RExpr<'a>,
-        env: &HashMap<(String, Option<usize>), RExpr<'a>>,
+        env: &HashMap<(&'a str, Option<usize>), RExpr<'a>>,
         lhs: &str,
         bit: Option<usize>,
         arena: &'a Bump,
     ) -> RExpr<'a> {
         match e {
             RExpr::Ident(s) if *s == lhs && bit.is_none() => env
-                .get(&(s.to_string(), None))
+                .get(&(*s, None))
                 .cloned()
                 .unwrap_or_else(|| e.clone()),
             RExpr::Not(x) => RExpr::Not(arena.alloc(subst(x, env, lhs, bit, arena))),
@@ -6106,13 +6115,13 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a
             other => other.clone(),
         }
     }
-    let mut env: HashMap<(String, Option<usize>), RExpr<'a>> = HashMap::new();
-    let mut order: Vec<(String, Option<usize>)> = Vec::new();
+    let mut env: HashMap<(&'a str, Option<usize>), RExpr<'a>> = HashMap::new();
+    let mut order: Vec<(&'a str, Option<usize>)> = Vec::new();
     for (lhs, bit, rhs) in stmts {
-        let key = (lhs.clone(), bit);
-        let rhs = subst(&rhs, &env, &lhs, bit, arena);
+        let key = (lhs, bit);
+        let rhs = subst(&rhs, &env, lhs, bit, arena);
         if !env.contains_key(&key) {
-            order.push(key.clone());
+            order.push(key);
         }
         env.insert(key, rhs);
     }
@@ -6123,22 +6132,22 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a
 }
 
 fn normalize_nbas<'a>(p: &P<'a>, stmts: Vec<Nba<'a>>) -> Vec<Nba<'a>> {
-    let mut order: Vec<(String, Option<usize>)> = Vec::new();
-    let mut map: HashMap<(String, Option<usize>), RExpr<'a>> = HashMap::new();
-    let put = |order: &mut Vec<(String, Option<usize>)>,
-               map: &mut HashMap<(String, Option<usize>), RExpr<'a>>,
-               key: (String, Option<usize>),
+    let mut order: Vec<(&'a str, Option<usize>)> = Vec::new();
+    let mut map: HashMap<(&'a str, Option<usize>), RExpr<'a>> = HashMap::new();
+    let put = |order: &mut Vec<(&'a str, Option<usize>)>,
+               map: &mut HashMap<(&'a str, Option<usize>), RExpr<'a>>,
+               key: (&'a str, Option<usize>),
                rhs: RExpr<'a>| {
         if !map.contains_key(&key) {
-            order.push(key.clone());
+            order.push(key);
         }
         map.insert(key, rhs);
     };
     for (lhs, bit, rhs) in stmts {
-        let w = p.widths.get(&lhs).copied().unwrap_or(1).min(256);
+        let w = p.widths.get(lhs).copied().unwrap_or(1).min(256);
         match bit {
             Some(b) => {
-                let full = (lhs.clone(), None);
+                let full = (lhs, None);
                 if map.remove(&full).is_some() {
                     order.retain(|k| k != &full);
                 }
@@ -6152,8 +6161,8 @@ fn normalize_nbas<'a>(p: &P<'a>, stmts: Vec<Nba<'a>>) -> Vec<Nba<'a>> {
                 order.retain(|(n, _)| n != &lhs);
                 map.retain(|(n, _), _| n != &lhs);
                 for i in 0..w {
-                    let key = (lhs.clone(), Some(i));
-                    order.push(key.clone());
+                    let key = (lhs, Some(i));
+                    order.push(key);
                     map.insert(key, bit_extract(rhs.clone(), i, p.arena));
                 }
             }
@@ -6171,7 +6180,7 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
     let name = p.ident()?;
     if p.eat_sym('.') {
         let field = p.ident()?;
-        let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+        let (lo, width, _) = resolve_packed_field(p, name, field)?;
         if p.eat_sym('[') {
             let idx = const_u(p)? as usize;
             if !p.eat_sym(']') {
@@ -6247,7 +6256,7 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
             } else if p.eat_sym(']') {
                 if p.eat_sym('.') {
                     let field = p.ident()?;
-                    let (lo, width, _) = resolve_packed_field(p, &name, &field)?;
+                    let (lo, width, _) = resolve_packed_field(p, name, field)?;
                     if matches!(p.peek(), Some(Tok::Le)) {
                         p.bump();
                     } else if !p.eat_sym('=') {
@@ -6350,7 +6359,7 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
         let mut k = 0usize;
         let mut i = lo;
         for _ in 0..span {
-            v.push((name.clone(), Some(i), bit_extract(rhs.clone(), k, p.arena)));
+            v.push((name, Some(i), bit_extract(rhs.clone(), k, p.arena)));
             k += 1;
             if i == usize::MAX {
                 break;
@@ -6411,7 +6420,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
                 continue;
             }
             out.push((
-                lhs.clone(),
+                lhs,
                 bit,
                 RExpr::Mux(
                     p.arena.alloc(cond.clone()),
@@ -6644,7 +6653,7 @@ fn parse_param_assigns<'a>(p: &mut P<'a>) -> Result<Vec<(String, u128)>, String>
                 match const_u(p) {
                     Ok(val) => {
                         if p.eat_sym(')') {
-                            out.push((name, val));
+                            out.push((name.to_string(), val));
                         } else {
                             skip_until_arg_end(p);
                             let _ = p.eat_sym(')');
@@ -6668,9 +6677,9 @@ fn parse_param_assigns<'a>(p: &mut P<'a>) -> Result<Vec<(String, u128)>, String>
                     Ok(val) => {
                         // Register immediately so later defaults can ref earlier ones
                         // (`OW = 2 * DW`). Existing overrides in p.params win.
-                        let effective = p.params.get(&name).copied().unwrap_or(val);
-                        p.params.insert(name.clone(), effective);
-                        out.push((name, effective));
+                        let effective = p.params.get(name).copied().unwrap_or(val);
+                        p.params.insert(name.to_string(), effective);
+                        out.push((name.to_string(), effective));
                     }
                     Err(_) => skip_until_arg_end(p),
                 }
@@ -7010,7 +7019,7 @@ fn parse_net_ref<'a>(p: &mut P<'a>) -> Result<String, String> {
         }
         return Ok(format!("{name}_{idx}"));
     }
-    Ok(name)
+    Ok(name.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -7050,15 +7059,15 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
             skip_sv_type(p);
             let w = p.width_opt().unwrap_or(1);
             if let Ok(n) = p.ident() {
-                ports.push((n.clone(), dir, w));
-                signals.push((n.clone(), w));
-                note_width(p, &n, w);
+                ports.push((n.to_string(), dir, w));
+                signals.push((n.to_string(), w));
+                note_width(p, n, w);
             }
             let _ = p.eat_sym(',');
         }
     }
     let _ = p.eat_sym(';');
-    note_width(p, &name, ret_w);
+    note_width(p, name, ret_w);
     while !p.eat_kw("endfunction") {
         if p.peek().is_none()
             || matches!(p.peek(), Some(Tok::Kw(k)) if *k == "endmodule" || *k == "module")
@@ -7070,17 +7079,17 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
             skip_sv_type(p);
             let w = p.width_opt().unwrap_or(1);
             if let Ok(n) = p.ident() {
-                ports.push((n.clone(), dir, w));
-                signals.push((n.clone(), w));
-                note_width(p, &n, w);
+                ports.push((n.to_string(), dir, w));
+                signals.push((n.to_string(), w));
+                note_width(p, n, w);
             }
             let _ = p.eat_sym(';');
             continue;
         }
         if p.eat_kw("integer") {
             if let Ok(n) = p.ident() {
-                signals.push((n.clone(), 32));
-                note_width(p, &n, 32);
+                signals.push((n.to_string(), 32));
+                note_width(p, n, 32);
             }
             let _ = p.eat_sym(';');
             continue;
@@ -7088,8 +7097,8 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
         if p.eat_kw("reg") || p.eat_kw("wire") || p.eat_kw("logic") {
             let w = p.width_opt().unwrap_or(1);
             if let Ok(n) = p.ident() {
-                signals.push((n.clone(), w));
-                note_width(p, &n, w);
+                signals.push((n.to_string(), w));
+                note_width(p, n, w);
             }
             skip_to_semi(p);
             continue;
@@ -7119,7 +7128,7 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
         }
     }
     Ok(FuncDef {
-        name,
+        name: name.to_string(),
         ret_w,
         ports,
         signals,
@@ -7127,13 +7136,13 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
     })
 }
 
-fn rexpr_names(e: &RExpr<'_>, out: &mut HashSet<String>) {
+fn rexpr_names<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
     match e {
         RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
-            out.insert(s.to_string());
+            out.insert(s);
         }
         RExpr::IndexPart { name, base, .. } => {
-            out.insert(name.to_string());
+            out.insert(name);
             rexpr_names(base, out);
         }
         RExpr::WordAt { addr, data } => {
@@ -7225,26 +7234,57 @@ fn map_rexpr_children<'a>(
     }
 }
 
-fn collect_calls(e: &RExpr<'_>, out: &mut HashSet<String>) {
-    if let RExpr::Call { name, args } = e {
-        out.insert(name.to_string());
-        for a in args {
-            collect_calls(a, out);
+fn collect_calls<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
+    match e {
+        RExpr::Call { name, args } => {
+            out.insert(name);
+            for a in args {
+                collect_calls(a, out);
+            }
         }
-        return;
+        RExpr::IndexPart { base, .. } => collect_calls(base, out),
+        RExpr::WordAt { addr, data } => {
+            collect_calls(addr, out);
+            collect_calls(data, out);
+        }
+        RExpr::Concat(parts) => {
+            for x in parts {
+                collect_calls(x, out);
+            }
+        }
+        RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => {
+            collect_calls(a, out);
+            collect_calls(b, out);
+        }
+        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::Not(x) => {
+            collect_calls(x, out)
+        }
+        RExpr::Mux(c, t, f) => {
+            collect_calls(c, out);
+            collect_calls(t, out);
+            collect_calls(f, out);
+        }
+        RExpr::Const { .. }
+        | RExpr::Ident(_)
+        | RExpr::Bit(_, _)
+        | RExpr::Range(_, _, _) => {}
     }
-    // Result discarded; a throwaway arena is fine.
-    let arena = Bump::new();
-    let _ = map_rexpr_children(e, &mut |c| {
-        collect_calls(c, out);
-        c.clone()
-    }, &arena);
 }
 
 /// Exactly one assign to the function name, and no other statements. `inv = ~d`.
 fn simple_return_assign<'a>(f: &FuncDef<'a>) -> Option<RExpr<'a>> {
     match f.stmts.as_slice() {
-        [(lhs, None, rhs)] if lhs == &f.name => Some(rhs.clone()),
+        [(lhs, None, rhs)] if *lhs == f.name => Some(rhs.clone()),
         _ => None,
     }
 }
@@ -7358,7 +7398,7 @@ fn inline_rexpr<'a>(
 }
 
 fn inline_nbas<'a>(
-    nbas: &mut [(String, Option<usize>, RExpr<'a>)],
+    nbas: &mut [Nba<'a>],
     funcs: &[FuncDef<'a>],
     arena: &'a Bump,
 ) {
@@ -7442,11 +7482,11 @@ fn parse_functions_in_slice<'a>(toks: &'a [Tok<'a>], arena: &'a Bump) -> Vec<Fun
 }
 
 fn lift_functions_if_no_body<'a>(
-    ports: &mut Vec<(String, PortDir, usize)>,
-    signals: &mut Vec<Signal>,
+    ports: &mut Vec<(&'a str, PortDir, usize)>,
+    signals: &mut Vec<Signal<'a>>,
     nbas: &[Nba<'a>],
     assigns: &mut Vec<Nba<'a>>,
-    insts: &[Inst],
+    insts: &[Inst<'a>],
     funcs: &[FuncDef<'a>],
     arena: &'a Bump,
 ) {
@@ -7480,8 +7520,10 @@ fn lift_functions_if_no_body<'a>(
             ids.insert(n.clone());
         }
         for (lhs, _, rhs) in &f.stmts {
-            ids.insert(lhs.clone());
-            rexpr_names(rhs, &mut ids);
+            ids.insert(lhs.to_string());
+            let mut rnames: HashSet<&str> = HashSet::new();
+            rexpr_names(rhs, &mut rnames);
+            ids.extend(rnames.iter().map(|n| n.to_string()));
         }
         let mut subst: HashMap<String, String> = HashMap::new();
         if multi {
@@ -7499,10 +7541,10 @@ fn lift_functions_if_no_body<'a>(
             for (n, dir, w) in &f.ports {
                 let pn = claim(&mut taken, mapped(&subst, n));
                 subst.insert(n.clone(), pn.clone());
-                ports.push((pn.clone(), *dir, *w));
-                if !signals.iter().any(|s| s.name == pn) {
+                ports.push((arena.alloc_str(&pn), *dir, *w));
+                if !signals.iter().any(|s| s.name == pn.as_str()) {
                     signals.push(Signal {
-                        name: pn,
+                        name: arena.alloc_str(&pn),
                         width: *w,
                         depth: 0,
                         keep: false,
@@ -7513,10 +7555,10 @@ fn lift_functions_if_no_body<'a>(
             }
             let on = claim(&mut taken, f.name.clone());
             subst.insert(f.name.clone(), on.clone());
-            ports.push((on.clone(), PortDir::Out, f.ret_w));
-            if !signals.iter().any(|s| s.name == on) {
+            ports.push((arena.alloc_str(&on), PortDir::Out, f.ret_w));
+            if !signals.iter().any(|s| s.name == on.as_str()) {
                 signals.push(Signal {
-                    name: on,
+                    name: arena.alloc_str(&on),
                     width: f.ret_w,
                     depth: 0,
                     keep: false,
@@ -7527,9 +7569,9 @@ fn lift_functions_if_no_body<'a>(
         }
         for (n, w) in &f.signals {
             let pn = mapped(&subst, n);
-            if !signals.iter().any(|s| s.name == pn) {
+            if !signals.iter().any(|s| s.name == pn.as_str()) {
                 signals.push(Signal {
-                    name: pn,
+                    name: arena.alloc_str(&pn),
                     width: *w,
                     depth: 0,
                     keep: false,
@@ -7540,9 +7582,9 @@ fn lift_functions_if_no_body<'a>(
         }
         for (lhs, bit, rhs) in &f.stmts {
             let ln = mapped(&subst, lhs);
-            if !signals.iter().any(|s| s.name == ln) {
+            if !signals.iter().any(|s| s.name == ln.as_str()) {
                 signals.push(Signal {
-                    name: ln.clone(),
+                    name: arena.alloc_str(&ln),
                     width: 1,
                     depth: 0,
                     keep: false,
@@ -7550,7 +7592,7 @@ fn lift_functions_if_no_body<'a>(
                     force_bram: false,
                 });
             }
-            assigns.push((ln, *bit, rewrite_rexpr(rhs, &subst, arena)));
+            assigns.push((arena.alloc_str(&ln), *bit, rewrite_rexpr(rhs, &subst, arena)));
         }
     }
 }
@@ -7561,9 +7603,9 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         return Err("expected module".into());
     }
     let module = p.ident()?;
-    set_cur_mod(&module);
+    set_cur_mod(module);
     if slice_is_sim_only(&p.t[p.i..]) {
-        note_sim_only(&module);
+        note_sim_only(module);
     }
     while p.eat_kw("import") {
         let _ = skip_item_or_block(&mut p);
@@ -7613,7 +7655,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
                 if !ok_typedef {
                     p.i = save;
                 } else if !tname.is_empty() {
-                    type_name = Some(tname);
+                    type_name = Some(tname.to_string());
                 }
             }
             is_signed |= skip_logic(&mut p);
@@ -7648,7 +7690,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
             };
             match p.ident() {
                 Ok(n) => {
-                    ports.push((n.clone(), dir, w));
+                    ports.push((n, dir, w));
                     let mut unpack_depth = packed_depth;
                     // Peek unpacked dims before pushing the signal so depth is recorded.
                     // `host_addr_i [NrHosts]` / `[N-1:0]` — do not leave depth=0 and
@@ -7695,7 +7737,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
                         unpack_depth = d0.min(4096);
                     }
                     if is_signed {
-                        note_signed(p, &n);
+                        note_signed(p, n);
                     }
                     if let Some(ty) = type_name.as_deref() {
                         note_sig_type(&n, ty);
@@ -7745,7 +7787,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     let mut pending_keep = false;
     let mut pending_md = false;
     let mut pending_bram = false;
-    let mut mem_inits: HashMap<String, BTreeMap<usize, u128>> = HashMap::new();
+    let mut mem_inits: HashMap<&'a str, BTreeMap<usize, u128>> = HashMap::new();
     let mut funcs: Vec<FuncDef<'a>> = Vec::new();
     let mut negedge_writes: Vec<NegedgeWrite<'a>> = Vec::new();
     skipped_funcs_clear();
@@ -7804,26 +7846,26 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         let mut seen_fn = HashSet::new();
         // Skipped/complex bodies that still appear as calls are not uncalled.
         for name in skipped.iter() {
-            if called.contains(name) && seen_fn.insert(name.clone()) {
-                note_function_called_not_inlined(&module, name);
+            if called.contains(name.as_str()) && seen_fn.insert(name.clone()) {
+                note_function_called_not_inlined(module, name.as_str());
             }
         }
         for f in &funcs {
-            if called.contains(&f.name)
-                && remaining.contains(&f.name)
+            if called.contains(f.name.as_str())
+                && remaining.contains(f.name.as_str())
                 && seen_fn.insert(f.name.clone())
             {
-                note_function_called_not_inlined(&module, &f.name);
+                note_function_called_not_inlined(module, &f.name);
             }
         }
         for f in &funcs {
-            if !called.contains(&f.name) && seen_fn.insert(f.name.clone()) {
-                note_function_not_called(&module, &f.name);
+            if !called.contains(f.name.as_str()) && seen_fn.insert(f.name.clone()) {
+                note_function_not_called(module, &f.name);
             }
         }
         for name in skipped {
             if seen_fn.insert(name.clone()) {
-                note_function_not_called(&module, &name);
+                note_function_not_called(module, name.as_str());
             }
         }
     }
@@ -7854,8 +7896,8 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
 /// diagnostic, not a folded 0.
 fn push_decl_assign<'a>(
     p: &mut P<'a>,
-    assigns: &mut Vec<(String, Option<usize>, RExpr<'a>)>,
-    name: &str,
+    assigns: &mut Vec<Nba<'a>>,
+    name: &'a str,
     net_assign: bool,
 ) {
     if !p.eat_sym('=') {
@@ -7866,7 +7908,7 @@ fn push_decl_assign<'a>(
         return;
     }
     match parse_rexpr(p) {
-        Ok(rhs) => assigns.push((name.to_string(), None, rhs)),
+        Ok(rhs) => assigns.push((name, None, rhs)),
         Err(_) => {
             note_assign_not_lowered(&cur_mod(), name);
             skip_until_arg_end(p);
@@ -7876,22 +7918,22 @@ fn push_decl_assign<'a>(
 
 fn parse_module_items<'a>(
     mut p: &mut P<'a>,
-    ports: &mut Vec<(String, PortDir, usize)>,
-    signals: &mut Vec<Signal>,
+    ports: &mut Vec<(&'a str, PortDir, usize)>,
+    signals: &mut Vec<Signal<'a>>,
     nbas: &mut Vec<Nba<'a>>,
-    assigns: &mut Vec<(String, Option<usize>, RExpr<'a>)>,
-    insts: &mut Vec<Inst>,
+    assigns: &mut Vec<Nba<'a>>,
+    insts: &mut Vec<Inst<'a>>,
     param_order: &mut Vec<(String, u128)>,
     pending_keep: &mut bool,
     pending_md: &mut bool,
     pending_bram: &mut bool,
-    mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
+    mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>,
     funcs: &mut Vec<FuncDef<'a>>,
     negedge_writes: &mut Vec<NegedgeWrite<'a>>,
     endkw: &str,
 ) -> Result<(), String> {
     for sig in signals.iter() {
-        note_width(p, &sig.name, sig.width);
+        note_width(p, sig.name, sig.width);
     }
     while !p.eat_kw(endkw) {
         if p.peek().is_none() {
@@ -7985,23 +8027,23 @@ fn parse_module_items<'a>(
                             if let Some(Tok::Str(sval)) = p.peek() {
                                 let h = str_param_hash(sval);
                                 p.bump();
-                                p.params.entry(name.clone()).or_insert(h);
+                                p.params.entry(name.to_string()).or_insert(h);
                             } else {
                                 let save_c = p.i;
                                 match const_u(p) {
                                     Ok(val) => {
-                                        p.params.entry(name.clone()).or_insert(val);
-                                        if !param_order.iter().any(|(n, _)| n == &name) {
-                                            param_order.push((name.clone(), val));
+                                        p.params.entry(name.to_string()).or_insert(val);
+                                        if !param_order.iter().any(|(n, _)| n.as_str() == name) {
+                                            param_order.push((name.to_string(), val));
                                         }
                                     }
                                     Err(_) => {
                                         p.i = save_c;
                                         match parse_rexpr(p) {
                                             Ok(RExpr::Const { val, .. }) => {
-                                                p.params.entry(name.clone()).or_insert(val);
-                                                if !param_order.iter().any(|(n, _)| n == &name) {
-                                                    param_order.push((name.clone(), val));
+                                                p.params.entry(name.to_string()).or_insert(val);
+                                                if !param_order.iter().any(|(n, _)| n.as_str() == name) {
+                                                    param_order.push((name.to_string(), val));
                                                 }
                                             }
                                             _ => skip_until_arg_end(p),
@@ -8164,18 +8206,18 @@ fn parse_module_items<'a>(
             let is_signed = skip_logic(&mut p);
             let w = p.width_opt()?;
             let n = p.ident()?;
-            if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| pn == &n) {
+            if let Some(ex) = ports.iter_mut().find(|(pn, _, _)| *pn == n) {
                 // Non-ANSI header listed the name with default dir/width 1.
                 ex.1 = dir;
                 ex.2 = w;
             } else {
-                ports.push((n.clone(), dir, w));
+                ports.push((n, dir, w));
             }
             if let Some(sig) = signals.iter_mut().find(|s| s.name == n) {
                 sig.width = w;
             } else {
                 signals.push(Signal {
-                    name: n.clone(),
+                    name: n,
                     width: w,
                     depth: 0,
                     keep: false,
@@ -8183,9 +8225,9 @@ fn parse_module_items<'a>(
                     force_bram: false,
                 });
             }
-            note_width(p, &n, w);
+            note_width(p, n, w);
             if is_signed {
-                note_signed(p, &n);
+                note_signed(p, n);
             }
             // `input signed [W-1:0] a,b` — the same range applies to each name.
             while p.eat_sym(',') {
@@ -8196,13 +8238,13 @@ fn parse_module_items<'a>(
                     ex.1 = dir;
                     ex.2 = w;
                 } else {
-                    ports.push((n2.clone(), dir, w));
+                    ports.push((n2, dir, w));
                 }
                 if let Some(sig) = signals.iter_mut().find(|s| s.name == n2) {
                     sig.width = w;
                 } else {
                     signals.push(Signal {
-                        name: n2.clone(),
+                        name: n2,
                         width: w,
                         depth: 0,
                         keep: false,
@@ -8210,9 +8252,9 @@ fn parse_module_items<'a>(
                         force_bram: false,
                     });
                 }
-                note_width(p, &n2, w);
+                note_width(p, n2, w);
                 if is_signed {
-                    note_signed(p, &n2);
+                    note_signed(p, n2);
                 }
             }
             let _ = p.eat_sym(';');
@@ -8315,7 +8357,7 @@ fn parse_module_items<'a>(
                 }
             } else {
                 signals.push(Signal {
-                    name: n.clone(),
+                    name: n,
                     width: w,
                     depth,
                     keep: *pending_keep,
@@ -8323,11 +8365,11 @@ fn parse_module_items<'a>(
                     force_bram: *pending_bram,
                 });
             }
-            note_width(p, &n, w);
+            note_width(p, n, w);
             if is_signed {
-                note_signed(p, &n);
+                note_signed(p, n);
             }
-            push_decl_assign(p, assigns, &n, net_assign);
+            push_decl_assign(p, assigns, n, net_assign);
             while p.eat_sym(',') {
                 if let Ok(n2) = p.ident() {
                     if let Some(sig) = signals.iter_mut().find(|s| s.name == n2) {
@@ -8336,7 +8378,7 @@ fn parse_module_items<'a>(
                         }
                     } else {
                         signals.push(Signal {
-                            name: n2.clone(),
+                            name: n2,
                             width: w,
                             depth,
                             keep: *pending_keep,
@@ -8344,14 +8386,14 @@ fn parse_module_items<'a>(
                             force_bram: *pending_bram,
                         });
                     }
-                    note_width(p, &n2, w);
+                    note_width(p, n2, w);
                     if is_signed {
-                        note_signed(p, &n2);
+                        note_signed(p, n2);
                     }
                     if matches!(p.peek(), Some(Tok::Sym('['))) {
                         skip_brackets(p);
                     }
-                    push_decl_assign(p, assigns, &n2, net_assign);
+                    push_decl_assign(p, assigns, n2, net_assign);
                 } else {
                     break;
                 }
@@ -8404,7 +8446,7 @@ fn parse_module_items<'a>(
         }
         if p.eat_kw("assign") {
             if p.eat_sym('{') {
-                let mut parts: Vec<(String, Option<usize>)> = Vec::new();
+                let mut parts: Vec<(&'a str, Option<usize>)> = Vec::new();
                 loop {
                     if p.eat_sym('}') {
                         break;
@@ -8414,7 +8456,7 @@ fn parse_module_items<'a>(
                         Ok(LhsKind::Bit(n, b)) => parts.push((n, Some(b))),
                         Ok(LhsKind::Slice { name, lo, width }) => {
                             for i in 0..width.max(1) {
-                                parts.push((name.clone(), Some(lo + i)));
+                                parts.push((name, Some(lo + i)));
                             }
                         }
                         Ok(LhsKind::Unpacked {
@@ -8424,7 +8466,7 @@ fn parse_module_items<'a>(
                             width,
                         }) => {
                             for i in 0..width.max(1) {
-                                parts.push((name.clone(), Some(encode_unpacked_bit(word, lo + i))));
+                                parts.push((name, Some(encode_unpacked_bit(word, lo + i))));
                             }
                         }
                         Err(_) => break,
@@ -8474,7 +8516,7 @@ fn parse_module_items<'a>(
                                         )
                                     };
                                     let lhs_bit = bit.or(if *w == 1 { None } else { Some(i) });
-                                    assigns.push((n.clone(), lhs_bit, piece));
+                                    assigns.push((n, lhs_bit, piece));
                                 }
                             }
                         }
@@ -8541,12 +8583,13 @@ fn parse_module_items<'a>(
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
                         if stmts.is_empty() {
                             let sig = seq_lhs_from_toks(&p.t[body_start..p.i]);
-                            note_negedge_write(negedge_writes, &cur_mod(), &clk, &sig, None, None);
+                            note_negedge_write(p.arena, negedge_writes, &cur_mod(), &clk, &sig, None, None);
                         } else {
                             let mut seen = HashSet::new();
                             for (lhs, bit, rhs) in &stmts {
-                                if seen.insert(lhs.clone()) {
+                                if seen.insert(*lhs) {
                                     note_negedge_write(
+                                        p.arena,
                                         negedge_writes,
                                         &cur_mod(),
                                         &clk,
@@ -8579,7 +8622,7 @@ fn parse_module_items<'a>(
                         let clk = edge_clk.unwrap_or_else(|| "clk".into());
                         let end = p.i.min(p.t.len());
                         let sig = seq_lhs_from_toks(&p.t[body_start..end]);
-                        note_negedge_write(negedge_writes, &cur_mod(), &clk, &sig, None, None);
+                        note_negedge_write(p.arena, negedge_writes, &cur_mod(), &clk, &sig, None, None);
                     } else {
                         note_skip(format!(
                             "diagnostic skip_always module={} (always body not parsed; not a LUT)",
@@ -8624,12 +8667,12 @@ fn parse_module_items<'a>(
             // Optional `pkg::` prefix. Width from harvested enum or packed struct.
             let save_td = p.i;
             if let Ok(first) = p.ident() {
-                let ty = if p.eat_sym(':') && p.eat_sym(':') {
+                let ty: &str = if p.eat_sym(':') && p.eat_sym(':') {
                     match p.ident() {
                         Ok(t) => t,
                         Err(_) => {
                             p.i = save_td;
-                            String::new()
+                            ""
                         }
                     }
                 } else {
@@ -8686,7 +8729,7 @@ fn parse_module_items<'a>(
                         {
                             if !signals.iter().any(|s| s.name == n) {
                                 signals.push(Signal {
-                                    name: n.clone(),
+                                    name: n,
                                     width: w,
                                     depth,
                                     keep: *pending_keep,
@@ -8698,7 +8741,7 @@ fn parse_module_items<'a>(
                                     sig.force_bram = true;
                                 }
                             }
-                            note_width(p, &n, w);
+                            note_width(p, n, w);
                             if !ty.is_empty() {
                                 note_sig_type(&n, &ty);
                             }
@@ -8715,7 +8758,7 @@ fn parse_module_items<'a>(
                                 if let Ok(n2) = p.ident() {
                                     if !signals.iter().any(|s| s.name == n2) {
                                         signals.push(Signal {
-                                            name: n2.clone(),
+                                            name: n2,
                                             width: w,
                                             depth: 0,
                                             keep: false,
@@ -8723,7 +8766,7 @@ fn parse_module_items<'a>(
                                             force_bram: false,
                                         });
                                     }
-                                    note_width(p, &n2, w);
+                                    note_width(p, n2, w);
                                 }
                             }
                             let _ = p.eat_sym(';');
@@ -8749,11 +8792,11 @@ fn parse_module_items<'a>(
 
 fn parse_for_unroll_module<'a>(
     p: &mut P<'a>,
-    signals: &mut Vec<Signal>,
+    signals: &mut Vec<Signal<'a>>,
     nbas: &mut Vec<Nba<'a>>,
-    insts: &mut Vec<Inst>,
-    assigns: &mut Vec<(String, Option<usize>, RExpr<'a>)>,
-    mem_inits: &mut HashMap<String, BTreeMap<usize, u128>>,
+    insts: &mut Vec<Inst<'a>>,
+    assigns: &mut Vec<Nba<'a>>,
+    mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>,
     negedge_writes: &mut Vec<NegedgeWrite<'a>>,
 ) -> Result<(), String> {
     if !p.eat_sym('(') {
@@ -8875,21 +8918,23 @@ fn parse_for_unroll_module<'a>(
         }
         // Local decls inside the generate-for must be uniquified per iteration
         // so vector widths survive and each copy maps to its own FF bits.
-        let mut subst: HashMap<String, String> = HashMap::new();
+        let mut subst: HashMap<&'a str, &'a str> = HashMap::new();
         for mut sig in dummy_sigs {
-            let fresh = format!("{}_{i}", sig.name);
-            subst.insert(sig.name.clone(), fresh.clone());
+            // Fresh per-iteration names are arena-borrowed: one bounded arena
+            // copy per generated signal, no per-use malloc.
+            let fresh: &'a str = sp.arena.alloc_str(&format!("{}_{i}", sig.name));
+            subst.insert(sig.name, fresh);
             sig.name = fresh;
             if !signals.iter().any(|s| s.name == sig.name) {
                 signals.push(sig);
             }
         }
         for mut inst in local_insts {
-            inst.name = format!("{}_{i}", inst.name);
+            inst.name = sp.arena.alloc_str(&format!("{}_{i}", inst.name));
             for (port, net) in inst.conns.iter_mut() {
                 let _ = port;
-                if let Some(n) = subst.get(net) {
-                    *net = n.clone();
+                if let Some(&n) = subst.get(*net) {
+                    *net = n;
                 }
             }
             insts.push(inst);
@@ -8907,7 +8952,7 @@ fn parse_for_unroll_module<'a>(
     Ok(())
 }
 
-fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<String> {
+fn parse_inst_net<'a>(p: &mut P<'a>) -> Option<&'a str> {
     while p.eat_sym('!') || p.eat_sym('~') {}
     if matches!(p.peek(), Some(Tok::Sym(')'))) {
         return None;
@@ -9059,10 +9104,10 @@ fn parse_gate_prim<'a>(p: &mut P<'a>) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst, String> {
+fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst<'a>, String> {
     let start = p.i;
     let module = match p.bump() {
-        Some(Tok::Ident(s)) => s.to_string(),
+        Some(Tok::Ident(s)) => *s,
         _ => {
             p.i = start;
             return Err("inst module".into());
@@ -9076,7 +9121,7 @@ fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst, String> {
         }
     };
     let name = match p.bump() {
-        Some(Tok::Ident(s)) => s.to_string(),
+        Some(Tok::Ident(s)) => *s,
         _ => {
             p.i = start;
             return Err("inst name".into());
@@ -9111,10 +9156,11 @@ fn parse_inst<'a>(p: &mut P<'a>) -> Result<Inst, String> {
                 }
                 let _ = p.eat_sym(')');
             } else {
-                conns.push((port.clone(), port));
+                conns.push((port, port));
             }
         } else if let Some(net) = parse_inst_net(p) {
-            conns.push((format!("#{pos}"), net));
+            // Positional port marker: arena-borrowed, not an owned String per port.
+            conns.push((p.arena.alloc_str(&format!("#{pos}")), net));
             pos += 1;
         }
         let _ = p.eat_sym(',');
@@ -9139,7 +9185,7 @@ fn sig_width(rtl: &Rtl, name: &str) -> usize {
         .or_else(|| {
             rtl.ports
                 .iter()
-                .find(|(n, _, _)| n == name)
+                .find(|(n, _, _)| *n == name)
                 .map(|(_, _, w)| *w)
         })
         .unwrap_or(1)
@@ -9730,13 +9776,13 @@ fn rexpr_add_depth(e: &RExpr<'_>) -> usize {
 }
 
 fn name_known(rtl: &Rtl, name: &str) -> bool {
-    rtl.signals.iter().any(|s| s.name == name) || rtl.ports.iter().any(|(n, _, _)| n == name)
+    rtl.signals.iter().any(|s| s.name == name) || rtl.ports.iter().any(|(n, _, _)| *n == name)
 }
 
 fn rexpr_unknown_name(e: &RExpr<'_>, rtl: &Rtl) -> Option<String> {
-    let mut names = HashSet::new();
+    let mut names: HashSet<&str> = HashSet::new();
     rexpr_names(e, &mut names);
-    names.into_iter().find(|n| !name_known(rtl, n))
+    names.into_iter().find(|n| !name_known(rtl, n)).map(|s| s.to_string())
 }
 
 /// Relational assign (`<` / `>=` / `==` and `&&`/`||`/`!` of those).
@@ -10452,8 +10498,8 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     let mut outs: Vec<&str> = Vec::new();
     for (n, dir, _) in &rtl.ports {
         match dir {
-            PortDir::In => ins.push(n.as_str()),
-            PortDir::Out => outs.push(n.as_str()),
+            PortDir::In => ins.push(*n),
+            PortDir::Out => outs.push(*n),
             PortDir::Inout => return None,
         }
     }
@@ -10484,7 +10530,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
         };
         (g, Some(v), true)
     };
-    if !rtl.assigns.iter().any(|(lhs, _, _)| lhs == gnt) {
+    if !rtl.assigns.iter().any(|(lhs, _, _)| *lhs == gnt) {
         return None;
     }
     // Require an internal 1-bit (already_granted / found) so random N:N comb
@@ -11641,23 +11687,23 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
     const MAX_DEPTH: usize = 16;
     const MAX_WIDTH: usize = 32;
     const MAX_BITS: usize = 128;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
     for (lhs, _, _) in &rtl.nbas {
         if sig_depth(rtl, lhs) == 0 {
             continue;
         }
-        if !names.iter().any(|n| n == lhs) {
-            names.push(lhs.clone());
+        if !names.iter().any(|n| *n == *lhs) {
+            names.push(*lhs);
         }
     }
     let mut out = Vec::new();
     let mut lowered = HashSet::new();
     for mem in names {
-        if sig_force_bram(rtl, &mem) {
+        if sig_force_bram(rtl, mem) {
             continue;
         }
-        let depth = sig_depth(rtl, &mem);
-        let width = sig_width(rtl, &mem).max(1);
+        let depth = sig_depth(rtl, mem);
+        let width = sig_width(rtl, mem).max(1);
         if depth == 0
             || depth > MAX_DEPTH
             || width > MAX_WIDTH
@@ -11684,7 +11730,7 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
                 ok = false;
                 break;
             };
-            let Some(src) = classify_word_src(rtl, &mem, src_r) else {
+            let Some(src) = classify_word_src(rtl, mem, src_r) else {
                 ok = false;
                 break;
             };
@@ -11725,9 +11771,9 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
                             Expr::Var(arena.alloc_str(&(bit_name(s, sw, bit))))
                         }
                     }
-                    WordShiftSrc::Word(w) => Expr::Var(arena.alloc_str(&(unpacked_word_q(&mem, *w, width, bit)))),
+                    WordShiftSrc::Word(w) => Expr::Var(arena.alloc_str(&(unpacked_word_q(mem, *w, width, bit)))),
                 };
-                let qn = unpacked_word_q(&mem, word, width, bit);
+                let qn = unpacked_word_q(mem, word, width, bit);
                 let d = if let Some(en) = en.clone() {
                     word_ce_mux(en, next, Expr::Var(arena.alloc_str(&(qn.clone()))), arena)
                 } else {
@@ -11736,7 +11782,7 @@ fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String,
                 out.push((qn, d));
             }
         }
-        lowered.insert(mem);
+        lowered.insert(mem.to_string());
     }
     (out, lowered)
 }
@@ -13304,31 +13350,31 @@ fn lower_const_word_adds(
     already: &HashSet<String>,
 ) -> HashSet<String> {
     const MAX_WIDTH: usize = 32;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
     for (lhs, bit, rhs) in &rtl.nbas {
-        if already.contains(lhs) || sig_depth(rtl, lhs) == 0 || bit.is_none() {
+        if already.contains(*lhs) || sig_depth(rtl, lhs) == 0 || bit.is_none() {
             continue;
         }
         if packed_add_pair(rhs, rtl).is_none() {
             continue;
         }
-        if !names.iter().any(|n| n == lhs) {
-            names.push(lhs.clone());
+        if !names.iter().any(|n| *n == *lhs) {
+            names.push(*lhs);
         }
     }
     let mut lowered = HashSet::new();
     for mem in names {
-        if sig_force_bram(rtl, &mem) {
+        if sig_force_bram(rtl, mem) {
             continue;
         }
-        let depth = sig_depth(rtl, &mem);
-        let width = sig_width(rtl, &mem).max(1);
+        let depth = sig_depth(rtl, mem);
+        let width = sig_width(rtl, mem).max(1);
         if depth == 0 || width > MAX_WIDTH {
             continue;
         }
         let mut words: Vec<(usize, String, String)> = Vec::new();
         let mut ok = true;
-        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| lhs == &mem) {
+        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| *lhs == mem) {
             let Some(word) = *bit else {
                 ok = false;
                 break;
@@ -13351,9 +13397,9 @@ fn lower_const_word_adds(
             continue;
         }
         for (word, a, b) in &words {
-            emit_word_add(d, rtl, clk, &mem, *word, width, a, b);
+            emit_word_add(d, rtl, clk, mem, *word, width, a, b);
         }
-        lowered.insert(mem);
+        lowered.insert(mem.to_string());
     }
     lowered
 }
@@ -13370,22 +13416,22 @@ fn lower_word_pipeline(
 ) -> HashSet<String> {
     const MAX_WORDS: usize = 4;
     const MAX_WIDTH: usize = 32;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
     for (lhs, _, _) in &rtl.nbas {
-        if already.contains(lhs) || sig_depth(rtl, lhs) == 0 {
+        if already.contains(*lhs) || sig_depth(rtl, lhs) == 0 {
             continue;
         }
-        if !names.iter().any(|n| n == lhs) {
-            names.push(lhs.clone());
+        if !names.iter().any(|n| *n == *lhs) {
+            names.push(*lhs);
         }
     }
     let mut lowered = HashSet::new();
     for mem in names {
-        if sig_force_bram(rtl, &mem) {
+        if sig_force_bram(rtl, mem) {
             continue;
         }
-        let depth = sig_depth(rtl, &mem);
-        let width = sig_width(rtl, &mem).max(1);
+        let depth = sig_depth(rtl, mem);
+        let width = sig_width(rtl, mem).max(1);
         if depth == 0 || width > MAX_WIDTH {
             continue;
         }
@@ -13393,7 +13439,7 @@ fn lower_word_pipeline(
         let mut shifts: Vec<(usize, usize)> = Vec::new();
         let mut ok = true;
         let mut saw_shift = false;
-        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| lhs == &mem) {
+        for (_, bit, rhs) in rtl.nbas.iter().filter(|(lhs, _, _)| *lhs == mem) {
             let Some(word) = *bit else {
                 ok = false;
                 break;
@@ -13447,7 +13493,7 @@ fn lower_word_pipeline(
             eprintln!(
                 "synth_rtl word_pipeline_cap mem={mem} words={words} hffs={width} add_word=0 clk={clk}"
             );
-            lowered.insert(mem);
+            lowered.insert(mem.to_string());
             continue;
         }
         emit_word_add(d, rtl, clk, &mem, 0, width, &add_a, &add_b);
@@ -13466,7 +13512,7 @@ fn lower_word_pipeline(
             "synth_rtl word_pipeline mem={mem} words={words} q_word={q_word} hffs={} add_word=0 clk={clk}",
             emitted * width
         );
-        lowered.insert(mem.clone());
+        lowered.insert(mem.to_string());
     }
     lowered
 }
@@ -13583,22 +13629,22 @@ fn lower_var_index_words<'a>(
 ) -> HashSet<String> {
     const MAX_DEPTH: usize = 32;
     const MAX_WIDTH: usize = 16;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
     for (lhs, _, _) in &rtl.nbas {
         if sig_depth(rtl, lhs) == 0 {
             continue;
         }
-        if !names.iter().any(|n| n == lhs) {
-            names.push(lhs.clone());
+        if !names.iter().any(|n| *n == *lhs) {
+            names.push(*lhs);
         }
     }
     let mut lowered = HashSet::new();
     for mem in names {
-        if sig_force_bram(rtl, &mem) {
+        if sig_force_bram(rtl, mem) {
             continue;
         }
-        let depth = sig_depth(rtl, &mem);
-        let width = sig_width(rtl, &mem).max(1);
+        let depth = sig_depth(rtl, mem);
+        let width = sig_width(rtl, mem).max(1);
         if depth == 0 || depth > MAX_DEPTH || width > MAX_WIDTH {
             continue;
         }
@@ -13678,7 +13724,7 @@ fn lower_var_index_words<'a>(
                 } else {
                     Expr::Var(arena.alloc_str(&(bit_name(&plan.data, data_w, bit))))
                 };
-                let qn = unpacked_word_q(&mem, word, width, bit);
+                let qn = unpacked_word_q(mem, word, width, bit);
                 let mux = word_ce_mux(Expr::Var(arena.alloc_str(&(mnet.clone()))), next, Expr::Var(arena.alloc_str(&(qn.clone()))), arena);
                 let lut = format!("u_vwl{bit_i}");
                 let dnet = format!("u_vwd{bit_i}");
@@ -13698,7 +13744,7 @@ fn lower_var_index_words<'a>(
             }
         }
         if ok && bit_i == depth.saturating_mul(width) {
-            lowered.insert(mem);
+            lowered.insert(mem.to_string());
         }
     }
     lowered
@@ -13708,14 +13754,14 @@ fn lower_var_index_words<'a>(
 /// Later OR/mux assigns see the source net, not a floating generate temp.
 /// Not a buffer LUT. Does not invent a multiplier.
 fn collect_net_copies<'a>(
-    assigns: &[(String, Option<usize>, RExpr<'a>)],
-) -> HashMap<(String, usize), RExpr<'a>> {
+    assigns: &[(&'a str, Option<usize>, RExpr<'a>)],
+) -> HashMap<(&'a str, usize), RExpr<'a>> {
     let mut map = HashMap::new();
     for (lhs, bit, rhs) in assigns {
         let Some(b) = *bit else { continue };
         match rhs {
             RExpr::Bit(_, _) | RExpr::Const { .. } => {
-                map.insert((lhs.clone(), b), rhs.clone());
+                map.insert((*lhs, b), rhs.clone());
             }
             _ => {}
         }
@@ -13725,12 +13771,12 @@ fn collect_net_copies<'a>(
 
 fn subst_net_copies<'a>(
     e: &RExpr<'a>,
-    map: &HashMap<(String, usize), RExpr<'a>>,
+    map: &HashMap<(&'a str, usize), RExpr<'a>>,
     arena: &'a Bump,
 ) -> RExpr<'a> {
     fn walk<'a>(
         e: &RExpr<'a>,
-        map: &HashMap<(String, usize), RExpr<'a>>,
+        map: &HashMap<(&'a str, usize), RExpr<'a>>,
         depth: usize,
         arena: &'a Bump,
     ) -> RExpr<'a> {
@@ -13740,7 +13786,7 @@ fn subst_net_copies<'a>(
         let w = |x: &RExpr<'a>| walk(x, map, depth + 1, arena);
         match e {
             RExpr::Bit(s, i) => {
-                if let Some(rep) = map.get(&(s.to_string(), *i)) {
+                if let Some(rep) = map.get(&(*s, *i)) {
                     return walk(rep, map, depth + 1, arena);
                 }
                 e.clone()
@@ -13788,7 +13834,7 @@ fn subst_net_copies<'a>(
 }
 
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
-    let mut d = Design::new(&rtl.module);
+    let mut d = Design::new(rtl.module);
     // Bump arena for transient boolean Expr trees built per bit below.
     // reg_bits/comb_bits borrow from it; all trees are consumed into the
     // AIG/Design before this function returns, so the arena dies here.
@@ -13801,22 +13847,22 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         } else {
             *dir
         };
-        d.add_port(n, dir);
+        d.add_port(*n, dir);
     }
     // User clock is the posedge/negedge name when that port exists.
     // Otherwise the historical first-`clk`/first-input pick (gold counter).
-    let clk_owned = edge_clk_of(&rtl.module)
+    let clk_owned = edge_clk_of(rtl.module)
         .filter(|c| {
             rtl.ports
                 .iter()
-                .any(|(n, dir, _)| n == c && *dir == PortDir::In)
+                .any(|(n, dir, _)| *n == c.as_str() && *dir == PortDir::In)
         })
         .or_else(|| {
             rtl.ports
                 .iter()
-                .find(|(n, dir, _)| *dir == PortDir::In && n == "clk")
+                .find(|(n, dir, _)| *dir == PortDir::In && *n == "clk")
                 .or_else(|| rtl.ports.iter().find(|(_, dir, _)| *dir == PortDir::In))
-                .map(|(n, _, _)| n.clone())
+                .map(|(n, _, _)| n.to_string())
         })
         .unwrap_or_else(|| "clk".into());
     let clk = clk_owned.as_str();
@@ -13876,13 +13922,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some(e) = e {
                 reg_bits.push((bit_name(lhs, w, *b), e));
             }
-        } else if rexpr_is_plus_one(rhs) && rexpr_ident(rhs).as_deref() == Some(lhs.as_str()) {
+        } else if rexpr_is_plus_one(rhs) && rexpr_ident(rhs).as_deref() == Some(*lhs) {
             for i in 0..w {
                 reg_bits.push((bit_name(lhs, w, i), inc_bit_expr(lhs, w, i, &arena)));
             }
         } else if let RExpr::Mux(cond, t, f) = rhs {
             if rexpr_is_plus_one(f)
-                && rexpr_ident(f).as_deref() == Some(lhs.as_str())
+                && rexpr_ident(f).as_deref() == Some(*lhs)
                 && matches!(*t, RExpr::Const { val: 0, .. })
             {
                 for i in 0..w {
@@ -13896,8 +13942,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     ));
                 }
             } else if rexpr_is_plus_one(f)
-                && rexpr_ident(f).as_deref() == Some(lhs.as_str())
-                && matches!(*t, RExpr::Ident(s) if s == lhs)
+                && rexpr_ident(f).as_deref() == Some(*lhs)
+                && matches!(*t, RExpr::Ident(s) if *s == *lhs)
             {
                 // saturating / hold: if (cond) cnt <= cnt; else cnt <= cnt+1
                 for i in 0..w {
@@ -13915,8 +13961,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     ));
                 }
             } else if rexpr_is_plus_one(t)
-                && rexpr_ident(t).as_deref() == Some(lhs.as_str())
-                && matches!(*f, RExpr::Ident(s) if s == lhs)
+                && rexpr_ident(t).as_deref() == Some(*lhs)
+                && matches!(*f, RExpr::Ident(s) if *s == *lhs)
             {
                 // clock enable: if (en) cnt <= cnt+1
                 for i in 0..w {
@@ -13951,18 +13997,18 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
     }
     eprintln!("synth_rtl after nbas reg_bits={}", reg_bits.len());
-    let mut mem_names: HashSet<String> = HashSet::new();
+    let mut mem_names: HashSet<&str> = HashSet::new();
     for (lhs, _, _) in &rtl.nbas {
-        if sig_depth(rtl, lhs) > 0 && !lowered_unpacked.contains(lhs) {
-            mem_names.insert(lhs.clone());
+        if sig_depth(rtl, lhs) > 0 && !lowered_unpacked.contains(*lhs) {
+            mem_names.insert(*lhs);
         }
     }
     for k in rtl.mem_inits.keys() {
-        mem_names.insert(k.clone());
+        mem_names.insert(*k);
     }
     for s in &rtl.signals {
         if s.force_bram {
-            mem_names.insert(s.name.clone());
+            mem_names.insert(s.name);
         }
     }
     for name in &mem_names {
@@ -14033,12 +14079,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     for (lhs, bit, rhs0) in &rtl.assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies, &arena);
         let rhs = &rhs_sub;
-        if clock_mux_sigs.contains(lhs) || clock_gate_sigs.contains(lhs) {
+        if clock_mux_sigs.contains(*lhs) || clock_gate_sigs.contains(*lhs) {
             continue;
         }
         // Priority cascade already drives onehot[+valid]; skip folded always @(*) body.
         if let Some((ref gnt, ref valid)) = priority_grant {
-            if lhs == gnt || valid.as_ref() == Some(lhs) {
+            if *lhs == gnt.as_str() || valid.as_deref() == Some(*lhs) {
                 continue;
             }
             if sig_width(rtl, lhs) == 1 && !rtl.ports.iter().any(|(p, _, _)| p == lhs) {
@@ -14052,10 +14098,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         eprintln!(
                             "synth_rtl concat_align signal={lhs} zeros={zeros} bus_lo={bus_lo}"
                         );
-                        concat_align.push((lhs.clone(), bus, zeros, bus_lo));
+                        concat_align.push((lhs.to_string(), bus, zeros, bus_lo));
                     }
                     Err(()) => {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                     }
                 }
                 continue;
@@ -14067,7 +14113,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 if word_pipeline_cap_for(&rtl.module) {
                     continue;
                 }
-                word_alias.push((lhs.clone(), mem, word));
+                word_alias.push((lhs.to_string(), mem, word));
                 continue;
             }
         }
@@ -14089,7 +14135,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                         RIPPLE_ADD_MAX
                     };
                     if w > max_w || !emit_ripple_add_const(&mut d, rtl, lhs, w, &bus, k) {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                     }
                     continue;
                 }
@@ -14104,7 +14150,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 if rexpr_unknown_name(rhs, rtl).is_none() {
                     let w = sig_width(rtl, lhs).max(1);
                     if w > 32 || !emit_ripple_sub_const(&mut d, rtl, lhs, w, &bus, k) {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                     }
                     continue;
                 }
@@ -14119,7 +14165,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     if w > 32
                         || !emit_ripple_const_minus(&mut d, rtl, lhs, w, &bus, k, bus_lo, bus_bits)
                     {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                     }
                     continue;
                 }
@@ -14133,7 +14179,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     let w = sig_width(rtl, lhs).max(1);
                     if w > RIPPLE_ADD_MAX || !emit_ripple_add_zpad_wires(&mut d, rtl, lhs, w, &zpad)
                     {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                     }
                     continue;
                 }
@@ -14148,7 +14194,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     let w = sig_width(rtl, lhs).max(1);
                     if w > RIPPLE_ADD_MAX || !emit_ripple_add(&mut d, rtl, lhs, w, &a_name, &b_name)
                     {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                     }
                     continue;
                 }
@@ -14209,7 +14255,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     if ba.width.max(bb.width) > RIPPLE_CMP_MAX
                         || !emit_ripple_ult(&mut d, rtl, &net, &ba, &bb, ge)
                     {
-                        note_assign_not_lowered(&rtl.module, lhs);
+                        note_assign_not_lowered(rtl.module, lhs);
                         continue;
                     }
                     rhs_cmp = Some(replace_one_bus_lt(rhs, rtl, &net, &arena));
@@ -14227,7 +14273,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     match rexpr_to_bit(rhs, rtl, 0, &arena) {
                         Ok(e) => {
                             if rel_lt {
-                                rel_sig.insert(bn.clone(), lhs.clone());
+                                rel_sig.insert(bn.clone(), lhs.to_string());
                             }
                             comb_bits.push((bn, e));
                         }
@@ -14246,7 +14292,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     match rexpr_to_bit(rhs, rtl, i, &arena) {
                         Ok(e) => {
                             if rel_lt {
-                                rel_sig.insert(bn.clone(), lhs.clone());
+                                rel_sig.insert(bn.clone(), lhs.to_string());
                             }
                             comb_bits.push((bn, e));
                         }
@@ -14259,7 +14305,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     match rexpr_to_bit(rhs, rtl, 0, &arena) {
                         Ok(e) => {
                             if rel_lt {
-                                rel_sig.insert(bn.clone(), lhs.clone());
+                                rel_sig.insert(bn.clone(), lhs.to_string());
                             }
                             comb_bits.push((bn, e));
                         }
@@ -14282,7 +14328,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 match rexpr_to_bit(rhs, rtl, i, &arena) {
                     Ok(e) => {
                         if rel_lt {
-                            rel_sig.insert(bn.clone(), lhs.clone());
+                            rel_sig.insert(bn.clone(), lhs.to_string());
                         }
                         comb_bits.push((bn, e));
                     }
@@ -14321,10 +14367,10 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         if s.keep {
-            keep_bits.insert(s.name.clone());
+            keep_bits.insert(s.name.to_string());
         }
         if s.mark_debug {
-            md_bits.insert(s.name.clone());
+            md_bits.insert(s.name.to_string());
         }
         for b in 0..s.width {
             let bn = bit_name(&s.name, s.width, b);
@@ -14705,7 +14751,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         // Constant word read: q is that word. Same nets as the Hff Q, no buffer LUT.
         if bit.is_none() {
-            if let Some((_, mem, word)) = word_alias.iter().find(|(n, _, _)| n == lhs) {
+            if let Some((_, mem, word)) = word_alias.iter().find(|(n, _, _)| n.as_str() == *lhs) {
                 let ow = sig_width(rtl, lhs);
                 let mw = sig_width(rtl, mem).max(1);
                 for i in 0..ow.min(mw).min(256) {
@@ -14770,23 +14816,26 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         ) {
             d.add_cell("u_iob", CellKind::IobOut);
             d.connect(qnet, "u_iob", "I");
-            d.connect(n, "u_iob", "PAD");
+            d.connect(*n, "u_iob", "PAD");
         }
     }
     Ok(d)
 }
 
-fn rewrite_rexpr<'a>(
+/// Rename substitution map is generic over the key: callers use owned
+/// `String` keys (function lifting generates fresh names) or borrowed `&str`
+/// keys (generate-for uniquification). Both are `Borrow<str>`.
+fn rewrite_rexpr<'a, K: Borrow<str> + Eq + Hash>(
     e: &RExpr<'a>,
-    subst: &HashMap<String, String>,
+    subst: &HashMap<K, K>,
     arena: &'a Bump,
 ) -> RExpr<'a> {
     // Renamed idents are copied into the arena once; untouched names reuse the
     // borrowed token span (zero allocation).
     let id = |s: &'a str| -> &'a str {
         subst
-            .get(s)
-            .map(|n| arena.alloc_str(n) as &str)
+            .get(s as &str)
+            .map(|n| arena.alloc_str(n.borrow()) as &str)
             .unwrap_or(s)
     };
     match e {
@@ -14952,7 +15001,7 @@ fn flatten_module_ov_vis<'s>(
         .ok_or_else(|| format!("unknown module {name}"))?;
     let src = elaborate_rtl(proto, overrides)?;
     let mut out = Rtl {
-        module: src.module.clone(),
+        module: src.module,
         ports: src.ports.clone(),
         signals: src.signals.clone(),
         nbas: src.nbas.clone(),
@@ -14964,7 +15013,7 @@ fn flatten_module_ov_vis<'s>(
         negedge_writes: src.negedge_writes.clone(),
     };
     for inst in &src.insts {
-        let Some(child_proto) = mods.get(&inst.module) else {
+        let Some(child_proto) = mods.get(inst.module) else {
             note_skip(format!(
                 "diagnostic unknown_instance module={} inst={} child={} (child body absent; not a LUT)",
                 name, inst.name, inst.module
@@ -14976,7 +15025,7 @@ fn flatten_module_ov_vis<'s>(
         let prefix = format!("{}_", inst.name);
         let mut subst: HashMap<String, String> = HashMap::new();
         for s in &child.signals {
-            subst.insert(s.name.clone(), format!("{prefix}{}", s.name));
+            subst.insert(s.name.to_string(), format!("{prefix}{}", s.name));
         }
         for (i, (pname, _, _)) in child.ports.iter().enumerate() {
             if let Some((_, net)) = inst
@@ -14985,14 +15034,14 @@ fn flatten_module_ov_vis<'s>(
                 .find(|(p, _)| p == pname)
                 .or_else(|| inst.conns.iter().find(|(p, _)| p == &format!("#{i}")))
             {
-                subst.insert(pname.clone(), net.clone());
+                subst.insert(pname.to_string(), net.to_string());
             }
         }
         for s in &child.signals {
-            let mapped = subst.get(&s.name).cloned().unwrap();
+            let mapped = subst.get(s.name).cloned().unwrap();
             if !out.signals.iter().any(|x| x.name == mapped) {
                 out.signals.push(Signal {
-                    name: mapped,
+                    name: arena.alloc_str(&mapped),
                     width: s.width,
                     depth: s.depth,
                     keep: s.keep,
@@ -15003,17 +15052,17 @@ fn flatten_module_ov_vis<'s>(
         }
         for (lhs, bit, rhs) in &child.nbas {
             let lhs = subst
-                .get(lhs)
+                .get(*lhs)
                 .cloned()
                 .unwrap_or_else(|| format!("{prefix}{lhs}"));
-            out.nbas.push((lhs, *bit, rewrite_rexpr(rhs, &subst, arena)));
+            out.nbas.push((arena.alloc_str(&lhs), *bit, rewrite_rexpr(rhs, &subst, arena)));
         }
         for (lhs, bit, rhs) in &child.assigns {
             let lhs = subst
-                .get(lhs)
+                .get(*lhs)
                 .cloned()
                 .unwrap_or_else(|| format!("{prefix}{lhs}"));
-            out.assigns.push((lhs, *bit, rewrite_rexpr(rhs, &subst, arena)));
+            out.assigns.push((arena.alloc_str(&lhs), *bit, rewrite_rexpr(rhs, &subst, arena)));
         }
     }
     visiting.remove(name);
@@ -15046,7 +15095,7 @@ fn tree_has_rtl_body(
 /// Resolve against the instance tree: a child port becomes the connected parent
 /// net; a child internal becomes the stitched `{inst}_{sig}` name (same prefix
 /// `stitch_child` applies). Not an instance → last ident (old unknown-name path).
-fn resolve_hier_path(mods: &HashMap<String, Rtl>, module: &str, path: &[&str]) -> (String, usize) {
+fn resolve_hier_path(mods: &HashMap<String, Rtl<'_>>, module: &str, path: &[&str]) -> (String, usize) {
     if path.is_empty() {
         return ("hier".into(), 1);
     }
@@ -15061,23 +15110,23 @@ fn resolve_hier_path(mods: &HashMap<String, Rtl>, module: &str, path: &[&str]) -
         return (path[path.len() - 1].to_string(), 1);
     };
     let rest = &path[1..];
-    let child = mods.get(&inst.module);
+    let child = mods.get(inst.module);
     if let Some(ch) = child {
         if ch.insts.iter().any(|i| i.name == rest[0]) {
             let (inner, w) = resolve_hier_path(mods, &inst.module, rest);
-            if let Some((_, net)) = inst.conns.iter().find(|(p, _)| p == &inner) {
-                return (net.clone(), sig_width(rtl, net).max(1));
+            if let Some((_, net)) = inst.conns.iter().find(|(p, _)| *p == inner.as_str()) {
+                return (net.to_string(), sig_width(rtl, net).max(1));
             }
             return (format!("{}_{inner}", inst.name), w.max(1));
         }
     }
     let sig = rest[0];
     if rest.len() == 1 {
-        if let Some((_, net)) = inst.conns.iter().find(|(p, _)| p == sig) {
+        if let Some((_, net)) = inst.conns.iter().find(|(p, _)| *p == sig) {
             let w = child
                 .map(|c| sig_width(c, sig))
                 .unwrap_or_else(|| sig_width(rtl, net));
-            return (net.clone(), w.max(1));
+            return (net.to_string(), w.max(1));
         }
         let w = child.map(|c| sig_width(c, sig)).unwrap_or(1);
         return (format!("{}_{sig}", inst.name), w.max(1));
@@ -15091,7 +15140,7 @@ fn rewrite_hier_expr<'a>(
     e: &RExpr<'a>,
     mods: &HashMap<String, Rtl<'a>>,
     module: &str,
-    taps: &mut Vec<(String, usize)>,
+    taps: &mut Vec<(&'a str, usize)>,
     arena: &'a Bump,
 ) -> RExpr<'a> {
     // Hierarchical names are rewritten; the new name is arena-copied once,
@@ -15102,8 +15151,9 @@ fn rewrite_hier_expr<'a>(
         }
         let path: Vec<&str> = s.split('.').collect();
         let (n, w) = resolve_hier_path(mods, module, &path);
-        taps.push((n.clone(), w));
-        arena.alloc_str(&n)
+        let interned = arena.alloc_str(&n);
+        taps.push((interned, w));
+        interned
     };
     match e {
         RExpr::Ident(s) => RExpr::Ident(rewrite_name(s)),
@@ -15130,9 +15180,9 @@ fn rewrite_hier_in_mods<'a>(mods: &mut HashMap<String, Rtl<'a>>) {
     let modules: Vec<String> = mods.keys().cloned().collect();
     let mut pending: Vec<(
         String,
-        Vec<(String, Option<usize>, RExpr<'a>)>,
-        Vec<(String, Option<usize>, RExpr<'a>)>,
-        Vec<(String, usize)>,
+        Vec<(&'a str, Option<usize>, RExpr<'a>)>,
+        Vec<(&'a str, Option<usize>, RExpr<'a>)>,
+        Vec<(&'a str, usize)>,
     )> = Vec::new();
     for module in modules {
         let rtl = &mods[&module];
@@ -15142,7 +15192,7 @@ fn rewrite_hier_in_mods<'a>(mods: &mut HashMap<String, Rtl<'a>>) {
             .iter()
             .map(|(l, b, r)| {
                 (
-                    l.clone(),
+                    *l,
                     *b,
                     rewrite_hier_expr(r, mods, &module, &mut taps, arena),
                 )
@@ -15153,7 +15203,7 @@ fn rewrite_hier_in_mods<'a>(mods: &mut HashMap<String, Rtl<'a>>) {
             .iter()
             .map(|(l, b, r)| {
                 (
-                    l.clone(),
+                    *l,
                     *b,
                     rewrite_hier_expr(r, mods, &module, &mut taps, arena),
                 )
@@ -15193,14 +15243,14 @@ fn synth_from_parsed_top(
     top: Option<&str>,
     overrides: &HashMap<String, u128>,
 ) -> Result<Design, String> {
-    let order: Vec<String> = mods.iter().map(|m| m.module.clone()).collect();
+    let order: Vec<String> = mods.iter().map(|m| m.module.to_string()).collect();
     let instantiated: HashMap<String, ()> = mods
         .iter()
-        .flat_map(|m| m.insts.iter().map(|i| (i.module.clone(), ())))
+        .flat_map(|m| m.insts.iter().map(|i| (i.module.to_string(), ())))
         .collect();
     let mut map: HashMap<String, Rtl> = HashMap::with_capacity(mods.len());
     for m in mods {
-        map.insert(m.module.clone(), m);
+        map.insert(m.module.to_string(), m);
     }
     rewrite_hier_in_mods(&mut map);
     let top_name = if let Some(name) = top {
@@ -15345,14 +15395,18 @@ fn record_instances_vis(
     };
     for inst in &rtl.insts {
         let name = if pfx.is_empty() {
-            inst.name.clone()
+            inst.name.to_string()
         } else {
             format!("{pfx}{}", inst.name)
         };
         d.instances.push(helion_ir::Instance {
             name: name.clone(),
-            module: inst.module.clone(),
-            conns: inst.conns.clone(),
+            module: inst.module.to_string(),
+            conns: inst
+                .conns
+                .iter()
+                .map(|(p, n)| (p.to_string(), n.to_string()))
+                .collect(),
             attrs: helion_ir::Attrs::default(),
         });
         record_instances_vis(mods, &inst.module, d, &format!("{name}_"), visiting);
@@ -15377,12 +15431,12 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
     let pre = preprocess_sv(&strip_comments(&expanded));
     let mut mods = parse_preprocessed(pre)?;
     if let Some(dir) = base {
-        let have: HashSet<String> = mods.iter().map(|m| m.module.clone()).collect();
+        let have: HashSet<String> = mods.iter().map(|m| m.module.to_string()).collect();
         let mut missing: HashSet<String> = HashSet::new();
         for m in &mods {
             for inst in &m.insts {
-                if !have.contains(&inst.module) {
-                    missing.insert(inst.module.clone());
+                if !have.contains(inst.module) {
+                    missing.insert(inst.module.to_string());
                 }
             }
         }
@@ -15416,7 +15470,7 @@ pub fn list_sv_modules_origin(source: &str, origin: &str) -> Result<Vec<String>,
     let pre = preprocess_sv(&strip_comments(source));
     Ok(parse_preprocessed(pre)?
         .into_iter()
-        .map(|m| m.module)
+        .map(|m| m.module.to_string())
         .collect())
 }
 
@@ -15431,7 +15485,7 @@ pub fn compile_sv(source: &str, origin: &str, opts: &SvCompileOpts) -> Result<Ve
     let _ = (origin, opts);
     Ok(parse_source(source)?
         .into_iter()
-        .map(|m| m.module)
+        .map(|m| m.module.to_string())
         .collect())
 }
 
@@ -15829,7 +15883,7 @@ endmodule
             child.connect("q", "ff", "Q");
             let inst = Inst {
                 module: "leaf".into(),
-                name: format!("u{i}"),
+                name: Box::leak(format!("u{i}").into_boxed_str()),
                 conns: vec![],
                 params: vec![],
             };
@@ -16876,7 +16930,7 @@ endmodule
                 mods.len()
             );
             let map: std::collections::HashMap<String, Rtl> =
-                mods.iter().map(|m| (m.module.clone(), m.clone())).collect();
+                mods.iter().map(|m| (m.module.to_string(), m.clone())).collect();
             let flat = flatten_module_ov(&map, "ysyx_ibex", &std::collections::HashMap::new())
                 .expect("flatten ibex");
             eprintln!(
@@ -16949,7 +17003,7 @@ endmodule
     fn assign_rhs<'a, 'b>(mods: &'a [Rtl<'b>], lhs: &str) -> &'a RExpr<'b> {
         mods.iter()
             .flat_map(|m| m.assigns.iter())
-            .find(|(n, _, _)| n == lhs)
+            .find(|(n, _, _)| *n == lhs)
             .map(|(_, _, e)| e)
             .expect("assign")
     }
@@ -20371,7 +20425,7 @@ endmodule
             for (n, v) in mems {
                 let mut words = BTreeMap::new();
                 words.insert(0, *v);
-                mem_inits.insert((*n).to_string(), words);
+                mem_inits.insert(*n, words);
             }
             Rtl {
                 module: "t".into(),
