@@ -1121,6 +1121,7 @@ pub enum WorkspacePane {
     Drc,
     Utilization,
     Runs,
+    Checkpoints,
 }
 
 /// Map every WorkspaceTab onto a real pane. None of these is a stub / popup / Timing dump.
@@ -1154,6 +1155,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::Drc => WorkspacePane::Drc,
         WorkspaceTab::Utilization => WorkspacePane::Utilization,
         WorkspaceTab::Runs => WorkspacePane::Runs,
+        WorkspaceTab::Checkpoints => WorkspacePane::Checkpoints,
     }
 }
 
@@ -1175,6 +1177,7 @@ pub fn is_report_detail(tab: WorkspaceTab) -> bool {
             | WorkspaceTab::Drc
             | WorkspaceTab::Utilization
             | WorkspaceTab::Runs
+            | WorkspaceTab::Checkpoints
     )
 }
 
@@ -1201,7 +1204,7 @@ mod tests {
         let labels = workspace_tab_labels();
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
@@ -1662,7 +1665,7 @@ mod tests {
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Schematic),
             WorkspacePane::Schematic
