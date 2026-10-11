@@ -4703,9 +4703,6 @@ fn paint_timing_path_table(
     let fill_w = ((w - fixed) / n_fill).max(80.0);
     let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
 
-    // Background rect for empty-space click-to-clear (captured after rows).
-    let bg_top = ui.min_rect().max.y;
-
     // Header row: 28px, 11px dim semibold, click to sort.
     let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
     let mut x = hrect.left();
@@ -4798,6 +4795,8 @@ fn paint_timing_path_table(
         spec_paint_cells(ui, rrect, &widths, &cells, false);
         spec_divider(ui, theme, rrect);
     }
+    // Empty-space click-to-clear starts below the last row (captured after rows).
+    let bg_top = ui.min_rect().max.y;
     let table_id = egui::Id::new("timing_path_table");
     if let Some(mi) = pick {
         // Cross-probe: the path lights up in Device + Schematic, and the
