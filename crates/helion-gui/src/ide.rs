@@ -4677,6 +4677,10 @@ pub struct IdeModel {
     pub tree: NetlistTree,
     pub console: Vec<ConsoleLine>,
     pub input: String,
+    /// Tcl console command history (newest last); `input_hist_idx` is the
+    /// cursor used by Up/Down (`None` = editing a fresh line).
+    pub input_history: Vec<String>,
+    pub input_hist_idx: Option<usize>,
     pub steps: [StepState; 5],
     pub timing: Option<TimingResult>,
     pub utilization: Option<Utilization>,
@@ -4882,6 +4886,8 @@ impl IdeModel {
             tree: NetlistTree::default(),
             console: Vec::new(),
             input: String::new(),
+            input_history: Vec::new(),
+            input_hist_idx: None,
             steps: [StepState::Pending; 5],
             timing: None,
             utilization: None,
@@ -6670,8 +6676,46 @@ impl IdeModel {
         if cmd.is_empty() {
             return None;
         }
+        // Record history (cap 200, skip consecutive duplicates).
+        if self.input_history.last().map(|s| s != &cmd).unwrap_or(true) {
+            self.input_history.push(cmd.clone());
+            if self.input_history.len() > 200 {
+                self.input_history.remove(0);
+            }
+        }
+        self.input_hist_idx = None;
         self.input.clear();
         Some(self.exec(&cmd))
+    }
+
+    /// Move the console input through history. `dir = -1` is Up (older),
+    /// `+1` is Down (newer); returns true when the input changed.
+    pub fn history_step(&mut self, dir: i8) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        let next = match self.input_hist_idx {
+            None if dir < 0 => Some(self.input_history.len() - 1),
+            None => return false,
+            Some(i) if dir < 0 => i.checked_sub(1),
+            Some(i) => {
+                let n = i + 1;
+                if n >= self.input_history.len() {
+                    self.input_hist_idx = None;
+                    self.input.clear();
+                    return true;
+                }
+                Some(n)
+            }
+        };
+        match next {
+            Some(i) => {
+                self.input_hist_idx = Some(i);
+                self.input = self.input_history[i].clone();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Status bar + Messages for Open/Implement/stage failures (never silent).
@@ -28820,6 +28864,35 @@ endmodule
     }
 
     /// Fig. 64: Tcl journal is selectable with Find; ok vs error still from Session.
+    #[test]
+    fn tcl_console_history_up_down() {
+        let mut ide = IdeModel::new();
+        for cmd in ["get_cells", "set a 1", "report_timing"] {
+            ide.input = cmd.into();
+            ide.submit_input();
+        }
+        assert_eq!(ide.input_history, vec!["get_cells", "set a 1", "report_timing"]);
+        // Up walks older; Down walks newer; Down past newest clears.
+        assert!(ide.history_step(-1));
+        assert_eq!(ide.input, "report_timing");
+        assert!(ide.history_step(-1));
+        assert_eq!(ide.input, "set a 1");
+        assert!(ide.history_step(-1));
+        assert_eq!(ide.input, "get_cells");
+        assert!(!ide.history_step(-1)); // already oldest
+        assert!(ide.history_step(1));
+        assert_eq!(ide.input, "set a 1");
+        assert!(ide.history_step(1));
+        assert_eq!(ide.input, "report_timing");
+        assert!(ide.history_step(1));
+        assert_eq!(ide.input, "");
+        assert!(ide.input_hist_idx.is_none());
+        // Empty input does not pollute history.
+        ide.input = "   ".into();
+        assert!(ide.submit_input().is_none());
+        assert_eq!(ide.input_history.len(), 3);
+    }
+
     #[test]
     fn tcl_console_journal_is_selectable_with_find() {
         let mut ide = IdeModel::new();
