@@ -1384,13 +1384,33 @@ impl RunCol {
     }
 }
 
+/// True when the run has no value for a sortable column.
+fn run_col_missing(r: &DesignRun, col: RunCol) -> bool {
+    match col {
+        RunCol::Name | RunCol::Strategy | RunCol::Status => false,
+        RunCol::Luts => r.luts.is_none(),
+        RunCol::Ffs => r.ffs.is_none(),
+        RunCol::Bram => r.brams.is_none(),
+        RunCol::Dsp => r.dsps.is_none(),
+        RunCol::Wns => r.wns_ps.is_none(),
+        RunCol::Tns => r.tns_ps.is_none(),
+        RunCol::Runtime => r.runtime_ms.is_none(),
+    }
+}
+
 /// Sort runs in place. Rows with no value for the column sort last,
 /// regardless of direction; ties break by name for a stable order.
 pub fn sort_design_runs(runs: &mut [DesignRun], col: RunCol, asc: bool) {
     runs.sort_by(|a, b| {
-        let ord = cmp_design_runs(a, b, col);
-        let ord = if asc { ord } else { ord.reverse() };
-        ord.then_with(|| a.name.cmp(&b.name))
+        match (run_col_missing(a, col), run_col_missing(b, col)) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => {
+                let ord = cmp_design_runs(a, b, col);
+                let ord = if asc { ord } else { ord.reverse() };
+                ord.then_with(|| a.name.cmp(&b.name))
+            }
+        }
     });
 }
 
@@ -1472,9 +1492,17 @@ pub fn cmp_design_runs(a: &DesignRun, b: &DesignRun, col: RunCol) -> std::cmp::O
 /// Sort row indices for display without disturbing `model.runs` order.
 pub fn sort_run_indices(order: &mut [usize], runs: &[DesignRun], col: RunCol, asc: bool) {
     order.sort_by(|&ia, &ib| {
-        let ord = cmp_design_runs(&runs[ia], &runs[ib], col);
-        let ord = if asc { ord } else { ord.reverse() };
-        ord.then_with(|| runs[ia].name.cmp(&runs[ib].name))
+        let a = &runs[ia];
+        let b = &runs[ib];
+        match (run_col_missing(a, col), run_col_missing(b, col)) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => {
+                let ord = cmp_design_runs(a, b, col);
+                let ord = if asc { ord } else { ord.reverse() };
+                ord.then_with(|| a.name.cmp(&b.name))
+            }
+        }
     });
 }
 
