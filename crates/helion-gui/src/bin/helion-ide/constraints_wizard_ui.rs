@@ -5,12 +5,15 @@
 //! step navigation, and the write + re-run-timing wiring.
 
 use super::HelionIde;
+use eframe::egui::{self};
 use helion_gui::constraints_wizard as wiz;
-use helion_gui::{IdeModel, JobKind, PortDir};
+use helion_gui::{IdeModel, JobKind};
+use helion_ir::PortDir;
 use std::path::PathBuf;
 
 /// Screenshot affordance: `HELION_CONSTRAINTS_WIZARD=1` auto-opens the wizard,
-/// `HELION_WIZARD_STEP=n` jumps straight to a step (0-4). Same spirit as the
+/// `HELION_WIZARD_STEP=n` jumps straight to a step (0-4), and
+/// `HELION_WIZARD_DEMO=1` prefills representative rows. Same spirit as the
 /// existing `HELION_SHOT*` / `HELION_WORKSPACE` launch variables.
 pub fn auto_open_from_env() -> Option<usize> {
     if std::env::var("HELION_CONSTRAINTS_WIZARD").as_deref() == Ok("1") {
@@ -98,7 +101,7 @@ impl WizardUi {
             .cloned()
             .unwrap_or_default();
         let known: Vec<String> = model.constraints.clocks.iter().map(|c| c.name.clone()).collect();
-        let w = Self {
+        let mut w = Self {
             step: wiz::WizardStep::Clocks,
             visited: vec![wiz::WizardStep::Clocks],
             clocks: vec![ClockDraft {
@@ -120,6 +123,60 @@ impl WizardUi {
             written_path: None,
             timing: None,
         };
+        // Screenshot/demo hook: prefill representative rows.
+        if std::env::var("HELION_WIZARD_DEMO").as_deref() == Ok("1") {
+            let in_ports: Vec<String> = model
+                .design()
+                .map(|d| {
+                    d.ports
+                        .iter()
+                        .filter(|p| matches!(p.dir, PortDir::In | PortDir::Inout))
+                        .map(|p| p.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let out_ports: Vec<String> = model
+                .design()
+                .map(|d| {
+                    d.ports
+                        .iter()
+                        .filter(|p| matches!(p.dir, PortDir::Out | PortDir::Inout))
+                        .map(|p| p.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let clk_name = w.clocks[0].name.clone();
+            if let Some(p) = in_ports.first() {
+                w.input_delays.push(IoDelayDraft {
+                    port: p.clone(),
+                    clock: clk_name.clone(),
+                    min_ns: "0.5".into(),
+                    max_ns: "1.5".into(),
+                });
+            }
+            if let Some(p) = out_ports.first() {
+                w.output_delays.push(IoDelayDraft {
+                    port: p.clone(),
+                    clock: clk_name.clone(),
+                    min_ns: String::new(),
+                    max_ns: "2.0".into(),
+                });
+            }
+            if let (Some(a), Some(b)) = (in_ports.first(), out_ports.first()) {
+                w.exceptions.push(ExceptionDraft::FalsePath {
+                    from: a.clone(),
+                    from_is_clock: false,
+                    to: clk_name.clone(),
+                    to_is_clock: true,
+                });
+                w.exceptions.push(ExceptionDraft::MaxDelay {
+                    from: a.clone(),
+                    to: b.clone(),
+                    delay_ns: "8.0".into(),
+                    datapath_only: true,
+                });
+            }
+        }
         w
     }
 
@@ -188,7 +245,7 @@ impl WizardUi {
             let tag = format!("Clock #{}: ", i + 1);
             let period_ns = req_f64(&c.period_ns, "period (ns)", &tag, wiz::WizardStep::Clocks, &mut errs).unwrap_or(-1.0);
             let duty_pct = req_f64(&c.duty_pct, "duty cycle (%)", &tag, wiz::WizardStep::Clocks, &mut errs).unwrap_or(-1.0);
-            let parse_u32 = |s: &str, what: &str| -> u32 {
+            let mut parse_u32 = |s: &str, what: &str| -> u32 {
                 let t = s.trim();
                 match t.parse::<u32>() {
                     Ok(v) => v,
@@ -301,6 +358,18 @@ impl WizardUi {
         }
         self.errors.clear();
     }
+
+    /// Jump to a step by index (screenshot/demo hook).
+    pub fn set_step_idx(&mut self, idx: usize) {
+        let idx = idx.min(wiz::WizardStep::ALL.len() - 1);
+        for s in wiz::WizardStep::ALL.iter().take(idx + 1) {
+            if !self.visited.contains(s) {
+                self.visited.push(*s);
+            }
+        }
+        self.step = wiz::WizardStep::ALL[idx];
+        self.errors.clear();
+    }
 }
 
 /// Where the wizard writes: the SDC already open in the Constraints tab, else
@@ -368,11 +437,14 @@ fn error_box(ui: &mut egui::Ui, errors: &[wiz::WizardError]) {
     egui::Frame::NONE
         .fill(egui::Color32::from_rgb(64, 24, 24))
         .inner_margin(8.0)
-        .rounding(4.0)
+        .corner_radius(4.0)
         .show(ui, |ui| {
             ui.label(egui::RichText::new(format!("{} problem(s) to fix:", errors.len())).strong().color(egui::Color32::from_rgb(255, 150, 150)));
             for e in errors {
-                ui.label(egui::RichText::new(format!("• [{}] {}", e.step.title(), e.message)).color(egui::Color32::from_rgb(255, 190, 190))));
+                let msg = format!("• [{}] {}", e.step.title(), e.message);
+                ui.label(
+                    egui::RichText::new(msg).color(egui::Color32::from_rgb(255, 190, 190)),
+                );
             }
         });
 }
@@ -387,7 +459,8 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
         let master_opts: Vec<String> = {
             let w = app.constraints_wizard.as_ref().unwrap();
             let cur = w.clocks[i].name.clone();
-            let mut opts: Vec<String> = known.iter().cloned().collect();
+            let mut opts: Vec<String> =
+                app.model.constraints.clocks.iter().map(|c| c.name.clone()).collect();
             for cc in &w.clocks {
                 if !cc.generated && cc.name != cur && !opts.contains(&cc.name) {
                     opts.push(cc.name.clone());
@@ -410,7 +483,7 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut c.name);
                 ui.label("Port");
-                egui::ComboBox::from_id_source(("wclk_port", i))
+                egui::ComboBox::from_id_salt(("wclk_port", i))
                     .selected_text(c.port.as_str())
                     .width(150.0)
                     .show_ui(ui, |ui| {
@@ -430,7 +503,7 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
             if c.generated {
                 ui.horizontal(|ui| {
                     ui.label("Master");
-                    egui::ComboBox::from_id_source(("wclk_master", i))
+                    egui::ComboBox::from_id_salt(("wclk_master", i))
                         .selected_text(c.master.as_str())
                         .width(150.0)
                         .show_ui(ui, |ui| {
@@ -491,7 +564,7 @@ fn paint_io_delays(ui: &mut egui::Ui, app: &mut HelionIde, is_input: bool) {
             let d = &mut list[i];
             ui.horizontal(|ui| {
                 ui.label("Port");
-                egui::ComboBox::from_id_source(("wio_port", is_input, i))
+                egui::ComboBox::from_id_salt(("wio_port", is_input, i))
                     .selected_text(d.port.as_str())
                     .width(150.0)
                     .show_ui(ui, |ui| {
@@ -507,7 +580,7 @@ fn paint_io_delays(ui: &mut egui::Ui, app: &mut HelionIde, is_input: bool) {
             let d = &mut list[i];
             ui.horizontal(|ui| {
                 ui.label("Clock");
-                egui::ComboBox::from_id_source(("wio_clk", is_input, i))
+                egui::ComboBox::from_id_salt(("wio_clk", is_input, i))
                     .selected_text(d.clock.as_str())
                     .width(150.0)
                     .show_ui(ui, |ui| {
@@ -565,7 +638,7 @@ fn paint_exceptions(ui: &mut egui::Ui, app: &mut HelionIde) {
                         ui.horizontal(|ui| {
                             ui.label(lbl);
                             let opts: &[String] = if *is_clk { &clocks } else { &ports };
-                            egui::ComboBox::from_id_source(("wfp", i, lbl))
+                            egui::ComboBox::from_id_salt(("wfp", i, lbl))
                                 .selected_text(val.as_str())
                                 .width(150.0)
                                 .show_ui(ui, |ui| {
@@ -581,7 +654,7 @@ fn paint_exceptions(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ExceptionDraft::MaxDelay { from, to, delay_ns, datapath_only } => {
                     ui.horizontal(|ui| {
                         ui.label("From");
-                        egui::ComboBox::from_id_source(("wmd_from", i))
+                        egui::ComboBox::from_id_salt(("wmd_from", i))
                             .selected_text(from.as_str())
                             .width(140.0)
                             .show_ui(ui, |ui| {
@@ -590,7 +663,7 @@ fn paint_exceptions(ui: &mut egui::Ui, app: &mut HelionIde) {
                                 }
                             });
                         ui.label("To");
-                        egui::ComboBox::from_id_source(("wmd_to", i))
+                        egui::ComboBox::from_id_salt(("wmd_to", i))
                             .selected_text(to.as_str())
                             .width(140.0)
                             .show_ui(ui, |ui| {
@@ -636,6 +709,14 @@ fn paint_exceptions(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
+    // Lazily build the preview (covers the HELION_WIZARD_STEP jump-in, which
+    // skips the Next-button validation that normally builds it).
+    {
+        let w = app.constraints_wizard.as_mut().unwrap();
+        if w.preview.is_none() && w.errors.is_empty() {
+            w.revalidate(&app.model, None);
+        }
+    }
     let target = target_path(&app.model);
     let target_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("constraints.sdc").to_string();
 
@@ -735,10 +816,12 @@ pub fn paint(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("✕ Close").clicked() {
                 app.constraints_wizard = None;
-                return;
             }
         });
     });
+    if app.constraints_wizard.is_none() {
+        return;
+    }
     ui.add_space(2.0);
 
     // Stepper.
