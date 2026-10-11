@@ -314,6 +314,9 @@ pub enum JobKind {
     Implement,
     Step(FlowStep),
     SimRun(u32),
+    /// One design run from the runs queue (strategy sweep). The model clone
+    /// carries the run list + queue; the worker fills the run's results.
+    DesignRun { name: String },
 }
 
 impl JobKind {
@@ -327,6 +330,7 @@ impl JobKind {
             JobKind::Step(FlowStep::Route) => "Route",
             JobKind::Step(FlowStep::Bitstream) => "Bitstream",
             JobKind::SimRun(_) => "Simulate",
+            JobKind::DesignRun { .. } => "DesignRun",
         }
     }
 
@@ -341,6 +345,7 @@ impl JobKind {
             JobKind::Implement => "Implementing — synthesis, opt, place, route…".into(),
             JobKind::Step(s) => format!("Running {}…", s.label()),
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
+            JobKind::DesignRun { name } => format!("Running design run {name}…"),
         }
     }
 }
@@ -367,6 +372,7 @@ fn run_kind(model: &mut IdeModel, kind: &JobKind) -> Result<String, String> {
         JobKind::Implement => model.implement(),
         JobKind::Step(s) => model.run_step(*s),
         JobKind::SimRun(n) => model.sim_run(*n),
+        JobKind::DesignRun { name } => model.execute_design_run(name),
     }
 }
 

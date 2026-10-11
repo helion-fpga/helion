@@ -1199,15 +1199,14 @@ impl DesignRun {
     }
 
     /// Effective strategy: full spec when present, else the legacy label.
+    /// Never panics: unparseable specs fall back to Custom knobs.
     pub fn run_strategy(&self) -> helion_proj::RunStrategy {
         if self.spec.trim().is_empty() {
-            helion_proj::RunStrategy::preset(&self.strategy).unwrap_or_else(|_| {
-                helion_proj::RunStrategy::preset("Custom").expect("Custom preset exists")
-            })
+            helion_proj::RunStrategy::preset(&self.strategy)
+                .unwrap_or_else(|_| helion_proj::RunStrategy::fallback())
         } else {
-            helion_proj::RunStrategy::parse_spec(&self.spec).unwrap_or_else(|_| {
-                helion_proj::RunStrategy::preset("Custom").expect("Custom preset exists")
-            })
+            helion_proj::RunStrategy::parse_spec(&self.spec)
+                .unwrap_or_else(|_| helion_proj::RunStrategy::fallback())
         }
     }
 
@@ -4883,6 +4882,10 @@ pub struct IdeModel {
     pub messages: Vec<IdeMessage>,
     pub log: Vec<String>,
     pub runs: Vec<DesignRun>,
+    /// Design-run queue: run names waiting for background execution.
+    /// Drained one at a time via `JobKind::DesignRun`; the panel fills it,
+    /// `poll_job` chains the next. Cleared by "Cancel queue".
+    pub run_queue: VecDeque<String>,
     pub schematic: SchematicView,
     pub device: DeviceView,
     /// Device canvas zoom. 1.0 = Zoom Fit (both axes). >1 scrolls the die.
@@ -5090,6 +5093,7 @@ impl IdeModel {
                 DesignRun::new("synth_1", "Synthesis"),
                 DesignRun::new("impl_1", "Implementation"),
             ],
+            run_queue: VecDeque::new(),
             schematic: SchematicView::default(),
             device: DeviceView::default(),
             device_zoom: 1.0,
@@ -12155,10 +12159,197 @@ impl IdeModel {
         Ok(format!("launch_runs {name} strategy={}", strategy.label()))
     }
 
+    /// Design-runs worker: execute one queued run on the engine thread
+    /// (`JobKind::DesignRun`). Re-synthesizes from the project RTL source
+    /// with this run's AIG setting (thread-local flag, restored on drop),
+    /// then runs the full [`helion_proj::RunStrategy`]. Fills the run's
+    /// result fields and keeps the finished [`Session`] so the run can
+    /// become the active design ("make active"). Never touches
+    /// `self.shell.session`.
+    pub fn execute_design_run(&mut self, name: &str) -> Result<String, String> {
+        let idx = self
+            .runs
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| format!("design_run: unknown run {name}"))?;
+        let mut strategy = self.runs[idx].run_strategy();
+        if let Some(seed) = self.runs[idx].seed {
+            strategy.placer_seed = seed;
+        }
+        self.runs[idx].status = "Running".into();
+
+        let src = self
+            .tree
+            .sources
+            .last()
+            .cloned()
+            .ok_or_else(|| format!("design_run {name}: no RTL source (open a source first)"))?;
+        let dev = self.device()?;
+
+        // AIG rewriting happens inside RTL synthesis; the flag is
+        // thread-local so the engine thread stays isolated. Restored on drop
+        // even if synthesis fails.
+        struct AigGuard;
+        impl Drop for AigGuard {
+            fn drop(&mut self) {
+                helion_sv::set_aig_rewrite(true);
+            }
+        }
+        helion_sv::set_aig_rewrite(strategy.aig_rewrite);
+        let _aig = AigGuard;
+
+        let t0 = std::time::Instant::now();
+        let outcome: Result<(), String> = (|| {
+            let d = crate::synth_hdl_path(Path::new(&src))?;
+            let mut side = Session::new(Mode::NonProject);
+            side.part = self.part().to_string();
+            side.synth_design(d);
+            if let Some(d) = side.design.as_mut() {
+                let _ = self.constraints.apply(d);
+            }
+            side.impl_with_run_strategy(&dev, &strategy)?;
+            let (luts, ffs, brams, dsps) = side
+                .placed
+                .as_ref()
+                .map(|p| {
+                    let luts = p.packed.lutffs.len();
+                    let ffs = p
+                        .packed
+                        .lutffs
+                        .iter()
+                        .filter(|lf| !lf.ff_cell.is_empty())
+                        .count();
+                    (luts, ffs, p.packed.brams.len(), p.packed.macs.len())
+                })
+                .unwrap_or((0, 0, 0, 0));
+            let clks = self.clocks_for_sta();
+            let (wns, tns) = match (side.design.as_ref(), side.routed.as_ref()) {
+                (Some(d), Some(r)) => report_timing_routed_xdc(d, r, &clks, &self.constraints)
+                    .ok()
+                    .map(|t| (Some(t.wns_ps), Some(t.tns_ps)))
+                    .unwrap_or((None, None)),
+                _ => (None, None),
+            };
+            let ms = t0.elapsed().as_millis() as u64;
+            let r = &mut self.runs[idx];
+            r.status = "Complete".into();
+            r.strategy = strategy.preset.clone();
+            r.spec = strategy.to_spec();
+            r.runtime_ms = Some(ms);
+            r.wns_ps = wns;
+            r.tns_ps = tns;
+            r.luts = Some(luts);
+            r.ffs = Some(ffs);
+            r.brams = Some(brams);
+            r.dsps = Some(dsps);
+            r.lutff = Some(luts);
+            r.cells = side.design.as_ref().map(|d| d.cells.len());
+            r.bitstream_hash = side.blinky_hash();
+            r.part = self.part().to_string();
+            r.top = side.design.as_ref().map(|d| d.name.clone());
+            r.result_session = Some(Box::new(side));
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => Ok(format!(
+                "design_run {name} complete wns={} luts={}",
+                self.runs[idx].wns_cell(),
+                self.runs[idx].luts_cell(),
+            )),
+            Err(e) => {
+                self.runs[idx].status = "Failed".into();
+                Err(format!("design_run {name}: {e}"))
+            }
+        }
+    }
+
+    /// Make a finished run the active design: swap in its result session and
+    /// re-sync every view. Errors when the run has no result yet.
+    pub fn make_run_active(&mut self, name: &str) -> Result<String, String> {
+        let idx = self
+            .runs
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| format!("make_active: unknown run {name}"))?;
+        let session = self.runs[idx]
+            .result_session
+            .clone()
+            .ok_or_else(|| format!("make_active {name}: run has no result yet"))?;
+        self.shell.session = *session;
+        self.sync_from_session();
+        Ok(format!("make_active {name}"))
+    }
+
+    /// Fill the background queue with run names (in order). Duplicates and
+    /// unknown names are refused so the queue stays clean.
+    pub fn enqueue_design_runs(&mut self, names: &[&str]) -> Result<String, String> {
+        for n in names {
+            if !self.runs.iter().any(|r| r.name == *n) {
+                return Err(format!("enqueue: unknown run {n}"));
+            }
+            if self.run_queue.iter().any(|q| q == n) {
+                return Err(format!("enqueue: {n} already queued"));
+            }
+        }
+        for n in names {
+            self.run_queue.push_back(n.to_string());
+        }
+        Ok(format!("queued {} run(s)", names.len()))
+    }
+
+    /// Drop every pending run. The run currently on the engine thread finishes;
+    /// nothing new starts afterwards.
+    pub fn cancel_run_queue(&mut self) -> String {
+        let n = self.run_queue.len();
+        self.run_queue.clear();
+        format!("cancelled {n} queued run(s)")
+    }
+
+    /// Seed sweep: create N runs from one strategy with member seeds and queue
+    /// them all. Names are `{base}_s{seed}`; existing names are refused.
+    pub fn create_seed_sweep(
+        &mut self,
+        base: &str,
+        spec: &str,
+        seeds: &[u64],
+    ) -> Result<String, String> {
+        if seeds.is_empty() {
+            return Err("seed_sweep: need at least one seed".into());
+        }
+        let strategy = helion_proj::RunStrategy::parse_spec(spec)
+            .map_err(|e| format!("seed_sweep: bad spec: {e}"))?;
+        for s in seeds {
+            let name = format!("{base}_s{s}");
+            if self.runs.iter().any(|r| r.name == name) {
+                return Err(format!("seed_sweep: {name} exists"));
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        for s in seeds {
+            let name = format!("{base}_s{s}");
+            let mut run = DesignRun::new(&name, "Implementation");
+            run.strategy = strategy.preset.clone();
+            run.spec = strategy.to_spec();
+            run.seed = Some(*s);
+            self.runs.push(run);
+            names.push(name);
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.enqueue_design_runs(&refs)?;
+        Ok(format!(
+            "seed_sweep {base}: {} runs queued",
+            names.len()
+        ))
+    }
+
     /// UG986 Lab 1: `create_run impl_runtime -strategy RuntimeOpt`
+    /// Full-spec form: `create_run impl_custom -spec Preset:opt=1,aig=on,...`
+    /// (`-spec` wins over `-strategy`).
     pub fn create_run(&mut self, spec: &str) -> Result<String, String> {
         let mut name = String::new();
         let mut strategy = ImplStrategy::Default;
+        let mut full_spec: Option<String> = None;
         let mut toks = spec.split_whitespace();
         if let Some(n) = toks.next() {
             name = n.to_string();
@@ -12167,6 +12358,13 @@ impl IdeModel {
             if t == "-strategy" || t == "-strat" {
                 if let Some(s) = toks.next() {
                     strategy = ImplStrategy::parse(s)?;
+                }
+            } else if t == "-spec" {
+                if let Some(s) = toks.next() {
+                    // Validate now; stored verbatim for the worker.
+                    helion_proj::RunStrategy::parse_spec(s)
+                        .map_err(|e| format!("create_run: bad -spec: {e}"))?;
+                    full_spec = Some(s.to_string());
                 }
             }
         }
@@ -12177,10 +12375,17 @@ impl IdeModel {
             return Err(format!("create_run: {name} exists"));
         }
         let mut run = DesignRun::new(&name, "Implementation");
-        run.strategy = strategy.label().into();
+        if let Some(spec_str) = full_spec {
+            let parsed = helion_proj::RunStrategy::parse_spec(&spec_str)
+                .unwrap_or_else(|_| helion_proj::RunStrategy::fallback());
+            run.strategy = parsed.preset.clone();
+            run.spec = spec_str;
+        } else {
+            run.strategy = strategy.label().into();
+        }
         self.runs.push(run);
         self.workspace = WorkspaceTab::Runs;
-        Ok(format!("create_run {name} strategy={}", strategy.label()))
+        Ok(format!("create_run {name}"))
     }
 
     /// UG986 Lab 2: re-synth current source and incremental-place from the checkpoint.
