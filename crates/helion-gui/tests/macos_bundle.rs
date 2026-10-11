@@ -32,7 +32,10 @@ fn build_script_documents_apple_silicon_release() {
     assert!(!plist.contains("x86_64"), "no Rosetta slice: {plist}");
     let icon = root().join("packaging/macos/AppIcon.png");
     let bytes = std::fs::read(&icon).unwrap();
-    assert!(bytes.starts_with(b"\x89PNG"), "icon placeholder must be a PNG");
+    assert!(
+        bytes.starts_with(b"\x89PNG"),
+        "icon placeholder must be a PNG"
+    );
     assert!(bytes.len() > 100, "icon too small: {}", bytes.len());
 }
 
@@ -64,8 +67,14 @@ fn skip_build_assembles_helion_app_layout() {
     );
 
     let app = dist.join("Helion.app");
-    assert!(app.join("Contents/Info.plist").is_file(), "missing Info.plist");
-    assert!(app.join("Contents/MacOS/Helion").is_file(), "missing GUI binary");
+    assert!(
+        app.join("Contents/Info.plist").is_file(),
+        "missing Info.plist"
+    );
+    assert!(
+        app.join("Contents/MacOS/Helion").is_file(),
+        "missing GUI binary"
+    );
     assert!(
         app.join("Contents/Resources/AppIcon.png").is_file(),
         "missing icon placeholder"

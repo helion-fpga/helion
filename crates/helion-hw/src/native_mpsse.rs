@@ -20,12 +20,14 @@ use std::path::Path;
 
 use helion_bits::Bitstream;
 
+#[cfg(feature = "usb-native")]
+use crate::ERR_CODE_USB_0;
 use crate::native_usb::enumerate_ftdi;
 #[cfg(feature = "usb-native")]
 use crate::native_usb::{FTDI_PID_FT2232H, FTDI_VID};
-use crate::{HadUsbTransport, NativeUsbError, ERR_CODE_EMPTY_BITSTREAM, IR_CFG_W, IR_IDCODE, IR_STAT};
-#[cfg(feature = "usb-native")]
-use crate::ERR_CODE_USB_0;
+use crate::{
+    ERR_CODE_EMPTY_BITSTREAM, HadUsbTransport, IR_CFG_W, IR_IDCODE, IR_STAT, NativeUsbError,
+};
 
 // --- FTDI MPSSE opcodes (subset used for JTAG) --------------------------------
 // Bit flags (FTDI AN_108 / libftdi / OpenOCD):
@@ -203,7 +205,7 @@ impl MpsseOpcodeBuilder {
     pub fn jtag_enter_shift_ir(&mut self) -> &mut Self {
         // Select-DR, Select-IR, Capture-IR, Shift-IR
         self.tms_out(0x03, 4, false); // 1100 LSB-first = bits 0,1 =1,1 then 0,0 → wait
-                                      // LSB-first: bit0 first. Want TMS sequence 1,1,0,0 → bits = 0b0011
+        // LSB-first: bit0 first. Want TMS sequence 1,1,0,0 → bits = 0b0011
         self
     }
 
@@ -1134,11 +1136,15 @@ mod tests {
             "stable empty code missing: {msg2}"
         );
         assert!(
-            msg2.to_ascii_lowercase().contains("empty bitstream refused")
+            msg2.to_ascii_lowercase()
+                .contains("empty bitstream refused")
                 || msg2.to_ascii_lowercase().contains("refusing done on empty"),
             "{msg2}"
         );
-        assert_eq!(t2.usb_open_count, 0, "header-only HBIT must not claim cable");
+        assert_eq!(
+            t2.usb_open_count, 0,
+            "header-only HBIT must not claim cable"
+        );
         assert!(!t2.is_open());
         assert!(!msg2.to_ascii_lowercase().contains("done=1"), "{msg2}");
     }

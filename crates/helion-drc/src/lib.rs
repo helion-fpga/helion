@@ -93,11 +93,7 @@ impl Drc {
         self.items
             .iter()
             .find(|v| v.id == id)
-            .or_else(|| {
-                self.items
-                    .iter()
-                    .find(|v| v.id.eq_ignore_ascii_case(id))
-            })
+            .or_else(|| self.items.iter().find(|v| v.id.eq_ignore_ascii_case(id)))
     }
 
     pub fn error_count(&self) -> usize {
@@ -155,11 +151,7 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
     for (site, ble) in &placed.lutff_sites {
         let clb = format!("CLB_X{}Y{}", site.x, site.y);
         if *ble as u32 >= dev.n_ble {
-            d.add(
-                "PLACE-3",
-                &clb,
-                format!("BLE {ble} out of range at {clb}"),
-            );
+            d.add("PLACE-3", &clb, format!("BLE {ble} out of range at {clb}"));
         }
         if !used.insert((site.x, site.y, *ble)) {
             d.add("PLACE-4", &clb, format!("overused {clb} BLE{ble}"));
@@ -213,22 +205,18 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
             );
             continue;
         };
-        let loc = p
-            .attrs
-            .get("LOC")
-            .and_then(parse_iob_xy)
-            .or_else(|| {
-                placed
-                    .iob_sites
-                    .iter()
-                    .zip(placed.packed.iobs.iter())
-                    .find_map(|(s, i)| {
-                        let hit = i.cell.contains(&p.name)
-                            || i.from_net == p.name
-                            || i.loc.as_deref() == Some(p.attrs.get("LOC").unwrap_or(""));
-                        hit.then_some((s.x, s.y))
-                    })
-            });
+        let loc = p.attrs.get("LOC").and_then(parse_iob_xy).or_else(|| {
+            placed
+                .iob_sites
+                .iter()
+                .zip(placed.packed.iobs.iter())
+                .find_map(|(s, i)| {
+                    let hit = i.cell.contains(&p.name)
+                        || i.from_net == p.name
+                        || i.loc.as_deref() == Some(p.attrs.get("LOC").unwrap_or(""));
+                    hit.then_some((s.x, s.y))
+                })
+        });
         if let Some((x, y)) = loc {
             if let Some(bank) = dev.iob_bank(x, y) {
                 by_bank
@@ -276,10 +264,7 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
                         d.add(
                             "DRIVE-2",
                             &p.name,
-                            format!(
-                                "DRIVE {ma} not legal for IOSTANDARD {std} on {}",
-                                p.name
-                            ),
+                            format!("DRIVE {ma} not legal for IOSTANDARD {std} on {}", p.name),
                         );
                     }
                 }
@@ -311,7 +296,10 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
                 d.add(
                     "DIFF-1",
                     &p.name,
-                    format!("DIFF_TERM {dt} on {} is not a HAD term (TRUE|FALSE)", p.name),
+                    format!(
+                        "DIFF_TERM {dt} on {} is not a HAD term (TRUE|FALSE)",
+                        p.name
+                    ),
                 );
             } else if !Device::diff_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), dt) {
                 let std = p
@@ -346,10 +334,7 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
                 d.add(
                     "INTERM-2",
                     &p.name,
-                    format!(
-                        "IN_TERM {it} not legal for IOSTANDARD {std} on {}",
-                        p.name
-                    ),
+                    format!("IN_TERM {it} not legal for IOSTANDARD {std} on {}", p.name),
                 );
             }
         }
@@ -415,7 +400,11 @@ mod tests {
         pl.lutff_sites.push(s);
         pl.packed.lutffs.push(pl.packed.lutffs[0].clone());
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "duplicate (site,BLE) must fail DRC: {:?}", drc.violations);
+        assert!(
+            !drc.ok(),
+            "duplicate (site,BLE) must fail DRC: {:?}",
+            drc.violations
+        );
     }
 
     #[test]
@@ -426,9 +415,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "illegal IOSTANDARD must fail DRC: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("IOSTANDARD") && v.contains("HAD")),
+            !drc.ok(),
+            "illegal IOSTANDARD must fail DRC: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("IOSTANDARD") && v.contains("HAD")),
             "{:?}",
             drc.violations
         );
@@ -445,9 +440,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "mixed VCCO on one bank must fail: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("VCCO") && v.contains("BANK")),
+            !drc.ok(),
+            "mixed VCCO on one bank must fail: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("VCCO") && v.contains("BANK")),
             "{:?}",
             drc.violations
         );
@@ -476,9 +477,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "illegal DRIVE must fail DRC: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("DRIVE") && v.contains("HAD")),
+            !drc.ok(),
+            "illegal DRIVE must fail DRC: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("DRIVE") && v.contains("HAD")),
             "{:?}",
             drc.violations
         );
@@ -515,9 +522,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "DRIVE 24 vs LVCMOS18 must fail: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("DRIVE") && v.contains("IOSTANDARD")),
+            !drc.ok(),
+            "DRIVE 24 vs LVCMOS18 must fail: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("DRIVE") && v.contains("IOSTANDARD")),
             "{:?}",
             drc.violations
         );
@@ -550,9 +563,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "illegal DIFF_TERM must fail DRC: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("DIFF_TERM") && v.contains("HAD")),
+            !drc.ok(),
+            "illegal DIFF_TERM must fail DRC: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("DIFF_TERM") && v.contains("HAD")),
             "{:?}",
             drc.violations
         );
@@ -578,9 +597,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "DIFF_TERM TRUE vs LVCMOS18 must fail: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("DIFF_TERM") && v.contains("IOSTANDARD")),
+            !drc.ok(),
+            "DIFF_TERM TRUE vs LVCMOS18 must fail: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("DIFF_TERM") && v.contains("IOSTANDARD")),
             "{:?}",
             drc.violations
         );
@@ -591,9 +616,15 @@ mod tests {
         let p = pack(&d, &dev).unwrap();
         let pl = place(&p, &dev).unwrap();
         let drc = check_placed(&d, &pl, &dev);
-        assert!(!drc.ok(), "IN_TERM vs LVCMOS18 must fail: {:?}", drc.violations);
         assert!(
-            drc.violations.iter().any(|v| v.contains("IN_TERM") && v.contains("IOSTANDARD")),
+            !drc.ok(),
+            "IN_TERM vs LVCMOS18 must fail: {:?}",
+            drc.violations
+        );
+        assert!(
+            drc.violations
+                .iter()
+                .any(|v| v.contains("IN_TERM") && v.contains("IOSTANDARD")),
             "{:?}",
             drc.violations
         );

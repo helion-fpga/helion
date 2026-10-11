@@ -23,10 +23,7 @@ fn helion_ide_version_and_doctor_are_headless() {
         stdout.contains(env!("CARGO_PKG_VERSION")),
         "version must match package: {stdout}"
     );
-    assert!(
-        !stdout.to_lowercase().contains("error"),
-        "{stdout}"
-    );
+    assert!(!stdout.to_lowercase().contains("error"), "{stdout}");
 
     let d = Command::new(bin)
         .arg("--doctor")
@@ -47,7 +44,10 @@ fn helion_ide_version_and_doctor_are_headless() {
     );
     assert!(out.contains("ok"), "{out}");
     // A display-less CI host must not try to open a window for these flags.
-    assert!(!out.contains("egui"), "doctor must not start the GUI: {out}");
+    assert!(
+        !out.contains("egui"),
+        "doctor must not start the GUI: {out}"
+    );
 }
 
 #[test]
@@ -56,8 +56,7 @@ fn helion_ide_stdin_flow_refuses_route_before_place() {
     use std::process::{Command, Stdio};
 
     let bin = env!("CARGO_BIN_EXE_helion-ide");
-    let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/counter.sv");
+    let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
     let mut child = Command::new(bin)
         .arg("--stdin")
         .stdin(Stdio::piped())
@@ -92,8 +91,7 @@ fn helion_ide_stdin_flow_refuses_route_before_place() {
 #[test]
 fn helion_ide_headless_prints_real_wns() {
     let bin = env!("CARGO_BIN_EXE_helion-ide");
-    let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/counter.sv");
+    let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
     let out = Command::new(bin)
         .args(["--headless", sv.to_str().unwrap()])
         .output()
@@ -116,7 +114,10 @@ fn helion_ide_headless_prints_real_wns() {
         wns.abs() < 100_000,
         "WNS_PS={wns} is not a picosecond slack from STA"
     );
-    assert!(!s.to_lowercase().contains("egui"), "headless must not start the GUI: {s}");
+    assert!(
+        !s.to_lowercase().contains("egui"),
+        "headless must not start the GUI: {s}"
+    );
 }
 
 #[test]
@@ -126,8 +127,16 @@ fn helion_ide_help_links_the_binary() {
         .arg("--help")
         .output()
         .expect("helion-ide --help");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let s = format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(s.contains("helion-ide"), "{s}");
     assert!(s.contains("--headless"), "{s}");
 }
@@ -153,7 +162,9 @@ fn macos_app_script_errors_without_apple_sdk_and_layout_only_ships_had() {
             String::from_utf8_lossy(&fail.stdout)
         );
         assert!(
-            err.contains("macOS") || err.contains("Apple SDK") || err.contains("aarch64-apple-darwin"),
+            err.contains("macOS")
+                || err.contains("Apple SDK")
+                || err.contains("aarch64-apple-darwin"),
             "script must error clearly: {err}"
         );
     }
@@ -176,7 +187,10 @@ fn macos_app_script_errors_without_apple_sdk_and_layout_only_ships_had() {
     assert!(had.is_file(), "bundle must ship HAD: {}", had.display());
     let plist = outdir.join("Helion.app/Contents/Info.plist");
     let plist_s = std::fs::read_to_string(&plist).unwrap();
-    assert!(plist_s.contains("Helion") || plist_s.contains("helion-ide"), "{plist_s}");
+    assert!(
+        plist_s.contains("Helion") || plist_s.contains("helion-ide"),
+        "{plist_s}"
+    );
     assert!(plist_s.contains("LSMinimumSystemVersion"), "{plist_s}");
     let _ = std::fs::remove_dir_all(&outdir);
 }

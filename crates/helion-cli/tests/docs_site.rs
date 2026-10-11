@@ -55,10 +55,7 @@ fn public_html_documents_the_app() {
             !body.contains("marquee-track"),
             "{name} still has marquee-track"
         );
-        assert!(
-            !body.contains('\u{2014}'),
-            "{name} contains U+2014 em dash"
-        );
+        assert!(!body.contains('\u{2014}'), "{name} contains U+2014 em dash");
     }
 
     let home_l = home.to_ascii_lowercase();
@@ -82,7 +79,9 @@ fn public_html_documents_the_app() {
     assert!(
         home_l.contains("not a wrapper")
             || home_l.contains("not a vendor")
-            || (home_l.contains("vendor") && home_l.contains("bitstream") && home_l.contains("no ")),
+            || (home_l.contains("vendor")
+                && home_l.contains("bitstream")
+                && home_l.contains("no ")),
         "home must say Helion is not a vendor-tool wrapper"
     );
 

@@ -188,9 +188,18 @@ fn preprocess_sv_once(source: &str) -> String {
                         stack.pop();
                     }
                 }
-                "include" | "timescale" | "resetall" | "default_nettype" | "line"
-                | "unconnected_drive" | "nounconnected_drive" | "celldefine"
-                | "endcelldefine" | "pragma" | "begin_keywords" | "end_keywords" => {
+                "include"
+                | "timescale"
+                | "resetall"
+                | "default_nettype"
+                | "line"
+                | "unconnected_drive"
+                | "nounconnected_drive"
+                | "celldefine"
+                | "endcelldefine"
+                | "pragma"
+                | "begin_keywords"
+                | "end_keywords" => {
                     skip_to_eol(b, &mut i);
                 }
                 _ => {
@@ -389,9 +398,7 @@ mod tests {
 
     #[test]
     fn ifdef_keeps_defined_branch() {
-        let s = preprocess_sv(
-            "`define FOO\n`ifdef FOO\nwire a;\n`else\nwire b;\n`endif\n",
-        );
+        let s = preprocess_sv("`define FOO\n`ifdef FOO\nwire a;\n`else\nwire b;\n`endif\n");
         assert!(s.contains("wire a;"), "{s}");
         assert!(!s.contains("wire b;"), "{s}");
     }
@@ -419,7 +426,10 @@ mod tests {
     #[test]
     fn object_like_paren_body_not_args() {
         let s = preprocess_sv("`define BAR (4)\nlogic [3:0] q;\nassign q = `BAR;\n");
-        assert!(s.contains("assign q = (4);") || s.contains("assign q = (4)"), "{s}");
+        assert!(
+            s.contains("assign q = (4);") || s.contains("assign q = (4)"),
+            "{s}"
+        );
         assert!(!s.contains('`'), "{s}");
     }
 

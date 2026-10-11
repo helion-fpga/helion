@@ -11,4 +11,9 @@ helion-place = { workspace = true }
 helion-route = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+helion-sv = { workspace = true }
 helion-pack = { workspace = true }
+[[bench]]
+name = "sta"
+harness = false

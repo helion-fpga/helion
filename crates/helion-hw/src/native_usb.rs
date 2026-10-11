@@ -32,7 +32,10 @@ impl FtdiDeviceInfo {
     /// Human detail line (never implies program success).
     pub fn detail(&self) -> String {
         let mut parts = vec![
-            format!("native-rusb FTDI vid={:#06x} pid={:#06x}", self.vid, self.pid),
+            format!(
+                "native-rusb FTDI vid={:#06x} pid={:#06x}",
+                self.vid, self.pid
+            ),
             format!("bus={} addr={}", self.bus, self.address),
         ];
         if let Some(ref m) = self.manufacturer {
