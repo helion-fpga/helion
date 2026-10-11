@@ -632,8 +632,8 @@ impl HelionIde {
                     TbStreamEvent::Log { time_ns, sev, text } => {
                         self.model.tb_log.push(TbLogLine { time_ns, sev, text });
                     }
-                    TbStreamEvent::Failure { file, line, message, time_ns } => {
-                        let f = TbFailure { file, line, message, time_ns };
+                    TbStreamEvent::Failure { file, line, message, time_ns, signals } => {
+                        let f = TbFailure { file, line, message, time_ns, signals, instance: String::new() };
                         if !self.model.tb_failures.contains(&f) {
                             self.model.tb_failures.push(f);
                         }
@@ -678,8 +678,9 @@ impl HelionIde {
                         format!("Testbench — {}", self.progress),
                     );
                     self.job = None;
-                    // "Run all": chain the next queued testbench.
-                    if !self.tb_queue.is_empty() {
+                    // "Run all": chain the next queued testbench — unless the
+                    // user stopped the run (a stop aborts the whole sweep).
+                    if !self.tb_queue.is_empty() && !self.progress.contains("STOPPED") {
                         let next = self.tb_queue.remove(0);
                         tb_start_run(self, next);
                     }
@@ -9285,7 +9286,9 @@ fn tb_start_run(app: &mut HelionIde, sel: String) {
     }
     let (tx, rx) = mpsc::channel();
     app.tb_rx = Some(rx);
-    surface::request_job(JobKind::TbRun(TbRunRequest { sel, vcd, tx }));
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.model.tb_cancel = Some(cancel.clone());
+    surface::request_job(JobKind::TbRun(TbRunRequest { sel, vcd, tx, cancel: Some(cancel) }));
 }
 
 /// Integrated testbench runner panel (VS Code test-explorer layout):
@@ -9334,6 +9337,20 @@ fn paint_testbench(ui: &mut egui::Ui, app: &mut HelionIde) {
         if busy {
             ui.spinner();
             ui.label(RichText::new(format!("Running {}…", app.model.tb_run_name)).color(theme.warn));
+        }
+        // Stop only when this panel owns the in-flight job.
+        let tb_running = app.model.tb_run_active;
+        if ui
+            .add_enabled(
+                tb_running,
+                egui::Button::new("Stop"),
+            )
+            .on_hover_text("Stop the in-flight testbench run")
+            .clicked()
+        {
+            let msg = app.model.tb_stop();
+            app.tb_queue.clear(); // a stop aborts the whole regression sweep
+            app.progress = msg;
         }
     });
     let proj = app
@@ -9448,12 +9465,22 @@ fn paint_tb_detail(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool, full_h: f
             {
                 tb_start_run(app, name.clone());
             }
+            if let Some(vcd) = app.model.tb_last_vcd.clone() {
+                if ui
+                    .button("Open in waveform viewer")
+                    .on_hover_text(format!("Open {} (stub — full viewer ships with VCD power)", vcd.display()))
+                    .clicked()
+                {
+                    app.progress = app.model.tb_open_vcd_in_waveform(&vcd);
+                }
+            }
         });
     });
     ui.separator();
 
     // Failures first (clickable → editor), then the live log.
     let mut jump: Option<usize> = None;
+    let mut sch: Option<usize> = None;
     if !app.model.tb_failures.is_empty() {
         ui.label(
             RichText::new(format!("Failures ({})", app.model.tb_failures.len()))
@@ -9463,22 +9490,45 @@ fn paint_tb_detail(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool, full_h: f
         );
         egui::ScrollArea::vertical()
             .id_salt("tb_failures")
-            .max_height(110.0)
+            .max_height(130.0)
             .show(ui, |ui| {
                 for (fi, f) in app.model.tb_failures.iter().enumerate() {
+                    let sigs = if f.signals.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {}",
+                            f.signals
+                                .iter()
+                                .map(|(n, v)| format!("{n}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    };
                     let label = format!(
-                        "{}:{}: {}",
+                        "@{} ns {}:{}: {}{}",
+                        f.time_ns,
                         f.file.rsplit('/').next().unwrap_or(&f.file),
                         f.line,
-                        f.message
+                        f.message,
+                        sigs,
                     );
-                    if ui
-                        .button(RichText::new(label).color(theme.danger).small())
-                        .on_hover_text(format!("Open {}:{}", f.file, f.line))
-                        .clicked()
-                    {
-                        jump = Some(fi);
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new(label).color(theme.danger).small())
+                            .on_hover_text(format!("Open {}:{}", f.file, f.line))
+                            .clicked()
+                        {
+                            jump = Some(fi);
+                        }
+                        if ui
+                            .small_button("sch")
+                            .on_hover_text("Highlight the failing DUT instance in the schematic")
+                            .clicked()
+                        {
+                            sch = Some(fi);
+                        }
+                    });
                 }
             });
         ui.separator();
@@ -9486,6 +9536,13 @@ fn paint_tb_detail(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool, full_h: f
     if let Some(fi) = jump {
         let msg = app.model.tb_jump_to_failure(fi).unwrap_or_else(|e| e);
         app.progress = msg;
+        return;
+    }
+    if let Some(fi) = sch {
+        app.progress = app
+            .model
+            .tb_highlight_failure_in_schematic(fi)
+            .unwrap_or_else(|e| e);
         return;
     }
 
@@ -9528,7 +9585,7 @@ fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
         );
         return;
     }
-    let col_w = chrome::stretched_col_w(6, ui.available_width());
+    let col_w = chrome::stretched_col_w(7, ui.available_width());
     egui::ScrollArea::vertical()
         .id_salt("tb_history")
         .max_height(150.0)
@@ -9537,10 +9594,11 @@ fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
                 .spacing([8.0, 4.0])
                 .min_col_width(col_w.min(150.0))
                 .show(ui, |ui| {
-                    for h in ["Testbench", "Result", "Sim time", "Wall", "Errors", "VCD"] {
+                    for h in ["Testbench", "Result", "Sim time", "Wall", "Errors", "VCD", "Waveform"] {
                         ui.label(RichText::new(h).strong().small());
                     }
                     ui.end_row();
+                    let mut open_wave: Option<PathBuf> = None;
                     for e in app.model.tb_history.iter().rev().take(20) {
                         ui.label(RichText::new(&e.tb_name).small());
                         let (txt, col) = if e.passed { ("Passed", theme.ok) } else { ("Failed", theme.danger) };
@@ -9549,7 +9607,21 @@ fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
                         ui.label(RichText::new(format!("{} ms", e.runtime_ms)).small());
                         ui.label(RichText::new(format!("{}", e.errors)).small());
                         ui.label(RichText::new(if e.vcd_path.is_some() { "yes" } else { "—" }).small());
+                        if let Some(vcd) = &e.vcd_path {
+                            if ui
+                                .small_button("open")
+                                .on_hover_text(format!("Open {} (stub — full viewer ships with VCD power)", vcd.display()))
+                                .clicked()
+                            {
+                                open_wave = Some(vcd.clone());
+                            }
+                        } else {
+                            ui.label(RichText::new("—").color(theme.faint).small());
+                        }
                         ui.end_row();
+                    }
+                    if let Some(vcd) = open_wave {
+                        app.progress = app.model.tb_open_vcd_in_waveform(&vcd);
                     }
                 });
         });
