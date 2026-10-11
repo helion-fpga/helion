@@ -78,7 +78,7 @@ impl<'a> P<'a> {
         if c == '\n' {
             self.line += 1;
         }
-        Some(c)
+        c
     }
     fn err<T>(&self, message: impl Into<String>) -> Result<T, ParseError> {
         Err(ParseError {

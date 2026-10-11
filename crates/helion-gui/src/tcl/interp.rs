@@ -4,7 +4,7 @@
 //! Everything is a string, like Tcl. See `docs/tcl-subset.md` for the
 //! honestly-supported subset.
 
-use super::SelObj;
+use super::design::SelObj;
 use super::parse::{parse_script, Command, Seg, Word};
 use crate::GpuiShell;
 use std::collections::HashMap;
@@ -1118,21 +1118,22 @@ impl TclInterp {
             return Ctl::err(line, "wrong # args: should be \"incr varName ?increment?\"");
         }
         let cur = self.lookup(&argv[1]).cloned().unwrap_or_else(|| "0".into());
-        let cur_i: i64 = match cur.trim().parse() {
-            Ok(v) => v,
-            Err(_) => {
-                return Ctl::err(line, format!("expected integer but got \"{cur}\""));
+        let cur_i: i64 = cur.trim().parse().map_err(|_| {
+            TclError {
+                msg: format!("expected integer but got \"{cur}\""),
+                line,
             }
-        };
-        let inc: i64 = match argv.get(2) {
-            None => 1,
-            Some(s) => match s.trim().parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ctl::err(line, format!("expected integer but got \"{s}\""));
-                }
-            },
-        };
+        })?;
+        let inc: i64 = argv
+            .get(2)
+            .map(|s| {
+                s.trim().parse().map_err(|_| TclError {
+                    msg: format!("expected integer but got \"{s}\""),
+                    line,
+                })
+            })
+            .transpose()?
+            .unwrap_or(1);
         let v = cur_i.wrapping_add(inc).to_string();
         self.assign(argv[1].clone(), v.clone());
         Ctl::Value(v)
@@ -1785,7 +1786,7 @@ impl<'a> ExprParser<'a> {
             }
             Some(c) if c.is_ascii_digit() || c == '.' => self.parse_number(),
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                let name = self.parse_ident();
+                let name = self.parse_ident()?;
                 self.skip_ws();
                 if self.peek() == Some('(') {
                     // function call
