@@ -700,6 +700,36 @@ pub fn analyze_power(
                 ),
             });
         }
+        // Cross-check: the VCD's own measured clock period vs the configured
+        // one. A mismatch means `cycles` (and hence every α) is off — usually
+        // the operating-conditions clock doesn't match the dump's timescale.
+        let vcd_half_period = clock_nets
+            .iter()
+            .map(|n| n.as_str())
+            .filter_map(|n| net_signal.get(n).copied())
+            .chain(vcd_clock_names.iter().map(|s| s.as_str()))
+            .filter_map(|sig| {
+                activity.and_then(|a| {
+                    a.signals
+                        .iter()
+                        .find(|x| x.name.as_str() == sig)
+                        .and_then(|x| x.min_period_ps)
+                })
+            })
+            .min();
+        if let Some(half) = vcd_half_period {
+            let vcd_period = half.saturating_mul(2).max(1);
+            let cfg_p = cfg.clock_period_ps.max(1);
+            if vcd_period > cfg_p * 2 || vcd_period * 2 < cfg_p {
+                warnings.push(PowerWarning {
+                    severity: PowerSeverity::Warning,
+                    message: format!(
+                        "VCD clock period ~{vcd_period} ps differs from configured {cfg_p} ps — \
+                         activity factors may be off; check operating conditions"
+                    ),
+                });
+            }
+        }
     }
     if dynamic_w > 0.0 && dyn_clk / dynamic_w > 0.4 && n_ff > 0 {
         warnings.push(PowerWarning {

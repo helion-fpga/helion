@@ -5508,10 +5508,11 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     } else {
         ui.label(
             RichText::new(format!(
-                "activity coverage: {}/{} nets ({:.0}%)",
+                "activity coverage: {}/{} nets ({:.0}%) · clock α={:.2}",
                 r.nets_matched,
                 r.nets_total,
-                r.coverage_pct()
+                r.coverage_pct(),
+                r.clock_alpha
             ))
             .color(theme.dim)
             .small(),
