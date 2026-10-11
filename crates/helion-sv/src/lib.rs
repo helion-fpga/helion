@@ -483,7 +483,7 @@ struct Inst {
 }
 
 #[derive(Clone, Debug)]
-struct Rtl {
+struct Rtl<'a> {
     module: String,
     ports: Vec<(String, PortDir, usize)>,
     signals: Vec<Signal>,
@@ -491,7 +491,7 @@ struct Rtl {
     assigns: Vec<(String, Option<usize>, RExpr)>,
     insts: Vec<Inst>,
     params: Vec<(String, u128)>,
-    toks: Vec<Tok>,
+    toks: Vec<Tok<'a>>,
     mem_inits: HashMap<String, BTreeMap<usize, u128>>,
 }
 
@@ -1746,10 +1746,10 @@ fn is_sim_display(name: &str) -> bool {
         || name.starts_with("$write")
 }
 
-fn tok_is_xz_lit(t: &Tok) -> bool {
+fn tok_is_xz_lit(t: &Tok<'_>) -> bool {
     match t {
         Tok::Pat { .. } => true,
-        Tok::Ident(s) if matches!(s.as_str(), "x" | "X" | "z" | "Z") => true,
+        Tok::Ident(s) if matches!(*s, "x" | "X" | "z" | "Z") => true,
         _ => false,
     }
 }
@@ -1769,7 +1769,7 @@ fn case_eq_against_xz(toks: &[Tok], i: usize) -> bool {
             Tok::Sym('(') => depth += 1,
             Tok::Sym(')') | Tok::Sym(';') | Tok::Sym(',') if depth == 0 => break,
             Tok::Kw(k)
-                if depth == 0 && matches!(k.as_str(), "begin" | "end" | "else" | "endcase") =>
+                if depth == 0 && matches!(*k, "begin" | "end" | "else" | "endcase") =>
             {
                 break;
             }
@@ -1798,7 +1798,7 @@ fn case_eq_against_xz(toks: &[Tok], i: usize) -> bool {
 fn slice_is_sim_only(toks: &[Tok]) -> bool {
     let mut i = 0;
     while i < toks.len() {
-        if matches!(&toks[i], Tok::Kw(k) if k == "endmodule") {
+        if matches!(&toks[i], Tok::Kw(k) if *k == "endmodule") {
             break;
         }
         if let Tok::Ident(s) = &toks[i] {
@@ -2147,7 +2147,7 @@ fn lhs_before_assign(toks: &[Tok], nba_only: bool) -> Option<String> {
             matches!(toks.get(j), Some(Tok::Le) | Some(Tok::Sym('=')))
         };
         if hit {
-            return Some(name.clone());
+            return Some(name.to_string());
         }
         i += 1;
     }
@@ -3407,16 +3407,30 @@ fn fnv_module_present(text: &str, name: &str) -> bool {
     false
 }
 
-fn parse_file_modules(path: &Path) -> Result<Vec<Rtl>, String> {
+/// Own the preprocessed text for a file-loaded module set.
+///
+/// `Tok` borrows from the preprocessed source, but file-loaded sources are
+/// built inside `parse_file_modules` and must outlive the returned `Rtl`s.
+/// The text is leaked once per source *file* (bounded by total input size,
+/// not by token count) and freed on process exit.
+///
+/// Written rationale for the no-`Box::leak` rule (quality-standards §2):
+/// the alternative is an owned `String` per token — 100k+ allocator
+/// round-trips on Ibex-scale inputs — to avoid one bounded leak per file.
+fn leak_preprocessed(pre: String) -> &'static str {
+    Box::leak(pre.into_boxed_str())
+}
+
+fn parse_file_modules(path: &Path) -> Result<Vec<Rtl<'static>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let dir = path.parent().unwrap_or(path);
     let expanded = expand_includes(&text, dir);
     let pre = preprocess_sv(&strip_comments(&expanded));
     push_readmem_base(&path.display().to_string());
-    parse_preprocessed(&pre)
+    parse_preprocessed(pre)
 }
 
-fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result<Vec<Rtl>, String> {
+fn sibling_modules(dir: &Path, missing: &HashSet<String>, skip: &Path) -> Result<Vec<Rtl<'static>>, String> {
     let mut out = Vec::new();
     if missing.is_empty() || !dir.is_dir() {
         return Ok(out);
@@ -3470,8 +3484,8 @@ fn strip_comments(s: &str) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Tok {
-    Ident(String),
+enum Tok<'a> {
+    Ident(&'a str),
     Number(u128, usize),
     /// based number with x/z/? don't-care bits (casez).
     Pat {
@@ -3479,8 +3493,8 @@ enum Tok {
         care: u128,
         width: usize,
     },
-    Kw(String),
-    Str(String),
+    Kw(&'a str),
+    Str(&'a str),
     Sym(char),
     Le,   // <=
     Ge,   // >=
@@ -3490,7 +3504,42 @@ enum Tok {
     Land, // &&
 }
 
-fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
+/// Parse already-scanned based-literal digits with the exact semantics the old
+/// code got from `u128::from_str_radix(mapped).unwrap_or(0)`: x/z/? count as
+/// 0; any digit invalid for `base`, or any overflow, yields 0 for the whole
+/// value. `_` separators are skipped. No allocation; one O(digits) pass.
+/// `digits` must be ASCII (it comes from the tokenizer's digit scan).
+fn parse_based_digits(digits: &str, base: u32) -> u128 {
+    let mut val: u128 = 0;
+    let mut any = false;
+    for ch in digits.chars() {
+        if ch == '_' {
+            continue;
+        }
+        any = true;
+        let d = match ch {
+            'x' | 'X' | 'z' | 'Z' | '?' => 0u32,
+            c => match c.to_digit(base) {
+                Some(d) => d,
+                None => return 0,
+            },
+        };
+        match val
+            .checked_mul(base as u128)
+            .and_then(|v| v.checked_add(d as u128))
+        {
+            Some(v) => val = v,
+            None => return 0,
+        }
+    }
+    if any {
+        val
+    } else {
+        0
+    }
+}
+
+fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
     let b = s.as_bytes();
     let mut i = 0;
     let mut out = Vec::new();
@@ -3576,15 +3625,15 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
         }
         if c == '"' {
             i += 1;
-            let mut s = String::new();
+            let start = i;
             while i < b.len() && b[i] != b'"' {
-                s.push(b[i] as char);
                 i += 1;
             }
+            let lit = &s[start..i];
             if i < b.len() {
                 i += 1;
             }
-            out.push(Tok::Str(s));
+            out.push(Tok::Str(lit));
             continue;
         }
         if c == '<' && b.get(i + 1) == Some(&b'=') {
@@ -3671,7 +3720,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                     }
                 }
             }
-            let mut digits = String::new();
+            let dstart = i;
             while i < b.len() {
                 let ch = b[i] as char;
                 if ch == '_' {
@@ -3682,28 +3731,17 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 if !ok {
                     break;
                 }
-                digits.push(ch);
                 i += 1;
             }
-            if digits.is_empty() {
+            // ASCII-only scan range, so slicing is safe.
+            let digits = &s[dstart..i];
+            let ndigits = digits.chars().filter(|&c| c != '_').count();
+            if ndigits == 0 {
                 out.push(Tok::Sym('\''));
                 continue;
             }
-            let width = if saw_base { digits.len().max(1) } else { 1 };
-            let val = u128::from_str_radix(
-                &digits
-                    .chars()
-                    .map(|c| {
-                        if matches!(c, 'x' | 'X' | 'z' | 'Z' | '?') {
-                            '0'
-                        } else {
-                            c
-                        }
-                    })
-                    .collect::<String>(),
-                base,
-            )
-            .unwrap_or(0);
+            let width = if saw_base { ndigits.max(1) } else { 1 };
+            let val = parse_based_digits(digits, base);
             out.push(Tok::Number(val, width));
             continue;
         }
@@ -3720,16 +3758,16 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         if c == '$' || c.is_ascii_alphabetic() || c == '_' {
-            let mut n = String::new();
+            let start = i;
             if c == '$' {
-                n.push(c);
                 i += 1;
             }
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                n.push(b[i] as char);
                 i += 1;
             }
-            if kws.contains(&n.as_str()) {
+            // Byte range is ASCII-only by construction, so slicing is safe.
+            let n = &s[start..i];
+            if kws.contains(&n) {
                 out.push(Tok::Kw(n));
             } else {
                 out.push(Tok::Ident(n));
@@ -3737,11 +3775,12 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         if c.is_ascii_digit() {
-            let mut n = String::new();
+            let nstart = i;
             while i < b.len() && b[i].is_ascii_digit() {
-                n.push(b[i] as char);
                 i += 1;
             }
+            // Byte range is ASCII-only by construction, so slicing is safe.
+            let n = &s[nstart..i];
             if b.get(i) == Some(&b'\'') {
                 i += 1;
                 let width: usize = n.parse().unwrap_or(1);
@@ -3767,7 +3806,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                         _ => {}
                     }
                 }
-                let mut digits = String::new();
+                let dstart = i;
                 while i < b.len() {
                     let ch = b[i] as char;
                     if ch == '_' {
@@ -3778,16 +3817,22 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                     if !ok {
                         break;
                     }
-                    digits.push(ch);
                     i += 1;
                 }
+                // ASCII-only scan range, so slicing is safe.
+                let digits = &s[dstart..i];
                 let mut val = 0u128;
                 let mut care = 0u128;
                 let mut dc = false;
                 if base == 2 {
                     let mut wide = width > 128;
-                    for (off, ch) in digits.chars().enumerate() {
+                    let mut off = 0usize;
+                    for ch in digits.chars() {
+                        if ch == '_' {
+                            continue;
+                        }
                         let bit = width.saturating_sub(off + 1);
+                        off += 1;
                         match ch {
                             '1' => {
                                 wide |= !or_u128_bit(&mut val, bit);
@@ -3805,21 +3850,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                         note_wide_literal(width);
                     }
                 } else {
-                    let parsed = u128::from_str_radix(
-                        &digits
-                            .chars()
-                            .map(|c| {
-                                if matches!(c, 'x' | 'X' | 'z' | 'Z' | '?') {
-                                    '0'
-                                } else {
-                                    c
-                                }
-                            })
-                            .collect::<String>(),
-                        base,
-                    )
-                    .unwrap_or(0);
-                    val = parsed;
+                    val = parse_based_digits(digits, base);
                     care = if width >= 128 {
                         u128::MAX
                     } else {
@@ -3852,7 +3883,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
 }
 
 struct P<'a> {
-    t: &'a [Tok],
+    t: &'a [Tok<'a>],
     i: usize,
     params: HashMap<String, u128>,
     /// Signal/port widths seen so far (slice assigns and const if).
@@ -3862,17 +3893,17 @@ struct P<'a> {
 }
 
 impl<'a> P<'a> {
-    fn peek(&self) -> Option<&'a Tok> {
+    fn peek(&self) -> Option<&'a Tok<'a>> {
         self.t.get(self.i)
     }
-    fn bump(&mut self) -> Option<&'a Tok> {
+    fn bump(&mut self) -> Option<&'a Tok<'a>> {
         let t = self.t.get(self.i)?;
         self.i += 1;
         Some(t)
     }
     fn eat_kw(&mut self, k: &str) -> bool {
         match self.peek() {
-            Some(Tok::Kw(s)) if s == k => {
+            Some(Tok::Kw(s)) if *s == k => {
                 self.i += 1;
                 true
             }
@@ -3890,7 +3921,7 @@ impl<'a> P<'a> {
     }
     fn ident(&mut self) -> Result<String, String> {
         match self.bump() {
-            Some(Tok::Ident(s)) => Ok(s.clone()),
+            Some(Tok::Ident(s)) => Ok(s.to_string()),
             other => Err(format!("expected ident, got {other:?}")),
         }
     }
@@ -3993,11 +4024,11 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             p.bump();
             Ok(n)
         }
-        Some(Tok::Ident(s)) if s == "$bits" => {
+        Some(Tok::Ident(s)) if *s == "$bits" => {
             p.bump();
             parse_bits_width(p)
         }
-        Some(Tok::Ident(s)) if s == "$clog2" => {
+        Some(Tok::Ident(s)) if *s == "$clog2" => {
             p.bump();
             if !p.eat_sym('(') {
                 return Err("$clog2 (".into());
@@ -4008,7 +4039,7 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             }
             Ok(clog2_u(arg))
         }
-        Some(Tok::Kw(k)) if k == "unsigned" || k == "signed" => {
+        Some(Tok::Kw(k)) if *k == "unsigned" || *k == "signed" => {
             // `unsigned'(expr)` — keyword form of a size cast. Value is inner.
             p.bump();
             if !(p.eat_sym('\'') && p.eat_sym('(')) {
@@ -4019,7 +4050,7 @@ fn const_atom(p: &mut P) -> Result<u128, String> {
             Ok(v)
         }
         Some(Tok::Ident(s)) => {
-            let mut name = s.clone();
+            let mut name = s.to_string();
             p.bump();
             // `unsigned'(expr)` size cast. The value is the inner const.
             if p.eat_sym('\'') && p.eat_sym('(') {
@@ -4764,7 +4795,7 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             width: *width,
             care: *care,
         }),
-        Some(Tok::Kw(k)) if k == "unsigned" || k == "signed" || k == "int" || k == "integer" => {
+        Some(Tok::Kw(k)) if *k == "unsigned" || *k == "signed" || *k == "int" || *k == "integer" => {
             // `unsigned'(expr)` / `int'(expr)` size cast. Value is the inner expr.
             // Keyword already consumed by the match.
             if !(p.eat_sym('\'') && p.eat_sym('(')) {
@@ -4777,7 +4808,7 @@ fn parse_atom_r(p: &mut P) -> Result<RExpr, String> {
             Ok(inner)
         }
         Some(Tok::Ident(s)) => {
-            let name = s.clone();
+            let name = s.to_string();
             // Ibex ALU: `$unsigned(a) + $unsigned(b)`. Value is the inner expr
             // (unsigned/signed cast does not invent bits). Not a generate miss.
             if (name == "$unsigned" || name == "$signed") && p.eat_sym('(') {
@@ -5255,7 +5286,7 @@ fn try_parse_readmem(p: &mut P, mem_inits: &mut HashMap<String, BTreeMap<usize, 
     let Some(Tok::Ident(n)) = p.peek() else {
         return false;
     };
-    let binary = match n.as_str() {
+    let binary = match *n {
         "$readmemb" => true,
         "$readmemh" => false,
         _ => return false,
@@ -5266,7 +5297,7 @@ fn try_parse_readmem(p: &mut P, mem_inits: &mut HashMap<String, BTreeMap<usize, 
         return false;
     }
     let path = match p.bump() {
-        Some(Tok::Str(s)) => s.clone(),
+        Some(Tok::Str(s)) => s.to_string(),
         _ => {
             p.i = save;
             return false;
@@ -5446,7 +5477,7 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
         if block && p.eat_kw("end") {
             break;
         }
-        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "end") {
+        if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "end") {
             p.eat_kw("end");
             break;
         }
@@ -5470,7 +5501,7 @@ fn parse_seq_block(p: &mut P, block: bool) -> Result<Vec<Nba>, String> {
 
 /// `unsigned'(expr)` / `signed'(expr)`. `unsigned` is a keyword, not an ident.
 fn eat_unsigned_cast_prefix(p: &mut P) -> bool {
-    let cast = matches!(p.peek(), Some(Tok::Kw(k)) if k == "unsigned" || k == "signed")
+    let cast = matches!(p.peek(), Some(Tok::Kw(k)) if *k == "unsigned" || *k == "signed")
         && matches!(p.t.get(p.i + 1), Some(Tok::Sym('\'')))
         && matches!(p.t.get(p.i + 2), Some(Tok::Sym('(')));
     if !cast {
@@ -5566,7 +5597,7 @@ fn parse_for_step_signed(p: &mut P) -> Result<i32, String> {
 /// Procedural `mem[i] <= mem[i-1]` (optional begin/end). Not a generate.
 fn body_is_word_shift(body: &[Tok], var: &str) -> Option<String> {
     let mut i = 0;
-    if matches!(body.get(i), Some(Tok::Kw(k)) if k == "begin") {
+    if matches!(body.get(i), Some(Tok::Kw(k)) if *k == "begin") {
         i += 1;
         if matches!(body.get(i), Some(Tok::Sym(':'))) {
             i += 1;
@@ -5576,7 +5607,7 @@ fn body_is_word_shift(body: &[Tok], var: &str) -> Option<String> {
         }
     }
     let mem = match body.get(i) {
-        Some(Tok::Ident(s)) => s.clone(),
+        Some(Tok::Ident(s)) => s.to_string(),
         _ => return None,
     };
     i += 1;
@@ -5589,9 +5620,9 @@ fn body_is_word_shift(body: &[Tok], var: &str) -> Option<String> {
     for t in body.iter().skip(i) {
         match t {
             Tok::Le => seen_le = true,
-            Tok::Ident(s) if !seen_le && s == var => lhs_var = true,
+            Tok::Ident(s) if !seen_le && *s == var => lhs_var = true,
             Tok::Ident(s) if seen_le && s == &mem => rhs_mem = true,
-            Tok::Kw(k) if k == "end" => break,
+            Tok::Kw(k) if *k == "end" => break,
             Tok::Sym(';') if seen_le && rhs_mem => break,
             _ => {}
         }
@@ -5633,8 +5664,8 @@ fn consume_nonconst_word_pipeline(p: &mut P, var: &str) -> Option<String> {
         let mut d = 1i32;
         while d > 0 {
             match p.bump() {
-                Some(Tok::Kw(k)) if k == "begin" => d += 1,
-                Some(Tok::Kw(k)) if k == "end" => d -= 1,
+                Some(Tok::Kw(k)) if *k == "begin" => d += 1,
+                Some(Tok::Kw(k)) if *k == "end" => d -= 1,
                 None => {
                     p.i = save;
                     return None;
@@ -5764,8 +5795,8 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
         let mut depth = 1i32;
         while depth > 0 {
             match p.bump() {
-                Some(Tok::Kw(k)) if k == "begin" => depth += 1,
-                Some(Tok::Kw(k)) if k == "end" => depth -= 1,
+                Some(Tok::Kw(k)) if *k == "begin" => depth += 1,
+                Some(Tok::Kw(k)) if *k == "end" => depth -= 1,
                 None => return Err("for body".into()),
                 _ => {}
             }
@@ -5803,7 +5834,7 @@ fn parse_for_unroll(p: &mut P) -> Result<Vec<Nba>, String> {
     let step = step.max(1);
     let mut i = start;
     for _ in 0..niter.min(4096) {
-        let toks: Vec<Tok> = body
+        let toks: Vec<Tok<'_>> = body
             .iter()
             .map(|t| match t {
                 Tok::Ident(s) if s == &var => Tok::Number(i as u128, 32),
@@ -5837,7 +5868,7 @@ fn parse_attr(p: &mut P) -> Option<(String, String)> {
         return None;
     }
     let k = match p.bump() {
-        Some(Tok::Ident(s) | Tok::Kw(s)) => s.clone(),
+        Some(Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
         _ => {
             p.i = save;
             return None;
@@ -5845,7 +5876,7 @@ fn parse_attr(p: &mut P) -> Option<(String, String)> {
     };
     let _ = p.eat_sym('=');
     let v = match p.bump() {
-        Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.clone(),
+        Some(Tok::Str(s) | Tok::Ident(s) | Tok::Kw(s)) => s.to_string(),
         Some(Tok::Number(n, _)) => n.to_string(),
         _ => "1".into(),
     };
@@ -6464,7 +6495,7 @@ fn skip_until_kw(p: &mut P, kw: &str) {
         if kw != "endmodule"
             && matches!(
                 p.peek(),
-                Some(Tok::Kw(k)) if k == "endmodule" || k == "endpackage" || k == "module"
+                Some(Tok::Kw(k)) if *k == "endmodule" || *k == "endpackage" || *k == "module"
             )
         {
             return;
@@ -6473,16 +6504,20 @@ fn skip_until_kw(p: &mut P, kw: &str) {
     }
 }
 
-fn parse_source(source: &str) -> Result<Vec<Rtl>, String> {
-    parse_preprocessed(&preprocess_sv(&strip_comments(source)))
+fn parse_source(source: &str) -> Result<Vec<Rtl<'static>>, String> {
+    parse_preprocessed(preprocess_sv(&strip_comments(source)))
 }
 
-fn parse_preprocessed(s: &str) -> Result<Vec<Rtl>, String> {
+fn parse_preprocessed(pre: String) -> Result<Vec<Rtl<'static>>, String> {
     pkg_enums_clear();
     clear_seq_notes();
-    let toks = tokenize(s)?;
+    let s: &'static str = leak_preprocessed(pre);
+    // The token slice is leaked alongside the source: one bounded allocation
+    // per parsed file (same rationale as `leak_preprocessed`), so the
+    // returned `Rtl<'static>` modules stay valid without cloning every token.
+    let toks: &'static [Tok<'static>] = Box::leak(tokenize(s)?.into_boxed_slice());
     let mut p = P {
-        t: &toks,
+        t: toks,
         i: 0,
         params: HashMap::new(),
         widths: HashMap::new(),
@@ -6533,7 +6568,7 @@ fn parse_preprocessed(s: &str) -> Result<Vec<Rtl>, String> {
             continue;
         }
         match p.peek() {
-            Some(Tok::Kw(k)) if k == "module" => match parse_one_module(&mut p) {
+            Some(Tok::Kw(k)) if *k == "module" => match parse_one_module(&mut p) {
                 Ok(m) => mods.push(m),
                 Err(_) => skip_until_kw(&mut p, "endmodule"),
             },
@@ -6550,7 +6585,7 @@ fn parse_preprocessed(s: &str) -> Result<Vec<Rtl>, String> {
 }
 
 #[allow(dead_code)] // intentional: kept as direct RTL entry for future callers / tests
-fn parse_rtl(source: &str) -> Result<Rtl, String> {
+fn parse_rtl(source: &str) -> Result<Rtl<'static>, String> {
     parse_source(source)?
         .into_iter()
         .next()
@@ -6669,14 +6704,14 @@ fn skip_begin_end(p: &mut P) -> Result<(), String> {
     let mut depth = 1i32;
     while depth > 0 {
         match p.peek() {
-            Some(Tok::Kw(k)) if k == "endmodule" || k == "endgenerate" || k == "endpackage" => {
+            Some(Tok::Kw(k)) if *k == "endmodule" || *k == "endgenerate" || *k == "endpackage" => {
                 return Err("unterminated begin".into());
             }
-            Some(Tok::Kw(k)) if k == "begin" => {
+            Some(Tok::Kw(k)) if *k == "begin" => {
                 p.bump();
                 depth += 1;
             }
-            Some(Tok::Kw(k)) if k == "end" => {
+            Some(Tok::Kw(k)) if *k == "end" => {
                 p.bump();
                 depth -= 1;
             }
@@ -6702,11 +6737,11 @@ fn skip_item_or_block(p: &mut P) -> Result<(), String> {
             break;
         }
         match p.peek() {
-            Some(Tok::Kw(k)) if k == "begin" => {
+            Some(Tok::Kw(k)) if *k == "begin" => {
                 p.bump();
                 depth += 1;
             }
-            Some(Tok::Kw(k)) if k == "end" => {
+            Some(Tok::Kw(k)) if *k == "end" => {
                 if depth == 0 {
                     break;
                 }
@@ -6717,9 +6752,9 @@ fn skip_item_or_block(p: &mut P) -> Result<(), String> {
                 }
             }
             Some(Tok::Kw(k))
-                if k == "endcase" || k == "endgenerate" || k == "endmodule" || k == "else" =>
+                if *k == "endcase" || *k == "endgenerate" || *k == "endmodule" || *k == "else" =>
             {
-                if depth == 0 || k == "endmodule" || k == "endgenerate" {
+                if depth == 0 || *k == "endmodule" || *k == "endgenerate" {
                     break;
                 }
                 p.bump();
@@ -6758,7 +6793,7 @@ fn skip_to_semi(p: &mut P) {
             Some(Tok::Kw(k))
                 if d == 0
                     && matches!(
-                        k.as_str(),
+                        *k,
                         "end" | "endmodule" | "endgenerate" | "endpackage" | "endcase" | "else"
                     ) =>
             {
@@ -6844,7 +6879,7 @@ fn skip_event_control(p: &mut P) -> (bool, Option<String>, bool) {
                 has_posedge = true;
                 if clk.is_none() {
                     if let Some(Tok::Ident(name)) = p.peek() {
-                        clk = Some(name.clone());
+                        clk = Some(name.to_string());
                         p.bump();
                     }
                 }
@@ -6854,7 +6889,7 @@ fn skip_event_control(p: &mut P) -> (bool, Option<String>, bool) {
                 has_negedge = true;
                 if clk.is_none() {
                     if let Some(Tok::Ident(name)) = p.peek() {
-                        clk = Some(name.clone());
+                        clk = Some(name.to_string());
                         p.bump();
                     }
                 }
@@ -7007,11 +7042,11 @@ fn parse_function(p: &mut P) -> Result<FuncDef, String> {
     note_width(p, &name, ret_w);
     while !p.eat_kw("endfunction") {
         if p.peek().is_none()
-            || matches!(p.peek(), Some(Tok::Kw(k)) if k == "endmodule" || k == "module")
+            || matches!(p.peek(), Some(Tok::Kw(k)) if *k == "endmodule" || *k == "module")
         {
             return Err("unterminated function".into());
         }
-        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output" || k == "inout") {
+        if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "input" || *k == "output" || *k == "inout") {
             let dir = parse_port_dir(p).unwrap_or(PortDir::In);
             skip_sv_type(p);
             let w = p.width_opt().unwrap_or(1);
@@ -7297,17 +7332,17 @@ fn function_toks_simple(toks: &[Tok]) -> bool {
     !toks.iter().any(|t| {
         matches!(
             t,
-            Tok::Kw(k) if k == "for"
-                || k == "foreach"
-                || k == "while"
-                || k == "forever"
-                || k == "repeat"
-                || k == "if"
-                || k == "case"
-                || k == "casex"
-                || k == "casez"
-                || k == "unique"
-                || k == "priority"
+            Tok::Kw(k) if *k == "for"
+                || *k == "foreach"
+                || *k == "while"
+                || *k == "forever"
+                || *k == "repeat"
+                || *k == "if"
+                || *k == "case"
+                || *k == "casex"
+                || *k == "casez"
+                || *k == "unique"
+                || *k == "priority"
         )
     })
 }
@@ -7477,7 +7512,7 @@ fn lift_functions_if_no_body(
     }
 }
 
-fn parse_one_module(mut p: &mut P) -> Result<Rtl, String> {
+fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     let tok_start = p.i;
     if !p.eat_kw("module") {
         return Err("expected module".into());
@@ -7814,7 +7849,7 @@ fn parse_module_items(
         if p.peek().is_none() {
             return Err(format!("unterminated until {endkw}"));
         }
-        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "end" || k == "endmodule" || k == "endgenerate" || k == "module")
+        if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "end" || *k == "endmodule" || *k == "endgenerate" || *k == "module")
         {
             break;
         }
@@ -7835,7 +7870,7 @@ fn parse_module_items(
         // treating them as next_decl left ram_style sticky onto a later memory.
         let next_net_decl = matches!(
             p.peek(),
-            Some(Tok::Kw(k)) if matches!(k.as_str(), "logic" | "wire" | "reg")
+            Some(Tok::Kw(k)) if matches!(*k, "logic" | "wire" | "reg")
         );
         if !next_net_decl {
             *pending_bram = false;
@@ -8072,7 +8107,7 @@ fn parse_module_items(
                 }
             }
         }
-        if matches!(p.peek(), Some(Tok::Kw(k)) if k == "input" || k == "output") {
+        if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "input" || *k == "output") {
             let dir = parse_port_dir(&mut p).unwrap();
             let is_signed = skip_logic(&mut p);
             let w = p.width_opt()?;
@@ -8731,7 +8766,7 @@ fn parse_for_unroll_module(
     }
     let mut i = start;
     while i < end {
-        let toks: Vec<Tok> = body
+        let toks: Vec<Tok<'_>> = body
             .iter()
             .map(|t| match t {
                 Tok::Ident(s) if s == &var => Tok::Number(i as u128, 32),
@@ -8902,7 +8937,7 @@ fn skip_balanced_paren(p: &mut P) -> bool {
 fn parse_gate_prim(p: &mut P) -> Result<(), String> {
     let start = p.i;
     let kind = match p.peek() {
-        Some(Tok::Ident(s)) if is_gate_prim(s) => s.clone(),
+        Some(Tok::Ident(s)) if is_gate_prim(s) => s.to_string(),
         _ => return Err("not a gate".into()),
     };
     p.bump();
@@ -8967,7 +9002,7 @@ fn parse_gate_prim(p: &mut P) -> Result<(), String> {
 fn parse_inst(p: &mut P) -> Result<Inst, String> {
     let start = p.i;
     let module = match p.bump() {
-        Some(Tok::Ident(s)) => s.clone(),
+        Some(Tok::Ident(s)) => s.to_string(),
         _ => {
             p.i = start;
             return Err("inst module".into());
@@ -8981,7 +9016,7 @@ fn parse_inst(p: &mut P) -> Result<Inst, String> {
         }
     };
     let name = match p.bump() {
-        Some(Tok::Ident(s)) => s.clone(),
+        Some(Tok::Ident(s)) => s.to_string(),
         _ => {
             p.i = start;
             return Err("inst name".into());
@@ -10969,7 +11004,7 @@ fn try_map_wide_bool(
 }
 
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
-fn match_ite_expr<'a>(e: &'a Expr<'a>) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
+fn match_ite_expr<'a>(e: &'a Expr<'a>) -> Option<(&'a Expr<'a>, &'a Expr<'a>, &'a Expr<'a>)> {
     fn same_struct(a: &Expr, b: &Expr) -> bool {
         match (a, b) {
             (Expr::Const(x), Expr::Const(y)) => x == y,
@@ -14751,7 +14786,7 @@ fn rewrite_rexpr(e: &RExpr, subst: &HashMap<String, String>) -> RExpr {
     }
 }
 
-fn elaborate_rtl(src: &Rtl, overrides: &HashMap<String, u128>) -> Result<Rtl, String> {
+fn elaborate_rtl<'a>(src: &'a Rtl<'a>, overrides: &HashMap<String, u128>) -> Result<Rtl<'a>, String> {
     if overrides.is_empty() {
         return Ok(src.clone());
     }
@@ -14788,24 +14823,24 @@ fn inst_overrides(inst: &Inst, child: &Rtl) -> HashMap<String, u128> {
 }
 
 #[allow(dead_code)] // intentional: thin wrapper over flatten_module_ov
-fn flatten_module(mods: &HashMap<String, Rtl>, name: &str) -> Result<Rtl, String> {
+fn flatten_module<'s>(mods: &'s HashMap<String, Rtl<'s>>, name: &str) -> Result<Rtl<'s>, String> {
     flatten_module_ov(mods, name, &HashMap::new())
 }
 
-fn flatten_module_ov(
-    mods: &HashMap<String, Rtl>,
+fn flatten_module_ov<'s>(
+    mods: &'s HashMap<String, Rtl<'s>>,
     name: &str,
     overrides: &HashMap<String, u128>,
-) -> Result<Rtl, String> {
+) -> Result<Rtl<'s>, String> {
     flatten_module_ov_vis(mods, name, overrides, &mut HashSet::new())
 }
 
-fn flatten_module_ov_vis(
-    mods: &HashMap<String, Rtl>,
+fn flatten_module_ov_vis<'s>(
+    mods: &'s HashMap<String, Rtl<'s>>,
     name: &str,
     overrides: &HashMap<String, u128>,
     visiting: &mut HashSet<String>,
-) -> Result<Rtl, String> {
+) -> Result<Rtl<'s>, String> {
     if !visiting.insert(name.to_string()) {
         let proto = mods
             .get(name)
@@ -15236,7 +15271,7 @@ pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
         source.to_string()
     };
     let pre = preprocess_sv(&strip_comments(&expanded));
-    let mut mods = parse_preprocessed(&pre)?;
+    let mut mods = parse_preprocessed(pre)?;
     if let Some(dir) = base {
         let have: HashSet<String> = mods.iter().map(|m| m.module.clone()).collect();
         let mut missing: HashSet<String> = HashSet::new();
@@ -15275,7 +15310,7 @@ pub fn list_sv_modules(source: &str) -> Result<Vec<String>, String> {
 pub fn list_sv_modules_origin(source: &str, origin: &str) -> Result<Vec<String>, String> {
     let _ = origin;
     let pre = preprocess_sv(&strip_comments(source));
-    Ok(parse_preprocessed(&pre)?
+    Ok(parse_preprocessed(pre)?
         .into_iter()
         .map(|m| m.module)
         .collect())
@@ -20214,7 +20249,7 @@ endmodule
 
     #[test]
     fn hash_own_sorts_mem_inits_by_name() {
-        fn rtl_with(mems: &[(&str, u128)]) -> Rtl {
+        fn rtl_with<'a>(mems: &'a [(&'a str, u128)]) -> Rtl<'a> {
             let mut mem_inits = HashMap::new();
             for (n, v) in mems {
                 let mut words = BTreeMap::new();
@@ -20242,3 +20277,4 @@ endmodule
         );
     }
 }
+
