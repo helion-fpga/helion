@@ -14571,8 +14571,33 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             continue;
         }
+        // FM-HEL-AREA-03: whole unpacked word assign `lhs[word] = ...`
+        // (bit=Some(word), not an encoded bit). The comb lowering drives
+        // per-bit unpacked_word_q(lhs, word, w, i) nets — one IOB per bit,
+        // not a single IOB on bit_name(lhs, w, word) (never driven).
+        if let Some(b) = bit {
+            if decode_unpacked_bit(*b).is_none() {
+                let depth = sig_depth(rtl, lhs);
+                if depth > 0 && *b < depth {
+                    for i in 0..w.max(1).min(256) {
+                        let qnet = unpacked_word_q(lhs, *b, w, i);
+                        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                    }
+                    continue;
+                }
+            }
+        }
         let qnet = if let Some(b) = bit {
-            bit_name(lhs, w, *b)
+            if let Some((word, lo)) = decode_unpacked_bit(*b) {
+                // FM-HEL-AREA-03: unpacked bit assign — the comb lowering
+                // drives unpacked_word_q(lhs, word, w, lo), not
+                // bit_name(lhs, w, b): the encoded index is not a real bit
+                // number, so the old name was never driven (IOBs on undriven
+                // nets, concat LUTs swept as dead).
+                unpacked_word_q(lhs, word, w, lo)
+            } else {
+                bit_name(lhs, w, *b)
+            }
         } else if let Ok((q, _)) = drive_target(rhs, rtl) {
             q
         } else {
@@ -18788,14 +18813,21 @@ endmodule
             lut_driven(&d, "imd_val_we_o_0"),
             "imd_val_we_o[0] must be driven"
         );
-        // FM-HEL-AREA-02: the imd_val_d_o[0] concat LUTs drive imd_val_d_o_w0_{i}
-        // nets that have no loads (the IOBs land on imd_val_d_o_{i} instead),
-        // so the dead sweep removes them. The live imd_val_we_o[0] LUT above
-        // keeps its IOB load and survives.
-        assert!(
-            (0..33).all(|i| !lut_driven(&d, &format!("imd_val_d_o_w0_{i}"))),
-            "dead concat LUTs must be swept"
-        );
+        // FM-HEL-AREA-03: the imd_val_d_o[0] concat bits drive
+        // imd_val_d_o_w0_{i} nets, and the IOB emitter connects the IobOuts
+        // to those same nets. Previously it used bit_name on the *encoded*
+        // unpacked index, landing 34 IOBs on undriven imd_val_d_o_{65536+i}
+        // nets while the concat LUTs were swept as dead — outputs going
+        // nowhere.
+        for i in 0..34 {
+            let net = format!("imd_val_d_o_w0_{i}");
+            assert!(lut_driven(&d, &net), "{net} must be driven");
+            assert!(
+                d.cells.iter().any(|c| matches!(c.kind, CellKind::IobOut)
+                    && d.net_on(&c.name, "I") == Some(net.as_str())),
+                "IobOut must connect to driven net {net}"
+            );
+        }
     }
 
     #[test]
