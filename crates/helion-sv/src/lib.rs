@@ -17,14 +17,25 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use sv_parser::{Define, DefineText, parse_sv_str};
 
+/// Bump arena for transient boolean [`Expr`] trees built during elaboration.
+///
+/// `rexpr_to_bit` rebuilds a fresh boolean tree per bit of every cone; the
+/// tree is consumed into the AIG immediately after. Allocating each node with
+/// `Box::new` was ~24M mallocs on Ibex. Nodes (and `Var` names) are bumped
+/// from this arena instead; the arena is dropped when the owning phase
+/// (`synth_rtl`) finishes. Trees are never mutated, so shared refs are sound.
+use bumpalo::Bump;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Expr {
+pub enum Expr<'a> {
     Const(bool),
-    Var(String),
-    Not(Box<Expr>),
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
-    Xor(Box<Expr>, Box<Expr>),
+    /// Variable name borrowed from the elaboration arena (`Bump::alloc_str`).
+    /// Trees are immutable after construction, so sharing the name is sound.
+    Var(&'a str),
+    Not(&'a Expr<'a>),
+    And(&'a Expr<'a>, &'a Expr<'a>),
+    Or(&'a Expr<'a>, &'a Expr<'a>),
+    Xor(&'a Expr<'a>, &'a Expr<'a>),
 }
 
 /// AIG: node 0 is const0. Edges are (node, inverted).
@@ -61,7 +72,7 @@ impl Lit {
 }
 
 impl Aig {
-    pub fn from_expr(e: &Expr) -> Self {
+    pub fn from_expr(e: &Expr<'_>) -> Self {
         let mut a = Self {
             pis: Vec::new(),
             pi_ix: HashMap::new(),
@@ -75,7 +86,7 @@ impl Aig {
         a
     }
 
-    fn collect_pis(&mut self, e: &Expr) {
+    fn collect_pis(&mut self, e: &Expr<'_>) {
         match e {
             Expr::Const(_) => {}
             Expr::Var(s) => {
@@ -125,7 +136,7 @@ impl Aig {
         }
     }
 
-    fn expr(&mut self, e: &Expr) -> Lit {
+    fn expr(&mut self, e: &Expr<'_>) -> Lit {
         match e {
             Expr::Const(false) => Lit::c0(),
             Expr::Const(true) => Lit::c1(),
@@ -313,55 +324,56 @@ pub fn parse_sv_opts(
 }
 
 /// Recursive-descent Boolean subset used after AST extraction.
-pub fn parse_expr(s: &str) -> Result<Expr, String> {
+/// Nodes are bump-allocated from `arena`; the caller owns the arena.
+pub fn parse_expr<'a>(s: &str, arena: &'a Bump) -> Result<Expr<'a>, String> {
     let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     let chars: Vec<char> = t.chars().collect();
     let mut i = 0;
-    fn parse_or(chars: &[char], i: &mut usize) -> Result<Expr, String> {
-        let mut e = parse_xor(chars, i)?;
+    fn parse_or<'a>(chars: &[char], i: &mut usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
+        let mut e = parse_xor(chars, i, arena)?;
         while *i < chars.len() && (chars[*i] == '|' && peek_not_pipe(chars, *i)) {
             *i += 1;
-            let r = parse_xor(chars, i)?;
-            e = Expr::Or(Box::new(e), Box::new(r));
+            let r = parse_xor(chars, i, arena)?;
+            e = Expr::Or(arena.alloc(e), arena.alloc(r));
         }
         Ok(e)
     }
     fn peek_not_pipe(chars: &[char], i: usize) -> bool {
         chars.get(i + 1) != Some(&'|')
     }
-    fn parse_xor(chars: &[char], i: &mut usize) -> Result<Expr, String> {
-        let mut e = parse_and(chars, i)?;
+    fn parse_xor<'a>(chars: &[char], i: &mut usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
+        let mut e = parse_and(chars, i, arena)?;
         while *i < chars.len() && chars[*i] == '^' {
             *i += 1;
-            let r = parse_and(chars, i)?;
-            e = Expr::Xor(Box::new(e), Box::new(r));
+            let r = parse_and(chars, i, arena)?;
+            e = Expr::Xor(arena.alloc(e), arena.alloc(r));
         }
         Ok(e)
     }
-    fn parse_and(chars: &[char], i: &mut usize) -> Result<Expr, String> {
-        let mut e = parse_un(chars, i)?;
+    fn parse_and<'a>(chars: &[char], i: &mut usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
+        let mut e = parse_un(chars, i, arena)?;
         while *i < chars.len() && chars[*i] == '&' && chars.get(*i + 1) != Some(&'&') {
             *i += 1;
-            let r = parse_un(chars, i)?;
-            e = Expr::And(Box::new(e), Box::new(r));
+            let r = parse_un(chars, i, arena)?;
+            e = Expr::And(arena.alloc(e), arena.alloc(r));
         }
         Ok(e)
     }
-    fn parse_un(chars: &[char], i: &mut usize) -> Result<Expr, String> {
+    fn parse_un<'a>(chars: &[char], i: &mut usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
         if *i < chars.len() && chars[*i] == '~' {
             *i += 1;
-            return Ok(Expr::Not(Box::new(parse_un(chars, i)?)));
+            return Ok(Expr::Not(arena.alloc(parse_un(chars, i, arena)?)));
         }
         if *i < chars.len() && chars[*i] == '!' {
             *i += 1;
-            return Ok(Expr::Not(Box::new(parse_un(chars, i)?)));
+            return Ok(Expr::Not(arena.alloc(parse_un(chars, i, arena)?)));
         }
-        parse_atom(chars, i)
+        parse_atom(chars, i, arena)
     }
-    fn parse_atom(chars: &[char], i: &mut usize) -> Result<Expr, String> {
+    fn parse_atom<'a>(chars: &[char], i: &mut usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
         if *i < chars.len() && chars[*i] == '(' {
             *i += 1;
-            let e = parse_or(chars, i)?;
+            let e = parse_or(chars, i, arena)?;
             if *i >= chars.len() || chars[*i] != ')' {
                 return Err("missing )".into());
             }
@@ -390,11 +402,11 @@ pub fn parse_expr(s: &str) -> Result<Expr, String> {
                 n.push(chars[*i]);
                 *i += 1;
             }
-            return Ok(Expr::Var(n));
+            return Ok(Expr::Var(arena.alloc_str(&n)));
         }
         Err(format!("expr at {i}: {:?}", chars.get(*i..)))
     }
-    let e = parse_or(&chars, &mut i)?;
+    let e = parse_or(&chars, &mut i, arena)?;
     Ok(e)
 }
 
@@ -9046,16 +9058,16 @@ fn bit_name(sig: &str, width: usize, bit: usize) -> String {
     }
 }
 
-fn inc_bit_expr(sig: &str, width: usize, i: usize) -> Expr {
-    let qi = Expr::Var(bit_name(sig, width, i));
+fn inc_bit_expr<'a>(sig: &str, width: usize, i: usize, arena: &'a Bump) -> Expr<'a> {
+    let qi = Expr::Var(arena.alloc_str(&(bit_name(sig, width, i))));
     if i == 0 {
-        return Expr::Not(Box::new(qi));
+        return Expr::Not(arena.alloc(qi));
     }
-    let mut and = Expr::Var(bit_name(sig, width, 0));
+    let mut and = Expr::Var(arena.alloc_str(&(bit_name(sig, width, 0))));
     for j in 1..i {
-        and = Expr::And(Box::new(and), Box::new(Expr::Var(bit_name(sig, width, j))));
+        and = Expr::And(arena.alloc(and), arena.alloc(Expr::Var(arena.alloc_str(&(bit_name(sig, width, j))))));
     }
-    Expr::Xor(Box::new(and), Box::new(qi))
+    Expr::Xor(arena.alloc(and), arena.alloc(qi))
 }
 
 fn rexpr_is_plus_one(e: &RExpr) -> bool {
@@ -9073,14 +9085,15 @@ fn rexpr_ident(e: &RExpr) -> Option<String> {
     }
 }
 
-fn index_part_bit(
+fn index_part_bit<'a>(
     name: &str,
     base: &RExpr,
     part_w: usize,
     ascending: bool,
     rtl: &Rtl,
     bit: usize,
-) -> Result<Expr, String> {
+    arena: &'a Bump,
+) -> Result<Expr<'a>, String> {
     let wsrc = sig_width(rtl, name);
     let depth = sig_depth(rtl, name);
     // Sole unpacked word (`[1]` / `[NrHosts]` with NrHosts=1): index is
@@ -9090,7 +9103,7 @@ fn index_part_bit(
         if bit >= wsrc {
             return Ok(Expr::Const(false));
         }
-        return Ok(Expr::Var(bit_name(name, wsrc, bit)));
+        return Ok(Expr::Var(arena.alloc_str(&(bit_name(name, wsrc, bit)))));
     }
     // Const word index of unpacked/packed-multi-dim depth>1: one fixed
     // word's packed bits. `name[w][hi:lo]` encodes base as (word<<16)|lo.
@@ -9110,7 +9123,7 @@ fn index_part_bit(
             if src >= wsrc {
                 return Ok(Expr::Const(false));
             }
-            return Ok(Expr::Var(unpacked_word_q(name, word, wsrc, src)));
+            return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(name, word, wsrc, src)))));
         }
     }
     if bit >= part_w {
@@ -9122,11 +9135,11 @@ fn index_part_bit(
         } else {
             (*val as usize).saturating_sub(bit)
         };
-        return Ok(Expr::Var(bit_name(
+        return Ok(Expr::Var(arena.alloc_str(&(bit_name(
             name,
             wsrc,
             idx.min(wsrc.saturating_sub(1)),
-        )));
+        )))));
     }
     // sel * stride  → N-way mux of data[k*stride + bit]
     let (sel, stride) = match base {
@@ -9157,12 +9170,12 @@ fn index_part_bit(
                     },
                     rtl,
                     true,
-                )?;
-                let src = Expr::Var(bit_name(name, wsrc, k));
-                let term = Expr::And(Box::new(eq), Box::new(src));
+                arena)?;
+                let src = Expr::Var(arena.alloc_str(&(bit_name(name, wsrc, k))));
+                let term = Expr::And(arena.alloc(eq), arena.alloc(src));
                 acc = Some(match acc {
                     None => term,
-                    Some(a) => Expr::Or(Box::new(a), Box::new(term)),
+                    Some(a) => Expr::Or(arena.alloc(a), arena.alloc(term)),
                 });
             }
             return Ok(acc.unwrap_or(Expr::Const(false)));
@@ -9180,17 +9193,17 @@ fn index_part_bit(
             },
             rtl,
             true,
-        )?;
+        arena)?;
         let src_idx = if ascending {
             k * stride + bit
         } else {
             k * stride + (part_w - 1 - bit)
         };
-        let src = Expr::Var(bit_name(name, wsrc, src_idx.min(wsrc.saturating_sub(1))));
-        let term = Expr::And(Box::new(eq), Box::new(src));
+        let src = Expr::Var(arena.alloc_str(&(bit_name(name, wsrc, src_idx.min(wsrc.saturating_sub(1))))));
+        let term = Expr::And(arena.alloc(eq), arena.alloc(src));
         acc = Some(match acc {
             None => term,
-            Some(a) => Expr::Or(Box::new(a), Box::new(term)),
+            Some(a) => Expr::Or(arena.alloc(a), arena.alloc(term)),
         });
     }
     Ok(acc.unwrap_or(Expr::Const(false)))
@@ -9216,7 +9229,7 @@ fn rexpr_bit_budget_take() -> bool {
     })
 }
 
-fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+fn rexpr_to_bit<'a>(e: &RExpr, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
     if !rexpr_bit_budget_take() {
         return Err("rexpr_to_bit budget exhausted".into());
     }
@@ -9233,7 +9246,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
         }
         RExpr::Ident(s) => {
             let w = sig_width(rtl, s);
-            Ok(Expr::Var(bit_name(s, w, bit.min(w.saturating_sub(1)))))
+            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, bit.min(w.saturating_sub(1)))))))
         }
         RExpr::Bit(s, i) => {
             let w = sig_width(rtl, s);
@@ -9244,16 +9257,16 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 if bit >= w {
                     return Ok(Expr::Const(false));
                 }
-                return Ok(Expr::Var(unpacked_word_q(s, *i, w, bit)));
+                return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit)))));
             }
             if depth == 1 {
                 if bit >= w {
                     return Ok(Expr::Const(false));
                 }
                 // Const word index on a sole-word array collapses to packed bits.
-                return Ok(Expr::Var(bit_name(s, w, bit)));
+                return Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, bit)))));
             }
-            Ok(Expr::Var(bit_name(s, w, *i)))
+            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, *i)))))
         }
         RExpr::Range(s, lo, hi) => {
             if range_span(*lo, *hi).is_none() {
@@ -9262,14 +9275,14 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             }
             let w = sig_width(rtl, s);
             let idx = lo.saturating_add(bit).min(*hi).min(w.saturating_sub(1));
-            Ok(Expr::Var(bit_name(s, w, idx)))
+            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, idx)))))
         }
         RExpr::IndexPart {
             name,
             base,
             width,
             ascending,
-        } => index_part_bit(name, base, *width, *ascending, rtl, bit),
+        } => index_part_bit(name, base, *width, *ascending, rtl, bit, arena),
         RExpr::WordAt { .. } => Err("word write is not a comb cone".into()),
         RExpr::Concat(parts) => {
             let mut offset = 0usize;
@@ -9280,7 +9293,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 };
                 let w = w.max(1);
                 if bit < offset.saturating_add(w) {
-                    return rexpr_to_bit(part, rtl, bit - offset);
+                    return rexpr_to_bit(part, rtl, bit - offset, arena);
                 }
                 offset = offset.saturating_add(w);
             }
@@ -9295,7 +9308,7 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if bit.saturating_add(shift) >= wa {
                 Ok(Expr::Const(false))
             } else {
-                rexpr_to_bit(a, rtl, bit + shift)
+                rexpr_to_bit(a, rtl, bit + shift, arena)
             }
         }
         RExpr::Ashr(a, sh) => {
@@ -9307,9 +9320,9 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             let src = bit.saturating_add(shift);
             if src >= wa {
                 // Sign-fill from MSB.
-                rexpr_to_bit(a, rtl, wa - 1)
+                rexpr_to_bit(a, rtl, wa - 1, arena)
             } else {
-                rexpr_to_bit(a, rtl, src)
+                rexpr_to_bit(a, rtl, src, arena)
             }
         }
         RExpr::RedXor(x) => {
@@ -9324,9 +9337,9 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if w > 128 {
                 return Err("reduction width too wide".into());
             }
-            let mut acc = rexpr_to_bit(x, rtl, 0)?;
+            let mut acc = rexpr_to_bit(x, rtl, 0, arena)?;
             for i in 1..w {
-                acc = Expr::Xor(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
+                acc = Expr::Xor(arena.alloc(acc), arena.alloc(rexpr_to_bit(x, rtl, i, arena)?));
             }
             Ok(acc)
         }
@@ -9342,9 +9355,9 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if w > 128 {
                 return Err("reduction width too wide".into());
             }
-            let mut acc = rexpr_to_bit(x, rtl, 0)?;
+            let mut acc = rexpr_to_bit(x, rtl, 0, arena)?;
             for i in 1..w {
-                acc = Expr::And(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
+                acc = Expr::And(arena.alloc(acc), arena.alloc(rexpr_to_bit(x, rtl, i, arena)?));
             }
             Ok(acc)
         }
@@ -9360,55 +9373,55 @@ fn rexpr_to_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if w > 128 {
                 return Err("reduction width too wide".into());
             }
-            let mut acc = rexpr_to_bit(x, rtl, 0)?;
+            let mut acc = rexpr_to_bit(x, rtl, 0, arena)?;
             for i in 1..w {
-                acc = Expr::Or(Box::new(acc), Box::new(rexpr_to_bit(x, rtl, i)?));
+                acc = Expr::Or(arena.alloc(acc), arena.alloc(rexpr_to_bit(x, rtl, i, arena)?));
             }
             Ok(acc)
         }
-        RExpr::Not(x) => Ok(Expr::Not(Box::new(rexpr_to_bit(x, rtl, bit)?))),
+        RExpr::Not(x) => Ok(Expr::Not(arena.alloc(rexpr_to_bit(x, rtl, bit, arena)?))),
         RExpr::And(a, b) => Ok(Expr::And(
-            Box::new(rexpr_to_bit(a, rtl, bit)?),
-            Box::new(rexpr_to_bit(b, rtl, bit)?),
+            arena.alloc(rexpr_to_bit(a, rtl, bit, arena)?),
+            arena.alloc(rexpr_to_bit(b, rtl, bit, arena)?),
         )),
         RExpr::Or(a, b) => Ok(Expr::Or(
-            Box::new(rexpr_to_bit(a, rtl, bit)?),
-            Box::new(rexpr_to_bit(b, rtl, bit)?),
+            arena.alloc(rexpr_to_bit(a, rtl, bit, arena)?),
+            arena.alloc(rexpr_to_bit(b, rtl, bit, arena)?),
         )),
         RExpr::Xor(a, b) => Ok(Expr::Xor(
-            Box::new(rexpr_to_bit(a, rtl, bit)?),
-            Box::new(rexpr_to_bit(b, rtl, bit)?),
+            arena.alloc(rexpr_to_bit(a, rtl, bit, arena)?),
+            arena.alloc(rexpr_to_bit(b, rtl, bit, arena)?),
         )),
-        RExpr::Add(a, b) => adder_sum_bit(a, b, rtl, bit),
-        RExpr::Sub(a, b) => sub_diff_bit(a, b, rtl, bit),
+        RExpr::Add(a, b) => adder_sum_bit(a, b, rtl, bit, arena),
+        RExpr::Sub(a, b) => sub_diff_bit(a, b, rtl, bit, arena),
         RExpr::Mul(_, _) => Err("mul is a DSP primitive, not a LUT cone".into()),
         RExpr::Mux(c, t, f) => {
-            let cv = rexpr_to_bit(c, rtl, 0)?;
-            let tv = rexpr_to_bit(t, rtl, bit)?;
-            let fv = rexpr_to_bit(f, rtl, bit)?;
+            let cv = rexpr_to_bit(c, rtl, 0, arena)?;
+            let tv = rexpr_to_bit(t, rtl, bit, arena)?;
+            let fv = rexpr_to_bit(f, rtl, bit, arena)?;
             Ok(Expr::Or(
-                Box::new(Expr::And(Box::new(cv.clone()), Box::new(tv))),
-                Box::new(Expr::And(Box::new(Expr::Not(Box::new(cv))), Box::new(fv))),
+                arena.alloc(Expr::And(arena.alloc(cv.clone()), arena.alloc(tv))),
+                arena.alloc(Expr::And(arena.alloc(Expr::Not(arena.alloc(cv))), arena.alloc(fv))),
             ))
         }
         RExpr::Eq(a, b) => {
             if bit != 0 {
                 return Ok(Expr::Const(false));
             }
-            Ok(cmp_eq_bits(a, b, rtl, true)?)
+            Ok(cmp_eq_bits(a, b, rtl, true, arena)?)
         }
         RExpr::Ne(a, b) => {
             if bit != 0 {
                 return Ok(Expr::Const(false));
             }
-            Ok(Expr::Not(Box::new(cmp_eq_bits(a, b, rtl, true)?)))
+            Ok(Expr::Not(arena.alloc(cmp_eq_bits(a, b, rtl, true, arena)?)))
         }
         RExpr::Lt(a, b) => {
             if bit != 0 {
                 return Ok(Expr::Const(false));
             }
             // unsigned: MSB-first: (a_msb < b_msb) | (eq_msb & lower)
-            lt_bits(a, b, rtl)
+            lt_bits(a, b, rtl, arena)
         }
         RExpr::Call { name, .. } => Err(format!("call {name} not inlined")),
     }
@@ -9430,7 +9443,7 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
                     if vars.len() >= 6 {
                         return false;
                     }
-                    vars.push(name.clone());
+                    vars.push(name.to_string());
                 }
                 true
             }
@@ -9449,7 +9462,7 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
             Expr::Const(b) => Some(*b),
             Expr::Var(name) => env
                 .iter()
-                .find(|(n, _)| *n == name.as_str())
+                .find(|(n, _)| *n == *name)
                 .map(|(_, b)| *b),
             Expr::Not(x) => Some(!eval(x, env, budget)?),
             Expr::And(a, b) => Some(eval(a, env, budget)? && eval(b, env, budget)?),
@@ -9484,7 +9497,7 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
 /// Word→bit split can leave sibling bits (`tmp_K_0` inside `tmp_K_1`) as extra
 /// PIs. Treat any bit of the same LHS bus as 0 so a ≤6-PI const case collapses
 /// (sha256_k_constants) instead of ITE fanout / hang-class cell storms.
-fn strip_self_hold(e: &Expr, self_bit: &str) -> Expr {
+fn strip_self_hold<'a>(e: &Expr<'a>, self_bit: &str, arena: &'a Bump) -> Expr<'a> {
     fn is_self_family(n: &str, self_bit: &str) -> bool {
         if n == self_bit {
             return true;
@@ -9504,19 +9517,19 @@ fn strip_self_hold(e: &Expr, self_bit: &str) -> Expr {
     match e {
         Expr::Var(n) if is_self_family(n, self_bit) => Expr::Const(false),
         Expr::Const(b) => Expr::Const(*b),
-        Expr::Var(n) => Expr::Var(n.clone()),
-        Expr::Not(x) => Expr::Not(Box::new(strip_self_hold(x, self_bit))),
+        Expr::Var(n) => Expr::Var(*n),
+        Expr::Not(x) => Expr::Not(arena.alloc(strip_self_hold(x, self_bit, arena))),
         Expr::And(a, b) => Expr::And(
-            Box::new(strip_self_hold(a, self_bit)),
-            Box::new(strip_self_hold(b, self_bit)),
+            arena.alloc(strip_self_hold(a, self_bit, arena)),
+            arena.alloc(strip_self_hold(b, self_bit, arena)),
         ),
         Expr::Or(a, b) => Expr::Or(
-            Box::new(strip_self_hold(a, self_bit)),
-            Box::new(strip_self_hold(b, self_bit)),
+            arena.alloc(strip_self_hold(a, self_bit, arena)),
+            arena.alloc(strip_self_hold(b, self_bit, arena)),
         ),
         Expr::Xor(a, b) => Expr::Xor(
-            Box::new(strip_self_hold(a, self_bit)),
-            Box::new(strip_self_hold(b, self_bit)),
+            arena.alloc(strip_self_hold(a, self_bit, arena)),
+            arena.alloc(strip_self_hold(b, self_bit, arena)),
         ),
     }
 }
@@ -9551,7 +9564,7 @@ fn const_care_of(e: &RExpr) -> u128 {
     }
 }
 
-fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+fn adder_sum_bit<'a>(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
     // Bound nested Add expansion: naive per-bit re-entry is exponential in nesting depth
     // (FM-HEL-HANG-1539: Ibex probe hung after flatten in rexpr_to_bit over Add trees).
     if bit > 64 {
@@ -9563,18 +9576,18 @@ fn adder_sum_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, St
     let mut cin = Expr::Const(false);
     let mut sum = Expr::Const(false);
     for i in 0..=bit {
-        let ai = rexpr_to_bit(a, rtl, i)?;
-        let bi = rexpr_to_bit(b, rtl, i)?;
-        let axb = Expr::Xor(Box::new(ai.clone()), Box::new(bi.clone()));
-        sum = Expr::Xor(Box::new(axb.clone()), Box::new(cin.clone()));
-        let ab = Expr::And(Box::new(ai), Box::new(bi));
-        let cin_axb = Expr::And(Box::new(cin), Box::new(axb));
-        cin = Expr::Or(Box::new(ab), Box::new(cin_axb));
+        let ai = rexpr_to_bit(a, rtl, i, arena)?;
+        let bi = rexpr_to_bit(b, rtl, i, arena)?;
+        let axb = Expr::Xor(arena.alloc(ai.clone()), arena.alloc(bi.clone()));
+        sum = Expr::Xor(arena.alloc(axb.clone()), arena.alloc(cin.clone()));
+        let ab = Expr::And(arena.alloc(ai), arena.alloc(bi));
+        let cin_axb = Expr::And(arena.alloc(cin), arena.alloc(axb));
+        cin = Expr::Or(arena.alloc(ab), arena.alloc(cin_axb));
     }
     Ok(sum)
 }
 
-fn sub_diff_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+fn sub_diff_bit<'a>(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
     // Bound like adder_sum_bit (Ibex hang caps).
     if bit > 64 {
         return Err("sub bit too wide".into());
@@ -9585,15 +9598,15 @@ fn sub_diff_bit(a: &RExpr, b: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, Str
     let mut borrow = Expr::Const(false);
     let mut diff = Expr::Const(false);
     for i in 0..=bit {
-        let ai = rexpr_to_bit(a, rtl, i)?;
-        let bi = rexpr_to_bit(b, rtl, i)?;
-        let axb = Expr::Xor(Box::new(ai.clone()), Box::new(bi.clone()));
-        diff = Expr::Xor(Box::new(axb.clone()), Box::new(borrow.clone()));
+        let ai = rexpr_to_bit(a, rtl, i, arena)?;
+        let bi = rexpr_to_bit(b, rtl, i, arena)?;
+        let axb = Expr::Xor(arena.alloc(ai.clone()), arena.alloc(bi.clone()));
+        diff = Expr::Xor(arena.alloc(axb.clone()), arena.alloc(borrow.clone()));
         // borrow_out = (~a & b) | (~(a^b) & borrow)
-        let nota_b = Expr::And(Box::new(Expr::Not(Box::new(ai))), Box::new(bi));
-        let eq_ab = Expr::Not(Box::new(axb));
-        let eq_bor = Expr::And(Box::new(eq_ab), Box::new(borrow));
-        borrow = Expr::Or(Box::new(nota_b), Box::new(eq_bor));
+        let nota_b = Expr::And(arena.alloc(Expr::Not(arena.alloc(ai))), arena.alloc(bi));
+        let eq_ab = Expr::Not(arena.alloc(axb));
+        let eq_bor = Expr::And(arena.alloc(eq_ab), arena.alloc(borrow));
+        borrow = Expr::Or(arena.alloc(nota_b), arena.alloc(eq_bor));
     }
     Ok(diff)
 }
@@ -9903,7 +9916,7 @@ fn cmp_operand_width(e: &RExpr, rtl: &Rtl) -> usize {
 /// Compare bit. Unknown names are an error, not const 0. Bits above a
 /// declared width are zero (unsigned), not a repeated MSB. A const whose
 /// value does not fit its token width uses the extra value bits.
-fn cmp_src_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
+fn cmp_src_bit<'a>(e: &RExpr, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
     match e {
         RExpr::Const { val, width, care } => {
             let fitted = const_fit_width(*val, *width);
@@ -9923,7 +9936,7 @@ fn cmp_src_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
             if bit >= w {
                 Ok(Expr::Const(false))
             } else {
-                Ok(Expr::Var(bit_name(s, w, bit)))
+                Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, bit)))))
             }
         }
         RExpr::Bit(s, i) => {
@@ -9936,21 +9949,21 @@ fn cmp_src_bit(e: &RExpr, rtl: &Rtl, bit: usize) -> Result<Expr, String> {
                 if bit >= w {
                     return Ok(Expr::Const(false));
                 }
-                return Ok(Expr::Var(unpacked_word_q(s, *i, w, bit)));
+                return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit)))));
             }
             if depth == 1 {
                 if bit >= w {
                     return Ok(Expr::Const(false));
                 }
-                return Ok(Expr::Var(bit_name(s, w, bit)));
+                return Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, bit)))));
             }
-            Ok(Expr::Var(bit_name(s, w, *i)))
+            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, *i)))))
         }
-        other => rexpr_to_bit(other, rtl, bit),
+        other => rexpr_to_bit(other, rtl, bit, arena),
     }
 }
 
-fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, String> {
+fn cmp_eq_bits<'a>(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool, arena: &'a Bump) -> Result<Expr<'a>, String> {
     let wa = cmp_operand_width(a, rtl);
     let wb = cmp_operand_width(b, rtl);
     let w = wa.max(wb).max(1);
@@ -9968,18 +9981,18 @@ fn cmp_eq_bits(a: &RExpr, b: &RExpr, rtl: &Rtl, _eq: bool) -> Result<Expr, Strin
         if (care >> i) & 1 == 0 {
             continue;
         }
-        let ai = cmp_src_bit(a, rtl, i)?;
-        let bi = cmp_src_bit(b, rtl, i)?;
-        let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
+        let ai = cmp_src_bit(a, rtl, i, arena)?;
+        let bi = cmp_src_bit(b, rtl, i, arena)?;
+        let xnor = Expr::Not(arena.alloc(Expr::Xor(arena.alloc(ai), arena.alloc(bi))));
         acc = Some(match acc {
             None => xnor,
-            Some(p) => Expr::And(Box::new(p), Box::new(xnor)),
+            Some(p) => Expr::And(arena.alloc(p), arena.alloc(xnor)),
         });
     }
     Ok(acc.unwrap_or(Expr::Const(true)))
 }
 
-fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
+fn lt_bits<'a>(a: &RExpr, b: &RExpr, rtl: &Rtl, arena: &'a Bump) -> Result<Expr<'a>, String> {
     let w = cmp_operand_width(a, rtl)
         .max(cmp_operand_width(b, rtl))
         .max(1);
@@ -9993,18 +10006,18 @@ fn lt_bits(a: &RExpr, b: &RExpr, rtl: &Rtl) -> Result<Expr, String> {
     let mut acc = Expr::Const(false);
     let mut eq_so_far = Expr::Const(true);
     for i in (0..w).rev() {
-        let ai = cmp_src_bit(a, rtl, i)?;
-        let bi = cmp_src_bit(b, rtl, i)?;
+        let ai = cmp_src_bit(a, rtl, i, arena)?;
+        let bi = cmp_src_bit(b, rtl, i, arena)?;
         let a0b1 = Expr::And(
-            Box::new(Expr::Not(Box::new(ai.clone()))),
-            Box::new(bi.clone()),
+            arena.alloc(Expr::Not(arena.alloc(ai.clone()))),
+            arena.alloc(bi.clone()),
         );
         acc = Expr::Or(
-            Box::new(acc),
-            Box::new(Expr::And(Box::new(eq_so_far.clone()), Box::new(a0b1))),
+            arena.alloc(acc),
+            arena.alloc(Expr::And(arena.alloc(eq_so_far.clone()), arena.alloc(a0b1))),
         );
-        let xnor = Expr::Not(Box::new(Expr::Xor(Box::new(ai), Box::new(bi))));
-        eq_so_far = Expr::And(Box::new(eq_so_far), Box::new(xnor));
+        let xnor = Expr::Not(arena.alloc(Expr::Xor(arena.alloc(ai), arena.alloc(bi))));
+        eq_so_far = Expr::And(arena.alloc(eq_so_far), arena.alloc(xnor));
     }
     Ok(acc)
 }
@@ -10503,7 +10516,7 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
             Expr::Const(_) => false,
             Expr::Var(name) => {
                 if !vars.iter().any(|v| v == name) {
-                    vars.push(name.clone());
+                    vars.push(name.to_string());
                     if vars.len() > n {
                         return true;
                     }
@@ -10654,13 +10667,13 @@ fn emit_lut_reduce(
     Some(net)
 }
 
-fn expr_and_chain(leaves: &[&Expr]) -> Option<Expr> {
+fn expr_and_chain<'a>(leaves: &[&'a Expr<'a>], arena: &'a Bump) -> Option<Expr<'a>> {
     if leaves.is_empty() {
         return None;
     }
     let mut acc = leaves[0].clone();
     for leaf in &leaves[1..] {
-        acc = Expr::And(Box::new(acc), Box::new((*leaf).clone()));
+        acc = Expr::And(arena.alloc(acc), arena.alloc((*leaf).clone()));
     }
     Some(acc)
 }
@@ -10679,9 +10692,9 @@ fn try_map_xnor_and_tree(
     share: &mut LutShare,
 ) -> Option<String> {
     fn is_xnor_leaf(e: &Expr) -> bool {
-        matches!(e, Expr::Not(inner) if matches!(inner.as_ref(), Expr::Xor(_, _)))
+        matches!(e, Expr::Not(inner) if matches!(inner, Expr::Xor(_, _)))
     }
-    fn collect_xnor_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+    fn collect_xnor_and<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) -> bool {
         match e {
             Expr::And(a, b) => collect_xnor_and(a, out) && collect_xnor_and(b, out),
             Expr::Const(true) => true,
@@ -10692,7 +10705,7 @@ fn try_map_xnor_and_tree(
             _ => false,
         }
     }
-    fn collect_and_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    fn collect_and_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr<'a>>) {
         match e {
             Expr::And(a, b) => {
                 collect_and_leaves(a, out);
@@ -10772,7 +10785,8 @@ fn try_map_xnor_and_tree(
                 pis = merged;
                 i += 1;
             }
-            let expr = expr_and_chain(&chunk)?;
+            let arena = Bump::new();
+            let expr = expr_and_chain(&chunk, &arena)?;
             let (init, pins) = lut6_from_bool_cone(&expr)?;
             // Sole packed leaf can drive `out` — skip a buffer LUT.
             let drive = if i >= xnors.len() && level.is_empty() {
@@ -10847,7 +10861,7 @@ fn try_map_xnor_and_tree(
     emit_and_reduce(d, prefix, share, out, level)
 }
 
-fn collect_or_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+fn collect_or_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr<'a>>) {
     match e {
         Expr::Or(a, b) => {
             collect_or_leaves(a, out);
@@ -10858,7 +10872,7 @@ fn collect_or_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-fn collect_and_leaves_ref<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+fn collect_and_leaves_ref<'a>(e: &'a Expr, out: &mut Vec<&'a Expr<'a>>) {
     match e {
         Expr::And(a, b) => {
             collect_and_leaves_ref(a, out);
@@ -10955,7 +10969,7 @@ fn try_map_wide_bool(
 }
 
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
-fn match_ite_expr<'a>(e: &'a Expr) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
+fn match_ite_expr<'a>(e: &'a Expr<'a>) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
     fn same_struct(a: &Expr, b: &Expr) -> bool {
         match (a, b) {
             (Expr::Const(x), Expr::Const(y)) => x == y,
@@ -10970,31 +10984,31 @@ fn match_ite_expr<'a>(e: &'a Expr) -> Option<(&'a Expr, &'a Expr, &'a Expr)> {
     let Expr::Or(l, r) = e else {
         return None;
     };
-    for (a, b) in [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())] {
+    for (a, b) in [(l, r), (r, l)] {
         let Expr::And(a1, a2) = a else {
             continue;
         };
         let Expr::And(b1, b2) = b else {
             continue;
         };
-        if let Expr::Not(nc) = b1.as_ref() {
+        if let Expr::Not(nc) = b1 {
             if same_struct(a1, nc) {
-                return Some((a1.as_ref(), a2.as_ref(), b2.as_ref()));
+                return Some((a1, a2, b2));
             }
         }
-        if let Expr::Not(nc) = b2.as_ref() {
+        if let Expr::Not(nc) = b2 {
             if same_struct(a1, nc) {
-                return Some((a1.as_ref(), a2.as_ref(), b1.as_ref()));
+                return Some((a1, a2, b1));
             }
         }
-        if let Expr::Not(nc) = a1.as_ref() {
+        if let Expr::Not(nc) = a1 {
             if same_struct(b1, nc) {
-                return Some((b1.as_ref(), b2.as_ref(), a2.as_ref()));
+                return Some((b1, b2, a2));
             }
         }
-        if let Expr::Not(nc) = a2.as_ref() {
+        if let Expr::Not(nc) = a2 {
             if same_struct(b1, nc) {
-                return Some((b1.as_ref(), b2.as_ref(), a1.as_ref()));
+                return Some((b1, b2, a1));
             }
         }
     }
@@ -11124,7 +11138,7 @@ fn try_map_ite_const_tree(
         match e {
             Expr::Const(v) => Some(MuxSrc::Const(*v)),
             Expr::Var(name) => Some(MuxSrc::Wire {
-                name: name.clone(),
+                name: name.to_string(),
                 inv: false,
             }),
             Expr::Not(x) => Some(negate_mux(lower_mux(d, x, prefix, share, depth + 1)?)),
@@ -11505,18 +11519,18 @@ fn classify_word_src(rtl: &Rtl, mem: &str, rhs: &RExpr) -> Option<WordShiftSrc> 
 }
 
 /// Enable must stay a handful of PIs. A wide enable is not this shift.
-fn simple_word_enable(en: &RExpr, rtl: &Rtl) -> Option<Expr> {
-    let e = rexpr_to_bit(en, rtl, 0).ok()?;
+fn simple_word_enable<'a>(en: &RExpr, rtl: &Rtl, arena: &'a Bump) -> Option<Expr<'a>> {
+    let e = rexpr_to_bit(en, rtl, 0, arena).ok()?;
     if cone_pi_exceeds(&e, 4) {
         return None;
     }
     Some(e)
 }
 
-fn word_ce_mux(en: Expr, next: Expr, hold: Expr) -> Expr {
+fn word_ce_mux<'a>(en: Expr<'a>, next: Expr<'a>, hold: Expr<'a>, arena: &'a Bump) -> Expr<'a> {
     Expr::Or(
-        Box::new(Expr::And(Box::new(en.clone()), Box::new(next))),
-        Box::new(Expr::And(Box::new(Expr::Not(Box::new(en))), Box::new(hold))),
+        arena.alloc(Expr::And(arena.alloc(en.clone()), arena.alloc(next))),
+        arena.alloc(Expr::And(arena.alloc(Expr::Not(arena.alloc(en))), arena.alloc(hold))),
     )
 }
 
@@ -11524,7 +11538,7 @@ fn word_ce_mux(en: Expr, next: Expr, hold: Expr) -> Expr {
 /// 3×12 enable-gated word copies become per-bit Hffs. A variable-index read
 /// is not expanded here — that would be a wide mux, not this lower.
 /// Returns (reg bits, memory names that lowered). Empty if no safe write.
-fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<String>) {
+fn lower_unpacked_clocked_words<'a>(rtl: &Rtl, arena: &'a Bump) -> (Vec<(String, Expr<'a>)>, HashSet<String>) {
     const MAX_DEPTH: usize = 16;
     const MAX_WIDTH: usize = 32;
     const MAX_BITS: usize = 128;
@@ -11582,7 +11596,7 @@ fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<Stri
                 }
             }
             let en = if let Some(er) = en_r {
-                match simple_word_enable(&er, rtl) {
+                match simple_word_enable(&er, rtl, arena) {
                     Some(e) => Some(e),
                     None => {
                         ok = false;
@@ -11609,14 +11623,14 @@ fn lower_unpacked_clocked_words(rtl: &Rtl) -> (Vec<(String, Expr)>, HashSet<Stri
                         if bit >= sw {
                             Expr::Const(false)
                         } else {
-                            Expr::Var(bit_name(s, sw, bit))
+                            Expr::Var(arena.alloc_str(&(bit_name(s, sw, bit))))
                         }
                     }
-                    WordShiftSrc::Word(w) => Expr::Var(unpacked_word_q(&mem, *w, width, bit)),
+                    WordShiftSrc::Word(w) => Expr::Var(arena.alloc_str(&(unpacked_word_q(&mem, *w, width, bit)))),
                 };
                 let qn = unpacked_word_q(&mem, word, width, bit);
                 let d = if let Some(en) = en.clone() {
-                    word_ce_mux(en, next, Expr::Var(qn.clone()))
+                    word_ce_mux(en, next, Expr::Var(arena.alloc_str(&(qn.clone()))), arena)
                 } else {
                     next
                 };
@@ -13353,23 +13367,23 @@ fn lower_word_pipeline(
 }
 
 /// `we && (addr == word)` as one LUT6. Address plus enable must stay ≤6 PIs.
-fn addr_match_expr(addr: &str, addr_w: usize, word: usize, en: Option<&Expr>) -> Expr {
+fn addr_match_expr<'a>(addr: &str, addr_w: usize, word: usize, en: Option<&Expr<'a>>, arena: &'a Bump) -> Expr<'a> {
     let mut acc: Option<Expr> = None;
     for i in 0..addr_w.max(1) {
-        let bit = Expr::Var(bit_name(addr, addr_w, i));
+        let bit = Expr::Var(arena.alloc_str(&(bit_name(addr, addr_w, i))));
         let term = if (word >> i) & 1 == 1 {
             bit
         } else {
-            Expr::Not(Box::new(bit))
+            Expr::Not(arena.alloc(bit))
         };
         acc = Some(match acc {
             None => term,
-            Some(a) => Expr::And(Box::new(a), Box::new(term)),
+            Some(a) => Expr::And(arena.alloc(a), arena.alloc(term)),
         });
     }
     let eq = acc.unwrap_or(Expr::Const(true));
     if let Some(en) = en {
-        Expr::And(Box::new(en.clone()), Box::new(eq))
+        Expr::And(arena.alloc(en.clone()), arena.alloc(eq))
     } else {
         eq
     }
@@ -13392,15 +13406,20 @@ fn emit_small_lut(d: &mut Design, cell: &str, out: &str, expr: &Expr) -> bool {
     true
 }
 
-struct VarWordWrite {
-    en: Option<Expr>,
+struct VarWordWrite<'a> {
+    en: Option<Expr<'a>>,
     addr: String,
     addr_w: usize,
     data: String,
 }
 
 /// Peel `if (we) mem[addr] <= data` (hold the unselected words).
-fn peel_var_word_write(rhs: &RExpr, mem: &str, rtl: &Rtl) -> Option<VarWordWrite> {
+fn peel_var_word_write<'a>(
+    rhs: &RExpr,
+    mem: &str,
+    rtl: &Rtl,
+    arena: &'a Bump,
+) -> Option<VarWordWrite<'a>> {
     let (en_r, payload) = match rhs {
         RExpr::WordAt { .. } => (None, rhs),
         RExpr::Mux(c, t, f) => {
@@ -13433,7 +13452,7 @@ fn peel_var_word_write(rhs: &RExpr, mem: &str, rtl: &Rtl) -> Option<VarWordWrite
         return None;
     }
     let en = if let Some(er) = en_r {
-        Some(simple_word_enable(er, rtl)?)
+        Some(simple_word_enable(er, rtl, arena)?)
     } else {
         None
     };
@@ -13451,7 +13470,12 @@ fn peel_var_word_write(rhs: &RExpr, mem: &str, rtl: &Rtl) -> Option<VarWordWrite
 /// Bounded unpacked variable-index write: one Hff per bit, clocked by `clk`.
 /// Depth ≤32 and width ≤16. The read is not expanded — address compare is a
 /// shared ≤6-PI LUT, then a 3-PI hold mux per bit. Not a >16 PI cone.
-fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String> {
+fn lower_var_index_words<'a>(
+    d: &mut Design,
+    rtl: &Rtl,
+    clk: &str,
+    arena: &'a Bump,
+) -> HashSet<String> {
     const MAX_DEPTH: usize = 32;
     const MAX_WIDTH: usize = 16;
     let mut names: Vec<String> = Vec::new();
@@ -13489,7 +13513,7 @@ fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String
                 ok = false;
                 break;
             }
-            let Some(w) = peel_var_word_write(rhs, &mem, rtl) else {
+            let Some(w) = peel_var_word_write(rhs, &mem, rtl, arena) else {
                 ok = false;
                 break;
             };
@@ -13514,7 +13538,7 @@ fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String
         }
         let mut matches: Vec<(String, Expr)> = Vec::new();
         for word in 0..depth {
-            let expr = addr_match_expr(&plan.addr, plan.addr_w, word, plan.en.as_ref());
+            let expr = addr_match_expr(&plan.addr, plan.addr_w, word, plan.en.as_ref(), arena);
             if cone_pi_exceeds(&expr, 6) {
                 ok = false;
                 break;
@@ -13547,10 +13571,10 @@ fn lower_var_index_words(d: &mut Design, rtl: &Rtl, clk: &str) -> HashSet<String
                 let next = if bit >= data_w {
                     Expr::Const(false)
                 } else {
-                    Expr::Var(bit_name(&plan.data, data_w, bit))
+                    Expr::Var(arena.alloc_str(&(bit_name(&plan.data, data_w, bit))))
                 };
                 let qn = unpacked_word_q(&mem, word, width, bit);
-                let mux = word_ce_mux(Expr::Var(mnet.clone()), next, Expr::Var(qn.clone()));
+                let mux = word_ce_mux(Expr::Var(arena.alloc_str(&(mnet.clone()))), next, Expr::Var(arena.alloc_str(&(qn.clone()))), arena);
                 let lut = format!("u_vwl{bit_i}");
                 let dnet = format!("u_vwd{bit_i}");
                 if !emit_small_lut(d, &lut, &dnet, &mux) {
@@ -13651,6 +13675,10 @@ fn subst_net_copies(e: &RExpr, map: &HashMap<(String, usize), RExpr>) -> RExpr {
 
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut d = Design::new(&rtl.module);
+    // Bump arena for transient boolean Expr trees built per bit below.
+    // reg_bits/comb_bits borrow from it; all trees are consumed into the
+    // AIG/Design before this function returns, so the arena dies here.
+    let arena = Bump::new();
     for (n, dir, _) in &rtl.ports {
         // A read-only inout is a load-enable input, not an output pad and
         // not a made-up bus. Timing still sees a plain input.
@@ -13704,7 +13732,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut n_bram = 0usize;
     // Bounded unpacked shift (const word index, small depth×width) → Hffs.
     // A variable-index read is not expanded here.
-    let (unpacked_bits, mut lowered_unpacked) = lower_unpacked_clocked_words(rtl);
+    let (unpacked_bits, mut lowered_unpacked) = lower_unpacked_clocked_words(rtl, &arena);
     reg_bits.extend(unpacked_bits);
     // Const-index word add (`res[0] <= a+b`) → ripple adder into Hffs.
     // Not a MAC, and not the generic cone (that left 2 bits and a wide_cone).
@@ -13714,7 +13742,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     lowered_unpacked.extend(lower_word_pipeline(&mut d, rtl, clk, &lowered_unpacked));
     // Variable-index write (depth≤32, width≤16) → Hffs on the user's clock.
     // The read stays a single variable_index_read; do not walk a wide cone.
-    lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk));
+    lowered_unpacked.extend(lower_var_index_words(&mut d, rtl, clk, &arena));
     for (lhs, bit, rhs) in &rtl.nbas {
         if sig_depth(rtl, lhs) > 0 {
             continue;
@@ -13727,16 +13755,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         let w = sig_width(rtl, lhs);
         if let Some(b) = bit {
             let e = if rexpr_is_plus_one(rhs) {
-                Some(inc_bit_expr(lhs, w, *b))
+                Some(inc_bit_expr(lhs, w, *b, &arena))
             } else {
-                rexpr_to_bit(rhs, rtl, 0).ok()
+                rexpr_to_bit(rhs, rtl, 0, &arena).ok()
             };
             if let Some(e) = e {
                 reg_bits.push((bit_name(lhs, w, *b), e));
             }
         } else if rexpr_is_plus_one(rhs) && rexpr_ident(rhs).as_deref() == Some(lhs.as_str()) {
             for i in 0..w {
-                reg_bits.push((bit_name(lhs, w, i), inc_bit_expr(lhs, w, i)));
+                reg_bits.push((bit_name(lhs, w, i), inc_bit_expr(lhs, w, i, &arena)));
             }
         } else if let RExpr::Mux(cond, t, f) = rhs {
             if rexpr_is_plus_one(f)
@@ -13744,13 +13772,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 && matches!(t.as_ref(), RExpr::Const { val: 0, .. })
             {
                 for i in 0..w {
-                    let inc = inc_bit_expr(lhs, w, i);
-                    let Ok(c) = rexpr_to_bit(cond, rtl, 0) else {
+                    let inc = inc_bit_expr(lhs, w, i, &arena);
+                    let Ok(c) = rexpr_to_bit(cond, rtl, 0, &arena) else {
                         break;
                     };
                     reg_bits.push((
                         bit_name(lhs, w, i),
-                        Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(inc)),
+                        Expr::And(arena.alloc(Expr::Not(arena.alloc(c))), arena.alloc(inc)),
                     ));
                 }
             } else if rexpr_is_plus_one(f)
@@ -13759,16 +13787,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             {
                 // saturating / hold: if (cond) cnt <= cnt; else cnt <= cnt+1
                 for i in 0..w {
-                    let inc = inc_bit_expr(lhs, w, i);
-                    let Ok(c) = rexpr_to_bit(cond, rtl, 0) else {
+                    let inc = inc_bit_expr(lhs, w, i, &arena);
+                    let Ok(c) = rexpr_to_bit(cond, rtl, 0, &arena) else {
                         break;
                     };
-                    let hold = Expr::Var(bit_name(lhs, w, i));
+                    let hold = Expr::Var(arena.alloc_str(&(bit_name(lhs, w, i))));
                     reg_bits.push((
                         bit_name(lhs, w, i),
                         Expr::Or(
-                            Box::new(Expr::And(Box::new(c.clone()), Box::new(hold))),
-                            Box::new(Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(inc))),
+                            arena.alloc(Expr::And(arena.alloc(c.clone()), arena.alloc(hold))),
+                            arena.alloc(Expr::And(arena.alloc(Expr::Not(arena.alloc(c))), arena.alloc(inc))),
                         ),
                     ));
                 }
@@ -13778,23 +13806,23 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             {
                 // clock enable: if (en) cnt <= cnt+1
                 for i in 0..w {
-                    let inc = inc_bit_expr(lhs, w, i);
-                    let Ok(c) = rexpr_to_bit(cond, rtl, 0) else {
+                    let inc = inc_bit_expr(lhs, w, i, &arena);
+                    let Ok(c) = rexpr_to_bit(cond, rtl, 0, &arena) else {
                         break;
                     };
-                    let hold = Expr::Var(bit_name(lhs, w, i));
+                    let hold = Expr::Var(arena.alloc_str(&(bit_name(lhs, w, i))));
                     reg_bits.push((
                         bit_name(lhs, w, i),
                         Expr::Or(
-                            Box::new(Expr::And(Box::new(c.clone()), Box::new(inc))),
-                            Box::new(Expr::And(Box::new(Expr::Not(Box::new(c))), Box::new(hold))),
+                            arena.alloc(Expr::And(arena.alloc(c.clone()), arena.alloc(inc))),
+                            arena.alloc(Expr::And(arena.alloc(Expr::Not(arena.alloc(c))), arena.alloc(hold))),
                         ),
                     ));
                 }
             } else {
                 let bw = w.min(32);
                 for i in 0..bw {
-                    if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
+                    if let Ok(e) = rexpr_to_bit(rhs, rtl, i, &arena) {
                         reg_bits.push((bit_name(lhs, w, i), e));
                     }
                 }
@@ -13802,7 +13830,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         } else {
             let bw = w.min(32);
             for i in 0..bw {
-                if let Ok(e) = rexpr_to_bit(rhs, rtl, i) {
+                if let Ok(e) = rexpr_to_bit(rhs, rtl, i, &arena) {
                     reg_bits.push((bit_name(lhs, w, i), e));
                 }
             }
@@ -14082,7 +14110,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             if let Some((word, lo)) = decode_unpacked_bit(*b) {
                 let bn = unpacked_word_q(lhs, word, w, lo);
                 if comb_accept(&comb_bits, &bn, &mut assign_capped) {
-                    match rexpr_to_bit(rhs, rtl, 0) {
+                    match rexpr_to_bit(rhs, rtl, 0, &arena) {
                         Ok(e) => {
                             if rel_lt {
                                 rel_sig.insert(bn.clone(), lhs.clone());
@@ -14101,7 +14129,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                     if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
                         break;
                     }
-                    match rexpr_to_bit(rhs, rtl, i) {
+                    match rexpr_to_bit(rhs, rtl, i, &arena) {
                         Ok(e) => {
                             if rel_lt {
                                 rel_sig.insert(bn.clone(), lhs.clone());
@@ -14114,7 +14142,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             } else {
                 let bn = bit_name(lhs, w, *b);
                 if comb_accept(&comb_bits, &bn, &mut assign_capped) {
-                    match rexpr_to_bit(rhs, rtl, 0) {
+                    match rexpr_to_bit(rhs, rtl, 0, &arena) {
                         Ok(e) => {
                             if rel_lt {
                                 rel_sig.insert(bn.clone(), lhs.clone());
@@ -14137,7 +14165,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 if !comb_accept(&comb_bits, &bn, &mut assign_capped) {
                     break;
                 }
-                match rexpr_to_bit(rhs, rtl, i) {
+                match rexpr_to_bit(rhs, rtl, i, &arena) {
                     Ok(e) => {
                         if rel_lt {
                             rel_sig.insert(bn.clone(), lhs.clone());
@@ -14303,7 +14331,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             break;
         }
-        let expr_rom = strip_self_hold(expr, bitn);
+        let expr_rom = strip_self_hold(expr, bitn, &arena);
         // Cheap ≤6-PI LUT6 before expr_node_count (full tree walk). sha256_k
         // and alu bit cones hit this without the 2k-node scan.
         if !cone_pi_exceeds(&expr_rom, 6) {
@@ -15687,7 +15715,8 @@ endmodule
 
     #[test]
     fn aig_flowmap_and() {
-        let e = parse_expr("a&b").unwrap();
+        let arena = Bump::new();
+        let e = parse_expr("a&b", &arena).unwrap();
         let aig = Aig::from_expr(&e);
         assert_eq!(aig.pis.len(), 2);
         let init = aig.flowmap_lut6();
@@ -16449,6 +16478,7 @@ endmodule
 
     #[test]
     fn nested_add_rexpr_is_bounded_not_hang() {
+        let arena = Bump::new();
         // Pathological nesting used to explode adder_sum_bit (HANG-1539).
         let mut e = RExpr::Ident("a".into());
         for _ in 0..12 {
@@ -16482,12 +16512,13 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
         };
-        let r = rexpr_to_bit(&e, &rtl, 7);
+        let r = rexpr_to_bit(&e, &rtl, 7, &arena);
         assert!(r.is_err(), "deep Add must Err, not hang: {r:?}");
     }
 
     #[test]
     fn nested_cmp_add_rexpr_is_bounded_not_hang() {
+        let arena = Bump::new();
         // CORPUS cmp/ashr path: nested Add under Eq/Lt must Err-skip, not hang.
         let mut a = RExpr::Ident("a".into());
         let mut b = RExpr::Ident("b".into());
@@ -16527,9 +16558,9 @@ endmodule
             &RExpr::Eq(Box::new(a.clone()), Box::new(b.clone())),
             &rtl,
             0,
-        );
+        &arena);
         assert!(eq.is_err(), "deep Eq(Add,Add) must Err, not hang: {eq:?}");
-        let lt = rexpr_to_bit(&RExpr::Lt(Box::new(a), Box::new(b)), &rtl, 0);
+        let lt = rexpr_to_bit(&RExpr::Lt(Box::new(a), Box::new(b)), &rtl, 0, &arena);
         assert!(lt.is_err(), "deep Lt(Add,Add) must Err, not hang: {lt:?}");
         let wide = Rtl {
             module: "t".into(),
@@ -16566,7 +16597,7 @@ endmodule
             ),
             &wide,
             0,
-        );
+        &arena);
         assert!(wide_eq.is_err(), "width>32 Eq must Err: {wide_eq:?}");
     }
 
@@ -16660,6 +16691,7 @@ endmodule
 
     #[test]
     fn ysyx_ibex_lists_modules_and_synths_top() {
+        let arena = Bump::new();
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ysyx_ibex.sv");
         assert!(
             p.exists(),
@@ -16712,14 +16744,14 @@ endmodule
             'probe: for (lhs, bit, rhs) in &flat.nbas {
                 let w = sig_width(&flat, lhs).min(64);
                 if let Some(b) = bit {
-                    match rexpr_to_bit(rhs, &flat, (*b).min(63)) {
+                    match rexpr_to_bit(rhs, &flat, (*b).min(63), &arena) {
                         Ok(_) => bit_ok += 1,
                         Err(_) => bit_fail += 1,
                     }
                     probed += 1;
                 } else {
                     for i in 0..w.max(1) {
-                        match rexpr_to_bit(rhs, &flat, i) {
+                        match rexpr_to_bit(rhs, &flat, i, &arena) {
                             Ok(_) => bit_ok += 1,
                             Err(_) => bit_fail += 1,
                         }

@@ -1541,6 +1541,7 @@ dependencies = [
 name = "helion-sv"
 version = "2.0.5"
 dependencies = [
+ "bumpalo",
  "criterion",
  "helion-bits",
  "helion-device",
