@@ -391,6 +391,33 @@ mod tests {
     }
 
     #[test]
+    fn synth_counter_sim_matches_gold_led_pattern() {
+        // FM-HEL-AREA-02: LUT peephole opts (dead sweep / const fold /
+        // inverter absorption) must not change counter.sv simulation. The
+        // synthesized netlist (not just the hand-built structural one) must
+        // produce the gold LED pattern.
+        let src = r#"
+module counter (
+    input  logic clk,
+    output logic led
+);
+    logic [3:0] cnt;
+    always_ff @(posedge clk) begin
+        cnt <= cnt + 1;
+    end
+    assign led = cnt[3];
+endmodule
+"#;
+        let d = helion_sv::synth_sv(src, "counter.sv").expect("synth counter");
+        let wave = run_tb(&d, 16);
+        let led: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        assert_eq!(
+            led, COUNTER_OVERLAY_SIM_LED,
+            "synthesized counter.sv must simulate to the gold LED pattern"
+        );
+    }
+
+    #[test]
     fn event_sim_counter_matches_fabric_gold() {
         let w = run_tb(&Design::structural_counter(), 16);
         assert!(w[0..7].iter().all(|b| !b), "{w:?}");

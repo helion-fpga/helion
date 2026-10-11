@@ -1,5 +1,9 @@
 //! Helion netlist IR (HNF). Structural cells, attributes, hierarchy, round-trip.
 
+mod opt;
+
+pub use opt::LutOptStats;
+
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, Default)]

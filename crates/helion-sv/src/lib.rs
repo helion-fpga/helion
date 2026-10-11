@@ -15054,6 +15054,17 @@ fn synth_from_parsed_top(
         );
     }
     record_instances(&map, &top_name, &mut d, "");
+    // FM-HEL-AREA-02: LUT peephole opts on the fully-stitched netlist —
+    // dead-LUT sweep, const folding, inverter absorption. See helion_ir::opt.
+    // Dead-only by construction (no rewiring of live logic); observable nets
+    // (mark_debug, ILA, top output ports) are never touched.
+    let opt = d.peephole_opt_luts();
+    if opt.total() + opt.consts_folded + opt.inverters_absorbed > 0 {
+        eprintln!(
+            "lut_opt dead={} consts={} inverters={} rounds={}",
+            opt.dead_swept, opt.consts_folded, opt.inverters_absorbed, opt.rounds
+        );
+    }
     let n_luts = d
         .cells
         .iter()
@@ -16886,10 +16897,12 @@ endmodule
 
     #[test]
     fn const_range_compare_lowers_small_lut() {
+        // Note: prg_is_ram is an output port so the LUT stays live through
+        // the FM-HEL-AREA-02 dead sweep; see dead_sweep_removes_unobserved_wire_lut
+        // for the swept case.
         let src = r#"
-module MMC4(input [15:0] prg_ain);
-  wire
-       prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
+module MMC4(input [15:0] prg_ain, output prg_is_ram);
+  assign prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
 endmodule
 "#;
         let d = synth_sv(src, "mmc4_ram.v").expect("range compare");
@@ -16956,6 +16969,38 @@ endmodule
             let got = (init >> addr) & 1 == 1;
             assert_eq!(got, want, "addr={addr:#b} field={field:#b} init={init:#x}");
         }
+    }
+
+    #[test]
+    fn dead_sweep_removes_unobserved_wire_lut() {
+        // FM-HEL-AREA-02: the range-compare LUT has no loads (prg_is_ram is
+        // not an output port), so the dead sweep removes it. Lowering still
+        // happens first (ASSIGN_NOT_LOWERED unset); the cone is just
+        // unobservable, so the whole design goes empty.
+        let src = r#"
+module MMC4(input [15:0] prg_ain);
+  wire prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
+endmodule
+"#;
+        let d = synth_sv(src, "mmc4_ram_dead.v").expect("range compare");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "small range must lower, not assign_not_lowered"
+        );
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })
+                && d.net_on(&c.name, "O") == Some("prg_is_ram")),
+            "dead prg_is_ram LUT must be swept"
+        );
+        assert_eq!(
+            d.cells
+                .iter()
+                .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+                .count(),
+            0,
+            "entire cone is unobservable; no LUTs may remain"
+        );
     }
 
     #[test]
@@ -17312,7 +17357,11 @@ endmodule
     }
 
     #[test]
-    fn function_lifted_into_empty_module_maps_lut() {
+    fn function_lifted_dead_cone_swept() {
+        // FM-HEL-AREA-02: the lifted function maps to 4 LUTs, but with no
+        // loads (nextCRC has no assign, hence no IOB) the dead sweep removes
+        // them. Lifting still happens — nextCRC exists as an output port —
+        // the mapped cone is just unobservable.
         let src = r#"
 module CRC_tiny();
   function [3:0] nextCRC;
@@ -17331,7 +17380,7 @@ endmodule
 "#;
         let d = synth_sv(src, "crc.v").expect("lift function");
         let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
-        assert!(luts >= 4, "lifted function must map LUTs, luts={luts} cells={:?}", d.cells);
+        assert_eq!(luts, 0, "dead lifted cone must be swept, luts={luts} cells={:?}", d.cells);
         assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
     }
 
@@ -18707,9 +18756,13 @@ endmodule
             lut_driven(&d, "imd_val_we_o_0"),
             "imd_val_we_o[0] must be driven"
         );
+        // FM-HEL-AREA-02: the imd_val_d_o[0] concat LUTs drive imd_val_d_o_w0_{i}
+        // nets that have no loads (the IOBs land on imd_val_d_o_{i} instead),
+        // so the dead sweep removes them. The live imd_val_we_o[0] LUT above
+        // keeps its IOB load and survives.
         assert!(
-            (0..33).all(|i| lut_driven(&d, &format!("imd_val_d_o_w0_{i}"))),
-            "imd_val_d_o[0] unpacked word must be driven from concat"
+            (0..33).all(|i| !lut_driven(&d, &format!("imd_val_d_o_w0_{i}"))),
+            "dead concat LUTs must be swept"
         );
     }
 
