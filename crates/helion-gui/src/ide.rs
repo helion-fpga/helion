@@ -4871,6 +4871,17 @@ pub struct IdeModel {
     pub tb_vcd_enabled: bool,
     /// Project dir for discovery + history (`<dir>/.helion/tb_history.json`).
     pub tb_project_dir: Option<std::path::PathBuf>,
+    /// Stop flag for the in-flight testbench run (UI thread sets it, the
+    /// engine-thread interpreter polls it).
+    pub tb_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// DUT module/instance of the last testbench run (schematic highlight).
+    pub tb_last_dut_module: String,
+    pub tb_last_dut_instance: String,
+    /// Last run's VCD path, if any (for "open in waveform viewer").
+    pub tb_last_vcd: Option<std::path::PathBuf>,
+    /// VCD queued for the waveform viewer (stub hook until the VCD-power
+    /// feature ships the real viewer; single integration call site).
+    pub tb_waveform_pending: Option<std::path::PathBuf>,
     /// UG893/UG986 ECO Changes selected cell name.
     pub selected_eco: Option<String>,
     /// UG986 Incremental Compile rows (HNF vs checkpoint).
@@ -5030,6 +5041,11 @@ impl IdeModel {
             tb_manual: Vec::new(),
             tb_vcd_enabled: false,
             tb_project_dir: None,
+            tb_cancel: None,
+            tb_last_dut_module: String::new(),
+            tb_last_dut_instance: String::new(),
+            tb_last_vcd: None,
+            tb_waveform_pending: None,
             selected_eco: None,
             incremental_rows: Vec::new(),
             selected_incremental: None,
@@ -5329,6 +5345,23 @@ impl IdeModel {
             self.tb_run_sync(sel, self.tb_vcd_enabled, None)
         } else if t == "tb_run_all" {
             self.tb_run_all_sync(self.tb_vcd_enabled)
+        } else if t == "tb_stop" {
+            Ok(self.tb_stop())
+        } else if let Some(rest) = t.strip_prefix("tb_sch ") {
+            let i: usize = rest
+                .trim()
+                .parse()
+                .map_err(|_| "tb_sch: need a failure index".to_string())?;
+            self.tb_highlight_failure_in_schematic(i)
+        } else if t == "tb_wave" || t.starts_with("tb_wave ") {
+            let v = t.strip_prefix("tb_wave").unwrap_or("").trim();
+            if !v.is_empty() {
+                Ok(self.tb_open_vcd_in_waveform(Path::new(v)))
+            } else if let Some(p) = self.tb_last_vcd.clone() {
+                Ok(self.tb_open_vcd_in_waveform(&p))
+            } else {
+                Err("tb_wave: no VCD from the last run (enable VCD dump and run first)".to_string())
+            }
         } else if let Some(rest) = t.strip_prefix("tb_add ") {
             self.tb_add(Path::new(rest.trim()))
         } else if t == "tb_vcd" || t.starts_with("tb_vcd ") {
@@ -18620,6 +18653,7 @@ impl IdeModel {
             tb_path: tb.path.clone(),
             vcd,
             max_units: crate::tb::TB_DEFAULT_MAX_UNITS,
+            cancel: self.tb_cancel.clone(),
         };
         let started_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -18629,8 +18663,21 @@ impl IdeModel {
         let result = crate::tb::run_testbench(&cfg, tx);
         let runtime_ms = wall.elapsed().as_millis() as u64;
         self.tb_run_active = false;
+        self.tb_cancel = None;
         match result {
             Ok(out) => {
+                self.tb_last_dut_module = out.dut_module.clone();
+                self.tb_last_dut_instance = out.dut_instance.clone();
+                self.tb_last_vcd = out.vcd_path.clone();
+                if out.stopped {
+                    // User-stopped: back to Idle, not a pass or a failure,
+                    // and no history entry (a stop is not a test result).
+                    self.tb_status[idx] = crate::tb::TbStatus::Idle;
+                    self.tb_log = out.log.clone();
+                    self.tb_failures.clear();
+                    self.tb_last_summary = out.summary.clone();
+                    return Ok(out.summary);
+                }
                 self.tb_status[idx] = if out.passed {
                     crate::tb::TbStatus::Passed
                 } else {
@@ -18685,6 +18732,56 @@ impl IdeModel {
         self.tb_run_sync(&req.sel, req.vcd, Some(&req.tx))
     }
 
+    /// Stop the in-flight testbench run. Sets the cancel flag the
+    /// engine-thread interpreter polls; the run unwinds within a few
+    /// simulation events and reports STOPPED (not a pass/fail).
+    pub fn tb_stop(&mut self) -> String {
+        if let Some(c) = self.tb_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.tb_run_active = false;
+            "testbench stop requested".to_string()
+        } else {
+            "no testbench run in flight".to_string()
+        }
+    }
+
+    /// Highlight the failing DUT instance in the schematic pane.
+    /// `tb_jump_to_failure` opens the assertion in the editor; this is its
+    /// schematic counterpart (requirement: click-to-highlight in schematic).
+    pub fn tb_highlight_failure_in_schematic(
+        &mut self,
+        idx: usize,
+    ) -> Result<String, String> {
+        if self.tb_failures.get(idx).is_none() {
+            return Err("no such failure".to_string());
+        }
+        for cand in [
+            self.tb_last_dut_instance.clone(),
+            self.tb_last_dut_module.clone(),
+        ] {
+            if !cand.is_empty() && self.schematic.has_cell(&cand) {
+                self.selected = Some(cand.clone());
+                self.workspace = WorkspaceTab::Schematic;
+                return Ok(format!("highlighted {cand} in schematic"));
+            }
+        }
+        Err(format!(
+            "DUT `{}` is not in the schematic — synth the DUT first",
+            self.tb_last_dut_module
+        ))
+    }
+
+    /// Placeholder hook: hand a VCD to the waveform viewer. The real viewer
+    /// ships with the VCD-power feature; until then the pending path is
+    /// recorded here so the integration has a single call site.
+    pub fn tb_open_vcd_in_waveform(&mut self, path: &Path) -> String {
+        self.tb_waveform_pending = Some(path.to_path_buf());
+        format!(
+            "waveform viewer (stub): queued {} — the full viewer ships with VCD power",
+            path.display()
+        )
+    }
+
     /// Merge a finished engine-thread run into the live model. Log lines and
     /// failures already arrived via the stream; status/history/summary merge
     /// here so nothing is lost or duplicated.
@@ -18698,6 +18795,10 @@ impl IdeModel {
         self.tb_run_active = false;
         self.tb_run_name = done.tb_run_name.clone();
         self.tb_last_summary = done.tb_last_summary.clone();
+        self.tb_last_dut_module = done.tb_last_dut_module.clone();
+        self.tb_last_dut_instance = done.tb_last_dut_instance.clone();
+        self.tb_last_vcd = done.tb_last_vcd.clone();
+        self.tb_waveform_pending = done.tb_waveform_pending.clone();
         // The streamed log is authoritative for the live view; the finished
         // model's copy is identical, so keep whichever is longer.
         if done.tb_log.len() > self.tb_log.len() {
@@ -38419,5 +38520,51 @@ endmodule
         m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
         let err = m.exec("tb_run nope").unwrap_err();
         assert!(err.contains("no testbench"), "err={err}");
+    }
+
+    #[test]
+    fn tb_stop_without_run_is_honest_noop() {
+        let mut m = IdeModel::new();
+        assert_eq!(m.exec("tb_stop").unwrap(), "no testbench run in flight");
+        assert!(m.tb_cancel.is_none());
+    }
+
+    #[test]
+    fn tb_stop_sets_cancel_flag_before_engine_copy() {
+        let mut m = IdeModel::new();
+        // tb_start_run puts a shared flag on the model before spawning.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        m.tb_cancel = Some(cancel.clone());
+        let msg = m.exec("tb_stop").unwrap();
+        assert_eq!(msg, "testbench stop requested");
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(m.exec("tb_stop").unwrap(), "no testbench run in flight");
+    }
+
+    #[test]
+    fn tb_failure_carries_signals_and_schematic_jump() {
+        let dir = tb_project();
+        let mut m = IdeModel::new();
+        m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
+        let summary = m.exec("tb_run and_dut_tb_fail").unwrap();
+        assert!(summary.contains("FAILED"), "summary={summary}");
+        let f = &m.tb_failures[0];
+        assert!(f.time_ns > 0, "{f:?}");
+        assert!(!f.signals.is_empty(), "{f:?}");
+        assert!(f.signals.iter().any(|(n, v)| n == "dut.y" && *v == 0), "{f:?}");
+        assert_eq!(f.instance, "dut");
+        assert_eq!(m.tb_last_dut_module, "and_dut");
+        assert_eq!(m.tb_last_dut_instance, "dut");
+
+        // Without a synthesized design there is no schematic cell: honest error.
+        let err = m.exec("tb_sch 0").unwrap_err();
+        assert!(err.contains("synth the DUT first"), "err={err}");
+
+        // The waveform hook records the pending path (stub until VCD power).
+        let err = m.exec("tb_wave").unwrap_err();
+        assert!(err.contains("no VCD"), "err={err}");
+        let msg = m.exec(&format!("tb_wave {}", dir.join("run.vcd").display())).unwrap();
+        assert!(msg.contains("waveform viewer"), "msg={msg}");
+        assert_eq!(m.tb_waveform_pending, Some(dir.join("run.vcd")));
     }
 }

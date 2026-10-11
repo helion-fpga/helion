@@ -28,7 +28,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 /// `#1` in a testbench is one nanosecond.
 pub const TB_PS_PER_UNIT: u64 = 1000;
@@ -1468,7 +1470,14 @@ impl TbSev {
 #[derive(Clone, Debug)]
 pub enum TbStreamEvent {
     Log { time_ns: u64, sev: TbSev, text: String },
-    Failure { file: String, line: usize, message: String, time_ns: u64 },
+    Failure {
+        file: String,
+        line: usize,
+        message: String,
+        time_ns: u64,
+        /// Relevant signals at failure time: `("dut.count", value)`.
+        signals: Vec<(String, u64)>,
+    },
     Progress { time_ns: u64 },
 }
 
@@ -1479,6 +1488,10 @@ pub struct TbFailure {
     pub line: usize,
     pub message: String,
     pub time_ns: u64,
+    /// Relevant signals at failure time: `("dut.count", value)`.
+    pub signals: Vec<(String, u64)>,
+    /// DUT instance name from the testbench (schematic highlight target).
+    pub instance: String,
 }
 
 /// One buffered log line (also written to `run.log`).
@@ -1494,6 +1507,8 @@ pub struct TbRunConfig {
     pub tb_path: PathBuf,
     pub vcd: bool,
     pub max_units: u64,
+    /// Set by the UI thread to stop an in-flight run (`tb_stop`).
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl TbRunConfig {
@@ -1502,6 +1517,7 @@ impl TbRunConfig {
             tb_path,
             vcd: false,
             max_units: TB_DEFAULT_MAX_UNITS,
+            cancel: None,
         }
     }
 }
@@ -1509,6 +1525,8 @@ impl TbRunConfig {
 #[derive(Clone, Debug)]
 pub struct TbOutcome {
     pub passed: bool,
+    /// The run was stopped by the user (`tb_stop`); not a pass or fail.
+    pub stopped: bool,
     pub sim_time_ns: u64,
     pub failures: Vec<TbFailure>,
     pub displays: u32,
@@ -1516,10 +1534,14 @@ pub struct TbOutcome {
     pub log_path: PathBuf,
     /// Full log lines (also streamed live and written to `run.log`).
     pub log: Vec<TbLogLine>,
-    /// One-line `NAME PASSED/FAILED: …` summary.
+    /// One-line `NAME PASSED/FAILED/STOPPED: …` summary.
     pub summary: String,
     /// Wall-clock runtime in milliseconds.
     pub runtime_ms: u64,
+    /// DUT module name from the testbench (for schematic highlight).
+    pub dut_module: String,
+    /// DUT instance name from the testbench (for schematic highlight).
+    pub dut_instance: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1565,6 +1587,10 @@ struct Interp<'a> {
     stopped: bool,
     max_ps: u64,
     tx: Option<&'a mpsc::Sender<TbStreamEvent>>,
+    /// Stop request from the UI thread (`tb_stop`); checked each event.
+    cancel: Option<Arc<AtomicBool>>,
+    /// The user cancelled this run (not a pass/fail).
+    cancel_hit: bool,
     log: Vec<TbLogLine>,
     /// VCD trace signals: (dotted name, width)
     trace_names: Vec<(String, u32)>,
@@ -1626,12 +1652,14 @@ impl<'a> Interp<'a> {
             TbStreamEvent::Log { time_ns, sev, text } => {
                 self.log.push(TbLogLine { time_ns: *time_ns, sev: *sev, text: text.clone() });
             }
-            TbStreamEvent::Failure { file, line, message, time_ns } => {
+            TbStreamEvent::Failure { file, line, message, time_ns, signals } => {
                 self.failures.push(TbFailure {
                     file: file.clone(),
                     line: *line,
                     message: message.clone(),
                     time_ns: *time_ns,
+                    signals: signals.clone(),
+                    instance: self.prog.dut_instance.clone(),
                 });
             }
             TbStreamEvent::Progress { .. } => {}
@@ -1655,16 +1683,36 @@ impl<'a> Interp<'a> {
         let t = self.time_ps / TB_PS_PER_UNIT;
         let text = format!("$error at {}:{}: {message}", self.file_label, line);
         self.emit(TbStreamEvent::Log { time_ns: t, sev: TbSev::Error, text });
+        // Snapshot the bound DUT ports so the failure row can show the
+        // relevant signal values (max 8, sorted by port name).
+        let mut port_sigs: Vec<(&String, &String)> =
+            self.tb_to_dut.iter().collect();
+        port_sigs.sort_by(|a, b| a.1.cmp(b.1));
+        let mut signals: Vec<(String, u64)> = Vec::new();
+        for (sig, port) in port_sigs.iter().take(8) {
+            match self.resolve(sig) {
+                Ok((v, _, _)) => signals.push((format!("dut.{port}"), v)),
+                Err(_) => signals.push((format!("dut.{port}"), 0)),
+            }
+        }
         self.emit(TbStreamEvent::Failure {
             file: self.file_label.clone(),
             line,
             message,
             time_ns: t,
+            signals,
         });
     }
 
     fn time_ns(&self) -> u64 {
         self.time_ps / TB_PS_PER_UNIT
+    }
+
+    /// True when the UI thread requested a stop (`tb_stop`).
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_deref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
     /// Resolve a testbench signal to (value, width, has_x).
@@ -2101,7 +2149,7 @@ impl<'a> Interp<'a> {
         self.poll_edge_wait(&want);
     }
 
-    fn run(mut self) -> Result<(), TbError> {
+    fn run(&mut self) -> Result<(), TbError> {
         // Initial samples at t=0 (before any event) for the VCD dumpvars.
         self.sample_all();
         self.push_event(0, EvKind::WakeInitial);
@@ -2111,6 +2159,12 @@ impl<'a> Interp<'a> {
         }
         loop {
             if self.stopped {
+                break;
+            }
+            if self.cancelled() {
+                // User hit Stop: unwind cleanly; the outcome reports STOPPED.
+                self.cancel_hit = true;
+                self.stopped = true;
                 break;
             }
             let ev = match self.events.pop() {
@@ -2162,7 +2216,7 @@ impl<'a> Interp<'a> {
                     self.poll_edge_wait(&sig);
                 }
             }
-            while self.state == InitState::Running && !self.stopped {
+            while self.state == InitState::Running && !self.stopped && !self.cancelled() {
                 self.step_initial()?;
             }
             // A #delay that already expired, or an edge that already
@@ -2310,6 +2364,8 @@ pub fn run_testbench(
         stopped: false,
         max_ps: cfg.max_units.saturating_mul(TB_PS_PER_UNIT),
         tx,
+        cancel: cfg.cancel.clone(),
+        cancel_hit: false,
         log: Vec::new(),
         trace_names,
         trace_idx: HashMap::new(),
@@ -2383,25 +2439,30 @@ pub fn run_testbench(
     };
 
     let runtime_ms = started.elapsed().as_millis() as u64;
-    let passed = !failed;
-    let summary = if passed {
+    let stopped_by_user = ip.cancel_hit;
+    let passed = !failed && !stopped_by_user;
+    let summary = if stopped_by_user {
+        format!("{stem} STOPPED by user at {sim_time_ns} ns (not a pass/fail)")
+    } else if passed {
         format!(
-            "{} PASSED: {} displays, sim_time={} ns, wall={} ms",
-            stem, displays, sim_time_ns, runtime_ms
+            "{stem} PASSED: {displays} displays, sim_time={sim_time_ns} ns, wall={runtime_ms} ms"
         )
     } else {
         format!(
-            "{} FAILED: {} error(s), {} displays, sim_time={} ns",
-            stem,
-            failures.len(),
-            displays,
-            sim_time_ns
+            "{stem} FAILED: {} error(s), {displays} displays, sim_time={sim_time_ns} ns",
+            failures.len()
         )
     };
     // The summary goes through the log both for the file and the stream.
     let summary_line = TbLogLine {
         time_ns: sim_time_ns,
-        sev: if passed { TbSev::Info } else { TbSev::Error },
+        sev: if passed {
+            TbSev::Info
+        } else if stopped_by_user {
+            TbSev::Warning
+        } else {
+            TbSev::Error
+        },
         text: summary.clone(),
     };
     {
@@ -2429,6 +2490,7 @@ pub fn run_testbench(
     full_log.push(summary_line);
     Ok(TbOutcome {
         passed,
+        stopped: stopped_by_user,
         sim_time_ns,
         failures,
         displays,
@@ -2437,6 +2499,8 @@ pub fn run_testbench(
         log: full_log,
         summary,
         runtime_ms,
+        dut_module: prog.dut_module.clone(),
+        dut_instance: prog.dut_instance.clone(),
     })
 }
 
@@ -2884,6 +2948,9 @@ pub struct TbRunRequest {
     pub sel: String,
     pub vcd: bool,
     pub tx: mpsc::Sender<TbStreamEvent>,
+    /// Stop flag: the app holds a clone and `tb_stop` sets it; the
+    /// engine-thread interpreter polls it.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Clone for TbRunRequest {
@@ -2892,6 +2959,7 @@ impl Clone for TbRunRequest {
             sel: self.sel.clone(),
             vcd: self.vcd,
             tx: self.tx.clone(),
+            cancel: self.cancel.clone(),
         }
     }
 }
@@ -3026,7 +3094,7 @@ endmodule
         write_file(&d, "and_dut.sv", AND_DUT);
         let tb = write_file(&d, "and_dut_tb.sv", AND_TB_PASS);
         let (tx, rx) = mpsc::channel();
-        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS };
+        let cfg = TbRunConfig { tb_path: tb, vcd: true, max_units: TB_DEFAULT_MAX_UNITS, cancel: None };
         let out = run_testbench(&cfg, Some(&tx)).unwrap();
         assert!(out.passed, "failures: {:?}", out.failures);
         assert!(out.failures.is_empty());
@@ -3080,6 +3148,35 @@ endmodule
         assert_eq!(f.line, 10, "failure: {f:?}");
         assert!(f.message.contains("boom y=0"), "{f:?}");
         assert!(out.vcd_path.is_none(), "vcd off by default");
+        // Failure UX: assertion message + sim time + relevant signals + instance.
+        assert!(f.time_ns > 0, "{f:?}");
+        assert!(!f.signals.is_empty(), "failure must snapshot DUT ports");
+        assert_eq!(f.instance, "dut");
+        assert!(
+            f.signals.iter().any(|(n, v)| n == "dut.y" && *v == 0),
+            "signals: {:?}",
+            f.signals
+        );
+        assert!(out.dut_module == "and_dut" && out.dut_instance == "dut");
+    }
+
+    #[test]
+    fn run_cancel_before_start_reports_stopped() {
+        let d = tmp_dir("cancel");
+        write_file(&d, "and_dut.sv", AND_DUT);
+        let tb = write_file(&d, "and_dut_tb.sv", AND_TB_PASS);
+        let cancel = Arc::new(AtomicBool::new(true)); // stop before it starts
+        let cfg = TbRunConfig {
+            tb_path: tb,
+            vcd: false,
+            max_units: TB_DEFAULT_MAX_UNITS,
+            cancel: Some(cancel),
+        };
+        let out = run_testbench(&cfg, None).unwrap();
+        assert!(out.stopped, "outcome: {:?}", out.summary);
+        assert!(!out.passed);
+        assert!(out.summary.contains("STOPPED"), "{:?}", out.summary);
+        assert!(out.failures.is_empty(), "stop is not a failure");
     }
 
     #[test]
@@ -3100,7 +3197,7 @@ endmodule
             "and_dut_tb.sv",
             "module and_dut_tb;\nlogic clk;\nand_dut dut (.clk(clk), .a(clk), .b(clk), .y(clk));\nalways #5 clk = ~clk;\ninitial begin\n#100000000;\n$finish;\nend\nendmodule\n",
         );
-        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100 };
+        let cfg = TbRunConfig { tb_path: tb, vcd: false, max_units: 100, cancel: None };
         let e = run_testbench(&cfg, None).unwrap_err();
         assert!(e.msg.contains("timed out"), "{e}");
     }
