@@ -25,12 +25,16 @@ mod commands;
 mod dashboard;
 #[path = "helion-ide/flow_nav.rs"]
 mod flow_nav;
+#[path = "helion-ide/hierarchy.rs"]
+mod hierarchy;
 #[path = "helion-ide/highlight.rs"]
 mod highlight;
 #[path = "helion-ide/icons.rs"]
 mod icons;
 #[path = "helion-ide/layouts.rs"]
 mod layouts;
+#[path = "helion-ide/schem_lod.rs"]
+mod schem_lod;
 #[path = "helion-ide/theme.rs"]
 mod theme;
 #[path = "helion-ide/toasts.rs"]
@@ -3538,126 +3542,8 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     }
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.horizontal(|ui| {
-        ui.heading("Hierarchy");
-        ui.add_space(12.0);
-        if ui.button("Show in Schematic").clicked() {
-            let _ = model.exec("open_hierarchy_sheet");
-        }
-    });
-    let drawing = model.hierarchy.drawing_arc();
-    ui.label(
-        RichText::new(format!(
-            "{} blocks · {}×{}",
-            drawing.boxes.len(),
-            drawing.width as i32,
-            drawing.height as i32
-        ))
-        .small()
-        .weak(),
-    );
-    let selected = model.selected.clone();
-    let mut pick = None;
-    let avail = ui.available_size();
-    let view_w = avail.x.max(80.0);
-    let view_h = chrome::pane_view_h(avail.y);
-    let fit = chrome::hierarchy_fit(drawing.width, drawing.height, view_w, view_h);
-    egui::ScrollArea::both()
-        .id_salt("hierarchy_die_scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let size = egui::vec2(fit.drawn_w.max(view_w), fit.drawn_h.max(view_h));
-            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-            if ui.is_rect_visible(rect) {
-                let p = ui.painter();
-                p.rect_filled(rect, 0.0, theme.die_bg);
-                let o = rect.min;
-                let sx = fit.scale_x;
-                let sy = fit.scale_y;
-                // Outer boxes first so nested leaves paint on top.
-                let mut ordered: Vec<_> = drawing.boxes.iter().collect();
-                ordered.sort_by(|a, b| (b.w * b.h).partial_cmp(&(a.w * a.h)).unwrap());
-                for b in ordered {
-                    let r = egui::Rect::from_min_size(
-                        egui::pos2(o.x + b.x * sx, o.y + b.y * sy),
-                        egui::vec2((b.w * sx).max(8.0), (b.h * sy).max(8.0)),
-                    );
-                    if !r.intersects(ui.clip_rect()) {
-                        continue;
-                    }
-                    let on = selected.as_deref() == Some(b.name.as_str());
-                    let fill = if b.kind == "module" {
-                        theme.surface
-                    } else if b.kind.starts_with("instance:") || b.kind == "leaves" {
-                        theme.surface
-                    } else {
-                        theme.gold.gamma_multiply(0.3)
-                    };
-                    p.rect_filled(r, 2.0, fill);
-                    p.rect_stroke(
-                        r,
-                        2.0,
-                        Stroke::new(
-                            if on { 2.0_f32 } else { 1.0_f32 },
-                            if on { theme.gold } else { theme.faint },
-                        ),
-                        egui::StrokeKind::Inside,
-                    );
-                    p.text(
-                        egui::pos2(r.left() + 6.0, r.top() + 3.0),
-                        egui::Align2::LEFT_TOP,
-                        &b.name,
-                        egui::FontId::monospace(10.0),
-                        theme.text,
-                    );
-                    p.text(
-                        egui::pos2(r.right() - 6.0, r.top() + 3.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{}", b.cells),
-                        egui::FontId::monospace(10.0),
-                        theme.dim,
-                    );
-                    if !b.kind.starts_with("instance:") && b.kind != "module" && b.kind != "leaves"
-                    {
-                        p.text(
-                            r.center() + egui::vec2(0.0, 6.0),
-                            egui::Align2::CENTER_CENTER,
-                            &b.kind,
-                            egui::FontId::monospace(9.0),
-                            theme.info,
-                        );
-                    }
-                }
-            }
-            if resp.clicked() || resp.double_clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let lx = (pos.x - rect.left()) / fit.scale_x.max(0.01);
-                    let ly = (pos.y - rect.top()) / fit.scale_y.max(0.01);
-                    // Prefer the smallest containing box (leaf over parent).
-                    let mut hit: Option<&helion_gui::HierBox> = None;
-                    for b in &drawing.boxes {
-                        if lx >= b.x && lx <= b.x + b.w && ly >= b.y && ly <= b.y + b.h {
-                            match hit {
-                                None => hit = Some(b),
-                                Some(h) if b.w * b.h < h.w * h.h => hit = Some(b),
-                                _ => {}
-                            }
-                        }
-                    }
-                    if let Some(b) = hit {
-                        pick = Some(b.name.clone());
-                        if resp.double_clicked() {
-                            let _ = model.exec(&format!("open_hierarchy_sheet {}", b.name));
-                        }
-                    }
-                }
-            }
-        });
-    if let Some(id) = pick {
-        model.select(&id);
-    }
+    hierarchy::paint_hierarchy(ui, model, theme);
 }
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
@@ -6241,9 +6127,19 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         model.schematic.apply_zoom_fit(sheet.width, sheet.height);
     } else if zoom_in {
         model.workspace = WorkspaceTab::Schematic;
-        model
-            .schematic
-            .zoom_at(1.35, canvas.x * 0.5, canvas.y * 0.5);
+        if cam0.zoom < schem_lod::BLOCK_ZOOM {
+            // In the block treemap the camera is at fit zoom; a relative
+            // zoom would never cross the LOD threshold, so jump straight
+            // to the gate sheet at a readable zoom, centered.
+            let z1 = 0.75_f32;
+            model.schematic.camera.zoom = z1;
+            model.schematic.camera.pan_x = canvas.x * 0.5 - (sheet.width * 0.5) * z1;
+            model.schematic.camera.pan_y = canvas.y * 0.5 - (sheet.height * 0.5) * z1;
+        } else {
+            model
+                .schematic
+                .zoom_at(1.35, canvas.x * 0.5, canvas.y * 0.5);
+        }
     } else if zoom_out {
         model.workspace = WorkspaceTab::Schematic;
         // Reset pan. zoom_at around the pane center clipped PORT_OUT on the right.
@@ -6264,7 +6160,16 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             let vx = pos.x - rect.left();
             let vy = pos.y - rect.top();
             if (zoom_delta - 1.0).abs() > 0.001 {
-                model.schematic.zoom_at(zoom_delta, vx, vy);
+                if model.schematic.camera.zoom < schem_lod::BLOCK_ZOOM && zoom_delta > 1.0 {
+                    // Pinching out of the block treemap: jump to gates.
+                    let z1 = 0.75_f32;
+                    let sheet = model.schematic.drawing_arc();
+                    model.schematic.camera.zoom = z1;
+                    model.schematic.camera.pan_x = canvas.x * 0.5 - (sheet.width * 0.5) * z1;
+                    model.schematic.camera.pan_y = canvas.y * 0.5 - (sheet.height * 0.5) * z1;
+                } else {
+                    model.schematic.zoom_at(zoom_delta, vx, vy);
+                }
             } else if (mods.command || mods.ctrl) && scroll.y.abs() > 0.1 {
                 let f = (1.0 + scroll.y * 0.004).clamp(0.5, 1.8);
                 model.schematic.zoom_at(f, vx, vy);
@@ -6281,6 +6186,32 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     let drawing = model.schematic.drawing_arc();
     let cam = model.schematic.camera;
     let z = cam.zoom.max(0.05);
+    // Level-of-detail: below BLOCK_ZOOM the sheet renders a treemap of
+    // hierarchical blocks instead of 15k individual gates (wire grid).
+    // Block mode needs at least 2 blocks to be meaningful.
+    let mut block_layer: Option<schem_lod::BlockLayer> = None;
+    if z < schem_lod::BLOCK_ZOOM {
+        let layer_id = egui::Id::new("schem_block_layer");
+        let key = (
+            std::sync::Arc::as_ptr(&drawing) as usize,
+            model.schematic.instances.len(),
+            drawing.symbols.len(),
+        );
+        let cached: Option<((usize, usize, usize), schem_lod::BlockLayer)> =
+            ui.ctx().data_mut(|d| d.get_temp(layer_id));
+        let layer = match cached {
+            Some((k, l)) if k == key => l,
+            _ => {
+                let top = model.hierarchy.top.as_deref().unwrap_or("(top)");
+                let l = schem_lod::build_block_layer(&drawing, &model.schematic.instances, top);
+                ui.ctx().data_mut(|d| d.insert_temp(layer_id, (key, l.clone())));
+                l
+            }
+        };
+        if layer.blocks.len() >= 2 {
+            block_layer = Some(layer);
+        }
+    }
     if ui.is_rect_visible(rect) {
         let p = ui.painter().with_clip_rect(rect);
         p.rect_filled(rect, 0.0, theme.die_bg);
@@ -6292,6 +6223,9 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         let pin_fs = 9.0 * z;
         let show_names = true;
         let show_pins = pin_fs >= 6.5;
+        if let Some(layer) = &block_layer {
+            schem_lod::paint_block_layer(&p, rect, layer, theme, selected.as_deref());
+        } else {
         for w in &drawing.wires {
             if w.points.len() < 2 {
                 continue;
@@ -6486,8 +6420,24 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                 }
             }
         }
+        }
         if resp.clicked() || resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some(layer) = &block_layer {
+                    // Block treemap: hit-test in view space. Single-click
+                    // selects (cross-probes); double-click drills into the
+                    // instance via Expand Inside.
+                    if let Some(i) = schem_lod::hit_block(layer, rect, pos) {
+                        let name = layer.blocks[i].name.clone();
+                        pick = Some(name.clone());
+                        if resp.double_clicked() && !layer.blocks[i].is_top {
+                            if model.schematic.is_instance(&name) {
+                                let _ = model.expand_inside(&name);
+                                model.schematic.zoom_fit();
+                            }
+                        }
+                    }
+                } else {
                 let lx = (pos.x - rect.left() - cam.pan_x) / z;
                 let ly = (pos.y - rect.top() - cam.pan_y) / z;
                 for sy in drawing.symbols.iter().rev() {
@@ -6529,6 +6479,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                     if let Some((_, net)) = best {
                         pick = Some(net);
                     }
+                }
                 }
             }
         }
