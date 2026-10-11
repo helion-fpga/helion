@@ -9,6 +9,7 @@
 
 mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
+mod aig_opt;
 
 use helion_ir::{Cell, CellKind, Design, Endpoint, Net, PortDir};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -41,12 +42,17 @@ pub enum Expr<'a> {
 }
 
 /// AIG: node 0 is const0. Edges are (node, inverted).
+///
+/// `and_hash` is structural hashing: canonically-ordered AND input pairs map
+/// to the existing node id, so identical subfunctions share one node
+/// (ABC `fraig`-lite). Safe by construction — same inputs, same function.
 #[derive(Clone, Debug)]
 pub struct Aig {
     pub pis: Vec<String>,
     pi_ix: HashMap<String, u32>,
     pub ands: Vec<(Lit, Lit)>,
     pub output: Lit,
+    and_hash: HashMap<(u32, bool, u32, bool), u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +86,7 @@ impl Aig {
             pi_ix: HashMap::new(),
             ands: Vec::new(),
             output: Lit::c0(),
+            and_hash: HashMap::new(),
         };
         // Allocate every PI first so AND node ids (1+n_pis+i) cannot collide
         // with later PIs — that collision folded `q2 ^ (q0 & q1)` to const 0.
@@ -118,7 +125,26 @@ impl Aig {
         }
     }
 
-    fn and_lit(&mut self, a: Lit, b: Lit) -> Lit {
+    /// Empty AIG over an existing PI list (rewrite passes rebuild into this).
+    pub(crate) fn with_pis(pis: Vec<String>) -> Self {
+        let pi_ix: HashMap<String, u32> =
+            pis.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
+        Self {
+            pis,
+            pi_ix,
+            ands: Vec::new(),
+            output: Lit::c0(),
+            and_hash: HashMap::new(),
+        }
+    }
+
+    /// Intern a PI by name (FM-HEL-AREA-05: cross-cone merge needs shared PI
+    /// ids across cones; `from_expr`'s private `pi` is per-cone).
+    pub(crate) fn pi_lit(&mut self, name: &str) -> Lit {
+        self.pi(name)
+    }
+
+    pub(crate) fn and_lit(&mut self, a: Lit, b: Lit) -> Lit {
         if a.node == 0 && !a.inv {
             return Lit::c0();
         }
@@ -131,11 +157,22 @@ impl Aig {
         if b.node == 0 && b.inv {
             return a;
         }
-        self.ands.push((a, b));
-        Lit {
-            node: 1 + self.pis.len() as u32 + (self.ands.len() as u32 - 1),
-            inv: false,
+        // Structural hashing: identical (node, polarity) input pairs share
+        // one AND node. Canonical order keeps the table deterministic.
+        let ka = (a.node, a.inv);
+        let kb = (b.node, b.inv);
+        let key = if ka <= kb {
+            (ka.0, ka.1, kb.0, kb.1)
+        } else {
+            (kb.0, kb.1, ka.0, ka.1)
+        };
+        if let Some(&n) = self.and_hash.get(&key) {
+            return Lit { node: n, inv: false };
         }
+        self.ands.push((a, b));
+        let n = 1 + self.pis.len() as u32 + (self.ands.len() as u32 - 1);
+        self.and_hash.insert(key, n);
+        Lit { node: n, inv: false }
     }
 
     fn expr(&mut self, e: &Expr<'_>) -> Lit {
@@ -164,7 +201,7 @@ impl Aig {
         }
     }
 
-    fn eval_lit(&self, lit: Lit, pi_bits: u64) -> bool {
+    pub(crate) fn eval_lit(&self, lit: Lit, pi_bits: u64) -> bool {
         let mut memo: HashMap<u32, bool> = HashMap::new();
         self.eval_lit_memo(lit, pi_bits, &mut memo)
     }
@@ -10610,9 +10647,16 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
 /// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
 /// printed `node_count` once per bit then spun in `map_wide_cone` until the
 /// 90s kill. Modest cones still lower; over this, one diagnostic and stop.
-const WIDE_CONE_PI_CAP: usize = 16;
+// FM-HEL-AREA-03: module cap raised 128->4096. The per-cone caps (PI/AND)
+/// are the real hang guard (map_wide_cone is O(ANDs) per cone). The module
+// backstop at 128 dropped bit 15 of a plain 16-bit counter: carry cones
+// accumulate ~N^2/2 ANDs across bits (16b needs ~135). 4096 fits 64-bit
+// counters with headroom while still catching pathological modules.
+// (PI cap also raised 16->32: a 16b counter MSB needs 17 PIs with ~20 ANDs;
+// narrow-but-wide cones are not a hang risk.)
+const WIDE_CONE_PI_CAP: usize = 32;
 const WIDE_CONE_AND_CAP: usize = 96;
-const WIDE_CONE_MODULE_LUT_CAP: usize = 128;
+const WIDE_CONE_MODULE_LUT_CAP: usize = 4096;
 const ASSIGN_BIT_CAP: usize = 2048;
 
 fn comb_accept(comb_bits: &[(String, Expr)], bitn: &str, capped: &mut bool) -> bool {
@@ -10679,6 +10723,10 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
     walk(e, &mut vars, &mut budget, n)
 }
 
+/// LUT6 INIT for O = I0 (identity buffer), shared by the mapper's
+/// buffer-threading in `LutShare::lut6` (FM-HEL-AREA-03).
+const BUF_INIT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+
 /// LUT6 identity: same INIT + pin nets → one cell. Intermediates (`out=None`)
 /// share; a required output net always gets its own driver (no pin alias).
 struct LutShare {
@@ -10702,6 +10750,22 @@ impl LutShare {
         init: u64,
         pins: &[String],
     ) -> String {
+        // FM-HEL-AREA-03: identity buffer (O = I0) — thread the input net to
+        // the use site instead of materializing a cell. The mapper chooses
+        // lut6_buf() by construction, so unlike a netlist bypass there is no
+        // polarity to misidentify (round-1's hazard was a *misidentified
+        // inverter*, not a true buffer). Safe only when no name contract
+        // requires driving `out`: with out=None the caller uses the returned
+        // net; with out=Some(o), o==pin the net is already driven. When
+        // out=Some(o), o!=pin (comb-path RTL nets referenced by name
+        // elsewhere) we must drive `o` — fall through and materialize.
+        if init == BUF_INIT && pins.len() == 1 {
+            match out {
+                None => return pins[0].clone(),
+                Some(o) if o == pins[0] => return pins[0].clone(),
+                _ => {}
+            }
+        }
         let key = (init, pins.to_vec());
         if out.is_none() {
             if let Some(existing) = self.by_fn.get(&key) {
@@ -11099,18 +11163,19 @@ fn try_map_and_or_mix(
 }
 
 /// Sequential / leftover comb cone that is too wide for one LUT6 but is an
-/// ITE / OR-of-eq / AND-OR mix. Returns true if `out` is driven.
+/// ITE / OR-of-eq / AND-OR mix. Returns the net driving the cone result.
+/// Takes no `out` name: the caller connects the returned net (FM-HEL-AREA-03),
+/// so identity buffers are threaded through instead of materialized.
 fn try_map_wide_bool(
     d: &mut Design,
     expr: &Expr,
     prefix: &str,
-    out: Option<&str>,
     share: &mut LutShare,
-) -> bool {
-    try_map_xnor_and_tree(d, expr, prefix, out, share).is_some()
-        || try_map_ite_const_tree(d, expr, prefix, out, share).is_some()
-        || try_map_or_eq_tree(d, expr, prefix, out, share).is_some()
-        || try_map_and_or_mix(d, expr, prefix, out, share).is_some()
+) -> Option<String> {
+    try_map_xnor_and_tree(d, expr, prefix, None, share)
+        .or_else(|| try_map_ite_const_tree(d, expr, prefix, None, share))
+        .or_else(|| try_map_or_eq_tree(d, expr, prefix, None, share))
+        .or_else(|| try_map_and_or_mix(d, expr, prefix, None, share))
 }
 
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
@@ -11429,15 +11494,111 @@ fn try_map_ite_const_tree(
 /// single-LUT6 path so gold INIT patterns do not move.
 /// Caller must refuse `wide_aig_over_cap` before calling; this does not invent
 /// a partial cone past the and/PI cap.
-fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> String {
+/// Build a LUT6 INIT for the AND of `invs.len()` literals, literal i
+/// inverted iff `invs[i]`. Periodic in unused upper addresses.
+fn lut6_and_invs(invs: &[bool]) -> u64 {
+    let k = invs.len().min(6);
+    if k == 0 {
+        return u64::MAX;
+    }
+    let mut init = 0u64;
+    for addr in 0..64u64 {
+        let mut ok = true;
+        for (i, inv) in invs.iter().take(k).enumerate() {
+            let bit = (addr >> i) & 1 == 1;
+            if bit == *inv {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            init |= 1u64 << addr;
+        }
+    }
+    init
+}
+
+/// Emit one LUT6 cell. Returns the driven net name.
+fn emit_and(
+    d: &mut Design,
+    prefix: &str,
+    n_lut: &mut usize,
+    pins: &[String],
+    invs: &[bool],
+    o_inv: bool,
+    out_net: Option<&str>,
+) -> String {
+    let cell = format!("{prefix}l{n_lut}");
+    let out = match out_net {
+        Some(n) => n.to_string(),
+        None => format!("{prefix}n{n_lut}"),
+    };
+    *n_lut += 1;
+    let mut init = lut6_and_invs(invs);
+    if o_inv {
+        init = !init;
+    }
+    d.add_cell(&cell, CellKind::Lut6 { init });
+    d.connect(&out, &cell, "O");
+    for (i, p) in pins.iter().enumerate() {
+        d.connect(p, &cell, format!("I{i}"));
+    }
+    out
+}
+
+/// Collect the leaf literals of the AND-tree rooted at `lit`, descending
+/// through single-fanout non-inverted non-output AND nodes (they merge into
+/// the parent LUT). Stops at PIs, consts, inverted lits, multi-fanout nodes
+/// and cone-output nodes — all of which must already have nets.
+fn flatten_and(
+    aig: &Aig,
+    lit: Lit,
+    fo: &[u32],
+    n_pi: usize,
+    out_nodes: &HashSet<u32>,
+    leaves: &mut Vec<Lit>,
+    const0: &mut bool,
+) {
+    if *const0 {
+        return;
+    }
+    if lit.node == 0 {
+        if !lit.inv {
+            *const0 = true;
+        }
+        return;
+    }
+    if (lit.node as usize) <= n_pi {
+        leaves.push(lit);
+        return;
+    }
+    let ai = (lit.node as usize) - 1 - n_pi;
+    if lit.inv || fo.get(ai).copied().unwrap_or(0) > 1 || out_nodes.contains(&lit.node) {
+        leaves.push(lit);
+        return;
+    }
+    let (a, b) = aig.ands[ai];
+    flatten_and(aig, a, fo, n_pi, out_nodes, leaves, const0);
+    flatten_and(aig, b, fo, n_pi, out_nodes, leaves, const0);
+}
+
+fn net_of(aig: &Aig, node: u32, node_net: &HashMap<u32, String>) -> String {
+    if (node as usize) <= aig.pis.len() {
+        return aig.pis[(node as usize) - 1].clone();
+    }
+    node_net.get(&node).cloned().unwrap_or_default()
+}
+
+/// Fanout counts per AND node, plus the inverted-use mask (FM-HEL-AREA-05:
+/// nodes consumed with inversion need their own LUT/net — see below).
+/// `extra`: additional literals whose fanout/inversion counts (outputs).
+fn aig_fanout(aig: &Aig, extra: &[Lit]) -> (Vec<u32>, Vec<bool>) {
     let n_pi = aig.pis.len();
     let n_and = aig.ands.len();
     let mut fo = vec![0u32; n_and];
+    let mut used_inv = vec![false; n_and];
     let mut bump = |lit: Lit| {
-        if lit.node == 0 {
-            return;
-        }
-        if (lit.node as usize) <= n_pi {
+        if lit.node == 0 || (lit.node as usize) <= n_pi {
             return;
         }
         let ai = (lit.node as usize) - 1 - n_pi;
@@ -11445,156 +11606,111 @@ fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> 
             fo[ai] = fo[ai].saturating_add(1);
         }
     };
+    let mut mark_inv = |lit: Lit| {
+        if lit.node != 0 && (lit.node as usize) > n_pi && lit.inv {
+            let ai = (lit.node as usize) - 1 - n_pi;
+            if ai < used_inv.len() {
+                used_inv[ai] = true;
+            }
+        }
+    };
     for &(a, b) in &aig.ands {
         bump(a);
         bump(b);
+        mark_inv(a);
+        mark_inv(b);
     }
-    bump(aig.output);
+    for &o in extra {
+        bump(o);
+        mark_inv(o);
+    }
+    (fo, used_inv)
+}
 
-    fn lut6_and_invs(invs: &[bool]) -> u64 {
-        let k = invs.len().min(6);
-        if k == 0 {
-            return u64::MAX;
-        }
-        let mut init = 0u64;
-        for addr in 0..64u64 {
-            let mut ok = true;
-            for (i, inv) in invs.iter().take(k).enumerate() {
-                let bit = (addr >> i) & 1 == 1;
-                if bit == *inv {
-                    ok = false;
-                    break;
-                }
+/// Emit one AND node as LUT6(s), flattening its single-fanout AND-tree.
+/// `drive`: required net name, or None for auto. `o_inv`: complement INIT.
+/// Returns the driven net. Caller records it in `node_net`.
+/// Complexity: O(leaves) per call; each node emitted once.
+fn emit_aig_node(
+    d: &mut Design,
+    aig: &Aig,
+    prefix: &str,
+    node: u32,
+    o_inv: bool,
+    drive: Option<&str>,
+    node_net: &HashMap<u32, String>,
+    fo: &[u32],
+    n_pi: usize,
+    out_nodes: &HashSet<u32>,
+    n_lut: &mut usize,
+) -> String {
+    let ai = (node as usize) - 1 - n_pi;
+    let (a, b) = aig.ands[ai];
+    let mut leaves = Vec::new();
+    let mut const0 = false;
+    flatten_and(aig, a, fo, n_pi, out_nodes, &mut leaves, &mut const0);
+    flatten_and(aig, b, fo, n_pi, out_nodes, &mut leaves, &mut const0);
+    if const0 {
+        return emit_and(d, prefix, n_lut, &[], &[], !o_inv, drive);
+    }
+    let mut uniq: Vec<Lit> = Vec::new();
+    let mut zero = false;
+    for lit in leaves {
+        if let Some(prev) = uniq.iter().find(|p| p.node == lit.node) {
+            if prev.inv != lit.inv {
+                zero = true;
+                break;
             }
-            if ok {
-                init |= 1u64 << addr;
-            }
+            continue;
         }
-        init
+        uniq.push(lit);
     }
+    if zero {
+        return emit_and(d, prefix, n_lut, &[], &[], !o_inv, drive);
+    }
+    let mut level: Vec<(String, bool)> = uniq
+        .iter()
+        .map(|l| (net_of(aig, l.node, node_net), l.inv))
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    while level.len() > 6 {
+        let chunk: Vec<(String, bool)> = level.drain(0..6).collect();
+        let pins: Vec<String> = chunk.iter().map(|(n, _)| n.clone()).collect();
+        let invs: Vec<bool> = chunk.iter().map(|(_, i)| *i).collect();
+        let net = emit_and(d, prefix, n_lut, &pins, &invs, false, None);
+        level.push((net, false));
+    }
+    if level.is_empty() {
+        return emit_and(d, prefix, n_lut, &[], &[], o_inv, drive);
+    }
+    let pins: Vec<String> = level.iter().map(|(n, _)| n.clone()).collect();
+    let invs: Vec<bool> = level.iter().map(|(_, i)| *i).collect();
+    emit_and(d, prefix, n_lut, &pins, &invs, o_inv, drive)
+}
 
-    fn emit_and(
-        d: &mut Design,
-        prefix: &str,
-        n_lut: &mut usize,
-        pins: &[String],
-        invs: &[bool],
-        o_inv: bool,
-        out_net: Option<&str>,
-    ) -> String {
-        let cell = format!("{prefix}l{n_lut}");
-        let out = match out_net {
-            Some(n) => n.to_string(),
-            None => format!("{prefix}n{n_lut}"),
-        };
-        *n_lut += 1;
-        let mut init = lut6_and_invs(invs);
-        if o_inv {
-            init = !init;
-        }
-        d.add_cell(&cell, CellKind::Lut6 { init });
-        d.connect(&out, &cell, "O");
-        for (i, p) in pins.iter().enumerate() {
-            d.connect(p, &cell, format!("I{i}"));
-        }
-        out
-    }
-
-    fn flatten_and(
-        aig: &Aig,
-        lit: Lit,
-        fo: &[u32],
-        n_pi: usize,
-        leaves: &mut Vec<Lit>,
-        const0: &mut bool,
-    ) {
-        if *const0 {
-            return;
-        }
-        if lit.node == 0 {
-            if !lit.inv {
-                *const0 = true;
-            }
-            return;
-        }
-        if (lit.node as usize) <= n_pi {
-            leaves.push(lit);
-            return;
-        }
-        let ai = (lit.node as usize) - 1 - n_pi;
-        if lit.inv || fo.get(ai).copied().unwrap_or(0) > 1 {
-            leaves.push(lit);
-            return;
-        }
-        let (a, b) = aig.ands[ai];
-        flatten_and(aig, a, fo, n_pi, leaves, const0);
-        flatten_and(aig, b, fo, n_pi, leaves, const0);
-    }
-
-    fn net_of(aig: &Aig, node: u32, node_net: &HashMap<u32, String>) -> String {
-        if (node as usize) <= aig.pis.len() {
-            return aig.pis[(node as usize) - 1].clone();
-        }
-        node_net.get(&node).cloned().unwrap_or_default()
-    }
+fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> String {
+    // FM-HEL-AREA-04: ABC-style cut rewriting before mapping. This emitter
+    // turns AND nodes into LUT6s, so fewer ANDs means fewer LUTs.
+    let rewritten = aig_opt::rewrite_aig(aig);
+    let aig = &rewritten;
+    let n_pi = aig.pis.len();
+    let n_and = aig.ands.len();
+    let (fo, used_inv) = aig_fanout(aig, &[aig.output]);
+    let out_nodes: HashSet<u32> = [aig.output.node].into_iter().collect();
 
     let mut node_net: HashMap<u32, String> = HashMap::new();
     let mut n_lut = 0usize;
     for ai in 0..n_and {
         let node = 1 + n_pi as u32 + ai as u32;
-        let is_out = aig.output.node == node;
-        if fo[ai] <= 1 && !is_out {
+        let is_out = out_nodes.contains(&node);
+        if fo[ai] <= 1 && !is_out && !used_inv[ai] {
             continue;
         }
-        let (a, b) = aig.ands[ai];
-        let mut leaves = Vec::new();
-        let mut const0 = false;
-        flatten_and(aig, a, &fo, n_pi, &mut leaves, &mut const0);
-        flatten_and(aig, b, &fo, n_pi, &mut leaves, &mut const0);
         let o_inv = is_out && aig.output.inv;
         let drive = if is_out { out } else { None };
-        if const0 {
-            let net = emit_and(d, prefix, &mut n_lut, &[], &[], !o_inv, drive);
-            node_net.insert(node, net);
-            continue;
-        }
-        let mut uniq: Vec<Lit> = Vec::new();
-        let mut zero = false;
-        for lit in leaves {
-            if let Some(prev) = uniq.iter().find(|p| p.node == lit.node) {
-                if prev.inv != lit.inv {
-                    zero = true;
-                    break;
-                }
-                continue;
-            }
-            uniq.push(lit);
-        }
-        if zero {
-            let net = emit_and(d, prefix, &mut n_lut, &[], &[], !o_inv, drive);
-            node_net.insert(node, net);
-            continue;
-        }
-        let mut level: Vec<(String, bool)> = uniq
-            .iter()
-            .map(|l| (net_of(aig, l.node, &node_net), l.inv))
-            .filter(|(n, _)| !n.is_empty())
-            .collect();
-        while level.len() > 6 {
-            let chunk: Vec<(String, bool)> = level.drain(0..6).collect();
-            let pins: Vec<String> = chunk.iter().map(|(n, _)| n.clone()).collect();
-            let invs: Vec<bool> = chunk.iter().map(|(_, i)| *i).collect();
-            let net = emit_and(d, prefix, &mut n_lut, &pins, &invs, false, None);
-            level.push((net, false));
-        }
-        if level.is_empty() {
-            let net = emit_and(d, prefix, &mut n_lut, &[], &[], o_inv, drive);
-            node_net.insert(node, net);
-            continue;
-        }
-        let pins: Vec<String> = level.iter().map(|(n, _)| n.clone()).collect();
-        let invs: Vec<bool> = level.iter().map(|(_, i)| *i).collect();
-        let net = emit_and(d, prefix, &mut n_lut, &pins, &invs, o_inv, drive);
+        let net = emit_aig_node(
+            d, aig, prefix, node, o_inv, drive, &node_net, &fo, n_pi, &out_nodes, &mut n_lut,
+        );
         node_net.insert(node, net);
     }
 
@@ -11619,6 +11735,218 @@ fn map_wide_cone(d: &mut Design, aig: &Aig, prefix: &str, out: Option<&str>) -> 
     }
     emit_and(d, prefix, &mut n_lut, &[], &[], true, out)
 }
+
+/// One wide cone deferred for cross-cone shared mapping (FM-HEL-AREA-05).
+/// Collected in phase 1 (reg + comb loops), mapped once in phase 2.
+struct WideCone {
+    aig: Aig,
+    req_name: Option<String>,
+    followup: WideFollowup,
+}
+
+/// What to do with a mapped cone's output net after the shared emission.
+enum WideFollowup {
+    /// Registered bit: drive the FF D pin (and mark keep/debug as before).
+    Reg {
+        ff: String,
+        qnet: String,
+        bit_clk: String,
+        bitn: String,
+    },
+    /// Combinational bit: output net already is `bitn`; nothing more.
+    Comb,
+}
+
+/// Map multiple cones through ONE global hashed AIG (FM-HEL-AREA-05).
+///
+/// `cones`: per-cone raw AIGs (as built for the wide path). They are merged
+/// (`merge_cones`) so structurally identical subfunctions across cones share
+/// one node, then `rewrite_aig_multi` + the shared emitter run over the
+/// union. `req_names`: per-cone required output net (None = auto).
+/// Returns one driven net per cone, in input order.
+///
+/// Deterministic: cone order, PI first-seen order, node-id emission order
+/// and the first-claimant-wins output rule are all fixed.
+fn map_wide_cones(
+    d: &mut Design,
+    cones: &[Aig],
+    req_names: &[Option<String>],
+    prefix: &str,
+) -> Vec<String> {
+    assert_eq!(cones.len(), req_names.len());
+    let (merged, merged_outs) = aig_opt::merge_cones(cones);
+    let (aig, outs) = aig_opt::rewrite_aig_multi(&merged, &merged_outs);
+    let n_pi = aig.pis.len();
+    let n_and = aig.ands.len();
+    let (fo, used_inv) = aig_fanout(&aig, &outs);
+    let out_nodes: HashSet<u32> = outs.iter().map(|o| o.node).collect();
+    // Nodes used as a child of another AND node. An output node with
+    // used_by_and MUST be emitted with its canonical (uncomplemented)
+    // function: internal parents flatten to it expecting exactly that, and
+    // handle edge polarity in their own INIT. (FM-HEL-AREA-05 fix: emitting
+    // such a node with a claimant's inverted polarity silently corrupted
+    // every internal user.)
+    let mut used_by_and = vec![false; n_and];
+    for &(a, b) in &aig.ands {
+        for lit in [a, b] {
+            if lit.node != 0 && (lit.node as usize) > n_pi {
+                let ai = (lit.node as usize) - 1 - n_pi;
+                if ai < n_and {
+                    used_by_and[ai] = true;
+                }
+            }
+        }
+    }
+
+    if std::env::var("HELION_AREA_STATS").is_ok() {
+        let raw: usize = cones.iter().map(|c| c.ands.len()).sum();
+        eprintln!(
+            "HELION_AREA_STATS cones={} raw_ands={} merged_ands={} rewritten_ands={}",
+            cones.len(),
+            raw,
+            merged.ands.len(),
+            n_and
+        );
+    }
+
+    // Per-cone output plan. Const/PI outputs need no shared LUT (handled
+    // inline like the single-output tail). AND outputs claim (node -> net).
+    // A node used inside other logic (canonical) is emitted once with its
+    // true function; inverted claimants get a duplicate top LUT. A node used
+    // ONLY as an output takes the first claimant's polarity (single-path
+    // rule); later cones with a different polarity or required name get a
+    // duplicate top LUT (1 extra LUT, still correct).
+    struct OutClaim {
+        net: String,
+        inv: bool,
+        canonical: bool,
+    }
+    enum Plan {
+        Const(bool),
+        Pi(String, bool),
+        UseClaimed(u32),
+        DupTop(u32, bool, String),
+    }
+    let mut plans: Vec<Plan> = Vec::with_capacity(cones.len());
+    let mut claimed: HashMap<u32, OutClaim> = HashMap::new();
+    for (ci, olit) in outs.iter().enumerate() {
+        if olit.node == 0 {
+            plans.push(Plan::Const(olit.inv));
+            continue;
+        }
+        if (olit.node as usize) <= n_pi {
+            plans.push(Plan::Pi(aig.pis[(olit.node as usize) - 1].clone(), olit.inv));
+            continue;
+        }
+        let node = olit.node;
+        let canonical = used_by_and[(node as usize) - 1 - n_pi];
+        let auto_name = || {
+            req_names[ci]
+                .clone()
+                .unwrap_or_else(|| format!("{prefix}o{ci}"))
+        };
+        if canonical {
+            let entry = claimed.entry(node).or_insert_with(|| OutClaim {
+                net: auto_name(),
+                inv: false,
+                canonical: true,
+            });
+            if !olit.inv {
+                match &req_names[ci] {
+                    None => plans.push(Plan::UseClaimed(node)),
+                    Some(n) if n == &entry.net => plans.push(Plan::UseClaimed(node)),
+                    Some(n) => plans.push(Plan::DupTop(node, false, n.clone())),
+                }
+            } else {
+                plans.push(Plan::DupTop(node, true, auto_name()));
+            }
+            continue;
+        }
+        match claimed.get(&node) {
+            Some(e) if e.inv == olit.inv => match &req_names[ci] {
+                None => plans.push(Plan::UseClaimed(node)),
+                Some(n) if n == &e.net => plans.push(Plan::UseClaimed(node)),
+                Some(n) => plans.push(Plan::DupTop(node, olit.inv, n.clone())),
+            },
+            Some(_) => plans.push(Plan::DupTop(node, olit.inv, auto_name())),
+            None => {
+                claimed.insert(
+                    node,
+                    OutClaim {
+                        net: auto_name(),
+                        inv: olit.inv,
+                        canonical: false,
+                    },
+                );
+                plans.push(Plan::UseClaimed(node));
+            }
+        }
+    }
+
+    let mut node_net: HashMap<u32, String> = HashMap::new();
+    let mut n_lut = 0usize;
+    // Phase 1: every AND node in id order (children before parents, so a
+    // node flattening through another cone's output always finds its net).
+    // Internal single-fanout non-inverted nodes are skipped (flattened into
+    // their parent); outputs are always emitted.
+    for ai in 0..n_and {
+        let node = 1 + n_pi as u32 + ai as u32;
+        let is_out = out_nodes.contains(&node);
+        if fo[ai] <= 1 && !is_out && !used_inv[ai] {
+            continue;
+        }
+        let (o_inv, drive) = if is_out {
+            let c = &claimed[&node];
+            let inv = if c.canonical { false } else { c.inv };
+            (inv, Some(c.net.as_str()))
+        } else {
+            (false, None)
+        };
+        let net = emit_aig_node(
+            d, &aig, prefix, node, o_inv, drive, &node_net, &fo, n_pi, &out_nodes, &mut n_lut,
+        );
+        node_net.insert(node, net);
+    }
+    // Phase 2: duplicate top LUTs (polarity/name conflicts), const/PI
+    // outputs, then resolve each cone's net.
+    let mut cone_net: Vec<String> = vec![String::new(); cones.len()];
+    for (ci, plan) in plans.iter().enumerate() {
+        match plan {
+            Plan::Const(inv) => {
+                let n = req_names[ci].clone().unwrap_or_else(|| format!("{prefix}o{ci}"));
+                cone_net[ci] = emit_and(d, prefix, &mut n_lut, &[], &[], !*inv, Some(&n));
+            }
+            Plan::Pi(pi, inv) => {
+                let net = if *inv {
+                    let n = req_names[ci].clone().unwrap_or_else(|| format!("{prefix}o{ci}"));
+                    emit_and(d, prefix, &mut n_lut, &[pi.clone()], &[true], false, Some(&n))
+                } else if let Some(req) = &req_names[ci] {
+                    if req != pi {
+                        emit_and(d, prefix, &mut n_lut, &[pi.clone()], &[false], false, Some(req))
+                    } else {
+                        pi.clone()
+                    }
+                } else {
+                    pi.clone()
+                };
+                cone_net[ci] = net;
+            }
+            Plan::UseClaimed(node) => {
+                cone_net[ci] = claimed[node].net.clone();
+            }
+            Plan::DupTop(node, inv, req) => {
+                // Extra top LUT with identical function, driving req.
+                // node_net keeps the canonical/shared net undisturbed.
+                cone_net[ci] = emit_aig_node(
+                    d, &aig, prefix, *node, *inv, Some(req), &node_net, &fo, n_pi,
+                    &out_nodes, &mut n_lut,
+                );
+            }
+        }
+    }
+    cone_net
+}
+
 
 /// Q net of one bit of an unpacked word. Distinct from packed `bit_name`.
 fn unpacked_word_q(mem: &str, word: usize, width: usize, bit: usize) -> String {
@@ -12743,7 +13071,7 @@ fn emit_ripple_add(d: &mut Design, rtl: &Rtl, sum: &str, width: usize, a: &str, 
 
 fn lut6_buf() -> u64 {
     // O = I0, independent of I1..I5.
-    0xAAAA_AAAA_AAAA_AAAA
+    BUF_INIT
 }
 
 fn lut6_xnor2() -> u64 {
@@ -13833,7 +14161,173 @@ fn subst_net_copies<'a>(
     walk(e, map, 0, arena)
 }
 
+/// FM-HEL-AREA-01: constant propagation for wires.
+///
+/// A wire driven by a constant `assign` is replaced by the constant at every
+/// use site. The AIG builder already folds `Expr::Const` (`and_lit` with
+/// c0/c1 identities, XNOR-with-const to wire/inverter), so this substitution
+/// is what unlocks it. Measured: `d == 16'd1250` cost 16 XNOR LUT6s plus a
+/// reduction tree (23 LUTs); after propagation it is a 3-LUT AND tree.
+///
+/// Only single-driver, non-port wires are propagated, and only when the wire
+/// is not also driven sequentially. The dead constant assigns are removed
+/// (their LHS is unreferenced after substitution). Complexity: O(8 * assigns)
+/// for the bounded fixpoint plus one walk per RExpr; runs once per module.
+/// Width of a constant-foldable RExpr, if it is syntactically constant.
+fn const_rexpr_width(e: &RExpr) -> Option<usize> {
+    match e {
+        RExpr::Const { width, .. } => Some(*width),
+        RExpr::Concat(parts) => {
+            let mut w = 0usize;
+            for p in parts {
+                w = w.saturating_add(const_rexpr_width(p)?);
+            }
+            Some(w)
+        }
+        RExpr::Not(x) => const_rexpr_width(x),
+        _ => None,
+    }
+}
+
+/// Replace references to constant-propagated wires with `Const`.
+/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
+/// (the parse lifetime) since results are stored back into the `Rtl`.
+fn subst_const_wires<'a>(
+    e: &RExpr<'a>,
+    map: &HashMap<&'a str, (u128, usize)>,
+    arena: &'a Bump,
+) -> RExpr<'a> {
+    fn walk<'a>(
+        e: &RExpr<'a>,
+        map: &HashMap<&'a str, (u128, usize)>,
+        arena: &'a Bump,
+        depth: usize,
+    ) -> RExpr<'a> {
+        if depth > 32 {
+            return e.clone();
+        }
+        let w = |x: &RExpr<'a>| walk(x, map, arena, depth + 1);
+        let mk_const = |val: u128, width: usize| RExpr::Const {
+            val: val & care_mask(width),
+            width,
+            care: care_mask(width),
+        };
+        match e {
+            RExpr::Ident(s) => match map.get(*s) {
+                Some(&(v, wd)) => mk_const(v, wd),
+                None => e.clone(),
+            },
+            RExpr::Bit(s, i) => match map.get(*s) {
+                Some(&(v, _)) => mk_const((v >> i) & 1, 1),
+                None => e.clone(),
+            },
+            RExpr::Range(s, hi, lo) => match map.get(*s) {
+                Some(&(v, _)) => {
+                    let wd = hi.saturating_sub(*lo).saturating_add(1).max(1);
+                    mk_const((v >> lo) & care_mask(wd), wd)
+                }
+                None => e.clone(),
+            },
+            RExpr::Const { .. } => e.clone(),
+            RExpr::Not(a) => RExpr::Not(arena.alloc(w(a))),
+            RExpr::And(a, b) => RExpr::And(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Or(a, b) => RExpr::Or(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Xor(a, b) => RExpr::Xor(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Add(a, b) => RExpr::Add(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Sub(a, b) => RExpr::Sub(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Mul(a, b) => RExpr::Mul(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Concat(ps) => RExpr::Concat(ps.iter().map(w).collect()),
+            RExpr::Mux(c, t, f) => RExpr::Mux(arena.alloc(w(c)), arena.alloc(w(t)), arena.alloc(w(f))),
+            RExpr::Eq(a, b) => RExpr::Eq(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Ne(a, b) => RExpr::Ne(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Lt(a, b) => RExpr::Lt(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::RedXor(a) => RExpr::RedXor(arena.alloc(w(a))),
+            RExpr::RedAnd(a) => RExpr::RedAnd(arena.alloc(w(a))),
+            RExpr::RedOr(a) => RExpr::RedOr(arena.alloc(w(a))),
+            RExpr::IndexPart { name, base, width, ascending } => {
+                let nb = w(base);
+                if let (Some(&(v, _)), Some(bv)) = (map.get(*name), rexpr_const_val(&nb)) {
+                    let b = (bv as usize).min(127);
+                    let wd = (*width).max(1);
+                    let lo = if *ascending { b } else { b.saturating_sub(wd - 1) };
+                    return mk_const((v >> lo) & care_mask(wd), wd);
+                }
+                RExpr::IndexPart { name: *name, base: arena.alloc(nb), width: *width, ascending: *ascending }
+            }
+            RExpr::WordAt { addr, data } => RExpr::WordAt { addr: arena.alloc(w(addr)), data: arena.alloc(w(data)) },
+            RExpr::Call { name, args } => RExpr::Call { name: *name, args: args.iter().map(w).collect() },
+        }
+    }
+    walk(e, map, arena, 0)
+}
+
+/// Identifiers referenced by an RExpr (for dead-assign elimination).
+fn collect_rexpr_idents<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
+    fn walk<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>, depth: usize) {
+        if depth > 32 { return; }
+        match e {
+            RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => { out.insert(*s); }
+            RExpr::Const { .. } => {}
+            RExpr::Not(a) => walk(a, out, depth + 1),
+            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Sub(a, b) | RExpr::Mul(a, b) | RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) | RExpr::Shr(a, b) | RExpr::Ashr(a, b) => { walk(a, out, depth + 1); walk(b, out, depth + 1); }
+            RExpr::Concat(ps) => { for p in ps { walk(p, out, depth + 1); } }
+            RExpr::Mux(c, t, f) => { walk(c, out, depth + 1); walk(t, out, depth + 1); walk(f, out, depth + 1); }
+            RExpr::RedXor(a) | RExpr::RedAnd(a) | RExpr::RedOr(a) => walk(a, out, depth + 1),
+            RExpr::IndexPart { name, base, .. } => { out.insert(*name); walk(base, out, depth + 1); }
+            RExpr::WordAt { addr, data } => { walk(addr, out, depth + 1); walk(data, out, depth + 1); }
+            RExpr::Call { args, .. } => { for a in args { walk(a, out, depth + 1); } }
+        }
+    }
+    walk(e, out, 0);
+}
+
+/// Propagate wire constants through a module's `assigns`/`nbas` and drop the
+/// now-dead constant assigns. See FM-HEL-AREA-01 above.
+fn propagate_const_wires<'a>(rtl: &mut Rtl<'a>, arena: &'a Bump) {
+    let port_set: HashSet<&'a str> = rtl.ports.iter().map(|(p, _, _)| *p).collect();
+    let nba_lhs: HashSet<&'a str> = rtl.nbas.iter().map(|(n, _, _)| *n).collect();
+    let mut drivers: HashMap<&'a str, usize> = HashMap::new();
+    for (lhs, _, _) in &rtl.assigns { *drivers.entry(*lhs).or_insert(0) += 1; }
+    let mut cmap: HashMap<&'a str, (u128, usize)> = HashMap::new();
+    for _ in 0..8 {
+        let mut changed = false;
+        for (lhs, bit, rhs) in &rtl.assigns {
+            if bit.is_some() || port_set.contains(*lhs) || cmap.contains_key(*lhs) || nba_lhs.contains(*lhs) { continue; }
+            if drivers.get(*lhs) != Some(&1) { continue; }
+            let sub = subst_const_wires(rhs, &cmap, arena);
+            if let Some(v) = rexpr_const_val(&sub) {
+                let width = const_rexpr_width(&sub).unwrap_or(1).clamp(1, 128);
+                cmap.insert(*lhs, (v & care_mask(width), width));
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    if cmap.is_empty() { return; }
+    for (_, _, rhs) in rtl.assigns.iter_mut() { *rhs = subst_const_wires(rhs, &cmap, arena); }
+    for (_, _, rhs) in rtl.nbas.iter_mut() { *rhs = subst_const_wires(rhs, &cmap, arena); }
+    let mut referenced: HashSet<&'a str> = HashSet::new();
+    for (_, _, rhs) in &rtl.assigns { collect_rexpr_idents(rhs, &mut referenced); }
+    for (_, _, rhs) in &rtl.nbas { collect_rexpr_idents(rhs, &mut referenced); }
+    for inst in &rtl.insts { for (_, parent) in &inst.conns { referenced.insert(*parent); } }
+    rtl.assigns.retain(|(lhs, bit, _)| {
+        if bit.is_some() || !cmap.contains_key(*lhs) { return true; }
+        if port_set.contains(*lhs) || referenced.contains(*lhs) { return true; }
+        false
+    });
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
+    // FM-HEL-AREA-01: fold constant-driven wires before mapping so the AIG
+    // builder sees `Expr::Const` (XNOR-with-const -> wire, AND-with-c0 -> c0).
+    // Const-prop rebuilds RExpr subtrees; the scratch arena is leaked so new
+    // nodes live for the parse lifetime (same pattern as the leaked source).
+    let prop_arena: &Bump = Box::leak(Box::new(Bump::new()));
+    let mut rtl_owned = rtl.clone();
+    propagate_const_wires(&mut rtl_owned, prop_arena);
+    let rtl: &Rtl = &rtl_owned;
     let mut d = Design::new(rtl.module);
     // Bump arena for transient boolean Expr trees built per bit below.
     // reg_bits/comb_bits borrow from it; all trees are consumed into the
@@ -14389,20 +14883,24 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut wide_capped = false;
     let mut wide_luts = 0usize;
     let mut share = LutShare::new();
+    // FM-HEL-AREA-05: wide cones are batched across the reg + comb loops
+    // and mapped once through a shared global AIG (cross-cone structural
+    // sharing). Phase 1 (below + comb loop) only decides; phase 2 emits.
+    let mut wide_batch: Vec<WideCone> = Vec::new();
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
-        let (ff, dnet, qnet) = if single_q {
-            ("u_ff".to_string(), "d".to_string(), "q".to_string())
+        let (ff, qnet) = if single_q {
+            ("u_ff".to_string(), "q".to_string())
         } else {
-            (format!("u_ff{i}"), format!("d{i}"), bitn.clone())
+            (format!("u_ff{i}"), bitn.clone())
         };
         let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
-        let map_seq_wide = |d: &mut Design, e: &Expr, share: &mut LutShare| -> bool {
-            try_map_wide_bool(d, e, &format!("u_sw{i}_"), Some(dnet.as_str()), share)
+        let map_seq_wide = |d: &mut Design, e: &Expr, share: &mut LutShare| -> Option<String> {
+            try_map_wide_bool(d, e, &format!("u_sw{i}_"), share)
         };
-        let emit_mapped_ff = |d: &mut Design| {
+        let emit_mapped_ff = |d: &mut Design, dnet: &str| {
             d.add_cell(&ff, CellKind::Hff);
             d.connect(&bit_clk, &ff, "CLK");
-            d.connect(&dnet, &ff, "D");
+            d.connect(dnet, &ff, "D");
             d.connect(&qnet, &ff, "Q");
             if keep_bits.contains(bitn) {
                 let _ = d.dont_touch(&ff);
@@ -14417,9 +14915,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // sibling bits (≤6-PI / ITE / xnor). Do not abort the whole module.
         let huge = expr_node_count(expr) > 8_000;
         if huge {
-            if cone_pi_exceeds(expr, 6) && map_seq_wide(&mut d, expr, &mut share) {
-                emit_mapped_ff(&mut d);
-                continue;
+            if cone_pi_exceeds(expr, 6) {
+                if let Some(dnet) = map_seq_wide(&mut d, expr, &mut share) {
+                    emit_mapped_ff(&mut d, &dnet);
+                    continue;
+                }
             }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
@@ -14427,27 +14927,37 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if wide_capped && cone_pi_exceeds(expr, 6) {
             continue;
         }
-        // >6-PI sequential: prefer packed ITE/OR-of-eq over AIG (FSM next-state
-        // can exceed AND_CAP=96 with few PIs — ibex2axi r_state_1).
-        if cone_pi_exceeds(expr, 6) && map_seq_wide(&mut d, expr, &mut share) {
-            emit_mapped_ff(&mut d);
-            continue;
-        }
+        // FM-HEL-AREA-04: prefer the rewritten AIG path for wide cones.
+        // Structural hashing in Aig shares subexpressions that the sw
+        // structural matchers duplicate on trees (measured 19-63% fewer
+        // LUTs on uart/picorv32). The sw matchers remain as fallback for
+        // cones the AIG caps refuse (hang classes).
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
-            if wide_capped
-                || wide_aig_over_cap(&aig)
-                || wide_luts.saturating_add(aig.ands.len()) > WIDE_CONE_MODULE_LUT_CAP
+            if !wide_capped
+                && !wide_aig_over_cap(&aig)
+                && wide_luts.saturating_add(aig.ands.len()) <= WIDE_CONE_MODULE_LUT_CAP
             {
-                emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
+                wide_luts = wide_luts.saturating_add(aig.ands.len());
+                wide_batch.push(WideCone {
+                    aig,
+                    req_name: None,
+                    followup: WideFollowup::Reg {
+                        ff: ff.clone(),
+                        qnet: qnet.clone(),
+                        bit_clk: bit_clk.clone(),
+                        bitn: bitn.clone(),
+                    },
+                });
                 continue;
             }
-            let wide = map_wide_cone(&mut d, &aig, &format!("u_w{i}_"), None);
-            wide_luts = wide_luts.saturating_add(aig.ands.len());
-            d.add_cell(&ff, CellKind::Hff);
-            d.connect(&bit_clk, &ff, "CLK");
-            d.connect(&wide, &ff, "D");
-            d.connect(&qnet, &ff, "Q");
+            if cone_pi_exceeds(expr, 6) {
+                if let Some(dnet) = map_seq_wide(&mut d, expr, &mut share) {
+                    emit_mapped_ff(&mut d, &dnet);
+                    continue;
+                }
+            }
+            emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
         }
         let init = aig.flowmap_lut6();
@@ -14655,8 +15165,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
                 continue;
             }
-            map_wide_cone(&mut d, &aig, &format!("u_cw{i}_"), Some(bitn));
             wide_luts = wide_luts.saturating_add(aig.ands.len());
+            wide_batch.push(WideCone {
+                aig,
+                req_name: Some(bitn.clone()),
+                followup: WideFollowup::Comb,
+            });
             continue;
         }
         let init = aig.flowmap_lut6();
@@ -14668,6 +15182,43 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         if md_bits.contains(bitn) {
             let _ = d.mark_debug(bitn);
+        }
+    }
+
+    // FM-HEL-AREA-05 phase 2: map all batched wide cones through one shared
+    // global AIG (cross-cone structural sharing), then do the per-cone
+    // follow-ups (FF hookup for reg bits; comb bits already drive bitn).
+    if !wide_batch.is_empty() {
+        let mut cones = Vec::with_capacity(wide_batch.len());
+        let mut reqs = Vec::with_capacity(wide_batch.len());
+        let mut followups = Vec::with_capacity(wide_batch.len());
+        for w in wide_batch {
+            cones.push(w.aig);
+            reqs.push(w.req_name);
+            followups.push(w.followup);
+        }
+        let nets = map_wide_cones(&mut d, &cones, &reqs, "u_wshare_");
+        for (followup, net) in followups.iter().zip(nets.iter()) {
+            match followup {
+                WideFollowup::Reg {
+                    ff,
+                    qnet,
+                    bit_clk,
+                    bitn,
+                } => {
+                    d.add_cell(ff, CellKind::Hff);
+                    d.connect(bit_clk, ff, "CLK");
+                    d.connect(net, ff, "D");
+                    d.connect(qnet, ff, "Q");
+                    if keep_bits.contains(bitn) {
+                        let _ = d.dont_touch(ff);
+                    }
+                    if md_bits.contains(bitn) {
+                        let _ = d.mark_debug(qnet);
+                    }
+                }
+                WideFollowup::Comb => {}
+            }
         }
     }
 
@@ -14798,8 +15349,33 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
             continue;
         }
+        // FM-HEL-AREA-03: whole unpacked word assign `lhs[word] = ...`
+        // (bit=Some(word), not an encoded bit). The comb lowering drives
+        // per-bit unpacked_word_q(lhs, word, w, i) nets — one IOB per bit,
+        // not a single IOB on bit_name(lhs, w, word) (never driven).
+        if let Some(b) = bit {
+            if decode_unpacked_bit(*b).is_none() {
+                let depth = sig_depth(rtl, lhs);
+                if depth > 0 && *b < depth {
+                    for i in 0..w.max(1).min(256) {
+                        let qnet = unpacked_word_q(lhs, *b, w, i);
+                        emit_iob(&mut d, &mut iob_n, &qnet, lhs);
+                    }
+                    continue;
+                }
+            }
+        }
         let qnet = if let Some(b) = bit {
-            bit_name(lhs, w, *b)
+            if let Some((word, lo)) = decode_unpacked_bit(*b) {
+                // FM-HEL-AREA-03: unpacked bit assign — the comb lowering
+                // drives unpacked_word_q(lhs, word, w, lo), not
+                // bit_name(lhs, w, b): the encoded index is not a real bit
+                // number, so the old name was never driven (IOBs on undriven
+                // nets, concat LUTs swept as dead).
+                unpacked_word_q(lhs, word, w, lo)
+            } else {
+                bit_name(lhs, w, *b)
+            }
         } else if let Ok((q, _)) = drive_target(rhs, rtl) {
             q
         } else {
@@ -15360,6 +15936,17 @@ fn synth_from_parsed_top(
         );
     }
     record_instances(&map, &top_name, &mut d, "");
+    // FM-HEL-AREA-02: LUT peephole opts on the fully-stitched netlist —
+    // dead-LUT sweep, const folding, inverter absorption. See helion_ir::opt.
+    // Dead-only by construction (no rewiring of live logic); observable nets
+    // (mark_debug, ILA, top output ports) are never touched.
+    let opt = d.peephole_opt_luts();
+    if opt.total() + opt.consts_folded + opt.inverters_absorbed > 0 {
+        eprintln!(
+            "lut_opt dead={} consts={} inverters={} rounds={}",
+            opt.dead_swept, opt.consts_folded, opt.inverters_absorbed, opt.rounds
+        );
+    }
     let n_luts = d
         .cells
         .iter()
@@ -15635,6 +16222,12 @@ mod tests {
     use super::*;
     use helion_ir::INC4_INIT;
 
+    /// Parse a test expression (leaked arena, test-only).
+    fn pe(s: &str) -> Result<Expr<'static>, String> {
+        let arena: &'static Bump = Box::leak(Box::new(Bump::new()));
+        parse_expr(s, arena)
+    }
+
     fn wrap(rhs: &str) -> String {
         format!(
             "module blinky(input logic clk, output logic led);\n  logic q;\n  always_ff @(posedge clk) q <= {rhs};\n  assign led = q;\nendmodule\n"
@@ -15817,8 +16410,10 @@ endmodule
         assert!(luts >= 4, "expect next-state/out LUTs, luts={luts}");
         // Pre-density baseline was >17 (identity/buffer LUTs). Packed LUT6
         // mapping is honest and may sit on that line; keep FFs+LUTs as the bar.
+        // FM-HEL-AREA-04: the rewritten AIG path shares subexpressions the
+        // sw matchers duplicated, so honest density is now 15 cells.
         assert!(
-            d.cells.len() >= 16,
+            d.cells.len() >= 15,
             "must keep real FSM fabric, got {}",
             d.cells.len()
         );
@@ -15915,6 +16510,212 @@ endmodule
         let init = aig.flowmap_lut6();
         // I0=a I1=b: AND is 1 only when addr & 3 == 3 → bits 3,7,11,...
         assert_eq!(init & 0b1111, 0b1000);
+    }
+
+    /// Evaluate a pure-LUT6 cone netlist as emitted by `map_wide_cone`.
+    /// Cells are in topological creation order (AND-id order), so a single
+    /// forward pass suffices. Unconnected high pins read 0 — safe because
+    /// `lut6_and_invs` builds INITs periodic in the unused upper addresses.
+    fn eval_cone_netlist(d: &Design, out_net: &str, pis: &[String], bits: u64) -> bool {
+        fn net_value(d: &Design, vals: &HashMap<String, bool>, cell: &str, pin: &str) -> bool {
+            for net in &d.nets {
+                for ep in &net.endpoints {
+                    if ep.cell == cell && ep.pin == pin {
+                        return vals.get(&net.name).copied().unwrap_or(false);
+                    }
+                }
+            }
+            false
+        }
+        let mut vals: HashMap<String, bool> = HashMap::new();
+        for (i, pi) in pis.iter().enumerate() {
+            vals.insert(pi.clone(), (bits >> i) & 1 == 1);
+        }
+        for cell in &d.cells {
+            let CellKind::Lut6 { init } = &cell.kind else {
+                panic!("cone netlist must be LUT6-only, found {:?}", cell.kind);
+            };
+            let mut addr = 0u64;
+            for pin_i in 0..6 {
+                if net_value(d, &vals, &cell.name, &format!("I{pin_i}")) {
+                    addr |= 1 << pin_i;
+                }
+            }
+            let out = (init >> addr) & 1 == 1;
+            for net in &d.nets {
+                for ep in &net.endpoints {
+                    if ep.cell == cell.name && ep.pin == "O" {
+                        vals.insert(net.name.clone(), out);
+                    }
+                }
+            }
+        }
+        vals.get(out_net).copied().unwrap_or(false)
+    }
+
+    /// FM-HEL-AREA-05: `map_wide_cone` must implement the cone function
+    /// exactly. Exhaustive miter over all PI assignments (cones kept ≤ 10
+    /// PIs so 2^k stays cheap). Regression guard for the inverted-leaf
+    /// miscompile (OR/XOR cones mapped to const).
+    fn assert_wide_cone_miter(expr_src: &str) {
+        let e = pe(expr_src).unwrap();
+        let aig = Aig::from_expr(&e);
+        assert!(
+            aig.pis.len() > 6,
+            "test must exercise the wide path: {expr_src}"
+        );
+        assert!(
+            aig.pis.len() <= 10,
+            "exhaustive miter budget: {expr_src}"
+        );
+        let mut d = Design::new("miter");
+        let net = map_wide_cone(&mut d, &aig, "u_m_", None);
+        for bits in 0..(1u64 << aig.pis.len()) {
+            let expected = aig.eval_lit(aig.output, bits);
+            let got = eval_cone_netlist(&d, &net, &aig.pis, bits);
+            assert_eq!(expected, got, "wide-cone miter mismatch at {bits:b}: {expr_src}");
+        }
+    }
+
+    #[test]
+    fn wide_cone_miter_or_of_ands() {
+        // The original miscompile: internal inverted lits, fo=1 nodes
+        // skipped, parent collapsed to const0.
+        assert_wide_cone_miter("(a&b)|(c&d)|(e&f)|(g&h)");
+    }
+
+    #[test]
+    fn wide_cone_miter_battery() {
+        let cases = [
+            "(a&b&c&d&e&f&g)|(h&i&j)",     // 10 PIs, deep AND-OR
+            "((a&b)|(c&d))&((e&f)|(g&h))", // AND of ORs
+            "(a^b)&(c^d)&(e^f)&(g&h)",     // XORs + AND, 8 PIs
+            "~((a&b)|(c&d)|(e&f)|(g&h)|i)", // inverted output, 9 PIs
+            "(a&b&c)|(d&e&f)|(g&h&i&j)",   // 10 PIs mixed widths
+            "(a&b)|(a&c)|(b&c)|(d&e&f&g)", // majority + AND, 7 PIs
+        ];
+        for src in cases {
+            assert_wide_cone_miter(src);
+        }
+    }
+
+    /// Deterministic xorshift (fixed seed): no external RNG in tests.
+    fn miter_xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// FM-HEL-AREA-05: `map_wide_cones` must implement every cone function
+    /// exactly, including shared subfunctions and (the hard case) a cone
+    /// whose output node is used inside another cone's logic. Exhaustive
+    /// over all PI assignments (PIs unioned, ≤ 10).
+    fn assert_wide_cones_miter(srcs: &[&str]) {
+        let mut cones = Vec::new();
+        for src in srcs {
+            let e = pe(src).unwrap();
+            cones.push(Aig::from_expr(&e));
+        }
+        // Union PIs across cones for the exhaustive assignment.
+        let mut pis: Vec<String> = Vec::new();
+        for c in &cones {
+            for p in &c.pis {
+                if !pis.contains(p) {
+                    pis.push(p.clone());
+                }
+            }
+        }
+        assert!(pis.len() <= 10, "exhaustive miter budget");
+        let mut d = Design::new("miter_multi");
+        let reqs: Vec<Option<String>> = (0..cones.len()).map(|_| None).collect();
+        let nets = map_wide_cones(&mut d, &cones, &reqs, "u_mm_");
+        assert_eq!(nets.len(), cones.len());
+        for bits in 0..(1u64 << pis.len()) {
+            for (ci, c) in cones.iter().enumerate() {
+                // Map union assignment down to this cone's PI order.
+                let mut cbits = 0u64;
+                for (i, p) in c.pis.iter().enumerate() {
+                    let ui = pis.iter().position(|x| x == p).unwrap();
+                    if (bits >> ui) & 1 == 1 {
+                        cbits |= 1 << i;
+                    }
+                }
+                let expected = c.eval_lit(c.output, cbits);
+                let got = eval_cone_netlist(&d, &nets[ci], &pis, bits);
+                assert_eq!(
+                    expected, got,
+                    "multi-cone miter mismatch cone {ci} at {bits:b}: {:?}",
+                    srcs[ci]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_cones_multi_miter() {
+        // Independent cones with a shared subfunction.
+        assert_wide_cones_miter(&["(a&b)|(c&d)|(e&f)|(g&h)", "(a&b)&(c&d)&(e&f)&(g&h)"]);
+        // One cone's output (a&b) is a subfunction of the other.
+        assert_wide_cones_miter(&["(a&b)|(c&d)|(e&f)|(g&h)", "a&b"]);
+        // Inverted-output cone sharing with a non-inverted one.
+        assert_wide_cones_miter(&["~((a&b)|(c&d)|(e&f)|(g&h))", "(a&b)|(c&d)|(e&f)|(g&h)"]);
+        // Three cones, mixed sharing.
+        assert_wide_cones_miter(&[
+            "(a&b&c&d)|(e&f&g&h)",
+            "(a&b)|(i&j)",
+            "~((a&b&c&d)|(e&f&g&h))",
+        ]);
+    }
+
+    #[test]
+    fn wide_cone_miter_random() {
+        // Wider cones (7-14 PIs), sampled assignments: 40 cones x 256 vectors.
+        let vars = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n"];
+        fn rand_expr(rng: &mut u64, vars: &[&str], depth: u32) -> String {
+            if depth == 0 || miter_xorshift(rng) % 3 == 0 {
+                let v = vars[(miter_xorshift(rng) as usize) % vars.len()];
+                return if miter_xorshift(rng) % 4 == 0 {
+                    format!("~{v}")
+                } else {
+                    v.to_string()
+                };
+            }
+            let l = rand_expr(rng, vars, depth - 1);
+            let r = rand_expr(rng, vars, depth - 1);
+            match miter_xorshift(rng) % 3 {
+                0 => format!("({l}&{r})"),
+                1 => format!("({l}|{r})"),
+                _ => format!("({l}^{r})"),
+            }
+        }
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut tested = 0;
+        for _ in 0..120 {
+            let src = rand_expr(&mut rng, &vars, 5);
+            let e = match pe(&src) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let aig = Aig::from_expr(&e);
+            let k = aig.pis.len();
+            if k <= 6 || k > 14 {
+                continue;
+            }
+            let mut d = Design::new("miter");
+            let net = map_wide_cone(&mut d, &aig, "u_m_", None);
+            let mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
+            for _ in 0..256 {
+                let bits = miter_xorshift(&mut rng) & mask;
+                let expected = aig.eval_lit(aig.output, bits);
+                let got = eval_cone_netlist(&d, &net, &aig.pis, bits);
+                assert_eq!(expected, got, "random wide-cone miter mismatch: {src}");
+            }
+            tested += 1;
+        }
+        assert!(tested >= 20, "random battery must exercise wide cones");
     }
 
     #[test]
@@ -17348,10 +18149,12 @@ endmodule
 
     #[test]
     fn const_range_compare_lowers_small_lut() {
+        // Note: prg_is_ram is an output port so the LUT stays live through
+        // the FM-HEL-AREA-02 dead sweep; see dead_sweep_removes_unobserved_wire_lut
+        // for the swept case.
         let src = r#"
-module MMC4(input [15:0] prg_ain);
-  wire
-       prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
+module MMC4(input [15:0] prg_ain, output prg_is_ram);
+  assign prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
 endmodule
 "#;
         let d = synth_sv(src, "mmc4_ram.v").expect("range compare");
@@ -17420,6 +18223,38 @@ endmodule
             let got = (init >> addr) & 1 == 1;
             assert_eq!(got, want, "addr={addr:#b} field={field:#b} init={init:#x}");
         }
+    }
+
+    #[test]
+    fn dead_sweep_removes_unobserved_wire_lut() {
+        // FM-HEL-AREA-02: the range-compare LUT has no loads (prg_is_ram is
+        // not an output port), so the dead sweep removes it. Lowering still
+        // happens first (ASSIGN_NOT_LOWERED unset); the cone is just
+        // unobservable, so the whole design goes empty.
+        let src = r#"
+module MMC4(input [15:0] prg_ain);
+  wire prg_is_ram = (prg_ain < 'h8000) && (prg_ain >= 'h6000);
+endmodule
+"#;
+        let d = synth_sv(src, "mmc4_ram_dead.v").expect("range compare");
+        assert_ne!(
+            d.attrs.get("ASSIGN_NOT_LOWERED"),
+            Some("1"),
+            "small range must lower, not assign_not_lowered"
+        );
+        assert!(
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })
+                && d.net_on(&c.name, "O") == Some("prg_is_ram")),
+            "dead prg_is_ram LUT must be swept"
+        );
+        assert_eq!(
+            d.cells
+                .iter()
+                .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+                .count(),
+            0,
+            "entire cone is unobservable; no LUTs may remain"
+        );
     }
 
     #[test]
@@ -17819,7 +18654,11 @@ endmodule
     }
 
     #[test]
-    fn function_lifted_into_empty_module_maps_lut() {
+    fn function_lifted_dead_cone_swept() {
+        // FM-HEL-AREA-02: the lifted function maps to 4 LUTs, but with no
+        // loads (nextCRC has no assign, hence no IOB) the dead sweep removes
+        // them. Lifting still happens — nextCRC exists as an output port —
+        // the mapped cone is just unobservable.
         let src = r#"
 module CRC_tiny();
   function [3:0] nextCRC;
@@ -17837,21 +18676,9 @@ module CRC_tiny();
 endmodule
 "#;
         let d = synth_sv(src, "crc.v").expect("lift function");
-        let luts = d
-            .cells
-            .iter()
-            .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-            .count();
-        assert!(
-            luts >= 4,
-            "lifted function must map LUTs, luts={luts} cells={:?}",
-            d.cells
-        );
-        assert!(
-            d.ports
-                .iter()
-                .any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out))
-        );
+        let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+        assert_eq!(luts, 0, "dead lifted cone must be swept, luts={luts} cells={:?}", d.cells);
+        assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
     }
 
     #[test]
@@ -19304,10 +20131,21 @@ endmodule
             lut_driven(&d, "imd_val_we_o_0"),
             "imd_val_we_o[0] must be driven"
         );
-        assert!(
-            (0..33).all(|i| lut_driven(&d, &format!("imd_val_d_o_w0_{i}"))),
-            "imd_val_d_o[0] unpacked word must be driven from concat"
-        );
+        // FM-HEL-AREA-03: the imd_val_d_o[0] concat bits drive
+        // imd_val_d_o_w0_{i} nets, and the IOB emitter connects the IobOuts
+        // to those same nets. Previously it used bit_name on the *encoded*
+        // unpacked index, landing 34 IOBs on undriven imd_val_d_o_{65536+i}
+        // nets while the concat LUTs were swept as dead — outputs going
+        // nowhere.
+        for i in 0..34 {
+            let net = format!("imd_val_d_o_w0_{i}");
+            assert!(lut_driven(&d, &net), "{net} must be driven");
+            assert!(
+                d.cells.iter().any(|c| matches!(c.kind, CellKind::IobOut)
+                    && d.net_on(&c.name, "I") == Some(net.as_str())),
+                "IobOut must connect to driven net {net}"
+            );
+        }
     }
 
     #[test]
