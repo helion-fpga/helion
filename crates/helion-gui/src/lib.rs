@@ -24,7 +24,7 @@ pub use surface::{
     central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
     JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
 };
-pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog, open_vcd_dialog};
+pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
 pub use ide::{
     BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
@@ -51,8 +51,7 @@ pub use helion_sta::{
 use helion_device::Device;
 use helion_ir::Design;
 use helion_proj::{
-    Mode, Session, expand_ip_packages, get_cells, get_nets, get_pins, load_prj, opt_design,
-    resolve_prj_path,
+    Mode, Session, expand_ip_packages, load_prj, resolve_prj_path,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -246,9 +245,12 @@ mod tests {
             "clock clk period 10000ps"
         );
         let rt = tcl_eval(&mut sh, "report_timing").unwrap();
-        assert!(rt.contains("WNS_PS="), "report_timing must hit STA: {rt}");
+        assert!(
+            rt.contains("WNS") && rt.contains("9640"),
+            "report_timing must hit STA: {rt}"
+        );
         let util = tcl_eval(&mut sh, "report_utilization").unwrap();
-        assert!(util.contains("LUTFF="), "{util}");
+        assert!(util.contains("LUTFF"), "{util}");
         assert!(
             tcl_eval(&mut sh, "open_hw_manager")
                 .unwrap()

@@ -4,10 +4,19 @@
 //! Everything is a string, like Tcl. See `docs/tcl-subset.md` for the
 //! honestly-supported subset.
 
-use super::design::SelObj;
+use super::SelObj;
 use super::parse::{parse_script, Command, Seg, Word};
 use crate::GpuiShell;
 use std::collections::HashMap;
+
+/// Built-in (non-design) command names, shared by `info commands` and the
+/// "did you mean …?" suggestion on unknown commands.
+pub const CORE_COMMANDS: &[&str] = &[
+    "set", "unset", "puts", "expr", "if", "foreach", "for", "while", "proc",
+    "return", "break", "continue", "list", "llength", "lindex", "lrange",
+    "lappend", "concat", "join", "split", "string", "info", "catch", "error",
+    "eval", "subst", "source", "format", "incr", "append", "help",
+];
 
 /// Interpreter-raised error with the 1-based script line.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +71,12 @@ pub struct TclInterp {
     pub clocks: helion_sta::Constraints,
     /// Objects named by `select_objects` / `highlight_objects`.
     pub selected: Vec<SelObj>,
+    /// Set by `select_objects`/`highlight_objects`; the IDE clears it after
+    /// driving the visual selection once.
+    pub selection_dirty: bool,
+    /// Set by the `clear` command; `IdeModel::exec` clears the console
+    /// journal once after the eval (mirrors `selection_dirty`).
+    pub clear_console: bool,
 }
 
 impl TclInterp {
@@ -73,6 +88,8 @@ impl TclInterp {
             output: String::new(),
             clocks: helion_sta::Constraints::default(),
             selected: Vec::new(),
+            selection_dirty: false,
+            clear_console: false,
         }
     }
 
@@ -195,6 +212,23 @@ impl TclInterp {
         })
     }
 
+    /// Names of user-defined procs (for `info procs`, help and suggestions).
+    pub fn proc_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.procs.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Parameter list of a user proc: (name, default) pairs.
+    pub fn proc_params(&self, name: &str) -> Option<Vec<(String, Option<String>)>> {
+        self.procs.get(name).map(|d| {
+            d.params
+                .iter()
+                .map(|p| (p.name.clone(), p.default.clone()))
+                .collect()
+        })
+    }
+
     /// Substitute a raw string fragment (array indices, proc defaults):
     /// parse it as words, substitute each, rejoin with spaces.
     fn subst_str(
@@ -248,7 +282,7 @@ impl TclInterp {
             "set" => self.c_set(argv, line),
             "unset" => self.c_unset(argv, line),
             "puts" => self.c_puts(argv, line),
-            "expr" => self.c_expr(argv, line),
+            "expr" => self.c_expr(argv, line, shell),
             "if" => self.c_if(argv, line, shell),
             "foreach" => self.c_foreach(argv, line, shell),
             "for" => self.c_for(argv, line, shell),
@@ -376,12 +410,12 @@ impl TclInterp {
         Ctl::Value(String::new())
     }
 
-    fn c_expr(&mut self, argv: &[String], line: usize) -> Ctl {
+    fn c_expr(&mut self, argv: &[String], line: usize, shell: &mut GpuiShell) -> Ctl {
         if argv.len() < 2 {
             return Ctl::err(line, "wrong # args: should be \"expr arg ...\"");
         }
         let src = argv[1..].join(" ");
-        match self.eval_expr(&src, line) {
+        match self.eval_expr(&src, line, shell) {
             Ok(v) => Ctl::Value(v.to_string()),
             Err(m) => Ctl::err(line, m),
         }
@@ -410,7 +444,7 @@ impl TclInterp {
             }
             let cond_src = argv[i].clone();
             let body = argv[i + 1].clone();
-            let cond = match self.eval_expr(&cond_src, line) {
+            let cond = match self.eval_expr(&cond_src, line, shell) {
                 Ok(v) => v,
                 Err(m) => return Ctl::err(line, m),
             };
@@ -422,11 +456,15 @@ impl TclInterp {
                 return self.eval_body(&body, line, shell);
             }
             i += 2;
-            if i < argv.len() && argv[i] == "elseif" {
+            if i >= argv.len() {
+                return Ctl::Value(String::new()); // condition false, no else
+            }
+            if argv[i] == "elseif" {
                 i += 1;
-            } else if i < argv.len() {
+            } else if argv[i] != "else" {
                 return Ctl::err(line, format!("unexpected \"{}\" after if body", argv[i]));
             }
+            // "else" is handled at the top of the loop.
         }
     }
 
@@ -494,7 +532,7 @@ impl TclInterp {
             return Ctl::Error(e);
         }
         loop {
-            let cond = match self.eval_expr(&test, line) {
+            let cond = match self.eval_expr(&test, line, shell) {
                 Ok(v) => v,
                 Err(m) => return Ctl::err(line, m),
             };
@@ -522,7 +560,7 @@ impl TclInterp {
         }
         let (test, body) = (argv[1].clone(), argv[2].clone());
         loop {
-            let cond = match self.eval_expr(&test, line) {
+            let cond = match self.eval_expr(&test, line, shell) {
                 Ok(v) => v,
                 Err(m) => return Ctl::err(line, m),
             };
@@ -555,26 +593,22 @@ impl TclInterp {
         };
         let mut params = Vec::new();
         for a in arglist {
-            let a = a.trim().to_string();
-            if let Some(inner) = a.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                // `{name default...}` — keep the default's raw text so it
-                // substitutes in the caller's scope at call time.
-                let inner = inner.trim_start();
-                match split_first_token(inner) {
-                    (name, "") => params.push(Param {
-                        name: name.to_string(),
-                        default: None,
-                    }),
-                    (name, rest) => params.push(Param {
-                        name: name.to_string(),
-                        default: Some(rest.trim().to_string()),
-                    }),
-                }
-            } else {
-                params.push(Param {
-                    name: a,
+            // Each arglist element is itself a list: `{name}` or
+            // `{name default...}`. (`split_list` already stripped one level
+            // of braces, so re-split the element to recover the grouping.)
+            let parts = split_list(&a).unwrap_or_else(|_| vec![a.clone()]);
+            match parts.as_slice() {
+                [] => return Ctl::err(line, "proc: empty parameter name"),
+                [name] => params.push(Param {
+                    name: name.clone(),
                     default: None,
-                });
+                }),
+                [name, rest @ ..] => params.push(Param {
+                    name: name.clone(),
+                    // Raw default text; substituted in the caller's scope
+                    // at call time.
+                    default: Some(rest.join(" ")),
+                }),
             }
         }
         let body = match parse_script(&argv[3]) {
@@ -897,21 +931,11 @@ impl TclInterp {
                 Ctl::Value(join_list(&names))
             }
             "commands" => {
-                let mut names = vec![
-                    "set", "unset", "puts", "expr", "if", "foreach", "for", "while", "proc",
-                    "return", "break", "continue", "list", "llength", "lindex", "lrange",
-                    "lappend", "concat", "join", "split", "string", "info", "catch", "error",
-                    "eval", "subst", "source", "format", "incr", "append", "help", "get_cells",
-                    "get_nets", "get_pins", "get_ports", "get_clocks", "get_timing_paths",
-                    "get_property", "set_property", "report_property", "list_property",
-                    "select_objects", "highlight_objects", "get_selected_objects",
-                    "current_design", "report_timing", "report_utilization", "synth_design",
-                    "opt_design", "place_design", "route_design", "write_bitstream",
-                    "write_checkpoint", "create_clock", "mark_debug", "eco", "clear",
-                ];
+                let mut names: Vec<&str> = CORE_COMMANDS.to_vec();
+                names.extend(super::design::HOST_COMMANDS);
+                names.sort();
                 let pat = argv.get(2).map(|s| s.as_str());
                 names.retain(|n| pat.is_none_or(|p| super::design::glob_match(p, n)));
-                names.sort();
                 Ctl::Value(join_list(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
             }
             "args" => {
@@ -1118,22 +1142,19 @@ impl TclInterp {
             return Ctl::err(line, "wrong # args: should be \"incr varName ?increment?\"");
         }
         let cur = self.lookup(&argv[1]).cloned().unwrap_or_else(|| "0".into());
-        let cur_i: i64 = cur.trim().parse().map_err(|_| {
-            TclError {
-                msg: format!("expected integer but got \"{cur}\""),
-                line,
+        let cur_i: i64 = match cur.trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                return Ctl::err(line, format!("expected integer but got \"{cur}\""));
             }
-        })?;
-        let inc: i64 = argv
-            .get(2)
-            .map(|s| {
-                s.trim().parse().map_err(|_| TclError {
-                    msg: format!("expected integer but got \"{s}\""),
-                    line,
-                })
-            })
-            .transpose()?
-            .unwrap_or(1);
+        };
+        let inc: i64 = match argv.get(2).map(|s| s.trim().parse::<i64>()) {
+            None => 1,
+            Some(Ok(v)) => v,
+            Some(Err(_)) => {
+                return Ctl::err(line, format!("expected integer but got \"{}\"", argv[2]));
+            }
+        };
         let v = cur_i.wrapping_add(inc).to_string();
         self.assign(argv[1].clone(), v.clone());
         Ctl::Value(v)
@@ -1154,12 +1175,18 @@ impl TclInterp {
     // ---- expression evaluation ----
 
     /// Evaluate an `expr`/`if`/`while` condition string.
-    pub fn eval_expr(&mut self, src: &str, line: usize) -> Result<XVal, String> {
+    pub fn eval_expr(
+        &mut self,
+        src: &str,
+        line: usize,
+        shell: &mut GpuiShell,
+    ) -> Result<XVal, String> {
         let mut xp = ExprParser {
             chars: src.chars().collect(),
             pos: 0,
             line,
             interp: self,
+            shell,
         };
         let v = xp.parse_ternary()?;
         xp.skip_ws();
@@ -1213,14 +1240,6 @@ fn cmd_source_len(src: &[char]) -> usize {
         k += 1;
     }
     k
-}
-
-/// Split off the first whitespace-delimited token: `(token, rest)`.
-fn split_first_token(s: &str) -> (&str, &str) {
-    match s.find(|c: char| c.is_whitespace()) {
-        Some(i) => (&s[..i], &s[i..]),
-        None => (s, ""),
-    }
 }
 
 // ---- Tcl lists ----
@@ -1456,6 +1475,7 @@ struct ExprParser<'a> {
     pos: usize,
     line: usize,
     interp: &'a mut TclInterp,
+    shell: &'a mut GpuiShell,
 }
 
 impl<'a> ExprParser<'a> {
@@ -1761,6 +1781,42 @@ impl<'a> ExprParser<'a> {
                 }
                 Ok(XVal::S(s))
             }
+            Some('[') => {
+                // Command substitution inside expressions (Tcl's expr does
+                // its own substitution): scan to the matching `]`,
+                // nesting-aware, then evaluate as a script.
+                let start = self.pos + 1;
+                let mut depth = 1usize;
+                let mut k = start;
+                while k < self.chars.len() {
+                    match self.chars[k] {
+                        '\\' => k += 1,
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if depth != 0 {
+                    return Err(self.err("expr: missing close-bracket"));
+                }
+                let inner: String = self.chars[start..k].iter().collect();
+                self.pos = k + 1;
+                let cmds = parse_script(&inner).map_err(|e| format!("expr: {e}"))?;
+                let interp = &mut *self.interp;
+                let shell = &mut *self.shell;
+                match interp.eval_cmds(&cmds, shell) {
+                    Ctl::Value(s) | Ctl::Return(s) => Ok(XVal::S(s)),
+                    Ctl::Break => Err("expr: break outside loop".into()),
+                    Ctl::Continue => Err("expr: continue outside loop".into()),
+                    Ctl::Error(e) => Err(e.msg),
+                }
+            }
             Some('$') => {
                 self.pos += 1;
                 let name = self.parse_ident();
@@ -1786,7 +1842,7 @@ impl<'a> ExprParser<'a> {
             }
             Some(c) if c.is_ascii_digit() || c == '.' => self.parse_number(),
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                let name = self.parse_ident()?;
+                let name = self.parse_ident();
                 self.skip_ws();
                 if self.peek() == Some('(') {
                     // function call
@@ -1919,7 +1975,8 @@ fn xcmp(a: &XVal, b: &XVal, op: &str) -> Result<bool, String> {
 }
 
 fn xadd(a: &XVal, b: &XVal) -> XVal {
-    match (a, b) {
+    let (a, b) = (num(a), num(b));
+    match (&a, &b) {
         (XVal::I(x), XVal::I(y)) => match x.checked_add(*y) {
             Some(v) => XVal::I(v),
             None => XVal::F(*x as f64 + *y as f64),
@@ -1928,7 +1985,8 @@ fn xadd(a: &XVal, b: &XVal) -> XVal {
     }
 }
 fn xsub(a: &XVal, b: &XVal) -> XVal {
-    match (a, b) {
+    let (a, b) = (num(a), num(b));
+    match (&a, &b) {
         (XVal::I(x), XVal::I(y)) => match x.checked_sub(*y) {
             Some(v) => XVal::I(v),
             None => XVal::F(*x as f64 - *y as f64),
@@ -1937,7 +1995,8 @@ fn xsub(a: &XVal, b: &XVal) -> XVal {
     }
 }
 fn xmul(a: &XVal, b: &XVal) -> XVal {
-    match (a, b) {
+    let (a, b) = (num(a), num(b));
+    match (&a, &b) {
         (XVal::I(x), XVal::I(y)) => match x.checked_mul(*y) {
             Some(v) => XVal::I(v),
             None => XVal::F(*x as f64 * *y as f64),
@@ -1946,7 +2005,8 @@ fn xmul(a: &XVal, b: &XVal) -> XVal {
     }
 }
 fn xdiv(a: &XVal, b: &XVal) -> Result<XVal, String> {
-    match (a, b) {
+    let (a, b) = (num(a), num(b));
+    match (&a, &b) {
         (XVal::I(x), XVal::I(y)) => {
             if *y == 0 {
                 return Err("expr: divide by zero".into());
@@ -1960,7 +2020,8 @@ fn xdiv(a: &XVal, b: &XVal) -> Result<XVal, String> {
     }
 }
 fn xpow(a: &XVal, b: &XVal) -> Result<XVal, String> {
-    match (a, b) {
+    let (a, b) = (num(a), num(b));
+    match (&a, &b) {
         (XVal::I(x), XVal::I(y)) if *y >= 0 => {
             let mut r: i64 = 1;
             for _ in 0..*y {
@@ -1972,6 +2033,25 @@ fn xpow(a: &XVal, b: &XVal) -> Result<XVal, String> {
             Ok(XVal::I(r))
         }
         _ => Ok(XVal::F(a.as_f64()?.powf(b.as_f64()?))),
+    }
+}
+
+/// Normalize a value for arithmetic: integer-shaped strings become `I`,
+/// float-shaped strings become `F`; anything else is left alone (the
+/// float paths below yield NaN for those, as before).
+fn num(v: &XVal) -> XVal {
+    match v {
+        XVal::S(s) => {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i64>() {
+                XVal::I(i)
+            } else if let Ok(f) = t.parse::<f64>() {
+                XVal::F(f)
+            } else {
+                v.clone()
+            }
+        }
+        _ => v.clone(),
     }
 }
 fn xneg(a: &XVal) -> XVal {
@@ -2390,13 +2470,15 @@ mod tests {
         assert_eq!(ev(&mut i, &mut sh, "expr {7.0 / 2}"), "3.5");
         assert_eq!(ev(&mut i, &mut sh, "expr {2 ** 10}"), "1024");
         assert_eq!(ev(&mut i, &mut sh, "expr {(1 + 2) * 3}"), "9");
-        assert_eq!(ev(&mut i, &mut sh, "expr {-2 ** 2}"), "-4");
+        // Tcl: unary minus binds tighter than `**`, so (-2)**2.
+        assert_eq!(ev(&mut i, &mut sh, "expr {-2 ** 2}"), "4");
         assert_eq!(ev(&mut i, &mut sh, "expr {0x10 + 1}"), "17");
         assert_eq!(ev(&mut i, &mut sh, "expr {1 < 2 && 3 > 4}"), "0");
         assert_eq!(ev(&mut i, &mut sh, r#"expr {"abc" eq "abc"}"#), "1");
         assert_eq!(ev(&mut i, &mut sh, "expr {5 % 3}"), "2");
         assert_eq!(ev(&mut i, &mut sh, "expr {1 ? 10 : 20}"), "10");
-        assert_eq!(ev(&mut i, &mut sh, "expr {abs(-5) + int(2.9) + round(2.5)}"), "9");
+        // round() rounds half away from zero, like Tcl: 5+2+3.
+        assert_eq!(ev(&mut i, &mut sh, "expr {abs(-5) + int(2.9) + round(2.5)}"), "10");
         assert_eq!(ev(&mut i, &mut sh, "set n 6; expr {$n * 7}"), "42");
         let e = ev_err(&mut i, &mut sh, "expr {1 / 0}");
         assert!(e.contains("divide by zero"), "{e}");
@@ -2548,5 +2630,43 @@ mod tests {
         assert!(!glob_match("[a-z]_lut[0-9]", "1_lut3"));
         assert!(glob_match(r"a\*b", "a*b"));
         assert!(!glob_match(r"a\*b", "axb"));
+    }
+
+    #[test]
+    fn multiline_scripts() {
+        let (mut i, mut sh) = interp();
+        // A real multi-line analysis script: loops, conditionals, nesting.
+        let script = "set total 0\n\
+                      foreach x {1 2 3 4} {\n\
+                      \x20 if {$x % 2 == 0} {\n\
+                      \x20\x20\x20 incr total $x\n\
+                      \x20 }\n\
+                      }\n\
+                      set total";
+        assert_eq!(ev(&mut i, &mut sh, script), "6");
+        // proc defined across lines, called later (state persists)
+        ev(
+            &mut i,
+            &mut sh,
+            "proc double {v} {\n  expr {$v * 2}\n}",
+        );
+        assert_eq!(ev(&mut i, &mut sh, "double 21"), "42");
+        // unbalanced input is a clean single-line error, not a panic
+        let e = ev_err(&mut i, &mut sh, "foreach x {1 2} { puts $x");
+        assert!(e.starts_with("ERROR:"), "{e}");
+        assert!(!e.contains('\n'), "{e}");
+    }
+
+    #[test]
+    fn unknown_core_command_suggests() {
+        let (mut i, mut sh) = interp();
+        let e = ev_err(&mut i, &mut sh, "forach x {1} {puts $x}");
+        assert!(e.contains("invalid command name"), "{e}");
+        assert!(e.contains("foreach"), "{e}");
+        assert!(!e.contains('\n'), "{e}");
+        // no close match: plain error, still single line
+        let e2 = ev_err(&mut i, &mut sh, "zzzqqq_not_a_command");
+        assert!(e2.contains("invalid command name"), "{e2}");
+        assert!(!e2.contains('\n'), "{e2}");
     }
 }

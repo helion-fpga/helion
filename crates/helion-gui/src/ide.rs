@@ -6032,7 +6032,39 @@ impl IdeModel {
         };
         self.journal(cmd, &r);
         self.sync_from_session();
+        self.sync_tcl_selection();
+        self.sync_tcl_clear();
         r
+    }
+
+    /// Honor the Tcl `clear` command: wipe the console + log transcripts
+    /// once (the `clear` row itself is removed too, like Vivado).
+    fn sync_tcl_clear(&mut self) {
+        if !self.shell.tcl_interp.clear_console {
+            return;
+        }
+        self.shell.tcl_interp.clear_console = false;
+        self.console.clear();
+        self.log.clear();
+        self.console_selected = None;
+        self.selected_log = None;
+        self.status = "console cleared".into();
+    }
+
+    /// Drive the IDE's visual selection from a Tcl `select_objects` /
+    /// `highlight_objects` command, so the console selection lights up the
+    /// netlist tree, properties and device routes. Only fires once per
+    /// Tcl selection change (guarded by `selection_dirty`).
+    fn sync_tcl_selection(&mut self) {
+        if !self.shell.tcl_interp.selection_dirty {
+            return;
+        }
+        self.shell.tcl_interp.selection_dirty = false;
+        if let Some(first) = self.shell.tcl_interp.selected.first().cloned() {
+            if self.selected.as_deref() != Some(first.name.as_str()) {
+                self.select(&first.name);
+            }
+        }
     }
 
     /// UG893 Messages pane: severity + Tcl id + engine text (not a restyled console).
@@ -6686,6 +6718,65 @@ impl IdeModel {
         self.input_hist_idx = None;
         self.input.clear();
         Some(self.exec(&cmd))
+    }
+
+    /// True when a console line is a complete Tcl command: braces, brackets
+    /// and double quotes are balanced (backslash-aware; `#` comments and
+    /// `{…}`-quoted text don't count). The console submits on Enter only
+    /// when this is true; otherwise Enter inserts a newline.
+    pub fn tcl_input_complete(s: &str) -> bool {
+        let mut brace = 0usize;
+        let mut bracket = 0usize;
+        let mut in_dquote = false;
+        let mut word_start = true; // `#` here starts a comment
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next();
+                word_start = false;
+                continue;
+            }
+            if in_dquote {
+                if c == '"' {
+                    in_dquote = false;
+                }
+                word_start = false;
+                continue;
+            }
+            match c {
+                '"' if brace == 0 => in_dquote = true,
+                '{' => brace += 1,
+                '}' => {
+                    if brace == 0 {
+                        return true; // unbalanced: let the interpreter report it
+                    }
+                    brace -= 1;
+                }
+                '[' if brace == 0 => bracket += 1,
+                ']' if brace == 0 => {
+                    if bracket == 0 {
+                        return true;
+                    }
+                    bracket -= 1;
+                }
+                '#' if word_start && brace == 0 => {
+                    for c2 in chars.by_ref() {
+                        if c2 == '\n' {
+                            break;
+                        }
+                    }
+                    word_start = true;
+                    continue;
+                }
+                '\n' | ';' => word_start = true,
+                c if c.is_whitespace() => {}
+                _ => word_start = false,
+            }
+            if matches!(c, '{' | '}' | '[' | ']' | '"') {
+                word_start = false;
+            }
+        }
+        brace == 0 && bracket == 0 && !in_dquote
     }
 
     /// Move the console input through history. `dir = -1` is Up (older),
@@ -28891,6 +28982,41 @@ endmodule
         ide.input = "   ".into();
         assert!(ide.submit_input().is_none());
         assert_eq!(ide.input_history.len(), 3);
+    }
+
+    #[test]
+    fn tcl_input_complete_drives_enter_to_submit() {
+        assert!(IdeModel::tcl_input_complete("get_cells"));
+        assert!(IdeModel::tcl_input_complete(""));
+        assert!(IdeModel::tcl_input_complete("set a [expr {2 + 2}]"));
+        assert!(IdeModel::tcl_input_complete("foreach i {1 2 3} {\n puts $i\n}"));
+        assert!(IdeModel::tcl_input_complete("# a { comment\nputs hi"));
+        assert!(IdeModel::tcl_input_complete("puts hi; # {"));
+        assert!(!IdeModel::tcl_input_complete("foreach i {1 2 3} {"));
+        assert!(!IdeModel::tcl_input_complete("foreach i {1 2 3} {\n puts $i"));
+        assert!(!IdeModel::tcl_input_complete("set a \"hello"));
+        assert!(!IdeModel::tcl_input_complete("expr {2+2"));
+        assert!(!IdeModel::tcl_input_complete("set b [get_cells u_lut"));
+        // unbalanced close: complete (the interpreter reports the error)
+        assert!(IdeModel::tcl_input_complete("puts hi}"));
+        // braces inside quotes don't count; quotes inside braces don't count
+        assert!(IdeModel::tcl_input_complete("set a \"{\""));
+        assert!(IdeModel::tcl_input_complete("set b {\"}"));
+    }
+
+    #[test]
+    fn tcl_clear_empties_console_and_log() {
+        let mut ide = IdeModel::new();
+        ide.exec("set a 1").unwrap();
+        assert!(!ide.console.is_empty());
+        assert!(!ide.log.is_empty());
+        ide.exec("clear").unwrap();
+        assert!(ide.console.is_empty());
+        assert!(ide.log.is_empty());
+        assert!(ide.console_selected.is_none());
+        // console keeps working after clear
+        ide.exec("set b 2").unwrap();
+        assert_eq!(ide.console.len(), 1);
     }
 
     #[test]
