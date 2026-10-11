@@ -46,5 +46,22 @@ fn bench_elaborate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(synth_benches, bench_parse, bench_elaborate);
+/// Internal frontend: the recursive-descent parser + RTL elaboration that
+/// `helion qor` actually runs (as opposed to `parse/*`, which measures the
+/// external `sv_parser` crate). This is the parser-allocation campaign's
+/// target: ~98% of frontend wall on Ibex.
+fn bench_parse_internal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_internal");
+    group.measurement_time(Duration::from_secs(40));
+    for (id, file, samples) in DESIGNS {
+        let src = std::fs::read_to_string(example(file)).expect("example missing");
+        group.sample_size(*samples);
+        group.bench_with_input(BenchmarkId::from_parameter(id), &src, |b, src| {
+            b.iter(|| helion_sv::list_sv_modules_origin(black_box(src), black_box("bench")).unwrap())
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(synth_benches, bench_parse, bench_parse_internal, bench_elaborate);
 criterion_main!(synth_benches);
