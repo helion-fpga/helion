@@ -24,6 +24,113 @@ fn err(line: usize, msg: impl Into<String>) -> Ctl {
     })
 }
 
+/// Host (design/flow/console) command names, shared by `info commands`,
+/// `help` topics and the unknown-command suggestion.
+pub const HOST_COMMANDS: &[&str] = &[
+    "help",
+    "clear",
+    "get_cells",
+    "get_nets",
+    "get_pins",
+    "get_ports",
+    "get_clocks",
+    "get_timing_paths",
+    "get_property",
+    "set_property",
+    "report_property",
+    "list_property",
+    "list_properties",
+    "select_objects",
+    "highlight_objects",
+    "get_selected_objects",
+    "current_design",
+    "synth_design",
+    "read_sv",
+    "read_verilog",
+    "read_vhdl",
+    "opt_design",
+    "place_design",
+    "route_design",
+    "write_bitstream",
+    "write_checkpoint",
+    "create_clock",
+    "report_timing",
+    "report_utilization",
+    "mark_debug",
+    "add_probe",
+    "eco",
+    "open_hw_manager",
+    "program_hw",
+    "program_hw_devices",
+    "report_die",
+    "report_hw_targets",
+    "report_featuremap",
+    "write_hnf",
+    "hds::synth",
+    "hds::impl",
+    "hds::flow",
+    "hds::tree",
+];
+
+/// Levenshtein distance over chars (small strings only).
+fn edit_dist(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (x, ca) in a.iter().enumerate() {
+        let mut prev = x + 1;
+        for (y, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            let cur = (row[y + 1] + 1).min((prev + 1).min(row[y] + cost));
+            row[y] = prev;
+            prev = cur;
+        }
+        row[b.len()] = prev;
+    }
+    row[b.len()]
+}
+
+/// Up to 3 "did you mean …?" candidates for an unknown command name:
+/// prefix matches first, then close edit-distance matches.
+fn suggest_commands(i: &TclInterp, name: &str) -> Vec<String> {
+    let mut cands: Vec<&str> = Vec::new();
+    cands.extend(super::interp::CORE_COMMANDS.iter().copied());
+    cands.extend(HOST_COMMANDS.iter().copied());
+    let procs = i.proc_names();
+    cands.extend(procs.iter().map(|s| s.as_str()));
+    let mut scored: Vec<(usize, &str)> = cands
+        .iter()
+        .filter(|c| **c != name)
+        .map(|c| {
+            let d = if c.starts_with(name) || name.starts_with(c) {
+                0
+            } else {
+                edit_dist(name, c)
+            };
+            (d, *c)
+        })
+        .filter(|(d, _)| *d <= 3)
+        .collect();
+    scored.sort();
+    scored.dedup();
+    scored.into_iter().take(3).map(|(_, c)| c.to_string()).collect()
+}
+
+/// Tcl-style unknown-command error with suggestions (single line, no panic).
+fn unknown_command(i: &TclInterp, name: &str, line: usize) -> Ctl {
+    let mut msg = format!("invalid command name \"{name}\"");
+    let sugg = suggest_commands(i, name);
+    if !sugg.is_empty() {
+        msg.push_str(&format!(
+            "; did you mean {}?",
+            sugg.iter()
+                .map(|s| format!("\"{s}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    err(line, msg)
+}
+
 fn design<'a>(shell: &'a GpuiShell, cmd: &str, line: usize) -> Result<&'a Design, TclError> {
     shell.session.design.as_ref().ok_or_else(|| TclError {
         msg: format!("{cmd}: no design (synth_design first)"),
@@ -283,26 +390,47 @@ fn resolve_obj(
     line: usize,
     allow_timing: bool,
 ) -> Result<(ObjKind, HashMap<String, String>), TclError> {
+    resolve_candidates(i, shell, name, line, allow_timing)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| TclError {
+            msg: format!("no such object \"{name}\""),
+            line,
+        })
+}
+
+/// All objects matching `name`, in `resolve_obj` priority order. Used by
+/// `get_property`, which picks the first candidate that actually HAS the
+/// requested property (so `PERIOD` finds a clock even when a same-named
+/// port shadows it, and `DIRECTION` still finds the port).
+fn resolve_candidates(
+    i: &mut TclInterp,
+    shell: &mut GpuiShell,
+    name: &str,
+    line: usize,
+    allow_timing: bool,
+) -> Result<Vec<(ObjKind, HashMap<String, String>)>, TclError> {
     let d = design(shell, "get_property", line)?;
+    let mut out = Vec::new();
     if let Some(cell) = d.cells.iter().find(|c| c.name == name) {
         let fanouts = cell_fanouts(d);
-        return Ok((ObjKind::Cell, cell_props(shell, cell, &fanouts)));
+        out.push((ObjKind::Cell, cell_props(shell, cell, &fanouts)));
     }
     if let Some(net) = d.nets.iter().find(|n| n.name == name) {
-        return Ok((ObjKind::Net, net_props(net)));
+        out.push((ObjKind::Net, net_props(net)));
     }
     if let Some((cell_name, pin)) = name.split_once('/') {
         if let Some(cell) = d.cells.iter().find(|c| c.name == cell_name) {
             if d.pin_index().net_on(cell_name, pin).is_some() {
-                return Ok((ObjKind::Pin, pin_props(d, cell, pin)));
+                out.push((ObjKind::Pin, pin_props(d, cell, pin)));
             }
         }
     }
     if let Some(port) = d.ports.iter().find(|p| p.name == name) {
-        return Ok((ObjKind::Port, port_props(d, port)));
+        out.push((ObjKind::Port, port_props(d, port)));
     }
     if let Some(c) = i.clocks.clocks.iter().find(|c| c.name == name) {
-        return Ok((ObjKind::Clock, clock_props(c)));
+        out.push((ObjKind::Clock, clock_props(c)));
     }
     if allow_timing {
         let paths = match ensure_timing(i, shell, line) {
@@ -310,13 +438,10 @@ fn resolve_obj(
             Err(_) => Vec::new(),
         };
         if let Some(p) = paths.iter().find(|p| p.name == name) {
-            return Ok((ObjKind::Path, path_props(p)));
+            out.push((ObjKind::Path, path_props(p)));
         }
     }
-    Err(TclError {
-        msg: format!("no such object \"{name}\""),
-        line,
-    })
+    Ok(out)
 }
 
 // ---- get_* options ----
@@ -508,7 +633,108 @@ fn ensure_timing(
     Ok((d.name.clone(), t, paths))
 }
 
-// ---- host dispatch ----
+/// Vivado-style timing table: summary line plus the worst paths, so the
+/// console output pane shows a readable report instead of a key=value dump.
+fn format_timing_table(
+    name: &str,
+    t: &helion_sta::TimingResult,
+    paths: &[TimingPath],
+) -> String {
+    fn ns(ps: i64) -> String {
+        format!("{:.3}ns", ps as f64 / 1000.0)
+    }
+    let mut s = format!(
+        "Timing Report: {name}\n\
+         WNS {wns} ({wns_ps}ps)   TNS {tns} ({tns_ps}ps)   endpoints {ep}\n\
+         Setup {setup} ({setup_ps}ps)   Hold {hold} ({hold_ps}ps)   Hold slack {hslack} ({hslack_ps}ps)\n\
+         Delay model: reg2reg {r2r}ps  iob {iob}ps  route {route}ps\n",
+        wns = ns(t.wns_ps),
+        wns_ps = t.wns_ps,
+        tns = ns(t.tns_ps),
+        tns_ps = t.tns_ps,
+        ep = t.endpoints,
+        setup = ns(t.setup_ps),
+        setup_ps = t.setup_ps,
+        hold = ns(t.hold_ps),
+        hold_ps = t.hold_ps,
+        hslack = ns(t.hold_slack_ps),
+        hslack_ps = t.hold_slack_ps,
+        r2r = t.r2r_ps,
+        iob = t.iob_ps,
+        route = t.route_ps,
+    );
+    let show = paths.len().min(10);
+    if show == 0 {
+        s.push_str("No timing paths.\n");
+        return s;
+    }
+    s.push_str(&format!(
+        "\n{:<12} {:>12} {:>12}  {:<28} {:<28}\n",
+        "Slack", "Slack(ps)", "Delay(ps)", "Startpoint", "Endpoint"
+    ));
+    for p in &paths[..show] {
+        s.push_str(&format!(
+            "{:<12} {:>12} {:>12}  {:<28} {:<28}\n",
+            ns(p.slack_ps),
+            p.slack_ps,
+            p.delay_ps,
+            truncate(&p.startpoint.cell, 28),
+            truncate(&p.endpoint.cell, 28),
+        ));
+    }
+    if paths.len() > show {
+        s.push_str(&format!("… {} more paths (get_timing_paths -max_paths N)\n", paths.len() - show));
+    }
+    s
+}
+
+fn truncate(s: &str, w: usize) -> String {
+    if s.chars().count() <= w {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(w - 1).collect();
+        t.push('…');
+        t
+    }
+}
+
+/// Vivado-style utilization table instead of the single-line
+/// `Session::report_utilization` dump.
+fn format_util_table(shell: &GpuiShell, dev: &Device) -> Result<String, String> {
+    let p = shell
+        .session
+        .placed
+        .as_ref()
+        .map(|pl| &pl.packed)
+        .or(shell.session.packed.as_ref())
+        .ok_or_else(|| "report_utilization: not packed".to_string())?;
+    let name = shell
+        .session
+        .design
+        .as_ref()
+        .map(|d| d.name.as_str())
+        .unwrap_or("?");
+    let rows: [(&str, usize, u64); 4] = [
+        ("LUTFF", p.lutffs.len(), u64::from(dev.lut6_count())),
+        ("IOB", p.iobs.len(), dev.iob_sites().count() as u64),
+        ("BRAM", p.brams.len(), u64::from(dev.n_bram)),
+        ("DSP", p.macs.len(), u64::from(dev.n_dsp)),
+    ];
+    let mut s = format!("Utilization: {name}  (part {})\n", dev.part);
+    s.push_str(&format!(
+        "{:<10} {:>8} {:>8} {:>7}\n",
+        "Resource", "Used", "Total", "Pct"
+    ));
+    for (r, used, total) in rows {
+        let pct = if total == 0 {
+            "—".to_string()
+        } else {
+            format!("{:.1}%", used as f64 * 100.0 / total as f64)
+        };
+        s.push_str(&format!("{r:<10} {used:>8} {total:>8} {pct:>7}\n"));
+    }
+    Ok(s)
+}
 
 /// Dispatch a non-core command against the design database / flow engines.
 pub fn eval_host(
@@ -519,7 +745,14 @@ pub fn eval_host(
     shell: &mut GpuiShell,
 ) -> Ctl {
     match name {
-        "help" => Ctl::Value(help_text()),
+        "help" => cmd_help(i, argv, line),
+        "clear" => {
+            if argv.len() != 1 {
+                return err(line, "wrong # args: should be \"clear\"");
+            }
+            i.clear_console = true;
+            Ctl::Value("console cleared".into())
+        }
         "get_cells" => cmd_get_cells(i, argv, line, shell),
         "get_nets" => cmd_get_nets(i, argv, line, shell),
         "get_pins" => cmd_get_pins(i, argv, line, shell),
@@ -529,7 +762,7 @@ pub fn eval_host(
         "get_property" => cmd_get_property(i, argv, line, shell),
         "set_property" => cmd_set_property(i, argv, line, shell),
         "report_property" => cmd_report_property(i, argv, line, shell),
-        "list_property" => cmd_list_property(i, argv, line, shell),
+        "list_property" | "list_properties" => cmd_list_property(i, argv, line, shell),
         "select_objects" => cmd_select_objects(i, argv, line, shell, false),
         "highlight_objects" => cmd_select_objects(i, argv, line, shell, true),
         "get_selected_objects" => Ctl::Value(join_list(
@@ -610,11 +843,7 @@ pub fn eval_host(
         }
         "create_clock" => cmd_create_clock(i, argv, line),
         "report_timing" => match ensure_timing(i, shell, line) {
-            Ok((name, t, _)) => Ctl::Value(format!(
-                "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-                name, t.wns_ps, t.tns_ps, t.setup_ps, t.hold_ps, t.hold_slack_ps,
-                t.endpoints, t.r2r_ps, t.iob_ps, t.route_ps
-            )),
+            Ok((name, t, paths)) => Ctl::Value(format_timing_table(&name, &t, &paths)),
             Err(e) => Ctl::Error(e),
         },
         "report_utilization" => {
@@ -625,7 +854,7 @@ pub fn eval_host(
                 Ok(d) => d,
                 Err(e) => return err(line, e),
             };
-            match shell.session.report_utilization(&dev) {
+            match format_util_table(shell, &dev) {
                 Ok(s) => Ctl::Value(s),
                 Err(e) => err(line, e),
             }
@@ -732,26 +961,219 @@ pub fn eval_host(
         }
         "hds::flow" => Ctl::Value(shell.flow.steps.join(" ")),
         "hds::tree" => Ctl::Value(shell.tree.nodes.join(" ")),
-        _ => err(line, format!("invalid command name \"{name}\"")),
+        _ => unknown_command(i, name, line),
     }
 }
 
-fn help_text() -> String {
+/// `help ?topic?`: overview with no args, per-command usage otherwise.
+fn cmd_help(i: &mut TclInterp, argv: &[String], line: usize) -> Ctl {
+    match argv.len() {
+        1 => Ctl::Value(help_overview()),
+        2 => {
+            let topic = argv[1].as_str();
+            if let Some((usage, desc)) = help_topic(topic) {
+                return Ctl::Value(format!("{usage}\n  {desc}"));
+            }
+            // User procs get help from their definition.
+            if let Some(params) = i.proc_params(topic) {
+                let plist: Vec<String> = params
+                    .iter()
+                    .map(|(n, d)| match d {
+                        Some(d) => format!("{{{n} {d}}}"),
+                        None => n.clone(),
+                    })
+                    .collect();
+                return Ctl::Value(format!(
+                    "proc {topic} {{{}}}\n  user procedure (info body {topic} for source)",
+                    plist.join(" ")
+                ));
+            }
+            let mut msg = format!("no help topic \"{topic}\"");
+            let sugg = suggest_commands(i, topic);
+            if !sugg.is_empty() {
+                msg.push_str(&format!(
+                    "; did you mean {}?",
+                    sugg.iter()
+                        .map(|s| format!("\"{s}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            err(line, msg)
+        }
+        _ => err(line, "wrong # args: should be \"help ?topic?\""),
+    }
+}
+
+/// (name, usage, one-line description) for every host command.
+fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        "help" => (
+            "help ?topic?",
+            "this overview, or usage for one command",
+        ),
+        "clear" => ("clear", "clear the console transcript"),
+        "get_cells" => (
+            "get_cells ?-hierarchical? ?-filter expr? ?-of_objects objs? ?-quiet? ?patterns...?",
+            "cells in the netlist (u_lut0, u_ff3…); -filter {TYPE == lut}",
+        ),
+        "get_nets" => (
+            "get_nets ?-filter expr? ?-of_objects objs? ?patterns...?",
+            "nets in the netlist",
+        ),
+        "get_pins" => (
+            "get_pins ?-of_objects cells? ?patterns...?",
+            "pins as cell/pin (u_lut0/A)",
+        ),
+        "get_ports" => ("get_ports ?patterns...?", "top-level ports"),
+        "get_clocks" => (
+            "get_clocks ?patterns...?",
+            "clocks from create_clock (empty until constrained)",
+        ),
+        "get_timing_paths" => (
+            "get_timing_paths ?-max_paths N? ?-filter expr? ?patterns...?",
+            "timing path endpoints; -filter {SLACK < 0} finds violations",
+        ),
+        "get_property" => (
+            "get_property ?-quiet? property object",
+            "one property (TYPE, NAME, SLACK, PERIOD, SITE…)",
+        ),
+        "set_property" => (
+            "set_property ?-quiet? name value objects…",
+            "DONT_TOUCH KEEP MARK_DEBUG LOC PACKAGE_PIN IOSTANDARD DRIVE",
+        ),
+        "report_property" => (
+            "report_property object",
+            "all properties of an object as a table",
+        ),
+        "list_property" | "list_properties" => (
+            "list_property object",
+            "property names defined on an object",
+        ),
+        "select_objects" => (
+            "select_objects objects",
+            "select cells/nets/pins in the IDE views",
+        ),
+        "highlight_objects" => (
+            "highlight_objects objects",
+            "highlight objects (stronger than select)",
+        ),
+        "get_selected_objects" => (
+            "get_selected_objects",
+            "names currently selected via select_objects",
+        ),
+        "current_design" => ("current_design", "name of the loaded design"),
+        "synth_design" | "read_sv" => (
+            "synth_design ?file…? | read_sv file",
+            "synthesize SystemVerilog into the netlist",
+        ),
+        "read_verilog" | "read_vhdl" => (
+            "read_verilog|read_vhdl file",
+            "synth alias (Vivado compat)",
+        ),
+        "opt_design" => ("opt_design", "dead-code sweep on the netlist"),
+        "place_design" => ("place_design", "pack + PathFinder place"),
+        "route_design" => ("route_design", "route the placed design"),
+        "write_bitstream" => ("write_bitstream", "generate the bitstream"),
+        "write_checkpoint" => (
+            "write_checkpoint",
+            "snapshot the session (size + hash)",
+        ),
+        "create_clock" => (
+            "create_clock -period <ns> ?-name n? ?-waveform {r f}? objects",
+            "define a clock for STA (period in ns)",
+        ),
+        "report_timing" => (
+            "report_timing",
+            "STA table: WNS/TNS plus the worst paths",
+        ),
+        "report_utilization" => (
+            "report_utilization",
+            "resource usage table vs the target die",
+        ),
+        "mark_debug" | "add_probe" => (
+            "mark_debug net",
+            "mark a net for ILA-style probing",
+        ),
+        "eco" => (
+            "eco ?cell? ?init?",
+            "engineering change: rewrite one LUT init",
+        ),
+        "open_hw_manager" => ("open_hw_manager", "open the HW manager (sim)"),
+        "program_hw" | "program_hw_devices" => (
+            "program_hw ?cable=id?",
+            "program the device (sim fabric by default)",
+        ),
+        "report_die" | "report_hw_targets" => (
+            "report_die",
+            "target die geometry and capacity",
+        ),
+        "report_featuremap" => ("report_featuremap", "device feature map"),
+        "write_hnf" => ("write_hnf", "dump the netlist in HNF text form"),
+        "hds::synth" => ("hds::synth", "Helion flow: synthesize"),
+        "hds::impl" => ("hds::impl", "Helion flow: implement through bitstream"),
+        "hds::flow" => ("hds::flow", "flow step names"),
+        "hds::tree" => ("hds::tree", "source tree entries"),
+        // core language
+        "set" => ("set var ?value?", "read/write a variable"),
+        "unset" => ("unset ?-nocomplain? var…", "delete variables"),
+        "puts" => ("puts ?-nonewline? string", "write to the console"),
+        "expr" => ("expr arg…", "evaluate a math/logic expression"),
+        "if" => (
+            "if cond body ?elseif c2 b2…? ?else? body",
+            "conditional",
+        ),
+        "foreach" => ("foreach var list body", "loop over a list"),
+        "for" => ("for init test next body", "C-style loop"),
+        "while" => ("while test body", "loop while true"),
+        "proc" => ("proc name params body", "define a procedure"),
+        "return" => ("return ?value?", "return from a procedure"),
+        "break" => ("break", "exit the innermost loop"),
+        "continue" => ("continue", "next loop iteration"),
+        "list" => ("list ?values…?", "build a list"),
+        "llength" => ("llength list", "number of list elements"),
+        "lindex" => ("lindex list i", "element i (supports end-N)"),
+        "lrange" => ("lrange list a b", "sub-list from a to b"),
+        "lappend" => ("lappend var ?values…?", "append to a list variable"),
+        "concat" => ("concat ?lists…?", "join lists"),
+        "join" => ("join list ?sep?", "join elements with sep"),
+        "split" => ("split string ?seps?", "split into a list"),
+        "source" => ("source file", "evaluate a Tcl script file"),
+        "catch" => ("catch script ?var?", "trap errors, Tcl-style"),
+        "error" => ("error msg", "raise an error"),
+        "eval" => ("eval arg…", "evaluate args as a script"),
+        "subst" => ("subst string", "perform substitutions"),
+        "format" => ("format fmt args…", "%s %d %f %x subset"),
+        "incr" => ("incr var ?n?", "increment an integer variable"),
+        "append" => ("append var ?values…?", "append to a variable"),
+        "string" => (
+            "string op ?args…?",
+            "length|range|index|match|tolower|toupper|trim|first|equal",
+        ),
+        "info" => (
+            "info exists|vars|procs|commands|args|body …",
+            "introspection",
+        ),
+        _ => return None,
+    })
+}
+
+fn help_overview() -> String {
     [
         "Helion Tcl console. Core: set puts expr if foreach for while proc return break continue",
         "  list llength lindex lrange lappend concat join split string info catch error eval subst source format incr append",
         "Objects: get_cells get_nets get_pins get_ports get_clocks get_timing_paths [-filter expr] [-of_objects objs] [patterns]",
         "  get_property prop obj | set_property name value objs | report_property obj | list_property obj",
-        "  select_objects highlight_objects get_selected_objects | current_design",
+        "  select_objects highlight_objects get_selected_objects | current_design | clear",
         "Flow: synth_design|read_sv file opt_design place_design route_design write_bitstream write_checkpoint",
         "  create_clock report_timing report_utilization mark_debug eco open_hw_manager program_hw report_die report_featuremap",
-        "See docs/tcl-subset.md for the supported subset.",
+        "help <command> for usage. See docs/tcl-subset.md for the supported subset.",
     ]
     .join("\n")
 }
 
 fn cmd_get_cells(
-    i: &mut TclInterp,
+    _i: &mut TclInterp,
     argv: &[String],
     line: usize,
     shell: &mut GpuiShell,
@@ -994,16 +1416,18 @@ fn cmd_get_property(
         );
     }
     let (a, b) = (argv[k].clone(), argv[k + 1].clone());
-    // Try Vivado order first: a = property, b = object.
-    let vivado = resolve_obj(i, shell, &b, line, true)
+    // Try Vivado order first: a = property, b = object. When several
+    // object types share the name (e.g. port `clk` vs clock `clk`), the
+    // first candidate that HAS the property wins.
+    let prop_key = a.to_uppercase();
+    let vivado = resolve_candidates(i, shell, &b, line, true)
         .ok()
-        .and_then(|(_, props)| {
-            props
-                .get(&a.to_uppercase())
-                .cloned()
-                .map(|v| (v, true))
+        .and_then(|cands| {
+            cands
+                .into_iter()
+                .find_map(|(_, props)| props.get(&prop_key).cloned())
         });
-    if let Some((v, _)) = vivado {
+    if let Some(v) = vivado {
         return Ctl::Value(v);
     }
     // Fallback: a = object, b = property.
@@ -1182,6 +1606,7 @@ fn cmd_select_objects(
             highlighted,
         });
     }
+    i.selection_dirty = true;
     Ctl::Value(join_list(&objs))
 }
 
@@ -1228,12 +1653,15 @@ fn cmd_create_clock(i: &mut TclInterp, argv: &[String], line: usize) -> Ctl {
             "-period" => {
                 k += 1;
                 let v: f64 = match argv.get(k) {
-                    Some(s) => s.parse().map_err(|_| {
-                        TclError {
-                            msg: format!("create_clock: bad -period \"{s}\""),
-                            line,
+                    Some(s) => match s.parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return err(
+                                line,
+                                format!("create_clock: bad -period \"{s}\""),
+                            );
                         }
-                    })?,
+                    },
                     None => {
                         return err(line, "create_clock: -period needs an argument");
                     }
@@ -1301,11 +1729,12 @@ mod tests {
             _ => panic!(),
         };
         assert!(pat.contains("u_lut") && !pat.contains("u_ff"), "{pat}");
-        // property + filter
+        // property + filter (filter text as the interpreter delivers it:
+        // braces are Tcl grouping, stripped by the parser)
         let filt = eval_host(
             &mut i,
             "get_cells",
-            &["get_cells".into(), "-filter".into(), "{TYPE == lut}".into()],
+            &["get_cells".into(), "-filter".into(), "TYPE == lut".into()],
             1,
             &mut sh,
         );
@@ -1315,7 +1744,7 @@ mod tests {
         };
         assert!(filt.contains("u_lut"), "{filt}");
         let nets = eval_host(&mut i, "get_nets", &["get_nets".into()], 1, &mut sh);
-        assert!(matches!(nets, Ctl::Value(s) if s.contains("cnt_")), "{nets:?}");
+        assert!(matches!(&nets, Ctl::Value(s) if s.contains("cnt_")), "{nets:?}");
         let pins = eval_host(
             &mut i,
             "get_pins",
@@ -1323,7 +1752,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(pins, Ctl::Value(s) if s.contains("u_lut0/")), "{pins:?}");
+        assert!(matches!(&pins, Ctl::Value(s) if s.contains("u_lut0/")), "{pins:?}");
     }
 
     #[test]
@@ -1338,7 +1767,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(v, Ctl::Value(s) if s == "lut"), "{v:?}");
+        assert!(matches!(&v, Ctl::Value(s) if s == "lut"), "{v:?}");
         // task order (obj prop)
         let v = eval_host(
             &mut i,
@@ -1347,7 +1776,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(v, Ctl::Value(s) if s == "lut"), "{v:?}");
+        assert!(matches!(&v, Ctl::Value(s) if s == "lut"), "{v:?}");
         // unknown property
         let e = eval_host(
             &mut i,
@@ -1356,7 +1785,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(e, Ctl::Error(_)), "{e:?}");
+        assert!(matches!(&e, Ctl::Error(_)), "{e:?}");
         // list_property
         let lp = eval_host(
             &mut i,
@@ -1365,7 +1794,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(lp, Ctl::Value(s) if s.contains("TYPE")), "{lp:?}");
+        assert!(matches!(&lp, Ctl::Value(s) if s.contains("TYPE")), "{lp:?}");
     }
 
     #[test]
@@ -1384,9 +1813,9 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(r, Ctl::Value(s) if s == "clock clk period 10000ps"), "{r:?}");
+        assert!(matches!(&r, Ctl::Value(s) if s == "clock clk period 10000ps"), "{r:?}");
         let g = eval_host(&mut i, "get_clocks", &["get_clocks".into()], 1, &mut sh);
-        assert!(matches!(g, Ctl::Value(s) if s == "clk"), "{g:?}");
+        assert!(matches!(&g, Ctl::Value(s) if s == "clk"), "{g:?}");
         let p = eval_host(
             &mut i,
             "get_property",
@@ -1394,7 +1823,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(p, Ctl::Value(s) if s == "10000"), "{p:?}");
+        assert!(matches!(&p, Ctl::Value(s) if s == "10000"), "{p:?}");
     }
 
     #[test]
@@ -1408,7 +1837,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(s, Ctl::Value(v) if v.contains("u_lut0")), "{s:?}");
+        assert!(matches!(&s, Ctl::Value(v) if v.contains("u_lut0")), "{s:?}");
         assert_eq!(i.selected.len(), 1);
         assert_eq!(i.selected[0].kind, "cell");
         let g = eval_host(
@@ -1418,7 +1847,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(g, Ctl::Value(v) if v == "u_lut0"), "{g:?}");
+        assert!(matches!(&g, Ctl::Value(v) if v == "u_lut0"), "{g:?}");
         let bad = eval_host(
             &mut i,
             "select_objects",
@@ -1426,7 +1855,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(bad, Ctl::Error(_)), "{bad:?}");
+        assert!(matches!(&bad, Ctl::Error(_)), "{bad:?}");
     }
 
     #[test]
@@ -1472,7 +1901,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(n, Ctl::Value(s) if !s.is_empty()), "{n:?}");
+        assert!(matches!(&n, Ctl::Value(s) if !s.is_empty()), "{n:?}");
         // cells of a net
         if let Ctl::Value(s) = n {
             let first_net = split_list(&s).unwrap()[0].clone();
@@ -1483,7 +1912,165 @@ mod tests {
                 1,
                 &mut sh,
             );
-            assert!(matches!(c, Ctl::Value(v) if v.contains("u_lut0")), "{c:?}");
+            assert!(matches!(&c, Ctl::Value(v) if v.contains("u_lut0")), "{c:?}");
         }
+    }
+
+    #[test]
+    fn help_topics() {
+        let mut sh = shell_with_counter();
+        let mut i = TclInterp::new();
+        // per-command usage
+        let h = eval_host(
+            &mut i,
+            "help",
+            &["help".into(), "get_cells".into()],
+            1,
+            &mut sh,
+        );
+        assert!(
+            matches!(&h, Ctl::Value(s) if s.contains("get_cells") && s.contains("-filter")),
+            "{h:?}"
+        );
+        // core command topic
+        let h2 = eval_host(&mut i, "help", &["help".into(), "foreach".into()], 1, &mut sh);
+        assert!(matches!(&h2, Ctl::Value(s) if s.contains("foreach")), "{h2:?}");
+        // alias topic
+        let h3 = eval_host(
+            &mut i,
+            "help",
+            &["help".into(), "list_properties".into()],
+            1,
+            &mut sh,
+        );
+        assert!(matches!(&h3, Ctl::Value(_)), "{h3:?}");
+        // overview with no args
+        let h0 = eval_host(&mut i, "help", &["help".into()], 1, &mut sh);
+        assert!(
+            matches!(&h0, Ctl::Value(s) if s.contains("get_cells") && s.contains("report_timing")),
+            "{h0:?}"
+        );
+        // unknown topic suggests
+        let hb = eval_host(
+            &mut i,
+            "help",
+            &["help".into(), "get_cellz".into()],
+            1,
+            &mut sh,
+        );
+        assert!(
+            matches!(&hb, Ctl::Error(e) if e.msg.contains("did you mean") && e.msg.contains("get_cells")),
+            "{hb:?}"
+        );
+        // user proc gets help from its definition
+        crate::tcl_eval(&mut sh, "proc mysum {a {b 10}} { expr {$a + $b} }").unwrap();
+        let mut i2 = std::mem::replace(&mut sh.tcl_interp, TclInterp::new());
+        let hp = eval_host(&mut i2, "help", &["help".into(), "mysum".into()], 1, &mut sh);
+        sh.tcl_interp = i2;
+        assert!(
+            matches!(&hp, Ctl::Value(s) if s.contains("mysum") && s.contains("{b 10}")),
+            "{hp:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_suggests_similar() {
+        let mut sh = shell_with_counter();
+        let mut i = TclInterp::new();
+        let e = eval_host(&mut i, "get_cellz", &["get_cellz".into()], 1, &mut sh);
+        match e {
+            Ctl::Error(te) => {
+                assert!(te.msg.contains("invalid command name"), "{}", te.msg);
+                assert!(te.msg.contains("get_cells"), "{}", te.msg);
+                assert!(!te.msg.contains('\n'), "{}", te.msg);
+            }
+            other => panic!("{other:?}"),
+        }
+        // far-off name: no suggestion, still a clean error
+        let e2 = eval_host(&mut i, "zzzqqq", &["zzzqqq".into()], 1, &mut sh);
+        assert!(matches!(&e2, Ctl::Error(_)), "{e2:?}");
+    }
+
+    #[test]
+    fn clear_sets_console_flag() {
+        let mut sh = shell_with_counter();
+        let mut i = TclInterp::new();
+        assert!(!i.clear_console);
+        let r = eval_host(&mut i, "clear", &["clear".into()], 1, &mut sh);
+        assert!(matches!(&r, Ctl::Value(_)), "{r:?}");
+        assert!(i.clear_console);
+        let bad = eval_host(&mut i, "clear", &["clear".into(), "x".into()], 1, &mut sh);
+        assert!(matches!(&bad, Ctl::Error(_)), "{bad:?}");
+    }
+
+    #[test]
+    fn list_properties_alias() {
+        let mut sh = shell_with_counter();
+        let mut i = TclInterp::new();
+        for cmd in ["list_property", "list_properties"] {
+            let lp = eval_host(&mut i, cmd, &[cmd.into(), "u_lut0".into()], 1, &mut sh);
+            assert!(
+                matches!(&lp, Ctl::Value(s) if s.contains("TYPE")),
+                "{cmd}: {lp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_tables_are_readable() {
+        let mut sh = shell_with_counter();
+        let mut i = TclInterp::new();
+        let t = eval_host(&mut i, "report_timing", &["report_timing".into()], 1, &mut sh);
+        match t {
+            Ctl::Value(s) => {
+                assert!(s.contains("Timing Report"), "{s}");
+                assert!(s.contains("WNS"), "{s}");
+                assert!(s.contains("9640"), "{s}"); // gold WNS_PS surfaces
+                assert!(s.contains("Startpoint"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let u = eval_host(
+            &mut i,
+            "report_utilization",
+            &["report_utilization".into()],
+            1,
+            &mut sh,
+        );
+        match u {
+            Ctl::Value(s) => {
+                assert!(s.contains("Utilization"), "{s}");
+                assert!(s.contains("LUTFF"), "{s}");
+                assert!(s.contains("Resource"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn demo_analysis_script_end_to_end() {
+        // A realistic user script through the real entry point: query the
+        // object model, filter in Tcl, and summarize — no direct eval_host.
+        let mut sh = shell_with_counter();
+        let r = crate::tcl_eval(
+            &mut sh,
+            "set cells [get_cells]\n\
+             set nluts 0\n\
+             foreach c $cells {\n\
+             \x20 if {[get_property TYPE $c] eq \"lut\"} { incr nluts }\n\
+             }\n\
+             list [llength $cells] $nluts",
+        )
+        .unwrap();
+        assert_eq!(r, "9 4", "{r}");
+        // -filter agrees with the scripted count
+        let f = crate::tcl_eval(&mut sh, "llength [get_cells -filter {TYPE == lut}]").unwrap();
+        assert_eq!(f, "4", "{f}");
+        // selection round-trips into the interp state
+        let s =
+            crate::tcl_eval(&mut sh, "select_objects [get_cells u_lut*]; get_selected_objects")
+                .unwrap();
+        assert!(s.contains("u_lut0"), "{s}");
+        assert_eq!(sh.tcl_interp.selected.len(), 4);
     }
 }

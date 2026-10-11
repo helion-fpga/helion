@@ -22,8 +22,9 @@
 //!
 //! Object model: `get_cells`, `get_nets`, `get_pins`, `get_ports`,
 //! `get_clocks`, `get_timing_paths`, `get_property`, `set_property`,
-//! `report_property`, `list_property`, `select_objects`,
-//! `highlight_objects`, `get_selected_objects`, `current_design`.
+//! `report_property`, `list_property`/`list_properties`, `select_objects`,
+//! `highlight_objects`, `get_selected_objects`, `current_design`, `clear`,
+//! `help ?topic?` (per-command usage, with "did you mean …?" on typos).
 //!
 //! Flow: `synth_design`/`read_sv`, `opt_design`, `place_design`,
 //! `route_design`, `write_bitstream`, `write_checkpoint`, `create_clock`,

@@ -78,7 +78,7 @@ impl<'a> P<'a> {
         if c == '\n' {
             self.line += 1;
         }
-        c
+        Some(c)
     }
     fn err<T>(&self, message: impl Into<String>) -> Result<T, ParseError> {
         Err(ParseError {
@@ -116,7 +116,12 @@ fn parse_commands(p: &mut P, end: Option<char>) -> Result<Vec<Command>, ParseErr
     loop {
         p.skip_blanks();
         match p.peek() {
-            None => break,
+            None => {
+                if end.is_some() {
+                    return p.err("missing close-bracket");
+                }
+                break;
+            }
             Some(c) if Some(c) == end => {
                 p.bump();
                 break;
@@ -148,7 +153,7 @@ fn parse_commands(p: &mut P, end: Option<char>) -> Result<Vec<Command>, ParseErr
                 None => break,
                 Some(c) if Some(c) == end => break,
                 Some(';') | Some('\n') => break,
-                _ => words.push(parse_word(p)?),
+                _ => words.push(parse_word(p, end)?),
             }
         }
         if !words.is_empty() {
@@ -170,7 +175,7 @@ fn is_var_char(c: char) -> bool {
 }
 
 /// Parse one word. `{`/`"` are only special as the first character.
-fn parse_word(p: &mut P) -> Result<Word, ParseError> {
+fn parse_word(p: &mut P, end: Option<char>) -> Result<Word, ParseError> {
     let mut segs: Vec<Seg> = Vec::new();
     let mut lit = String::new();
     let first = p.peek();
@@ -238,6 +243,7 @@ fn parse_word(p: &mut P) -> Result<Word, ParseError> {
                         }
                     }
                 }
+                Some(c) if Some(c) == end => break,
                 Some(' ') | Some('\t') | Some('\r') | Some('\n') | Some(';') | None => break,
                 _ => parse_word_char(p, &mut lit, &mut segs)?,
             }
@@ -246,6 +252,7 @@ fn parse_word(p: &mut P) -> Result<Word, ParseError> {
         loop {
             match p.peek() {
                 None => break,
+                Some(c) if Some(c) == end => break,
                 Some(' ') | Some('\t') | Some('\r') | Some('\n') | Some(';') => break,
                 _ => parse_word_char(p, &mut lit, &mut segs)?,
             }
@@ -402,7 +409,7 @@ mod tests {
     fn braces_quotes_brackets() {
         let c = parse_script(r#"set a {x $y [cmd]}; puts "v=$a ok""#).unwrap();
         let w = words(&c);
-        assert_eq!(w[0][1], "BL[x $y [cmd]]");
+        assert_eq!(w[0][2], "BL[x $y [cmd]]");
         assert_eq!(w[1][1], "L[v=]V[a]L[ ok]");
     }
 
@@ -418,7 +425,9 @@ mod tests {
         let c = parse_script("# hi\nset a 1 \\\n 2").unwrap();
         assert_eq!(c.len(), 1);
         let w = words(&c);
-        assert_eq!(w[0], vec!["L[set]", "L[a]", "L[1]L[ 2]"]);
+        // `1 \` + newline + ` 2`: the space ends the word, so the
+        // continuation starts a new word (same as real Tcl).
+        assert_eq!(w[0], vec!["L[set]", "L[a]", "L[1]", "L[2]"]);
     }
 
     #[test]

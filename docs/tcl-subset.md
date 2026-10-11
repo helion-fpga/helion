@@ -16,7 +16,7 @@ Everything is a string, like Tcl. Errors are `ERROR: <msg> (line <n>)`.
 | `set var ?value?` | read/write; `set a [expr {...}]` works |
 | `unset var...` | |
 | `puts ?-nonewline? string` | output goes to the console pane |
-| `expr arg...` | arithmetic, comparisons, `&&`/`||`/`!`, `?:`, math funcs (`abs int double round sqrt pow sin cos atan2 log exp`), string compare ops (`eq ne`) |
+| `expr arg...` | arithmetic, comparisons, `&&`/`||`/`!`, `?:`, math funcs (`abs int double round sqrt pow sin cos atan2 log exp`), string compare ops (`eq ne`), `[cmd]` substitution inside expressions |
 | `if cond body ?elseif ...? ?else?` | |
 | `foreach var list body` / `foreach {a b} list body` | |
 | `for init test next body` | |
@@ -31,7 +31,15 @@ Everything is a string, like Tcl. Errors are `ERROR: <msg> (line <n>)`.
 | `eval arg...`, `subst`, `source file` | |
 | `format fmt args...` | `%s %d %f %x` subset |
 | `incr var ?n?`, `append var args...` | |
-| `help` | lists object-model commands |
+| `help ?topic?` | overview, or usage for one command (also works for your `proc`s) |
+| `clear` | clear the console transcript |
+
+Unknown commands raise a Tcl-style error with "did you mean …?" suggestions
+instead of failing silently. Errors are single-line, never panics.
+
+The console input is multi-line: Enter runs the command when braces /
+brackets / quotes are balanced, otherwise it inserts a newline (Shift+Enter
+always inserts a newline). Up/Down walk command history on single-line input.
 
 ## Object model (Vivado-style, backed by the real design DB)
 
@@ -39,9 +47,13 @@ Everything is a string, like Tcl. Errors are `ERROR: <msg> (line <n>)`.
 `get_timing_paths` — glob patterns, `-filter {PROP == val}` / `!=`, `>`, `<`,
 `=~` (glob), `-of_objects`, `-quiet`, `-max_paths` (timing paths).
 
-`get_property`, `set_property`, `report_property`, `list_property`,
-`select_objects`, `highlight_objects`, `get_selected_objects`,
-`current_design`.
+`get_property`, `set_property`, `report_property`, `list_property`
+(`list_properties` is an alias), `select_objects`, `highlight_objects`,
+`get_selected_objects`, `current_design`.
+
+`report_timing` prints a WNS/TNS summary plus the worst-paths table;
+`report_utilization` prints a per-resource usage table against the die.
+Select a console row to read the full report in the properties pane.
 
 ## Flow commands (same engines as the GUI buttons)
 
