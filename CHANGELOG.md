@@ -12,7 +12,35 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.0.5...HEAD
+[unreleased]: https://github.com/helion-fpga/helion/compare/v2.1.0...HEAD
+
+## [2.1.0] — 2026-10-11
+
+Performance campaign, area campaign, and IDE rebuild.
+
+### Added
+
+- Permanent criterion benchmark harness for all five engines (synth, pack, place, route, STA), a full-flow profiler, and a perf-budget proposal.
+- ABC-style AIG rewriting in synthesis: structural hashing, K=4 cut enumeration, exact minimum-AND truth-table resynthesis, and cross-cone structural sharing via one global hashed AIG — all guarded by exhaustive miter equivalence tests.
+- IDE: rebuilt Project Summary (8 space-filling sections), real code editor (line-number gutter, syntax highlighting, breadcrumbs, diagnostic gutter ticks, CJK font fallback), expandable hierarchy tree, schematic level-of-detail (hierarchical block treemap at fit zoom, gate sheet on zoom-in), sortable timing tables with endpoint-slack histogram, clickable status bar.
+- 80-surface screenshot gallery (`helion-research/surfaces/`) covering PicoRV32 and Ibex across all 28 workspace tabs.
+- README overhaul with hero screenshots, measured benchmarks, and architecture/roadmap docs.
+
+### Changed
+
+- Synthesis frontend allocations 12.7M → 409k (−97%); frontend wall time −69% (arena-allocated elaboration, borrowed tokenizer spans, arena parser, interned names).
+- Area: uart 420 → 244 LUTs (−42%), spi 73 → 52 (−29%), cnt16 37 → 16 (−57%), cmp16 39 → 20 (−49%); PicoRV32 −19% LUTs from AIG rewriting and −10% further from cross-cone sharing (63% of cross-cone logic was structurally duplicated).
+- `Rtl`/`RExpr` now borrow `&str` name spans and arena-allocate nodes instead of per-node `String`/`Box`.
+
+### Fixed
+
+- Unpacked-word output IOBs were attached to undriven net names while the real output nets went nowhere.
+- 16-bit counters silently dropped bit 15.
+- Cross-cone sharing polarity corruption (an output node reused inside another cone's logic) — caught by new multi-cone miter tests before shipping.
+- DRC message column clipped at 1600px; Timing Constraints button now shows the actual filename.
+- Ibex CJK comments rendered as `?????` (bundled font lacked CJK glyphs; DroidSansFallback wired as fallback).
+
+[2.1.0]: https://github.com/helion-fpga/helion/compare/v2.0.5...v2.1.0
 
 ## [2.0.5] — 2026-10-01
 
