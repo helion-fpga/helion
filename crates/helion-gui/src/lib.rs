@@ -7,6 +7,8 @@ pub mod chrome;
 pub use chrome::{Activity, Canvas, WorkspacePane, pane_for_workspace};
 pub mod doctor;
 pub mod ide;
+pub mod power;
+pub mod vcd;
 pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
@@ -22,7 +24,12 @@ pub use surface::{
     central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
     JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
 };
-pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
+pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog, open_vcd_dialog};
+pub use vcd::{SignalActivity, VcdActivity, parse_vcd};
+pub use power::{
+    CapTable, HierPower, LeakTable, NetPower, PowerConfig, PowerSeverity, PowerWarning,
+    ResourcePower, VcdPowerReport, analyze_power,
+};
 pub use ide::{
     BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,

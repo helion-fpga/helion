@@ -11,10 +11,10 @@ use helion_gui::surface::{
     ChromeState, EventClass, JobHandle, JobKind, UiEvent, UiTrace,
 };
 use helion_gui::{
-    doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
-    ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TimingPathSortCol,
-    WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
+    doctor, open_hdl_dialog, open_vcd_dialog, pane_for_workspace, BottomTab, CdcSeverity,
+    ClockRelation, ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
+    MethodologySeverity, MsgSeverity, PathGroupKind, PowerSeverity, SourceLine, StepState,
+    TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -5330,6 +5330,12 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         }
         return;
     }
+    paint_vcd_power_section(ui, model, theme);
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(RichText::new("Rails (vectorless STA)").strong());
+    ui.add_space(4.0);
     ui.label(format!(
         "part={} VOLTAGE_MV={} TEMP_C={} F_MHZ={}",
         report.part, report.voltage_mv, report.temperature_c, report.f_mhz
@@ -5437,6 +5443,216 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
     if let Some(rail) = pick_blk {
         let _ = model.select_power(&rail);
+    }
+}
+
+/// VCD-driven switching-activity power section of the Power tab.
+///
+/// Mode badge (VCD-driven vs vectorless estimate), load/dump/clear actions,
+/// total/static/dynamic cards, per-resource bars, per-hierarchy table,
+/// top-20 toggling nets, and activity-annotated findings. Capacitances are
+/// modeled, not silicon-measured — see `helion_gui::power`.
+fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+    ui.label(RichText::new("Switching activity").strong());
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Load VCD…").clicked() {
+            if let Some(p) = open_vcd_dialog() {
+                let _ = model.read_vcd(&p.to_string_lossy());
+            }
+        }
+        if ui.button("Dump VCD from sim").clicked() {
+            surface::request_job(JobKind::DumpVcd(256));
+        }
+        if model.vcd_activity.is_some() && ui.button("Clear VCD").clicked() {
+            let _ = model.exec("clear_vcd");
+        }
+    });
+    ui.add_space(4.0);
+    if let Some(err) = model.vcd_error.clone() {
+        ui.label(RichText::new(format!("VCD error: {err}")).color(theme.danger));
+        ui.add_space(4.0);
+    }
+    let Some(r) = model.vcd_power_report() else {
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        if r.vectorless {
+            ui.label(
+                RichText::new("◉ vectorless estimate")
+                    .color(theme.warn)
+                    .strong(),
+            );
+        } else {
+            ui.label(RichText::new("◉ VCD-driven").color(theme.ok).strong());
+        }
+        if let Some(p) = &r.vcd_path {
+            let short = p.rsplit('/').next().unwrap_or(p);
+            ui.label(RichText::new(short).color(theme.dim).monospace())
+                .on_hover_text(p);
+        }
+        ui.label(
+            RichText::new(format!("{} cycles", r.cycles))
+                .color(theme.dim)
+                .small(),
+        );
+    });
+    if r.vectorless {
+        ui.label(
+            RichText::new(
+                "Default toggle rates — load a VCD for measured switching activity. \
+                 Capacitances are modeled, not silicon-measured.",
+            )
+            .color(theme.dim)
+            .small(),
+        );
+    } else {
+        ui.label(
+            RichText::new(format!(
+                "activity coverage: {}/{} nets ({:.0}%)",
+                r.nets_matched,
+                r.nets_total,
+                r.coverage_pct()
+            ))
+            .color(theme.dim)
+            .small(),
+        );
+        if !r.unmatched_signals.is_empty() {
+            let mut shown = r
+                .unmatched_signals
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if r.unmatched_count > r.unmatched_signals.len() {
+                shown.push_str(&format!(
+                    " (+{} more)",
+                    r.unmatched_count - r.unmatched_signals.len()
+                ));
+            }
+            ui.label(
+                RichText::new(format!("unmatched VCD signals: {shown}"))
+                    .color(theme.dim)
+                    .small(),
+            )
+            .on_hover_text(
+                "VCD signals that matched no design net — check hierarchical scope or net names",
+            );
+        }
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        for (label, mw) in [
+            ("Total", r.total_mw),
+            ("Static", r.static_mw),
+            ("Dynamic", r.dynamic_mw),
+        ] {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(format!("{mw:.3} mW")).strong().size(18.0));
+                ui.label(RichText::new(label).color(theme.dim).small());
+            });
+            ui.add_space(28.0);
+        }
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(format!("{} mV · {} °C", r.voltage_mv, r.temperature_c)).strong(),
+            );
+            ui.label(
+                RichText::new("operating conditions").color(theme.dim).small(),
+            );
+        });
+    });
+    ui.add_space(8.0);
+    ui.label(RichText::new("By resource").strong());
+    let max_mw = r
+        .by_resource
+        .iter()
+        .map(|x| x.mw)
+        .fold(0.0f64, f64::max)
+        .max(1e-9);
+    egui::Grid::new("vcd_power_resources")
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for res in &r.by_resource {
+                ui.label(RichText::new(&res.name).monospace());
+                ui.label(format!("{:.3} mW", res.mw));
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(160.0, 10.0), Sense::hover());
+                ui.painter().rect_filled(bar, 2.0, theme.surface);
+                let frac = (res.mw / max_mw).clamp(0.0, 1.0) as f32;
+                let fill = bar.with_max_x(bar.left() + bar.width() * frac);
+                ui.painter().rect_filled(fill, 2.0, theme.info);
+                ui.end_row();
+            }
+        });
+    if !r.by_hierarchy.is_empty() {
+        ui.add_space(8.0);
+        ui.label(RichText::new("By hierarchy").strong());
+        egui::Grid::new("vcd_power_hier")
+            .spacing([8.0, 2.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new("Block").strong());
+                ui.label(RichText::new("Cells").strong());
+                ui.label(RichText::new("mW").strong());
+                ui.end_row();
+                for h in r.by_hierarchy.iter().take(8) {
+                    ui.label(RichText::new(&h.name).monospace());
+                    ui.label(h.cells.to_string());
+                    ui.label(format!("{:.3}", h.mw));
+                    ui.end_row();
+                }
+            });
+    }
+    ui.add_space(8.0);
+    ui.label(RichText::new("Top toggling nets").strong());
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .id_salt("vcd_top_nets")
+        .show(ui, |ui| {
+            egui::Grid::new("vcd_top_nets_grid")
+                .spacing([8.0, 2.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Net").strong());
+                    ui.label(RichText::new("Toggles").strong());
+                    ui.label(RichText::new("α").strong());
+                    ui.label(RichText::new("mW").strong());
+                    ui.end_row();
+                    for n in &r.top_nets {
+                        let name = if n.is_clock {
+                            RichText::new(format!("{} (clock)", n.name))
+                                .monospace()
+                                .color(theme.info)
+                        } else {
+                            RichText::new(&n.name).monospace()
+                        };
+                        // Click a hot net to cross-probe it in the schematic
+                        // (device routes highlighted).
+                        if ui
+                            .selectable_label(false, name)
+                            .on_hover_text("Cross-probe in schematic")
+                            .clicked()
+                        {
+                            model.select_vcd_net(&n.name);
+                        }
+                        ui.label(n.toggles.to_string());
+                        ui.label(format!("{:.2}", n.activity));
+                        ui.label(format!("{:.4}", n.mw));
+                        ui.end_row();
+                    }
+                });
+        });
+    if !r.warnings.is_empty() {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Findings").strong());
+        for w in &r.warnings {
+            let color = match w.severity {
+                PowerSeverity::Critical => theme.danger,
+                PowerSeverity::Warning => theme.warn,
+                PowerSeverity::Info => theme.dim,
+            };
+            ui.label(RichText::new(format!("• {}", w.message)).color(color));
+        }
     }
 }
 
