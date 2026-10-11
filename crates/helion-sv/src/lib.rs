@@ -10287,6 +10287,10 @@ fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
     walk(e, &mut vars, &mut budget, n)
 }
 
+/// LUT6 INIT for O = I0 (identity buffer), shared by the mapper's
+/// buffer-threading in `LutShare::lut6` (FM-HEL-AREA-03).
+const BUF_INIT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+
 /// LUT6 identity: same INIT + pin nets → one cell. Intermediates (`out=None`)
 /// share; a required output net always gets its own driver (no pin alias).
 struct LutShare {
@@ -10310,6 +10314,22 @@ impl LutShare {
         init: u64,
         pins: &[String],
     ) -> String {
+        // FM-HEL-AREA-03: identity buffer (O = I0) — thread the input net to
+        // the use site instead of materializing a cell. The mapper chooses
+        // lut6_buf() by construction, so unlike a netlist bypass there is no
+        // polarity to misidentify (round-1's hazard was a *misidentified
+        // inverter*, not a true buffer). Safe only when no name contract
+        // requires driving `out`: with out=None the caller uses the returned
+        // net; with out=Some(o), o==pin the net is already driven. When
+        // out=Some(o), o!=pin (comb-path RTL nets referenced by name
+        // elsewhere) we must drive `o` — fall through and materialize.
+        if init == BUF_INIT && pins.len() == 1 {
+            match out {
+                None => return pins[0].clone(),
+                Some(o) if o == pins[0] => return pins[0].clone(),
+                _ => {}
+            }
+        }
         let key = (init, pins.to_vec());
         if out.is_none() {
             if let Some(existing) = self.by_fn.get(&key) {
@@ -10706,18 +10726,19 @@ fn try_map_and_or_mix(
 }
 
 /// Sequential / leftover comb cone that is too wide for one LUT6 but is an
-/// ITE / OR-of-eq / AND-OR mix. Returns true if `out` is driven.
+/// ITE / OR-of-eq / AND-OR mix. Returns the net driving the cone result.
+/// Takes no `out` name: the caller connects the returned net (FM-HEL-AREA-03),
+/// so identity buffers are threaded through instead of materialized.
 fn try_map_wide_bool(
     d: &mut Design,
     expr: &Expr,
     prefix: &str,
-    out: Option<&str>,
     share: &mut LutShare,
-) -> bool {
-    try_map_xnor_and_tree(d, expr, prefix, out, share).is_some()
-        || try_map_ite_const_tree(d, expr, prefix, out, share).is_some()
-        || try_map_or_eq_tree(d, expr, prefix, out, share).is_some()
-        || try_map_and_or_mix(d, expr, prefix, out, share).is_some()
+) -> Option<String> {
+    try_map_xnor_and_tree(d, expr, prefix, None, share)
+        .or_else(|| try_map_ite_const_tree(d, expr, prefix, None, share))
+        .or_else(|| try_map_or_eq_tree(d, expr, prefix, None, share))
+        .or_else(|| try_map_and_or_mix(d, expr, prefix, None, share))
 }
 
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
@@ -12353,7 +12374,7 @@ fn emit_ripple_add(
 
 fn lut6_buf() -> u64 {
     // O = I0, independent of I1..I5.
-    0xAAAA_AAAA_AAAA_AAAA
+    BUF_INIT
 }
 
 fn lut6_xnor2() -> u64 {
@@ -14130,19 +14151,19 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     let mut wide_luts = 0usize;
     let mut share = LutShare::new();
     for (i, (bitn, expr)) in reg_bits.iter().enumerate() {
-        let (ff, dnet, qnet) = if single_q {
-            ("u_ff".to_string(), "d".to_string(), "q".to_string())
+        let (ff, qnet) = if single_q {
+            ("u_ff".to_string(), "q".to_string())
         } else {
-            (format!("u_ff{i}"), format!("d{i}"), bitn.clone())
+            (format!("u_ff{i}"), bitn.clone())
         };
         let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
-        let map_seq_wide = |d: &mut Design, e: &Expr, share: &mut LutShare| -> bool {
-            try_map_wide_bool(d, e, &format!("u_sw{i}_"), Some(dnet.as_str()), share)
+        let map_seq_wide = |d: &mut Design, e: &Expr, share: &mut LutShare| -> Option<String> {
+            try_map_wide_bool(d, e, &format!("u_sw{i}_"), share)
         };
-        let emit_mapped_ff = |d: &mut Design| {
+        let emit_mapped_ff = |d: &mut Design, dnet: &str| {
             d.add_cell(&ff, CellKind::Hff);
             d.connect(&bit_clk, &ff, "CLK");
-            d.connect(&dnet, &ff, "D");
+            d.connect(dnet, &ff, "D");
             d.connect(&qnet, &ff, "Q");
             if keep_bits.contains(bitn) {
                 let _ = d.dont_touch(&ff);
@@ -14157,9 +14178,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // sibling bits (≤6-PI / ITE / xnor). Do not abort the whole module.
         let huge = expr_node_count(expr) > 8_000;
         if huge {
-            if cone_pi_exceeds(expr, 6) && map_seq_wide(&mut d, expr, &mut share) {
-                emit_mapped_ff(&mut d);
-                continue;
+            if cone_pi_exceeds(expr, 6) {
+                if let Some(dnet) = map_seq_wide(&mut d, expr, &mut share) {
+                    emit_mapped_ff(&mut d, &dnet);
+                    continue;
+                }
             }
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
@@ -14169,9 +14192,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         // >6-PI sequential: prefer packed ITE/OR-of-eq over AIG (FSM next-state
         // can exceed AND_CAP=96 with few PIs — ibex2axi r_state_1).
-        if cone_pi_exceeds(expr, 6) && map_seq_wide(&mut d, expr, &mut share) {
-            emit_mapped_ff(&mut d);
-            continue;
+        if cone_pi_exceeds(expr, 6) {
+            if let Some(dnet) = map_seq_wide(&mut d, expr, &mut share) {
+                emit_mapped_ff(&mut d, &dnet);
+                continue;
+            }
         }
         let aig = Aig::from_expr(expr);
         if aig.pis.len() > 6 {
