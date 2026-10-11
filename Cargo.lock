@@ -1300,14 +1300,14 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helion-bd"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-ipxact",
 ]
 
 [[package]]
 name = "helion-bits"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-device",
  "helion-ir",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "helion-cli"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "helion-debug"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",
@@ -1353,11 +1353,11 @@ dependencies = [
 
 [[package]]
 name = "helion-device"
-version = "2.0.5"
+version = "2.1.0"
 
 [[package]]
 name = "helion-drc"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-device",
  "helion-ir",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "helion-fabric"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",
@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "helion-gui"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "eframe",
  "helion-bd",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "helion-hls"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-ir",
  "helion-sv",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "helion-hw"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",
@@ -1432,15 +1432,15 @@ dependencies = [
 
 [[package]]
 name = "helion-ipxact"
-version = "2.0.5"
+version = "2.1.0"
 
 [[package]]
 name = "helion-ir"
-version = "2.0.5"
+version = "2.1.0"
 
 [[package]]
 name = "helion-lab"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",
@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "helion-lib"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-device",
  "helion-ir",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "helion-pack"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "criterion",
  "helion-device",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "helion-place"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "criterion",
  "helion-device",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "helion-proj"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-debug",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "helion-route"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "criterion",
  "helion-device",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "helion-sim"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "helion-sta"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "criterion",
  "helion-device",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "helion-sv"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "bumpalo",
  "criterion",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "helion-vhdl"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "helion-bits",
  "helion-device",

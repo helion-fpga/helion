@@ -44,6 +44,8 @@ jobs:
           fi
       - name: Helion.app
         run: ./scripts/build-macos-app.sh
+      - name: verify app signature
+        run: codesign --verify --deep --strict dist/Helion.app && echo "ad-hoc signature OK"
       - name: helion-prog
         run: cargo build --release --target aarch64-apple-darwin -p helion-hw
       - name: zip app
