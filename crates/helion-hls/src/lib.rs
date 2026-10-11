@@ -179,8 +179,18 @@ enum CExpr {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 enum Stmt {
-    Assign { lhs: String, deref: bool, bit: Option<usize>, rhs: CExpr },
-    For { var: String, start: usize, end: usize, body: Vec<Stmt> }, // var kept for debug
+    Assign {
+        lhs: String,
+        deref: bool,
+        bit: Option<usize>,
+        rhs: CExpr,
+    },
+    For {
+        var: String,
+        start: usize,
+        end: usize,
+        body: Vec<Stmt>,
+    }, // var kept for debug
     Return(CExpr),
 }
 
@@ -685,7 +695,8 @@ pub fn hls_compile(source: &str) -> Result<HlsResult, String> {
         return Err("hls: unsupported body".into());
     }
     let (sv, ops) = emit_sv(&fname, &args, &vars, &flat)?;
-    let design = helion_sv::synth_sv(&sv, "hls.sv").map_err(|e| format!("sv synth: {e} :: {sv}"))?;
+    let design =
+        helion_sv::synth_sv(&sv, "hls.sv").map_err(|e| format!("sv synth: {e} :: {sv}"))?;
     Ok(HlsResult { design, ops, sv })
 }
 
@@ -748,8 +759,18 @@ void counter(bool *led) {
 "#;
         let r3 = hls_compile(inc3).unwrap();
         let r4 = hls_compile(inc4).unwrap();
-        assert_eq!(r3.design.lut_inits().len(), 3, "3-bit HLS incrementer {:?}", r3.sv);
-        assert_eq!(r4.design.lut_inits(), INC4_INIT.to_vec(), "4-bit must match gold {}", r4.sv);
+        assert_eq!(
+            r3.design.lut_inits().len(),
+            3,
+            "3-bit HLS incrementer {:?}",
+            r3.sv
+        );
+        assert_eq!(
+            r4.design.lut_inits(),
+            INC4_INIT.to_vec(),
+            "4-bit must match gold {}",
+            r4.sv
+        );
         assert_ne!(r3.design.lut_inits().len(), r4.design.lut_inits().len());
         assert!(r3.ops.iter().any(|o| o.res == Res::Lut));
         assert!(r3.ops.iter().any(|o| o.res == Res::Ff));
@@ -768,10 +789,24 @@ int mac2(int a, int b) {
 "#;
         let m1 = hls_compile(one).unwrap();
         let m2 = hls_compile(two).unwrap();
-        let n1 = m1.design.cells.iter().filter(|c| matches!(c.kind, CellKind::Mac27)).count();
-        let n2 = m2.design.cells.iter().filter(|c| matches!(c.kind, CellKind::Mac27)).count();
+        let n1 = m1
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Mac27))
+            .count();
+        let n2 = m2
+            .design
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Mac27))
+            .count();
         assert_eq!(n1, 1, "one mul → one DSP {}", m1.sv);
-        assert_eq!(n2, 2, "unrolled 2-iter mul loop must bind 2 DSP, not 1: ops={:?} sv={}", m2.ops, m2.sv);
+        assert_eq!(
+            n2, 2,
+            "unrolled 2-iter mul loop must bind 2 DSP, not 1: ops={:?} sv={}",
+            m2.ops, m2.sv
+        );
         assert!(m2.ops.iter().filter(|o| o.res == Res::Dsp).count() >= 2);
         assert!(
             m2.ops.iter().any(|o| o.cycle >= 1),

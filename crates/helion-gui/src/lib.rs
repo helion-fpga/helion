@@ -11,45 +11,42 @@ pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
 pub mod surface;
-pub use learner_l1::{
-    ConstraintProvenance, SessionStage, StageError, StageStatus,
-};
-pub use learner_l2::{
-    critical_path_highlight, highlight_set_from_path, packing_summary_from_placed, HighlightSet,
-    HighlightSetExt,
-};
-pub use surface::{
-    central_pane, ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind,
-    JobOutcome, UiTrace, apply_activity, apply_canvas, apply_more, geometry_at, queue_flow, spawn_job,
-};
-pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
-pub use ide::{
-    BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
-    DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
-    HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
-    IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
-    MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
-    ConstraintRow, ConstraintSection,
-    Pblock, ProjectSummaryGadget, PropertyRow, ReportCatalogRow,
-    NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
-    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
-    schematic_kind_label, schematic_short_name,
-    TimingPathPin,
-    UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
-    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
-};
 pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{
     CdcReport, CdcSeverity, CdcViolation, ClockInteraction, ClockInteractionCell, ClockNetwork,
     ClockNetworkReport, ClockRelation, MethodologyReport, MethodologySeverity,
     MethodologyViolation, PathGroupKind, PowerReport, TimingSummary, TimingSummaryGroup,
 };
+pub use ide::{
+    BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab,
+    BreakpointRow, ClockRegion, ConsoleLine, ConstraintRow, ConstraintSection, DesignRun,
+    DeviceRoute, DeviceSiteView, DeviceView, EcoRow, EditorMarker, FindHit, FlowStep, ForceRow,
+    HierBox, HierOccupancy, HierarchyDrawing, HierarchyView, HwManager, HwStatReport, HwStatRow,
+    IdeMessage, IdeModel, IlaDashboard, IlaSampleRow, IlaTrigger, IncrementalRow, IoPortView,
+    IpCatalogRow, LayoutKind, LocalRow, MemoryBlock, MemoryWordRow, MsgSeverity, NavAction,
+    NavSection, NetlistRow, NetlistTree, PackageDrawing, PackagePin, Pblock, ProjectSummaryGadget,
+    PropertyRow, ReportCatalogRow, SchematicCamera, SchematicDrawing, SchematicPin,
+    SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, SourceLine,
+    StepState, TimingPath, TimingPathPin, UltraFastStage, UtilOccupancy, Utilization,
+    UtilizationReport, VirtualBus, WaveCursorRow, WaveMarker, WaveRadix, WaveStyle, WaveTrace,
+    Waveform, WorkspaceTab, schematic_kind_label, schematic_short_name,
+};
+pub use learner_l1::{ConstraintProvenance, SessionStage, StageError, StageStatus};
+pub use learner_l2::{
+    HighlightSet, HighlightSetExt, critical_path_highlight, highlight_set_from_path,
+    packing_summary_from_placed,
+};
+pub use open_dialog::{HDL_EXTENSIONS, dialog_backend, hdl_file_dialog, open_hdl_dialog};
+pub use surface::{
+    ChromeDriver, ChromeState, EventClass, GeometryReport, JobHandle, JobKind, JobOutcome, UiTrace,
+    apply_activity, apply_canvas, apply_more, central_pane, geometry_at, queue_flow, spawn_job,
+};
 
 use helion_device::Device;
 use helion_ir::Design;
 use helion_proj::{
-    expand_ip_packages, get_cells, get_nets, get_pins, load_prj, opt_design, resolve_prj_path, Mode,
-    Session,
+    Mode, Session, expand_ip_packages, get_cells, get_nets, get_pins, load_prj, opt_design,
+    resolve_prj_path,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -195,7 +192,12 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
     {
         let d = synth_hdl_path(std::path::Path::new(path.trim()))?;
         shell.tree.nodes.push(d.name.clone());
-        let msg = format!("synth {} cells {} luts {}", d.name, d.cells.len(), d.lut_inits().len());
+        let msg = format!(
+            "synth {} cells {} luts {}",
+            d.name,
+            d.cells.len(),
+            d.lut_inits().len()
+        );
         shell.session.synth_design(d);
         return Ok(msg);
     }
@@ -204,7 +206,12 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         shell.session.place_design(&dev)?;
         return Ok(format!(
             "place_design sites {}",
-            shell.session.placed.as_ref().map(|p| p.lutff_sites.len()).unwrap_or(0)
+            shell
+                .session
+                .placed
+                .as_ref()
+                .map(|p| p.lutff_sites.len())
+                .unwrap_or(0)
         ));
     }
     if t == "route_design" {
@@ -215,14 +222,25 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         shell.session.route_design(&dev)?;
         return Ok(format!(
             "route_design hops {}",
-            shell.session.routed.as_ref().and_then(|r| r.iob_src.first()).map(|i| i.hops).unwrap_or(0)
+            shell
+                .session
+                .routed
+                .as_ref()
+                .and_then(|r| r.iob_src.first())
+                .map(|i| i.hops)
+                .unwrap_or(0)
         ));
     }
     if t == "hds::impl" || t.starts_with("hds::impl") {
         impl_if_needed(shell)?;
         return Ok(format!(
             "impl frames {}",
-            shell.session.bitstream.as_ref().map(|b| b.frames.len()).unwrap_or(0)
+            shell
+                .session
+                .bitstream
+                .as_ref()
+                .map(|b| b.frames.len())
+                .unwrap_or(0)
         ));
     }
     if t == "opt_design" {
@@ -335,14 +353,19 @@ pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
         let mut parts = rest.split_whitespace();
         let cell = parts.next().unwrap_or("u_lut");
         let init_s = parts.next().unwrap_or("0xAAAAAAAAAAAAAAAA");
-        let init = u64::from_str_radix(init_s.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
+        let init =
+            u64::from_str_radix(init_s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
         shell.session.eco(&dev, cell, init)?;
         return Ok(format!("eco {cell} {init:#x}"));
     }
     if t == "write_checkpoint" || t.starts_with("write_checkpoint ") {
         let ck = shell.session.checkpoint();
-        return Ok(format!("write_checkpoint {} bytes hash {:#x}", ck.len(), shell.session.blinky_hash().unwrap_or(0)));
+        return Ok(format!(
+            "write_checkpoint {} bytes hash {:#x}",
+            ck.len(),
+            shell.session.blinky_hash().unwrap_or(0)
+        ));
     }
     if t == "report_featuremap" {
         let dev = Device::load_part(&shell.part)?;
@@ -370,13 +393,19 @@ mod tests {
         let mut sh = GpuiShell::default();
         assert!(sh.tree.nodes.contains(&"sources".into()));
         assert!(sh.flow.steps.contains(&"synth"));
-        assert_eq!(tcl_eval(&mut sh, "hds::tree").unwrap(), "sources constraints runs");
-        assert_eq!(tcl_eval(&mut sh, "hds::flow").unwrap(), "synth opt place route bits hw");
+        assert_eq!(
+            tcl_eval(&mut sh, "hds::tree").unwrap(),
+            "sources constraints runs"
+        );
+        assert_eq!(
+            tcl_eval(&mut sh, "hds::flow").unwrap(),
+            "synth opt place route bits hw"
+        );
         assert_eq!(tcl_eval(&mut sh, "hds::synth").unwrap(), "synth ok");
         assert!(sh.console.journal.iter().any(|j| j.contains("synth")));
         assert!(tcl_eval(&mut sh, "not_a_cmd").is_err());
-        let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/counter.sv");
+        let sv =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter.sv");
         let r = tcl_eval(&mut sh, &format!("read_sv {}", sv.display())).unwrap();
         assert!(r.contains("luts 4"), "{r}");
         assert!(tcl_eval(&mut sh, "get_cells").unwrap().contains("u_lut"));
@@ -394,17 +423,26 @@ mod tests {
         assert!(rt.contains("WNS_PS="), "report_timing must hit STA: {rt}");
         let util = tcl_eval(&mut sh, "report_utilization").unwrap();
         assert!(util.contains("LUTFF="), "{util}");
-        assert!(tcl_eval(&mut sh, "open_hw_manager").unwrap().contains("sim"));
+        assert!(
+            tcl_eval(&mut sh, "open_hw_manager")
+                .unwrap()
+                .contains("sim")
+        );
         // USB=0: bare program_hw refuses board DONE; explicit sim for fabric.
         let board_err = tcl_eval(&mut sh, "program_hw").unwrap_err();
         assert!(
-            board_err.contains("refused DONE") || board_err.contains("no USB") || board_err.contains("programmer"),
+            board_err.contains("refused DONE")
+                || board_err.contains("no USB")
+                || board_err.contains("programmer"),
             "{board_err}"
         );
         assert!(!board_err.contains("soft-hold"), "{board_err}");
         let hw = tcl_eval(&mut sh, "program_hw cable=sim").unwrap();
         assert!(hw.contains("DONE=1"), "{hw}");
-        assert!(hw.contains("not board DONE") || hw.contains("backend=sim"), "{hw}");
+        assert!(
+            hw.contains("not board DONE") || hw.contains("backend=sim"),
+            "{hw}"
+        );
         let md = tcl_eval(&mut sh, "mark_debug cnt_3").unwrap();
         assert!(md.contains("cnt_3"), "{md}");
         let eco = tcl_eval(&mut sh, "eco u_lut0 0xAAAAAAAAAAAAAAAA").unwrap();
@@ -414,7 +452,10 @@ mod tests {
         let die = tcl_eval(&mut sh, "report_die").unwrap();
         assert!(die.contains("HL10T-C32-1"), "{die}");
         assert!(die.contains("LUT6=8192"), "{die}");
-        assert!(die.contains("sites_clb=1024"), "die report must list HAD sites: {die}");
+        assert!(
+            die.contains("sites_clb=1024"),
+            "die report must list HAD sites: {die}"
+        );
         let fm = tcl_eval(&mut sh, "report_featuremap").unwrap();
         assert!(fm.contains("featuremap part=HL10T-C32-1"), "{fm}");
         assert!(fm.contains("BLE0.LUT.INIT[0] minor 0 bit 0"), "{fm}");
@@ -425,7 +466,8 @@ mod tests {
     #[test]
     fn tcl_place_route_are_stepwise_engines() {
         let mut sh = GpuiShell::default();
-        let sv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/blinky.sv");
+        let sv =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/blinky.sv");
         tcl_eval(&mut sh, &format!("synth_design {}", sv.display())).unwrap();
         let pl = tcl_eval(&mut sh, "place_design").unwrap();
         assert!(pl.contains("place_design"), "{pl}");

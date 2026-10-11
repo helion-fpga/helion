@@ -21,9 +21,18 @@ module arb (
 endmodule
 "#;
     let d = synth_sv(src, "arb.sv").expect("arb");
-    eprintln!("ARB cells={} anl={:?} wide={:?}", d.cells.len(), d.attrs.get("ASSIGN_NOT_LOWERED"), d.attrs.get("WIDE_CONE"));
+    eprintln!(
+        "ARB cells={} anl={:?} wide={:?}",
+        d.cells.len(),
+        d.attrs.get("ASSIGN_NOT_LOWERED"),
+        d.attrs.get("WIDE_CONE")
+    );
     assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-    assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })));
+    assert!(
+        d.cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+    );
 }
 
 #[test]
@@ -43,7 +52,12 @@ module tidx2 (
 endmodule
 "#;
     let d = synth_sv(src, "tidx2.sv").expect("tidx2");
-    eprintln!("VARIDX cells={} anl={:?} wide={:?}", d.cells.len(), d.attrs.get("ASSIGN_NOT_LOWERED"), d.attrs.get("WIDE_CONE"));
+    eprintln!(
+        "VARIDX cells={} anl={:?} wide={:?}",
+        d.cells.len(),
+        d.attrs.get("ASSIGN_NOT_LOWERED"),
+        d.attrs.get("WIDE_CONE")
+    );
     assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
     assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
     assert!(d.cells.len() > 10);
@@ -59,10 +73,22 @@ fn bus_n3_soft_diag() {
             eprintln!("ATTR {k}={v}");
         }
     }
-    let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
+    let luts = d
+        .cells
+        .iter()
+        .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
+        .count();
     eprintln!("luts={luts}");
-    assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"), "bus should map device_sel");
-    assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"), "bus assigns should lower");
+    assert_ne!(
+        d.attrs.get("WIDE_CONE"),
+        Some("1"),
+        "bus should map device_sel"
+    );
+    assert_ne!(
+        d.attrs.get("ASSIGN_NOT_LOWERED"),
+        Some("1"),
+        "bus assigns should lower"
+    );
     assert!(luts > 20, "expected mapped decode LUTs, got {luts}");
 }
 

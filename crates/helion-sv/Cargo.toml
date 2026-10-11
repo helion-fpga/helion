@@ -9,9 +9,13 @@ helion-ir = { workspace = true }
 sv-parser = "0.13"
 
 [dev-dependencies]
+criterion = { workspace = true }
 helion-device = { workspace = true }
 helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
 helion-pack = { workspace = true }
 helion-place = { workspace = true }
 helion-route = { workspace = true }
+[[bench]]
+name = "synth"
+harness = false

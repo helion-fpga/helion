@@ -10,7 +10,7 @@ use helion_device::{Device, Site, SiteKind};
 use helion_place::Placed;
 
 pub use helion_place::packing_summary_from_placed;
-pub use helion_sta::{critical_path_highlight, highlight_set_from_path, HighlightSet};
+pub use helion_sta::{HighlightSet, critical_path_highlight, highlight_set_from_path};
 
 /// Convenience methods on the crate [`HighlightSet`] for headless GUI dumps.
 pub trait HighlightSetExt {
@@ -158,7 +158,10 @@ mod tests {
         assert!(lines.iter().any(|l| l == "CLB_X3Y0: 1 LUTFF"), "{lines:?}");
         let sum: usize = lines
             .iter()
-            .filter_map(|l| l.split_once(": ").and_then(|(_, r)| r.strip_suffix(" LUTFF")))
+            .filter_map(|l| {
+                l.split_once(": ")
+                    .and_then(|(_, r)| r.strip_suffix(" LUTFF"))
+            })
             .filter_map(|n| n.parse::<usize>().ok())
             .sum();
         assert_eq!(sum, placed.lutff_sites.len());

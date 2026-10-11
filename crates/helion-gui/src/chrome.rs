@@ -452,7 +452,11 @@ pub fn fit_or_more(
         return (labels.to_vec(), Vec::new());
     }
     let vis = visible_if_clipped(labels, (available - label_extent(MORE)).max(1.0));
-    let overflow: Vec<_> = labels.iter().copied().filter(|l| !vis.contains(l)).collect();
+    let overflow: Vec<_> = labels
+        .iter()
+        .copied()
+        .filter(|l| !vis.contains(l))
+        .collect();
     let mut row = vis;
     row.push(MORE);
     (row, overflow)
@@ -558,7 +562,13 @@ fn floorplan_zoom_clamped(zoom: f32) -> f32 {
 ///
 /// At Zoom Fit (`zoom` ≤ 1) the painted extent must not exceed the leftover rect.
 /// A short window shrinks the die into that rect; it must not clip Y=0.
-pub fn floorplan_zoom_cells(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> (f32, f32) {
+pub fn floorplan_zoom_cells(
+    cols: u32,
+    rows: u32,
+    avail_w: f32,
+    avail_h: f32,
+    zoom: f32,
+) -> (f32, f32) {
     let cols_f = cols.max(1) as f32;
     let rows_f = rows.max(1) as f32;
     let aw = avail_w.max(1.0);
@@ -597,7 +607,13 @@ pub fn floorplan_zoom_cell(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoo
 }
 
 /// Content size of the die including axis chrome.
-pub fn floorplan_zoom_content(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> (f32, f32) {
+pub fn floorplan_zoom_content(
+    cols: u32,
+    rows: u32,
+    avail_w: f32,
+    avail_h: f32,
+    zoom: f32,
+) -> (f32, f32) {
     let (cw, ch) = floorplan_zoom_cells(cols, rows, avail_w, avail_h, zoom);
     (
         FLOORPLAN_LEFT + cw * cols.max(1) as f32 + FLOORPLAN_RIGHT,
@@ -606,7 +622,13 @@ pub fn floorplan_zoom_content(cols: u32, rows: u32, avail_w: f32, avail_h: f32, 
 }
 
 /// Empty pixels to the right of a Zoom Fit die (left-aligned paint).
-pub fn floorplan_zoom_right_gap(cols: u32, rows: u32, avail_w: f32, avail_h: f32, zoom: f32) -> f32 {
+pub fn floorplan_zoom_right_gap(
+    cols: u32,
+    rows: u32,
+    avail_w: f32,
+    avail_h: f32,
+    zoom: f32,
+) -> f32 {
     let (w, _) = floorplan_zoom_content(cols, rows, avail_w, avail_h, zoom);
     (avail_w - w).max(0.0)
 }
@@ -628,14 +650,25 @@ pub fn schematic_fit_zoom(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32) -> f32 {
 /// One Zoom Out step, never larger than the pane. Pan is reset by `schematic_frame_pan`.
 pub fn schematic_zoom_out_zoom(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32, current: f32) -> f32 {
     let fit = schematic_fit_zoom(sheet_w, sheet_h, vw, vh);
-    let cur = if current.is_finite() { current.max(0.05) } else { 1.0 };
+    let cur = if current.is_finite() {
+        current.max(0.05)
+    } else {
+        1.0
+    };
     (cur / 1.35).clamp(0.05, 16.0).min(fit)
 }
 
 /// Center the sheet so left and right symbols (PORT_IN / PORT_OUT) stay in the canvas.
 pub fn schematic_frame_pan(sheet_w: f32, sheet_h: f32, vw: f32, vh: f32, zoom: f32) -> (f32, f32) {
-    let z = if zoom.is_finite() { zoom.max(0.05) } else { 1.0 };
-    ((vw - sheet_w.max(1.0) * z) * 0.5, (vh - sheet_h.max(1.0) * z) * 0.5)
+    let z = if zoom.is_finite() {
+        zoom.max(0.05)
+    } else {
+        1.0
+    };
+    (
+        (vw - sheet_w.max(1.0) * z) * 0.5,
+        (vh - sheet_h.max(1.0) * z) * 0.5,
+    )
 }
 
 /// Identity camera whose sheet bottom (full cell, including a name under the box)
@@ -651,7 +684,11 @@ pub fn schematic_identity_clips_bottom(
     if !identity {
         return false;
     }
-    let z = if zoom.is_finite() { zoom.max(0.05) } else { 1.0 };
+    let z = if zoom.is_finite() {
+        zoom.max(0.05)
+    } else {
+        1.0
+    };
     pan_y + sheet_h.max(1.0) * z > vh - 2.0
 }
 
@@ -805,7 +842,6 @@ pub fn device_band_share(window_w: f32, window_h: f32, after_legend: f32) -> Dev
     }
 }
 
-
 /// Remaining-pane fill bar (Program / Package / Schematic / Hierarchy / IP drawings).
 pub const PANE_FILL_MIN: f32 = 0.80;
 pub const PANE_EMPTY_GAP_MAX: f32 = 80.0;
@@ -837,7 +873,14 @@ pub struct DrawingFit {
 }
 
 impl DrawingFit {
-    fn from_drawn(pane_w: f32, pane_h: f32, scale_x: f32, scale_y: f32, drawn_w: f32, drawn_h: f32) -> Self {
+    fn from_drawn(
+        pane_w: f32,
+        pane_h: f32,
+        scale_x: f32,
+        scale_y: f32,
+        drawn_w: f32,
+        drawn_h: f32,
+    ) -> Self {
         let pw = pane_w.max(1.0);
         let ph = pane_h.max(1.0);
         Self {
@@ -854,7 +897,9 @@ impl DrawingFit {
     }
 
     pub fn fills(&self) -> bool {
-        self.fill + 0.000_5 >= PANE_FILL_MIN && self.empty_gap <= PANE_EMPTY_GAP_MAX && self.right_clip <= 0.5
+        self.fill + 0.000_5 >= PANE_FILL_MIN
+            && self.empty_gap <= PANE_EMPTY_GAP_MAX
+            && self.right_clip <= 0.5
     }
 }
 
@@ -933,7 +978,9 @@ pub fn hardware_content_bbox(n_bits: usize, pane_w: f32, pane_h: f32) -> Drawing
 
 /// Native Hierarchy/IP sheet as a fraction of the pane (postage stamp in the More shots).
 pub fn native_drawing_fill(sheet_w: f32, sheet_h: f32, pane_w: f32, pane_h: f32) -> f32 {
-    (sheet_w / pane_w.max(1.0)).min(sheet_h / pane_h.max(1.0)).clamp(0.0, 1.0)
+    (sheet_w / pane_w.max(1.0))
+        .min(sheet_h / pane_h.max(1.0))
+        .clamp(0.0, 1.0)
 }
 
 /// Stretch a Hierarchy/IP sheet so the drawn bbox fills the remaining pane.
@@ -1158,7 +1205,10 @@ mod tests {
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
-        assert!(!would_clip(&labels, avail), "3 canvases must fit at 1440 (avail={avail})");
+        assert!(
+            !would_clip(&labels, avail),
+            "3 canvases must fit at 1440 (avail={avail})"
+        );
         assert_eq!(naive_tab_overflow(avail), OverflowMode::Fit);
         assert_eq!(workspace_tab_overflow(avail), OverflowMode::Fit);
         assert!(OverflowMode::Wrap.steals_canvas());
@@ -1178,13 +1228,18 @@ mod tests {
 
         assert_eq!(
             plan.rail_actions,
-            vec!["Files", "Device", "Timing", "Simulate", "Program", "Reports"]
+            vec![
+                "Files", "Device", "Timing", "Simulate", "Program", "Reports"
+            ]
         );
         for a in Activity::ALL {
             assert!(plan.rail_is_selectable(a.label()), "rail {}", a.label());
         }
         for (label, _) in RAIL_OPEN_SOURCES {
-            assert!(!plan.rail_actions.iter().any(|l| *l == label), "{label} on rail");
+            assert!(
+                !plan.rail_actions.iter().any(|l| *l == label),
+                "{label} on rail"
+            );
             assert!(!plan.rail_is_selectable(label));
         }
         assert!(!plan.rail_actions.iter().any(|l| l.starts_with("Open ")));
@@ -1235,25 +1290,42 @@ mod tests {
         assert!(short_w <= 520.0 + 1.0, "short die width {short_w}");
         let (wide_w, _) = floorplan_zoom_content(32, 33, 1100.0, 360.0, 1.0);
         let (fit_w, _) = floorplan_zoom_content(32, 33, 800.0, 360.0, 1.0);
-        assert!(wide_w > fit_w + 40.0, "wide window must grow the die, {wide_w} vs {fit_w}");
+        assert!(
+            wide_w > fit_w + 40.0,
+            "wide window must grow the die, {wide_w} vs {fit_w}"
+        );
         assert!(
             !floorplan_zoom_fits(32, 33, 800.0, 360.0, 2.0),
             "zoom-in must overflow so the die ScrollArea can scroll"
         );
         let zout = floorplan_zoom_cell(32, 33, 800.0, 360.0, 0.5);
-        assert!(zout < fit && zout > 2.0, "zoom-out stays readable, cell={zout}");
+        assert!(
+            zout < fit && zout > 2.0,
+            "zoom-out stays readable, cell={zout}"
+        );
         // Zoom Fit fills leftover width: right gap is chrome, not a letterbox void.
         let gap = floorplan_zoom_right_gap(32, 33, 800.0, 360.0, 1.0);
         assert!(gap <= 8.0, "Zoom Fit right gap must be a few px, got {gap}");
         let (cw, ch) = floorplan_zoom_content(32, 33, 800.0, 360.0, 1.82);
-        assert!(ch > 360.0, "zoom-in must grow past the pane so the die bottom scrolls, h={ch}");
+        assert!(
+            ch > 360.0,
+            "zoom-in must grow past the pane so the die bottom scrolls, h={ch}"
+        );
         assert!(cw > 800.0 || ch > 360.0);
         let z = schematic_zoom_out_zoom(1400.0, 400.0, 900.0, 500.0, 1.0);
         let (px, _py) = schematic_frame_pan(1400.0, 400.0, 900.0, 500.0, z);
         let right = px + 1400.0 * z;
-        assert!(right <= 900.0 + 0.5, "PORT_OUT must stay inside after zoom-out, right={right}");
+        assert!(
+            right <= 900.0 + 0.5,
+            "PORT_OUT must stay inside after zoom-out, right={right}"
+        );
         assert!(px + 0.5 >= 0.0, "PORT_IN must stay inside, pan={px}");
-        assert!(device_io_site_line_fits("led", "OUT", "IOB_X31Y16", SIDEBAR_WIDTH - 16.0));
+        assert!(device_io_site_line_fits(
+            "led",
+            "OUT",
+            "IOB_X31Y16",
+            SIDEBAR_WIDTH - 16.0
+        ));
         assert!(!device_io_site_line("led", "OUT", "IOB_X31Y16").contains('…'));
         let narrow_band = device_band_share(920.0, 620.0, 360.0);
         assert!(narrow_band.narrow && !narrow_band.short);
@@ -1286,7 +1358,11 @@ mod tests {
             wide_band.die_min_h
         );
         assert_eq!(wide_band.clock_h, clock_region_viewport_h(2));
-        assert!(wide_band.clock_h < 168.0, "wide clock strip must stay short, got {}", wide_band.clock_h);
+        assert!(
+            wide_band.clock_h < 168.0,
+            "wide clock strip must stay short, got {}",
+            wide_band.clock_h
+        );
         assert!(
             wide_band.tables_h <= clock_region_viewport_h(2) + 0.5,
             "wide pblock strip must stay short, got {}",
@@ -1295,10 +1371,17 @@ mod tests {
         let wide = share_available(1600.0, 900.0);
         let narrow = share_available(780.0, 700.0);
         let short = share_available(1200.0, 420.0);
-        assert!(wide.sidebar_w + 8.0 < 1600.0 - RAIL_WIDTH, "wide spare stays for the die");
+        assert!(
+            wide.sidebar_w + 8.0 < 1600.0 - RAIL_WIDTH,
+            "wide spare stays for the die"
+        );
         assert!(narrow.sidebar_w <= wide.sidebar_w);
         assert!(narrow.sidebar_w >= narrow.sidebar_floor - 0.5);
-        assert!(short.console_h < CONSOLE_DEFAULT_HEIGHT, "short window shrinks console, got {}", short.console_h);
+        assert!(
+            short.console_h < CONSOLE_DEFAULT_HEIGHT,
+            "short window shrinks console, got {}",
+            short.console_h
+        );
         assert!(short.tables_max_h <= DEVICE_TABLES_MAX_HEIGHT);
         assert!(short.console_h + short.canvas_floor_h < 420.0);
         assert_eq!(pane_view_h(90.0), 90.0);
@@ -1360,7 +1443,13 @@ mod tests {
         assert_eq!(HIT_COMFORT, 36.0);
         assert_eq!(TOOLBAR_CTRL_H, HIT_COMFORT);
         assert_eq!(flow_chip_size()[1], HIT_COMFORT);
-        for label in ["New Project…", "Open…", "Bitstream", "Implement", "Implementing…"] {
+        for label in [
+            "New Project…",
+            "Open…",
+            "Bitstream",
+            "Implement",
+            "Implementing…",
+        ] {
             let s = toolbar_ctrl_size(label);
             assert_eq!(s[1], HIT_COMFORT, "{label} height");
             assert!(s[0] >= 72.0, "{label} width {}", s[0]);
@@ -1380,7 +1469,8 @@ mod tests {
         let narrow = chrome_at(1100.0);
         assert_eq!(narrow.dropped_workspace(), 0);
         assert!(
-            narrow.workspace_mode == OverflowMode::Fit || narrow.tab_rows.iter().any(|r| r.contains(&MORE)),
+            narrow.workspace_mode == OverflowMode::Fit
+                || narrow.tab_rows.iter().any(|r| r.contains(&MORE)),
             "narrow window keeps canvases or More: {:?}",
             narrow.tab_rows
         );
@@ -1395,7 +1485,10 @@ mod tests {
     fn toolbar_and_wave_geometry_are_uniform_and_fill() {
         assert_eq!(TOOLBAR_CTRL_H, 36.0);
         assert_eq!(flow_chip_size(), [72.0, 36.0]);
-        assert_eq!(toolbar_ctrl_size("Open…")[1], toolbar_ctrl_size("Implement")[1]);
+        assert_eq!(
+            toolbar_ctrl_size("Open…")[1],
+            toolbar_ctrl_size("Implement")[1]
+        );
         // One trace in a 400px remaining pane must not be a 32px strip.
         let h1 = wave_trace_row_h(1, 400.0);
         assert!(
@@ -1411,9 +1504,18 @@ mod tests {
             w * 7.0 + 12.0 * 6.0 <= 700.0 + 1.0,
             "stretched columns plus gaps must fit the pane ({w})"
         );
-        assert!(!schematic_pin_visible(true, false), "n/c hidden unless selected");
-        assert!(schematic_pin_visible(true, true), "n/c shown on selected cell");
-        assert!(schematic_pin_visible(false, false), "connected pins always shown");
+        assert!(
+            !schematic_pin_visible(true, false),
+            "n/c hidden unless selected"
+        );
+        assert!(
+            schematic_pin_visible(true, true),
+            "n/c shown on selected cell"
+        );
+        assert!(
+            schematic_pin_visible(false, false),
+            "connected pins always shown"
+        );
         assert!(ip_catalog_name_fits("h_rv32_hb1"));
         assert!(ip_catalog_name_fits("h_uart"));
         assert!(ip_catalog_chip_w("h_rv32_hb1") >= 96.0);
@@ -1423,7 +1525,10 @@ mod tests {
             hw.drawn_w < 1000.0 * PANE_FILL_MIN || hw.fill >= PANE_FILL_MIN,
             "bbox must measure tiles, not clamp to 80%: {hw:?}"
         );
-        assert!(hw.fills() || hw.fill >= PANE_FILL_MIN, "program tiles {hw:?}");
+        assert!(
+            hw.fills() || hw.fill >= PANE_FILL_MIN,
+            "program tiles {hw:?}"
+        );
         let empty = empty_cta_occupies_pane(80.0, 400.0);
         assert!(
             empty.fills() || empty.fill >= PANE_FILL_MIN,
@@ -1544,7 +1649,10 @@ mod tests {
         );
         let tight = occupancy_bar_w(pane_w - labels4);
         let legacy = occupancy_bar_w(pane_w - 280.0);
-        assert!(tight > legacy, "tight occupancy bars {tight} vs legacy {legacy}");
+        assert!(
+            tight > legacy,
+            "tight occupancy bars {tight} vs legacy {legacy}"
+        );
         assert!(
             pane_w - labels4 - tight <= PANE_EMPTY_GAP_MAX,
             "occupancy bars must meet Hierarchical right edge"
@@ -1555,14 +1663,38 @@ mod tests {
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
         assert_eq!(WorkspaceTab::ALL.len(), 28);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Schematic), WorkspacePane::Schematic);
-        assert_ne!(pane_for_workspace(WorkspaceTab::Schematic), WorkspacePane::Timing);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Package), WorkspacePane::Package);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Hierarchy), WorkspacePane::Hierarchy);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Summary), WorkspacePane::Summary);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Settings), WorkspacePane::Settings);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Bitstream), WorkspacePane::Bitstream);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Hardware), WorkspacePane::Hardware);
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Schematic),
+            WorkspacePane::Schematic
+        );
+        assert_ne!(
+            pane_for_workspace(WorkspaceTab::Schematic),
+            WorkspacePane::Timing
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Package),
+            WorkspacePane::Package
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Hierarchy),
+            WorkspacePane::Hierarchy
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Summary),
+            WorkspacePane::Summary
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Settings),
+            WorkspacePane::Settings
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Bitstream),
+            WorkspacePane::Bitstream
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Hardware),
+            WorkspacePane::Hardware
+        );
         assert_eq!(pane_for_workspace(WorkspaceTab::Ip), WorkspacePane::Ip);
         assert_eq!(pane_for_workspace(WorkspaceTab::Find), WorkspacePane::Find);
         let mut more = 0usize;
@@ -1589,8 +1721,14 @@ mod tests {
             pane_for_workspace(WorkspaceTab::Reports),
             WorkspacePane::ReportsCatalog
         );
-        assert_eq!(pane_for_workspace(WorkspaceTab::TextEditor), WorkspacePane::Editor);
-        assert_eq!(pane_for_workspace(WorkspaceTab::Device), WorkspacePane::Device);
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::TextEditor),
+            WorkspacePane::Editor
+        );
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Device),
+            WorkspacePane::Device
+        );
     }
 
     #[test]

@@ -36,10 +36,8 @@ impl Stat {
     /// Unconfigured: GTS and GSR asserted.
     pub const RESET_WORD: u32 = (1 << Self::BIT_GTS) | (1 << Self::BIT_GSR);
     /// After `finish_startup`: INIT | GWE | DONE | EOS.
-    pub const STARTUP_WORD: u32 = (1 << Self::BIT_INIT)
-        | (1 << Self::BIT_GWE)
-        | (1 << Self::BIT_DONE)
-        | (1 << Self::BIT_EOS);
+    pub const STARTUP_WORD: u32 =
+        (1 << Self::BIT_INIT) | (1 << Self::BIT_GWE) | (1 << Self::BIT_DONE) | (1 << Self::BIT_EOS);
 
     fn reset() -> Self {
         Self {
@@ -423,7 +421,11 @@ impl Fabric {
     }
 
     pub fn frame_bit(&self, block: u8, major: u16, minor: u8, bit: u8) -> bool {
-        let f = self.frames.get(&(block, major, minor)).copied().unwrap_or(0);
+        let f = self
+            .frames
+            .get(&(block, major, minor))
+            .copied()
+            .unwrap_or(0);
         (f >> bit) & 1 == 1
     }
 
@@ -466,8 +468,7 @@ impl Fabric {
     }
 
     pub fn bind_iob_to_clb_ble(&mut self, iob_x: u32, iob_y: u32, ble: u8) {
-        self.iob_src
-            .insert((iob_x, iob_y), (iob_x, iob_y + 1, ble));
+        self.iob_src.insert((iob_x, iob_y), (iob_x, iob_y + 1, ble));
     }
 
     fn q_at(&self, x: u32, y: u32, ble: u8) -> bool {
@@ -799,18 +800,21 @@ impl Fabric {
     }
 
     pub fn frame_word(&self, block: u8, major: u16, minor: u8) -> u128 {
-        self.frames.get(&(block, major, minor)).copied().unwrap_or(0)
+        self.frames
+            .get(&(block, major, minor))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_bits::{assemble, bitgen, bitgen_pblock, FeatureSet};
+    use helion_bits::{FeatureSet, assemble, bitgen, bitgen_pblock};
     use helion_device::{Device, Far};
     use helion_ir::{CellKind, Design, PortDir};
     use helion_pack::pack;
-    use helion_place::{place_with, PlaceOpts};
+    use helion_place::{PlaceOpts, place_with};
     use helion_route::route;
 
     #[test]
@@ -835,7 +839,11 @@ mod tests {
         );
         let reset = Fabric::new(&dev).stat;
         assert_eq!(reset.word(), Stat::RESET_WORD);
-        assert_ne!(reset.word(), fab.stat.word(), "startup flips GTS/GSR → DONE");
+        assert_ne!(
+            reset.word(),
+            fab.stat.word(),
+            "startup flips GTS/GSR → DONE"
+        );
     }
 
     #[test]
@@ -867,7 +875,14 @@ mod tests {
     fn decoded_hbits_programs_gold_counter() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_counter(), &dev).unwrap();
-        let pl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pl = place_with(
+            &p,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         let r = route(&pl, &dev).unwrap();
         let bits = bitgen(&dev, &r).unwrap();
         let (idcode, frames) = helion_bits::decode_packets(&bits.packets).unwrap();
@@ -907,7 +922,11 @@ mod tests {
         d.add_port("clk", PortDir::In);
         d.add_port("led", PortDir::Out);
         for i in 0..9u32 {
-            let init = if i == 8 { last_init } else { 0x5555_5555_5555_5555 };
+            let init = if i == 8 {
+                last_init
+            } else {
+                0x5555_5555_5555_5555
+            };
             d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init });
             d.add_cell(format!("u_ff{i}"), CellKind::Hff);
             d.connect("clk", format!("u_ff{i}"), "CLK");
@@ -929,8 +948,22 @@ mod tests {
         let db = nine_inv(0xAAAA_AAAA_AAAA_AAAA);
         let pa = pack(&da, &dev).unwrap();
         let pbk = pack(&db, &dev).unwrap();
-        let pla = place_with(&pa, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
-        let plb = place_with(&pbk, &dev, PlaceOpts { timing_weight: 0.75 }).unwrap();
+        let pla = place_with(
+            &pa,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
+        let plb = place_with(
+            &pbk,
+            &dev,
+            PlaceOpts {
+                timing_weight: 0.75,
+            },
+        )
+        .unwrap();
         assert_ne!(
             (pla.lutff_sites[0].0.x, pla.lutff_sites[0].0.y),
             (pla.lutff_sites[8].0.x, pla.lutff_sites[8].0.y),
@@ -960,11 +993,19 @@ mod tests {
         let static_after: Vec<_> = (0..dev.clb_minors as u8)
             .map(|m| fab.frame_word(Far::CLB_IO_CLK, static_maj, m))
             .collect();
-        assert_eq!(static_before, static_after, "static frames must be unchanged after RM swap");
+        assert_eq!(
+            static_before, static_after,
+            "static frames must be unchanged after RM swap"
+        );
         let rm_after = fab.lut_init(rx, ry, 0);
         assert_eq!(rm_after, 0xAAAA_AAAA_AAAA_AAAA, "RM LUT must swap");
         assert_ne!(full_a.frames, full_b.frames);
-        assert!(partial.frames.keys().all(|(b, maj, _)| *b != Far::CLB_IO_CLK || *maj == rm_maj));
+        assert!(
+            partial
+                .frames
+                .keys()
+                .all(|(b, maj, _)| *b != Far::CLB_IO_CLK || *maj == rm_maj)
+        );
     }
 
     #[test]
@@ -974,7 +1015,11 @@ mod tests {
         assert_eq!(fab.bram_read_word(0, 3), 0);
         fab.bram_write_word(0, 3, 0xA5A5_A5A5_A5A5_A5A5);
         assert_eq!(fab.bram_read_word(0, 3), 0xA5A5_A5A5_A5A5_A5A5);
-        assert_eq!(fab.bram_read_word(0, 4), 0, "unwritten addr stays init/zero");
+        assert_eq!(
+            fab.bram_read_word(0, 4),
+            0,
+            "unwritten addr stays init/zero"
+        );
     }
 
     #[test]

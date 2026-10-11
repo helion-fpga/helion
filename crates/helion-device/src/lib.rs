@@ -319,13 +319,15 @@ impl Device {
 
     /// Load a part by name (`HL10T-C32-1`) from HAD TOML. This is the shipped API.
     pub fn load_part(name: &str) -> Result<Self, String> {
-        let path = Self::devices_dir().join("parts").join(format!("{name}.toml"));
+        let path = Self::devices_dir()
+            .join("parts")
+            .join(format!("{name}.toml"));
         Self::load_part_path(&path)
     }
 
     pub fn load_part_path(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let mut part = String::new();
         let mut sku = String::new();
         let mut part_id = 0u32;
@@ -422,8 +424,8 @@ impl Device {
     }
 
     pub fn load_board_path(path: &Path) -> Result<Board, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let mut board = String::new();
         let mut part = String::new();
         let mut cables = Vec::new();
@@ -491,8 +493,7 @@ impl Device {
     }
 
     fn list_toml_stems(dir: &Path) -> Result<Vec<String>, String> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
         let mut names = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
@@ -623,8 +624,7 @@ impl Device {
     pub const DEFAULT_IN_TERM: &'static str = "NONE";
 
     pub fn iob_bank(&self, x: u32, y: u32) -> Option<u32> {
-        self.iob_major(x, y)
-            .map(|m| m as u32 / Self::IOB_BANK_PINS)
+        self.iob_major(x, y).map(|m| m as u32 / Self::IOB_BANK_PINS)
     }
 
     /// Bank VCCO in millivolts for a Helion I/O standard, or `None` if not in HAD.
@@ -651,7 +651,9 @@ impl Device {
     pub fn parse_drive(s: &str) -> Option<u32> {
         let t = s
             .trim()
-            .trim_end_matches(|c: char| c.eq_ignore_ascii_case(&'m') || c.eq_ignore_ascii_case(&'a'))
+            .trim_end_matches(|c: char| {
+                c.eq_ignore_ascii_case(&'m') || c.eq_ignore_ascii_case(&'a')
+            })
             .trim();
         t.parse().ok().filter(|&ma| Self::legal_drive(ma))
     }
@@ -701,10 +703,7 @@ impl Device {
             .map(|s| s.trim().to_ascii_uppercase())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Self::DEFAULT_IOSTANDARD.to_string());
-        matches!(
-            std.as_str(),
-            "SSTL15" | "SSTL15_I" | "HSTL_I" | "HSTL_I_18"
-        )
+        matches!(std.as_str(), "SSTL15" | "SSTL15_I" | "HSTL_I" | "HSTL_I_18")
     }
 
     /// `DIFF_TERM TRUE` is HAD-legal only on SSTL/HSTL; FALSE is always legal.
@@ -806,15 +805,9 @@ impl Device {
         match site.kind {
             SiteKind::Clb => self.clb_major(site.x, site.y).is_some(),
             SiteKind::Iob => self.iob_major(site.x, site.y).is_some(),
-            SiteKind::Clk => self
-                .clk_sites()
-                .any(|s| s.x == site.x && s.y == site.y),
-            SiteKind::Dsp => self
-                .dsp_sites()
-                .any(|s| s.x == site.x && s.y == site.y),
-            SiteKind::Bram => self
-                .bram_sites()
-                .any(|s| s.x == site.x && s.y == site.y),
+            SiteKind::Clk => self.clk_sites().any(|s| s.x == site.x && s.y == site.y),
+            SiteKind::Dsp => self.dsp_sites().any(|s| s.x == site.x && s.y == site.y),
+            SiteKind::Bram => self.bram_sites().any(|s| s.x == site.x && s.y == site.y),
         }
     }
 
@@ -863,10 +856,7 @@ impl Device {
         if dy == 0 && dx <= 3 {
             return true;
         }
-        (dx == 1 && dy == 1)
-            || (dx == 2 && dy == 2)
-            || (dx == 2 && dy == 1)
-            || (dx == 1 && dy == 2)
+        (dx == 1 && dy == 1) || (dx == 2 && dy == 2) || (dx == 2 && dy == 1) || (dx == 1 && dy == 2)
     }
 
     /// Construct a PIP ID between two HAD sites if they are legal IMUX neighbors.
@@ -1207,7 +1197,9 @@ mod tests {
         let exe = Path::new("/Applications/Helion.app/Contents/MacOS/helion-ide");
         let paths = Device::had_search_paths_from(None, Some(exe), None, &compile);
         assert!(
-            paths.iter().any(|p| p.to_string_lossy().contains("Resources/devices/helion")),
+            paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("Resources/devices/helion")),
             "search must include Helion.app Resources HAD: {paths:?}"
         );
         assert!(
@@ -1256,7 +1248,11 @@ mod tests {
     fn iob_bank_and_iostandard_from_had() {
         let d = Device::load_part("HL10T-C32-1").unwrap();
         assert_eq!(d.iob_bank(2, 0), Some(0));
-        assert_eq!(d.iob_bank(9, 0), Some(0), "8 pins per bank: dx=7 still BANK0");
+        assert_eq!(
+            d.iob_bank(9, 0),
+            Some(0),
+            "8 pins per bank: dx=7 still BANK0"
+        );
         assert_eq!(d.iob_bank(10, 0), Some(1));
         assert!(d.iob_bank(0, 0).is_none(), "x=0 is not a HAD IOB");
         assert!(Device::legal_iostandard("LVCMOS18"));
@@ -1289,9 +1285,18 @@ mod tests {
             0,
             "defaults must not change the gold IOB word"
         );
-        assert_ne!(Device::iob_electrical_bits(Some("4"), None, None, None, None), 0);
-        assert_ne!(Device::iob_electrical_bits(None, Some("FAST"), None, None, None), 0);
-        assert_ne!(Device::iob_electrical_bits(None, None, Some("PULLUP"), None, None), 0);
+        assert_ne!(
+            Device::iob_electrical_bits(Some("4"), None, None, None, None),
+            0
+        );
+        assert_ne!(
+            Device::iob_electrical_bits(None, Some("FAST"), None, None, None),
+            0
+        );
+        assert_ne!(
+            Device::iob_electrical_bits(None, None, Some("PULLUP"), None, None),
+            0
+        );
         assert_ne!(
             Device::iob_electrical_bits(None, None, None, Some("TRUE"), None),
             0
@@ -1313,10 +1318,19 @@ mod tests {
         assert!(!Device::legal_in_term("50"));
         assert!(Device::diff_term_legal_for_iostandard(None, "FALSE"));
         assert!(!Device::diff_term_legal_for_iostandard(None, "TRUE"));
-        assert!(Device::diff_term_legal_for_iostandard(Some("SSTL15"), "TRUE"));
+        assert!(Device::diff_term_legal_for_iostandard(
+            Some("SSTL15"),
+            "TRUE"
+        ));
         assert!(Device::in_term_legal_for_iostandard(None, "NONE"));
-        assert!(!Device::in_term_legal_for_iostandard(Some("LVCMOS18"), "UNTUNED_SPLIT_50"));
-        assert!(Device::in_term_legal_for_iostandard(Some("HSTL_I"), "UNTUNED_SPLIT_50"));
+        assert!(!Device::in_term_legal_for_iostandard(
+            Some("LVCMOS18"),
+            "UNTUNED_SPLIT_50"
+        ));
+        assert!(Device::in_term_legal_for_iostandard(
+            Some("HSTL_I"),
+            "UNTUNED_SPLIT_50"
+        ));
     }
 
     #[test]
@@ -1354,12 +1368,18 @@ mod tests {
         assert!(r.contains("frame_bits=128"), "{r}");
         assert!(r.contains("sites_clb=1024"), "{r}");
         assert!(r.contains("sites_bram=8"), "{r}");
-        assert!(!r.contains("MISSING"), "every reported feature must exist: {r}");
+        assert!(
+            !r.contains("MISSING"),
+            "every reported feature must exist: {r}"
+        );
         // The report must agree with locate(), not with a hardcoded string.
         for feature in ["BLE0.LUT.INIT[0]", "BLE0.LUT.FRACTURE", "IMUX[0][0]"] {
             let loc = d.locate(&format!("CLB_X2Y1.{feature}")).unwrap();
             assert!(
-                r.contains(&format!("{feature} minor {} bit {}", loc.far.minor, loc.bit)),
+                r.contains(&format!(
+                    "{feature} minor {} bit {}",
+                    loc.far.minor, loc.bit
+                )),
                 "report row for {feature} must match locate() minor {} bit {}: {r}",
                 loc.far.minor,
                 loc.bit
@@ -1390,8 +1410,18 @@ mod tests {
             assert_eq!(back, far, "FAR {far:?} must survive encode/decode");
         }
         // Consecutive FARs inside one major differ by 1 (frame runs rely on it).
-        let a = Far { block_type: Far::CLB_IO_CLK, die: 0, major: 5, minor: 3 };
-        let b = Far { block_type: Far::CLB_IO_CLK, die: 0, major: 5, minor: 4 };
+        let a = Far {
+            block_type: Far::CLB_IO_CLK,
+            die: 0,
+            major: 5,
+            minor: 3,
+        };
+        let b = Far {
+            block_type: Far::CLB_IO_CLK,
+            die: 0,
+            major: 5,
+            minor: 4,
+        };
         assert_eq!(a.encode() + 1, b.encode());
     }
 
@@ -1446,7 +1476,11 @@ mod tests {
         assert_eq!(b.board, "HB1");
         assert_eq!(b.part, "HL10T-C32-1");
         for c in ["sim", "ofl", "native", "usb", "mpsse-sim"] {
-            assert!(b.cables.iter().any(|x| x == c), "missing cable {c}: {:?}", b.cables);
+            assert!(
+                b.cables.iter().any(|x| x == c),
+                "missing cable {c}: {:?}",
+                b.cables
+            );
         }
         let part = Device::load_part(&b.part).expect("HB1 part must load");
         assert_eq!(part.lut6_count(), 8192);
@@ -1494,7 +1528,9 @@ mod tests {
         assert!(!samples.is_empty());
         for site in samples {
             let id = site.id();
-            let back = d.site_by_id(&id).unwrap_or_else(|| panic!("site_by_id missed {id}"));
+            let back = d
+                .site_by_id(&id)
+                .unwrap_or_else(|| panic!("site_by_id missed {id}"));
             assert_eq!(back, site);
             assert!(d.contains_site(site));
             assert_eq!(Site::parse_id(&id), Some(site));
@@ -1555,16 +1591,15 @@ mod tests {
             kind: SiteKind::Clb,
         };
         assert!(d.contains_site(a) && d.contains_site(b));
-        let pip = d.pip_between(a, b).expect("N-S±1 must be legal IMUX neighbor");
+        let pip = d
+            .pip_between(a, b)
+            .expect("N-S±1 must be legal IMUX neighbor");
         let id = pip.id();
         assert_eq!(id, format!("PIP:{}->{}", a.id(), b.id()));
         // Deterministic: same call again yields identical string.
         assert_eq!(d.pip_between(a, b).unwrap().id(), id);
         let with_sel = PipId::with_sel(a, a, 16);
-        assert_eq!(
-            with_sel.id(),
-            format!("PIP:{}->{}:sel16", a.id(), a.id())
-        );
+        assert_eq!(with_sel.id(), format!("PIP:{}->{}:sel16", a.id(), a.id()));
         // Far-away pair is not a legal local PIP.
         let far = Site {
             x: d.clb_x0 + d.interior_cols.saturating_sub(1),

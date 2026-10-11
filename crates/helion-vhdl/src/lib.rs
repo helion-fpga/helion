@@ -358,11 +358,7 @@ fn softs_forest_for(
         return base.get(&key).cloned().unwrap_or_default();
     }
     let mut softs = base.get(&key).cloned().unwrap_or_default();
-    if let Some(arch) = archs
-        .iter()
-        .rev()
-        .find(|a| a.of.eq_ignore_ascii_case(name))
-    {
+    if let Some(arch) = archs.iter().rev().find(|a| a.of.eq_ignore_ascii_case(name)) {
         for st in &arch.stmts {
             let CStmt::Inst {
                 module,
@@ -3068,11 +3064,7 @@ fn normalize_bitstr(s: &str, base: u32) -> String {
         };
         bits.push_str(&format!("{v:0width$b}", width = w));
     }
-    if bits.is_empty() {
-        "0".into()
-    } else {
-        bits
-    }
+    if bits.is_empty() { "0".into() } else { bits }
 }
 
 #[cfg(test)]
@@ -3670,10 +3662,11 @@ end;
             mr.has_softs(),
             "SOFT must be first-class, not silent cells=0"
         );
-        assert!(mr
-            .softs
-            .iter()
-            .any(|s| s.name == "missing_component" && s.module == "top"));
+        assert!(
+            mr.softs
+                .iter()
+                .any(|s| s.name == "missing_component" && s.module == "top")
+        );
         let detail = mr
             .softs
             .iter()
@@ -3684,10 +3677,11 @@ end;
         assert!(detail.contains("child=ghost_ent"), "{detail}");
         assert_eq!(mr.design.attrs.get("NO_BODY"), Some("1"));
         assert!(mr.design.cells.is_empty());
-        assert!(!mr
-            .soft_table_lines()
-            .iter()
-            .any(|l| l.to_ascii_uppercase().contains("PASS")));
+        assert!(
+            !mr.soft_table_lines()
+                .iter()
+                .any(|l| l.to_ascii_uppercase().contains("PASS"))
+        );
     }
 
     #[test]
@@ -3741,18 +3735,21 @@ end;
             .find(|s| s.name == "clock_clk_clash")
             .unwrap_or_else(|| panic!("clock_clk_clash SoftDiag, got {:?}", mr.soft_table_lines()));
         assert_eq!(clash.module, "clash");
-        assert!(clash
-            .detail
-            .as_deref()
-            .unwrap_or("")
-            .contains("occupied=clk"));
+        assert!(
+            clash
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("occupied=clk")
+        );
         assert_eq!(clash.span.file.as_deref(), Some("vhdl.vhd"));
         assert!(clash.span.line.is_some());
-        assert!(mr
-            .design
-            .cells
-            .iter()
-            .any(|c| matches!(c.kind, CellKind::Hff)));
+        assert!(
+            mr.design
+                .cells
+                .iter()
+                .any(|c| matches!(c.kind, CellKind::Hff))
+        );
     }
 
     #[test]

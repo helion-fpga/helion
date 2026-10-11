@@ -18,7 +18,7 @@ use helion_bits::Bitstream;
 use helion_device::Device;
 use helion_fabric::Stat;
 
-use crate::{Tap, TapState, IR_CFG_W, IR_IDCODE, IR_STAT, IR_USR1};
+use crate::{IR_CFG_W, IR_IDCODE, IR_STAT, IR_USR1, Tap, TapState};
 
 /// Error from the sim bitbang harness (never pretends to be USB I/O failure).
 #[derive(Clone, Debug, Eq, PartialEq)]
