@@ -590,10 +590,9 @@ impl HelionIde {
             class: EventClass::Ok,
         });
         let model = self.model.clone();
-        let started_label = kind.progress_english();
+        // No "Started" toast: job progress already lives in the status bar
+        // (busy spinner + progress segment). Toasts are for completions only.
         self.job = Some(spawn_job(model, kind));
-        self.toasts
-            .push(toasts::ToastKind::Info, format!("Started: {started_label}"));
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -609,13 +608,20 @@ impl HelionIde {
                     Ok(s) => s.clone(),
                     Err(e) => e.clone(),
                 };
+                // Short toast; the detail string stays in the status bar
+                // progress segment and the Messages tab.
+                let widget = out.kind.widget();
                 self.toasts.push(
                     if out.result.is_ok() {
                         toasts::ToastKind::Ok
                     } else {
                         toasts::ToastKind::Error
                     },
-                    format!("{} — {}", out.kind.widget(), self.progress),
+                    if out.result.is_ok() {
+                        format!("{widget} finished")
+                    } else {
+                        format!("{widget} failed — see Messages")
+                    },
                 );
                 if matches!(out.kind, JobKind::Implement) && out.result.is_ok() {
                     self.set_canvas(Canvas::Device);
