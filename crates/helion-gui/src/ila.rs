@@ -596,6 +596,206 @@ impl IlaViewer {
     }
 }
 
+/// Edge/pattern at one sample on one probe: Rising/Falling for scalar
+/// probes, else ValueMatch on the current value masked to the probe width.
+/// `None` when the sample is X (invalid) or out of range.
+pub fn edge_kind_at(cap: &IlaCapture, probe: usize, sample: usize) -> Option<IlaTriggerKind> {
+    let p = cap.probes.get(probe)?;
+    let vals = cap.samples.get(probe)?;
+    let cur = *vals.get(sample)?;
+    if !cap.valid.get(probe)?.get(sample).copied().unwrap_or(false) {
+        return None;
+    }
+    if p.width() == 1 && sample > 0 {
+        let prev_ok = cap.valid[probe].get(sample - 1).copied().unwrap_or(false);
+        if prev_ok {
+            let prev = vals[sample - 1];
+            if prev & 1 == 0 && cur & 1 == 1 {
+                return Some(IlaTriggerKind::Rising);
+            }
+            if prev & 1 == 1 && cur & 1 == 0 {
+                return Some(IlaTriggerKind::Falling);
+            }
+        }
+    }
+    let w = p.width();
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    Some(IlaTriggerKind::ValueMatch {
+        value: cur & mask,
+        mask,
+    })
+}
+
+/// First probe (in order) with a usable trigger suggestion at `sample`.
+/// Scalars prefer their edge kind; buses fall back to a value match.
+pub fn suggest_trigger_at(cap: &IlaCapture, sample: usize) -> Option<(usize, IlaTriggerKind)> {
+    for pi in 0..cap.probes.len() {
+        if let Some(k) = edge_kind_at(cap, pi, sample) {
+            // Prefer a genuine scalar edge over a bus value match.
+            if cap.probes[pi].width() == 1
+                && matches!(k, IlaTriggerKind::Rising | IlaTriggerKind::Falling)
+            {
+                return Some((pi, k));
+            }
+        }
+    }
+    for pi in 0..cap.probes.len() {
+        if let Some(k) = edge_kind_at(cap, pi, sample) {
+            return Some((pi, k));
+        }
+    }
+    None
+}
+
+/// VCD identifier: base-94 over printable ASCII `!`..=`~`.
+fn vcd_id(mut k: usize) -> String {
+    let mut s = String::new();
+    loop {
+        s.push((b'!' + (k % 94) as u8) as char);
+        k /= 94;
+        if k == 0 {
+            break;
+        }
+    }
+    s
+}
+
+/// Sanitize a net name for `$var` (no whitespace / control chars).
+fn vcd_safe_name(n: &str) -> String {
+    n.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_.$:[]<>".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Largest standard VCD timescale unit dividing `timescale_ps` evenly.
+fn vcd_timescale(timescale_ps: u64) -> (u64, &'static str) {
+    let ts = timescale_ps.max(1);
+    for (unit, ps) in [
+        ("s", 1_000_000_000_000u64),
+        ("ms", 1_000_000_000),
+        ("us", 1_000_000),
+        ("ns", 1_000),
+        ("ps", 1),
+    ] {
+        if ts % ps == 0 {
+            return (ts / ps, unit);
+        }
+    }
+    (ts, "ps")
+}
+
+/// Write the capture as a VCD file readable by GTKWave/surfer.
+///
+/// One scalar `$var` per probed net (first-seen order), `x` for invalid
+/// samples, change-only value dumping, and a `$comment` marking the trigger
+/// sample. Pure writer; the only failure modes are empty captures and IO.
+pub fn export_vcd(path: &Path, cap: &IlaCapture) -> Result<(), String> {
+    if cap.is_empty() {
+        return Err("ila: no samples to export".into());
+    }
+    // Unique nets, first-seen order.
+    let mut nets: Vec<&str> = Vec::new();
+    for p in &cap.probes {
+        for n in &p.nets {
+            if !nets.iter().any(|x| *x == n) {
+                nets.push(n);
+            }
+        }
+    }
+    if nets.is_empty() {
+        return Err("ila: no nets to export".into());
+    }
+    // Map each net to (probe, lsb index) of its packed column.
+    let mut cols: Vec<(usize, usize)> = Vec::with_capacity(nets.len());
+    for net in &nets {
+        let mut found = None;
+        for (pi, p) in cap.probes.iter().enumerate() {
+            if let Some(j) = p.nets.iter().position(|x| x == net) {
+                found = Some((pi, p.width() - 1 - j));
+                break;
+            }
+        }
+        let (pi, lsb) =
+            found.ok_or_else(|| format!("ila vcd: net {net} has no probe column"))?;
+        cols.push((pi, lsb));
+    }
+    let bit_at = |net_i: usize, s: usize| -> char {
+        let (pi, lsb) = cols[net_i];
+        let ok = cap
+            .valid
+            .get(pi)
+            .and_then(|v| v.get(s))
+            .copied()
+            .unwrap_or(false);
+        if !ok {
+            return 'x';
+        }
+        match cap.samples.get(pi).and_then(|v| v.get(s)) {
+            Some(v) if (v >> lsb) & 1 == 1 => '1',
+            Some(_) => '0',
+            None => 'x',
+        }
+    };
+
+    let (ts_num, ts_unit) = vcd_timescale(cap.timescale_ps);
+    let n = cap.len();
+    let mut out = String::with_capacity(n * nets.len() * 4);
+    out.push_str("$date\n   helion ILA export\n$end\n");
+    out.push_str("$version\n   helion\n$end\n");
+    out.push_str(&format!("$timescale {ts_num} {ts_unit} $end\n"));
+    out.push_str("$scope module ila $end\n");
+    for (i, net) in nets.iter().enumerate() {
+        out.push_str(&format!(
+            "$var wire 1 {} {} $end\n",
+            vcd_id(i),
+            vcd_safe_name(net)
+        ));
+    }
+    out.push_str("$upscope $end\n$enddefinitions $end\n");
+    if let Some(ti) = cap.trigger_sample.filter(|_| cap.found_trigger) {
+        out.push_str(&format!("$comment trigger sample {ti} of {n} $end\n"));
+    }
+    // Initial values, then change-only dumps.
+    out.push_str("#0\n$dumpvars\n");
+    let mut prev: Vec<char> = Vec::with_capacity(nets.len());
+    for i in 0..nets.len() {
+        let b = bit_at(i, 0);
+        out.push(b);
+        out.push_str(&vcd_id(i));
+        out.push('\n');
+        prev.push(b);
+    }
+    out.push_str("$end\n");
+    for s in 1..n {
+        let t = s as u64 * ts_num;
+        let mut changed = false;
+        let mut body = String::new();
+        for i in 0..nets.len() {
+            let b = bit_at(i, s);
+            if b != prev[i] {
+                body.push(b);
+                body.push_str(&vcd_id(i));
+                body.push('\n');
+                prev[i] = b;
+                changed = true;
+            }
+        }
+        if changed {
+            out.push('#');
+            out.push_str(&t.to_string());
+            out.push('\n');
+            out.push_str(&body);
+        }
+    }
+    std::fs::write(path, out).map_err(|e| format!("ila vcd {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +1051,107 @@ mod tests {
         let c = IlaConfig::default();
         assert_eq!(c.pre(), 256);
         assert_eq!(c.post(), 1024 - 256 - 1);
+    }
+
+    fn demo_capture() -> IlaCapture {
+        let d = Design::structural_counter();
+        let mut cfg = IlaConfig::default();
+        cfg.probes.push(IlaProbeCfg::scalar("q0", "q0"));
+        cfg.probes.push(IlaProbeCfg {
+            name: "cnt".into(),
+            nets: vec!["q3".into(), "q2".into(), "q1".into(), "q0".into()],
+            radix: IlaRadix::Hex,
+        });
+        cfg.depth = 32;
+        cfg.pre_ratio = 0.25;
+        cfg.trigger = IlaTrigger {
+            probe: 0,
+            kind: IlaTriggerKind::Rising,
+        };
+        run_sim_ila_capture(&d, &cfg, &|_| {}).expect("capture")
+    }
+
+    #[test]
+    fn edge_kind_at_detects_edges_and_bus_value() {
+        let cap = demo_capture();
+        let ti = cap.trigger_sample.expect("trigger");
+        // q0 rises at the trigger sample.
+        assert_eq!(edge_kind_at(&cap, 0, ti), Some(IlaTriggerKind::Rising));
+        // No edge one sample later.
+        assert!(matches!(
+            edge_kind_at(&cap, 0, ti + 1),
+            Some(IlaTriggerKind::ValueMatch { .. })
+        ));
+        // Bus probe gives a value match with the current value.
+        match edge_kind_at(&cap, 1, ti) {
+            Some(IlaTriggerKind::ValueMatch { value, mask }) => {
+                assert_eq!(mask, 0xF);
+                assert_eq!(value, cap.samples[1][ti] & 0xF);
+            }
+            other => panic!("expected value match, got {other:?}"),
+        }
+        // Out of range / X-free design: sample past the end is None.
+        assert_eq!(edge_kind_at(&cap, 0, cap.len()), None);
+        assert_eq!(edge_kind_at(&cap, 9, 0), None);
+    }
+
+    #[test]
+    fn suggest_trigger_at_prefers_scalar_edge() {
+        let cap = demo_capture();
+        let ti = cap.trigger_sample.expect("trigger");
+        // q0 (probe 0) rises at ti: suggestion is the scalar edge.
+        assert_eq!(
+            suggest_trigger_at(&cap, ti),
+            Some((0, IlaTriggerKind::Rising))
+        );
+        // q0 falls at ti+1.
+        assert_eq!(
+            suggest_trigger_at(&cap, ti + 1),
+            Some((0, IlaTriggerKind::Falling))
+        );
+    }
+
+    #[test]
+    fn export_vcd_writes_gtkwave_structure() {
+        let cap = demo_capture();
+        let dir = std::env::temp_dir().join("helion-ila-vcd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cap.vcd");
+        export_vcd(&path, &cap).expect("export");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("$timescale 10 ns $end"), "{}", &text[..400]);
+        assert!(text.contains("$var wire 1 ! q0 $end"));
+        assert!(text.contains("$var wire 1 \" q3 $end"));
+        assert!(text.contains("$enddefinitions $end"));
+        let ti = cap.trigger_sample.unwrap();
+        assert!(text.contains(&format!("$comment trigger sample {ti}")));
+        // Values: q0's id is '!' — both 0! and 1! transitions must appear.
+        assert!(text.contains("0!\n"));
+        assert!(text.contains("1!\n"));
+        // Timestamps: ts=10ns is 1 timescale unit per sample, so #1 exists.
+        assert!(text.contains("#1\n"));
+        // Empty capture fails loud.
+        let empty = IlaCapture {
+            probes: vec![],
+            samples: vec![],
+            valid: vec![],
+            timescale_ps: 10_000,
+            clock_net: "clk".into(),
+            trigger_sample: None,
+            cycles_run: 0,
+            found_trigger: false,
+        };
+        assert!(export_vcd(&dir.join("empty.vcd"), &empty).is_err());
+    }
+
+    #[test]
+    fn export_vcd_marks_invalid_as_x() {
+        let mut cap = demo_capture();
+        cap.valid[0][3] = false;
+        let dir = std::env::temp_dir().join("helion-ila-vcd");
+        let path = dir.join("x.vcd");
+        export_vcd(&path, &cap).expect("export");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("x!\n"), "invalid sample must dump as x");
     }
 }

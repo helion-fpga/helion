@@ -3885,6 +3885,44 @@ impl SimIla {
         Ok(format!("ila trigger probe {}", self.config.probes[idx].name))
     }
 
+    /// Set the trigger from the waveform at `sample` on probe `probe`
+    /// (click-an-edge UX): scalar edges become Rising/Falling, anything else
+    /// becomes a value match on the sample's value.
+    pub fn set_trigger_from_wave(&mut self, probe: usize, sample: usize) -> Result<String, String> {
+        let cap = self.capture.as_ref().ok_or_else(|| "ila: no capture".to_string())?;
+        let kind =
+            ila::edge_kind_at(cap, probe, sample).ok_or_else(|| "ila: no trigger at cursor".to_string())?;
+        let pname = cap.probes[probe].name.clone();
+        if let ila::IlaTriggerKind::ValueMatch { value, mask } = kind {
+            self.trig_value_text = format!("{value}");
+            self.trig_mask_text = format!("0x{mask:X}");
+        }
+        self.config.trigger.probe = probe;
+        self.config.trigger.kind = kind;
+        Ok(format!("ila trigger {} @{}", kind.label(), pname))
+    }
+
+    /// Suggest a trigger at `sample` across all probes (toolbar button):
+    /// first scalar edge wins, else a bus value match.
+    pub fn suggest_trigger_at_cursor(&mut self, sample: usize) -> Result<String, String> {
+        let (pi, kind, pname) = {
+            let cap = self
+                .capture
+                .as_ref()
+                .ok_or_else(|| "ila: no capture".to_string())?;
+            let (pi, kind) = ila::suggest_trigger_at(cap, sample)
+                .ok_or_else(|| "ila: no edge at cursor".to_string())?;
+            (pi, kind, cap.probes[pi].name.clone())
+        };
+        if let ila::IlaTriggerKind::ValueMatch { value, mask } = kind {
+            self.trig_value_text = format!("{value}");
+            self.trig_mask_text = format!("0x{mask:X}");
+        }
+        self.config.trigger.probe = pi;
+        self.config.trigger.kind = kind;
+        Ok(format!("ila trigger {} @{}", kind.label(), pname))
+    }
+
     pub fn status_text(&self) -> String {
         let n = self.config.probes.len();
         let trig = &self.config.trigger;
@@ -6323,6 +6361,26 @@ impl IdeModel {
             let r = self.sim_ila.capture_sync(&d);
             self.workspace = WorkspaceTab::Ila;
             r
+        } else if let Some(rest) = t.strip_prefix("ila_sim_trigger_at ") {
+            let mut parts = rest.split_whitespace();
+            let probe: usize = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or("ila_sim_trigger_at: need <probe> <sample>")?;
+            let sample: usize = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or("ila_sim_trigger_at: need <probe> <sample>")?;
+            self.sim_ila.set_trigger_from_wave(probe, sample)
+        } else if let Some(rest) = t.strip_prefix("ila_sim_export_vcd ") {
+            let path = rest.trim().to_string();
+            let cap = self
+                .sim_ila
+                .capture
+                .clone()
+                .ok_or_else(|| "ila: no capture to export".to_string())?;
+            ila::export_vcd(std::path::Path::new(&path), &cap)?;
+            Ok(format!("ila vcd exported {path}"))
         } else if t == "ila_sim_status" {
             Ok(self.sim_ila.status_text())
         } else if let Some(rest) = t.strip_prefix("ila_sim_save ") {
@@ -22744,6 +22802,58 @@ mod tests {
         assert!(cap.found_trigger);
         let ti = cap.trigger_sample.expect("trigger index");
         assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+    }
+
+    /// Sim ILA: click-an-edge trigger and VCD export through the exec path.
+    #[test]
+    fn sim_ila_trigger_from_wave_and_vcd_export() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.exec("ila_sim_add cnt_3").unwrap();
+        ide.exec("ila_sim_add cnt_0").unwrap();
+        ide.exec("ila_sim_depth 32").unwrap();
+        ide.exec("ila_sim_capture").unwrap();
+        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        let ti = cap.trigger_sample.expect("immediate trigger at 0");
+        // cnt_3 rises at sample 7: edge-from-wave picks the rising edge.
+        let msg = ide.exec("ila_sim_trigger_at 0 7").unwrap();
+        assert!(msg.contains("Rising edge"), "{msg}");
+        assert_eq!(ide.sim_ila.config.trigger.probe, 0);
+        assert_eq!(
+            ide.sim_ila.config.trigger.kind,
+            crate::ila::IlaTriggerKind::Rising
+        );
+        // No edge at sample 0 for cnt_3 -> value match on current value.
+        let msg = ide.exec("ila_sim_trigger_at 0 1").unwrap();
+        assert!(msg.contains("Value match"), "{msg}");
+        assert!(ide.sim_ila.trig_value_text == "0");
+        // Out-of-range sample fails loud.
+        assert!(ide.exec("ila_sim_trigger_at 0 99999").is_err());
+        assert!(ide.exec("ila_sim_trigger_at 9 0").is_err());
+
+        // VCD export: real file with GTKWave structure.
+        let dir = std::env::temp_dir().join(format!(
+            "helion-ila-vcd-exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ila.vcd");
+        let msg = ide
+            .exec(&format!("ila_sim_export_vcd {}", path.display()))
+            .unwrap();
+        assert!(msg.contains("ila.vcd"), "{msg}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("$timescale"));
+        assert!(text.contains("$var wire 1"));
+        assert!(text.contains("cnt_3"));
+        assert!(text.contains(&format!("$comment trigger sample {ti}")));
+        // Export with no capture fails loud.
+        ide.sim_ila.capture = None;
+        assert!(ide.exec("ila_sim_export_vcd /tmp/nowhere.vcd").is_err());
     }
 
     /// The console widget must be a pipe onto the real engines: `report_timing` has to
