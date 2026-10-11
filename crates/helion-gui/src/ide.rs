@@ -38443,7 +38443,7 @@ endmodule
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("and_dut.sv"), AND_DUT).unwrap();
         std::fs::write(dir.join("and_dut_tb.sv"), AND_TB_PASS).unwrap();
-        std::fs::write(dir.join("and_dut_tb_fail.sv"), AND_TB_FAIL).unwrap();
+        std::fs::write(dir.join("and_dut_fail_tb.sv"), AND_TB_FAIL).unwrap();
         dir
     }
 
@@ -38459,7 +38459,7 @@ endmodule
         // Run the passing one by name.
         let summary = m.exec("tb_run and_dut_tb").unwrap();
         assert!(summary.contains("PASSED"), "summary={summary}");
-        assert_eq!(m.tb_status, vec![crate::tb::TbStatus::Passed, crate::tb::TbStatus::Idle]);
+        assert_eq!(m.tb_status, vec![crate::tb::TbStatus::Idle, crate::tb::TbStatus::Passed]);
         assert!(m.tb_failures.is_empty());
         assert_eq!(m.tb_history.len(), 1);
         assert!(m.tb_history[0].passed);
@@ -38476,7 +38476,7 @@ endmodule
         let dir = tb_project();
         let mut m = IdeModel::new();
         m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
-        let summary = m.exec("tb_run and_dut_tb_fail").unwrap();
+        let summary = m.exec("tb_run and_dut_fail_tb").unwrap();
         assert!(summary.contains("FAILED"), "summary={summary}");
         assert_eq!(m.tb_failures.len(), 1);
         let f = &m.tb_failures[0];
@@ -38485,7 +38485,7 @@ endmodule
 
         // Clicking the failure jumps the editor to the file:line.
         let jump = m.exec("tb_jump 0").unwrap();
-        assert!(jump.contains("and_dut_tb_fail.sv:8"), "jump={jump}");
+        assert!(jump.contains("and_dut_fail_tb.sv:8"), "jump={jump}");
         assert_eq!(m.selected_source_line, Some(8));
         assert_eq!(m.workspace, WorkspaceTab::TextEditor);
         assert!(m.editor_line_focus);
@@ -38493,7 +38493,7 @@ endmodule
             .selected_source
             .as_deref()
             .unwrap_or("")
-            .ends_with("and_dut_tb_fail.sv"));
+            .ends_with("and_dut_fail_tb.sv"));
     }
 
     #[test]
@@ -38511,7 +38511,7 @@ endmodule
         assert!(m
             .tb_history
             .iter()
-            .any(|e| e.tb_name == "and_dut_tb_fail" && !e.passed));
+            .any(|e| e.tb_name == "and_dut_fail_tb" && !e.passed));
     }
 
     #[test]
@@ -38547,7 +38547,7 @@ endmodule
         let dir = tb_project();
         let mut m = IdeModel::new();
         m.exec(&format!("tb_rescan {}", dir.display())).unwrap();
-        let summary = m.exec("tb_run and_dut_tb_fail").unwrap();
+        let summary = m.exec("tb_run and_dut_fail_tb").unwrap();
         assert!(summary.contains("FAILED"), "summary={summary}");
         let f = &m.tb_failures[0];
         assert!(f.time_ns > 0, "{f:?}");
