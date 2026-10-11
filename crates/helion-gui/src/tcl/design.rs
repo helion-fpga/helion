@@ -399,6 +399,9 @@ fn resolve_obj(
         })
 }
 
+/// One resolved object: its kind plus its property map.
+type ObjCandidate = (ObjKind, HashMap<String, String>);
+
 /// All objects matching `name`, in `resolve_obj` priority order. Used by
 /// `get_property`, which picks the first candidate that actually HAS the
 /// requested property (so `PERIOD` finds a clock even when a same-named
@@ -409,7 +412,7 @@ fn resolve_candidates(
     name: &str,
     line: usize,
     allow_timing: bool,
-) -> Result<Vec<(ObjKind, HashMap<String, String>)>, TclError> {
+) -> Result<Vec<ObjCandidate>, TclError> {
     let d = design(shell, "get_property", line)?;
     let mut out = Vec::new();
     if let Some(cell) = d.cells.iter().find(|c| c.name == name) {
