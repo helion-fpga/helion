@@ -13429,7 +13429,159 @@ fn subst_net_copies(e: &RExpr, map: &HashMap<(String, usize), RExpr>) -> RExpr {
     walk(e, map, 0)
 }
 
+/// FM-HEL-AREA-01: constant propagation for wires.
+///
+/// A wire driven by a constant `assign` is replaced by the constant at every
+/// use site. The AIG builder already folds `Expr::Const` (`and_lit` with
+/// c0/c1 identities, XNOR-with-const to wire/inverter), so this substitution
+/// is what unlocks it. Measured: `d == 16'd1250` cost 16 XNOR LUT6s plus a
+/// reduction tree (23 LUTs); after propagation it is a 3-LUT AND tree.
+///
+/// Only single-driver, non-port wires are propagated, and only when the wire
+/// is not also driven sequentially. The dead constant assigns are removed
+/// (their LHS is unreferenced after substitution). Complexity: O(8 * assigns)
+/// for the bounded fixpoint plus one walk per RExpr; runs once per module.
+/// Width of a constant-foldable RExpr, if it is syntactically constant.
+fn const_rexpr_width(e: &RExpr) -> Option<usize> {
+    match e {
+        RExpr::Const { width, .. } => Some(*width),
+        RExpr::Concat(parts) => {
+            let mut w = 0usize;
+            for p in parts {
+                w = w.saturating_add(const_rexpr_width(p)?);
+            }
+            Some(w)
+        }
+        RExpr::Not(x) => const_rexpr_width(x),
+        _ => None,
+    }
+}
+
+/// Replace references to constant-propagated wires with `Const`.
+fn subst_const_wires(e: &RExpr, map: &HashMap<String, (u128, usize)>) -> RExpr {
+    fn walk(e: &RExpr, map: &HashMap<String, (u128, usize)>, depth: usize) -> RExpr {
+        if depth > 32 {
+            return e.clone();
+        }
+        let w = |x: &RExpr| walk(x, map, depth + 1);
+        let mk_const = |val: u128, width: usize| RExpr::Const {
+            val: val & care_mask(width),
+            width,
+            care: care_mask(width),
+        };
+        match e {
+            RExpr::Ident(s) => match map.get(s) {
+                Some(&(v, wd)) => mk_const(v, wd),
+                None => e.clone(),
+            },
+            RExpr::Bit(s, i) => match map.get(s) {
+                Some(&(v, _)) => mk_const((v >> i) & 1, 1),
+                None => e.clone(),
+            },
+            RExpr::Range(s, hi, lo) => match map.get(s) {
+                Some(&(v, _)) => {
+                    let wd = hi.saturating_sub(*lo).saturating_add(1).max(1);
+                    mk_const((v >> lo) & care_mask(wd), wd)
+                }
+                None => e.clone(),
+            },
+            RExpr::Const { .. } => e.clone(),
+            RExpr::Not(a) => RExpr::Not(Box::new(w(a))),
+            RExpr::And(a, b) => RExpr::And(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Or(a, b) => RExpr::Or(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Xor(a, b) => RExpr::Xor(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Add(a, b) => RExpr::Add(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Sub(a, b) => RExpr::Sub(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Mul(a, b) => RExpr::Mul(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Concat(ps) => RExpr::Concat(ps.iter().map(w).collect()),
+            RExpr::Mux(c, t, f) => RExpr::Mux(Box::new(w(c)), Box::new(w(t)), Box::new(w(f))),
+            RExpr::Eq(a, b) => RExpr::Eq(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Ne(a, b) => RExpr::Ne(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Lt(a, b) => RExpr::Lt(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Shr(a, b) => RExpr::Shr(Box::new(w(a)), Box::new(w(b))),
+            RExpr::Ashr(a, b) => RExpr::Ashr(Box::new(w(a)), Box::new(w(b))),
+            RExpr::RedXor(a) => RExpr::RedXor(Box::new(w(a))),
+            RExpr::RedAnd(a) => RExpr::RedAnd(Box::new(w(a))),
+            RExpr::RedOr(a) => RExpr::RedOr(Box::new(w(a))),
+            RExpr::IndexPart { name, base, width, ascending } => {
+                let nb = w(base);
+                if let (Some(&(v, _)), Some(bv)) = (map.get(name), rexpr_const_val(&nb)) {
+                    let b = (bv as usize).min(127);
+                    let wd = (*width).max(1);
+                    let lo = if *ascending { b } else { b.saturating_sub(wd - 1) };
+                    return mk_const((v >> lo) & care_mask(wd), wd);
+                }
+                RExpr::IndexPart { name: name.clone(), base: Box::new(nb), width: *width, ascending: *ascending }
+            }
+            RExpr::WordAt { addr, data } => RExpr::WordAt { addr: Box::new(w(addr)), data: Box::new(w(data)) },
+            RExpr::Call { name, args } => RExpr::Call { name: name.clone(), args: args.iter().map(w).collect() },
+        }
+    }
+    walk(e, map, 0)
+}
+
+/// Identifiers referenced by an RExpr (for dead-assign elimination).
+fn collect_rexpr_idents(e: &RExpr, out: &mut HashSet<String>) {
+    fn walk(e: &RExpr, out: &mut HashSet<String>, depth: usize) {
+        if depth > 32 { return; }
+        match e {
+            RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => { out.insert(s.clone()); }
+            RExpr::Const { .. } => {}
+            RExpr::Not(a) => walk(a, out, depth + 1),
+            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Sub(a, b) | RExpr::Mul(a, b) | RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) | RExpr::Shr(a, b) | RExpr::Ashr(a, b) => { walk(a, out, depth + 1); walk(b, out, depth + 1); }
+            RExpr::Concat(ps) => { for p in ps { walk(p, out, depth + 1); } }
+            RExpr::Mux(c, t, f) => { walk(c, out, depth + 1); walk(t, out, depth + 1); walk(f, out, depth + 1); }
+            RExpr::RedXor(a) | RExpr::RedAnd(a) | RExpr::RedOr(a) => walk(a, out, depth + 1),
+            RExpr::IndexPart { name, base, .. } => { out.insert(name.clone()); walk(base, out, depth + 1); }
+            RExpr::WordAt { addr, data } => { walk(addr, out, depth + 1); walk(data, out, depth + 1); }
+            RExpr::Call { args, .. } => { for a in args { walk(a, out, depth + 1); } }
+        }
+    }
+    walk(e, out, 0);
+}
+
+/// Propagate wire constants through a module's `assigns`/`nbas` and drop the
+/// now-dead constant assigns. See FM-HEL-AREA-01 above.
+fn propagate_const_wires(rtl: &mut Rtl) {
+    let port_set: HashSet<&str> = rtl.ports.iter().map(|(p, _, _)| p.as_str()).collect();
+    let nba_lhs: HashSet<&str> = rtl.nbas.iter().map(|(n, _, _)| n.as_str()).collect();
+    let mut drivers: HashMap<&str, usize> = HashMap::new();
+    for (lhs, _, _) in &rtl.assigns { *drivers.entry(lhs.as_str()).or_insert(0) += 1; }
+    let mut cmap: HashMap<String, (u128, usize)> = HashMap::new();
+    for _ in 0..8 {
+        let mut changed = false;
+        for (lhs, bit, rhs) in &rtl.assigns {
+            if bit.is_some() || port_set.contains(lhs.as_str()) || cmap.contains_key(lhs) || nba_lhs.contains(lhs.as_str()) { continue; }
+            if drivers.get(lhs.as_str()) != Some(&1) { continue; }
+            let sub = subst_const_wires(rhs, &cmap);
+            if let Some(v) = rexpr_const_val(&sub) {
+                let width = const_rexpr_width(&sub).unwrap_or(1).clamp(1, 128);
+                cmap.insert(lhs.clone(), (v & care_mask(width), width));
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    if cmap.is_empty() { return; }
+    for (_, _, rhs) in rtl.assigns.iter_mut() { *rhs = subst_const_wires(rhs, &cmap); }
+    for (_, _, rhs) in rtl.nbas.iter_mut() { *rhs = subst_const_wires(rhs, &cmap); }
+    let mut referenced: HashSet<String> = HashSet::new();
+    for (_, _, rhs) in &rtl.assigns { collect_rexpr_idents(rhs, &mut referenced); }
+    for (_, _, rhs) in &rtl.nbas { collect_rexpr_idents(rhs, &mut referenced); }
+    for inst in &rtl.insts { for (_, parent) in &inst.conns { referenced.insert(parent.clone()); } }
+    rtl.assigns.retain(|(lhs, bit, _)| {
+        if bit.is_some() || !cmap.contains_key(lhs) { return true; }
+        if port_set.contains(lhs.as_str()) || referenced.contains(lhs) { return true; }
+        false
+    });
+}
+
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
+    // FM-HEL-AREA-01: fold constant-driven wires before mapping so the AIG
+    // builder sees `Expr::Const` (XNOR-with-const -> wire, AND-with-c0 -> c0).
+    let mut rtl_owned = rtl.clone();
+    propagate_const_wires(&mut rtl_owned);
+    let rtl: &Rtl = &rtl_owned;
     let mut d = Design::new(&rtl.module);
     for (n, dir, _) in &rtl.ports {
         // A read-only inout is a load-enable input, not an output pad and
