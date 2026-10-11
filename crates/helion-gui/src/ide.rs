@@ -7,6 +7,7 @@
 //! output anywhere in this file, so the widget layer (`helion-ide`) is a thin painter
 //! over this model and can be tested without a display.
 
+use crate::qor::{QorInputs, QorReport, analyze_qor};
 use crate::{GpuiShell, tcl_eval};
 use helion_bd::{BlockDesign, emit_sv, validate};
 use helion_debug::{
@@ -846,6 +847,10 @@ impl NavSection {
                 NavAction {
                     label: "Report Methodology",
                     tcl: "report_methodology",
+                },
+                NavAction {
+                    label: "Report QoR Suggestions",
+                    tcl: "report_qor_suggestions",
                 },
             ],
             NavSection::ProgramDebug => &[
@@ -4121,6 +4126,7 @@ pub enum WorkspaceTab {
     ClockNetworks,
     Power,
     Methodology,
+    Qor,
     Drc,
     Utilization,
     Hierarchy,
@@ -4131,7 +4137,7 @@ pub enum WorkspaceTab {
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 28] = [
+    pub const ALL: [WorkspaceTab; 29] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -4153,6 +4159,7 @@ impl WorkspaceTab {
         WorkspaceTab::ClockNetworks,
         WorkspaceTab::Power,
         WorkspaceTab::Methodology,
+        WorkspaceTab::Qor,
         WorkspaceTab::Drc,
         WorkspaceTab::Utilization,
         WorkspaceTab::Hierarchy,
@@ -4180,6 +4187,7 @@ impl WorkspaceTab {
             | WorkspaceTab::ClockNetworks
             | WorkspaceTab::Power
             | WorkspaceTab::Methodology
+            | WorkspaceTab::Qor
             | WorkspaceTab::Drc
             | WorkspaceTab::Utilization
             | WorkspaceTab::Runs => WorkspaceTab::Reports,
@@ -4247,6 +4255,7 @@ impl WorkspaceTab {
             WorkspaceTab::ClockNetworks => "Clock Networks",
             WorkspaceTab::Power => "Power",
             WorkspaceTab::Methodology => "Methodology",
+            WorkspaceTab::Qor => "QoR Suggestions",
             WorkspaceTab::Drc => "DRC",
             WorkspaceTab::Utilization => "Utilization",
             WorkspaceTab::Hierarchy => "Hierarchy",
@@ -4726,6 +4735,12 @@ pub struct IdeModel {
     methodology_cache: RefCell<Option<(u64, MethodologyReport)>>,
     /// How many times the cache actually called `report_methodology`.
     methodology_computes: Cell<u32>,
+    /// `report_qor_suggestions`: same paint-cost story as methodology.
+    qor_cache: RefCell<Option<(u64, QorReport)>>,
+    /// How many times the cache actually ran the QoR rule registry.
+    qor_computes: Cell<u32>,
+    /// Selected QoR suggestion id (panel highlight).
+    pub selected_qor: Option<String>,
     /// Properties follow the Text Editor line (last click), not the Sources file.
     editor_line_focus: bool,
     bp_prev: HashMap<String, u64>,
@@ -4921,6 +4936,9 @@ impl IdeModel {
             editor_bookmarks: Vec::new(),
             methodology_cache: RefCell::new(None),
             methodology_computes: Cell::new(0),
+            qor_cache: RefCell::new(None),
+            qor_computes: Cell::new(0),
+            selected_qor: None,
             editor_line_focus: false,
             bp_prev: HashMap::new(),
             next_bp_id: 1,
@@ -5599,6 +5617,19 @@ impl IdeModel {
             let text = self.methodology_text();
             self.mirror_methodology_messages();
             Ok(text)
+        } else if t == "report_qor_suggestions" || t == "qor_suggestions" {
+            self.workspace = WorkspaceTab::Qor;
+            Ok(self.qor_text())
+        } else if t == "refresh_qor_suggestions" {
+            Ok(self.refresh_qor())
+        } else if let Some(spec) = t.strip_prefix("select_qor_object ") {
+            self.select_qor_object(spec.trim())
+        } else if t == "select_qor_object" {
+            self.select_qor_object("")
+        } else if let Some(rest) = t.strip_prefix("select_qor ") {
+            self.select_qor(rest.trim())
+        } else if t == "select_qor" {
+            self.select_qor("")
         } else if t == "close_project" || t == "close" {
             self.close_project()
         } else if t == "save_project_as"
@@ -6159,6 +6190,7 @@ impl IdeModel {
             }
             "report_drc" => self.workspace = WorkspaceTab::Drc,
             "report_methodology" => self.workspace = WorkspaceTab::Methodology,
+            "report_qor_suggestions" => self.workspace = WorkspaceTab::Qor,
             "report_cdc" => self.workspace = WorkspaceTab::Cdc,
             "report_power" => self.workspace = WorkspaceTab::Power,
             "report_clock_interaction" => {
@@ -10607,6 +10639,7 @@ impl IdeModel {
             }
             "report_drc" => self.workspace = WorkspaceTab::Drc,
             "report_methodology" => self.workspace = WorkspaceTab::Methodology,
+            "report_qor_suggestions" => self.workspace = WorkspaceTab::Qor,
             "report_cdc" => self.workspace = WorkspaceTab::Cdc,
             "report_power" => self.workspace = WorkspaceTab::Power,
             "report_clock_interaction" => {
@@ -15360,6 +15393,23 @@ impl IdeModel {
         } else {
             "Complete"
         };
+
+        let qor = self.qor_report();
+        let qor_ready = self.shell.session.design.is_some();
+        let qor_sum = format!(
+            "suggestions={} critical={} warning={} info={}",
+            qor.suggestions.len(),
+            qor.critical_count(),
+            qor.warning_count(),
+            qor.info_count()
+        );
+        let qor_status = if qor.critical_count() > 0 {
+            "Failed"
+        } else if qor.warning_count() > 0 {
+            "Warnings"
+        } else {
+            "Complete"
+        };
         let drc_warn = drc
             .items
             .iter()
@@ -15427,6 +15477,15 @@ impl IdeModel {
                 meth_ready,
                 meth_sum,
                 meth_status,
+            ),
+            row(
+                "report_qor_suggestions",
+                "QoR Suggestions",
+                "Implementation",
+                WorkspaceTab::Qor,
+                qor_ready,
+                qor_sum,
+                qor_status,
             ),
             row(
                 "report_drc",
@@ -16477,6 +16536,163 @@ impl IdeModel {
             return "no design — synth / report_methodology".into();
         }
         self.methodology_report().text()
+    }
+
+    /// Cache key for the QoR report: anything a rule reads that can change
+    /// between paints (design shape, timing, routing, constraints, paths).
+    fn qor_cache_key(&self) -> u64 {
+        let (cells, nets) = match self.shell.session.design.as_ref() {
+            Some(d) => (d.cells.len() as u64, d.nets.len() as u64),
+            None => (0, 0),
+        };
+        let overused = self
+            .shell
+            .session
+            .routed
+            .as_ref()
+            .map(|r| r.overused as u64)
+            .unwrap_or(0);
+        cells.wrapping_mul(1_000_003)
+            ^ nets.wrapping_mul(1_000_033)
+            ^ (self.constraints.clocks.len() as u64).wrapping_mul(1_000_039)
+            ^ (self.timing_paths.len() as u64).wrapping_mul(1_000_043)
+            ^ self.timing.as_ref().map(|t| t.wns_ps as u64).unwrap_or(0)
+            ^ overused.wrapping_mul(1_000_049)
+            ^ self
+                .utilization
+                .map(|u| u.lutff as u64)
+                .unwrap_or(0)
+                .wrapping_mul(1_000_051)
+    }
+
+    /// Effective analysis period: first pane clock, else the IDE default.
+    fn qor_period_ps(&self) -> u64 {
+        self.pane_clocks()
+            .first()
+            .map(|c| c.period_ps)
+            .unwrap_or(self.clock_period_ps)
+    }
+
+    /// `report_qor_suggestions`: run the rule registry, cached per paint like
+    /// `methodology_report`. Empty design yields an empty report.
+    pub fn qor_report(&self) -> QorReport {
+        let key = self.qor_cache_key();
+        if let Some((k, cached)) = self.qor_cache.borrow().as_ref() {
+            if *k == key {
+                return cached.clone();
+            }
+        }
+        // `pane_clocks()` borrows self immutably; build inputs inline so the
+        // clock slice lives long enough for `analyze_qor`.
+        let report = match self.shell.session.design.as_ref() {
+            None => QorReport::default(),
+            Some(design) => {
+                let clocks = self.pane_clocks();
+                let period = self.qor_period_ps();
+                let inputs = QorInputs {
+                    design,
+                    timing: self.timing.as_ref(),
+                    paths: &self.timing_paths,
+                    routed: self.shell.session.routed.as_ref(),
+                    constraints: &self.constraints,
+                    clocks: &clocks,
+                    user_sdc: self.user_sdc,
+                    utilization: self.utilization.as_ref(),
+                    period_ps: period,
+                };
+                analyze_qor(&inputs)
+            }
+        };
+        self.qor_computes
+            .set(self.qor_computes.get().saturating_add(1));
+        *self.qor_cache.borrow_mut() = Some((key, report.clone()));
+        report
+    }
+
+    pub fn qor_text(&self) -> String {
+        if self.shell.session.design.is_none() {
+            return "no design — synth / report_qor_suggestions".into();
+        }
+        self.qor_report().text()
+    }
+
+    /// Re-run the QoR registry on demand (button / post-flow refresh).
+    pub fn refresh_qor(&mut self) -> String {
+        self.qor_cache.borrow_mut().take();
+        let report = self.qor_report();
+        format!(
+            "report_qor_suggestions refreshed suggestions={} critical={} warning={} info={}",
+            report.suggestions.len(),
+            report.critical_count(),
+            report.warning_count(),
+            report.info_count()
+        )
+    }
+
+    /// Click a QoR suggestion row: select it (panel highlight + properties).
+    pub fn select_qor(&mut self, id: &str) -> Result<String, String> {
+        let report = self.qor_report();
+        let v = report
+            .suggestion(id)
+            .ok_or_else(|| format!("select_qor: no suggestion {id}"))?;
+        self.selected_qor = Some(v.id.to_string());
+        self.workspace = WorkspaceTab::Qor;
+        let gain = v
+            .gain_ps
+            .map(|g| format!(" gain_ps={g}"))
+            .unwrap_or_default();
+        Ok(format!(
+            "qor ID={} SEVERITY={} CATEGORY={}{gain} {}",
+            v.id,
+            v.severity.as_str(),
+            v.category,
+            v.title
+        ))
+    }
+
+    /// "Locate" a QoR suggestion's object: cross-probe HNF/HAD like the
+    /// methodology object links, using the selection API on master.
+    pub fn select_qor_object(&mut self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("select_qor_object: missing name".into());
+        }
+        if self.shell.session.design.is_none() {
+            return Err("select_qor_object: no design".into());
+        }
+        let report = self.qor_report();
+        // Resolve the spec to a real object: exact object name first, then a
+        // suggestion id whose object list contains it.
+        let named = report
+            .suggestions
+            .iter()
+            .flat_map(|s| s.objects.iter())
+            .find(|o| o.eq_ignore_ascii_case(spec))
+            .cloned()
+            .or_else(|| {
+                report.suggestion(spec).and_then(|s| {
+                    s.objects
+                        .iter()
+                        .find(|o| {
+                            self.tree.has_net(o)
+                                || self.tree.has_cell(o)
+                                || self.io_ports.iter().any(|p| p.name == **o)
+                        })
+                        .cloned()
+                })
+            })
+            .ok_or_else(|| format!("select_qor_object: no object {spec}"))?;
+        if let Some(v) = report
+            .suggestions
+            .iter()
+            .find(|v| v.objects.iter().any(|o| o == &named))
+        {
+            self.selected_qor = Some(v.id.to_string());
+        }
+        let probed = self
+            .apply_object_crossprobe(&named)
+            .ok_or_else(|| format!("select_qor_object: no object {named}"))?;
+        Ok(format!("qor_object OBJECT={probed}"))
     }
 
     /// Click a methodology check: properties + Methodology workspace.
@@ -21502,6 +21718,22 @@ impl IdeModel {
                 props.push(("CATEGORY".into(), v.category));
                 props.push(("OBJECTS".into(), v.objects));
                 props.push(("MESSAGE".into(), v.message));
+            }
+        }
+        if self.workspace == WorkspaceTab::Qor {
+            if let Some(v) = self.qor_report().suggestion(&id).cloned() {
+                if !props.iter().any(|(k, _)| k == "TYPE") {
+                    props.push(("TYPE".into(), "qor_suggestion".into()));
+                }
+                props.push(("SEVERITY".into(), v.severity.as_str().into()));
+                props.push(("CATEGORY".into(), v.category.into()));
+                props.push(("OBJECTS".into(), v.objects.join(", ")));
+                props.push(("TITLE".into(), v.title));
+                props.push(("EXPLANATION".into(), v.explanation));
+                if let Some(g) = v.gain_ps {
+                    props.push(("EST_GAIN_PS".into(), g.to_string()));
+                }
+                props.push(("FIX".into(), v.fix_hint));
             }
         }
         if self.workspace == WorkspaceTab::Drc {
@@ -31796,6 +32028,126 @@ endmodule
         );
     }
 
+    /// QoR suggestions golden test on examples/counter.sv: the registry runs on
+    /// the real implemented design; every suggestion cites real objects; a tiny
+    /// passing design gets no Critical suggestions; select/locate round-trips.
+    #[test]
+    fn qor_suggestions_counter_golden() {
+        use crate::qor::QorSeverity;
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.implement().expect("implement counter");
+
+        // Tcl surface: report + navigation.
+        let out = ide.exec("report_qor_suggestions").unwrap();
+        assert!(out.starts_with("report_qor_suggestions"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Qor);
+
+        let report = ide.qor_report();
+        let design = ide.shell.session.design.as_ref().expect("design");
+        let cell_names: std::collections::HashSet<&str> = design
+            .cells
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        let net_names: std::collections::HashSet<&str> =
+            design.nets.iter().map(|n| n.name.as_str()).collect();
+        let path_names: std::collections::HashSet<&str> = ide
+            .timing_paths
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+
+        for s in &report.suggestions {
+            // Every cited object must be real — a cell, net, or path from the
+            // analysis — never invented.
+            for o in &s.objects {
+                assert!(
+                    cell_names.contains(o.as_str())
+                        || net_names.contains(o.as_str())
+                        || path_names.contains(o.as_str()),
+                    "suggestion {} cites unknown object {o}",
+                    s.id
+                );
+            }
+            // Gain is a positive estimate or absent — never a placeholder.
+            if let Some(g) = s.gain_ps {
+                assert!(g > 0, "gain estimate must be positive: {}", s.id);
+            }
+            assert!(
+                !s.title.is_empty() && !s.explanation.is_empty(),
+                "suggestion {} needs title + explanation",
+                s.id
+            );
+            assert!(
+                !s.fix_hint.is_empty(),
+                "suggestion {} needs a fix hint",
+                s.id
+            );
+            // The explanation must cite a measured number, not generic advice.
+            assert!(
+                s.explanation.chars().any(|c| c.is_ascii_digit()),
+                "suggestion {} explanation cites no measured number: {}",
+                s.id,
+                s.explanation
+            );
+        }
+
+        // Counter is tiny and passes timing: nothing Critical may fire.
+        assert!(
+            report.at(QorSeverity::Critical).is_empty(),
+            "counter must have no Critical QoR suggestions: {:?}",
+            report
+                .suggestions
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        );
+
+        // Select round-trip on the first suggestion, if any fired.
+        if let Some(first) = report.suggestions.first() {
+            let id = first.id;
+            ide.exec(&format!("select_qor {id}")).unwrap();
+            assert_eq!(ide.selected_qor.as_deref(), Some(id));
+            // Locate via suggestion id resolves to a real probed object when
+            // the suggestion names one; otherwise it errors without panicking.
+            let located = ide.exec(&format!("select_qor_object {id}"));
+            if first.objects.iter().any(|o| {
+                cell_names.contains(o.as_str()) || net_names.contains(o.as_str())
+            }) {
+                located.unwrap();
+                assert!(
+                    ide.selected.is_some(),
+                    "locate must select a real object for {id}"
+                );
+            } else {
+                assert!(located.is_err(), "locate with no objects must err: {id}");
+            }
+        }
+
+        // Bogus select/locate never panics.
+        assert!(ide.exec("select_qor QOR-NOPE").is_err());
+        assert!(ide.exec("select_qor_object nope_nope").is_err());
+
+        // Re-run is idempotent.
+        let r = ide.exec("refresh_qor_suggestions").unwrap();
+        assert!(r.contains("refreshed"), "{r}");
+        assert_eq!(
+            ide.qor_report().suggestions.len(),
+            report.suggestions.len(),
+            "refresh must be deterministic"
+        );
+
+        // Report catalog carries the QoR row with a real summary.
+        let row = ide
+            .report_catalog()
+            .into_iter()
+            .find(|r| r.id == "report_qor_suggestions")
+            .expect("catalog QoR row");
+        assert!(row.summary.starts_with("suggestions="), "{}", row.summary);
+    }
+
     /// Messages TIMING-7 click jumps Vivado-shaped to Constraints with the
     /// set_output_delay Fix template (Methodology Jump path) and cross-probes led.
     /// Editor may be dirty; examples/counter.sdc on disk must stay gold.
@@ -37279,7 +37631,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(
