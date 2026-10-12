@@ -19,8 +19,9 @@ use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ipxact::{IpCore, catalog as ipxact_catalog, to_xml};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_proj::{
-    ImplStrategy, Mode, ProjectFile, ReuseReport, Session, expand_ip_packages, format_prj,
-    get_cells, get_nets, load_prj, resolve_prj_path,
+    CheckpointMeta, CheckpointSummary, ImplStrategy, Mode, ProjectFile, ReuseReport, Session,
+    delete_checkpoint, diff_metas, expand_ip_packages, format_prj, get_cells, get_nets,
+    list_checkpoints, load_checkpoint, load_prj, resolve_prj_path, save_checkpoint, stage_of,
 };
 use helion_sim::{Sim, SimLocal};
 use helion_sta::{
@@ -4495,11 +4496,12 @@ pub enum WorkspaceTab {
     Find,
     Package,
     Runs,
+    Checkpoints,
     Bitstream,
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 28] = [
+    pub const ALL: [WorkspaceTab; 29] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -4527,6 +4529,7 @@ impl WorkspaceTab {
         WorkspaceTab::Find,
         WorkspaceTab::Package,
         WorkspaceTab::Runs,
+        WorkspaceTab::Checkpoints,
         WorkspaceTab::Bitstream,
     ];
 
@@ -4550,7 +4553,8 @@ impl WorkspaceTab {
             | WorkspaceTab::Methodology
             | WorkspaceTab::Drc
             | WorkspaceTab::Utilization
-            | WorkspaceTab::Runs => WorkspaceTab::Reports,
+            | WorkspaceTab::Runs
+            | WorkspaceTab::Checkpoints => WorkspaceTab::Reports,
             other => other,
         }
     }
@@ -4621,6 +4625,7 @@ impl WorkspaceTab {
             WorkspaceTab::Find => "Find Results",
             WorkspaceTab::Package => "Package",
             WorkspaceTab::Runs => "Design Runs",
+            WorkspaceTab::Checkpoints => "Checkpoints",
             WorkspaceTab::Bitstream => "Bitstream",
         }
     }
@@ -5243,6 +5248,14 @@ pub struct IdeModel {
     pub last_report_export: Option<String>,
     /// Last opened/saved `.prj` path (Save Project As / Open / Create) for Recent.
     pub last_project_path: Option<PathBuf>,
+    /// Design checkpoints (`.hck2`) in the project checkpoint dir, newest first.
+    pub checkpoints: Vec<CheckpointMeta>,
+    /// Selected checkpoint names (restore/delete use the first; diff uses two).
+    pub checkpoint_sel: Vec<String>,
+    /// Draft name in the checkpoint save box.
+    pub checkpoint_name: String,
+    /// Auto-save a checkpoint after each flow stage completes.
+    pub auto_checkpoint: bool,
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
 }
@@ -5383,6 +5396,10 @@ impl IdeModel {
             sdc_editor_dirty: false,
             last_report_export: None,
             last_project_path: None,
+            checkpoints: Vec::new(),
+            checkpoint_sel: Vec::new(),
+            checkpoint_name: String::new(),
+            auto_checkpoint: false,
             event_sim: None,
             fabric_sim: None,
         };
@@ -5913,6 +5930,60 @@ impl IdeModel {
             self.reset_runs(name)
         } else if t == "write_checkpoint" {
             self.shell.session.write_checkpoint()
+        } else if t == "checkpoint_list" || t.starts_with("checkpoint_list ") {
+            self.refresh_checkpoints();
+            if self.checkpoints.is_empty() {
+                Ok("checkpoint_list: no checkpoints".into())
+            } else {
+                let mut out = String::new();
+                for c in &self.checkpoints {
+                    out.push_str(&format!(
+                        "{} stage={} cells={} wns_ps={} tns_ps={} bytes={}\n",
+                        c.name,
+                        c.stage.label(),
+                        c.cell_total(),
+                        c.wns_ps,
+                        c.tns_ps,
+                        c.bytes
+                    ));
+                }
+                Ok(out)
+            }
+        } else if t == "checkpoint_save" || t.starts_with("checkpoint_save ") {
+            let name = t.split_whitespace().nth(1).unwrap_or("checkpoint");
+            self.save_checkpoint_named(name)
+        } else if t == "checkpoint_restore" || t.starts_with("checkpoint_restore ") {
+            let name = t
+                .split_whitespace()
+                .nth(1)
+                .ok_or("checkpoint_restore: need a name")?;
+            self.restore_checkpoint(name)
+        } else if t == "checkpoint_delete" || t.starts_with("checkpoint_delete ") {
+            let name = t
+                .split_whitespace()
+                .nth(1)
+                .ok_or("checkpoint_delete: need a name")?;
+            self.delete_checkpoint_named(name)
+        } else if t == "checkpoint_select" || t.starts_with("checkpoint_select ") {
+            let names: Vec<String> = t
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.to_string())
+                .collect();
+            if names.is_empty() {
+                return Err("checkpoint_select: need at least one name".into());
+            }
+            self.refresh_checkpoints();
+            for n in &names {
+                if !self.checkpoints.iter().any(|c| &c.name == n) {
+                    return Err(format!("checkpoint not found: {n}"));
+                }
+            }
+            self.checkpoint_sel = names;
+            Ok(format!(
+                "checkpoint_select {}",
+                self.checkpoint_sel.join(",")
+            ))
         } else if t == "incremental_impl" {
             self.incremental_impl()
         } else if t == "incremental_place" {
@@ -7728,7 +7799,123 @@ impl IdeModel {
         };
         self.journal(step.tcl(), &r);
         self.sync_from_session();
+        if r.is_ok() {
+            self.maybe_auto_checkpoint();
+        }
         r
+    }
+
+    // ------------------------------------------------------------------
+    // Design checkpoints (`.hck2`) — Vivado `write_checkpoint`/`open_checkpoint`.
+    // ------------------------------------------------------------------
+
+    /// Directory holding `.hck2` files: `<project dir>/checkpoints`, or
+    /// `./checkpoints` when no project is open.
+    pub fn checkpoint_dir(&self) -> PathBuf {
+        self.last_project_path
+            .as_deref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("checkpoints")
+    }
+
+    /// Refresh `self.checkpoints` from disk, newest first; prune dead selections.
+    pub fn refresh_checkpoints(&mut self) {
+        let mut v = list_checkpoints(&self.checkpoint_dir());
+        v.sort_by(|a, b| b.created_unix.cmp(&a.created_unix));
+        self.checkpoints = v;
+        self.checkpoint_sel
+            .retain(|n| self.checkpoints.iter().any(|c| &c.name == n));
+    }
+
+    fn checkpoint_summary_now(&self) -> CheckpointSummary {
+        match &self.timing {
+            Some(t) => CheckpointSummary {
+                wns_ps: t.wns_ps,
+                tns_ps: t.tns_ps,
+            },
+            None => CheckpointSummary::default(),
+        }
+    }
+
+    /// Save the current session state as a named checkpoint; refreshes the list.
+    pub fn save_checkpoint_named(&mut self, name: &str) -> Result<String, String> {
+        let summary = self.checkpoint_summary_now();
+        let dir = self.checkpoint_dir();
+        let path = save_checkpoint(
+            &self.shell.session,
+            &self.constraints,
+            name,
+            &dir,
+            &summary,
+        )?;
+        self.refresh_checkpoints();
+        let msg = format!("checkpoint saved {}", path.display());
+        self.status = msg.clone();
+        Ok(msg)
+    }
+
+    /// Restore a checkpoint by name: the session, constraints, and all views
+    /// are replaced with the checkpointed state.
+    pub fn restore_checkpoint(&mut self, name: &str) -> Result<String, String> {
+        let dev = self.device()?;
+        let path = self
+            .checkpoints
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.path.clone())
+            .ok_or_else(|| format!("checkpoint not found: {name}"))?;
+        let rc = load_checkpoint(&path, &dev)?;
+        let stage = rc.meta.stage;
+        self.shell.session = rc.session;
+        self.constraints = rc.constraints;
+        // sync_from_session refreshes steps/tree/reports from the restored state.
+        self.sync_from_session();
+        self.refresh_checkpoints();
+        let msg = format!("checkpoint restored {name} ({})", stage.label());
+        self.status = msg.clone();
+        Ok(msg)
+    }
+
+    /// Delete a checkpoint by name; refreshes the list.
+    pub fn delete_checkpoint_named(&mut self, name: &str) -> Result<String, String> {
+        let path = self
+            .checkpoints
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.path.clone())
+            .ok_or_else(|| format!("checkpoint not found: {name}"))?;
+        delete_checkpoint(&path)?;
+        self.refresh_checkpoints();
+        let msg = format!("checkpoint deleted {name}");
+        self.status = msg.clone();
+        Ok(msg)
+    }
+
+    /// Diff text for the first two selected checkpoints (b minus a).
+    pub fn checkpoint_diff_text(&self) -> Option<String> {
+        let mut it = self.checkpoint_sel.iter().filter_map(|n| {
+            self.checkpoints.iter().find(|c| &c.name == n)
+        });
+        let a = it.next()?;
+        let b = it.next()?;
+        Some(diff_metas(a, b).text())
+    }
+
+    /// Best-effort auto-checkpoint after a flow step: saves once per stage so
+    /// Route→Bitstream (both post-route) does not duplicate. Never fails the step.
+    fn maybe_auto_checkpoint(&mut self) {
+        if !self.auto_checkpoint {
+            return;
+        }
+        let Some(stage) = stage_of(&self.shell.session) else {
+            return;
+        };
+        if self.checkpoints.first().is_some_and(|c| c.stage == stage) {
+            return;
+        }
+        let name = format!("auto-{}", stage.label());
+        let _ = self.save_checkpoint_named(&name);
     }
 
     fn run_step_inner(
@@ -20734,6 +20921,7 @@ impl IdeModel {
         self.refresh_analysis();
         self.refresh_hw();
         self.refresh_runs();
+        self.refresh_checkpoints();
         if self.selected.is_some() {
             self.refresh_properties();
         }
@@ -38486,7 +38674,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 28);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(

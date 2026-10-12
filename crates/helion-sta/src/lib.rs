@@ -13,7 +13,9 @@ use helion_place::Placed;
 use helion_route::Routed;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-#[derive(Clone, Debug)]
+mod constraints_codec;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Clock {
     pub name: String,
     pub period_ps: u64,
@@ -1030,7 +1032,7 @@ fn tcl_from_to(toks: &[&str]) -> (String, String) {
 }
 
 /// UG903 `set_multicycle_path`: setup/hold path multipliers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MulticyclePath {
     pub from: String,
     pub to: String,
@@ -1041,7 +1043,7 @@ pub struct MulticyclePath {
 }
 
 /// UG903 `set_max_delay`: absolute setup requirement (ps), replacing the period check.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaxDelay {
     pub from: String,
     pub to: String,
@@ -1050,7 +1052,7 @@ pub struct MaxDelay {
 }
 
 /// UG903 `set_min_delay`: absolute hold requirement (ps), replacing HOLD_REQ_PS.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MinDelay {
     pub from: String,
     pub to: String,
@@ -1059,7 +1061,7 @@ pub struct MinDelay {
 }
 
 /// UG903 `set_clock_groups`: CDC / exclusive groups (false path between groups).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClockGroups {
     pub asynchronous: bool,
     pub exclusive: bool,
@@ -1067,7 +1069,7 @@ pub struct ClockGroups {
 }
 
 /// UG903 `set_clock_uncertainty`: subtracted from setup and/or hold slack.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClockUncertainty {
     pub from: String,
     pub to: String,
@@ -1076,7 +1078,7 @@ pub struct ClockUncertainty {
 }
 
 /// UG903 `set_clock_latency`: late adds to setup arrival; early reduces hold slack.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClockLatency {
     pub clock: String,
     pub late_ps: i64,
@@ -1085,7 +1087,7 @@ pub struct ClockLatency {
 }
 
 /// UG903 `set_disable_timing`: drop timing arcs through a cell or pin pair.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisableTiming {
     pub from: String,
     pub to: String,
@@ -1093,14 +1095,14 @@ pub struct DisableTiming {
 }
 
 /// UG903 `set_case_analysis`: force a constant on a pin/port (disables unused arcs).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaseAnalysis {
     pub value: String,
     pub object: String,
 }
 
 /// UG903 `set_clock_sense`: rising / falling / stop_propagation on a clock pin.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClockSense {
     pub object: String,
     /// `positive`, `negative`, or `stop`.
@@ -1108,7 +1110,7 @@ pub struct ClockSense {
 }
 
 /// UG903 `set_input_jitter`: peak-to-peak primary-clock jitter (ps). Feeds STA like uncertainty.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputJitter {
     pub clock: String,
     pub jitter_ps: i64,
@@ -1116,7 +1118,7 @@ pub struct InputJitter {
 
 /// UG903 `set_timing_derate`: OCV scale on early (hold) / late (setup) path delay.
 /// `*_milli` is parts-per-thousand (1100 = 1.100); 0 means this edge was not set.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TimingDerate {
     pub early_milli: i64,
     pub late_milli: i64,
@@ -1128,7 +1130,7 @@ pub struct TimingDerate {
 
 /// UG903 `set_operating_conditions`: PVT overlay on HAD delays.
 /// Unset voltage/temperature keeps the gold (1.00 V, 25 °C) corner.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OperatingConditions {
     pub voltage_mv: i64,
     pub temperature_c: i64,
@@ -1156,7 +1158,7 @@ impl OperatingConditions {
 }
 
 /// UG903 `set_bus_skew`: max allowed skew between bits (ps). Subtracted from slack.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BusSkew {
     pub from: String,
     pub to: String,
@@ -1166,7 +1168,7 @@ pub struct BusSkew {
 }
 
 /// UG903 `group_path`: named path group; `-weight` scales setup delay (1000 = 1.0).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathGroup {
     pub name: String,
     pub from: String,
@@ -1177,7 +1179,7 @@ pub struct PathGroup {
 
 /// UG903 `set_max_time_borrow`: latch may steal this much from the next period (ps).
 /// Added to setup slack. Empty list keeps gold WNS (FF / no-borrow).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaxTimeBorrow {
     pub object: String,
     pub borrow_ps: i64,
@@ -1185,7 +1187,7 @@ pub struct MaxTimeBorrow {
 
 /// UG903 `set_data_check`: data-to-data setup/hold between `-from` and `-to` (ps).
 /// Setup subtracts from WNS; hold subtracts from hold slack.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataCheck {
     pub from: String,
     pub to: String,
@@ -1194,7 +1196,7 @@ pub struct DataCheck {
     pub clock: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Constraints {
     pub clocks: Vec<Clock>,
     pub input_delay_ps: BTreeMap<String, i64>,

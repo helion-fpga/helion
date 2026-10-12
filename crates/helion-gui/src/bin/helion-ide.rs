@@ -436,6 +436,10 @@ impl HelionIde {
                 app.open_path(&pb);
             }
         }
+        // Demo/shot hook: auto-save one checkpoint per flow stage.
+        if std::env::var("HELION_AUTO_CHECKPOINT").as_deref() == Ok("1") {
+            app.model.auto_checkpoint = true;
+        }
         match std::env::var("HELION_FLOW").as_deref() {
             Ok("implement") => {
                 let _ = app.model.implement();
@@ -2591,6 +2595,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspacePane::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspacePane::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspacePane::Wave
         | WorkspacePane::Source
         | WorkspacePane::Memory
@@ -2630,6 +2635,7 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
         WorkspaceTab::Reports => {
             // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
@@ -2654,6 +2660,7 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
         WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
@@ -3690,6 +3697,200 @@ fn kick_run_queue(model: &mut IdeModel) {
         surface::request_job(JobKind::DesignRun { name });
     }
 }
+/// Format unix seconds as `YYYY-MM-DD HH:MM` (UTC) without extra crates.
+fn fmt_checkpoint_time(secs: u64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let hh = (secs % 86_400) / 3_600;
+    let mm = (secs % 3_600) / 60;
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+fn fmt_checkpoint_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.1} KB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Design checkpoints (`.hck2`): save / restore / delete / diff snapshots of the
+/// design database at post-synth, post-pack, post-place, or post-route.
+fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+    ui.horizontal(|ui| {
+        ui.heading("Checkpoints");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.checkbox(&mut model.auto_checkpoint, "Auto-checkpoint after each stage")
+                .on_hover_text(tip(
+                    "Auto-checkpoint",
+                    "",
+                    "saves one checkpoint per flow stage (post-synth, post-pack, post-place, post-route)",
+                ));
+        });
+    });
+    ui.add_space(4.0);
+
+    // Save row.
+    ui.horizontal(|ui| {
+        ui.label("Save:");
+        let resp = ui.add_sized(
+            [220.0, chrome::HIT_SIDEBAR],
+            egui::TextEdit::singleline(&mut model.checkpoint_name)
+                .hint_text("checkpoint name…"),
+        );
+        let mut do_save = primary_button(ui, "Save checkpoint")
+            .on_hover_text(tip("Save checkpoint", "", "checkpoint_save <name>"))
+            .clicked();
+        do_save |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if do_save {
+            let name = model.checkpoint_name.trim().to_string();
+            let name = if name.is_empty() { "checkpoint".into() } else { name };
+            match model.save_checkpoint_named(&name) {
+                Ok(_) => model.checkpoint_name.clear(),
+                Err(e) => model.status = format!("checkpoint save failed: {e}"),
+            }
+        }
+        ui.label(
+            RichText::new(format!("→ {}", model.checkpoint_dir().display()))
+                .size(12.0)
+                .color(theme.dim),
+        );
+    });
+    ui.add_space(6.0);
+
+    // Table.
+    let mut toggle: Option<String> = None;
+    egui::ScrollArea::both()
+        .id_salt("checkpoints_table")
+        .max_height(260.0)
+        .show(ui, |ui| {
+            egui::Grid::new("checkpoints_grid")
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    for h in [
+                        "Name", "Stage", "Created", "LUT", "FF", "IOB", "DSP", "BRAM",
+                        "WNS", "TNS", "Size",
+                    ] {
+                        ui.label(RichText::new(h).strong());
+                    }
+                    ui.end_row();
+                    if model.checkpoints.is_empty() {
+                        ui.label(
+                            RichText::new("No checkpoints yet.")
+                                .color(theme.dim),
+                        );
+                        ui.end_row();
+                    }
+                    for c in &model.checkpoints {
+                        let on = model.checkpoint_sel.iter().any(|n| n == &c.name);
+                        if ui.selectable_label(on, &c.name).clicked() {
+                            toggle = Some(c.name.clone());
+                        }
+                        ui.label(c.stage.label());
+                        ui.label(fmt_checkpoint_time(c.created_unix));
+                        ui.label(c.luts.to_string());
+                        ui.label(c.ffs.to_string());
+                        ui.label(c.iobs.to_string());
+                        ui.label(c.dsps.to_string());
+                        ui.label(c.brams.to_string());
+                        ui.label(if c.has_timing() {
+                            format!("{} ps", c.wns_ps)
+                        } else {
+                            "—".into()
+                        });
+                        ui.label(if c.has_timing() {
+                            format!("{} ps", c.tns_ps)
+                        } else {
+                            "—".into()
+                        });
+                        ui.label(fmt_checkpoint_bytes(c.bytes));
+                        ui.end_row();
+                    }
+                });
+        });
+    if let Some(name) = toggle {
+        if let Some(i) = model.checkpoint_sel.iter().position(|n| n == &name) {
+            model.checkpoint_sel.remove(i);
+        } else {
+            model.checkpoint_sel.push(name);
+        }
+    }
+    ui.add_space(6.0);
+
+    // Actions.
+    ui.horizontal(|ui| {
+        let n_sel = model.checkpoint_sel.len();
+        let restore_btn = ui
+            .add_enabled(
+                n_sel == 1,
+                egui::Button::new("Restore selected"),
+            )
+            .on_hover_text(tip(
+                "Restore",
+                "",
+                "replace the session with the checkpoint (views refresh)",
+            ));
+        if restore_btn.clicked() {
+            if let Some(name) = model.checkpoint_sel.first().cloned() {
+                if let Err(e) = model.restore_checkpoint(&name) {
+                    model.status = format!("checkpoint restore failed: {e}");
+                }
+            }
+        }
+        let delete_btn = ui
+            .add_enabled(
+                n_sel >= 1,
+                egui::Button::new(if n_sel > 1 {
+                    format!("Delete {} selected", n_sel)
+                } else {
+                    "Delete selected".into()
+                }),
+            )
+            .on_hover_text(tip("Delete", "", "checkpoint_delete <name>"));
+        if delete_btn.clicked() {
+            let names = model.checkpoint_sel.clone();
+            for name in names {
+                if let Err(e) = model.delete_checkpoint_named(&name) {
+                    model.status = format!("checkpoint delete failed: {e}");
+                    break;
+                }
+            }
+        }
+        if n_sel == 2 {
+            ui.label(
+                RichText::new("Two selected — diff below.")
+                    .color(theme.dim),
+            );
+        } else if n_sel > 2 {
+            ui.label(
+                RichText::new("Select exactly two for a diff.")
+                    .color(theme.dim),
+            );
+        }
+    });
+
+    // Diff.
+    if model.checkpoint_sel.len() == 2 {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Diff (second minus first)").strong());
+        if let Some(text) = model.checkpoint_diff_text() {
+            ui.label(RichText::new(text).monospace().size(13.0));
+        }
+    }
+}
+
 fn incremental_status_color(theme: &theme::Theme, status: &str) -> Color32 {
     match status {
         "Reused" => theme.ok,
