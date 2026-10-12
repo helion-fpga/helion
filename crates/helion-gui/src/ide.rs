@@ -2865,6 +2865,14 @@ pub struct DeviceView {
     pub routes: Vec<DeviceRoute>,
     /// UG893 Floorplanning Pblock rectangles (create_pblock / resize_pblock).
     pub pblocks: Vec<Pblock>,
+    /// Physical View 2.0: per-tile routed-net usage, die-indexed row-major
+    /// (`congestion[dy * cols + dx]` for tile (`x0 + dx`, `y0 + dy`)).
+    /// Copied from `helion_route::Routed::congestion` on route import;
+    /// empty when nothing routed.
+    pub congestion: Vec<u32>,
+    /// Physical View 2.0: worst slack per net across STA timing paths.
+    /// Rebuilt after each timing run; empty when no timing data.
+    pub net_slack: HashMap<String, i64>,
 }
 
 /// Fig. 49: tile the HAD die into 2×2 clock-region rectangles.
@@ -22647,6 +22655,8 @@ impl IdeModel {
             (Some(d), Some(t)) => extract_timing_paths(d, t, &self.device),
             _ => Vec::new(),
         };
+        // Physical View 2.0: worst slack per net for the criticality overlay.
+        self.device.net_slack = crate::physview::build_net_slack(&self.timing_paths);
         if let Some(i) = self.selected_timing_path {
             if i >= self.timing_paths.len() {
                 self.selected_timing_path = None;
@@ -23070,6 +23080,8 @@ impl IdeModel {
             clock_regions: had_clock_regions(x0, y0, cols, rows),
             routes: Vec::new(),
             pblocks: self.pblocks.clone(),
+            congestion: Vec::new(),
+            net_slack: HashMap::new(),
         };
         self.refresh_device_routes();
     }
@@ -23086,12 +23098,40 @@ impl IdeModel {
                     highlighted: false,
                 });
             }
+            // Physical View 2.0: copy the router's TileGrid-indexed congestion
+            // into the die-indexed DeviceView vector (row-major over
+            // (x0..x0+cols, y0..y0+rows)). Tiles outside the router grid
+            // (e.g. IOB ring rows) stay zero.
+            let cols = self.device.cols.max(1) as usize;
+            let rows = self.device.rows.max(1) as usize;
+            let x0 = self.device.x0;
+            let y0 = self.device.y0;
+            let mut congestion = vec![0u32; cols * rows];
+            let gcols = r.congestion_cols as usize;
+            for (gi, &u) in r.congestion.iter().enumerate() {
+                if u == 0 {
+                    continue;
+                }
+                let gx = r.congestion_x0 + (gi % gcols.max(1)) as u32;
+                let gy = r.congestion_y0 + (gi / gcols.max(1)) as u32;
+                if gx >= x0 && gy >= y0 {
+                    let dx = (gx - x0) as usize;
+                    let dy = (gy - y0) as usize;
+                    if dx < cols && dy < rows {
+                        congestion[dy * cols + dx] =
+                            congestion[dy * cols + dx].saturating_add(u);
+                    }
+                }
+            }
+            self.device.congestion = congestion;
+        } else {
+            self.device.congestion = Vec::new();
         }
         self.device.routes = routes;
         self.highlight_device_routes();
     }
 
-    fn highlight_device_routes(&mut self) {
+    pub(crate) fn highlight_device_routes(&mut self) {
         let sel = self.selected.clone();
         let path_cells = &self.schematic.highlight_cells;
         let path_nets = &self.schematic.highlight_nets;

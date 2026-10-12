@@ -22,6 +22,18 @@ pub struct Routed {
     pub overused: u32,
     /// LUT-pin drivers outside bring-up IMUX reach (axis±4 / diag±2 / knight; Ibex-scale).
     pub imux_skip: u32,
+    /// Final per-tile net usage over the router TileGrid, row-major:
+    /// `congestion[dy * congestion_cols + dx]` counts nets whose best path
+    /// traverses tile (`congestion_x0 + dx`, `congestion_y0 + dy`).
+    /// Only intermediate tiles count (a net's own driver/sink terminals do
+    /// not congest themselves); empty when nothing routed. Feeds the
+    /// Physical View 2.0 congestion heat map.
+    pub congestion: Vec<u32>,
+    /// Origin and dims of the TileGrid the congestion vector is indexed over.
+    pub congestion_x0: u32,
+    pub congestion_y0: u32,
+    pub congestion_cols: u32,
+    pub congestion_rows: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -603,6 +615,8 @@ pub fn route_with_guide(
     let mut hist = vec![0u32; grid.len()];
     let mut iob_src = Vec::new();
     let mut iters = 0u32;
+    let (cong_x0, cong_y0, cong_cols, cong_rows) =
+        (grid.x0, grid.y0, grid.cols, grid.rows);
     if nets.is_empty() {
         return Ok(Routed {
             placed: placed.clone(),
@@ -611,6 +625,11 @@ pub fn route_with_guide(
             pathfinder_iters: 0,
             overused: 0,
             imux_skip,
+            congestion: vec![0u32; grid.len()],
+            congestion_x0: cong_x0,
+            congestion_y0: cong_y0,
+            congestion_cols: cong_cols,
+            congestion_rows: cong_rows,
         });
     }
     let max_iters = opts.max_iters.max(1);
@@ -701,6 +720,20 @@ pub fn route_with_guide(
             imux.len()
         );
     }
+    // Congestion heat map data: count intermediate tiles of each net's best
+    // path (same terminal-skip rule as the per-iteration `pres` count).
+    let mut congestion = vec![0u32; grid.len()];
+    for (i, path) in best_paths.iter().enumerate() {
+        let (src, dst, _, _) = nets[i];
+        for &(tx, ty) in path {
+            if (tx, ty) == src || (tx, ty) == dst {
+                continue;
+            }
+            if let Some(ti) = grid.index(tx, ty) {
+                congestion[ti] = congestion[ti].saturating_add(1);
+            }
+        }
+    }
     Ok(Routed {
         placed: placed.clone(),
         iob_src,
@@ -708,6 +741,11 @@ pub fn route_with_guide(
         pathfinder_iters: iters,
         overused: best_overused,
         imux_skip,
+        congestion,
+        congestion_x0: cong_x0,
+        congestion_y0: cong_y0,
+        congestion_cols: cong_cols,
+        congestion_rows: cong_rows,
     })
 }
 
@@ -759,6 +797,48 @@ mod tests {
         let pl = place(&p, &dev).unwrap();
         let r = route(&pl, &dev).unwrap();
         assert!(r.iob_src[0].clb.1 > r.iob_src[0].iob.1);
+    }
+
+    #[test]
+    fn congestion_counts_intermediate_tiles() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let pl = place(&p, &dev).unwrap();
+        let r = route(&pl, &dev).unwrap();
+        assert_eq!(
+            r.congestion.len(),
+            r.congestion_cols as usize * r.congestion_rows as usize
+        );
+        // Grid origin matches the router tile grid.
+        assert!(r.congestion_cols > 0 && r.congestion_rows > 0);
+        // Every intermediate tile of the routed path counts exactly once;
+        // driver and sink terminals never count toward themselves.
+        let io = &r.iob_src[0];
+        let mut expect = vec![0u32; r.congestion.len()];
+        for &(tx, ty) in &io.path {
+            if (tx, ty) == io.clb || (tx, ty) == io.iob {
+                continue;
+            }
+            let dx = tx - r.congestion_x0;
+            let dy = ty - r.congestion_y0;
+            expect[(dy * r.congestion_cols + dx) as usize] += 1;
+        }
+        assert_eq!(r.congestion, expect);
+        // Sanity: an unrouted (empty) Routed has an all-zero congestion map.
+        let r2 = Routed {
+            placed: pl.clone(),
+            iob_src: Vec::new(),
+            imux: Vec::new(),
+            pathfinder_iters: 0,
+            overused: 0,
+            imux_skip: 0,
+            congestion: vec![0u32; r.congestion.len()],
+            congestion_x0: r.congestion_x0,
+            congestion_y0: r.congestion_y0,
+            congestion_cols: r.congestion_cols,
+            congestion_rows: r.congestion_rows,
+        };
+        assert!(r2.congestion.iter().all(|&c| c == 0));
     }
 
     #[test]
