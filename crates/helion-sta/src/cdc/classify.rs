@@ -606,7 +606,11 @@ mod tests {
         d.add_port("clk_a", PortDir::In);
         d.add_port("clk_b", PortDir::In);
         for i in 0..4 {
-            ff(&mut d, &format!("cnt{i}"), "clk_a", &format!("cnt{i}_d"));
+            let src = format!("cnt{i}");
+            d.add_cell(&src, CellKind::Hff);
+            d.connect("clk_a", &src, "CLK");
+            d.connect(&format!("cnt{i}_d"), &src, "D");
+            d.connect(&format!("cnt[{i}]"), &src, "Q");
             let cap = format!("cap{i}");
             d.add_cell(&cap, CellKind::Hff);
             d.connect("clk_b", &cap, "CLK");
