@@ -1,0 +1,268 @@
+//! Emit stage: [`Routed7`] → FASM text ([`Bitstream7`]).
+//!
+//! Walks the placed+routed design and emits one FASM line per configured
+//! feature, grouped by tile. The FASM text is the human-readable,
+//! diffable interchange format; [`crate::frames`] assembles it into
+//! configuration frames and [`crate::bitstream`] writes the `.bit` file.
+
+use crate::pack::IobDir;
+use crate::place::Placed7;
+use crate::route::{RouteKind, Routed7};
+
+/// What the emitter needs from the device model.
+pub trait EmitDevice {
+    /// Tile type for a tile name, e.g. `"CLBLL_L_X14Y100"` → `"CLBLL_L"`.
+    /// (FASM tile prefixes use the type for segbits lookup, but the line
+    /// itself uses the full tile name.)
+    fn tile_type(&self, tile: &str) -> Option<String>;
+    /// Site name relative to its tile for FASM, e.g.
+    /// `("RIOB33_X43Y75", "IOB_X1Y76")` → `"IOB_Y1"`,
+    /// `("CLBLL_L_X14Y100", "SLICE_X28Y100")` → `"SLICEL_X0"`.
+    /// Returns the site-type-qualified relative name.
+    fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
+}
+
+/// Backend-owned bitstream: FASM text plus assembled configuration frames.
+#[derive(Clone, Debug, Default)]
+pub struct Bitstream7 {
+    /// FASM feature lines, one per line
+    /// (e.g. `CLBLL_L_X14Y100.SLICEL_X0.ALUT.INIT[63:0] = 64'h...`).
+    pub fasm: Vec<String>,
+    /// Assembled configuration frames (101 words each); filled by
+    /// [`crate::frames`] from [`Bitstream7::fasm`].
+    pub frames: Vec<u32>,
+}
+
+/// Emit FASM for a routed design.
+///
+/// Every line is `TILE.FEATURE` or `TILE.FEATURE = value`. Tile order is
+/// sorted for deterministic output.
+pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7, String> {
+    let placed = &routed.placed;
+    let packed = &placed.packed;
+    let mut lines: Vec<String> = Vec::new();
+
+    // LUTs: INIT vector per occupied ALUT..DLUT.
+    for lut in &placed.luts {
+        let site_rel = device
+            .site_rel(&lut.tile, &lut.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", lut.tile, lut.site))?;
+        let bel = lut_bel(&lut.bel)?; // "A6LUT" -> "ALUT"
+        lines.push(format!(
+            "{}.{}.{}.INIT[63:0] = 64'h{:016X}",
+            lut.tile, site_rel, bel, lut.init
+        ));
+    }
+
+    // FFs: ZINI + D-mux select.
+    for ff in &placed.ffs {
+        let site_rel = device
+            .site_rel(&ff.tile, &ff.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", ff.tile, ff.site))?;
+        let bel = ff_bel(&ff.bel)?; // "AFF" -> "AFF"
+        // D from LUT O: the AFFMUX selects AX when the paired LUT drives D.
+        // (Pack pairs FF.D == LUT.O on the same BEL letter.)
+        let mux_src = mux_for_ff(ff, packed, placed);
+        lines.push(format!("{}.{}.{}.ZINI", ff.tile, site_rel, bel));
+        lines.push(format!("{}.{}.{}MUX.{}", ff.tile, site_rel, bel, mux_src));
+    }
+
+    // IOBs.
+    for iob in &placed.iobs {
+        let site_rel = device
+            .site_rel(&iob.tile, &iob.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", iob.tile, iob.site))?;
+        let p = packed.iobs.iter().find(|p| p.name == iob.name).ok_or_else(|| {
+            format!("emit: packed IOB {} not found", iob.name)
+        })?;
+        match iob.dir {
+            IobDir::In => {
+                // IBUF: input buffer. The IN feature lives under a combined
+                // iostandard prefix; IN_ONLY disables the output driver.
+                lines.push(format!(
+                    "{}.{}.LVCMOS25_LVCMOS33_LVTTL.IN",
+                    iob.tile, site_rel
+                ));
+                lines.push(format!(
+                    "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY",
+                    iob.tile, site_rel
+                ));
+            }
+            IobDir::Out => {
+                // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
+                // Default I16: the X-Ray DB only has segbits for I16
+                // (LVCMOS33 also allows 4/8/12/24 in silicon).
+                let drive = p.drive.as_deref().unwrap_or("I16");
+                lines.push(format!(
+                    "{}.{}.{}.DRIVE.{}",
+                    iob.tile, site_rel, p.iostandard, drive
+                ));
+                let slew = p.slew.as_deref().unwrap_or("SLOW");
+                lines.push(format!(
+                    "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.{}",
+                    iob.tile, site_rel, slew
+                ));
+            }
+        }
+        let _ = p;
+    }
+
+    // BUFGCTRLs. Feature path: TILE.BUFGCTRL.<site>.IN_USE.
+    for bufg in &placed.bufgs {
+        let site_rel = device
+            .site_rel(&bufg.tile, &bufg.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
+        lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
+        lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED", bufg.tile, site_rel));
+    }
+
+    // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
+    // connections (e.g. OLOGIC bypass): traversed for connectivity but
+    // never emitted (no configuration bits).
+    for net in &routed.nets {
+        if let RouteKind::Pips(pips) = &net.kind {
+            for pip in pips {
+                if !pip.is_pseudo {
+                    lines.push(format!("{}.{}.{}", pip.tile, pip.dst_wire, pip.src_wire));
+                }
+            }
+        }
+    }
+
+    lines.sort();
+    lines.dedup();
+    Ok(Bitstream7 {
+        fasm: lines,
+        frames: Vec::new(),
+    })
+}
+
+/// `"A6LUT"` → `"ALUT"`.
+fn lut_bel(bel: &str) -> Result<String, String> {
+    let letter = bel
+        .chars()
+        .next()
+        .ok_or_else(|| format!("emit: bad LUT bel `{bel}`"))?;
+    if !('A'..='D').contains(&letter) || !bel.ends_with("6LUT") {
+        return Err(format!("emit: bad LUT bel `{bel}`"));
+    }
+    Ok(format!("{letter}LUT"))
+}
+
+/// `"AFF"` → `"AFF"` (validate shape).
+fn ff_bel(bel: &str) -> Result<String, String> {
+    let letter = bel
+        .chars()
+        .next()
+        .ok_or_else(|| format!("emit: bad FF bel `{bel}`"))?;
+    if !('A'..='D').contains(&letter) || !bel.ends_with("FF") {
+        return Err(format!("emit: bad FF bel `{bel}`"));
+    }
+    Ok(format!("{letter}FF"))
+}
+
+/// Which AFFMUX input feeds this FF's D. When the FF is paired with a LUT
+/// on the same BEL letter (pack's pairing invariant), D comes from the
+/// LUT's O via the `AX` mux input.
+fn mux_for_ff(
+    ff: &crate::place::PlacedFf,
+    packed: &crate::pack::Packed7,
+    placed: &Placed7,
+) -> &'static str {
+    let letter = ff.bel.chars().next().unwrap_or('A');
+    // Find the FF's D net driver: if it's a LUT on the same site+letter, use AX.
+    if let Some(pff) = packed.ffs.iter().find(|f| f.name == ff.name) {
+        for lut in &placed.luts {
+            if lut.site == ff.site
+                && lut.bel.starts_with(letter)
+                && packed
+                    .luts
+                    .iter()
+                    .find(|l| l.name == lut.name)
+                    .map(|l| l.output_net == pff.d_net)
+                    .unwrap_or(false)
+            {
+                return "AX";
+            }
+        }
+    }
+    // Default: AX (most common); the router/emitter can refine.
+    "AX"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::{IobDir, Packed7, PackedFf, PackedIob, PackedLut};
+    use crate::place::{Placed7, PlacedFf, PlacedIob, PlacedLut};
+    use crate::route::{Routed7, RoutedNet7, RouteKind};
+
+    struct FakeEmit;
+    impl EmitDevice for FakeEmit {
+        fn tile_type(&self, _tile: &str) -> Option<String> {
+            Some("CLBLL_L".into())
+        }
+        fn site_rel(&self, tile: &str, site: &str) -> Option<String> {
+            if tile.starts_with("CLB") {
+                Some(if site.ends_with("Y0") { "SLICEL_X0".into() } else { "SLICEL_X1".into() })
+            } else if tile.starts_with("RIOB") {
+                Some("IOB_Y1".into())
+            } else {
+                Some("BUFGCTRL_X0Y0".into())
+            }
+        }
+    }
+
+    fn routed_blinky() -> Routed7 {
+        let packed = Packed7 {
+            luts: vec![PackedLut {
+                name: "u_inv".into(),
+                init: 0x5555_5555_5555_5555,
+                input_nets: [Some("q".into()), None, None, None, None, None],
+                output_net: "d".into(),
+            }],
+            ffs: vec![PackedFf {
+                name: "u_ff".into(),
+                d_net: "d".into(),
+                q_net: "q".into(),
+                clk_net: "clk_bufg".into(),
+                ce_net: None,
+                sr_net: None,
+            }],
+            iobs: vec![PackedIob {
+                name: "u_obuf".into(), port: "led".into(), dir: IobDir::Out,
+                net: "q".into(), loc: Some("H5".into()), iostandard: "LVCMOS33".into(),
+                drive: None, slew: None,
+            }],
+            bufgs: vec![],
+        };
+        let placed = Placed7 {
+            packed: packed.clone(),
+            luts: vec![PlacedLut { name: "u_inv".into(), init: 0x5555_5555_5555_5555, tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "A6LUT".into() }],
+            ffs: vec![PlacedFf { name: "u_ff".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into() }],
+            iobs: vec![PlacedIob { name: "u_obuf".into(), port: "led".into(), dir: IobDir::Out, tile: "RIOB33_X0Y0".into(), site: "IOB_X0Y0".into() }],
+            bufgs: vec![],
+        };
+        Routed7 {
+            placed,
+            nets: vec![RoutedNet7 { net: "q".into(), kind: RouteKind::SiteInternal }],
+        }
+    }
+
+    #[test]
+    fn emit_blinky_fasm() {
+        let bs = emit_fasm(&routed_blinky(), &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
+        assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I16"), "got:\n{text}");
+    }
+
+    #[test]
+    fn lut_bel_names() {
+        assert_eq!(lut_bel("A6LUT").unwrap(), "ALUT");
+        assert_eq!(lut_bel("D6LUT").unwrap(), "DLUT");
+        assert!(lut_bel("X6LUT").is_err());
+    }
+}

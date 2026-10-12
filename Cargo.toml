@@ -23,6 +23,8 @@ members = [
     "crates/helion-drc",
     "crates/helion-vhdl",
     "crates/helion-hls",
+    "crates/helion-backend",
+    "crates/helion-xilinx7",
 ]
 
 [workspace.package]
@@ -54,6 +56,8 @@ helion-lib = { path = "crates/helion-lib" }
 helion-drc = { path = "crates/helion-drc" }
 helion-vhdl = { path = "crates/helion-vhdl" }
 helion-hls = { path = "crates/helion-hls" }
+helion-backend = { path = "crates/helion-backend" }
+helion-xilinx7 = { path = "crates/helion-xilinx7" }
 criterion = "0.5"
 
 [profile.bench]

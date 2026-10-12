@@ -4,6 +4,26 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
+## [Unreleased]
+
+### Added
+
+- `helion-ir` (semver-minor): two new `CellKind` variants for multi-backend
+  flows — `IobIn` (input IOB, e.g. a clock pin) and `ClockBuf` (global clock
+  buffer, e.g. BUFGCTRL) — each with HNF (`to_hnf`/`from_hnf`) round-trip
+  support; plus a `NetlistIr` alias for `Design` as the backend-neutral input
+  to the new `helion-backend` trait. The HL10T `helion-pack` flow rejects
+  `IobIn`/`ClockBuf` cells with a clear "unsupported for HL10T" error instead
+  of silently dropping them.
+- New `helion-backend` crate: architecture-neutral `Backend` trait with
+  associated stage types (`Packed`/`Placed`/`Routed`/`Bitstream`) and the
+  pack → place → route → bitstream stage contract. No vendor data lives here.
+- New `helion-xilinx7` crate: Xilinx 7-series backend skeleton
+  (`Xilinx7Backend`, `xilinx7`, part e.g. `xc7a35t`) implementing the
+  `helion-backend` trait with Xilinx-shaped stage types; open-bitstream-databases-only
+  policy (Project X-Ray / prjxray; no vendor tools). Stage bodies are stubs
+  returning "not yet implemented" pending the flow logic.
+
 ## [2.5.0] — 2026-10-12
 
 Nine "best in the market" IDE features, toast/macOS hotfixes, and a UX fix batch.
