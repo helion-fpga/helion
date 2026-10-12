@@ -290,7 +290,7 @@ fn cut_cost(
 
 /// Input reference inside a synthesized replacement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RInp {
+pub(crate) enum RInp {
     Leaf(usize, bool),
     Node(usize, bool),
     Const(bool),
@@ -298,9 +298,9 @@ enum RInp {
 
 /// Minimum-AND structure computing a cut function (leaves not yet bound).
 #[derive(Clone, Debug)]
-struct RawSynth {
-    ands: Vec<(RInp, RInp)>,
-    out: RInp,
+pub(crate) struct RawSynth {
+    pub(crate) ands: Vec<(RInp, RInp)>,
+    pub(crate) out: RInp,
 }
 
 /// Chosen replacement for one AND node, with bound cut leaves.
@@ -329,7 +329,7 @@ const SYNTH_EVAL_BUDGET: u64 = 500_000;
 /// Minimum-AND implementation of truth table `t` over `k` ≤ 4 variables
 /// using at most `budget` AND nodes. None if impossible within budget.
 /// Trivial (0-AND) cases are answered regardless of budget.
-fn exact_synth(t: u16, k: usize, budget: usize) -> Option<RawSynth> {
+pub(crate) fn exact_synth(t: u16, k: usize, budget: usize) -> Option<RawSynth> {
     let full: u16 = if k >= 4 { 0xFFFF } else { (1u16 << (1u32 << k)) - 1 };
     let t = t & full;
     let zero = |out| Some(RawSynth { ands: Vec::new(), out });
