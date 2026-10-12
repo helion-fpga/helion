@@ -134,7 +134,7 @@ impl<'a> DeviceQuery for XDevice<'a> {
 }
 
 impl<'a> RouteQuery for XDevice<'a> {
-    fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String)> {
+    fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
         let idx = match self.tile_idx(tile) {
             Some(i) => i,
             None => return Vec::new(),
@@ -146,11 +146,10 @@ impl<'a> RouteQuery for XDevice<'a> {
         self.device
             .pips_from(idx, wire)
             .iter()
-            .filter(|p| !p.is_pseudo)
             .filter_map(|p| {
                 let dst = wires.get(p.dst as usize)?.clone();
                 let src = wires.get(p.src as usize)?.clone();
-                Some((dst, src))
+                Some((dst, src, p.is_pseudo))
             })
             .collect()
     }

@@ -90,7 +90,9 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             }
             IobDir::Out => {
                 // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
-                let drive = p.drive.as_deref().unwrap_or("I12");
+                // Default I16: the X-Ray DB only has segbits for I16
+                // (LVCMOS33 also allows 4/8/12/24 in silicon).
+                let drive = p.drive.as_deref().unwrap_or("I16");
                 lines.push(format!(
                     "{}.{}.{}.DRIVE.{}",
                     iob.tile, site_rel, p.iostandard, drive
@@ -114,11 +116,15 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED", bufg.tile, site_rel));
     }
 
-    // Routing pips: TILE.DST.SRC.
+    // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
+    // connections (e.g. OLOGIC bypass): traversed for connectivity but
+    // never emitted (no configuration bits).
     for net in &routed.nets {
         if let RouteKind::Pips(pips) = &net.kind {
             for pip in pips {
-                lines.push(format!("{}.{}.{}", pip.tile, pip.dst_wire, pip.src_wire));
+                if !pip.is_pseudo {
+                    lines.push(format!("{}.{}.{}", pip.tile, pip.dst_wire, pip.src_wire));
+                }
             }
         }
     }
@@ -250,7 +256,7 @@ mod tests {
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.ALUT.INIT[63:0] = 64'h5555555555555555"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFF.ZINI"), "got:\n{text}");
         assert!(text.contains("CLBLL_L_X0Y0.SLICEL_X0.AFFMUX.AX"), "got:\n{text}");
-        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I12"), "got:\n{text}");
+        assert!(text.contains("RIOB33_X0Y0.IOB_Y1.LVCMOS33.DRIVE.I16"), "got:\n{text}");
     }
 
     #[test]

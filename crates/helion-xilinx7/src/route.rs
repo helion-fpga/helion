@@ -11,9 +11,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// What the router needs from the device model.
 pub trait RouteQuery {
-    /// Pips with `src_wire == wire` in `tile`: `(dst_wire, src_wire)` pairs.
-    /// Includes `always` pseudo-pips as zero-cost edges (caller may weight).
-    fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String)>;
+    /// Pips with `src_wire == wire` in `tile`: `(dst_wire, src_wire, is_pseudo)`.
+    /// Includes `always` pseudo-pips as zero-cost edges (caller may weight);
+    /// the router traverses them for connectivity but never emits them.
+    fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)>;
     /// `(tile, wire)` pairs in neighboring tiles electrically connected to
     /// `(tile, wire)` via tileconn stitching.
     fn node_wires(&self, tile: &str, wire: &str) -> Vec<(String, String)>;
@@ -26,11 +27,14 @@ pub trait RouteQuery {
 }
 
 /// A single programmed pip: `tile.dst_wire <- src_wire`.
+/// Pseudo-pips are always-on hard connections: traversed for connectivity
+/// but never emitted to FASM.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutedPip {
     pub tile: String,
     pub dst_wire: String,
     pub src_wire: String,
+    pub is_pseudo: bool,
 }
 
 /// How a net is routed.
@@ -113,10 +117,14 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
     }
     for iob in &packed.iobs {
         let site = iob_site.get(iob.name.as_str()).copied().unwrap_or("");
+        // X-Ray names IOB pins from the fabric's perspective: `I` is data
+        // INTO the fabric (pad -> IBUF -> fabric, the input path), `O` is
+        // data OUT OF the fabric (fabric -> OLOGIC -> OBUF -> pad, the
+        // output path). The output path must go through the OLOGIC bypass.
         if iob.dir == crate::pack::IobDir::In {
-            add_ep(iob.net.clone(), site.to_string(), "O", true);
+            add_ep(iob.net.clone(), site.to_string(), "I", true);
         } else {
-            add_ep(iob.net.clone(), site.to_string(), "I", false);
+            add_ep(iob.net.clone(), site.to_string(), "O", false);
         }
     }
     for bufg in &packed.bufgs {
@@ -170,7 +178,7 @@ fn route_net(
         return Ok(RouteKind::ClockSpine);
     }
     // IBUF -> BUFG: dedicated clock input route (no general pip path).
-    let driver_is_ibuf = driver.pin == "O" && driver.site.starts_with("IOB_");
+    let driver_is_ibuf = driver.pin == "I" && driver.site.starts_with("IOB_");
     let loads_are_bufg = loads.iter().all(|l| l.site.starts_with("BUFGCTRL_"));
     if driver_is_ibuf && loads_are_bufg {
         return Ok(RouteKind::ClockSpine);
@@ -198,7 +206,7 @@ fn route_net(
     }
     // Dedup shared pips.
     all_pips.sort_by(|a, b| (&a.tile, &a.dst_wire, &a.src_wire).cmp(&(&b.tile, &b.dst_wire, &b.src_wire)));
-    all_pips.dedup_by(|a, b| a.tile == b.tile && a.dst_wire == b.dst_wire && a.src_wire == b.src_wire);
+    all_pips.dedup_by(|a, b| a.tile == b.tile && a.dst_wire == b.dst_wire && a.src_wire == b.src_wire && a.is_pseudo == b.is_pseudo);
     Ok(RouteKind::Pips(all_pips))
 }
 
@@ -225,8 +233,9 @@ fn bfs_route(
             found = Some((tile, wire));
             break;
         }
-        // Through pips in this tile.
-        for (dst_wire, src_w) in device.pips_from(&tile, &wire) {
+        // Through pips in this tile (including pseudo-pips: always-on
+        // connections like the OLOGIC bypass, traversed but not emitted).
+        for (dst_wire, src_w, is_pseudo) in device.pips_from(&tile, &wire) {
             debug_assert_eq!(src_w, wire);
             let next = (tile.clone(), dst_wire.clone());
             if !parent.contains_key(&next) {
@@ -234,6 +243,7 @@ fn bfs_route(
                     tile: tile.clone(),
                     dst_wire: dst_wire.clone(),
                     src_wire: wire.clone(),
+                    is_pseudo,
                 };
                 parent.insert(next.clone(), Some(((tile.clone(), wire.clone()), pip)));
                 queue.push_back(next);
@@ -247,6 +257,7 @@ fn bfs_route(
                     tile: format!("{tile}~{ntile}"),
                     dst_wire: nwire.clone(),
                     src_wire: wire.clone(),
+                    is_pseudo: false,
                 })));
                 queue.push_back(next);
             }
@@ -279,12 +290,12 @@ mod tests {
 
     struct FakeRouter;
     impl RouteQuery for FakeRouter {
-        fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String)> {
+        fn pips_from(&self, tile: &str, wire: &str) -> Vec<(String, String, bool)> {
             // Tiny graph: INT_X0: A -> B -> C ; INT_X1: C -> D
             match (tile, wire) {
-                ("INT_X0", "A") => vec![("B".into(), "A".into())],
-                ("INT_X0", "B") => vec![("C".into(), "B".into())],
-                ("INT_X1", "C") => vec![("D".into(), "C".into())],
+                ("INT_X0", "A") => vec![("B".into(), "A".into(), false)],
+                ("INT_X0", "B") => vec![("C".into(), "B".into(), false)],
+                ("INT_X1", "C") => vec![("D".into(), "C".into(), false)],
                 _ => vec![],
             }
         }
@@ -302,7 +313,7 @@ mod tests {
         }
         fn wire_for_site_pin(&self, site: &str, pin: &str) -> Vec<(String, String)> {
             match (site, pin) {
-                ("IOB_X1", "I") => vec![("INT_X1".into(), "D".into())],
+                ("IOB_X1", "O") => vec![("INT_X1".into(), "D".into())],
                 _ => vec![],
             }
         }
@@ -359,7 +370,7 @@ mod tests {
     fn unroutable_net_fails_loudly() {
         struct NoRoute;
         impl RouteQuery for NoRoute {
-            fn pips_from(&self, _: &str, _: &str) -> Vec<(String, String)> { vec![] }
+            fn pips_from(&self, _: &str, _: &str) -> Vec<(String, String, bool)> { vec![] }
             fn node_wires(&self, _: &str, _: &str) -> Vec<(String, String)> { vec![] }
             fn site_pin_wire(&self, _: &str, _: &str) -> Option<(String, String)> { None }
             fn wire_for_site_pin(&self, _: &str, _: &str) -> Vec<(String, String)> { vec![] }
