@@ -59,7 +59,7 @@ pub fn save_editor(app: &mut HelionIde) {
 }
 
 /// Block-comment state after scanning one line.
-fn block_state_after(line: &str, mut in_block: bool) -> bool {
+pub(crate) fn block_state_after(line: &str, mut in_block: bool) -> bool {
     let b = line.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -77,7 +77,7 @@ fn block_state_after(line: &str, mut in_block: bool) -> bool {
 }
 
 /// Append one highlighted line's sections into a [`egui::text::LayoutJob`].
-fn append_highlighted(
+pub(crate) fn append_highlighted(
     job: &mut egui::text::LayoutJob,
     line: &str,
     lang: highlight::Lang,
