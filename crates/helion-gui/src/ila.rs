@@ -1172,6 +1172,7 @@ mod tests {
         let mut cap = demo_capture();
         cap.valid[0][3] = false;
         let dir = std::env::temp_dir().join("helion-ila-vcd-invalid");
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("x.vcd");
         export_vcd(&path, &cap).expect("export");
         let text = std::fs::read_to_string(&path).unwrap();
