@@ -12,6 +12,7 @@ pub use constraints_wizard::{
 };
 pub mod doctor;
 pub mod ide;
+pub mod ila;
 pub mod power;
 pub mod vcd;
 pub mod learner_l1;
@@ -51,6 +52,7 @@ pub use ide::{
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
     HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
+    SimIla, SimIlaStatus,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection,
     Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
