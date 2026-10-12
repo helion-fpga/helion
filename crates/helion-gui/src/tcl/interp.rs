@@ -1188,10 +1188,13 @@ impl TclInterp {
             interp: self,
             shell,
         };
+        let line = xp.line;
         let v = xp.parse_ternary()?;
         xp.skip_ws();
         if xp.pos != xp.chars.len() {
-            return Err(format!("syntax error in expression \"{src}\""));
+            return Err(format!(
+                "syntax error in expression \"{src}\" (line {line})"
+            ));
         }
         Ok(v)
     }
