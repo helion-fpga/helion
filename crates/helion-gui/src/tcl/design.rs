@@ -1487,7 +1487,8 @@ fn cmd_set_property(
     let mut applied = 0usize;
     for obj in &objs {
         let r = match prop.as_str() {
-            "DONT_TOUCH" | "KEEP" => d.set_cell_attr(obj, "DONT_TOUCH", &value),
+            "DONT_TOUCH" => d.set_cell_attr(obj, "DONT_TOUCH", &value),
+            "KEEP" => d.set_cell_attr(obj, "KEEP", &value),
             "MARK_DEBUG" => d.set_net_attr(obj, "mark_debug", &value),
             "LOC" | "PACKAGE_PIN" => d.set_loc(obj, &value),
             "IOSTANDARD" => d.set_iostandard(obj, &value),
@@ -1798,6 +1799,46 @@ mod tests {
             &mut sh,
         );
         assert!(matches!(&lp, Ctl::Value(s) if s.contains("TYPE")), "{lp:?}");
+    }
+
+    #[test]
+    fn set_property_keep_sticks_as_keep() {
+        let mut sh = shell_with_counter();
+        let mut i = TclInterp::new();
+        let r = eval_host(
+            &mut i,
+            "set_property",
+            &[
+                "set_property".into(),
+                "KEEP".into(),
+                "TRUE".into(),
+                "u_lut0".into(),
+            ],
+            1,
+            &mut sh,
+        );
+        assert!(matches!(&r, Ctl::Value(_)), "{r:?}");
+        let v = eval_host(
+            &mut i,
+            "get_property",
+            &["get_property".into(), "KEEP".into(), "u_lut0".into()],
+            1,
+            &mut sh,
+        );
+        assert!(matches!(&v, Ctl::Value(s) if s == "TRUE"), "{v:?}");
+        // The copy-paste bug wrote DONT_TOUCH instead; it must not be set.
+        let e = eval_host(
+            &mut i,
+            "get_property",
+            &[
+                "get_property".into(),
+                "DONT_TOUCH".into(),
+                "u_lut0".into(),
+            ],
+            1,
+            &mut sh,
+        );
+        assert!(matches!(&e, Ctl::Error(_)), "DONT_TOUCH must not stick: {e:?}");
     }
 
     #[test]
