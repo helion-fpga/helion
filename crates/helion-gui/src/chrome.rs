@@ -1118,6 +1118,7 @@ pub enum WorkspacePane {
     ClockNetworks,
     Power,
     Methodology,
+    Qor,
     Drc,
     Utilization,
     Runs,
@@ -1153,6 +1154,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::ClockNetworks => WorkspacePane::ClockNetworks,
         WorkspaceTab::Power => WorkspacePane::Power,
         WorkspaceTab::Methodology => WorkspacePane::Methodology,
+        WorkspaceTab::Qor => WorkspacePane::Qor,
         WorkspaceTab::Drc => WorkspacePane::Drc,
         WorkspaceTab::Utilization => WorkspacePane::Utilization,
         WorkspaceTab::Runs => WorkspacePane::Runs,
@@ -1176,6 +1178,7 @@ pub fn is_report_detail(tab: WorkspaceTab) -> bool {
             | WorkspaceTab::ClockNetworks
             | WorkspaceTab::Power
             | WorkspaceTab::Methodology
+            | WorkspaceTab::Qor
             | WorkspaceTab::Drc
             | WorkspaceTab::Utilization
             | WorkspaceTab::Runs
