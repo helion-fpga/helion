@@ -165,7 +165,7 @@ impl TmplBuilder {
 /// `exact_synth`'s DFS shares one evaluation budget per call, so a large
 /// budget can exhaust it exploring deep bad paths and return None where a
 /// small budget quickly finds the minimal solution.
-fn synth_cofactor(t: u16) -> Option<RawSynth> {
+fn synth_4lut(t: u16) -> Option<RawSynth> {
     for budget in 0..=COFACTOR_BUDGET {
         if let Some(raw) = exact_synth(t, 4, budget) {
             return Some(raw);
@@ -174,51 +174,79 @@ fn synth_cofactor(t: u16) -> Option<RawSynth> {
     None
 }
 
-/// Fixed Shannon mux tree over all 64 INIT bits. Total: always works, used
-/// only if [`exact_synth`] fails a cofactor.
-fn const_tree(b: &mut TmplBuilder, init: u64) -> RInp {
-    let mut level: Vec<RInp> = (0..64)
+/// Synthesize one 3-LUT (low 8 bits of `t`) via [`exact_synth`]. The 3-LUT
+/// search space is tiny, so this is reliable where the 4-LUT DFS can stall.
+fn synth_3lut(t: u16) -> Option<RawSynth> {
+    for budget in 0..=6 {
+        if let Some(raw) = exact_synth(t & 0xFF, 3, budget) {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+/// Fixed Shannon mux tree over `2^k` INIT bits with selects `Leaf(base..)`.
+/// Total: always works.
+fn const_tree_k(b: &mut TmplBuilder, init: u64, k: usize, base: usize) -> RInp {
+    let mut level: Vec<RInp> = (0..(1u64 << k))
         .map(|i| RInp::Const((init >> i) & 1 == 1))
         .collect();
-    for s in 0..6 {
+    for s in 0..k {
         let mut next = Vec::with_capacity(level.len() / 2);
         for pair in level.chunks_exact(2) {
             // pair[0] = select 0, pair[1] = select 1.
-            next.push(b.mux(RInp::Leaf(s, false), pair[1], pair[0]));
+            next.push(b.mux(RInp::Leaf(base + s, false), pair[1], pair[0]));
         }
         level = next;
     }
     level[0]
 }
 
+/// Fixed Shannon mux tree over all 64 INIT bits. Total: always works, used
+/// only if [`exact_synth`] fails a cofactor.
+fn const_tree(b: &mut TmplBuilder, init: u64) -> RInp {
+    const_tree_k(b, init, 6, 0)
+}
+
+/// Build one 4-LUT cofactor template, tiered:
+/// 1. [`exact_synth`] (minimal ANDs);
+/// 2. Shannon split on input 3 into two 3-LUTs (reliable);
+/// 3. fixed const tree (total).
+/// Appends to the builder and returns the output reference.
+fn build_cofactor(b: &mut TmplBuilder, t: u16) -> RInp {
+    if let Some(raw) = synth_4lut(t) {
+        return b.append_raw(&raw);
+    }
+    let lo = t & 0xFF;
+    let hi = (t >> 8) & 0xFF;
+    match (synth_3lut(lo), synth_3lut(hi)) {
+        (Some(rlo), Some(rhi)) => {
+            let lo_r = b.append_raw(&rlo);
+            let hi_r = b.append_raw(&rhi);
+            // i3 ? hi : lo.
+            b.mux(RInp::Leaf(3, false), hi_r, lo_r)
+        }
+        _ => const_tree_k(b, t as u64, 4, 0),
+    }
+}
+
 /// Build the template for one 64-bit LUT6 INIT word.
 ///
 /// `addr = I0 + 2*I1 + 4*I2 + 8*I3 + 16*I4 + 32*I5`; cofactor `c` (over
 /// `I0..I3`) is bits `[16*c, 16*c+16)` with `c = I4 + 2*I5`. Output =
-/// `mux(I4, mux(I5, c0, c2), mux(I5, c1, c3))`.
+/// `mux(I4, mux(I5, c2, c0), mux(I5, c3, c1))` (mux(s,a,b) = s ? a : b).
 fn lut6_template(init: u64) -> RawSynth {
     let mut b = TmplBuilder::new();
     let mut cofactors = Vec::with_capacity(4);
-    let mut ok = true;
     for c in 0..4 {
         let t = ((init >> (16 * c)) & 0xFFFF) as u16;
-        match synth_cofactor(t) {
-            Some(raw) => cofactors.push(b.append_raw(&raw)),
-            None => {
-                ok = false;
-                break;
-            }
-        }
+        cofactors.push(build_cofactor(&mut b, t));
     }
-    let out = if ok {
-        // mux(s, a, b) = s ? a : b. m0 covers the i4=0 half (chunks c0/c2),
-        // m1 the i4=1 half (chunks c1/c3).
-        let m0 = b.mux(RInp::Leaf(5, false), cofactors[2], cofactors[0]);
-        let m1 = b.mux(RInp::Leaf(5, false), cofactors[3], cofactors[1]);
-        b.mux(RInp::Leaf(4, false), m1, m0)
-    } else {
-        const_tree(&mut b, init)
-    };
+    // mux(s, a, b) = s ? a : b. m0 covers the i4=0 half (chunks c0/c2),
+    // m1 the i4=1 half (chunks c1/c3).
+    let m0 = b.mux(RInp::Leaf(5, false), cofactors[2], cofactors[0]);
+    let m1 = b.mux(RInp::Leaf(5, false), cofactors[3], cofactors[1]);
+    let out = b.mux(RInp::Leaf(4, false), m1, m0);
     b.finish(out)
 }
 
@@ -337,10 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn lut_bridge_synth_covers_typical() {
-        // exact_synth should cover realistic cofactor shapes (not silently
-        // fall back to the fat const tree): constants, single inputs,
-        // INC4 mapper patterns, parity nibbles.
+    fn lut_bridge_templates_stay_small() {
+        // Tiered synthesis (exact 4-LUT -> Shannon 3-LUTs -> const tree) must
+        // keep templates small for realistic cofactors: well under the
+        // 45-AND const-tree fallback. Constants, single inputs, INC4 mapper
+        // patterns, parity nibbles.
         let mut cases: Vec<u16> = vec![0x0000, 0xFFFF];
         for i in 0..4 {
             let mut t = 0u16;
@@ -357,7 +386,6 @@ mod tests {
                 cases.push(((init >> (16 * c)) & 0xFFFF) as u16);
             }
         }
-        // 4-bit parity nibble.
         let mut par = 0u16;
         for addr in 0..16u16 {
             if addr.count_ones() % 2 == 1 {
@@ -365,11 +393,31 @@ mod tests {
             }
         }
         cases.push(par);
+        // Include the cofactors exact_synth's 4-LUT DFS stalls on.
+        cases.push(0x7878);
+        cases.push(0x7f80);
         for t in cases {
+            let mut b = TmplBuilder::new();
+            let out = build_cofactor(&mut b, t);
+            let tmpl = b.finish(out);
             assert!(
-                synth_cofactor(t).is_some(),
-                "exact_synth failed on cofactor {t:#06x}, would use fat fallback"
+                tmpl.ands.len() < 45,
+                "cofactor {t:#06x}: template has {} ANDs, expected tiered synthesis to stay small",
+                tmpl.ands.len()
             );
+            // And it must still be correct: spot-check all 16 combos.
+            let mut aig = Aig::with_pis(Vec::new());
+            let lits: [Lit; 6] = std::array::from_fn(|i| aig.pi_lit(&format!("i{i}")));
+            // Embed the cofactor template over inputs 0..3 (inputs 4,5 unused).
+            let out_lit = instantiate(&mut aig, &tmpl, lits);
+            for addr in 0..16u64 {
+                let expected = (t >> addr) & 1 == 1;
+                assert_eq!(
+                    aig.eval_lit(out_lit, addr),
+                    expected,
+                    "cofactor {t:#06x} addr {addr}: wrong"
+                );
+            }
         }
     }
 
