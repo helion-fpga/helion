@@ -11,6 +11,12 @@ mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
 mod aig_opt;
 pub mod equiv;
+/// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
+pub mod sva;
+use sva::{
+    conc_text, imm_text, rewrite_sva_bool, ConcPropAst, ImmAssertAst, SvaBool, SvaImplKind,
+    SvaSeverity,
+};
 
 thread_local! {
     /// ABC-style AIG rewriting during LUT mapping (area campaign, v2.1).
@@ -558,6 +564,10 @@ struct Rtl<'a> {
     /// Negedge-only always writes noted during parse (replaces the old
     /// NEGEDGE_WRITES thread-local; per-module data belongs on the module).
     negedge_writes: Vec<NegedgeWrite<'a>>,
+    /// Concurrent SVA assertions (v3.0 subset), module scope.
+    sva_conc: Vec<ConcPropAst<'a>>,
+    /// Immediate SVA assertions (v3.0 subset), from procedural blocks.
+    sva_imm: Vec<ImmAssertAst<'a>>,
 }
 
 thread_local! {
@@ -650,6 +660,33 @@ fn cur_mod() -> String {
 
 fn note_skip(msg: String) {
     eprintln!("{msg}");
+}
+
+thread_local! {
+    /// First named SVA subset rejection seen during the current parse.
+    /// A rejected assertion aborts its module inside the parser, so the
+    /// message would otherwise be swallowed; `synth_sv_with_sva` re-raises
+    /// it after parsing.
+    static SVA_PARSE_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Named SVA "not in the v3.0 subset" rejection: loud on stderr, recorded
+/// for `synth_sv_with_sva` to re-raise, and returned as the parse error.
+pub(crate) fn sva_err(msg: impl Into<String>) -> String {
+    let e = format!("sva: {}", msg.into());
+    eprintln!("sva_reject: {e}");
+    SVA_PARSE_ERROR.with(|s| {
+        if s.borrow().is_none() {
+            *s.borrow_mut() = Some(e.clone());
+        }
+    });
+    e
+}
+
+/// Take (and clear) the recorded SVA rejection, if any.
+pub(crate) fn take_sva_error() -> Option<String> {
+    SVA_PARSE_ERROR.with(|s| s.borrow_mut().take())
 }
 
 thread_local! {
@@ -5344,6 +5381,15 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: &'a str) -> Result<LhsKind<'a>,
 }
 
 type Nba<'a> = (&'a str, Option<usize>, RExpr<'a>);
+
+/// One sequential statement's parse output: either NBA assignments or an
+/// immediate SVA assertion (v3.0 subset). `parse_seq_item` additionally
+/// returns nested immediates from compound statements (if/case/for) as a
+/// tuple second element so they bubble to the enclosing block.
+pub(crate) enum SeqItemOut<'a> {
+    Nbas(Vec<Nba<'a>>),
+    ImmAssert(ImmAssertAst<'a>),
+}
 /// One negedge-only always write: (module, clk, signal, bit, optional RHS).
 type NegedgeWrite<'a> = (&'a str, &'a str, &'a str, Option<usize>, Option<RExpr<'a>>);
 
@@ -5538,8 +5584,12 @@ fn parse_nba<'a>(p: &mut P<'a>) -> Result<Nba<'a>, String> {
     }
 }
 
-fn parse_seq_block<'a>(p: &mut P<'a>, block: bool) -> Result<Vec<Nba<'a>>, String> {
+fn parse_seq_block<'a>(
+    p: &mut P<'a>,
+    block: bool,
+) -> Result<(Vec<Nba<'a>>, Vec<ImmAssertAst<'a>>), String> {
     let mut v = Vec::new();
+    let mut imms = Vec::new();
     loop {
         if block && p.eat_kw("end") {
             break;
@@ -5552,7 +5602,16 @@ fn parse_seq_block<'a>(p: &mut P<'a>, block: bool) -> Result<Vec<Nba<'a>>, Strin
             break;
         }
         match parse_seq_item(p) {
-            Ok(s) => v.extend(s),
+            Ok((SeqItemOut::Nbas(s), nested)) => {
+                v.extend(s);
+                imms.extend(nested);
+            }
+            Ok((SeqItemOut::ImmAssert(a), nested)) => {
+                imms.push(a);
+                imms.extend(nested);
+            }
+            // Named SVA rejections propagate; anything else skips gracefully.
+            Err(e) if e.starts_with("sva:") => return Err(e),
             Err(_) => {
                 let _ = skip_item_or_block(p);
             }
@@ -5561,7 +5620,7 @@ fn parse_seq_block<'a>(p: &mut P<'a>, block: bool) -> Result<Vec<Nba<'a>>, Strin
             break;
         }
     }
-    Ok(v)
+    Ok((v, imms))
 }
 
 /// Parse for-loop step: `i++`, `i += N`, or `i = i + N` (default step 1).
@@ -5756,7 +5815,7 @@ fn consume_nonconst_word_pipeline<'a>(p: &mut P<'a>, var: &str) -> Option<String
     }
 }
 
-fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
+fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<(Vec<Nba<'a>>, Vec<ImmAssertAst<'a>>), String> {
     if !p.eat_sym('(') {
         return Err("for (".into());
     }
@@ -5803,7 +5862,7 @@ fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
             p.i = bound_at;
             if let Some(mem) = consume_nonconst_word_pipeline(p, &var) {
                 note_word_pipeline_cap(&cur_mod(), &mem, "nonconst");
-                return Ok(Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             }
             return Err("for bound".into());
         }
@@ -5896,10 +5955,11 @@ fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
         }
     }
     if niter > 4096 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let step = step.max(1);
     let mut i = start;
+    let mut imm_out: Vec<ImmAssertAst<'a>> = Vec::new();
     for _ in 0..niter.min(4096) {
         let toks: Vec<Tok<'_>> = body
             .iter()
@@ -5921,14 +5981,16 @@ fn parse_for_unroll<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
             widths: p.widths.clone(),
             signed: p.signed.clone(),
         };
-        out.extend(parse_seq_block(&mut sp, block)?);
+        let (nb, ni) = parse_seq_block(&mut sp, block)?;
+        out.extend(nb);
+        imm_out.extend(ni);
         if step_down {
             i = i.saturating_sub(step);
         } else {
             i = i.saturating_add(step);
         }
     }
-    Ok(out)
+    Ok((out, imm_out))
 }
 
 fn parse_attr<'a>(p: &mut P<'a>) -> Option<(String, String)> {
@@ -6425,11 +6487,395 @@ fn parse_assign_nbas<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
     Ok(vec![(name, bit, rhs)])
 }
 
-fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
+/// Pure lookahead: is the upcoming statement `[label:] assert ...`?
+/// Consumes nothing.
+fn peek_assert_stmt(p: &P) -> bool {
+    let mut i = p.i;
+    if matches!(p.t.get(i), Some(Tok::Ident(_)))
+        && matches!(p.t.get(i + 1), Some(Tok::Sym(':')))
+    {
+        i += 2;
+    }
+    matches!(p.t.get(i), Some(Tok::Kw(k)) if *k == "assert")
+}
+
+/// Parse the optional `else $error/$warning/$info[(msg)]` action of an
+/// assertion. No `else` defaults to `Error` severity. `$fatal` and anything
+/// else is a named out-of-subset error.
+fn parse_sva_else_action(p: &mut P<'_>) -> Result<(SvaSeverity, Option<String>), String> {
+    if !p.eat_kw("else") {
+        return Ok((SvaSeverity::Error, None));
+    }
+    let severity = match p.peek() {
+        Some(Tok::Ident(s)) if *s == "$error" => SvaSeverity::Error,
+        Some(Tok::Ident(s)) if *s == "$warning" => SvaSeverity::Warning,
+        Some(Tok::Ident(s)) if *s == "$info" => SvaSeverity::Info,
+        Some(Tok::Ident(s)) if *s == "$fatal" => {
+            return Err(sva_err("`$fatal` is not in the v3.0 SVA subset"));
+        }
+        other => {
+            return Err(sva_err(format!(
+                "assertion `else` action must be $error/$warning/$info, got {other:?}"
+            )));
+        }
+    };
+    p.bump();
+    let mut msg = None;
+    if p.eat_sym('(') {
+        // Optional message string; format arguments are ignored.
+        if let Some(Tok::Str(s)) = p.peek() {
+            msg = Some(s.to_string());
+        }
+        let mut d = 1i32;
+        while d > 0 && p.peek().is_some() {
+            if p.eat_sym('(') {
+                d += 1;
+            } else if p.eat_sym(')') {
+                d -= 1;
+            } else {
+                p.bump();
+            }
+        }
+    }
+    Ok((severity, msg))
+}
+
+/// Implication scan over the token range of one `assert property (...)`.
+/// Returns `(implication index, kind, closing-paren index)`. The implication
+/// triple is only recognized at paren-depth 0, so `a | b` and `a || b` never
+/// match, and `a | -b` is excluded by requiring the `>` third token.
+/// Sequence-level out-of-subset constructs get named errors here.
+fn scan_implication(t: &[Tok<'_>], start: usize) -> Result<(usize, SvaImplKind, usize), String> {
+    let mut depth = 0i32;
+    let mut found: Option<(usize, SvaImplKind)> = None;
+    let mut i = start;
+    while i < t.len() {
+        match &t[i] {
+            Tok::Sym('(') => depth += 1,
+            Tok::Sym(')') => {
+                if depth == 0 {
+                    return match found {
+                        Some((k, kind)) => Ok((k, kind, i)),
+                        None => Err(sva_err(
+                            "no `|->`/`|=>` implication found in `assert property`",
+                        )),
+                    };
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        if depth == 0 {
+            if let Tok::Ident(s) = &t[i] {
+                if *s == "disable"
+                    && matches!(t.get(i + 1), Some(Tok::Ident(n)) if *n == "iff")
+                {
+                    return Err(sva_err("`disable iff` is not in the v3.0 SVA subset"));
+                }
+                if *s == "throughout" {
+                    return Err(sva_err("`throughout` is not in the v3.0 SVA subset"));
+                }
+            }
+            if matches!(t[i], Tok::Sym('[')) {
+                match t.get(i + 1) {
+                    Some(Tok::Sym('*')) => {
+                        return Err(sva_err("repetition `[*N]` is not in the v3.0 SVA subset"));
+                    }
+                    Some(Tok::Sym('=')) => {
+                        return Err(sva_err("repetition `[=N]` is not in the v3.0 SVA subset"));
+                    }
+                    Some(Tok::Sym('-')) => {
+                        return Err(sva_err("repetition `[->N]` is not in the v3.0 SVA subset"));
+                    }
+                    _ => {}
+                }
+            }
+            let is_over = matches!(t[i], Tok::Sym('|'))
+                && matches!(t.get(i + 1), Some(Tok::Sym('-')))
+                && matches!(t.get(i + 2), Some(Tok::Sym('>')));
+            let is_nonover = matches!(t[i], Tok::Sym('|'))
+                && matches!(t.get(i + 1), Some(Tok::Sym('=')))
+                && matches!(t.get(i + 2), Some(Tok::Sym('>')));
+            if found.is_none() && is_over {
+                found = Some((i, SvaImplKind::Overlapped));
+            } else if found.is_none() && is_nonover {
+                found = Some((i, SvaImplKind::NonOverlapped));
+            } else if found.is_some() && (is_over || is_nonover) {
+                return Err(sva_err(
+                    "chained implications are not in the v3.0 SVA subset",
+                ));
+            }
+        }
+        i += 1;
+    }
+    Err(sva_err("unterminated `assert property`"))
+}
+
+/// Parse one boolean side of a property from a token sub-range, via a
+/// sub-parser sharing the arena (and params/widths/signedness) with the
+/// parent. `$rose`/`$fell`/`$stable` calls become sampled nodes; any other
+/// call is a named out-of-subset error.
+fn parse_sva_bool<'a>(p: &P<'a>, start: usize, end: usize) -> Result<SvaBool<'a>, String> {
+    let mut sub = P {
+        t: &p.t[start..end],
+        i: 0,
+        arena: p.arena,
+        params: p.params.clone(),
+        widths: p.widths.clone(),
+        signed: p.signed.clone(),
+    };
+    let e = parse_rexpr(&mut sub).map_err(|e| sva_err(format!("bad property expression: {e}")))?;
+    if sub.i != sub.t.len() {
+        return Err(sva_err("trailing tokens in property expression"));
+    }
+    rewrite_sva_bool(&e)
+}
+
+/// Concurrent assertion:
+/// `[label:] assert [#0] property (@(posedge|negedge clk) <ante> |-> [##N] <conseq>)`
+/// `[else $error/$warning/$info[(msg)]] ;`
+/// Everything outside the v3.0 subset is a named error, never a silent skip.
+pub(crate) fn parse_concurrent_assert<'a>(
+    p: &mut P<'a>,
+) -> Result<ConcPropAst<'a>, String> {
+    let label = if matches!(p.peek(), Some(Tok::Ident(_)))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+    {
+        let l = p
+            .ident()
+            .map_err(|e| sva_err(format!("bad assert label: {e}")))?
+            .to_string();
+        p.eat_sym(':');
+        Some(l)
+    } else {
+        None
+    };
+    if !p.eat_kw("assert") {
+        return Err(sva_err("expected `assert`"));
+    }
+    if matches!(p.peek(), Some(Tok::Sym('#'))) {
+        return Err(sva_err(
+            "`assert #0` (deferred assertion) is not in the v3.0 SVA subset",
+        ));
+    }
+    if !p.eat_kw("property") {
+        return Err(sva_err("expected `property` after `assert`"));
+    }
+    if !p.eat_sym('(') {
+        return Err(sva_err("expected `(` after `assert property`"));
+    }
+    if !p.eat_sym('@') {
+        return Err(sva_err(
+            "expected `@(posedge clk)` after `assert property (`",
+        ));
+    }
+    if !p.eat_sym('(') {
+        return Err(sva_err("expected `(` after `@`"));
+    }
+    let negedge = if p.eat_kw("posedge") {
+        false
+    } else if p.eat_kw("negedge") {
+        true
+    } else {
+        return Err(sva_err("expected `posedge`/`negedge` in `@(...)`"));
+    };
+    let clk = p
+        .ident()
+        .map_err(|_| sva_err("expected clock name in `@(...)`"))?
+        .to_string();
+    if !p.eat_sym(')') {
+        return Err(sva_err("expected `)` after the clock name"));
+    }
+    let prop_start = p.i;
+    let (impl_idx, kind, end_idx) = scan_implication(p.t, p.i)?;
+    // `##` delays live only right after the implication: reject them in the
+    // antecedent (e.g. `a ##1 b |-> c`).
+    {
+        let mut d = 0i32;
+        for t in &p.t[prop_start..impl_idx] {
+            match t {
+                Tok::Sym('(') => d += 1,
+                Tok::Sym(')') => d -= 1,
+                Tok::Sym('#') if d == 0 => {
+                    return Err(sva_err(
+                        "`##` delays are only supported once, right after `|->`/`|=>`",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut j = impl_idx + 3;
+    let mut delay: u32 = match kind {
+        SvaImplKind::Overlapped => 0,
+        SvaImplKind::NonOverlapped => 1,
+    };
+    let mut delay_lit: Option<u32> = None;
+    if matches!(p.t.get(j), Some(Tok::Sym('#'))) {
+        if !matches!(p.t.get(j + 1), Some(Tok::Sym('#'))) {
+            return Err(sva_err("expected `##N` after the implication"));
+        }
+        j += 2;
+        match p.t.get(j) {
+            Some(Tok::Sym('[')) => {
+                return Err(sva_err("`##[N:M]` delays are not in the v3.0 SVA subset"));
+            }
+            Some(Tok::Sym('*')) => {
+                return Err(sva_err("`##*` (unbounded delay) is not in the v3.0 SVA subset"));
+            }
+            Some(Tok::Sym('(')) => {
+                return Err(sva_err("`##(expr)` delays are not in the v3.0 SVA subset"));
+            }
+            Some(Tok::Number(n, _)) => {
+                if *n > 256 {
+                    return Err(sva_err("`##N` with N > 256 is not in the v3.0 SVA subset"));
+                }
+                delay += *n as u32;
+                delay_lit = Some(*n as u32);
+                j += 1;
+            }
+            other => {
+                return Err(sva_err(format!(
+                    "expected a delay literal after `##`, got {other:?}"
+                )));
+            }
+        }
+    }
+    // No chained or stray `##` in the consequent: it is a pure boolean expr.
+    {
+        let mut d = 0i32;
+        for t in &p.t[j..end_idx] {
+            match t {
+                Tok::Sym('(') => d += 1,
+                Tok::Sym(')') => d -= 1,
+                Tok::Sym('#') if d == 0 => {
+                    return Err(sva_err(
+                        "`##` delays are only supported once, right after `|->`/`|=>`",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    let antecedent = parse_sva_bool(p, prop_start, impl_idx)?;
+    let consequent = parse_sva_bool(p, j, end_idx)?;
+    p.i = end_idx + 1; // consume the property's closing paren
+    let (severity, else_msg) = parse_sva_else_action(p)?;
+    if !p.eat_sym(';') {
+        return Err(sva_err("expected `;` after `assert property (...)`"));
+    }
+    let text = conc_text(
+        &clk,
+        negedge,
+        &antecedent,
+        kind,
+        delay_lit,
+        &consequent,
+        severity,
+        &else_msg,
+    );
+    Ok(ConcPropAst {
+        label,
+        clk,
+        negedge,
+        antecedent,
+        delay,
+        consequent,
+        severity,
+        else_msg,
+        text,
+    })
+}
+
+/// Immediate assertion:
+/// `[label:] assert [final] (expr) [else $error/$warning/$info[(msg)]] ;`
+pub(crate) fn parse_immediate_assert<'a>(
+    p: &mut P<'a>,
+) -> Result<ImmAssertAst<'a>, String> {
+    let label = if matches!(p.peek(), Some(Tok::Ident(_)))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Sym(':')))
+    {
+        let l = p
+            .ident()
+            .map_err(|e| sva_err(format!("bad assert label: {e}")))?
+            .to_string();
+        p.eat_sym(':');
+        Some(l)
+    } else {
+        None
+    };
+    if !p.eat_kw("assert") {
+        return Err(sva_err("expected `assert`"));
+    }
+    if matches!(p.peek(), Some(Tok::Sym('#'))) {
+        return Err(sva_err(
+            "`assert #0` (deferred assertion) is not in the v3.0 SVA subset",
+        ));
+    }
+    if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "property") {
+        return Err(sva_err(
+            "concurrent `assert property` is only supported at module scope in v3.0",
+        ));
+    }
+    // `final` is not a tokenizer keyword; it arrives as an identifier.
+    let is_final = if matches!(p.peek(), Some(Tok::Ident(s)) if *s == "final") {
+        p.bump();
+        true
+    } else {
+        false
+    };
+    if !p.eat_sym('(') {
+        return Err(sva_err("expected `(` after `assert`"));
+    }
+    // Balance-scan to the matching close paren, then parse the sub-range.
+    let start = p.i;
+    let mut d = 1i32;
+    let mut i = start;
+    while d > 0 && i < p.t.len() {
+        match &p.t[i] {
+            Tok::Sym('(') => d += 1,
+            Tok::Sym(')') => d -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if d != 0 {
+        return Err(sva_err("unterminated `assert (...)`"));
+    }
+    let end = i - 1;
+    let expr = parse_sva_bool(p, start, end)?;
+    p.i = end + 1;
+    let (severity, else_msg) = parse_sva_else_action(p)?;
+    if !p.eat_sym(';') {
+        return Err(sva_err("expected `;` after immediate `assert`"));
+    }
+    let text = imm_text(is_final, &expr, severity, &else_msg);
+    Ok(ImmAssertAst {
+        label,
+        is_final,
+        expr,
+        severity,
+        else_msg,
+        text,
+    })
+}
+
+
+fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst<'a>>), String> {
+    // Immediate SVA assertion (v3.0 subset): `[label:] assert [final] (expr)
+    // [else $error/$warning/$info("msg")] ;`
+    if peek_assert_stmt(p) {
+        let ast = parse_immediate_assert(p)?;
+        return Ok((SeqItemOut::ImmAssert(ast), Vec::new()));
+    }
+    if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "expect") {
+        return Err(sva_err("`expect` is not in the v3.0 SVA subset"));
+    }
     let _ = p.eat_kw("unique");
     let _ = p.eat_kw("priority");
     if p.eat_kw("for") {
-        return parse_for_unroll(p);
+        let (nbas, imms) = parse_for_unroll(p)?;
+        return Ok((SeqItemOut::Nbas(nbas), imms));
     }
     if p.eat_kw("if") {
         if !p.eat_sym('(') {
@@ -6440,20 +6886,25 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
             return Err("if )".into());
         }
         let then_b = p.eat_kw("begin");
-        let then_raw = parse_seq_block(p, then_b)?;
+        let (then_raw, then_imms) = parse_seq_block(p, then_b)?;
         let then_s = normalize_nbas(p, then_raw);
-        let else_s = if p.eat_kw("else") {
+        let (else_s, nested_imms) = if p.eat_kw("else") {
             let eb = p.eat_kw("begin");
-            let else_raw = parse_seq_block(p, eb)?;
-            normalize_nbas(p, else_raw)
+            let (else_raw, else_imms) = parse_seq_block(p, eb)?;
+            (normalize_nbas(p, else_raw), else_imms)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        // Immediates nested in branches bubble to the enclosing block: the
+        // checker evaluates every immediate assert each posedge.
+        let mut nested: Vec<ImmAssertAst<'a>> = then_imms;
+        nested.extend(nested_imms);
         // Parameter string compare (e.g. operation_mode == "dynamic") is
         // an elaboration constant — keep the taken branch, do not mux both.
         if let RExpr::Const { val, care, .. } = &cond {
             if *care & 1 == 1 {
-                return Ok(if *val != 0 { then_s } else { else_s });
+                let nbas = if *val != 0 { then_s } else { else_s };
+                return Ok((SeqItemOut::Nbas(nbas), nested));
             }
         }
         let mut out = Vec::new();
@@ -6483,7 +6934,7 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
                 ),
             ));
         }
-        return Ok(out);
+        return Ok((SeqItemOut::Nbas(out), nested));
     }
     if p.eat_kw("case") || p.eat_kw("casez") || p.eat_kw("casex") {
         if !p.eat_sym('(') {
@@ -6495,6 +6946,8 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
         }
         let mut arms: Vec<(Option<RExpr<'a>>, Vec<Nba<'a>>)> = Vec::new();
         let mut def: Vec<Nba<'a>> = Vec::new();
+        // Immediates nested in arms bubble to the enclosing block.
+        let mut nested: Vec<ImmAssertAst<'a>> = Vec::new();
         while !p.eat_kw("endcase") {
             if p.peek().is_none() {
                 return Err("unterminated case".into());
@@ -6502,8 +6955,9 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
             if p.eat_kw("default") {
                 let _ = p.eat_sym(':');
                 let b = p.eat_kw("begin");
-                let def_raw = parse_seq_block(p, b)?;
+                let (def_raw, def_imms) = parse_seq_block(p, b)?;
                 def = normalize_nbas(p, def_raw);
+                nested.extend(def_imms);
                 continue;
             }
             // Multi-value arm: `2'b10, 2'b11:` (Ibex LSU / decoder).
@@ -6516,8 +6970,9 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
                 return Err("case :".into());
             }
             let b = p.eat_kw("begin");
-            let body_raw = parse_seq_block(p, b)?;
+            let (body_raw, body_imms) = parse_seq_block(p, b)?;
             let body = normalize_nbas(p, body_raw);
+            nested.extend(body_imms);
             // One Or-of-Eq cond shared by the arm (not N duplicate arms).
             let mut cond = RExpr::Eq(p.arena.alloc(sel.clone()), p.arena.alloc(items[0].clone()));
             for it in items.into_iter().skip(1) {
@@ -6558,9 +7013,10 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<Vec<Nba<'a>>, String> {
                 out.push((lhs, bit, rhs));
             }
         }
-        return Ok(out);
+        return Ok((SeqItemOut::Nbas(out), nested));
     }
-    parse_assign_nbas(p)
+    let nbas = parse_assign_nbas(p)?;
+    Ok((SeqItemOut::Nbas(nbas), Vec::new()))
 }
 
 fn skip_until_kw<'a>(p: &mut P<'a>, kw: &str) {
@@ -7162,7 +7618,16 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
                 let _ = p.ident();
             }
             match parse_seq_block(p, true) {
-                Ok(s) => stmts.extend(normalize_nbas(p, s)),
+                Ok((s, imms)) => {
+                    // Immediate assertions in function bodies are out of
+                    // subset: they must not silently vanish into the function.
+                    if !imms.is_empty() {
+                        return Err(sva_err(
+                            "`assert` in function bodies is not in the v3.0 SVA subset",
+                        ));
+                    }
+                    stmts.extend(normalize_nbas(p, s))
+                }
                 Err(_) => {
                     let _ = skip_begin_end(p);
                 }
@@ -7844,6 +8309,8 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
     let mut mem_inits: HashMap<&'a str, BTreeMap<usize, u128>> = HashMap::new();
     let mut funcs: Vec<FuncDef<'a>> = Vec::new();
     let mut negedge_writes: Vec<NegedgeWrite<'a>> = Vec::new();
+    let mut sva_conc: Vec<ConcPropAst<'a>> = Vec::new();
+    let mut sva_imm: Vec<ImmAssertAst<'a>> = Vec::new();
     skipped_funcs_clear();
     if parse_module_items(
         &mut p,
@@ -7859,6 +8326,8 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         &mut mem_inits,
         &mut funcs,
         &mut negedge_writes,
+        &mut sva_conc,
+        &mut sva_imm,
         "endmodule",
     )
     .is_err()
@@ -7942,6 +8411,8 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         toks,
         mem_inits,
         negedge_writes,
+        sva_conc,
+        sva_imm,
     })
 }
 
@@ -7984,6 +8455,8 @@ fn parse_module_items<'a>(
     mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>,
     funcs: &mut Vec<FuncDef<'a>>,
     negedge_writes: &mut Vec<NegedgeWrite<'a>>,
+    sva_conc: &mut Vec<ConcPropAst<'a>>,
+    sva_imm: &mut Vec<ImmAssertAst<'a>>,
     endkw: &str,
 ) -> Result<(), String> {
     for sig in signals.iter() {
@@ -8053,6 +8526,8 @@ fn parse_module_items<'a>(
                 mem_inits,
                 funcs,
                 negedge_writes,
+                sva_conc,
+                sva_imm,
                 "endgenerate",
             )?;
             continue;
@@ -8164,6 +8639,8 @@ fn parse_module_items<'a>(
                             mem_inits,
                             funcs,
                             negedge_writes,
+                            sva_conc,
+                            sva_imm,
                             "end",
                         )?;
                     } else {
@@ -8182,6 +8659,8 @@ fn parse_module_items<'a>(
                             mem_inits,
                             funcs,
                             negedge_writes,
+                            sva_conc,
+                            sva_imm,
                             "else",
                         )?;
                         // parse_module_items consumed the else keyword — put it back
@@ -8220,6 +8699,8 @@ fn parse_module_items<'a>(
                             mem_inits,
                             funcs,
                             negedge_writes,
+                            sva_conc,
+                            sva_imm,
                             "end",
                         )?;
                     } else {
@@ -8237,13 +8718,24 @@ fn parse_module_items<'a>(
         if p.eat_kw("for") {
             // Unroll: NBA body and/or instantiations. Skip still-unsupported bounds.
             let save = p.i;
-            match parse_for_unroll_module(p, signals, nbas, insts, assigns, mem_inits, negedge_writes) {
+            match parse_for_unroll_module(
+                p,
+                signals,
+                nbas,
+                insts,
+                assigns,
+                mem_inits,
+                negedge_writes,
+                sva_conc,
+                sva_imm,
+            ) {
                 Ok(()) => continue,
                 Err(_) => {
                     p.i = save;
                     match parse_for_unroll(p) {
-                        Ok(v) => {
+                        Ok((v, imms)) => {
                             nbas.extend(v);
+                            sva_imm.extend(imms);
                             continue;
                         }
                         Err(_) => {
@@ -8473,6 +8965,12 @@ fn parse_module_items<'a>(
                     }
                     continue;
                 }
+                // Immediate assertions in `initial` blocks are out of subset.
+                if peek_assert_stmt(p) {
+                    return Err(sva_err(
+                        "`assert` in `initial` blocks is not in the v3.0 SVA subset",
+                    ));
+                }
                 match parse_nba(p) {
                     Ok((lhs, bit, rhs)) => {
                         if let RExpr::Const { val, width, .. } = rhs {
@@ -8603,7 +9101,10 @@ fn parse_module_items<'a>(
                 let _ = p.ident();
             }
             match parse_seq_block(&mut p, block) {
-                Ok(stmts) => assigns.extend(fold_blocking_assigns(stmts, p.arena)),
+                Ok((stmts, simms)) => {
+                    assigns.extend(fold_blocking_assigns(stmts, p.arena));
+                    sva_imm.extend(simms);
+                }
                 Err(_) => {
                     note_skip(format!(
                         "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
@@ -8627,7 +9128,8 @@ fn parse_module_items<'a>(
             }
             let body_start = p.i;
             match parse_seq_block(&mut p, block) {
-                Ok(stmts) => {
+                Ok((stmts, simms)) => {
+                    sva_imm.extend(simms);
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
                         assigns.extend(fold_blocking_assigns(stmts, p.arena));
@@ -8710,6 +9212,19 @@ fn parse_module_items<'a>(
         if p.eat_kw("import") || p.eat_kw("export") {
             let _ = skip_item_or_block(p);
             continue;
+        }
+        // SVA concurrent assertions (v3.0 subset): `[label:] assert property`.
+        // `assume` / `cover` keep their historical silent skip; `expect` and
+        // every other out-of-subset construct get a named rejection.
+        if peek_assert_stmt(p) {
+            match parse_concurrent_assert(p) {
+                Ok(ast) => sva_conc.push(ast),
+                Err(e) => return Err(e),
+            }
+            continue;
+        }
+        if matches!(p.peek(), Some(Tok::Kw(k)) if *k == "expect") {
+            return Err(sva_err("`expect` is not in the v3.0 SVA subset"));
         }
         if matches!(p.peek(), Some(Tok::Ident(_))) {
             if parse_gate_prim(&mut p).is_ok() {
@@ -8852,6 +9367,8 @@ fn parse_for_unroll_module<'a>(
     assigns: &mut Vec<Nba<'a>>,
     mem_inits: &mut HashMap<&'a str, BTreeMap<usize, u128>>,
     negedge_writes: &mut Vec<NegedgeWrite<'a>>,
+    sva_conc: &mut Vec<ConcPropAst<'a>>,
+    sva_imm: &mut Vec<ImmAssertAst<'a>>,
 ) -> Result<(), String> {
     if !p.eat_sym('(') {
         return Err("for (".into());
@@ -8946,6 +9463,12 @@ fn parse_for_unroll_module<'a>(
         let mut local_assigns = Vec::new();
         let mut local_insts = Vec::new();
         let mut dummy_funcs: Vec<FuncDef<'a>> = Vec::new();
+        // Assertions in generate-for bodies are threaded through unrenamed:
+        // per-iteration signal renames do not apply to them, so an assert
+        // over a per-iteration local fails loud at elaboration (unresolvable
+        // probe) instead of silently checking the wrong signal.
+        let mut local_sva_conc: Vec<ConcPropAst<'a>> = Vec::new();
+        let mut local_sva_imm: Vec<ImmAssertAst<'a>> = Vec::new();
         if block {
             parse_module_items(
                 &mut sp,
@@ -8961,6 +9484,8 @@ fn parse_for_unroll_module<'a>(
                 mem_inits,
                 &mut dummy_funcs,
                 negedge_writes,
+                &mut local_sva_conc,
+                &mut local_sva_imm,
                 "end",
             )?;
         } else if parse_gate_prim(&mut sp).is_ok() {
@@ -8968,7 +9493,14 @@ fn parse_for_unroll_module<'a>(
         } else if let Ok(inst) = parse_inst(&mut sp) {
             local_insts.push(inst);
         } else {
-            local_nbas.extend(parse_seq_block(&mut sp, false)?);
+            let (gnb, gim) = parse_seq_block(&mut sp, false)?;
+            if !gim.is_empty() {
+                // Immediate asserts in a generate-for body are threaded
+                // through unrenamed (see above); they fail loud at
+                // elaboration if they name per-iteration signals.
+                local_sva_imm.extend(gim);
+            }
+            local_nbas.extend(gnb);
         }
         // Local decls inside the generate-for must be uniquified per iteration
         // so vector widths survive and each copy maps to its own FF bits.
@@ -9001,6 +9533,8 @@ fn parse_for_unroll_module<'a>(
             let lhs = subst.get(&lhs).cloned().unwrap_or(lhs);
             assigns.push((lhs, bit, rewrite_rexpr(&rhs, &subst, p.arena)));
         }
+        sva_conc.extend(local_sva_conc.drain(..));
+        sva_imm.extend(local_sva_imm.drain(..));
         i += step;
     }
     Ok(())
@@ -15614,6 +16148,8 @@ fn flatten_module_ov_vis<'s>(
         toks: src.toks.clone(),
         mem_inits: src.mem_inits.clone(),
         negedge_writes: src.negedge_writes.clone(),
+        sva_conc: src.sva_conc.clone(),
+        sva_imm: src.sva_imm.clone(),
     };
     for inst in &src.insts {
         let Some(child_proto) = mods.get(inst.module) else {
@@ -15841,35 +16377,39 @@ fn synth_from_parsed(mods: Vec<Rtl>) -> Result<Design, String> {
     synth_from_parsed_top(mods, None, &HashMap::new())
 }
 
+/// Top-module selection shared by `synth_from_parsed_top` and
+/// `sva::synth_sv_with_sva`: an explicit name must exist, otherwise the last
+/// non-instantiated module (else the last module) wins.
+pub(crate) fn top_module_name(mods: &[Rtl], top: Option<&str>) -> Result<String, String> {
+    if let Some(name) = top {
+        if mods.iter().any(|m| m.module == name) {
+            return Ok(name.to_string());
+        }
+        return Err(format!("unknown module {name}"));
+    }
+    let instantiated: HashSet<String> = mods
+        .iter()
+        .flat_map(|m| m.insts.iter().map(|i| i.module.to_string()))
+        .collect();
+    mods.iter()
+        .rev()
+        .find(|m| !instantiated.contains(m.module))
+        .or_else(|| mods.last())
+        .map(|m| m.module.to_string())
+        .ok_or_else(|| "no top module".to_string())
+}
+
 fn synth_from_parsed_top(
     mods: Vec<Rtl>,
     top: Option<&str>,
     overrides: &HashMap<String, u128>,
 ) -> Result<Design, String> {
-    let order: Vec<String> = mods.iter().map(|m| m.module.to_string()).collect();
-    let instantiated: HashMap<String, ()> = mods
-        .iter()
-        .flat_map(|m| m.insts.iter().map(|i| (i.module.to_string(), ())))
-        .collect();
+    let top_name = top_module_name(&mods, top)?;
     let mut map: HashMap<String, Rtl> = HashMap::with_capacity(mods.len());
     for m in mods {
         map.insert(m.module.to_string(), m);
     }
     rewrite_hier_in_mods(&mut map);
-    let top_name = if let Some(name) = top {
-        if !map.contains_key(name) {
-            return Err(format!("unknown module {name}"));
-        }
-        name.to_string()
-    } else {
-        order
-            .iter()
-            .rev()
-            .find(|m| !instantiated.contains_key(*m))
-            .or_else(|| order.last())
-            .ok_or_else(|| "no top module".to_string())?
-            .clone()
-    };
     let t_syn = std::time::Instant::now();
     let t_flat = std::time::Instant::now();
     synth_sub_reset();
@@ -16029,48 +16569,10 @@ fn record_instances_vis(
 }
 
 pub fn synth_sv(source: &str, origin: &str) -> Result<Design, String> {
-    clear_function_notes();
-    pkg_enums_clear();
-    set_readmem_origin(origin);
-    let t_parse = std::time::Instant::now();
-    let origin_path = Path::new(origin);
-    let base = origin_path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty() && d.exists());
-    let expanded = if let Some(dir) = base {
-        expand_includes(source, dir)
-    } else {
-        source.to_string()
-    };
-    let pre = preprocess_sv(&strip_comments(&expanded));
-    let mut mods = parse_preprocessed(pre)?;
-    if let Some(dir) = base {
-        let have: HashSet<String> = mods.iter().map(|m| m.module.to_string()).collect();
-        let mut missing: HashSet<String> = HashSet::new();
-        for m in &mods {
-            for inst in &m.insts {
-                if !have.contains(inst.module) {
-                    missing.insert(inst.module.to_string());
-                }
-            }
-        }
-        if !missing.is_empty() {
-            if let Ok(extra) = sibling_modules(dir, &missing, origin_path) {
-                mods.extend(extra);
-            }
-        }
-    }
-    eprintln!(
-        "hang_diag parse mods={} bytes={} ms={}",
-        mods.len(),
-        source.len(),
-        t_parse.elapsed().as_millis()
-    );
-    let stem = Path::new(origin)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| mods.iter().any(|m| m.module == *s));
-    synth_from_parsed_top(mods, stem, &HashMap::new())
+    // The SVA parse runs for every synth: assertions are parsed (and named
+    // out-of-subset rejections raised) uniformly; elaboration only acts when
+    // the top module actually carries assertions.
+    sva::synth_sv_with_sva(source, origin).map(|o| o.design)
 }
 
 /// Module names in one SV file (helion-sv parse). UG900 SIM_TOP candidates.
@@ -17541,6 +18043,8 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            sva_conc: Vec::new(),
+            sva_imm: Vec::new(),
         };
         let r = rexpr_to_bit(&e, &rtl, 7, &arena);
         assert!(r.is_err(), "deep Add must Err, not hang: {r:?}");
@@ -17584,6 +18088,8 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            sva_conc: Vec::new(),
+            sva_imm: Vec::new(),
         };
         let eq = rexpr_to_bit(
             &RExpr::Eq(arena.alloc(a.clone()), arena.alloc(b.clone())),
@@ -17621,6 +18127,8 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            sva_conc: Vec::new(),
+            sva_imm: Vec::new(),
         };
         let wide_eq = rexpr_to_bit(
             &RExpr::Eq(
@@ -21303,6 +21811,8 @@ endmodule
                 toks: vec![],
                 mem_inits,
                 negedge_writes: vec![],
+            sva_conc: Vec::new(),
+            sva_imm: Vec::new(),
             }
         }
         let a = rtl_with(&[("m2", 1), ("m1", 2)]);
