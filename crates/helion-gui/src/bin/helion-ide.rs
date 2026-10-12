@@ -2783,7 +2783,7 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             WorkspacePane::Locals => paint_locals(ui, &mut app.model),
             WorkspacePane::Forces => paint_forces(ui, &mut app.model),
             WorkspacePane::SimSettings => paint_sim_settings(ui, &mut app.model),
-            WorkspacePane::Source => paint_source(ui, &mut app.model),
+            WorkspacePane::Source => paint_source(ui, &mut app.model, &app.theme),
             WorkspacePane::Testbench => paint_testbench(ui, app),
             _ => paint_wave(ui, &mut app.model, &app.theme),
         }
@@ -8874,7 +8874,7 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
 }
 
 #[allow(dead_code)] // intentional: retained for upcoming device routing inspection panel
-fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Source");
     ui.horizontal(|ui| {
         let n = model.sim_runtime_cycles.max(1);
@@ -8925,6 +8925,7 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
                         ui.label("No sources yet.");
                         ui.end_row();
                     } else {
+                        let mut in_block = false;
                         for r in &rows {
                             let on = selected == Some(r.line);
                             let bp_on = armed.contains(&r.line);
@@ -8945,10 +8946,29 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
                             if ui.selectable_label(on, r.type_cell()).clicked() {
                                 pick_line = Some(r.line.to_string());
                             }
-                            if ui
-                                .selectable_label(on, RichText::new(r.text.trim()).monospace())
-                                .clicked()
-                            {
+                            // Syntax-highlighted source text (Editor colors),
+                            // selectable and clickable like the old label.
+                            let mut job = egui::text::LayoutJob::default();
+                            editor::append_highlighted(
+                                &mut job,
+                                r.text.trim(),
+                                highlight::Lang::SystemVerilog,
+                                in_block,
+                                theme,
+                                13.0,
+                            );
+                            in_block = editor::block_state_after(r.text, in_block);
+                            let galley = ui.fonts(|f| f.layout_job(job));
+                            let (cell_rect, _) =
+                                ui.allocate_exact_size(galley.size(), egui::Sense::click());
+                            if on {
+                                ui.painter().rect_filled(cell_rect, 2.0, theme.sel);
+                            }
+                            let cell_resp = ui.put(
+                                cell_rect,
+                                egui::Label::new(galley).selectable(true).sense(egui::Sense::click()),
+                            );
+                            if cell_resp.clicked() {
                                 pick_line = Some(r.line.to_string());
                             }
                             ui.end_row();
