@@ -288,7 +288,8 @@ mod tests {
 
     #[test]
     fn dimacs_roundtrip_shape() {
-        // o = a & b: 1 const unit + 2 PI vars + 1 AND var = 3 vars, 4 clauses.
+        // o = a & b: 1 const var + 2 PI vars + 1 AND var = 4 vars;
+        // 1 const unit + 3 AND clauses = 4 clauses.
         let mut a = aig_with_pis(&["x", "y"]);
         let lx = a.pi_lit("x");
         let ly = a.pi_lit("y");
@@ -297,10 +298,10 @@ mod tests {
         let mut pi_vars = HashMap::new();
         let node_lits = enc.encode_aig(&a, &mut pi_vars);
         let _ = enc.lit_signed(o, &node_lits);
-        assert_eq!(enc.num_vars(), 3);
+        assert_eq!(enc.num_vars(), 4);
         assert_eq!(enc.clauses().len(), 4);
         let dimacs = enc.to_dimacs();
-        assert!(dimacs.starts_with("p cnf 3 4\n"));
+        assert!(dimacs.starts_with("p cnf 4 4\n"));
         assert_eq!(dimacs.lines().count(), 5);
     }
 }
