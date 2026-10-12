@@ -289,10 +289,39 @@ impl Device {
     ) -> Result<Vec<SiteInst>, String> {
         let mut names: Vec<&String> = sites.keys().collect();
         names.sort();
+        // Group template indices by site_type, preserving template order.
+        // Template types may be more specific than tilegrid types
+        // (e.g. `IOB33S`/`IOB33M` vs `IOB33`); match by prefix.
+        let mut tmpl_by_type: HashMap<String, Vec<u32>> = HashMap::new();
+        for (i, t) in tdata.site_templates.iter().enumerate() {
+            tmpl_by_type
+                .entry(t.site_type.clone())
+                .or_default()
+                .push(i as u32);
+        }
+        // Positional index of each site among sites of the same type.
+        let mut type_counts: HashMap<&str, usize> = HashMap::new();
         let mut out = Vec::with_capacity(names.len());
         for sname in names {
             let stype = &sites[sname];
-            let template = Self::match_template(&tdata.site_templates, sname, stype);
+            let mut template = Self::match_template(&tdata.site_templates, sname, stype);
+            // Positional fallback: Nth site of this type -> Nth template whose
+            // type matches (by prefix). Covers IOB pairs and BUFGCTRL banks
+            // where names carry die-level coordinates.
+            if template.is_none() {
+                let mut candidates: Vec<u32> = Vec::new();
+                for (ttype, idxs) in &tmpl_by_type {
+                    if ttype == stype || ttype.starts_with(stype.as_str()) {
+                        candidates.extend(idxs);
+                    }
+                }
+                candidates.sort();
+                let pos = type_counts.get(stype.as_str()).copied().unwrap_or(0);
+                if pos < candidates.len() {
+                    template = Some(candidates[pos]);
+                }
+            }
+            *type_counts.entry(stype.as_str()).or_insert(0) += 1;
             out.push(SiteInst { name: (*sname).clone(), site_type: stype.clone(), template });
         }
         Ok(out)

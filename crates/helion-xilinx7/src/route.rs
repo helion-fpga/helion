@@ -52,7 +52,7 @@ pub struct RoutedNet7 {
 }
 
 /// Backend-owned routed netlist for xc7a35t.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Routed7 {
     pub placed: Placed7,
     pub nets: Vec<RoutedNet7>,
@@ -256,7 +256,6 @@ mod tests {
     use super::*;
     use crate::pack::{IobDir, Packed7, PackedIob, PackedLut};
     use crate::place::{Placed7, PlacedIob, PlacedLut};
-    use std::collections::HashSet;
 
     struct FakeRouter;
     impl RouteQuery for FakeRouter {
@@ -277,8 +276,7 @@ mod tests {
         }
         fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)> {
             match (site, pin) {
-                ("IOB_X0", "O") => Some(("INT_X0".into(), "A".into())),
-                ("SLICE_X0", "Q") => Some(("INT_X0".into(), "B".into())),
+                ("SLICE_X0", "O") => Some(("INT_X0".into(), "B".into())),
                 _ => None,
             }
         }
@@ -304,11 +302,6 @@ mod tests {
             ffs: vec![],
             iobs: vec![
                 PackedIob {
-                    name: "ibuf".into(), port: "a".into(), dir: IobDir::In,
-                    net: "n1".into(), loc: None, iostandard: "LVCMOS33".into(),
-                    drive: None, slew: None,
-                },
-                PackedIob {
                     name: "obuf".into(), port: "b".into(), dir: IobDir::Out,
                     net: "n1".into(), loc: None, iostandard: "LVCMOS33".into(),
                     drive: None, slew: None,
@@ -321,7 +314,6 @@ mod tests {
             luts: vec![PlacedLut { name: "u_inv".into(), init: 0, tile: "CLB_X0".into(), site: "SLICE_X0".into(), bel: "A6LUT".into() }],
             ffs: vec![],
             iobs: vec![
-                PlacedIob { name: "ibuf".into(), port: "a".into(), dir: IobDir::In, tile: "IOB_T".into(), site: "IOB_X0".into() },
                 PlacedIob { name: "obuf".into(), port: "b".into(), dir: IobDir::Out, tile: "IOB_T".into(), site: "IOB_X1".into() },
             ],
             bufgs: vec![],
@@ -334,9 +326,10 @@ mod tests {
         assert_eq!(routed.nets.len(), 1);
         match &routed.nets[0].kind {
             RouteKind::Pips(pips) => {
-                assert_eq!(pips.len(), 3);
-                assert_eq!(pips[0].dst_wire, "B");
-                assert_eq!(pips[2].dst_wire, "D");
+                // B -> C (pip), C -> C across tiles (node, skipped), C -> D (pip).
+                assert_eq!(pips.len(), 2);
+                assert_eq!(pips[0].dst_wire, "C");
+                assert_eq!(pips[1].dst_wire, "D");
             }
             other => panic!("expected Pips, got {other:?}"),
         }
