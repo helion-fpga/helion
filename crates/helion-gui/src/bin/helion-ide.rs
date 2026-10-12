@@ -13,8 +13,8 @@ use helion_gui::surface::{
 use helion_gui::{
     doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, SourceLine, StepState, TimingPathSortCol,
-    WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
+    MethodologySeverity, MsgSeverity, PathGroupKind, ProbeSelection, SourceLine, StepState,
+    TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -475,6 +475,15 @@ impl HelionIde {
                 .find(|a| a.label().eq_ignore_ascii_case(name.trim()))
             {
                 app.set_activity(act);
+            }
+        }
+        // Cross-probe demo/screenshot hook: probe a timing path by index
+        // after the flow and workspace are set up. Unlike select_timing_path,
+        // this does not move the workspace, so it composes with
+        // HELION_WORKSPACE (Timing/Device/Schematic views).
+        if let Ok(spec) = std::env::var("HELION_PROBE_PATH") {
+            if let Ok(idx) = spec.trim().parse::<usize>() {
+                let _ = app.model.probe_timing_path(idx);
             }
         }
         if let Ok(cmds) = std::env::var("HELION_EXEC") {
@@ -4565,6 +4574,51 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
         let _ = model.exec(&format!("select_timing_path {spec}"));
     }
 
+    // Reverse cross-probe: an object selected in Device/Schematic surfaces
+    // the timing paths through it here; click one to probe it.
+    if model.selected_timing_path.is_none() {
+        if let Some(id) = model.selected.clone() {
+            let hits = model.paths_through(&id);
+            if !hits.is_empty() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} timing path{} through",
+                            hits.len(),
+                            if hits.len() == 1 { "" } else { "s" }
+                        ))
+                        .size(12.0)
+                        .color(theme.dim),
+                    );
+                    ui.label(
+                        egui::RichText::new(&id)
+                            .size(12.0)
+                            .color(theme.text)
+                            .strong(),
+                    );
+                });
+                let mut probe_pick: Option<usize> = None;
+                for &hi in &hits {
+                    let row_label = {
+                        let p = &model.timing_paths[hi];
+                        format!(
+                            "{} → {}   slack {} ps",
+                            p.startpoint, p.endpoint, p.slack_ps
+                        )
+                    };
+                    if ui.selectable_label(false, row_label).clicked() {
+                        probe_pick = Some(hi);
+                    }
+                }
+                if let Some(hi) = probe_pick {
+                    model.set_probe(ProbeSelection::Path(hi));
+                }
+                ui.add_space(4.0);
+            }
+        }
+    }
+
     if model.timing_paths.is_empty() {
         // Designed empty state (§3.8): centered dim text + action, never a bare rect.
         ui.add_space(28.0);
@@ -4756,11 +4810,57 @@ fn paint_timing_path_table(
         spec_paint_cells(ui, rrect, &widths, &cells, false);
         spec_divider(ui, theme, rrect);
     }
+    // Empty-space click-to-clear starts below the last row (captured after rows).
+    let bg_top = ui.min_rect().max.y;
+    let table_id = egui::Id::new("timing_path_table");
     if let Some(mi) = pick {
-        let _ = model.select_timing_path_report(&mi.to_string());
+        // Cross-probe: the path lights up in Device + Schematic, and the
+        // pin-delay pane below lists its elements.
+        model.set_probe(ProbeSelection::Path(mi));
+        ui.ctx().memory_mut(|m| m.request_focus(table_id));
     }
     if let Some(mi) = dbl {
         let _ = model.exec(&format!("select_timing_path {mi}"));
+    }
+    // Clicking empty table space clears the probe.
+    let bg_rect = egui::Rect::from_x_y_ranges(
+        ui.min_rect().x_range(),
+        bg_top..=ui.min_rect().max.y,
+    );
+    let bg_resp = ui.interact(bg_rect, egui::Id::new("tpath_bg"), egui::Sense::click());
+    if bg_resp.clicked() && pick.is_none() && sort_click.is_none() {
+        model.clear_probe();
+    }
+    // Keyboard: Up/Down walks the (sorted/filtered) path list, driving
+    // Device + Schematic live; Esc clears. Gated on table focus so arrows
+    // keep scrolling everywhere else.
+    if ui.ctx().memory(|m| m.has_focus(table_id)) {
+        let dir = if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            1
+        } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            -1
+        } else {
+            0
+        };
+        if dir != 0 && !order.is_empty() {
+            let cur = model
+                .selected_timing_path
+                .and_then(|mi| order.iter().position(|&x| x == mi));
+            let next = match cur {
+                Some(p) => (p as i32 + dir).clamp(0, order.len() as i32 - 1) as usize,
+                None => {
+                    if dir > 0 {
+                        0
+                    } else {
+                        order.len() - 1
+                    }
+                }
+            };
+            model.set_probe(ProbeSelection::Path(order[next]));
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            model.clear_probe();
+        }
     }
 }
 
@@ -4793,6 +4893,44 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .color(theme.dim),
     );
     ui.add_space(4.0);
+
+    // Cross-probe element strip: ordered cells/nets with per-element
+    // arrival; click one to probe it alone in Device + Schematic.
+    let elements = model.probe_elements();
+    if !elements.is_empty() {
+        ui.label(
+            egui::RichText::new("Path elements")
+                .size(11.0)
+                .color(theme.dim),
+        );
+        let mut el_pick: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (i, el) in elements.iter().enumerate() {
+                if i > 0 {
+                    ui.label(egui::RichText::new("→").size(11.0).color(theme.faint));
+                }
+                let chip = format!("{} {} · {}ps", el.kind, el.id, el.arrival_ps);
+                let btn = egui::Button::new(
+                    egui::RichText::new(chip).size(11.0).monospace().color(
+                        if el.kind == "cell" {
+                            theme.text
+                        } else {
+                            theme.info
+                        },
+                    ),
+                )
+                .small();
+                if ui.add(btn).clicked() {
+                    el_pick = Some(el.id.clone());
+                }
+            }
+        });
+        if let Some(id) = el_pick {
+            model.set_probe(ProbeSelection::Object(id));
+        }
+        ui.add_space(4.0);
+    }
 
     // (title, fixed width | None = fill, numeric)
     let cols: &[(&str, Option<f32>, bool)] = &[
@@ -6006,6 +6144,8 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                 if ui.button("Zoom Fit").clicked() {
                     zoom_fit = true;
                 }
+                ui.checkbox(&mut model.schematic.auto_fit_on_probe, "Auto-fit path")
+                    .on_hover_text("Zoom to fit the probed timing path on selection");
                 if ui.button("Expand Cone").clicked() {
                     let _ = model.exec("expand_cone");
                 }
@@ -6190,6 +6330,33 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         model.schematic.pan_by(d.x, d.y);
     }
     let drawing = model.schematic.drawing_arc();
+    // Cross-probe: a freshly probed timing path auto-frames in the viewport
+    // (toggle: "Auto-fit path" in the toolbar).
+    if model.schematic.zoom_to_path_pending {
+        model.schematic.zoom_to_path_pending = false;
+        if model.schematic.auto_fit_on_probe {
+            let mut bb: Option<(f32, f32, f32, f32)> = None;
+            for sy in drawing.symbols.iter() {
+                if model.schematic.highlight_cells.contains(&sy.name) {
+                    let (x0, y0, x1, y1) = (sy.x, sy.y, sy.x + sy.w, sy.y + sy.h);
+                    bb = Some(match bb {
+                        Some((ax0, ay0, ax1, ay1)) => {
+                            (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1))
+                        }
+                        None => (x0, y0, x1, y1),
+                    });
+                }
+            }
+            if let Some((x0, y0, x1, y1)) = bb {
+                // Pad so the path doesn't touch the pane edges.
+                let px = (x1 - x0) * 0.15 + 40.0;
+                let py = (y1 - y0) * 0.15 + 40.0;
+                model
+                    .schematic
+                    .zoom_to_region(x0 - px, y0 - py, x1 + px, y1 + py);
+            }
+        }
+    }
     let cam = model.schematic.camera;
     let z = cam.zoom.max(0.05);
     // Level-of-detail: below BLOCK_ZOOM the sheet renders a treemap of
@@ -6491,7 +6658,8 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         }
     }
     if let Some(id) = pick {
-        model.select(&id);
+        // Cross-probe: schematic selection reflects in Device + Timing.
+        model.set_probe(ProbeSelection::Object(id));
     }
     if let Some(id) = expand {
         if model.schematic.is_instance(&id) {
@@ -6782,6 +6950,9 @@ fn paint_device(
             );
             let p = ui.painter();
             p.rect_filled(rect, 0.0, theme.die_bg);
+            // Cross-probe: while a timing path is probed, its sites paint
+            // gold and everything else dims (Vivado-style focus).
+            let path_probe = matches!(model.probe(), ProbeSelection::Path(_));
             for dx in 0..cols {
                 let x = x0 + dx;
                 let px = origin.x + dx as f32 * cell_w;
@@ -6817,11 +6988,14 @@ fn paint_device(
                     );
                     let site = model.device.site_at(x, y);
                     let path_hl = site.is_some_and(|s| s.highlighted);
-                    let fill = if path_hl {
-                        // STA path / selection: gold fill so multi-cell paths read on the die.
+                    // Cross-probe: a path probe paints gold; a single-object
+                    // probe paints the accent outline. Non-path sites dim
+                    // while a path is probed (Vivado-style focus).
+                    let fill = if path_hl && path_probe {
+                        // STA path: gold fill so multi-cell paths read on the die.
                         theme.gold
                     } else {
-                        match site {
+                        let base = match site {
                             Some(s) if s.occupant.is_some() || !s.bels.is_empty() => {
                                 match s.occupancy_char() {
                                     'O' => theme.info,
@@ -6837,6 +7011,11 @@ fn paint_device(
                                 helion_device::SiteKind::Clb => theme.ok.gamma_multiply(0.32),
                             },
                             None => theme.die_bg,
+                        };
+                        if path_probe {
+                            base.gamma_multiply(0.45)
+                        } else {
+                            base
                         }
                     };
                     p.rect_filled(tile, 1.0, fill);
@@ -6848,16 +7027,24 @@ fn paint_device(
                                 || s.bels.iter().any(|b| Some(b.as_str()) == id)
                         });
                     if selected {
+                        let (sw, scol) = if path_hl && path_probe {
+                            (2.2_f32, theme.gold)
+                        } else {
+                            (2.5_f32, theme.accent)
+                        };
                         p.rect_stroke(
                             tile,
                             1.0,
-                            Stroke::new(if path_hl { 2.2_f32 } else { 1.5_f32 }, theme.gold),
+                            Stroke::new(sw, scol),
                             egui::StrokeKind::Outside,
                         );
                     }
                 }
             }
             // Fig. 49: clock-region outlines over the die.
+            // Cross-probe state for the die: path probes paint gold, single
+            // selections paint the accent color, everything else dims.
+            let path_probe = model.selected_timing_path.is_some();
             let purple = theme.violet;
             let gold = theme.gold;
             let amber = theme.amber;
@@ -6924,14 +7111,33 @@ fn paint_device(
                         if rt.tiles.len() < 2 {
                             continue;
                         }
-                        let col = if rt.highlighted {
-                            gold
+                        // Path nets paint gold and thick; a singly selected net
+                        // paints the accent color; the rest dim while probing.
+                        let hl_path_net = path_probe
+                            && model.schematic.highlight_nets.contains(&rt.net);
+                        let (col, thick) = if hl_path_net {
+                            (gold, 2.6_f32)
+                        } else if rt.highlighted {
+                            (theme.accent, 2.2_f32)
                         } else if rt.hops == 0 {
-                            unroute_col
+                            (
+                                if path_probe {
+                                    unroute_col.gamma_multiply(0.45)
+                                } else {
+                                    unroute_col
+                                },
+                                1.7_f32,
+                            )
                         } else {
-                            route_col
+                            (
+                                if path_probe {
+                                    route_col.gamma_multiply(0.45)
+                                } else {
+                                    route_col
+                                },
+                                1.7_f32,
+                            )
                         };
-                        let thick = if rt.highlighted { 2.6_f32 } else { 1.7_f32 };
                         let mut pts = Vec::new();
                         for &(x, y) in &rt.tiles {
                             let dx = x.saturating_sub(x0);
