@@ -68,6 +68,14 @@ cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv
 
 Needs rustc **1.85**. CI is Linux; the desktop app is Apple Silicon (`aarch64-apple-darwin`).
 
+**macOS install note:** the `.app` is ad-hoc signed, not Apple-notarized, so Gatekeeper may refuse to open the download ("damaged" / "cannot be checked"). Clear the quarantine flag once and it launches fine:
+
+```bash
+xattr -cr /Applications/Helion.app
+```
+
+(Alternative: System Settings → Privacy & Security → Open Anyway.)
+
 ## Benchmarks
 
 10 real designs, identical RTL, Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5. Full report: [`docs/benchmarks/benchmark-report-2026-10-10.md`](docs/benchmarks/benchmark-report-2026-10-10.md).

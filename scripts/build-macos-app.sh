@@ -18,6 +18,13 @@ SKIP_BUILD=${HELION_SKIP_BUILD:-0}
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
+# Bundle version: single source of truth is [workspace.package] in the root
+# Cargo.toml. The plist template carries __HELION_VERSION__ placeholders —
+# never hardcode a version there again (v2.1.0 shipped a stale 2.0.5).
+HELION_VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/p' "$ROOT/Cargo.toml" \
+    | grep -m1 '^version' | sed 's/^version *= *"\(.*\)".*/\1/')
+[ -n "$HELION_VERSION" ] || die "could not read version from $ROOT/Cargo.toml [workspace.package]"
+
 usage() {
     cat <<'USAGE'
 usage: scripts/build-macos-app.sh [--layout-only] [--out DIR]
@@ -120,7 +127,14 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RES/devices" "$RES/examples"
-cp "$PLIST" "$APP/Contents/Info.plist"
+# Stamp the Cargo version into the bundle (replaces __HELION_VERSION__ in the
+# plist template). Fail loudly if a placeholder survives.
+sed "s/__HELION_VERSION__/${HELION_VERSION}/g" "$PLIST" > "$APP/Contents/Info.plist" \
+    || die "failed to write $APP/Contents/Info.plist"
+if grep -q "__HELION_VERSION__" "$APP/Contents/Info.plist"; then
+    die "unreplaced __HELION_VERSION__ placeholder in $APP/Contents/Info.plist"
+fi
+printf 'bundle version: %s\n' "$HELION_VERSION"
 if [ -n "$ICON" ]; then
     cp "$ICON" "$RES/AppIcon.png"
 fi
@@ -174,5 +188,13 @@ if [ "$SKIP_BUILD" = "1" ]; then
 fi
 printf 'built %s\n' "$APP"
 printf '  MacOS: Helion + helion-ide + helion-cli\n'
+# Ad-hoc sign so Gatekeeper sees a well-formed bundle instead of reporting
+# "damaged". This does NOT replace Apple notarization: first launch from a
+# download still needs `xattr -cr` or Settings > Privacy & Security > Open Anyway.
+if command -v codesign >/dev/null 2>&1; then
+    codesign --deep --force -s - "$APP" \
+        && codesign --verify --deep --strict "$APP" \
+        && printf 'codesigned (ad-hoc): %s\n' "$APP"
+fi
 printf 'run:    open %s\n' "$APP"
 printf 'doctor: %s/helion doctor\n' "$MACOS"
