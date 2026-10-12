@@ -28,6 +28,8 @@ mod commands;
 mod constraints_wizard_ui;
 #[path = "helion-ide/dashboard.rs"]
 mod dashboard;
+#[path = "helion-ide/editor.rs"]
+mod editor;
 #[path = "helion-ide/flow_nav.rs"]
 mod flow_nav;
 #[path = "helion-ide/hierarchy.rs"]
@@ -353,6 +355,21 @@ struct HelionIde {
     /// Constraints Wizard draft state (None = closed). Lives on the app, not
     /// the model, so engine-thread jobs never disturb it.
     constraints_wizard: Option<constraints_wizard_ui::WizardUi>,
+    /// Editable source editor (UX fixes Part 2): buffer + backing file.
+    editor_text: String,
+    editor_path: Option<PathBuf>,
+    editor_dirty: bool,
+    /// Soft-wrap toggle (Alt+Z / header button).
+    editor_wrap: bool,
+    /// Visual rows per logical line (wrap mode), refreshed by the layouter.
+    editor_line_rows: Vec<usize>,
+    /// Longest laid-out line width: sizes the TextEdit so it never scrolls
+    /// internally (the outer ScrollArea owns scrolling).
+    editor_content_w: f32,
+    /// Pending minimap-driven vertical scroll offset.
+    editor_mini_scroll: Option<f32>,
+    /// Cached minimap galley: (text hash, font size bits, Arc galley).
+    editor_minimap_cache: Option<(u64, u32, std::sync::Arc<egui::Galley>)>,
 }
 
 /// Device viewer layer visibility (P1-3): Vivado Device-window layer toggles.
@@ -435,6 +452,14 @@ impl HelionIde {
             device_layers: DeviceLayers::default(),
             device_zoom_target: None,
             constraints_wizard: None,
+            editor_text: String::new(),
+            editor_path: None,
+            editor_dirty: false,
+            editor_wrap: false,
+            editor_line_rows: Vec::new(),
+            editor_content_w: 600.0,
+            editor_mini_scroll: None,
+            editor_minimap_cache: None,
         };
         if let Ok(w) = std::env::var("HELION_SIDEBAR_WIDTH") {
             if let Ok(v) = w.parse::<f32>() {
@@ -984,6 +1009,10 @@ impl eframe::App for HelionIde {
         if !self.sidebar_hidden {
             paint_sidebar(ctx, self);
         }
+        // Consume the re-share flag here — not inside the sidebar painter, which
+        // runs after paint_bottom and never runs when the sidebar is hidden.
+        // A stuck flag pinned the bottom console every frame and killed dragging.
+        self.force_share = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             let theme = self.theme;
             if welcome::should_show(self) {
@@ -1127,6 +1156,16 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut HelionIde) {
     if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::K)) {
         app.show_cheatsheet = !app.show_cheatsheet;
     }
+    if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::S)) {
+        // Save the open source file (editor canvas only; no project binding
+        // uses ⌘S today).
+        if app.canvas == Canvas::Editor {
+            editor::save_editor(app);
+        }
+    }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Z)) {
+        app.editor_wrap = !app.editor_wrap;
+    }
 }
 
 fn native_close_project(app: &mut HelionIde) {
@@ -1261,7 +1300,15 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
     egui::TopBottomPanel::top("toolbar")
         .exact_height(chrome::TOOLBAR_HEIGHT)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // Horizontal scroll when the window is too narrow for all controls:
+            // buttons are never clipped into unreachability (D7). The
+            // right-aligned flow buttons stay at the visible right edge on
+            // wide windows and scroll with the content on narrow ones.
+            egui::ScrollArea::horizontal()
+                .id_salt("toolbar_hscroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
                 ui.add_space(6.0);
                 let new_proj = ui
                     .add_sized(
@@ -1378,6 +1425,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                         if b.clicked() {
                             app.submit_job(JobKind::Step(FlowStep::Bitstream));
                         }
+                    });
                     });
                 });
             });
@@ -1514,8 +1562,10 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
         .resizable(true)
         .default_width(width);
     if app.force_share {
+        // Re-share frame: snap to the shared width once. The flag itself is
+        // cleared at the end of the frame (not here), so a hidden sidebar
+        // can't leave it stuck on.
         panel = panel.exact_width(width);
-        app.force_share = false;
     }
     let inner = panel
         .width_range({
@@ -2179,7 +2229,18 @@ fn apply_shared_chrome(ctx: &egui::Context, app: &mut HelionIde) {
     let r = ctx.screen_rect();
     let share = chrome::share_available(r.width(), r.height());
     let size = [r.width(), r.height()];
-    if (app.last_share[0] - size[0]).abs() > 1.0 || (app.last_share[1] - size[1]).abs() > 1.0 {
+    if app.last_share[0] == 0.0 && app.last_share[1] == 0.0 {
+        // First frame: seed from the real window size. This is NOT a resize —
+        // the constructor may have set sizes from HELION_* env hooks, which a
+        // reset-to-default here would silently clobber.
+        app.last_share = size;
+        app.sidebar_width = app
+            .sidebar_width
+            .clamp(share.sidebar_floor, share.sidebar_cap);
+        app.console_height = app
+            .console_height
+            .clamp(share.console_floor, share.console_cap);
+    } else if (app.last_share[0] - size[0]).abs() > 1.0 || (app.last_share[1] - size[1]).abs() > 1.0 {
         app.sidebar_width = share.sidebar_w;
         app.console_height = share.console_h;
         app.last_share = size;
@@ -2196,13 +2257,24 @@ fn apply_shared_chrome(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
     let share = chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
+    if !app.force_share && ctx.screen_rect().height() < 540.0 {
+        // Short window: clamp toward the default share instead of pinning every
+        // frame, so the resize handle keeps working.
+        app.console_height = app.console_height.min(share.console_h);
+    }
     let mut console = egui::TopBottomPanel::bottom("console")
         .resizable(true)
         .default_height(app.console_height)
         .min_height(share.console_floor)
         .max_height(share.console_cap);
-    if app.force_share || ctx.screen_rect().height() < 540.0 {
-        console = console.exact_height(app.console_height.min(share.console_h));
+    if app.force_share {
+        // Re-share frame (window resized, or first frame): snap to the current
+        // console_height once. apply_shared_chrome already reset it to the
+        // default share on real resizes, and the first frame honors any
+        // HELION_CONSOLE_HEIGHT override. The flag is cleared at the end of
+        // the frame, so it can never get stuck on and pin the panel — a stuck
+        // flag is what made the user's drag snap back / go dead.
+        console = console.exact_height(app.console_height);
     }
     let inner = console.show_separator_line(true).show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -2223,15 +2295,10 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
             if m.clicked() {
                 app.model.bottom_tab = BottomTab::Messages;
             }
-            let tcl = ui.add_sized(
-                [56.0, chrome::HIT_SIDEBAR],
-                egui::Button::selectable(app.show_tcl, "Tcl"),
-            );
-            if tcl.clicked() {
-                app.show_tcl = true;
-                app.tcl_focus = true;
-                app.model.bottom_tab = BottomTab::Tcl;
-            }
+            // Note: the "Console" tab above IS the inline Tcl console
+            // (BottomTab::Tcl). There is deliberately no separate "Tcl" tab:
+            // it used to pop a floating dialog, which users did not want. The
+            // floating Tcl window remains on Cmd+Backtick.
             if app.activity == Activity::Simulate {
                 let s = ui.add_sized(
                     [88.0, chrome::HIT_SIDEBAR],
@@ -2638,7 +2705,8 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
             if app.model.tree.sources.is_empty() && app.model.source_line_rows().is_empty() {
                 paint_empty_editor(ui, app);
             } else {
-                paint_text_editor(ui, &mut app.model, &app.theme);
+                let theme = app.theme;
+                editor::paint_editor(ui, app, &theme);
             }
         }
         Canvas::Device => {
@@ -2760,7 +2828,10 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         | WorkspacePane::Forces
         | WorkspacePane::SimSettings => paint_sim_workspace(ui, app),
         WorkspacePane::ReportsCatalog => paint_reports_detail(ui, app),
-        WorkspacePane::Editor => paint_text_editor(ui, &mut app.model, &app.theme),
+        WorkspacePane::Editor => {
+            let theme = app.theme;
+            editor::paint_editor(ui, app, &theme)
+        }
         WorkspacePane::Device => paint_device(
             ui,
             &mut app.model,
@@ -3087,6 +3158,7 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
     let mut pick: Option<usize> = None;
     let mut pick_obj: Option<usize> = None;
     egui::ScrollArea::both()
+        .id_salt("messages_scroll")
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -3179,6 +3251,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
         .collect();
     let mut pick_line = None;
     egui::ScrollArea::both()
+        .id_salt("tcl_journal_scroll")
         .stick_to_bottom(true)
         .max_height(ui.available_height() - 28.0)
         .auto_shrink([false, false])
@@ -3199,6 +3272,21 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
                         ui.end_row();
                     } else {
                         for (i, line) in &rows {
+                            if line.is_session_separator() {
+                                // D10: session boundary — dim rule-like row,
+                                // not selectable, not clickable.
+                                ui.label(RichText::new("—").small().color(theme.faint));
+                                ui.label(RichText::new("").small());
+                                ui.label(RichText::new("").small());
+                                ui.label(
+                                    RichText::new("— session started —")
+                                        .small()
+                                        .italics()
+                                        .color(theme.faint),
+                                );
+                                ui.end_row();
+                                continue;
+                            }
                             let on = selected == Some(*i);
                             let hit = hits.contains(i);
                             ui.monospace(i.to_string());
@@ -3286,6 +3374,7 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         .collect();
     let mut pick: Option<usize> = None;
     egui::ScrollArea::both()
+        .id_salt("log_scroll")
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -3305,6 +3394,21 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                         ui.end_row();
                     } else {
                         for (i, line) in &rows {
+                            if line.is_session_separator() {
+                                // D10: session boundary — dim rule-like row,
+                                // not selectable, not clickable.
+                                ui.label(RichText::new("—").small().color(theme.faint));
+                                ui.label(RichText::new("").small());
+                                ui.label(RichText::new("").small());
+                                ui.label(
+                                    RichText::new("— session started —")
+                                        .small()
+                                        .italics()
+                                        .color(theme.faint),
+                                );
+                                ui.end_row();
+                                continue;
+                            }
                             let on = selected == Some(*i);
                             ui.monospace(i.to_string());
                             let status = if line.ok { "ok" } else { "error" };
@@ -3348,6 +3452,7 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) 
     let rows = model.sim_log.clone();
     let mut pick: Option<usize> = None;
     egui::ScrollArea::both()
+        .id_salt("simlog_scroll")
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -4261,6 +4366,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         return;
     }
     egui::ScrollArea::both()
+        .id_salt("find_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("find_results_table")
@@ -5655,6 +5761,7 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
     egui::ScrollArea::vertical()
+        .id_salt("timing_pin_details")
         .max_height(280.0)
         .hscroll(true)
         .show(ui, |ui| {
@@ -5767,7 +5874,7 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
         let total: f32 = widths.iter().sum();
         let w = ui.available_width().max(total);
         let period = model.clock_period_ps;
-        egui::ScrollArea::horizontal().show(ui, |ui| {
+        egui::ScrollArea::horizontal().id_salt("timing_summary_hscroll").show(ui, |ui| {
             let (hrect, _) =
                 ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
             let hcells: Vec<SpecCell> = headers
@@ -5912,7 +6019,7 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     let selected = model.selected.clone();
     let mut pick: Option<(String, String)> = None;
     let mut pick_obj: Option<String> = None;
-    egui::ScrollArea::both().show(ui, |ui| {
+    egui::ScrollArea::both().id_salt("clock_interaction_scroll").show(ui, |ui| {
         egui::Grid::new("clock_interaction_matrix")
             .spacing([4.0, 4.0])
             .show(ui, |ui| {
@@ -6022,7 +6129,7 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let selected = model.selected.clone();
     let mut pick: Option<(String, String)> = None;
     let mut pick_obj: Option<(String, String)> = None;
-    egui::ScrollArea::both().show(ui, |ui| {
+    egui::ScrollArea::both().id_salt("cdc_scroll").show(ui, |ui| {
         egui::Grid::new("cdc_table")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
@@ -6560,7 +6667,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         let n_f = n as f32;
         let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
         let col_w = chrome::stretched_col_w_gap(5, ui.available_width(), 8.0);
-        egui::ScrollArea::both().show(ui, |ui| {
+        egui::ScrollArea::both().id_salt("methodology_scroll").show(ui, |ui| {
             egui::Grid::new("methodology_table")
                 .spacing([8.0, row_gap])
                 .min_col_width(col_w)
@@ -6803,7 +6910,7 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     ));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
-    egui::ScrollArea::both().max_height(280.0).show(ui, |ui| {
+    egui::ScrollArea::both().id_salt("bitstream_scroll").max_height(280.0).show(ui, |ui| {
         egui::Grid::new("bitstream_far_table")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
@@ -6898,7 +7005,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("drc_scroll").show(ui, |ui| {
         let w = ui.available_width();
         let obj_w = ((w - 170.0) * 0.35).max(90.0);
         let msg_w = (w - 170.0 - obj_w).max(90.0);
@@ -7263,6 +7370,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                 let mut pick_path = None;
                 let selected_path = model.selected_timing_path;
                 egui::ScrollArea::vertical()
+                    .id_salt("schematic_timing_paths_scroll")
                     .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
                     .show(ui, |ui| {
                         egui::Grid::new("schematic_timing_paths")
@@ -8510,34 +8618,6 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-/// Per-line "begins inside a `/* … */` block comment" flags (SystemVerilog
-/// only). Cheap forward byte scan over all rows so scrolled windows start
-/// with correct state. Strings are not excluded — a `/*` inside a string
-/// literal is rare, and the per-line tokenizer handles the common cases.
-fn block_comment_starts(rows: &[SourceLine], lang: highlight::Lang) -> Vec<bool> {
-    let mut starts = Vec::with_capacity(rows.len());
-    let mut in_block = false;
-    for r in rows {
-        starts.push(in_block);
-        if lang == highlight::Lang::SystemVerilog {
-            let b = r.text.as_bytes();
-            let mut i = 0;
-            while i < b.len() {
-                if !in_block && i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
-                    in_block = true;
-                    i += 2;
-                } else if in_block && i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
-                    in_block = false;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-    }
-    starts
-}
-
 /// Colored [`egui::text::LayoutJob`] for one editor line. `starts_in_block`
 /// paints through the closing `*/` as a comment first, then tokenizes the
 /// rest. All slicing is char-boundary-guarded: the tokenizer is
@@ -8761,216 +8841,6 @@ fn editor_crumbs(rows: &[SourceLine], cursor: usize, lang: highlight::Lang) -> E
         }
     }
     out
-}
-
-fn paint_text_editor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    // Header + breadcrumb (no rows borrow held; actions deferred).
-    let lang = model
-        .selected_source
-        .as_deref()
-        .or_else(|| model.tree.sources.first().map(String::as_str))
-        .map(highlight::detect_lang)
-        .unwrap_or(highlight::Lang::Unknown);
-    let file_name = model
-        .selected_source
-        .as_deref()
-        .or_else(|| model.tree.sources.first().map(String::as_str))
-        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
-        .unwrap_or_else(|| "no file".to_string());
-    let n = model.source_line_rows().len();
-    let selected = model.selected_source_line;
-    let cursor = selected.unwrap_or(1).min(n.max(1));
-    let crumbs = editor_crumbs(model.source_line_rows(), cursor, lang);
-
-    // One-shot scroll target from a breadcrumb click last frame.
-    let scroll_id = egui::Id::new("text_editor_scroll_to");
-    let scroll_to: Option<usize> = ui.ctx().memory(|m| m.data.get_temp(scroll_id));
-    if scroll_to.is_some() {
-        ui.ctx().memory_mut(|m| m.data.remove::<usize>(scroll_id));
-    }
-
-    let mut pick_line: Option<usize> = None;
-    let mut pick_mark: Option<usize> = None;
-    let mut nav_line: Option<usize> = None;
-    let mut do_open = false;
-    let mut do_goto = false;
-
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(&file_name)
-                .color(theme.faint)
-                .font(theme::font_ui(12.0)),
-        );
-        if let Some((name, line)) = &crumbs.module {
-            ui.label(RichText::new("›").color(theme.faint).font(theme::font_ui(12.0)));
-            if ui
-                .link(RichText::new(name).color(theme.text).font(theme::font_ui(12.0)))
-                .on_hover_text(format!("Go to line {line}"))
-                .clicked()
-            {
-                pick_line = Some(*line);
-                nav_line = Some(*line);
-            }
-        }
-        if let Some((name, line)) = &crumbs.block {
-            ui.label(RichText::new("›").color(theme.faint).font(theme::font_ui(12.0)));
-            if ui
-                .link(RichText::new(name).color(theme.text).font(theme::font_ui(12.0)))
-                .on_hover_text(format!("Go to line {line}"))
-                .clicked()
-            {
-                pick_line = Some(*line);
-                nav_line = Some(*line);
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Goto Source").clicked() {
-                do_goto = true;
-            }
-            if ui.small_button("Open").clicked() {
-                do_open = true;
-            }
-        });
-    });
-    ui.separator();
-
-    if do_open {
-        let _ = model.open_text_editor();
-    }
-    if do_goto {
-        let _ = model.goto_editor("");
-    }
-
-    // Code pane: gutter (diagnostic ticks + right-aligned line numbers) and
-    // syntax-highlighted source. Indentation is preserved; the old table
-    // trimmed every line.
-    let markers = model.editor_markers();
-    let rows = model.source_line_rows();
-    let in_block: Vec<bool> = block_comment_starts(rows, lang);
-    let row_h = 13.0 * 1.5;
-    let gutter_w = 56.0;
-    let mut scroll = egui::ScrollArea::both().id_salt("ug893_text_editor");
-    if let Some(tline) = scroll_to {
-        if let Some(pos) = rows.iter().position(|r| r.line == tline) {
-            let view_h = ui.available_height().max(row_h * 4.0);
-            let y = (pos as f32 * row_h - view_h / 2.0).max(0.0);
-            scroll = scroll.vertical_scroll_offset(y);
-        }
-    }
-    scroll.show_rows(ui, row_h, n.max(1), |ui, range| {
-            if n == 0 {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("No sources yet. Open a file to edit.")
-                            .color(theme.faint)
-                            .font(theme::font_ui(13.0)),
-                    );
-                });
-                return;
-            }
-            let end = range.end.min(n);
-            for (ri, r) in rows[range.start..end].iter().enumerate() {
-                let starts_in_block = in_block.get(range.start + ri).copied().unwrap_or(false);
-                let on = selected == Some(r.line);
-                let mk = markers.iter().filter(|m| m.line == r.line).min_by_key(|m| {
-                    match m.kind.as_str() {
-                        "error" => 0u8,
-                        "warning" => 1,
-                        "advisory" => 2,
-                        "probe" => 3,
-                        "bookmark" => 4,
-                        _ => 9,
-                    }
-                });
-                let (tick_color, tick_tip): (Option<Color32>, Option<String>) =
-                    match mk.map(|m| m.kind.as_str()) {
-                        Some("error") => (
-                            Some(theme.danger),
-                            mk.map(|m| format!("{}: {}", m.id, m.text)),
-                        ),
-                        Some("warning") => (
-                            Some(theme.warn),
-                            mk.map(|m| format!("{}: {}", m.id, m.text)),
-                        ),
-                        Some("advisory") => (
-                            Some(theme.info),
-                            mk.map(|m| format!("{}: {}", m.id, m.text)),
-                        ),
-                        Some("bookmark") => (
-                            Some(theme.accent),
-                            Some("bookmark — click to remove".to_string()),
-                        ),
-                        _ => (None, None),
-                    };
-                // Selection wash behind the visible row.
-                let bg_rect = egui::Rect::from_min_size(
-                    ui.available_rect_before_wrap().min,
-                    egui::vec2(ui.available_width(), row_h),
-                );
-                if on {
-                    ui.painter().rect_filled(bg_rect, 2.0, theme.sel);
-                }
-                let mut tick_hit = false;
-                ui.horizontal(|ui| {
-                    ui.set_min_height(row_h);
-                    // Gutter: diagnostic/bookmark tick, then right-aligned number.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(gutter_w, row_h),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new(r.line.to_string())
-                                            .font(theme::font_code(12.0))
-                                            .color(if on { theme.text } else { theme.faint }),
-                                    )
-                                    .sense(Sense::click()),
-                                )
-                                .clicked()
-                            {
-                                pick_line = Some(r.line);
-                            }
-                            ui.add_space(6.0);
-                            if tick_color.is_some() {
-                                let (tr, tr_resp) =
-                                    ui.allocate_exact_size(egui::vec2(8.0, 12.0), Sense::click());
-                                if let Some(c) = tick_color {
-                                    ui.painter().rect_filled(tr, 1.0, c);
-                                }
-                                let hit = tr_resp.clicked();
-                                if let Some(tip) = tick_tip {
-                                    tr_resp.on_hover_text(tip);
-                                }
-                                if hit {
-                                    tick_hit = true;
-                                    pick_mark = Some(r.line);
-                                }
-                            }
-                        },
-                    );
-                    // Highlighted source text; indentation preserved.
-                    let job = highlight_line_job(&r.text, lang, starts_in_block, theme);
-                    if ui
-                        .add(egui::Label::new(job).sense(Sense::click()))
-                        .clicked()
-                        && !tick_hit
-                    {
-                        pick_line = Some(r.line);
-                    }
-                });
-            }
-        });
-    if let Some(line) = pick_mark {
-        let _ = model.toggle_editor_bookmark(&line.to_string());
-    }
-    if let Some(line) = pick_line {
-        let _ = model.select_editor_line(&line.to_string());
-        if nav_line == Some(line) {
-            ui.ctx()
-                .memory_mut(|m| m.data.insert_temp(scroll_id, line));
-        }
-    }
 }
 
 fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
@@ -10918,7 +10788,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ));
                 let cursor = model.wave.cursor;
                 let mut pick_s: Option<usize> = None;
-                egui::ScrollArea::both().max_height(220.0).show(ui, |ui| {
+                egui::ScrollArea::both().id_salt("hw_ila_scroll").max_height(220.0).show(ui, |ui| {
                     egui::Grid::new("ila_sample_table")
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {

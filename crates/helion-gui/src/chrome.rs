@@ -737,7 +737,9 @@ pub fn share_available(window_w: f32, window_h: f32) -> SharedChrome {
     // Hold the usual 220 when the pane can spare it; shrink before the canvas letterboxes.
     let sidebar_w = SIDEBAR_WIDTH.clamp(sidebar_floor, sidebar_cap);
 
-    let console_floor = 52.0_f32.min(body_h * 0.28).max(36.0);
+    // Floor hugs the tab strip (~40px) so the console can collapse to
+    // "completely small" — the user's drag, not the chrome, decides the height.
+    let console_floor = 40.0_f32.min(body_h * 0.28).max(36.0);
     let console_cap = (body_h * 0.26)
         .clamp(console_floor, CONSOLE_MAX_HEIGHT)
         .max(console_floor);
