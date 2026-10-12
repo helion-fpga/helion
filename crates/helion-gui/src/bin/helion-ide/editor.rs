@@ -296,7 +296,11 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
             if ui.small_button("Goto Source").clicked() {
                 do_goto = true;
             }
-            if ui.small_button("Open").clicked() {
+            if ui
+                .small_button("Show RTL")
+                .on_hover_text("Show the current RTL source in the text editor")
+                .clicked()
+            {
                 do_open = true;
             }
             if ui

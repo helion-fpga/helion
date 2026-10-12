@@ -1,4 +1,4 @@
-//! CAD chrome: three canvases, one activity rail, More ⋯ overflow.
+//! CAD chrome: three canvases, one activity rail, More ... overflow.
 //!
 //! Paint calls these helpers; tests assert the same units at ~1440×900 without eframe.
 
@@ -60,7 +60,7 @@ pub const IDLE_ANIM_HZ: u32 = 0;
 pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 /// Minimum column width used to decide whether a grid clips its last column.
 pub const MIN_COL_PX: f32 = 80.0;
-pub const MORE: &str = "More ⋯";
+pub const MORE: &str = "More ...";
 pub const MORE_LABEL: &str = MORE;
 const CHAR_PX: f32 = RAIL_WORD_CHAR_PX;
 const TAB_PAD_PX: f32 = 16.0;
@@ -294,7 +294,7 @@ pub enum OverflowMode {
     Wrap,
     /// One row with horizontal scroll + chevrons.
     Scroll,
-    /// One row; overflow goes into a More ⋯ menu (shipped).
+    /// One row; overflow goes into a More ... menu (shipped).
     More,
 }
 
@@ -443,7 +443,7 @@ pub fn would_clip(labels: &[&'static str], available: f32) -> bool {
     visible_if_clipped(labels, available).len() < labels.len()
 }
 
-/// One row + More ⋯. Never wrap (wrap steals canvas).
+/// One row + More .... Never wrap (wrap steals canvas).
 pub fn fit_or_more(
     labels: &[&'static str],
     available: f32,
@@ -472,7 +472,7 @@ pub fn naive_tab_overflow(available: f32) -> OverflowMode {
     }
 }
 
-/// Shipped workspace strip: one row + More ⋯. Never wrap.
+/// Shipped workspace strip: one row + More .... Never wrap.
 pub fn workspace_tab_overflow(available: f32) -> OverflowMode {
     match naive_tab_overflow(available) {
         OverflowMode::Clip => OverflowMode::More,
@@ -1091,7 +1091,7 @@ pub fn rail_name_fits(label: &str) -> bool {
     rail_name_extent(label) + 8.0 <= RAIL_WIDTH
 }
 
-/// Central pane a `WorkspaceTab` must fill. More ⋯ destinations never collapse to Timing.
+/// Central pane a `WorkspaceTab` must fill. More ... destinations never collapse to Timing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspacePane {
     Editor,
@@ -1167,7 +1167,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
     }
 }
 
-/// Non-canvas WorkspaceTabs live in More ⋯ and must paint `pane_for_workspace` in the center.
+/// Non-canvas WorkspaceTabs live in More ... and must paint `pane_for_workspace` in the center.
 pub fn is_more_destination(tab: WorkspaceTab) -> bool {
     !tab.is_canvas()
 }
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(tiny.tab_rows.len(), 1);
         assert!(
             tiny.tab_rows.iter().any(|r| r.contains(&MORE)),
-            "More ⋯: {:?}",
+            "More ...: {:?}",
             tiny.tab_rows
         );
         assert_eq!(tiny.dropped_workspace(), 0);

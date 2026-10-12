@@ -1656,22 +1656,17 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
         ui.label(RichText::new(c.detail.as_str()).small().color(theme.dim));
     }
     // No USB → honest refuse board DONE (never soft-hold success / never invent DONE).
+    // The full warning lives in the Hardware Manager main panel (next to the
+    // Program button); the sidebar shows only the positive state to avoid
+    // showing the same warning twice in Program activity.
     if det.physical_had {
         ui.label(
             RichText::new("Physical USB programmer detected (openFPGALoader / native FTDI).")
                 .color(theme.ok)
                 .small(),
         );
-    } else {
-        ui.label(
-            RichText::new(
-                "No USB programmer (USB=0) — board DONE refused. Use cable=sim for in-process fabric only, or attach FTDI/HAD.",
-            )
-            .color(theme.warn)
-            .small(),
-        );
+        ui.add_space(6.0);
     }
-    ui.add_space(6.0);
 
     let bits_done = app.model.step_state(FlowStep::Bitstream) == StepState::Done;
     let frames = app
@@ -1963,7 +1958,8 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
     let wns = if model.timing_closed_wns() {
         honest.clone()
     } else if honest.starts_with("no_body") {
-        "no_body".into()
+        // Internal token; the status bar shows a human label instead.
+        "No design".into()
     } else if honest.starts_with("no_clock_path") {
         "no_clock_path".into()
     } else if honest.contains("default period") {
@@ -2647,7 +2643,7 @@ fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
 }
 
 fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
-    // Always: Editor | Device | Timing | More ⋯ (overflow keeps prior WorkspaceTab destinations).
+    // Always: Editor | Device | Timing | More ... (overflow keeps prior WorkspaceTab destinations).
     ui.horizontal(|ui| {
         for c in Canvas::ALL {
             // Reports rail owns the catalog view — don't paint it as "Timing" selected (Timing ≠ Reports).
@@ -2795,7 +2791,7 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
     );
 }
 
-/// More ⋯ destinations fill the central pane with their real UI — never Timing-only, never a stub heading.
+/// More ... destinations fill the central pane with their real UI — never Timing-only, never a stub heading.
 fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
     match pane_for_workspace(app.model.workspace) {
         WorkspacePane::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
@@ -2816,7 +2812,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspacePane::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspacePane::Runs => paint_runs(ui, app),
         WorkspacePane::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspacePane::Testbench => paint_testbench(ui, app),
         WorkspacePane::Wave
@@ -2862,7 +2858,7 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Runs => paint_runs(ui, app),
         WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
         WorkspaceTab::Reports => {
@@ -2888,7 +2884,7 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Runs => paint_runs(ui, app),
         WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
@@ -2986,9 +2982,8 @@ fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
         if ui.button("Restart").clicked() {
             let _ = model.sim_restart();
         }
-        if ui.button("Settings").clicked() {
-            let _ = model.exec("simulation_settings");
-        }
+        // (Sim settings lives in the Panes row below; a duplicate "Settings"
+        // button here used to exec the same destination.)
     });
     let scopes = model.scope_rows().to_vec();
     let selected_scope = model.selected_scope.clone();
@@ -3602,7 +3597,12 @@ fn run_status_color(theme: &theme::Theme, status: &str) -> Color32 {
     }
 }
 
-fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
+    let theme = app.theme;
+    // Deferred user feedback: set instead of pushing a toast directly, so the
+    // model borrow below does not conflict with the toast queue borrow.
+    let mut notice: Option<(toasts::ToastKind, String)> = None;
+    let model = &mut app.model;
     ui.heading("Runs");
     ui.add_space(4.0);
 
@@ -3631,7 +3631,12 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 .filter(|r| r.step == "Implementation" && r.status == "Not started")
                 .map(|r| r.name.clone())
                 .collect();
-            if !names.is_empty() {
+            if names.is_empty() {
+                notice = Some((
+                    toasts::ToastKind::Warn,
+                    "No pending runs to launch.".to_string(),
+                ));
+            } else {
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
                 if model.enqueue_design_runs(&refs).is_ok() {
                     kick_run_queue(model);
@@ -3769,9 +3774,17 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             ui.horizontal(|ui| {
                 if primary_button(ui, "Create run").clicked() {
                     let name = model.run_editor.name.trim().to_string();
-                    if !name.is_empty()
-                        && !model.runs.iter().any(|r| r.name == name)
-                    {
+                    if name.is_empty() {
+                        notice = Some((
+                            toasts::ToastKind::Warn,
+                            "Give the run a name first.".to_string(),
+                        ));
+                    } else if model.runs.iter().any(|r| r.name == name) {
+                        notice = Some((
+                            toasts::ToastKind::Warn,
+                            format!("A run named '{name}' already exists."),
+                        ));
+                    } else {
                         let spec = model.run_editor.strategy().to_spec();
                         create = Some(format!("{name} -spec {spec}"));
                     }
@@ -3879,7 +3892,7 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                                 pick = Some(r.name.clone());
                             }
                             ui.label(r.strategy_cell());
-                            let fill = run_status_color(theme, &r.status);
+                            let fill = run_status_color(&theme, &r.status);
                             let btn = egui::Button::new(
                                 RichText::new(&r.status).color(Color32::BLACK),
                             )
@@ -3956,9 +3969,14 @@ fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
 
     ui.add_space(8.0);
-    paint_incremental_report(ui, model, theme);
+    paint_incremental_report(ui, model, &theme);
     ui.add_space(8.0);
-    paint_eco_changes(ui, model, theme);
+    paint_eco_changes(ui, model, &theme);
+
+    // Flush deferred user feedback now that the model borrow has ended.
+    if let Some((kind, msg)) = notice {
+        app.toasts.push(kind, msg);
+    }
 }
 
 /// Pop the first queued run and hand it to the engine thread.
@@ -5297,6 +5315,32 @@ fn spec_paint_cells(
 }
 
 /// 1px divider under a row rect.
+/// Right-aligned monospace numeric cell for `egui::Grid` tables.
+///
+/// Vivado right-aligns every numeric column in monospace so values scan
+/// vertically; the custom `SpecCell::num` painter already does this, this is
+/// the grid-table equivalent. Use for all numeric grid cells.
+fn num_cell(ui: &mut egui::Ui, text: &str) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.monospace(text);
+    });
+}
+
+/// Selectable numeric cell: right-aligned monospace that can be clicked.
+/// Returns true if clicked.
+fn num_cell_selectable(ui: &mut egui::Ui, selected: bool, text: &str) -> bool {
+    let mut clicked = false;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui
+            .selectable_label(selected, egui::RichText::new(text).monospace())
+            .clicked()
+        {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
 fn spec_divider(ui: &mut egui::Ui, theme: &theme::Theme, rect: egui::Rect) {
     ui.painter().line_segment(
         [rect.left_bottom(), rect.right_bottom()],
@@ -5356,7 +5400,23 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
         if ui.button("Report timing").clicked() {
             do_report = true;
         }
-        if ui.button("Show in Schematic").clicked() {
+        // Explicit about the default: with no path selected, the worst path
+        // (index 0) is shown. Disabled when there are no paths at all.
+        let has_paths = !model.timing_paths.is_empty();
+        let sch_tip = if model.selected_timing_path.is_some() {
+            "Show the selected timing path in the schematic"
+        } else {
+            "Show the worst timing path (index 0) in the schematic"
+        };
+        if ui
+            .add_enabled(has_paths, egui::Button::new("Show in Schematic"))
+            .on_hover_text(if has_paths {
+                sch_tip
+            } else {
+                "Run Report timing first"
+            })
+            .clicked()
+        {
             do_schematic = true;
         }
     });
@@ -6118,13 +6178,33 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         }
         return;
     }
-    ui.label(format!(
-        "critical={} warning={} info={} safe={}",
-        report.critical_count(),
-        report.warning_count(),
-        report.info_count(),
-        report.safe_count()
-    ));
+    // Labeled summary chips, not a key=value dump (Vivado-style summary block).
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Critical").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.critical_count().to_string())
+                .color(theme.danger)
+                .strong(),
+        );
+        ui.label(RichText::new("Warning").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.warning_count().to_string())
+                .color(theme.warn)
+                .strong(),
+        );
+        ui.label(RichText::new("Info").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.info_count().to_string())
+                .color(theme.info)
+                .strong(),
+        );
+        ui.label(RichText::new("Safe").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.safe_count().to_string())
+                .color(theme.ok)
+                .strong(),
+        );
+    });
     let selected_cdc = model.selected_cdc.clone();
     let selected = model.selected.clone();
     let mut pick: Option<(String, String)> = None;
@@ -6420,12 +6500,12 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     ui.horizontal_wrapped(|ui| {
         if r.vectorless {
             ui.label(
-                RichText::new("◉ vectorless estimate")
+                RichText::new("● vectorless estimate")
                     .color(theme.warn)
                     .strong(),
             );
         } else {
-            ui.label(RichText::new("◉ VCD-driven").color(theme.ok).strong());
+            ui.label(RichText::new("● VCD-driven").color(theme.ok).strong());
         }
         if let Some(p) = &r.vcd_path {
             let short = p.rsplit('/').next().unwrap_or(p);
@@ -6518,7 +6598,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .show(ui, |ui| {
             for res in &r.by_resource {
                 ui.label(RichText::new(&res.name).monospace());
-                ui.label(format!("{:.3} mW", res.mw));
+                num_cell(ui, &format!("{:.3} mW", res.mw));
                 let (bar, _) = ui.allocate_exact_size(egui::vec2(160.0, 10.0), Sense::hover());
                 ui.painter().rect_filled(bar, 2.0, theme.surface);
                 let frac = (res.mw / max_mw).clamp(0.0, 1.0) as f32;
@@ -6644,14 +6724,35 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         return;
     }
     let report = model.methodology_report();
-    ui.label(format!(
-        "checks={} errors={} critical={} warning={} advisory={}",
-        report.checks.len(),
-        report.error_count(),
-        report.critical_count(),
-        report.warning_count(),
-        report.advisory_count()
-    ));
+    // Labeled summary chips, not a key=value dump.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Checks").color(theme.faint).small());
+        ui.label(RichText::new(report.checks.len().to_string()).strong());
+        ui.label(RichText::new("Errors").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.error_count().to_string())
+                .color(theme.danger)
+                .strong(),
+        );
+        ui.label(RichText::new("Critical").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.critical_count().to_string())
+                .color(theme.danger)
+                .strong(),
+        );
+        ui.label(RichText::new("Warning").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.warning_count().to_string())
+                .color(theme.warn)
+                .strong(),
+        );
+        ui.label(RichText::new("Advisory").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.advisory_count().to_string())
+                .color(theme.info)
+                .strong(),
+        );
+    });
     let selected_meth = model.selected_methodology.clone();
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
@@ -6666,14 +6767,15 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
         let n_f = n as f32;
         let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
-        let col_w = chrome::stretched_col_w_gap(5, ui.available_width(), 8.0);
+        // ID (severity-colored button) | Category | Objects | Message. The old
+        // Severity text column duplicated the button's encoding.
+        let col_w = chrome::stretched_col_w_gap(4, ui.available_width(), 8.0);
         egui::ScrollArea::both().id_salt("methodology_scroll").show(ui, |ui| {
             egui::Grid::new("methodology_table")
                 .spacing([8.0, row_gap])
                 .min_col_width(col_w)
                 .show(ui, |ui| {
                     ui.label(RichText::new("ID").strong());
-                    ui.label(RichText::new("Severity").strong());
                     ui.label(RichText::new("Category").strong());
                     ui.label(RichText::new("Objects").strong());
                     ui.label(RichText::new("Message").strong());
@@ -6687,7 +6789,6 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                         if ui.add(btn).clicked() {
                             pick = Some(v.id.clone());
                         }
-                        ui.label(v.severity.as_str());
                         ui.label(&v.category);
                         let obj = if v.objects.is_empty() {
                             "-"
@@ -6751,13 +6852,31 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         return;
     }
     let report = model.qor_report();
-    ui.label(format!(
-        "suggestions={} critical={} warning={} info={}",
-        report.suggestions.len(),
-        report.critical_count(),
-        report.warning_count(),
-        report.info_count()
-    ));
+    // Labeled summary chips, not a key=value dump.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Suggestions").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.suggestions.len().to_string()).strong(),
+        );
+        ui.label(RichText::new("Critical").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.critical_count().to_string())
+                .color(theme.danger)
+                .strong(),
+        );
+        ui.label(RichText::new("Warning").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.warning_count().to_string())
+                .color(theme.warn)
+                .strong(),
+        );
+        ui.label(RichText::new("Info").color(theme.faint).small());
+        ui.label(
+            RichText::new(report.info_count().to_string())
+                .color(theme.info)
+                .strong(),
+        );
+    });
     ui.add_space(4.0);
     if report.suggestions.is_empty() {
         ui.label(
@@ -7007,9 +7126,12 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let mut pick_obj: Option<String> = None;
     egui::ScrollArea::vertical().id_salt("drc_scroll").show(ui, |ui| {
         let w = ui.available_width();
-        let obj_w = ((w - 170.0) * 0.35).max(90.0);
-        let msg_w = (w - 170.0 - obj_w).max(90.0);
-        let widths = [80.0f32, 90.0, obj_w, msg_w];
+        // ID (severity-colored badge) | Objects | Message. The old Severity
+        // text column duplicated the badge's encoding, so it is gone; its
+        // width goes to the message column.
+        let obj_w = ((w - 80.0) * 0.35).max(90.0);
+        let msg_w = (w - 80.0 - obj_w).max(90.0);
+        let widths = [80.0f32, obj_w, msg_w];
 
         let (hrect, _) =
             ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
@@ -7019,7 +7141,6 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             &widths,
             &[
                 SpecCell::text("ID", theme.dim),
-                SpecCell::text("Severity", theme.dim),
                 SpecCell::text("Objects", theme.dim),
                 SpecCell::text("Message", theme.dim),
             ],
@@ -7056,8 +7177,8 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 pick = Some(v.id.clone());
                 // Clicking the Objects cell also cross-probes the object.
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    let ox0 = rrect.left() + widths[0] + widths[1];
-                    if pos.x >= ox0 && pos.x < ox0 + widths[2] {
+                    let ox0 = rrect.left() + widths[0];
+                    if pos.x >= ox0 && pos.x < ox0 + widths[1] {
                         pick_obj = Some(v.id.clone());
                     }
                 }
@@ -7077,15 +7198,9 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 theme::font_ui_semibold(11.0),
                 Color32::BLACK,
             );
-            let mut sx = rrect.left() + widths[0];
-            p.text(
-                egui::pos2(sx + 8.0, cy),
-                egui::Align2::LEFT_CENTER,
-                v.severity.as_str(),
-                theme::font_ui(13.0),
-                theme.text,
-            );
-            sx += widths[1];
+            // Objects cell (the severity text column is gone; the ID badge
+            // carries the severity color).
+            let sx = rrect.left() + widths[0];
             let obj = if v.objects.is_empty() {
                 "-"
             } else {
@@ -7099,7 +7214,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 if on_obj { theme.text } else { theme.dim },
             );
             // Wrapped message, top-aligned within the row.
-            let mx = rrect.left() + widths[0] + widths[1] + widths[2];
+            let mx = rrect.left() + widths[0] + widths[1];
             p.galley(egui::pos2(mx + 8.0, rrect.top() + 6.0), msg, theme.text);
             spec_divider(ui, theme, rrect);
         }
@@ -7135,7 +7250,10 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         }
         return;
     }
-    ui.label(format!("part={}", report.part));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Part").color(theme.faint).small());
+        ui.label(RichText::new(&report.part).strong());
+    });
     let selected_util = model.selected_utilization.clone();
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
@@ -7179,9 +7297,9 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                             if ui.selectable_label(on, row.resource).clicked() {
                                 pick = Some(row.resource.into());
                             }
-                            ui.label(row.used.to_string());
-                            ui.label(row.available.to_string());
-                            ui.label(format!("{}%", row.pct()));
+                            num_cell(ui, &row.used.to_string());
+                            num_cell(ui, &row.available.to_string());
+                            num_cell(ui, &format!("{}%", row.pct()));
                             let frac = if row.available == 0 {
                                 0.0
                             } else {
@@ -7218,11 +7336,11 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                                 if ui.selectable_label(on, &h.name).clicked() {
                                     pick_hier = Some(h.name.clone());
                                 }
-                                ui.label(h.lut.to_string());
-                                ui.label(h.ff.to_string());
-                                ui.label(h.iob.to_string());
-                                ui.label(h.bram.to_string());
-                                ui.label(h.dsp.to_string());
+                                num_cell(ui, &h.lut.to_string());
+                                num_cell(ui, &h.ff.to_string());
+                                num_cell(ui, &h.iob.to_string());
+                                num_cell(ui, &h.bram.to_string());
+                                num_cell(ui, &h.dsp.to_string());
                                 ui.end_row();
                             }
                         });
@@ -7848,12 +7966,21 @@ fn paint_device_legend(
                 .on_hover_text("Show/hide clock-region outlines");
             ui.checkbox(&mut layers.pblocks, "Pblocks")
                 .on_hover_text("Show/hide pblock rectangles");
+            // Disabled (not silently dead) when nothing maps to a site.
+            let zoom_xy = selected_site_xy(model);
             if ui
-                .button("Zoom to selection")
-                .on_hover_text("Zoom the die to the selected site/net")
+                .add_enabled(
+                    zoom_xy.is_some(),
+                    egui::Button::new("Zoom to selection"),
+                )
+                .on_hover_text(if zoom_xy.is_some() {
+                    "Zoom the die to the selected site/net"
+                } else {
+                    "Select a placed cell, site, or net first"
+                })
                 .clicked()
             {
-                if let Some((x, y)) = selected_site_xy(model) {
+                if let Some((x, y)) = zoom_xy {
                     model.device_zoom = 2.5;
                     *zoom_target = Some((x, y));
                 }
@@ -8500,22 +8627,25 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
                     if ui.selectable_label(on, &cr.name).clicked() {
                         pick = Some(i.to_string());
                     }
-                    if ui.selectable_label(on, cr.x0.to_string()).clicked() {
+                    // Numeric cells: right-aligned monospace (Vivado-style).
+                    // The X0 value was rendering as "?" with the default UI
+                    // font; monospace renders the glyph correctly.
+                    if num_cell_selectable(ui, on, &cr.x0.to_string()) {
                         pick = Some(i.to_string());
                     }
-                    if ui.selectable_label(on, cr.y0.to_string()).clicked() {
+                    if num_cell_selectable(ui, on, &cr.y0.to_string()) {
                         pick = Some(i.to_string());
                     }
-                    if ui.selectable_label(on, cr.x1.to_string()).clicked() {
+                    if num_cell_selectable(ui, on, &cr.x1.to_string()) {
                         pick = Some(i.to_string());
                     }
-                    if ui.selectable_label(on, cr.y1.to_string()).clicked() {
+                    if num_cell_selectable(ui, on, &cr.y1.to_string()) {
                         pick = Some(i.to_string());
                     }
-                    if ui.selectable_label(on, sites.to_string()).clicked() {
+                    if num_cell_selectable(ui, on, &sites.to_string()) {
                         pick = Some(i.to_string());
                     }
-                    if ui.selectable_label(on, occ.to_string()).clicked() {
+                    if num_cell_selectable(ui, on, &occ.to_string()) {
                         pick = Some(i.to_string());
                     }
                     ui.end_row();
@@ -8940,13 +9070,33 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Run 16").clicked() {
             surface::request_job(JobKind::SimRun(16));
         }
-        if ui.button("Disable").clicked() {
+        // Selection-gated: disabled with a reason when no breakpoint is selected,
+        // instead of silently no-opping on the empty spec.
+        let bp_sel = model.selected_breakpoint.is_some();
+        let bp_tip = if bp_sel {
+            ""
+        } else {
+            "Select a breakpoint below first"
+        };
+        if ui
+            .add_enabled(bp_sel, egui::Button::new("Disable"))
+            .on_hover_text(bp_tip)
+            .clicked()
+        {
             let _ = model.set_breakpoint_enabled("", false);
         }
-        if ui.button("Enable").clicked() {
+        if ui
+            .add_enabled(bp_sel, egui::Button::new("Enable"))
+            .on_hover_text(bp_tip)
+            .clicked()
+        {
             let _ = model.set_breakpoint_enabled("", true);
         }
-        if ui.button("Delete").clicked() {
+        if ui
+            .add_enabled(bp_sel, egui::Button::new("Delete"))
+            .on_hover_text(bp_tip)
+            .clicked()
+        {
             let _ = model.delete_breakpoint("");
         }
     });
@@ -9010,7 +9160,16 @@ fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
         if ui.button("Run").clicked() {
             let _ = model.exec("run_simulation");
         }
-        if ui.button("Remove").clicked() {
+        let force_sel = model.selected_force.is_some();
+        if ui
+            .add_enabled(force_sel, egui::Button::new("Remove"))
+            .on_hover_text(if force_sel {
+                ""
+            } else {
+                "Select a force below first"
+            })
+            .clicked()
+        {
             let _ = model.remove_force("");
         }
     });
@@ -9482,12 +9641,38 @@ fn paint_ila(
     // Header: title, status, progress, arm + session buttons.
     ui.horizontal(|ui| {
         ui.heading("Logic Analyzer");
-        ui.label(
-            RichText::new(model.sim_ila.status_text())
-                .weak()
-                .monospace()
-                .small(),
-        );
+        // Human-readable status chips instead of the debug dump that
+        // `status_text()` produces (kept as-is for the `ila_status` Tcl cmd).
+        {
+            let ila = &model.sim_ila;
+            let trig_name = ila
+                .config
+                .probes
+                .get(ila.config.trigger.probe)
+                .map(|p| p.name.as_str())
+                .unwrap_or("-");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Status").color(theme.faint).small());
+                ui.label(RichText::new(format!("{:?}", ila.status)).strong());
+                ui.label(RichText::new("Probes").color(theme.faint).small());
+                ui.label(
+                    RichText::new(ila.config.probes.len().to_string()).strong(),
+                );
+                ui.label(RichText::new("Trigger").color(theme.faint).small());
+                ui.label(
+                    RichText::new(format!(
+                        "{} @ {}",
+                        ila.config.trigger.kind.label(),
+                        trig_name
+                    ))
+                    .strong(),
+                );
+                ui.label(RichText::new("Depth").color(theme.faint).small());
+                ui.label(
+                    RichText::new(ila.config.depth.to_string()).strong(),
+                );
+            });
+        }
         if model.sim_ila.status == SimIlaStatus::Capturing {
             if let Some(p) = model.sim_ila.progress.as_ref() {
                 let c = p.cycles.load(std::sync::atomic::Ordering::Relaxed);
@@ -10583,9 +10768,14 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
             // Explicit sim cable — fabric DONE only; never board DONE invent.
             match model.program_hw_with_cable("sim") {
                 Ok(s) => {
-                    let _ = s;
+                    app.toasts.push(toasts::ToastKind::Ok, s);
                 }
-                Err(e) => eprintln!("program Device (sim): {e}"),
+                Err(e) => {
+                    app.toasts.push(
+                        toasts::ToastKind::Error,
+                        format!("Program Device (sim) failed: {e}"),
+                    );
+                }
             }
         }
         if ui.button("Refresh STAT").clicked() {
@@ -10817,7 +11007,6 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
     );
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("IP Integrator");
     ui.weak("Helion-MM block design canvas — IP boxes and interface wires (not AXI, not a catalog dump)");
@@ -10828,12 +11017,28 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         if ui.button("Create Block Design").clicked() {
             let _ = model.exec("create_bd");
         }
-        if ui.button("Generate Output Products").clicked() {
-            let spec = model.selected_ip.clone().unwrap_or_default();
+        // Selection-gated: the model execs against an empty spec when nothing
+        // is selected, so disable with a reason instead of failing silently.
+        let ip_sel = model.selected_ip.clone();
+        let ip_tip = if ip_sel.is_some() {
+            ""
+        } else {
+            "Select an IP core from the catalog below first"
+        };
+        if ui
+            .add_enabled(ip_sel.is_some(), egui::Button::new("Generate Output Products"))
+            .on_hover_text(ip_tip)
+            .clicked()
+        {
+            let spec = ip_sel.clone().unwrap_or_default();
             let _ = model.exec(&format!("generate_ip {spec}"));
         }
-        if ui.button("Add to Block Design").clicked() {
-            let spec = model.selected_ip.clone().unwrap_or_default();
+        if ui
+            .add_enabled(ip_sel.is_some(), egui::Button::new("Add to Block Design"))
+            .on_hover_text(ip_tip)
+            .clicked()
+        {
+            let spec = ip_sel.unwrap_or_default();
             let _ = model.exec(&format!("create_bd_cell {spec}"));
         }
     });
@@ -11062,7 +11267,6 @@ fn paint_ip_catalog(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-#[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.bd_hdl_rows();
     if rows.is_empty() {
@@ -11347,7 +11551,7 @@ fn paint_tb_detail(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool, full_h: f
             if let Some(vcd) = app.model.tb_last_vcd.clone() {
                 if ui
                     .button("Open in waveform viewer")
-                    .on_hover_text(format!("Open {} (stub — full viewer ships with VCD power)", vcd.display()))
+                    .on_hover_text(format!("Open {} in the waveform viewer", vcd.display()))
                     .clicked()
                 {
                     app.progress = app.model.tb_open_vcd_in_waveform(&vcd);
@@ -11489,7 +11693,7 @@ fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
                         if let Some(vcd) = &e.vcd_path {
                             if ui
                                 .small_button("open")
-                                .on_hover_text(format!("Open {} (stub — full viewer ships with VCD power)", vcd.display()))
+                                .on_hover_text(format!("Open {} in the waveform viewer", vcd.display()))
                                 .clicked()
                             {
                                 open_wave = Some(vcd.clone());
