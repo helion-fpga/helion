@@ -233,8 +233,8 @@ pub(crate) fn impl_if_needed(shell: &mut GpuiShell) -> Result<(), String> {
     shell.session.impl_design(d, &dev)
 }
 
-/// Tcl dispatch — every chrome button is a command string.
-/// Tcl dispatch — every chrome button is a command string.
+/// Tcl dispatch - every chrome button is a command string.
+/// Tcl dispatch - every chrome button is a command string.
 ///
 /// Evaluates `cmd` with the real Tcl-subset interpreter
 /// ([`crate::tcl`]) against the shell's persistent session. `puts` output

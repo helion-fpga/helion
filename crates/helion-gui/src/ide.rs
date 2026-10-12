@@ -1,4 +1,4 @@
-//! Headless IDE model — the Vivado-class application state.
+//! Headless IDE model - the Vivado-class application state.
 //!
 //! Sources/netlist Name/Type table, Tcl Console Status/Cmd/Out table, flow rail
 //! (Synthesis → Opt → Place → Route → Bitstream), UG893 Project Summary dashboard
@@ -471,7 +471,7 @@ impl UtilizationReport {
 
     pub fn text(&self) -> String {
         if self.part.is_empty() {
-            return "no placed design — run Place".into();
+            return "no placed design - run Place".into();
         }
         let mut lines = Vec::new();
         if let (Some(lut), Some(iob), Some(bram), Some(dsp)) = (
@@ -654,7 +654,7 @@ impl NavSection {
         }
     }
 
-    /// UG949 Flow Navigator children — each Tcl hits a Helion engine, not empty chrome.
+    /// UG949 Flow Navigator children - each Tcl hits a Helion engine, not empty chrome.
     pub fn actions(self) -> &'static [NavAction] {
         match self {
             NavSection::BoardDevice => &[
@@ -976,7 +976,7 @@ pub enum ConstraintSection {
     IoDelay,
     Exception,
     /// I/O placement properties (PACKAGE_PIN, IOSTANDARD, DRIVE, SLEW,
-    /// PULLTYPE, DIFF_TERM, IN_TERM) — not timing exceptions.
+    /// PULLTYPE, DIFF_TERM, IN_TERM) - not timing exceptions.
     IoPlacement,
 }
 
@@ -1149,7 +1149,7 @@ impl BitstreamReport {
 
     pub fn text(&self) -> String {
         if self.frames == 0 && self.bytes == 0 {
-            return "no bitstream — run Bitstream".into();
+            return "no bitstream - run Bitstream".into();
         }
         let mut s = format!(
             "bitstream idcode={:#010x} hash={:#010x} bytes={} frames={} configured={}",
@@ -2632,7 +2632,7 @@ pub struct DeviceSiteView {
 impl DeviceSiteView {
     /// HAD site name as painted on the Device drawing (`CLB_X2Y1`, `IOB_X5Y0`).
     pub fn site_name(&self) -> String {
-        // Live HAD Site::id (FM-HEL-L2-UI) — same CLB_/IOB_ form as DeviceView::site_name.
+        // Live HAD Site::id (FM-HEL-L2-UI) - same CLB_/IOB_ form as DeviceView::site_name.
         Site {
             x: self.x,
             y: self.y,
@@ -3015,7 +3015,7 @@ impl WaveTrace {
         }
     }
 
-    /// 0/1 string of the LSB of each sample — the fabric LED bitstring for scalars.
+    /// 0/1 string of the LSB of each sample - the fabric LED bitstring for scalars.
     pub fn bit_string(&self) -> String {
         self.samples
             .iter()
@@ -3706,7 +3706,7 @@ pub struct ForceRow {
     /// `force` (hold) / `deposit` (one-shot poke).
     pub kind: String,
     pub value: u64,
-    /// `bin` / `hex` — UG900 radix column, not a dump caption.
+    /// `bin` / `hex` - UG900 radix column, not a dump caption.
     pub radix: String,
     pub start_ps: u64,
     /// 0 = no cancel (hold until `remove_force`).
@@ -3929,17 +3929,17 @@ pub struct IoPortView {
     pub site: Option<String>,
     /// `set_property PACKAGE_PIN` / LOC constraint (may precede place).
     pub package_pin: Option<String>,
-    /// `set_property IOSTANDARD` — HAD-legal pad standard (STA pad delay / DRC VCCO).
+    /// `set_property IOSTANDARD` - HAD-legal pad standard (STA pad delay / DRC VCCO).
     pub iostandard: Option<String>,
-    /// `set_property DRIVE` — HAD-legal mA (STA pad delay / DRC vs IOSTANDARD / bitgen).
+    /// `set_property DRIVE` - HAD-legal mA (STA pad delay / DRC vs IOSTANDARD / bitgen).
     pub drive: Option<String>,
-    /// `set_property SLEW` — SLOW | FAST.
+    /// `set_property SLEW` - SLOW | FAST.
     pub slew: Option<String>,
-    /// `set_property PULLTYPE` — NONE | PULLUP | PULLDOWN | KEEPER.
+    /// `set_property PULLTYPE` - NONE | PULLUP | PULLDOWN | KEEPER.
     pub pulltype: Option<String>,
-    /// `set_property DIFF_TERM` — TRUE | FALSE (HAD SSTL/HSTL only when TRUE).
+    /// `set_property DIFF_TERM` - TRUE | FALSE (HAD SSTL/HSTL only when TRUE).
     pub diff_term: Option<String>,
-    /// `set_property IN_TERM` — NONE | UNTUNED_SPLIT_{40,50,60}.
+    /// `set_property IN_TERM` - NONE | UNTUNED_SPLIT_{40,50,60}.
     pub in_term: Option<String>,
 }
 
@@ -4636,7 +4636,7 @@ impl HwStatReport {
 
     pub fn text(&self) -> String {
         if !self.open {
-            return "no hardware — open_hw_manager".into();
+            return "no hardware - open_hw_manager".into();
         }
         let mut s = format!(
             "hw_stat target={} part={} idcode={:#010x} ir={:#04x} programmed={} word={}",
@@ -5198,7 +5198,7 @@ impl ProjectSummaryGadget {
     }
 }
 
-/// UG893 Hierarchy — top module + instances + leaf primitives from HNF.
+/// UG893 Hierarchy - top module + instances + leaf primitives from HNF.
 #[derive(Clone, Debug, Default)]
 pub struct HierarchyView {
     pub top: Option<String>,
@@ -5436,7 +5436,7 @@ pub struct FindHit {
     /// Object type: `cell` / `net` / `port` / `pin` (HNF or HAD).
     pub kind: String,
     pub name: String,
-    /// LUT6 / HFF / IN / fanout=N / BANKn — Type is `kind`, this is the primitive.
+    /// LUT6 / HFF / IN / fanout=N / BANKn - Type is `kind`, this is the primitive.
     pub primitive: String,
     /// HNF top / connected port.
     pub parent: String,
@@ -5668,7 +5668,7 @@ pub struct IdeModel {
     pub generated_ip_xml: Option<String>,
     pub block_design: Option<BdView>,
     pub drc: Option<Drc>,
-    /// UG893 Timing Constraints — SDC/XDC clocks that feed helion-sta.
+    /// UG893 Timing Constraints - SDC/XDC clocks that feed helion-sta.
     pub constraints: Constraints,
     pub hierarchy: HierarchyView,
     pub find_results: Vec<FindHit>,
@@ -5702,7 +5702,7 @@ pub struct IdeModel {
     pub sim_timescale_ps: u64,
     /// UG900 default `run_simulation` / `sim_run` cycle count.
     pub sim_runtime_cycles: u32,
-    /// UG900 `log_all_signals` — sample every helion-sim object onto Wave.
+    /// UG900 `log_all_signals` - sample every helion-sim object onto Wave.
     pub sim_log_all_signals: bool,
     /// UG900 Simulation set (`sim_1`). Independent of Project Settings FILESET.
     pub sim_fileset: String,
@@ -6012,7 +6012,7 @@ impl IdeModel {
             fabric_sim: None,
             sim_ila: SimIla::default(),
         };
-        // Vivado shows the part floorplan before sources exist — HAD
+        // Vivado shows the part floorplan before sources exist - HAD
         // sites, not empty chrome.
         // D10: every launch's journal opens with a session boundary, so
         // repeated commands never read as accidental duplicates.
@@ -6135,7 +6135,7 @@ impl IdeModel {
         }
     }
 
-    /// Real bitstream hash — `None` until `write_bitstream` actually ran.
+    /// Real bitstream hash - `None` until `write_bitstream` actually ran.
     pub fn bitstream_hash(&self) -> Option<u32> {
         self.shell.session.blinky_hash()
     }
@@ -6246,7 +6246,7 @@ impl IdeModel {
         if self.shell.session.design.is_some() {
             return self.placed_timing_pane();
         }
-        "no routed design — run Route".into()
+        "no routed design - run Route".into()
     }
 
     /// Place/route facts plus the honesty label. No closed WNS without an Hff.
@@ -7302,7 +7302,7 @@ impl IdeModel {
         } else if t == "select_log" {
             self.select_log("")
         } else if t == "report_timing" {
-            // Same clocks as the Reports/Constraints panes — not Session's 10 ns default.
+            // Same clocks as the Reports/Constraints panes - not Session's 10 ns default.
             self.report_timing_now()
         } else {
             tcl_eval(&mut self.shell, cmd)
@@ -7644,7 +7644,7 @@ impl IdeModel {
         None
     }
 
-    /// Click a UG893 Messages object link — cross-probe HNF/HAD, not a dump.
+    /// Click a UG893 Messages object link - cross-probe HNF/HAD, not a dump.
     pub fn select_message_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -7701,7 +7701,7 @@ impl IdeModel {
         s
     }
 
-    /// Clickable Log rows — same journal as the Tcl console, not a restyle of `log`.
+    /// Clickable Log rows - same journal as the Tcl console, not a restyle of `log`.
     pub fn log_rows(&self) -> Vec<(usize, &ConsoleLine)> {
         self.console.iter().enumerate().collect()
     }
@@ -7824,7 +7824,7 @@ impl IdeModel {
         Ok(self.sim_log_text())
     }
 
-    /// Click a UG900 Simulation Log row — Wave/Source, not a Tcl/Log dump.
+    /// Click a UG900 Simulation Log row - Wave/Source, not a Tcl/Log dump.
     pub fn select_sim_log(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -7904,7 +7904,7 @@ impl IdeModel {
         s
     }
 
-    /// Clickable Tcl Console rows — Status/Cmd/Out over Session, not a restyle of `log`.
+    /// Clickable Tcl Console rows - Status/Cmd/Out over Session, not a restyle of `log`.
     pub fn console_rows(&self) -> Vec<(usize, &ConsoleLine)> {
         self.console.iter().enumerate().collect()
     }
@@ -8167,7 +8167,7 @@ impl IdeModel {
     /// and synthesizes so Implement can place+route.
     ///
     /// Files lists this project's sources (`.sv`/`.v`/…) and constraint files (`.sdc`/`.xdc`)
-    /// — prior Sources rows are replaced so Recent → Open `.prj` matches Create Project.
+    /// - prior Sources rows are replaced so Recent → Open `.prj` matches Create Project.
     pub fn open_project(&mut self, path: &Path) -> Result<String, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("open_project {}: {e}", path.display()))?;
@@ -8317,7 +8317,7 @@ impl IdeModel {
         }
 
         let mut commented = String::new();
-        commented.push_str(&format!("# Helion project — {name}\n"));
+        commented.push_str(&format!("# Helion project - {name}\n"));
         commented.push_str(&format_prj(&pf));
         std::fs::write(&prj_path, &commented)
             .map_err(|e| format!("create_project write {}: {e}", prj_path.display()))?;
@@ -8424,7 +8424,7 @@ impl IdeModel {
             return Err("save_project_as: open a design with at least one RTL source first".into());
         }
         if self.shell.session.design.is_none() {
-            return Err("save_project_as: no open design — synthesize first".into());
+            return Err("save_project_as: no open design - synthesize first".into());
         }
 
         let default_name = self
@@ -8538,7 +8538,7 @@ impl IdeModel {
         }
 
         let mut commented = String::new();
-        commented.push_str(&format!("# Helion project — {name} (Save Project As)\n"));
+        commented.push_str(&format!("# Helion project - {name} (Save Project As)\n"));
         commented.push_str(&format_prj(&pf));
         std::fs::write(&prj_path, &commented)
             .map_err(|e| format!("save_project_as write {}: {e}", prj_path.display()))?;
@@ -8568,8 +8568,8 @@ impl IdeModel {
         self.save_project_as(Path::new(dest), name)
     }
 
-    /// Run one rail step. Refuses to run out of order — Route before Place is an error,
-    /// Bitstream before Route is an error — and every step calls the real engine.
+    /// Run one rail step. Refuses to run out of order - Route before Place is an error,
+    /// Bitstream before Route is an error - and every step calls the real engine.
     pub fn run_step(&mut self, step: FlowStep) -> Result<String, String> {
         self.run_step_from(step, None)
     }
@@ -8656,7 +8656,7 @@ impl IdeModel {
     }
 
     // ------------------------------------------------------------------
-    // Design checkpoints (`.hck2`) — Vivado `write_checkpoint`/`open_checkpoint`.
+    // Design checkpoints (`.hck2`) - Vivado `write_checkpoint`/`open_checkpoint`.
     // ------------------------------------------------------------------
 
     /// Directory holding `.hck2` files: `<project dir>/checkpoints`, or
@@ -8803,7 +8803,7 @@ impl IdeModel {
                 self.load_sibling_sdc(&path);
                 // Soft-hold I/O Planning: UI/Tcl set_property IOSTANDARD/DRIVE/SLEW
                 // live in constraints + HNF. Re-synth rebuilds the design, so re-apply
-                // onto the new ports — otherwise the I/O Ports table falls back to
+                // onto the new ports - otherwise the I/O Ports table falls back to
                 // constraints labels (wallpaper) while STA/DRC lose the attrs.
                 if let Some(d) = self.shell.session.design.as_mut() {
                     let _ = self.constraints.apply(d);
@@ -9215,7 +9215,7 @@ impl IdeModel {
         Ok(self.wave_markers_text())
     }
 
-    /// Click a UG900 Wave Marker row — sets the wave cursor to that engine sample.
+    /// Click a UG900 Wave Marker row - sets the wave cursor to that engine sample.
     pub fn select_wave_marker(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -9327,7 +9327,7 @@ impl IdeModel {
         Ok(self.virtual_buses_text())
     }
 
-    /// Click a UG900 Virtual Bus row — Wave/Properties, not a pack dump.
+    /// Click a UG900 Virtual Bus row - Wave/Properties, not a pack dump.
     pub fn select_virtual_bus(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -9522,7 +9522,7 @@ impl IdeModel {
         Ok(self.wave_cursors_text())
     }
 
-    /// Click a UG900 A/B cursor row — Properties + Wave, not a caption dump.
+    /// Click a UG900 A/B cursor row - Properties + Wave, not a caption dump.
     pub fn select_wave_cursor(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -9688,7 +9688,7 @@ impl IdeModel {
         s
     }
 
-    /// Click a UG893 Sources row (name, path, or index) — Name/Type table, not a dump.
+    /// Click a UG893 Sources row (name, path, or index) - Name/Type table, not a dump.
     pub fn select_source(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -9731,7 +9731,7 @@ impl IdeModel {
         Ok(row.row_text())
     }
 
-    /// Click a UG893 Netlist row (name or index) — Name/Type table, not a collapsing dump.
+    /// Click a UG893 Netlist row (name or index) - Name/Type table, not a collapsing dump.
     pub fn select_netlist(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -9771,7 +9771,7 @@ impl IdeModel {
         Ok(row.row_text())
     }
 
-    /// Click a UG893 Netlist object link — cross-probe HNF cell/net, not a dump.
+    /// Click a UG893 Netlist object link - cross-probe HNF cell/net, not a dump.
     pub fn select_netlist_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -9849,7 +9849,7 @@ impl IdeModel {
     /// UG893 Hierarchy pane dump: top, instances, then leaf primitives.
     pub fn hierarchy_text(&self) -> String {
         match &self.hierarchy.top {
-            None => "no hierarchy — synth first".into(),
+            None => "no hierarchy - synth first".into(),
             Some(top) => {
                 let mut s = format!("top={top}");
                 for (name, kind) in &self.hierarchy.nodes {
@@ -10162,7 +10162,7 @@ impl IdeModel {
     /// RTL Analysis / Synthesis child: open the elaborated HNF schematic.
     pub fn open_elaborated_schematic(&mut self) -> Result<String, String> {
         if self.schematic.nodes.is_empty() {
-            return Err("open_elaborated_schematic: no HNF — Run Synthesis first".into());
+            return Err("open_elaborated_schematic: no HNF - Run Synthesis first".into());
         }
         self.workspace = WorkspaceTab::Schematic;
         self.nav = NavSection::RtlAnalysis;
@@ -10172,7 +10172,7 @@ impl IdeModel {
     /// Fig. 61→55/56: open the schematic sheet for a hierarchy instance (or selection).
     pub fn open_hierarchy_sheet(&mut self, spec: &str) -> Result<String, String> {
         if self.schematic.nodes.is_empty() {
-            return Err("open_hierarchy_sheet: no HNF — Run Synthesis first".into());
+            return Err("open_hierarchy_sheet: no HNF - Run Synthesis first".into());
         }
         let name = {
             let s = spec.trim();
@@ -10308,7 +10308,7 @@ impl IdeModel {
 
     /// On-screen timing line. Closed `WNS_PS=` only with cells>0 and an Hff clock path,
     /// and only when no cone was skipped. A skipped map (`wide_cone`, `gate_primitive`,
-    /// and the other incomplete attrs) is `timing_incomplete` even with no Hff —
+    /// and the other incomplete attrs) is `timing_incomplete` even with no Hff -
     /// that is not `no_clock_path`. `sim_only` stays `no_body`. Built-in period
     /// says `default period, not user SDC`.
     pub fn timing_honesty_label(&self) -> String {
@@ -10445,7 +10445,7 @@ impl IdeModel {
     /// Current cross-probe selection, derived from model state.
     ///
     /// Invariant: `probe() == ProbeSelection::Path(_)` exactly when
-    /// `selected_timing_path` is `Some` — only [`IdeModel::set_probe`] sets
+    /// `selected_timing_path` is `Some` - only [`IdeModel::set_probe`] sets
     /// the field, and resets clear it.
     pub fn probe(&self) -> ProbeSelection {
         if let Some(idx) = self.selected_timing_path {
@@ -10861,7 +10861,7 @@ impl IdeModel {
         s
     }
 
-    /// UG900: click a Scope row (name or index) — Name/Type table, not a dump.
+    /// UG900: click a Scope row (name or index) - Name/Type table, not a dump.
     pub fn select_scope(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -10901,7 +10901,7 @@ impl IdeModel {
         Ok(s)
     }
 
-    /// UG900: click an Objects row (name or index) — add_wave + Properties, not a dump.
+    /// UG900: click an Objects row (name or index) - add_wave + Properties, not a dump.
     pub fn select_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -11043,7 +11043,7 @@ impl IdeModel {
             .unwrap_or_else(|| "-".into());
         let mut s = format!("source n={n} file={file} pc={pc}");
         if n == 0 {
-            s.push_str(" no source — add RTL");
+            s.push_str(" no source - add RTL");
             return s;
         }
         for l in &self.source_lines {
@@ -11216,7 +11216,7 @@ impl IdeModel {
         let n_mark = markers.iter().filter(|m| m.kind != "probe").count();
         let mut s = format!("text_editor n={n} file={file} line={line} markers={n_mark}");
         if n == 0 {
-            s.push_str(" no source — add RTL");
+            s.push_str(" no source - add RTL");
             return s;
         }
         for l in &self.source_lines {
@@ -11246,7 +11246,7 @@ impl IdeModel {
         Ok(self.editor_text())
     }
 
-    /// Click a UG893 Text Editor line — cross-probes the HNF net/cell, not a dump.
+    /// Click a UG893 Text Editor line - cross-probes the HNF net/cell, not a dump.
     pub fn select_editor_line(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -11388,7 +11388,7 @@ impl IdeModel {
         self.select_editor_line(&line.to_string())
     }
 
-    /// Click a UG900 Source line (number or index) — Line/BP/Text table, not a dump.
+    /// Click a UG900 Source line (number or index) - Line/BP/Text table, not a dump.
     pub fn select_source_line(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -11523,7 +11523,7 @@ impl IdeModel {
         let n = self.memories.len();
         let mut s = format!("memory n={n}");
         if n == 0 {
-            s.push_str(" no memories — run simulation");
+            s.push_str(" no memories - run simulation");
             return s;
         }
         for m in &self.memories {
@@ -11560,7 +11560,7 @@ impl IdeModel {
         let rows = self.memory_word_rows();
         let mut s = format!("memory_words n={} name={name}", rows.len());
         if rows.is_empty() {
-            s.push_str(" no words — select_memory");
+            s.push_str(" no words - select_memory");
             return s;
         }
         for r in &rows {
@@ -11576,7 +11576,7 @@ impl IdeModel {
         let scope = self.selected_scope.as_deref().unwrap_or("-");
         let mut s = format!("locals n={n} scope={scope}");
         if n == 0 {
-            s.push_str(" no locals — run simulation");
+            s.push_str(" no locals - run simulation");
             return s;
         }
         for l in &self.locals {
@@ -11637,7 +11637,7 @@ impl IdeModel {
         let kernel = self.sim_kernel();
         let mut s = format!("forces n={n} kernel={kernel} engine=helion-sim");
         if n == 0 {
-            s.push_str(" no forces — add_force");
+            s.push_str(" no forces - add_force");
             return s;
         }
         for r in &self.forces {
@@ -12003,7 +12003,7 @@ impl IdeModel {
         }
     }
 
-    /// UG900: click a Memory row (name or index) — contents + Properties, not a dump.
+    /// UG900: click a Memory row (name or index) - contents + Properties, not a dump.
     pub fn select_memory(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -12044,7 +12044,7 @@ impl IdeModel {
         Ok(format!("{}\n{}", m.row_text(), self.memory_words_text()))
     }
 
-    /// UG900: click a Memory address — Properties show Addr/Data from the engine word.
+    /// UG900: click a Memory address - Properties show Addr/Data from the engine word.
     pub fn select_memory_word(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -12077,7 +12077,7 @@ impl IdeModel {
         Ok(format!("memory_word NAME={name} {}", row.row_text()))
     }
 
-    /// UG900: click a Locals row (name or index) — add_wave + Properties.
+    /// UG900: click a Locals row (name or index) - add_wave + Properties.
     pub fn select_local(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -12595,7 +12595,7 @@ impl IdeModel {
         Ok(self.io_ports_text())
     }
 
-    /// Click a UG893 I/O Ports row (name or index) — Package workspace, not a dump.
+    /// Click a UG893 I/O Ports row (name or index) - Package workspace, not a dump.
     pub fn select_io_port(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -12650,7 +12650,7 @@ impl IdeModel {
         }
     }
 
-    /// Click a UG893 I/O Ports object link — cross-probe HNF port / HAD pin, not a dump.
+    /// Click a UG893 I/O Ports object link - cross-probe HNF port / HAD pin, not a dump.
     pub fn select_io_port_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -12835,7 +12835,7 @@ impl IdeModel {
 
     /// After pblock re-place/route, re-apply PACKAGE_PIN LOCs via `place_design`
     /// so counter gold WNS_PS=9640 holds while the pblocks table stays filled.
-    /// Only `clk` / `led` — extra package pins are not re-placed (gold WNS).
+    /// Only `clk` / `led` - extra package pins are not re-placed (gold WNS).
     /// Uses existing constraints when set; otherwise gold led=IOB_X2Y0 / clk=IOB_X3Y0.
     fn reapply_package_pins_after_pblock(&mut self) -> Result<(), String> {
         let ports: HashSet<String> = self
@@ -13064,7 +13064,7 @@ impl IdeModel {
         }
     }
 
-    /// Click a UG893 Floorplanning object link — cross-probe HNF cells / HAD CLB, not a dump.
+    /// Click a UG893 Floorplanning object link - cross-probe HNF cells / HAD CLB, not a dump.
     pub fn select_pblock_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -13284,7 +13284,7 @@ impl IdeModel {
     }
 
     /// I/O Planning `set_property IOSTANDARD`: bind HAD pad standard on the HNF
-    /// port so STA pad delay and DRC bank-VCCO see it — not a table label.
+    /// port so STA pad delay and DRC bank-VCCO see it - not a table label.
     pub fn set_iostandard(&mut self, port: &str, std: &str) -> Result<String, String> {
         let port = port.trim();
         let std = std.trim();
@@ -14132,7 +14132,7 @@ impl IdeModel {
         Ok(self.incremental_report_text())
     }
 
-    /// Click a UG986 Incremental Compile row — Device/Properties, not a reuse dump.
+    /// Click a UG986 Incremental Compile row - Device/Properties, not a reuse dump.
     pub fn select_incremental(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -14234,7 +14234,7 @@ impl IdeModel {
             .unwrap_or_else(|| "-".into())
     }
 
-    /// Click a UG986 Incremental Compile object link — cross-probe HNF/HAD, not a dump.
+    /// Click a UG986 Incremental Compile object link - cross-probe HNF/HAD, not a dump.
     pub fn select_incremental_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -14412,7 +14412,7 @@ impl IdeModel {
         Ok(self.eco_changes_text())
     }
 
-    /// Click a UG893/UG986 ECO Changes row — Device/Properties, not a check_eco dump.
+    /// Click a UG893/UG986 ECO Changes row - Device/Properties, not a check_eco dump.
     pub fn select_eco(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -14474,7 +14474,7 @@ impl IdeModel {
         row.name.clone()
     }
 
-    /// Click a UG893/UG986 ECO Changes object link — cross-probe HNF/HAD, not a dump.
+    /// Click a UG893/UG986 ECO Changes object link - cross-probe HNF/HAD, not a dump.
     pub fn select_eco_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -14620,7 +14620,7 @@ impl IdeModel {
         Ok(self.find_results_text())
     }
 
-    /// Click a UG893 Find Results row (name or index) — Find workspace, not a dump.
+    /// Click a UG893 Find Results row (name or index) - Find workspace, not a dump.
     pub fn select_find(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -14663,7 +14663,7 @@ impl IdeModel {
         Ok(hit.row_text())
     }
 
-    /// Click a UG893 Find Results object link — cross-probe HNF/HAD, not a dump.
+    /// Click a UG893 Find Results object link - cross-probe HNF/HAD, not a dump.
     pub fn select_find_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -15021,7 +15021,7 @@ impl IdeModel {
         let n = self.properties.len();
         let mut s = format!("properties n={n} object={obj}");
         if n == 0 {
-            s.push_str("\nno properties — select a cell, net, or port");
+            s.push_str("\nno properties - select a cell, net, or port");
             return s;
         }
         for row in self.property_rows() {
@@ -15031,7 +15031,7 @@ impl IdeModel {
         s
     }
 
-    /// Click a UG893 Properties Name/Value row — highlight that property, not a dump.
+    /// Click a UG893 Properties Name/Value row - highlight that property, not a dump.
     pub fn select_property(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -15619,7 +15619,7 @@ impl IdeModel {
         self.selected_property = Some(name.to_string());
     }
 
-    /// Click a UG893 Project Settings Name/Value row — highlight that setting, not a dump.
+    /// Click a UG893 Project Settings Name/Value row - highlight that setting, not a dump.
     pub fn select_project_setting(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -15971,7 +15971,7 @@ impl IdeModel {
         }
         let mods = self.sim_sv_modules();
         if mods.is_empty() {
-            return Err("set_property SIM_TOP: no helion-sv modules — add a source first".into());
+            return Err("set_property SIM_TOP: no helion-sv modules - add a source first".into());
         }
         let canon = mods
             .iter()
@@ -16197,7 +16197,7 @@ impl IdeModel {
     pub fn compile_sim(&mut self) -> Result<String, String> {
         let files = self.sim_rtl_files();
         if files.is_empty() {
-            return Err("compile: no helion-sv sources — add a source first".into());
+            return Err("compile: no helion-sv sources - add a source first".into());
         }
         let opts = self.sim_compile_opts();
         let mut mods = Vec::new();
@@ -16230,7 +16230,7 @@ impl IdeModel {
     pub fn elaborate_sim(&mut self) -> Result<String, String> {
         let files = self.sim_rtl_files();
         if files.is_empty() {
-            return Err("elaborate: no helion-sv sources — add a source first".into());
+            return Err("elaborate: no helion-sv sources - add a source first".into());
         }
         let opts = self.sim_compile_opts();
         let params = Self::parse_sv_params(&self.sim_param)?;
@@ -16463,7 +16463,7 @@ impl IdeModel {
         self.selected_property = Some(name.to_string());
     }
 
-    /// Click a UG900 Simulation Settings Name/Value row — highlight that setting, not a dump.
+    /// Click a UG900 Simulation Settings Name/Value row - highlight that setting, not a dump.
     pub fn select_sim_setting(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -16887,7 +16887,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG949 Clock Interaction object link — cross-probe HNF clock source.
+    /// Click a UG949 Clock Interaction object link - cross-probe HNF clock source.
     pub fn select_clock_interaction_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -16955,7 +16955,7 @@ impl IdeModel {
         self.timing_summary().text()
     }
 
-    /// Vivado-shaped `write_report` / `export_report` — UTF-8 Timing Summary or
+    /// Vivado-shaped `write_report` / `export_report` - UTF-8 Timing Summary or
     /// Utilization text to a real path (create parents). Numbers match the pane.
     pub fn write_report_cmd(&mut self, cmd: &str) -> Result<String, String> {
         let mut parts = cmd.split_whitespace();
@@ -17113,7 +17113,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG906 Timing Summary object link — cross-probe HNF clock source.
+    /// Click a UG906 Timing Summary object link - cross-probe HNF clock source.
     pub fn select_timing_summary_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -17620,7 +17620,7 @@ impl IdeModel {
         ))
     }
 
-    /// Select a net-level structural CDC crossing by net name — sets the
+    /// Select a net-level structural CDC crossing by net name - sets the
     /// property inspector (NET/CLASS/SEVERITY/CHECK/FROM/TO/DRIVERS/LOADS)
     /// and cross-probes the first driver/load cell found in the design.
     pub fn select_cdc_crossing(&mut self, net: &str) -> Result<String, String> {
@@ -17644,7 +17644,7 @@ impl IdeModel {
         self.selected_power = None;
         self.selected_utilization = None;
         self.selected = Some(net.to_string());
-        // Cross-probe: driver cells first, then loads — first hit wins.
+        // Cross-probe: driver cells first, then loads - first hit wins.
         let mut probed: Option<String> = None;
         for cell in c.driver_cells.iter().chain(c.load_cells.iter()) {
             if let Some(o) = self.apply_object_crossprobe(cell) {
@@ -17685,7 +17685,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG906 CDC object link — cross-probe HNF clock source, not a dump.
+    /// Click a UG906 CDC object link - cross-probe HNF clock source, not a dump.
     pub fn select_cdc_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -17835,7 +17835,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG903 Clock Networks object link — cross-probe HNF source/net.
+    /// Click a UG903 Clock Networks object link - cross-probe HNF source/net.
     pub fn select_clock_network_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -17916,7 +17916,7 @@ impl IdeModel {
     /// Returns `None` when there is no design. With no VCD loaded the
     /// report is the vectorless estimate (`vectorless == true`, default
     /// toggle rates, clearly labeled). Capacitances are modeled, not
-    /// silicon-measured — see [`crate::power`].
+    /// silicon-measured - see [`crate::power`].
     pub fn vcd_power_report(&self) -> Option<crate::power::VcdPowerReport> {
         let design = self.shell.session.design.as_ref()?;
         let dev = self.device().ok()?;
@@ -18033,7 +18033,7 @@ impl IdeModel {
         self.read_vcd(&s)
     }
 
-    /// Click a hot net in the VCD-driven power table — cross-probe it in the
+    /// Click a hot net in the VCD-driven power table - cross-probe it in the
     /// schematic (device routes highlighted), like any other net selection.
     /// Returns true when the net was found in the design.
     pub fn select_vcd_net(&mut self, name: &str) -> bool {
@@ -18188,7 +18188,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG907 Power object link — cross-probe HNF cells/nets, not a dump.
+    /// Click a UG907 Power object link - cross-probe HNF cells/nets, not a dump.
     pub fn select_power_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -18389,7 +18389,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG893 Utilization hierarchy instance — cross-probe HNF/Hierarchy.
+    /// Click a UG893 Utilization hierarchy instance - cross-probe HNF/Hierarchy.
     pub fn select_utilization_hier(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -18449,7 +18449,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG893 Utilization object link — cross-probe HNF cells/instances.
+    /// Click a UG893 Utilization object link - cross-probe HNF cells/instances.
     pub fn select_utilization_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -18501,7 +18501,7 @@ impl IdeModel {
         ) {
             (Some(d), _) => d.text(),
             (None, true) => self.drc_report().text(),
-            (None, false) => "no DRC — run Place/Route".into(),
+            (None, false) => "no DRC - run Place/Route".into(),
         }
     }
 
@@ -18576,7 +18576,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG893 DRC object link — cross-probe HNF/HAD, not a dump.
+    /// Click a UG893 DRC object link - cross-probe HNF/HAD, not a dump.
     pub fn select_drc_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -18585,7 +18585,7 @@ impl IdeModel {
         if self.drc.is_none()
             && !(self.shell.session.placed.is_some() || self.shell.session.routed.is_some())
         {
-            return Err("select_drc_object: no DRC — run Place/Route".into());
+            return Err("select_drc_object: no DRC - run Place/Route".into());
         }
         let report = if let Some(d) = self.drc.clone() {
             d
@@ -18669,7 +18669,7 @@ impl IdeModel {
 
     pub fn methodology_text(&self) -> String {
         if self.shell.session.design.is_none() {
-            return "no design — synth / report_methodology".into();
+            return "no design - synth / report_methodology".into();
         }
         self.methodology_report().text()
     }
@@ -18747,7 +18747,7 @@ impl IdeModel {
 
     pub fn qor_text(&self) -> String {
         if self.shell.session.design.is_none() {
-            return "no design — synth / report_qor_suggestions".into();
+            return "no design - synth / report_qor_suggestions".into();
         }
         self.qor_report().text()
     }
@@ -18891,7 +18891,7 @@ impl IdeModel {
         ))
     }
 
-    /// Click a UG949 Methodology object link — cross-probe HNF/HAD, not a dump.
+    /// Click a UG949 Methodology object link - cross-probe HNF/HAD, not a dump.
     pub fn select_methodology_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -19021,7 +19021,7 @@ impl IdeModel {
     }
 
     /// Jump to Constraints with a Vivado-shaped Fix template inserted (ready to Save).
-    /// Does not apply STA yet — Save / Apply set_output_delay does.
+    /// Does not apply STA yet - Save / Apply set_output_delay does.
     pub fn goto_methodology_constraints(&mut self, id: &str) -> Result<String, String> {
         let id = id.trim();
         if id.is_empty() {
@@ -19041,7 +19041,7 @@ impl IdeModel {
 
     /// Apply the methodology Fix (TIMING-7 → set_output_delay), insert into the
     /// Constraints SDC editor, persist via `save_sdc_editor`, and open Constraints.
-    /// Timing numbers may move — that is honest; untouched default without this
+    /// Timing numbers may move - that is honest; untouched default without this
     /// Fix still keeps gold WNS. Callers that must not dirty `examples/counter.sdc`
     /// should `open_sdc_editor` on a temp copy first.
     pub fn fix_methodology(&mut self, id: &str) -> Result<String, String> {
@@ -19528,7 +19528,7 @@ impl IdeModel {
     pub fn constraints_table_text(&self) -> String {
         let rows = self.constraint_rows();
         if rows.is_empty() {
-            return "no timing constraints — create_clock / create_generated_clock / read_xdc"
+            return "no timing constraints - create_clock / create_generated_clock / read_xdc"
                 .into();
         }
         let n_clk = rows
@@ -19630,7 +19630,7 @@ impl IdeModel {
     /// create_generated_clock / read_xdc.
     pub fn constraints_text(&self) -> String {
         if self.constraint_rows().is_empty() {
-            return "no timing constraints — create_clock / create_generated_clock / read_xdc"
+            return "no timing constraints - create_clock / create_generated_clock / read_xdc"
                 .into();
         }
         let mut lines = Vec::new();
@@ -20244,7 +20244,7 @@ impl IdeModel {
                     .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
             }
             let stock =
-                "# Helion SDC — 100 MHz on clk\ncreate_clock -period 10.000 [get_ports clk]\n";
+                "# Helion SDC - 100 MHz on clk\ncreate_clock -period 10.000 [get_ports clk]\n";
             std::fs::write(&path, stock)
                 .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
         }
@@ -20443,7 +20443,7 @@ impl IdeModel {
         if self.event_sim.is_some() || self.fabric_sim.is_some() {
             return "led".into();
         }
-        // Require explicit led — do not silently take first Out.
+        // Require explicit led - do not silently take first Out.
         "led".into()
     }
 
@@ -20537,7 +20537,7 @@ impl IdeModel {
                 })
                 .count();
             // sim_only stays no_body. A skipped cone is timing_incomplete even
-            // with no Hff — leftover LUTs are not a mapped design with no clock.
+            // with no Hff - leftover LUTs are not a mapped design with no clock.
             if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
                 return Ok(format!(
                     "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
@@ -21022,7 +21022,7 @@ impl IdeModel {
             }
         }
         Err(format!(
-            "DUT `{}` is not in the schematic — synth the DUT first",
+            "DUT `{}` is not in the schematic - synth the DUT first",
             self.tb_last_dut_module
         ))
     }
@@ -21033,7 +21033,7 @@ impl IdeModel {
     pub fn tb_open_vcd_in_waveform(&mut self, path: &Path) -> String {
         self.tb_waveform_pending = Some(path.to_path_buf());
         format!(
-            "waveform viewer (stub): queued {} — the full viewer ships with VCD power",
+            "waveform viewer (stub): queued {} - the full viewer ships with VCD power",
             path.display()
         )
     }
@@ -21973,7 +21973,7 @@ impl IdeModel {
         let mut extras: Vec<(String, u64, u8)> = Vec::new();
         if let Some(sim) = &self.event_sim {
             for (name, value) in sim.object_values() {
-                // clock is owned by sim_step_inner half-cycle sampling — never flatten it.
+                // clock is owned by sim_step_inner half-cycle sampling - never flatten it.
                 if skip(&name) {
                     continue;
                 }
@@ -22555,7 +22555,7 @@ impl IdeModel {
         if !self.ila.bits.is_empty() {
             return format!("{md_part}ILA {}×{}", self.ila.net, self.ila.bits.len());
         }
-        format!("{md_part}ILA —")
+        format!("{md_part}ILA -")
     }
 
     pub fn ila_arm(&mut self, spec: &str) -> Result<String, String> {
@@ -22921,7 +22921,7 @@ impl IdeModel {
     /// View bind of clock input ports onto HAD IOB sites.
     /// Clock ports are `PortDir::In` names that match create_clock / timing
     /// clock names and have no packed IOB. Prefers `PACKAGE_PIN` / LOC when
-    /// set (even if a capped fabric IOB already claims the site — Device must
+    /// set (even if a capped fabric IOB already claims the site - Device must
     /// show clk occupied). Otherwise picks the first unused `dev.iob_sites()`
     /// slot. Does not change pack, place, route, or STA.
     fn clock_port_view_sites(&self) -> Vec<(String, u32, u32)> {
@@ -22970,7 +22970,7 @@ impl IdeModel {
             if packed {
                 continue;
             }
-            // PACKAGE_PIN / LOC wins — mid-size fabrics can fill every HAD IOB
+            // PACKAGE_PIN / LOC wins - mid-size fabrics can fill every HAD IOB
             // via place_iob_cap; clk must still land on the user pin.
             let pin = p.attrs.get("LOC").or_else(|| {
                 self.constraints
@@ -24420,7 +24420,7 @@ impl IdeModel {
         let lutff = self.utilization.map(|u| u.lutff);
         let synth_done = self.shell.session.design.is_some();
         // D9: "Complete" means the implementation flow finished (routed), not
-        // merely that a bitstream was written — bitstream is a separate step
+        // merely that a bitstream was written - bitstream is a separate step
         // with its own card row. Gating on bitstream left "▶ Running" stuck on
         // the card after a fully completed implement.
         let impl_done = self.shell.session.routed.is_some();
@@ -25836,7 +25836,7 @@ end architecture;
     }
 
     /// UG900 A/B dual cursors sit on the engine sample grid; Δt is B−A in the
-    /// wave timescale, and Value-at-A/B is the fabric bits — not a canned pair.
+    /// wave timescale, and Value-at-A/B is the fabric bits - not a canned pair.
     #[test]
     fn wave_ab_cursors_time_delta_from_engine_samples() {
         let mut ide = IdeModel::new();
@@ -26381,7 +26381,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints pane is clickable clocks / I/O-delay / exception
-    /// tables from helion-sta XDC — not a concatenated report_box dump.
+    /// tables from helion-sta XDC - not a concatenated report_box dump.
     #[test]
     fn timing_constraints_pane_clickable_clocks_io_delay_exception_table() {
         let mut ide = IdeModel::new();
@@ -26556,7 +26556,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: create_generated_clock -divide_by is a
-    /// pane command that scales the STA period/WNS — not a label. Empty XDC
+    /// pane command that scales the STA period/WNS - not a label. Empty XDC
     /// keeps gold WNS.
     #[test]
     fn timing_constraints_generated_clock_divide_by_moves_sta() {
@@ -26658,7 +26658,7 @@ end architecture;
     }
 
     /// UG893/UG903 create_generated_clock -multiply_by / -invert / -edges
-    /// move helion-sta WNS — empty XDC keeps gold.
+    /// move helion-sta WNS - empty XDC keeps gold.
     #[test]
     fn timing_constraints_generated_clock_multiply_by_invert_edges_moves_sta() {
         let mut ide = IdeModel::new();
@@ -26789,7 +26789,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_bus_skew / group_path -weight
-    /// move helion-sta WNS — empty XDC keeps gold.
+    /// move helion-sta WNS - empty XDC keeps gold.
     #[test]
     fn timing_constraints_bus_skew_group_path_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -26911,7 +26911,7 @@ end architecture;
     }
 
     /// UG893/UG903 Timing Constraints Apply: set_max_time_borrow (latch steal)
-    /// and set_data_check (data-to-data) move helion-sta WNS — empty XDC keeps gold.
+    /// and set_data_check (data-to-data) move helion-sta WNS - empty XDC keeps gold.
     #[test]
     fn timing_constraints_time_borrow_data_check_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27031,7 +27031,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_input/output_delay and set_false_path
-    /// are pane commands that move helion-sta WNS — not labels on a stub editor.
+    /// are pane commands that move helion-sta WNS - not labels on a stub editor.
     #[test]
     fn timing_constraints_io_delay_false_path_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27136,7 +27136,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_multicycle_path / set_max_delay
-    /// move helion-sta setup WNS and hold slack — not labels on a stub editor.
+    /// move helion-sta setup WNS and hold slack - not labels on a stub editor.
     #[test]
     fn timing_constraints_multicycle_max_delay_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27263,7 +27263,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_min_delay / set_clock_groups
-    /// move helion-sta hold slack and setup WNS — not labels on a stub editor.
+    /// move helion-sta hold slack and setup WNS - not labels on a stub editor.
     #[test]
     fn timing_constraints_min_delay_clock_groups_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27387,7 +27387,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_clock_uncertainty / set_clock_latency
-    /// move helion-sta setup WNS and hold slack — not labels on a stub editor.
+    /// move helion-sta setup WNS and hold slack - not labels on a stub editor.
     #[test]
     fn timing_constraints_uncertainty_latency_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27529,7 +27529,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_input_jitter / set_system_jitter
-    /// move helion-sta setup WNS and hold slack like uncertainty — empty XDC keeps gold.
+    /// move helion-sta setup WNS and hold slack like uncertainty - empty XDC keeps gold.
     #[test]
     fn timing_constraints_input_system_jitter_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27636,7 +27636,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_timing_derate / set_operating_conditions
-    /// scale helion-sta setup/hold path delay — empty XDC keeps gold.
+    /// scale helion-sta setup/hold path delay - empty XDC keeps gold.
     #[test]
     fn timing_constraints_derate_operating_conditions_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27768,7 +27768,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_disable_timing / set_case_analysis
-    /// drop/force paths in helion-sta like false path — not labels on a stub editor.
+    /// drop/force paths in helion-sta like false path - not labels on a stub editor.
     #[test]
     fn timing_constraints_disable_timing_case_analysis_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -27905,7 +27905,7 @@ end architecture;
     }
 
     /// UG893 Timing Constraints Apply: set_propagated_clock / set_clock_sense
-    /// fold routed clock-network delay into helion-sta — ideal clocks keep gold WNS.
+    /// fold routed clock-network delay into helion-sta - ideal clocks keep gold WNS.
     #[test]
     fn timing_constraints_propagated_clock_sense_apply_moves_sta() {
         let mut ide = IdeModel::new();
@@ -30732,7 +30732,7 @@ endmodule
         assert_eq!(ide.wns_ps(), Some(9640));
     }
 
-    /// Cross-probe: set_probe(Path) is the single choke point — one call
+    /// Cross-probe: set_probe(Path) is the single choke point - one call
     /// must update the selection model, schematic highlights, and device
     /// highlights together.
     #[test]
@@ -32451,7 +32451,7 @@ endmodule
     }
 
     /// UG893 I/O Planning: `set_property PACKAGE_PIN` re-places onto the HAD IOB
-    /// and re-runs STA — not a pin-name list.
+    /// and re-runs STA - not a pin-name list.
     #[test]
     fn io_planning_package_pin_replaces_and_hits_sta() {
         let mut ide = IdeModel::new();
@@ -32620,7 +32620,7 @@ endmodule
     }
 
     /// UG893 I/O Ports: `set_property IOSTANDARD` hits HNF + HAD + STA pad delay
-    /// and DRC bank VCCO — not a table label.
+    /// and DRC bank VCCO - not a table label.
     #[test]
     fn io_planning_iostandard_hits_sta_and_drc() {
         let mut ide = IdeModel::new();
@@ -32751,7 +32751,7 @@ endmodule
     }
 
     /// UG893 I/O Ports: `set_property DRIVE / SLEW / PULLTYPE` hit HNF + HAD +
-    /// STA pad delay + DRC + bitgen — not table labels.
+    /// STA pad delay + DRC + bitgen - not table labels.
     #[test]
     fn io_planning_drive_slew_pulltype_hit_sta_drc_bitgen() {
         let mut ide = IdeModel::new();
@@ -33016,7 +33016,7 @@ endmodule
     }
 
     /// UG893 I/O Ports: `set_property DIFF_TERM / IN_TERM` hit HNF + HAD + STA
-    /// pad delay + DRC + bitgen — not table labels.
+    /// pad delay + DRC + bitgen - not table labels.
     #[test]
     fn io_planning_diff_term_in_term_hit_sta_drc_bitgen() {
         let mut ide = IdeModel::new();
@@ -33405,7 +33405,7 @@ endmodule
     }
 
     /// UG893 Floorplanning: `create_pblock` / `resize_pblock` re-places into a
-    /// HAD rectangle and hits `helion-bits::bitgen_pblock` — not a site dump.
+    /// HAD rectangle and hits `helion-bits::bitgen_pblock` - not a site dump.
     /// Gold PACKAGE_PIN restore keeps counter WNS_PS=9640 after the fabric move.
     #[test]
     fn pblock_floorplanning_hits_place_and_bitgen_pblock() {
@@ -33822,7 +33822,7 @@ endmodule
     }
 
     /// UG949 Clock Interaction (`report_clock_interaction`) pane is STA clocks
-    /// + XDC CDC exceptions — not a canned matrix. Empty XDC keeps gold WNS.
+    /// + XDC CDC exceptions - not a canned matrix. Empty XDC keeps gold WNS.
     #[test]
     fn clock_interaction_pane_from_sta_clocks_not_a_dump() {
         let mut ide = IdeModel::new();
@@ -34101,7 +34101,7 @@ endmodule
     }
 
     /// UG903/UG949 `report_timing_summary` pane is intra/inter-clock WNS/TNS/WHS/THS
-    /// by path group from STA — not a canned table. Empty XDC keeps gold WNS.
+    /// by path group from STA - not a canned table. Empty XDC keeps gold WNS.
     #[test]
     fn timing_summary_pane_intra_inter_other_from_sta_not_a_dump() {
         let mut ide = IdeModel::new();
@@ -35175,8 +35175,8 @@ endmodule
             ide.timing_paths.iter().map(|p| p.name.clone()).collect();
 
         for s in &report.suggestions {
-            // Every cited object must be real — a cell, net, or path from the
-            // analysis — never invented.
+            // Every cited object must be real - a cell, net, or path from the
+            // analysis - never invented.
             for o in &s.objects {
                 assert!(
                     cell_names.contains(o.as_str())
@@ -35186,7 +35186,7 @@ endmodule
                     s.id
                 );
             }
-            // Gain is a positive estimate or absent — never a placeholder.
+            // Gain is a positive estimate or absent - never a placeholder.
             if let Some(g) = s.gain_ps {
                 assert!(g > 0, "gain estimate must be positive: {}", s.id);
             }
@@ -35320,7 +35320,7 @@ endmodule
     }
 
     /// UG949 `report_methodology` + UG893 DRC/Utilization panes are engine-backed
-    /// violation/occupancy tables — not one-line dumps. Empty XDC keeps gold WNS.
+    /// violation/occupancy tables - not one-line dumps. Empty XDC keeps gold WNS.
     #[test]
     fn methodology_drc_utilization_panes_from_engines_not_dumps() {
         let mut ide = IdeModel::new();
@@ -35742,7 +35742,7 @@ endmodule
             tmp_after_fix.contains("create_clock"),
             "persisted SDC must keep create_clock: {tmp_after_fix}"
         );
-        // Do not fake gold 9640 after adding delay — just assert STA still runs.
+        // Do not fake gold 9640 after adding delay - just assert STA still runs.
         assert!(ide.wns_ps().is_some(), "STA after Fix");
 
         // Repo gold SDC must remain create_clock-only (no committed output delay).
@@ -36929,7 +36929,7 @@ endmodule
     }
 
     /// examples/timing_lut_as_clock.sv+.sdc: LUT drives FF CLK → TIMING-10 Warning /
-    /// catalog Warnings. Honest gated-clock netlist only — no fake methodology rows.
+    /// catalog Warnings. Honest gated-clock netlist only - no fake methodology rows.
     /// Counter gold WNS_PS=9640 unchanged.
     #[test]
     fn timing_lut_as_clock_timing10_warning_catalog_warnings() {
@@ -41070,7 +41070,7 @@ endmodule
             .expect("save_project_as");
         assert!(out.contains("save_project_as"), "{out}");
         let prj = dest.join("counter_copy/counter_copy.prj");
-        assert!(prj.is_file(), "missing {} — {out}", prj.display());
+        assert!(prj.is_file(), "missing {} - {out}", prj.display());
         assert_eq!(
             ide.last_project_path.as_deref(),
             Some(prj.as_path()),
