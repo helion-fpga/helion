@@ -4,12 +4,13 @@
 //! chain walk (`sync_chain`), plus the mux-select `init`-word predicate,
 //! the handshake shape detector, and the async-FIFO heuristic.
 //!
-//! Depth semantics: `sync_depth` counts passthrough-`Lut6` links in the
-//! destination-domain synchronizer chain. On tech-mapped netlists every FF
-//! `D` is driven through a LUT, so one stage contributes exactly one link:
-//! a lone capture FF has depth 1, a 2-FF synchronizer depth 2. A `D` driven
-//! directly by another domain's FF `Q` (no LUT) or by non-passthrough
-//! combinational logic has depth 0.
+//! Depth semantics: `sync_depth` counts destination-domain synchronizer
+//! stages. A stage link through a LUT counts only when the LUT's `init`
+//! word is a buffer/inverter of the driving FF `Q` (`is_buffer_init`): a
+//! LUT with a single FF-`Q` input that computes something else (e.g. an AND
+//! with another input) is combinational logic, not a stage. A lone capture
+//! FF whose `D` is driven directly by another domain's FF `Q` (no LUT) or
+//! by non-passthrough combinational logic has depth 0.
 
 use helion_ir::{CellKind, Design};
 use std::collections::{HashMap, HashSet};
@@ -21,10 +22,33 @@ use super::domains::DomainMap;
 enum DSource {
     /// `D` net driven directly by one FF `Q` (no LUT in between).
     DirectQ(String),
-    /// `D` net driven by one passthrough LUT whose sole FF-`Q` input is `src`.
+    /// `D` net driven by one buffer/inverter LUT whose input is an FF `Q`.
+    /// The `init`-word check is deliberate: a LUT with a single FF-`Q` input
+    /// that is NOT a buffer (e.g. an AND with a port input) is combinational
+    /// logic, not a synchronizer stage link.
     ViaLut { lut: String, src: String },
     /// Anything else: combinational logic, ports, multi-driver nets.
     Other,
+}
+
+/// True when the `Lut6` `init` word implements `O = I{pin}` or `O = ~I{pin}`
+/// for every address: a buffer or inverter of a single input.
+fn is_buffer_init(init: u64, pin: u32) -> bool {
+    if pin >= 6 {
+        return false;
+    }
+    let mut is_buf = true;
+    let mut is_inv = true;
+    for addr in 0..64u64 {
+        let bit = (init >> addr) & 1;
+        let inp = (addr >> pin) & 1;
+        is_buf &= bit == inp;
+        is_inv &= bit != inp;
+        if !is_buf && !is_inv {
+            return false;
+        }
+    }
+    is_buf || is_inv
 }
 
 /// Classify what drives `ff`'s `D` pin. Refines [`ff_d_source_ff`]: the
@@ -63,10 +87,15 @@ fn d_source(design: &Design, ff: &str) -> DSource {
     if lut_drivers.len() != 1 || !q_drivers.is_empty() {
         return DSource::Other;
     }
-    // Exactly one LUT driver: passthrough iff its sole FF-Q input is one FF.
+    // Exactly one LUT driver: a synchronizer-stage link iff the LUT is a
+    // buffer/inverter of a single FF Q input (init-word verified).
     let lut = lut_drivers.pop().unwrap_or_default();
-    let mut q_pis: Vec<String> = Vec::new();
-    for pin in ["I0", "I1", "I2", "I3", "I4", "I5"] {
+    let init = match design.cell(&lut).map(|c| &c.kind) {
+        Some(CellKind::Lut6 { init }) => *init,
+        _ => return DSource::Other,
+    };
+    let mut q_pin: Option<(u32, String)> = None;
+    for (idx, pin) in ["I0", "I1", "I2", "I3", "I4", "I5"].iter().enumerate() {
         let Some(pi) = design.net_on(&lut, pin) else {
             continue;
         };
@@ -78,17 +107,20 @@ fn d_source(design: &Design, ff: &str) -> DSource {
                 && design
                     .cell(&e.cell)
                     .is_some_and(|c| matches!(c.kind, CellKind::Hff))
-                && !q_pis.contains(&e.cell)
             {
-                q_pis.push(e.cell.clone());
+                match &q_pin {
+                    Some((_, s)) if s == &e.cell => {}
+                    Some(_) => return DSource::Other,
+                    None => q_pin = Some((idx as u32, e.cell.clone())),
+                }
             }
         }
     }
-    if q_pis.len() == 1 {
-        DSource::ViaLut {
-            lut,
-            src: q_pis.pop().unwrap_or_default(),
-        }
+    let Some((pin_idx, src)) = q_pin else {
+        return DSource::Other;
+    };
+    if is_buffer_init(init, pin_idx) {
+        DSource::ViaLut { lut, src }
     } else {
         DSource::Other
     }
