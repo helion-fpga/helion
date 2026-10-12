@@ -40,6 +40,8 @@ mod highlight;
 mod icons;
 #[path = "helion-ide/layouts.rs"]
 mod layouts;
+#[path = "helion-ide/physview_panels.rs"]
+mod physview_panels;
 #[path = "helion-ide/schem_lod.rs"]
 mod schem_lod;
 #[path = "helion-ide/theme.rs"]
@@ -348,8 +350,8 @@ struct HelionIde {
     layout_state: layouts::LayoutState,
     /// Welcome page dismissed this session.
     welcome_dismissed: bool,
-    /// Device viewer layer toggles (P1-3).
-    device_layers: DeviceLayers,
+    /// Physical View 2.0 state: layer model, docks, rulers, find palette.
+    physview: physview_panels::PhysViewState,
     /// Pending zoom-to-selection target (die tile coords), consumed by paint_device.
     device_zoom_target: Option<(u32, u32)>,
     /// Constraints Wizard draft state (None = closed). Lives on the app, not
@@ -370,24 +372,6 @@ struct HelionIde {
     editor_mini_scroll: Option<f32>,
     /// Cached minimap galley: (text hash, font size bits, Arc galley).
     editor_minimap_cache: Option<(u64, u32, std::sync::Arc<egui::Galley>)>,
-}
-
-/// Device viewer layer visibility (P1-3): Vivado Device-window layer toggles.
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceLayers {
-    pub routes: bool,
-    pub clock_regions: bool,
-    pub pblocks: bool,
-}
-
-impl Default for DeviceLayers {
-    fn default() -> Self {
-        Self {
-            routes: true,
-            clock_regions: true,
-            pblocks: true,
-        }
-    }
 }
 
 impl HelionIde {
@@ -449,7 +433,7 @@ impl HelionIde {
             toasts: toasts::ToastQueue::default(),
             layout_state: layouts::LayoutState::default(),
             welcome_dismissed: false,
-            device_layers: DeviceLayers::default(),
+            physview: physview_panels::PhysViewState::default(),
             device_zoom_target: None,
             constraints_wizard: None,
             editor_text: String::new(),
@@ -2714,7 +2698,7 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ui,
                 &mut app.model,
                 &app.theme,
-                &mut app.device_layers,
+                &mut app.physview,
                 &mut app.device_zoom_target,
             );
         }
@@ -2836,7 +2820,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
             ui,
             &mut app.model,
             &app.theme,
-            &mut app.device_layers,
+            &mut app.physview,
             &mut app.device_zoom_target,
         ),
         WorkspacePane::Timing => paint_timing_only(ui, &mut app.model, &app.theme),
@@ -7826,138 +7810,6 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     }
 }
 
-fn paint_device_legend(
-    ui: &mut egui::Ui,
-    model: &mut IdeModel,
-    theme: &theme::Theme,
-    floor_scroll: bool,
-    layers: &mut DeviceLayers,
-    zoom_target: &mut Option<(u32, u32)>,
-) {
-    // Single control row (P1-3): layer toggles + zoom-to-selection + zoom
-    // tools. One row, not three — the die is the hero and needs the height.
-    let tools = |ui: &mut egui::Ui,
-                 model: &mut IdeModel,
-                 layers: &mut DeviceLayers,
-                 zoom_target: &mut Option<(u32, u32)>| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Layers").small().color(theme.faint));
-            ui.checkbox(&mut layers.routes, "Routes")
-                .on_hover_text("Show/hide PathFinder route segments");
-            ui.checkbox(&mut layers.clock_regions, "Clock regions")
-                .on_hover_text("Show/hide clock-region outlines");
-            ui.checkbox(&mut layers.pblocks, "Pblocks")
-                .on_hover_text("Show/hide pblock rectangles");
-            if ui
-                .button("Zoom to selection")
-                .on_hover_text("Zoom the die to the selected site/net")
-                .clicked()
-            {
-                if let Some((x, y)) = selected_site_xy(model) {
-                    model.device_zoom = 2.5;
-                    *zoom_target = Some((x, y));
-                }
-            }
-            ui.separator();
-            if ui.button("Zoom In").clicked() {
-                let _ = model.device_zoom_in();
-            }
-            if ui.button("Zoom Out").clicked() {
-                let _ = model.device_zoom_out();
-            }
-            if ui.button("Zoom Fit").clicked() {
-                let _ = model.device_zoom_fit();
-            }
-            let dbg_net = model.selected_debug_net();
-            ui.add_enabled_ui(dbg_net.is_some(), |ui| {
-                let md = match &dbg_net {
-                    Some(n) => format!("Mark Debug {n}"),
-                    None => "Mark Debug".into(),
-                };
-                if ui
-                    .button(md)
-                    .on_hover_text("UG908 Mark Debug on the selected Device route/net")
-                    .clicked()
-                {
-                    let _ = model.exec("mark_debug");
-                }
-                if ui
-                    .button("Add Probe")
-                    .on_hover_text("UG908 Add Probe → ILA dashboard")
-                    .clicked()
-                {
-                    let _ = model.exec("add_probe");
-                }
-            });
-            ui.label(
-                RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
-                    .small()
-                    .weak(),
-            );
-        });
-    };
-    if floor_scroll {
-        // One tool row. Narrow windows scroll it; wrapping would steal die height.
-        egui::ScrollArea::horizontal()
-            .id_salt("device_legend_tools")
-            .auto_shrink([false, true])
-            .max_height(36.0)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-            .show(ui, |ui| tools(ui, model, layers, zoom_target));
-    } else {
-        tools(ui, model, layers, zoom_target);
-    }
-    // Complete chips only. Narrow: one row, scroll sideways so names stay fully visible.
-    let chips: [(&str, Color32); 8] = [
-        ("CLB", theme.ok),
-        ("IOB", theme.cat_blue),
-        ("BRAM", theme.violet),
-        ("placed LUT", theme.ok),
-        ("placed I/O", theme.info),
-        ("clock region", theme.violet),
-        ("route", theme.ok),
-        ("pblock", theme.amber),
-    ];
-    if floor_scroll {
-        egui::ScrollArea::horizontal()
-            .id_salt("device_legend_chips")
-            .auto_shrink([false, true])
-            .max_height(chrome::DEVICE_LEGEND_ROW_H + 4.0)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    let mut used = 0.0_f32;
-                    for (text, col) in chips {
-                        used += text.chars().count() as f32 * 7.2 + 14.0;
-                        ui.label(RichText::new(text).small().color(col));
-                    }
-                    ui.set_min_width(used);
-                });
-            });
-        return;
-    }
-    let budget = ui.available_width().min(ui.clip_rect().width()).max(96.0) - 12.0;
-    let mut rows: Vec<Vec<(&str, Color32)>> = vec![Vec::new()];
-    let mut used = 0.0_f32;
-    for chip in chips {
-        let w = chip.0.chars().count() as f32 * 7.2 + 14.0;
-        if !rows.last().unwrap().is_empty() && used + w > budget {
-            rows.push(Vec::new());
-            used = 0.0;
-        }
-        rows.last_mut().unwrap().push(chip);
-        used += w;
-    }
-    for row in rows {
-        ui.horizontal(|ui| {
-            for (text, col) in row {
-                ui.label(RichText::new(text).small().color(col));
-            }
-        });
-    }
-}
-
 /// Die coords of the current selection (site name, occupant cell, or BEL),
 /// for zoom-to-selection. `None` when nothing selectable is selected.
 fn selected_site_xy(model: &IdeModel) -> Option<(u32, u32)> {
@@ -7970,20 +7822,209 @@ fn selected_site_xy(model: &IdeModel) -> Option<(u32, u32)> {
     })
 }
 
+/// Clear selection, rulers, solo, and cross-probe highlight (Esc / Clear).
+fn clear_physview_selection(model: &mut IdeModel, pv: &mut physview_panels::PhysViewState) {
+    model.selected = None;
+    model.schematic.highlight_nets.clear();
+    model.schematic.highlight_cells.clear();
+    model.clear_probe();
+    pv.multi_select.clear();
+    pv.rulers.clear();
+    pv.ruler_anchor = None;
+    pv.inspector_ruler = None;
+    pv.layers.clear_solo();
+    model.highlight_device_routes();
+}
+
+fn paint_device_toolbar(
+    ui: &mut egui::Ui,
+    model: &mut IdeModel,
+    _theme: &theme::Theme,
+    pv: &mut physview_panels::PhysViewState,
+    zoom_target: &mut Option<(u32, u32)>,
+) {
+    ui.horizontal(|ui| {
+        if ui.button("Fit").on_hover_text("Zoom the die to fit (F)").clicked() {
+            let _ = model.device_zoom_fit();
+        }
+        if ui
+            .button("Find...")
+            .on_hover_text("Find a site, cell, or net (Ctrl+K)")
+            .clicked()
+        {
+            pv.find_open = true;
+            pv.find_query.clear();
+            pv.find_selected = 0;
+            pv.find_needs_focus = true;
+        }
+        let ruler_text = if pv.ruler_tool { "Ruler [on]" } else { "Ruler" };
+        if ui
+            .button(ruler_text)
+            .on_hover_text("Ruler tool: click-drag on the die to measure (R)")
+            .clicked()
+        {
+            pv.ruler_tool = !pv.ruler_tool;
+            pv.ruler_anchor = None;
+        }
+        if ui
+            .button("Clear")
+            .on_hover_text("Clear selection, rulers, and solo (Esc)")
+            .clicked()
+        {
+            clear_physview_selection(model, pv);
+        }
+        ui.separator();
+        if ui
+            .small_button(if pv.show_display_control {
+                "Layers [-]"
+            } else {
+                "Layers [+]"
+            })
+            .on_hover_text("Toggle the Display Control dock")
+            .clicked()
+        {
+            pv.show_display_control = !pv.show_display_control;
+        }
+        if ui
+            .small_button(if pv.show_inspector {
+                "Inspector [-]"
+            } else {
+                "Inspector [+]"
+            })
+            .on_hover_text("Toggle the Inspector dock")
+            .clicked()
+        {
+            pv.show_inspector = !pv.show_inspector;
+        }
+        ui.separator();
+        if ui
+            .button("Zoom to selection")
+            .on_hover_text("Zoom the die to the selected site/net")
+            .clicked()
+        {
+            if let Some((x, y)) = selected_site_xy(model) {
+                model.device_zoom = 2.5;
+                *zoom_target = Some((x, y));
+            }
+        }
+        if ui.button("Zoom In").clicked() {
+            let _ = model.device_zoom_in();
+        }
+        if ui.button("Zoom Out").clicked() {
+            let _ = model.device_zoom_out();
+        }
+        if ui.button("Zoom Fit").clicked() {
+            let _ = model.device_zoom_fit();
+        }
+        let dbg_net = model.selected_debug_net();
+        ui.add_enabled_ui(dbg_net.is_some(), |ui| {
+            let md = match &dbg_net {
+                Some(n) => format!("Mark Debug {n}"),
+                None => "Mark Debug".into(),
+            };
+            if ui
+                .button(md)
+                .on_hover_text("UG908 Mark Debug on the selected Device route/net")
+                .clicked()
+            {
+                let _ = model.exec("mark_debug");
+            }
+            if ui
+                .button("Add Probe")
+                .on_hover_text("UG908 Add Probe to ILA dashboard")
+                .clicked()
+            {
+                let _ = model.exec("add_probe");
+            }
+        });
+        ui.label(
+            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
+                .small()
+                .weak(),
+        );
+    });
+}
+
+/// Device-view keyboard shortcuts. Guarded to the Device workspace and to
+/// "not typing" so editor and Tcl input is never stolen.
+fn device_shortcuts(
+    ui: &mut egui::Ui,
+    model: &mut IdeModel,
+    pv: &mut physview_panels::PhysViewState,
+) {
+    use helion_gui::physview::{HeatMode, LayerId, ALL_LAYERS};
+    if model.workspace != WorkspaceTab::Device {
+        return;
+    }
+    let ctx = ui.ctx();
+    if ctx.wants_keyboard_input() {
+        return;
+    }
+    let num_keys = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+    ];
+    for (i, layer) in ALL_LAYERS.iter().enumerate().take(9) {
+        if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, num_keys[i])) {
+            let on = !pv.layers.is_visible(*layer);
+            pv.layers.set_visible(*layer, on);
+        }
+    }
+    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, egui::Key::Num0)) {
+        // Heat-map master: toggle congestion; pressing again turns it off.
+        let on = pv.layers.heat_mode != HeatMode::Congestion;
+        pv.layers.set_visible(LayerId::CongestionHeat, on);
+    }
+    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+        let _ = model.device_zoom_fit();
+    }
+    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+        pv.ruler_tool = !pv.ruler_tool;
+        pv.ruler_anchor = None;
+    }
+    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
+        pv.find_open = true;
+        pv.find_query.clear();
+        pv.find_selected = 0;
+        pv.find_needs_focus = true;
+    }
+    if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if pv.find_open {
+            pv.find_open = false;
+            pv.find_query.clear();
+        } else {
+            clear_physview_selection(model, pv);
+        }
+    }
+}
+
 fn paint_device(
     ui: &mut egui::Ui,
     model: &mut IdeModel,
     theme: &theme::Theme,
-    layers: &mut DeviceLayers,
+    pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
     ui.heading("Device");
+    paint_device_toolbar(ui, model, theme, pv, zoom_target);
+    device_shortcuts(ui, model, pv);
+    physview_panels::paint_find_dialog(ui.ctx(), model, pv, theme, zoom_target);
+
     let screen = ui.ctx().screen_rect();
     let narrow = chrome::device_window_narrow(screen.width());
     let short = chrome::device_window_short(screen.height());
-    paint_device_legend(ui, model, theme, narrow || short, layers, zoom_target);
-    let after_legend = ui.available_height().max(1.0);
-    let band = chrome::device_band_share(screen.width(), screen.height(), after_legend);
+    let docked = !(narrow || short);
+
+    // Tables band (pblocks + clock regions), same shares as before.
+    let after_toolbar = ui.available_height().max(1.0);
+    let band = chrome::device_band_share(screen.width(), screen.height(), after_toolbar);
     let pane_w = ui.available_width().max(48.0);
     if narrow || short {
         // Tables and legend floor, then scroll horizontally. Die keeps the leftover.
@@ -8034,6 +8075,181 @@ fn paint_device(
             });
     }
     ui.separator();
+
+    if docked {
+        ui.horizontal(|ui| {
+            if pv.show_display_control {
+                ui.vertical(|ui| {
+                    ui.set_min_width(216.0);
+                    ui.set_max_width(234.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("pv_display_control")
+                        .show(ui, |ui| {
+                            physview_panels::paint_display_control(ui, pv, model, theme);
+                        });
+                });
+            } else if ui
+                .small_button(">")
+                .on_hover_text("Show Display Control")
+                .clicked()
+            {
+                pv.show_display_control = true;
+            }
+            // Die fills the middle.
+            ui.vertical(|ui| {
+                let insp_w = if pv.show_inspector { 272.0 } else { 30.0 };
+                let w = (ui.available_width() - insp_w).max(220.0);
+                ui.set_min_width(w);
+                paint_device_die(ui, model, theme, pv, zoom_target);
+            });
+            if pv.show_inspector {
+                ui.vertical(|ui| {
+                    ui.set_min_width(252.0);
+                    ui.set_max_width(268.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("pv_inspector")
+                        .show(ui, |ui| {
+                            physview_panels::paint_inspector(ui, model, pv, theme, zoom_target);
+                        });
+                });
+            } else if ui
+                .small_button("<")
+                .on_hover_text("Show Inspector")
+                .clicked()
+            {
+                pv.show_inspector = true;
+            }
+        });
+    } else {
+        // Narrow windows: docks float so nothing is lost.
+        if pv.show_display_control {
+            egui::Window::new("Display Control")
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(216.0);
+                    physview_panels::paint_display_control(ui, pv, model, theme);
+                });
+        }
+        if pv.show_inspector {
+            egui::Window::new("Inspector")
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(252.0);
+                    physview_panels::paint_inspector(ui, model, pv, theme, zoom_target);
+                });
+        }
+        paint_device_die(ui, model, theme, pv, zoom_target);
+    }
+}
+
+/// Die tile under a pointer position, if the pointer is over the die.
+fn die_tile_at(
+    pos: egui::Pos2,
+    origin: egui::Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    x0: u32,
+    y0: u32,
+    cols: u32,
+    rows: u32,
+) -> Option<(u32, u32)> {
+    let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
+    let dy = ((pos.y - origin.y) / cell_h).floor() as i32;
+    if dx >= 0 && dy >= 0 && (dx as u32) < cols && (dy as u32) < rows {
+        Some((x0 + dx as u32, y0 + (rows - 1 - dy as u32)))
+    } else {
+        None
+    }
+}
+
+/// Tile-center pixel for a die tile (Y-up die coords to Y-down pixels).
+fn tile_center_px(
+    x: u32,
+    y: u32,
+    origin: egui::Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    x0: u32,
+    y0: u32,
+    rows: u32,
+) -> egui::Pos2 {
+    let dx = x.saturating_sub(x0);
+    let dy = rows
+        .saturating_sub(1)
+        .saturating_sub(y.saturating_sub(y0));
+    egui::pos2(
+        origin.x + dx as f32 * cell_w + cell_w / 2.0,
+        origin.y + dy as f32 * cell_h + cell_h / 2.0,
+    )
+}
+
+fn dist_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let len2 = abx * abx + aby * aby;
+    if len2 < 1e-6 {
+        return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
+    }
+    let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len2).clamp(0.0, 1.0);
+    let qx = a.x + abx * t;
+    let qy = a.y + aby * t;
+    ((p.x - qx).powi(2) + (p.y - qy).powi(2)).sqrt()
+}
+
+/// Net whose route polyline passes within ~4 px of the pointer (nearest wins).
+fn route_hit_at(
+    model: &IdeModel,
+    pos: egui::Pos2,
+    origin: egui::Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    x0: u32,
+    y0: u32,
+    rows: u32,
+) -> Option<String> {
+    let mut best: Option<(f32, String)> = None;
+    for rt in &model.device.routes {
+        if rt.tiles.len() < 2 {
+            continue;
+        }
+        let pts: Vec<egui::Pos2> = rt
+            .tiles
+            .iter()
+            .map(|&(x, y)| tile_center_px(x, y, origin, cell_w, cell_h, x0, y0, rows))
+            .collect();
+        let d = pts
+            .windows(2)
+            .map(|w| dist_to_segment(pos, w[0], w[1]))
+            .fold(f32::INFINITY, f32::min);
+        if d <= 4.0 && best.as_ref().map(|(bd, _)| d < *bd).unwrap_or(true) {
+            best = Some((d, rt.net.clone()));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// Ruler measurement whose line passes within ~4 px of the pointer.
+fn ruler_hit_at(
+    rulers: &[helion_gui::physview::RulerMeasurement],
+    pos: egui::Pos2,
+    to_px: &impl Fn(u32, u32) -> egui::Pos2,
+) -> Option<usize> {
+    rulers.iter().enumerate().find_map(|(i, m)| {
+        let a = to_px(m.x0, m.y0);
+        let b = to_px(m.x1, m.y1);
+        (dist_to_segment(pos, a, b) <= 4.0).then_some(i)
+    })
+}
+
+/// The die canvas: tile grid, heat maps, sites, clock regions, pblocks,
+/// routes, rulers, hover tooltips, click/drag interaction.
+fn paint_device_die(
+    ui: &mut egui::Ui,
+    model: &mut IdeModel,
+    theme: &theme::Theme,
+    pv: &mut physview_panels::PhysViewState,
+    zoom_target: &mut Option<(u32, u32)>,
+) {
     let cols = model.device.cols.max(1);
     let rows = model.device.rows.max(1);
     let x0 = model.device.x0;
@@ -8106,6 +8322,43 @@ fn paint_device(
             );
             let p = ui.painter();
             p.rect_filled(rect, 0.0, theme.die_bg);
+            // Physical View 2.0: congestion heat map paints under the sites
+            // but over the die background.
+            if pv.layers.is_visible(helion_gui::physview::LayerId::CongestionHeat) {
+                let max_u = model.device.congestion.iter().copied().max().unwrap_or(0);
+                if max_u > 0 {
+                    let op = pv.layers.heat_opacity
+                        * pv.layers.layer_alpha(helion_gui::physview::LayerId::CongestionHeat);
+                    let n = model.device.congestion.len();
+                    for dyy in 0..rows {
+                        for dxx in 0..cols {
+                            // Die coords are Y-up: paint row dyy is die row (rows-1-dyy).
+                            let idx = (rows - 1 - dyy) as usize * cols as usize + dxx as usize;
+                            if idx >= n {
+                                continue;
+                            }
+                            let u = model.device.congestion[idx];
+                            if u == 0 {
+                                continue;
+                            }
+                            let rgb = helion_gui::physview::congestion_ramp(
+                                helion_gui::physview::congestion_t(u, max_u),
+                            );
+                            let px = origin.x + dxx as f32 * cell_w;
+                            let py = origin.y + dyy as f32 * cell_h;
+                            let htile = egui::Rect::from_min_size(
+                                egui::pos2(px + 0.5, py + 0.5),
+                                egui::vec2((cell_w - 1.0).max(1.0), (cell_h - 1.0).max(1.0)),
+                            );
+                            p.rect_filled(
+                                htile,
+                                1.0,
+                                Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(op),
+                            );
+                        }
+                    }
+                }
+            }
             // Cross-probe: while a timing path is probed, its sites paint
             // gold and everything else dims (Vivado-style focus).
             let path_probe = matches!(model.probe(), ProbeSelection::Path(_));
@@ -8144,12 +8397,23 @@ fn paint_device(
                     );
                     let site = model.device.site_at(x, y);
                     let path_hl = site.is_some_and(|s| s.highlighted);
+                    // Physical View 2.0: per-site-kind layer visibility + solo dimming.
+                    let site_layer =
+                        site.and_then(|s| helion_gui::physview::LayerId::for_site_kind(s.kind));
+                    let site_on = site_layer
+                        .map(|l| pv.layers.is_visible(l))
+                        .unwrap_or(true);
+                    let solo_alpha = site_layer
+                        .map(|l| pv.layers.layer_alpha(l))
+                        .unwrap_or(1.0);
                     // Cross-probe: a path probe paints gold; a single-object
                     // probe paints the accent outline. Non-path sites dim
                     // while a path is probed (Vivado-style focus).
-                    let fill = if path_hl && path_probe {
+                    let fill = if !site_on {
+                        theme.die_bg
+                    } else if path_hl && path_probe {
                         // STA path: gold fill so multi-cell paths read on the die.
-                        theme.gold
+                        theme.gold.gamma_multiply(solo_alpha)
                     } else {
                         let base = match site {
                             Some(s) if s.occupant.is_some() || !s.bels.is_empty() => {
@@ -8169,9 +8433,9 @@ fn paint_device(
                             None => theme.die_bg,
                         };
                         if path_probe {
-                            base.gamma_multiply(0.45)
+                            base.gamma_multiply(0.45 * solo_alpha)
                         } else {
-                            base
+                            base.gamma_multiply(solo_alpha)
                         }
                     };
                     p.rect_filled(tile, 1.0, fill);
@@ -8204,7 +8468,9 @@ fn paint_device(
             let purple = theme.violet;
             let gold = theme.gold;
             let amber = theme.amber;
-            if layers.clock_regions {
+            if pv.layers.is_visible(helion_gui::physview::LayerId::ClockRegions) {
+                let cr_alpha =
+                    pv.layers.layer_alpha(helion_gui::physview::LayerId::ClockRegions);
                 for cr in &model.device.clock_regions {
                     let px = origin.x + (cr.x0 - x0) as f32 * cell_w;
                     let py = origin.y + (rows - 1 - (cr.y1 - y0)) as f32 * cell_h;
@@ -8212,13 +8478,12 @@ fn paint_device(
                     let ph = cr.rows() as f32 * cell_h;
                     let rr = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
                     let on = model.selected.as_deref() == Some(cr.name.as_str());
+                    let stroke_col = if on { gold } else { purple }.gamma_multiply(cr_alpha);
+                    let text_col = if on { gold } else { purple }.gamma_multiply(cr_alpha);
                     p.rect_stroke(
                         rr,
                         0.0,
-                        Stroke::new(
-                            if on { 3.0_f32 } else { 2.0_f32 },
-                            if on { gold } else { purple },
-                        ),
+                        Stroke::new(if on { 3.0_f32 } else { 2.0_f32 }, stroke_col),
                         egui::StrokeKind::Inside,
                     );
                     p.text(
@@ -8226,12 +8491,13 @@ fn paint_device(
                         egui::Align2::LEFT_TOP,
                         &cr.name,
                         egui::FontId::monospace(9.0),
-                        if on { gold } else { purple },
+                        text_col,
                     );
                 }
             }
             // Pblock rectangles (create_pblock / resize_pblock).
-            if layers.pblocks {
+            if pv.layers.is_visible(helion_gui::physview::LayerId::Pblocks) {
+                let pb_alpha = pv.layers.layer_alpha(helion_gui::physview::LayerId::Pblocks);
                 for pb in &model.pblocks {
                     if !pb.ranged {
                         continue;
@@ -8242,13 +8508,12 @@ fn paint_device(
                     let ph = pb.rows() as f32 * cell_h;
                     let rr = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
                     let on = model.selected.as_deref() == Some(pb.name.as_str());
+                    let stroke_col = if on { gold } else { amber }.gamma_multiply(pb_alpha);
+                    let text_col = if on { gold } else { amber }.gamma_multiply(pb_alpha);
                     p.rect_stroke(
                         rr,
                         0.0,
-                        Stroke::new(
-                            if on { 3.0_f32 } else { 2.0_f32 },
-                            if on { gold } else { amber },
-                        ),
+                        Stroke::new(if on { 3.0_f32 } else { 2.0_f32 }, stroke_col),
                         egui::StrokeKind::Inside,
                     );
                     p.text(
@@ -8256,17 +8521,34 @@ fn paint_device(
                         egui::Align2::LEFT_TOP,
                         &pb.name,
                         egui::FontId::monospace(9.0),
-                        if on { gold } else { amber },
+                        text_col,
                     );
                 }
                 // PathFinder IOB nets over the die.
-                if layers.routes {
+                if pv.layers.is_visible(helion_gui::physview::LayerId::Routes) {
                     let route_col = theme.ok;
                     let unroute_col = theme.faint;
+                    let route_alpha =
+                        pv.layers.layer_alpha(helion_gui::physview::LayerId::Routes);
+                    // Physical View 2.0: criticality heat map colors each
+                    // route polyline by its worst-slack bucket.
+                    let crit_on = pv.layers.is_visible(
+                        helion_gui::physview::LayerId::CriticalityHeat,
+                    );
                     for rt in &model.device.routes {
                         if rt.tiles.len() < 2 {
                             continue;
                         }
+                        let crit_col = if crit_on {
+                            model.device.net_slack.get(&rt.net).map(|slack| {
+                                let rgb = helion_gui::physview::slack_color(
+                                    helion_gui::physview::slack_bucket(*slack),
+                                );
+                                Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+                            })
+                        } else {
+                            None
+                        };
                         // Path nets paint gold and thick; a singly selected net
                         // paints the accent color; the rest dim while probing.
                         let hl_path_net = path_probe
@@ -8275,6 +8557,8 @@ fn paint_device(
                             (gold, 2.6_f32)
                         } else if rt.highlighted {
                             (theme.accent, 2.2_f32)
+                        } else if let Some(cc) = crit_col {
+                            (cc, 2.0_f32)
                         } else if rt.hops == 0 {
                             (
                                 if path_probe {
@@ -8294,6 +8578,7 @@ fn paint_device(
                                 1.7_f32,
                             )
                         };
+                        let col = col.gamma_multiply(route_alpha);
                         let mut pts = Vec::new();
                         for &(x, y) in &rt.tiles {
                             let dx = x.saturating_sub(x0);
@@ -8314,7 +8599,22 @@ fn paint_device(
                             p.circle_filled(b, 2.4, col);
                         }
                     }
-                } // layers.routes
+                } // routes layer
+                // Physical View 2.0: ruler measurements over the routes.
+                if pv.layers.is_visible(helion_gui::physview::LayerId::Rulers)
+                    && (!pv.rulers.is_empty() || pv.ruler_anchor.is_some())
+                {
+                    let to_px =
+                        |x: u32, y: u32| tile_center_px(x, y, origin, cell_w, cell_h, x0, y0, rows);
+                    let draft = match (pv.ruler_anchor, resp.hover_pos()) {
+                        (Some(a), Some(pos)) => die_tile_at(
+                            pos, origin, cell_w, cell_h, x0, y0, cols, rows,
+                        )
+                        .map(|b| (a, b)),
+                        _ => None,
+                    };
+                    physview_panels::paint_rulers(p, &pv.rulers, draft, &to_px, theme);
+                }
             } // layers.pblocks
             if let Some(pos) = resp.hover_pos() {
                 let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
@@ -8345,10 +8645,18 @@ fn paint_device(
                         if !tip.is_empty() {
                             tip.push(' ');
                         }
+                        // Physical View 2.0: occupant + BEL count on the site line.
+                        let occ = s.occupant.as_deref().unwrap_or("-");
                         if s.bels.is_empty() {
-                            tip.push_str(&s.site_name());
+                            tip.push_str(&format!("{}  occ={}", s.site_name(), occ));
                         } else {
-                            tip.push_str(&format!("{}  {}", s.site_name(), s.bels.join(",")));
+                            tip.push_str(&format!(
+                                "{}  occ={}  bels={} ({})",
+                                s.site_name(),
+                                occ,
+                                s.bels.len(),
+                                s.bels.join(",")
+                            ));
                         }
                     }
                     if let Some(rt) = model.device.route_at(x, y) {
@@ -8376,7 +8684,39 @@ fn paint_device(
                 ui.scroll_to_rect(target, Some(egui::Align::Center));
             }
         }
-        if resp.clicked() {
+        // Physical View 2.0: ruler tool consumes drags; plain clicks select.
+        if pv.ruler_tool {
+            if resp.drag_started() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let origin = egui::pos2(
+                        rect.left() + chrome::FLOORPLAN_LEFT + origin_dx,
+                        rect.top() + chrome::FLOORPLAN_TOP + origin_dy,
+                    );
+                    pv.ruler_anchor =
+                        die_tile_at(pos, origin, cell_w, cell_h, x0, y0, cols, rows);
+                }
+            }
+            if resp.drag_stopped() {
+                if let (Some(a), Some(pos)) =
+                    (pv.ruler_anchor.take(), resp.interact_pointer_pos())
+                {
+                    let origin = egui::pos2(
+                        rect.left() + chrome::FLOORPLAN_LEFT + origin_dx,
+                        rect.top() + chrome::FLOORPLAN_TOP + origin_dy,
+                    );
+                    if let Some((x, y)) =
+                        die_tile_at(pos, origin, cell_w, cell_h, x0, y0, cols, rows)
+                    {
+                        pv.rulers.push(helion_gui::physview::RulerMeasurement {
+                            x0: a.0,
+                            y0: a.1,
+                            x1: x,
+                            y1: y,
+                        });
+                    }
+                }
+            }
+        } else if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let origin = egui::pos2(
                     rect.left() + chrome::FLOORPLAN_LEFT + origin_dx,
@@ -8405,19 +8745,68 @@ fn paint_device(
                         }
                     }
                     if !header {
-                        pick_site = Some((x, y));
+                        // Route polylines (within ~4 px) beat the site tile.
+                        if let Some(net) =
+                            route_hit_at(model, pos, origin, cell_w, cell_h, x0, y0, rows)
+                        {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            if shift {
+                                if !pv.multi_select.contains(&net) {
+                                    pv.multi_select.push(net.clone());
+                                }
+                            } else {
+                                pv.multi_select.clear();
+                            }
+                            pv.inspector_ruler = None;
+                            model.selected = Some(net);
+                            model.highlight_device_routes();
+                            header = true;
+                        }
+                    }
+                    if !header {
+                        // Ruler lines select the measurement for the inspector.
+                        let to_px = |rx: u32, ry: u32| {
+                            tile_center_px(rx, ry, origin, cell_w, cell_h, x0, y0, rows)
+                        };
+                        if let Some(i) = ruler_hit_at(&pv.rulers, pos, &to_px) {
+                            pv.inspector_ruler = Some(i);
+                            pv.multi_select.clear();
+                            model.selected = None;
+                            model.highlight_device_routes();
+                            header = true;
+                        }
+                    }
+                    if !header {
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        if shift {
+                            let id = format!("X{x}Y{y}");
+                            if !pv.multi_select.contains(&id) {
+                                pv.multi_select.push(id.clone());
+                            }
+                            pv.inspector_ruler = None;
+                            model.selected = Some(id);
+                            model.highlight_device_routes();
+                        } else {
+                            pick_site = Some((x, y));
+                        }
                     }
                 }
             }
         }
     });
     if let Some(name) = click_pblock {
+        pv.multi_select.clear();
+        pv.inspector_ruler = None;
         let _ = model.select_pblock(&name);
     }
     if let Some(name) = pick_region {
+        pv.multi_select.clear();
+        pv.inspector_ruler = None;
         let _ = model.select_clock_region(&name);
     }
     if let Some((x, y)) = pick_site {
+        pv.multi_select.clear();
+        pv.inspector_ruler = None;
         let _ = model.select_device_site(&format!("X{x}Y{y}"));
     }
 }
