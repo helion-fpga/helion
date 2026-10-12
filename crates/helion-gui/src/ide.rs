@@ -1148,15 +1148,28 @@ pub struct DesignRun {
     pub step: String,
     pub status: String,
     pub wns_ps: Option<i64>,
+    pub tns_ps: Option<i64>,
     pub cells: Option<usize>,
     pub lutff: Option<usize>,
+    pub luts: Option<usize>,
+    pub ffs: Option<usize>,
+    pub brams: Option<usize>,
+    pub dsps: Option<usize>,
     pub part: String,
     pub top: Option<String>,
     pub bitstream_hash: Option<u32>,
     /// UG986 Lab 1 Helion strategy (Default / TimingExplore / RuntimeOpt / PhysOpt).
     pub strategy: String,
+    /// Full [`helion_proj::RunStrategy`] spec (`Preset:opt=…,…`). Empty =
+    /// derive from the legacy `strategy` label. Persisted in the `.prj`.
+    pub spec: String,
+    /// Seed-sweep member seed (None = standalone run).
+    pub seed: Option<u64>,
     pub runtime_ms: Option<u64>,
     pub reuse_pct: Option<u32>,
+    /// Full result session, kept so a finished run can become the active
+    /// design ("make active"). Boxed: sessions are heavy.
+    pub result_session: Option<Box<Session>>,
 }
 
 impl DesignRun {
@@ -1166,14 +1179,34 @@ impl DesignRun {
             step: step.into(),
             status: "Not started".into(),
             wns_ps: None,
+            tns_ps: None,
             cells: None,
             lutff: None,
+            luts: None,
+            ffs: None,
+            brams: None,
+            dsps: None,
             part: "HL10T-C32-1".into(),
             top: None,
             bitstream_hash: None,
             strategy: "Default".into(),
+            spec: String::new(),
+            seed: None,
             runtime_ms: None,
             reuse_pct: None,
+            result_session: None,
+        }
+    }
+
+    /// Effective strategy: full spec when present, else the legacy label.
+    /// Never panics: unparseable specs fall back to Custom knobs.
+    pub fn run_strategy(&self) -> helion_proj::RunStrategy {
+        if self.spec.trim().is_empty() {
+            helion_proj::RunStrategy::preset(&self.strategy)
+                .unwrap_or_else(|_| helion_proj::RunStrategy::fallback())
+        } else {
+            helion_proj::RunStrategy::parse_spec(&self.spec)
+                .unwrap_or_else(|_| helion_proj::RunStrategy::fallback())
         }
     }
 
@@ -1190,6 +1223,32 @@ impl DesignRun {
         self.wns_ps
             .map(|n| n.to_string())
             .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn tns_cell(&self) -> String {
+        self.tns_ps
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+
+    fn opt_cell(v: Option<usize>) -> String {
+        v.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
+    }
+
+    pub fn luts_cell(&self) -> String {
+        Self::opt_cell(self.luts)
+    }
+
+    pub fn ffs_cell(&self) -> String {
+        Self::opt_cell(self.ffs)
+    }
+
+    pub fn brams_cell(&self) -> String {
+        Self::opt_cell(self.brams)
+    }
+
+    pub fn dsps_cell(&self) -> String {
+        Self::opt_cell(self.dsps)
     }
 
     pub fn runtime_cell(&self) -> String {
@@ -1267,6 +1326,258 @@ impl DesignRun {
             s.push_str(&format!(" hash={h:#010x}"));
         }
         s
+    }
+}
+
+/// Sortable Design Runs result-table column.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RunCol {
+    Name,
+    Strategy,
+    Status,
+    Luts,
+    Ffs,
+    Bram,
+    Dsp,
+    Wns,
+    Tns,
+    Runtime,
+}
+
+impl RunCol {
+    /// Header label, in table order.
+    pub const ALL: [RunCol; 10] = [
+        RunCol::Name,
+        RunCol::Strategy,
+        RunCol::Status,
+        RunCol::Luts,
+        RunCol::Ffs,
+        RunCol::Bram,
+        RunCol::Dsp,
+        RunCol::Wns,
+        RunCol::Tns,
+        RunCol::Runtime,
+    ];
+
+    pub fn header(self) -> &'static str {
+        match self {
+            RunCol::Name => "Run",
+            RunCol::Strategy => "Strategy",
+            RunCol::Status => "Status",
+            RunCol::Luts => "LUTs",
+            RunCol::Ffs => "FFs",
+            RunCol::Bram => "BRAM",
+            RunCol::Dsp => "DSP",
+            RunCol::Wns => "WNS",
+            RunCol::Tns => "TNS",
+            RunCol::Runtime => "Runtime",
+        }
+    }
+
+    /// Lower-is-better columns (area, runtime). WNS/TNS: higher-is-better
+    /// (TNS is ≤ 0; the best TNS is closest to zero).
+    pub fn lower_is_better(self) -> bool {
+        matches!(
+            self,
+            RunCol::Luts | RunCol::Ffs | RunCol::Bram | RunCol::Dsp | RunCol::Runtime
+        )
+    }
+}
+
+/// True when the run has no value for a sortable column.
+fn run_col_missing(r: &DesignRun, col: RunCol) -> bool {
+    match col {
+        RunCol::Name | RunCol::Strategy | RunCol::Status => false,
+        RunCol::Luts => r.luts.is_none(),
+        RunCol::Ffs => r.ffs.is_none(),
+        RunCol::Bram => r.brams.is_none(),
+        RunCol::Dsp => r.dsps.is_none(),
+        RunCol::Wns => r.wns_ps.is_none(),
+        RunCol::Tns => r.tns_ps.is_none(),
+        RunCol::Runtime => r.runtime_ms.is_none(),
+    }
+}
+
+/// Sort runs in place. Rows with no value for the column sort last,
+/// regardless of direction; ties break by name for a stable order.
+pub fn sort_design_runs(runs: &mut [DesignRun], col: RunCol, asc: bool) {
+    runs.sort_by(|a, b| {
+        match (run_col_missing(a, col), run_col_missing(b, col)) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => {
+                let ord = cmp_design_runs(a, b, col);
+                let ord = if asc { ord } else { ord.reverse() };
+                ord.then_with(|| a.name.cmp(&b.name))
+            }
+        }
+    });
+}
+
+fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        // Present values always beat missing ones, either direction.
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Index of the best finished run for a column, if any value is present.
+/// Honors [`RunCol::lower_is_better`].
+pub fn best_run_index(runs: &[DesignRun], col: RunCol) -> Option<usize> {
+    let val = |r: &DesignRun| -> Option<i128> {
+        match col {
+            RunCol::Luts => r.luts.map(|v| v as i128),
+            RunCol::Ffs => r.ffs.map(|v| v as i128),
+            RunCol::Bram => r.brams.map(|v| v as i128),
+            RunCol::Dsp => r.dsps.map(|v| v as i128),
+            RunCol::Wns => r.wns_ps.map(|v| v as i128),
+            RunCol::Tns => r.tns_ps.map(|v| v as i128),
+            RunCol::Runtime => r.runtime_ms.map(|v| v as i128),
+            _ => None,
+        }
+    };
+    let mut best: Option<(usize, i128)> = None;
+    for (i, r) in runs.iter().enumerate() {
+        let Some(v) = val(r) else { continue };
+        let better = match best {
+            None => true,
+            Some((_, b)) => {
+                if col.lower_is_better() {
+                    v < b
+                } else {
+                    v > b
+                }
+            }
+        };
+        if better {
+            best = Some((i, v));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Seed-sweep aggregate: (best, worst, mean) WNS over finished sweep members.
+pub fn sweep_wns_stats(runs: &[DesignRun]) -> Option<(i64, i64, i64)> {
+    let mut vals: Vec<i64> = runs.iter().filter_map(|r| r.wns_ps).collect();
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_unstable();
+    let best = vals[vals.len() - 1];
+    let worst = vals[0];
+    let mean = vals.iter().sum::<i64>() / vals.len() as i64;
+    Some((best, worst, mean))
+}
+
+/// Compare two runs on a column (no sorting). Shared by [`sort_design_runs`]
+/// and the panel's index sort so the table and the model agree.
+pub fn cmp_design_runs(a: &DesignRun, b: &DesignRun, col: RunCol) -> std::cmp::Ordering {
+    match col {
+        RunCol::Name => a.name.cmp(&b.name),
+        RunCol::Strategy => a.strategy.cmp(&b.strategy),
+        RunCol::Status => a.status.cmp(&b.status),
+        RunCol::Luts => cmp_opt(a.luts, b.luts),
+        RunCol::Ffs => cmp_opt(a.ffs, b.ffs),
+        RunCol::Bram => cmp_opt(a.brams, b.brams),
+        RunCol::Dsp => cmp_opt(a.dsps, b.dsps),
+        RunCol::Wns => cmp_opt(a.wns_ps, b.wns_ps),
+        RunCol::Tns => cmp_opt(a.tns_ps, b.tns_ps),
+        RunCol::Runtime => cmp_opt(a.runtime_ms, b.runtime_ms),
+    }
+}
+
+/// Sort row indices for display without disturbing `model.runs` order.
+pub fn sort_run_indices(order: &mut [usize], runs: &[DesignRun], col: RunCol, asc: bool) {
+    order.sort_by(|&ia, &ib| {
+        let a = &runs[ia];
+        let b = &runs[ib];
+        match (run_col_missing(a, col), run_col_missing(b, col)) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => {
+                let ord = cmp_design_runs(a, b, col);
+                let ord = if asc { ord } else { ord.reverse() };
+                ord.then_with(|| a.name.cmp(&b.name))
+            }
+        }
+    });
+}
+
+/// Runs-panel form state: new-run strategy editor + seed sweep + table sort.
+/// UI-only; strategies persist via each run's `spec`.
+#[derive(Clone, Debug)]
+pub struct RunEditorState {
+    pub name: String,
+    pub preset: String,
+    pub opt_level: u8,
+    pub aig_rewrite: bool,
+    pub timing_driven: bool,
+    pub placer_seed: u64,
+    pub router_iters: u32,
+    pub phys_opt: bool,
+    pub sort_col: RunCol,
+    pub sort_asc: bool,
+    pub sweep_base: String,
+    pub sweep_seeds: String,
+    pub sweep_spec_from_editor: bool,
+}
+
+impl Default for RunEditorState {
+    fn default() -> Self {
+        let p = helion_proj::RunStrategy::fallback();
+        Self {
+            name: String::new(),
+            preset: p.preset.clone(),
+            opt_level: p.opt_level,
+            aig_rewrite: p.aig_rewrite,
+            timing_driven: p.timing_driven,
+            placer_seed: p.placer_seed,
+            router_iters: p.router_iters,
+            phys_opt: p.phys_opt,
+            sort_col: RunCol::Wns,
+            sort_asc: false,
+            sweep_base: "sweep".into(),
+            sweep_seeds: "1,2,3".into(),
+            sweep_spec_from_editor: true,
+        }
+    }
+}
+
+impl RunEditorState {
+    /// Apply a named preset to every knob.
+    pub fn apply_preset(&mut self, name: &str) {
+        if let Ok(p) = helion_proj::RunStrategy::preset(name) {
+            self.preset = p.preset.clone();
+            self.opt_level = p.opt_level;
+            self.aig_rewrite = p.aig_rewrite;
+            self.timing_driven = p.timing_driven;
+            self.placer_seed = p.placer_seed;
+            self.router_iters = p.router_iters;
+            self.phys_opt = p.phys_opt;
+        }
+    }
+
+    /// Current knob set as a [`helion_proj::RunStrategy`].
+    pub fn strategy(&self) -> helion_proj::RunStrategy {
+        helion_proj::RunStrategy {
+            preset: self.preset.clone(),
+            opt_level: self.opt_level,
+            aig_rewrite: self.aig_rewrite,
+            timing_driven: self.timing_driven,
+            placer_seed: self.placer_seed,
+            router_iters: self.router_iters,
+            phys_opt: self.phys_opt,
+        }
+    }
+
+    /// Any manual knob edit turns the preset into Custom.
+    pub fn touched(&mut self) {
+        if self.preset != "Custom" {
+            self.preset = "Custom".into();
+        }
     }
 }
 
@@ -4750,6 +5061,12 @@ pub struct IdeModel {
     pub messages: Vec<IdeMessage>,
     pub log: Vec<String>,
     pub runs: Vec<DesignRun>,
+    /// Design-run queue: run names waiting for background execution.
+    /// Drained one at a time via `JobKind::DesignRun`; the panel fills it,
+    /// `poll_job` chains the next. Cleared by "Cancel queue".
+    pub run_queue: VecDeque<String>,
+    /// Runs-panel form state (strategy editor, sweep, table sort). UI-only.
+    pub run_editor: RunEditorState,
     pub schematic: SchematicView,
     pub device: DeviceView,
     /// Device canvas zoom. 1.0 = Zoom Fit (both axes). >1 scrolls the die.
@@ -4959,6 +5276,8 @@ impl IdeModel {
                 DesignRun::new("synth_1", "Synthesis"),
                 DesignRun::new("impl_1", "Implementation"),
             ],
+            run_queue: VecDeque::new(),
+            run_editor: RunEditorState::default(),
             schematic: SchematicView::default(),
             device: DeviceView::default(),
             device_zoom: 1.0,
@@ -12306,10 +12625,204 @@ impl IdeModel {
         Ok(format!("launch_runs {name} strategy={}", strategy.label()))
     }
 
+    /// Design-runs worker: execute one queued run on the engine thread
+    /// (`JobKind::DesignRun`). Re-synthesizes from the project RTL source
+    /// with this run's AIG setting (thread-local flag, restored on drop),
+    /// then runs the full [`helion_proj::RunStrategy`]. Fills the run's
+    /// result fields and keeps the finished [`Session`] so the run can
+    /// become the active design ("make active"). Never touches
+    /// `self.shell.session`.
+    pub fn execute_design_run(&mut self, name: &str) -> Result<String, String> {
+        let idx = self
+            .runs
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| format!("design_run: unknown run {name}"))?;
+        let mut strategy = self.runs[idx].run_strategy();
+        if let Some(seed) = self.runs[idx].seed {
+            strategy.placer_seed = seed;
+        }
+        self.runs[idx].status = "Running".into();
+
+        let src = self
+            .tree
+            .sources
+            .last()
+            .cloned()
+            .ok_or_else(|| format!("design_run {name}: no RTL source (open a source first)"))?;
+        let dev = self.device()?;
+
+        // AIG rewriting happens inside RTL synthesis; the flag is
+        // thread-local so the engine thread stays isolated. Restored on drop
+        // even if synthesis fails.
+        struct AigGuard;
+        impl Drop for AigGuard {
+            fn drop(&mut self) {
+                helion_sv::set_aig_rewrite(true);
+            }
+        }
+        helion_sv::set_aig_rewrite(strategy.aig_rewrite);
+        let _aig = AigGuard;
+
+        let t0 = std::time::Instant::now();
+        let outcome: Result<(), String> = (|| {
+            let d = crate::synth_hdl_path(Path::new(&src))?;
+            let mut side = Session::new(Mode::NonProject);
+            side.part = self.part().to_string();
+            side.synth_design(d);
+            if let Some(d) = side.design.as_mut() {
+                let _ = self.constraints.apply(d);
+            }
+            side.impl_with_run_strategy(&dev, &strategy)?;
+            let (luts, ffs, brams, dsps) = side
+                .placed
+                .as_ref()
+                .map(|p| {
+                    let luts = p.packed.lutffs.len();
+                    let ffs = p
+                        .packed
+                        .lutffs
+                        .iter()
+                        .filter(|lf| !lf.ff_cell.is_empty())
+                        .count();
+                    (luts, ffs, p.packed.brams.len(), p.packed.macs.len())
+                })
+                .unwrap_or((0, 0, 0, 0));
+            let clks = self.clocks_for_sta();
+            let (wns, tns) = match (side.design.as_ref(), side.routed.as_ref()) {
+                (Some(d), Some(r)) => report_timing_routed_xdc(d, r, &clks, &self.constraints)
+                    .ok()
+                    .map(|t| (Some(t.wns_ps), Some(t.tns_ps)))
+                    .unwrap_or((None, None)),
+                _ => (None, None),
+            };
+            let ms = t0.elapsed().as_millis() as u64;
+            // Gather everything needing `&self` before the mutable run update.
+            let part = self.part().to_string();
+            let cells = side.design.as_ref().map(|d| d.cells.len());
+            let bitstream_hash = side.blinky_hash();
+            let top = side.design.as_ref().map(|d| d.name.clone());
+            let strategy_label = strategy.preset.clone();
+            let spec = strategy.to_spec();
+            let r = &mut self.runs[idx];
+            r.status = "Complete".into();
+            r.strategy = strategy_label;
+            r.spec = spec;
+            r.runtime_ms = Some(ms);
+            r.wns_ps = wns;
+            r.tns_ps = tns;
+            r.luts = Some(luts);
+            r.ffs = Some(ffs);
+            r.brams = Some(brams);
+            r.dsps = Some(dsps);
+            r.lutff = Some(luts);
+            r.cells = cells;
+            r.bitstream_hash = bitstream_hash;
+            r.part = part;
+            r.top = top;
+            r.result_session = Some(Box::new(side));
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => Ok(format!(
+                "design_run {name} complete wns={} luts={}",
+                self.runs[idx].wns_cell(),
+                self.runs[idx].luts_cell(),
+            )),
+            Err(e) => {
+                self.runs[idx].status = "Failed".into();
+                Err(format!("design_run {name}: {e}"))
+            }
+        }
+    }
+
+    /// Make a finished run the active design: swap in its result session and
+    /// re-sync every view. Errors when the run has no result yet.
+    pub fn make_run_active(&mut self, name: &str) -> Result<String, String> {
+        let idx = self
+            .runs
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| format!("make_active: unknown run {name}"))?;
+        let session = self.runs[idx]
+            .result_session
+            .clone()
+            .ok_or_else(|| format!("make_active {name}: run has no result yet"))?;
+        self.shell.session = *session;
+        self.sync_from_session();
+        Ok(format!("make_active {name}"))
+    }
+
+    /// Fill the background queue with run names (in order). Duplicates and
+    /// unknown names are refused so the queue stays clean.
+    pub fn enqueue_design_runs(&mut self, names: &[&str]) -> Result<String, String> {
+        for n in names {
+            if !self.runs.iter().any(|r| r.name == *n) {
+                return Err(format!("enqueue: unknown run {n}"));
+            }
+            if self.run_queue.iter().any(|q| q == n) {
+                return Err(format!("enqueue: {n} already queued"));
+            }
+        }
+        for n in names {
+            self.run_queue.push_back(n.to_string());
+        }
+        Ok(format!("queued {} run(s)", names.len()))
+    }
+
+    /// Drop every pending run. The run currently on the engine thread finishes;
+    /// nothing new starts afterwards.
+    pub fn cancel_run_queue(&mut self) -> String {
+        let n = self.run_queue.len();
+        self.run_queue.clear();
+        format!("cancelled {n} queued run(s)")
+    }
+
+    /// Seed sweep: create N runs from one strategy with member seeds and queue
+    /// them all. Names are `{base}_s{seed}`; existing names are refused.
+    pub fn create_seed_sweep(
+        &mut self,
+        base: &str,
+        spec: &str,
+        seeds: &[u64],
+    ) -> Result<String, String> {
+        if seeds.is_empty() {
+            return Err("seed_sweep: need at least one seed".into());
+        }
+        let strategy = helion_proj::RunStrategy::parse_spec(spec)
+            .map_err(|e| format!("seed_sweep: bad spec: {e}"))?;
+        for s in seeds {
+            let name = format!("{base}_s{s}");
+            if self.runs.iter().any(|r| r.name == name) {
+                return Err(format!("seed_sweep: {name} exists"));
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        for s in seeds {
+            let name = format!("{base}_s{s}");
+            let mut run = DesignRun::new(&name, "Implementation");
+            run.strategy = strategy.preset.clone();
+            run.spec = strategy.to_spec();
+            run.seed = Some(*s);
+            self.runs.push(run);
+            names.push(name);
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.enqueue_design_runs(&refs)?;
+        Ok(format!(
+            "seed_sweep {base}: {} runs queued",
+            names.len()
+        ))
+    }
+
     /// UG986 Lab 1: `create_run impl_runtime -strategy RuntimeOpt`
+    /// Full-spec form: `create_run impl_custom -spec Preset:opt=1,aig=on,...`
+    /// (`-spec` wins over `-strategy`).
     pub fn create_run(&mut self, spec: &str) -> Result<String, String> {
         let mut name = String::new();
         let mut strategy = ImplStrategy::Default;
+        let mut full_spec: Option<String> = None;
         let mut toks = spec.split_whitespace();
         if let Some(n) = toks.next() {
             name = n.to_string();
@@ -12318,6 +12831,13 @@ impl IdeModel {
             if t == "-strategy" || t == "-strat" {
                 if let Some(s) = toks.next() {
                     strategy = ImplStrategy::parse(s)?;
+                }
+            } else if t == "-spec" {
+                if let Some(s) = toks.next() {
+                    // Validate now; stored verbatim for the worker.
+                    helion_proj::RunStrategy::parse_spec(s)
+                        .map_err(|e| format!("create_run: bad -spec: {e}"))?;
+                    full_spec = Some(s.to_string());
                 }
             }
         }
@@ -12328,10 +12848,17 @@ impl IdeModel {
             return Err(format!("create_run: {name} exists"));
         }
         let mut run = DesignRun::new(&name, "Implementation");
-        run.strategy = strategy.label().into();
+        if let Some(spec_str) = full_spec {
+            let parsed = helion_proj::RunStrategy::parse_spec(&spec_str)
+                .unwrap_or_else(|_| helion_proj::RunStrategy::fallback());
+            run.strategy = parsed.preset.clone();
+            run.spec = spec_str;
+        } else {
+            run.strategy = strategy.label().into();
+        }
         self.runs.push(run);
         self.workspace = WorkspaceTab::Runs;
-        Ok(format!("create_run {name} strategy={}", strategy.label()))
+        Ok(format!("create_run {name}"))
     }
 
     /// UG986 Lab 2: re-synth current source and incremental-place from the checkpoint.
@@ -38611,5 +39138,154 @@ endmodule
             })
             .sum();
         assert_eq!(sum, n, "sum counts == lutff_sites.len(); lines={lines:?}");
+    }
+
+    // --- Design runs ------------------------------------------------------
+
+    fn mk_run(name: &str, luts: Option<usize>, wns: Option<i64>) -> DesignRun {
+        let mut r = DesignRun::new(name, "Implementation");
+        r.status = "Complete".into();
+        r.luts = luts;
+        r.wns_ps = wns;
+        r
+    }
+
+    #[test]
+    fn design_runs_sort_orders_by_column() {
+        let mut runs = vec![
+            mk_run("b", Some(100), Some(-500)),
+            mk_run("a", Some(50), Some(100)),
+            mk_run("c", None, None),
+        ];
+        sort_design_runs(&mut runs, RunCol::Luts, true);
+        assert_eq!(runs[0].name, "a");
+        assert_eq!(runs[1].name, "b");
+        assert_eq!(runs[2].name, "c", "missing values sort last");
+        sort_design_runs(&mut runs, RunCol::Wns, false);
+        assert_eq!(runs[0].name, "a", "best WNS first descending");
+        assert_eq!(runs[2].name, "c");
+    }
+
+    #[test]
+    fn design_runs_sort_indices_matches_model_sort() {
+        let runs = vec![
+            mk_run("b", Some(100), Some(-500)),
+            mk_run("a", Some(50), Some(100)),
+        ];
+        let mut order = vec![0usize, 1];
+        sort_run_indices(&mut order, &runs, RunCol::Luts, true);
+        assert_eq!(order, vec![1, 0]);
+        // Model order untouched.
+        assert_eq!(runs[0].name, "b");
+    }
+
+    #[test]
+    fn design_runs_best_column_honors_direction() {
+        let runs = vec![
+            mk_run("b", Some(100), Some(-500)),
+            mk_run("a", Some(50), Some(100)),
+            mk_run("c", None, None),
+        ];
+        assert_eq!(best_run_index(&runs, RunCol::Luts), Some(1), "fewest LUTs wins");
+        assert_eq!(best_run_index(&runs, RunCol::Wns), Some(1), "highest WNS wins");
+        let empty: Vec<DesignRun> = vec![mk_run("x", None, None)];
+        assert_eq!(best_run_index(&empty, RunCol::Luts), None);
+    }
+
+    #[test]
+    fn design_runs_sweep_stats_best_worst_mean() {
+        let runs = vec![
+            mk_run("s1", Some(10), Some(-100)),
+            mk_run("s2", Some(10), Some(200)),
+            mk_run("s3", Some(10), Some(-300)),
+        ];
+        assert_eq!(sweep_wns_stats(&runs), Some((200, -300, -66)));
+        let none: Vec<DesignRun> = vec![mk_run("x", None, None)];
+        assert_eq!(sweep_wns_stats(&none), None);
+    }
+
+    #[test]
+    fn design_runs_queue_state_machine() {
+        let mut model = IdeModel::new();
+        model.create_run("r1 -strategy RuntimeOpt").unwrap();
+        model.create_run("r2 -strategy PhysOpt").unwrap();
+        assert!(model.enqueue_design_runs(&["r1", "r2"]).is_ok());
+        assert!(model.enqueue_design_runs(&["r1"]).is_err(), "no duplicates");
+        assert!(model.enqueue_design_runs(&["nope"]).is_err(), "unknown refused");
+        assert_eq!(model.run_queue.len(), 2);
+        assert_eq!(model.run_queue.pop_front().as_deref(), Some("r1"));
+        assert_eq!(model.cancel_run_queue(), "cancelled 1 queued run(s)");
+        assert!(model.run_queue.is_empty());
+    }
+
+    #[test]
+    fn design_runs_create_run_spec_round_trip() {
+        let mut model = IdeModel::new();
+        model
+            .create_run("custom1 -spec Custom:opt=0,aig=off,timing=off,seed=7,route_iters=4,phys=on")
+            .unwrap();
+        let r = model.runs.iter().find(|r| r.name == "custom1").unwrap();
+        let s = r.run_strategy();
+        assert_eq!(s.opt_level, 0);
+        assert!(!s.aig_rewrite);
+        assert!(!s.timing_driven);
+        assert_eq!(s.placer_seed, 7);
+        assert_eq!(s.router_iters, 4);
+        assert!(s.phys_opt);
+        // Spec persists verbatim for the worker.
+        assert!(r.spec.contains("seed=7"));
+    }
+
+    #[test]
+    fn design_runs_run_strategy_fallback_never_panics() {
+        let mut r = DesignRun::new("x", "Implementation");
+        r.spec = "Bogus:opt=zzz".into();
+        let s = r.run_strategy();
+        assert_eq!(s.preset, "Custom");
+        r.spec.clear();
+        r.strategy = "NotARealPreset".into();
+        let s = r.run_strategy();
+        assert_eq!(s.preset, "Custom");
+    }
+
+    #[test]
+    fn design_runs_seed_sweep_creates_and_queues() {
+        let mut model = IdeModel::new();
+        let spec = helion_proj::RunStrategy::preset("RuntimeOpt")
+            .unwrap()
+            .to_spec();
+        model.create_seed_sweep("sw", &spec, &[3, 4]).unwrap();
+        assert!(model.runs.iter().any(|r| r.name == "sw_s3"));
+        assert!(model.runs.iter().any(|r| r.name == "sw_s4"));
+        let s3 = model.runs.iter().find(|r| r.name == "sw_s3").unwrap();
+        assert_eq!(s3.seed, Some(3));
+        assert_eq!(model.run_queue.len(), 2);
+        assert!(model.create_seed_sweep("sw", &spec, &[3]).is_err(), "dup refused");
+    }
+
+    #[test]
+    fn design_runs_execute_counter_end_to_end() {
+        let mut model = IdeModel::new();
+        model
+            .tree
+            .sources
+            .push(example("counter.sv").to_string_lossy().into_owned());
+        model.create_run("e2e -strategy RuntimeOpt").unwrap();
+        let out = model.execute_design_run("e2e").expect("run executes");
+        assert!(out.contains("complete"), "{out}");
+        let r = model.runs.iter().find(|r| r.name == "e2e").unwrap();
+        assert_eq!(r.status, "Complete");
+        assert!(r.luts.unwrap_or(0) > 0, "LUTs measured");
+        assert!(r.ffs.is_some(), "FFs measured");
+        assert!(r.wns_ps.is_some(), "WNS measured");
+        assert!(r.tns_ps.is_some(), "TNS measured");
+        assert!(r.runtime_ms.is_some(), "runtime measured");
+        assert!(r.result_session.is_some(), "session kept for make-active");
+        // Make active swaps the session in.
+        model.make_run_active("e2e").expect("make active");
+        assert!(model.shell.session.placed.is_some());
+        // Unknown run / missing result are clean errors, not panics.
+        assert!(model.execute_design_run("nope").is_err());
+        assert!(model.make_run_active("impl_1").is_err());
     }
 }
