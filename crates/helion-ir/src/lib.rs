@@ -149,6 +149,12 @@ impl MapResult {
     }
 }
 
+/// The backend-neutral netlist IR: the single input type for every
+/// device-backend flow trait implementation. An alias for
+/// [`Design`]; kept as its own name so M1 backend-trait code can refer to
+/// the netlist IR without caring about the concrete struct name.
+pub type NetlistIr = Design;
+
 #[derive(Clone, Debug)]
 pub struct Design {
     pub name: String,
@@ -195,6 +201,15 @@ pub enum CellKind {
     Hff,
     /// Output IOB driving a top port.
     IobOut,
+    /// Input IOB: a top-level input port lands here (e.g. an oscillator
+    /// clock pin) before fanout into the fabric. Backend-neutral: any target
+    /// maps it to its own input-buffer primitive (Xilinx IBUF).
+    IobIn,
+    /// Global clock buffer: a single high-fanout clock net. Backend-neutral:
+    /// any target maps it to its own clock-buffer primitive (Xilinx BUFGCTRL).
+    /// On the HL10T flow this is rejected at pack/route time with an
+    /// "unsupported for HL10T" error; it is only legal for multi-backend flows.
+    ClockBuf,
     /// DSP MAC27 (pre-add * mul + acc). Site primitive.
     Mac27,
     /// Inserted ILA core capturing `net`.
@@ -664,6 +679,8 @@ impl Design {
                 CellKind::Lut6 { init } => s.push_str(&format!("cell {} Lut6 {init:#x}\n", c.name)),
                 CellKind::Hff => s.push_str(&format!("cell {} Hff\n", c.name)),
                 CellKind::IobOut => s.push_str(&format!("cell {} IobOut\n", c.name)),
+                CellKind::IobIn => s.push_str(&format!("cell {} IobIn\n", c.name)),
+                CellKind::ClockBuf => s.push_str(&format!("cell {} ClockBuf\n", c.name)),
                 CellKind::Mac27 => s.push_str(&format!("cell {} Mac27\n", c.name)),
                 CellKind::Ila { net } => s.push_str(&format!("cell {} Ila {net}\n", c.name)),
                 CellKind::Bram18 => s.push_str(&format!("cell {} Bram18\n", c.name)),
@@ -748,6 +765,8 @@ impl Design {
                         }
                         "Hff" => CellKind::Hff,
                         "IobOut" => CellKind::IobOut,
+                        "IobIn" => CellKind::IobIn,
+                        "ClockBuf" => CellKind::ClockBuf,
                         "Mac27" => CellKind::Mac27,
                         "Ila" => CellKind::Ila { net: rest },
                         "Bram18" => CellKind::Bram18,
@@ -1054,5 +1073,40 @@ mod soft_diag_tests {
         assert!(lines[0].contains("span=ibex_core.sv:120"));
         assert!(lines[1].contains("soft name=generate_not_lowered"));
         assert!(mr.has_softs());
+    }
+}
+
+#[cfg(test)]
+mod multibackend_cell_tests {
+    use super::*;
+
+    #[test]
+    fn iob_in_and_clock_buf_round_trip_hnf() {
+        let mut d = Design::new("rt");
+        d.add_cell("u_clk_iob", CellKind::IobIn);
+        d.add_cell("u_bufg", CellKind::ClockBuf);
+        d.add_cell("u_out_iob", CellKind::IobOut);
+        let hnf = d.to_hnf();
+        assert!(hnf.contains("cell u_clk_iob IobIn"));
+        assert!(hnf.contains("cell u_bufg ClockBuf"));
+        let back = Design::from_hnf(&hnf).expect("hnf round trip");
+        assert!(matches!(
+            back.cell("u_clk_iob").unwrap().kind,
+            CellKind::IobIn
+        ));
+        assert!(matches!(
+            back.cell("u_bufg").unwrap().kind,
+            CellKind::ClockBuf
+        ));
+        assert!(matches!(
+            back.cell("u_out_iob").unwrap().kind,
+            CellKind::IobOut
+        ));
+    }
+
+    #[test]
+    fn netlist_ir_alias_is_design() {
+        let d: NetlistIr = Design::structural_counter();
+        assert_eq!(d.name, "counter");
     }
 }
