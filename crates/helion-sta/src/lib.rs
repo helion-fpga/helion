@@ -4252,12 +4252,13 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let d = Design::structural_blinky();
         let p = pack(&d, &dev).unwrap();
-        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
+        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0, seed: 0 }).unwrap();
         let td = place_with(
             &p,
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -4279,12 +4280,13 @@ create_generated_clock -name clkedg -source [get_ports clk] -edges {1 3 5} [get_
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let d = Design::structural_blinky();
         let p = pack(&d, &dev).unwrap();
-        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
+        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0, seed: 0 }).unwrap();
         let td = place_with(
             &p,
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -6019,7 +6021,7 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(d, &dev).unwrap();
         let guide = xdc.timing_guide();
-        let pl = place_with_guide(&p, &dev, PlaceOpts { timing_weight }, &guide).unwrap();
+        let pl = place_with_guide(&p, &dev, PlaceOpts { timing_weight, seed: 0 }, &guide).unwrap();
         let rt = route_with_guide(&pl, &dev, RouteOpts::default(), &guide).unwrap();
         let mut clks = xdc.clocks.clone();
         if clks.is_empty() {
