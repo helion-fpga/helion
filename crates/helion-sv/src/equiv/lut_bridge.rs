@@ -19,7 +19,8 @@ use crate::{Aig, Lit};
 use std::collections::HashMap;
 
 /// Maximum AND budget tried per 4-LUT cofactor via [`exact_synth`].
-const COFACTOR_BUDGET: usize = 10;
+/// Tried as increasing budgets 0..=COFACTOR_BUDGET (see [`synth_cofactor`]).
+const COFACTOR_BUDGET: usize = 8;
 
 /// Memoized per-INIT templates. Key = the 64-bit INIT word.
 #[derive(Clone, Debug, Default)]
@@ -158,11 +159,19 @@ impl TmplBuilder {
     }
 }
 
-/// Synthesize one 4-LUT cofactor truth table. A single `exact_synth` call
-/// with the max budget suffices: its DFS already explores 1, 2, ... AND
-/// implementations in order and returns the first (minimal) one found.
+/// Synthesize one 4-LUT cofactor truth table, trying increasing AND budgets.
+///
+/// Note: budgets are tried small-to-large (not a single large budget).
+/// `exact_synth`'s DFS shares one evaluation budget per call, so a large
+/// budget can exhaust it exploring deep bad paths and return None where a
+/// small budget quickly finds the minimal solution.
 fn synth_cofactor(t: u16) -> Option<RawSynth> {
-    exact_synth(t, 4, COFACTOR_BUDGET)
+    for budget in 0..=COFACTOR_BUDGET {
+        if let Some(raw) = exact_synth(t, 4, budget) {
+            return Some(raw);
+        }
+    }
+    None
 }
 
 /// Fixed Shannon mux tree over all 64 INIT bits. Total: always works, used
