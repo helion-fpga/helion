@@ -1213,7 +1213,7 @@ mod tests {
         let labels = workspace_tab_labels();
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 29);
+        assert_eq!(WorkspaceTab::ALL.len(), 32);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
@@ -1674,7 +1674,7 @@ mod tests {
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
-        assert_eq!(WorkspaceTab::ALL.len(), 29);
+        assert_eq!(WorkspaceTab::ALL.len(), 32);
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Schematic),
             WorkspacePane::Schematic
@@ -1730,7 +1730,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(more, 26, "29 tabs − 3 canvases");
+        assert_eq!(more, 29, "32 tabs − 3 canvases");
         assert!(is_report_detail(WorkspaceTab::Utilization));
         assert!(!is_report_detail(WorkspaceTab::Schematic));
         assert_eq!(

@@ -35972,7 +35972,7 @@ endmodule
 
         let table = ide.exec("reports").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Reports);
-        assert!(table.contains("reports n=9"), "{table}");
+        assert!(table.contains("reports n=10"), "{table}");
         assert!(table.contains("complete=0"), "{table}");
         assert!(
             table.contains('\n'),
@@ -40542,7 +40542,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 29);
+        assert_eq!(WorkspaceTab::ALL.len(), 32);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(

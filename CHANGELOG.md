@@ -4,18 +4,30 @@ All notable Helion releases are listed here. Version numbers match
 `workspace.package.version` in `Cargo.toml` and Git tags `vMAJOR.MINOR.PATCH`.
 Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/helion/releases).
 
-## [Unreleased]
+## [2.5.0] — 2026-10-12
+
+Nine "best in the market" IDE features, toast/macOS hotfixes, and a UX fix batch.
 
 ### Added
 
-### Changed
+- Cross-probing: clicking a timing path lights it up in the device view and schematic (probe selection synced across views).
+- Real Tcl console: inline console (bottom panel) plus a floating window on Cmd+Backtick; drives the same `Session` engines as the CLI, with expression syntax errors that report line numbers.
+- Design runs + strategy sweep: named runs with strategy presets (Default, TimingExplore, RuntimeOpt, PhysOpt, Custom), per-run placer seed / router iters / AIG rewrite / timing-driven / phys-opt toggles, queue with streaming results, seed sweeps, and best-run activation.
+- Checkpoints: save/restore named implementation checkpoints; checkpoint manager pane.
+- Integrated testbench runner: discover `*_tb.sv` testbenches, run them against the sim kernel (full net resolution for LUT pins, driven top-level inputs, multi-level LUT chains), stream logs with severity coloring.
+- Constraints wizard: visual SDC editor — clocks, I/O delays, false paths, and multicycle exceptions with a draft/apply flow.
+- QoR suggestions engine: analyzes the implemented design and surfaces prioritized, actionable QoR suggestions with severity levels.
+- VCD-driven power estimation: VCD dumper with exact multi-level LUT-chain net resolution, switching-activity power report with severity-graded nets.
+- ILA / logic analyzer: sim-side ILA with probe selection, edge/value triggers, waveform viewer (GTKWave-style with cursor/A-B markers), and VCD export marking invalid samples as X.
+- Editable source editor (UX batch): click-and-type editing with syntax highlighting, VS Code-style minimap, line numbers, dirty indicator, Cmd+S save, Alt+Z soft-wrap.
 
 ### Fixed
 
 - Toast notifications no longer pile up as giant permanent cards: they auto-dismiss after 5s on a wall-clock timer (the old frame-count timer never expired while the UI was idle), are capped at 360px with wrapping, max 4 stacked, deduped, and the "Started: …" spam is gone — job progress already lives in the status bar; toasts are completions/errors only.
 - macOS: ad-hoc codesign the `Helion.app` bundle during the release build (and verify it in CI). Unsigned downloads were reported as "damaged" by Gatekeeper on recent macOS; the bundle is now well-formed. The bundle version is stamped from `workspace.package.version` at build time (no more hardcoded plist version). First launch from a download still needs one `xattr -cr /Applications/Helion.app` (documented in the README) until Apple notarization is set up.
+- UX audit fixes: red Timing warnings resolved, bottom panel holds its drag position, the Tcl tab no longer pops a floating dialog (inline console under the "Console" tab instead), toolbar scrolls on narrow windows, console opens with a clean "session started" separator.
 
-[unreleased]: https://github.com/helion-fpga/helion/compare/v2.1.0...HEAD
+[2.5.0]: https://github.com/helion-fpga/helion/compare/v2.1.0...v2.5.0
 
 ## [2.1.0] — 2026-10-11
 
