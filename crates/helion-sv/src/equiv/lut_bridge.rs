@@ -167,10 +167,10 @@ fn shannon_tree(b: &mut TmplBuilder, init: u64, k: usize, base: usize) -> RInp {
     match (lo_r, hi_r) {
         (RInp::Const(false), RInp::Const(false)) => RInp::Const(false),
         (RInp::Const(true), RInp::Const(true)) => RInp::Const(true),
-        (RInp::Const(false), h) => b.push(s, h),
-        (RInp::Const(true), h) => flip(b.push(flip(s), flip(h))),
-        (l, RInp::Const(false)) => b.push(flip(s), l),
-        (l, RInp::Const(true)) => flip(b.push(s, flip(l))),
+        (RInp::Const(false), h) => b.push(s, h), // s & h
+        (RInp::Const(true), h) => flip(b.push(flip(h), s)), // h | ~s
+        (l, RInp::Const(false)) => b.push(flip(s), l), // ~s & l
+        (l, RInp::Const(true)) => flip(b.push(flip(s), flip(l))), // s | l
         (l, h) => b.mux(s, h, l),
     }
 }
