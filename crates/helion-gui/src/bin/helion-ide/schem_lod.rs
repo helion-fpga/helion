@@ -2,8 +2,8 @@
 //!
 //! At fit zoom on a 15k-cell design, drawing every gate and wire produces
 //! visual noise (a wire grid with no readable gates). Below [`BLOCK_ZOOM`]
-//! the sheet renders a treemap of hierarchical instance blocks — one box per
-//! module, sized and labeled by cell count — instead of the flat gate layout
+//! the sheet renders a treemap of hierarchical instance blocks - one box per
+//! module, sized and labeled by cell count - instead of the flat gate layout
 //! (whose kind-column placement interleaves hierarchy, so world-space boxes
 //! would all coincide). Zooming in past the threshold, or double-clicking a
 //! block (Expand Inside), restores the gate-level sheet.
@@ -204,7 +204,7 @@ pub fn paint_block_layer(
             ),
             egui::StrokeKind::Inside,
         );
-        // Labels only when they fit inside the box — never overflow.
+        // Labels only when they fit inside the box - never overflow.
         let name_need = b.short.len() as f32 * 7.0 + 16.0;
         if r.width() >= 80.0 && r.height() >= 48.0 && r.width() >= name_need {
             p.text(

@@ -11,7 +11,7 @@
 //! scrolls internally. One outer [`egui::ScrollArea`] does all the scrolling,
 //! which keeps the gutter overlay and the minimap viewport math trivially in
 //! sync. The gutter and minimap are painted as overlays *after* the scroll
-//! area, positioned from the current frame's scroll state — no lag.
+//! area, positioned from the current frame's scroll state - no lag.
 
 use super::*;
 use std::cell::RefCell;
@@ -114,7 +114,7 @@ fn base_format(theme: &theme::Theme, font_size: f32) -> egui::TextFormat {
 ///
 /// In wrap mode each logical line is also laid out on its own so the gutter
 /// can size rows to the true visual height; the counts are reported through
-/// `line_rows_out` (visual rows per logical line, same frame — no lag).
+/// `line_rows_out` (visual rows per logical line, same frame - no lag).
 fn build_editor_galley(
     ui: &egui::Ui,
     text: &str,

@@ -9,26 +9,26 @@ use crate::{ide::WaveDensity, BottomTab, WorkspaceTab};
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
-/// Activity rail — letter above the full name. 48px clipped "Device"/"Program"/"Reports".
+/// Activity rail - letter above the full name. 48px clipped "Device"/"Program"/"Reports".
 pub const RAIL_WIDTH: f32 = 88.0;
 /// Tall enough for letter glyph + full name under it (hit ≥28px).
 pub const HIT_RAIL: f32 = 56.0;
 /// One sidebar (MUST 5).
 pub const SIDEBAR_WIDTH: f32 = 220.0;
-/// Legacy aliases — side chrome is rail + sidebar, not 680.
+/// Legacy aliases - side chrome is rail + sidebar, not 680.
 pub const NAV_WIDTH: f32 = RAIL_WIDTH;
 pub const TREE_WIDTH: f32 = SIDEBAR_WIDTH;
-/// Properties dock — shown on selection, not always-on.
+/// Properties dock - shown on selection, not always-on.
 pub const PROPERTIES_WIDTH: f32 = 220.0;
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const RAIL_MIN_HEIGHT: f32 = TOOLBAR_HEIGHT;
 pub const STATUS_HEIGHT: f32 = 22.0;
 pub const HIT_PRIMARY: f32 = 32.0;
-/// Comfort primary (Implement / Open) — ≥44 where the toolbar has room.
+/// Comfort primary (Implement / Open) - ≥44 where the toolbar has room.
 pub const HIT_COMFORT: f32 = 36.0;
 /// Every toolbar / flow chip shares this height. Width may follow the label; height may not.
 pub const TOOLBAR_CTRL_H: f32 = HIT_COMFORT;
-/// Approx glyph width at the rail's primary (word) size — letter is secondary.
+/// Approx glyph width at the rail's primary (word) size - letter is secondary.
 const RAIL_WORD_CHAR_PX: f32 = 8.0;
 pub const HIT_SIDEBAR: f32 = 28.0;
 pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
@@ -51,14 +51,14 @@ pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 140.0;
 /// Floorplan / package canvas never shrinks below this if the pane has room.
 pub const DRAWING_MIN_HEIGHT: f32 = 280.0;
 /// Idle paint policy (Air budgets): eframe reactive; no continuous `request_repaint`.
-/// Floorplan/device paint is O(pins + tiles) per *input* frame only — not a synth loop.
+/// Floorplan/device paint is O(pins + tiles) per *input* frame only - not a synth loop.
 pub const IDLE_PAINT_POLICY: &str = "reactive-no-request_repaint";
 /// Soft budget: idle CPU should be ~0% when the window is unfocused / no input (OS compositor).
 pub const IDLE_CPU_SOFT_PCT: u32 = 1;
 /// Soft budget: no uncapped animation timer; paint only on egui events.
 pub const IDLE_ANIM_HZ: u32 = 0;
 
-/// Legacy alias — canvas expands; do not use as a max cap.
+/// Legacy alias - canvas expands; do not use as a max cap.
 pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 /// Minimum column width used to decide whether a grid clips its last column.
 pub const MIN_COL_PX: f32 = 80.0;
@@ -73,7 +73,7 @@ pub fn toolbar_ctrl_size(label: &str) -> [f32; 2] {
     [w, TOOLBAR_CTRL_H]
 }
 
-/// Synth/Opt/Place/Route chips — same height as Open/Implement.
+/// Synth/Opt/Place/Route chips - same height as Open/Implement.
 pub fn flow_chip_size() -> [f32; 2] {
     [72.0, TOOLBAR_CTRL_H]
 }
@@ -81,7 +81,7 @@ pub fn flow_chip_size() -> [f32; 2] {
 /// Waveform trace row height. One or two traces must fill the remaining pane
 /// instead of painting a 32px strip over a black slab.
 /// Waveform lane height comes from the density toggle (GTKWave-style),
-/// not from stretching rows to fill the pane — stretching produced 150px
+/// not from stretching rows to fill the pane - stretching produced 150px
 /// lanes with few traces. Leftover space below the lanes is normal.
 pub fn wave_trace_row_h(density: WaveDensity) -> f32 {
     density.lane_h()
@@ -320,7 +320,7 @@ impl Activity {
         }
     }
 
-    /// Name under the letter. Full words — the rail is wide enough to paint them.
+    /// Name under the letter. Full words - the rail is wide enough to paint them.
     pub fn short_label(self) -> &'static str {
         self.label()
     }
@@ -776,7 +776,7 @@ pub fn device_io_site_line_fits(name: &str, dir: &str, site: &str, avail: f32) -
     line.chars().count() as f32 * 7.0 + 8.0 <= avail + 0.5
 }
 
-/// Shared chrome for the current window. Floors, then scroll — never a fixed letterbox
+/// Shared chrome for the current window. Floors, then scroll - never a fixed letterbox
 /// and never a pane taller than the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SharedChrome {
@@ -807,7 +807,7 @@ pub fn share_available(window_w: f32, window_h: f32) -> SharedChrome {
     let sidebar_w = SIDEBAR_WIDTH.clamp(sidebar_floor, sidebar_cap);
 
     // Floor hugs the tab strip (~40px) so the console can collapse to
-    // "completely small" — the user's drag, not the chrome, decides the height.
+    // "completely small" - the user's drag, not the chrome, decides the height.
     let console_floor = 40.0_f32.min(body_h * 0.28).max(36.0);
     let console_cap = (body_h * 0.26)
         .clamp(console_floor, CONSOLE_MAX_HEIGHT)
@@ -1145,7 +1145,7 @@ pub fn chrome_at(window_w: f32) -> ChromeOverflow {
     }
 }
 
-/// Silence unused WorkspaceTab import helper — canvases stay in sync with CANVASES.
+/// Silence unused WorkspaceTab import helper - canvases stay in sync with CANVASES.
 pub fn workspace_matches_canvases() -> bool {
     WorkspaceTab::CANVASES.len() == Canvas::ALL.len()
 }

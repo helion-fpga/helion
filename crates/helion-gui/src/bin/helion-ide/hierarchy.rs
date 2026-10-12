@@ -3,7 +3,7 @@
 //! Replaces the treemap (unreadable noise past a few hundred blocks) with a
 //! real expandable tree: chevron rows, indent guides, per-node cell counts,
 //! 28px rows, full-width selection highlight, and a filter field. Virtualized
-//! via `ScrollArea::show_rows` so 15k-block designs stay interactive — rows
+//! via `ScrollArea::show_rows` so 15k-block designs stay interactive - rows
 //! are only materialized for expanded paths, never all at once.
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +35,7 @@ struct TreeState {
     top: Option<String>,
     nodes: Vec<TreeNode>,
     root: usize,
-    /// Parent index per node (None for root) — drives the breadcrumb bar.
+    /// Parent index per node (None for root) - drives the breadcrumb bar.
     parent: Vec<Option<usize>>,
     expanded: HashSet<String>,
     filter: String,
