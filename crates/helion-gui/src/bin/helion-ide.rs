@@ -1391,45 +1391,52 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                 ui.label(RichText::new("Layout").small().color(app.theme.dim))
                     .on_hover_text("Task-curated window arrangement (persists)");
                 layouts::paint_layout_selector(ui, app);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    let synth_blocked = app.model.step_blocked(FlowStep::Synthesis);
-                    let busy = app.busy;
-                    ui.add_enabled_ui(synth_blocked.is_none(), |ui| {
-                        let impl_label = if busy { "Implementing…" } else { "Implement" };
-                        let impl_btn = ui
-                            .add_sized(
-                                chrome::toolbar_ctrl_size(impl_label),
-                                egui::Button::new(RichText::new(impl_label).strong()),
-                            )
-                            .on_hover_text(match synth_blocked {
-                                Some(why) => why.to_string(),
-                                None if busy => "Busy — wait for the current run.".into(),
-                                None => tip("Implement", "⌘↩", "impl_design"),
-                            });
-                        if impl_btn.clicked() {
-                            run_implement(app);
-                        }
-                    });
-                    let bits_blocked = app.model.step_blocked(FlowStep::Bitstream);
-                    ui.add_enabled_ui(bits_blocked.is_none(), |ui| {
-                        let b = ui
-                            .add_sized(
-                                chrome::toolbar_ctrl_size("Bitstream"),
-                                egui::Button::new("Bitstream"),
-                            )
-                            .on_hover_text(match bits_blocked {
-                                Some(why) => why.to_string(),
-                                None => tip("Bitstream", "", "write_bitstream"),
-                            });
-                        if b.clicked() {
-                            app.submit_job(JobKind::Step(FlowStep::Bitstream));
-                        }
-                    });
-                    });
+                // Right-pin the flow buttons WITHOUT overlapping the left content:
+                // a spacer takes the remaining viewport width minus the buttons'
+                // own width (min 16px gap), then buttons lay out left-to-right in
+                // visual order. Narrow windows collapse the spacer and the row
+                // scrolls (VS Code pattern) instead of painting "BitstreamDesign"
+                // text soup.
+                let busy = app.busy;
+                let impl_label = if busy { "Implementing…" } else { "Implement" };
+                let right_w = chrome::toolbar_ctrl_size(impl_label)[0]
+                    + chrome::toolbar_ctrl_size("Bitstream")[0]
+                    + ui.spacing().item_spacing.x;
+                ui.add_space((ui.available_width() - right_w).max(16.0));
+                let bits_blocked = app.model.step_blocked(FlowStep::Bitstream);
+                ui.add_enabled_ui(bits_blocked.is_none(), |ui| {
+                    let b = ui
+                        .add_sized(
+                            chrome::toolbar_ctrl_size("Bitstream"),
+                            egui::Button::new("Bitstream"),
+                        )
+                        .on_hover_text(match bits_blocked {
+                            Some(why) => why.to_string(),
+                            None => tip("Bitstream", "", "write_bitstream"),
+                        });
+                    if b.clicked() {
+                        app.submit_job(JobKind::Step(FlowStep::Bitstream));
+                    }
                 });
-            });
+                let synth_blocked = app.model.step_blocked(FlowStep::Synthesis);
+                ui.add_enabled_ui(synth_blocked.is_none(), |ui| {
+                    let impl_btn = ui
+                        .add_sized(
+                            chrome::toolbar_ctrl_size(impl_label),
+                            egui::Button::new(RichText::new(impl_label).strong()),
+                        )
+                        .on_hover_text(match synth_blocked {
+                            Some(why) => why.to_string(),
+                            None if busy => "Busy — wait for the current run.".into(),
+                            None => tip("Implement", "⌘↩", "impl_design"),
+                        });
+                    if impl_btn.clicked() {
+                        run_implement(app);
+                    }
+                });
         });
+        });
+    });
 }
 
 fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
@@ -2644,6 +2651,12 @@ fn paint_examples_popup(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     // Always: Editor | Device | Timing | More ... (overflow keeps prior WorkspaceTab destinations).
+    // Scrolls horizontally at narrow widths (VS Code pattern) so tabs never
+    // overlap neighboring chrome.
+    egui::ScrollArea::horizontal()
+        .id_salt("workspace_tabs")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     ui.horizontal(|ui| {
         for c in Canvas::ALL {
             // Reports rail owns the catalog view — don't paint it as "Timing" selected (Timing ≠ Reports).
@@ -2681,6 +2694,7 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
                     ui.close();
                 }
             }
+        });
         });
     });
     ui.separator();
@@ -7395,87 +7409,179 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         }
         s.len()
     };
-    // Toolbar scrolls horizontally instead of clipping the last buttons.
-    egui::ScrollArea::horizontal()
-        .id_salt("schematic_toolbar")
-        .auto_shrink([false, true])
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Previous").clicked() {
-                    let _ = model.schematic_previous_view();
-                }
-                if ui.button("Next").clicked() {
-                    let _ = model.schematic_next_view();
-                }
-                if ui.button("Zoom In").clicked() {
-                    zoom_in = true;
-                }
-                if ui.button("Zoom Out").clicked() {
-                    zoom_out = true;
-                }
-                if ui.button("Zoom Fit").clicked() {
-                    zoom_fit = true;
-                }
-                ui.checkbox(&mut model.schematic.auto_fit_on_probe, "Auto-fit path")
-                    .on_hover_text("Zoom to fit the probed timing path on selection");
-                if ui.button("Expand Cone").clicked() {
-                    let _ = model.exec("expand_cone");
-                }
-                if ui.button("Collapse Cone").clicked() {
-                    let _ = model.exec("collapse_cone");
-                }
-                if ui.button("Expand Inside").clicked() {
-                    let _ = model.exec("expand_inside");
-                }
-                if ui.button("Collapse Inside").clicked() {
-                    let _ = model.exec("collapse_inside");
-                }
-                // Fig. 55 sheet links: Cells / I/O Ports / Nets open Find Results.
-                if ui.link(format!("{n_cells} Cells")).clicked() {
-                    let _ = model.exec("sheet_find cells");
-                }
-                if ui.link(format!("{n_ports} I/O Ports")).clicked() {
-                    let _ = model.exec("sheet_find ports");
-                }
-                if ui.link(format!("{n_nets} Nets")).clicked() {
-                    let _ = model.exec("sheet_find nets");
-                }
-                // UG908: Device/Schematic net → Mark Debug / Add Probe → ILA.
-                let dbg_net = model.selected_debug_net();
-                ui.add_enabled_ui(dbg_net.is_some(), |ui| {
-                    let md = match &dbg_net {
-                        Some(n) => format!("Mark Debug {n}"),
-                        None => "Mark Debug".into(),
-                    };
-                    if ui
-                        .button(md)
-                        .on_hover_text("UG908 Mark Debug on the selected Schematic/Device net")
-                        .clicked()
-                    {
-                        let _ = model.exec("mark_debug");
+    // Overflow toolbar: actions that do not fit move into a ">>" menu
+    // (VS Code pattern) instead of truncating or needing a scroll strip.
+    #[derive(Clone, Copy, PartialEq)]
+    enum SchemTool {
+        Previous,
+        Next,
+        ZoomIn,
+        ZoomOut,
+        ZoomFit,
+        ExpandCone,
+        CollapseCone,
+        ExpandInside,
+        CollapseInside,
+        FindCells,
+        FindPorts,
+        FindNets,
+        MarkDebug,
+        AddProbe,
+    }
+    {
+        let dbg_net = model.selected_debug_net();
+        let md_label = match &dbg_net {
+            Some(n) => format!("Mark Debug {n}"),
+            None => "Mark Debug".into(),
+        };
+        let items = [
+            SchemTool::Previous,
+            SchemTool::Next,
+            SchemTool::ZoomIn,
+            SchemTool::ZoomOut,
+            SchemTool::ZoomFit,
+            SchemTool::ExpandCone,
+            SchemTool::CollapseCone,
+            SchemTool::ExpandInside,
+            SchemTool::CollapseInside,
+            SchemTool::FindCells,
+            SchemTool::FindPorts,
+            SchemTool::FindNets,
+            SchemTool::MarkDebug,
+            SchemTool::AddProbe,
+        ];
+        let label_of = |t: SchemTool| -> String {
+            match t {
+                SchemTool::Previous => "Previous".into(),
+                SchemTool::Next => "Next".into(),
+                SchemTool::ZoomIn => "Zoom In".into(),
+                SchemTool::ZoomOut => "Zoom Out".into(),
+                SchemTool::ZoomFit => "Zoom Fit".into(),
+                SchemTool::ExpandCone => "Expand Cone".into(),
+                SchemTool::CollapseCone => "Collapse Cone".into(),
+                SchemTool::ExpandInside => "Expand Inside".into(),
+                SchemTool::CollapseInside => "Collapse Inside".into(),
+                SchemTool::FindCells => format!("{n_cells} Cells"),
+                SchemTool::FindPorts => format!("{n_ports} I/O Ports"),
+                SchemTool::FindNets => format!("{n_nets} Nets"),
+                SchemTool::MarkDebug => md_label.clone(),
+                SchemTool::AddProbe => "Add Probe".into(),
+            }
+        };
+        let widths: Vec<chrome::OverflowItem> = items
+            .iter()
+            .map(|t| chrome::OverflowItem {
+                width: chrome::text_button_w(&label_of(*t)),
+            })
+            .collect();
+        let m = &mut *model;
+        chrome::overflow_toolbar(ui, &widths, |ui, idx, in_menu| {
+            let t = items[idx];
+            // In the overflow menu everything is a plain button row.
+            let clicked = match t {
+                SchemTool::Previous => ui.button("Previous").clicked(),
+                SchemTool::Next => ui.button("Next").clicked(),
+                SchemTool::ZoomIn => ui.button("Zoom In").clicked(),
+                SchemTool::ZoomOut => ui.button("Zoom Out").clicked(),
+                SchemTool::ZoomFit => ui.button("Zoom Fit").clicked(),
+                SchemTool::ExpandCone => ui.button("Expand Cone").clicked(),
+                SchemTool::CollapseCone => ui.button("Collapse Cone").clicked(),
+                SchemTool::ExpandInside => ui.button("Expand Inside").clicked(),
+                SchemTool::CollapseInside => ui.button("Collapse Inside").clicked(),
+                SchemTool::FindCells => {
+                    if in_menu {
+                        ui.button(format!("{n_cells} Cells")).clicked()
+                    } else {
+                        ui.link(format!("{n_cells} Cells")).clicked()
                     }
-                    if ui
-                        .button("Add Probe")
+                }
+                SchemTool::FindPorts => {
+                    if in_menu {
+                        ui.button(format!("{n_ports} I/O Ports")).clicked()
+                    } else {
+                        ui.link(format!("{n_ports} I/O Ports")).clicked()
+                    }
+                }
+                SchemTool::FindNets => {
+                    if in_menu {
+                        ui.button(format!("{n_nets} Nets")).clicked()
+                    } else {
+                        ui.link(format!("{n_nets} Nets")).clicked()
+                    }
+                }
+                SchemTool::MarkDebug => {
+                    ui.add_enabled(
+                        dbg_net.is_some(),
+                        egui::Button::new(md_label.clone()),
+                    )
+                    .on_hover_text("UG908 Mark Debug on the selected Schematic/Device net")
+                    .clicked()
+                }
+                SchemTool::AddProbe => {
+                    ui.add_enabled(dbg_net.is_some(), egui::Button::new("Add Probe"))
                         .on_hover_text("UG908 Add Probe → ILA dashboard")
                         .clicked()
-                    {
-                        let _ = model.exec("add_probe");
-                    }
-                });
-                if let Some(root) = &model.schematic.cone_root {
-                    ui.label(RichText::new(format!("Cone {root}")).small().weak());
                 }
-                if let Some(inst) = &model.schematic.expand_inside {
-                    ui.label(RichText::new(format!("Inside {inst}")).small().weak());
+            };
+            if !clicked {
+                return;
+            }
+            match t {
+                SchemTool::Previous => {
+                    let _ = m.schematic_previous_view();
                 }
-                ui.label(
-                    RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0))
-                        .small()
-                        .weak(),
-                );
-            });
+                SchemTool::Next => {
+                    let _ = m.schematic_next_view();
+                }
+                SchemTool::ZoomIn => zoom_in = true,
+                SchemTool::ZoomOut => zoom_out = true,
+                SchemTool::ZoomFit => zoom_fit = true,
+                SchemTool::ExpandCone => {
+                    let _ = m.exec("expand_cone");
+                }
+                SchemTool::CollapseCone => {
+                    let _ = m.exec("collapse_cone");
+                }
+                SchemTool::ExpandInside => {
+                    let _ = m.exec("expand_inside");
+                }
+                SchemTool::CollapseInside => {
+                    let _ = m.exec("collapse_inside");
+                }
+                SchemTool::FindCells => {
+                    let _ = m.exec("sheet_find cells");
+                }
+                SchemTool::FindPorts => {
+                    let _ = m.exec("sheet_find ports");
+                }
+                SchemTool::FindNets => {
+                    let _ = m.exec("sheet_find nets");
+                }
+                SchemTool::MarkDebug => {
+                    let _ = m.exec("mark_debug");
+                }
+                SchemTool::AddProbe => {
+                    let _ = m.exec("add_probe");
+                }
+            }
         });
+        // Auto-fit checkbox + status labels stay inline after the row.
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut model.schematic.auto_fit_on_probe, "Auto-fit path")
+                .on_hover_text("Zoom to fit the probed timing path on selection");
+            if let Some(root) = &model.schematic.cone_root {
+                ui.label(RichText::new(format!("Cone {root}")).small().weak());
+            }
+            if let Some(inst) = &model.schematic.expand_inside {
+                ui.label(RichText::new(format!("Inside {inst}")).small().weak());
+            }
+            ui.label(
+                RichText::new(format!("Zoom {:.0}%", model.schematic.camera.zoom * 100.0))
+                    .small()
+                    .weak(),
+            );
+        });
+    }
     // Full hint on hover. Visible words are complete — never "pinch or …".
     let pinch_hint = "pinch or ⌘-scroll to zoom · drag to pan";
     ui.add(egui::Label::new(RichText::new("pinch to zoom · drag to pan").small().weak()).wrap())
@@ -7955,66 +8061,136 @@ fn paint_device_legend(
 ) {
     // Single control row (P1-3): layer toggles + zoom-to-selection + zoom
     // tools. One row, not three — the die is the hero and needs the height.
+    // Device canvas toolbar as an overflow row: controls that do not fit
+    // move into a ">>" menu (VS Code pattern) instead of truncating.
+    #[derive(Clone, Copy, PartialEq)]
+    enum DevTool {
+        Routes,
+        ClockRegions,
+        Pblocks,
+        ZoomSel,
+        ZoomIn,
+        ZoomOut,
+        ZoomFit,
+        MarkDebug,
+        AddProbe,
+    }
     let tools = |ui: &mut egui::Ui,
                  model: &mut IdeModel,
                  layers: &mut DeviceLayers,
                  zoom_target: &mut Option<(u32, u32)>| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Layers").small().color(theme.faint));
-            ui.checkbox(&mut layers.routes, "Routes")
-                .on_hover_text("Show/hide PathFinder route segments");
-            ui.checkbox(&mut layers.clock_regions, "Clock regions")
-                .on_hover_text("Show/hide clock-region outlines");
-            ui.checkbox(&mut layers.pblocks, "Pblocks")
-                .on_hover_text("Show/hide pblock rectangles");
             // Disabled (not silently dead) when nothing maps to a site.
             let zoom_xy = selected_site_xy(model);
-            if ui
-                .add_enabled(
-                    zoom_xy.is_some(),
-                    egui::Button::new("Zoom to selection"),
-                )
-                .on_hover_text(if zoom_xy.is_some() {
-                    "Zoom the die to the selected site/net"
-                } else {
-                    "Select a placed cell, site, or net first"
-                })
-                .clicked()
-            {
-                if let Some((x, y)) = zoom_xy {
-                    model.device_zoom = 2.5;
-                    *zoom_target = Some((x, y));
-                }
-            }
-            ui.separator();
-            if ui.button("Zoom In").clicked() {
-                let _ = model.device_zoom_in();
-            }
-            if ui.button("Zoom Out").clicked() {
-                let _ = model.device_zoom_out();
-            }
-            if ui.button("Zoom Fit").clicked() {
-                let _ = model.device_zoom_fit();
-            }
             let dbg_net = model.selected_debug_net();
-            ui.add_enabled_ui(dbg_net.is_some(), |ui| {
-                let md = match &dbg_net {
-                    Some(n) => format!("Mark Debug {n}"),
-                    None => "Mark Debug".into(),
-                };
-                if ui
-                    .button(md)
-                    .on_hover_text("UG908 Mark Debug on the selected Device route/net")
-                    .clicked()
-                {
-                    let _ = model.exec("mark_debug");
-                }
-                if ui
-                    .button("Add Probe")
-                    .on_hover_text("UG908 Add Probe → ILA dashboard")
-                    .clicked()
-                {
-                    let _ = model.exec("add_probe");
+            let md_label = match &dbg_net {
+                Some(n) => format!("Mark Debug {n}"),
+                None => "Mark Debug".into(),
+            };
+            let items = [
+                DevTool::Routes,
+                DevTool::ClockRegions,
+                DevTool::Pblocks,
+                DevTool::ZoomSel,
+                DevTool::ZoomIn,
+                DevTool::ZoomOut,
+                DevTool::ZoomFit,
+                DevTool::MarkDebug,
+                DevTool::AddProbe,
+            ];
+            let widths: Vec<chrome::OverflowItem> = items
+                .iter()
+                .map(|t| {
+                    let w = match t {
+                        DevTool::Routes => chrome::checkbox_w("Routes"),
+                        DevTool::ClockRegions => chrome::checkbox_w("Clock regions"),
+                        DevTool::Pblocks => chrome::checkbox_w("Pblocks"),
+                        DevTool::ZoomSel => chrome::text_button_w("Zoom to selection"),
+                        DevTool::ZoomIn => chrome::text_button_w("Zoom In"),
+                        DevTool::ZoomOut => chrome::text_button_w("Zoom Out"),
+                        DevTool::ZoomFit => chrome::text_button_w("Zoom Fit"),
+                        DevTool::MarkDebug => chrome::text_button_w(&md_label),
+                        DevTool::AddProbe => chrome::text_button_w("Add Probe"),
+                    };
+                    chrome::OverflowItem { width: w }
+                })
+                .collect();
+            let m = &mut *model;
+            let l = &mut *layers;
+            let zt = &mut *zoom_target;
+            chrome::overflow_toolbar(ui, &widths, |ui, idx, _in_menu| {
+                match items[idx] {
+                    DevTool::Routes => {
+                        ui.checkbox(&mut l.routes, "Routes")
+                            .on_hover_text("Show/hide PathFinder route segments");
+                    }
+                    DevTool::ClockRegions => {
+                        ui.checkbox(&mut l.clock_regions, "Clock regions")
+                            .on_hover_text("Show/hide clock-region outlines");
+                    }
+                    DevTool::Pblocks => {
+                        ui.checkbox(&mut l.pblocks, "Pblocks")
+                            .on_hover_text("Show/hide pblock rectangles");
+                    }
+                    DevTool::ZoomSel => {
+                        if ui
+                            .add_enabled(
+                                zoom_xy.is_some(),
+                                egui::Button::new("Zoom to selection"),
+                            )
+                            .on_hover_text(if zoom_xy.is_some() {
+                                "Zoom the die to the selected site/net"
+                            } else {
+                                "Select a placed cell, site, or net first"
+                            })
+                            .clicked()
+                        {
+                            if let Some((x, y)) = zoom_xy {
+                                m.device_zoom = 2.5;
+                                *zt = Some((x, y));
+                            }
+                        }
+                    }
+                    DevTool::ZoomIn => {
+                        if ui.button("Zoom In").clicked() {
+                            let _ = m.device_zoom_in();
+                        }
+                    }
+                    DevTool::ZoomOut => {
+                        if ui.button("Zoom Out").clicked() {
+                            let _ = m.device_zoom_out();
+                        }
+                    }
+                    DevTool::ZoomFit => {
+                        if ui.button("Zoom Fit").clicked() {
+                            let _ = m.device_zoom_fit();
+                        }
+                    }
+                    DevTool::MarkDebug => {
+                        if ui
+                            .add_enabled(
+                                dbg_net.is_some(),
+                                egui::Button::new(md_label.clone()),
+                            )
+                            .on_hover_text("UG908 Mark Debug on the selected Device route/net")
+                            .clicked()
+                        {
+                            let _ = m.exec("mark_debug");
+                        }
+                    }
+                    DevTool::AddProbe => {
+                        if ui
+                            .add_enabled(
+                                dbg_net.is_some(),
+                                egui::Button::new("Add Probe"),
+                            )
+                            .on_hover_text("UG908 Add Probe → ILA dashboard")
+                            .clicked()
+                        {
+                            let _ = m.exec("add_probe");
+                        }
+                    }
                 }
             });
             ui.label(
@@ -8024,17 +8200,8 @@ fn paint_device_legend(
             );
         });
     };
-    if floor_scroll {
-        // One tool row. Narrow windows scroll it; wrapping would steal die height.
-        egui::ScrollArea::horizontal()
-            .id_salt("device_legend_tools")
-            .auto_shrink([false, true])
-            .max_height(36.0)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-            .show(ui, |ui| tools(ui, model, layers, zoom_target));
-    } else {
-        tools(ui, model, layers, zoom_target);
-    }
+    // The overflow row handles narrow windows itself; no separate scroll mode.
+    tools(ui, model, layers, zoom_target);
     // Complete chips only. Narrow: one row, scroll sideways so names stay fully visible.
     let chips: [(&str, Color32); 8] = [
         ("CLB", theme.ok),

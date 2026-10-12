@@ -99,6 +99,72 @@ pub fn stretched_col_w_gap(n_cols: usize, avail: f32, gap: f32) -> f32 {
     ((avail - gaps).max(48.0) / n).max(48.0)
 }
 
+/// Estimated drawn width of a content-sized text button (matches `ui.button`).
+pub fn text_button_w(label: &str) -> f32 {
+    label.chars().count() as f32 * 7.0 + 22.0
+}
+
+/// Estimated drawn width of a checkbox with its label.
+pub fn checkbox_w(label: &str) -> f32 {
+    18.0 + 6.0 + label.chars().count() as f32 * 7.0
+}
+
+/// One item in an overflow-capable toolbar row.
+pub struct OverflowItem {
+    /// Estimated drawn width in px (see `text_button_w` / `checkbox_w`).
+    pub width: f32,
+}
+
+/// Render toolbar items left-to-right; items that do not fit go into a ">>"
+/// overflow menu (VS Code pattern) instead of truncating into "Zoo..." soup.
+/// `render(ui, index, in_menu)` draws item `index`; `in_menu` lets it adapt
+/// (menu rows are full-width). At least one item always stays inline.
+pub fn overflow_toolbar(
+    ui: &mut egui::Ui,
+    items: &[OverflowItem],
+    mut render: impl FnMut(&mut egui::Ui, usize, bool),
+) {
+    let avail_w = ui.available_width().max(64.0);
+    let spacing = ui.spacing().item_spacing.x;
+    let more_w = 40.0; // the ">>" button itself
+    if items.is_empty() {
+        return;
+    }
+    let total: f32 =
+        items.iter().map(|i| i.width).sum::<f32>() + spacing * items.len().saturating_sub(1) as f32;
+    ui.horizontal(|ui| {
+        if total <= avail_w {
+            for idx in 0..items.len() {
+                render(ui, idx, false);
+            }
+            return;
+        }
+        // Overflow: fit as many leading items as possible, reserving the ">>".
+        let mut inline_count = 1; // never strand the row with only ">>"
+        let mut used = items[0].width;
+        for (idx, item) in items.iter().enumerate().skip(1) {
+            if used + spacing + item.width + spacing + more_w <= avail_w {
+                used += spacing + item.width;
+                inline_count = idx + 1;
+            } else {
+                break;
+            }
+        }
+        for idx in 0..inline_count {
+            render(ui, idx, false);
+        }
+        ui.menu_button(">>", |ui| {
+            ui.label(egui::RichText::new("More actions").strong().small());
+            ui.separator();
+            for idx in inline_count..items.len() {
+                render(ui, idx, true);
+            }
+        })
+        .response
+        .on_hover_text("More toolbar actions");
+    });
+}
+
 /// Vivado Autohide Pins / Quartus hide instance pins: unconnected pins stay
 /// in the model but are not painted unless the symbol is selected.
 pub fn schematic_pin_visible(net_empty: bool, symbol_selected: bool) -> bool {
