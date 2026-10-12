@@ -76,6 +76,22 @@ impl PackingSummary {
 }
 
 pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
+    // Multi-backend cell kinds never reach the HL10T packer: reject loudly
+    // instead of silently dropping them (which would miscompile).
+    for c in &design.cells {
+        if matches!(c.kind, CellKind::IobIn) {
+            return Err(format!(
+                "cell {} is IobIn (input IOB): unsupported for HL10T pack (multi-backend flow only)",
+                c.name
+            ));
+        }
+        if matches!(c.kind, CellKind::ClockBuf) {
+            return Err(format!(
+                "cell {} is ClockBuf (global clock buffer): unsupported for HL10T pack (multi-backend flow only)",
+                c.name
+            ));
+        }
+    }
     // Ibex-scale: linear scans via Design::net_on are O(n^3). Index once.
     let pins = design.pin_index();
     let mut d_driver: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -352,5 +368,22 @@ mod tests {
         assert_eq!(dev.site_by_id(&s0.id()), Some(s0));
         assert_eq!(dev.site_by_id(&s1.id()), Some(s1));
         assert_eq!(sum.sites.len(), 2);
+    }
+
+    #[test]
+    fn pack_rejects_multibackend_cells_for_hl10t() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        for kind in [CellKind::IobIn, CellKind::ClockBuf] {
+            let mut d = Design::new("mb");
+            d.add_cell("u_mb", kind);
+            let err = pack(&d, &dev).unwrap_err();
+            assert!(
+                err.contains("unsupported for HL10T"),
+                "expected HL10T rejection, got: {err}"
+            );
+        }
+        // The gold counter (no multi-backend cells) still packs fine.
+        let p = pack(&Design::structural_counter(), &dev).unwrap();
+        assert_eq!(p.lutffs.len(), 4);
     }
 }

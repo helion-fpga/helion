@@ -729,6 +729,7 @@ mod tests {
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -764,12 +765,13 @@ mod tests {
     fn delay_in_cost_makes_td_faster_than_wl() {
         let dev = Device::load_part("HL10T-C32-1").unwrap();
         let p = pack(&Design::structural_blinky(), &dev).unwrap();
-        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0 }).unwrap();
+        let wl = place_with(&p, &dev, PlaceOpts { timing_weight: 0.0, seed: 0 }).unwrap();
         let td = place_with(
             &p,
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -799,6 +801,7 @@ mod tests {
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -861,6 +864,7 @@ mod tests {
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -877,6 +881,7 @@ mod tests {
         assert!(p.lutffs.len() >= 8);
         let opts = PlaceOpts {
             timing_weight: 0.75,
+                seed: 0,
         };
         let g0 = TimingGuide::default();
         let gfp = TimingGuide {
@@ -917,6 +922,7 @@ mod tests {
         let p = pack(&hard_heartbeat(), &dev).unwrap();
         let opts = PlaceOpts {
             timing_weight: 0.75,
+                seed: 0,
         };
         let g0 = TimingGuide::default();
         let gm = TimingGuide {
@@ -966,6 +972,7 @@ mod tests {
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();
@@ -1009,6 +1016,7 @@ mod tests {
             &dev,
             PlaceOpts {
                 timing_weight: 0.75,
+                seed: 0,
             },
         )
         .unwrap();

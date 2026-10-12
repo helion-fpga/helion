@@ -1357,6 +1357,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helion-backend"
+version = "2.5.0"
+dependencies = [
+ "helion-ir",
+]
+
+[[package]]
 name = "helion-bd"
 version = "2.5.0"
 dependencies = [
@@ -1628,6 +1635,17 @@ dependencies = [
  "helion-place",
  "helion-route",
  "helion-sv",
+]
+
+[[package]]
+name = "helion-xilinx7"
+version = "2.5.0"
+dependencies = [
+ "helion-backend",
+ "helion-ir",
+ "helion-sv",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
