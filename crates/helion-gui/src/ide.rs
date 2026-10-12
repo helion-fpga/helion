@@ -6714,6 +6714,9 @@ impl IdeModel {
         } else if t == "report_cdc" || t == "cdc" {
             self.workspace = WorkspaceTab::Cdc;
             Ok(self.cdc_text())
+        } else if t == "report_cdc_crossings" || t == "cdc_crossings" {
+            self.workspace = WorkspaceTab::Cdc;
+            Ok(self.cdc_crossings_text())
         } else if t == "report_clock_networks" || t == "clock_networks" {
             self.workspace = WorkspaceTab::ClockNetworks;
             Ok(self.clock_networks_text())
@@ -6772,6 +6775,10 @@ impl IdeModel {
             self.select_cdc_object(spec.trim())
         } else if t == "select_cdc_object" {
             self.select_cdc_object("")
+        } else if let Some(spec) = t.strip_prefix("select_cdc_crossing ") {
+            self.select_cdc_crossing(spec.trim())
+        } else if t == "select_cdc_crossing" {
+            self.select_cdc_crossing("")
         } else if let Some(name) = t.strip_prefix("select_clock_network ") {
             self.select_clock_network(name.trim())
         } else if t == "select_clock_network" {
@@ -17452,6 +17459,17 @@ impl IdeModel {
         self.cdc_report().text()
     }
 
+    /// Tcl `report_cdc_crossings`: only the net-level structural `CROSSING …` lines.
+    pub fn cdc_crossings_text(&self) -> String {
+        let report = self.cdc_report();
+        let mut out = String::new();
+        for c in &report.crossings {
+            out.push_str(&c.text());
+            out.push('\n');
+        }
+        out
+    }
+
     fn cdc_object_hay(&self, v: &helion_sta::CdcViolation) -> String {
         let report = self.cdc_report();
         let mut hay = format!("{} {}", v.from, v.to);
@@ -17462,6 +17480,16 @@ impl IdeModel {
                 hay.push(' ');
                 hay.push_str(&c.source.replace('/', " "));
             }
+        }
+        hay
+    }
+
+    /// Haystack for a net-level structural crossing: net + driver/load cells.
+    fn cdc_crossing_hay(&self, c: &helion_sta::CdcCrossing) -> String {
+        let mut hay = c.net.clone();
+        for cell in c.driver_cells.iter().chain(c.load_cells.iter()) {
+            hay.push(' ');
+            hay.push_str(cell);
         }
         hay
     }
@@ -17530,6 +17558,71 @@ impl IdeModel {
         ))
     }
 
+    /// Select a net-level structural CDC crossing by net name — sets the
+    /// property inspector (NET/CLASS/SEVERITY/CHECK/FROM/TO/DRIVERS/LOADS)
+    /// and cross-probes the first driver/load cell found in the design.
+    pub fn select_cdc_crossing(&mut self, net: &str) -> Result<String, String> {
+        let net = net.trim();
+        if net.is_empty() {
+            return Err("select_cdc_crossing: missing net".into());
+        }
+        let report = self.cdc_report();
+        let c = report
+            .crossings
+            .iter()
+            .find(|c| c.net == net)
+            .cloned()
+            .ok_or_else(|| format!("select_cdc_crossing: no crossing on net {net}"))?;
+        self.selected_cdc = Some(format!("crossing:{net}"));
+        self.selected_drc = None;
+        self.selected_methodology = None;
+        self.selected_clock_interaction = None;
+        self.selected_clock_network = None;
+        self.selected_timing_summary = None;
+        self.selected_power = None;
+        self.selected_utilization = None;
+        self.selected = Some(net.to_string());
+        // Cross-probe: driver cells first, then loads — first hit wins.
+        let mut probed: Option<String> = None;
+        for cell in c.driver_cells.iter().chain(c.load_cells.iter()) {
+            if let Some(o) = self.apply_object_crossprobe(cell) {
+                probed = Some(o);
+                break;
+            }
+        }
+        let drivers = c.driver_cells.join(",");
+        let loads = c.load_cells.join(",");
+        self.properties = vec![
+            ("NAME".into(), net.to_string()),
+            ("TYPE".into(), "cdc_crossing".into()),
+            ("CLASS".into(), c.class.as_str().into()),
+            ("SEVERITY".into(), c.severity.as_str().into()),
+            ("CHECK".into(), c.check.clone()),
+            ("FROM".into(), c.from_domain.clone()),
+            ("TO".into(), c.to_domain.clone()),
+            ("DRIVERS".into(), drivers.clone()),
+            ("LOADS".into(), loads.clone()),
+            ("SYNC_DEPTH".into(), c.sync_depth.to_string()),
+            (
+                "OBJECT".into(),
+                probed.clone().unwrap_or_else(|| "-".into()),
+            ),
+        ];
+        if probed.is_none() {
+            self.workspace = WorkspaceTab::Cdc;
+        }
+        Ok(format!(
+            "cdc_crossing NET={net} CLASS={} SEVERITY={} CHECK={} FROM={} TO={} DRIVERS={drivers} LOADS={loads} SYNC_DEPTH={} OBJECT={}",
+            c.class.as_str(),
+            c.severity.as_str(),
+            c.check,
+            c.from_domain,
+            c.to_domain,
+            c.sync_depth,
+            probed.as_deref().unwrap_or("-")
+        ))
+    }
+
     /// Click a UG906 CDC object link — cross-probe HNF clock source, not a dump.
     pub fn select_cdc_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
@@ -17543,6 +17636,10 @@ impl IdeModel {
         let mut hay = String::new();
         for v in &report.violations {
             hay.push_str(&self.cdc_object_hay(v));
+            hay.push(' ');
+        }
+        for c in &report.crossings {
+            hay.push_str(&self.cdc_crossing_hay(c));
             hay.push(' ');
         }
         let objs = self.extract_design_objects(&hay);
