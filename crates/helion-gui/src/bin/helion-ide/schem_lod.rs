@@ -17,12 +17,17 @@ use helion_gui::SchematicDrawing;
 
 /// Below this camera zoom the sheet renders blocks, not gates.
 pub const BLOCK_ZOOM: f32 = 0.5;
+/// Block mode only kicks in for designs at or above this cell count.
+/// Small designs are readable at fit zoom; the treemap would be noise.
+pub const LOD_MIN_CELLS: usize = 500;
 
 #[derive(Clone, Debug)]
 pub struct BlockInfo {
     pub name: String,
     pub short: String,
     pub cells: usize,
+    /// Total symbol pins in the block (Vivado-style port count).
+    pub ports: usize,
     /// True for the synthetic top-level group (not a real instance).
     pub is_top: bool,
 }
@@ -58,6 +63,7 @@ pub fn build_block_layer(
     let mut order: Vec<String> = Vec::new();
     let mut idx_of: HashMap<&str, usize> = HashMap::new();
     let mut cells = Vec::new();
+    let mut ports = Vec::new();
 
     for sy in &drawing.symbols {
         if sy.kind.starts_with("PORT") {
@@ -71,10 +77,12 @@ pub fn build_block_layer(
                 order.push(inst.to_string());
                 idx_of.insert(inst, i);
                 cells.push(0usize);
+                ports.push(0usize);
                 i
             }
         };
         cells[bi] += 1;
+        ports[bi] += sy.pins.len();
     }
 
     let mut blocks: Vec<BlockInfo> = Vec::with_capacity(order.len());
@@ -95,6 +103,7 @@ pub fn build_block_layer(
                 helion_gui::schematic_short_name(inst)
             },
             cells: cells[i],
+            ports: ports[i],
             is_top,
         });
     }
@@ -208,7 +217,7 @@ pub fn paint_block_layer(
             p.text(
                 egui::pos2(r.center().x, r.center().y + 10.0),
                 egui::Align2::CENTER_CENTER,
-                format!("{} cells", b.cells),
+                format!("{} cells · {} ports", b.cells, b.ports),
                 egui::FontId::proportional(11.0),
                 theme.dim,
             );
