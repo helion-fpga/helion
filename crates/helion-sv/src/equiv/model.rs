@@ -26,8 +26,9 @@ use std::collections::{HashMap, HashSet};
 ///
 /// `inputs` are PI names in deterministic order (top-level input ports in
 /// declared order, then `ff.<cell>.Q` pseudo-PIs in cell order). `outputs`
-/// pairs each observable output name (top ports, then `ff.<cell>.D`
-/// pseudo-outputs) with its AIG literal.
+/// pairs each observable output name with its AIG literal, in deterministic
+/// order (`ff.<cell>.D` pseudo-outputs in cell order, then top ports in
+/// declared order).
 #[derive(Clone, Debug)]
 pub struct EquivModel {
     pub inputs: Vec<String>,
