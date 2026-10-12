@@ -957,9 +957,9 @@ mod tests {
     fn fanout_fires_on_hot_net() {
         let mut d = Design::new("fan");
         d.add_cell("src", CellKind::Hff);
+        d.connect("hot", "src", "Q");
         for i in 0..40 {
             d.add_cell(format!("sink{i}"), CellKind::Hff);
-            d.connect("hot", "src", "Q");
             d.connect("hot", format!("sink{i}"), "D");
         }
         let c = empty_constraints();

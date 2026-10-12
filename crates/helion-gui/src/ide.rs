@@ -33898,18 +33898,14 @@ endmodule
 
         let report = ide.qor_report();
         let design = ide.shell.session.design.as_ref().expect("design");
-        let cell_names: std::collections::HashSet<&str> = design
-            .cells
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
-        let net_names: std::collections::HashSet<&str> =
-            design.nets.iter().map(|n| n.name.as_str()).collect();
-        let path_names: std::collections::HashSet<&str> = ide
-            .timing_paths
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect();
+        // Owned: the immutable borrow of `design` must end before the
+        // `ide.exec` calls below.
+        let cell_names: std::collections::HashSet<String> =
+            design.cells.iter().map(|c| c.name.clone()).collect();
+        let net_names: std::collections::HashSet<String> =
+            design.nets.iter().map(|n| n.name.clone()).collect();
+        let path_names: std::collections::HashSet<String> =
+            ide.timing_paths.iter().map(|p| p.name.clone()).collect();
 
         for s in &report.suggestions {
             // Every cited object must be real — a cell, net, or path from the
