@@ -5221,6 +5221,11 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
             ConstraintSection::Exception,
             "constraints_exceptions",
         ),
+        (
+            "I/O Placement (PACKAGE_PIN / IOSTANDARD / DRIVE / SLEW / …)",
+            ConstraintSection::IoPlacement,
+            "constraints_io_placement",
+        ),
     ];
     for (title, section, grid) in sections {
         let sect: Vec<_> = rows.iter().filter(|r| r.section == section).collect();
