@@ -7612,9 +7612,24 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                                 ui.end_row();
                                 for (i, p) in model.timing_paths.iter().enumerate() {
                                     let on = selected_path == Some(i);
-                                    if ui.selectable_label(on, &p.name).clicked() {
+                                    let resp = ui.selectable_label(on, &p.name);
+                                    if resp.clicked() {
                                         pick_path = Some(i);
                                     }
+                                    // Right-click: Copy row / cross-probe (Vivado pattern).
+                                    resp.context_menu(|ui| {
+                                        if ui.button("Copy row").clicked() {
+                                            ui.ctx().copy_text(format!(
+                                                "{}\t{}\t{}\t{}",
+                                                p.name, p.startpoint, p.endpoint, p.slack_ps
+                                            ));
+                                            ui.close();
+                                        }
+                                        if ui.button("Cross-probe in Device").clicked() {
+                                            pick_path = Some(i);
+                                            ui.close();
+                                        }
+                                    });
                                     ui.label(&p.startpoint);
                                     ui.label(&p.endpoint);
                                     ui.label(p.slack_ps.to_string());
@@ -8384,6 +8399,9 @@ fn paint_device(
     let mut pick_site: Option<(u32, u32)> = None;
     let mut pick_region: Option<String> = None;
     let mut click_pblock: Option<String> = None;
+    let mut ctx_mark_debug = false;
+    let mut ctx_add_probe = false;
+    let mut ctx_zoom_fit = false;
     let mut scroller = egui::ScrollArea::both()
         .id_salt("device_die_scroll")
         .auto_shrink([false, false])
@@ -8710,6 +8728,22 @@ fn paint_device(
                 }
             }
         }
+        // Right-click menu (Vivado pattern): debug actions on the die.
+        resp.context_menu(|ui| {
+            if ui.button("Mark Debug").clicked() {
+                ctx_mark_debug = true;
+                ui.close();
+            }
+            if ui.button("Add Probe").clicked() {
+                ctx_add_probe = true;
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Zoom Fit").clicked() {
+                ctx_zoom_fit = true;
+                ui.close();
+            }
+        });
     });
     if let Some(name) = click_pblock {
         let _ = model.select_pblock(&name);
@@ -8719,6 +8753,15 @@ fn paint_device(
     }
     if let Some((x, y)) = pick_site {
         let _ = model.select_device_site(&format!("X{x}Y{y}"));
+    }
+    if ctx_mark_debug {
+        let _ = model.exec("mark_debug");
+    }
+    if ctx_add_probe {
+        let _ = model.exec("add_probe");
+    }
+    if ctx_zoom_fit {
+        let _ = model.device_zoom_fit();
     }
 }
 
@@ -9761,6 +9804,44 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                     }
                 }
             }
+            // Right-click menu (GTKWave pattern): per-trace radix and style.
+            let t_name = t.name.clone();
+            let t_style = t.style;
+            let t_radix = t.radix;
+            resp.context_menu(|ui| {
+                let radix_label = if t_radix == WaveRadix::Hexadecimal {
+                    "Set radix: Binary"
+                } else {
+                    "Set radix: Hex"
+                };
+                if ui.button(radix_label).clicked() {
+                    radix_cmd = Some((
+                        t_name.clone(),
+                        if t_radix == WaveRadix::Hexadecimal {
+                            WaveRadix::Binary
+                        } else {
+                            WaveRadix::Hexadecimal
+                        },
+                    ));
+                    ui.close();
+                }
+                let style_label = if t_style == WaveStyle::Analog {
+                    "Show as Digital"
+                } else {
+                    "Show as Analog"
+                };
+                if ui.button(style_label).clicked() {
+                    style_cmd = Some((
+                        t_name.clone(),
+                        if t_style == WaveStyle::Analog {
+                            WaveStyle::Digital
+                        } else {
+                            WaveStyle::Analog
+                        },
+                    ));
+                    ui.close();
+                }
+            });
         });
     }
     if let Some((name, st)) = style_cmd {
