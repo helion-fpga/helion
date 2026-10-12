@@ -10936,7 +10936,10 @@ fn width_step<'x>(
             child(*b as *const RExpr<'x>)?;
             Some(1)
         }
-        RExpr::Not(x) => Some(child(*x as *const RExpr<'x>)?.min(1).max(1)),
+        RExpr::Not(x) => {
+            child(*x as *const RExpr<'x>)?;
+            Some(1)
+        }
         RExpr::And(a, b)
         | RExpr::Or(a, b)
         | RExpr::Xor(a, b)
@@ -11020,7 +11023,7 @@ where
                 arena.alloc(rebuilt(&memo, b)),
             ),
             RExpr::Mux(c, t, f) => RExpr::Mux(
-                *c,
+                c,
                 arena.alloc(rebuilt(&memo, t)),
                 arena.alloc(rebuilt(&memo, f)),
             ),
