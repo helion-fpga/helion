@@ -35,10 +35,10 @@
   <main id="main" class="page">
     <div class="prose">
       <h1>Legal fence</h1>
-      <p class="lede">Helion is an original FPGA family and CAD, not a wrapper around a vendor tool. Vendor user guides are a checklist of <em>capabilities</em>, not a source tree to copy. Device facts come from HAD, never hardcoded in the CAD. No vendor bitstream.</p>
+      <p class="lede">Helion is an original FPGA family and CAD, not a wrapper around a vendor tool. Vendor user guides are a checklist of <em>capabilities</em>, not a source tree to copy. Device facts come from HAD, never hardcoded in the CAD. No proprietary vendor IP or databases.</p>
 
       <div class="fence">
-        <p><strong>Do not add</strong> Project X-Ray, vendor Tcl, UNISIM names, or 7-series / UltraScale / Lattice / Intel bitstream backends.</p>
+        <p><strong>Do not add</strong> proprietary vendor databases, vendor Tcl, or UNISIM names. Vendor backends are allowed <strong>only</strong> on open bitstream databases: the Xilinx 7-series backend is built on Project X-Ray data, never on vendor IP.</p>
         <p><strong>Do not</strong> ship AXI interconnect as Helion IP. The buses are Helion-MM and Helion-ST.</p>
         <p><strong>Do not</strong> use vendor trademarks as product names in the UI or docs.</p>
       </div>

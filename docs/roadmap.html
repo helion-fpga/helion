@@ -133,7 +133,6 @@
 
       <h2>2.0.x: post-bar runtime / QoR grind</h2>
       <p>
-        <strong>Current tip: <a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.4">v2.0.4</a>.</strong>
         Patch line after the 2.0 bar: measured STA / bitgen / place-legalize /
         synth_rtl / parse cuts without moving gold. SOFT &ne; PASS.
         Empty-XDC counter stays <span class="gold">WNS_PS=9640</span>.
@@ -141,6 +140,26 @@
         parse 416→353 ms, synth_rtl 670→524 ms, place legalize 213→23 ms,
         imux_skip 158→123. Table:
         <a href="https://github.com/helion-fpga/helion/blob/master/docs/perf-2.0.4.md">docs/perf-2.0.4.md</a>.
+      </p>
+
+      <h2>2.5: best-in-market IDE</h2>
+      <p>
+        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v2.5.0">v2.5.0</a>.</strong>
+        Cross-probing, real Tcl console, design runs with strategy sweep,
+        checkpoints, testbench runner, constraints wizard, QoR suggestions engine,
+        VCD-driven power, integrated logic analyzer, plus toast/macOS fixes and
+        the UX/editor batch.
+      </p>
+
+      <h2>3.0: second backend, verification</h2>
+      <p>
+        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>.</strong>
+        Xilinx 7-series backend (xc7a35t: pack, place, route, FASM, frames,
+        <code>.bit</code>, zero vendor tools, open bitstream databases only),
+        verification track (SAT-based equivalence checking, SystemVerilog
+        assertions, CDC structural analysis), Physical View 2.0, 12 review
+        criticals fixed, debug-build stack-overflow fix. Gold
+        <span class="gold">WNS_PS=9640</span> untouched throughout.
       </p>
 
       <p class="cta">
