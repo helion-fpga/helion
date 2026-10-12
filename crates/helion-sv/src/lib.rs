@@ -13656,22 +13656,73 @@ fn emit_word_add(
                     cin = Some(cout);
                 }
             }
-            _ => {
-                let src = an.clone().or(bn.clone());
-                if let Some(src) = src.as_deref() {
+            // Zero-extended high bit of the narrower operand: full adder with
+            // a 0 in the missing position. Carry propagates; dropping it
+            // miscomputes every bit above the narrower operand's MSB.
+            (None, Some(bn), None) => {
+                // sum = b, cout = 0
+                emit_lut_pins(d, &sum_cell, &sum, lut6_buf(), &[(bn, "I0")]);
+                cin = None;
+            }
+            (Some(an), None, None) => {
+                emit_lut_pins(d, &sum_cell, &sum, lut6_buf(), &[(an, "I0")]);
+                cin = None;
+            }
+            (None, Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum,
+                    lut6_xor2(),
+                    &[(bn, "I0"), (cn, "I1")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
                     emit_lut_pins(
                         d,
-                        &sum_cell,
-                        &sum,
+                        &cry_cell,
+                        &cout,
                         lut6_and2(false, false, false),
-                        &[(src, "I0"), (src, "I1")],
+                        &[(bn, "I0"), (cn, "I1")],
                     );
+                    cin = Some(cout);
                 } else {
-                    emit_lut_pins(d, &sum_cell, &sum, lut6_const(false), &[]);
-                }
-                if bit + 1 < width {
                     cin = None;
                 }
+            }
+            (Some(an), None, Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum,
+                    lut6_xor2(),
+                    &[(an, "I0"), (cn, "I1")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+            }
+            (None, None, Some(cn)) => {
+                // 0+0+cin: sum = cin, cout = 0
+                emit_lut_pins(d, &sum_cell, &sum, lut6_buf(), &[(cn, "I0")]);
+                cin = None;
+            }
+            (None, None, None) => {
+                // 0+0 with no cin: sum bit tied low.
+                emit_lut_pins(d, &sum_cell, &sum, lut6_const(false), &[]);
+                cin = None;
             }
         }
         let ff = format!("u_aff{word}_{bit}");
@@ -21422,6 +21473,71 @@ endmodule
             "second instance stitch missing"
         );
     }
+
+    #[test]
+    fn word_add_mixed_width_carry_reaches_upper_bits() {
+        // mem[0] <= a16 + b32: the zero-extension region must keep the carry.
+        // Bit 16 sum is b[16] XOR carry with a carry-out LUT, not a buffer
+        // of b[16] with the carry dropped.
+        let rtl = Rtl {
+            module: "t",
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "a",
+                    width: 16,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+                Signal {
+                    name: "b",
+                    width: 32,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: HashMap::new(),
+            negedge_writes: vec![],
+        };
+        let mut d = Design::new("t");
+        emit_word_add(&mut d, &rtl, "clk", "mem", 0, 32, "a", "b");
+        let init_of = |name: &str| {
+            let cell = d
+                .cells
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("cell {name} missing"));
+            match cell.kind {
+                CellKind::Lut6 { init } => init,
+                _ => panic!("{name} is not a LUT"),
+            }
+        };
+        assert_eq!(
+            init_of("u_alu0_16s"),
+            lut6_xor2(),
+            "bit-16 sum must XOR the carry, not buffer b16"
+        );
+        assert_eq!(
+            init_of("u_alu0_16c"),
+            lut6_and2(false, false, false),
+            "bit-16 carry-out must propagate"
+        );
+        assert_eq!(
+            init_of("u_alu0_31s"),
+            lut6_xor2(),
+            "top bit sum must XOR the carry"
+        );
+    }
+
 
 }
 
