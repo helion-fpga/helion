@@ -329,7 +329,7 @@ const SYNTH_EVAL_BUDGET: u64 = 500_000;
 /// Minimum-AND implementation of truth table `t` over `k` ≤ 4 variables
 /// using at most `budget` AND nodes. None if impossible within budget.
 /// Trivial (0-AND) cases are answered regardless of budget.
-pub(crate) fn exact_synth(t: u16, k: usize, budget: usize) -> Option<RawSynth> {
+fn exact_synth(t: u16, k: usize, budget: usize) -> Option<RawSynth> {
     let full: u16 = if k >= 4 { 0xFFFF } else { (1u16 << (1u32 << k)) - 1 };
     let t = t & full;
     let zero = |out| Some(RawSynth { ands: Vec::new(), out });

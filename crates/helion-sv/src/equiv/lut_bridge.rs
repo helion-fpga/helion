@@ -2,25 +2,19 @@
 //!
 //! Each `CellKind::Lut6 { init }` becomes an AIG fragment so the whole
 //! equivalence flow has one encoding path (AIG -> CNF). The 64-bit INIT is
-//! Shannon-split into four 4-LUT cofactors over inputs `I0..I3`
-//! (`init[addr]` uses `{I5..I0}` as addr, I0 = LSB, matching
-//! `helion_ir::CellKind::Lut6`), each cofactor synthesized with the tested
-//! [`exact_synth`] (k <= 4, the same function the area campaign's
-//! correctness rests on), then stitched with a fixed 2:1 mux tree on
-//! `I4`/`I5`. Templates are memoized per INIT word: repeated INITs (the
-//! common case in mapped netlists) share one template.
+//! decomposed by direct Shannon expansion (`init[addr]` uses `{I5..I0}` as
+//! addr, I0 = LSB, matching `helion_ir::CellKind::Lut6`) with constant
+//! simplifications. Templates are memoized per INIT word: repeated INITs
+//! (the common case in mapped netlists) share one template.
 //!
-//! Totality: if `exact_synth` cannot cover a cofactor within budget (not
-//! observed; every 4-LUT is cheap), the template falls back to a fixed
-//! Shannon mux tree over the 64 INIT bits, which always works.
+//! The decomposition is direct (no search): predictable, fast, total, and
+//! deterministic. Structural hashing in `Aig::and_lit` shares identical
+//! subtrees when a template is instantiated.
 
-use crate::aig_opt::{exact_synth, RawSynth, RInp};
+use crate::aig_opt::{RawSynth, RInp};
 use crate::{Aig, Lit};
 use std::collections::HashMap;
 
-/// Maximum AND budget tried per 4-LUT cofactor via [`exact_synth`].
-/// Tried as increasing budgets 0..=COFACTOR_BUDGET (see [`synth_cofactor`]).
-const COFACTOR_BUDGET: usize = 8;
 
 /// Memoized per-INIT templates. Key = the 64-bit INIT word.
 #[derive(Clone, Debug, Default)]
@@ -130,27 +124,6 @@ impl TmplBuilder {
         flip(self.push(flip(t1), flip(t2)))
     }
 
-    /// Append a synthesized cofactor; its `Leaf(i)` (i < 4) already names the
-    /// template's LUT input positions, so only node indices are rebased.
-    fn append_raw(&mut self, raw: &RawSynth) -> RInp {
-        let base = self.ands.len();
-        for (a, b) in &raw.ands {
-            let ra = match *a {
-                RInp::Node(j, inv) => RInp::Node(base + j, inv),
-                other => other,
-            };
-            let rb = match *b {
-                RInp::Node(j, inv) => RInp::Node(base + j, inv),
-                other => other,
-            };
-            self.ands.push((ra, rb));
-        }
-        match raw.out {
-            RInp::Node(j, inv) => RInp::Node(base + j, inv),
-            other => other,
-        }
-    }
-
     fn finish(self, out: RInp) -> RawSynth {
         RawSynth {
             ands: self.ands,
@@ -159,94 +132,54 @@ impl TmplBuilder {
     }
 }
 
-/// Synthesize one 4-LUT cofactor truth table, trying increasing AND budgets.
+/// Direct Shannon decomposition of a k-LUT into an AIG template.
 ///
-/// Note: budgets are tried small-to-large (not a single large budget).
-/// `exact_synth`'s DFS shares one evaluation budget per call, so a large
-/// budget can exhaust it exploring deep bad paths and return None where a
-/// small budget quickly finds the minimal solution.
-fn synth_4lut(t: u16) -> Option<RawSynth> {
-    for budget in 0..=COFACTOR_BUDGET {
-        if let Some(raw) = exact_synth(t, 4, budget) {
-            return Some(raw);
-        }
-    }
-    None
-}
-
-/// Synthesize one 3-LUT (low 8 bits of `t`) via [`exact_synth`]. The 3-LUT
-/// search space is tiny, so this is reliable where the 4-LUT DFS can stall.
-fn synth_3lut(t: u16) -> Option<RawSynth> {
-    for budget in 0..=6 {
-        if let Some(raw) = exact_synth(t & 0xFF, 3, budget) {
-            return Some(raw);
-        }
-    }
-    None
-}
-
-/// Fixed Shannon mux tree over `2^k` INIT bits with selects `Leaf(base..)`.
-/// Total: always works.
-fn const_tree_k(b: &mut TmplBuilder, init: u64, k: usize, base: usize) -> RInp {
-    let mut level: Vec<RInp> = (0..(1u64 << k))
-        .map(|i| RInp::Const((init >> i) & 1 == 1))
-        .collect();
-    for s in 0..k {
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks_exact(2) {
-            // pair[0] = select 0, pair[1] = select 1.
-            next.push(b.mux(RInp::Leaf(base + s, false), pair[1], pair[0]));
-        }
-        level = next;
-    }
-    level[0]
-}
-
-/// Fixed Shannon mux tree over all 64 INIT bits. Total: always works, used
-/// only if [`exact_synth`] fails a cofactor.
-fn const_tree(b: &mut TmplBuilder, init: u64) -> RInp {
-    const_tree_k(b, init, 6, 0)
-}
-
-/// Build one 4-LUT cofactor template, tiered:
-/// 1. [`exact_synth`] (minimal ANDs);
-/// 2. Shannon split on input 3 into two 3-LUTs (reliable);
-/// 3. fixed const tree (total).
-/// Appends to the builder and returns the output reference.
-fn build_cofactor(b: &mut TmplBuilder, t: u16) -> RInp {
-    if let Some(raw) = synth_4lut(t) {
-        return b.append_raw(&raw);
-    }
-    let lo = t & 0xFF;
-    let hi = (t >> 8) & 0xFF;
-    match (synth_3lut(lo), synth_3lut(hi)) {
-        (Some(rlo), Some(rhi)) => {
-            let lo_r = b.append_raw(&rlo);
-            let hi_r = b.append_raw(&rhi);
-            // i3 ? hi : lo.
-            b.mux(RInp::Leaf(3, false), hi_r, lo_r)
-        }
-        _ => const_tree_k(b, t as u64, 4, 0),
-    }
-}
-
-/// Build the template for one 64-bit LUT6 INIT word.
+/// `init` holds the `2^k` truth-table bits; inputs are template leaves
+/// `base..base+k` (`init[addr]` uses `{I_{k-1}..I_0}` as addr, I_0 = LSB,
+/// matching `CellKind::Lut6`). Splits on the highest input with constant
+/// simplifications:
+/// - independent of select -> recurse on the shared half;
+/// - `s ? h : 0` = `s & h`, `s ? 0 : l` = `~s & l` (1 AND);
+/// - `s ? h : 1` = `h | ~s`, `s ? 1 : l` = `~s | l` (2 ANDs via De Morgan);
+/// - else a full 2:1 mux (3 ANDs).
 ///
-/// `addr = I0 + 2*I1 + 4*I2 + 8*I3 + 16*I4 + 32*I5`; cofactor `c` (over
-/// `I0..I3`) is bits `[16*c, 16*c+16)` with `c = I4 + 2*I5`. Output =
-/// `mux(I4, mux(I5, c2, c0), mux(I5, c3, c1))` (mux(s,a,b) = s ? a : b).
+/// Predictable, fast (no search), total, and deterministic. Structural
+/// hashing in `Aig::and_lit` shares identical subtrees at instantiation.
+fn shannon_tree(b: &mut TmplBuilder, init: u64, k: usize, base: usize) -> RInp {
+    if k == 0 {
+        return RInp::Const(init & 1 == 1);
+    }
+    let half_bits = 1u32 << (k - 1);
+    let mask = if half_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << half_bits) - 1
+    };
+    let lo = init & mask;
+    let hi = (init >> half_bits) & mask;
+    if lo == hi {
+        return shannon_tree(b, lo, k - 1, base);
+    }
+    let lo_r = shannon_tree(b, lo, k - 1, base);
+    let hi_r = shannon_tree(b, hi, k - 1, base);
+    let s = RInp::Leaf(base + k - 1, false);
+    // out = s ? hi : lo.
+    match (lo_r, hi_r) {
+        (RInp::Const(false), RInp::Const(false)) => RInp::Const(false),
+        (RInp::Const(true), RInp::Const(true)) => RInp::Const(true),
+        (RInp::Const(false), h) => b.push(s, h),
+        (RInp::Const(true), h) => flip(b.push(flip(s), flip(h))),
+        (l, RInp::Const(false)) => b.push(flip(s), l),
+        (l, RInp::Const(true)) => flip(b.push(s, flip(l))),
+        (l, h) => b.mux(s, h, l),
+    }
+}
+
+/// Build the template for one 64-bit LUT6 INIT word via direct Shannon
+/// decomposition (see [`shannon_tree`]).
 fn lut6_template(init: u64) -> RawSynth {
     let mut b = TmplBuilder::new();
-    let mut cofactors = Vec::with_capacity(4);
-    for c in 0..4 {
-        let t = ((init >> (16 * c)) & 0xFFFF) as u16;
-        cofactors.push(build_cofactor(&mut b, t));
-    }
-    // mux(s, a, b) = s ? a : b. m0 covers the i4=0 half (chunks c0/c2),
-    // m1 the i4=1 half (chunks c1/c3).
-    let m0 = b.mux(RInp::Leaf(5, false), cofactors[2], cofactors[0]);
-    let m1 = b.mux(RInp::Leaf(5, false), cofactors[3], cofactors[1]);
-    let out = b.mux(RInp::Leaf(4, false), m1, m0);
+    let out = shannon_tree(&mut b, init, 6, 0);
     b.finish(out)
 }
 
@@ -366,59 +299,33 @@ mod tests {
 
     #[test]
     fn lut_bridge_templates_stay_small() {
-        // Tiered synthesis (exact 4-LUT -> Shannon 3-LUTs -> const tree) must
-        // keep templates small for realistic cofactors: well under the
-        // 45-AND const-tree fallback. Constants, single inputs, INC4 mapper
-        // patterns, parity nibbles.
-        let mut cases: Vec<u16> = vec![0x0000, 0xFFFF];
-        for i in 0..4 {
-            let mut t = 0u16;
-            for addr in 0..16u16 {
-                if (addr >> i) & 1 == 1 {
-                    t |= 1 << addr;
-                }
-            }
-            cases.push(t);
-            cases.push(!t);
-        }
-        for &init in &INC4_INIT {
-            for c in 0..4 {
-                cases.push(((init >> (16 * c)) & 0xFFFF) as u16);
-            }
-        }
-        let mut par = 0u16;
-        for addr in 0..16u16 {
-            if addr.count_ones() % 2 == 1 {
-                par |= 1 << addr;
-            }
-        }
-        cases.push(par);
-        // Include the cofactors exact_synth's 4-LUT DFS stalls on.
-        cases.push(0x7878);
-        cases.push(0x7f80);
-        for t in cases {
-            let mut b = TmplBuilder::new();
-            let out = build_cofactor(&mut b, t);
-            let tmpl = b.finish(out);
+        // Direct Shannon decomposition must keep templates small: constants
+        // and wires need 0 ANDs, simple functions a handful, and even
+        // 6-bit parity stays well under 100 ANDs. Cases: full 64-bit INITs.
+        let cases: Vec<u64> = vec![
+            0x0000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xFFFF_0000_FFFF_0000, // I4
+            0x8000_0000_0000_0000, // AND6
+            0x6996_6996_6996_6996, // 6-bit parity (replicated nibble)
+            0xCCCC_CCCC_AAAA_AAAA, // mux21 pattern
+        ];
+        for init in cases {
+            let mut cache = LutCache::new();
+            let tmpl = cache.template(init);
             assert!(
-                tmpl.ands.len() < 45,
-                "cofactor {t:#06x}: template has {} ANDs, expected tiered synthesis to stay small",
+                tmpl.ands.len() < 100,
+                "init {init:#018x}: template has {} ANDs, expected small Shannon tree",
                 tmpl.ands.len()
             );
-            // And it must still be correct: spot-check all 16 combos.
-            let mut aig = Aig::with_pis(Vec::new());
-            let lits: [Lit; 6] = std::array::from_fn(|i| aig.pi_lit(&format!("i{i}")));
-            // Embed the cofactor template over inputs 0..3 (inputs 4,5 unused).
-            let out_lit = instantiate(&mut aig, &tmpl, lits);
-            for addr in 0..16u64 {
-                let expected = (t >> addr) & 1 == 1;
-                assert_eq!(
-                    aig.eval_lit(out_lit, addr),
-                    expected,
-                    "cofactor {t:#06x} addr {addr}: wrong"
-                );
-            }
         }
+        // Wires and constants collapse to (near-)zero ANDs.
+        let wire = LutCache::new().template(0xFFFF_0000_FFFF_0000);
+        assert!(
+            wire.ands.len() <= 2,
+            "I4 wire should be ~0 ANDs, got {}",
+            wire.ands.len()
+        );
     }
 
     #[test]
