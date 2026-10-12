@@ -3036,14 +3036,35 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
     }
     ui.horizontal(|ui| {
         ui.label(RichText::new("helion%").monospace());
-        let edit = egui::TextEdit::singleline(&mut model.input)
+        let edit = egui::TextEdit::multiline(&mut model.input)
             .desired_width(f32::INFINITY)
-            .hint_text("synth_design / sim_run 16 / nav simulation / report_drc …")
+            .desired_rows(1)
+            .hint_text("get_cells | get_nets clk* | report_timing | set a [expr {2+2}] … (Enter: run · Shift+Enter: newline · Up/Down: history)")
             .font(egui::TextStyle::Monospace);
         let resp = ui.add(edit);
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let _ = model.submit_input();
-            resp.request_focus();
+        if resp.has_focus() {
+            let (up, down, enter, shift) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::Enter),
+                    i.modifiers.shift,
+                )
+            });
+            // Up/Down walk history only on a single-line edit, so they
+            // still move the cursor inside multi-line scripts.
+            let single = !model.input.contains('\n');
+            if up && single {
+                model.history_step(-1);
+            } else if down && single {
+                model.history_step(1);
+            }
+            // Enter already inserted a newline; submit only when the
+            // command is complete, otherwise keep editing the script.
+            if enter && !shift && IdeModel::tcl_input_complete(&model.input) {
+                let _ = model.submit_input();
+                resp.request_focus();
+            }
         }
     });
 }

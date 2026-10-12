@@ -4734,6 +4734,10 @@ pub struct IdeModel {
     pub tree: NetlistTree,
     pub console: Vec<ConsoleLine>,
     pub input: String,
+    /// Tcl console command history (newest last); `input_hist_idx` is the
+    /// cursor used by Up/Down (`None` = editing a fresh line).
+    pub input_history: Vec<String>,
+    pub input_hist_idx: Option<usize>,
     pub steps: [StepState; 5],
     pub timing: Option<TimingResult>,
     pub utilization: Option<Utilization>,
@@ -4939,6 +4943,8 @@ impl IdeModel {
             tree: NetlistTree::default(),
             console: Vec::new(),
             input: String::new(),
+            input_history: Vec::new(),
+            input_hist_idx: None,
             steps: [StepState::Pending; 5],
             timing: None,
             utilization: None,
@@ -6083,7 +6089,39 @@ impl IdeModel {
         };
         self.journal(cmd, &r);
         self.sync_from_session();
+        self.sync_tcl_selection();
+        self.sync_tcl_clear();
         r
+    }
+
+    /// Honor the Tcl `clear` command: wipe the console + log transcripts
+    /// once (the `clear` row itself is removed too, like Vivado).
+    fn sync_tcl_clear(&mut self) {
+        if !self.shell.tcl_interp.clear_console {
+            return;
+        }
+        self.shell.tcl_interp.clear_console = false;
+        self.console.clear();
+        self.log.clear();
+        self.console_selected = None;
+        self.selected_log = None;
+        self.status = "console cleared".into();
+    }
+
+    /// Drive the IDE's visual selection from a Tcl `select_objects` /
+    /// `highlight_objects` command, so the console selection lights up the
+    /// netlist tree, properties and device routes. Only fires once per
+    /// Tcl selection change (guarded by `selection_dirty`).
+    fn sync_tcl_selection(&mut self) {
+        if !self.shell.tcl_interp.selection_dirty {
+            return;
+        }
+        self.shell.tcl_interp.selection_dirty = false;
+        if let Some(first) = self.shell.tcl_interp.selected.first().cloned() {
+            if self.selected.as_deref() != Some(first.name.as_str()) {
+                self.select(&first.name);
+            }
+        }
     }
 
     /// UG893 Messages pane: severity + Tcl id + engine text (not a restyled console).
@@ -6727,8 +6765,105 @@ impl IdeModel {
         if cmd.is_empty() {
             return None;
         }
+        // Record history (cap 200, skip consecutive duplicates).
+        if self.input_history.last().map(|s| s != &cmd).unwrap_or(true) {
+            self.input_history.push(cmd.clone());
+            if self.input_history.len() > 200 {
+                self.input_history.remove(0);
+            }
+        }
+        self.input_hist_idx = None;
         self.input.clear();
         Some(self.exec(&cmd))
+    }
+
+    /// True when a console line is a complete Tcl command: braces, brackets
+    /// and double quotes are balanced (backslash-aware; `#` comments and
+    /// `{…}`-quoted text don't count). The console submits on Enter only
+    /// when this is true; otherwise Enter inserts a newline.
+    pub fn tcl_input_complete(s: &str) -> bool {
+        let mut brace = 0usize;
+        let mut bracket = 0usize;
+        let mut in_dquote = false;
+        let mut word_start = true; // `#` here starts a comment
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next();
+                word_start = false;
+                continue;
+            }
+            if in_dquote {
+                if c == '"' {
+                    in_dquote = false;
+                }
+                word_start = false;
+                continue;
+            }
+            match c {
+                '"' if brace == 0 => in_dquote = true,
+                '{' => brace += 1,
+                '}' => {
+                    if brace == 0 {
+                        return true; // unbalanced: let the interpreter report it
+                    }
+                    brace -= 1;
+                }
+                '[' if brace == 0 => bracket += 1,
+                ']' if brace == 0 => {
+                    if bracket == 0 {
+                        return true;
+                    }
+                    bracket -= 1;
+                }
+                '#' if word_start && brace == 0 => {
+                    for c2 in chars.by_ref() {
+                        if c2 == '\n' {
+                            break;
+                        }
+                    }
+                    word_start = true;
+                    continue;
+                }
+                '\n' | ';' => word_start = true,
+                c if c.is_whitespace() => {}
+                _ => word_start = false,
+            }
+            if matches!(c, '{' | '}' | '[' | ']' | '"') {
+                word_start = false;
+            }
+        }
+        brace == 0 && bracket == 0 && !in_dquote
+    }
+
+    /// Move the console input through history. `dir = -1` is Up (older),
+    /// `+1` is Down (newer); returns true when the input changed.
+    pub fn history_step(&mut self, dir: i8) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        let next = match self.input_hist_idx {
+            None if dir < 0 => Some(self.input_history.len() - 1),
+            None => return false,
+            Some(i) if dir < 0 => i.checked_sub(1),
+            Some(i) => {
+                let n = i + 1;
+                if n >= self.input_history.len() {
+                    self.input_hist_idx = None;
+                    self.input.clear();
+                    return true;
+                }
+                Some(n)
+            }
+        };
+        match next {
+            Some(i) => {
+                self.input_hist_idx = Some(i);
+                self.input = self.input_history[i].clone();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Status bar + Messages for Open/Implement/stage failures (never silent).
@@ -29301,6 +29436,70 @@ endmodule
     }
 
     /// Fig. 64: Tcl journal is selectable with Find; ok vs error still from Session.
+    #[test]
+    fn tcl_console_history_up_down() {
+        let mut ide = IdeModel::new();
+        for cmd in ["get_cells", "set a 1", "report_timing"] {
+            ide.input = cmd.into();
+            ide.submit_input();
+        }
+        assert_eq!(ide.input_history, vec!["get_cells", "set a 1", "report_timing"]);
+        // Up walks older; Down walks newer; Down past newest clears.
+        assert!(ide.history_step(-1));
+        assert_eq!(ide.input, "report_timing");
+        assert!(ide.history_step(-1));
+        assert_eq!(ide.input, "set a 1");
+        assert!(ide.history_step(-1));
+        assert_eq!(ide.input, "get_cells");
+        assert!(!ide.history_step(-1)); // already oldest
+        assert!(ide.history_step(1));
+        assert_eq!(ide.input, "set a 1");
+        assert!(ide.history_step(1));
+        assert_eq!(ide.input, "report_timing");
+        assert!(ide.history_step(1));
+        assert_eq!(ide.input, "");
+        assert!(ide.input_hist_idx.is_none());
+        // Empty input does not pollute history.
+        ide.input = "   ".into();
+        assert!(ide.submit_input().is_none());
+        assert_eq!(ide.input_history.len(), 3);
+    }
+
+    #[test]
+    fn tcl_input_complete_drives_enter_to_submit() {
+        assert!(IdeModel::tcl_input_complete("get_cells"));
+        assert!(IdeModel::tcl_input_complete(""));
+        assert!(IdeModel::tcl_input_complete("set a [expr {2 + 2}]"));
+        assert!(IdeModel::tcl_input_complete("foreach i {1 2 3} {\n puts $i\n}"));
+        assert!(IdeModel::tcl_input_complete("# a { comment\nputs hi"));
+        assert!(IdeModel::tcl_input_complete("puts hi; # {"));
+        assert!(!IdeModel::tcl_input_complete("foreach i {1 2 3} {"));
+        assert!(!IdeModel::tcl_input_complete("foreach i {1 2 3} {\n puts $i"));
+        assert!(!IdeModel::tcl_input_complete("set a \"hello"));
+        assert!(!IdeModel::tcl_input_complete("expr {2+2"));
+        assert!(!IdeModel::tcl_input_complete("set b [get_cells u_lut"));
+        // unbalanced close: complete (the interpreter reports the error)
+        assert!(IdeModel::tcl_input_complete("puts hi}"));
+        // braces inside quotes don't count; quotes inside braces don't count
+        assert!(IdeModel::tcl_input_complete("set a \"{\""));
+        assert!(IdeModel::tcl_input_complete("set b {\"}"));
+    }
+
+    #[test]
+    fn tcl_clear_empties_console_and_log() {
+        let mut ide = IdeModel::new();
+        ide.exec("set a 1").unwrap();
+        assert!(!ide.console.is_empty());
+        assert!(!ide.log.is_empty());
+        ide.exec("clear").unwrap();
+        assert!(ide.console.is_empty());
+        assert!(ide.log.is_empty());
+        assert!(ide.console_selected.is_none());
+        // console keeps working after clear
+        ide.exec("set b 2").unwrap();
+        assert_eq!(ide.console.len(), 1);
+    }
+
     #[test]
     fn tcl_console_journal_is_selectable_with_find() {
         let mut ide = IdeModel::new();

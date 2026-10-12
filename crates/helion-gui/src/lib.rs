@@ -11,6 +11,8 @@ pub mod learner_l1;
 pub mod learner_l2;
 pub mod open_dialog;
 pub mod surface;
+pub mod tcl;
+pub use tcl::{SelObj, TclInterp};
 pub use learner_l1::{
     ConstraintProvenance, SessionStage, StageError, StageStatus,
 };
@@ -49,8 +51,7 @@ pub use helion_sta::{
 use helion_device::Device;
 use helion_ir::Design;
 use helion_proj::{
-    Mode, Session, expand_ip_packages, get_cells, get_nets, get_pins, load_prj, opt_design,
-    resolve_prj_path,
+    Mode, Session, expand_ip_packages, load_prj, resolve_prj_path,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -144,6 +145,8 @@ pub struct GpuiShell {
     pub mode: Mode,
     pub session: Session,
     pub part: String,
+    /// Persistent Tcl session: variables, procs, clocks, selection.
+    pub tcl_interp: TclInterp,
 }
 
 impl Default for GpuiShell {
@@ -159,11 +162,12 @@ impl Default for GpuiShell {
             mode: Mode::Project,
             session: Session::new(Mode::Project),
             part: "HL10T-C32-1".into(),
+            tcl_interp: TclInterp::new(),
         }
     }
 }
 
-fn impl_if_needed(shell: &mut GpuiShell) -> Result<(), String> {
+pub(crate) fn impl_if_needed(shell: &mut GpuiShell) -> Result<(), String> {
     if shell.session.bitstream.is_some() {
         return Ok(());
     }
@@ -177,215 +181,32 @@ fn impl_if_needed(shell: &mut GpuiShell) -> Result<(), String> {
 }
 
 /// Tcl dispatch — every chrome button is a command string.
+/// Tcl dispatch — every chrome button is a command string.
+///
+/// Evaluates `cmd` with the real Tcl-subset interpreter
+/// ([`crate::tcl`]) against the shell's persistent session. `puts` output
+/// is prepended to the returned value; errors are `ERROR: ...` style.
 pub fn tcl_eval(shell: &mut GpuiShell, cmd: &str) -> Result<String, String> {
     shell.console.journal.push(cmd.into());
-    let t = cmd.trim();
-    if t.is_empty() {
-        return Ok(String::new());
-    }
-    if t == "hds::help" || t == "help" {
-        return Ok("hds::synth hds::impl hds::hw get_cells get_nets opt_design write_bitstream report_die report_featuremap".into());
-    }
-    if t == "hds::synth" {
-        return Ok("synth ok".into());
-    }
-    if let Some(path) = t
-        .strip_prefix("hds::synth ")
-        .or_else(|| t.strip_prefix("synth_design "))
-        .or_else(|| t.strip_prefix("read_sv "))
-    {
-        let d = synth_hdl_path(std::path::Path::new(path.trim()))?;
-        shell.tree.nodes.push(d.name.clone());
-        let msg = format!(
-            "synth {} cells {} luts {}",
-            d.name,
-            d.cells.len(),
-            d.lut_inits().len()
-        );
-        shell.session.synth_design(d);
-        return Ok(msg);
-    }
-    if t == "place_design" {
-        let dev = Device::load_part(&shell.part)?;
-        shell.session.place_design(&dev)?;
-        return Ok(format!(
-            "place_design sites {}",
-            shell
-                .session
-                .placed
-                .as_ref()
-                .map(|p| p.lutff_sites.len())
-                .unwrap_or(0)
-        ));
-    }
-    if t == "route_design" {
-        let dev = Device::load_part(&shell.part)?;
-        if shell.session.placed.is_none() {
-            shell.session.place_design(&dev)?;
+    // The interpreter lives on the shell, but `eval` needs `&mut shell`:
+    // move it out, evaluate, move it back.
+    let mut interp = std::mem::replace(&mut shell.tcl_interp, TclInterp::new());
+    let r = interp.eval(cmd, shell);
+    let puts_out = std::mem::take(&mut interp.output);
+    shell.tcl_interp = interp;
+    let combine = |v: String| {
+        if puts_out.is_empty() {
+            v
+        } else if v.is_empty() {
+            puts_out.clone()
+        } else {
+            format!("{puts_out}\n{v}")
         }
-        shell.session.route_design(&dev)?;
-        return Ok(format!(
-            "route_design hops {}",
-            shell
-                .session
-                .routed
-                .as_ref()
-                .and_then(|r| r.iob_src.first())
-                .map(|i| i.hops)
-                .unwrap_or(0)
-        ));
+    };
+    match r {
+        Ok(v) => Ok(combine(v)),
+        Err(e) => Err(combine(e)),
     }
-    if t == "hds::impl" || t.starts_with("hds::impl") {
-        impl_if_needed(shell)?;
-        return Ok(format!(
-            "impl frames {}",
-            shell
-                .session
-                .bitstream
-                .as_ref()
-                .map(|b| b.frames.len())
-                .unwrap_or(0)
-        ));
-    }
-    if t == "opt_design" {
-        let d = shell.session.design.as_mut().ok_or("no design")?;
-        let n = opt_design(d);
-        return Ok(format!("opt removed {n} dead LUTFF"));
-    }
-    if t == "get_cells" {
-        let d = shell.session.design.as_ref().ok_or("no design")?;
-        return Ok(get_cells(d, None).join(" "));
-    }
-    if t == "get_nets" {
-        let d = shell.session.design.as_ref().ok_or("no design")?;
-        return Ok(get_nets(d, None).join(" "));
-    }
-    if let Some(cell) = t.strip_prefix("get_pins ") {
-        let d = shell.session.design.as_ref().ok_or("no design")?;
-        return Ok(get_pins(d, cell.trim()).join(" "));
-    }
-    if let Some(rest) = t.strip_prefix("set_property ") {
-        let d = shell.session.design.as_mut().ok_or("no design")?;
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let key = parts[0];
-            let val = parts[1].trim_matches('"');
-            let obj = parts[2].trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
-            if key.eq_ignore_ascii_case("DONT_TOUCH") || key.eq_ignore_ascii_case("keep") {
-                d.set_cell_attr(obj, "DONT_TOUCH", val)?;
-            } else if key.eq_ignore_ascii_case("mark_debug") {
-                d.set_net_attr(obj, "mark_debug", val)?;
-            } else if key.eq_ignore_ascii_case("LOC") || key.eq_ignore_ascii_case("PACKAGE_PIN") {
-                d.set_loc(obj, val)?;
-            } else if key.eq_ignore_ascii_case("IOSTANDARD") {
-                d.set_iostandard(obj, val)?;
-            } else if key.eq_ignore_ascii_case("DRIVE") {
-                d.set_drive(obj, val)?;
-            } else if key.eq_ignore_ascii_case("SLEW") {
-                d.set_slew(obj, val)?;
-            } else if key.eq_ignore_ascii_case("PULLTYPE") {
-                d.set_pulltype(obj, val)?;
-            } else if key.eq_ignore_ascii_case("DIFF_TERM") {
-                d.set_diff_term(obj, val)?;
-            } else if key.eq_ignore_ascii_case("IN_TERM") {
-                d.set_in_term(obj, val)?;
-            }
-            return Ok(format!("set_property {key} {val} {obj}"));
-        }
-    }
-    if t == "write_hnf" {
-        let d = shell.session.design.as_ref().ok_or("no design")?;
-        return Ok(d.to_hnf());
-    }
-    if t == "write_bitstream" {
-        impl_if_needed(shell)?;
-        let n = shell
-            .session
-            .bitstream
-            .as_ref()
-            .map(|b| b.packets.len())
-            .unwrap_or(0);
-        return Ok(format!("write_bitstream {n} bytes"));
-    }
-    if t == "create_clock" || t.starts_with("create_clock ") {
-        return Ok("clock clk period 10000ps".into());
-    }
-    if t == "report_timing" {
-        impl_if_needed(shell)?;
-        let dev = Device::load_part(&shell.part)?;
-        return shell.session.report_timing(&dev);
-    }
-    if t == "report_utilization" {
-        impl_if_needed(shell)?;
-        let dev = Device::load_part(&shell.part)?;
-        return shell.session.report_utilization(&dev);
-    }
-    if t == "open_hw_manager" {
-        shell.session.open_hw_manager();
-        return Ok("open_hw_manager sim".into());
-    }
-    if t == "program_hw" || t == "program_hw_devices" || t.starts_with("program_hw ") {
-        let dev = Device::load_part(&shell.part)?;
-        if shell.session.bitstream.is_none() {
-            impl_if_needed(shell)?;
-        }
-        if !shell.session.hw_open {
-            shell.session.open_hw_manager();
-        }
-        // Optional `program_hw cable=sim|mpsse-sim|auto|ofl|native`.
-        // Bare program_hw = auto (board path) — USB=0 refuses DONE.
-        let cable = t
-            .split_whitespace()
-            .skip(1)
-            .find_map(|a| a.strip_prefix("cable="))
-            .unwrap_or("auto");
-        return shell.session.program_hw_cable(&dev, cable);
-    }
-    if let Some(net) = t.strip_prefix("mark_debug ") {
-        shell.session.mark_debug(net.trim())?;
-        return Ok(format!("mark_debug {}", net.trim()));
-    }
-    if let Some(net) = t.strip_prefix("add_probe ") {
-        // Tcl alias: Mark Debug + bind probe net (IdeModel::add_probe also opens Hardware).
-        let net = net.trim();
-        shell.session.mark_debug(net)?;
-        return Ok(format!("add_probe {net}"));
-    }
-    if let Some(rest) = t.strip_prefix("eco ") {
-        impl_if_needed(shell)?;
-        let dev = Device::load_part(&shell.part)?;
-        let mut parts = rest.split_whitespace();
-        let cell = parts.next().unwrap_or("u_lut");
-        let init_s = parts.next().unwrap_or("0xAAAAAAAAAAAAAAAA");
-        let init =
-            u64::from_str_radix(init_s.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .unwrap_or(0xAAAA_AAAA_AAAA_AAAA);
-        shell.session.eco(&dev, cell, init)?;
-        return Ok(format!("eco {cell} {init:#x}"));
-    }
-    if t == "write_checkpoint" || t.starts_with("write_checkpoint ") {
-        let ck = shell.session.checkpoint();
-        return Ok(format!(
-            "write_checkpoint {} bytes hash {:#x}",
-            ck.len(),
-            shell.session.blinky_hash().unwrap_or(0)
-        ));
-    }
-    if t == "report_featuremap" {
-        let dev = Device::load_part(&shell.part)?;
-        return Ok(dev.report_featuremap());
-    }
-    if t == "report_die" || t == "report_hw_targets" {
-        let dev = Device::load_part(&shell.part)?;
-        return Ok(dev.report_die());
-    }
-    if t == "hds::flow" {
-        return Ok(shell.flow.steps.join(" "));
-    }
-    if t == "hds::tree" {
-        return Ok(shell.tree.nodes.join(" "));
-    }
-    Err(format!("unknown {t}"))
 }
 
 #[cfg(test)]
@@ -424,9 +245,12 @@ mod tests {
             "clock clk period 10000ps"
         );
         let rt = tcl_eval(&mut sh, "report_timing").unwrap();
-        assert!(rt.contains("WNS_PS="), "report_timing must hit STA: {rt}");
+        assert!(
+            rt.contains("WNS") && rt.contains("9640"),
+            "report_timing must hit STA: {rt}"
+        );
         let util = tcl_eval(&mut sh, "report_utilization").unwrap();
-        assert!(util.contains("LUTFF="), "{util}");
+        assert!(util.contains("LUTFF"), "{util}");
         assert!(
             tcl_eval(&mut sh, "open_hw_manager")
                 .unwrap()
