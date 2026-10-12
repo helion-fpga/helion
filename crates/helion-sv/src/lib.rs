@@ -3866,12 +3866,16 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
                 let mut dc = false;
                 if base == 2 {
                     let mut wide = width > 128;
+                    // Place the value from the digit count, not the declared
+                    // width: 4'b1 is 1, not 8. Other bases already fold
+                    // parse_based_digits(digits) this way.
+                    let ndigits = digits.chars().filter(|c| *c != '_').count();
                     let mut off = 0usize;
                     for ch in digits.chars() {
                         if ch == '_' {
                             continue;
                         }
-                        let bit = width.saturating_sub(off + 1);
+                        let bit = ndigits.saturating_sub(off + 1);
                         off += 1;
                         match ch {
                             '1' => {
@@ -21312,5 +21316,37 @@ endmodule
             "mem_inits must hash in name order"
         );
     }
+
+    #[test]
+    fn sized_binary_literal_value_uses_digit_count() {
+        // The tokenizer used to place a binary literal's value at the
+        // declared width: 4'b1 -> 8, 8'b1 -> 128. The value comes from the
+        // digit count, like the other bases.
+        let num = |s: &str| {
+            let toks = tokenize(s).unwrap();
+            assert_eq!(toks.len(), 1, "one token for {s}");
+            match &toks[0] {
+                Tok::Number(v, w) => (*v, *w),
+                other => panic!("expected Number for {s}, got {other:?}"),
+            }
+        };
+        assert_eq!(num("4'b1"), (1, 4));
+        assert_eq!(num("8'b1"), (1, 8));
+        assert_eq!(num("8'b101"), (5, 8));
+        assert_eq!(num("16'b1"), (1, 16));
+        // End to end: the value reaches the elaborated assign.
+        let rtl =
+            parse_rtl("module m(output [3:0] y); assign y = 4'b1; endmodule").expect("parse");
+        let (_, _, rhs) = rtl
+            .assigns
+            .iter()
+            .find(|(lhs, _, _)| *lhs == "y")
+            .expect("y assign");
+        assert!(
+            matches!(rhs, RExpr::Const { val: 1, .. }),
+            "4'b1 must elaborate to 1, got {rhs:?}"
+        );
+    }
+
 }
 
