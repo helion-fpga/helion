@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 helion-ir = { workspace = true }
+# v3.0 verification track (Part B): SVA elaborated types for the sim checkers.
+helion-sv = { workspace = true }
 
 [dev-dependencies]
 helion-device = { workspace = true }
@@ -14,4 +16,3 @@ helion-place = { workspace = true }
 helion-route = { workspace = true }
 helion-bits = { workspace = true }
 helion-fabric = { workspace = true }
-helion-sv = { workspace = true }
