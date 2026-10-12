@@ -7635,9 +7635,10 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     let z = cam.zoom.max(0.05);
     // Level-of-detail: below BLOCK_ZOOM the sheet renders a treemap of
     // hierarchical blocks instead of 15k individual gates (wire grid).
-    // Block mode needs at least 2 blocks to be meaningful.
+    // Block mode needs at least 2 blocks and a large-enough design to be
+    // meaningful; small designs stay on the readable gate sheet at fit zoom.
     let mut block_layer: Option<schem_lod::BlockLayer> = None;
-    if z < schem_lod::BLOCK_ZOOM {
+    if z < schem_lod::BLOCK_ZOOM && n_cells >= schem_lod::LOD_MIN_CELLS {
         let layer_id = egui::Id::new("schem_block_layer");
         let key = (
             std::sync::Arc::as_ptr(&drawing) as usize,
