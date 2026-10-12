@@ -192,7 +192,7 @@ fn imux_local(from: Site, to: Site) -> bool {
 fn imux_illegal_pins(
     lf: &helion_pack::PackedLutFf,
     site: Site,
-    ff_at: &std::collections::HashMap<&str, Site>,
+    ff_at: &std::collections::HashMap<String, Site>,
 ) -> u32 {
     imux_score(lf, site, ff_at).0
 }
@@ -204,7 +204,7 @@ fn imux_illegal_pins(
 fn imux_score(
     lf: &helion_pack::PackedLutFf,
     site: Site,
-    ff_at: &std::collections::HashMap<&str, Site>,
+    ff_at: &std::collections::HashMap<String, Site>,
 ) -> (u32, u32) {
     let mut n = 0u32;
     let mut spill = 0u32;
@@ -504,7 +504,7 @@ pub fn place_with_guide(
     let mut packed = packed.clone();
     packed.iobs = order.iter().map(|&i| packed.iobs[i].clone()).collect();
 
-    let mut lutff_sites = Vec::new();
+    let mut lutff_sites: Vec<(Site, u8)> = Vec::new();
     if !packed.lutffs.is_empty() {
         let t_aff = std::time::Instant::now();
         // Prefer the IOB column that each cluster drives (multi-IOB comb mux).
@@ -543,11 +543,15 @@ pub fn place_with_guide(
         let mut xs_seen: HashSet<u32> = HashSet::new();
         let mut y_seen: HashSet<u32> = HashSet::new();
         // FF cell → site as we place (IMUX: same-CLB / N-S±1/±2 / E-W±1/±2 / diag±1 / knight).
-        let mut ff_at: std::collections::HashMap<&str, Site> = std::collections::HashMap::new();
+        let mut ff_at: std::collections::HashMap<String, Site> = std::collections::HashMap::new();
         let mut excepted_iob: HashSet<usize> = HashSet::new();
         // Seed sweeps: process LUTFFs in a seeded order so different seeds
         // explore genuinely different placements. Seed 0 = legacy order.
+        // Sites are recorded by PACKED index, never in visitation order:
+        // lutff_sites[i] must match packed.lutffs[i] (INIT programming,
+        // router IMUX, cell_bel, lutff_of all index by packed order).
         let lutff_order = seeded_order(packed.lutffs.len(), opts.seed);
+        let mut site_of: Vec<Option<(Site, u8)>> = vec![None; packed.lutffs.len()];
         for &li in &lutff_order {
             let lf = &packed.lutffs[li];
             let drives_iob = iob_for_net.contains_key(lf.q_net.as_str());
@@ -749,13 +753,25 @@ pub fn place_with_guide(
             }
             *site_used_n.entry((site_ble.0.x, site_ble.0.y)).or_insert(0) += 1;
             if !lf.ff_cell.is_empty() {
-                ff_at.insert(lf.ff_cell.as_str(), site_ble.0);
+                ff_at.insert(lf.ff_cell.clone(), site_ble.0);
             }
             if excepted_iob_cluster {
-                excepted_iob.insert(lutff_sites.len());
+                excepted_iob.insert(li);
             }
-            lutff_sites.push(site_ble);
+            site_of[li] = Some(site_ble);
         }
+        // Compact to packed order, dropping unplaced LUTFFs (affinity-loop
+        // break) from both sides together so the index pairing stays exact.
+        let mut packed_order_sites: Vec<(Site, u8)> = Vec::with_capacity(packed.lutffs.len());
+        let mut kept_lutffs = Vec::with_capacity(packed.lutffs.len());
+        for (lf, slot) in packed.lutffs.drain(..).zip(site_of) {
+            if let Some(sb) = slot {
+                kept_lutffs.push(lf);
+                packed_order_sites.push(sb);
+            }
+        }
+        packed.lutffs = kept_lutffs;
+        lutff_sites = packed_order_sites;
 
         let nplace = lutff_sites.len();
         eprintln!(
@@ -1046,7 +1062,7 @@ pub fn place_with_guide(
                     grid.relocate(skip, (site.x, site.y, ble), i);
                     lutff_sites[i] = (site, ble);
                     if !lf.ff_cell.is_empty() {
-                        ff_at.insert(lf.ff_cell.as_str(), site);
+                        ff_at.insert(lf.ff_cell.clone(), site);
                     }
                     pass_moved += 1;
                     continue;
@@ -1105,10 +1121,10 @@ pub fn place_with_guide(
                     lutff_sites[i] = (site, ble);
                     lutff_sites[j] = (cur_site, cur_ble);
                     if !lf.ff_cell.is_empty() {
-                        ff_at.insert(lf.ff_cell.as_str(), site);
+                        ff_at.insert(lf.ff_cell.clone(), site);
                     }
                     if !packed.lutffs[j].ff_cell.is_empty() {
-                        ff_at.insert(packed.lutffs[j].ff_cell.as_str(), cur_site);
+                        ff_at.insert(packed.lutffs[j].ff_cell.clone(), cur_site);
                     }
                     pass_swapped += 1;
                 }
@@ -1194,7 +1210,7 @@ pub fn place_with_guide(
                 if let Some((site, ble, _)) = best {
                     grid.relocate(skip, (site.x, site.y, ble), i);
                     lutff_sites[i] = (site, ble);
-                    ff_at.insert(d_ff, site);
+                    ff_at.insert(d_ff.to_owned(), site);
                     pass_drv_moved += 1;
                     continue;
                 }
@@ -1276,9 +1292,9 @@ pub fn place_with_guide(
                     );
                     lutff_sites[i] = (site, ble);
                     lutff_sites[j] = (cur_site, cur_ble);
-                    ff_at.insert(d_ff, site);
+                    ff_at.insert(d_ff.to_owned(), site);
                     if !packed.lutffs[j].ff_cell.is_empty() {
-                        ff_at.insert(packed.lutffs[j].ff_cell.as_str(), cur_site);
+                        ff_at.insert(packed.lutffs[j].ff_cell.clone(), cur_site);
                     }
                     pass_drv_swapped += 1;
                 }
@@ -1951,5 +1967,58 @@ mod tests {
         assert_eq!(sorted, (0..64).collect::<Vec<_>>());
         // Different seeds (almost surely) shuffle differently.
         assert_ne!(a, seeded_order(64, 999));
+    }
+
+    /// Seed sweeps must not disturb the lutff_sites[i] <-> packed.lutffs[i]
+    /// pairing that INIT programming, the router, cell_bel and lutff_of rely
+    /// on. Eight pin-less LUTFFs share one site (n_ble = 8), so the k-th
+    /// visited LUTFF takes BLE k; in packed order that means
+    /// lutff_sites[i].1 == position of i in seeded_order(n, seed).
+    /// Recording sites in visitation order (the old bug) yields ble == i
+    /// for every seed instead.
+    #[test]
+    fn seeded_place_keeps_lutff_sites_in_packed_order() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut p = pack(&Design::structural_blinky(), &dev).unwrap();
+        let proto = p.lutffs[0].clone();
+        p.lutffs.clear();
+        let n = 8usize;
+        for i in 0..n {
+            let mut lf = proto.clone();
+            lf.lut_cell = format!("u_lut{i}");
+            lf.ff_cell = format!("u_ff{i}");
+            lf.q_net = format!("q{i}");
+            lf.lut_pins = Vec::new();
+            lf.init = 0xAAAAAAAAAAAAAAAAu64 ^ (i as u64);
+            p.lutffs.push(lf);
+        }
+        for seed in [12345u64, 999u64] {
+            let perm = seeded_order(n, seed);
+            assert_ne!(perm, (0..n).collect::<Vec<_>>());
+            let mut pos = vec![0usize; n];
+            for (k, &li) in perm.iter().enumerate() {
+                pos[li] = k;
+            }
+            let opts = PlaceOpts {
+                timing_weight: 0.0,
+                seed,
+            };
+            let pl = place_with(&p, &dev, opts).expect("seeded place must succeed");
+            assert_eq!(pl.lutff_sites.len(), n);
+            assert_eq!(pl.packed.lutffs.len(), n);
+            let site0 = pl.lutff_sites[0].0;
+            for i in 0..n {
+                let (site, ble) = pl.lutff_sites[i];
+                assert_eq!(site, site0, "seed {seed}: all 8 share one site");
+                assert_eq!(
+                    ble as usize, pos[i],
+                    "seed {seed}: lutff_sites[{i}] must hold packed.lutffs[{i}]'s site"
+                );
+                // The packed-index pairing must survive the public lookups too.
+                let lf = &pl.packed.lutffs[i];
+                assert_eq!(pl.cell_bel(&lf.lut_cell).unwrap().site, site);
+                assert_eq!(lutff_of(&pl, &lf.ff_cell), Some((site, ble)));
+            }
+        }
     }
 }
