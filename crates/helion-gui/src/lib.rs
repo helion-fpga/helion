@@ -30,7 +30,7 @@ pub use ide::{
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection,
-    Pblock, ProjectSummaryGadget, PropertyRow, ReportCatalogRow,
+    Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
     NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
     schematic_kind_label, schematic_short_name,
