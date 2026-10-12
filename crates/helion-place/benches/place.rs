@@ -52,6 +52,7 @@ fn bench_place(c: &mut Criterion) {
                     black_box(&dev),
                     black_box(PlaceOpts {
                         timing_weight: 0.75,
+                        seed: 0,
                     }),
                 )
                 .unwrap()
