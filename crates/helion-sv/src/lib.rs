@@ -9307,16 +9307,10 @@ fn index_part_bit<'a>(
     // word's packed bits. `name[w][hi:lo]` encodes base as (word<<16)|lo.
     if depth > 1 {
         if let RExpr::Const { val, .. } = base {
-            let word = if *val >= 0x1_0000 {
-                (*val >> 16) as usize
-            } else {
-                *val as usize
-            };
-            let bit_lo = if *val >= 0x1_0000 {
-                (*val & 0xffff) as usize
-            } else {
-                0usize
-            };
+            // `name[w][hi:lo]` encodes base as (word<<16)|lo, so a small val
+            // is word 0 with lo = val, not word = val.
+            let word = (*val >> 16) as usize;
+            let bit_lo = (*val & 0xffff) as usize;
             let src = bit_lo.saturating_add(bit);
             if src >= wsrc {
                 return Ok(Expr::Const(false));
@@ -21346,6 +21340,53 @@ endmodule
             matches!(rhs, RExpr::Const { val: 1, .. }),
             "4'b1 must elaborate to 1, got {rhs:?}"
         );
+    }
+
+    #[test]
+    fn index_part_bit_small_val_is_word0_with_lo() {
+        // `arr[0][15:8]` encodes base as (0<<16)|8 = 8. Bit 0 must resolve
+        // to arr_w0_8, not arr_w8_0.
+        let arena = Bump::new();
+        let rtl = Rtl {
+            module: "t",
+            ports: vec![],
+            signals: vec![Signal {
+                name: "arr",
+                width: 32,
+                depth: 4,
+                keep: false,
+                mark_debug: false,
+                force_bram: false,
+            }],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: HashMap::new(),
+            negedge_writes: vec![],
+        };
+        let base = RExpr::Const {
+            val: 8,
+            width: 32,
+            care: u128::MAX,
+        };
+        let e = index_part_bit("arr", &base, 8, true, &rtl, 0, &arena).expect("bit 0");
+        match e {
+            Expr::Var(name) => assert_eq!(name, "arr_w0_8", "word-0 lo=8 resolves wrong"),
+            other => panic!("expected Var, got {other:?}"),
+        }
+        // A word>=1 encoding is unaffected: arr[2][7:0] bit 3 -> arr_w2_3.
+        let base2 = RExpr::Const {
+            val: 2u128 << 16,
+            width: 32,
+            care: u128::MAX,
+        };
+        let e2 = index_part_bit("arr", &base2, 8, true, &rtl, 3, &arena).expect("bit 3");
+        match e2 {
+            Expr::Var(name) => assert_eq!(name, "arr_w2_3"),
+            other => panic!("expected Var, got {other:?}"),
+        }
     }
 
 }
