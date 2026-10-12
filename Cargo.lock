@@ -1496,6 +1496,7 @@ dependencies = [
  "helion-place",
  "helion-route",
  "helion-sta",
+ "helion-sv",
 ]
 
 [[package]]
