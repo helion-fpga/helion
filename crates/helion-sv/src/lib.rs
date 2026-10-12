@@ -2907,18 +2907,6 @@ impl OwnHash {
                     stack.push(FeedOp::Visit(*b));
                     stack.push(FeedOp::Visit(*a));
                 }
-                RExpr::RedXor(a) => {
-                    self.feed("^r");
-                    stack.push(FeedOp::Visit(*a));
-                }
-                RExpr::RedAnd(a) => {
-                    self.feed("&r");
-                    stack.push(FeedOp::Visit(*a));
-                }
-                RExpr::RedOr(a) => {
-                    self.feed("|r");
-                    stack.push(FeedOp::Visit(*a));
-                }
             }
         }
     }
@@ -23432,6 +23420,8 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            sva_conc: vec![],
+            sva_imm: vec![],
         };
         let base = RExpr::Const {
             val: 8,
@@ -23521,6 +23511,8 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            sva_conc: vec![],
+            sva_imm: vec![],
         };
         let mut d = Design::new("t");
         emit_word_add(&mut d, &rtl, "clk", "mem", 0, 32, "a", "b");
@@ -23665,6 +23657,8 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            sva_conc: vec![],
+            sva_imm: vec![],
         };
         fn eval(e: &Expr, vals: &HashMap<String, bool>) -> bool {
             match e {

@@ -417,6 +417,7 @@ fn rexpr_text(e: &RExpr) -> String {
                 .join(", ")
         ),
         RExpr::Shr(a, b) => format!("({} >> {})", rexpr_text(a), rexpr_text(b)),
+        RExpr::Shl(a, b) => format!("({} << {})", rexpr_text(a), rexpr_text(b)),
         RExpr::Ashr(a, b) => format!("({} >>> {})", rexpr_text(a), rexpr_text(b)),
         RExpr::RedXor(x) => format!("(^{})", rexpr_text(x)),
         RExpr::RedAnd(x) => format!("(&{})", rexpr_text(x)),
@@ -774,6 +775,10 @@ impl<'r> Elab<'r> {
                 Ok(SvaExpr::Concat(out))
             }
             RExpr::Shr(a, b) => Ok(SvaExpr::Shr(
+                Box::new(self.lower_rexpr(a, d1)?),
+                Box::new(self.lower_rexpr(b, d1)?),
+            )),
+            RExpr::Shl(a, b) => Ok(SvaExpr::Shl(
                 Box::new(self.lower_rexpr(a, d1)?),
                 Box::new(self.lower_rexpr(b, d1)?),
             )),
