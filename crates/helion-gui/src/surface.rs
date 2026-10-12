@@ -320,6 +320,8 @@ pub enum JobKind {
     TbRun(crate::tb::TbRunRequest),
     /// Re-run STA (`report_timing_now`) against the current constraints.
     ReportTiming,
+    /// VCD dump from helion-sim for power analysis (engine thread).
+    DumpVcd(u32),
 }
 
 impl JobKind {
@@ -336,6 +338,7 @@ impl JobKind {
             JobKind::DesignRun { .. } => "DesignRun",
             JobKind::TbRun(_) => "Testbench",
             JobKind::ReportTiming => "Timing",
+            JobKind::DumpVcd(_) => "Power",
         }
     }
 
@@ -353,6 +356,7 @@ impl JobKind {
             JobKind::DesignRun { name } => format!("Running design run {name}…"),
             JobKind::TbRun(r) => format!("Running testbench {}…", r.sel),
             JobKind::ReportTiming => "Re-running timing analysis…".into(),
+            JobKind::DumpVcd(n) => format!("Dumping VCD ({n} cycles) for power…"),
         }
     }
 }
@@ -382,6 +386,7 @@ fn run_kind(model: &mut IdeModel, kind: &JobKind) -> Result<String, String> {
         JobKind::DesignRun { name } => model.execute_design_run(name),
         JobKind::TbRun(req) => model.tb_run_job(req),
         JobKind::ReportTiming => model.report_timing_now(),
+        JobKind::DumpVcd(n) => model.dump_vcd(*n),
     }
 }
 

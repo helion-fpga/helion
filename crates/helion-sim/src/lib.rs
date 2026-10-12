@@ -6,6 +6,8 @@
 use helion_ir::{CellKind, Design, PortDir};
 use std::collections::HashMap;
 
+pub mod vcd;
+
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimForceKind {
@@ -405,6 +407,50 @@ impl Sim {
             });
         }
         v
+    }
+
+    /// Evaluate one LUT's combinational output from current net values (no
+    /// clock advance). Used by the VCD sampler; delegates to the kernel's
+    /// memoized multi-level resolver so LUT chains evaluate exactly.
+    fn lut_output(&self, lut: &str) -> Option<bool> {
+        if !self.lut_init.contains_key(lut) {
+            return None;
+        }
+        let mut memo = HashMap::new();
+        let mut stack = Vec::new();
+        Some(self.lut_output_live(lut, &mut memo, &mut stack))
+    }
+
+    /// Current logic value of every net with a resolvable driver.
+    ///
+    /// A net resolves through its first driver endpoint: FF `Q` → current
+    /// register state, LUT `O` → combinational evaluation from current FF
+    /// state. Nets with no FF/LUT driver (undriven, IOB-only) are skipped.
+    /// Used by the VCD dumper ([`vcd::dump_vcd`]); sorted by net name so
+    /// dumps are deterministic.
+    pub fn sample_nets(&self, d: &Design) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for n in &d.nets {
+            let mut val: Option<bool> = None;
+            for e in &n.endpoints {
+                if e.pin == "Q" {
+                    if let Some(q) = self.ff_q.get(&e.cell) {
+                        val = Some(*q);
+                        break;
+                    }
+                } else if e.pin == "O" {
+                    if let Some(o) = self.lut_output(&e.cell) {
+                        val = Some(o);
+                        break;
+                    }
+                }
+            }
+            if let Some(v) = val {
+                out.push((n.name.clone(), v));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Probe a named signal for UG900 breakpoints (LED, FF Q, or LUT INIT word).
