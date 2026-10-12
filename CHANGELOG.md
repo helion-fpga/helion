@@ -12,6 +12,9 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ### Fixed
 
+- Toast notifications no longer pile up as giant permanent cards: they auto-dismiss after 5s on a wall-clock timer (the old frame-count timer never expired while the UI was idle), are capped at 360px with wrapping, max 4 stacked, deduped, and the "Started: …" spam is gone — job progress already lives in the status bar; toasts are completions/errors only.
+- macOS: ad-hoc codesign the `Helion.app` bundle during the release build (and verify it in CI). Unsigned downloads were reported as "damaged" by Gatekeeper on recent macOS; the bundle is now well-formed. The bundle version is stamped from `workspace.package.version` at build time (no more hardcoded plist version). First launch from a download still needs one `xattr -cr /Applications/Helion.app` (documented in the README) until Apple notarization is set up.
+
 [unreleased]: https://github.com/helion-fpga/helion/compare/v2.1.0...HEAD
 
 ## [2.1.0] — 2026-10-11
