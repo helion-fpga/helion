@@ -2,7 +2,9 @@
 //!
 //! Paint calls these helpers; tests assert the same units at ~1440×900 without eframe.
 
-use crate::{BottomTab, WorkspaceTab};
+use eframe::egui;
+
+use crate::{ide::WaveDensity, BottomTab, WorkspaceTab};
 
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
@@ -78,10 +80,11 @@ pub fn flow_chip_size() -> [f32; 2] {
 
 /// Waveform trace row height. One or two traces must fill the remaining pane
 /// instead of painting a 32px strip over a black slab.
-pub fn wave_trace_row_h(n_traces: usize, remaining_h: f32) -> f32 {
-    let n = n_traces.max(1) as f32;
-    let remain = remaining_h.max(36.0);
-    (remain / n).clamp(36.0, remain)
+/// Waveform lane height comes from the density toggle (GTKWave-style),
+/// not from stretching rows to fill the pane — stretching produced 150px
+/// lanes with few traces. Leftover space below the lanes is normal.
+pub fn wave_trace_row_h(density: WaveDensity) -> f32 {
+    density.lane_h()
 }
 
 /// Stretch a table across the remaining pane (Win32: leftover empty regions are incorrect).
@@ -1501,15 +1504,9 @@ mod tests {
             toolbar_ctrl_size("Open…")[1],
             toolbar_ctrl_size("Implement")[1]
         );
-        // One trace in a 400px remaining pane must not be a 32px strip.
-        let h1 = wave_trace_row_h(1, 400.0);
-        assert!(
-            h1 >= 400.0 * PANE_FILL_MIN,
-            "single wave trace row {h1} leaves a black slab in 400px"
-        );
-        let h2 = wave_trace_row_h(2, 400.0);
-        assert!(h2 >= 180.0, "two traces share the pane, got {h2}");
-        assert_eq!(wave_trace_row_h(20, 400.0), 36.0);
+        // Waveform lanes are density-driven (no stretch-to-fill).
+        assert_eq!(wave_trace_row_h(WaveDensity::Comfortable), 56.0);
+        assert_eq!(wave_trace_row_h(WaveDensity::Compact), 36.0);
         let w = stretched_col_w(7, 700.0);
         assert!(w >= 48.0, "{w}");
         assert!(
