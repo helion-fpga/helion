@@ -129,6 +129,8 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity, String> {
     // id -> (width, hierarchical name), insertion ordered.
     let mut vars: Vec<(String, VarDecl)> = Vec::new();
     let mut var_index: HashMap<String, usize> = HashMap::new();
+    // Set when the header declares more signals than MAX_VCD_PARSE_SIGNALS.
+    let mut truncated = false;
 
     // --- header ---
     let mut enddefs = false;
@@ -186,9 +188,13 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity, String> {
                         name.push('.');
                     }
                     name.push_str(&reference);
-                    if vars.len() < MAX_VCD_PARSE_SIGNALS && !var_index.contains_key(&id) {
-                        var_index.insert(id.clone(), vars.len());
-                        vars.push((id, VarDecl { width, name }));
+                    if !var_index.contains_key(&id) {
+                        if vars.len() < MAX_VCD_PARSE_SIGNALS {
+                            var_index.insert(id.clone(), vars.len());
+                            vars.push((id, VarDecl { width, name }));
+                        } else {
+                            truncated = true;
+                        }
                     }
                 }
             }
@@ -399,7 +405,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity, String> {
         timescale_ps: timescale_fs / 1000,
         duration_ps: max_fs / 1000,
         signals,
-        truncated: false,
+        truncated,
     })
 }
 
@@ -477,6 +483,24 @@ b0010 #
     #[test]
     fn missing_enddefinitions_errors() {
         assert!(parse_vcd("$timescale 1ps $end\n#0\n").is_err());
+    }
+
+    #[test]
+    fn small_vcd_not_truncated() {
+        let a = parse_vcd(GOLDEN).expect("parse");
+        assert!(!a.truncated, "under-cap VCD must not report truncated");
+    }
+
+    #[test]
+    fn signal_cap_reports_truncated() {
+        let mut vcd = String::from("$timescale 1ps $end\n$scope module t $end\n");
+        for i in 0..MAX_VCD_PARSE_SIGNALS + 2 {
+            vcd.push_str(&format!("$var wire 1 id{i} s{i} $end\n"));
+        }
+        vcd.push_str("$upscope $end\n$enddefinitions $end\n");
+        let a = parse_vcd(&vcd).expect("parse");
+        assert_eq!(a.signals.len(), MAX_VCD_PARSE_SIGNALS);
+        assert!(a.truncated, "over-cap VCD must report truncated");
     }
 
     #[test]
