@@ -199,7 +199,17 @@ fn run_command(app: &mut HelionIde, cmd: Command) {
             let p = helion_device::Device::examples_dir().join("counter.sdc");
             exec_tcl(app, &format!("read_xdc {}", p.display()));
         }
-        Command::ToggleWelcome => app.welcome_dismissed = false,
+        Command::ToggleWelcome => {
+            app.welcome_dismissed = false;
+            // The welcome page only shows with no project open; say so instead
+            // of silently doing nothing.
+            if !super::welcome::should_show(app) {
+                app.toasts.push(
+                    ToastKind::Warn,
+                    "Close the current project to see the welcome page.",
+                );
+            }
+        }
         Command::Cheatsheet => app.show_cheatsheet = true,
         Command::ToggleTheme => toggle_theme(app),
         Command::ToggleDensity => toggle_density(app),
@@ -829,6 +839,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("⌘P", "Command palette: go to file"),
     ("⇧⌘P", "Command palette: commands"),
     ("⌘K", "Toggle this cheatsheet"),
+    ("⌘S", "Save open file (Editor canvas)"),
+    ("Alt+Z", "Toggle soft wrap (Editor canvas)"),
 ];
 
 /// Keys that only work while the palette is open.

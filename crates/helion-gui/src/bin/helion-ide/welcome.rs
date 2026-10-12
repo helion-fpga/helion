@@ -109,6 +109,7 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
     let mut dismiss = false;
     let mut open_path: Option<std::path::PathBuf> = None;
     let mut run_gold = false;
+    let mut stale_toast: Option<String> = None;
 
     // Centered column; everything aligns to it. Vertical scroll keeps the
     // footer reachable on short windows.
@@ -202,7 +203,15 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
 
                     // ---- Examples: a real card grid ----
                     section_head(ui, theme, "Examples");
-                    let cols = if col_w < 480.0 { 2 } else { 3 };
+                    // Responsive: 1 column on very narrow windows so card text
+                    // never truncates, 2 below 480px, 3 above.
+                    let cols = if col_w < 300.0 {
+                        1
+                    } else if col_w < 480.0 {
+                        2
+                    } else {
+                        3
+                    };
                     let card_gap = 12.0;
                     let card_w = (col_w - (cols as f32 - 1.0) * card_gap) / cols as f32;
                     let card_h = 84.0;
@@ -248,8 +257,15 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
                                 parent
                             };
                             if recent_row(ui, theme, &name, &parent, col_w) {
-                                open_path = Some(path.clone());
-                                dismiss = true;
+                                // Stale entries toast instead of dismissing
+                                // into an empty project.
+                                if path.is_file() {
+                                    open_path = Some(path.clone());
+                                    dismiss = true;
+                                } else {
+                                    stale_toast =
+                                        Some(format!("File not found: {}", path.display()));
+                                }
                             }
                         }
                         ui.add_space(8.0);
@@ -269,7 +285,7 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
                         );
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new("Ctrl+P command palette   ·   ? keyboard shortcuts")
+                            RichText::new("⌘P command palette   ·   ⌘K keyboard shortcuts")
                                 .font(font_ui(12.0))
                                 .color(theme.faint),
                         );
@@ -284,9 +300,10 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
         app.welcome_dismissed = true;
     }
     if let Some(p) = open_path {
-        if p.is_file() {
-            app.open_path(&p);
-        }
+        app.open_path(&p);
+    }
+    if let Some(msg) = stale_toast {
+        app.toasts.push(super::toasts::ToastKind::Warn, msg);
     }
     if run_gold {
         let p = helion_device::Device::examples_dir().join("counter.sv");
