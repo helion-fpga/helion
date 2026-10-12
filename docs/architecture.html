@@ -59,6 +59,8 @@ helion-gui IdeModel paints the Session</code></pre>
           <tr><td><code>helion-sta</code></td><td>XDC/SDC constraints, WNS + hold (see <code>crates/helion-sta/src/lib.rs::load_xdc</code>)</td></tr>
           <tr><td><code>helion-drc</code></td><td>Occupancy, unrouted IO, clocks</td></tr>
           <tr><td><code>helion-bits</code></td><td>FeatureMap frames, sparse <code>.hbits</code>, partial (DFX)</td></tr>
+          <tr><td><code>helion-backend</code></td><td><code>Backend</code> trait with associated types; each device family implements pack, place, route, bitgen</td></tr>
+          <tr><td><code>helion-xilinx7</code></td><td>Xilinx 7-series backend: xc7a35t device model, pack, place, route, FASM emission, frames to <code>.bit</code></td></tr>
           <tr><td><code>helion-fabric</code> / <code>helion-sim</code></td><td>Cycle fabric (6-input IMUX LUT + FF + IOB + STAT) and event kernel</td></tr>
           <tr><td><code>helion-hw</code></td><td>IEEE 1149.1 TAP, sim cable, OFL / native MPSSE</td></tr>
           <tr><td><code>helion-gui</code></td><td><code>IdeModel</code> + eframe shell (<code>helion-ide</code>)</td></tr>

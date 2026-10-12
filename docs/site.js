@@ -287,3 +287,123 @@
   }
   requestAnimationFrame(tick);
 })();
+
+/* v3: terminal typing, counters, reveals, magnetic buttons. Restrained. */
+(function () {
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var hoverable = window.matchMedia("(hover: hover)").matches;
+
+  /* ---- scroll reveals ---- */
+  var revealEls = document.querySelectorAll(".reveal");
+  if (reduce || !("IntersectionObserver" in window)) {
+    revealEls.forEach(function (el) { el.classList.add("in"); });
+  } else {
+    var rio = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("in"); rio.unobserve(e.target); }
+      });
+    }, { threshold: 0.1, rootMargin: "0px 0px -6% 0px" });
+    revealEls.forEach(function (el, i) {
+      el.style.setProperty("--reveal-delay", Math.min(i % 4, 3) * 70 + "ms");
+      rio.observe(el);
+    });
+  }
+
+  /* ---- animated counters ---- */
+  function setFinal(el) { el.textContent = el.getAttribute("data-count"); }
+  var counters = document.querySelectorAll("[data-count]");
+  if (reduce || !("IntersectionObserver" in window)) {
+    counters.forEach(setFinal);
+  } else {
+    var cio = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        cio.unobserve(e.target);
+        var el = e.target;
+        var target = parseInt(el.getAttribute("data-count"), 10);
+        var t0 = null;
+        function frame(t) {
+          if (!t0) t0 = t;
+          var p = Math.min(1, (t - t0) / 1300);
+          var eased = 1 - Math.pow(1 - p, 3);
+          el.textContent = Math.round(target * eased);
+          if (p < 1) requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+      });
+    }, { threshold: 0.4 });
+    counters.forEach(function (el) { cio.observe(el); });
+  }
+
+  /* ---- hero terminal typing ---- */
+  var termText = document.getElementById("term-text");
+  if (termText) {
+    var LINES = [
+      { plain: "$ helion implement examples/counter.sv",
+        html: '<span class="t-prompt">$</span> helion implement examples/counter.sv' },
+      { plain: "synth_design .... 4 LUTFF 1 IOB",
+        html: 'synth_design <span class="t-dim">....</span> <span class="t-ok">4 LUTFF 1 IOB</span>' },
+      { plain: "opt_design ..... removed=0",
+        html: 'opt_design <span class="t-dim">.....</span> removed=0' },
+      { plain: "place_design ... cost=0.750",
+        html: 'place_design <span class="t-dim">...</span> cost=0.750' },
+      { plain: "route_design ... overused=0 hops=1",
+        html: 'route_design <span class="t-dim">...</span> overused=0 hops=1' },
+      { plain: "report_timing .. WNS_PS=9640",
+        html: 'report_timing <span class="t-dim">..</span> <span class="t-gold">WNS_PS=9640</span>' },
+      { plain: "LED[16]=0000000111111110",
+        html: '<span class="t-ok">LED[16]=0000000111111110</span>' }
+    ];
+    if (reduce) {
+      termText.innerHTML = LINES.map(function (l) {
+        var d = document.createElement("div"); d.innerHTML = l.html; return d.outerHTML;
+      }).join("");
+    } else {
+      var li = 0, ci = 0, lineDiv = null;
+      function newLine() {
+        lineDiv = document.createElement("div");
+        termText.appendChild(lineDiv);
+      }
+      newLine();
+      function type() {
+        if (li >= LINES.length) {
+          setTimeout(function () { termText.innerHTML = ""; li = 0; ci = 0; newLine(); type(); }, 2800);
+          return;
+        }
+        var line = LINES[li];
+        if (ci < line.plain.length) {
+          lineDiv.textContent += line.plain.charAt(ci);
+          ci++;
+          var ch = line.plain.charAt(ci - 1);
+          setTimeout(type, ch === " " ? 8 : 14 + Math.random() * 22);
+        } else {
+          lineDiv.innerHTML = line.html;
+          li++; ci = 0;
+          setTimeout(function () { newLine(); type(); }, li === 1 ? 420 : 200);
+        }
+      }
+      /* start when the hero is visible */
+      var started = false;
+      function start() { if (!started) { started = true; type(); } }
+      if ("IntersectionObserver" in window) {
+        var tio = new IntersectionObserver(function (es) {
+          es.forEach(function (e) { if (e.isIntersecting) { start(); tio.disconnect(); } });
+        });
+        tio.observe(termText);
+      } else { start(); }
+    }
+  }
+
+  /* ---- magnetic hero buttons (subtle) ---- */
+  if (!reduce && hoverable) {
+    document.querySelectorAll(".hero .btn").forEach(function (b) {
+      b.addEventListener("pointermove", function (e) {
+        var r = b.getBoundingClientRect();
+        var dx = e.clientX - (r.left + r.width / 2);
+        var dy = e.clientY - (r.top + r.height / 2);
+        b.style.transform = "translate(" + (dx * 0.07).toFixed(1) + "px," + (dy * 0.1).toFixed(1) + "px)";
+      });
+      b.addEventListener("pointerleave", function () { b.style.transform = ""; });
+    });
+  }
+})();

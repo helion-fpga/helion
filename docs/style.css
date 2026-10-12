@@ -469,7 +469,7 @@ a:hover { color: var(--copper); text-decoration-color: var(--copper); }
   line-height: 1.05;
 }
 .facts strong .unit { font-size: 0.45em; color: var(--copper); letter-spacing: 0; }
-.facts span { color: var(--mute); font-size: 0.9rem; display: block; margin-top: 0.3rem; }
+.facts > div > span:last-child { color: var(--mute); font-size: 0.9rem; display: block; margin-top: 0.3rem; }
 
 /* ---------- band / giant ---------- */
 
@@ -810,4 +810,172 @@ pre code {
   html, body { background: #fff; color: #000; font-size: 12pt; }
   .page { max-width: none; }
   a { color: #000; }
+}
+
+/* ---------- v3: chrome, calm, micro-interactions ---------- */
+
+/* Liquid chrome display text. Restrained: hero headline only. */
+.chrome-text {
+  background-image: linear-gradient(172deg,
+    #f7f5ef 0%, #cfd2d8 20%, #878d98 38%,
+    #eceae3 50%, #6e747f 62%, #d9d7d1 80%, #a2a8b2 100%);
+  background-size: 100% 220%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: chrome-drift 9s ease-in-out infinite alternate;
+}
+@keyframes chrome-drift {
+  from { background-position: 50% 0%; }
+  to { background-position: 50% 100%; }
+}
+
+/* Metallic hairline: light from top-left, dark at bottom-right. */
+.card, .shot, .term, .table-wrap {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--surface), var(--surface)) padding-box,
+    linear-gradient(155deg, rgba(255,255,255,0.16), rgba(255,255,255,0.03) 32%, rgba(0,0,0,0.55) 92%) border-box;
+}
+.table-wrap { background:
+    linear-gradient(var(--surface), var(--surface)) padding-box,
+    linear-gradient(155deg, rgba(255,255,255,0.13), rgba(255,255,255,0.02) 32%, rgba(0,0,0,0.55) 92%) border-box;
+}
+
+/* Sheen sweep on hover. Apply .sheen to buttons and cards. */
+.sheen { position: relative; overflow: hidden; }
+.sheen::after {
+  content: "";
+  position: absolute;
+  inset: -45%;
+  background: linear-gradient(105deg, transparent 42%, rgba(255,255,255,0.11) 50%, transparent 58%);
+  transform: translateX(-72%);
+  transition: transform 0.9s ease;
+  pointer-events: none;
+}
+@media (hover: hover) {
+  .sheen:hover::after { transform: translateX(72%); }
+}
+
+/* Scroll reveal. JS adds .in via IntersectionObserver. */
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.7s ease, transform 0.7s cubic-bezier(0.22, 0.61, 0.36, 1);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+.reveal.in { opacity: 1; transform: none; }
+
+/* Terminal card (hero). */
+.term {
+  margin-top: 1.9rem;
+  max-width: 35rem;
+  border-radius: 12px;
+  overflow: hidden;
+  font-family: var(--mono);
+  box-shadow: var(--shadow);
+}
+.term-bar {
+  display: flex; align-items: center; gap: 0.42rem;
+  padding: 0.6rem 0.95rem;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.02);
+}
+.term-bar .dot { width: 0.62rem; height: 0.62rem; border-radius: 50%; background: #2b333f; }
+.term-bar .dot:first-child { background: var(--copper); }
+.term-title { margin-left: 0.45rem; color: var(--faint); font-size: 0.72rem; letter-spacing: 0.04em; }
+.term-body {
+  margin: 0; padding: 1rem 1.1rem 1.15rem;
+  min-height: 13.2rem;
+  font-size: 0.8rem; line-height: 1.75;
+  color: #cfd6c9; white-space: pre-wrap;
+  background: #06090d;
+}
+.caret {
+  display: inline-block; width: 0.55em; height: 1.05em;
+  background: var(--copper); vertical-align: -0.12em;
+  animation: caret-blink 1.05s steps(1) infinite;
+}
+@keyframes caret-blink { 50% { opacity: 0; } }
+.t-prompt { color: var(--copper); }
+.t-ok { color: var(--ok); }
+.t-gold { color: var(--gold); font-weight: 600; }
+.t-dim { color: var(--mute); }
+
+/* Screenshot gallery. */
+.shots {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+  margin-top: 1.9rem;
+}
+.shot { margin: 0; border-radius: var(--radius); overflow: hidden; }
+.shot img {
+  display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; object-position: top;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  transition: transform 0.5s ease;
+}
+@media (hover: hover) {
+  .shot:hover img { transform: scale(1.025); }
+}
+.shot figcaption { padding: 0.85rem 1.05rem; color: var(--mute); font-size: 0.88rem; }
+
+/* Feature cards: 2x2, roomier. */
+.cards.feat { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cards.feat .card { min-height: 0; }
+.cards.feat .card-body { padding: 1.35rem 1.4rem 1.5rem; }
+.cards.feat .card-body strong { font-size: 1.25rem; margin-bottom: 0.5rem; }
+.cards.feat .card-body p { font-size: 0.95rem; }
+
+/* Ticks list (Why Helion). */
+.ticks { list-style: none; padding: 0; margin: 1.6rem 0 0; max-width: var(--measure); }
+.ticks li {
+  position: relative;
+  padding: 0.95rem 0 0.95rem 2.1rem;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--mute);
+}
+.ticks li:last-child { border-bottom: 0; }
+.ticks li::before {
+  content: "";
+  position: absolute; left: 0.25rem; top: 1.45rem;
+  width: 0.55rem; height: 0.55rem; border-radius: 50%;
+  background: linear-gradient(145deg, #f2efe8, #8f96a1 70%, #5b616b);
+  box-shadow: 0 0 0 4px rgba(255,255,255,0.045);
+}
+.ticks strong { color: var(--ink); }
+
+/* Nav link underline slide. */
+#site-nav a { position: relative; }
+#site-nav a::after {
+  content: ""; position: absolute; left: 0.7rem; right: 0.7rem; bottom: 0.55rem;
+  height: 1px; background: var(--copper);
+  transform: scaleX(0); transform-origin: left;
+  transition: transform 0.28s ease;
+}
+@media (hover: hover) {
+  #site-nav a:hover::after { transform: scaleX(1); }
+}
+
+/* DeepSeek-calm spacing: more air between sections. */
+.section { margin: 5.5rem 0 0; }
+.page { padding: 3rem var(--pad) 6rem; }
+section[id], div[id] { scroll-margin-top: 5rem; }
+
+/* Stat value tabular alignment during count-up. */
+.facts strong span[data-count] { font-variant-numeric: tabular-nums; }
+
+@media (max-width: 1100px) {
+  .cards.feat { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 640px) {
+  .cards.feat, .shots { grid-template-columns: 1fr; }
+  .term-body { min-height: 15rem; font-size: 0.74rem; }
+}
+
+/* Motion safety: already handled globally, plus these specifics. */
+@media (prefers-reduced-motion: reduce) {
+  .reveal { opacity: 1; transform: none; }
+  .chrome-text { animation: none; }
+  .caret { animation: none; }
 }

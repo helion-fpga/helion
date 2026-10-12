@@ -65,7 +65,7 @@
       <h2>Rules that fail the PR</h2>
       <ul>
         <li><code>unsafe</code> except documented islands (none in 0.1).</li>
-        <li>UNISIM names, vendor Tcl, Project X-Ray, 7-series / UltraScale / Lattice / Intel bitstream backends.</li>
+        <li>UNISIM names, vendor Tcl, proprietary vendor databases. Vendor backends only on open bitstream databases.</li>
         <li>AXI interconnect as Helion IP (use Helion-MM/ST).</li>
         <li>Skipping a missing <code>examples/ysyx_ibex.sv</code> in tests that claim to ingest it.</li>
         <li>Changing gold WNS without updating the QoR table with a reason.</li>

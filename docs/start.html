@@ -5,7 +5,7 @@
   <meta name="theme-color" content="#0a0c10" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Start: download and build Helion</title>
-  <meta name="description" content="Install Helion 2.1.0 from GitHub Releases or build from source. Rust 1.85, cargo test, headless gold counter WNS_PS=9640." />
+  <meta name="description" content="Install Helion 3.0.0 from GitHub Releases or build from source. Rust 1.85, cargo test, headless gold counter WNS_PS=9640." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -39,19 +39,20 @@
         (<code>x86_64-unknown-linux-gnu</code>). rustc 1.85.0.
       </p>
 
-      <h2>Download (v2.1.0)</h2>
+      <h2>Download (v3.0.0)</h2>
       <p>
         Each <code>vX.Y.Z</code> tag publishes these files. Current release is
-        <a href="https://github.com/helion-fpga/helion/releases/tag/v2.1.0">v2.1.0</a>
-        (perf campaign: synth allocations -98%; area campaign: uart -42% LUTs;
-        IDE rebuild; same counter gold WNS_PS=9640).
+        <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>
+        (Xilinx 7-series backend, verification track with SAT equivalence /
+        SVA / CDC, Physical View 2.0, 12 review criticals fixed, stack-overflow
+        fix; same counter gold WNS_PS=9640).
       </p>
       <div class="table-wrap"><table>
         <thead><tr><th>File</th><th>What</th></tr></thead>
         <tbody>
-          <tr><td><code>Helion-2.1.0-macos-arm64.zip</code></td><td><code>Helion.app</code> for Apple Silicon. Unsigned. Gatekeeper will warn.</td></tr>
-          <tr><td><code>helion-2.1.0-aarch64-apple-darwin.tar.gz</code></td><td>CLI + IDE + HAD + examples</td></tr>
-          <tr><td><code>helion-2.1.0-x86_64-unknown-linux-gnu.tar.gz</code></td><td>Linux CLI + headless IDE</td></tr>
+          <tr><td><code>Helion-3.0.0-macos-arm64.zip</code></td><td><code>Helion.app</code> for Apple Silicon. Unsigned. Gatekeeper will warn.</td></tr>
+          <tr><td><code>helion-3.0.0-aarch64-apple-darwin.tar.gz</code></td><td>CLI + IDE + HAD + examples</td></tr>
+          <tr><td><code>helion-3.0.0-x86_64-unknown-linux-gnu.tar.gz</code></td><td>Linux CLI + headless IDE</td></tr>
           <tr><td><code>SHA256SUMS.txt</code></td><td>hashes</td></tr>
         </tbody>
       </table></div>
