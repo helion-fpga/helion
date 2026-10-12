@@ -6144,7 +6144,7 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                                 pick_obj = Some(from.name.clone());
                             }
                         });
-                    }
+                    });
                     for to in &report.clocks {
                         if let Some(cell) = report.cell(&from.name, &to.name) {
                             let key = format!("{}->{}", cell.from, cell.to);
@@ -8979,7 +8979,7 @@ fn paint_source(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                                 theme,
                                 13.0,
                             );
-                            in_block = editor::block_state_after(r.text, in_block);
+                            in_block = editor::block_state_after(&r.text, in_block);
                             let galley = ui.fonts(|f| f.layout_job(job));
                             let (cell_rect, _) =
                                 ui.allocate_exact_size(galley.size(), egui::Sense::click());
