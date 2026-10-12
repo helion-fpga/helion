@@ -510,6 +510,9 @@ enum RExpr<'a> {
     Shr(&'a RExpr<'a>, &'a RExpr<'a>),
     /// Arithmetic right shift `a >>> sh` (const shift; sign-fill from MSB).
     Ashr(&'a RExpr<'a>, &'a RExpr<'a>),
+    /// Logical left shift `a << sh` / `a <<< sh`. Result width is the LHS
+    /// width; bit i is OR over k of (a[k] & (sh == i-k)) in rexpr_to_bit.
+    Shl(&'a RExpr<'a>, &'a RExpr<'a>),
     /// Reduction XOR `^in` (1-bit result).
     RedXor(&'a RExpr<'a>),
     /// Reduction AND `&in` (1-bit). `~&in` is Not(RedAnd(...)).
@@ -1618,6 +1621,7 @@ fn rexpr_has_mux(e: &RExpr<'_>) -> bool {
         RExpr::Mux(_, _, _) => true,
         RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => rexpr_has_mux(x),
         RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b)
         | RExpr::And(a, b)
         | RExpr::Or(a, b)
@@ -1664,6 +1668,7 @@ fn rexpr_has_nested_arith(e: &RExpr<'_>) -> bool {
         | RExpr::Or(a, b)
         | RExpr::Xor(a, b)
         | RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b)
         | RExpr::Eq(a, b)
         | RExpr::Ne(a, b)
@@ -2237,6 +2242,7 @@ fn mux_cond_mentions(e: &RExpr<'_>, name: &str) -> bool {
         | RExpr::Ne(a, b)
         | RExpr::Lt(a, b)
         | RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b) => mux_cond_mentions(a, name) || mux_cond_mentions(b, name),
         RExpr::Concat(parts) => parts.iter().any(|p| mux_cond_mentions(p, name)),
         RExpr::IndexPart { base, .. } => mux_cond_mentions(base, name),
@@ -2433,6 +2439,7 @@ fn rhs_unpacked_index(rhs: &RExpr<'_>, rtl: &Rtl) -> bool {
             RExpr::Mux(c, t, f) => walk(c, rtl) || walk(t, rtl) || walk(f, rtl),
             RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => walk(x, rtl),
             RExpr::Shr(a, b)
+            | RExpr::Shl(a, b)
             | RExpr::Ashr(a, b)
             | RExpr::And(a, b)
             | RExpr::Or(a, b)
@@ -2648,6 +2655,11 @@ impl OwnHash {
             }
             RExpr::Shr(a, b) => {
                 self.feed(">>");
+                self.feed_rexpr(a);
+                self.feed_rexpr(b);
+            }
+            RExpr::Shl(a, b) => {
+                self.feed("<<");
                 self.feed_rexpr(a);
                 self.feed_rexpr(b);
             }
@@ -4456,7 +4468,10 @@ fn parse_shift<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
             };
             continue;
         }
-        // `<<` / `<<<` — const fold when both sides const; else leave as identity*shift via mul-of-power2 not needed for corpus.
+        // `<<` / `<<<`: const fold when both sides const; `ident << K`
+        // with const K lowers to {ident[w-1-K:0], K'b0} (zero_fill_concat maps
+        // that shape as wire align). Anything else becomes Shl and lowers
+        // per-bit in rexpr_to_bit; never silently keep the LHS.
         if matches!(p.peek(), Some(Tok::Sym('<')))
             && matches!(p.t.get(p.i + 1), Some(Tok::Sym('<')))
         {
@@ -4480,7 +4495,33 @@ fn parse_shift<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                         care: *ca,
                     }
                 }
-                _ => e, // non-const shl: keep LHS (rare); prefer not to drop assign
+                (RExpr::Ident(name), RExpr::Const { val: b, .. }) => {
+                    let name: &str = name;
+                    let Some(&w) = p.widths.get(name) else {
+                        return Err("shift lhs width unknown".into());
+                    };
+                    let w = w.max(1);
+                    let k = (*b).min(w as u128) as usize;
+                    if k == 0 {
+                        e
+                    } else if k >= w {
+                        RExpr::Const {
+                            val: 0,
+                            width: w,
+                            care: care_mask(w),
+                        }
+                    } else {
+                        RExpr::Concat(vec![
+                            RExpr::Range(name, 0, w - k - 1),
+                            RExpr::Const {
+                                val: 0,
+                                width: k,
+                                care: care_mask(k),
+                            },
+                        ])
+                    }
+                }
+                _ => RExpr::Shl(p.alloc(e), p.alloc(sh)),
             };
             continue;
         }
@@ -6171,6 +6212,10 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str)
                 arena.alloc(subst(a, env, lhs, bit, arena)),
                 arena.alloc(subst(b, env, lhs, bit, arena)),
             ),
+            RExpr::Shl(a, b) => RExpr::Shl(
+                arena.alloc(subst(a, env, lhs, bit, arena)),
+                arena.alloc(subst(b, env, lhs, bit, arena)),
+            ),
             RExpr::IndexPart {
                 name,
                 base,
@@ -7231,6 +7276,7 @@ fn rexpr_names<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
             }
         }
         RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b)
         | RExpr::And(a, b)
         | RExpr::Or(a, b)
@@ -7288,6 +7334,7 @@ fn map_rexpr_children<'a>(
         },
         RExpr::Concat(parts) => RExpr::Concat(parts.iter().map(|p| f(p)).collect()),
         RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(f(a)), arena.alloc(f(b))),
+        RExpr::Shl(a, b) => RExpr::Shl(arena.alloc(f(a)), arena.alloc(f(b))),
         RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(f(a)), arena.alloc(f(b))),
         RExpr::RedXor(x) => RExpr::RedXor(arena.alloc(f(x))),
         RExpr::RedAnd(x) => RExpr::RedAnd(arena.alloc(f(x))),
@@ -7329,6 +7376,7 @@ fn collect_calls<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
             }
         }
         RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b)
         | RExpr::And(a, b)
         | RExpr::Or(a, b)
@@ -8625,7 +8673,7 @@ fn parse_module_items<'a>(
                 let _ = p.ident();
             }
             match parse_seq_block(&mut p, block) {
-                Ok(stmts) => assigns.extend(fold_blocking_assigns(stmts, p.arena)),
+                Ok(stmts) => assigns.extend(fold_blocking_assigns(stmts, p.arena, &cur_mod())),
                 Err(_) => {
                     note_skip(format!(
                         "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
@@ -8652,7 +8700,7 @@ fn parse_module_items<'a>(
                 Ok(stmts) => {
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
-                        assigns.extend(fold_blocking_assigns(stmts, p.arena));
+                        assigns.extend(fold_blocking_assigns(stmts, p.arena, &cur_mod()));
                     } else if negedge_only {
                         // Falling-edge always is its own clock. Do not fold it
                         // into the posedge cone (that drops the name).
@@ -9536,6 +9584,27 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                 rexpr_to_bit(a, rtl, src, arena)
             }
         }
+        RExpr::Shl(a, sh) => {
+            // Bit i of (a << s) is OR over k of (a[k] & (s == i-k)): a
+            // barrel shift as an OR-of-ANDs. Result width is the LHS width.
+            let wa = rexpr_width(a, rtl).max(1);
+            let mut acc: Option<Expr> = None;
+            for k in 0..=bit.min(wa.saturating_sub(1)) {
+                let abit = rexpr_to_bit(a, rtl, k, arena)?;
+                let want = RExpr::Const {
+                    val: (bit - k) as u128,
+                    width: 32,
+                    care: u128::MAX,
+                };
+                let eq = cmp_eq_bits(sh, &want, rtl, true, arena)?;
+                let term = Expr::And(arena.alloc(abit), arena.alloc(eq));
+                acc = Some(match acc {
+                    None => term,
+                    Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(term)),
+                });
+            }
+            Ok(acc.unwrap_or(Expr::Const(false)))
+        }
         RExpr::RedXor(x) => {
             if bit != 0 {
                 return Ok(Expr::Const(false));
@@ -9826,7 +9895,7 @@ fn rexpr_add_depth(e: &RExpr<'_>) -> usize {
     match e {
         RExpr::Add(a, b) | RExpr::Sub(a, b) => 1 + rexpr_add_depth(a).max(rexpr_add_depth(b)),
         RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => rexpr_add_depth(x),
-        RExpr::Shr(a, b) | RExpr::Ashr(a, b) => rexpr_add_depth(a).max(rexpr_add_depth(b)),
+        RExpr::Shr(a, b) | RExpr::Shl(a, b) | RExpr::Ashr(a, b) => rexpr_add_depth(a).max(rexpr_add_depth(b)),
         RExpr::Concat(parts) => parts.iter().map(rexpr_add_depth).max().unwrap_or(0),
         RExpr::And(a, b)
         | RExpr::Or(a, b)
@@ -10256,7 +10325,7 @@ fn rexpr_width_checked(e: &RExpr<'_>, rtl: &Rtl) -> Option<usize> {
             }
             Some(acc)
         }
-        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width_checked(a, rtl),
+        RExpr::Shr(a, _) | RExpr::Ashr(a, _) | RExpr::Shl(a, _) => rexpr_width_checked(a, rtl),
         RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
             rexpr_width_checked(x, rtl)?;
             Some(1)
@@ -10351,6 +10420,7 @@ fn expr_contains_mul(e: &RExpr<'_>) -> bool {
         | RExpr::Ne(a, b)
         | RExpr::Lt(a, b)
         | RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b) => expr_contains_mul(a) || expr_contains_mul(b),
         RExpr::Mux(c, t, f) => expr_contains_mul(c) || expr_contains_mul(t) || expr_contains_mul(f),
         RExpr::Concat(parts) => parts.iter().any(expr_contains_mul),
@@ -14444,6 +14514,7 @@ fn subst_net_copies<'a>(
             RExpr::Ne(a, b) => RExpr::Ne(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Lt(a, b) => RExpr::Lt(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Shl(a, b) => RExpr::Shl(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::RedXor(a) => RExpr::RedXor(arena.alloc(w(a))),
             RExpr::RedAnd(a) => RExpr::RedAnd(arena.alloc(w(a))),
@@ -14585,7 +14656,7 @@ fn collect_rexpr_idents<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
             RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => { out.insert(*s); }
             RExpr::Const { .. } => {}
             RExpr::Not(a) => walk(a, out, depth + 1),
-            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Sub(a, b) | RExpr::Mul(a, b) | RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) | RExpr::Shr(a, b) | RExpr::Ashr(a, b) => { walk(a, out, depth + 1); walk(b, out, depth + 1); }
+            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Sub(a, b) | RExpr::Mul(a, b) | RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) | RExpr::Shr(a, b) | RExpr::Shl(a, b) | RExpr::Ashr(a, b) => { walk(a, out, depth + 1); walk(b, out, depth + 1); }
             RExpr::Concat(ps) => { for p in ps { walk(p, out, depth + 1); } }
             RExpr::Mux(c, t, f) => { walk(c, out, depth + 1); walk(t, out, depth + 1); walk(f, out, depth + 1); }
             RExpr::RedXor(a) | RExpr::RedAnd(a) | RExpr::RedOr(a) => walk(a, out, depth + 1),
@@ -15758,6 +15829,10 @@ fn rewrite_rexpr<'a, K: Borrow<str> + Eq + Hash>(
             RExpr::Concat(parts.iter().map(|p| rewrite_rexpr(p, subst, arena)).collect())
         }
         RExpr::Shr(a, b) => RExpr::Shr(
+            arena.alloc(rewrite_rexpr(a, subst, arena)),
+            arena.alloc(rewrite_rexpr(b, subst, arena)),
+        ),
+        RExpr::Shl(a, b) => RExpr::Shl(
             arena.alloc(rewrite_rexpr(a, subst, arena)),
             arena.alloc(rewrite_rexpr(b, subst, arena)),
         ),
@@ -21829,5 +21904,115 @@ endmodule
         );
     }
 
+    #[test]
+    fn const_amount_shift_left_lowers_not_drops() {
+        // `y << 2` used to silently compile to just `y`.
+        let rtl = parse_rtl(
+            "module m(input [7:0] y, output [7:0] z); assign z = y << 2; endmodule",
+        )
+        .expect("parse");
+        let (_, _, rhs) = rtl
+            .assigns
+            .iter()
+            .find(|(lhs, _, _)| *lhs == "z")
+            .expect("z assign");
+        match rhs {
+            RExpr::Concat(parts) => {
+                assert_eq!(parts.len(), 2, "y << 2 is {{y[5:0], 2'b0}}");
+                assert!(
+                    matches!(&parts[0], RExpr::Range(s, 0, 5) if *s == "y"),
+                    "high part must be y[5:0], got {:?}", parts[0]
+                );
+                assert!(
+                    matches!(&parts[1], RExpr::Const { val: 0, width: 2, .. }),
+                    "low part must be 2'b0, got {:?}", parts[1]
+                );
+            }
+            other => panic!("y << 2 must lower to a concat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_shift_left_lowers_per_bit() {
+        // `y << k` with a variable amount must lower to a real shift, not
+        // silently keep y. Exhaustive check of the Shl barrel lowering.
+        let arena = Bump::new();
+        let rtl = Rtl {
+            module: "t",
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "y",
+                    width: 8,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+                Signal {
+                    name: "k",
+                    width: 3,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: HashMap::new(),
+            negedge_writes: vec![],
+        };
+        fn eval(e: &Expr, vals: &HashMap<String, bool>) -> bool {
+            match e {
+                Expr::Const(b) => *b,
+                Expr::Var(n) => vals.get(*n).copied().expect("var"),
+                Expr::Not(x) => !eval(x, vals),
+                Expr::And(a, b) => eval(a, vals) && eval(b, vals),
+                Expr::Or(a, b) => eval(a, vals) || eval(b, vals),
+                Expr::Xor(a, b) => eval(a, vals) ^ eval(b, vals),
+            }
+        }
+        let ey = RExpr::Ident("y");
+        let ek = RExpr::Ident("k");
+        let shl = RExpr::Shl(&ey, &ek);
+        // The parse must produce Shl, not silently drop the shift.
+        let prtl = parse_rtl(
+            "module m(input [7:0] y, input [2:0] k, output [7:0] z); assign z = y << k; endmodule",
+        )
+        .expect("parse");
+        let (_, _, prhs) = prtl
+            .assigns
+            .iter()
+            .find(|(lhs, _, _)| *lhs == "z")
+            .expect("z assign");
+        assert!(
+            matches!(prhs, RExpr::Shl(_, _)),
+            "y << k must parse to Shl, got {prhs:?}"
+        );
+        for y in 0..256u16 {
+            for k in 0..8u16 {
+                let mut vals = HashMap::new();
+                for i in 0..8 {
+                    vals.insert(format!("y_{i}"), (y >> i) & 1 == 1);
+                }
+                for i in 0..3 {
+                    vals.insert(format!("k_{i}"), (k >> i) & 1 == 1);
+                }
+                let expect = (y << k) & 0xFF;
+                for bit in 0..8 {
+                    let ex = rexpr_to_bit(&shl, &rtl, bit, &arena).expect("lower bit");
+                    assert_eq!(
+                        eval(&ex, &vals),
+                        (expect >> bit) & 1 == 1,
+                        "y={y} k={k} bit={bit}"
+                    );
+                }
+            }
+        }
+    }
 }
 
