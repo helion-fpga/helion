@@ -25,6 +25,14 @@ pub fn open_hdl_dialog() -> Option<PathBuf> {
     hdl_file_dialog().pick_file()
 }
 
+/// Modal native VCD picker for power analysis. `None` on cancel / no display.
+pub fn open_vcd_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open VCD (switching activity)")
+        .add_filter("VCD", &["vcd"])
+        .pick_file()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

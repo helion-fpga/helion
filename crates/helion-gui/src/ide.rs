@@ -5233,6 +5233,12 @@ pub struct IdeModel {
     pub selected_timing_summary: Option<String>,
     /// UG907 Power selected rail (table highlight; `selected` is the object).
     pub selected_power: Option<String>,
+    /// VCD switching activity for power analysis (`read_vcd` / `dump_vcd`).
+    pub vcd_activity: Option<crate::vcd::VcdActivity>,
+    /// Path of the loaded VCD, if any.
+    pub vcd_path: Option<String>,
+    /// Last VCD load/dump error, shown in the Power tab.
+    pub vcd_error: Option<String>,
     /// UG893 Utilization selected resource or `hier:<name>` (table highlight).
     pub selected_utilization: Option<String>,
     /// UG893 Reports window selected catalog row (`report_cdc`, …).
@@ -5436,6 +5442,9 @@ impl IdeModel {
             selected_clock_network: None,
             selected_timing_summary: None,
             selected_power: None,
+            vcd_activity: None,
+            vcd_path: None,
+            vcd_error: None,
             selected_utilization: None,
             selected_report: None,
             selected_summary: None,
@@ -6219,6 +6228,25 @@ impl IdeModel {
         } else if t == "report_power" || t == "power" {
             self.workspace = WorkspaceTab::Power;
             Ok(self.power_text())
+        } else if t == "read_vcd" || t.starts_with("read_vcd ") {
+            let arg = t.strip_prefix("read_vcd").unwrap_or("").trim();
+            if arg.is_empty() {
+                self.read_vcd_auto()
+            } else {
+                self.read_vcd(arg)
+            }
+        } else if t == "dump_vcd" || t.starts_with("dump_vcd ") {
+            let n = t
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256);
+            self.dump_vcd(n)
+        } else if t == "clear_vcd" {
+            self.vcd_activity = None;
+            self.vcd_path = None;
+            self.vcd_error = None;
+            Ok("clear_vcd: switching activity cleared (vectorless fallback)".into())
         } else if let Some(rest) = t.strip_prefix("select_timing_summary ") {
             let mut p = rest.split_whitespace();
             let a = p.next().unwrap_or("");
@@ -17059,6 +17087,135 @@ impl IdeModel {
 
     pub fn power_text(&self) -> String {
         self.power_report().text()
+    }
+
+    /// VCD-driven (or vectorless fallback) on-chip power analysis.
+    ///
+    /// Returns `None` when there is no design. With no VCD loaded the
+    /// report is the vectorless estimate (`vectorless == true`, default
+    /// toggle rates, clearly labeled). Capacitances are modeled, not
+    /// silicon-measured — see [`crate::power`].
+    pub fn vcd_power_report(&self) -> Option<crate::power::VcdPowerReport> {
+        let design = self.shell.session.design.as_ref()?;
+        let dev = self.device().ok()?;
+        let oc = &self.constraints.operating_conditions;
+        let period_ps = self
+            .pane_clocks()
+            .iter()
+            .map(|c| c.period_ps)
+            .min()
+            .unwrap_or(10_000)
+            .max(1);
+        let mut cfg = crate::power::PowerConfig::for_part(
+            &dev.part,
+            oc.voltage_mv.max(0) as u64,
+            oc.temperature_c,
+            period_ps,
+        );
+        cfg.lut_cap = dev.lut6_count() as u64;
+        cfg.ff_cap = dev.lut6_count() as u64; // one FF per LUT site class
+        cfg.bram_cap = dev.n_bram as u64;
+        cfg.dsp_cap = dev.n_dsp as u64;
+        cfg.iob_cap = dev.iob_sites().count() as u64;
+        Some(crate::power::analyze_power(
+            design,
+            &cfg,
+            self.vcd_activity.as_ref(),
+            self.vcd_path.clone(),
+        ))
+    }
+
+    /// `read_vcd <path>`: parse a VCD file into switching activity for power.
+    pub fn read_vcd(&mut self, path: &str) -> Result<String, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("read_vcd: missing path".into());
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format!("read_vcd: {e}");
+                self.vcd_error = Some(msg.clone());
+                return Err(msg);
+            }
+        };
+        match crate::vcd::parse_vcd(&text) {
+            Ok(a) => {
+                let n = a.signals.len();
+                let dur = a.duration_ps;
+                self.vcd_activity = Some(a);
+                self.vcd_path = Some(path.to_string());
+                self.vcd_error = None;
+                self.workspace = WorkspaceTab::Power;
+                Ok(format!("read_vcd {path}: {n} signals, {dur} ps"))
+            }
+            Err(e) => {
+                self.vcd_error = Some(e.clone());
+                Err(format!("read_vcd: {e}"))
+            }
+        }
+    }
+
+    /// `read_vcd` with no path: auto-offer the newest `*.vcd` in the temp
+    /// dir (where `dump_vcd` writes) or the current working directory.
+    pub fn read_vcd_auto(&mut self) -> Result<String, String> {
+        let dirs = [
+            std::env::temp_dir(),
+            std::env::current_dir().unwrap_or_default(),
+        ];
+        let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        for dir in dirs {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("vcd") {
+                    continue;
+                }
+                let mt = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().map_or(true, |(t, _)| mt > *t) {
+                    best = Some((mt, p));
+                }
+            }
+        }
+        match best {
+            Some((_, p)) => self.read_vcd(&p.to_string_lossy()),
+            None => Err("read_vcd: no .vcd found (run dump_vcd first)".into()),
+        }
+    }
+
+    /// `dump_vcd [cycles]`: run helion-sim on the current design, write the
+    /// VCD to the temp dir, and load it as switching activity.
+    pub fn dump_vcd(&mut self, cycles: u32) -> Result<String, String> {
+        let design = self
+            .shell
+            .session
+            .design
+            .clone()
+            .ok_or("dump_vcd: no design (synth first)")?;
+        let cycles = cycles.clamp(1, 100_000);
+        let timescale_ps = self.sim_timescale_ps.max(1);
+        let vcd = helion_sim::vcd::dump_vcd(&design, cycles, timescale_ps);
+        let path = std::env::temp_dir().join(format!("helion-{}-{cycles}cyc.vcd", design.name));
+        std::fs::write(&path, vcd).map_err(|e| format!("dump_vcd: {e}"))?;
+        let s = path.to_string_lossy().into_owned();
+        self.push_sim_log(
+            MsgSeverity::Info,
+            "dump_vcd",
+            format!("dump_vcd wrote {s} cycles={cycles}"),
+        );
+        self.read_vcd(&s)
+    }
+
+    /// Click a hot net in the VCD-driven power table — cross-probe it in the
+    /// schematic (device routes highlighted), like any other net selection.
+    /// Returns true when the net was found in the design.
+    pub fn select_vcd_net(&mut self, name: &str) -> bool {
+        self.apply_object_crossprobe(name).is_some()
     }
 
     fn power_object_hay(&self, rail: &str) -> String {
@@ -33688,6 +33845,7 @@ endmodule
             "Power cross-probe must not disturb gold WNS"
         );
 
+
         let mut blinky = IdeModel::new();
         blinky.open_source(&example("blinky.sv")).unwrap();
         blinky.run_step(FlowStep::Place).unwrap();
@@ -33700,6 +33858,58 @@ endmodule
             9640,
             "power objects are per-design, not canned WNS"
         );
+    }
+
+    /// VCD-driven power: `dump_vcd` runs helion-sim, writes a temp VCD, and
+    /// loads switching activity; the report is labeled VCD-driven (not
+    /// vectorless) with a toggling top-net table. `read_vcd` on a missing
+    /// file errors without clobbering loaded activity.
+    #[test]
+    fn vcd_power_dump_and_report_flow() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+
+        // Vectorless fallback before any VCD.
+        let base = ide.vcd_power_report().expect("report with design");
+        assert!(base.vectorless, "no VCD → vectorless label");
+        assert!(base.total_mw > 0.0);
+
+        // Dump from sim and reload.
+        let msg = ide.exec("dump_vcd 32").unwrap();
+        assert!(msg.contains("signals"), "{msg}");
+        assert!(ide.vcd_activity.is_some());
+        assert!(ide.vcd_error.is_none());
+        assert_eq!(ide.workspace, WorkspaceTab::Power);
+
+        let r = ide.vcd_power_report().expect("VCD-driven report");
+        assert!(!r.vectorless, "loaded VCD → VCD-driven label");
+        assert!(r.vcd_path.as_deref().unwrap().ends_with(".vcd"));
+        assert!(r.total_mw > 0.0);
+        assert!((r.total_mw - (r.static_mw + r.dynamic_mw)).abs() < 1e-9);
+        assert!(!r.top_nets.is_empty(), "toggle table populated");
+        assert!(
+            r.top_nets.iter().any(|n| n.is_clock),
+            "clock detected: {:?}",
+            r.top_nets.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.message.contains("almost every cycle")),
+            "hot-net finding present"
+        );
+
+        // `read_vcd` round-trips the dumped file.
+        let path = ide.vcd_path.clone().unwrap();
+        ide.exec("clear_vcd").unwrap();
+        assert!(ide.vcd_activity.is_none());
+        let msg2 = ide.exec(&format!("read_vcd {path}")).unwrap();
+        assert!(msg2.contains("signals"), "{msg2}");
+        assert!(!ide.vcd_power_report().unwrap().vectorless);
+
+        // Missing file errors cleanly.
+        let err = ide.exec("read_vcd /no/such/file.vcd").unwrap_err();
+        assert!(err.contains("read_vcd"), "{err}");
+        assert!(ide.vcd_error.is_some());
     }
 
     /// UG893 Utilization hierarchy instance + resource links cross-probe HNF,
