@@ -202,9 +202,11 @@ fn lut6_template(init: u64) -> RawSynth {
         }
     }
     let out = if ok {
-        let m0 = b.mux(RInp::Leaf(5, false), cofactors[0], cofactors[2]);
-        let m1 = b.mux(RInp::Leaf(5, false), cofactors[1], cofactors[3]);
-        b.mux(RInp::Leaf(4, false), m0, m1)
+        // mux(s, a, b) = s ? a : b. m0 covers the i4=0 half (chunks c0/c2),
+        // m1 the i4=1 half (chunks c1/c3).
+        let m0 = b.mux(RInp::Leaf(5, false), cofactors[2], cofactors[0]);
+        let m1 = b.mux(RInp::Leaf(5, false), cofactors[3], cofactors[1]);
+        b.mux(RInp::Leaf(4, false), m1, m0)
     } else {
         const_tree(&mut b, init)
     };
@@ -322,6 +324,43 @@ mod tests {
         };
         for _ in 0..40 {
             check_template_agrees(next());
+        }
+    }
+
+    #[test]
+    fn lut_bridge_synth_covers_typical() {
+        // exact_synth should cover realistic cofactor shapes (not silently
+        // fall back to the fat const tree): constants, single inputs,
+        // INC4 mapper patterns, parity nibbles.
+        let mut cases: Vec<u16> = vec![0x0000, 0xFFFF];
+        for i in 0..4 {
+            let mut t = 0u16;
+            for addr in 0..16u16 {
+                if (addr >> i) & 1 == 1 {
+                    t |= 1 << addr;
+                }
+            }
+            cases.push(t);
+            cases.push(!t);
+        }
+        for &init in &INC4_INIT {
+            for c in 0..4 {
+                cases.push(((init >> (16 * c)) & 0xFFFF) as u16);
+            }
+        }
+        // 4-bit parity nibble.
+        let mut par = 0u16;
+        for addr in 0..16u16 {
+            if addr.count_ones() % 2 == 1 {
+                par |= 1 << addr;
+            }
+        }
+        cases.push(par);
+        for t in cases {
+            assert!(
+                synth_cofactor(t).is_some(),
+                "exact_synth failed on cofactor {t:#06x}, would use fat fallback"
+            );
         }
     }
 
