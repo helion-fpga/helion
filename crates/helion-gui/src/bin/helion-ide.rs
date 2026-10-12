@@ -2779,9 +2779,9 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
                 paint_ila(ui, &mut app.model, &mut app.ila_rx, &mut app.toasts, &app.theme)
             }
             WorkspacePane::Memory => paint_memory(ui, &mut app.model, &app.theme),
-            WorkspacePane::Breakpoints => paint_breakpoints(ui, &mut app.model),
+            WorkspacePane::Breakpoints => paint_breakpoints(ui, &mut app.model, &app.theme),
             WorkspacePane::Locals => paint_locals(ui, &mut app.model),
-            WorkspacePane::Forces => paint_forces(ui, &mut app.model),
+            WorkspacePane::Forces => paint_forces(ui, &mut app.model, &app.theme),
             WorkspacePane::SimSettings => paint_sim_settings(ui, &mut app.model),
             WorkspacePane::Source => paint_source(ui, &mut app.model, &app.theme),
             WorkspacePane::Testbench => paint_testbench(ui, app),
@@ -6228,6 +6228,12 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let selected = model.selected.clone();
     let mut pick: Option<(String, String)> = None;
     let mut pick_obj: Option<(String, String)> = None;
+    if report.violations.is_empty() {
+        if paint_remaining_cta(ui, "No CDC violations.", "Run CDC analysis", theme) {
+            let _ = model.exec("report_cdc");
+        }
+        return;
+    }
     egui::ScrollArea::both().id_salt("cdc_scroll").show(ui, |ui| {
         egui::Grid::new("cdc_table")
             .spacing([8.0, 4.0])
@@ -9294,7 +9300,7 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
 }
 
-fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Breakpoints");
     ui.horizontal(|ui| {
         if ui.button("Add led == 1").clicked() {
@@ -9339,6 +9345,12 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.breakpoint_rows().to_vec();
     let selected = model.selected_breakpoint;
     let mut pick: Option<String> = None;
+    if rows.is_empty() {
+        if paint_remaining_cta(ui, "No breakpoints yet.", "Add led == 1", theme) {
+            let _ = model.add_breakpoint("led 1");
+        }
+        return;
+    }
     data_scroll("ug900_breakpoints").show(ui, |ui| {
         egui::Grid::new("ug900_breakpoints_table")
             .spacing([8.0, 4.0])
@@ -9349,13 +9361,7 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.label(RichText::new("Condition").strong());
                 ui.label(RichText::new("Hits").strong());
                 ui.end_row();
-                if rows.is_empty() {
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("No breakpoints yet. Set one from the Source view.");
-                    ui.end_row();
-                } else {
+                {
                     for b in &rows {
                         let on = selected == Some(b.id);
                         let id = b.id.to_string();
@@ -9384,7 +9390,7 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
 }
 
-fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
+fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Force Constants");
     ui.horizontal(|ui| {
         if ui.button("Force led 1").clicked() {
@@ -9412,6 +9418,12 @@ fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
     let rows = model.force_rows().to_vec();
     let selected = model.selected_force.clone();
     let mut pick: Option<String> = None;
+    if rows.is_empty() {
+        if paint_remaining_cta(ui, "No force constants yet.", "Force led 1", theme) {
+            let _ = model.add_force("led 1");
+        }
+        return;
+    }
     data_scroll("ug900_forces").show(ui, |ui| {
         egui::Grid::new("ug900_forces_table")
             .spacing([8.0, 4.0])
@@ -9424,16 +9436,7 @@ fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.label(RichText::new("Cancel_ps").strong());
                 ui.label(RichText::new("Status").strong());
                 ui.end_row();
-                if rows.is_empty() {
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("—");
-                    ui.label("No force constants yet.");
-                    ui.end_row();
-                } else {
+                {
                     for (i, r) in rows.iter().enumerate() {
                         let on = selected.as_deref() == Some(r.name.as_str());
                         let key = i.to_string();
