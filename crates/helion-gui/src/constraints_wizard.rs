@@ -380,7 +380,7 @@ pub fn generate_sdc(input: &WizardInput, design_name: &str) -> String {
                     c.divide_by,
                     c.multiply_by,
                     if c.invert { " -invert" } else { "" },
-                    c.master,
+                    c.port,
                 ));
             } else {
                 // Waveform is recorded for Vivado export; Helion STA keys off period.
@@ -655,7 +655,7 @@ set_max_delay 8.000 -from [get_ports ena] -to [get_ports led] -datapath_only\n";
                 WizardClock::primary("clk", "clk", 10.0, 50.0),
                 WizardClock {
                     name: "clk_div2".into(),
-                    port: String::new(),
+                    port: "ena".into(),
                     period_ns: 20.0,
                     duty_pct: 50.0,
                     generated: true,
@@ -671,7 +671,7 @@ set_max_delay 8.000 -from [get_ports ena] -to [get_ports led] -datapath_only\n";
         assert!(validate(&input, &d, &[]).is_empty());
         let text = generate_sdc(&input, "counter");
         assert!(
-            text.contains("create_generated_clock -name clk_div2 -source [get_ports clk] -divide_by 2 -multiply_by 1 [get_ports clk]"),
+            text.contains("create_generated_clock -name clk_div2 -source [get_ports clk] -divide_by 2 -multiply_by 1 [get_ports ena]"),
             "unexpected generated clock line:\n{text}"
         );
         validate_sdc(&text).expect("generated clock SDC must parse");

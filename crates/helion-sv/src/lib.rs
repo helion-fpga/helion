@@ -539,6 +539,9 @@ enum RExpr<'a> {
     Shr(&'a RExpr<'a>, &'a RExpr<'a>),
     /// Arithmetic right shift `a >>> sh` (const shift; sign-fill from MSB).
     Ashr(&'a RExpr<'a>, &'a RExpr<'a>),
+    /// Logical left shift `a << sh` / `a <<< sh`. Result width is the LHS
+    /// width; bit i is OR over k of (a[k] & (sh == i-k)) in rexpr_to_bit.
+    Shl(&'a RExpr<'a>, &'a RExpr<'a>),
     /// Reduction XOR `^in` (1-bit result).
     RedXor(&'a RExpr<'a>),
     /// Reduction AND `&in` (1-bit). `~&in` is Not(RedAnd(...)).
@@ -761,6 +764,13 @@ thread_local! {
     /// Signal/port → packed-struct or enum type name for the current module.
     static SIG_TYPES: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Modules whose priority-encoder always @(*) fold was skipped by
+    /// `compact_priority_onehot_unroll` after its own validation (>=48 bit
+    /// writes, >=75% set-to-1 RHSs, scalar carry). `try_emit_priority_onehot_grant`
+    /// trusts the zeroed assigns only for these modules, never for a
+    /// user-written `assign gnt = 0`.
+    static PRIO_COMPACT_VALIDATED: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 /// One packed-struct field: bit `lo` is LSB of the field in the parent.
@@ -1389,6 +1399,15 @@ fn note_function_called_not_inlined(module: &str, function: &str) {
 fn clear_function_notes() {
     FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
     FUNC_CALLED_NOT_INLINED_SEEN.with(|s| s.borrow_mut().clear());
+    PRIO_COMPACT_VALIDATED.with(|s| s.borrow_mut().clear());
+}
+
+fn prio_compact_validated_insert(module: &str) {
+    PRIO_COMPACT_VALIDATED.with(|s| s.borrow_mut().insert(module.to_string()));
+}
+
+fn prio_compact_validated_contains(module: &str) -> bool {
+    PRIO_COMPACT_VALIDATED.with(|s| s.borrow().contains(module))
 }
 
 /// `[msb:lsb]` width. A string parameter is hashed above bit 96; the old
@@ -1700,6 +1719,7 @@ where
             | RExpr::Or(a, b)
             | RExpr::Xor(a, b)
             | RExpr::Shr(a, b)
+            | RExpr::Shl(a, b)
             | RExpr::Ashr(a, b)
             | RExpr::Eq(a, b)
             | RExpr::Ne(a, b)
@@ -2315,6 +2335,7 @@ fn mux_cond_mentions(e: &RExpr<'_>, name: &str) -> bool {
             | RExpr::Ne(a, b)
             | RExpr::Lt(a, b)
             | RExpr::Shr(a, b)
+            | RExpr::Shl(a, b)
             | RExpr::Ashr(a, b) => {
                 stack.push(*b);
                 stack.push(*a);
@@ -2831,6 +2852,33 @@ impl OwnHash {
                 RExpr::Lt(a, b) => {
                     self.feed("<");
                     stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Shr(a, b) => {
+                    self.feed(">>");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Shl(a, b) => {
+                    self.feed("<<");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Ashr(a, b) => {
+                    self.feed(">>>");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::RedXor(a) => {
+                    self.feed("^r");
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::RedAnd(a) => {
+                    self.feed("&r");
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::RedOr(a) => {
+                    self.feed("|r");
                     stack.push(FeedOp::Visit(*a));
                 }
             }
@@ -3427,7 +3475,9 @@ fn emit_module_into(
         let own = lower_own_cached(proto)?;
         let summary = soft_from_design(&own);
         stitch_own_into(dst, &own, prefix, port_map);
-        visiting.remove(name);
+        // Do not remove from `visiting` here: the ancestor frame that
+        // inserted `name` removes it at its own exit. Removing early lets a
+        // second instance on the same cycle re-enter this frame forever.
         return Ok(summary);
     }
     let own_hit = lower_own_for_stitch(proto)?;
@@ -3993,12 +4043,16 @@ fn tokenize(s: &str) -> Result<Vec<Tok<'_>>, String> {
                 let mut dc = false;
                 if base == 2 {
                     let mut wide = width > 128;
+                    // Place the value from the digit count, not the declared
+                    // width: 4'b1 is 1, not 8. Other bases already fold
+                    // parse_based_digits(digits) this way.
+                    let ndigits = digits.chars().filter(|c| *c != '_').count();
                     let mut off = 0usize;
                     for ch in digits.chars() {
                         if ch == '_' {
                             continue;
                         }
-                        let bit = width.saturating_sub(off + 1);
+                        let bit = ndigits.saturating_sub(off + 1);
                         off += 1;
                         match ch {
                             '1' => {
@@ -4561,7 +4615,10 @@ fn parse_shift<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
             };
             continue;
         }
-        // `<<` / `<<<` — const fold when both sides const; else leave as identity*shift via mul-of-power2 not needed for corpus.
+        // `<<` / `<<<`: const fold when both sides const; `ident << K`
+        // with const K lowers to {ident[w-1-K:0], K'b0} (zero_fill_concat maps
+        // that shape as wire align). Anything else becomes Shl and lowers
+        // per-bit in rexpr_to_bit; never silently keep the LHS.
         if matches!(p.peek(), Some(Tok::Sym('<')))
             && matches!(p.t.get(p.i + 1), Some(Tok::Sym('<')))
         {
@@ -4585,7 +4642,33 @@ fn parse_shift<'a>(p: &mut P<'a>) -> Result<RExpr<'a>, String> {
                         care: *ca,
                     }
                 }
-                _ => e, // non-const shl: keep LHS (rare); prefer not to drop assign
+                (RExpr::Ident(name), RExpr::Const { val: b, .. }) => {
+                    let name: &str = name;
+                    let Some(&w) = p.widths.get(name) else {
+                        return Err("shift lhs width unknown".into());
+                    };
+                    let w = w.max(1);
+                    let k = (*b).min(w as u128) as usize;
+                    if k == 0 {
+                        e
+                    } else if k >= w {
+                        RExpr::Const {
+                            val: 0,
+                            width: w,
+                            care: care_mask(w),
+                        }
+                    } else {
+                        RExpr::Concat(vec![
+                            RExpr::Range(name, 0, w - k - 1),
+                            RExpr::Const {
+                                val: 0,
+                                width: k,
+                                care: care_mask(k),
+                            },
+                        ])
+                    }
+                }
+                _ => RExpr::Shl(p.alloc(e), p.alloc(sh)),
             };
             continue;
         }
@@ -6160,7 +6243,7 @@ fn rhs_looks_like_priority_bit_set(e: &RExpr<'_>) -> bool {
     false
 }
 
-fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>> {
+fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>], module: &str) -> Option<Vec<Nba<'a>>> {
     let mut bits_per: HashMap<&'a str, usize> = HashMap::new();
     let mut prio_sets: HashMap<&'a str, usize> = HashMap::new();
     let mut scalar_writes: HashSet<&'a str> = HashSet::new();
@@ -6197,6 +6280,7 @@ fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>>
     eprintln!(
         "synth_rtl compact_priority_onehot signal={bus} bit_writes={nbits} (skip hang-class fold)"
     );
+    prio_compact_validated_insert(module);
     let mut out = vec![(
         bus,
         None,
@@ -6241,6 +6325,7 @@ where
         }
         RExpr::Concat(parts) => stack.extend(parts.iter().rev()),
         RExpr::Shr(a, b)
+        | RExpr::Shl(a, b)
         | RExpr::Ashr(a, b)
         | RExpr::And(a, b)
         | RExpr::Or(a, b)
@@ -6313,9 +6398,8 @@ where
     }
 }
 
-fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a>> {
-    if let Some(compact) = compact_priority_onehot_unroll(&stmts) {
-        return compact;
+fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str) -> Vec<Nba<'a>> {
+    if let Some(compact) = compact_priority_onehot_unroll(&stmts, module) {        return compact;
     }
     /// Iterative post-order substitution: rebuilds `e` with `env` applied,
     /// exactly like the old recursive `subst`, but on an explicit heap stack
@@ -6366,6 +6450,7 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a
                 RExpr::Mul(a, b) => RExpr::Mul(kid(*a as *const _), kid(*b as *const _)),
                 RExpr::Shr(a, b) => RExpr::Shr(kid(*a as *const _), kid(*b as *const _)),
                 RExpr::Ashr(a, b) => RExpr::Ashr(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Shl(a, b) => RExpr::Shl(kid(*a as *const _), kid(*b as *const _)),
                 RExpr::IndexPart {
                     name,
                     base,
@@ -6386,8 +6471,7 @@ fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a
                 RExpr::RedXor(x) => RExpr::RedXor(kid(*x as *const _)),
                 RExpr::RedAnd(x) => RExpr::RedAnd(kid(*x as *const _)),
                 RExpr::RedOr(x) => RExpr::RedOr(kid(*x as *const _)),
-                other => (*other).clone(),
-            }
+                other => (*other).clone(),            }
         }
         // Phase 1: post-order collection (children before parents), DAG-safe.
         let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
@@ -7436,8 +7520,7 @@ fn rexpr_names<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
             }
             RExpr::IndexPart { name, base, .. } => {
                 out.insert(name);
-                stack.push(*base);
-            }
+                stack.push(*base);            }
             RExpr::Const { .. } => {}
             _ => push_rexpr_children(n, &mut stack),
         }
@@ -7471,6 +7554,7 @@ fn map_rexpr_children<'a>(
         },
         RExpr::Concat(parts) => RExpr::Concat(parts.iter().map(|p| f(p)).collect()),
         RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(f(a)), arena.alloc(f(b))),
+        RExpr::Shl(a, b) => RExpr::Shl(arena.alloc(f(a)), arena.alloc(f(b))),
         RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(f(a)), arena.alloc(f(b))),
         RExpr::RedXor(x) => RExpr::RedXor(arena.alloc(f(x))),
         RExpr::RedAnd(x) => RExpr::RedAnd(arena.alloc(f(x))),
@@ -8934,7 +9018,7 @@ fn parse_module_items<'a>(
                 let _ = p.ident();
             }
             match parse_seq_block(&mut p, block) {
-                Ok(stmts) => assigns.extend(fold_blocking_assigns(stmts, p.arena)),
+                Ok(stmts) => assigns.extend(fold_blocking_assigns(stmts, p.arena, &cur_mod())),
                 Err(_) => {
                     note_skip(format!(
                         "diagnostic skip_always module={} (always_comb body not parsed; not a LUT)",
@@ -8961,7 +9045,7 @@ fn parse_module_items<'a>(
                 Ok(stmts) => {
                     if combo {
                         // `always @(*)` next-state etc. → comb assigns, not FFs.
-                        assigns.extend(fold_blocking_assigns(stmts, p.arena));
+                        assigns.extend(fold_blocking_assigns(stmts, p.arena, &cur_mod()));
                     } else if negedge_only {
                         // Falling-edge always is its own clock. Do not fold it
                         // into the posedge cone (that drops the name).
@@ -9641,16 +9725,10 @@ fn index_part_bit<'a>(
     // word's packed bits. `name[w][hi:lo]` encodes base as (word<<16)|lo.
     if depth > 1 {
         if let RExpr::Const { val, .. } = base {
-            let word = if *val >= 0x1_0000 {
-                (*val >> 16) as usize
-            } else {
-                *val as usize
-            };
-            let bit_lo = if *val >= 0x1_0000 {
-                (*val & 0xffff) as usize
-            } else {
-                0usize
-            };
+            // `name[w][hi:lo]` encodes base as (word<<16)|lo, so a small val
+            // is word 0 with lo = val, not word = val.
+            let word = (*val >> 16) as usize;
+            let bit_lo = (*val & 0xffff) as usize;
             let src = bit_lo.saturating_add(bit);
             if src >= wsrc {
                 return Ok(Expr::Const(false));
@@ -9772,8 +9850,7 @@ type ToBitKey<'x> = (*const RExpr<'x>, usize);
 enum ToBitBinOp {
     And,
     Or,
-    Xor,
-}
+    Xor,}
 
 /// Reduction op for a `ToBitOp::Red` build step.
 #[derive(Clone, Copy)]
@@ -9968,6 +10045,29 @@ fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Re
                                 stack.push(ToBitTask::Visit(*a, src));
                             }
                         }
+                    }
+                    RExpr::Shl(a, sh) => {
+                        // Bit i of (a << s) is OR over k of (a[k] & (s == i-k)):
+                        // a barrel shift as an OR-of-ANDs. Result width is the
+                        // LHS width. Direct lowering via recursive calls is safe:
+                        // rexpr_to_bit is iterative (heap work-stack).
+                        let wa = rexpr_width(a, rtl).max(1);
+                        let mut acc: Option<Expr> = None;
+                        for k in 0..=bit.min(wa.saturating_sub(1)) {
+                            let abit = rexpr_to_bit(a, rtl, k, arena)?;
+                            let want = RExpr::Const {
+                                val: (bit - k) as u128,
+                                width: 32,
+                                care: u128::MAX,
+                            };
+                            let eq = cmp_eq_bits(sh, &want, rtl, true, arena)?;
+                            let term = Expr::And(arena.alloc(abit), arena.alloc(eq));
+                            acc = Some(match acc {
+                                None => term,
+                                Some(prev) => Expr::Or(arena.alloc(prev), arena.alloc(term)),
+                            });
+                        }
+                        memo.insert(key, acc.unwrap_or(Expr::Const(false)));
                     }
                     RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
                         let redop = if matches!(*n, RExpr::RedXor(_)) {
@@ -10407,7 +10507,7 @@ fn rexpr_add_depth(e: &RExpr<'_>) -> usize {
             RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
                 child(&memo, *x as *const RExpr<'_>)
             }
-            RExpr::Shr(a, b) | RExpr::Ashr(a, b) => child(&memo, *a as *const RExpr<'_>)
+            RExpr::Shr(a, b) | RExpr::Shl(a, b) | RExpr::Ashr(a, b) => child(&memo, *a as *const RExpr<'_>)
                 .max(child(&memo, *b as *const RExpr<'_>)),
             RExpr::Concat(parts) => parts
                 .iter()
@@ -10435,8 +10535,7 @@ fn rexpr_add_depth(e: &RExpr<'_>) -> usize {
                 .unwrap_or(0),
             RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
         };
-        memo.insert(n as *const RExpr<'_>, d);
-    }
+        memo.insert(n as *const RExpr<'_>, d);    }
     memo.get(&(e as *const RExpr<'_>)).copied().unwrap_or(0)
 }
 
@@ -10942,7 +11041,7 @@ fn width_step<'x>(
             }
             Some(acc)
         }
-        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => child(*a as *const RExpr<'x>),
+        RExpr::Shr(a, _) | RExpr::Shl(a, _) | RExpr::Ashr(a, _) => child(*a as *const RExpr<'x>),
         RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
             child(*x as *const RExpr<'x>)?;
             Some(1)
@@ -11071,6 +11170,7 @@ fn expr_contains_mul(e: &RExpr<'_>) -> bool {
             | RExpr::Ne(a, b)
             | RExpr::Lt(a, b)
             | RExpr::Shr(a, b)
+            | RExpr::Shl(a, b)
             | RExpr::Ashr(a, b) => {
                 stack.push(*b);
                 stack.push(*a);
@@ -11314,13 +11414,229 @@ fn lut6_const(one: bool) -> u64 {
     if one { u64::MAX } else { 0 }
 }
 
+/// Carry wire of one fold-residue grant bit: `~carry & req[bit]`, optionally
+/// wrapped as Mux(gate, 1, _) from the if-form fold. Returns the carry name.
+fn priority_gate_carry<'a>(req: &str, bit: usize, rhs: &'a RExpr<'a>) -> Option<&'a str> {
+    let cond = match rhs {
+        RExpr::Mux(c, t, _) => match *t {
+            RExpr::Const { val: 1, .. } => *c,
+            _ => return None,
+        },
+        other => other,
+    };
+    let (a, b) = match cond {
+        RExpr::And(a, b) => (*a, *b),
+        _ => return None,
+    };
+    let carry_of = |e: &'a RExpr<'a>| match e {
+        RExpr::Not(RExpr::Ident(c)) => Some(*c),
+        _ => None,
+    };
+    let bit_of = |e: &'a RExpr<'a>| {
+        matches!(e, RExpr::Bit(s, i) if *s == req && *i == bit)
+    };
+    if let (Some(c), true) = (carry_of(a), bit_of(b)) {
+        return Some(c);
+    }
+    if let (true, Some(c)) = (bit_of(a), carry_of(b)) {
+        return Some(c);
+    }
+    None
+}
+
+/// OR-reduction over `req` bits: the carry/valid definition in the fold
+/// residue. Accepts Bit(req,_), Or of reductions, the
+/// Mux(And(Not(p), Bit(req,_)), 1, p) fold form (= p | req[k]), Const 0,
+/// and one chase through a 1-bit internal wire definition (cycle-guarded).
+/// The fold clones the prefix tree per level, so depth is ~3x the bit count.
+fn is_req_or_reduction(rtl: &Rtl, req: &str, e: &RExpr, depth: usize) -> bool {
+    if depth > 512 {
+        return false;
+    }
+    match e {
+        RExpr::Const { val: 0, .. } => true,
+        RExpr::Bit(s, _) if *s == req => true,
+        RExpr::Or(a, b) => {
+            is_req_or_reduction(rtl, req, a, depth + 1)
+                && is_req_or_reduction(rtl, req, b, depth + 1)
+        }
+        RExpr::Mux(c, t, f) => match (*c, *t) {
+            (RExpr::And(a, b), RExpr::Const { val: 1, .. }) => {
+                let prefix_ok = match (*a, *b) {
+                    (RExpr::Not(p), RExpr::Bit(s, _)) if *s == req => {
+                        is_req_or_reduction(rtl, req, p, depth + 1)
+                    }
+                    (RExpr::Bit(s, _), RExpr::Not(p)) if *s == req => {
+                        is_req_or_reduction(rtl, req, p, depth + 1)
+                    }
+                    _ => false,
+                };
+                prefix_ok && is_req_or_reduction(rtl, req, f, depth + 1)
+            }
+            _ => false,
+        },
+        RExpr::Ident(s) => {
+            let mut any = false;
+            let mut ok = true;
+            for (_, _, rhs) in rtl.assigns.iter().filter(|(lhs, _, _)| *lhs == *s) {
+                any = true;
+                ok &= is_req_or_reduction(rtl, req, rhs, depth + 1);
+            }
+            any && ok
+        }
+        _ => false,
+    }
+}
+
+/// Verify the assigns to `gnt` are the fold residue of a priority-encoder
+/// always @(*) loop, or the validated compact marker, before the cascade
+/// replaces them. A bitwise assign like `assign gnt = ~req` has no carry
+/// gate and is rejected: it must lower normally, never as a priority
+/// encoder. Returns (gnt, valid, wires whose assigns the cascade replaces).
+fn verify_priority_grant(
+    rtl: &Rtl,
+    req: &str,
+    gnt: &str,
+    valid: Option<&str>,
+    n: usize,
+) -> Option<(String, Option<String>, Vec<String>)> {
+    let is_zero = |rhs: &RExpr| matches!(rhs, RExpr::Const { val: 0, .. });
+    let gnt_assigns: Vec<(Option<usize>, &RExpr)> = rtl
+        .assigns
+        .iter()
+        .filter(|(lhs, _, _)| *lhs == gnt)
+        .map(|(_, bit, rhs)| (*bit, rhs))
+        .collect();
+    if gnt_assigns.is_empty() {
+        return None;
+    }
+    // Compact marker: `compact_priority_onehot_unroll` zeroed the bus and
+    // the scalar carry after its own validation. Trust it only for modules
+    // it actually validated, never for a user-written `assign gnt = 0`.
+    if gnt_assigns
+        .iter()
+        .all(|(bit, rhs)| bit.is_none() && is_zero(rhs))
+    {
+        if !prio_compact_validated_contains(rtl.module) {
+            return None;
+        }
+        let mut skip_wires = Vec::new();
+        for s in &rtl.signals {
+            if s.width != 1 || s.depth != 0 || s.name == req || s.name == gnt {
+                continue;
+            }
+            if valid.map(|v| s.name == v).unwrap_or(false) {
+                continue;
+            }
+            if rtl.ports.iter().any(|(p, _, _)| p == &s.name) {
+                continue;
+            }
+            let assigns: Vec<&RExpr> = rtl
+                .assigns
+                .iter()
+                .filter(|(lhs, _, _)| *lhs == s.name)
+                .map(|(_, _, rhs)| rhs)
+                .collect();
+            if !assigns.is_empty() && assigns.iter().all(|rhs| is_zero(rhs)) {
+                skip_wires.push(s.name.to_string());
+            }
+        }
+        // `found`'s zero assign may already be dead-eliminated (nothing reads
+        // it after the compact); an empty skip list just means nothing extra
+        // to skip. The compact validation above is the safety, not the list.
+        if let Some(v) = valid {
+            let v_assigns: Vec<(Option<usize>, &RExpr)> = rtl
+                .assigns
+                .iter()
+                .filter(|(lhs, _, _)| *lhs == v)
+                .map(|(_, bit, rhs)| (*bit, rhs))
+                .collect();
+            if v_assigns.is_empty()
+                || !v_assigns
+                    .iter()
+                    .all(|(bit, rhs)| bit.is_none() && is_zero(rhs))
+            {
+                return None;
+            }
+        }
+        return Some((gnt.to_string(), valid.map(str::to_string), skip_wires));
+    }
+    // Fold residue: every grant bit is `~carry & req[i]` over one shared
+    // 1-bit carry wire whose definition is an OR-reduction over req.
+    let mut carry: Option<String> = None;
+    let mut seen = vec![false; n];
+    for (bit, rhs) in &gnt_assigns {
+        match bit {
+            None => {
+                // Whole-vector pre-clear (`grant = {N{1'b0}}`) only.
+                if !is_zero(rhs) {
+                    return None;
+                }
+            }
+            Some(i) => {
+                if *i >= n {
+                    return None;
+                }
+                let c = priority_gate_carry(req, *i, rhs)?;
+                match &carry {
+                    Some(prev) if *prev != c => return None,
+                    _ => carry = Some(c.to_string()),
+                }
+                seen[*i] = true;
+            }
+        }
+    }
+    if seen.iter().any(|s| !s) {
+        return None;
+    }
+    let carry = carry?;
+    let carry_sig = rtl.signals.iter().find(|s| s.name == carry)?;
+    if carry_sig.width != 1 || carry_sig.depth != 0 || carry == req || carry == gnt {
+        return None;
+    }
+    if valid.map(|v| carry == v).unwrap_or(false) {
+        return None;
+    }
+    if rtl.ports.iter().any(|(p, _, _)| p == &carry.as_str()) {
+        return None;
+    }
+    let carry_ok = rtl
+        .assigns
+        .iter()
+        .filter(|(lhs, _, _)| *lhs == carry.as_str())
+        .any(|(_, _, rhs)| is_req_or_reduction(rtl, req, rhs, 0));
+    if !carry_ok {
+        return None;
+    }
+    if let Some(v) = valid {
+        let valid_ok = rtl
+            .assigns
+            .iter()
+            .filter(|(lhs, _, _)| *lhs == v)
+            .any(|(_, _, rhs)| is_req_or_reduction(rtl, req, rhs, 0));
+        if !valid_ok {
+            return None;
+        }
+    }
+    Some((gnt.to_string(), valid.map(str::to_string), vec![carry]))
+}
+
 /// LogikBench fixed-priority onehot cascade (real LUT2s, no silent drop).
 /// - Ascending (arbiter): `grant[i] = request[i] & ~OR(request[0..i))` — 1 out.
 /// - Descending MSB-first (bin2prio): `out[i] = in[i] & ~OR(in[i+1..])` plus
 ///   optional 1-bit `valid = OR(in[*])` — 2 outs. DW=64 for-loop fold was a
 ///   banner-only ~40s AIG hang-class; cascade clears it.
-/// Returns `(onehot_out, optional_valid_out)` so callers skip both cones.
-fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, Option<String>)> {
+///
+/// The cascade replaces the folded always @(*) body, so it fires only when
+/// `verify_priority_grant` recognizes that body as carry-gated per-bit
+/// residue or the validated compact marker. A bitwise assign like
+/// `gnt = ~req` is rejected and lowers normally. Returns
+/// `(onehot_out, optional_valid_out, replaced_wires)` so callers skip exactly
+/// the folded residue, never unrelated 1-bit logic.
+fn try_emit_priority_onehot_grant(
+    d: &mut Design,
+    rtl: &Rtl,
+) -> Option<(String, Option<String>, Vec<String>)> {
     if !rtl.nbas.is_empty() {
         return None;
     }
@@ -11376,6 +11692,9 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     if !has_carry {
         return None;
     }
+    // Verify the assigns are the fold residue of a priority loop (or the
+    // validated compact marker) before replacing them with the cascade.
+    let (gnt, valid, skip_wires) = verify_priority_grant(rtl, req, gnt, valid, n)?;
     let order: Vec<usize> = if msb_first {
         (0..n).rev().collect()
     } else {
@@ -11384,7 +11703,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     let mut carry: Option<String> = None;
     for &i in &order {
         let r = bit_name(req, n, i);
-        let g = bit_name(gnt, n, i);
+        let g = bit_name(&gnt, n, i);
         let gcell = format!("u_prio_{gnt}_{i}g");
         match &carry {
             None => {
@@ -11421,7 +11740,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
             }
         }
     }
-    if let (Some(v), Some(c)) = (valid, carry.as_ref()) {
+    if let (Some(v), Some(c)) = (valid.as_deref(), carry.as_ref()) {
         // valid = OR(all inputs) = final carry after the cascade.
         emit_lut_pins(
             d,
@@ -11434,7 +11753,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     } else {
         eprintln!("synth_rtl priority_onehot signal={gnt} bits={n}");
     }
-    Some((gnt.to_string(), valid.map(|s| s.to_string())))
+    Some((gnt, valid, skip_wires))
 }
 
 /// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
@@ -14621,22 +14940,73 @@ fn emit_word_add(
                     cin = Some(cout);
                 }
             }
-            _ => {
-                let src = an.clone().or(bn.clone());
-                if let Some(src) = src.as_deref() {
+            // Zero-extended high bit of the narrower operand: full adder with
+            // a 0 in the missing position. Carry propagates; dropping it
+            // miscomputes every bit above the narrower operand's MSB.
+            (None, Some(bn), None) => {
+                // sum = b, cout = 0
+                emit_lut_pins(d, &sum_cell, &sum, lut6_buf(), &[(bn, "I0")]);
+                cin = None;
+            }
+            (Some(an), None, None) => {
+                emit_lut_pins(d, &sum_cell, &sum, lut6_buf(), &[(an, "I0")]);
+                cin = None;
+            }
+            (None, Some(bn), Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum,
+                    lut6_xor2(),
+                    &[(bn, "I0"), (cn, "I1")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
                     emit_lut_pins(
                         d,
-                        &sum_cell,
-                        &sum,
+                        &cry_cell,
+                        &cout,
                         lut6_and2(false, false, false),
-                        &[(src, "I0"), (src, "I1")],
+                        &[(bn, "I0"), (cn, "I1")],
                     );
+                    cin = Some(cout);
                 } else {
-                    emit_lut_pins(d, &sum_cell, &sum, lut6_const(false), &[]);
-                }
-                if bit + 1 < width {
                     cin = None;
                 }
+            }
+            (Some(an), None, Some(cn)) => {
+                emit_lut_pins(
+                    d,
+                    &sum_cell,
+                    &sum,
+                    lut6_xor2(),
+                    &[(an, "I0"), (cn, "I1")],
+                );
+                if bit + 1 < width {
+                    let cout = format!("u_add{word}_{bit}c");
+                    let cry_cell = format!("u_alu{word}_{bit}c");
+                    emit_lut_pins(
+                        d,
+                        &cry_cell,
+                        &cout,
+                        lut6_and2(false, false, false),
+                        &[(an, "I0"), (cn, "I1")],
+                    );
+                    cin = Some(cout);
+                } else {
+                    cin = None;
+                }
+            }
+            (None, None, Some(cn)) => {
+                // 0+0+cin: sum = cin, cout = 0
+                emit_lut_pins(d, &sum_cell, &sum, lut6_buf(), &[(cn, "I0")]);
+                cin = None;
+            }
+            (None, None, None) => {
+                // 0+0 with no cin: sum bit tied low.
+                emit_lut_pins(d, &sum_cell, &sum, lut6_const(false), &[]);
+                cin = None;
             }
         }
         let ff = format!("u_aff{word}_{bit}");
@@ -15122,6 +15492,7 @@ fn subst_net_copies<'a>(
             RExpr::Ne(a, b) => RExpr::Ne(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Lt(a, b) => RExpr::Lt(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Shl(a, b) => RExpr::Shl(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::RedXor(a) => RExpr::RedXor(arena.alloc(w(a))),
             RExpr::RedAnd(a) => RExpr::RedAnd(arena.alloc(w(a))),
@@ -15189,25 +15560,6 @@ fn const_rexpr_width(e: &RExpr) -> Option<usize> {
 /// Replace references to constant-propagated wires with `Const`.
 /// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
 /// (the parse lifetime) since results are stored back into the `Rtl`.
-/// Replace references to constant-propagated wires with `Const`.
-/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
-/// (the parse lifetime) since results are stored back into the `Rtl`.
-///
-/// Iterative post-order rebuild with memo. The old recursion (with a
-/// `depth > 32` guard) still overflowed: the guard's `e.clone()` on a deep
-/// tree recurses in `Clone`. The heap work-stack removes the need for any
-/// depth limit.
-/// Replace references to constant-propagated wires with `Const`.
-/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
-/// (the parse lifetime) since results are stored back into the `Rtl`.
-///
-/// Iterative post-order rebuild with memo. The old recursion (with a
-/// `depth > 32` guard) still overflowed: the guard's `e.clone()` on a deep
-/// tree recurses in `Clone`. The heap work-stack removes the need for any
-/// depth limit.
-/// Replace references to constant-propagated wires with `Const`.
-/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
-/// (the parse lifetime) since results are stored back into the `Rtl`.
 ///
 /// Iterative post-order rebuild with memo. The old recursion (with a
 /// `depth > 32` guard) still overflowed: the guard's `e.clone()` on a deep
@@ -15242,7 +15594,7 @@ where
                 },
                 None => (*n).clone(),
             },
-            RExpr::Range(s, hi, lo) => match map.get(*s) {
+            RExpr::Range(s, lo, hi) => match map.get(*s) {
                 Some(&(v, _)) => {
                     let wd = hi.saturating_sub(*lo).saturating_add(1).max(1);
                     RExpr::Const {
@@ -15265,8 +15617,7 @@ where
                     .unwrap_or(*base);
                 let nb_owned = (*bbase).clone();
                 if let (Some(&(v, _)), Some(bv)) = (map.get(*name), rexpr_const_val(&nb_owned))
-                {
-                    let b = (bv as usize).min(127);
+                {                    let b = (bv as usize).min(127);
                     let wd = (*width).max(1);
                     let lo = if *ascending {
                         b
@@ -15313,7 +15664,7 @@ fn collect_rexpr_idents<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
             RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => { out.insert(*s); }
             RExpr::Const { .. } => {}
             RExpr::Not(a) => walk(a, out, depth + 1),
-            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Sub(a, b) | RExpr::Mul(a, b) | RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) | RExpr::Shr(a, b) | RExpr::Ashr(a, b) => { walk(a, out, depth + 1); walk(b, out, depth + 1); }
+            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) | RExpr::Add(a, b) | RExpr::Sub(a, b) | RExpr::Mul(a, b) | RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) | RExpr::Shr(a, b) | RExpr::Shl(a, b) | RExpr::Ashr(a, b) => { walk(a, out, depth + 1); walk(b, out, depth + 1); }
             RExpr::Concat(ps) => { for p in ps { walk(p, out, depth + 1); } }
             RExpr::Mux(c, t, f) => { walk(c, out, depth + 1); walk(t, out, depth + 1); walk(f, out, depth + 1); }
             RExpr::RedXor(a) | RExpr::RedAnd(a) | RExpr::RedOr(a) => walk(a, out, depth + 1),
@@ -15618,12 +15969,14 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if clock_mux_sigs.contains(*lhs) || clock_gate_sigs.contains(*lhs) {
             continue;
         }
-        // Priority cascade already drives onehot[+valid]; skip folded always @(*) body.
-        if let Some((ref gnt, ref valid)) = priority_grant {
+        // Priority cascade already drives onehot[+valid] and its carry wire;
+        // skip exactly the folded residue it replaces. Unrelated 1-bit wires
+        // lower normally instead of being silently dropped.
+        if let Some((ref gnt, ref valid, ref skip_wires)) = priority_grant {
             if *lhs == gnt.as_str() || valid.as_deref() == Some(*lhs) {
                 continue;
             }
-            if sig_width(rtl, lhs) == 1 && !rtl.ports.iter().any(|(p, _, _)| p == lhs) {
+            if skip_wires.iter().any(|w| w.as_str() == *lhs) {
                 continue;
             }
         }
@@ -16515,6 +16868,10 @@ where
                 kc(*a as *const RExpr<'a>, a),
                 kc(*b as *const RExpr<'a>, b),
             ),
+            RExpr::Shl(a, b) => RExpr::Shl(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
             RExpr::Ashr(a, b) => RExpr::Ashr(
                 kc(*a as *const RExpr<'a>, a),
                 kc(*b as *const RExpr<'a>, b),
@@ -16576,8 +16933,7 @@ where
                     .collect(),
             },
         };
-        memo.insert(n as *const RExpr<'a>, arena.alloc(r));
-    }
+        memo.insert(n as *const RExpr<'a>, arena.alloc(r));    }
     (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
@@ -22509,6 +22865,343 @@ endmodule
             hash_own(&b),
             "mem_inits must hash in name order"
         );
+    }
+
+    #[test]
+    fn sized_binary_literal_value_uses_digit_count() {
+        // The tokenizer used to place a binary literal's value at the
+        // declared width: 4'b1 -> 8, 8'b1 -> 128. The value comes from the
+        // digit count, like the other bases.
+        let num = |s: &str| {
+            let toks = tokenize(s).unwrap();
+            assert_eq!(toks.len(), 1, "one token for {s}");
+            match &toks[0] {
+                Tok::Number(v, w) => (*v, *w),
+                other => panic!("expected Number for {s}, got {other:?}"),
+            }
+        };
+        assert_eq!(num("4'b1"), (1, 4));
+        assert_eq!(num("8'b1"), (1, 8));
+        assert_eq!(num("8'b101"), (5, 8));
+        assert_eq!(num("16'b1"), (1, 16));
+        // End to end: the value reaches the elaborated assign.
+        let rtl =
+            parse_rtl("module m(output [3:0] y); assign y = 4'b1; endmodule").expect("parse");
+        let (_, _, rhs) = rtl
+            .assigns
+            .iter()
+            .find(|(lhs, _, _)| *lhs == "y")
+            .expect("y assign");
+        assert!(
+            matches!(rhs, RExpr::Const { val: 1, .. }),
+            "4'b1 must elaborate to 1, got {rhs:?}"
+        );
+    }
+
+    #[test]
+    fn index_part_bit_small_val_is_word0_with_lo() {
+        // `arr[0][15:8]` encodes base as (0<<16)|8 = 8. Bit 0 must resolve
+        // to arr_w0_8, not arr_w8_0.
+        let arena = Bump::new();
+        let rtl = Rtl {
+            module: "t",
+            ports: vec![],
+            signals: vec![Signal {
+                name: "arr",
+                width: 32,
+                depth: 4,
+                keep: false,
+                mark_debug: false,
+                force_bram: false,
+            }],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: HashMap::new(),
+            negedge_writes: vec![],
+        };
+        let base = RExpr::Const {
+            val: 8,
+            width: 32,
+            care: u128::MAX,
+        };
+        let e = index_part_bit("arr", &base, 8, true, &rtl, 0, &arena).expect("bit 0");
+        match e {
+            Expr::Var(name) => assert_eq!(name, "arr_w0_8", "word-0 lo=8 resolves wrong"),
+            other => panic!("expected Var, got {other:?}"),
+        }
+        // A word>=1 encoding is unaffected: arr[2][7:0] bit 3 -> arr_w2_3.
+        let base2 = RExpr::Const {
+            val: 2u128 << 16,
+            width: 32,
+            care: u128::MAX,
+        };
+        let e2 = index_part_bit("arr", &base2, 8, true, &rtl, 3, &arena).expect("bit 3");
+        match e2 {
+            Expr::Var(name) => assert_eq!(name, "arr_w2_3"),
+            other => panic!("expected Var, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hierarchical_cycle_with_two_instances_terminates() {
+        // cyc_a instantiates cyc_b twice; cyc_b instantiates cyc_a back: a
+        // dependency cycle. The old cycle path dropped the module from
+        // `visiting` early, so the second instance re-entered the frame
+        // forever (stack overflow). This must terminate.
+        let src = r#"
+module cyc_a(input x, output y);
+  wire b1, b2;
+  cyc_b u1(.x(x), .y(b1));
+  cyc_b u2(.x(x), .y(b2));
+  assign y = b1 ^ b2;
+endmodule
+module cyc_b(input x, output y);
+  wire a1;
+  cyc_a u1(.x(x), .y(a1));
+  assign y = a1 ^ x;
+endmodule
+"#;
+        let d = synth_sv(src, "cyc.sv").expect("cyclic hierarchy must terminate");
+        // Both cycle-path stitches happened: cyc_b's own logic appears under
+        // each of cyc_a's two instance prefixes.
+        assert!(
+            d.cells.iter().any(|c| c.name.starts_with("u1_u1_")),
+            "first instance stitch missing"
+        );
+        assert!(
+            d.cells.iter().any(|c| c.name.starts_with("u1_u2_")),
+            "second instance stitch missing"
+        );
+    }
+
+    #[test]
+    fn word_add_mixed_width_carry_reaches_upper_bits() {
+        // mem[0] <= a16 + b32: the zero-extension region must keep the carry.
+        // Bit 16 sum is b[16] XOR carry with a carry-out LUT, not a buffer
+        // of b[16] with the carry dropped.
+        let rtl = Rtl {
+            module: "t",
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "a",
+                    width: 16,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+                Signal {
+                    name: "b",
+                    width: 32,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: HashMap::new(),
+            negedge_writes: vec![],
+        };
+        let mut d = Design::new("t");
+        emit_word_add(&mut d, &rtl, "clk", "mem", 0, 32, "a", "b");
+        let init_of = |name: &str| {
+            let cell = d
+                .cells
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("cell {name} missing"));
+            match cell.kind {
+                CellKind::Lut6 { init } => init,
+                _ => panic!("{name} is not a LUT"),
+            }
+        };
+        assert_eq!(
+            init_of("u_alu0_16s"),
+            lut6_xor2(),
+            "bit-16 sum must XOR the carry, not buffer b16"
+        );
+        assert_eq!(
+            init_of("u_alu0_16c"),
+            lut6_and2(false, false, false),
+            "bit-16 carry-out must propagate"
+        );
+        assert_eq!(
+            init_of("u_alu0_31s"),
+            lut6_xor2(),
+            "top bit sum must XOR the carry"
+        );
+    }
+
+
+    #[test]
+    fn const_wire_range_fold_uses_lo_hi_order() {
+        // w = 8'hAB; w[3:0] must fold to 4'hB, not 1'b1. RExpr::Range is
+        // (name, lo, hi) at every construction site.
+        let arena = Bump::new();
+        let mut map: HashMap<&str, (u128, usize)> = HashMap::new();
+        map.insert("w", (0xAB, 8));
+        let e = RExpr::Range("w", 0, 3);
+        let folded = subst_const_wires(&e, &map, &arena);
+        match folded {
+            RExpr::Const { val, width, .. } => {
+                assert_eq!((val, width), (0xB, 4), "w[3:0] of 8'hAB must be 4'hB")
+            }
+            other => panic!("expected Const, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn priority_heuristic_rejects_bitwise_inverter() {
+        // `assign gnt = ~req` with a stray 1-bit wire: the old loose shape
+        // check replaced it with a priority encoder and dropped the wire's
+        // assign. It must elaborate to inverters, with the wire logic kept.
+        let src = r#"
+module inv_n #(parameter N = 8)
+   (
+    input [N-1:0]  req,
+    output [N-1:0] gnt,
+    output         flag_o
+    );
+   wire flag;
+   assign gnt = ~req;
+   assign flag = ^req;
+   assign flag_o = flag;
+endmodule
+"#;
+        let d = synth_sv(src, "inv_n.v").expect("inverter");
+        assert!(
+            !d.cells.iter().any(|c| c.name.contains("u_prio_")),
+            "bitwise inverter must not get a priority cascade"
+        );
+        assert!(
+            d.lut_inits().iter().any(|&i| i == lut6_inv()),
+            "gnt must lower to inverters, inits={:?}",
+            d.lut_inits()
+        );
+        assert!(
+            d.nets.iter().any(|n| n.name == "flag"),
+            "unrelated 1-bit wire must keep its logic"
+        );
+    }
+
+    #[test]
+    fn const_amount_shift_left_lowers_not_drops() {
+        // `y << 2` used to silently compile to just `y`.
+        let rtl = parse_rtl(
+            "module m(input [7:0] y, output [7:0] z); assign z = y << 2; endmodule",
+        )
+        .expect("parse");
+        let (_, _, rhs) = rtl
+            .assigns
+            .iter()
+            .find(|(lhs, _, _)| *lhs == "z")
+            .expect("z assign");
+        match rhs {
+            RExpr::Concat(parts) => {
+                assert_eq!(parts.len(), 2, "y << 2 is {{y[5:0], 2'b0}}");
+                assert!(
+                    matches!(&parts[0], RExpr::Range(s, 0, 5) if *s == "y"),
+                    "high part must be y[5:0], got {:?}", parts[0]
+                );
+                assert!(
+                    matches!(&parts[1], RExpr::Const { val: 0, width: 2, .. }),
+                    "low part must be 2'b0, got {:?}", parts[1]
+                );
+            }
+            other => panic!("y << 2 must lower to a concat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_shift_left_lowers_per_bit() {
+        // `y << k` with a variable amount must lower to a real shift, not
+        // silently keep y. Exhaustive check of the Shl barrel lowering.
+        let arena = Bump::new();
+        let rtl = Rtl {
+            module: "t",
+            ports: vec![],
+            signals: vec![
+                Signal {
+                    name: "y",
+                    width: 8,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+                Signal {
+                    name: "k",
+                    width: 3,
+                    depth: 0,
+                    keep: false,
+                    mark_debug: false,
+                    force_bram: false,
+                },
+            ],
+            nbas: vec![],
+            assigns: vec![],
+            insts: vec![],
+            params: vec![],
+            toks: vec![],
+            mem_inits: HashMap::new(),
+            negedge_writes: vec![],
+        };
+        fn eval(e: &Expr, vals: &HashMap<String, bool>) -> bool {
+            match e {
+                Expr::Const(b) => *b,
+                Expr::Var(n) => vals.get(*n).copied().expect("var"),
+                Expr::Not(x) => !eval(x, vals),
+                Expr::And(a, b) => eval(a, vals) && eval(b, vals),
+                Expr::Or(a, b) => eval(a, vals) || eval(b, vals),
+                Expr::Xor(a, b) => eval(a, vals) ^ eval(b, vals),
+            }
+        }
+        let ey = RExpr::Ident("y");
+        let ek = RExpr::Ident("k");
+        let shl = RExpr::Shl(&ey, &ek);
+        // The parse must produce Shl, not silently drop the shift.
+        let prtl = parse_rtl(
+            "module m(input [7:0] y, input [2:0] k, output [7:0] z); assign z = y << k; endmodule",
+        )
+        .expect("parse");
+        let (_, _, prhs) = prtl
+            .assigns
+            .iter()
+            .find(|(lhs, _, _)| *lhs == "z")
+            .expect("z assign");
+        assert!(
+            matches!(prhs, RExpr::Shl(_, _)),
+            "y << k must parse to Shl, got {prhs:?}"
+        );
+        for y in 0..256u16 {
+            for k in 0..8u16 {
+                let mut vals = HashMap::new();
+                for i in 0..8 {
+                    vals.insert(format!("y_{i}"), (y >> i) & 1 == 1);
+                }
+                for i in 0..3 {
+                    vals.insert(format!("k_{i}"), (k >> i) & 1 == 1);
+                }
+                let expect = (y << k) & 0xFF;
+                for bit in 0..8 {
+                    let ex = rexpr_to_bit(&shl, &rtl, bit, &arena).expect("lower bit");
+                    assert_eq!(
+                        eval(&ex, &vals),
+                        (expect >> bit) & 1 == 1,
+                        "y={y} k={k} bit={bit}"
+                    );
+                }
+            }
+        }
     }
 }
 
