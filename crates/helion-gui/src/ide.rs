@@ -28089,13 +28089,14 @@ endmodule
             !ide.schematic.path_only,
             "single object restores the full sheet"
         );
-        // The object's site still highlights on the die.
+        // The object's site still highlights on the die. The cell may share
+        // its site with a packed LUT (occupant is the first bel), so match
+        // against the site's bel list, not just the occupant name.
         assert!(
             ide.device
                 .sites
                 .iter()
-                .any(|s| s.highlighted
-                    && s.occupant.as_deref() == Some(cell.as_str())),
+                .any(|s| s.highlighted && s.bels.iter().any(|b| b == &cell)),
             "selected cell site highlights"
         );
     }
