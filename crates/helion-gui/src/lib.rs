@@ -62,7 +62,7 @@ pub use ide::{
     TimingPathPin, TimingPathSortCol,
     RunCol, best_run_index, sort_run_indices, sweep_wns_stats,
     UltraFastStage, Utilization, UtilizationReport, UtilOccupancy, HierOccupancy, VirtualBus,
-    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab,
+    Waveform, WaveMarker, WaveCursorRow, WaveRadix, WaveStyle, WaveTrace, WorkspaceTab, WaveDensity,
 };
 pub use helion_drc::{Drc, DrcSeverity, DrcViolation};
 pub use helion_sta::{

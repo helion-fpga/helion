@@ -2959,6 +2959,26 @@ pub enum WaveRadix {
     Hexadecimal,
 }
 
+/// Waveform lane density (GTKWave-style). Comfortable keeps roomy lanes for
+/// probing; Compact fits ~3x more signals in the same pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WaveDensity {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+impl WaveDensity {
+    /// Lane height in px (GTKWave default ~24px per signal; ours carry
+    /// inline name/value/buttons, so the floor is higher).
+    pub fn lane_h(self) -> f32 {
+        match self {
+            WaveDensity::Comfortable => 56.0,
+            WaveDensity::Compact => 36.0,
+        }
+    }
+}
+
 /// One UG900 design wave object: Name, Value-at-cursor, sample series.
 #[derive(Clone, Debug)]
 pub struct WaveTrace {
@@ -3126,6 +3146,8 @@ pub struct Waveform {
     pub cursor_a: Option<usize>,
     /// UG900 measurement cursor B (sample index). Independent of the main cursor.
     pub cursor_b: Option<usize>,
+    /// Lane density toggle (GTKWave-style comfortable/compact).
+    pub density: WaveDensity,
 }
 
 impl Default for Waveform {
@@ -3138,6 +3160,7 @@ impl Default for Waveform {
             virtual_buses: Vec::new(),
             cursor_a: None,
             cursor_b: None,
+            density: WaveDensity::default(),
         }
     }
 }

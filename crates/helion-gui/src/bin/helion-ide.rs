@@ -9335,6 +9335,14 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         if sidebar_button(ui, "Virtual bus").clicked() {
             let _ = model.add_wave_virtual_bus("vb led cnt");
         }
+        // GTKWave-style lane density.
+        ui.label(RichText::new("Density").small().weak());
+        let mut dens = model.wave.density;
+        ui.radio_value(&mut dens, helion_gui::WaveDensity::Comfortable, "Comfortable")
+            .on_hover_text("Roomy lanes for probing");
+        ui.radio_value(&mut dens, helion_gui::WaveDensity::Compact, "Compact")
+            .on_hover_text("Fit ~3x more signals in the pane");
+        model.wave.density = dens;
     });
     ui.label(
         RichText::new("click cursor · Shift A · Alt B")
@@ -9475,7 +9483,7 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let cursor_a = model.wave.cursor_a;
     let cursor_b = model.wave.cursor_b;
     let ts = model.wave.timescale_ps;
-    let row_h = chrome::wave_trace_row_h(model.wave.traces.len(), ui.available_height() - 8.0);
+    let row_h = chrome::wave_trace_row_h(model.wave.density);
 
     for t in &model.wave.traces {
         ui.horizontal(|ui| {
