@@ -3300,7 +3300,9 @@ fn emit_module_into(
         let own = lower_own_cached(proto)?;
         let summary = soft_from_design(&own);
         stitch_own_into(dst, &own, prefix, port_map);
-        visiting.remove(name);
+        // Do not remove from `visiting` here: the ancestor frame that
+        // inserted `name` removes it at its own exit. Removing early lets a
+        // second instance on the same cycle re-enter this frame forever.
         return Ok(summary);
     }
     let own_hit = lower_own_for_stitch(proto)?;
@@ -21387,6 +21389,38 @@ endmodule
             Expr::Var(name) => assert_eq!(name, "arr_w2_3"),
             other => panic!("expected Var, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hierarchical_cycle_with_two_instances_terminates() {
+        // cyc_a instantiates cyc_b twice; cyc_b instantiates cyc_a back: a
+        // dependency cycle. The old cycle path dropped the module from
+        // `visiting` early, so the second instance re-entered the frame
+        // forever (stack overflow). This must terminate.
+        let src = r#"
+module cyc_a(input x, output y);
+  wire b1, b2;
+  cyc_b u1(.x(x), .y(b1));
+  cyc_b u2(.x(x), .y(b2));
+  assign y = b1 ^ b2;
+endmodule
+module cyc_b(input x, output y);
+  wire a1;
+  cyc_a u1(.x(x), .y(a1));
+  assign y = a1 ^ x;
+endmodule
+"#;
+        let d = synth_sv(src, "cyc.sv").expect("cyclic hierarchy must terminate");
+        // Both cycle-path stitches happened: cyc_b's own logic appears under
+        // each of cyc_a's two instance prefixes.
+        assert!(
+            d.cells.iter().any(|c| c.name.starts_with("u1_u1_")),
+            "first instance stitch missing"
+        );
+        assert!(
+            d.cells.iter().any(|c| c.name.starts_with("u1_u2_")),
+            "second instance stitch missing"
+        );
     }
 
 }
