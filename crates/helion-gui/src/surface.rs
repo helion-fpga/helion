@@ -317,6 +317,7 @@ pub enum JobKind {
     /// One design run from the runs queue (strategy sweep). The model clone
     /// carries the run list + queue; the worker fills the run's results.
     DesignRun { name: String },
+    TbRun(crate::tb::TbRunRequest),
 }
 
 impl JobKind {
@@ -331,6 +332,7 @@ impl JobKind {
             JobKind::Step(FlowStep::Bitstream) => "Bitstream",
             JobKind::SimRun(_) => "Simulate",
             JobKind::DesignRun { .. } => "DesignRun",
+            JobKind::TbRun(_) => "Testbench",
         }
     }
 
@@ -346,6 +348,7 @@ impl JobKind {
             JobKind::Step(s) => format!("Running {}…", s.label()),
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
             JobKind::DesignRun { name } => format!("Running design run {name}…"),
+            JobKind::TbRun(r) => format!("Running testbench {}…", r.sel),
         }
     }
 }
@@ -373,6 +376,7 @@ fn run_kind(model: &mut IdeModel, kind: &JobKind) -> Result<String, String> {
         JobKind::Step(s) => model.run_step(*s),
         JobKind::SimRun(n) => model.sim_run(*n),
         JobKind::DesignRun { name } => model.execute_design_run(name),
+        JobKind::TbRun(req) => model.tb_run_job(req),
     }
 }
 
