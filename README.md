@@ -75,11 +75,11 @@ Needs rustc **1.85**. CI is Linux; the desktop app is Apple Silicon (`aarch64-ap
 | Design | Helion LUT6 | WNS (ps) | Helion wall | Yosys+nextpnr wall |
 |---|---|---|---|---|
 | PicoRV32 | 2477 | 8700 | 3.5 s | 10.4 s |
-| AES-128 | 6534 | 8700 | 1.9 s | ~332 s |
+| AES-128 | 6534 (80% of die) | 8700 | 1.9 s | ~332 s |
 | UART | 379 | 9600 | 0.3 s | 5.8 s |
 | SPI | 62 | 9580 | 0.03 s | 3.6 s |
 
-All 10 designs completed every Helion stage (synth → pack → place → route → STA → bitstream). Read honestly: Helion targets its own LUT6 fabric while the baseline targets Lattice LUT4, so absolute LUT counts aren't silicon-to-silicon. Yosys+ABC still produces 2–5× fewer LUTs — the area gap is real and being closed (uart 420 → 244 LUTs so far). Helion's delay model is simpler and more optimistic than signoff STA; calibration is on the roadmap. Ibex (~11.6k LUTs) exceeds the 8k-LUT die — the flow fails loudly instead of emitting a clipped bitstream.
+All 10 designs completed every Helion stage (synth → pack → place → route → STA → bitstream). Read honestly: Helion targets its own LUT6 fabric while the baseline targets Lattice LUT4, so absolute LUT counts aren't silicon-to-silicon. Yosys+ABC still produces 2–5× fewer LUTs — the area gap is real and being closed (uart 420 → 244 LUTs so far). Helion's delay model is simpler and more optimistic than signoff STA; calibration is on the roadmap. Helion's SystemVerilog frontend parsed all 10 designs; Yosys 0.69's could not parse three of them (Ibex's assignment patterns, CORDIC's variable-bound loop, an inferred latch in MIPS). Ibex (~11.6k LUTs) exceeds the 8k-LUT die — the flow fails loudly instead of emitting a clipped bitstream.
 
 Recent measured wins (all pushed, all green):
 
