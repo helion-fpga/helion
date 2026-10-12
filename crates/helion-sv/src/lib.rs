@@ -10,6 +10,7 @@
 mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
 mod aig_opt;
+pub mod equiv;
 
 thread_local! {
     /// ABC-style AIG rewriting during LUT mapping (area campaign, v2.1).
