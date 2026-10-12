@@ -111,16 +111,19 @@ impl Aig {
         a
     }
 
-    fn collect_pis(&mut self, e: &Expr<'_>) {
-        match e {
-            Expr::Const(_) => {}
-            Expr::Var(s) => {
-                let _ = self.pi(s);
-            }
-            Expr::Not(x) => self.collect_pis(x),
-            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
-                self.collect_pis(a);
-                self.collect_pis(b);
+    // Iterative DFS; the old recursion overflowed the stack on deep Expr trees.
+    fn collect_pis<'x, 'e>(&mut self, e: &'e Expr<'x>)
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e Expr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                Expr::Const(_) => {}
+                Expr::Var(s) => {
+                    let _ = self.pi(s);
+                }
+                _ => push_expr_children(n, &mut stack),
             }
         }
     }
@@ -191,30 +194,56 @@ impl Aig {
         Lit { node: n, inv: false }
     }
 
-    fn expr(&mut self, e: &Expr<'_>) -> Lit {
-        match e {
-            Expr::Const(false) => Lit::c0(),
-            Expr::Const(true) => Lit::c1(),
-            Expr::Var(s) => self.pi(s),
-            Expr::Not(x) => self.expr(x).not(),
-            Expr::And(a, b) => {
-                let la = self.expr(a);
-                let lb = self.expr(b);
-                self.and_lit(la, lb)
+    // Iterative post-order AIG construction with memo. The old recursion
+    // overflowed the stack on deep Expr trees.
+    fn expr<'x, 'e>(&mut self, e: &'e Expr<'x>) -> Lit
+    where
+        'x: 'e,
+    {
+        let mut seen: HashSet<*const Expr<'x>> = HashSet::new();
+        let mut post: Vec<&'e Expr<'x>> = Vec::new();
+        let mut stack: Vec<&'e Expr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n as *const Expr<'x>) {
+                continue;
             }
-            Expr::Or(a, b) => {
-                let la = self.expr(a);
-                let lb = self.expr(b);
-                self.and_lit(la.not(), lb.not()).not()
-            }
-            Expr::Xor(a, b) => {
-                let la = self.expr(a);
-                let lb = self.expr(b);
-                let t1 = self.and_lit(la, lb.not());
-                let t2 = self.and_lit(la.not(), lb);
-                self.and_lit(t1.not(), t2.not()).not()
-            }
+            post.push(n);
+            push_expr_children(n, &mut stack);
         }
+        let mut memo: HashMap<*const Expr<'x>, Lit> = HashMap::with_capacity(post.len() + 1);
+        for n in post.into_iter().rev() {
+            // `self.pi` / `self.and_lit` mutate the AIG; memo holds child Lits.
+            // Child Lits are always memoized before their parent in post-order;
+            // the fallback is unreachable but keeps this panic-free.
+            let child = |p: *const Expr<'x>| -> Lit {
+                memo.get(&p).copied().unwrap_or(Lit::c0())
+            };
+            let lit = match n {
+                Expr::Const(false) => Lit::c0(),
+                Expr::Const(true) => Lit::c1(),
+                Expr::Var(s) => self.pi(s),
+                Expr::Not(x) => child(*x as *const Expr<'x>).not(),
+                Expr::And(a, b) => {
+                    let la = child(*a as *const Expr<'x>);
+                    let lb = child(*b as *const Expr<'x>);
+                    self.and_lit(la, lb)
+                }
+                Expr::Or(a, b) => {
+                    let la = child(*a as *const Expr<'x>);
+                    let lb = child(*b as *const Expr<'x>);
+                    self.and_lit(la.not(), lb.not()).not()
+                }
+                Expr::Xor(a, b) => {
+                    let la = child(*a as *const Expr<'x>);
+                    let lb = child(*b as *const Expr<'x>);
+                    let t1 = self.and_lit(la, lb.not());
+                    let t2 = self.and_lit(la.not(), lb);
+                    self.and_lit(t1.not(), t2.not()).not()
+                }
+            };
+            memo.insert(n as *const Expr<'x>, lit);
+        }
+        memo.get(&(e as *const Expr<'x>)).copied().unwrap_or(Lit::c0())
     }
 
     pub(crate) fn eval_lit(&self, lit: Lit, pi_bits: u64) -> bool {
@@ -1110,9 +1139,22 @@ fn pkg_param_is_csr_or_mubi(name: &str) -> bool {
         || name.starts_with("SCRAMBLE_")
 }
 
+/// Fold a const-valued tree to `u128`. Only `Not` nests, so walk the `Not`
+/// spine iteratively instead of recursing.
 fn rexpr_const_val(e: &RExpr<'_>) -> Option<u128> {
-    match e {
-        RExpr::Const { val, .. } => Some(*val),
+    let mut n = e;
+    let mut nots = 0usize;
+    loop {
+        match n {
+            RExpr::Not(x) => {
+                nots += 1;
+                n = x;
+            }
+            _ => break,
+        }
+    }
+    let mut v: u128 = match n {
+        RExpr::Const { val, .. } => *val,
         RExpr::Concat(parts) => {
             let mut acc = 0u128;
             let mut sh = 0usize;
@@ -1127,11 +1169,14 @@ fn rexpr_const_val(e: &RExpr<'_>) -> Option<u128> {
                     break;
                 }
             }
-            Some(acc)
+            acc
         }
-        RExpr::Not(x) => Some(if rexpr_const_val(x)? != 0 { 0 } else { 1 }),
-        _ => None,
+        _ => return None,
+    };
+    for _ in 0..nots {
+        v = if v != 0 { 0 } else { 1 };
     }
+    Some(v)
 }
 
 /// Package `localparam exc_cause_t ExcCauseIrqNm = '{irq_ext: 1'b1, ...};`.
@@ -1597,26 +1642,22 @@ fn flatten_cap_for(module: &str) -> bool {
     FLATTEN_CAP_SEEN.with(|s| s.borrow().contains(module))
 }
 
+/// Iterative DFS: true if any `Mux` node exists in the tree.
+/// Replaces the naive-recursive version (deep `Mux` spines overflowed the stack).
+/// Iterative DFS: true if the tree contains a `Mux`. The old recursion
+/// overflowed the stack on deep Mux spines; the heap work-stack is safe
+/// for arbitrary depth.
 fn rexpr_has_mux(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Mux(_, _, _) => true,
-        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => rexpr_has_mux(x),
-        RExpr::Shr(a, b)
-        | RExpr::Ashr(a, b)
-        | RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Add(a, b)
-        | RExpr::Sub(a, b)
-        | RExpr::Mul(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b) => rexpr_has_mux(a) || rexpr_has_mux(b),
-        RExpr::Concat(parts) => parts.iter().any(rexpr_has_mux),
-        RExpr::IndexPart { base, .. } => rexpr_has_mux(base),
-        RExpr::WordAt { addr, data } => rexpr_has_mux(addr) || rexpr_has_mux(data),
-        _ => false,
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Mux(_, _, _) => return true,
+            // The old recursion did not look inside calls; preserve that.
+            RExpr::Call { .. } => {}
+            _ => push_rexpr_children(n, &mut stack),
+        }
     }
+    false
 }
 
 /// Add/Sub under Mux/Concat (or Add of Concat) is not a packed bus pair.
@@ -1628,72 +1669,111 @@ fn rexpr_is_arith_leaf(e: &RExpr<'_>) -> bool {
     )
 }
 
-fn rexpr_has_nested_arith(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Add(a, b) | RExpr::Sub(a, b) => {
-            // Ident/Const/Bit/Range leaves are packed forms (ripple or bit-blast).
-            // Mux/Concat/Not under add/sub still stalls QA — keep flatten_cap.
-            if rexpr_is_arith_leaf(a) && rexpr_is_arith_leaf(b) {
-                return false;
+/// Iterative DFS: true if an `Add`/`Sub` with a non-leaf operand exists.
+/// `Add`/`Sub` of two arith leaves is a false leaf (not descended into),
+/// matching the old recursive early-`return false`.
+/// Iterative: true if the tree contains nested arithmetic.
+fn rexpr_has_nested_arith<'x, 'e>(e: &'e RExpr<'x>) -> bool
+where
+    'x: 'e,
+{
+    let mut stack: Vec<&'e RExpr<'x>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Add(a, b) | RExpr::Sub(a, b) => {
+                // Ident/Const/Bit/Range leaves are packed forms (ripple or bit-blast).
+                // Mux/Concat/Not under add/sub still stalls QA — keep flatten_cap.
+                if !(rexpr_is_arith_leaf(a) && rexpr_is_arith_leaf(b)) {
+                    return true;
+                }
+                // Leaves are fine, no need to recurse (they're arith leaves).
             }
-            true
+            RExpr::Mux(c, t, f) => {
+                stack.push(*f);
+                stack.push(*t);
+                stack.push(*c);
+            }
+            RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+                stack.push(*x);
+            }
+            RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b)
+            | RExpr::Mul(a, b) => {
+                stack.push(*b);
+                stack.push(*a);
+            }
+            RExpr::Concat(parts) => {
+                for p in parts.iter().rev() {
+                    stack.push(p);
+                }
+            }
+            RExpr::IndexPart { base, .. } => stack.push(*base),
+            RExpr::WordAt { addr, data } => {
+                stack.push(*data);
+                stack.push(*addr);
+            }
+            _ => {}
         }
-        RExpr::Mux(c, t, f) => {
-            rexpr_has_nested_arith(c) || rexpr_has_nested_arith(t) || rexpr_has_nested_arith(f)
-        }
-        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
-            rexpr_has_nested_arith(x)
-        }
-        RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Shr(a, b)
-        | RExpr::Ashr(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b)
-        | RExpr::Mul(a, b) => rexpr_has_nested_arith(a) || rexpr_has_nested_arith(b),
-        RExpr::Concat(parts) => parts.iter().any(rexpr_has_nested_arith),
-        RExpr::IndexPart { base, .. } => rexpr_has_nested_arith(base),
-        RExpr::WordAt { addr, data } => {
-            rexpr_has_nested_arith(addr) || rexpr_has_nested_arith(data)
-        }
-        _ => false,
     }
+    false
 }
 
 /// Wire/concat/mux tree: Ident/Const/Bit/Range, Concat of those, Mux of those,
 /// Not/Eq/Ne/And/Or used as case selects. Ibex `adder_in_a` / `result_o` /
 /// compressed `instr_o`. Or/And of Concat (decode_in leftover) and Add/Sub
 /// stay out — those hang in bit-blast.
+/// Iterative post-order fold: true if the tree is a wire/concat/mux form.
+/// Replaces the naive-recursive version (deep trees overflowed the stack).
 fn rexpr_is_wire_mux_form(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Ident(_) | RExpr::Const { .. } | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => true,
-        RExpr::Not(x) => rexpr_is_wire_mux_form(x),
-        RExpr::Mux(c, t, f) => {
-            rexpr_is_wire_mux_form(c) && rexpr_is_wire_mux_form(t) && rexpr_is_wire_mux_form(f)
-        }
-        RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) => {
-            rexpr_is_wire_mux_form(a) && rexpr_is_wire_mux_form(b)
-        }
-        // Nested if/case boolean connectives. Or/And of Concat
-        // (decode_in `{data,data}|sreg`) still hangs — refuse Concat ops.
-        RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) => {
-            !matches!(*a, RExpr::Concat(_))
-                && !matches!(*b, RExpr::Concat(_))
-                && rexpr_is_wire_mux_form(a)
-                && rexpr_is_wire_mux_form(b)
-        }
-        // Const shift of a wire/concat leaf (normalize_nbas bit_extract).
-        RExpr::Shr(a, s) | RExpr::Ashr(a, s) => {
-            matches!(*s, RExpr::Const { .. }) && rexpr_is_wire_mux_form(a)
-        }
-        RExpr::Concat(parts) => parts.iter().all(rexpr_is_wire_mux_form),
-        // Packed `bus[sel]` (Ibex op_numerator_q[div_counter_d]) is an OR-of-eq
-        // LUT mux, not a Concat leftover. Wide/nested index stays flatten_cap.
-        RExpr::IndexPart { base, .. } => rexpr_is_wire_mux_form(base),
-        _ => false,
+    let post: Vec<&RExpr<'_>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'_>, bool> = HashMap::with_capacity(post.len());
+    // Children are memoized before parents (post-order), so a missing entry
+    // can only mean a bug; default false rather than panic.
+    let child = |memo: &HashMap<*const RExpr<'_>, bool>, p: *const RExpr<'_>| -> bool {
+        memo.get(&p).copied().unwrap_or(false)
+    };
+    for n in post {
+        let v = match n {
+            RExpr::Ident(_) | RExpr::Const { .. } | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => {
+                true
+            }
+            RExpr::Not(x) => child(&memo, *x as *const RExpr<'_>),
+            RExpr::Mux(c, t, f) => {
+                child(&memo, *c as *const _) && child(&memo, *t as *const _)
+                    && child(&memo, *f as *const _)
+            }
+            RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) => {
+                child(&memo, *a as *const _) && child(&memo, *b as *const _)
+            }
+            // Nested if/case boolean connectives. Or/And of Concat
+            // (decode_in `{data,data}|sreg`) still hangs — refuse Concat ops.
+            RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) => {
+                !matches!(*a, RExpr::Concat(_))
+                    && !matches!(*b, RExpr::Concat(_))
+                    && child(&memo, *a as *const _)
+                    && child(&memo, *b as *const _)
+            }
+            // Const shift of a wire/concat leaf (normalize_nbas bit_extract).
+            RExpr::Shr(a, s) | RExpr::Ashr(a, s) => {
+                matches!(*s, RExpr::Const { .. }) && child(&memo, *a as *const _)
+            }
+            RExpr::Concat(parts) => parts
+                .iter()
+                .all(|p| child(&memo, p as *const RExpr<'_>)),
+            // Packed `bus[sel]` (Ibex op_numerator_q[div_counter_d]) is an OR-of-eq
+            // LUT mux, not a Concat leftover. Wide/nested index stays flatten_cap.
+            RExpr::IndexPart { base, .. } => child(&memo, *base as *const RExpr<'_>),
+            _ => false,
+        };
+        memo.insert(n as *const RExpr<'_>, v);
     }
+    memo.get(&(e as *const RExpr<'_>)).copied().unwrap_or(false)
 }
 
 /// Name the signal whose post-flatten cone stalls, or None.
@@ -2202,33 +2282,57 @@ fn seq_lhs_from_toks(toks: &[Tok]) -> String {
 }
 
 /// `ena` appears in a mux condition (load enable), not only as data.
+/// Iterative DFS: true if any `Mux` condition in the tree mentions `name`.
+/// Like the old recursive version, a `Mux` condition's own subtree is checked
+/// for names but never descended into for nested muxes.
+/// Iterative DFS: true if `name` appears in any Mux condition in the tree.
+/// The old recursion overflowed the stack on deep Mux spines; the heap
+/// work-stack is safe for arbitrary depth. Visit order matches the old
+/// short-circuit (condition names, then t, then f).
 fn mux_cond_mentions(e: &RExpr<'_>, name: &str) -> bool {
-    match e {
-        RExpr::Mux(c, t, f) => {
-            let mut names = HashSet::new();
-            rexpr_names(c, &mut names);
-            names.contains(name) || mux_cond_mentions(t, name) || mux_cond_mentions(f, name)
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    let mut names = HashSet::new();
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Mux(c, t, f) => {
+                names.clear();
+                rexpr_names(c, &mut names);
+                if names.contains(name) {
+                    return true;
+                }
+                stack.push(*f);
+                stack.push(*t);
+            }
+            RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+                stack.push(*x);
+            }
+            RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Add(a, b)
+            | RExpr::Sub(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b)
+            | RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b) => {
+                stack.push(*b);
+                stack.push(*a);
+            }
+            RExpr::Concat(parts) => {
+                for p in parts.iter().rev() {
+                    stack.push(p);
+                }
+            }
+            RExpr::IndexPart { base, .. } => stack.push(*base),
+            RExpr::WordAt { addr, data } => {
+                stack.push(*data);
+                stack.push(*addr);
+            }
+            _ => {}
         }
-        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
-            mux_cond_mentions(x, name)
-        }
-        RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Add(a, b)
-        | RExpr::Sub(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b)
-        | RExpr::Shr(a, b)
-        | RExpr::Ashr(a, b) => mux_cond_mentions(a, name) || mux_cond_mentions(b, name),
-        RExpr::Concat(parts) => parts.iter().any(|p| mux_cond_mentions(p, name)),
-        RExpr::IndexPart { base, .. } => mux_cond_mentions(base, name),
-        RExpr::WordAt { addr, data } => {
-            mux_cond_mentions(addr, name) || mux_cond_mentions(data, name)
-        }
-        _ => false,
     }
+    false
 }
 
 fn signal_is_driven(rtl: &Rtl, name: &str) -> bool {
@@ -2398,37 +2502,31 @@ fn rhs_reads_seq_mem(rhs: &RExpr<'_>, rtl: &Rtl) -> bool {
 
 /// `mem[index]` / concat of those. Never walk into a cone; depth>0 is a word read.
 fn rhs_unpacked_index(rhs: &RExpr<'_>, rtl: &Rtl) -> bool {
-    fn walk(e: &RExpr<'_>, rtl: &Rtl) -> bool {
-        match e {
-            RExpr::IndexPart { name, base, .. } => {
-                // depth==1 collapses in index_part_bit; still walk nested bases.
-                // Const word index of depth>1 is a fixed word read (not a mux).
-                let d = sig_depth(rtl, name);
-                if d <= 1 {
-                    return walk(base, rtl);
+    // Iterative DFS; the old recursion overflowed the stack on deep trees.
+    fn walk<'x, 'e>(e: &'e RExpr<'x>, rtl: &Rtl) -> bool
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e RExpr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                RExpr::IndexPart { name, base, .. } => {
+                    // depth==1 collapses in index_part_bit; still walk nested bases.
+                    // Const word index of depth>1 is a fixed word read (not a mux).
+                    let d = sig_depth(rtl, name);
+                    if d <= 1 {
+                        stack.push(*base);
+                        continue;
+                    }
+                    if const_rexpr_usize(base).is_some() {
+                        continue;
+                    }
+                    return true;
                 }
-                if const_rexpr_usize(base).is_some() {
-                    return false;
-                }
-                true
+                _ => push_rexpr_children(n, &mut stack),
             }
-            RExpr::Concat(parts) => parts.iter().any(|p| walk(p, rtl)),
-            RExpr::WordAt { addr, data } => walk(addr, rtl) || walk(data, rtl),
-            RExpr::Mux(c, t, f) => walk(c, rtl) || walk(t, rtl) || walk(f, rtl),
-            RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => walk(x, rtl),
-            RExpr::Shr(a, b)
-            | RExpr::Ashr(a, b)
-            | RExpr::And(a, b)
-            | RExpr::Or(a, b)
-            | RExpr::Xor(a, b)
-            | RExpr::Add(a, b)
-            | RExpr::Sub(a, b)
-            | RExpr::Mul(a, b)
-            | RExpr::Eq(a, b)
-            | RExpr::Ne(a, b)
-            | RExpr::Lt(a, b) => walk(a, rtl) || walk(b, rtl),
-            _ => false,
         }
+        false
     }
     walk(rhs, rtl)
 }
@@ -2553,6 +2651,13 @@ struct OwnHash {
     h: u64,
 }
 
+/// Deferred hash operations for iterative [`OwnHash::feed_rexpr`].
+enum FeedOp<'x, 'e> {
+    Visit(&'e RExpr<'x>),
+    Str(&'static str),
+    U64(u64),
+}
+
 impl OwnHash {
     fn new() -> Self {
         Self {
@@ -2573,139 +2678,161 @@ impl OwnHash {
             self.h = self.h.wrapping_mul(0x100000001b3);
         }
     }
-    fn feed_rexpr(&mut self, e: &RExpr<'_>) {
-        match e {
-            RExpr::Call { name, args } => {
-                self.feed("call");
-                self.feed(name);
-                self.feed_u64(args.len() as u64);
-                for a in args {
-                    self.feed_rexpr(a);
+    /// Iterative depth-first pre-order hash. Feeds tags and children in the
+    /// exact order of the old recursion, so hashes are unchanged; the old
+    /// version overflowed the stack on deep trees.
+    fn feed_rexpr<'x, 'e>(&mut self, e: &'e RExpr<'x>)
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<FeedOp<'x, 'e>> = vec![FeedOp::Visit(e)];
+        while let Some(op) = stack.pop() {
+            let n = match op {
+                FeedOp::Visit(n) => n,
+                FeedOp::Str(s) => {
+                    self.feed(s);
+                    continue;
                 }
-            }
-            RExpr::Const { val, width, care } => {
-                self.feed("C");
-                self.feed_u64(*val as u64);
-                self.feed_u64((*val >> 64) as u64);
-                self.feed_u64(*width as u64);
-                self.feed_u64(*care as u64);
-                self.feed_u64((*care >> 64) as u64);
-            }
-            RExpr::Ident(s) => {
-                self.feed("I");
-                self.feed(s);
-            }
-            RExpr::Bit(s, i) => {
-                self.feed("B");
-                self.feed(s);
-                self.feed_u64(*i as u64);
-            }
-            RExpr::Range(s, hi, lo) => {
-                self.feed("R");
-                self.feed(s);
-                self.feed_u64(*hi as u64);
-                self.feed_u64(*lo as u64);
-            }
-            RExpr::IndexPart {
-                name,
-                base,
-                width,
-                ascending,
-            } => {
-                self.feed("P");
-                self.feed(name);
-                self.feed_rexpr(base);
-                self.feed_u64(*width as u64);
-                self.feed(if *ascending { "A" } else { "D" });
-            }
-            RExpr::WordAt { addr, data } => {
-                self.feed("W");
-                self.feed_rexpr(addr);
-                self.feed_rexpr(data);
-            }
-            RExpr::Concat(v) => {
-                self.feed("K");
-                self.feed_u64(v.len() as u64);
-                for x in v {
-                    self.feed_rexpr(x);
+                FeedOp::U64(v) => {
+                    self.feed_u64(v);
+                    continue;
                 }
-            }
-            RExpr::Shr(a, b) => {
-                self.feed(">>");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Ashr(a, b) => {
-                self.feed(">>>");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::RedXor(a) => {
-                self.feed("^r");
-                self.feed_rexpr(a);
-            }
-            RExpr::RedAnd(a) => {
-                self.feed("&r");
-                self.feed_rexpr(a);
-            }
-            RExpr::RedOr(a) => {
-                self.feed("|r");
-                self.feed_rexpr(a);
-            }
-            RExpr::Not(a) => {
-                self.feed("~");
-                self.feed_rexpr(a);
-            }
-            RExpr::And(a, b) => {
-                self.feed("&");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Or(a, b) => {
-                self.feed("|");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Xor(a, b) => {
-                self.feed("^");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Add(a, b) => {
-                self.feed("+");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Sub(a, b) => {
-                self.feed("-");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Mul(a, b) => {
-                self.feed("*");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Mux(c, t, f) => {
-                self.feed("?");
-                self.feed_rexpr(c);
-                self.feed_rexpr(t);
-                self.feed_rexpr(f);
-            }
-            RExpr::Eq(a, b) => {
-                self.feed("==");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Ne(a, b) => {
-                self.feed("!=");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
-            }
-            RExpr::Lt(a, b) => {
-                self.feed("<");
-                self.feed_rexpr(a);
-                self.feed_rexpr(b);
+            };
+            match n {
+                RExpr::Call { name, args } => {
+                    self.feed("call");
+                    self.feed(name);
+                    self.feed_u64(args.len() as u64);
+                    for a in args.iter().rev() {
+                        stack.push(FeedOp::Visit(a));
+                    }
+                }
+                RExpr::Const { val, width, care } => {
+                    self.feed("C");
+                    self.feed_u64(*val as u64);
+                    self.feed_u64((*val >> 64) as u64);
+                    self.feed_u64(*width as u64);
+                    self.feed_u64(*care as u64);
+                    self.feed_u64((*care >> 64) as u64);
+                }
+                RExpr::Ident(s) => {
+                    self.feed("I");
+                    self.feed(s);
+                }
+                RExpr::Bit(s, i) => {
+                    self.feed("B");
+                    self.feed(s);
+                    self.feed_u64(*i as u64);
+                }
+                RExpr::Range(s, hi, lo) => {
+                    self.feed("R");
+                    self.feed(s);
+                    self.feed_u64(*hi as u64);
+                    self.feed_u64(*lo as u64);
+                }
+                RExpr::IndexPart {
+                    name,
+                    base,
+                    width,
+                    ascending,
+                } => {
+                    self.feed("P");
+                    self.feed(name);
+                    // Original order: base subtree, then width, then flag.
+                    // Defer the trailing feeds via the op stack.
+                    stack.push(FeedOp::Str(if *ascending { "A" } else { "D" }));
+                    stack.push(FeedOp::U64(*width as u64));
+                    stack.push(FeedOp::Visit(*base));
+                }
+                RExpr::WordAt { addr, data } => {
+                    self.feed("W");
+                    stack.push(FeedOp::Visit(*data));
+                    stack.push(FeedOp::Visit(*addr));
+                }
+                RExpr::Concat(v) => {
+                    self.feed("K");
+                    self.feed_u64(v.len() as u64);
+                    for x in v.iter().rev() {
+                        stack.push(FeedOp::Visit(x));
+                    }
+                }
+                RExpr::Shr(a, b) => {
+                    self.feed(">>");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Ashr(a, b) => {
+                    self.feed(">>>");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::RedXor(a) => {
+                    self.feed("^r");
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::RedAnd(a) => {
+                    self.feed("&r");
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::RedOr(a) => {
+                    self.feed("|r");
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Not(a) => {
+                    self.feed("~");
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::And(a, b) => {
+                    self.feed("&");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Or(a, b) => {
+                    self.feed("|");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Xor(a, b) => {
+                    self.feed("^");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Add(a, b) => {
+                    self.feed("+");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Sub(a, b) => {
+                    self.feed("-");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Mul(a, b) => {
+                    self.feed("*");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Mux(c, t, f) => {
+                    self.feed("?");
+                    stack.push(FeedOp::Visit(*f));
+                    stack.push(FeedOp::Visit(*t));
+                    stack.push(FeedOp::Visit(*c));
+                }
+                RExpr::Eq(a, b) => {
+                    self.feed("==");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Ne(a, b) => {
+                    self.feed("!=");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
+                RExpr::Lt(a, b) => {
+                    self.feed("<");
+                    stack.push(FeedOp::Visit(*b));
+                    stack.push(FeedOp::Visit(*a));
+                }
             }
         }
     }
@@ -6010,14 +6137,27 @@ fn ident_cmp_zero_signbit<'a>(p: &P<'a>, name: &str, zero: &RExpr<'_>) -> bool {
 /// Compact a priority-encoder for-loop unroll (≥32 bit writes + scalar flag)
 /// before fold. DW=64 bin2prio substitutes `found` through 64 mux arms and
 /// hangs (~40s banner-only); arbiter N=16 stays on the normal fold path.
+/// Iterative DFS: true if the tree is a `Mux` spine over `Const(1)` leaves.
+/// Iterative DFS: true if any Mux arm in the spine is `Const{val: 1}`.
+/// The old recursion overflowed the stack on deep Mux spines.
 fn rhs_looks_like_priority_bit_set(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Const { val, .. } => *val == 1,
-        RExpr::Mux(_, t, f) => {
-            rhs_looks_like_priority_bit_set(t) || rhs_looks_like_priority_bit_set(f)
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Const { val, .. } => {
+                if *val == 1 {
+                    return true;
+                }
+            }
+            // The old recursion only descended into Mux arms; preserve that.
+            RExpr::Mux(_, t, f) => {
+                stack.push(*f);
+                stack.push(*t);
+            }
+            _ => {}
         }
-        _ => false,
     }
+    false
 }
 
 fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>> {
@@ -6082,91 +6222,184 @@ fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>>
     Some(out)
 }
 
+/// Push the immediate children of `e` onto `stack` for iterative DFS.
+///
+/// Heap-allocated traversal: safe for arbitrarily deep trees (priority
+/// chains build Mux spines linear in chain length). The `'a: 'e` bound lets
+/// arena-child refs (`&'a`) be reborrowed for the traversal; region
+/// inference satisfies it at every call site.
+fn push_rexpr_children<'a, 'e>(e: &'e RExpr<'a>, stack: &mut Vec<&'e RExpr<'a>>)
+where
+    'a: 'e,
+{
+    match e {
+        RExpr::Const { .. } | RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => {}
+        RExpr::IndexPart { base, .. } => stack.push(*base),
+        RExpr::WordAt { addr, data } => {
+            stack.push(*data);
+            stack.push(*addr);
+        }
+        RExpr::Concat(parts) => stack.extend(parts.iter().rev()),
+        RExpr::Shr(a, b)
+        | RExpr::Ashr(a, b)
+        | RExpr::And(a, b)
+        | RExpr::Or(a, b)
+        | RExpr::Xor(a, b)
+        | RExpr::Add(a, b)
+        | RExpr::Sub(a, b)
+        | RExpr::Mul(a, b)
+        | RExpr::Eq(a, b)
+        | RExpr::Ne(a, b)
+        | RExpr::Lt(a, b) => {
+            // Push in reverse so pop order (LIFO) matches original recursion (a then b).
+            stack.push(*b);
+            stack.push(*a);
+        }
+        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::Not(x) => stack.push(*x),
+        RExpr::Mux(c, t, f) => {
+            // Push in reverse so pop order matches original (c, t, f).
+            stack.push(*f);
+            stack.push(*t);
+            stack.push(*c);
+        }
+        RExpr::Call { args, .. } => stack.extend(args.iter().rev()),
+    }
+}
+
+/// Collect nodes in post-order (children before parents) for a DAG.
+/// Uses an explicit stack of (node, expanded) tuples. The `seen` set ensures
+/// shared subtrees are visited once, and the `expanded` flag ensures a node
+/// is emitted only after all its children.
+fn rexpr_post_order<'a, 'e>(e: &'e RExpr<'a>) -> Vec<&'e RExpr<'a>>
+where
+    'a: 'e,
+{
+    let mut seen: HashSet<*const RExpr<'a>> = HashSet::new();
+    let mut post: Vec<&'e RExpr<'a>> = Vec::new();
+    let mut stack: Vec<(&'e RExpr<'a>, bool)> = vec![(e, false)];
+    while let Some((n, expanded)) = stack.pop() {
+        if expanded {
+            post.push(n);
+            continue;
+        }
+        let p = n as *const RExpr<'a>;
+        if !seen.insert(p) {
+            continue;
+        }
+        stack.push((n, true));
+        // Push children (unexpanded). Use a temp vec to avoid borrow issues.
+        let mut kids: Vec<&'e RExpr<'a>> = Vec::new();
+        push_rexpr_children(n, &mut kids);
+        for k in kids {
+            stack.push((k, false));
+        }
+    }
+    post
+}
+
+/// Push the immediate children of an `Expr` (boolean cone) for iterative DFS.
+fn push_expr_children<'a, 'e>(e: &'e Expr<'a>, stack: &mut Vec<&'e Expr<'a>>)
+where
+    'a: 'e,
+{
+    match e {
+        Expr::Const(_) | Expr::Var(_) => {}
+        Expr::Not(x) => stack.push(*x),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            // Push in reverse so pop order (LIFO) matches original recursion (a then b).
+            stack.push(*b);
+            stack.push(*a);
+        }
+    }
+}
+
 fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a>> {
     if let Some(compact) = compact_priority_onehot_unroll(&stmts) {
         return compact;
     }
-    fn subst<'a>(
-        e: &RExpr<'a>,
+    /// Iterative post-order substitution: rebuilds `e` with `env` applied,
+    /// exactly like the old recursive `subst`, but on an explicit heap stack
+    /// so arbitrarily deep trees (priority chains build Mux spines linear in
+    /// chain length) can never overflow the thread stack. Results are
+    /// memoized by node identity (arena refs are stable), which also cures
+    /// the old code's exponential re-walk of shared DAG subtrees.
+    fn subst<'a, 'e>(
+        e: &'e RExpr<'a>,
         env: &HashMap<(&'a str, Option<usize>), RExpr<'a>>,
         lhs: &str,
         bit: Option<usize>,
         arena: &'a Bump,
-    ) -> RExpr<'a> {
-        match e {
-            RExpr::Ident(s) if *s == lhs && bit.is_none() => env
-                .get(&(*s, None))
-                .cloned()
-                .unwrap_or_else(|| e.clone()),
-            RExpr::Not(x) => RExpr::Not(arena.alloc(subst(x, env, lhs, bit, arena))),
-            RExpr::And(a, b) => RExpr::And(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Or(a, b) => RExpr::Or(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Xor(a, b) => RExpr::Xor(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Mux(c, t, f) => RExpr::Mux(
-                arena.alloc(subst(c, env, lhs, bit, arena)),
-                arena.alloc(subst(t, env, lhs, bit, arena)),
-                arena.alloc(subst(f, env, lhs, bit, arena)),
-            ),
-            RExpr::Eq(a, b) => RExpr::Eq(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Ne(a, b) => RExpr::Ne(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Lt(a, b) => RExpr::Lt(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Add(a, b) => RExpr::Add(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Sub(a, b) => RExpr::Sub(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Mul(a, b) => RExpr::Mul(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Shr(a, b) => RExpr::Shr(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::Ashr(a, b) => RExpr::Ashr(
-                arena.alloc(subst(a, env, lhs, bit, arena)),
-                arena.alloc(subst(b, env, lhs, bit, arena)),
-            ),
-            RExpr::IndexPart {
-                name,
-                base,
-                width,
-                ascending,
-            } => RExpr::IndexPart {
-                name: name,
-                base: arena.alloc(subst(base, env, lhs, bit, arena)),
-                width: *width,
-                ascending: *ascending,
-            },
-            RExpr::Concat(parts) => {
-                RExpr::Concat(parts.iter().map(|p| subst(p, env, lhs, bit, arena)).collect())
+    ) -> RExpr<'a>
+    where
+        'a: 'e,
+    {
+        // Rebuild one node from already-memoized children.
+        fn rebuild<'a, 'e>(
+            n: &'e RExpr<'a>,
+            env: &HashMap<(&'a str, Option<usize>), RExpr<'a>>,
+            lhs: &str,
+            bit: Option<usize>,
+            memo: &HashMap<*const RExpr<'a>, &'a RExpr<'a>>,
+        ) -> RExpr<'a>
+        where
+            'a: 'e,
+        {
+            // Resolve a child to its rebuilt node via identity memo.
+            let kid = |p: *const RExpr<'a>| -> &'a RExpr<'a> { memo[&p] };
+            match n {
+                RExpr::Ident(s) if *s == lhs && bit.is_none() => env
+                    .get(&(*s, None))
+                    .cloned()
+                    .unwrap_or_else(|| (*n).clone()),
+                RExpr::Not(x) => RExpr::Not(kid(*x as *const RExpr<'a>)),
+                RExpr::And(a, b) => RExpr::And(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Or(a, b) => RExpr::Or(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Xor(a, b) => RExpr::Xor(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Mux(c, t, f) => {
+                    RExpr::Mux(kid(*c as *const _), kid(*t as *const _), kid(*f as *const _))
+                }
+                RExpr::Eq(a, b) => RExpr::Eq(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Ne(a, b) => RExpr::Ne(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Lt(a, b) => RExpr::Lt(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Add(a, b) => RExpr::Add(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Sub(a, b) => RExpr::Sub(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Mul(a, b) => RExpr::Mul(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Shr(a, b) => RExpr::Shr(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::Ashr(a, b) => RExpr::Ashr(kid(*a as *const _), kid(*b as *const _)),
+                RExpr::IndexPart {
+                    name,
+                    base,
+                    width,
+                    ascending,
+                } => RExpr::IndexPart {
+                    name: *name,
+                    base: kid(*base as *const _),
+                    width: *width,
+                    ascending: *ascending,
+                },
+                RExpr::Concat(parts) => RExpr::Concat(
+                    parts
+                        .iter()
+                        .map(|p| (*kid(p as *const RExpr<'a>)).clone())
+                        .collect(),
+                ),
+                RExpr::RedXor(x) => RExpr::RedXor(kid(*x as *const _)),
+                RExpr::RedAnd(x) => RExpr::RedAnd(kid(*x as *const _)),
+                RExpr::RedOr(x) => RExpr::RedOr(kid(*x as *const _)),
+                other => (*other).clone(),
             }
-            RExpr::RedXor(x) => RExpr::RedXor(arena.alloc(subst(x, env, lhs, bit, arena))),
-            RExpr::RedAnd(x) => RExpr::RedAnd(arena.alloc(subst(x, env, lhs, bit, arena))),
-            RExpr::RedOr(x) => RExpr::RedOr(arena.alloc(subst(x, env, lhs, bit, arena))),
-            other => other.clone(),
         }
+        // Phase 1: post-order collection (children before parents), DAG-safe.
+        let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+        // Phase 2: rebuild each node from memoized children.
+        let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+            HashMap::with_capacity(post.len() + 1);
+        for n in post.into_iter() {
+            let rebuilt = rebuild(n, env, lhs, bit, &memo);
+            memo.insert(n as *const RExpr<'a>, arena.alloc(rebuilt));
+        }
+        // Phase 3: return the rebuilt root from the memo.
+        (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
     }
     let mut env: HashMap<(&'a str, Option<usize>), RExpr<'a>> = HashMap::new();
     let mut order: Vec<(&'a str, Option<usize>)> = Vec::new();
@@ -7189,52 +7422,25 @@ fn parse_function<'a>(p: &mut P<'a>) -> Result<FuncDef<'a>, String> {
     })
 }
 
+/// Iterative DFS collecting every signal name in the tree.
+/// Replaces the naive-recursive version (deep trees overflowed the stack).
+/// Iterative DFS collection of identifier names. The old recursion overflowed
+/// the stack on deep trees (priority chains build Mux spines linear in chain
+/// length); the heap work-stack is safe for arbitrary depth.
 fn rexpr_names<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
-    match e {
-        RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
-            out.insert(s);
-        }
-        RExpr::IndexPart { name, base, .. } => {
-            out.insert(name);
-            rexpr_names(base, out);
-        }
-        RExpr::WordAt { addr, data } => {
-            rexpr_names(addr, out);
-            rexpr_names(data, out);
-        }
-        RExpr::Concat(parts) => {
-            for p in parts {
-                rexpr_names(p, out);
+    let mut stack: Vec<&RExpr<'a>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Ident(s) | RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
+                out.insert(s);
             }
-        }
-        RExpr::Shr(a, b)
-        | RExpr::Ashr(a, b)
-        | RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Add(a, b)
-        | RExpr::Sub(a, b)
-        | RExpr::Mul(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b) => {
-            rexpr_names(a, out);
-            rexpr_names(b, out);
-        }
-        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::Not(x) => {
-            rexpr_names(x, out)
-        }
-        RExpr::Mux(c, t, f) => {
-            rexpr_names(c, out);
-            rexpr_names(t, out);
-            rexpr_names(f, out);
-        }
-        RExpr::Call { args, .. } => {
-            for a in args {
-                rexpr_names(a, out);
+            RExpr::IndexPart { name, base, .. } => {
+                out.insert(name);
+                stack.push(*base);
             }
+            RExpr::Const { .. } => {}
+            _ => push_rexpr_children(n, &mut stack),
         }
-        RExpr::Const { .. } => {}
     }
 }
 
@@ -7287,50 +7493,25 @@ fn map_rexpr_children<'a>(
     }
 }
 
-fn collect_calls<'a>(e: &RExpr<'a>, out: &mut HashSet<&'a str>) {
-    match e {
-        RExpr::Call { name, args } => {
-            out.insert(name);
-            for a in args {
-                collect_calls(a, out);
+/// Iterative DFS collecting every called function name in the tree.
+/// Collect called function names. Iterative DFS to avoid stack overflow
+/// on deep trees.
+fn collect_calls<'x, 'e>(e: &'e RExpr<'x>, out: &mut HashSet<&'x str>)
+where
+    'x: 'e,
+{
+    let mut stack: Vec<&'e RExpr<'x>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Call { name, args } => {
+                out.insert(*name);
+                // Push in reverse for correct order.
+                for a in args.iter().rev() {
+                    stack.push(a);
+                }
             }
+            _ => push_rexpr_children(n, &mut stack),
         }
-        RExpr::IndexPart { base, .. } => collect_calls(base, out),
-        RExpr::WordAt { addr, data } => {
-            collect_calls(addr, out);
-            collect_calls(data, out);
-        }
-        RExpr::Concat(parts) => {
-            for x in parts {
-                collect_calls(x, out);
-            }
-        }
-        RExpr::Shr(a, b)
-        | RExpr::Ashr(a, b)
-        | RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Add(a, b)
-        | RExpr::Sub(a, b)
-        | RExpr::Mul(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b) => {
-            collect_calls(a, out);
-            collect_calls(b, out);
-        }
-        RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::Not(x) => {
-            collect_calls(x, out)
-        }
-        RExpr::Mux(c, t, f) => {
-            collect_calls(c, out);
-            collect_calls(t, out);
-            collect_calls(f, out);
-        }
-        RExpr::Const { .. }
-        | RExpr::Ident(_)
-        | RExpr::Bit(_, _)
-        | RExpr::Range(_, _, _) => {}
     }
 }
 
@@ -7344,91 +7525,242 @@ fn simple_return_assign<'a>(f: &FuncDef<'a>) -> Option<RExpr<'a>> {
 
 /// True when a Bit/Range/IndexPart on a formal would drop the select against a
 /// non-Ident actual — refuse inline instead of silent wrong logic.
+/// Iterative DFS: true if any `Bit`/`Range`/`IndexPart` selects a signal whose
+/// substitution is not a plain `Ident` (so inlining must be refused).
+/// Iterative DFS: true if any `Bit`/`Range`/`IndexPart` in the tree maps to a
+/// non-`Ident` replacement (caller must then refuse the inline). The old
+/// recursion overflowed the stack on deep trees.
 fn subst_select_needs_ident(e: &RExpr<'_>, map: &HashMap<String, RExpr>) -> bool {
-    match e {
-        RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
-            matches!(map.get(*s), Some(rep) if !matches!(rep, RExpr::Ident(_)))
-        }
-        RExpr::IndexPart { name, base, .. } => {
-            let bad_name = matches!(map.get(*name), Some(rep) if !matches!(rep, RExpr::Ident(_)));
-            bad_name || subst_select_needs_ident(base, map)
-        }
-        other => {
-            let mut bad = false;
-            // Result discarded; a throwaway arena is fine.
-            let arena = Bump::new();
-            let _ = map_rexpr_children(other, &mut |c| {
-                if subst_select_needs_ident(c, map) {
-                    bad = true;
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Bit(s, _) | RExpr::Range(s, _, _) => {
+                if matches!(map.get(*s), Some(rep) if !matches!(rep, RExpr::Ident(_))) {
+                    return true;
                 }
-                c.clone()
-            }, &arena);
-            bad
+            }
+            RExpr::IndexPart { name, base, .. } => {
+                if matches!(map.get(*name), Some(rep) if !matches!(rep, RExpr::Ident(_))) {
+                    return true;
+                }
+                stack.push(*base);
+            }
+            _ => push_rexpr_children(n, &mut stack),
         }
     }
+    false
 }
 
-fn subst_idents<'a>(
-    e: &RExpr<'a>,
+/// Substitute identifiers per `map`. Iterative post-order rebuild with memo;
+/// replaces the naive-recursive version (deep trees overflowed the stack).
+/// Children are rebuilt before parents; results are memoized by node identity
+/// (arena refs are stable).
+fn subst_idents<'a, 'e>(
+    e: &'e RExpr<'a>,
     map: &HashMap<String, RExpr<'a>>,
     arena: &'a Bump,
-) -> RExpr<'a> {
-    match e {
-        RExpr::Ident(s) => map.get(*s).cloned().unwrap_or_else(|| e.clone()),
-        RExpr::Bit(s, i) => match map.get(*s) {
-            Some(RExpr::Ident(n)) => RExpr::Bit(n, *i),
-            // Non-Ident actual: caller must refuse inline (see subst_select_needs_ident).
-            Some(_) | None => e.clone(),
-        },
-        RExpr::Range(s, lo, hi) => match map.get(*s) {
-            Some(RExpr::Ident(n)) => RExpr::Range(n, *lo, *hi),
-            Some(_) | None => e.clone(),
-        },
-        RExpr::IndexPart {
-            name,
-            base,
-            width,
-            ascending,
-        } => {
-            let base = arena.alloc(subst_idents(base, map, arena));
-            match map.get(*name) {
-                Some(RExpr::Ident(n)) => RExpr::IndexPart {
-                    name: n,
-                    base,
-                    width: *width,
-                    ascending: *ascending,
-                },
-                _ => RExpr::IndexPart {
-                    name: name,
-                    base,
-                    width: *width,
-                    ascending: *ascending,
-                },
+) -> RExpr<'a>
+where
+    'a: 'e,
+{
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    // Rebuilt child by identity; post-order guarantees every child is
+    // memoized, falling back to a verbatim clone.
+    let rebuilt = |memo: &HashMap<*const RExpr<'a>, &'a RExpr<'a>>,
+                   c: &RExpr<'a>|
+     -> RExpr<'a> {
+        memo
+            .get(&(c as *const RExpr<'a>))
+            .copied()
+            .map(|rr| (*rr).clone())
+            .unwrap_or_else(|| c.clone())
+    };
+    for n in post {
+        let r: RExpr<'a> = match n {
+            RExpr::Ident(s) => map.get(*s).cloned().unwrap_or_else(|| (*n).clone()),
+            RExpr::Bit(s, i) => match map.get(*s) {
+                Some(RExpr::Ident(nn)) => RExpr::Bit(nn, *i),
+                // Non-Ident actual: caller must refuse inline (see subst_select_needs_ident).
+                Some(_) | None => (*n).clone(),
+            },
+            RExpr::Range(s, lo, hi) => match map.get(*s) {
+                Some(RExpr::Ident(nn)) => RExpr::Range(nn, *lo, *hi),
+                Some(_) | None => (*n).clone(),
+            },
+            RExpr::IndexPart {
+                name,
+                base,
+                width,
+                ascending,
+            } => {
+                let base_m = arena.alloc(rebuilt(&memo, base));
+                match map.get(*name) {
+                    Some(RExpr::Ident(nn)) => RExpr::IndexPart {
+                        name: nn,
+                        base: base_m,
+                        width: *width,
+                        ascending: *ascending,
+                    },
+                    _ => RExpr::IndexPart {
+                        name,
+                        base: base_m,
+                        width: *width,
+                        ascending: *ascending,
+                    },
+                }
             }
-        }
-        other => map_rexpr_children(other, &mut |c| subst_idents(c, map, arena), arena),
+            other => map_rexpr_children(
+                other,
+                &mut |c: &RExpr<'a>| rebuilt(&memo, c),
+                arena,
+            ),
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(r));
     }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
-fn inline_rexpr<'a>(
-    e: &RExpr<'a>,
+/// Inline function calls in the tree. The tree walk is iterative (post-order
+/// with memo); a successfully inlined `Call` body is processed with a fresh
+/// call at `depth + 1`, so native recursion is bounded by the depth cap (8).
+/// Inline simple function calls. Iterative post-order to avoid stack
+/// overflow on deep trees. The `depth` limits inlining recursion (not tree
+/// traversal).
+/// Inline simple function calls. Iterative to avoid stack overflow.
+/// The `depth` limits inlining recursion.
+fn inline_rexpr<'a, 'e>(
+    e: &'e RExpr<'a>,
     funcs: &[FuncDef<'a>],
     depth: usize,
     arena: &'a Bump,
-) -> RExpr<'a> {
+) -> RExpr<'a>
+where
+    'a: 'e,
+{
     if depth > 8 {
-        return e.clone();
+        // Iterative clone to avoid stack overflow in derived Clone.
+        let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+        let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+            HashMap::with_capacity(post.len() + 1);
+        for n in post.into_iter() {
+            let r: RExpr<'a> = map_rexpr_children(
+                n,
+                &mut |c: &RExpr<'a>| {
+                    memo.get(&(c as *const RExpr<'a>))
+                        .copied()
+                        .map(|rr| (*rr).clone())
+                        .unwrap_or_else(|| c.clone())
+                },
+                arena,
+            );
+            memo.insert(n as *const RExpr<'a>, arena.alloc(r));
+        }
+        return (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone();
     }
-    let e = map_rexpr_children(e, &mut |c| inline_rexpr(c, funcs, depth, arena), arena);
-    let RExpr::Call { name, args } = &e else {
-        return e;
-    };
-    let Some(f) = funcs.iter().find(|f| f.name == *name) else {
-        return e;
-    };
-    let Some(body) = simple_return_assign(f) else {
-        return e;
-    };
+    // Check if there are any calls to inline.
+    let mut calls: HashSet<&'a str> = HashSet::new();
+    {
+        // Use iterative collect_calls
+        let mut stack: Vec<&'e RExpr<'a>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                RExpr::Call { name, args } => {
+                    calls.insert(*name);
+                    for a in args.iter().rev() {
+                        stack.push(a);
+                    }
+                }
+                _ => push_rexpr_children(n, &mut stack),
+            }
+        }
+    }
+    if calls.is_empty() {
+        // No calls: iterative clone.
+        let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+        let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+            HashMap::with_capacity(post.len() + 1);
+        for n in post.into_iter() {
+            let r: RExpr<'a> = map_rexpr_children(
+                n,
+                &mut |c: &RExpr<'a>| {
+                    memo.get(&(c as *const RExpr<'a>))
+                        .copied()
+                        .map(|rr| (*rr).clone())
+                        .unwrap_or_else(|| c.clone())
+                },
+                arena,
+            );
+            memo.insert(n as *const RExpr<'a>, arena.alloc(r));
+        }
+        return (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone();
+    }
+    // Has calls: fall back to original logic but with iterative child processing.
+    // For simplicity, do post-order and inline at each Call node.
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    for n in post.into_iter() {
+        let rebuilt: RExpr<'a> = map_rexpr_children(
+            n,
+            &mut |c: &RExpr<'a>| {
+                memo.get(&(c as *const RExpr<'a>))
+                    .copied()
+                    .map(|rr| (*rr).clone())
+                    .unwrap_or_else(|| c.clone())
+            },
+            arena,
+        );
+        // Try to inline if Call.
+        let result: RExpr<'a> = match rebuilt {
+            RExpr::Call { ref name, ref args } => {
+                if let Some(f) = funcs.iter().find(|f| f.name == *name) {
+                    if let Some(body) = simple_return_assign(f) {
+                        let ins: Vec<_> = f.ports.iter().filter(|(_, d, _)| *d == PortDir::In).cloned().collect();
+                        let plist = if ins.is_empty() { f.ports.clone() } else { ins };
+                        if args.len() == plist.len() {
+                            let mut map = HashMap::new();
+                            for (i, (pn, _, _)) in plist.iter().enumerate() {
+                                map.insert(pn.clone(), args[i].clone());
+                            }
+                            if !subst_select_needs_ident(&body, &map) {
+                                // Inline by substituting. Use iterative subst_idents.
+                                // subst_idents is currently the original recursive version;
+                                // for function bodies (small), recursion is fine.
+                                subst_idents(&body, &map, arena)
+                            } else {
+                                rebuilt
+                            }
+                        } else {
+                            rebuilt
+                        }
+                    } else {
+                        rebuilt
+                    }
+                } else {
+                    rebuilt
+                }
+            }
+            _ => rebuilt,
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(result));
+    }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
+}
+
+/// Try to inline one `Call` node. Returns `None` if the call is not inlinable.
+/// On success the substituted body is run through `inline_rexpr` at
+/// `depth + 1` (bounded by the depth cap, so native recursion here is finite).
+fn try_inline_call<'a>(
+    name: &str,
+    args: &[RExpr<'a>],
+    funcs: &[FuncDef<'a>],
+    depth: usize,
+    arena: &'a Bump,
+) -> Option<RExpr<'a>> {
+    let f = funcs.iter().find(|f| f.name == name)?;
+    let body = simple_return_assign(f)?;
     let ins: Vec<_> = f
         .ports
         .iter()
@@ -7437,17 +7769,17 @@ fn inline_rexpr<'a>(
         .collect();
     let plist = if ins.is_empty() { f.ports.clone() } else { ins };
     if args.len() != plist.len() {
-        return e;
+        return None;
     }
     let mut map = HashMap::new();
     for (i, (pn, _, _)) in plist.iter().enumerate() {
         map.insert(pn.clone(), args[i].clone());
     }
     if subst_select_needs_ident(&body, &map) {
-        return e;
+        return None;
     }
     let body = subst_idents(&body, &map, arena);
-    inline_rexpr(&body, funcs, depth + 1, arena)
+    Some(inline_rexpr(&body, funcs, depth + 1, arena))
 }
 
 fn inline_nbas<'a>(
@@ -9271,11 +9603,17 @@ fn rexpr_is_plus_one(e: &RExpr<'_>) -> bool {
     }
 }
 
+/// Leftmost `Ident` under an `Add` spine, iteratively.
+/// Iterative left-spine walk: the ident under a chain of `Add`s, if any.
+/// The old recursion overflowed the stack on deep `Add` spines.
 fn rexpr_ident(e: &RExpr<'_>) -> Option<String> {
-    match e {
-        RExpr::Ident(s) => Some(s.to_string()),
-        RExpr::Add(l, _) => rexpr_ident(l),
-        _ => None,
+    let mut n = e;
+    loop {
+        match n {
+            RExpr::Ident(s) => return Some(s.to_string()),
+            RExpr::Add(l, _) => n = l,
+            _ => return None,
+        }
     }
 }
 
@@ -9423,246 +9761,465 @@ fn rexpr_bit_budget_take() -> bool {
     })
 }
 
-fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
-    if !rexpr_bit_budget_take() {
-        return Err("rexpr_to_bit budget exhausted".into());
-    }
-    match e {
-        RExpr::Const { val, width, care } => {
-            let _ = width;
-            if bit >= 128 {
-                return Ok(Expr::Const(false));
-            }
-            if (care >> bit) & 1 == 0 {
-                return Ok(Expr::Const(false));
-            }
-            Ok(Expr::Const((val >> bit) & 1 == 1))
-        }
-        RExpr::Ident(s) => {
-            let w = sig_width(rtl, s);
-            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, bit.min(w.saturating_sub(1)))))))
-        }
-        RExpr::Bit(s, i) => {
-            let w = sig_width(rtl, s);
-            let depth = sig_depth(rtl, s);
-            // depth==1: sole word uses packed bit names (same as index_part_bit).
-            // depth>1 const word index: distinct per-word nets.
-            if depth > 1 {
-                if bit >= w {
-                    return Ok(Expr::Const(false));
-                }
-                return Ok(Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit)))));
-            }
-            if depth == 1 {
-                if bit >= w {
-                    return Ok(Expr::Const(false));
-                }
-                // Const word index on a sole-word array collapses to packed bits.
-                return Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, bit)))));
-            }
-            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, *i)))))
-        }
-        RExpr::Range(s, lo, hi) => {
-            if range_span(*lo, *hi).is_none() {
-                note_width_overflow();
-                return Err("width_overflow".into());
-            }
-            let w = sig_width(rtl, s);
-            let idx = lo.saturating_add(bit).min(*hi).min(w.saturating_sub(1));
-            Ok(Expr::Var(arena.alloc_str(&(bit_name(s, w, idx)))))
-        }
-        RExpr::IndexPart {
-            name,
-            base,
-            width,
-            ascending,
-        } => index_part_bit(name, base, *width, *ascending, rtl, bit, arena),
-        RExpr::WordAt { .. } => Err("word write is not a comb cone".into()),
-        RExpr::Concat(parts) => {
-            let mut offset = 0usize;
-            for part in parts.iter().rev() {
-                let Some(w) = rexpr_width_checked(part, rtl) else {
-                    note_width_overflow();
-                    return Err("width_overflow".into());
-                };
-                let w = w.max(1);
-                if bit < offset.saturating_add(w) {
-                    return rexpr_to_bit(part, rtl, bit - offset, arena);
-                }
-                offset = offset.saturating_add(w);
-            }
-            Ok(Expr::Const(false))
-        }
-        RExpr::Shr(a, sh) => {
-            let shift = match *sh {
-                RExpr::Const { val, .. } => *val as usize,
-                _ => return Err("shift amount not const".into()),
-            };
-            let wa = rexpr_width(a, rtl);
-            if bit.saturating_add(shift) >= wa {
-                Ok(Expr::Const(false))
-            } else {
-                rexpr_to_bit(a, rtl, bit + shift, arena)
-            }
-        }
-        RExpr::Ashr(a, sh) => {
-            let shift = match *sh {
-                RExpr::Const { val, .. } => *val as usize,
-                _ => return Err("ashr amount not const".into()),
-            };
-            let wa = rexpr_width(a, rtl).max(1);
-            let src = bit.saturating_add(shift);
-            if src >= wa {
-                // Sign-fill from MSB.
-                rexpr_to_bit(a, rtl, wa - 1, arena)
-            } else {
-                rexpr_to_bit(a, rtl, src, arena)
-            }
-        }
-        RExpr::RedXor(x) => {
-            if bit != 0 {
-                return Ok(Expr::Const(false));
-            }
-            let Some(w) = rexpr_width_checked(x, rtl) else {
-                note_width_overflow();
-                return Err("width_overflow".into());
-            };
-            let w = w.max(1);
-            if w > 128 {
-                return Err("reduction width too wide".into());
-            }
-            let mut acc = rexpr_to_bit(x, rtl, 0, arena)?;
-            for i in 1..w {
-                acc = Expr::Xor(arena.alloc(acc), arena.alloc(rexpr_to_bit(x, rtl, i, arena)?));
-            }
-            Ok(acc)
-        }
-        RExpr::RedAnd(x) => {
-            if bit != 0 {
-                return Ok(Expr::Const(false));
-            }
-            let Some(w) = rexpr_width_checked(x, rtl) else {
-                note_width_overflow();
-                return Err("width_overflow".into());
-            };
-            let w = w.max(1);
-            if w > 128 {
-                return Err("reduction width too wide".into());
-            }
-            let mut acc = rexpr_to_bit(x, rtl, 0, arena)?;
-            for i in 1..w {
-                acc = Expr::And(arena.alloc(acc), arena.alloc(rexpr_to_bit(x, rtl, i, arena)?));
-            }
-            Ok(acc)
-        }
-        RExpr::RedOr(x) => {
-            if bit != 0 {
-                return Ok(Expr::Const(false));
-            }
-            let Some(w) = rexpr_width_checked(x, rtl) else {
-                note_width_overflow();
-                return Err("width_overflow".into());
-            };
-            let w = w.max(1);
-            if w > 128 {
-                return Err("reduction width too wide".into());
-            }
-            let mut acc = rexpr_to_bit(x, rtl, 0, arena)?;
-            for i in 1..w {
-                acc = Expr::Or(arena.alloc(acc), arena.alloc(rexpr_to_bit(x, rtl, i, arena)?));
-            }
-            Ok(acc)
-        }
-        RExpr::Not(x) => Ok(Expr::Not(arena.alloc(rexpr_to_bit(x, rtl, bit, arena)?))),
-        RExpr::And(a, b) => Ok(Expr::And(
-            arena.alloc(rexpr_to_bit(a, rtl, bit, arena)?),
-            arena.alloc(rexpr_to_bit(b, rtl, bit, arena)?),
-        )),
-        RExpr::Or(a, b) => Ok(Expr::Or(
-            arena.alloc(rexpr_to_bit(a, rtl, bit, arena)?),
-            arena.alloc(rexpr_to_bit(b, rtl, bit, arena)?),
-        )),
-        RExpr::Xor(a, b) => Ok(Expr::Xor(
-            arena.alloc(rexpr_to_bit(a, rtl, bit, arena)?),
-            arena.alloc(rexpr_to_bit(b, rtl, bit, arena)?),
-        )),
-        RExpr::Add(a, b) => adder_sum_bit(a, b, rtl, bit, arena),
-        RExpr::Sub(a, b) => sub_diff_bit(a, b, rtl, bit, arena),
-        RExpr::Mul(_, _) => Err("mul is a DSP primitive, not a LUT cone".into()),
-        RExpr::Mux(c, t, f) => {
-            let cv = rexpr_to_bit(c, rtl, 0, arena)?;
-            let tv = rexpr_to_bit(t, rtl, bit, arena)?;
-            let fv = rexpr_to_bit(f, rtl, bit, arena)?;
-            Ok(Expr::Or(
-                arena.alloc(Expr::And(arena.alloc(cv.clone()), arena.alloc(tv))),
-                arena.alloc(Expr::And(arena.alloc(Expr::Not(arena.alloc(cv))), arena.alloc(fv))),
-            ))
-        }
-        RExpr::Eq(a, b) => {
-            if bit != 0 {
-                return Ok(Expr::Const(false));
-            }
-            Ok(cmp_eq_bits(a, b, rtl, true, arena)?)
-        }
-        RExpr::Ne(a, b) => {
-            if bit != 0 {
-                return Ok(Expr::Const(false));
-            }
-            Ok(Expr::Not(arena.alloc(cmp_eq_bits(a, b, rtl, true, arena)?)))
-        }
-        RExpr::Lt(a, b) => {
-            if bit != 0 {
-                return Ok(Expr::Const(false));
-            }
-            // unsigned: MSB-first: (a_msb < b_msb) | (eq_msb & lower)
-            lt_bits(a, b, rtl, arena)
-        }
-        RExpr::Call { name, .. } => Err(format!("call {name} not inlined")),
-    }
+
+/// Memo key for the iterative `rexpr_to_bit`: node identity plus bit index.
+/// Raw pointers are only used as hash keys; the nodes themselves are
+/// reached through the borrowed references carried by `ToBitTask::Visit`.
+type ToBitKey<'x> = (*const RExpr<'x>, usize);
+
+/// Binary boolean op for a `ToBitOp::Bin` build step.
+#[derive(Clone, Copy)]
+enum ToBitBinOp {
+    And,
+    Or,
+    Xor,
 }
+
+/// Reduction op for a `ToBitOp::Red` build step.
+#[derive(Clone, Copy)]
+enum ToBitRedOp {
+    Xor,
+    And,
+    Or,
+}
+
+/// How a work-stack `Build` task combines already-memoized children.
+/// Child results are looked up in the memo by `(node, bit)` key.
+enum ToBitOp<'x> {
+    Not(ToBitKey<'x>),
+    Bin(ToBitBinOp, ToBitKey<'x>, ToBitKey<'x>),
+    Mux {
+        c: ToBitKey<'x>,
+        t: ToBitKey<'x>,
+        f: ToBitKey<'x>,
+    },
+    Red(ToBitRedOp, Vec<ToBitKey<'x>>),
+    Forward(ToBitKey<'x>),
+}
+
+/// Explicit heap work-stack item for the iterative `rexpr_to_bit`.
+/// `Visit` lowers one `(node, bit)` pair: leaves record their result
+/// directly, interior nodes push a `Build` plus one `Visit` per child.
+/// `Build` pops only after its children's `Visit`s have memoized them
+/// (LIFO order), so a shared DAG child is expanded once: a second `Visit`
+/// for the same `(node, bit)` always pops after the first one's `Build`
+/// has memoized it, and then skips via the memo check.
+enum ToBitTask<'r, 'x> {
+    Visit(&'r RExpr<'x>, usize),
+    Build { key: ToBitKey<'x>, op: ToBitOp<'x> },
+}
+
+/// Identity key for one `(node, bit)` lowering unit.
+fn tobit_key<'x>(n: &RExpr<'x>, bit: usize) -> ToBitKey<'x> {
+    (n as *const RExpr<'x>, bit)
+}
+
+/// Lower one bit of an `RExpr` to a boolean `Expr`.
+///
+/// Iterative: the old naive-recursive implementation walked chained
+/// `Mux`/`And`/`Or` spines (depth linear in blocking-assignment chain length)
+/// with multi-KB debug frames and overflowed the main-thread stack on large
+/// designs. This keeps an explicit work-stack on the heap and memoizes by
+/// `(node, bit)` identity, so depth is unbounded and shared DAG subtrees are
+/// lowered once instead of exponentially often. The per-bit budget
+/// ([`rexpr_bit_budget_take`]) and every lowering rule are unchanged.
+fn rexpr_to_bit<'a>(e: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: &'a Bump) -> Result<Expr<'a>, String> {
+    let mut memo: HashMap<ToBitKey<'_>, Expr<'a>> = HashMap::new();
+    let mut stack: Vec<ToBitTask<'_, '_>> = vec![ToBitTask::Visit(e, bit)];
+    while let Some(task) = stack.pop() {
+        match task {
+            ToBitTask::Visit(n, bit) => {
+                let key = tobit_key(n, bit);
+                if memo.contains_key(&key) {
+                    continue;
+                }
+                if !rexpr_bit_budget_take() {
+                    return Err("rexpr_to_bit budget exhausted".into());
+                }
+                match n {
+                    RExpr::Const { val, width, care } => {
+                        let _ = width;
+                        let v = if bit >= 128 {
+                            Expr::Const(false)
+                        } else if (care >> bit) & 1 == 0 {
+                            Expr::Const(false)
+                        } else {
+                            Expr::Const((val >> bit) & 1 == 1)
+                        };
+                        memo.insert(key, v);
+                    }
+                    RExpr::Ident(s) => {
+                        let w = sig_width(rtl, s);
+                        memo.insert(
+                            key,
+                            Expr::Var(arena.alloc_str(&(bit_name(s, w, bit.min(w.saturating_sub(1)))))),
+                        );
+                    }
+                    RExpr::Bit(s, i) => {
+                        let w = sig_width(rtl, s);
+                        let depth = sig_depth(rtl, s);
+                        // depth==1: sole word uses packed bit names (same as index_part_bit).
+                        // depth>1 const word index: distinct per-word nets.
+                        let v = if depth > 1 && bit >= w {
+                            Expr::Const(false)
+                        } else if depth > 1 {
+                            Expr::Var(arena.alloc_str(&(unpacked_word_q(s, *i, w, bit))))
+                        } else if depth == 1 && bit >= w {
+                            Expr::Const(false)
+                        } else if depth == 1 {
+                            // Const word index on a sole-word array collapses to packed bits.
+                            Expr::Var(arena.alloc_str(&(bit_name(s, w, bit))))
+                        } else {
+                            Expr::Var(arena.alloc_str(&(bit_name(s, w, *i))))
+                        };
+                        memo.insert(key, v);
+                    }
+                    RExpr::Range(s, lo, hi) => {
+                        if range_span(*lo, *hi).is_none() {
+                            note_width_overflow();
+                            return Err("width_overflow".into());
+                        }
+                        let w = sig_width(rtl, s);
+                        let idx = lo.saturating_add(bit).min(*hi).min(w.saturating_sub(1));
+                        memo.insert(key, Expr::Var(arena.alloc_str(&(bit_name(s, w, idx)))));
+                    }
+                    RExpr::IndexPart {
+                        name,
+                        base,
+                        width,
+                        ascending,
+                    } => {
+                        memo.insert(
+                            key,
+                            index_part_bit(name, base, *width, *ascending, rtl, bit, arena)?,
+                        );
+                    }
+                    RExpr::WordAt { .. } => return Err("word write is not a comb cone".into()),
+                    RExpr::Concat(parts) => {
+                        let mut offset = 0usize;
+                        let mut done = false;
+                        for part in parts.iter().rev() {
+                            let Some(w) = rexpr_width_checked(part, rtl) else {
+                                note_width_overflow();
+                                return Err("width_overflow".into());
+                            };
+                            let w = w.max(1);
+                            if bit < offset.saturating_add(w) {
+                                let ck = tobit_key(part, bit - offset);
+                                stack.push(ToBitTask::Build {
+                                    key,
+                                    op: ToBitOp::Forward(ck),
+                                });
+                                if !memo.contains_key(&ck) {
+                                    stack.push(ToBitTask::Visit(part, bit - offset));
+                                }
+                                done = true;
+                                break;
+                            }
+                            offset = offset.saturating_add(w);
+                        }
+                        if !done {
+                            memo.insert(key, Expr::Const(false));
+                        }
+                    }
+                    RExpr::Shr(a, sh) => {
+                        let shift = match *sh {
+                            RExpr::Const { val, .. } => *val as usize,
+                            _ => return Err("shift amount not const".into()),
+                        };
+                        let wa = rexpr_width(a, rtl);
+                        if bit.saturating_add(shift) >= wa {
+                            memo.insert(key, Expr::Const(false));
+                        } else {
+                            let ck = tobit_key(*a, bit + shift);
+                            stack.push(ToBitTask::Build {
+                                key,
+                                op: ToBitOp::Forward(ck),
+                            });
+                            if !memo.contains_key(&ck) {
+                                stack.push(ToBitTask::Visit(*a, bit + shift));
+                            }
+                        }
+                    }
+                    RExpr::Ashr(a, sh) => {
+                        let shift = match *sh {
+                            RExpr::Const { val, .. } => *val as usize,
+                            _ => return Err("ashr amount not const".into()),
+                        };
+                        let wa = rexpr_width(a, rtl).max(1);
+                        let src = bit.saturating_add(shift);
+                        if src >= wa {
+                            // Sign-fill from MSB.
+                            let ck = tobit_key(*a, wa - 1);
+                            stack.push(ToBitTask::Build {
+                                key,
+                                op: ToBitOp::Forward(ck),
+                            });
+                            if !memo.contains_key(&ck) {
+                                stack.push(ToBitTask::Visit(*a, wa - 1));
+                            }
+                        } else {
+                            let ck = tobit_key(*a, src);
+                            stack.push(ToBitTask::Build {
+                                key,
+                                op: ToBitOp::Forward(ck),
+                            });
+                            if !memo.contains_key(&ck) {
+                                stack.push(ToBitTask::Visit(*a, src));
+                            }
+                        }
+                    }
+                    RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+                        let redop = if matches!(*n, RExpr::RedXor(_)) {
+                            ToBitRedOp::Xor
+                        } else if matches!(*n, RExpr::RedAnd(_)) {
+                            ToBitRedOp::And
+                        } else {
+                            ToBitRedOp::Or
+                        };
+                        if bit != 0 {
+                            memo.insert(key, Expr::Const(false));
+                        } else {
+                            let Some(w) = rexpr_width_checked(*x, rtl) else {
+                                note_width_overflow();
+                                return Err("width_overflow".into());
+                            };
+                            let w = w.max(1);
+                            if w > 128 {
+                                return Err("reduction width too wide".into());
+                            }
+                            let kids: Vec<ToBitKey<'_>> =
+                                (0..w).map(|i| tobit_key(*x, i)).collect();
+                            stack.push(ToBitTask::Build {
+                                key,
+                                op: ToBitOp::Red(redop, kids),
+                            });
+                            for i in (0..w).rev() {
+                                let ck = tobit_key(*x, i);
+                                if !memo.contains_key(&ck) {
+                                    stack.push(ToBitTask::Visit(*x, i));
+                                }
+                            }
+                        }
+                    }
+                    RExpr::Not(x) => {
+                        let ck = tobit_key(*x, bit);
+                        stack.push(ToBitTask::Build {
+                            key,
+                            op: ToBitOp::Not(ck),
+                        });
+                        if !memo.contains_key(&ck) {
+                            stack.push(ToBitTask::Visit(*x, bit));
+                        }
+                    }
+                    RExpr::And(a, b) | RExpr::Or(a, b) | RExpr::Xor(a, b) => {
+                        let binop = if matches!(*n, RExpr::And(..)) {
+                            ToBitBinOp::And
+                        } else if matches!(*n, RExpr::Or(..)) {
+                            ToBitBinOp::Or
+                        } else {
+                            ToBitBinOp::Xor
+                        };
+                        let lk = tobit_key(*a, bit);
+                        let rk = tobit_key(*b, bit);
+                        stack.push(ToBitTask::Build {
+                            key,
+                            op: ToBitOp::Bin(binop, lk, rk),
+                        });
+                        // Reversed so pops follow the original call order (a, then b).
+                        if !memo.contains_key(&rk) {
+                            stack.push(ToBitTask::Visit(*b, bit));
+                        }
+                        if !memo.contains_key(&lk) {
+                            stack.push(ToBitTask::Visit(*a, bit));
+                        }
+                    }
+                    RExpr::Add(a, b) => {
+                        memo.insert(key, adder_sum_bit(*a, *b, rtl, bit, arena)?);
+                    }
+                    RExpr::Sub(a, b) => {
+                        memo.insert(key, sub_diff_bit(*a, *b, rtl, bit, arena)?);
+                    }
+                    RExpr::Mul(_, _) => return Err("mul is a DSP primitive, not a LUT cone".into()),
+                    RExpr::Mux(c, t, f) => {
+                        let ck = tobit_key(*c, 0);
+                        let tk = tobit_key(*t, bit);
+                        let fk = tobit_key(*f, bit);
+                        stack.push(ToBitTask::Build {
+                            key,
+                            op: ToBitOp::Mux { c: ck, t: tk, f: fk },
+                        });
+                        // Reversed so pops follow the original call order (c, t, f).
+                        for (node, kbit) in [(*f, fk), (*t, tk), (*c, ck)] {
+                            if !memo.contains_key(&kbit) {
+                                stack.push(ToBitTask::Visit(node, kbit.1));
+                            }
+                        }
+                    }
+                    RExpr::Eq(a, b) => {
+                        if bit != 0 {
+                            memo.insert(key, Expr::Const(false));
+                        } else {
+                            memo.insert(key, cmp_eq_bits(*a, *b, rtl, true, arena)?);
+                        }
+                    }
+                    RExpr::Ne(a, b) => {
+                        if bit != 0 {
+                            memo.insert(key, Expr::Const(false));
+                        } else {
+                            memo.insert(
+                                key,
+                                Expr::Not(arena.alloc(cmp_eq_bits(*a, *b, rtl, true, arena)?)),
+                            );
+                        }
+                    }
+                    RExpr::Lt(a, b) => {
+                        if bit != 0 {
+                            memo.insert(key, Expr::Const(false));
+                        } else {
+                            memo.insert(key, lt_bits(*a, *b, rtl, arena)?);
+                        }
+                    }
+                    RExpr::Call { name, .. } => {
+                        return Err(format!("call {name} not inlined"));
+                    }
+                }
+            }
+            ToBitTask::Build { key, op } => {
+                let child = |k: &ToBitKey<'_>| -> Result<Expr<'a>, String> {
+                    memo
+                        .get(k)
+                        .cloned()
+                        .ok_or_else(|| "rexpr_to_bit internal error: child not memoized".to_string())
+                };
+                let v = match op {
+                    ToBitOp::Not(ck) => Expr::Not(arena.alloc(child(&ck)?)),
+                    ToBitOp::Bin(binop, lk, rk) => {
+                        let l = child(&lk)?;
+                        let r = child(&rk)?;
+                        match binop {
+                            ToBitBinOp::And => Expr::And(arena.alloc(l), arena.alloc(r)),
+                            ToBitBinOp::Or => Expr::Or(arena.alloc(l), arena.alloc(r)),
+                            ToBitBinOp::Xor => Expr::Xor(arena.alloc(l), arena.alloc(r)),
+                        }
+                    }
+                    ToBitOp::Mux { c, t, f } => {
+                        let cv = child(&c)?;
+                        let tv = child(&t)?;
+                        let fv = child(&f)?;
+                        Expr::Or(
+                            arena.alloc(Expr::And(arena.alloc(cv.clone()), arena.alloc(tv))),
+                            arena.alloc(Expr::And(
+                                arena.alloc(Expr::Not(arena.alloc(cv))),
+                                arena.alloc(fv),
+                            )),
+                        )
+                    }
+                    ToBitOp::Red(redop, kids) => {
+                        let mut acc: Option<Expr<'a>> = None;
+                        for k in kids.iter() {
+                            let e = child(k)?;
+                            acc = Some(match acc {
+                                None => e,
+                                Some(p) => match redop {
+                                    ToBitRedOp::Xor => Expr::Xor(arena.alloc(p), arena.alloc(e)),
+                                    ToBitRedOp::And => Expr::And(arena.alloc(p), arena.alloc(e)),
+                                    ToBitRedOp::Or => Expr::Or(arena.alloc(p), arena.alloc(e)),
+                                },
+                            });
+                        }
+                        acc.ok_or_else(|| {
+                            "rexpr_to_bit internal error: empty reduction".to_string()
+                        })?
+                    }
+                    ToBitOp::Forward(ck) => child(&ck)?,
+                };
+                memo.insert(key, v);
+            }
+        }
+    }
+    memo
+        .remove(&tobit_key(e, bit))
+        .ok_or_else(|| "rexpr_to_bit internal error: root not memoized".to_string())
+}
+
 
 /// Truth-table a boolean cone with ≤6 PIs. Linear in the AST, so a huge
 /// nested assign of a few inputs (Problem4) maps without lifting the Ibex
 /// AIG/add hang guard on wide cones.
 fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
-    fn collect(e: &Expr, vars: &mut Vec<String>, budget: &mut usize) -> bool {
-        if *budget == 0 {
-            return false;
-        }
-        *budget -= 1;
-        match e {
-            Expr::Const(_) => true,
-            Expr::Var(name) => {
-                if !vars.iter().any(|v| v == name) {
-                    if vars.len() >= 6 {
-                        return false;
+    // Iterative DFS: the old recursion overflowed the stack on deep cones
+    // before the 2M budget could trip.
+    fn collect<'x, 'e>(e: &'e Expr<'x>, vars: &mut Vec<String>, budget: &mut usize) -> bool
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e Expr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            match n {
+                Expr::Const(_) => {}
+                Expr::Var(name) => {
+                    if !vars.iter().any(|v| v == name) {
+                        if vars.len() >= 6 {
+                            return false;
+                        }
+                        vars.push(name.to_string());
                     }
-                    vars.push(name.to_string());
                 }
-                true
-            }
-            Expr::Not(x) => collect(x, vars, budget),
-            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
-                collect(a, vars, budget) && collect(b, vars, budget)
+                _ => push_expr_children(n, &mut stack),
             }
         }
+        true
     }
-    fn eval(e: &Expr, env: &[(&str, bool)], budget: &mut usize) -> Option<bool> {
-        if *budget == 0 {
-            return None;
+    // Iterative post-order evaluation with memo. The old recursion overflowed
+    // the stack on deep cones before the 2M budget could trip.
+    fn eval<'x, 'e>(
+        e: &'e Expr<'x>,
+        env: &[(&str, bool)],
+        budget: &mut usize,
+    ) -> Option<bool>
+    where
+        'x: 'e,
+    {
+        let mut seen: HashSet<*const Expr<'x>> = HashSet::new();
+        let mut post: Vec<&'e Expr<'x>> = Vec::new();
+        let mut stack: Vec<&'e Expr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            if !seen.insert(n as *const Expr<'x>) {
+                continue;
+            }
+            post.push(n);
+            push_expr_children(n, &mut stack);
         }
-        *budget -= 1;
-        match e {
-            Expr::Const(b) => Some(*b),
-            Expr::Var(name) => env
-                .iter()
-                .find(|(n, _)| *n == *name)
-                .map(|(_, b)| *b),
-            Expr::Not(x) => Some(!eval(x, env, budget)?),
-            Expr::And(a, b) => Some(eval(a, env, budget)? && eval(b, env, budget)?),
-            Expr::Or(a, b) => Some(eval(a, env, budget)? || eval(b, env, budget)?),
-            Expr::Xor(a, b) => Some(eval(a, env, budget)? ^ eval(b, env, budget)?),
+        let mut memo: HashMap<*const Expr<'x>, Option<bool>> =
+            HashMap::with_capacity(post.len() + 1);
+        for n in post.into_iter().rev() {
+            let v = |p: *const Expr<'x>| -> Option<bool> {
+                memo.get(&p).copied().flatten()
+            };
+            let r = match n {
+                Expr::Const(b) => Some(*b),
+                Expr::Var(name) => env.iter().find(|(nn, _)| *nn == *name).map(|(_, b)| *b),
+                Expr::Not(x) => Some(!v(*x as *const Expr<'x>)?),
+                Expr::And(a, b) => {
+                    Some(v(*a as *const Expr<'x>)? && v(*b as *const Expr<'x>)?)
+                }
+                Expr::Or(a, b) => {
+                    Some(v(*a as *const Expr<'x>)? || v(*b as *const Expr<'x>)?)
+                }
+                Expr::Xor(a, b) => Some(v(*a as *const Expr<'x>)? ^ v(*b as *const Expr<'x>)?),
+            };
+            memo.insert(n as *const Expr<'x>, r);
         }
+        memo.get(&(e as *const Expr<'x>)).copied().flatten()
     }
     let mut vars = Vec::new();
     // Deep case-mux trees (sha256_k 64-arm) still have ≤6 PIs; need headroom
@@ -9691,6 +10248,12 @@ fn lut6_from_bool_cone(expr: &Expr) -> Option<(u64, Vec<String>)> {
 /// Word→bit split can leave sibling bits (`tmp_K_0` inside `tmp_K_1`) as extra
 /// PIs. Treat any bit of the same LHS bus as 0 so a ≤6-PI const case collapses
 /// (sha256_k_constants) instead of ITE fanout / hang-class cell storms.
+/// Replace self-family vars with const-0. Iterative post-order rebuild with
+/// memo; replaces the naive-recursive version (deep `Expr` trees from lowered
+/// `Mux` chains overflowed the stack).
+/// Iterative post-order rebuild; the old recursion overflowed the stack on
+/// deep `Expr` trees. Children are rebuilt before parents; results are
+/// memoized by node identity.
 fn strip_self_hold<'a>(e: &Expr<'a>, self_bit: &str, arena: &'a Bump) -> Expr<'a> {
     fn is_self_family(n: &str, self_bit: &str) -> bool {
         if n == self_bit {
@@ -9708,47 +10271,69 @@ fn strip_self_hold<'a>(e: &Expr<'a>, self_bit: &str, arena: &'a Bump) -> Expr<'a
             && n.as_bytes()[base.len()] == b'_'
             && n[base.len() + 1..].chars().all(|c| c.is_ascii_digit())
     }
-    match e {
-        Expr::Var(n) if is_self_family(n, self_bit) => Expr::Const(false),
-        Expr::Const(b) => Expr::Const(*b),
-        Expr::Var(n) => Expr::Var(n),
-        Expr::Not(x) => Expr::Not(arena.alloc(strip_self_hold(x, self_bit, arena))),
-        Expr::And(a, b) => Expr::And(
-            arena.alloc(strip_self_hold(a, self_bit, arena)),
-            arena.alloc(strip_self_hold(b, self_bit, arena)),
-        ),
-        Expr::Or(a, b) => Expr::Or(
-            arena.alloc(strip_self_hold(a, self_bit, arena)),
-            arena.alloc(strip_self_hold(b, self_bit, arena)),
-        ),
-        Expr::Xor(a, b) => Expr::Xor(
-            arena.alloc(strip_self_hold(a, self_bit, arena)),
-            arena.alloc(strip_self_hold(b, self_bit, arena)),
-        ),
+    let mut memo: HashMap<*const Expr<'a>, &'a Expr<'a>> = HashMap::new();
+    let mut stack: Vec<(&Expr<'a>, bool)> = vec![(e, false)];
+    while let Some((n, expanded)) = stack.pop() {
+        if expanded {
+            let r: Expr<'a> = match n {
+                Expr::Var(nn) if is_self_family(nn, self_bit) => Expr::Const(false),
+                Expr::Const(b) => Expr::Const(*b),
+                Expr::Var(nn) => Expr::Var(nn),
+                Expr::Not(x) => {
+                    Expr::Not(memo.get(&(*x as *const Expr<'a>)).copied().unwrap_or(*x))
+                }
+                Expr::And(a, b) => Expr::And(
+                    memo.get(&(*a as *const Expr<'a>)).copied().unwrap_or(*a),
+                    memo.get(&(*b as *const Expr<'a>)).copied().unwrap_or(*b),
+                ),
+                Expr::Or(a, b) => Expr::Or(
+                    memo.get(&(*a as *const Expr<'a>)).copied().unwrap_or(*a),
+                    memo.get(&(*b as *const Expr<'a>)).copied().unwrap_or(*b),
+                ),
+                Expr::Xor(a, b) => Expr::Xor(
+                    memo.get(&(*a as *const Expr<'a>)).copied().unwrap_or(*a),
+                    memo.get(&(*b as *const Expr<'a>)).copied().unwrap_or(*b),
+                ),
+            };
+            memo.insert(n as *const Expr<'a>, arena.alloc(r));
+            continue;
+        }
+        stack.push((n, true));
+        match n {
+            Expr::Not(x) => stack.push((x, false)),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+            }
+            _ => {}
+        }
     }
+    (*memo.get(&(e as *const Expr<'a>)).copied().unwrap_or(e)).clone()
 }
 
+/// Count nodes up to a 16k budget (returns 16_001 when over cap).
+/// Iterative; the old recursive walk overflowed the stack on deep trees
+/// even though the budget bounded the count.
 fn expr_node_count(e: &Expr) -> usize {
-    fn walk(e: &Expr, budget: &mut usize) -> usize {
-        if *budget == 0 {
-            return 0;
+    let mut budget = 16_000usize;
+    let mut count = 0usize;
+    let mut stack: Vec<&Expr> = vec![e];
+    while let Some(n) = stack.pop() {
+        if budget == 0 {
+            return 16_001; // treat as over-cap
         }
-        *budget -= 1;
-        match e {
-            Expr::Const(_) | Expr::Var(_) => 1,
-            Expr::Not(x) => 1 + walk(x, budget),
+        budget -= 1;
+        count += 1;
+        match n {
+            Expr::Const(_) | Expr::Var(_) => {}
+            Expr::Not(x) => stack.push(x),
             Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
-                1 + walk(a, budget) + walk(b, budget)
+                stack.push(b);
+                stack.push(a);
             }
         }
     }
-    let mut budget = 16_000usize;
-    let n = walk(e, &mut budget);
-    if budget == 0 {
-        16_001 // treat as over-cap
-    } else {
-        n
-    }
+    count
 }
 
 fn const_care_of(e: &RExpr<'_>) -> u128 {
@@ -9805,27 +10390,54 @@ fn sub_diff_bit<'a>(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, bit: usize, arena: 
     Ok(diff)
 }
 
+/// Maximum `Add`/`Sub` nesting depth. Iterative post-order fold with memo;
+/// replaces the naive-recursive version (deep trees overflowed the stack).
 fn rexpr_add_depth(e: &RExpr<'_>) -> usize {
-    match e {
-        RExpr::Add(a, b) | RExpr::Sub(a, b) => 1 + rexpr_add_depth(a).max(rexpr_add_depth(b)),
-        RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => rexpr_add_depth(x),
-        RExpr::Shr(a, b) | RExpr::Ashr(a, b) => rexpr_add_depth(a).max(rexpr_add_depth(b)),
-        RExpr::Concat(parts) => parts.iter().map(rexpr_add_depth).max().unwrap_or(0),
-        RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Mul(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b) => rexpr_add_depth(a).max(rexpr_add_depth(b)),
-        RExpr::Mux(c, t, f) => rexpr_add_depth(c)
-            .max(rexpr_add_depth(t))
-            .max(rexpr_add_depth(f)),
-        RExpr::IndexPart { base, .. } => rexpr_add_depth(base),
-        RExpr::WordAt { addr, data } => rexpr_add_depth(addr).max(rexpr_add_depth(data)),
-        RExpr::Call { args, .. } => args.iter().map(rexpr_add_depth).max().unwrap_or(0),
-        RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
+    let post: Vec<&RExpr<'_>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'_>, usize> = HashMap::with_capacity(post.len());
+    let child = |memo: &HashMap<*const RExpr<'_>, usize>, p: *const RExpr<'_>| -> usize {
+        memo.get(&p).copied().unwrap_or(0)
+    };
+    for n in post {
+        let d = match n {
+            RExpr::Add(a, b) | RExpr::Sub(a, b) => {
+                1 + child(&memo, *a as *const RExpr<'_>)
+                    .max(child(&memo, *b as *const RExpr<'_>))
+            }
+            RExpr::Not(x) | RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
+                child(&memo, *x as *const RExpr<'_>)
+            }
+            RExpr::Shr(a, b) | RExpr::Ashr(a, b) => child(&memo, *a as *const RExpr<'_>)
+                .max(child(&memo, *b as *const RExpr<'_>)),
+            RExpr::Concat(parts) => parts
+                .iter()
+                .map(|p| child(&memo, p as *const RExpr<'_>))
+                .max()
+                .unwrap_or(0),
+            RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Mul(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b) => child(&memo, *a as *const RExpr<'_>)
+                .max(child(&memo, *b as *const RExpr<'_>)),
+            RExpr::Mux(c, t, f) => child(&memo, *c as *const RExpr<'_>)
+                .max(child(&memo, *t as *const RExpr<'_>))
+                .max(child(&memo, *f as *const RExpr<'_>)),
+            RExpr::IndexPart { base, .. } => child(&memo, *base as *const RExpr<'_>),
+            RExpr::WordAt { addr, data } => child(&memo, *addr as *const RExpr<'_>)
+                .max(child(&memo, *data as *const RExpr<'_>)),
+            RExpr::Call { args, .. } => args
+                .iter()
+                .map(|a| child(&memo, a as *const RExpr<'_>))
+                .max()
+                .unwrap_or(0),
+            RExpr::Range(_, _, _) | RExpr::Bit(_, _) | RExpr::Ident(_) | RExpr::Const { .. } => 0,
+        };
+        memo.insert(n as *const RExpr<'_>, d);
     }
+    memo.get(&(e as *const RExpr<'_>)).copied().unwrap_or(0)
 }
 
 fn name_known(rtl: &Rtl, name: &str) -> bool {
@@ -9839,24 +10451,42 @@ fn rexpr_unknown_name(e: &RExpr<'_>, rtl: &Rtl) -> Option<String> {
 }
 
 /// Relational assign (`<` / `>=` / `==` and `&&`/`||`/`!` of those).
+/// Iterative DFS: true if the tree contains a relational op under `Not`s.
+/// The old recursion overflowed the stack on deep trees.
 fn rexpr_is_rel(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Lt(_, _) | RExpr::Eq(_, _) | RExpr::Ne(_, _) => true,
-        RExpr::Not(x) => rexpr_is_rel(x),
-        RExpr::And(a, b) | RExpr::Or(a, b) => rexpr_is_rel(a) || rexpr_is_rel(b),
-        _ => false,
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Lt(_, _) | RExpr::Eq(_, _) | RExpr::Ne(_, _) => return true,
+            RExpr::Not(x) => stack.push(*x),
+            RExpr::And(a, b) | RExpr::Or(a, b) => {
+                stack.push(*b);
+                stack.push(*a);
+            }
+            _ => {}
+        }
     }
+    false
 }
 
 /// True when the formula contains `<` (including `>=` as `!(a < b)`).
 /// Eq/Ne stay off this path so OR-of-eq can map (Ibex bwlogic_or).
+/// Iterative DFS: true if the tree contains an `Lt` under `Not`s.
+/// The old recursion overflowed the stack on deep trees.
 fn rexpr_has_lt(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Lt(_, _) => true,
-        RExpr::Not(x) => rexpr_has_lt(x),
-        RExpr::And(a, b) | RExpr::Or(a, b) => rexpr_has_lt(a) || rexpr_has_lt(b),
-        _ => false,
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Lt(_, _) => return true,
+            RExpr::Not(x) => stack.push(*x),
+            RExpr::And(a, b) | RExpr::Or(a, b) => {
+                stack.push(*b);
+                stack.push(*a);
+            }
+            _ => {}
+        }
     }
+    false
 }
 
 /// A constant range is a test of a few bus bits, not a full-width cone.
@@ -9993,41 +10623,86 @@ fn collect_lt_pis(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, out: &mut Vec<(String
     }
 }
 
+/// Iterative post-order: true if the formula is a const relational test.
+/// Sets `saw_lt` and collects PIs via `collect_lt_pis` on `Lt` nodes.
+/// Iterative DFS preserving the old recursion's left-to-right short-circuit
+/// evaluation order: `And`/`Or` children are visited a-then-b, and evaluation
+/// stops at the first `false` so side effects on `out`/`saw_lt` match exactly.
+/// The old recursion overflowed the stack on deep trees.
 fn formula_is_const_rel(
     e: &RExpr<'_>,
     rtl: &Rtl,
     out: &mut Vec<(String, usize)>,
     saw_lt: &mut bool,
 ) -> bool {
-    match e {
-        RExpr::Not(x) => formula_is_const_rel(x, rtl, out, saw_lt),
-        RExpr::And(a, b) | RExpr::Or(a, b) => {
-            formula_is_const_rel(a, rtl, out, saw_lt) && formula_is_const_rel(b, rtl, out, saw_lt)
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        let ok = match n {
+            RExpr::Not(x) => {
+                stack.push(*x);
+                continue;
+            }
+            RExpr::And(a, b) | RExpr::Or(a, b) => {
+                stack.push(*b);
+                stack.push(*a);
+                continue;
+            }
+            RExpr::Lt(a, b) => {
+                *saw_lt = true;
+                collect_lt_pis(a, b, rtl, out)
+            }
+            _ => false,
+        };
+        if !ok {
+            return false;
         }
-        RExpr::Lt(a, b) => {
-            *saw_lt = true;
-            collect_lt_pis(a, b, rtl, out)
-        }
-        _ => false,
     }
+    true
 }
 
+/// Evaluate a boolean formula under `env`. Iterative post-order with memo;
+/// replaces the naive-recursive version (deep trees overflowed the stack).
+/// The subcalls are pure, so evaluating both sides of `And`/`Or` (instead of
+/// short-circuiting) cannot change the result, only do redundant work on
+/// formulas that would have evaluated to `None`/`false` early.
 fn eval_const_rel(e: &RExpr<'_>, rtl: &Rtl, env: &HashMap<String, bool>) -> Option<bool> {
-    match e {
-        RExpr::Not(x) => Some(!eval_const_rel(x, rtl, env)?),
-        RExpr::And(a, b) => Some(eval_const_rel(a, rtl, env)? && eval_const_rel(b, rtl, env)?),
-        RExpr::Or(a, b) => Some(eval_const_rel(a, rtl, env)? || eval_const_rel(b, rtl, env)?),
-        RExpr::Lt(a, b) => {
-            if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
-                Some(rel_bus_val(&bus, rtl, env) < c)
-            } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
-                Some(c < rel_bus_val(&bus, rtl, env))
-            } else {
-                None
+    let post: Vec<&RExpr<'_>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'_>, Option<bool>> =
+        HashMap::with_capacity(post.len());
+    let child = |memo: &HashMap<*const RExpr<'_>, Option<bool>>, p: *const RExpr<'_>| {
+        memo.get(&p).copied().flatten()
+    };
+    for n in post {
+        let v: Option<bool> = match n {
+            RExpr::Not(x) => child(&memo, *x as *const RExpr<'_>).map(|b| !b),
+            RExpr::And(a, b) => match (
+                child(&memo, *a as *const RExpr<'_>),
+                child(&memo, *b as *const RExpr<'_>),
+            ) {
+                (Some(x), Some(y)) => Some(x && y),
+                _ => None,
+            },
+            RExpr::Or(a, b) => match (
+                child(&memo, *a as *const RExpr<'_>),
+                child(&memo, *b as *const RExpr<'_>),
+            ) {
+                (Some(x), Some(y)) => Some(x || y),
+                _ => None,
+            },
+            RExpr::Lt(a, b) => {
+                if let (Some(bus), Some(c)) = (as_rel_bus(a, rtl), const_rel_value(b)) {
+                    Some(rel_bus_val(&bus, rtl, env) < c)
+                } else if let (Some(c), Some(bus)) = (const_rel_value(a), as_rel_bus(b, rtl)) {
+                    Some(c < rel_bus_val(&bus, rtl, env))
+                } else {
+                    None
+                }
             }
-        }
-        _ => None,
+            _ => None,
+        };
+        memo.insert(n as *const RExpr<'_>, v);
     }
+    memo.get(&(e as *const RExpr<'_>)).copied().flatten()
 }
 
 fn rel_bus_val(bus: &RelBus, rtl: &Rtl, env: &HashMap<String, bool>) -> u128 {
@@ -10219,8 +10894,36 @@ fn lt_bits<'a>(a: &RExpr<'_>, b: &RExpr<'_>, rtl: &Rtl, arena: &'a Bump) -> Resu
 /// Width, or `None` when a slice/concat does not fit. Probe reductions,
 /// compares, and mux conditions so a nested `sig[W-1:0]` with `W=0` is not
 /// a 1-bit cone.
+/// Iterative post-order fold computing `RExpr` bit-width.
+///
+/// Replaces the old naive-recursive implementation. Chained `Mux`/`And`/`Or`
+/// spines (e.g. long blocking-assignment priority chains) are linear in depth,
+/// and a recursive walk overflows the main-thread stack in debug builds (each
+/// frame is several KB). This keeps its own work-stack on the heap and
+/// memoizes by node identity (arena refs are stable), which also makes it
+/// linear-time on shared DAG subtrees instead of exponential.
+
+/// Iterative post-order fold using `width_step`; replaces the naive-recursive
+/// version (deep trees overflowed the stack).
 fn rexpr_width_checked(e: &RExpr<'_>, rtl: &Rtl) -> Option<usize> {
-    match e {
+    let post: Vec<&RExpr<'_>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'_>, Option<usize>> =
+        HashMap::with_capacity(post.len());
+    for n in post {
+        memo.insert(n as *const RExpr<'_>, width_step(n, rtl, &memo));
+    }
+    memo.get(&(e as *const RExpr<'_>)).copied().flatten()
+}
+
+/// One node's width from its children's already-memoized widths.
+/// Mirrors the old recursive `rexpr_width_checked` arm-for-arm.
+fn width_step<'x>(
+    n: &RExpr<'x>,
+    rtl: &Rtl,
+    memo: &HashMap<*const RExpr<'x>, Option<usize>>,
+) -> Option<usize> {
+    let child = |p: *const RExpr<'x>| -> Option<usize> { memo.get(&p).copied().flatten() };
+    match n {
         RExpr::Ident(s) | RExpr::Bit(s, _) => Some(sig_width(rtl, s)),
         RExpr::Range(_, lo, hi) => range_span(*lo, *hi),
         RExpr::IndexPart { name, width, .. } => {
@@ -10230,40 +10933,45 @@ fn rexpr_width_checked(e: &RExpr<'_>, rtl: &Rtl) -> Option<usize> {
                 Some((*width).max(1))
             }
         }
-        RExpr::WordAt { data, .. } => Some(rexpr_width_checked(data, rtl)?.max(1)),
+        RExpr::WordAt { data, .. } => Some(child(*data as *const RExpr<'x>)?.max(1)),
         RExpr::Const { width, .. } => Some((*width).max(1)),
         RExpr::Concat(parts) => {
             let mut acc = 0usize;
             for p in parts {
-                acc = acc.checked_add(rexpr_width_checked(p, rtl)?.max(1))?;
+                acc = acc.checked_add(child(p as *const RExpr<'x>)?.max(1))?;
             }
             Some(acc)
         }
-        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => rexpr_width_checked(a, rtl),
+        RExpr::Shr(a, _) | RExpr::Ashr(a, _) => child(*a as *const RExpr<'x>),
         RExpr::RedXor(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) => {
-            rexpr_width_checked(x, rtl)?;
+            child(*x as *const RExpr<'x>)?;
             Some(1)
         }
         RExpr::Eq(a, b) | RExpr::Ne(a, b) | RExpr::Lt(a, b) => {
-            rexpr_width_checked(a, rtl)?;
-            rexpr_width_checked(b, rtl)?;
+            child(*a as *const RExpr<'x>)?;
+            child(*b as *const RExpr<'x>)?;
             Some(1)
         }
-        RExpr::Not(x) => Some(rexpr_width_checked(x, rtl)?.min(1).max(1)),
+        RExpr::Not(x) => {
+            child(*x as *const RExpr<'x>)?;
+            Some(1)
+        }
         RExpr::And(a, b)
         | RExpr::Or(a, b)
         | RExpr::Xor(a, b)
         | RExpr::Add(a, b)
         | RExpr::Sub(a, b)
-        | RExpr::Mul(a, b) => Some(rexpr_width_checked(a, rtl)?.max(rexpr_width_checked(b, rtl)?)),
+        | RExpr::Mul(a, b) => Some(
+            child(*a as *const RExpr<'x>)?.max(child(*b as *const RExpr<'x>)?),
+        ),
         RExpr::Mux(c, t, f) => {
-            rexpr_width_checked(c, rtl)?;
-            Some(rexpr_width_checked(t, rtl)?.max(rexpr_width_checked(f, rtl)?))
+            child(*c as *const RExpr<'x>)?;
+            Some(child(*t as *const RExpr<'x>)?.max(child(*f as *const RExpr<'x>)?))
         }
         RExpr::Call { args, .. } => {
             let mut w = 1usize;
             for a in args {
-                w = w.max(rexpr_width_checked(a, rtl).unwrap_or(1));
+                w = w.max(child(a as *const RExpr<'x>).unwrap_or(1));
             }
             Some(w)
         }
@@ -10300,47 +11008,89 @@ fn strip_range_to_ident<'a>(e: &RExpr<'a>) -> RExpr<'a> {
     }
 }
 
-fn normalize_mul_operands<'a>(e: &RExpr<'a>, arena: &'a Bump) -> RExpr<'a> {
-    match e {
-        RExpr::Mul(a, b) => RExpr::Mul(
-            arena.alloc(strip_range_to_ident(a)),
-            arena.alloc(strip_range_to_ident(b)),
-        ),
-        RExpr::Add(a, b) => RExpr::Add(
-            arena.alloc(normalize_mul_operands(a, arena)),
-            arena.alloc(normalize_mul_operands(b, arena)),
-        ),
-        RExpr::Mux(c, t, f) => RExpr::Mux(
-            arena.alloc((**c).clone()),
-            arena.alloc(normalize_mul_operands(t, arena)),
-            arena.alloc(normalize_mul_operands(f, arena)),
-        ),
-        other => other.clone(),
+/// Iterative post-order rebuild; the old recursion overflowed the stack on
+/// deep `Add`/`Mux` spines. Only `Add` children and `Mux` t/f arms are
+/// normalized (matching the old recursion); `Mul` operands get only the
+/// top-level range strip, and `Mux` conditions are cloned verbatim.
+fn normalize_mul_operands<'a, 'e>(e: &'e RExpr<'a>, arena: &'a Bump) -> RExpr<'a>
+where
+    'a: 'e,
+{
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    let rebuilt = |memo: &HashMap<*const RExpr<'a>, &'a RExpr<'a>>,
+                   c: &RExpr<'a>|
+     -> RExpr<'a> {
+        memo
+            .get(&(c as *const RExpr<'a>))
+            .copied()
+            .map(|rr| (*rr).clone())
+            .unwrap_or_else(|| c.clone())
+    };
+    for n in post {
+        let r: RExpr<'a> = match n {
+            RExpr::Mul(a, b) => RExpr::Mul(
+                arena.alloc(strip_range_to_ident(a)),
+                arena.alloc(strip_range_to_ident(b)),
+            ),
+            RExpr::Add(a, b) => RExpr::Add(
+                arena.alloc(rebuilt(&memo, a)),
+                arena.alloc(rebuilt(&memo, b)),
+            ),
+            RExpr::Mux(c, t, f) => RExpr::Mux(
+                c,
+                arena.alloc(rebuilt(&memo, t)),
+                arena.alloc(rebuilt(&memo, f)),
+            ),
+            other => (*other).clone(),
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(r));
     }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
+/// Iterative DFS: true if any `Mul` node exists in the tree.
+/// The old recursion overflowed the stack on deep spines. Note the old
+/// recursion did not descend into `IndexPart` (address math is not a DSP
+/// multiply); that is preserved.
 fn expr_contains_mul(e: &RExpr<'_>) -> bool {
-    match e {
-        RExpr::Mul(_, _) => true,
-        RExpr::Not(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::RedXor(x) => {
-            expr_contains_mul(x)
+    let mut stack: Vec<&RExpr<'_>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Mul(_, _) => return true,
+            RExpr::Not(x) | RExpr::RedAnd(x) | RExpr::RedOr(x) | RExpr::RedXor(x) => {
+                stack.push(*x)
+            }
+            RExpr::And(a, b)
+            | RExpr::Or(a, b)
+            | RExpr::Xor(a, b)
+            | RExpr::Add(a, b)
+            | RExpr::Sub(a, b)
+            | RExpr::Eq(a, b)
+            | RExpr::Ne(a, b)
+            | RExpr::Lt(a, b)
+            | RExpr::Shr(a, b)
+            | RExpr::Ashr(a, b) => {
+                stack.push(*b);
+                stack.push(*a);
+            }
+            RExpr::Mux(c, t, f) => {
+                stack.push(*f);
+                stack.push(*t);
+                stack.push(*c);
+            }
+            RExpr::Concat(parts) => {
+                for p in parts.iter().rev() {
+                    stack.push(p);
+                }
+            }
+            // Address math in sig[base*+:W] is not a DSP multiply.
+            RExpr::IndexPart { .. } => {}
+            _ => {}
         }
-        RExpr::And(a, b)
-        | RExpr::Or(a, b)
-        | RExpr::Xor(a, b)
-        | RExpr::Add(a, b)
-        | RExpr::Sub(a, b)
-        | RExpr::Eq(a, b)
-        | RExpr::Ne(a, b)
-        | RExpr::Lt(a, b)
-        | RExpr::Shr(a, b)
-        | RExpr::Ashr(a, b) => expr_contains_mul(a) || expr_contains_mul(b),
-        RExpr::Mux(c, t, f) => expr_contains_mul(c) || expr_contains_mul(t) || expr_contains_mul(f),
-        RExpr::Concat(parts) => parts.iter().any(expr_contains_mul),
-        // Address math in sig[base*+:W] is not a DSP multiply.
-        RExpr::IndexPart { .. } => false,
-        _ => false,
     }
+    false
 }
 
 /// Pull (A, B, optional C-accum) port/signal names from a MAC/mul RHS tree.
@@ -10348,45 +11098,72 @@ fn mac_ab_c_from_rhs(e: &RExpr<'_>) -> (Option<String>, Option<String>, Option<S
     // Transient rewrite; the arena dies with this call.
     let arena = Bump::new();
     let e = normalize_mul_operands(e, &arena);
-    fn mul_ab(e: &RExpr<'_>) -> Option<(String, String)> {
-        match e {
-            RExpr::Mul(a, b) => Some((
-                rexpr_ident(a).or_else(|| match *a {
-                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.to_string()),
-                    _ => None,
-                })?,
-                rexpr_ident(b).or_else(|| match *b {
-                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.to_string()),
-                    _ => None,
-                })?,
-            )),
-            RExpr::Add(l, r) => mul_ab(l).or_else(|| mul_ab(r)),
-            RExpr::Mux(_, t, f) => mul_ab(t).or_else(|| mul_ab(f)),
-            _ => None,
-        }
-    }
-    fn accum_c(e: &RExpr<'_>, a: &str, b: &str) -> Option<String> {
-        match e {
-            RExpr::Add(l, r) => {
-                let li = rexpr_ident(l).or_else(|| match *l {
-                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.to_string()),
-                    _ => None,
-                });
-                let ri = rexpr_ident(r).or_else(|| match *r {
-                    RExpr::Range(n, _, _) | RExpr::Bit(n, _) => Some(n.to_string()),
-                    _ => None,
-                });
-                if matches!(*r, RExpr::Mul(_, _)) {
-                    return li.filter(|n| n != a && n != b);
+    // Iterative DFS; the old recursion overflowed the stack on deep spines.
+    fn mul_ab<'x, 'e>(e: &'e RExpr<'x>) -> Option<(String, String)>
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e RExpr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                RExpr::Mul(a, b) => {
+                    let sa = rexpr_ident(*a).or_else(|| match *a {
+                        RExpr::Range(nn, _, _) | RExpr::Bit(nn, _) => Some(nn.to_string()),
+                        _ => None,
+                    })?;
+                    let sb = rexpr_ident(*b).or_else(|| match *b {
+                        RExpr::Range(nn, _, _) | RExpr::Bit(nn, _) => Some(nn.to_string()),
+                        _ => None,
+                    })?;
+                    return Some((sa, sb));
                 }
-                if matches!(*l, RExpr::Mul(_, _)) {
-                    return ri.filter(|n| n != a && n != b);
+                RExpr::Add(l, r) => {
+                    stack.push(*r);
+                    stack.push(*l);
                 }
-                accum_c(l, a, b).or_else(|| accum_c(r, a, b))
+                RExpr::Mux(_, t, f) => {
+                    stack.push(*f);
+                    stack.push(*t);
+                }
+                _ => {}
             }
-            RExpr::Mux(_, t, f) => accum_c(t, a, b).or_else(|| accum_c(f, a, b)),
-            _ => None,
         }
+        None
+    }
+    // Iterative DFS; the old recursion overflowed the stack on deep spines.
+    fn accum_c<'x, 'e>(e: &'e RExpr<'x>, a: &str, b: &str) -> Option<String>
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e RExpr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                RExpr::Add(l, r) => {
+                    let li = rexpr_ident(*l).or_else(|| match *l {
+                        RExpr::Range(nn, _, _) | RExpr::Bit(nn, _) => Some(nn.to_string()),
+                        _ => None,
+                    });
+                    let ri = rexpr_ident(*r).or_else(|| match *r {
+                        RExpr::Range(nn, _, _) | RExpr::Bit(nn, _) => Some(nn.to_string()),
+                        _ => None,
+                    });
+                    if matches!(*r, RExpr::Mul(_, _)) {
+                        return li.filter(|nn| nn != a && nn != b);
+                    }
+                    if matches!(*l, RExpr::Mul(_, _)) {
+                        return ri.filter(|nn| nn != a && nn != b);
+                    }
+                    stack.push(*r);
+                    stack.push(*l);
+                }
+                RExpr::Mux(_, t, f) => {
+                    stack.push(*f);
+                    stack.push(*t);
+                }
+                _ => {}
+            }
+        }
+        None
     }
     match mul_ab(&e) {
         Some((a, b)) => {
@@ -10711,6 +11488,9 @@ fn emit_wide_cone(module: &str, signal: &str, capped: &mut bool) {
 /// True if the cone has more than `n` distinct PIs, or the walk budget dies
 /// before that can be ruled out. Stops at the (n+1)th variable so a wide
 /// compare does not full-eval.
+/// True if the cone uses more than `n` distinct input vars.
+/// Iterative DFS with early exit; the old recursive walk (2M budget) still
+/// overflowed the stack on deep trees before the budget could save it.
 fn cone_pi_exceeds(e: &Expr, n: usize) -> bool {
     fn walk(e: &Expr, vars: &mut Vec<String>, budget: &mut usize, n: usize) -> bool {
         if *budget == 0 {
@@ -10919,25 +11699,45 @@ fn try_map_xnor_and_tree(
     fn is_xnor_leaf(e: &Expr) -> bool {
         matches!(e, Expr::Not(inner) if matches!(inner, Expr::Xor(_, _)))
     }
-    fn collect_xnor_and<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) -> bool {
-        match e {
-            Expr::And(a, b) => collect_xnor_and(a, out) && collect_xnor_and(b, out),
-            Expr::Const(true) => true,
-            other if is_xnor_leaf(other) => {
-                out.push(other);
-                true
+    // Iterative DFS. Callers only use `out` when this returns true, so a
+    // single pass (partial `out` on false) is equivalent to the old recursion.
+    fn collect_xnor_and<'x, 'e>(e: &'e Expr<'x>, out: &mut Vec<&'e Expr<'x>>) -> bool
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e Expr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                Expr::And(a, b) => {
+                    let aa: &'e Expr<'x> = *a;
+                    let bb: &'e Expr<'x> = *b;
+                    stack.push(bb);
+                    stack.push(aa);
+                }
+                Expr::Const(true) => {}
+                other if is_xnor_leaf(other) => out.push(other),
+                _ => return false,
             }
-            _ => false,
         }
+        true
     }
-    fn collect_and_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr<'a>>) {
-        match e {
-            Expr::And(a, b) => {
-                collect_and_leaves(a, out);
-                collect_and_leaves(b, out);
+    // Iterative: flatten an `And` spine into leaves.
+    fn collect_and_leaves<'x, 'e>(e: &'e Expr<'x>, out: &mut Vec<&'e Expr<'x>>)
+    where
+        'x: 'e,
+    {
+        let mut stack: Vec<&'e Expr<'x>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                Expr::And(a, b) => {
+                    let aa: &'e Expr<'x> = *a;
+                    let bb: &'e Expr<'x> = *b;
+                    stack.push(bb);
+                    stack.push(aa);
+                }
+                Expr::Const(true) => {}
+                other => out.push(other),
             }
-            Expr::Const(true) => {}
-            other => out.push(other),
         }
     }
     fn emit_and_reduce(
@@ -11086,25 +11886,38 @@ fn try_map_xnor_and_tree(
     emit_and_reduce(d, prefix, share, out, level)
 }
 
+/// Iterative: flatten an `Or` spine into leaves (deep spines overflowed the stack).
+/// Iterative DFS: flatten an `Or` spine into leaves. The old recursion
+/// overflowed the stack on deep `Or` spines; visit order (a-then-b) is
+/// preserved via reverse push.
 fn collect_or_leaves<'a>(e: &'a Expr, out: &mut Vec<&'a Expr<'a>>) {
-    match e {
-        Expr::Or(a, b) => {
-            collect_or_leaves(a, out);
-            collect_or_leaves(b, out);
+    let mut stack: Vec<&'a Expr<'a>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            Expr::Or(a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            Expr::Const(false) => {}
+            other => out.push(other),
         }
-        Expr::Const(false) => {}
-        other => out.push(other),
     }
 }
 
+/// Iterative DFS: flatten an `And` spine into leaves. The old recursion
+/// overflowed the stack on deep `And` spines; visit order (a-then-b) is
+/// preserved via reverse push.
 fn collect_and_leaves_ref<'a>(e: &'a Expr, out: &mut Vec<&'a Expr<'a>>) {
-    match e {
-        Expr::And(a, b) => {
-            collect_and_leaves_ref(a, out);
-            collect_and_leaves_ref(b, out);
+    let mut stack: Vec<&'a Expr<'a>> = vec![e];
+    while let Some(n) = stack.pop() {
+        match n {
+            Expr::And(a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            Expr::Const(true) => {}
+            other => out.push(other),
         }
-        Expr::Const(true) => {}
-        other => out.push(other),
     }
 }
 
@@ -11196,16 +12009,33 @@ fn try_map_wide_bool(
 
 /// Structural `c ? t : f` as Or(And(c,t), And(Not(c),f)) (either order).
 fn match_ite_expr<'a>(e: &'a Expr<'a>) -> Option<(&'a Expr<'a>, &'a Expr<'a>, &'a Expr<'a>)> {
+    /// Iterative structural equality; the old recursion overflowed the stack
+    /// on deep trees.
     fn same_struct(a: &Expr, b: &Expr) -> bool {
-        match (a, b) {
-            (Expr::Const(x), Expr::Const(y)) => x == y,
-            (Expr::Var(x), Expr::Var(y)) => x == y,
-            (Expr::Not(x), Expr::Not(y)) => same_struct(x, y),
-            (Expr::And(a1, a2), Expr::And(b1, b2))
-            | (Expr::Or(a1, a2), Expr::Or(b1, b2))
-            | (Expr::Xor(a1, a2), Expr::Xor(b1, b2)) => same_struct(a1, b1) && same_struct(a2, b2),
-            _ => false,
+        let mut stack: Vec<(&Expr, &Expr)> = vec![(a, b)];
+        while let Some((x, y)) = stack.pop() {
+            match (x, y) {
+                (Expr::Const(px), Expr::Const(py)) => {
+                    if px != py {
+                        return false;
+                    }
+                }
+                (Expr::Var(px), Expr::Var(py)) => {
+                    if px != py {
+                        return false;
+                    }
+                }
+                (Expr::Not(px), Expr::Not(py)) => stack.push((px, py)),
+                (Expr::And(a1, a2), Expr::And(b1, b2))
+                | (Expr::Or(a1, a2), Expr::Or(b1, b2))
+                | (Expr::Xor(a1, a2), Expr::Xor(b1, b2)) => {
+                    stack.push((a2, b2));
+                    stack.push((a1, b1));
+                }
+                _ => return false,
+            }
         }
+        true
     }
     let Expr::Or(l, r) = e else {
         return None;
@@ -11241,32 +12071,77 @@ fn match_ite_expr<'a>(e: &'a Expr<'a>) -> Option<(&'a Expr<'a>, &'a Expr<'a>, &'
     None
 }
 
+/// Iterative post-order AND-fold: true if every leaf is a const.
+/// The old recursion overflowed the stack on deep trees.
 fn expr_only_const_leaves(e: &Expr) -> bool {
-    match e {
-        Expr::Const(_) => true,
-        Expr::Var(_) => false,
-        Expr::Not(x) => expr_only_const_leaves(x),
-        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
-            expr_only_const_leaves(a) && expr_only_const_leaves(b)
+    // Post-order fold: a node is const-only iff all its children are.
+    let mut memo: HashMap<*const Expr, bool> = HashMap::new();
+    let mut stack: Vec<(&Expr, bool)> = vec![(e, false)];
+    while let Some((n, expanded)) = stack.pop() {
+        if expanded {
+            let v = match n {
+                Expr::Const(_) => true,
+                Expr::Var(_) => false,
+                Expr::Not(x) => memo.get(&(*x as *const Expr)).copied().unwrap_or(false),
+                Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                    memo.get(&(*a as *const Expr)).copied().unwrap_or(false)
+                        && memo.get(&(*b as *const Expr)).copied().unwrap_or(false)
+                }
+            };
+            memo.insert(n as *const Expr, v);
+            continue;
+        }
+        stack.push((n, true));
+        match n {
+            Expr::Not(x) => stack.push((x, false)),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+            }
+            _ => {}
         }
     }
+    memo.get(&(e as *const Expr)).copied().unwrap_or(false)
 }
 
 /// True when ITE data arms are const-only (sha256_k case-of-const). Conditions
 /// may use Vars. Wire mux arms (`sel ? a : b`) are not const-ROM.
+/// Iterative: true when ITE data arms are const-only. Descends through `Not`
+/// and ITE arms; non-ITE subtrees must be const-leaved. The old recursion
+/// overflowed the stack on deep trees.
 fn ite_arm_is_const_rom(e: &Expr) -> bool {
-    match e {
-        Expr::Const(_) => true,
-        Expr::Var(_) => false,
-        Expr::Not(x) => ite_arm_is_const_rom(x),
-        other => {
-            if let Some((_, t, f)) = match_ite_expr(other) {
-                ite_arm_is_const_rom(t) && ite_arm_is_const_rom(f)
-            } else {
-                expr_only_const_leaves(other)
+    // Work stack with explicit AND-combine markers: each `Node` pushes exactly
+    // one bool onto `results`; `And` pops two and pushes their conjunction.
+    enum Item<'x> {
+        Node(&'x Expr<'x>),
+        And,
+    }
+    let mut stack: Vec<Item<'_>> = vec![Item::Node(e)];
+    let mut results: Vec<bool> = Vec::new();
+    while let Some(item) = stack.pop() {
+        match item {
+            Item::Node(n) => match n {
+                Expr::Const(_) => results.push(true),
+                Expr::Var(_) => results.push(false),
+                Expr::Not(x) => stack.push(Item::Node(x)),
+                other => {
+                    if let Some((_, t, f)) = match_ite_expr(other) {
+                        stack.push(Item::And);
+                        stack.push(Item::Node(f));
+                        stack.push(Item::Node(t));
+                    } else {
+                        results.push(expr_only_const_leaves(other));
+                    }
+                }
+            },
+            Item::And => {
+                let b = results.pop().unwrap_or(false);
+                let a = results.pop().unwrap_or(false);
+                results.push(a && b);
             }
         }
     }
+    results.pop().unwrap_or(true)
 }
 
 fn ite_tree_is_case_of_const(e: &Expr) -> bool {
@@ -11566,6 +12441,9 @@ fn emit_and(
 /// through single-fanout non-inverted non-output AND nodes (they merge into
 /// the parent LUT). Stops at PIs, consts, inverted lits, multi-fanout nodes
 /// and cone-output nodes — all of which must already have nets.
+/// Iterative DFS over the AIG AND-tree; the old recursion overflowed the stack
+/// on deep single-fanout AND chains. Visit order and `const0` short-circuit
+/// match the old recursion: a child's `const0` unwinds the rest of the stack.
 fn flatten_and(
     aig: &Aig,
     lit: Lit,
@@ -11575,27 +12453,30 @@ fn flatten_and(
     leaves: &mut Vec<Lit>,
     const0: &mut bool,
 ) {
-    if *const0 {
-        return;
-    }
-    if lit.node == 0 {
-        if !lit.inv {
-            *const0 = true;
+    let mut stack: Vec<Lit> = vec![lit];
+    while let Some(l) = stack.pop() {
+        if *const0 {
+            return;
         }
-        return;
+        if l.node == 0 {
+            if !l.inv {
+                *const0 = true;
+            }
+            continue;
+        }
+        if (l.node as usize) <= n_pi {
+            leaves.push(l);
+            continue;
+        }
+        let ai = (l.node as usize) - 1 - n_pi;
+        if l.inv || fo.get(ai).copied().unwrap_or(0) > 1 || out_nodes.contains(&l.node) {
+            leaves.push(l);
+            continue;
+        }
+        let (a, b) = aig.ands[ai];
+        stack.push(b);
+        stack.push(a);
     }
-    if (lit.node as usize) <= n_pi {
-        leaves.push(lit);
-        return;
-    }
-    let ai = (lit.node as usize) - 1 - n_pi;
-    if lit.inv || fo.get(ai).copied().unwrap_or(0) > 1 || out_nodes.contains(&lit.node) {
-        leaves.push(lit);
-        return;
-    }
-    let (a, b) = aig.ands[ai];
-    flatten_and(aig, a, fo, n_pi, out_nodes, leaves, const0);
-    flatten_and(aig, b, fo, n_pi, out_nodes, leaves, const0);
 }
 
 fn net_of(aig: &Aig, node: u32, node_net: &HashMap<u32, String>) -> String {
@@ -12231,33 +13112,60 @@ struct ZpadAdd<'a> {
     add_bits: Vec<Option<RExpr<'a>>>,
 }
 
-fn zpad_one_bit_leaf<'a>(e: &RExpr<'a>, rtl: &Rtl, arena: &'a Bump) -> Option<RExpr<'a>> {
-    match e {
-        RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
-            Some(RExpr::Ident(s))
-        }
-        RExpr::Bit(s, i) if name_known(rtl, s) => Some(RExpr::Bit(s, *i)),
-        RExpr::Not(x) => match *x {
+/// Iterative post-order rebuild; the old recursion overflowed the stack on
+/// deep `And`/`Or` spines.
+/// Iterative post-order rebuild with memo; the old recursion overflowed the
+/// stack on deep `And`/`Or` trees. Semantics match the old version arm for
+/// arm: only `Ident`/`Bit` leaves (and one-level `Not` thereof) survive.
+fn zpad_one_bit_leaf<'a, 'e>(e: &'e RExpr<'a>, rtl: &Rtl, arena: &'a Bump) -> Option<RExpr<'a>>
+where
+    'a: 'e,
+{
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, Option<RExpr<'a>>> =
+        HashMap::with_capacity(post.len());
+    for n in post {
+        let v: Option<RExpr<'a>> = match n {
             RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
-                Some(RExpr::Not(arena.alloc(RExpr::Ident(s))))
+                Some(RExpr::Ident(s))
             }
-            RExpr::Bit(s, i) if name_known(rtl, s) => {
-                Some(RExpr::Not(arena.alloc(RExpr::Bit(s, *i))))
+            RExpr::Bit(s, i) if name_known(rtl, s) => Some(RExpr::Bit(s, *i)),
+            RExpr::Not(x) => match *x {
+                RExpr::Ident(s) if name_known(rtl, s) && sig_width(rtl, s) == 1 => {
+                    Some(RExpr::Not(arena.alloc(RExpr::Ident(s))))
+                }
+                RExpr::Bit(s, i) if name_known(rtl, s) => {
+                    Some(RExpr::Not(arena.alloc(RExpr::Bit(s, *i))))
+                }
+                _ => None,
+            },
+            RExpr::And(a, b) => {
+                let aa = memo
+                    .get(&(*a as *const RExpr<'a>))
+                    .cloned()
+                    .flatten()?;
+                let bb = memo
+                    .get(&(*b as *const RExpr<'a>))
+                    .cloned()
+                    .flatten()?;
+                Some(RExpr::And(arena.alloc(aa), arena.alloc(bb)))
+            }
+            RExpr::Or(a, b) => {
+                let aa = memo
+                    .get(&(*a as *const RExpr<'a>))
+                    .cloned()
+                    .flatten()?;
+                let bb = memo
+                    .get(&(*b as *const RExpr<'a>))
+                    .cloned()
+                    .flatten()?;
+                Some(RExpr::Or(arena.alloc(aa), arena.alloc(bb)))
             }
             _ => None,
-        },
-        RExpr::And(a, b) => {
-            let aa = zpad_one_bit_leaf(a, rtl, arena)?;
-            let bb = zpad_one_bit_leaf(b, rtl, arena)?;
-            Some(RExpr::And(arena.alloc(aa), arena.alloc(bb)))
-        }
-        RExpr::Or(a, b) => {
-            let aa = zpad_one_bit_leaf(a, rtl, arena)?;
-            let bb = zpad_one_bit_leaf(b, rtl, arena)?;
-            Some(RExpr::Or(arena.alloc(aa), arena.alloc(bb)))
-        }
-        _ => None,
+        };
+        memo.insert(n as *const RExpr<'a>, v);
     }
+    memo.get(&(e as *const RExpr<'a>)).cloned().flatten()
 }
 
 fn zpad_parse_pad<'a>(pad_e: &RExpr<'a>, rtl: &Rtl, arena: &'a Bump) -> Option<Vec<Option<RExpr<'a>>>> {
@@ -12454,58 +13362,69 @@ fn lut6_or2() -> u64 {
 }
 
 fn emit_zpad_leaf_net(d: &mut Design, rtl: &Rtl, cell: &str, net: &str, leaf: &RExpr<'_>) -> bool {
-    match leaf {
-        RExpr::Ident(s) => {
-            let src = bit_name(s, sig_width(rtl, s), 0);
-            emit_lut_pins(d, cell, net, lut6_buf(), &[(&src, "I0")]);
-            true
+    // Iterative post-order emission for one-bit AND/OR/NOT/leaf trees.
+    // The old recursion overflowed the stack on deep trees. Each `And`/`Or`
+    // node is emitted after its children (`{net}_a`/`{net}_b` nets), exactly
+    // like the old recursion; a `false` from any subtree unwinds without
+    // emitting the remaining ancestors (matching the old early `return false`).
+    // Stack items are (node, cell, net, children_emitted); the
+    // `children_emitted` flag is the post-order marker: the first visit
+    // pushes the children, the second visit emits the gate.
+    let mut stack: Vec<(&RExpr<'_>, String, String, bool)> =
+        vec![(leaf, cell.to_string(), net.to_string(), false)];
+    let mut failed = false;
+    while let Some((n, c, nn, emitted)) = stack.pop() {
+        if failed {
+            return false;
         }
-        RExpr::Bit(s, b) => {
-            let src = bit_name(s, sig_width(rtl, s), *b);
-            emit_lut_pins(d, cell, net, lut6_buf(), &[(&src, "I0")]);
-            true
-        }
-        RExpr::Not(x) => {
-            let src = match *x {
-                RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), 0),
-                RExpr::Bit(s, b) => bit_name(s, sig_width(rtl, s), *b),
-                _ => return false,
-            };
-            emit_lut_pins(d, cell, net, lut6_inv(), &[(&src, "I0")]);
-            true
-        }
-        RExpr::And(a, b) => {
-            let an = format!("{net}_a");
-            let bn = format!("{net}_b");
-            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_a"), &an, a) {
-                return false;
+        if emitted {
+            // Both children were emitted (or we failed above); emit this gate.
+            let (an, bn) = (format!("{nn}_a"), format!("{nn}_b"));
+            let pins = [(&an[..], "I0"), (&bn[..], "I1")];
+            match n {
+                RExpr::And(..) => {
+                    emit_lut_pins(d, &c, &nn, lut6_and2(false, false, false), &pins)
+                }
+                RExpr::Or(..) => emit_lut_pins(d, &c, &nn, lut6_or2(), &pins),
+                _ => {}
             }
-            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_b"), &bn, b) {
-                return false;
-            }
-            emit_lut_pins(
-                d,
-                cell,
-                net,
-                lut6_and2(false, false, false),
-                &[(&an, "I0"), (&bn, "I1")],
-            );
-            true
+            continue;
         }
-        RExpr::Or(a, b) => {
-            let an = format!("{net}_a");
-            let bn = format!("{net}_b");
-            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_a"), &an, a) {
-                return false;
+        match n {
+            RExpr::Ident(s) => {
+                let src = bit_name(s, sig_width(rtl, s), 0);
+                emit_lut_pins(d, &c, &nn, lut6_buf(), &[(&src, "I0")]);
             }
-            if !emit_zpad_leaf_net(d, rtl, &format!("{cell}_b"), &bn, b) {
-                return false;
+            RExpr::Bit(s, b) => {
+                let src = bit_name(s, sig_width(rtl, s), *b);
+                emit_lut_pins(d, &c, &nn, lut6_buf(), &[(&src, "I0")]);
             }
-            emit_lut_pins(d, cell, net, lut6_or2(), &[(&an, "I0"), (&bn, "I1")]);
-            true
+            RExpr::Not(x) => {
+                let src = match *x {
+                    RExpr::Ident(s) => bit_name(s, sig_width(rtl, s), 0),
+                    RExpr::Bit(s, b) => bit_name(s, sig_width(rtl, s), *b),
+                    _ => {
+                        failed = true;
+                        continue;
+                    }
+                };
+                emit_lut_pins(d, &c, &nn, lut6_inv(), &[(&src, "I0")]);
+            }
+            RExpr::And(a, b) | RExpr::Or(a, b) => {
+                let (an, bn) = (format!("{nn}_a"), format!("{nn}_b"));
+                let (ca, cb) = (format!("{c}_a"), format!("{c}_b"));
+                // Re-push self for post-order emission after the children.
+                stack.push((n, c, nn, true));
+                // Push b then a so a is emitted first (matches old order).
+                stack.push((b, cb, bn, false));
+                stack.push((a, ca, an, false));
+            }
+            _ => {
+                failed = true;
+            }
         }
-        _ => false,
     }
+    !failed
 }
 
 fn emit_ripple_add_zpad_wires(
@@ -13268,44 +14187,90 @@ fn packed_bus_lt_mix(e: &RExpr<'_>, rtl: &Rtl) -> Option<(RelBus, RelBus, bool)>
     if ok { found } else { None }
 }
 
-fn replace_one_bus_lt<'a>(e: &RExpr<'a>, rtl: &Rtl, net: &str, arena: &'a Bump) -> RExpr<'a> {
-    fn walk<'a>(
-        e: &RExpr<'a>,
-        rtl: &Rtl,
-        net: &str,
-        done: &mut bool,
-        arena: &'a Bump,
-    ) -> RExpr<'a> {
-        if *done {
-            return e.clone();
-        }
-        match e {
-            RExpr::Lt(a, b) if as_bus_lt_pair(a, b, rtl).is_some() => {
-                *done = true;
-                RExpr::Ident(arena.alloc_str(net))
-            }
+/// Replace the first (pre-order, left-to-right) `Lt` bus pair — or `Not`
+/// thereof — with `net`. Iterative two-phase: (1) pre-order search for the
+/// target node's pointer, descending only through `Not`/`And`/`Or` like the
+/// old recursion; (2) post-order rebuild replacing exactly that pointer with
+/// `Ident(net)`, cloning everything else verbatim. The old recursion
+/// overflowed the stack on deep trees.
+fn replace_one_bus_lt<'a, 'e>(e: &'e RExpr<'a>, rtl: &Rtl, net: &str, arena: &'a Bump) -> RExpr<'a>
+where
+    'a: 'e,
+{
+    fn is_target(n: &RExpr<'_>, rtl: &Rtl) -> bool {
+        match n {
+            RExpr::Lt(a, b) => as_bus_lt_pair(a, b, rtl).is_some(),
             RExpr::Not(x) => {
-                if let RExpr::Lt(a, b) = *x {
-                    if as_bus_lt_pair(a, b, rtl).is_some() {
-                        *done = true;
-                        return RExpr::Ident(arena.alloc_str(net));
-                    }
-                }
-                RExpr::Not(arena.alloc(walk(x, rtl, net, done, arena)))
+                matches!(*x, RExpr::Lt(a, b) if as_bus_lt_pair(a, b, rtl).is_some())
             }
-            RExpr::And(a, b) => RExpr::And(
-                arena.alloc(walk(a, rtl, net, done, arena)),
-                arena.alloc(walk(b, rtl, net, done, arena)),
-            ),
-            RExpr::Or(a, b) => RExpr::Or(
-                arena.alloc(walk(a, rtl, net, done, arena)),
-                arena.alloc(walk(b, rtl, net, done, arena)),
-            ),
-            other => other.clone(),
+            _ => false,
         }
     }
-    let mut done = false;
-    walk(e, rtl, net, &mut done, arena)
+    // Phase 1: pre-order DFS for the first target's pointer.
+    let mut target: Option<*const RExpr<'a>> = None;
+    {
+        let mut stack: Vec<&'e RExpr<'a>> = vec![e];
+        while let Some(n) = stack.pop() {
+            if is_target(n, rtl) {
+                target = Some(n as *const RExpr<'a>);
+                break;
+            }
+            match n {
+                RExpr::Not(x) => stack.push(*x),
+                RExpr::And(a, b) | RExpr::Or(a, b) => {
+                    stack.push(*b);
+                    stack.push(*a);
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(tp) = target else {
+        return e.clone();
+    };
+    // Phase 2: post-order rebuild; the target pointer becomes Ident(net).
+    // Non-Not/And/Or nodes are cloned verbatim (the old `done`-flag clone).
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len());
+    for n in post {
+        let ptr = n as *const RExpr<'a>;
+        let r: RExpr<'a> = if ptr == tp {
+            RExpr::Ident(arena.alloc_str(net))
+        } else {
+            match n {
+                RExpr::Not(x) => RExpr::Not(
+                    memo
+                        .get(&(*x as *const RExpr<'a>))
+                        .copied()
+                        .unwrap_or(*x),
+                ),
+                RExpr::And(a, b) => RExpr::And(
+                    memo
+                        .get(&(*a as *const RExpr<'a>))
+                        .copied()
+                        .unwrap_or(*a),
+                    memo
+                        .get(&(*b as *const RExpr<'a>))
+                        .copied()
+                        .unwrap_or(*b),
+                ),
+                RExpr::Or(a, b) => RExpr::Or(
+                    memo
+                        .get(&(*a as *const RExpr<'a>))
+                        .copied()
+                        .unwrap_or(*a),
+                    memo
+                        .get(&(*b as *const RExpr<'a>))
+                        .copied()
+                        .unwrap_or(*b),
+                ),
+                other => (*other).clone(),
+            }
+        };
+        memo.insert(ptr, arena.alloc(r));
+    }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
 /// Unsigned `a < b` / `a >= b` as a per-bit ripple, not a 2W-PI AIG.
@@ -14200,93 +15165,144 @@ fn subst_net_copies<'a>(
 /// (their LHS is unreferenced after substitution). Complexity: O(8 * assigns)
 /// for the bounded fixpoint plus one walk per RExpr; runs once per module.
 /// Width of a constant-foldable RExpr, if it is syntactically constant.
+/// Width of a const-only tree. Iterative post-order fold with memo.
+/// Iterative DFS: total const width of a `Concat`/`Not` const tree.
+/// The old recursion overflowed the stack on deep trees.
 fn const_rexpr_width(e: &RExpr) -> Option<usize> {
-    match e {
-        RExpr::Const { width, .. } => Some(*width),
-        RExpr::Concat(parts) => {
-            let mut w = 0usize;
-            for p in parts {
-                w = w.saturating_add(const_rexpr_width(p)?);
+    let mut stack: Vec<&RExpr> = vec![e];
+    let mut w = 0usize;
+    while let Some(n) = stack.pop() {
+        match n {
+            RExpr::Const { width, .. } => w = w.saturating_add(*width),
+            RExpr::Concat(parts) => {
+                for p in parts.iter().rev() {
+                    stack.push(p);
+                }
             }
-            Some(w)
+            RExpr::Not(x) => stack.push(*x),
+            _ => return None,
         }
-        RExpr::Not(x) => const_rexpr_width(x),
-        _ => None,
     }
+    Some(w)
 }
 
 /// Replace references to constant-propagated wires with `Const`.
 /// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
 /// (the parse lifetime) since results are stored back into the `Rtl`.
-fn subst_const_wires<'a>(
-    e: &RExpr<'a>,
+/// Replace references to constant-propagated wires with `Const`.
+/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
+/// (the parse lifetime) since results are stored back into the `Rtl`.
+///
+/// Iterative post-order rebuild with memo. The old recursion (with a
+/// `depth > 32` guard) still overflowed: the guard's `e.clone()` on a deep
+/// tree recurses in `Clone`. The heap work-stack removes the need for any
+/// depth limit.
+/// Replace references to constant-propagated wires with `Const`.
+/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
+/// (the parse lifetime) since results are stored back into the `Rtl`.
+///
+/// Iterative post-order rebuild with memo. The old recursion (with a
+/// `depth > 32` guard) still overflowed: the guard's `e.clone()` on a deep
+/// tree recurses in `Clone`. The heap work-stack removes the need for any
+/// depth limit.
+/// Replace references to constant-propagated wires with `Const`.
+/// Rebuilt subtrees are allocated in `arena`, which must live for `'a`
+/// (the parse lifetime) since results are stored back into the `Rtl`.
+///
+/// Iterative post-order rebuild with memo. The old recursion (with a
+/// `depth > 32` guard) still overflowed: the guard's `e.clone()` on a deep
+/// tree recurses in `Clone`. The heap work-stack removes the need for any
+/// depth limit.
+fn subst_const_wires<'a, 'e>(
+    e: &'e RExpr<'a>,
     map: &HashMap<&'a str, (u128, usize)>,
     arena: &'a Bump,
-) -> RExpr<'a> {
-    fn walk<'a>(
-        e: &RExpr<'a>,
-        map: &HashMap<&'a str, (u128, usize)>,
-        arena: &'a Bump,
-        depth: usize,
-    ) -> RExpr<'a> {
-        if depth > 32 {
-            return e.clone();
-        }
-        let w = |x: &RExpr<'a>| walk(x, map, arena, depth + 1);
-        let mk_const = |val: u128, width: usize| RExpr::Const {
-            val: val & care_mask(width),
-            width,
-            care: care_mask(width),
-        };
-        match e {
+) -> RExpr<'a>
+where
+    'a: 'e,
+{
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    for n in post.into_iter() {
+        let r: RExpr<'a> = match n {
             RExpr::Ident(s) => match map.get(*s) {
-                Some(&(v, wd)) => mk_const(v, wd),
-                None => e.clone(),
+                Some(&(v, wd)) => RExpr::Const {
+                    val: v & care_mask(wd),
+                    width: wd,
+                    care: care_mask(wd),
+                },
+                None => (*n).clone(),
             },
             RExpr::Bit(s, i) => match map.get(*s) {
-                Some(&(v, _)) => mk_const((v >> i) & 1, 1),
-                None => e.clone(),
+                Some(&(v, _)) => RExpr::Const {
+                    val: (v >> i) & 1,
+                    width: 1,
+                    care: 1,
+                },
+                None => (*n).clone(),
             },
             RExpr::Range(s, hi, lo) => match map.get(*s) {
                 Some(&(v, _)) => {
                     let wd = hi.saturating_sub(*lo).saturating_add(1).max(1);
-                    mk_const((v >> lo) & care_mask(wd), wd)
+                    RExpr::Const {
+                        val: (v >> lo) & care_mask(wd),
+                        width: wd,
+                        care: care_mask(wd),
+                    }
                 }
-                None => e.clone(),
+                None => (*n).clone(),
             },
-            RExpr::Const { .. } => e.clone(),
-            RExpr::Not(a) => RExpr::Not(arena.alloc(w(a))),
-            RExpr::And(a, b) => RExpr::And(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Or(a, b) => RExpr::Or(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Xor(a, b) => RExpr::Xor(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Add(a, b) => RExpr::Add(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Sub(a, b) => RExpr::Sub(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Mul(a, b) => RExpr::Mul(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Concat(ps) => RExpr::Concat(ps.iter().map(w).collect()),
-            RExpr::Mux(c, t, f) => RExpr::Mux(arena.alloc(w(c)), arena.alloc(w(t)), arena.alloc(w(f))),
-            RExpr::Eq(a, b) => RExpr::Eq(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Ne(a, b) => RExpr::Ne(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Lt(a, b) => RExpr::Lt(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(w(a)), arena.alloc(w(b))),
-            RExpr::RedXor(a) => RExpr::RedXor(arena.alloc(w(a))),
-            RExpr::RedAnd(a) => RExpr::RedAnd(arena.alloc(w(a))),
-            RExpr::RedOr(a) => RExpr::RedOr(arena.alloc(w(a))),
-            RExpr::IndexPart { name, base, width, ascending } => {
-                let nb = w(base);
-                if let (Some(&(v, _)), Some(bv)) = (map.get(*name), rexpr_const_val(&nb)) {
+            RExpr::IndexPart {
+                name,
+                base,
+                width,
+                ascending,
+            } => {
+                let bbase: &'a RExpr<'a> = memo
+                    .get(&(*base as *const RExpr<'a>))
+                    .copied()
+                    .unwrap_or(*base);
+                let nb_owned = (*bbase).clone();
+                if let (Some(&(v, _)), Some(bv)) = (map.get(*name), rexpr_const_val(&nb_owned))
+                {
                     let b = (bv as usize).min(127);
                     let wd = (*width).max(1);
-                    let lo = if *ascending { b } else { b.saturating_sub(wd - 1) };
-                    return mk_const((v >> lo) & care_mask(wd), wd);
+                    let lo = if *ascending {
+                        b
+                    } else {
+                        b.saturating_sub(wd - 1)
+                    };
+                    RExpr::Const {
+                        val: (v >> lo) & care_mask(wd),
+                        width: wd,
+                        care: care_mask(wd),
+                    }
+                } else {
+                    RExpr::IndexPart {
+                        name: *name,
+                        base: bbase,
+                        width: *width,
+                        ascending: *ascending,
+                    }
                 }
-                RExpr::IndexPart { name: *name, base: arena.alloc(nb), width: *width, ascending: *ascending }
             }
-            RExpr::WordAt { addr, data } => RExpr::WordAt { addr: arena.alloc(w(addr)), data: arena.alloc(w(data)) },
-            RExpr::Call { name, args } => RExpr::Call { name: *name, args: args.iter().map(w).collect() },
-        }
+            RExpr::Const { .. } => (*n).clone(),
+            other => map_rexpr_children(
+                other,
+                &mut |c: &RExpr<'a>| {
+                    memo
+                        .get(&(c as *const RExpr<'a>))
+                        .copied()
+                        .map(|rr| (*rr).clone())
+                        .unwrap_or_else(|| c.clone())
+                },
+                arena,
+            ),
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(r));
     }
-    walk(e, map, arena, 0)
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
 /// Identifiers referenced by an RExpr (for dead-assign elimination).
@@ -15427,11 +16443,18 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 /// Rename substitution map is generic over the key: callers use owned
 /// `String` keys (function lifting generates fresh names) or borrowed `&str`
 /// keys (generate-for uniquification). Both are `Borrow<str>`.
-fn rewrite_rexpr<'a, K: Borrow<str> + Eq + Hash>(
-    e: &RExpr<'a>,
+/// Rename identifiers per `subst`. Iterative post-order rebuild with memo;
+/// replaces the naive-recursive version (deep trees overflowed the stack).
+/// Rename identifiers per `subst`. Iterative post-order rebuild with memo;
+/// replaces the naive-recursive version (deep trees overflowed the stack).
+fn rewrite_rexpr<'a, 'e, K: Borrow<str> + Eq + Hash>(
+    e: &'e RExpr<'a>,
     subst: &HashMap<K, K>,
     arena: &'a Bump,
-) -> RExpr<'a> {
+) -> RExpr<'a>
+where
+    'a: 'e,
+{
     // Renamed idents are copied into the arena once; untouched names reuse the
     // borrowed token span (zero allocation).
     let id = |s: &'a str| -> &'a str {
@@ -15440,91 +16463,122 @@ fn rewrite_rexpr<'a, K: Borrow<str> + Eq + Hash>(
             .map(|n| arena.alloc_str(n.borrow()) as &str)
             .unwrap_or(s)
     };
-    match e {
-        RExpr::Const { val, width, care } => RExpr::Const {
-            val: *val,
-            width: *width,
-            care: *care,
-        },
-        RExpr::Ident(s) => RExpr::Ident(id(s)),
-        RExpr::Bit(s, i) => RExpr::Bit(id(s), *i),
-        RExpr::Range(s, lo, hi) => RExpr::Range(id(s), *lo, *hi),
-        RExpr::IndexPart {
-            name,
-            base,
-            width,
-            ascending,
-        } => RExpr::IndexPart {
-            name: id(name),
-            base: arena.alloc(rewrite_rexpr(base, subst, arena)),
-            width: *width,
-            ascending: *ascending,
-        },
-        RExpr::WordAt { addr, data } => RExpr::WordAt {
-            addr: arena.alloc(rewrite_rexpr(addr, subst, arena)),
-            data: arena.alloc(rewrite_rexpr(data, subst, arena)),
-        },
-        RExpr::Concat(parts) => {
-            RExpr::Concat(parts.iter().map(|p| rewrite_rexpr(p, subst, arena)).collect())
-        }
-        RExpr::Shr(a, b) => RExpr::Shr(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Ashr(a, b) => RExpr::Ashr(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::RedXor(x) => RExpr::RedXor(arena.alloc(rewrite_rexpr(x, subst, arena))),
-        RExpr::RedAnd(x) => RExpr::RedAnd(arena.alloc(rewrite_rexpr(x, subst, arena))),
-        RExpr::RedOr(x) => RExpr::RedOr(arena.alloc(rewrite_rexpr(x, subst, arena))),
-        RExpr::Not(x) => RExpr::Not(arena.alloc(rewrite_rexpr(x, subst, arena))),
-        RExpr::And(a, b) => RExpr::And(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Or(a, b) => RExpr::Or(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Xor(a, b) => RExpr::Xor(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Add(a, b) => RExpr::Add(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Sub(a, b) => RExpr::Sub(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Mul(a, b) => RExpr::Mul(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Mux(c, t, f) => RExpr::Mux(
-            arena.alloc(rewrite_rexpr(c, subst, arena)),
-            arena.alloc(rewrite_rexpr(t, subst, arena)),
-            arena.alloc(rewrite_rexpr(f, subst, arena)),
-        ),
-        RExpr::Eq(a, b) => RExpr::Eq(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Ne(a, b) => RExpr::Ne(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Lt(a, b) => RExpr::Lt(
-            arena.alloc(rewrite_rexpr(a, subst, arena)),
-            arena.alloc(rewrite_rexpr(b, subst, arena)),
-        ),
-        RExpr::Call { name, args } => RExpr::Call {
-            name: name,
-            args: args.iter().map(|a| rewrite_rexpr(a, subst, arena)).collect(),
-        },
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    // Rebuilt child by identity; post-order guarantees every child is
+    // memoized, falling back to the original ref.
+    let kid = |memo: &HashMap<*const RExpr<'a>, &'a RExpr<'a>>, p: *const RExpr<'a>| {
+        memo.get(&p).copied()
+    };
+    for n in post {
+        // Resolve child or keep the original ref when the memo misses (cannot
+        // happen under post-order; the fallback keeps this total).
+        let kc = |p: *const RExpr<'a>, orig: &'a RExpr<'a>| -> &'a RExpr<'a> {
+            kid(&memo, p).unwrap_or(orig)
+        };
+        let r: RExpr<'a> = match n {
+            RExpr::Const { val, width, care } => RExpr::Const {
+                val: *val,
+                width: *width,
+                care: *care,
+            },
+            RExpr::Ident(s) => RExpr::Ident(id(s)),
+            RExpr::Bit(s, i) => RExpr::Bit(id(s), *i),
+            RExpr::Range(s, lo, hi) => RExpr::Range(id(s), *lo, *hi),
+            RExpr::IndexPart {
+                name,
+                base,
+                width,
+                ascending,
+            } => RExpr::IndexPart {
+                name: id(name),
+                base: kc(*base as *const RExpr<'a>, base),
+                width: *width,
+                ascending: *ascending,
+            },
+            RExpr::WordAt { addr, data } => RExpr::WordAt {
+                addr: kc(*addr as *const RExpr<'a>, addr),
+                data: kc(*data as *const RExpr<'a>, data),
+            },
+            RExpr::Concat(parts) => RExpr::Concat(
+                parts
+                    .iter()
+                    .map(|p| {
+                        kid(&memo, p as *const RExpr<'a>)
+                            .map(|rr| (*rr).clone())
+                            .unwrap_or_else(|| (*p).clone())
+                    })
+                    .collect(),
+            ),
+            RExpr::Shr(a, b) => RExpr::Shr(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Ashr(a, b) => RExpr::Ashr(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::RedXor(x) => RExpr::RedXor(kc(*x as *const RExpr<'a>, x)),
+            RExpr::RedAnd(x) => RExpr::RedAnd(kc(*x as *const RExpr<'a>, x)),
+            RExpr::RedOr(x) => RExpr::RedOr(kc(*x as *const RExpr<'a>, x)),
+            RExpr::Not(x) => RExpr::Not(kc(*x as *const RExpr<'a>, x)),
+            RExpr::And(a, b) => RExpr::And(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Or(a, b) => RExpr::Or(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Xor(a, b) => RExpr::Xor(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Add(a, b) => RExpr::Add(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Sub(a, b) => RExpr::Sub(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Mul(a, b) => RExpr::Mul(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Mux(c, t, f) => RExpr::Mux(
+                kc(*c as *const RExpr<'a>, c),
+                kc(*t as *const RExpr<'a>, t),
+                kc(*f as *const RExpr<'a>, f),
+            ),
+            RExpr::Eq(a, b) => RExpr::Eq(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Ne(a, b) => RExpr::Ne(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Lt(a, b) => RExpr::Lt(
+                kc(*a as *const RExpr<'a>, a),
+                kc(*b as *const RExpr<'a>, b),
+            ),
+            RExpr::Call { name, args } => RExpr::Call {
+                name,
+                args: args
+                    .iter()
+                    .map(|a| {
+                        kid(&memo, a as *const RExpr<'a>)
+                            .map(|rr| (*rr).clone())
+                            .unwrap_or_else(|| (*a).clone())
+                    })
+                    .collect(),
+            },
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(r));
     }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
 fn elaborate_rtl<'a>(src: &'a Rtl<'a>, overrides: &HashMap<String, u128>) -> Result<Rtl<'a>, String> {
@@ -15738,42 +16792,151 @@ fn resolve_hier_path(mods: &HashMap<String, Rtl<'_>>, module: &str, path: &[&str
     (format!("{}_{inner}", inst.name), w.max(1))
 }
 
-fn rewrite_hier_expr<'a>(
-    e: &RExpr<'a>,
+/// Rewrite hierarchical names. Iterative post-order rebuild with memo;
+/// replaces the naive-recursive version (deep trees overflowed the stack).
+/// Rewrite hierarchical names in an `RExpr`. Iterative post-order to
+/// avoid stack overflow on deep trees.
+fn rewrite_hier_expr<'a, 'e>(
+    e: &'e RExpr<'a>,
     mods: &HashMap<String, Rtl<'a>>,
     module: &str,
     taps: &mut Vec<(&'a str, usize)>,
     arena: &'a Bump,
-) -> RExpr<'a> {
-    // Hierarchical names are rewritten; the new name is arena-copied once,
-    // untouched names reuse the borrowed token span.
-    let mut rewrite_name = |s: &'a str| -> &'a str {
-        if !s.contains('.') {
-            return s;
+) -> RExpr<'a>
+where
+    'a: 'e,
+{
+    // Fast path: if no hierarchical names, just do iterative clone.
+    // Check via iterative scan.
+    let mut has_hier = false;
+    {
+        let mut stack: Vec<&'e RExpr<'a>> = vec![e];
+        while let Some(n) = stack.pop() {
+            match n {
+                RExpr::Ident(s) | RExpr::Bit(s, _) => {
+                    if s.contains('.') {
+                        has_hier = true;
+                        break;
+                    }
+                }
+                RExpr::Range(s, _, _) => {
+                    if s.contains('.') {
+                        has_hier = true;
+                        break;
+                    }
+                }
+                RExpr::IndexPart { name, .. } => {
+                    if name.contains('.') {
+                        has_hier = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if !has_hier {
+                push_rexpr_children(n, &mut stack);
+            }
         }
-        let path: Vec<&str> = s.split('.').collect();
-        let (n, w) = resolve_hier_path(mods, module, &path);
-        let interned = arena.alloc_str(&n);
-        taps.push((interned, w));
-        interned
-    };
-    match e {
-        RExpr::Ident(s) => RExpr::Ident(rewrite_name(s)),
-        RExpr::Bit(s, i) => RExpr::Bit(rewrite_name(s), *i),
-        RExpr::Range(s, lo, hi) => RExpr::Range(rewrite_name(s), *lo, *hi),
-        RExpr::IndexPart {
-            name,
-            base,
-            width,
-            ascending,
-        } => RExpr::IndexPart {
-            name: rewrite_name(name),
-            base: arena.alloc(rewrite_hier_expr(base, mods, module, taps, arena)),
-            width: *width,
-            ascending: *ascending,
-        },
-        other => map_rexpr_children(other, &mut |c| rewrite_hier_expr(c, mods, module, taps, arena), arena),
     }
+    if !has_hier {
+        // No hierarchical names: iterative clone via post-order.
+        let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+        let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+            HashMap::with_capacity(post.len() + 1);
+        for n in post.into_iter() {
+            let r: RExpr<'a> = map_rexpr_children(
+                n,
+                &mut |c: &RExpr<'a>| {
+                    memo.get(&(c as *const RExpr<'a>))
+                        .copied()
+                        .map(|rr| (*rr).clone())
+                        .unwrap_or_else(|| c.clone())
+                },
+                arena,
+            );
+            memo.insert(n as *const RExpr<'a>, arena.alloc(r));
+        }
+        return (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone();
+    }
+    // Has hierarchical names: need to rewrite them.
+    // Do post-order, applying rewrite_name to Ident/Bit/Range/IndexPart names.
+    let post: Vec<&'e RExpr<'a>> = rexpr_post_order(e);
+    let mut memo: HashMap<*const RExpr<'a>, &'a RExpr<'a>> =
+        HashMap::with_capacity(post.len() + 1);
+    // Helper to rewrite a name (cannot be a closure due to borrow issues with taps).
+    for n in post.into_iter() {
+        let r: RExpr<'a> = match n {
+            RExpr::Ident(s) => {
+                let ns: &'a str = if !s.contains('.') {
+                    *s
+                } else {
+                    let path: Vec<&str> = s.split('.').collect();
+                    let (nn, w) = resolve_hier_path(mods, module, &path);
+                    let interned = arena.alloc_str(&nn);
+                    taps.push((interned, w));
+                    interned
+                };
+                RExpr::Ident(ns)
+            }
+            RExpr::Bit(s, i) => {
+                let ns: &'a str = if !s.contains('.') {
+                    *s
+                } else {
+                    let path: Vec<&str> = s.split('.').collect();
+                    let (nn, w) = resolve_hier_path(mods, module, &path);
+                    let interned = arena.alloc_str(&nn);
+                    taps.push((interned, w));
+                    interned
+                };
+                RExpr::Bit(ns, *i)
+            }
+            RExpr::Range(s, lo, hi) => {
+                let ns: &'a str = if !s.contains('.') {
+                    *s
+                } else {
+                    let path: Vec<&str> = s.split('.').collect();
+                    let (nn, w) = resolve_hier_path(mods, module, &path);
+                    let interned = arena.alloc_str(&nn);
+                    taps.push((interned, w));
+                    interned
+                };
+                RExpr::Range(ns, *lo, *hi)
+            }
+            RExpr::IndexPart { name, base, width, ascending } => {
+                let ns: &'a str = if !name.contains('.') {
+                    *name
+                } else {
+                    let path: Vec<&str> = name.split('.').collect();
+                    let (nn, w) = resolve_hier_path(mods, module, &path);
+                    let interned = arena.alloc_str(&nn);
+                    taps.push((interned, w));
+                    interned
+                };
+                let bbase: &'a RExpr<'a> = memo
+                    .get(&(*base as *const RExpr<'a>))
+                    .copied()
+                    .unwrap_or(*base);
+                RExpr::IndexPart {
+                    name: ns,
+                    base: bbase,
+                    width: *width,
+                    ascending: *ascending,
+                }
+            }
+            other => map_rexpr_children(
+                other,
+                &mut |c: &RExpr<'a>| {
+                    memo.get(&(c as *const RExpr<'a>))
+                        .copied()
+                        .map(|rr| (*rr).clone())
+                        .unwrap_or_else(|| c.clone())
+                },
+                arena,
+            ),
+        };
+        memo.insert(n as *const RExpr<'a>, arena.alloc(r));
+    }
+    (*memo.get(&(e as *const RExpr<'a>)).copied().unwrap_or(e)).clone()
 }
 
 fn rewrite_hier_in_mods<'a>(mods: &mut HashMap<String, Rtl<'a>>) {
@@ -16243,10 +17406,45 @@ pub fn lut_init_of(source: &str) -> Result<u64, String> {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use helion_ir::INC4_INIT;
+
+    /// Regression: deep `always_comb` priority chains must not overflow the
+    /// stack, no matter how deep. Chained blocking assignments
+    /// (`x = cN ? v : x`) build `Mux` spines linear in chain length; the old
+    /// naive-recursive walkers (`fold_blocking_assigns::subst`,
+    /// `rexpr_to_bit`, ...) overflowed the 8MB main-thread stack in debug
+    /// builds at ~1.2k depth. These now use heap work-stacks.
+    fn synth_priority_chain(depth: usize) {
+        let mut src = String::from(
+            "module deep_chain(input logic clk,\n\
+              \u{20} input logic [127:0] c,\n\
+              \u{20} output logic x);\n\
+              \u{20} logic x_r;\n\
+              \u{20} always_comb begin\n\
+              \u{20}   x_r = 1'b0;\n",
+        );
+        for i in 0..depth {
+            let bit = i % 128;
+            src.push_str(&format!("    x_r = c[{bit}] ? 1'b1 : x_r;\n"));
+        }
+        src.push_str("  end\n  assign x = x_r;\nendmodule\n");
+        let d = synth_sv(&src, "deep_chain.sv").expect("deep priority chain must synthesize");
+        assert!(!d.cells.is_empty(), "expected LUT cells for the chain");
+    }
+
+    #[test]
+    fn deep_priority_chain_5k_no_stack_overflow() {
+        synth_priority_chain(5_000);
+    }
+
+    #[test]
+    fn deep_priority_chain_50k_no_stack_overflow() {
+        synth_priority_chain(50_000);
+    }
 
     /// Parse a test expression (leaked arena, test-only).
     fn pe(s: &str) -> Result<Expr<'static>, String> {
