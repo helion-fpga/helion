@@ -6099,20 +6099,32 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     let mut pick: Option<(String, String)> = None;
     let mut pick_obj: Option<String> = None;
     egui::ScrollArea::both().id_salt("clock_interaction_scroll").show(ui, |ui| {
+        // Fixed 120px columns (Vivado matrix): headers center over their
+        // cells instead of ragged content-sized labels.
+        const CELL_W: f32 = 120.0;
+        const HEAD_H: f32 = 28.0;
         egui::Grid::new("clock_interaction_matrix")
             .spacing([4.0, 4.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("From \\ To").strong());
+                ui.allocate_ui(egui::vec2(CELL_W, HEAD_H), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("From \\ To").strong());
+                    });
+                });
                 for c in &report.clocks {
                     let src = c.source.split('/').next().unwrap_or(c.source.as_str());
                     let on_obj = selected.as_deref() == Some(src)
                         || selected.as_deref() == Some(c.name.as_str());
-                    if ui
-                        .selectable_label(on_obj, RichText::new(&c.name).strong())
-                        .clicked()
-                    {
-                        pick_obj = Some(c.name.clone());
-                    }
+                    ui.allocate_ui(egui::vec2(CELL_W, HEAD_H), |ui| {
+                        ui.centered_and_justified(|ui| {
+                            if ui
+                                .selectable_label(on_obj, RichText::new(&c.name).strong())
+                                .clicked()
+                            {
+                                pick_obj = Some(c.name.clone());
+                            }
+                        });
+                    });
                 }
                 ui.end_row();
                 for from in &report.clocks {
@@ -6123,11 +6135,15 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                         .unwrap_or(from.source.as_str());
                     let on_obj = selected.as_deref() == Some(src)
                         || selected.as_deref() == Some(from.name.as_str());
-                    if ui
-                        .selectable_label(on_obj, RichText::new(&from.name).strong())
-                        .clicked()
-                    {
-                        pick_obj = Some(from.name.clone());
+                    ui.allocate_ui(egui::vec2(CELL_W, HEAD_H), |ui| {
+                        ui.centered_and_justified(|ui| {
+                            if ui
+                                .selectable_label(on_obj, RichText::new(&from.name).strong())
+                                .clicked()
+                            {
+                                pick_obj = Some(from.name.clone());
+                            }
+                        });
                     }
                     for to in &report.clocks {
                         if let Some(cell) = report.cell(&from.name, &to.name) {
