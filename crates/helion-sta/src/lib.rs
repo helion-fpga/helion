@@ -13,7 +13,18 @@ use helion_place::Placed;
 use helion_route::Routed;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+mod cdc;
 mod constraints_codec;
+
+// Structural CDC analysis (v3.0 verification track): clock-domain
+// extraction, net-level crossing detection, synchronizer recognition, and
+// the 11 CdcClass violation classes layered on `report_cdc`.
+pub use cdc::{
+    classify_crossings, extract_domains, find_crossings, is_mux_select, sync_chain, CdcClass,
+    CdcCrossing, ClockDomain, CrossingSource, DomainKind, DomainMap, RawCrossing, SyncChain,
+};
+// Legacy pair-level helpers, moved into `cdc::` (still crate-internal).
+pub(crate) use cdc::{cdc_synchronizer, clock_ff_loads, clock_net_name};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Clock {
@@ -396,6 +407,9 @@ pub struct CdcViolation {
 pub struct CdcReport {
     pub clocks: Vec<Clock>,
     pub violations: Vec<CdcViolation>,
+    /// Net-level structural crossings (v3.0): the 11 `CdcClass` violations.
+    /// Populated when `report_cdc` is given `design: Some`.
+    pub crossings: Vec<CdcCrossing>,
 }
 
 impl CdcReport {
@@ -430,6 +444,22 @@ impl CdcReport {
         self.violations
             .iter()
             .filter(|v| v.severity == CdcSeverity::Safe)
+            .count()
+    }
+
+    /// Net-level structural crossings at Critical severity.
+    pub fn structural_critical_count(&self) -> usize {
+        self.crossings
+            .iter()
+            .filter(|c| c.severity == CdcSeverity::Critical)
+            .count()
+    }
+
+    /// Net-level structural crossings at Warning severity.
+    pub fn structural_warning_count(&self) -> usize {
+        self.crossings
+            .iter()
+            .filter(|c| c.severity == CdcSeverity::Warning)
             .count()
     }
 
@@ -470,6 +500,17 @@ impl CdcReport {
                 v.endpoints,
                 v.relation.as_str()
             ));
+        }
+        if !self.crossings.is_empty() {
+            lines.push(format!(
+                "crossings={} structural_critical={} structural_warning={}",
+                self.crossings.len(),
+                self.structural_critical_count(),
+                self.structural_warning_count()
+            ));
+            for c in &self.crossings {
+                lines.push(c.text());
+            }
         }
         lines.join("\n")
     }
@@ -1979,126 +2020,12 @@ fn cdc_check(relation: ClockRelation, synchronizer: bool) -> (&'static str, CdcS
     }
 }
 
-fn clock_net_name(design: &Design, clk: &Clock) -> String {
-    if let Some((cell, pin)) = clk.source.split_once('/') {
-        if let Some(n) = design.net_on(cell, pin) {
-            return n.to_string();
-        }
-    }
-    if let Some(n) = design.net_on(&clk.source, "Q") {
-        return n.to_string();
-    }
-    clk.source.clone()
-}
-
-fn clock_ff_loads(design: &Design, net: &str) -> usize {
-    design
-        .cells
-        .iter()
-        .filter(|c| matches!(c.kind, CellKind::Hff) && design.net_on(&c.name, "CLK") == Some(net))
-        .count()
-}
-
-/// Driver FF of `ff`'s D pin: direct Q, or one tech-mapped passthrough LUT
-/// whose sole data PI is an FF Q. Multi-input LUTs are not passthrough.
-fn ff_d_source_ff(design: &Design, ff: &str) -> Option<String> {
-    let d_net = design.net_on(ff, "D")?;
-    let net = design.net(d_net)?;
-    let q_drivers: Vec<String> = net
-        .endpoints
-        .iter()
-        .filter(|e| e.pin == "Q")
-        .filter(|e| {
-            design
-                .cell(&e.cell)
-                .is_some_and(|c| matches!(c.kind, CellKind::Hff))
-        })
-        .map(|e| e.cell.clone())
-        .collect();
-    if q_drivers.len() == 1 {
-        return Some(q_drivers[0].clone());
-    }
-    let lut_drivers: Vec<String> = net
-        .endpoints
-        .iter()
-        .filter(|e| e.pin == "O")
-        .filter(|e| {
-            design
-                .cell(&e.cell)
-                .is_some_and(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-        })
-        .map(|e| e.cell.clone())
-        .collect();
-    if lut_drivers.len() != 1 {
-        return None;
-    }
-    let lut = &lut_drivers[0];
-    let mut q_pis = Vec::new();
-    for pin in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-        let Some(pi) = design.net_on(lut, pin) else {
-            continue;
-        };
-        let Some(pin_net) = design.net(pi) else {
-            continue;
-        };
-        for e in &pin_net.endpoints {
-            if e.pin == "Q"
-                && design
-                    .cell(&e.cell)
-                    .is_some_and(|c| matches!(c.kind, CellKind::Hff))
-            {
-                if !q_pis.iter().any(|x| x == &e.cell) {
-                    q_pis.push(e.cell.clone());
-                }
-            }
-        }
-    }
-    if q_pis.len() == 1 {
-        Some(q_pis[0].clone())
-    } else {
-        None
-    }
-}
-
-/// UG906-style sync detect: a 2FF chain on `to_net` whose first stage samples
-/// a launch FF on `from_net`. Tech-map inserts a LUT on every D; walk one
-/// passthrough LUT. A lone capture FF (cdc_cross) stays unsynchronized.
-fn cdc_synchronizer(design: &Design, from_net: &str, to_net: &str) -> (usize, bool) {
-    let mut endpoints = 0usize;
-    let mut sync = false;
-    let dest_ffs: Vec<String> = design
-        .cells
-        .iter()
-        .filter(|c| matches!(c.kind, CellKind::Hff))
-        .filter(|c| design.net_on(&c.name, "CLK") == Some(to_net))
-        .map(|c| c.name.clone())
-        .collect();
-    for ff in &dest_ffs {
-        let Some(src) = ff_d_source_ff(design, ff) else {
-            continue;
-        };
-        let src_clk = design.net_on(&src, "CLK");
-        if src_clk == Some(from_net) {
-            endpoints += 1;
-            continue;
-        }
-        if src_clk != Some(to_net) {
-            continue;
-        }
-        // Second stage of a 2FF sync: dest FF ← dest FF ← launch FF.
-        if let Some(launch) = ff_d_source_ff(design, &src) {
-            if design.net_on(&launch, "CLK") == Some(from_net) {
-                endpoints += 1;
-                sync = true;
-            }
-        }
-    }
-    (endpoints, sync)
-}
-
 /// UG906 `report_cdc`: inter-clock rows from STA clocks + XDC CDC exceptions.
 /// Optional HNF marks 2FF synchronizers (CDC-1 Warning). Empty clocks yield
 /// an empty report (not a canned table). Does not move WNS.
+/// With `design: Some`, also runs the structural CDC pass
+/// (`extract_domains` -> `find_crossings` -> `classify_crossings`) into
+/// `CdcReport::crossings`; pair-level rows are unchanged.
 pub fn report_cdc(
     clocks: &[Clock],
     xdc: &Constraints,
@@ -2165,6 +2092,13 @@ pub fn report_cdc(
     CdcReport {
         clocks: clocks.to_vec(),
         violations,
+        crossings: match design {
+            Some(d) => {
+                let domains = extract_domains(d, clocks, xdc);
+                classify_crossings(d, &domains, find_crossings(d, &domains))
+            }
+            None => Vec::new(),
+        },
     }
 }
 
