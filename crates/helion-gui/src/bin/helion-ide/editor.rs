@@ -11,7 +11,7 @@
 //! scrolls internally. One outer [`egui::ScrollArea`] does all the scrolling,
 //! which keeps the gutter overlay and the minimap viewport math trivially in
 //! sync. The gutter and minimap are painted as overlays *after* the scroll
-//! area, positioned from the current frame's scroll state — no lag.
+//! area, positioned from the current frame's scroll state - no lag.
 
 use super::*;
 use std::cell::RefCell;
@@ -59,7 +59,7 @@ pub fn save_editor(app: &mut HelionIde) {
 }
 
 /// Block-comment state after scanning one line.
-fn block_state_after(line: &str, mut in_block: bool) -> bool {
+pub(crate) fn block_state_after(line: &str, mut in_block: bool) -> bool {
     let b = line.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -77,7 +77,7 @@ fn block_state_after(line: &str, mut in_block: bool) -> bool {
 }
 
 /// Append one highlighted line's sections into a [`egui::text::LayoutJob`].
-fn append_highlighted(
+pub(crate) fn append_highlighted(
     job: &mut egui::text::LayoutJob,
     line: &str,
     lang: highlight::Lang,
@@ -114,7 +114,7 @@ fn base_format(theme: &theme::Theme, font_size: f32) -> egui::TextFormat {
 ///
 /// In wrap mode each logical line is also laid out on its own so the gutter
 /// can size rows to the true visual height; the counts are reported through
-/// `line_rows_out` (visual rows per logical line, same frame — no lag).
+/// `line_rows_out` (visual rows per logical line, same frame - no lag).
 fn build_editor_galley(
     ui: &egui::Ui,
     text: &str,
@@ -296,7 +296,11 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
             if ui.small_button("Goto Source").clicked() {
                 do_goto = true;
             }
-            if ui.small_button("Open").clicked() {
+            if ui
+                .small_button("Show RTL")
+                .on_hover_text("Show the current RTL source in the text editor")
+                .clicked()
+            {
                 do_open = true;
             }
             if ui

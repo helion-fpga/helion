@@ -1,32 +1,34 @@
-//! CAD chrome: three canvases, one activity rail, More ⋯ overflow.
+//! CAD chrome: three canvases, one activity rail, More ... overflow.
 //!
 //! Paint calls these helpers; tests assert the same units at ~1440×900 without eframe.
 
-use crate::{BottomTab, WorkspaceTab};
+use eframe::egui;
+
+use crate::{ide::WaveDensity, BottomTab, WorkspaceTab};
 
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
-/// Activity rail — letter above the full name. 48px clipped "Device"/"Program"/"Reports".
+/// Activity rail - letter above the full name. 48px clipped "Device"/"Program"/"Reports".
 pub const RAIL_WIDTH: f32 = 88.0;
 /// Tall enough for letter glyph + full name under it (hit ≥28px).
 pub const HIT_RAIL: f32 = 56.0;
 /// One sidebar (MUST 5).
 pub const SIDEBAR_WIDTH: f32 = 220.0;
-/// Legacy aliases — side chrome is rail + sidebar, not 680.
+/// Legacy aliases - side chrome is rail + sidebar, not 680.
 pub const NAV_WIDTH: f32 = RAIL_WIDTH;
 pub const TREE_WIDTH: f32 = SIDEBAR_WIDTH;
-/// Properties dock — shown on selection, not always-on.
+/// Properties dock - shown on selection, not always-on.
 pub const PROPERTIES_WIDTH: f32 = 220.0;
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const RAIL_MIN_HEIGHT: f32 = TOOLBAR_HEIGHT;
 pub const STATUS_HEIGHT: f32 = 22.0;
 pub const HIT_PRIMARY: f32 = 32.0;
-/// Comfort primary (Implement / Open) — ≥44 where the toolbar has room.
+/// Comfort primary (Implement / Open) - ≥44 where the toolbar has room.
 pub const HIT_COMFORT: f32 = 36.0;
 /// Every toolbar / flow chip shares this height. Width may follow the label; height may not.
 pub const TOOLBAR_CTRL_H: f32 = HIT_COMFORT;
-/// Approx glyph width at the rail's primary (word) size — letter is secondary.
+/// Approx glyph width at the rail's primary (word) size - letter is secondary.
 const RAIL_WORD_CHAR_PX: f32 = 8.0;
 pub const HIT_SIDEBAR: f32 = 28.0;
 pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
@@ -49,18 +51,18 @@ pub const DEVICE_TABLES_MAX_HEIGHT: f32 = 140.0;
 /// Floorplan / package canvas never shrinks below this if the pane has room.
 pub const DRAWING_MIN_HEIGHT: f32 = 280.0;
 /// Idle paint policy (Air budgets): eframe reactive; no continuous `request_repaint`.
-/// Floorplan/device paint is O(pins + tiles) per *input* frame only — not a synth loop.
+/// Floorplan/device paint is O(pins + tiles) per *input* frame only - not a synth loop.
 pub const IDLE_PAINT_POLICY: &str = "reactive-no-request_repaint";
 /// Soft budget: idle CPU should be ~0% when the window is unfocused / no input (OS compositor).
 pub const IDLE_CPU_SOFT_PCT: u32 = 1;
 /// Soft budget: no uncapped animation timer; paint only on egui events.
 pub const IDLE_ANIM_HZ: u32 = 0;
 
-/// Legacy alias — canvas expands; do not use as a max cap.
+/// Legacy alias - canvas expands; do not use as a max cap.
 pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 /// Minimum column width used to decide whether a grid clips its last column.
 pub const MIN_COL_PX: f32 = 80.0;
-pub const MORE: &str = "More ⋯";
+pub const MORE: &str = "More ...";
 pub const MORE_LABEL: &str = MORE;
 const CHAR_PX: f32 = RAIL_WORD_CHAR_PX;
 const TAB_PAD_PX: f32 = 16.0;
@@ -71,17 +73,18 @@ pub fn toolbar_ctrl_size(label: &str) -> [f32; 2] {
     [w, TOOLBAR_CTRL_H]
 }
 
-/// Synth/Opt/Place/Route chips — same height as Open/Implement.
+/// Synth/Opt/Place/Route chips - same height as Open/Implement.
 pub fn flow_chip_size() -> [f32; 2] {
     [72.0, TOOLBAR_CTRL_H]
 }
 
 /// Waveform trace row height. One or two traces must fill the remaining pane
 /// instead of painting a 32px strip over a black slab.
-pub fn wave_trace_row_h(n_traces: usize, remaining_h: f32) -> f32 {
-    let n = n_traces.max(1) as f32;
-    let remain = remaining_h.max(36.0);
-    (remain / n).clamp(36.0, remain)
+/// Waveform lane height comes from the density toggle (GTKWave-style),
+/// not from stretching rows to fill the pane - stretching produced 150px
+/// lanes with few traces. Leftover space below the lanes is normal.
+pub fn wave_trace_row_h(density: WaveDensity) -> f32 {
+    density.lane_h()
 }
 
 /// Stretch a table across the remaining pane (Win32: leftover empty regions are incorrect).
@@ -94,6 +97,72 @@ pub fn stretched_col_w_gap(n_cols: usize, avail: f32, gap: f32) -> f32 {
     let n = n_cols.max(1) as f32;
     let gaps = gap * (n - 1.0).max(0.0);
     ((avail - gaps).max(48.0) / n).max(48.0)
+}
+
+/// Estimated drawn width of a content-sized text button (matches `ui.button`).
+pub fn text_button_w(label: &str) -> f32 {
+    label.chars().count() as f32 * 7.0 + 22.0
+}
+
+/// Estimated drawn width of a checkbox with its label.
+pub fn checkbox_w(label: &str) -> f32 {
+    18.0 + 6.0 + label.chars().count() as f32 * 7.0
+}
+
+/// One item in an overflow-capable toolbar row.
+pub struct OverflowItem {
+    /// Estimated drawn width in px (see `text_button_w` / `checkbox_w`).
+    pub width: f32,
+}
+
+/// Render toolbar items left-to-right; items that do not fit go into a ">>"
+/// overflow menu (VS Code pattern) instead of truncating into "Zoo..." soup.
+/// `render(ui, index, in_menu)` draws item `index`; `in_menu` lets it adapt
+/// (menu rows are full-width). At least one item always stays inline.
+pub fn overflow_toolbar(
+    ui: &mut egui::Ui,
+    items: &[OverflowItem],
+    mut render: impl FnMut(&mut egui::Ui, usize, bool),
+) {
+    let avail_w = ui.available_width().max(64.0);
+    let spacing = ui.spacing().item_spacing.x;
+    let more_w = 40.0; // the ">>" button itself
+    if items.is_empty() {
+        return;
+    }
+    let total: f32 =
+        items.iter().map(|i| i.width).sum::<f32>() + spacing * items.len().saturating_sub(1) as f32;
+    ui.horizontal(|ui| {
+        if total <= avail_w {
+            for idx in 0..items.len() {
+                render(ui, idx, false);
+            }
+            return;
+        }
+        // Overflow: fit as many leading items as possible, reserving the ">>".
+        let mut inline_count = 1; // never strand the row with only ">>"
+        let mut used = items[0].width;
+        for (idx, item) in items.iter().enumerate().skip(1) {
+            if used + spacing + item.width + spacing + more_w <= avail_w {
+                used += spacing + item.width;
+                inline_count = idx + 1;
+            } else {
+                break;
+            }
+        }
+        for idx in 0..inline_count {
+            render(ui, idx, false);
+        }
+        ui.menu_button(">>", |ui| {
+            ui.label(egui::RichText::new("More actions").strong().small());
+            ui.separator();
+            for idx in inline_count..items.len() {
+                render(ui, idx, true);
+            }
+        })
+        .response
+        .on_hover_text("More toolbar actions");
+    });
 }
 
 /// Vivado Autohide Pins / Quartus hide instance pins: unconnected pins stay
@@ -251,7 +320,7 @@ impl Activity {
         }
     }
 
-    /// Name under the letter. Full words — the rail is wide enough to paint them.
+    /// Name under the letter. Full words - the rail is wide enough to paint them.
     pub fn short_label(self) -> &'static str {
         self.label()
     }
@@ -294,7 +363,7 @@ pub enum OverflowMode {
     Wrap,
     /// One row with horizontal scroll + chevrons.
     Scroll,
-    /// One row; overflow goes into a More ⋯ menu (shipped).
+    /// One row; overflow goes into a More ... menu (shipped).
     More,
 }
 
@@ -443,7 +512,7 @@ pub fn would_clip(labels: &[&'static str], available: f32) -> bool {
     visible_if_clipped(labels, available).len() < labels.len()
 }
 
-/// One row + More ⋯. Never wrap (wrap steals canvas).
+/// One row + More .... Never wrap (wrap steals canvas).
 pub fn fit_or_more(
     labels: &[&'static str],
     available: f32,
@@ -472,7 +541,7 @@ pub fn naive_tab_overflow(available: f32) -> OverflowMode {
     }
 }
 
-/// Shipped workspace strip: one row + More ⋯. Never wrap.
+/// Shipped workspace strip: one row + More .... Never wrap.
 pub fn workspace_tab_overflow(available: f32) -> OverflowMode {
     match naive_tab_overflow(available) {
         OverflowMode::Clip => OverflowMode::More,
@@ -707,7 +776,7 @@ pub fn device_io_site_line_fits(name: &str, dir: &str, site: &str, avail: f32) -
     line.chars().count() as f32 * 7.0 + 8.0 <= avail + 0.5
 }
 
-/// Shared chrome for the current window. Floors, then scroll — never a fixed letterbox
+/// Shared chrome for the current window. Floors, then scroll - never a fixed letterbox
 /// and never a pane taller than the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SharedChrome {
@@ -738,7 +807,7 @@ pub fn share_available(window_w: f32, window_h: f32) -> SharedChrome {
     let sidebar_w = SIDEBAR_WIDTH.clamp(sidebar_floor, sidebar_cap);
 
     // Floor hugs the tab strip (~40px) so the console can collapse to
-    // "completely small" — the user's drag, not the chrome, decides the height.
+    // "completely small" - the user's drag, not the chrome, decides the height.
     let console_floor = 40.0_f32.min(body_h * 0.28).max(36.0);
     let console_cap = (body_h * 0.26)
         .clamp(console_floor, CONSOLE_MAX_HEIGHT)
@@ -1076,7 +1145,7 @@ pub fn chrome_at(window_w: f32) -> ChromeOverflow {
     }
 }
 
-/// Silence unused WorkspaceTab import helper — canvases stay in sync with CANVASES.
+/// Silence unused WorkspaceTab import helper - canvases stay in sync with CANVASES.
 pub fn workspace_matches_canvases() -> bool {
     WorkspaceTab::CANVASES.len() == Canvas::ALL.len()
 }
@@ -1091,7 +1160,7 @@ pub fn rail_name_fits(label: &str) -> bool {
     rail_name_extent(label) + 8.0 <= RAIL_WIDTH
 }
 
-/// Central pane a `WorkspaceTab` must fill. More ⋯ destinations never collapse to Timing.
+/// Central pane a `WorkspaceTab` must fill. More ... destinations never collapse to Timing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspacePane {
     Editor,
@@ -1167,7 +1236,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
     }
 }
 
-/// Non-canvas WorkspaceTabs live in More ⋯ and must paint `pane_for_workspace` in the center.
+/// Non-canvas WorkspaceTabs live in More ... and must paint `pane_for_workspace` in the center.
 pub fn is_more_destination(tab: WorkspaceTab) -> bool {
     !tab.is_canvas()
 }
@@ -1280,7 +1349,7 @@ mod tests {
         assert_eq!(tiny.tab_rows.len(), 1);
         assert!(
             tiny.tab_rows.iter().any(|r| r.contains(&MORE)),
-            "More ⋯: {:?}",
+            "More ...: {:?}",
             tiny.tab_rows
         );
         assert_eq!(tiny.dropped_workspace(), 0);
@@ -1501,15 +1570,9 @@ mod tests {
             toolbar_ctrl_size("Open…")[1],
             toolbar_ctrl_size("Implement")[1]
         );
-        // One trace in a 400px remaining pane must not be a 32px strip.
-        let h1 = wave_trace_row_h(1, 400.0);
-        assert!(
-            h1 >= 400.0 * PANE_FILL_MIN,
-            "single wave trace row {h1} leaves a black slab in 400px"
-        );
-        let h2 = wave_trace_row_h(2, 400.0);
-        assert!(h2 >= 180.0, "two traces share the pane, got {h2}");
-        assert_eq!(wave_trace_row_h(20, 400.0), 36.0);
+        // Waveform lanes are density-driven (no stretch-to-fill).
+        assert_eq!(wave_trace_row_h(WaveDensity::Comfortable), 56.0);
+        assert_eq!(wave_trace_row_h(WaveDensity::Compact), 36.0);
         let w = stretched_col_w(7, 700.0);
         assert!(w >= 48.0, "{w}");
         assert!(
