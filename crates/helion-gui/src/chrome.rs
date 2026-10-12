@@ -1122,6 +1122,7 @@ pub enum WorkspacePane {
     Utilization,
     Runs,
     Checkpoints,
+    Testbench,
 }
 
 /// Map every WorkspaceTab onto a real pane. None of these is a stub / popup / Timing dump.
@@ -1156,6 +1157,7 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::Utilization => WorkspacePane::Utilization,
         WorkspaceTab::Runs => WorkspacePane::Runs,
         WorkspaceTab::Checkpoints => WorkspacePane::Checkpoints,
+        WorkspaceTab::Testbench => WorkspacePane::Testbench,
     }
 }
 
@@ -1700,6 +1702,10 @@ mod tests {
         );
         assert_eq!(pane_for_workspace(WorkspaceTab::Ip), WorkspacePane::Ip);
         assert_eq!(pane_for_workspace(WorkspaceTab::Find), WorkspacePane::Find);
+        assert_eq!(
+            pane_for_workspace(WorkspaceTab::Testbench),
+            WorkspacePane::Testbench
+        );
         let mut more = 0usize;
         for tab in WorkspaceTab::ALL {
             let pane = pane_for_workspace(tab);
@@ -1717,7 +1723,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(more, 25, "28 tabs − 3 canvases");
+        assert_eq!(more, 26, "29 tabs − 3 canvases");
         assert!(is_report_detail(WorkspaceTab::Utilization));
         assert!(!is_report_detail(WorkspaceTab::Schematic));
         assert_eq!(
