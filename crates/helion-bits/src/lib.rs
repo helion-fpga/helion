@@ -916,6 +916,11 @@ mod tests {
             pathfinder_iters: 0,
             overused: 0,
             imux_skip: 0,
+            congestion: vec![],
+            congestion_x0: 0,
+            congestion_y0: 0,
+            congestion_cols: 0,
+            congestion_rows: 0,
         };
         let err = bitgen(&dev, &empty).unwrap_err();
         assert!(
