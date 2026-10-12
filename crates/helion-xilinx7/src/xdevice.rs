@@ -8,15 +8,13 @@ use crate::device::Device;
 use crate::emit::EmitDevice;
 use crate::place::DeviceQuery;
 use crate::route::RouteQuery;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-/// [`Device`] plus per-run state (clock nets, used sites).
+/// [`Device`] plus per-run state (clock nets).
 pub struct XDevice<'a> {
     pub device: &'a Device,
     /// Nets driven by BUFGCTRL outputs (dedicated clock spine).
     pub clock_nets: HashSet<String>,
-    /// (tile, wire) -> node members, built lazily for routing.
-    node_members: Option<HashMap<u32, Vec<(String, String)>>>,
 }
 
 impl<'a> XDevice<'a> {
@@ -24,7 +22,6 @@ impl<'a> XDevice<'a> {
         Self {
             device,
             clock_nets: HashSet::new(),
-            node_members: None,
         }
     }
 
@@ -34,35 +31,6 @@ impl<'a> XDevice<'a> {
 
     fn tile_name(&self, idx: usize) -> Option<&str> {
         self.device.tile(idx).map(|t| t.name.as_str())
-    }
-
-    /// Build the node -> members map (expensive; done once).
-    fn ensure_nodes(&mut self) {
-        if self.node_members.is_some() {
-            return;
-        }
-        let mut map: HashMap<u32, Vec<(String, String)>> = HashMap::new();
-        let n = self.device.tile_count();
-        // Note: node_of takes &mut self; we can't call it here on shared ref.
-        // Instead, group by tile-local wires only (tileconn stitching handled
-        // per-wire via a second pass below if needed).
-        for idx in 0..n {
-            let tile = match self.device.tile(idx) {
-                Some(t) => t,
-                None => continue,
-            };
-            let base = match self.device.tile_wire_base(idx) {
-                Some(b) => b,
-                None => continue,
-            };
-            if let Some(wires) = self.device.wires(idx) {
-                for (wi, w) in wires.iter().enumerate() {
-                    let wid = base + wi as u32;
-                    map.entry(wid).or_default().push((tile.name.clone(), w.clone()));
-                }
-            }
-        }
-        self.node_members = Some(map);
     }
 }
 
