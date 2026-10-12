@@ -805,7 +805,7 @@ pub fn export_vcd(path: &Path, cap: &IlaCapture) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ir::{CellKind, PortDir};
+    use helion_ir::CellKind;
 
     fn trace(v: &[u64]) -> Vec<u64> {
         v.to_vec()
@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn export_vcd_writes_gtkwave_structure() {
         let cap = demo_capture();
-        let dir = std::env::temp_dir().join("helion-ila-vcd");
+        let dir = std::env::temp_dir().join("helion-ila-vcd-structure");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.vcd");
         export_vcd(&path, &cap).expect("export");
@@ -1171,7 +1171,7 @@ mod tests {
     fn export_vcd_marks_invalid_as_x() {
         let mut cap = demo_capture();
         cap.valid[0][3] = false;
-        let dir = std::env::temp_dir().join("helion-ila-vcd");
+        let dir = std::env::temp_dir().join("helion-ila-vcd-invalid");
         let path = dir.join("x.vcd");
         export_vcd(&path, &cap).expect("export");
         let text = std::fs::read_to_string(&path).unwrap();
