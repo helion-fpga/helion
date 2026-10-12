@@ -5734,6 +5734,12 @@ pub struct IdeModel {
     pub selected_log: Option<usize>,
     /// UG900 Simulation Log from helion-sim/fabric (not Tcl Console / Log).
     pub sim_log: Vec<SimLogRow>,
+    /// SVA checkers elaborated at synth (Part B): concurrent properties and
+    /// immediate assertions attached to the sim at start.
+    pub sva_props: Vec<helion_sv::sva::SvaProperty>,
+    pub sva_imms: Vec<helion_sv::sva::SvaImmProp>,
+    /// Last `assert_report` text (Tcl).
+    pub last_sva_report: String,
     /// UG900 Simulation Log selected row.
     pub selected_sim_log: Option<usize>,
     /// Integrated testbench runner: discovered `*_tb.sv` / `tb_*.sv` files.
@@ -5937,6 +5943,9 @@ impl IdeModel {
             selected_summary: None,
             selected_log: None,
             sim_log: Vec::new(),
+            sva_props: Vec::new(),
+            sva_imms: Vec::new(),
+            last_sva_report: String::new(),
             selected_sim_log: None,
             tb_files: Vec::new(),
             tb_status: Vec::new(),
@@ -6717,6 +6726,8 @@ impl IdeModel {
         } else if t == "report_cdc_crossings" || t == "cdc_crossings" {
             self.workspace = WorkspaceTab::Cdc;
             Ok(self.cdc_crossings_text())
+        } else if t == "assert_report" {
+            Ok(self.assert_report_text())
         } else if t == "report_clock_networks" || t == "clock_networks" {
             self.workspace = WorkspaceTab::ClockNetworks;
             Ok(self.clock_networks_text())
@@ -8739,13 +8750,23 @@ impl IdeModel {
                 let path = source
                     .or_else(|| self.tree.sources.last().map(PathBuf::from))
                     .ok_or("synth_design: add a source first")?;
-                let d = crate::synth_hdl_path(&path)?;
+                let (d, sva_props, sva_imms) = crate::synth_hdl_path_with_sva(&path)?;
+                self.sva_props = sva_props;
+                self.sva_imms = sva_imms;
+                self.last_sva_report.clear();
                 let mut msg = format!(
                     "synth_design {} cells={} luts={}",
                     d.name,
                     d.cells.len(),
                     d.lut_inits().len()
                 );
+                if !self.sva_props.is_empty() || !self.sva_imms.is_empty() {
+                    msg.push_str(&format!(
+                        " sva_props={} sva_imm={}",
+                        self.sva_props.len(),
+                        self.sva_imms.len()
+                    ));
+                }
                 if d.attrs.get("NO_BODY") == Some("1") {
                     msg.push_str(" no_body");
                 }
@@ -17470,6 +17491,14 @@ impl IdeModel {
         out
     }
 
+    /// Tcl `assert_report`: per-assertion SVA status from the last sim run.
+    pub fn assert_report_text(&self) -> String {
+        if self.last_sva_report.is_empty() {
+            return "assert_report: no SVA assertions elaborated (run synth on SV with assertions, then sim)".into();
+        }
+        self.last_sva_report.clone()
+    }
+
     fn cdc_object_hay(&self, v: &helion_sta::CdcViolation) -> String {
         let report = self.cdc_report();
         let mut hay = format!("{} {}", v.from, v.to);
@@ -21101,6 +21130,25 @@ impl IdeModel {
         } else {
             self.event_sim = Some(Sim::new(&d));
             self.fabric_sim = None;
+            // Attach SVA checkers elaborated at synth; probe-resolution
+            // failures surface as an error message, never a silent skip.
+            if let Some(sim) = self.event_sim.as_mut() {
+                if !self.sva_props.is_empty() || !self.sva_imms.is_empty() {
+                    if let Some(design) = self.shell.session.design.as_ref() {
+                        if let Err(e) = sim.attach_sva(
+                            design,
+                            self.sva_props.clone(),
+                            self.sva_imms.clone(),
+                        ) {
+                            self.messages.push(IdeMessage {
+                                severity: MsgSeverity::Error,
+                                id: "SVA-ATTACH".into(),
+                                text: format!("sva attach failed: {e}"),
+                            });
+                        }
+                    }
+                }
+            }
         }
         self.wave.timescale_ps = (self.sim_timescale_ps.max(1) / 2).max(1);
         if self.wave.traces.is_empty() {
@@ -21290,6 +21338,31 @@ impl IdeModel {
             fab.step_user();
         } else if let Some(sim) = self.event_sim.as_mut() {
             sim.step_posedge(delay);
+            let failures = sim.sva_failures();
+            let report_lines = sim.sva_report().tcl_lines();
+            for f in failures {
+                let sample =
+                    (f.time / self.wave.timescale_ps.max(1)) as usize;
+                let sample = sample.min(self.wave.sample_len().saturating_sub(1));
+                let name = format!("SVA FAIL t={}ps", f.time);
+                self.wave.markers.retain(|m| m.name != name);
+                self.wave.markers.push(WaveMarker { name, sample });
+                let sev = match f.severity {
+                    helion_sv::sva::SvaSeverity::Error => MsgSeverity::Error,
+                    helion_sv::sva::SvaSeverity::Warning => MsgSeverity::Warning,
+                    helion_sv::sva::SvaSeverity::Info => MsgSeverity::Info,
+                };
+                let line = f.to_string();
+                self.push_sim_log(sev, "SVA-001", line.clone());
+                self.messages.push(IdeMessage {
+                    severity: sev,
+                    id: "SVA-001".into(),
+                    text: line,
+                });
+            }
+            if !report_lines.is_empty() {
+                self.last_sva_report = report_lines.join("\n");
+            }
         } else {
             return Err("sim: not started".into());
         }
