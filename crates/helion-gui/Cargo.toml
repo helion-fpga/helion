@@ -29,6 +29,7 @@ helion-bd = { workspace = true }
 helion-ipxact = { workspace = true }
 helion-place = { workspace = true }
 helion-pack = { workspace = true }
+helion-route = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 rfd = "0.15"
 # rfd's Linux xdg-portal path pulls ashpd → zbus. zbus ≥5.14 / zvariant ≥5.10
