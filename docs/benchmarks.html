@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="theme-color" content="#0a0c10" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Helion benchmarks: measured, not claimed</title>
+  <meta name="description" content="Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5 on 10 real designs, identical RTL. Real numbers with the caveats printed next to them." />
+  <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css?v=docs1" />
+</head>
+<body>
+  <a class="skip" href="#main">Skip to main content</a>
+  <header class="bar">
+    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
+    <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
+    <nav id="site-nav">
+      <a href="index.html">Home</a>
+      <a href="use.html">Use</a>
+      <a href="start.html">Start</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="wiki.html">Wiki</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="get-involved.html">Get involved</a>
+      <a href="https://github.com/helion-fpga/helion">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <div class="page">
+      <section class="section">
+        <h1>Benchmarks</h1>
+        <p class="lede">
+          10 real designs, identical RTL, Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5,
+          measured 2026-10-10. Helion targeted its HL10T die (8,192 LUT6); the baseline
+          targeted a Lattice LFE5U-25F (24k LUT4). Every number below is measured.
+          The caveats are printed next to the numbers, because that is how it should be.
+        </p>
+        <div class="table-wrap wide-table"><table>
+          <thead><tr>
+            <th>Design</th><th>Helion LUT6</th><th>Helion WNS (ps)</th><th>Helion wall</th>
+            <th>Yosys+nextpnr LUT4</th><th>Yosys+nextpnr wall</th><th>Verdict</th>
+          </tr></thead>
+          <tbody>
+            <tr><td>PicoRV32</td><td>2,477</td><td>8,700</td><td>3.5 s</td><td>830</td><td>10.4 s</td><td>OK</td></tr>
+            <tr><td>AES-128</td><td>6,534 (80% of die)</td><td>8,700</td><td>1.9 s</td><td>11,584</td><td>~332 s</td><td>OK</td></tr>
+            <tr><td>SHA-256</td><td>1,865</td><td>8,220</td><td>0.9 s</td><td>2,753</td><td>~146 s</td><td>OK</td></tr>
+            <tr><td>UART</td><td>379</td><td>9,600</td><td>0.3 s</td><td>133</td><td>5.8 s</td><td>OK</td></tr>
+            <tr><td>SPI master</td><td>62</td><td>9,580</td><td>0.03 s</td><td>13</td><td>3.6 s</td><td>OK</td></tr>
+            <tr><td>I2C master</td><td>822</td><td>9,580</td><td>0.9 s</td><td>183</td><td>5.0 s</td><td>OK</td></tr>
+            <tr><td>SERV</td><td>395</td><td>7,620</td><td>0.7 s</td><td>133</td><td>1.9 s</td><td>OK</td></tr>
+            <tr><td>MIPS 1-cycle</td><td>397</td><td>9,600</td><td>0.09 s</td><td colspan="2">no baseline: Yosys rejected an inferred latch in the RTL</td><td>OK (Helion only)</td></tr>
+            <tr><td>CORDIC</td><td>385</td><td>9,600</td><td>0.08 s</td><td colspan="2">no baseline: Yosys could not elaborate a variable-bound loop</td><td>OK (Helion only)</td></tr>
+            <tr><td>Ibex RV32</td><td colspan="3">11,572 LUTFFs wanted vs 8,192 on die</td><td colspan="2">no baseline: Yosys 0.69 cannot parse the SystemVerilog assignment patterns</td><td>Over capacity, refused</td></tr>
+          </tbody>
+        </table></div>
+        <p>
+          Full report with stage breakdowns, method, and reproductions steps:
+          <a href="https://github.com/helion-fpga/helion/blob/master/docs/benchmarks/benchmark-report-2026-10-10.md">benchmark-report-2026-10-10.md</a>.
+        </p>
+      </section>
+
+      <section class="section">
+        <h2>Read honestly</h2>
+        <ul>
+          <li><strong>Different fabrics.</strong> Helion targets its own LUT6 HL10T die; the baseline targets Lattice ECP5 (LUT4). Absolute LUT counts are not silicon-to-silicon comparable.</li>
+          <li><strong>Speed.</strong> Helion runs 3-100x faster wall-clock on identical RTL (AES-128: 1.9 s vs ~5.5 min). Helion is a straight pipeline with no heavy optimization passes; Yosys spends its time in ABC and nextpnr in simulated-annealing placement.</li>
+          <li><strong>Area.</strong> Yosys+ABC still produces 2-5x fewer LUTs on the same RTL. Part of that is LUT4 vs LUT6 accounting; most of it is ABC's logic optimization vs Helion's direct AIG to FlowMap mapping. Helion trades area for speed and simplicity, a stated bring-up-stage tradeoff.</li>
+          <li><strong>Timing.</strong> Every Helion run met the 10 ns target with positive WNS. Helion's delay model is simpler and more optimistic than nextpnr's signoff-style STA, so do not compare MHz head-to-head. Calibration is on the roadmap.</li>
+          <li><strong>Robustness.</strong> Helion's SystemVerilog frontend parsed all 10 designs, including three Yosys 0.69 could not handle. 9 of 10 fit the die and routed with zero congestion.</li>
+          <li><strong>Over capacity fails loudly.</strong> Ibex wants ~11.6k LUTs on an 8k-LUT die. The flow errors naming the overused resource instead of emitting a clipped bitstream.</li>
+        </ul>
+      </section>
+
+      <section class="section">
+        <h2>Latest measured wins (v2.1.0)</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Campaign</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>Perf</td><td>Synthesis allocations 24.2M to ~409k (-98%); frontend wall time -69%</td></tr>
+            <tr><td>Area</td><td>uart 420 to 244 LUTs (-42%); PicoRV32 cross-cone sharing -10%, miter-proven each round</td></tr>
+            <tr><td>Correctness</td><td>168/168 helion-sv tests, 198/198 GUI tests green; QoR gate green; gold <span class="gold">WNS_PS=9640</span> untouched</td></tr>
+          </tbody>
+        </table></div>
+        <p class="cta">
+          <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 2.1.0</a>
+          <a class="btn ghost" href="roadmap.html">Roadmap</a>
+          <a class="btn ghost" href="https://github.com/helion-fpga/helion">GitHub</a>
+        </p>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site">
+    <span>Apache-2.0 OR MIT · <a href="https://github.com/saksham-45">@saksham-45</a> · <a href="https://github.com/helion-fpga">helion-fpga</a></span>
+    <span><a href="legal.html">Legal</a> · <a href="start.html">Start</a></span>
+  </footer>
+  <script src="site.js?v=docs1"></script>
+</body>
+</html>
