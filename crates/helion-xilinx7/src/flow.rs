@@ -28,8 +28,9 @@ pub fn run_for_part(netlist: &NetlistIr, part: &str) -> Result<Bitstream7, Strin
             "unsupported part {part}: only xc7a35t has an X-Ray database wired up"
         ));
     }
-    let device = Device::load_xc7a35t(&default_db_root())?;
-    let xdev = XDevice::new(&device);
+    let mut device = Device::load_xc7a35t(&default_db_root())?;
+    let node_maps = crate::xdevice::build_node_map(&mut device);
+    let xdev = XDevice::new(&device, node_maps);
     let packed = pack(netlist)?;
     let placed = place(&packed, &xdev)?;
     let routed = route(&placed, &xdev)?;

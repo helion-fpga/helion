@@ -3,14 +3,15 @@
 //! Requires the X-Ray DB at `~/workspace/xilinx-dbsrc` (or `HELION_XILINX_DB`).
 
 use helion_xilinx7::device::{default_db_root, Device};
-use helion_xilinx7::xdevice::XDevice;
+use helion_xilinx7::xdevice::{build_node_map, XDevice};
 use helion_xilinx7::{emit_fasm, pack, place, route};
 
 #[test]
 fn blinky_e2e_fasm() {
     let db_root = default_db_root();
-    let device = Device::load_xc7a35t(&db_root).expect("load device");
+    let mut device = Device::load_xc7a35t(&db_root).expect("load device");
     assert!(device.tile_count() > 10000, "tile_count = {}", device.tile_count());
+    let node_maps = build_node_map(&mut device);
 
     // Synthesize.
     let src = std::fs::read_to_string("../../examples/blinky.sv").expect("blinky.sv");
@@ -29,7 +30,7 @@ fn blinky_e2e_fasm() {
     assert!(!packed.ffs.is_empty(), "no FFs packed");
     assert_eq!(packed.bufgs.len(), 1, "expected 1 BUFG");
 
-    let mut xdev = XDevice::new(&device);
+    let mut xdev = XDevice::new(&device, node_maps);
     // Clock nets for the router.
     for b in &packed.bufgs {
         xdev.clock_nets.insert(b.out_net.clone());

@@ -84,23 +84,31 @@ pub fn route(placed: &Placed7, device: &dyn RouteQuery) -> Result<Routed7, Strin
 
     // Map placed cells back to packed nets via name lookup.
     let lut_site: HashMap<&str, &str> = placed.luts.iter().map(|l| (l.name.as_str(), l.site.as_str())).collect();
+    let lut_bel: HashMap<&str, &str> = placed.luts.iter().map(|l| (l.name.as_str(), l.bel.as_str())).collect();
     let ff_site: HashMap<&str, &str> = placed.ffs.iter().map(|f| (f.name.as_str(), f.site.as_str())).collect();
+    let ff_bel: HashMap<&str, &str> = placed.ffs.iter().map(|f| (f.name.as_str(), f.bel.as_str())).collect();
     let iob_site: HashMap<&str, &str> = placed.iobs.iter().map(|i| (i.name.as_str(), i.site.as_str())).collect();
     let bufg_site: HashMap<&str, &str> = placed.bufgs.iter().map(|b| (b.name.as_str(), b.site.as_str())).collect();
 
     for lut in &packed.luts {
         let site = lut_site.get(lut.name.as_str()).copied().unwrap_or("");
+        let bel = lut_bel.get(lut.name.as_str()).copied().unwrap_or("A6LUT");
+        // Per-BEL pins: A6LUT -> A1-A6 inputs, AMUX output.
+        let bel_letter = bel.chars().next().unwrap_or('A');
         for (i, net) in lut.input_nets.iter().enumerate() {
             if let Some(n) = net {
-                add_ep(n.clone(), site.to_string(), &format!("A{i}"), false);
+                add_ep(n.clone(), site.to_string(), &format!("{bel_letter}{}", i + 1), false);
             }
         }
-        add_ep(lut.output_net.clone(), site.to_string(), "O", true);
+        add_ep(lut.output_net.clone(), site.to_string(), &format!("{bel_letter}MUX"), true);
     }
     for ff in &packed.ffs {
         let site = ff_site.get(ff.name.as_str()).copied().unwrap_or("");
+        let bel = ff_bel.get(ff.name.as_str()).copied().unwrap_or("AFF");
+        // Q is per-BEL (AQ/BQ/CQ/DQ); D and CLK are slice-shared.
+        let bel_letter = bel.chars().next().unwrap_or('A');
         add_ep(ff.d_net.clone(), site.to_string(), "D", false);
-        add_ep(ff.q_net.clone(), site.to_string(), "Q", true);
+        add_ep(ff.q_net.clone(), site.to_string(), &format!("{bel_letter}Q"), true);
         add_ep(ff.clk_net.clone(), site.to_string(), "CLK", false);
     }
     for iob in &packed.iobs {
@@ -150,21 +158,33 @@ fn route_net(
     loads: &[&Endpoint],
     device: &dyn RouteQuery,
 ) -> Result<RouteKind, String> {
-    // Site-internal: all endpoints on one site.
-    if loads.iter().all(|l| l.site == driver.site) {
+    // Split loads into site-internal (same site as driver) and external.
+    let (internal, external): (Vec<&&Endpoint>, Vec<&&Endpoint>) =
+        loads.iter().partition(|l| l.site == driver.site);
+    // If all loads are site-internal, no pips needed.
+    if external.is_empty() {
         return Ok(RouteKind::SiteInternal);
     }
     // Clock spine: BUFG-driven nets use the dedicated network.
     if device.is_clock_net(net) {
         return Ok(RouteKind::ClockSpine);
     }
+    // IBUF -> BUFG: dedicated clock input route (no general pip path).
+    let driver_is_ibuf = driver.pin == "O" && driver.site.starts_with("IOB_");
+    let loads_are_bufg = loads.iter().all(|l| l.site.starts_with("BUFGCTRL_"));
+    if driver_is_ibuf && loads_are_bufg {
+        return Ok(RouteKind::ClockSpine);
+    }
+    // Route to external loads via pips. (Internal loads are site-local.)
+    let external_loads: Vec<&Endpoint> = external.into_iter().copied().collect();
+    let _ = internal; // site-internal loads need no pips
 
     let (src_tile, src_wire) = device
         .site_pin_wire(&driver.site, &driver.pin)
         .ok_or_else(|| format!("route: no wire for driver {}.{} (net `{net}`)", driver.site, driver.pin))?;
 
     let mut all_pips: Vec<RoutedPip> = Vec::new();
-    for load in loads {
+    for load in &external_loads {
         let sinks = device.wire_for_site_pin(&load.site, &load.pin);
         if sinks.is_empty() {
             return Err(format!(
@@ -276,7 +296,7 @@ mod tests {
         }
         fn site_pin_wire(&self, site: &str, pin: &str) -> Option<(String, String)> {
             match (site, pin) {
-                ("SLICE_X0", "O") => Some(("INT_X0".into(), "B".into())),
+                ("SLICE_X0", "AMUX") => Some(("INT_X0".into(), "B".into())),
                 _ => None,
             }
         }

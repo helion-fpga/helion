@@ -25,6 +25,7 @@ pub mod pack;
 pub mod place;
 pub mod route;
 pub mod xdevice;
+pub use xdevice::{build_node_map, XDevice};
 
 pub use backend::{Bitstream7, Packed7, Placed7, Routed7, RoutedNet7, Xilinx7Backend};
 pub use device::Device;

@@ -388,7 +388,7 @@ impl Device {
         // tiles carry TIEOFF sites whose HARD pins hit VCC/GND wires).
         let mut site_pin_wires = std::collections::HashSet::new();
         for s in &tt.sites {
-            for pin in s.site_pins.values() {
+            for pin in s.site_pins.values().flatten() {
                 if pin.wire != "VCC_WIRE" && pin.wire != "GND_WIRE" {
                     site_pin_wires.insert(pin.wire.clone());
                 }
@@ -398,8 +398,11 @@ impl Device {
                 prefix: s.prefix.clone(),
                 site_type: s.site_type.clone(),
                 pins: {
-                    let mut p: Vec<SitePin> =
-                        s.site_pins.iter().map(|(k, v)| (k.clone(), v.wire.clone())).collect();
+                    let mut p: Vec<SitePin> = s
+                        .site_pins
+                        .iter()
+                        .filter_map(|(k, v)| v.as_ref().map(|pin| (k.clone(), pin.wire.clone())))
+                        .collect();
                     p.sort();
                     p
                 },

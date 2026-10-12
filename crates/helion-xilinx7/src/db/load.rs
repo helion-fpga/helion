@@ -128,8 +128,9 @@ pub struct SiteTemplate {
     pub x_coord: i32,
     #[serde(default)]
     pub y_coord: i32,
+    /// Some pins are null in the JSON (unconnected); skipped during load.
     #[serde(default)]
-    pub site_pins: HashMap<String, SitePinInfo>,
+    pub site_pins: HashMap<String, Option<SitePinInfo>>,
 }
 
 /// Raw `tile_type_*.json` contents.
