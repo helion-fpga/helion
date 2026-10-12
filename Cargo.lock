@@ -1401,6 +1401,8 @@ dependencies = [
  "helion-sv",
  "helion-vhdl",
  "rfd",
+ "serde",
+ "serde_json",
  "zbus",
  "zbus_macros",
  "zbus_names",

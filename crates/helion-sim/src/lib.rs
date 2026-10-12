@@ -23,6 +23,17 @@ pub struct SimForce {
     pub value: u64,
 }
 
+/// What drives a net, for ILA probing of arbitrary (incl. combinational) nets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NetDriver {
+    /// Net driven by an HFF Q pin — value is the live FF state.
+    Ff(String),
+    /// Net driven by a LUT O pin — value is the INIT evaluated on live inputs.
+    Lut(String),
+    /// No resolvable driver (top-level input port, undriven, …) — probes read X.
+    Undriven,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sim {
     pub time: u64,
@@ -46,6 +57,9 @@ pub struct Sim {
     ports: HashMap<String, PortDir>,
     /// Output IOB PAD net → net on the IOB's I pin (output-port sampling).
     iob_pad_to_i: HashMap<String, String>,
+    /// ILA probe support: driver per net + LUT input net per pin (all 6 pins).
+    net_drivers: HashMap<String, NetDriver>,
+    lut_input_nets: HashMap<String, [Option<String>; 6]>,
 }
 
 impl Sim {
@@ -117,6 +131,36 @@ impl Sim {
                 }
             }
         }
+        // ILA probe maps: driver per net (Q beats O on multi-endpoint nets) and
+        // the net on every LUT input pin so chained LUTs evaluate exactly.
+        let mut net_drivers = HashMap::new();
+        for n in &d.nets {
+            let driver = n
+                .endpoints
+                .iter()
+                .find(|e| e.pin == "Q")
+                .map(|e| NetDriver::Ff(e.cell.clone()))
+                .or_else(|| {
+                    n.endpoints
+                        .iter()
+                        .find(|e| e.pin == "O")
+                        .map(|e| NetDriver::Lut(e.cell.clone()))
+                })
+                .unwrap_or(NetDriver::Undriven);
+            net_drivers.insert(n.name.clone(), driver);
+        }
+        let mut lut_input_nets: HashMap<String, [Option<String>; 6]> = HashMap::new();
+        for c in &d.cells {
+            if matches!(c.kind, CellKind::Lut6 { .. }) {
+                let mut pins: [Option<String>; 6] = Default::default();
+                for (i, slot) in pins.iter_mut().enumerate() {
+                    *slot = pin_ix
+                        .net_on(&c.name, &format!("I{i}"))
+                        .map(|s| s.to_string());
+                }
+                lut_input_nets.insert(c.name.clone(), pins);
+            }
+        }
         Self {
             time: 0,
             lut_init,
@@ -131,6 +175,8 @@ impl Sim {
             input_values: HashMap::new(),
             ports,
             iob_pad_to_i,
+            net_drivers,
+            lut_input_nets,
         }
     }
 
@@ -453,6 +499,75 @@ impl Sim {
         out
     }
 
+    /// ILA probe: live value of any net, including combinational (LUT-driven)
+    /// nets. Returns `None` for undriven/unknown nets and combinational loops —
+    /// the ILA renders those as X. `"led"` resolves to the LED state; `"clk"`
+    /// is the sampling event itself, so it reads 1 at every posedge sample.
+    pub fn net_value(&self, net: &str) -> Option<bool> {
+        if net.eq_ignore_ascii_case("led") {
+            return Some(self.led);
+        }
+        if net.eq_ignore_ascii_case("clk") {
+            return Some(true);
+        }
+        let mut memo: HashMap<&str, bool> = HashMap::new();
+        let mut stack: Vec<&str> = Vec::new();
+        self.eval_net(net, &mut memo, &mut stack)
+    }
+
+    fn eval_net<'s>(
+        &'s self,
+        net: &'s str,
+        memo: &mut HashMap<&'s str, bool>,
+        stack: &mut Vec<&'s str>,
+    ) -> Option<bool> {
+        if let Some(&v) = memo.get(net) {
+            return Some(v);
+        }
+        if stack.contains(&net) {
+            return None; // combinational loop — probe reads X
+        }
+        let v = match self.net_drivers.get(net)? {
+            NetDriver::Undriven => None,
+            NetDriver::Ff(cell) => self.ff_q.get(cell).copied(),
+            NetDriver::Lut(cell) => {
+                let init = self.lut_init.get(cell).copied().unwrap_or(0);
+                let inputs = self.lut_input_nets.get(cell);
+                stack.push(net);
+                let mut addr = 0u64;
+                let mut unknown = false;
+                for pin in 0..6usize {
+                    let net_on_pin = inputs
+                        .and_then(|ins| ins.get(pin))
+                        .and_then(|o| o.as_deref());
+                    // Unconnected LUT inputs tie low — same as `step_posedge`,
+                    // which only drives addr bits from connected FF Qs. Only a
+                    // connected-but-unresolvable net (undriven, loop) yields X.
+                    let bit = match net_on_pin {
+                        None => Some(false),
+                        Some(n) => self.eval_net(n, memo, stack),
+                    };
+                    match bit {
+                        Some(true) => addr |= 1 << pin,
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
+                }
+                stack.pop();
+                if unknown {
+                    None
+                } else {
+                    Some((init >> addr) & 1 == 1)
+                }
+            }
+        };
+        if let Some(b) = v {
+            memo.insert(net, b);
+        }
+        v
+
+    }
+
     /// Probe a named signal for UG900 breakpoints (LED, FF Q, or LUT INIT word).
     pub fn signal_value(&self, name: &str) -> Option<u64> {
         if name.eq_ignore_ascii_case("led") {
@@ -688,6 +803,61 @@ endmodule
             mem.len()
         );
         assert!(!mem.is_empty());
+    }
+
+    #[test]
+    fn ila_net_value_probes_ff_and_combinational_nets() {
+        // Structural counter: q0..q3 are FF Q nets, d0..d3 are LUT O nets.
+        let mut s = Sim::new(&Design::structural_counter());
+        assert_eq!(s.net_value("q0"), Some(false));
+        assert_eq!(s.net_value("led"), Some(false));
+        assert_eq!(s.net_value("clk"), Some(true));
+        assert_eq!(s.net_value("no_such_net"), None);
+        // d0 = ~q0 while q0 = 0 → d0 must read 1 combinationally.
+        assert_eq!(s.net_value("d0"), Some(true));
+        s.step_posedge(10);
+        assert_eq!(s.net_value("q0"), Some(true));
+        assert_eq!(s.net_value("d0"), Some(false));
+        // A full count cycle: q reads as a binary counter on the Q nets.
+        let mut s = Sim::new(&Design::structural_counter());
+        for expect in 0..16u64 {
+            let mut q = 0u64;
+            for (i, n) in ["q0", "q1", "q2", "q3"].iter().enumerate() {
+                if s.net_value(n) == Some(true) {
+                    q |= 1 << i;
+                }
+            }
+            assert_eq!(q, expect, "Q-net bus must count 0..15");
+            s.step_posedge(10);
+        }
+    }
+
+    #[test]
+    fn ila_net_value_handles_chained_luts_and_loops() {
+        // LUT→LUT chain: e = d0 AND q1 (2-level combo), then probe e.
+        let mut d = Design::structural_counter();
+        d.add_cell("u_and", CellKind::Lut6 { init: 0x8888_8888_8888_8888 });
+        d.connect("d0", "u_and", "I0");
+        d.connect("q1", "u_and", "I1");
+        d.connect("e", "u_and", "O");
+        let mut s = Sim::new(&d);
+        // q0=0,q1=0 → d0=1, e = 1&0 = 0.
+        assert_eq!(s.net_value("e"), Some(false));
+        s.step_posedge(10);
+        s.step_posedge(10);
+        // q=2: q0=0,q1=1 → d0=1, e = 1&1 = 1.
+        assert_eq!(s.net_value("q0"), Some(false));
+        assert_eq!(s.net_value("q1"), Some(true));
+        assert_eq!(s.net_value("e"), Some(true));
+        // Self-loop LUT (O feeds back to I0): probe must read X, not hang.
+        let mut l = Design::new("loop");
+        l.add_cell("u_l", CellKind::Lut6 { init: !0 });
+        l.add_cell("u_ff", CellKind::Hff);
+        l.connect("w", "u_l", "O");
+        l.connect("w", "u_l", "I0");
+        l.connect("w", "u_ff", "D");
+        let s2 = Sim::new(&l);
+        assert_eq!(s2.net_value("w"), None);
     }
 
     #[test]
