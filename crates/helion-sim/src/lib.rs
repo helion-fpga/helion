@@ -4,9 +4,12 @@
 //! ([`OverlaySimReport`]) — never bare board DONE.
 
 use helion_ir::{CellKind, Design, PortDir};
+use helion_sv::sva::{SvaImmProp, SvaProperty};
 use std::collections::HashMap;
 
+pub mod sva;
 pub mod vcd;
+use sva::{SvaEngine, SvaFailure, SvaReport};
 
 /// UG900 force vs deposit: hold until `release`, or one-shot poke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +40,9 @@ enum NetDriver {
 #[derive(Clone, Debug)]
 pub struct Sim {
     pub time: u64,
+    /// Posedge count (cycle 1 = first [`Sim::step_posedge`]). SVA failures
+    /// timestamp against this.
+    pub cycle: u64,
     lut_init: HashMap<String, u64>,
     ff_d_lut: HashMap<String, String>,
     iob_from_ff: Option<String>,
@@ -53,6 +59,12 @@ pub struct Sim {
     net_lut_o: HashMap<String, String>,
     /// Testbench stimulus: top-level input port name (= its net) → driven bit.
     input_values: HashMap<String, bool>,
+    /// SVA stimulus: input port name → driven bit (set via [`Sim::drive`]).
+    /// Checkers sample `InputBit` probes from here.
+    stim: HashMap<String, bool>,
+    /// SVA checker sidecars (v3.0 verification track). Empty until
+    /// [`Sim::attach_sva`].
+    sva: SvaEngine,
     /// Top-level port name → direction, for [`Sim::drive_input`] validation.
     ports: HashMap<String, PortDir>,
     /// Output IOB PAD net → net on the IOB's I pin (output-port sampling).
@@ -163,6 +175,7 @@ impl Sim {
         }
         Self {
             time: 0,
+            cycle: 0,
             lut_init,
             ff_d_lut,
             iob_from_ff,
@@ -173,6 +186,8 @@ impl Sim {
             net_ff,
             net_lut_o,
             input_values: HashMap::new(),
+            stim: HashMap::new(),
+            sva: SvaEngine::new(),
             ports,
             iob_pad_to_i,
             net_drivers,
@@ -253,6 +268,45 @@ impl Sim {
                 ))
             }
         }
+    }
+
+    /// Drive a top-level input (or inout) port for SVA testbenches. Like
+    /// [`Sim::drive_input`], and additionally records the value in the SVA
+    /// stimulus map that checker `InputBit` probes sample.
+    pub fn drive(&mut self, name: &str, value: bool) -> Result<(), String> {
+        self.drive_input(name, value)?;
+        self.stim.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    /// Attach SVA checkers elaborated by `helion_sv::sva` (see
+    /// [`synth_sv_with_sva`](helion_sv::sva::synth_sv_with_sva)). Probe
+    /// resolution failures name the property and the net.
+    pub fn attach_sva(
+        &mut self,
+        design: &Design,
+        props: Vec<SvaProperty>,
+        imms: Vec<SvaImmProp>,
+    ) -> Result<(), String> {
+        self.sva.attach(design, props, imms)
+    }
+
+    /// Drain stored SVA failures (cap 128 stored; the total count in
+    /// [`Sim::sva_report`] is unbounded). The IDE turns these into
+    /// waveform markers, sim-log rows, and messages.
+    pub fn sva_failures(&mut self) -> Vec<SvaFailure> {
+        self.sva.drain_failures()
+    }
+
+    /// Per-assertion SVA status: attempts, vacuous passes, failures, and
+    /// first-failure times.
+    pub fn sva_report(&self) -> SvaReport {
+        self.sva.report()
+    }
+
+    /// Clear stored SVA failures and the total failure count.
+    pub fn clear_sva_failures(&mut self) {
+        self.sva.clear_failures();
     }
 
     /// Top-level input (or inout) port names, sorted.
@@ -383,6 +437,10 @@ impl Sim {
 
     pub fn step_posedge(&mut self, delay: u64) {
         self.time += delay;
+        self.cycle += 1;
+        // SVA preponed region: concurrent properties + non-final immediate
+        // asserts sample the pre-edge state.
+        self.sva.sample_pre(self.time, self.cycle, &self.ff_q, &self.stim);
         let mut next_q = HashMap::new();
         // One memo per step: net values are stable across this edge.
         let mut memo: HashMap<String, bool> = HashMap::new();
@@ -406,6 +464,9 @@ impl Sim {
             .copied()
             .unwrap_or(false);
         self.apply_forces();
+        // SVA postponed region: `assert final` sees the committed state.
+        self.sva
+            .sample_post(self.time, self.cycle, &self.ff_q, &self.stim);
     }
 
     /// UG900 Objects pane: live helion-sim probes (LED + each FF Q), not a static name list.

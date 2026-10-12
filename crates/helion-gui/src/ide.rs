@@ -5734,6 +5734,12 @@ pub struct IdeModel {
     pub selected_log: Option<usize>,
     /// UG900 Simulation Log from helion-sim/fabric (not Tcl Console / Log).
     pub sim_log: Vec<SimLogRow>,
+    /// SVA checkers elaborated at synth (Part B): concurrent properties and
+    /// immediate assertions attached to the sim at start.
+    pub sva_props: Vec<helion_sv::sva::SvaProperty>,
+    pub sva_imms: Vec<helion_sv::sva::SvaImmProp>,
+    /// Last `assert_report` text (Tcl).
+    pub last_sva_report: String,
     /// UG900 Simulation Log selected row.
     pub selected_sim_log: Option<usize>,
     /// Integrated testbench runner: discovered `*_tb.sv` / `tb_*.sv` files.
@@ -5937,6 +5943,9 @@ impl IdeModel {
             selected_summary: None,
             selected_log: None,
             sim_log: Vec::new(),
+            sva_props: Vec::new(),
+            sva_imms: Vec::new(),
+            last_sva_report: String::new(),
             selected_sim_log: None,
             tb_files: Vec::new(),
             tb_status: Vec::new(),
@@ -6714,6 +6723,11 @@ impl IdeModel {
         } else if t == "report_cdc" || t == "cdc" {
             self.workspace = WorkspaceTab::Cdc;
             Ok(self.cdc_text())
+        } else if t == "report_cdc_crossings" || t == "cdc_crossings" {
+            self.workspace = WorkspaceTab::Cdc;
+            Ok(self.cdc_crossings_text())
+        } else if t == "assert_report" {
+            Ok(self.assert_report_text())
         } else if t == "report_clock_networks" || t == "clock_networks" {
             self.workspace = WorkspaceTab::ClockNetworks;
             Ok(self.clock_networks_text())
@@ -6772,6 +6786,10 @@ impl IdeModel {
             self.select_cdc_object(spec.trim())
         } else if t == "select_cdc_object" {
             self.select_cdc_object("")
+        } else if let Some(spec) = t.strip_prefix("select_cdc_crossing ") {
+            self.select_cdc_crossing(spec.trim())
+        } else if t == "select_cdc_crossing" {
+            self.select_cdc_crossing("")
         } else if let Some(name) = t.strip_prefix("select_clock_network ") {
             self.select_clock_network(name.trim())
         } else if t == "select_clock_network" {
@@ -8732,13 +8750,23 @@ impl IdeModel {
                 let path = source
                     .or_else(|| self.tree.sources.last().map(PathBuf::from))
                     .ok_or("synth_design: add a source first")?;
-                let d = crate::synth_hdl_path(&path)?;
+                let (d, sva_props, sva_imms) = crate::synth_hdl_path_with_sva(&path)?;
+                self.sva_props = sva_props;
+                self.sva_imms = sva_imms;
+                self.last_sva_report.clear();
                 let mut msg = format!(
                     "synth_design {} cells={} luts={}",
                     d.name,
                     d.cells.len(),
                     d.lut_inits().len()
                 );
+                if !self.sva_props.is_empty() || !self.sva_imms.is_empty() {
+                    msg.push_str(&format!(
+                        " sva_props={} sva_imm={}",
+                        self.sva_props.len(),
+                        self.sva_imms.len()
+                    ));
+                }
                 if d.attrs.get("NO_BODY") == Some("1") {
                     msg.push_str(" no_body");
                 }
@@ -17452,6 +17480,25 @@ impl IdeModel {
         self.cdc_report().text()
     }
 
+    /// Tcl `report_cdc_crossings`: only the net-level structural `CROSSING …` lines.
+    pub fn cdc_crossings_text(&self) -> String {
+        let report = self.cdc_report();
+        let mut out = String::new();
+        for c in &report.crossings {
+            out.push_str(&c.text());
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Tcl `assert_report`: per-assertion SVA status from the last sim run.
+    pub fn assert_report_text(&self) -> String {
+        if self.last_sva_report.is_empty() {
+            return "assert_report: no SVA assertions elaborated (run synth on SV with assertions, then sim)".into();
+        }
+        self.last_sva_report.clone()
+    }
+
     fn cdc_object_hay(&self, v: &helion_sta::CdcViolation) -> String {
         let report = self.cdc_report();
         let mut hay = format!("{} {}", v.from, v.to);
@@ -17462,6 +17509,16 @@ impl IdeModel {
                 hay.push(' ');
                 hay.push_str(&c.source.replace('/', " "));
             }
+        }
+        hay
+    }
+
+    /// Haystack for a net-level structural crossing: net + driver/load cells.
+    fn cdc_crossing_hay(&self, c: &helion_sta::CdcCrossing) -> String {
+        let mut hay = c.net.clone();
+        for cell in c.driver_cells.iter().chain(c.load_cells.iter()) {
+            hay.push(' ');
+            hay.push_str(cell);
         }
         hay
     }
@@ -17530,6 +17587,71 @@ impl IdeModel {
         ))
     }
 
+    /// Select a net-level structural CDC crossing by net name — sets the
+    /// property inspector (NET/CLASS/SEVERITY/CHECK/FROM/TO/DRIVERS/LOADS)
+    /// and cross-probes the first driver/load cell found in the design.
+    pub fn select_cdc_crossing(&mut self, net: &str) -> Result<String, String> {
+        let net = net.trim();
+        if net.is_empty() {
+            return Err("select_cdc_crossing: missing net".into());
+        }
+        let report = self.cdc_report();
+        let c = report
+            .crossings
+            .iter()
+            .find(|c| c.net == net)
+            .cloned()
+            .ok_or_else(|| format!("select_cdc_crossing: no crossing on net {net}"))?;
+        self.selected_cdc = Some(format!("crossing:{net}"));
+        self.selected_drc = None;
+        self.selected_methodology = None;
+        self.selected_clock_interaction = None;
+        self.selected_clock_network = None;
+        self.selected_timing_summary = None;
+        self.selected_power = None;
+        self.selected_utilization = None;
+        self.selected = Some(net.to_string());
+        // Cross-probe: driver cells first, then loads — first hit wins.
+        let mut probed: Option<String> = None;
+        for cell in c.driver_cells.iter().chain(c.load_cells.iter()) {
+            if let Some(o) = self.apply_object_crossprobe(cell) {
+                probed = Some(o);
+                break;
+            }
+        }
+        let drivers = c.driver_cells.join(",");
+        let loads = c.load_cells.join(",");
+        self.properties = vec![
+            ("NAME".into(), net.to_string()),
+            ("TYPE".into(), "cdc_crossing".into()),
+            ("CLASS".into(), c.class.as_str().into()),
+            ("SEVERITY".into(), c.severity.as_str().into()),
+            ("CHECK".into(), c.check.clone()),
+            ("FROM".into(), c.from_domain.clone()),
+            ("TO".into(), c.to_domain.clone()),
+            ("DRIVERS".into(), drivers.clone()),
+            ("LOADS".into(), loads.clone()),
+            ("SYNC_DEPTH".into(), c.sync_depth.to_string()),
+            (
+                "OBJECT".into(),
+                probed.clone().unwrap_or_else(|| "-".into()),
+            ),
+        ];
+        if probed.is_none() {
+            self.workspace = WorkspaceTab::Cdc;
+        }
+        Ok(format!(
+            "cdc_crossing NET={net} CLASS={} SEVERITY={} CHECK={} FROM={} TO={} DRIVERS={drivers} LOADS={loads} SYNC_DEPTH={} OBJECT={}",
+            c.class.as_str(),
+            c.severity.as_str(),
+            c.check,
+            c.from_domain,
+            c.to_domain,
+            c.sync_depth,
+            probed.as_deref().unwrap_or("-")
+        ))
+    }
+
     /// Click a UG906 CDC object link — cross-probe HNF clock source, not a dump.
     pub fn select_cdc_object(&mut self, spec: &str) -> Result<String, String> {
         let spec = spec.trim();
@@ -17543,6 +17665,10 @@ impl IdeModel {
         let mut hay = String::new();
         for v in &report.violations {
             hay.push_str(&self.cdc_object_hay(v));
+            hay.push(' ');
+        }
+        for c in &report.crossings {
+            hay.push_str(&self.cdc_crossing_hay(c));
             hay.push(' ');
         }
         let objs = self.extract_design_objects(&hay);
@@ -21004,6 +21130,25 @@ impl IdeModel {
         } else {
             self.event_sim = Some(Sim::new(&d));
             self.fabric_sim = None;
+            // Attach SVA checkers elaborated at synth; probe-resolution
+            // failures surface as an error message, never a silent skip.
+            if let Some(sim) = self.event_sim.as_mut() {
+                if !self.sva_props.is_empty() || !self.sva_imms.is_empty() {
+                    if let Some(design) = self.shell.session.design.as_ref() {
+                        if let Err(e) = sim.attach_sva(
+                            design,
+                            self.sva_props.clone(),
+                            self.sva_imms.clone(),
+                        ) {
+                            self.messages.push(IdeMessage {
+                                severity: MsgSeverity::Error,
+                                id: "SVA-ATTACH".into(),
+                                text: format!("sva attach failed: {e}"),
+                            });
+                        }
+                    }
+                }
+            }
         }
         self.wave.timescale_ps = (self.sim_timescale_ps.max(1) / 2).max(1);
         if self.wave.traces.is_empty() {
@@ -21193,6 +21338,31 @@ impl IdeModel {
             fab.step_user();
         } else if let Some(sim) = self.event_sim.as_mut() {
             sim.step_posedge(delay);
+            let failures = sim.sva_failures();
+            let report_lines = sim.sva_report().tcl_lines();
+            for f in failures {
+                let sample =
+                    (f.time / self.wave.timescale_ps.max(1)) as usize;
+                let sample = sample.min(self.wave.sample_len().saturating_sub(1));
+                let name = format!("SVA FAIL t={}ps", f.time);
+                self.wave.markers.retain(|m| m.name != name);
+                self.wave.markers.push(WaveMarker { name, sample });
+                let sev = match f.severity {
+                    helion_sv::sva::SvaSeverity::Error => MsgSeverity::Error,
+                    helion_sv::sva::SvaSeverity::Warning => MsgSeverity::Warning,
+                    helion_sv::sva::SvaSeverity::Info => MsgSeverity::Info,
+                };
+                let line = f.to_string();
+                self.push_sim_log(sev, "SVA-001", line.clone());
+                self.messages.push(IdeMessage {
+                    severity: sev,
+                    id: "SVA-001".into(),
+                    text: line,
+                });
+            }
+            if !report_lines.is_empty() {
+                self.last_sva_report = report_lines.join("\n");
+            }
         } else {
             return Err("sim: not started".into());
         }
