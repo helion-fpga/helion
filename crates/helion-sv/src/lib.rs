@@ -732,6 +732,13 @@ thread_local! {
     /// Signal/port → packed-struct or enum type name for the current module.
     static SIG_TYPES: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Modules whose priority-encoder always @(*) fold was skipped by
+    /// `compact_priority_onehot_unroll` after its own validation (>=48 bit
+    /// writes, >=75% set-to-1 RHSs, scalar carry). `try_emit_priority_onehot_grant`
+    /// trusts the zeroed assigns only for these modules, never for a
+    /// user-written `assign gnt = 0`.
+    static PRIO_COMPACT_VALIDATED: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 /// One packed-struct field: bit `lo` is LSB of the field in the parent.
@@ -1344,6 +1351,15 @@ fn note_function_called_not_inlined(module: &str, function: &str) {
 fn clear_function_notes() {
     FUNC_NOT_CALLED_SEEN.with(|s| s.borrow_mut().clear());
     FUNC_CALLED_NOT_INLINED_SEEN.with(|s| s.borrow_mut().clear());
+    PRIO_COMPACT_VALIDATED.with(|s| s.borrow_mut().clear());
+}
+
+fn prio_compact_validated_insert(module: &str) {
+    PRIO_COMPACT_VALIDATED.with(|s| s.borrow_mut().insert(module.to_string()));
+}
+
+fn prio_compact_validated_contains(module: &str) -> bool {
+    PRIO_COMPACT_VALIDATED.with(|s| s.borrow().contains(module))
 }
 
 /// `[msb:lsb]` width. A string parameter is hashed above bit 96; the old
@@ -6026,7 +6042,7 @@ fn rhs_looks_like_priority_bit_set(e: &RExpr<'_>) -> bool {
     }
 }
 
-fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>> {
+fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>], module: &str) -> Option<Vec<Nba<'a>>> {
     let mut bits_per: HashMap<&'a str, usize> = HashMap::new();
     let mut prio_sets: HashMap<&'a str, usize> = HashMap::new();
     let mut scalar_writes: HashSet<&'a str> = HashSet::new();
@@ -6063,6 +6079,7 @@ fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>>
     eprintln!(
         "synth_rtl compact_priority_onehot signal={bus} bit_writes={nbits} (skip hang-class fold)"
     );
+    prio_compact_validated_insert(module);
     let mut out = vec![(
         bus,
         None,
@@ -6088,8 +6105,8 @@ fn compact_priority_onehot_unroll<'a>(stmts: &[Nba<'a>]) -> Option<Vec<Nba<'a>>>
     Some(out)
 }
 
-fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump) -> Vec<Nba<'a>> {
-    if let Some(compact) = compact_priority_onehot_unroll(&stmts) {
+fn fold_blocking_assigns<'a>(stmts: Vec<Nba<'a>>, arena: &'a Bump, module: &str) -> Vec<Nba<'a>> {
+    if let Some(compact) = compact_priority_onehot_unroll(&stmts, module) {
         return compact;
     }
     fn subst<'a>(
@@ -10537,13 +10554,229 @@ fn lut6_const(one: bool) -> u64 {
     if one { u64::MAX } else { 0 }
 }
 
+/// Carry wire of one fold-residue grant bit: `~carry & req[bit]`, optionally
+/// wrapped as Mux(gate, 1, _) from the if-form fold. Returns the carry name.
+fn priority_gate_carry<'a>(req: &str, bit: usize, rhs: &'a RExpr<'a>) -> Option<&'a str> {
+    let cond = match rhs {
+        RExpr::Mux(c, t, _) => match *t {
+            RExpr::Const { val: 1, .. } => *c,
+            _ => return None,
+        },
+        other => other,
+    };
+    let (a, b) = match cond {
+        RExpr::And(a, b) => (*a, *b),
+        _ => return None,
+    };
+    let carry_of = |e: &'a RExpr<'a>| match e {
+        RExpr::Not(RExpr::Ident(c)) => Some(*c),
+        _ => None,
+    };
+    let bit_of = |e: &'a RExpr<'a>| {
+        matches!(e, RExpr::Bit(s, i) if *s == req && *i == bit)
+    };
+    if let (Some(c), true) = (carry_of(a), bit_of(b)) {
+        return Some(c);
+    }
+    if let (true, Some(c)) = (bit_of(a), carry_of(b)) {
+        return Some(c);
+    }
+    None
+}
+
+/// OR-reduction over `req` bits: the carry/valid definition in the fold
+/// residue. Accepts Bit(req,_), Or of reductions, the
+/// Mux(And(Not(p), Bit(req,_)), 1, p) fold form (= p | req[k]), Const 0,
+/// and one chase through a 1-bit internal wire definition (cycle-guarded).
+/// The fold clones the prefix tree per level, so depth is ~3x the bit count.
+fn is_req_or_reduction(rtl: &Rtl, req: &str, e: &RExpr, depth: usize) -> bool {
+    if depth > 512 {
+        return false;
+    }
+    match e {
+        RExpr::Const { val: 0, .. } => true,
+        RExpr::Bit(s, _) if *s == req => true,
+        RExpr::Or(a, b) => {
+            is_req_or_reduction(rtl, req, a, depth + 1)
+                && is_req_or_reduction(rtl, req, b, depth + 1)
+        }
+        RExpr::Mux(c, t, f) => match (*c, *t) {
+            (RExpr::And(a, b), RExpr::Const { val: 1, .. }) => {
+                let prefix_ok = match (*a, *b) {
+                    (RExpr::Not(p), RExpr::Bit(s, _)) if *s == req => {
+                        is_req_or_reduction(rtl, req, p, depth + 1)
+                    }
+                    (RExpr::Bit(s, _), RExpr::Not(p)) if *s == req => {
+                        is_req_or_reduction(rtl, req, p, depth + 1)
+                    }
+                    _ => false,
+                };
+                prefix_ok && is_req_or_reduction(rtl, req, f, depth + 1)
+            }
+            _ => false,
+        },
+        RExpr::Ident(s) => {
+            let mut any = false;
+            let mut ok = true;
+            for (_, _, rhs) in rtl.assigns.iter().filter(|(lhs, _, _)| *lhs == *s) {
+                any = true;
+                ok &= is_req_or_reduction(rtl, req, rhs, depth + 1);
+            }
+            any && ok
+        }
+        _ => false,
+    }
+}
+
+/// Verify the assigns to `gnt` are the fold residue of a priority-encoder
+/// always @(*) loop, or the validated compact marker, before the cascade
+/// replaces them. A bitwise assign like `assign gnt = ~req` has no carry
+/// gate and is rejected: it must lower normally, never as a priority
+/// encoder. Returns (gnt, valid, wires whose assigns the cascade replaces).
+fn verify_priority_grant(
+    rtl: &Rtl,
+    req: &str,
+    gnt: &str,
+    valid: Option<&str>,
+    n: usize,
+) -> Option<(String, Option<String>, Vec<String>)> {
+    let is_zero = |rhs: &RExpr| matches!(rhs, RExpr::Const { val: 0, .. });
+    let gnt_assigns: Vec<(Option<usize>, &RExpr)> = rtl
+        .assigns
+        .iter()
+        .filter(|(lhs, _, _)| *lhs == gnt)
+        .map(|(_, bit, rhs)| (*bit, rhs))
+        .collect();
+    if gnt_assigns.is_empty() {
+        return None;
+    }
+    // Compact marker: `compact_priority_onehot_unroll` zeroed the bus and
+    // the scalar carry after its own validation. Trust it only for modules
+    // it actually validated, never for a user-written `assign gnt = 0`.
+    if gnt_assigns
+        .iter()
+        .all(|(bit, rhs)| bit.is_none() && is_zero(rhs))
+    {
+        if !prio_compact_validated_contains(rtl.module) {
+            return None;
+        }
+        let mut skip_wires = Vec::new();
+        for s in &rtl.signals {
+            if s.width != 1 || s.depth != 0 || s.name == req || s.name == gnt {
+                continue;
+            }
+            if valid.map(|v| s.name == v).unwrap_or(false) {
+                continue;
+            }
+            if rtl.ports.iter().any(|(p, _, _)| p == &s.name) {
+                continue;
+            }
+            let assigns: Vec<&RExpr> = rtl
+                .assigns
+                .iter()
+                .filter(|(lhs, _, _)| *lhs == s.name)
+                .map(|(_, _, rhs)| rhs)
+                .collect();
+            if !assigns.is_empty() && assigns.iter().all(|rhs| is_zero(rhs)) {
+                skip_wires.push(s.name.to_string());
+            }
+        }
+        // `found`'s zero assign may already be dead-eliminated (nothing reads
+        // it after the compact); an empty skip list just means nothing extra
+        // to skip. The compact validation above is the safety, not the list.
+        if let Some(v) = valid {
+            let v_assigns: Vec<(Option<usize>, &RExpr)> = rtl
+                .assigns
+                .iter()
+                .filter(|(lhs, _, _)| *lhs == v)
+                .map(|(_, bit, rhs)| (*bit, rhs))
+                .collect();
+            if v_assigns.is_empty()
+                || !v_assigns
+                    .iter()
+                    .all(|(bit, rhs)| bit.is_none() && is_zero(rhs))
+            {
+                return None;
+            }
+        }
+        return Some((gnt.to_string(), valid.map(str::to_string), skip_wires));
+    }
+    // Fold residue: every grant bit is `~carry & req[i]` over one shared
+    // 1-bit carry wire whose definition is an OR-reduction over req.
+    let mut carry: Option<String> = None;
+    let mut seen = vec![false; n];
+    for (bit, rhs) in &gnt_assigns {
+        match bit {
+            None => {
+                // Whole-vector pre-clear (`grant = {N{1'b0}}`) only.
+                if !is_zero(rhs) {
+                    return None;
+                }
+            }
+            Some(i) => {
+                if *i >= n {
+                    return None;
+                }
+                let c = priority_gate_carry(req, *i, rhs)?;
+                match &carry {
+                    Some(prev) if *prev != c => return None,
+                    _ => carry = Some(c.to_string()),
+                }
+                seen[*i] = true;
+            }
+        }
+    }
+    if seen.iter().any(|s| !s) {
+        return None;
+    }
+    let carry = carry?;
+    let carry_sig = rtl.signals.iter().find(|s| s.name == carry)?;
+    if carry_sig.width != 1 || carry_sig.depth != 0 || carry == req || carry == gnt {
+        return None;
+    }
+    if valid.map(|v| carry == v).unwrap_or(false) {
+        return None;
+    }
+    if rtl.ports.iter().any(|(p, _, _)| p == &carry.as_str()) {
+        return None;
+    }
+    let carry_ok = rtl
+        .assigns
+        .iter()
+        .filter(|(lhs, _, _)| *lhs == carry.as_str())
+        .any(|(_, _, rhs)| is_req_or_reduction(rtl, req, rhs, 0));
+    if !carry_ok {
+        return None;
+    }
+    if let Some(v) = valid {
+        let valid_ok = rtl
+            .assigns
+            .iter()
+            .filter(|(lhs, _, _)| *lhs == v)
+            .any(|(_, _, rhs)| is_req_or_reduction(rtl, req, rhs, 0));
+        if !valid_ok {
+            return None;
+        }
+    }
+    Some((gnt.to_string(), valid.map(str::to_string), vec![carry]))
+}
+
 /// LogikBench fixed-priority onehot cascade (real LUT2s, no silent drop).
 /// - Ascending (arbiter): `grant[i] = request[i] & ~OR(request[0..i))` — 1 out.
 /// - Descending MSB-first (bin2prio): `out[i] = in[i] & ~OR(in[i+1..])` plus
 ///   optional 1-bit `valid = OR(in[*])` — 2 outs. DW=64 for-loop fold was a
 ///   banner-only ~40s AIG hang-class; cascade clears it.
-/// Returns `(onehot_out, optional_valid_out)` so callers skip both cones.
-fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, Option<String>)> {
+///
+/// The cascade replaces the folded always @(*) body, so it fires only when
+/// `verify_priority_grant` recognizes that body as carry-gated per-bit
+/// residue or the validated compact marker. A bitwise assign like
+/// `gnt = ~req` is rejected and lowers normally. Returns
+/// `(onehot_out, optional_valid_out, replaced_wires)` so callers skip exactly
+/// the folded residue, never unrelated 1-bit logic.
+fn try_emit_priority_onehot_grant(
+    d: &mut Design,
+    rtl: &Rtl,
+) -> Option<(String, Option<String>, Vec<String>)> {
     if !rtl.nbas.is_empty() {
         return None;
     }
@@ -10599,6 +10832,9 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     if !has_carry {
         return None;
     }
+    // Verify the assigns are the fold residue of a priority loop (or the
+    // validated compact marker) before replacing them with the cascade.
+    let (gnt, valid, skip_wires) = verify_priority_grant(rtl, req, gnt, valid, n)?;
     let order: Vec<usize> = if msb_first {
         (0..n).rev().collect()
     } else {
@@ -10607,7 +10843,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     let mut carry: Option<String> = None;
     for &i in &order {
         let r = bit_name(req, n, i);
-        let g = bit_name(gnt, n, i);
+        let g = bit_name(&gnt, n, i);
         let gcell = format!("u_prio_{gnt}_{i}g");
         match &carry {
             None => {
@@ -10644,7 +10880,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
             }
         }
     }
-    if let (Some(v), Some(c)) = (valid, carry.as_ref()) {
+    if let (Some(v), Some(c)) = (valid.as_deref(), carry.as_ref()) {
         // valid = OR(all inputs) = final carry after the cascade.
         emit_lut_pins(
             d,
@@ -10657,7 +10893,7 @@ fn try_emit_priority_onehot_grant(d: &mut Design, rtl: &Rtl) -> Option<(String, 
     } else {
         eprintln!("synth_rtl priority_onehot signal={gnt} bits={n}");
     }
-    Some((gnt.to_string(), valid.map(|s| s.to_string())))
+    Some((gnt, valid, skip_wires))
 }
 
 /// Wide-cone mapping cap (FM-HEL-10m-0854). VGA-style 12-bit compare muxes
@@ -14654,12 +14890,14 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         if clock_mux_sigs.contains(*lhs) || clock_gate_sigs.contains(*lhs) {
             continue;
         }
-        // Priority cascade already drives onehot[+valid]; skip folded always @(*) body.
-        if let Some((ref gnt, ref valid)) = priority_grant {
+        // Priority cascade already drives onehot[+valid] and its carry wire;
+        // skip exactly the folded residue it replaces. Unrelated 1-bit wires
+        // lower normally instead of being silently dropped.
+        if let Some((ref gnt, ref valid, ref skip_wires)) = priority_grant {
             if *lhs == gnt.as_str() || valid.as_deref() == Some(*lhs) {
                 continue;
             }
-            if sig_width(rtl, lhs) == 1 && !rtl.ports.iter().any(|(p, _, _)| p == lhs) {
+            if skip_wires.iter().any(|w| w.as_str() == *lhs) {
                 continue;
             }
         }
@@ -21555,6 +21793,40 @@ endmodule
             }
             other => panic!("expected Const, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn priority_heuristic_rejects_bitwise_inverter() {
+        // `assign gnt = ~req` with a stray 1-bit wire: the old loose shape
+        // check replaced it with a priority encoder and dropped the wire's
+        // assign. It must elaborate to inverters, with the wire logic kept.
+        let src = r#"
+module inv_n #(parameter N = 8)
+   (
+    input [N-1:0]  req,
+    output [N-1:0] gnt,
+    output         flag_o
+    );
+   wire flag;
+   assign gnt = ~req;
+   assign flag = ^req;
+   assign flag_o = flag;
+endmodule
+"#;
+        let d = synth_sv(src, "inv_n.v").expect("inverter");
+        assert!(
+            !d.cells.iter().any(|c| c.name.contains("u_prio_")),
+            "bitwise inverter must not get a priority cascade"
+        );
+        assert!(
+            d.lut_inits().iter().any(|&i| i == lut6_inv()),
+            "gnt must lower to inverters, inits={:?}",
+            d.lut_inits()
+        );
+        assert!(
+            d.nets.iter().any(|n| n.name == "flag"),
+            "unrelated 1-bit wire must keep its logic"
+        );
     }
 
 }
