@@ -3,7 +3,7 @@
 //! Replaces the treemap (unreadable noise past a few hundred blocks) with a
 //! real expandable tree: chevron rows, indent guides, per-node cell counts,
 //! 28px rows, full-width selection highlight, and a filter field. Virtualized
-//! via `ScrollArea::show_rows` so 15k-block designs stay interactive — rows
+//! via `ScrollArea::show_rows` so 15k-block designs stay interactive - rows
 //! are only materialized for expanded paths, never all at once.
 
 use std::collections::{HashMap, HashSet};
@@ -35,6 +35,8 @@ struct TreeState {
     top: Option<String>,
     nodes: Vec<TreeNode>,
     root: usize,
+    /// Parent index per node (None for root) - drives the breadcrumb bar.
+    parent: Vec<Option<usize>>,
     expanded: HashSet<String>,
     filter: String,
 }
@@ -61,7 +63,7 @@ fn parent_of<'a>(name: &'a str, inst_set: &HashSet<&'a str>) -> Option<&'a str> 
     None
 }
 
-fn build_tree(top: &str, nodes: &[(String, String)]) -> (Vec<TreeNode>, usize) {
+fn build_tree(top: &str, nodes: &[(String, String)]) -> (Vec<TreeNode>, usize, Vec<Option<usize>>) {
     let inst_names: HashSet<&str> = nodes
         .iter()
         .filter(|(_, k)| k.starts_with("instance:"))
@@ -140,7 +142,14 @@ fn build_tree(top: &str, nodes: &[(String, String)]) -> (Vec<TreeNode>, usize) {
             tree[i].leaf_count = kids.iter().map(|&c| tree[c].leaf_count).sum();
         }
     }
-    (tree, 0)
+    // Parent index per node for the breadcrumb bar.
+    let mut parent: Vec<Option<usize>> = vec![None; tree.len()];
+    for (i, n) in tree.iter().enumerate() {
+        for &c in &n.children {
+            parent[c] = Some(i);
+        }
+    }
+    (tree, 0, parent)
 }
 
 /// Visible row indices in pre-order, descending only into expanded nodes.
@@ -254,12 +263,13 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
         .data_mut(|d| d.get_temp::<TreeState>(state_id))
         .unwrap_or_default();
     if state.top.as_deref() != Some(top_name.as_str()) || state.nodes.is_empty() {
-        let (nodes, root) = build_tree(&top_name, &model.hierarchy.nodes);
+        let (nodes, root, parent) = build_tree(&top_name, &model.hierarchy.nodes);
         let root_name = nodes[root].name.clone();
         state = TreeState {
             top: Some(top_name.clone()),
             nodes,
             root,
+            parent,
             expanded: HashSet::from([root_name]),
             filter: String::new(),
         };
@@ -306,7 +316,40 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
         );
     }
 
+    // Breadcrumb: root > ... > selected node (Vivado hierarchy-tab pattern).
+    // Segments select their ancestor; keeps orientation in deep trees.
     let selected = model.selected.clone();
+    let sel_idx = selected
+        .as_deref()
+        .and_then(|s| state.nodes.iter().position(|n| n.name == s));
+    if let Some(mut i) = sel_idx {
+        let mut path = vec![i];
+        while let Some(p) = state.parent[i] {
+            path.push(p);
+            i = p;
+        }
+        path.reverse();
+        let mut crumb_pick: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (k, &ni) in path.iter().enumerate() {
+                if k > 0 {
+                    ui.label(egui::RichText::new("›").small().color(theme.faint));
+                }
+                let last = k + 1 == path.len();
+                let lbl = egui::RichText::new(&state.nodes[ni].short)
+                    .small()
+                    .color(if last { theme.text } else { theme.info });
+                if ui.link(lbl).clicked() {
+                    crumb_pick = Some(state.nodes[ni].name.clone());
+                }
+            }
+        });
+        if let Some(id) = crumb_pick {
+            model.select(&id);
+        }
+        ui.add_space(2.0);
+    }
+
     let mut pick: Option<String> = None;
     let mut toggle: Option<String> = None;
     let mut open_sheet: Option<String> = None;

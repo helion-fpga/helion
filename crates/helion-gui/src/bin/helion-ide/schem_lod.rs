@@ -2,8 +2,8 @@
 //!
 //! At fit zoom on a 15k-cell design, drawing every gate and wire produces
 //! visual noise (a wire grid with no readable gates). Below [`BLOCK_ZOOM`]
-//! the sheet renders a treemap of hierarchical instance blocks — one box per
-//! module, sized and labeled by cell count — instead of the flat gate layout
+//! the sheet renders a treemap of hierarchical instance blocks - one box per
+//! module, sized and labeled by cell count - instead of the flat gate layout
 //! (whose kind-column placement interleaves hierarchy, so world-space boxes
 //! would all coincide). Zooming in past the threshold, or double-clicking a
 //! block (Expand Inside), restores the gate-level sheet.
@@ -17,12 +17,17 @@ use helion_gui::SchematicDrawing;
 
 /// Below this camera zoom the sheet renders blocks, not gates.
 pub const BLOCK_ZOOM: f32 = 0.5;
+/// Block mode only kicks in for designs at or above this cell count.
+/// Small designs are readable at fit zoom; the treemap would be noise.
+pub const LOD_MIN_CELLS: usize = 500;
 
 #[derive(Clone, Debug)]
 pub struct BlockInfo {
     pub name: String,
     pub short: String,
     pub cells: usize,
+    /// Total symbol pins in the block (Vivado-style port count).
+    pub ports: usize,
     /// True for the synthetic top-level group (not a real instance).
     pub is_top: bool,
 }
@@ -58,6 +63,7 @@ pub fn build_block_layer(
     let mut order: Vec<String> = Vec::new();
     let mut idx_of: HashMap<&str, usize> = HashMap::new();
     let mut cells = Vec::new();
+    let mut ports = Vec::new();
 
     for sy in &drawing.symbols {
         if sy.kind.starts_with("PORT") {
@@ -71,10 +77,12 @@ pub fn build_block_layer(
                 order.push(inst.to_string());
                 idx_of.insert(inst, i);
                 cells.push(0usize);
+                ports.push(0usize);
                 i
             }
         };
         cells[bi] += 1;
+        ports[bi] += sy.pins.len();
     }
 
     let mut blocks: Vec<BlockInfo> = Vec::with_capacity(order.len());
@@ -95,6 +103,7 @@ pub fn build_block_layer(
                 helion_gui::schematic_short_name(inst)
             },
             cells: cells[i],
+            ports: ports[i],
             is_top,
         });
     }
@@ -195,7 +204,7 @@ pub fn paint_block_layer(
             ),
             egui::StrokeKind::Inside,
         );
-        // Labels only when they fit inside the box — never overflow.
+        // Labels only when they fit inside the box - never overflow.
         let name_need = b.short.len() as f32 * 7.0 + 16.0;
         if r.width() >= 80.0 && r.height() >= 48.0 && r.width() >= name_need {
             p.text(
@@ -208,7 +217,7 @@ pub fn paint_block_layer(
             p.text(
                 egui::pos2(r.center().x, r.center().y + 10.0),
                 egui::Align2::CENTER_CENTER,
-                format!("{} cells", b.cells),
+                format!("{} cells · {} ports", b.cells, b.ports),
                 egui::FontId::proportional(11.0),
                 theme.dim,
             );
