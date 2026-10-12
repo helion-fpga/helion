@@ -975,6 +975,9 @@ pub enum ConstraintSection {
     Clocks,
     IoDelay,
     Exception,
+    /// I/O placement properties (PACKAGE_PIN, IOSTANDARD, DRIVE, SLEW,
+    /// PULLTYPE, DIFF_TERM, IN_TERM) — not timing exceptions.
+    IoPlacement,
 }
 
 impl ConstraintSection {
@@ -983,6 +986,7 @@ impl ConstraintSection {
             Self::Clocks => "clocks",
             Self::IoDelay => "io_delay",
             Self::Exception => "exception",
+            Self::IoPlacement => "io_placement",
         }
     }
 }
@@ -19424,7 +19428,7 @@ impl IdeModel {
         }
         for (port, pin) in &self.constraints.package_pins {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property PACKAGE_PIN",
                 format!("package_pin:{port}"),
                 port.clone(),
@@ -19435,7 +19439,7 @@ impl IdeModel {
         }
         for (port, std) in &self.constraints.iostandards {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property IOSTANDARD",
                 format!("iostandard:{port}"),
                 port.clone(),
@@ -19446,7 +19450,7 @@ impl IdeModel {
         }
         for (port, ma) in &self.constraints.drives {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property DRIVE",
                 format!("drive:{port}"),
                 port.clone(),
@@ -19457,7 +19461,7 @@ impl IdeModel {
         }
         for (port, slew) in &self.constraints.slews {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property SLEW",
                 format!("slew:{port}"),
                 port.clone(),
@@ -19468,7 +19472,7 @@ impl IdeModel {
         }
         for (port, pull) in &self.constraints.pulltypes {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property PULLTYPE",
                 format!("pulltype:{port}"),
                 port.clone(),
@@ -19479,7 +19483,7 @@ impl IdeModel {
         }
         for (port, term) in &self.constraints.diff_terms {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property DIFF_TERM",
                 format!("diff_term:{port}"),
                 port.clone(),
@@ -19490,7 +19494,7 @@ impl IdeModel {
         }
         for (port, term) in &self.constraints.in_terms {
             push(
-                ConstraintSection::Exception,
+                ConstraintSection::IoPlacement,
                 "set_property IN_TERM",
                 format!("in_term:{port}"),
                 port.clone(),
