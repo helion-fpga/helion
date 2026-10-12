@@ -4503,7 +4503,7 @@ pub enum WorkspaceTab {
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 29] = [
+    pub const ALL: [WorkspaceTab; 30] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
