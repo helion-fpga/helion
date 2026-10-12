@@ -586,6 +586,13 @@ fn dec_routed(r: &mut Reader) -> Result<Routed, String> {
         pathfinder_iters,
         overused,
         imux_skip,
+        // The checkpoint format predates the congestion export and is
+        // version-locked; the heat map stays empty until a fresh route run.
+        congestion: Vec::new(),
+        congestion_x0: 0,
+        congestion_y0: 0,
+        congestion_cols: 0,
+        congestion_rows: 0,
     })
 }
 
