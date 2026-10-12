@@ -800,12 +800,14 @@ impl TclInterp {
                 }
                 let ch: Vec<char> = argv[2].chars().collect();
                 let n = ch.len();
-                let first = str_index(&argv[3], n).unwrap_or(0);
-                let last = str_index(&argv[4], n).unwrap_or(n.saturating_sub(1));
-                if last < first || n == 0 {
-                    return Ctl::Value(String::new());
+                // Out-of-range (or reversed) indices yield an empty string,
+                // matching Tcl; indices are never clamped into range.
+                match (str_index(&argv[3], n), str_index(&argv[4], n)) {
+                    (Some(first), Some(last)) if last >= first => {
+                        Ctl::Value(ch[first..=last].iter().collect())
+                    }
+                    _ => Ctl::Value(String::new()),
                 }
-                Ctl::Value(ch[first..=last.min(n - 1)].iter().collect())
             }
             "index" => {
                 if argv.len() != 4 {
@@ -1383,7 +1385,9 @@ fn list_index(spec: &str, len: usize, line: usize) -> Result<Option<usize>, TclE
     }
 }
 
-/// Resolve `string range` index: integer or `end`/`end-N`. Clamps into range.
+/// Resolve `string range`/`string index` index: integer or `end`/`end-N`.
+/// Out-of-range indices resolve to `None` (Tcl yields an empty string);
+/// they are never clamped into range.
 fn str_index(spec: &str, len: usize) -> Option<usize> {
     let spec = spec.trim();
     if len == 0 {
@@ -1395,13 +1399,10 @@ fn str_index(spec: &str, len: usize) -> Option<usize> {
     if let Some(rest) = spec.strip_prefix("end-") {
         return rest.parse::<usize>().ok().and_then(|n| len.checked_sub(1 + n));
     }
-    spec.parse::<i64>().ok().and_then(|i| {
-        if i < 0 {
-            Some(0)
-        } else {
-            Some((i as usize).min(len - 1))
-        }
-    })
+    spec.parse::<i64>()
+        .ok()
+        .and_then(|i| usize::try_from(i).ok())
+        .filter(|&i| i < len)
 }
 
 // ---- expr ----
@@ -2570,7 +2571,13 @@ mod tests {
         let (mut i, mut sh) = interp();
         assert_eq!(ev(&mut i, &mut sh, "string length hello"), "5");
         assert_eq!(ev(&mut i, &mut sh, "string range hello 1 3"), "ell");
+        // Out-of-range indices yield empty, not clamped: Tcl behavior.
+        assert_eq!(ev(&mut i, &mut sh, "string range abc 10 20"), "");
+        assert_eq!(ev(&mut i, &mut sh, "string range abc 1 20"), "");
+        assert_eq!(ev(&mut i, &mut sh, "string range hello 3 1"), "");
+        assert_eq!(ev(&mut i, &mut sh, "string range hello end-1 end"), "lo");
         assert_eq!(ev(&mut i, &mut sh, "string index hello end"), "o");
+        assert_eq!(ev(&mut i, &mut sh, "string index hello 10"), "");
         assert_eq!(ev(&mut i, &mut sh, r#"string match "h*o" hello"#), "1");
         assert_eq!(ev(&mut i, &mut sh, "string toupper hello"), "HELLO");
         assert_eq!(ev(&mut i, &mut sh, r#"string trim "  hi  ""#), "hi");
