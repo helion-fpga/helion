@@ -57,8 +57,8 @@ impl LayerId {
             LayerId::BramSites => "BRAM sites",
             LayerId::DspSites => "DSP sites",
             LayerId::ClkSites => "CLK sites",
-            LayerId::CongestionHeat => "Congestion heat map",
-            LayerId::CriticalityHeat => "Criticality heat map",
+            LayerId::CongestionHeat => "Congestion",
+            LayerId::CriticalityHeat => "Criticality",
             LayerId::ClockRegions => "Clock regions",
             LayerId::Pblocks => "Pblocks",
             LayerId::Routes => "Routes",
@@ -920,6 +920,30 @@ mod tests {
         let get = |k: &str| rows.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("Sites").as_deref(), Some("4"));
         assert_eq!(get("Occupied").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn inspect_pblock_rows() {
+        use crate::ide::Pblock;
+        let mut model = fixture_model();
+        model.pblocks.push(Pblock {
+            name: "pb0".into(),
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 0,
+            cells: vec!["lut_cell".into()],
+            frames: 10,
+            bytes: 100,
+            ranged: true,
+        });
+        let rows = inspect_pblock(&model, "pb0");
+        let get = |k: &str| rows.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("Pblock").as_deref(), Some("pb0"));
+        assert_eq!(get("Frames").as_deref(), Some("10"));
+        assert_eq!(get("Sites").as_deref(), Some("2"));
+        assert_eq!(get("Occupied").as_deref(), Some("2"));
+        assert_eq!(get("Objects").as_deref(), Some("lut_cell"));
     }
 
     #[test]

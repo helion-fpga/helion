@@ -8077,17 +8077,21 @@ fn paint_device(
     ui.separator();
 
     if docked {
+        let band_h = ui.available_height().max(1.0);
         ui.horizontal(|ui| {
             if pv.show_display_control {
-                ui.vertical(|ui| {
-                    ui.set_min_width(216.0);
-                    ui.set_max_width(234.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("pv_display_control")
-                        .show(ui, |ui| {
-                            physview_panels::paint_display_control(ui, pv, model, theme);
-                        });
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(234.0, band_h),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("pv_display_control")
+                            .show(ui, |ui| {
+                                ui.set_min_width(216.0);
+                                physview_panels::paint_display_control(ui, pv, model, theme);
+                            });
+                    },
+                );
             } else if ui
                 .small_button(">")
                 .on_hover_text("Show Display Control")
@@ -8096,22 +8100,30 @@ fn paint_device(
                 pv.show_display_control = true;
             }
             // Die fills the middle.
-            ui.vertical(|ui| {
+            {
                 let insp_w = if pv.show_inspector { 272.0 } else { 30.0 };
                 let w = (ui.available_width() - insp_w).max(220.0);
-                ui.set_min_width(w);
-                paint_device_die(ui, model, theme, pv, zoom_target);
-            });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, band_h),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        paint_device_die(ui, model, theme, pv, zoom_target);
+                    },
+                );
+            }
             if pv.show_inspector {
-                ui.vertical(|ui| {
-                    ui.set_min_width(252.0);
-                    ui.set_max_width(268.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("pv_inspector")
-                        .show(ui, |ui| {
-                            physview_panels::paint_inspector(ui, model, pv, theme, zoom_target);
-                        });
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(268.0, band_h),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("pv_inspector")
+                            .show(ui, |ui| {
+                                ui.set_min_width(252.0);
+                                physview_panels::paint_inspector(ui, model, pv, theme, zoom_target);
+                            });
+                    },
+                );
             } else if ui
                 .small_button("<")
                 .on_hover_text("Show Inspector")
