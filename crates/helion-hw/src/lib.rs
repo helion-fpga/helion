@@ -2017,16 +2017,14 @@ mod tests {
             &pa,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         let plb = place_with(
             &pb,
             &dev,
             PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .unwrap();
         let ra = route(&pla, &dev).unwrap();

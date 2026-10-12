@@ -13,8 +13,9 @@ use helion_gui::surface::{
 use helion_gui::{
     doctor, open_hdl_dialog, pane_for_workspace, BottomTab, CdcSeverity, ClockRelation,
     ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
-    MethodologySeverity, MsgSeverity, PathGroupKind, ProbeSelection, SourceLine, StepState,
-    TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab,
+    MethodologySeverity, MsgSeverity, PathGroupKind, ProbeSelection, RunCol, SourceLine, StepState,
+    TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane, WorkspaceTab, best_run_index,
+    sort_run_indices, sweep_wns_stats,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -585,6 +586,13 @@ impl HelionIde {
 
     fn submit_job(&mut self, kind: JobKind) {
         if self.job.is_some() {
+            // Never drop a design-run queue item: park it back at the front;
+            // the completion handler chains the queue.
+            if let JobKind::DesignRun { name } = &kind {
+                if !self.model.run_queue.iter().any(|q| q == name) {
+                    self.model.run_queue.push_front(name.clone());
+                }
+            }
             self.progress = "Busy — wait for the current run to finish.".into();
             return;
         }
@@ -610,7 +618,22 @@ impl HelionIde {
         };
         match job.try_recv() {
             Ok(out) => {
+                // The job ran on a model clone: merge back live design-run
+                // state (queue edits, newly created runs) before adopting
+                // the clone, so mid-flight panel edits are never lost.
+                let live_queue = std::mem::take(&mut self.model.run_queue);
+                let live_runs = std::mem::take(&mut self.model.runs);
                 self.model = out.model;
+                for name in live_queue {
+                    if !self.model.run_queue.iter().any(|q| q == &name) {
+                        self.model.run_queue.push_back(name);
+                    }
+                }
+                for r in live_runs {
+                    if !self.model.runs.iter().any(|e| e.name == r.name) {
+                        self.model.runs.push(r);
+                    }
+                }
                 self.busy = false;
                 self.progress = match &out.result {
                     Ok(s) if s.is_empty() => format!("{} finished.", out.kind.widget()),
@@ -650,7 +673,17 @@ impl HelionIde {
                 if matches!(out.kind, JobKind::SimRun(_)) && out.result.is_ok() {
                     self.set_activity(Activity::Simulate);
                 }
+                // Design-run queue chaining. `submit_job` refuses while a job
+                // is live, so drop the handle first.
+                let chained = if matches!(out.kind, JobKind::DesignRun { .. }) {
+                    self.model.run_queue.pop_front()
+                } else {
+                    None
+                };
                 self.job = None;
+                if let Some(name) = chained {
+                    self.submit_job(JobKind::DesignRun { name });
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -3292,118 +3325,371 @@ fn run_status_color(theme: &theme::Theme, status: &str) -> Color32 {
 
 fn paint_runs(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Runs");
+    ui.add_space(4.0);
+
+    // --- Queue actions -----------------------------------------------------
+    let pending = model.run_queue.len();
+    let selected_name = model
+        .selected
+        .as_deref()
+        .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string());
+    let selected_has_result = selected_name
+        .as_deref()
+        .and_then(|n| model.runs.iter().find(|r| r.name == *n))
+        .is_some_and(|r| r.result_session.is_some());
+
     ui.horizontal(|ui| {
         if ui
             .add_sized(
-                [148.0, chrome::HIT_COMFORT],
+                [140.0, chrome::HIT_COMFORT],
+                egui::Button::new("Launch all pending"),
+            )
+            .clicked()
+        {
+            let names: Vec<String> = model
+                .runs
+                .iter()
+                .filter(|r| r.step == "Implementation" && r.status == "Not started")
+                .map(|r| r.name.clone())
+                .collect();
+            if !names.is_empty() {
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                if model.enqueue_design_runs(&refs).is_ok() {
+                    kick_run_queue(model);
+                }
+            }
+        }
+        if ui
+            .add_sized(
+                [130.0, chrome::HIT_COMFORT],
                 egui::Button::new("Launch selected"),
             )
             .clicked()
         {
-            if let Some(name) = model
-                .selected
-                .as_deref()
-                .map(|s| s.strip_prefix("run:").unwrap_or(s).to_string())
-            {
-                if model.runs.iter().any(|r| r.name == name) {
-                    let _ = model.exec(&format!("launch_runs {name}"));
+            if let Some(name) = selected_name.clone() {
+                if model.enqueue_design_runs(&[name.as_str()]).is_ok() {
+                    kick_run_queue(model);
                 }
-            } else if let Some(r) = model.runs.first() {
-                let _ = model.exec(&format!("launch_runs {}", r.name));
             }
         }
-        ui.menu_button("New run…", |ui| {
-            if ui.button("RuntimeOpt").clicked() {
-                let _ = model.exec("create_run impl_runtime -strategy RuntimeOpt");
-                ui.close();
+        if ui
+            .add_sized(
+                [110.0, chrome::HIT_COMFORT],
+                egui::Button::new("Cancel queue"),
+            )
+            .clicked()
+        {
+            model.cancel_run_queue();
+        }
+        // Disabled until the selected run has a result to activate.
+        let make_active = ui
+            .add_enabled_ui(selected_has_result, |ui| {
+                ui.add_sized(
+                    [110.0, chrome::HIT_COMFORT],
+                    egui::Button::new("Make active"),
+                )
+            })
+            .inner;
+        if make_active.clicked() {
+            if let Some(name) = selected_name.clone() {
+                let _ = model.make_run_active(&name);
             }
-            if ui.button("PhysOpt").clicked() {
-                let _ = model.exec("create_run impl_phys -strategy PhysOpt");
-                ui.close();
-            }
-        });
+        }
     });
-    ui.add_space(6.0);
-    let selected = model.selected.clone();
-    let mut pick: Option<String> = None;
-    egui::ScrollArea::both().max_height(220.0).show(ui, |ui| {
-        egui::Grid::new("design_runs_table")
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Name").strong());
-                ui.label(RichText::new("Strategy").strong());
-                ui.label(RichText::new("Status").strong());
-                ui.label(RichText::new("LUTFF").strong());
-                ui.label(RichText::new("WNS_PS").strong());
-                ui.label(RichText::new("Runtime").strong());
-                ui.label(RichText::new("Reuse").strong());
-                ui.label(RichText::new("Hash").strong());
-                ui.end_row();
-                for r in &model.runs {
-                    let id = format!("run:{}", r.name);
-                    let on = selected.as_deref() == Some(id.as_str())
-                        || selected.as_deref() == Some(r.name.as_str());
-                    if ui.selectable_label(on, &r.name).clicked() {
-                        pick = Some(r.name.clone());
-                    }
-                    ui.label(r.strategy_cell());
-                    let fill = run_status_color(theme, &r.status);
-                    let btn = egui::Button::new(RichText::new(&r.status).color(Color32::BLACK))
-                        .fill(fill)
-                        .selected(on);
-                    if ui.add(btn).clicked() {
-                        pick = Some(r.name.clone());
-                    }
-                    ui.label(r.lutff_cell());
-                    ui.label(r.wns_cell());
-                    ui.label(r.runtime_cell());
-                    ui.label(r.reuse_cell());
-                    ui.label(r.hash_cell());
-                    ui.end_row();
+    if pending > 0 {
+        ui.label(
+            RichText::new(format!(
+                "Queue: {pending} run{} waiting — results stream in as each finishes.",
+                if pending == 1 { "" } else { "s" }
+            ))
+            .color(theme.info),
+        );
+    } else {
+        ui.label(
+            RichText::new("Queue empty. Create runs below, then launch them.")
+                .color(theme.dim),
+        );
+    }
+    ui.add_space(8.0);
+
+    // --- New run: strategy editor ------------------------------------------
+    egui::CollapsingHeader::new("New run — strategy")
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut create: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut model.run_editor.name);
+                ui.label("Preset:");
+                let cur = model.run_editor.preset.clone();
+                egui::ComboBox::from_id_salt("run_preset")
+                    .selected_text(cur.as_str())
+                    .show_ui(ui, |ui| {
+                        for p in [
+                            "Default",
+                            "TimingExplore",
+                            "RuntimeOpt",
+                            "PhysOpt",
+                            "Custom",
+                        ] {
+                            if ui.selectable_label(cur == p, p).clicked() {
+                                model.run_editor.apply_preset(p);
+                            }
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Opt level:");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut model.run_editor.opt_level)
+                            .range(0..=2),
+                    )
+                    .changed()
+                {
+                    model.run_editor.touched();
+                }
+                if ui
+                    .checkbox(&mut model.run_editor.aig_rewrite, "AIG rewrite")
+                    .changed()
+                {
+                    model.run_editor.touched();
+                }
+                if ui
+                    .checkbox(&mut model.run_editor.timing_driven, "Timing-driven")
+                    .changed()
+                {
+                    model.run_editor.touched();
+                }
+                if ui
+                    .checkbox(&mut model.run_editor.phys_opt, "Phys-opt")
+                    .changed()
+                {
+                    model.run_editor.touched();
                 }
             });
-    });
-    ui.add_space(8.0);
-    ui.label(RichText::new("Compare Runs (name / strategy / WNS / runtime / hash)").strong());
-    {
-        let cmp: Vec<_> = model.compare_run_rows().into_iter().cloned().collect();
-        if cmp.is_empty() {
-            ui.label("No runs yet. Use New run… or Launch selected.");
-        } else {
-            egui::Grid::new("compare_runs_table")
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Name").strong());
-                    ui.label(RichText::new("Strategy").strong());
-                    ui.label(RichText::new("WNS_PS").strong());
-                    ui.label(RichText::new("Runtime").strong());
-                    ui.label(RichText::new("Hash").strong());
-                    ui.end_row();
-                    for r in &cmp {
-                        let id = format!("run:{}", r.name);
-                        let on = selected.as_deref() == Some(id.as_str())
-                            || selected.as_deref() == Some(r.name.as_str());
-                        if ui.selectable_label(on, r.name.as_str()).clicked() {
-                            pick = Some(r.name.clone());
-                        }
-                        ui.label(r.strategy_cell());
-                        ui.label(r.wns_cell());
-                        ui.label(r.runtime_cell());
-                        ui.label(r.hash_cell());
-                        ui.end_row();
+            ui.horizontal(|ui| {
+                ui.label("Placer seed:");
+                if ui
+                    .add(egui::DragValue::new(&mut model.run_editor.placer_seed))
+                    .changed()
+                {
+                    model.run_editor.touched();
+                }
+                ui.label("Router iters:");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut model.run_editor.router_iters)
+                            .range(1..=64),
+                    )
+                    .changed()
+                {
+                    model.run_editor.touched();
+                }
+            });
+            ui.horizontal(|ui| {
+                if primary_button(ui, "Create run").clicked() {
+                    let name = model.run_editor.name.trim().to_string();
+                    if !name.is_empty()
+                        && !model.runs.iter().any(|r| r.name == name)
+                    {
+                        let spec = model.run_editor.strategy().to_spec();
+                        create = Some(format!("{name} -spec {spec}"));
                     }
-                });
+                }
+                ui.label(
+                    RichText::new("Seed 0 = deterministic (legacy order).")
+                        .color(theme.dim),
+                );
+            });
+            if let Some(cmd) = create {
+                let _ = model.create_run(&cmd);
+                model.run_editor.name.clear();
+            }
+        });
+    ui.add_space(4.0);
+
+    // --- Seed sweep ----------------------------------------------------------
+    egui::CollapsingHeader::new("Seed sweep")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Base name:");
+                ui.text_edit_singleline(&mut model.run_editor.sweep_base);
+                ui.label("Seeds (comma-separated):");
+                ui.text_edit_singleline(&mut model.run_editor.sweep_seeds);
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut model.run_editor.sweep_spec_from_editor,
+                    "Use strategy editor settings (else Default)",
+                );
+            });
+            if primary_button(ui, "Create + queue sweep").clicked() {
+                let base = model.run_editor.sweep_base.trim().to_string();
+                let seeds: Vec<u64> = model
+                    .run_editor
+                    .sweep_seeds
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .collect();
+                let spec = if model.run_editor.sweep_spec_from_editor {
+                    model.run_editor.strategy().to_spec()
+                } else {
+                    helion_proj::RunStrategy::preset("Default")
+                        .map(|p| p.to_spec())
+                        .unwrap_or_default()
+                };
+                if !base.is_empty() && !spec.is_empty() {
+                    if model.create_seed_sweep(&base, &spec, &seeds).is_ok() {
+                        kick_run_queue(model);
+                    }
+                }
+            }
+            ui.label(
+                RichText::new("Each seed becomes its own run (base_s1, base_s2, …) with the placer seed knob set.")
+                    .color(theme.dim),
+            );
+        });
+    ui.add_space(8.0);
+
+    // --- Results table (sortable, best-in-column highlighted) ----------------
+    ui.label(RichText::new("Results").strong());
+    {
+        let sort_col = model.run_editor.sort_col;
+        let sort_asc = model.run_editor.sort_asc;
+        let mut order: Vec<usize> = (0..model.runs.len()).collect();
+        sort_run_indices(&mut order, &model.runs, sort_col, sort_asc);
+        // Best value per numeric column, over finished runs.
+        let best: std::collections::HashMap<RunCol, usize> = RunCol::ALL
+            .iter()
+            .filter_map(|c| best_run_index(&model.runs, *c).map(|i| (*c, i)))
+            .collect();
+
+        let selected = model.selected.clone();
+        let mut pick: Option<String> = None;
+        let mut sort_click: Option<RunCol> = None;
+        egui::ScrollArea::both()
+            .id_salt("design_runs_results")
+            .max_height(260.0)
+            .show(ui, |ui| {
+                egui::Grid::new("design_runs_table")
+                    .spacing([10.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for col in RunCol::ALL {
+                            let arrow = if sort_col == col {
+                                if sort_asc { " ▲" } else { " ▼" }
+                            } else {
+                                ""
+                            };
+                            if ui
+                                .link(format!("{}{}", col.header(), arrow))
+                                .clicked()
+                            {
+                                sort_click = Some(col);
+                            }
+                        }
+                        ui.end_row();
+                        for &i in &order {
+                            let r = &model.runs[i];
+                            let id = format!("run:{}", r.name);
+                            let on = selected.as_deref() == Some(id.as_str())
+                                || selected.as_deref() == Some(r.name.as_str());
+                            if ui.selectable_label(on, &r.name).clicked() {
+                                pick = Some(r.name.clone());
+                            }
+                            ui.label(r.strategy_cell());
+                            let fill = run_status_color(theme, &r.status);
+                            let btn = egui::Button::new(
+                                RichText::new(&r.status).color(Color32::BLACK),
+                            )
+                            .fill(fill)
+                            .selected(on);
+                            if ui.add(btn).clicked() {
+                                pick = Some(r.name.clone());
+                            }
+                            for col in [
+                                RunCol::Luts,
+                                RunCol::Ffs,
+                                RunCol::Bram,
+                                RunCol::Dsp,
+                                RunCol::Wns,
+                                RunCol::Tns,
+                                RunCol::Runtime,
+                            ] {
+                                let txt = match col {
+                                    RunCol::Luts => r.luts_cell(),
+                                    RunCol::Ffs => r.ffs_cell(),
+                                    RunCol::Bram => r.brams_cell(),
+                                    RunCol::Dsp => r.dsps_cell(),
+                                    RunCol::Wns => r.wns_cell(),
+                                    RunCol::Tns => r.tns_cell(),
+                                    RunCol::Runtime => r.runtime_cell(),
+                                    _ => "-".into(),
+                                };
+                                let is_best =
+                                    best.get(&col).is_some_and(|&bi| bi == i);
+                                let label = if is_best {
+                                    RichText::new(format!("★ {txt}"))
+                                        .color(theme.ok)
+                                        .strong()
+                                } else {
+                                    RichText::new(txt)
+                                };
+                                ui.label(label);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(col) = sort_click {
+            if model.run_editor.sort_col == col {
+                model.run_editor.sort_asc = !model.run_editor.sort_asc;
+            } else {
+                model.run_editor.sort_col = col;
+                // Numeric "lower is better" columns default ascending;
+                // WNS/TNS default descending (best first).
+                model.run_editor.sort_asc = col.lower_is_better()
+                    || matches!(col, RunCol::Name | RunCol::Strategy | RunCol::Status);
+            }
+        }
+        if let Some(name) = pick {
+            let _ = model.select_run(&name);
         }
     }
-    if let Some(name) = pick {
-        let _ = model.select_run(&name);
+    ui.add_space(4.0);
+
+    // --- Sweep summary -------------------------------------------------------
+    {
+        let sweep_runs: Vec<helion_gui::DesignRun> = model
+            .runs
+            .iter()
+            .filter(|r| r.seed.is_some())
+            .cloned()
+            .collect();
+        if let Some((best, worst, mean)) = sweep_wns_stats(&sweep_runs) {
+            ui.label(RichText::new(format!(
+                "Seed sweep WNS: best {best} ps · worst {worst} ps · mean {mean} ps ({} runs)",
+                sweep_runs.len()
+            )));
+        }
     }
+
     ui.add_space(8.0);
     paint_incremental_report(ui, model, theme);
     ui.add_space(8.0);
     paint_eco_changes(ui, model, theme);
 }
 
+/// Pop the first queued run and hand it to the engine thread.
+/// If a job is already live, `submit_job` re-queues the name at the front —
+/// the queue is the source of truth and nothing is ever dropped.
+fn kick_run_queue(model: &mut IdeModel) {
+    if let Some(name) = model.run_queue.pop_front() {
+        surface::request_job(JobKind::DesignRun { name });
+    }
+}
 fn incremental_status_color(theme: &theme::Theme, status: &str) -> Color32 {
     match status {
         "Reused" => theme.ok,

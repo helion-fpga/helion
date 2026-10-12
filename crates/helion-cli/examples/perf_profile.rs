@@ -92,8 +92,7 @@ fn main() {
             &packed,
             &dev,
             helion_place::PlaceOpts {
-                timing_weight: 0.75,
-            },
+                timing_weight: 0.75, seed: 0 },
         )
         .expect("place failed");
         stage("place", t, b0, n0, placed.lutff_sites.len());
