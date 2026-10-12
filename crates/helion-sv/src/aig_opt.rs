@@ -290,7 +290,7 @@ fn cut_cost(
 
 /// Input reference inside a synthesized replacement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RInp {
+pub(crate) enum RInp {
     Leaf(usize, bool),
     Node(usize, bool),
     Const(bool),
@@ -298,9 +298,9 @@ enum RInp {
 
 /// Minimum-AND structure computing a cut function (leaves not yet bound).
 #[derive(Clone, Debug)]
-struct RawSynth {
-    ands: Vec<(RInp, RInp)>,
-    out: RInp,
+pub(crate) struct RawSynth {
+    pub(crate) ands: Vec<(RInp, RInp)>,
+    pub(crate) out: RInp,
 }
 
 /// Chosen replacement for one AND node, with bound cut leaves.

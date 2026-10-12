@@ -1106,7 +1106,8 @@ fn timing_clock_rows(
     let (cdc_badge, cdc_dot) = if cdc.clocks.is_empty() {
         (None, theme.faint)
     } else {
-        let (crit, warn) = (cdc.critical_count(), cdc.warning_count());
+        let crit = cdc.critical_count() + cdc.structural_critical_count();
+        let warn = cdc.warning_count() + cdc.structural_warning_count();
         let dot = if crit > 0 {
             theme.danger
         } else if warn > 0 {

@@ -95,6 +95,35 @@ pub fn synth_hdl_path(path: &Path) -> Result<Design, String> {
     }
 }
 
+/// Like [`synth_hdl_path`], but also returns elaborated SVA checkers for
+/// SystemVerilog sources. Non-SV sources yield empty checker lists.
+pub fn synth_hdl_path_with_sva(
+    path: &Path,
+) -> Result<
+    (
+        Design,
+        Vec<helion_sv::sva::SvaProperty>,
+        Vec<helion_sv::sva::SvaImmProp>,
+    ),
+    String,
+> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "vhd" | "vhdl" => Ok((helion_vhdl::synth_vhdl_path(path)?, Vec::new(), Vec::new())),
+        "prj" => Ok((synth_prj_path(path)?, Vec::new(), Vec::new())),
+        _ => {
+            let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let out =
+                helion_sv::sva::synth_sv_with_sva(&src, &path.display().to_string())?;
+            Ok((out.design, out.properties, out.immediates))
+        }
+    }
+}
+
 /// Multi-file Helion `.prj`: resolve `read_sv` sources and elaborate with optional `top`.
 fn synth_prj_path(path: &Path) -> Result<Design, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;

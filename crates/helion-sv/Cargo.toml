@@ -10,6 +10,9 @@ sv-parser = "0.13"
 # Bump arena for elaborated boolean Expr trees (standards §2: arenas for
 # phase-lived data). Pinned to the version already in Cargo.lock.
 bumpalo = "=3.20.3"
+# SAT solver for v3.0 verification track (Part A: equivalence checking).
+# Pure Rust, MIT/Apache-2.0 dual license matching Helion's own.
+varisat = "=0.2.1"
 
 [dev-dependencies]
 criterion = { workspace = true }
