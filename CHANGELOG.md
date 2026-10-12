@@ -6,23 +6,62 @@ Downloadable builds are on [GitHub Releases](https://github.com/helion-fpga/heli
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-12
+
+Two new product tracks plus a reliability sweep and a major IDE upgrade.
+
 ### Added
 
-- `helion-ir` (semver-minor): two new `CellKind` variants for multi-backend
-  flows — `IobIn` (input IOB, e.g. a clock pin) and `ClockBuf` (global clock
-  buffer, e.g. BUFGCTRL) — each with HNF (`to_hnf`/`from_hnf`) round-trip
-  support; plus a `NetlistIr` alias for `Design` as the backend-neutral input
-  to the new `helion-backend` trait. The HL10T `helion-pack` flow rejects
-  `IobIn`/`ClockBuf` cells with a clear "unsupported for HL10T" error instead
-  of silently dropping them.
-- New `helion-backend` crate: architecture-neutral `Backend` trait with
-  associated stage types (`Packed`/`Placed`/`Routed`/`Bitstream`) and the
-  pack → place → route → bitstream stage contract. No vendor data lives here.
-- New `helion-xilinx7` crate: Xilinx 7-series backend skeleton
-  (`Xilinx7Backend`, `xilinx7`, part e.g. `xc7a35t`) implementing the
-  `helion-backend` trait with Xilinx-shaped stage types; open-bitstream-databases-only
-  policy (Project X-Ray / prjxray; no vendor tools). Stage bodies are stubs
-  returning "not yet implemented" pending the flow logic.
+- Xilinx 7-series backend (zero vendor tools, open bitstream databases only
+  via Project X-Ray / prjxray):
+  - New `helion-backend` crate: architecture-neutral `Backend` trait with
+    associated stage types (`Packed`/`Placed`/`Routed`/`Bitstream`) and the
+    pack to place to route to bitstream stage contract.
+  - New `helion-xilinx7` crate: xc7a35t device model (18,055 tiles), 7-series
+    pack/place/route, human-readable FASM emission, frame resolution, and a
+    `.bit` writer. Blinky runs end to end from SystemVerilog to a valid
+    bitstream: FASM to frames is byte-identical against prjxray's
+    `fasm2frames.py`, and the writer reproduces openXC7's `blinky.bit`
+    byte-for-byte on identical frames.
+  - `helion-ir`: new `CellKind::IobIn` (input IOB) and `CellKind::ClockBuf`
+    (global clock buffer) with HNF round-trip support, plus a `NetlistIr`
+    alias as the backend-neutral design input. HL10T pack now rejects these
+    cells loudly instead of silently dropping them.
+- Verification track:
+  - SAT-based combinational equivalence checking (`SolverBackend` trait,
+    varisat 0.2.1 backend, Tseitin encoding, LUT6 to AIG bridge, miter
+    construction with counterexample reporting).
+  - SVA subset: immediate `assert`, `assert final`, concurrent
+    `assert property`, `|->`, `|=>`, fixed `##N`, `$rose`/`$fell`/`$stable`,
+    with parser, sim engine, and IDE integration (wave markers, Tcl
+    `assert_report`).
+  - CDC structural analysis in `helion-sta`: clock-domain extraction,
+    crossing detection, synchronizer recognition, and all eleven violation
+    classes with IDE integration (`report_cdc_crossings`, cross-probing).
+    Handshakes and async FIFOs are flagged for review, never declared safe.
+- Physical View 2.0: FPGA resource layers with solo/isolate controls,
+  congestion and timing-criticality heat maps, inspector panel, find palette
+  (Ctrl+K), ruler with tile and delay measurement, and upgraded die
+  interaction (route hit-testing, multi-select, hover tooltips).
+- UX pass 2: schematic level-of-detail for large designs (block rectangles
+  with cell/port counts at fit zoom), hierarchy breadcrumb for large designs,
+  waveform density toggle (Comfortable/Compact), scrolling tab bar and
+  toolbar overflow menus, right-click context menus (timing rows, device
+  canvas, waveforms), syntax highlighting in the sim source view, proper
+  empty states, and a real clock-interaction matrix.
+
+### Fixed
+
+- Stack overflow on deep priority chains: all recursive RExpr/Expr walkers on
+  the synthesis path are now iterative with heap work stacks; the 50,000-deep
+  regression test passes and debug Ibex synthesis no longer crashes.
+- All 12 code-review criticals, each with a regression test: binary literal
+  sizing, `index_part` small-value decoding, hierarchy cycle infinite
+  recursion, mixed-width word-add carry drop, `RExpr::Range` lo/hi order,
+  priority-grant heuristic scope, non-constant shift lowering (new
+  `RExpr::Shl`), placer seed/site-index invariant, VCD truncation flag,
+  generated-clock constraint target port, Tcl `set_property KEEP`, and Tcl
+  `string range` out-of-range handling.
 
 ## [2.5.0] — 2026-10-12
 
