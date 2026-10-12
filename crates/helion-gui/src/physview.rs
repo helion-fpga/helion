@@ -6,10 +6,9 @@
 //! binary paints these; colors are plain RGB triples here and get mapped to
 //! the app theme at the paint site.
 
-use crate::ide::{ClockRegion, DeviceRoute, DeviceSiteView, DeviceView, IdeModel, Pblock};
+use crate::ide::{DeviceSiteView, IdeModel, TimingPath};
 use helion_device::SiteKind;
 use helion_route::HOP_DELAY_PS;
-use helion_sta::TimingPath;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -728,6 +727,7 @@ pub fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ide::{ClockRegion, DeviceRoute, DeviceView};
     use helion_device::Device;
 
     fn fixture_model() -> IdeModel {
@@ -936,20 +936,14 @@ mod tests {
     fn net_slack_takes_worst() {
         let mk = |nets: Vec<&str>, slack: i64| TimingPath {
             name: "p".into(),
-            startpoint: helion_sta::TimingPathEndpoint {
-                cell: String::new(),
-                site_id: String::new(),
-                bel_id: String::new(),
-            },
-            endpoint: helion_sta::TimingPathEndpoint {
-                cell: String::new(),
-                site_id: String::new(),
-                bel_id: String::new(),
-            },
+            startpoint: String::new(),
+            endpoint: String::new(),
             cells: Vec::new(),
             nets: nets.into_iter().map(|s| s.to_string()).collect(),
             delay_ps: 0,
             slack_ps: slack,
+            pins: Vec::new(),
+            group: String::new(),
         };
         let paths = vec![mk(vec!["n1"], 500), mk(vec!["n1", "n2"], -20)];
         let map = build_net_slack(&paths);

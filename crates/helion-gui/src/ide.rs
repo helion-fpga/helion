@@ -23131,7 +23131,9 @@ impl IdeModel {
         self.highlight_device_routes();
     }
 
-    pub(crate) fn highlight_device_routes(&mut self) {
+    /// Refresh route/site highlight flags from the current selection.
+    /// Called by the Physical View 2.0 inspector after changing selection.
+    pub fn highlight_device_routes(&mut self) {
         let sel = self.selected.clone();
         let path_cells = &self.schematic.highlight_cells;
         let path_nets = &self.schematic.highlight_nets;
