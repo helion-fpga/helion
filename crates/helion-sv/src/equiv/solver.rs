@@ -24,7 +24,7 @@ pub struct VarisatBackend<'solver> {
     solver: Solver<'solver>,
 }
 
-impl<'solver> VarisatBackend<'solver> {
+impl VarisatBackend<'_> {
     /// Create a backend pre-allocating `nvars` variables (must cover every
     /// variable referenced by later [`add_clause`][SolverBackend::add_clause]
     /// calls).
@@ -46,7 +46,7 @@ impl<'solver> VarisatBackend<'solver> {
     }
 }
 
-impl<'solver> SolverBackend for VarisatBackend<'solver> {
+impl SolverBackend for VarisatBackend<'_> {
     fn add_clause(&mut self, clause: &[i32]) {
         let vs: Vec<VsatLit> = clause.iter().map(|&l| Self::to_vsat(l)).collect();
         self.solver.add_clause(&vs);
