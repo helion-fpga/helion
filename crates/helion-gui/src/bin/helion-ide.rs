@@ -24,6 +24,8 @@ use std::sync::mpsc;
 
 #[path = "helion-ide/commands.rs"]
 mod commands;
+#[path = "helion-ide/constraints_wizard_ui.rs"]
+mod constraints_wizard_ui;
 #[path = "helion-ide/dashboard.rs"]
 mod dashboard;
 #[path = "helion-ide/flow_nav.rs"]
@@ -346,6 +348,9 @@ struct HelionIde {
     device_layers: DeviceLayers,
     /// Pending zoom-to-selection target (die tile coords), consumed by paint_device.
     device_zoom_target: Option<(u32, u32)>,
+    /// Constraints Wizard draft state (None = closed). Lives on the app, not
+    /// the model, so engine-thread jobs never disturb it.
+    constraints_wizard: Option<constraints_wizard_ui::WizardUi>,
 }
 
 /// Device viewer layer visibility (P1-3): Vivado Device-window layer toggles.
@@ -426,6 +431,7 @@ impl HelionIde {
             welcome_dismissed: false,
             device_layers: DeviceLayers::default(),
             device_zoom_target: None,
+            constraints_wizard: None,
         };
         if let Ok(w) = std::env::var("HELION_SIDEBAR_WIDTH") {
             if let Ok(v) = w.parse::<f32>() {
@@ -531,6 +537,13 @@ impl HelionIde {
             if let Ok(v) = z.parse::<f32>() {
                 app.model.device_zoom = v.clamp(0.40, 6.0);
             }
+        }
+        // Screenshot/demo hook: auto-open the Constraints Wizard, optionally
+        // on a given step (HELION_WIZARD_STEP=0..4).
+        if let Some(step) = constraints_wizard_ui::auto_open_from_env() {
+            let mut w = constraints_wizard_ui::WizardUi::new(&app.model);
+            w.set_step_idx(step);
+            app.constraints_wizard = Some(w);
         }
         layouts::load_chrome_state(&mut app);
         app
@@ -761,6 +774,9 @@ impl HelionIde {
                 }
                 if matches!(out.kind, JobKind::SimRun(_)) && out.result.is_ok() {
                     self.set_activity(Activity::Simulate);
+                }
+                if matches!(out.kind, JobKind::ReportTiming) {
+                    constraints_wizard_ui::on_timing_done(self, out.result);
                 }
                 // Design-run queue chaining. `submit_job` refuses while a job
                 // is live, so drop the handle first.
@@ -2674,7 +2690,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Find => paint_find(ui, &mut app.model, &app.theme),
         WorkspacePane::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
         WorkspacePane::Summary => dashboard::paint_dashboard(ui, app),
-        WorkspacePane::Constraints => paint_constraints(ui, &mut app.model),
+        WorkspacePane::Constraints => paint_constraints_tab(ui, app),
         WorkspacePane::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
         WorkspacePane::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
         WorkspacePane::ClockNetworks => paint_clock_networks(ui, &mut app.model),
@@ -2715,7 +2731,7 @@ fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
 /// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
 fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
     match app.model.workspace {
-        WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
+        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
         WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
         WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
@@ -2740,7 +2756,7 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
     match app.model.workspace {
-        WorkspaceTab::Constraints => paint_constraints(ui, &mut app.model),
+        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
         WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
         WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
         WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
@@ -4880,6 +4896,22 @@ fn paint_package(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) 
             let _ = model.select_package_pin(&pin);
         }
     }
+}
+
+/// Constraints tab: the wizard takes over the pane while open.
+fn paint_constraints_tab(ui: &mut egui::Ui, app: &mut HelionIde) {
+    if app.constraints_wizard.is_some() {
+        constraints_wizard_ui::paint(ui, app);
+        return;
+    }
+    ui.horizontal(|ui| {
+        if ui.button("🧭 Constraints Wizard…").clicked() {
+            app.constraints_wizard = Some(constraints_wizard_ui::WizardUi::new(&app.model));
+        }
+        ui.weak("Guided: clocks → I/O delays → exceptions → SDC");
+    });
+    ui.add_space(4.0);
+    paint_constraints(ui, &mut app.model);
 }
 
 fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {

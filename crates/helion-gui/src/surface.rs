@@ -318,6 +318,8 @@ pub enum JobKind {
     /// carries the run list + queue; the worker fills the run's results.
     DesignRun { name: String },
     TbRun(crate::tb::TbRunRequest),
+    /// Re-run STA (`report_timing_now`) against the current constraints.
+    ReportTiming,
 }
 
 impl JobKind {
@@ -333,6 +335,7 @@ impl JobKind {
             JobKind::SimRun(_) => "Simulate",
             JobKind::DesignRun { .. } => "DesignRun",
             JobKind::TbRun(_) => "Testbench",
+            JobKind::ReportTiming => "Timing",
         }
     }
 
@@ -349,6 +352,7 @@ impl JobKind {
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
             JobKind::DesignRun { name } => format!("Running design run {name}…"),
             JobKind::TbRun(r) => format!("Running testbench {}…", r.sel),
+            JobKind::ReportTiming => "Re-running timing analysis…".into(),
         }
     }
 }
@@ -377,6 +381,7 @@ fn run_kind(model: &mut IdeModel, kind: &JobKind) -> Result<String, String> {
         JobKind::SimRun(n) => model.sim_run(*n),
         JobKind::DesignRun { name } => model.execute_design_run(name),
         JobKind::TbRun(req) => model.tb_run_job(req),
+        JobKind::ReportTiming => model.report_timing_now(),
     }
 }
 

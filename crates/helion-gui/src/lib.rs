@@ -5,6 +5,11 @@ pub const GPUI_TOOLKIT: &str = "gpui";
 
 pub mod chrome;
 pub use chrome::{Activity, Canvas, WorkspacePane, pane_for_workspace};
+pub mod constraints_wizard;
+pub use constraints_wizard::{
+    WizardClock, WizardError, WizardException, WizardInput, WizardIoDelay, WizardStep, generate_sdc,
+    parse_wns, validate, validate_sdc,
+};
 pub mod doctor;
 pub mod ide;
 pub mod learner_l1;
