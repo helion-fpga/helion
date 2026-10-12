@@ -14298,7 +14298,7 @@ fn subst_const_wires<'a>(
                 Some(&(v, _)) => mk_const((v >> i) & 1, 1),
                 None => e.clone(),
             },
-            RExpr::Range(s, hi, lo) => match map.get(*s) {
+            RExpr::Range(s, lo, hi) => match map.get(*s) {
                 Some(&(v, _)) => {
                     let wd = hi.saturating_sub(*lo).saturating_add(1).max(1);
                     mk_const((v >> lo) & care_mask(wd), wd)
@@ -14319,6 +14319,7 @@ fn subst_const_wires<'a>(
             RExpr::Ne(a, b) => RExpr::Ne(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Lt(a, b) => RExpr::Lt(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Shr(a, b) => RExpr::Shr(arena.alloc(w(a)), arena.alloc(w(b))),
+            RExpr::Shl(a, b) => RExpr::Shl(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::Ashr(a, b) => RExpr::Ashr(arena.alloc(w(a)), arena.alloc(w(b))),
             RExpr::RedXor(a) => RExpr::RedXor(arena.alloc(w(a))),
             RExpr::RedAnd(a) => RExpr::RedAnd(arena.alloc(w(a))),
@@ -21538,6 +21539,23 @@ endmodule
         );
     }
 
+
+    #[test]
+    fn const_wire_range_fold_uses_lo_hi_order() {
+        // w = 8'hAB; w[3:0] must fold to 4'hB, not 1'b1. RExpr::Range is
+        // (name, lo, hi) at every construction site.
+        let arena = Bump::new();
+        let mut map: HashMap<&str, (u128, usize)> = HashMap::new();
+        map.insert("w", (0xAB, 8));
+        let e = RExpr::Range("w", 0, 3);
+        let folded = subst_const_wires(&e, &map, &arena);
+        match folded {
+            RExpr::Const { val, width, .. } => {
+                assert_eq!((val, width), (0xB, 4), "w[3:0] of 8'hAB must be 4'hB")
+            }
+            other => panic!("expected Const, got {other:?}"),
+        }
+    }
 
 }
 
