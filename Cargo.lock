@@ -1432,6 +1432,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-ecp5"
+version = "3.0.0"
+dependencies = [
+ "helion-backend",
+ "helion-ir",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "helion-fabric"
 version = "3.0.0"
 dependencies = [

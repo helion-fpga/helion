@@ -1,0 +1,11 @@
+[package]
+name = "helion-ecp5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-ir = { workspace = true }
+helion-backend = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
