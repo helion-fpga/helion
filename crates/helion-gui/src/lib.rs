@@ -51,9 +51,9 @@ pub use power::{
 pub use ide::{
     BdAddrEntry, BdHdlRow, BdPin, BdView, BitstreamFrame, BitstreamReport, BottomTab, ClockRegion, ConsoleLine, DesignRun, DeviceRoute,
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
-    HwManager, HwStatReport, HwStatRow, IdeMessage, IlaSampleRow,
-    IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
-    SimIla, SimIlaStatus,
+    HwManager, HwStatReport, HwStatRow, IdeMessage,
+    IdeModel, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
+    Ila, IlaStatus,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection, MidRunUi,
     Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
