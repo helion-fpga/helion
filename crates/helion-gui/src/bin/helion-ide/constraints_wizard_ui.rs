@@ -331,7 +331,7 @@ impl WizardUi {
         let design = match model.design() {
             Some(d) => d,
             None => {
-                errs.push(wiz::WizardError { step: wiz::WizardStep::Clocks, message: "No design loaded — open RTL first.".into() });
+                errs.push(wiz::WizardError { step: wiz::WizardStep::Clocks, message: "No design loaded - open RTL first.".into() });
                 self.errors = errs;
                 self.preview = None;
                 return false;
@@ -738,7 +738,7 @@ fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
     };
 
     if let Some(text) = &preview {
-        ui.label(egui::RichText::new("Generated SDC — parses clean against the repo SDC frontend:").strong());
+        ui.label(egui::RichText::new("Generated SDC - parses clean against the repo SDC frontend:").strong());
         ui.add(
             egui::TextEdit::multiline(&mut text.clone())
                 .code_editor()
@@ -780,7 +780,7 @@ fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
             }
         });
         if written.is_none() {
-            ui.weak("Write the file first — re-run timing needs the new constraints applied.");
+            ui.weak("Write the file first - re-run timing needs the new constraints applied.");
         }
     }
 
@@ -797,9 +797,9 @@ fn paint_review(ui: &mut egui::Ui, app: &mut HelionIde) {
             ui.label(egui::RichText::new("Timing after new constraints:").strong());
             if let Some(w) = wns {
                 let (txt, color) = if w < 0 {
-                    (format!("WNS = {w} ps — VIOLATED"), egui::Color32::from_rgb(255, 120, 120))
+                    (format!("WNS = {w} ps - VIOLATED"), egui::Color32::from_rgb(255, 120, 120))
                 } else {
-                    (format!("WNS = {w} ps — met"), egui::Color32::from_rgb(140, 230, 140))
+                    (format!("WNS = {w} ps - met"), egui::Color32::from_rgb(140, 230, 140))
                 };
                 ui.label(egui::RichText::new(txt).strong().color(color).monospace());
             } else {
