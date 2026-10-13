@@ -12,7 +12,7 @@ use helion_gui::surface::{
 };
 use helion_gui::{
     doctor, ila, open_hdl_dialog, open_vcd_dialog, pane_for_workspace, BottomTab, CdcSeverity,
-    ClockRelation, ConstraintSection, DrcSeverity, FlowStep, IdeModel, IlaTrigger, LayoutKind,
+    ClockRelation, ConstraintSection, DrcSeverity, FlowStep, IdeModel, LayoutKind,
     MethodologySeverity, MsgSeverity, PathGroupKind, PowerSeverity, ProbeSelection, QorAction,
     QorSeverity, RunCol, SimIlaStatus, SourceLine, StepState, TbFailure, TbLogLine, TbRunRequest,
     TbSev, TbStatus, TbStreamEvent, TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane,
@@ -11453,7 +11453,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
     } else {
         3
     };
-    let (tile_band, ila_h, cols, rows, cw, ch) =
+    let (tile_band, _ila_h, cols, rows, cw, ch) =
         chrome::program_layout(n_tiles, remain.x, remain.y.max(200.0));
     let (dash, dash_resp) =
         ui.allocate_exact_size(egui::vec2(remain.x.max(80.0), tile_band), Sense::click());
@@ -11534,141 +11534,13 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
         }
     }
     ui.add_space(8.0);
-    let (ila_rect, _) = ui.allocate_exact_size(
-        egui::vec2(remain.x.max(80.0), ila_h.max(80.0)),
-        Sense::hover(),
-    );
-    ui.scope_builder(
-        egui::UiBuilder::new().max_rect(ila_rect.shrink(4.0)),
-        |ui| {
-            ui.label(RichText::new("ILA Dashboard").strong());
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(model.ila.trigger == IlaTrigger::Rising, "Rising")
-                    .clicked()
-                {
-                    let _ = model.exec("ila_trigger rising");
-                }
-                if ui
-                    .selectable_label(model.ila.trigger == IlaTrigger::Falling, "Falling")
-                    .clicked()
-                {
-                    let _ = model.exec("ila_trigger falling");
-                }
-                if ui
-                    .selectable_label(model.ila.trigger == IlaTrigger::Immediate, "Immediate")
-                    .clicked()
-                {
-                    let _ = model.exec("ila_trigger immediate");
-                }
-                if ui.button("Window 8").clicked() {
-                    let _ = model.exec("ila_window 8");
-                }
-                if ui.button("Window 16").clicked() {
-                    let _ = model.exec("ila_window 16");
-                }
-                // Default arm uses IdeModel::ila_arm probe resolution (session net / led),
-                // not a hardcoded cnt_3 dump - capture is fabric-backed via helion-debug.
-                let probe = model.default_ila_probe();
-                if ui
-                    .button(format!("Arm / Capture {probe}"))
-                    .on_hover_text("ila_arm soft ble_out; ila_arm_deep → fabric BRAM sample buffer")
-                    .clicked()
-                {
-                    let _ = model.exec(&format!("ila_arm {probe}"));
-                }
-                if ui
-                    .button("Capture cnt_3")
-                    .on_hover_text("counter MSB probe")
-                    .clicked()
-                {
-                    let _ = model.exec("ila_arm cnt_3");
-                }
-            });
-            let samples = model.ila_sample_rows();
-            if samples.is_empty() {
-                ui.label("No ILA capture yet.");
-                ui.weak("Open Hardware Manager, program the sim cable, then Arm / Capture a net.");
-                let rest = ui.available_size().max(egui::vec2(120.0, 80.0));
-                let (cap, _) = ui.allocate_exact_size(rest, Sense::hover());
-                if ui.is_rect_visible(cap) {
-                    let p = ui.painter();
-                    p.rect_filled(cap, 4.0, theme.bg);
-                    p.rect_stroke(
-                        cap,
-                        4.0,
-                        Stroke::new(1.0_f32, theme.line),
-                        egui::StrokeKind::Inside,
-                    );
-                    let lanes = 6;
-                    for i in 0..lanes {
-                        let y = cap.top() + cap.height() * (i as f32 + 0.5) / lanes as f32;
-                        p.line_segment(
-                            [
-                                egui::pos2(cap.left() + 12.0, y),
-                                egui::pos2(cap.right() - 12.0, y),
-                            ],
-                            Stroke::new(1.0_f32, theme.surface),
-                        );
-                    }
-                    p.text(
-                        cap.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "ILA capture · arm a probe to fill",
-                        egui::FontId::proportional(14.0),
-                        theme.dim,
-                    );
-                }
-            } else {
-                ui.label(format!(
-                    "probe={} window={} trigger={} trigger_at={} bits={}",
-                    if model.ila.net.is_empty() {
-                        "-"
-                    } else {
-                        model.ila.net.as_str()
-                    },
-                    model.ila.window,
-                    model.ila.trigger.tcl(),
-                    model
-                        .ila
-                        .trigger_at
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    if model.ila.bits.is_empty() {
-                        "-"
-                    } else {
-                        model.ila.bits.as_str()
-                    }
-                ));
-                let cursor = model.wave.cursor;
-                let mut pick_s: Option<usize> = None;
-                egui::ScrollArea::both().id_salt("hw_ila_scroll").max_height(220.0).show(ui, |ui| {
-                    egui::Grid::new("ila_sample_table")
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Sample").strong());
-                            ui.label(RichText::new("Time_ps").strong());
-                            ui.label(RichText::new("Value").strong());
-                            ui.label(RichText::new("Marker").strong());
-                            ui.end_row();
-                            for r in &samples {
-                                let on = cursor == r.sample;
-                                if ui.selectable_label(on, r.sample.to_string()).clicked() {
-                                    pick_s = Some(r.sample);
-                                }
-                                ui.label(r.time_ps.to_string());
-                                ui.label(r.value.to_string());
-                                ui.label(if r.trigger { "TRIGGER" } else { "-" });
-                                ui.end_row();
-                            }
-                        });
-                });
-                if let Some(i) = pick_s {
-                    let _ = model.select_ila_sample(&i.to_string());
-                }
-            }
-        },
-    );
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Logic Analyzer").strong());
+        ui.weak("probes, triggers, and captures live in the ILA view");
+        if ui.button("Open ILA").clicked() {
+            model.workspace = WorkspaceTab::Ila;
+        }
+    });
 }
 
 fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
