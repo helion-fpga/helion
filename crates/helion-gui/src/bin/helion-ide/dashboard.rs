@@ -14,6 +14,7 @@ use eframe::egui;
 
 use super::open_more_workspace;
 use super::theme;
+use super::BottomTab;
 use super::HelionIde;
 use super::IdeModel;
 use super::WorkspaceTab;
@@ -878,7 +879,8 @@ fn paint_runs_body(
             theme,
             &format!("View all {} runs", app.model.runs.len()),
         ) {
-            go = Some(WorkspaceTab::Runs);
+            // Runs live in the Z6 Jobs tab (grammar R12), not a Z5 pane.
+            app.model.bottom_tab = BottomTab::Jobs;
         }
     }
     go
