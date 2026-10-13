@@ -14,7 +14,7 @@ use helion_gui::{
     doctor, ila, open_hdl_dialog, open_vcd_dialog, pane_for_workspace, BottomTab, CdcSeverity,
     ClockRelation, ConstraintSection, DrcSeverity, FlowStep, IdeModel, LayoutKind,
     MethodologySeverity, MsgSeverity, PathGroupKind, PowerSeverity, ProbeSelection, QorAction,
-    QorSeverity, RunCol, SimIlaStatus, SourceLine, StepState, TbFailure, TbLogLine, TbRunRequest,
+    QorSeverity, RunCol, IlaStatus, SourceLine, StepState, TbFailure, TbLogLine, TbRunRequest,
     TbSev, TbStatus, TbStreamEvent, TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane,
     WorkspaceTab, best_run_index, sort_run_indices, sweep_wns_stats,
 };
@@ -834,7 +834,7 @@ impl HelionIde {
                     ),
                     Err(e) => e.clone(),
                 };
-                self.model.sim_ila.finish_capture(r);
+                self.model.ila.finish_capture(r);
                 self.ila_rx = None;
                 self.toasts.push(
                     if ok {
@@ -849,9 +849,9 @@ impl HelionIde {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.model.sim_ila.status = SimIlaStatus::Error;
-                self.model.sim_ila.last_error = Some("ila: capture thread died".into());
-                self.model.sim_ila.progress = None;
+                self.model.ila.status = IlaStatus::Error;
+                self.model.ila.last_error = Some("ila: capture thread died".into());
+                self.model.ila.progress = None;
                 self.ila_rx = None;
             }
         }
@@ -10308,7 +10308,7 @@ fn paint_ila(
         // Human-readable status chips instead of the debug dump that
         // `status_text()` produces (kept as-is for the `ila_status` Tcl cmd).
         {
-            let ila = &model.sim_ila;
+            let ila = &model.ila;
             let trig_name = ila
                 .config
                 .probes
@@ -10337,8 +10337,8 @@ fn paint_ila(
                 );
             });
         }
-        if model.sim_ila.status == SimIlaStatus::Capturing {
-            if let Some(p) = model.sim_ila.progress.as_ref() {
+        if model.ila.status == IlaStatus::Capturing {
+            if let Some(p) = model.ila.progress.as_ref() {
                 let c = p.cycles.load(std::sync::atomic::Ordering::Relaxed);
                 ui.label(RichText::new(format!("capturing… {c} cycles")).color(theme.info));
             }
@@ -10357,7 +10357,7 @@ fn paint_ila(
             if sidebar_button(ui, "Save session").clicked() {
                 intents.push(Intent::Save);
             }
-            let armed = model.sim_ila.status == SimIlaStatus::Capturing;
+            let armed = model.ila.status == IlaStatus::Capturing;
             if armed {
                 if sidebar_button(ui, "Stop")
                     .on_hover_text("Stop the capture in flight (keeps partial samples)")
@@ -10376,7 +10376,7 @@ fn paint_ila(
             });
         });
     });
-    if let Some(e) = model.sim_ila.last_error.clone() {
+    if let Some(e) = model.ila.last_error.clone() {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("error: {e}")).color(theme.danger));
             if ui.small_button("clear").clicked() {
@@ -10399,14 +10399,14 @@ fn paint_ila(
             ui.label(RichText::new("Probes").strong());
             ui.horizontal(|ui| {
                 ui.label("Search");
-                ui.text_edit_singleline(&mut model.sim_ila.search);
+                ui.text_edit_singleline(&mut model.ila.search);
             });
             let nets: Vec<String> = model
                 .shell
                 .session
                 .design
                 .as_ref()
-                .map(|d| model.sim_ila.probe_net_list(d))
+                .map(|d| model.ila.probe_net_list(d))
                 .unwrap_or_default();
             egui::ScrollArea::vertical()
                 .id_salt("ila_net_list")
@@ -10435,14 +10435,14 @@ fn paint_ila(
                 });
             ui.separator();
             let rows: Vec<(String, usize, ila::IlaRadix)> = model
-                .sim_ila
+                .ila
                 .config
                 .probes
                 .iter()
                 .map(|p| (p.name.clone(), p.width(), p.radix))
                 .collect();
-            if model.sim_ila.group.len() != rows.len() {
-                model.sim_ila.group = vec![false; rows.len()];
+            if model.ila.group.len() != rows.len() {
+                model.ila.group = vec![false; rows.len()];
             }
             ui.label(RichText::new(format!("Probe list ({})", rows.len())).strong());
             egui::ScrollArea::vertical()
@@ -10451,9 +10451,9 @@ fn paint_ila(
                 .show(ui, |ui| {
                     for (i, (name, width, radix)) in rows.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            let mut g = model.sim_ila.group[i];
+                            let mut g = model.ila.group[i];
                             if ui.checkbox(&mut g, "").on_hover_text("Check to group into a bus").changed() {
-                                model.sim_ila.group[i] = g;
+                                model.ila.group[i] = g;
                             }
                             ui.label(RichText::new(name).monospace().strong());
                             ui.label(
@@ -10482,7 +10482,7 @@ fn paint_ila(
                 if sidebar_button(ui, "Group checked as bus").clicked() {
                     intents.push(Intent::GroupBus);
                 }
-                ui.text_edit_singleline(&mut model.sim_ila.bus_name)
+                ui.text_edit_singleline(&mut model.ila.bus_name)
                     .on_hover_text("Bus name (empty = first probe's name)");
             });
         });
@@ -10491,13 +10491,13 @@ fn paint_ila(
             ui.label(RichText::new("Trigger & Capture").strong());
             // Trigger probe picker.
             let names: Vec<String> = model
-                .sim_ila
+                .ila
                 .config
                 .probes
                 .iter()
                 .map(|p| p.name.clone())
                 .collect();
-            let tp = model.sim_ila.config.trigger.probe.min(names.len().saturating_sub(1));
+            let tp = model.ila.config.trigger.probe.min(names.len().saturating_sub(1));
             ui.horizontal(|ui| {
                 ui.label("Probe");
                 egui::ComboBox::from_id_salt("ila_trig_probe")
@@ -10511,7 +10511,7 @@ fn paint_ila(
                         }
                     });
                 ui.label("Kind");
-                let kind = model.sim_ila.config.trigger.kind;
+                let kind = model.ila.config.trigger.kind;
                 egui::ComboBox::from_id_salt("ila_trig_kind")
                     .selected_text(kind.label())
                     .width(120.0)
@@ -10529,25 +10529,25 @@ fn paint_ila(
                     });
             });
             if matches!(
-                model.sim_ila.config.trigger.kind,
+                model.ila.config.trigger.kind,
                 ila::IlaTriggerKind::ValueMatch { .. }
             ) {
                 ui.horizontal(|ui| {
                     ui.label("Value");
-                    ui.text_edit_singleline(&mut model.sim_ila.trig_value_text);
+                    ui.text_edit_singleline(&mut model.ila.trig_value_text);
                     ui.label("Mask");
-                    ui.text_edit_singleline(&mut model.sim_ila.trig_mask_text);
+                    ui.text_edit_singleline(&mut model.ila.trig_mask_text);
                 });
             }
             ui.horizontal(|ui| {
                 ui.label("Depth");
                 ui.add(
-                    egui::DragValue::new(&mut model.sim_ila.config.depth)
+                    egui::DragValue::new(&mut model.ila.config.depth)
                         .range(1.0..=ila::MAX_DEPTH as f64),
                 );
                 ui.label("Pre-trigger");
                 ui.add(
-                    egui::Slider::new(&mut model.sim_ila.config.pre_ratio, 0.0..=1.0)
+                    egui::Slider::new(&mut model.ila.config.pre_ratio, 0.0..=1.0)
                         .show_value(true),
                 );
             });
@@ -10558,35 +10558,35 @@ fn paint_ila(
                     .session
                     .design
                     .as_ref()
-                    .map(|d| model.sim_ila.clock_net_list(d))
+                    .map(|d| model.ila.clock_net_list(d))
                     .unwrap_or_default();
-                let cur = model.sim_ila.config.clock_net.clone();
+                let cur = model.ila.config.clock_net.clone();
                 egui::ComboBox::from_id_salt("ila_clock")
                     .selected_text(&cur)
                     .width(120.0)
                     .show_ui(ui, |ui| {
                         for c in &clocks {
                             if ui.selectable_label(&cur == c, c).clicked() {
-                                model.sim_ila.config.clock_net = c.clone();
+                                model.ila.config.clock_net = c.clone();
                             }
                         }
                     });
                 ui.label("Max cycles");
                 ui.add(
-                    egui::DragValue::new(&mut model.sim_ila.config.max_cycles)
+                    egui::DragValue::new(&mut model.ila.config.max_cycles)
                         .range(1.0..=ila::MAX_CYCLES as f64),
                 );
             });
             ui.horizontal(|ui| {
                 ui.label("Timescale ps");
                 ui.add(
-                    egui::DragValue::new(&mut model.sim_ila.config.timescale_ps)
+                    egui::DragValue::new(&mut model.ila.config.timescale_ps)
                         .range(1.0..=1_000_000_000.0),
                 );
             });
             ui.horizontal(|ui| {
                 ui.label("Session");
-                ui.text_edit_singleline(&mut model.sim_ila.session_path)
+                ui.text_edit_singleline(&mut model.ila.session_path)
                     .on_hover_text("Session JSON path (empty = project dir / cwd)");
             });
             ui.label(
@@ -10597,116 +10597,116 @@ fn paint_ila(
         });
     });
 
-    // Apply intents (design borrows end before the &mut model.sim_ila calls).
+    // Apply intents (design borrows end before the &mut model.ila calls).
     for intent in intents {
         match intent {
             Intent::AddProbe(net) => {
                 if let Some(d) = model.shell.session.design.as_ref() {
-                    if let Err(e) = model.sim_ila.add_probe(d, &net) {
-                        model.sim_ila.last_error = Some(e);
+                    if let Err(e) = model.ila.add_probe(d, &net) {
+                        model.ila.last_error = Some(e);
                     } else {
-                        model.sim_ila.last_error = None;
+                        model.ila.last_error = None;
                     }
                 }
             }
             Intent::RemoveProbe(i) => {
-                if let Err(e) = model.sim_ila.remove_probe(i) {
-                    model.sim_ila.last_error = Some(e);
+                if let Err(e) = model.ila.remove_probe(i) {
+                    model.ila.last_error = Some(e);
                 }
             }
             Intent::SetRadix(i, r) => {
-                if let Some(p) = model.sim_ila.config.probes.get_mut(i) {
+                if let Some(p) = model.ila.config.probes.get_mut(i) {
                     p.radix = r;
                 }
             }
             Intent::GroupBus => {
-                let name = model.sim_ila.bus_name.clone();
+                let name = model.ila.bus_name.clone();
                 if let Some(d) = model.shell.session.design.as_ref() {
-                    match model.sim_ila.group_checked_as_bus(d, &name) {
+                    match model.ila.group_checked_as_bus(d, &name) {
                         Ok(_) => {
-                            model.sim_ila.bus_name.clear();
-                            model.sim_ila.last_error = None;
+                            model.ila.bus_name.clear();
+                            model.ila.last_error = None;
                         }
-                        Err(e) => model.sim_ila.last_error = Some(e),
+                        Err(e) => model.ila.last_error = Some(e),
                     }
                 }
             }
             Intent::SetTrigKind(k) => {
-                if let Err(e) = model.sim_ila.set_trigger_kind(k) {
-                    model.sim_ila.last_error = Some(e);
+                if let Err(e) = model.ila.set_trigger_kind(k) {
+                    model.ila.last_error = Some(e);
                 }
             }
             Intent::SetTrigProbe(i) => {
-                if let Err(e) = model.sim_ila.set_trigger_probe(i) {
-                    model.sim_ila.last_error = Some(e);
+                if let Err(e) = model.ila.set_trigger_probe(i) {
+                    model.ila.last_error = Some(e);
                 }
             }
             Intent::Arm => {
                 // Design moves to the capture thread; never on the egui frame.
                 if let Some(d) = model.shell.session.design.clone() {
-                    match model.sim_ila.start_capture(&d) {
+                    match model.ila.start_capture(&d) {
                         Ok(rx) => {
                             *ila_rx = Some(rx);
                         }
                         Err(e) => {
-                            model.sim_ila.last_error = Some(e);
-                            model.sim_ila.status = SimIlaStatus::Error;
+                            model.ila.last_error = Some(e);
+                            model.ila.status = IlaStatus::Error;
                         }
                     }
                 }
             }
             Intent::Disarm => {
-                if let Err(e) = model.sim_ila.disarm() {
-                    model.sim_ila.last_error = Some(e);
+                if let Err(e) = model.ila.disarm() {
+                    model.ila.last_error = Some(e);
                 }
             }
             Intent::Save => {
                 let pp = model.last_project_path.clone();
-                let r = model.sim_ila.save_session(pp.as_deref(), "");
+                let r = model.ila.save_session(pp.as_deref(), "");
                 match r {
                     Ok(msg) => {
-                        model.sim_ila.last_error = None;
+                        model.ila.last_error = None;
                         toasts.push(toasts::ToastKind::Ok, msg);
                     }
-                    Err(e) => model.sim_ila.last_error = Some(e),
+                    Err(e) => model.ila.last_error = Some(e),
                 }
             }
             Intent::Load => {
                 let pp = model.last_project_path.clone();
                 let d = model.shell.session.design.clone();
                 let r = model
-                    .sim_ila
+                    .ila
                     .load_session(d.as_ref(), pp.as_deref(), "");
                 match r {
                     Ok(msg) => {
-                        model.sim_ila.last_error = None;
+                        model.ila.last_error = None;
                         toasts.push(toasts::ToastKind::Ok, msg);
                     }
-                    Err(e) => model.sim_ila.last_error = Some(e),
+                    Err(e) => model.ila.last_error = Some(e),
                 }
             }
-            Intent::ClearError => model.sim_ila.last_error = None,
+            Intent::ClearError => model.ila.last_error = None,
             Intent::ExportVcd => {
                 // Default next to the session path (or project dir / cwd).
                 let pp = model.last_project_path.clone();
-                let base = if !model.sim_ila.session_path.trim().is_empty() {
-                    std::path::PathBuf::from(model.sim_ila.session_path.trim())
+                let base = if !model.ila.session_path.trim().is_empty() {
+                    std::path::PathBuf::from(model.ila.session_path.trim())
                 } else if let Some(p) = pp.as_deref().and_then(|p| p.parent()) {
                     p.join("ila_capture.json")
                 } else {
                     std::path::PathBuf::from("ila_capture.json")
                 };
                 let path = base.with_extension("vcd");
-                match model.sim_ila.capture.clone() {
+                match model.ila.capture.clone() {
                     Some(cap) => match ila::export_vcd(&path, &cap) {
                         Ok(()) => toasts.push(
                             toasts::ToastKind::Ok,
                             format!("ILA VCD saved {}", path.display()),
                         ),
-                        Err(e) => model.sim_ila.last_error = Some(e),
+                        Err(e) => model.ila.last_error = Some(e),
                     },
                     None => {
-                        model.sim_ila.last_error = Some("ila: no capture to export".into());
+                        model.ila.last_error = Some("ila: no capture to export".into());
                     }
                 }
             }
@@ -10736,7 +10736,7 @@ fn paint_ila_wave(
     model: &mut IdeModel,
     theme: &theme::Theme,
 ) -> Option<String> {
-    let n = model.sim_ila.capture.as_ref().map(|c| c.len()).unwrap_or(0);
+    let n = model.ila.capture.as_ref().map(|c| c.len()).unwrap_or(0);
     if n == 0 {
         ui.label(
             RichText::new("No capture yet - add probes, set the trigger, press Arm Capture.")
@@ -10745,7 +10745,7 @@ fn paint_ila_wave(
         return None;
     }
     let nprobes = model
-        .sim_ila
+        .ila
         .capture
         .as_ref()
         .map(|c| c.probes.len())
@@ -10754,7 +10754,7 @@ fn paint_ila_wave(
         return None;
     }
     let ts = model
-        .sim_ila
+        .ila
         .capture
         .as_ref()
         .map(|c| c.timescale_ps)
@@ -10764,54 +10764,54 @@ fn paint_ila_wave(
     let mut trig_msg: Option<String> = None;
     ui.horizontal(|ui| {
         if sidebar_button(ui, "−").on_hover_text("Zoom in").clicked() {
-            model.sim_ila.viewer.zoom_center(0.5, n);
+            model.ila.viewer.zoom_center(0.5, n);
         }
         if sidebar_button(ui, "+").on_hover_text("Zoom out").clicked() {
-            model.sim_ila.viewer.zoom_center(2.0, n);
+            model.ila.viewer.zoom_center(2.0, n);
         }
         if sidebar_button(ui, "Fit").on_hover_text("Fit capture").clicked() {
-            let w = model.sim_ila.viewer.view_w;
+            let w = model.ila.viewer.view_w;
             let (c, ca, cb) = (
-                model.sim_ila.viewer.cursor,
-                model.sim_ila.viewer.cursor_a,
-                model.sim_ila.viewer.cursor_b,
+                model.ila.viewer.cursor,
+                model.ila.viewer.cursor_a,
+                model.ila.viewer.cursor_b,
             );
-            model.sim_ila.viewer = ila::IlaViewer::fit(n, w);
-            model.sim_ila.viewer.cursor = c;
-            model.sim_ila.viewer.cursor_a = ca;
-            model.sim_ila.viewer.cursor_b = cb;
+            model.ila.viewer = ila::IlaViewer::fit(n, w);
+            model.ila.viewer.cursor = c;
+            model.ila.viewer.cursor_a = ca;
+            model.ila.viewer.cursor_b = cb;
         }
-        let mut from = model.sim_ila.viewer.first.max(0.0) as usize;
+        let mut from = model.ila.viewer.first.max(0.0) as usize;
         ui.label("From");
         if ui
             .add(egui::DragValue::new(&mut from).range(0.0..=n.saturating_sub(1) as f64))
             .changed()
         {
-            model.sim_ila.viewer.first = from as f64;
-            model.sim_ila.viewer.clamp(n);
+            model.ila.viewer.first = from as f64;
+            model.ila.viewer.clamp(n);
         }
-        let to = (model.sim_ila.viewer.first
-            + model.sim_ila.viewer.view_w as f64 * model.sim_ila.viewer.spp)
+        let to = (model.ila.viewer.first
+            + model.ila.viewer.view_w as f64 * model.ila.viewer.spp)
             as usize;
         ui.label(format!("To {}", to.min(n.saturating_sub(1))));
         ui.separator();
-        let cur_txt = match model.sim_ila.viewer.cursor {
+        let cur_txt = match model.ila.viewer.cursor {
             Some(c) => format!("t={} ({})", c, ila_fmt_time(c as u64, ts)),
             None => "t=-".into(),
         };
         ui.label(RichText::new(cur_txt).monospace().small());
-        let (a_txt, b_txt, d_txt) = match model.sim_ila.viewer.delta_samples() {
+        let (a_txt, b_txt, d_txt) = match model.ila.viewer.delta_samples() {
             Some((a, b, d)) => (
                 format!("A={}", ila_fmt_time(a as u64, ts)),
                 format!("B={}", ila_fmt_time(b as u64, ts)),
                 format!("Δt={d} ({} )", ila_fmt_time(d as u64, ts)),
             ),
             _ => {
-                let a = match model.sim_ila.viewer.cursor_a {
+                let a = match model.ila.viewer.cursor_a {
                     Some(a) => format!("A={}", ila_fmt_time(a as u64, ts)),
                     None => "A=-".into(),
                 };
-                let b = match model.sim_ila.viewer.cursor_b {
+                let b = match model.ila.viewer.cursor_b {
                     Some(b) => format!("B={}", ila_fmt_time(b as u64, ts)),
                     None => "B=-".into(),
                 };
@@ -10821,14 +10821,14 @@ fn paint_ila_wave(
         ui.label(RichText::new(a_txt).monospace().small().color(theme.danger));
         ui.label(RichText::new(b_txt).monospace().small().color(theme.trace_b));
         ui.label(RichText::new(d_txt).monospace().small());
-        if let Some(ti) = model.sim_ila.capture.as_ref().and_then(|c| c.trigger_sample) {
+        if let Some(ti) = model.ila.capture.as_ref().and_then(|c| c.trigger_sample) {
             ui.label(
                 RichText::new(format!("TRIG @{} ({})", ti, ila_fmt_time(ti as u64, ts)))
                     .monospace()
                     .small()
                     .color(theme.warn),
             );
-        } else if model.sim_ila.capture.as_ref().is_some_and(|c| !c.found_trigger) {
+        } else if model.ila.capture.as_ref().is_some_and(|c| !c.found_trigger) {
             ui.label(
                 RichText::new("trigger not found in window")
                     .small()
@@ -10841,13 +10841,13 @@ fn paint_ila_wave(
             .on_hover_text("Set the trigger from the edge/value under the cursor")
             .clicked()
         {
-            if let Some(c) = model.sim_ila.viewer.cursor {
-                match model.sim_ila.suggest_trigger_at_cursor(c) {
+            if let Some(c) = model.ila.viewer.cursor {
+                match model.ila.suggest_trigger_at_cursor(c) {
                     Ok(msg) => trig_msg = Some(msg),
-                    Err(e) => model.sim_ila.last_error = Some(e),
+                    Err(e) => model.ila.last_error = Some(e),
                 }
             } else {
-                model.sim_ila.last_error = Some("ila: place the cursor first".into());
+                model.ila.last_error = Some("ila: place the cursor first".into());
             }
         }
     });
@@ -10874,10 +10874,10 @@ fn paint_ila_wave(
                     ui.label(RichText::new("Value").strong().monospace().small());
                 });
             });
-            let cursor = model.sim_ila.viewer.cursor.unwrap_or(0).min(n - 1);
+            let cursor = model.ila.viewer.cursor.unwrap_or(0).min(n - 1);
             for i in 0..nprobes {
                 let (name, val) = {
-                    let cap = model.sim_ila.capture.as_ref().expect("ila capture");
+                    let cap = model.ila.capture.as_ref().expect("ila capture");
                     (cap.probes[i].name.clone(), cap.formatted_at(i, cursor))
                 };
                 ui.horizontal(|ui| {
@@ -10897,44 +10897,44 @@ fn paint_ila_wave(
             egui::vec2(canvas_w, canvas_h),
             egui::Sense::click_and_drag(),
         );
-        model.sim_ila.viewer.view_w = rect.width();
+        model.ila.viewer.view_w = rect.width();
         // Interactions.
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
         if scroll.abs() > 0.5 {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                let anchor = model.sim_ila.viewer.sample_at(pos.x, rect.left());
+                let anchor = model.ila.viewer.sample_at(pos.x, rect.left());
                 model
-                    .sim_ila
+                    .ila
                     .viewer
                     .zoom(2f64.powf(-scroll as f64 / 240.0), anchor, n);
             }
         }
         if resp.dragged() {
-            let dx = resp.drag_delta().x as f64 * model.sim_ila.viewer.spp;
-            model.sim_ila.viewer.pan_samples(-dx, n);
+            let dx = resp.drag_delta().x as f64 * model.ila.viewer.spp;
+            model.ila.viewer.pan_samples(-dx, n);
         }
         if resp.clicked() || resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let s = model.sim_ila.viewer.sample_at(pos.x, rect.left()).round() as usize;
+                let s = model.ila.viewer.sample_at(pos.x, rect.left()).round() as usize;
                 let s = s.min(n - 1);
                 let mods = ui.input(|i| i.modifiers);
                 if mods.ctrl || mods.command || resp.double_clicked() {
                     // Click-an-edge: set the trigger from the row's probe.
                     let row =
                         ((pos.y - rect.top() - ruler_h) / row_h).floor() as usize;
-                    model.sim_ila.viewer.cursor = Some(s);
+                    model.ila.viewer.cursor = Some(s);
                     if row < nprobes {
-                        match model.sim_ila.set_trigger_from_wave(row, s) {
+                        match model.ila.set_trigger_from_wave(row, s) {
                             Ok(msg) => trig_msg = Some(msg),
-                            Err(e) => model.sim_ila.last_error = Some(e),
+                            Err(e) => model.ila.last_error = Some(e),
                         }
                     }
                 } else if mods.shift {
-                    model.sim_ila.viewer.cursor_a = Some(s);
+                    model.ila.viewer.cursor_a = Some(s);
                 } else if mods.alt {
-                    model.sim_ila.viewer.cursor_b = Some(s);
+                    model.ila.viewer.cursor_b = Some(s);
                 } else {
-                    model.sim_ila.viewer.cursor = Some(s);
+                    model.ila.viewer.cursor = Some(s);
                 }
             }
         }
@@ -10958,8 +10958,8 @@ fn paint_ila_traces(
     theme: &theme::Theme,
 ) {
     let p = ui.painter();
-    let cap = model.sim_ila.capture.as_ref().expect("ila capture");
-    let v = &model.sim_ila.viewer;
+    let cap = model.ila.capture.as_ref().expect("ila capture");
+    let v = &model.ila.viewer;
     let wave_x0 = rect.left();
     let wave_w = rect.width().max(1.0);
     let top = rect.top();
