@@ -3872,9 +3872,11 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
         let selected = model.selected.clone();
         let mut pick: Option<String> = None;
         let mut sort_click: Option<RunCol> = None;
+        // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
         egui::ScrollArea::both()
             .id_salt("design_runs_results")
             .max_height(260.0)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 egui::Grid::new("design_runs_table")
                     .spacing([10.0, 4.0])
@@ -4073,9 +4075,11 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
 
     // Table.
     let mut toggle: Option<String> = None;
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::both()
         .id_salt("checkpoints_table")
         .max_height(260.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("checkpoints_grid")
                 .spacing([8.0, 4.0])
@@ -4219,9 +4223,11 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel, theme: &the
         }
         return;
     }
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::both()
         .id_salt("ug986_incremental_report")
         .max_height(180.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("incremental_report_table")
                 .spacing([8.0, 4.0])
@@ -4314,9 +4320,11 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         }
         return;
     }
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::both()
         .id_salt("ug893_eco_changes")
         .max_height(180.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("eco_changes_table")
                 .spacing([8.0, 4.0])
@@ -5836,9 +5844,11 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
 
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::vertical()
         .id_salt("timing_pin_details")
         .max_height(280.0)
+        .auto_shrink([false, true])
         .hscroll(true)
         .show(ui, |ui| {
             for pin in &path.pins {
@@ -6670,9 +6680,12 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     }
     ui.add_space(8.0);
     ui.label(RichText::new("Top toggling nets").strong());
+    // auto_shrink([false, true]): full-width wheel-hover rect so the wheel
+    // traps anywhere over the list, not just over the text (nested-scroll fix).
     egui::ScrollArea::vertical()
         .max_height(220.0)
         .id_salt("vcd_top_nets")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("vcd_top_nets_grid")
                 .spacing([8.0, 2.0])
@@ -7075,7 +7088,12 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     ));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
-    egui::ScrollArea::both().id_salt("bitstream_scroll").max_height(280.0).show(ui, |ui| {
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
+    egui::ScrollArea::both()
+        .id_salt("bitstream_scroll")
+        .max_height(280.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
         egui::Grid::new("bitstream_far_table")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
@@ -7631,9 +7649,11 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             .show(ui, |ui| {
                 let mut pick_path = None;
                 let selected_path = model.selected_timing_path;
+                // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
                 egui::ScrollArea::vertical()
                     .id_salt("schematic_timing_paths_scroll")
                     .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                         egui::Grid::new("schematic_timing_paths")
                             .spacing([8.0, 4.0])
@@ -11637,7 +11657,12 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
                 ));
                 let cursor = model.wave.cursor;
                 let mut pick_s: Option<usize> = None;
-                egui::ScrollArea::both().id_salt("hw_ila_scroll").max_height(220.0).show(ui, |ui| {
+                // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
+                egui::ScrollArea::both()
+                    .id_salt("hw_ila_scroll")
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                     egui::Grid::new("ila_sample_table")
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
