@@ -923,8 +923,16 @@ fn warmup(
 ) -> Option<String> {
     if let Some(design) = design {
         if design.is_file() {
-            app.open_path(design);
-            say(cfg, &format!("fuzz: warmup opened {}", design.display()));
+            // Copy to a scratch path: the fuzzer types in the editor and the
+            // app auto-saves, which must never mutate the repo's examples.
+            let scratch = cfg.logdir.join("fuzz_design_scratch.sv");
+            if std::fs::copy(design, &scratch).is_ok() {
+                app.open_path(&scratch);
+                say(cfg, &format!("fuzz: warmup opened {}", scratch.display()));
+            } else {
+                app.open_path(design);
+                say(cfg, &format!("fuzz: warmup opened {}", design.display()));
+            }
         } else {
             say(cfg, &format!("fuzz: warmup design missing: {}", design.display()));
         }
