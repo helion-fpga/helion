@@ -5085,7 +5085,6 @@ pub enum WorkspaceTab {
 
 impl WorkspaceTab {
     pub const ALL: [WorkspaceTab; 29] = [
-(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -41128,7 +41127,6 @@ endmodule
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
         assert_eq!(WorkspaceTab::ALL.len(), 29);
-(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(
