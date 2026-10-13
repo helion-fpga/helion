@@ -16,6 +16,10 @@ pub trait DeviceQuery {
     fn iob_site_for_pin(&self, pin: &str) -> Option<(String, String)>;
     /// A BUFGCTRL site: `(tile, site)`.
     fn bufg_site(&self) -> Option<(String, String)>;
+    /// A RAMB18E1 site: `(tile, site)`.
+    fn ramb_site(&self) -> Option<(String, String)>;
+    /// A DSP48E1 site: `(tile, site)`.
+    fn dsp_site(&self) -> Option<(String, String)>;
     /// Grid coordinates of a tile (for distance estimates).
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
     /// A free SLICEL site near `(x, y)`; `used` holds taken site names.
@@ -61,6 +65,30 @@ pub struct PlacedBufg {
     pub site: String,
 }
 
+/// A placed RAMB18E1.
+#[derive(Clone, Debug)]
+pub struct PlacedBram {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed DSP48E1.
+#[derive(Clone, Debug)]
+pub struct PlacedDsp {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
+/// A placed CARRY4 (in a SLICE).
+#[derive(Clone, Debug)]
+pub struct PlacedCarry {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
 /// Backend-owned placed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Placed7 {
@@ -69,6 +97,9 @@ pub struct Placed7 {
     pub ffs: Vec<PlacedFf>,
     pub iobs: Vec<PlacedIob>,
     pub bufgs: Vec<PlacedBufg>,
+    pub brams: Vec<PlacedBram>,
+    pub dsps: Vec<PlacedDsp>,
+    pub carries: Vec<PlacedCarry>,
 }
 
 /// BEL letters within a slice: A, B, C, D.
@@ -119,6 +150,47 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         });
     }
 
+    // 2b. RAMB18E1s.
+    for bram in &packed.brams {
+        let (tile, site) = device
+            .ramb_site()
+            .ok_or_else(|| format!("place: no RAMB18E1 site for {}", bram.name))?;
+        used_sites.insert(site.clone());
+        out.brams.push(PlacedBram {
+            name: bram.name.clone(),
+            tile,
+            site,
+        });
+    }
+
+    // 2c. DSP48E1s.
+    for dsp in &packed.dsps {
+        let (tile, site) = device
+            .dsp_site()
+            .ok_or_else(|| format!("place: no DSP48E1 site for {}", dsp.name))?;
+        used_sites.insert(site.clone());
+        out.dsps.push(PlacedDsp {
+            name: dsp.name.clone(),
+            tile,
+            site,
+        });
+    }
+
+    // 2d. CARRY4s. Placed in SLICE sites; the carry chain connects
+    // vertically within the column. Minimal: place on free slices.
+    let (ax, ay) = anchor.unwrap_or((0, 0));
+    for carry in &packed.carries {
+        let (tile, site) = device
+            .slice_near(ax, ay, &used_sites)
+            .ok_or_else(|| format!("place: no SLICE site for CARRY4 {}", carry.name))?;
+        used_sites.insert(site.clone());
+        out.carries.push(PlacedCarry {
+            name: carry.name.clone(),
+            tile,
+            site,
+        });
+    }
+
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
     let lut_by_output: HashMap<&str, usize> = packed
         .luts
@@ -129,8 +201,6 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     let mut lut_placed: HashSet<usize> = HashSet::new();
     // BEL occupancy per site: site -> letters used.
     let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
-
-    let (ax, ay) = anchor.unwrap_or((0, 0));
 
     // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
     // before opening a new one.
@@ -218,6 +288,12 @@ mod tests {
         fn bufg_site(&self) -> Option<(String, String)> {
             Some(("CLK_BUFG_X0Y0".into(), "BUFGCTRL_X0Y0".into()))
         }
+        fn ramb_site(&self) -> Option<(String, String)> {
+            Some(("BRAM_X0Y0".into(), "RAMB18_X0Y0".into()))
+        }
+        fn dsp_site(&self) -> Option<(String, String)> {
+            Some(("DSP_X0Y0".into(), "DSP48_X0Y0".into()))
+        }
         fn tile_xy(&self, _tile: &str) -> Option<(i32, i32)> {
             Some((10, 10))
         }
@@ -275,6 +351,9 @@ mod tests {
                 in_net: "clk_ibuf".into(),
                 out_net: "clk_bufg".into(),
             }],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![],
         }
     }
 

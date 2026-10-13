@@ -67,6 +67,44 @@ pub struct PackedBufg {
     pub out_net: String,
 }
 
+/// A packed block RAM (RAMB18E1).
+///
+/// The IR's [`helion_ir::CellKind::Bram18`] is a memory block with INIT data
+/// but no pin-level interface yet; the 7-series backend places it on a
+/// RAMB18E1 site and programs the INIT features. Pin-level memory interface
+/// modeling (address/data/clock/enable routing) is future work at the IR
+/// level.
+#[derive(Clone, Debug)]
+pub struct PackedBram {
+    /// Source IR cell name.
+    pub name: String,
+    /// Initialization words (up to 1024 64-bit words for 18Kb).
+    pub init: Vec<u64>,
+}
+
+/// A packed DSP block (DSP48E1).
+///
+/// The IR's [`helion_ir::CellKind::Mac27`] is a multiply-accumulate marker
+/// with no pin-level interface yet; the 7-series backend places it on a
+/// DSP48E1 site configured for combinational multiply-add. Pin-level
+/// DSP interface modeling (A/B/C/P routing) is future work at the IR level.
+#[derive(Clone, Debug)]
+pub struct PackedDsp {
+    /// Source IR cell name.
+    pub name: String,
+}
+
+/// A packed carry chain (CARRY4).
+///
+/// The IR's [`helion_ir::CellKind::Carry4`] marks a 4-bit fast carry
+/// chain; the 7-series backend places it in a SLICE and emits the CARRY4
+/// configuration. Synth inference from adder logic is future work.
+#[derive(Clone, Debug)]
+pub struct PackedCarry {
+    /// Source IR cell name.
+    pub name: String,
+}
+
 /// Backend-owned packed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Packed7 {
@@ -74,6 +112,9 @@ pub struct Packed7 {
     pub ffs: Vec<PackedFf>,
     pub iobs: Vec<PackedIob>,
     pub bufgs: Vec<PackedBufg>,
+    pub brams: Vec<PackedBram>,
+    pub dsps: Vec<PackedDsp>,
+    pub carries: Vec<PackedCarry>,
 }
 
 /// Pack a [`Design`] into 7-series packable units.
@@ -185,6 +226,30 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     out_net,
                 });
             }
+            CellKind::Bram18 => {
+                let init = cell
+                    .attrs
+                    .get("INIT")
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
+                    .collect();
+                out.brams.push(PackedBram {
+                    name: cell.name.clone(),
+                    init,
+                });
+            }
+            CellKind::Mac27 => {
+                out.dsps.push(PackedDsp {
+                    name: cell.name.clone(),
+                });
+            }
+            CellKind::Carry4 => {
+                out.carries.push(PackedCarry {
+                    name: cell.name.clone(),
+                });
+            }
             other => {
                 return Err(format!(
                     "pack: unsupported CellKind {other:?} for 7-series (cell {})",
@@ -292,7 +357,7 @@ mod tests {
     #[test]
     fn pack_rejects_unsupported_loudly() {
         let mut d = Design::new("bad");
-        d.add_cell("u_mac", CellKind::Mac27);
+        d.add_cell("u_ila", CellKind::Ila { net: "x".into() });
         let err = pack(&d).unwrap_err();
         assert!(err.contains("unsupported"), "got: {err}");
     }

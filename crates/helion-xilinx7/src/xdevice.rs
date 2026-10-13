@@ -10,6 +10,17 @@ use crate::place::DeviceQuery;
 use crate::route::RouteQuery;
 use std::collections::{HashMap, HashSet};
 
+/// Precomputed routing node maps, built once per [`Device`] by
+/// [`build_node_map`] and shared (cloned) across flow stages.
+///
+/// Tuple fields: `(wire_id -> node_id, node_id -> member wire_ids,
+/// wire_id -> (tile_idx, wire_idx))`.
+pub type NodeMaps = (
+    Vec<u32>,
+    HashMap<u32, Vec<u32>>,
+    Vec<(usize, u32)>,
+);
+
 /// [`Device`] plus per-run state (clock nets, node stitching).
 pub struct XDevice<'a> {
     pub device: &'a Device,
@@ -24,10 +35,7 @@ pub struct XDevice<'a> {
 }
 
 impl<'a> XDevice<'a> {
-    pub fn new(
-        device: &'a Device,
-        maps: (Vec<u32>, HashMap<u32, Vec<u32>>, Vec<(usize, u32)>),
-    ) -> Self {
+    pub fn new(device: &'a Device, maps: NodeMaps) -> Self {
         let (wire_to_node, node_members, wire_to_tile) = maps;
         Self {
             device,
@@ -65,9 +73,7 @@ impl<'a> XDevice<'a> {
 /// Build the node -> members map from a mutable Device.
 /// Returns (wire_id -> node_id, node_id -> wire_ids, wire_id -> (tile_idx, wire_idx)).
 /// Call once after loading; pass the result to [`XDevice::new`].
-pub fn build_node_map(
-    device: &mut Device,
-) -> (Vec<u32>, HashMap<u32, Vec<u32>>, Vec<(usize, u32)>) {
+pub fn build_node_map(device: &mut Device) -> NodeMaps {
     let n = device.tile_count();
     // First pass: find max wire_id.
     let mut max_wid: u32 = 0;
@@ -111,6 +117,14 @@ impl<'a> DeviceQuery for XDevice<'a> {
 
     fn bufg_site(&self) -> Option<(String, String)> {
         self.device.bufg_sites().into_iter().next()
+    }
+
+    fn ramb_site(&self) -> Option<(String, String)> {
+        self.device.ramb_sites().into_iter().next()
+    }
+
+    fn dsp_site(&self) -> Option<(String, String)> {
+        self.device.dsp_sites().into_iter().next()
     }
 
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {

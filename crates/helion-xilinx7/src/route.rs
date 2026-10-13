@@ -339,6 +339,9 @@ mod tests {
                 },
             ],
             bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![],
         };
         Placed7 {
             packed,
@@ -348,6 +351,9 @@ mod tests {
                 PlacedIob { name: "obuf".into(), port: "b".into(), dir: IobDir::Out, tile: "IOB_T".into(), site: "IOB_X1".into() },
             ],
             bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![],
         }
     }
 
