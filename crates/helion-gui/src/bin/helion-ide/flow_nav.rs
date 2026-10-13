@@ -191,7 +191,10 @@ fn paint_stage_body(ui: &mut egui::Ui, app: &mut HelionIde, step: FlowStep) {
 /// Where "Open results" lands for each stage.
 fn results_tab(step: FlowStep) -> WorkspaceTab {
     match step {
-        FlowStep::Synthesis => WorkspaceTab::Hierarchy,
+        // Grammar R15: the hierarchy tree is a Z3 sidebar section now. After
+        // synthesis the netlist viewer (Schematic) is the results pane; the
+        // Files sidebar shows the hierarchy tree beside it.
+        FlowStep::Synthesis => WorkspaceTab::Schematic,
         FlowStep::Opt => WorkspaceTab::Reports,
         FlowStep::Place => WorkspaceTab::Device,
         FlowStep::Route => WorkspaceTab::Device,

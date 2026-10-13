@@ -1,10 +1,14 @@
 //! Hierarchy tree view: Vivado Netlist-tree pattern.
 //!
-//! Replaces the treemap (unreadable noise past a few hundred blocks) with a
-//! real expandable tree: chevron rows, indent guides, per-node cell counts,
-//! 28px rows, full-width selection highlight, and a filter field. Virtualized
-//! via `ScrollArea::show_rows` so 15k-block designs stay interactive - rows
-//! are only materialized for expanded paths, never all at once.
+//! Z3 sidebar section (grammar R15), not a central pane: an expandable tree
+//! with chevron rows, indent guides, per-node cell counts, 28px rows,
+//! full-width selection highlight, and a filter field. Virtualized via
+//! `ScrollArea::show_rows` so 15k-block designs stay interactive - rows are
+//! only materialized for expanded paths, never all at once.
+//!
+//! Selection cross-probes through the shared `model.selected` identity:
+//! single-click selects (sidebar highlight, Z4 inspector, Device canvas),
+//! double-click opens the hierarchy sheet in Schematic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -39,6 +43,10 @@ struct TreeState {
     parent: Vec<Option<usize>>,
     expanded: HashSet<String>,
     filter: String,
+    /// Selection the tree has already revealed. When the model selection
+    /// changes, ancestors expand so the node lands on a visible row; the
+    /// user's own expand/collapse choices are never fought on other frames.
+    revealed: Option<String>,
 }
 
 impl TreeState {
@@ -230,8 +238,8 @@ fn paint_chevron(p: &egui::Painter, center: egui::Pos2, expanded: bool, color: e
     p.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
-/// Vivado Netlist-tree hierarchy pane. `model.selected` is the cross-view
-/// selection identity shared with Schematic/Device/Properties.
+/// Vivado Netlist-tree hierarchy section (Z3 sidebar). `model.selected` is the
+/// cross-view selection identity shared with Schematic/Device/Properties.
 pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.horizontal(|ui| {
         ui.heading("Hierarchy");
@@ -272,7 +280,25 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
             parent,
             expanded: HashSet::from([root_name]),
             filter: String::new(),
+            revealed: None,
         };
+    }
+
+    // Reveal a cross-probed selection ("Show in Hierarchy", message links,
+    // utilization rows): on selection change, expand the node's ancestors so
+    // it lands on a visible row instead of hiding inside a collapsed subtree.
+    if state.revealed.as_deref() != model.selected.as_deref() {
+        state.revealed = model.selected.clone();
+        if let Some(mut i) = state
+            .nodes
+            .iter()
+            .position(|n| Some(n.name.as_str()) == model.selected.as_deref())
+        {
+            while let Some(p) = state.parent[i] {
+                state.expanded.insert(state.nodes[p].name.clone());
+                i = p;
+            }
+        }
     }
 
     let n_instances = state

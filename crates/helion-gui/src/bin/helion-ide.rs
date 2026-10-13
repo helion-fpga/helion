@@ -1590,9 +1590,14 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     flow_nav::paint_flow_nav(ui, app);
                     ui.separator();
                     paint_files_tree(ui, app);
+                    // Grammar R15: hierarchy tree (Quartus Project Navigator
+                    // pattern) - RTL hierarchy under Files.
+                    paint_hierarchy_section(ui, app);
                 }
                 Activity::Device => {
                     paint_io_ports_table(ui, &mut app.model, "sidebar_io");
+                    // Grammar R15: netlist/placed hierarchy tree under Device.
+                    paint_hierarchy_section(ui, app);
                 }
                 Activity::Timing => {
                     paint_timing_paths(ui, &mut app.model, &app.theme);
@@ -2811,52 +2816,61 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
     );
 }
 
-/// More ... destinations fill the central pane with their real UI - never Timing-only, never a stub heading.
-fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
-    match pane_for_workspace(app.model.workspace) {
-        WorkspacePane::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
-        WorkspacePane::Package => paint_package(ui, &mut app.model, &app.theme),
-        WorkspacePane::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
-        WorkspacePane::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
-        WorkspacePane::Hardware => paint_hw(ui, app),
-        WorkspacePane::Ip => paint_ip(ui, &mut app.model, &app.theme),
-        WorkspacePane::Find => paint_find(ui, &mut app.model, &app.theme),
-        WorkspacePane::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
-        WorkspacePane::Summary => dashboard::paint_dashboard(ui, app),
-        WorkspacePane::Constraints => paint_constraints_tab(ui, app),
-        WorkspacePane::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
-        WorkspacePane::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
-        WorkspacePane::ClockNetworks => paint_clock_networks(ui, &mut app.model),
-        WorkspacePane::Power => paint_power(ui, &mut app.model, &app.theme),
-        WorkspacePane::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
-        WorkspacePane::Qor => paint_qor(ui, &mut app.model, &app.theme),
-        WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
-        WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspacePane::Runs => paint_runs(ui, app),
-        WorkspacePane::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
-        WorkspacePane::Testbench => paint_testbench(ui, app),
-        WorkspacePane::Wave
-        | WorkspacePane::Ila
-        | WorkspacePane::Source
-        | WorkspacePane::Memory
-        | WorkspacePane::Breakpoints
-        | WorkspacePane::Locals
-        | WorkspacePane::Forces
-        | WorkspacePane::SimSettings => paint_sim_workspace(ui, app),
-        WorkspacePane::ReportsCatalog => paint_reports_detail(ui, app),
-        WorkspacePane::Editor => {
+/// Single Z5 dispatch: every WorkspaceTab paints its real pane (grammar P3).
+/// Total match over the tab enum, so adding a tab forces an arm here - no tab
+/// can silently fall through to a stub or to Timing. `paint_more_pane`,
+/// `paint_reports_detail`, and `paint_timing_canvas_body` all route through
+/// this; the tab -> painter mapping lives in exactly one place. (This
+/// replaces three copy-pasted match blocks, one of which also carried a dead
+/// `WorkspacePane::Timing` arm: `pane_for_workspace` never returns Timing.)
+fn paint_tab_pane(ui: &mut egui::Ui, app: &mut HelionIde, tab: WorkspaceTab) {
+    match tab {
+        WorkspaceTab::TextEditor => {
             let theme = app.theme;
             editor::paint_editor(ui, app, &theme)
         }
-        WorkspacePane::Device => paint_device(
+        WorkspaceTab::Device => paint_device(
             ui,
             &mut app.model,
             &app.theme,
             &mut app.physview,
             &mut app.device_zoom_target,
         ),
-        WorkspacePane::Timing => paint_timing_only(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Reports => paint_reports_detail(ui, app),
+        WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Hardware => paint_hw(ui, app),
+        WorkspaceTab::Ip => paint_ip(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Find => paint_find(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
+        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
+        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
+        WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Runs => paint_runs(ui, app),
+        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Testbench => paint_testbench(ui, app),
+        WorkspaceTab::Wave
+        | WorkspaceTab::Ila
+        | WorkspaceTab::Source
+        | WorkspaceTab::Memory
+        | WorkspaceTab::Breakpoints
+        | WorkspaceTab::Locals
+        | WorkspaceTab::Forces
+        | WorkspaceTab::SimSettings => paint_sim_workspace(ui, app),
     }
+}
+
+/// More ... destinations fill the central pane with their real UI - never Timing-only, never a stub heading.
+fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
+    paint_tab_pane(ui, app, app.model.workspace);
 }
 
 /// Timing ⌘3 / Timing rail: WNS + paths only - never Reports catalog.
@@ -2868,53 +2882,42 @@ fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
 
 /// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
 fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
-    match app.model.workspace {
-        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
-        WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, app),
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
-        WorkspaceTab::Reports => {
-            // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
-            paint_timing_summary(ui, &mut app.model, &app.theme);
-        }
-        other => {
-            // Fall through to known panes / timing-only for overflow More picks.
-            let _ = other;
-            paint_timing_canvas_body(ui, app);
-        }
+    let tab = app.model.workspace;
+    if tab == WorkspaceTab::Reports {
+        // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
+        paint_timing_summary(ui, &mut app.model, &app.theme);
+    } else if chrome::is_report_detail(tab) || tab == WorkspaceTab::Summary {
+        paint_tab_pane(ui, app, tab);
+    } else {
+        // Fall through to known panes / timing-only for overflow More picks.
+        paint_timing_canvas_body(ui, app);
     }
 }
 
 fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
+    // Tabs with their own pane keep it inside the Timing canvas; canvas and
+    // sim tabs fall back to summary + paths (the Timing canvas contract).
+    // The pane set matches the old explicit list exactly.
     match app.model.workspace {
-        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
-        WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, app),
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Hardware => paint_hw(ui, app),
-        WorkspaceTab::Ip => paint_ip(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Find => paint_find(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
+        WorkspaceTab::Schematic
+        | WorkspaceTab::Package
+        | WorkspaceTab::Bitstream
+        | WorkspaceTab::Hardware
+        | WorkspaceTab::Ip
+        | WorkspaceTab::Find
+        | WorkspaceTab::Settings
+        | WorkspaceTab::Summary
+        | WorkspaceTab::Constraints
+        | WorkspaceTab::ClockInteraction
+        | WorkspaceTab::Cdc
+        | WorkspaceTab::ClockNetworks
+        | WorkspaceTab::Power
+        | WorkspaceTab::Methodology
+        | WorkspaceTab::Qor
+        | WorkspaceTab::Drc
+        | WorkspaceTab::Utilization
+        | WorkspaceTab::Runs
+        | WorkspaceTab::Checkpoints => paint_tab_pane(ui, app, app.model.workspace),
         _ => {
             paint_timing_summary(ui, &mut app.model, &app.theme);
             ui.add_space(8.0);
@@ -4375,8 +4378,15 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     }
 }
 
-fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    hierarchy::paint_hierarchy(ui, model, theme);
+/// Z3 hierarchy section (grammar R15): the netlist tree is structural
+/// navigation, so it lives in the navigation sidebar - under Files (RTL
+/// hierarchy) and under Device (netlist/placed hierarchy). Selection
+/// cross-probes into the Z5 canvas: a click selects through the shared
+/// selection identity (sidebar highlight, Z4 inspector, Device canvas);
+/// double-click opens the hierarchy sheet in Schematic.
+fn paint_hierarchy_section(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.separator();
+    hierarchy::paint_hierarchy(ui, &mut app.model, &app.theme);
 }
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
