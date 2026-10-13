@@ -5224,6 +5224,12 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
             "constraints_io_placement",
         ),
     ];
+    // Dense data grid: horizontal scroll keeps long names/values reachable on
+    // narrow windows (the same sanctioned fallback the methodology/QoR grids use).
+    egui::ScrollArea::horizontal()
+        .id_salt("constraints_tables_hscroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     for (title, section, grid) in sections {
         let sect: Vec<_> = rows.iter().filter(|r| r.section == section).collect();
         ui.add_space(6.0);
@@ -5263,6 +5269,7 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
             }
         });
     }
+    });
     if let Some(id) = pick {
         let _ = model.select_constraint(&id);
     }
@@ -6334,6 +6341,12 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    // Dense data grid: horizontal scroll keeps long clock/source names
+    // reachable on narrow windows.
+    egui::ScrollArea::horizontal()
+        .id_salt("clock_networks_hscroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     egui::Grid::new("clock_networks_table")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -6368,6 +6381,7 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.end_row();
             }
         });
+    });
     if let Some(name) = pick_obj {
         let _ = model.select_clock_network(&name);
         let _ = model.select_clock_network_object(&name);
@@ -6633,6 +6647,11 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .map(|x| x.mw)
         .fold(0.0f64, f64::max)
         .max(1e-9);
+    // Horizontal scroll keeps long resource names reachable on narrow panes.
+    egui::ScrollArea::horizontal()
+        .id_salt("vcd_power_resources_hscroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     egui::Grid::new("vcd_power_resources")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -6647,6 +6666,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                 ui.end_row();
             }
         });
+    });
     if !r.by_hierarchy.is_empty() {
         ui.add_space(8.0);
         ui.label(RichText::new("By hierarchy").strong());
@@ -7619,7 +7639,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             .show(ui, |ui| {
                 let mut pick_path = None;
                 let selected_path = model.selected_timing_path;
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .id_salt("schematic_timing_paths_scroll")
                     .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
                     .show(ui, |ui| {
