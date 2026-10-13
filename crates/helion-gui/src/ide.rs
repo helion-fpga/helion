@@ -4113,7 +4113,7 @@ impl Ila {
     pub fn add_probe(&mut self, design: &helion_ir::Design, net: &str) -> Result<String, String> {
         let net = net.trim();
         if net.is_empty() {
-            return Err("ila_sim_add: empty net".into());
+            return Err("ila add: empty net".into());
         }
         let d = design;
         if self.config.probes.iter().any(|p| p.nets == [net]) {
@@ -4131,10 +4131,10 @@ impl Ila {
     pub fn add_bus(&mut self, design: &helion_ir::Design, name: &str, nets: &[String]) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("ila_sim_bus: empty name".into());
+            return Err("ila bus: empty name".into());
         }
         if nets.is_empty() {
-            return Err("ila_sim_bus: no nets".into());
+            return Err("ila bus: no nets".into());
         }
         let d = design;
         let probe = ila::IlaProbeCfg {
@@ -24632,24 +24632,24 @@ mod tests {
         );
 
         // Probe setup: scalar + bus.
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        assert!(ide.exec("ila_sim_add cnt_3").unwrap().contains("(already)"));
-        ide.exec("ila_sim_bus cntbus cnt_3 cnt_2 cnt_1 cnt_0").unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        assert!(ide.exec("ila add cnt_3").unwrap().contains("(already)"));
+        ide.exec("ila bus cntbus cnt_3 cnt_2 cnt_1 cnt_0").unwrap();
         assert_eq!(ide.ila.config.probes.len(), 2);
         assert_eq!(ide.ila.config.probes[1].width(), 4);
 
         // Trigger: rising edge on probe 0 (q3).
-        ide.exec("ila_sim_trigger rising 0").unwrap();
-        ide.exec("ila_sim_depth 32").unwrap();
-        ide.exec("ila_sim_preratio 0.25").unwrap();
-        ide.exec("ila_sim_radix 1 hex").unwrap();
+        ide.exec("ila trigger rising 0").unwrap();
+        ide.exec("ila depth 32").unwrap();
+        ide.exec("ila preratio 0.25").unwrap();
+        ide.exec("ila radix 1 hex").unwrap();
         assert_eq!(
             ide.ila.config.probes[1].radix,
             crate::ila::IlaRadix::Hex
         );
 
         // Capture (synchronous in the exec path).
-        let msg = ide.exec("ila_sim_capture").unwrap();
+        let msg = ide.exec("ila capture").unwrap();
         assert!(msg.contains("samples="), "{msg}");
         let cap = ide.ila.capture.as_ref().expect("capture");
         assert!(cap.found_trigger, "cnt_3 must rise within max_cycles");
@@ -24662,13 +24662,13 @@ mod tests {
         assert_eq!(ide.ila.status, IlaStatus::Done);
         assert_eq!(ide.ila.viewer.cursor, Some(ti));
 
-        let st = ide.exec("ila_sim_status").unwrap();
+        let st = ide.exec("ila status").unwrap();
         assert!(st.contains("probes=2"), "{st}");
         assert!(st.contains("status=Done"), "{st}");
 
         // Value-match trigger via text fields.
-        ide.exec("ila_sim_trigger value 1 5 0xF").unwrap();
-        let msg = ide.exec("ila_sim_capture").unwrap();
+        ide.exec("ila trigger value 1 5 0xF").unwrap();
+        let msg = ide.exec("ila capture").unwrap();
         assert!(msg.contains("samples="), "{msg}");
         let cap = ide.ila.capture.as_ref().expect("capture");
         let ti = cap.trigger_sample.expect("value trigger");
@@ -24685,19 +24685,19 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.json");
-        ide.exec(&format!("ila_sim_save {}", path.display())).unwrap();
+        ide.exec(&format!("ila save {}", path.display())).unwrap();
         ide.ila.config.probes.clear();
         ide.ila.capture = None;
-        ide.exec(&format!("ila_sim_load {}", path.display())).unwrap();
+        ide.exec(&format!("ila load {}", path.display())).unwrap();
         assert_eq!(ide.ila.config.probes.len(), 2);
         let reloaded = ide.ila.capture.as_ref().expect("reloaded capture");
         assert_eq!(reloaded.len(), reloaded.trigger_sample.unwrap() + 1 + ide.ila.config.post());
 
         // Fail loud, never half-configured.
-        assert!(ide.exec("ila_sim_add no_such_net").is_err());
-        assert!(ide.exec("ila_sim_trigger banana 0").is_err());
-        assert!(ide.exec("ila_sim_remove 9").is_err());
-        assert!(ide.exec("ila_sim_radix 0 oct").is_err());
+        assert!(ide.exec("ila add no_such_net").is_err());
+        assert!(ide.exec("ila trigger banana 0").is_err());
+        assert!(ide.exec("ila remove 9").is_err());
+        assert!(ide.exec("ila radix 0 oct").is_err());
     }
 
     /// Sim ILA: background (threaded) capture merges through finish_capture.
@@ -24706,9 +24706,9 @@ mod tests {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        ide.exec("ila_sim_trigger rising 0").unwrap();
-        ide.exec("ila_sim_depth 64").unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila trigger rising 0").unwrap();
+        ide.exec("ila depth 64").unwrap();
         let d = ide.shell.session.design.clone().expect("design");
         let rx = ide.ila.start_capture(&d).expect("arm");
         assert_eq!(ide.ila.status, IlaStatus::Capturing);
@@ -24729,14 +24729,14 @@ mod tests {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        ide.exec("ila_sim_add cnt_0").unwrap();
-        ide.exec("ila_sim_depth 32").unwrap();
-        ide.exec("ila_sim_capture").unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila add cnt_0").unwrap();
+        ide.exec("ila depth 32").unwrap();
+        ide.exec("ila capture").unwrap();
         let cap = ide.ila.capture.as_ref().expect("capture");
         let ti = cap.trigger_sample.expect("immediate trigger at 0");
         // cnt_3 rises at sample 7: edge-from-wave picks the rising edge.
-        let msg = ide.exec("ila_sim_trigger_at 0 7").unwrap();
+        let msg = ide.exec("ila trigger_at 0 7").unwrap();
         assert!(msg.contains("Rising edge"), "{msg}");
         assert_eq!(ide.ila.config.trigger.probe, 0);
         assert_eq!(
@@ -24744,12 +24744,12 @@ mod tests {
             crate::ila::IlaTriggerKind::Rising
         );
         // No edge at sample 0 for cnt_3 -> value match on current value.
-        let msg = ide.exec("ila_sim_trigger_at 0 1").unwrap();
+        let msg = ide.exec("ila trigger_at 0 1").unwrap();
         assert!(msg.contains("Value match"), "{msg}");
         assert!(ide.ila.trig_value_text == "0");
         // Out-of-range sample fails loud.
-        assert!(ide.exec("ila_sim_trigger_at 0 99999").is_err());
-        assert!(ide.exec("ila_sim_trigger_at 9 0").is_err());
+        assert!(ide.exec("ila trigger_at 0 99999").is_err());
+        assert!(ide.exec("ila trigger_at 9 0").is_err());
 
         // VCD export: real file with GTKWave structure.
         let dir = std::env::temp_dir().join(format!(
@@ -24762,7 +24762,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ila.vcd");
         let msg = ide
-            .exec(&format!("ila_sim_export_vcd {}", path.display()))
+            .exec(&format!("ila export_vcd {}", path.display()))
             .unwrap();
         assert!(msg.contains("ila.vcd"), "{msg}");
         let text = std::fs::read_to_string(&path).unwrap();
@@ -24772,7 +24772,7 @@ mod tests {
         assert!(text.contains(&format!("$comment trigger sample {ti}")));
         // Export with no capture fails loud.
         ide.ila.capture = None;
-        assert!(ide.exec("ila_sim_export_vcd /tmp/nowhere.vcd").is_err());
+        assert!(ide.exec("ila export_vcd /tmp/nowhere.vcd").is_err());
     }
 
     /// Sim ILA: disarm stops a capture in flight; disarm at idle fails loud.
@@ -24781,16 +24781,16 @@ mod tests {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        ide.exec("ila_sim_add clk").unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila add clk").unwrap();
         // clk reads 1 at every posedge sample: value 0 never fires, so the
         // disarm deterministically wins the race.
-        ide.exec("ila_sim_trigger value 1 0 1").unwrap();
-        ide.exec("ila_sim_depth 1024").unwrap();
-        assert!(ide.exec("ila_sim_disarm").is_err(), "idle disarm fails loud");
+        ide.exec("ila trigger value 1 0 1").unwrap();
+        ide.exec("ila depth 1024").unwrap();
+        assert!(ide.exec("ila disarm").is_err(), "idle disarm fails loud");
         let d = ide.shell.session.design.clone().expect("design");
         let rx = ide.ila.start_capture(&d).expect("arm");
-        ide.exec("ila_sim_disarm").unwrap();
+        ide.exec("ila disarm").unwrap();
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("capture done");
@@ -29572,6 +29572,54 @@ endmodule
         assert_eq!(cap.len(), 16);
         // Both probes sampled every cycle.
         assert!(cap.samples.iter().all(|s| s.len() == 16));
+    }
+
+    #[test]
+    fn ila_arm_no_probes_fails_loud() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        let err = ide.exec("ila arm").expect_err("arm with no probes must fail loud");
+        assert!(err.contains("no probes"), "{err}");
+        assert!(ide.ila.capture.is_none(), "no silent empty capture");
+    }
+
+    #[test]
+    fn ila_trigger_valuematch_hw_arm_fails_loud() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila trigger value 0 10 15").unwrap();
+        let err = ide.exec("ila arm").expect_err("value-match arm must fail loud");
+        assert!(err.contains("value-match"), "{err}");
+        assert!(ide.ila.capture.is_none(), "no silent partial capture");
+    }
+
+    #[test]
+    fn ila_e2e_sim_capture_opens_viewer() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila depth 16").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        let out = ide.exec("ila capture").unwrap();
+        assert!(out.contains("samples=16"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Ila, "capture opens the ILA viewer");
+        let cap = ide.ila.capture.as_ref().expect("capture present");
+        assert_eq!(cap.len(), 16);
+        assert_eq!(
+            ide.ila.viewer.cursor,
+            cap.trigger_sample,
+            "viewer cursor tracks the trigger sample"
+        );
     }
 
     /// UG893 Device is a HAD die occupancy grid, not a list of occupied site names.
