@@ -179,6 +179,11 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.RAMB18.{}.IN_USE", bram.tile, site_rel));
     }
 
+    // DSP48E1s: placed on sites but configuration FASM not yet emitted.
+    // Full DSP configuration (USE_MULT, OPMODE, ALUMODE, INMODE, pipeline
+    // registers) requires the detailed attribute bit mapping; future work.
+    let _ = &placed.dsps;
+
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
     // connections (e.g. OLOGIC bypass): traversed for connectivity but
     // never emitted (no configuration bits).
@@ -301,6 +306,7 @@ mod tests {
             }],
             bufgs: vec![],
             brams: vec![],
+            dsps: vec![],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -309,6 +315,7 @@ mod tests {
             iobs: vec![PlacedIob { name: "u_obuf".into(), port: "led".into(), dir: IobDir::Out, tile: "RIOB33_X0Y0".into(), site: "IOB_X0Y0".into() }],
             bufgs: vec![],
             brams: vec![],
+            dsps: vec![],
         };
         Routed7 {
             placed,
@@ -343,6 +350,7 @@ mod tests {
             iobs: vec![],
             bufgs: vec![],
             brams: vec![PackedBram { name: "u_bram".into(), init: vec![] }],
+            dsps: vec![],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -351,6 +359,7 @@ mod tests {
             iobs: vec![],
             bufgs: vec![],
             brams: vec![PlacedBram { name: "u_bram".into(), tile: "BRAM_L_X0Y0".into(), site: "RAMB18_X0Y0".into() }],
+            dsps: vec![],
         };
         let routed = Routed7 { placed, nets: vec![] };
         let bs = emit_fasm(&routed, &FakeEmit).unwrap();

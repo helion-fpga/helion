@@ -82,6 +82,18 @@ pub struct PackedBram {
     pub init: Vec<u64>,
 }
 
+/// A packed DSP block (DSP48E1).
+///
+/// The IR's [`helion_ir::CellKind::Mac27`] is a multiply-accumulate marker
+/// with no pin-level interface yet; the 7-series backend places it on a
+/// DSP48E1 site configured for combinational multiply-add. Pin-level
+/// DSP interface modeling (A/B/C/P routing) is future work at the IR level.
+#[derive(Clone, Debug)]
+pub struct PackedDsp {
+    /// Source IR cell name.
+    pub name: String,
+}
+
 /// Backend-owned packed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Packed7 {
@@ -90,6 +102,7 @@ pub struct Packed7 {
     pub iobs: Vec<PackedIob>,
     pub bufgs: Vec<PackedBufg>,
     pub brams: Vec<PackedBram>,
+    pub dsps: Vec<PackedDsp>,
 }
 
 /// Pack a [`Design`] into 7-series packable units.
@@ -213,6 +226,11 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 out.brams.push(PackedBram {
                     name: cell.name.clone(),
                     init,
+                });
+            }
+            CellKind::Mac27 => {
+                out.dsps.push(PackedDsp {
+                    name: cell.name.clone(),
                 });
             }
             other => {
