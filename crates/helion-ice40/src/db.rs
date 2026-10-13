@@ -91,9 +91,43 @@ pub fn parse_db(text: &str) -> Vec<DbEntry> {
     text.lines().filter_map(parse_line).collect()
 }
 
+/// Map an iCE40-8k RAM tile `inputN_M` net to its `ram/RADDR_*` /
+/// `ram/WADDR_*` name, ported from IceStorm `icebox.py::netname_normalize`
+/// (`ramb_8k` / `ramt_8k` flavors).
+///
+/// On 8k the RAMB tile (odd y) carries the read-address inputs and the
+/// RAMT tile (even y) the write-address inputs; `ramb` selects which.
+/// The index table is `[7,6,5,4,3,2,1,0,-1,...,-1,10,9,8]` addressed by
+/// `N*4+M`; a `-1` entry (or a non-`input` name) is returned unchanged.
+pub fn normalize_ram_input(net: &str, ramb: bool) -> String {
+    const TABLE: [i8; 16] = [7, 6, 5, 4, 3, 2, 1, 0, -1, -1, -1, -1, -1, 10, 9, 8];
+    let rest = match net.strip_prefix("input") {
+        Some(r) => r,
+        None => return net.to_string(),
+    };
+    let (ns, ms) = match rest.split_once('_') {
+        Some(p) => p,
+        None => return net.to_string(),
+    };
+    let (n, m): (usize, usize) = match (ns.parse(), ms.parse()) {
+        (Ok(n), Ok(m)) => (n, m),
+        _ => return net.to_string(),
+    };
+    let idx = n.checked_mul(4).and_then(|v| v.checked_add(m));
+    let bit = match idx {
+        Some(i) if i < TABLE.len() => TABLE[i],
+        _ => return net.to_string(),
+    };
+    if bit < 0 {
+        return net.to_string();
+    }
+    let port = if ramb { "RADDR" } else { "WADDR" };
+    format!("ram/{port}_{bit}")
+}
+
 /// IceStorm net-name normalization, ported from `icebox.py::netname_normalize`
-/// (logic-tile flavor; RAM variants handled by the caller replacing `input`
-/// names first).
+/// (logic-tile flavor; RAM `inputN_M` names are handled by
+/// [`normalize_ram_input`], applied by the caller for RAM tile kinds).
 pub fn normalize_netname(net: &str) -> String {
     let mut n = net.to_string();
     // input_2_N -> wire_logic_cluster/lc_N/in_2  (handled before other replaces)
@@ -147,6 +181,21 @@ mod tests {
     fn parses_lc_config() {
         let e = parse_line("B0[36],B1[36]\tLC_4").unwrap();
         assert_eq!(e.func, DbFunc::LcConfig(4));
+    }
+
+    #[test]
+    fn ram_input_normalization_matches_icebox() {
+        // icebox.py netname_normalize, ramb_8k/ramt_8k flavors:
+        // inputN_M -> ram/RADDR_{[7,6,5,4,3,2,1,0,-1*5,10,9,8][N*4+M]}.
+        assert_eq!(normalize_ram_input("input0_0", true), "ram/RADDR_7");
+        assert_eq!(normalize_ram_input("input0_7", true), "ram/RADDR_0");
+        assert_eq!(normalize_ram_input("input2_5", true), "ram/RADDR_10");
+        assert_eq!(normalize_ram_input("input2_7", true), "ram/RADDR_8");
+        assert_eq!(normalize_ram_input("input0_3", false), "ram/WADDR_4");
+        assert_eq!(normalize_ram_input("input2_6", false), "ram/WADDR_9");
+        // Non-input names pass through untouched.
+        assert_eq!(normalize_ram_input("ram/RDATA_3", true), "ram/RDATA_3");
+        assert_eq!(normalize_ram_input("local_g0_1", false), "local_g0_1");
     }
 
     #[test]
