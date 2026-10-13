@@ -44,14 +44,17 @@ Open results). After Implement succeeds the canvas auto-switches to Device
    user ever pressed Run, and "Re-run" is the only synth action. The staged
    mental model (add sources → review → synthesize) does not exist.
 
-3. [BROKEN] Multi-file designs opened via File > Open… (no .prj): the
-   Sources list shows both files, but synthesis elaborates ONLY the
-   last-opened file (`run_step_inner` Synthesis uses
-   `tree.sources.last()`; `synth_hdl_path_with_sva` elaborates the single
-   path). A top that instantiates a submodule from another file either fails
-   or synthesizes a shell, with no message that the other Sources rows were
-   ignored. Vivado/Quartus elaborate the whole project with a chosen top.
-   Multi-file only works via `.prj`. Repro in driver `wf1b_multifile_open`.
+3. [UX GAP] No explicit top-module selection: the top is implicitly the
+   last-opened file (`open_source` → synth that path; `tree.top` only
+   mirrors the result, ide.rs:22647). Sibling `.sv`/`.v` files in the same
+   directory ARE auto-discovered (`sibling_modules` in helion-sv), so
+   multi-file works when opened in any order - reproduced: opening sub.sv
+   then top2.sv, or top2.sv alone, both synthesize working "top2"
+   (driver `wf1b_multifile_open`, `wf1c_multifile_top_first`). What is
+   missing vs Vivado/Quartus: (a) no "Set as Top" action - with two
+   candidate tops the design silently becomes whichever file was opened
+   last; (b) sources in different directories are not elaborated together
+   (only the opened file + its own directory's siblings).
 
 4. [MISLEAD] "Implement" means two different things. The GUI's Implement
    button / Flow menu (`JobKind::Implement` → `implement()`) runs
