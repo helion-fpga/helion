@@ -392,61 +392,95 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
         }
     }
     // RAM blocks: SB_RAM40_4K spans a RAMB tile (x, y) and RAMT tile (x, y+1).
-    // Lower data bits (0..7) live on RAMT, upper bits (8..15) on RAMB.
+    // Port split per the IceStorm 8k RAM DBs (verified against arachne-pnr):
+    // RAMB (odd y) carries RADDR/RCLK/RE and RDATA/WDATA[15:8];
+    // RAMT (even y) carries WADDR/WCLK/WE and RDATA/WDATA[7:0].
+    // (The ram_tile.rst doc table has these columns swapped; the DB and
+    // arachne-pnr's own output agree on the layout above.)
+    //
+    // pack_ram marks unconnected RAM pins with the "gnd" placeholder net;
+    // those endpoints are skipped (their muxes stay unprogrammed) instead
+    // of failing as undriven nets.
     for (ri, ram) in placed.packed.rams.iter().enumerate() {
         let placed_ram = &placed.rams[ri];
         let (x, y) = (placed_ram.x, placed_ram.y);
         let ram_pack = &placed.packed.rams[ri];
+        let mut add_ram_ep =
+            |net: &str, node: Option<NodeId>, is_driver: bool, what: &str| -> Result<(), String> {
+                if net == "gnd" {
+                    return Ok(());
+                }
+                add_ep(net, node, is_driver, what)
+            };
         // Read data outputs.
         for i in 0..8 {
             let n = router.lookup(x, y + 1, &format!("ram/RDATA_{i}"));
-            add_ep(&ram_pack.rdata_net[i], n, true, &format!("RAM {} RDATA{i}", ram_pack.name))?;
+            add_ram_ep(&ram_pack.rdata_net[i], n, true, &format!("RAM {} RDATA{i}", ram_pack.name))?;
         }
         for i in 8..16 {
             let n = router.lookup(x, y, &format!("ram/RDATA_{i}"));
-            add_ep(&ram_pack.rdata_net[i], n, true, &format!("RAM {} RDATA{i}", ram_pack.name))?;
+            add_ram_ep(&ram_pack.rdata_net[i], n, true, &format!("RAM {} RDATA{i}", ram_pack.name))?;
         }
         // Write data inputs.
         for i in 0..8 {
             let n = router.lookup(x, y + 1, &format!("ram/WDATA_{i}"));
-            add_ep(&ram_pack.wdata_net[i], n, false, &format!("RAM {} WDATA{i}", ram_pack.name))?;
+            add_ram_ep(&ram_pack.wdata_net[i], n, false, &format!("RAM {} WDATA{i}", ram_pack.name))?;
         }
         for i in 8..16 {
             let n = router.lookup(x, y, &format!("ram/WDATA_{i}"));
-            add_ep(&ram_pack.wdata_net[i], n, false, &format!("RAM {} WDATA{i}", ram_pack.name))?;
+            add_ram_ep(&ram_pack.wdata_net[i], n, false, &format!("RAM {} WDATA{i}", ram_pack.name))?;
         }
         // Addresses and clocks.
         for i in 0..11 {
             let n = router.lookup(x, y, &format!("ram/RADDR_{i}"));
-            add_ep(&ram_pack.raddr_net[i], n, false, &format!("RAM {} RADDR{i}", ram_pack.name))?;
+            add_ram_ep(&ram_pack.raddr_net[i], n, false, &format!("RAM {} RADDR{i}", ram_pack.name))?;
             let n = router.lookup(x, y + 1, &format!("ram/WADDR_{i}"));
-            add_ep(&ram_pack.waddr_net[i], n, false, &format!("RAM {} WADDR{i}", ram_pack.name))?;
+            add_ram_ep(&ram_pack.waddr_net[i], n, false, &format!("RAM {} WADDR{i}", ram_pack.name))?;
         }
         let n = router.lookup(x, y, "ram/RCLK");
-        add_ep(&ram_pack.rclk_net, n, false, &format!("RAM {} RCLK", ram_pack.name))?;
+        add_ram_ep(&ram_pack.rclk_net, n, false, &format!("RAM {} RCLK", ram_pack.name))?;
         let n = router.lookup(x, y + 1, "ram/WCLK");
-        add_ep(&ram_pack.wclk_net, n, false, &format!("RAM {} WCLK", ram_pack.name))?;
+        add_ram_ep(&ram_pack.wclk_net, n, false, &format!("RAM {} WCLK", ram_pack.name))?;
         if let Some(re) = &ram_pack.re_net {
             let n = router.lookup(x, y, "ram/RE");
-            add_ep(re, n, false, &format!("RAM {} RE", ram_pack.name))?;
+            add_ram_ep(re, n, false, &format!("RAM {} RE", ram_pack.name))?;
         }
         if let Some(we) = &ram_pack.we_net {
             let n = router.lookup(x, y + 1, "ram/WE");
-            add_ep(we, n, false, &format!("RAM {} WE", ram_pack.name))?;
+            add_ram_ep(we, n, false, &format!("RAM {} WE", ram_pack.name))?;
         }
         let _ = ram;
     }
-    // PLLs: reference clock input and global clock output.
-    // (v1: PLL output routes as a plain net; full global-network support TBD.)
+    // PLLs: the reference clock is a load on the PLL site's REFERENCECLK
+    // `fabout` net (io_tile (13,0) for the bottom PLL, (13,33) for the top
+    // one; IceStorm icebox.py pllinfo_db "8k_0"/"8k_1"). The router programs
+    // the local-track -> fabout buffer, as arachne-pnr does.
+    //
+    // The PLL output (PLLOUTGLOBAL) physically drives the dedicated global
+    // clock network via the padin_glb_netwk extra bit, which this backend
+    // does not emit yet. For v1 the output is driven as a plain net from a
+    // logic-cell output node in the tile adjacent to the PLL site so the
+    // design routes structurally; see asc.rs for the config-bit emission.
     for (pi, pll) in placed.packed.plls.iter().enumerate() {
         let placed_pll = &placed.plls[pi];
-        // Reference clock: driven from fabric (or a pin). Treat as a load
-        // that must be driven; the driver is the net's source.
-        // Output: drives the out_net.
-        // For v1, we require the ref_net to have a driver elsewhere and the
-        // out_net to be loaded elsewhere; the PLL itself is a pass-through
-        // marker. Full PLL config bits are TBD.
-        let _ = (pll, placed_pll);
+        let (ref_tile, drv_tile) = match placed_pll.kind {
+            crate::pack::PllKind::Pad => ((13u8, 0u8), (16u8, 1u8)),
+            crate::pack::PllKind::Core => ((13u8, 33u8), (16u8, 32u8)),
+        };
+        let n = router.lookup(ref_tile.0, ref_tile.1, "fabout");
+        add_ep(
+            &pll.ref_net,
+            n,
+            false,
+            &format!("PLL {} REFERENCECLK", pll.name),
+        )?;
+        let n = router.lookup(drv_tile.0, drv_tile.1, "lutff_0/out");
+        add_ep(
+            &pll.out_net,
+            n,
+            true,
+            &format!("PLL {} PLLOUTGLOBAL", pll.name),
+        )?;
     }
 
     // Route each net: driver -> all loads via a shared tree.
