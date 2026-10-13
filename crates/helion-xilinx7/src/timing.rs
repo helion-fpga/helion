@@ -285,6 +285,7 @@ mod tests {
             iobs: vec![],
             bufgs: vec![],
             brams: vec![],
+            dsps: vec![],
         };
         let routed = Routed7 {
             placed: Placed7 {
@@ -299,6 +300,7 @@ mod tests {
                 iobs: vec![],
                 bufgs: vec![],
                 brams: vec![],
+            dsps: vec![],
             },
             nets: vec![],
         };
