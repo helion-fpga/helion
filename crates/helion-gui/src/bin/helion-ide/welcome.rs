@@ -12,19 +12,24 @@ use super::theme::{font_ui, font_ui_medium, Theme};
 use super::HelionIde;
 use helion_gui::chrome::{welcome_col_w, welcome_stack_actions};
 
-/// True when the IDE launched empty: no sources, no project.
+/// True when the IDE launched empty: no sources, no project, and the user
+/// is on the Files activity (the default). Navigating to another activity
+/// (Device, Timing, Reports, etc.) shows that view's own empty state instead
+/// of the welcome screen, so sidebar and center never disagree.
 pub fn should_show(app: &HelionIde) -> bool {
     !app.welcome_dismissed
         && app.model.tree.sources.is_empty()
         && app.model.last_project_path.is_none()
+        && app.activity == helion_gui::chrome::Activity::Files
 }
 
 /// (file name, one-line description) for the Examples card grid.
+/// Descriptions use a consistent plain-English style: what it is, not signal names.
 const EXAMPLE_CARDS: [(&str, &str); 5] = [
-    ("counter.sv", "4-bit incrementer, LED = cnt[3]"),
-    ("blinky.sv", "Registered inverter, LED = Q"),
+    ("counter.sv", "4-bit counter driving an LED"),
+    ("blinky.sv", "LED blinker with registered output"),
     ("hier.sv", "Hierarchical multi-module blinky"),
-    ("complex.sv", "16x incrementers, XOR reduce"),
+    ("complex.sv", "16 counters with XOR reduction"),
     ("ysyx_ibex.sv", "Ibex RISC-V core"),
 ];
 
@@ -78,7 +83,8 @@ fn example_card(ui: &mut egui::Ui, theme: &Theme, name: &str, desc: &str, w: f32
             ui.label(RichText::new(desc).font(font_ui(11.5)).color(theme.dim));
         },
     );
-    let resp = resp.on_hover_text(format!("Open examples/{name}"));
+    let stem = name.strip_suffix(".sv").unwrap_or(name);
+    let resp = resp.on_hover_text(format!("Open {stem} example"));
     resp.clicked()
 }
 

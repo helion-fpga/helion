@@ -915,9 +915,9 @@ fn truncate_str(s: &str, n: usize) -> String {
     }
 }
 
-/// "Timing Analysis" report catalog: regroups the timing-related report tabs
-/// (summary, paths, clocks, CDC, power, methodology, DRC, utilization) into one
-/// section tree for the Reports sidebar. Replaces the flat report catalog.
+/// Report catalog for the Reports sidebar: timing reports under TIMING ANALYSIS,
+/// quality reports (power, methodology, DRC, utilization) under DESIGN QUALITY.
+/// Two sections, not one: power and DRC are not timing analysis.
 pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
     ui.label(
@@ -926,7 +926,20 @@ pub fn paint_timing_catalog(ui: &mut egui::Ui, app: &mut HelionIde) {
             .color(theme.faint),
     );
     ui.add_space(4.0);
-    let rows = timing_rows(&app.model, &theme);
+    let rows = timing_clock_rows(&app.model, &theme);
+    for (label, badge, dot, tab) in rows {
+        if catalog_row(ui, &theme, &label, badge.as_deref(), dot) {
+            open_more_workspace(app, tab);
+        }
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("DESIGN QUALITY")
+            .small()
+            .color(theme.faint),
+    );
+    ui.add_space(4.0);
+    let rows = timing_quality_rows(&app.model, &theme);
     for (label, badge, dot, tab) in rows {
         if catalog_row(ui, &theme, &label, badge.as_deref(), dot) {
             open_more_workspace(app, tab);
@@ -1049,16 +1062,6 @@ fn cat_row(
     tab: WorkspaceTab,
 ) -> (String, Option<String>, egui::Color32, WorkspaceTab) {
     (label.into(), badge, dot, tab)
-}
-
-/// Full catalog row list. Badges come from cheap model fields only.
-fn timing_rows(
-    model: &IdeModel,
-    theme: &theme::Theme,
-) -> Vec<(String, Option<String>, egui::Color32, WorkspaceTab)> {
-    let mut rows = timing_clock_rows(model, theme);
-    rows.extend(timing_quality_rows(model, theme));
-    rows
 }
 
 /// Timing + clock rows: summary, paths, clock interaction, CDC, clock networks.

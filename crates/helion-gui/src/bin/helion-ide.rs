@@ -2061,7 +2061,7 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         .utilization
         .as_ref()
         .map(|u| format!("{}/{}", u.lutff, u.lutff_cap))
-        .unwrap_or_else(|| "-".into());
+        .unwrap_or_else(|| "n/a".into());
     let run = model
         .runs
         .iter()
@@ -2164,9 +2164,13 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
                 Some(Go::Activity(Activity::Timing)),
             );
             spec(
-                format!("provenance={provenance}"),
+                match provenance.as_str() {
+                    "UserXdc" => "user constraints".to_string(),
+                    "NoClockPath" => "no clock found".to_string(),
+                    _ => "default constraints".to_string(),
+                },
                 theme.faint,
-                "",
+                "Timing constraint source",
                 None,
             );
             let issue_label = if errors + warnings == 0 {
