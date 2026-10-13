@@ -47,12 +47,14 @@
 //!   trait wiring (`type Placed = place::PlacedEcp5`, calling
 //!   `place(self.device(), packed)`) is left to the coordinator because
 //!   `backend.rs` is owned by another worker.
-//! - `place::PackedEcp5` is a MINIMAL LOCAL MIRROR of the pack worker's
-//!   packed representation (`pack.rs`, parallel worker, not yet landed in
-//!   this worktree). It covers exactly the documented concepts: LUT4+init,
-//!   FF, ALU/carry chain, EBR/DSP/PLL instances with parameters, IOs with
-//!   package pins. Field names are my choice; the coordinator must unify
-//!   them with the real `pack::PackedEcp5` at integration.
+//! - `place` consumes the real [`crate::pack::PackedEcp5`] (no local
+//!   mirror): LUT4s carry `input_nets`/`output_net`/`alu`, FFs carry
+//!   `d_net`/`q_net`/`clk_net`, carry chains are `alu_chains`, RAMs are
+//!   `rams` (9-bit INIT words, no width attributes: v1 places them
+//!   `DATA_WIDTH` 9/9), DSPs are `MULT18X18D` (`a`/`b`/`c`/`p` nets), PLLs
+//!   carry `ref_net`/`out_net`, IOs carry their PIO site coordinates, and
+//!   `clks` (ClockBuf cells) join the global-clock list after the FF
+//!   clocks.
 //! - `place::PlacedEcp5` is the REAL placed type (re-exported as
 //!   `helion_ecp5::PlacedEcp5` from `lib.rs`). The route worker reads
 //!   [`PlacedEcp5`]: every primitive carries a [`SiteAddr`] (tile grid
@@ -76,70 +78,24 @@
 //!   tilegrid site is `DCCn`.
 
 use crate::device::{Device, SiteClass};
+use crate::pack::{IoDir, PackedEcp5};
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
-// Packed mirror (place-local; the coordinator unifies this with pack.rs)
+// Placed-side helper types
 // ---------------------------------------------------------------------------
+// (The packed input is the real `crate::pack::PackedEcp5`; there is no
+// local mirror. The types below belong to the *placed* representation:
+// carry membership of placed LUTs, EBR width parameters, and the DSP bel
+// kind selected at placement.)
 
-/// Minimal mirror of the pack worker's `PackedEcp5`.
-///
-/// The pack worker (parallel, `pack.rs`) owns the real definition; this
-/// mirror covers only the concepts placement needs. Field names are the
-/// place worker's choice and must be reconciled at integration.
-#[derive(Clone, Debug, Default)]
-pub struct PackedEcp5 {
-    /// Top module name, carried through the stages.
-    pub top: String,
-    /// Package name as in `iodb.json`, e.g. `"CABGA381"`.
-    pub package: String,
-    /// Packed LUT4s.
-    pub luts: Vec<PackedLut>,
-    /// Packed flip-flops.
-    pub ffs: Vec<PackedFf>,
-    /// Packed IOs (each bound to a package pin).
-    pub ios: Vec<PackedIo>,
-    /// Inferred block RAMs.
-    pub ebrs: Vec<PackedEbr>,
-    /// Inferred DSP instances.
-    pub dsps: Vec<PackedDsp>,
-    /// Inferred PLLs.
-    pub plls: Vec<PackedPll>,
-    /// ALU/carry chains; `PackedLut.carry` indexes into this vec.
-    pub carry_chains: Vec<CarryChain>,
-}
-
-/// One packed LUT4.
-#[derive(Clone, Debug)]
-pub struct PackedLut {
-    /// Instance name.
-    pub name: String,
-    /// LUT4 truth table.
-    pub init: u16,
-    /// Nets on LUT inputs A, B, C, D (`None` = unconnected).
-    pub inputs: [Option<String>; 4],
-    /// Output net.
-    pub output: String,
-    /// `Some` when this LUT is a bit of an ALU/carry chain.
-    pub carry: Option<CarryBit>,
-}
-
-/// One bit of an ALU/carry chain.
+/// One bit of an ALU/carry chain (placed side).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CarryBit {
-    /// Index into [`PackedEcp5::carry_chains`].
+    /// Index into [`PackedEcp5::alu_chains`].
     pub chain: usize,
     /// Bit position in the chain (0 = LSB).
     pub seq: usize,
-}
-
-/// One ALU/carry chain.
-#[derive(Clone, Debug)]
-pub struct CarryChain {
-    /// Chain name.
-    pub name: String,
-    /// Carry-in source.
-    pub cin: CarryIn,
 }
 
 /// Carry-in source of a chain.
@@ -151,67 +107,14 @@ pub enum CarryIn {
     One,
 }
 
-/// One packed flip-flop.
-#[derive(Clone, Debug)]
-pub struct PackedFf {
-    /// Instance name.
-    pub name: String,
-    /// D input net.
-    pub d: String,
-    /// Q output net.
-    pub q: String,
-    /// Clock net (must be non-empty; becomes a global clock).
-    pub clk: String,
-    /// Clock-enable net, if any.
-    pub ce: Option<String>,
-    /// Set/reset net, if any.
-    pub sr: Option<String>,
-}
-
-/// IO direction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IoDir {
-    /// Input buffer.
-    In,
-    /// Output buffer.
-    Out,
-    /// Bidirectional buffer.
-    Inout,
-}
-
-/// One packed IO.
-#[derive(Clone, Debug)]
-pub struct PackedIo {
-    /// Instance name.
-    pub name: String,
-    /// Top-level port name.
-    pub port: String,
-    /// Direction.
-    pub dir: IoDir,
-    /// Fabric net.
-    pub net: String,
-    /// Package pin name, e.g. `"A10"` (must exist in `iodb.json`).
-    pub pin: String,
-}
-
-/// Block-RAM parameters (v1 minimal set).
+/// Block-RAM parameters (v1: always 9/9, from the pack worker's 9-bit INIT
+/// word convention; the bitstream worker only supports `DATA_WIDTH` 9).
 #[derive(Clone, Debug)]
 pub struct EbrParams {
     /// Port A data width.
     pub width_a: u32,
     /// Port B data width.
     pub width_b: u32,
-}
-
-/// One inferred block RAM (one 18Kb sysMEM block).
-#[derive(Clone, Debug)]
-pub struct PackedEbr {
-    /// Instance name.
-    pub name: String,
-    /// Parameters.
-    pub params: EbrParams,
-    /// Nets touching the block (for wirelength).
-    pub nets: Vec<String>,
 }
 
 /// DSP instance kind.
@@ -237,28 +140,6 @@ impl DspKind {
             DspKind::Alu24 => "ALU24_",
         }
     }
-}
-
-/// One inferred DSP instance.
-#[derive(Clone, Debug)]
-pub struct PackedDsp {
-    /// Instance name.
-    pub name: String,
-    /// Kind (selects the bel).
-    pub kind: DspKind,
-    /// Nets touching the block (for wirelength).
-    pub nets: Vec<String>,
-}
-
-/// One inferred PLL.
-#[derive(Clone, Debug)]
-pub struct PackedPll {
-    /// Instance name.
-    pub name: String,
-    /// Reference clock input net.
-    pub ref_net: String,
-    /// Output clock nets (each becomes a global clock).
-    pub out_nets: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +303,7 @@ pub struct PlacedEcp5 {
     pub top: String,
     /// Package name, carried through the stages.
     pub package: String,
-    /// The packed input (mirror), kept so later stages can read parameters.
+    /// The packed input, kept so later stages can read parameters.
     pub packed: PackedEcp5,
     /// Placed LUT4s.
     pub luts: Vec<PlacedLut>,
@@ -728,12 +609,12 @@ fn ctrl_compatible(a: Option<&Ctrl>, b: Option<&Ctrl>) -> bool {
 fn pair_lut_ff(packed: &PackedEcp5) -> (Vec<Option<usize>>, Vec<bool>) {
     let mut lut_by_output: HashMap<&str, usize> = HashMap::new();
     for (li, lut) in packed.luts.iter().enumerate() {
-        lut_by_output.entry(lut.output.as_str()).or_insert(li);
+        lut_by_output.entry(lut.output_net.as_str()).or_insert(li);
     }
     let mut ff_lut = vec![None; packed.ffs.len()];
     let mut lut_paired = vec![false; packed.luts.len()];
     for (fi, ff) in packed.ffs.iter().enumerate() {
-        if let Some(&li) = lut_by_output.get(ff.d.as_str()) {
+        if let Some(&li) = lut_by_output.get(ff.d_net.as_str()) {
             if !lut_paired[li] {
                 ff_lut[fi] = Some(li);
                 lut_paired[li] = true;
@@ -819,23 +700,27 @@ fn tap_of(globals: &crate::db::Globals, col: u32) -> Result<String, String> {
     Err(format!("place: column {col} is in no clock tap range"))
 }
 
-/// Distinct clock nets: FF clock nets in first-seen order, then PLL output
-/// nets. An empty FF clock net is a pack bug and fails loudly.
+/// Distinct clock nets: FF clock nets in first-seen order, then explicit
+/// `ClockBuf` globals, then PLL output nets. An empty FF clock net is a
+/// pack bug and fails loudly.
 fn clock_net_list(packed: &PackedEcp5) -> Result<Vec<String>, String> {
     let mut clock_nets: Vec<String> = Vec::new();
     for ff in &packed.ffs {
-        if ff.clk.is_empty() {
+        if ff.clk_net.is_empty() {
             return Err(format!("place: FF {} has an empty clock net", ff.name));
         }
-        if !clock_nets.contains(&ff.clk) {
-            clock_nets.push(ff.clk.clone());
+        if !clock_nets.contains(&ff.clk_net) {
+            clock_nets.push(ff.clk_net.clone());
+        }
+    }
+    for clk in &packed.clks {
+        if !clock_nets.contains(&clk.out_net) {
+            clock_nets.push(clk.out_net.clone());
         }
     }
     for pll in &packed.plls {
-        for n in &pll.out_nets {
-            if !clock_nets.contains(n) {
-                clock_nets.push(n.clone());
-            }
+        if !clock_nets.contains(&pll.out_net) {
+            clock_nets.push(pll.out_net.clone());
         }
     }
     Ok(clock_nets)
@@ -908,9 +793,8 @@ fn plan_clocks(device: &Device, clock_nets: Vec<String>) -> Result<Vec<ClockAssi
 
 /// Place a packed ECP5 netlist onto the LFE5U-85F tile grid.
 ///
-/// `packed` is the place-local mirror of the pack worker's `PackedEcp5`
-/// (see the module docs); the coordinator unifies it with `pack.rs` at
-/// integration. Every failure mode (unknown package/pin, double-used pin,
+/// `packed` is the real [`crate::pack::PackedEcp5`]. Every failure mode
+/// (unknown package/pin, double-used pin,
 /// exhausted EBR/DSP/PLL/DCC sites, unplaceable carry chain, empty clock
 /// net) returns `Err`: nothing is silently clipped or dropped.
 ///
@@ -1055,22 +939,33 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
 
     // ---- 2. EBR / DSP / PLL ---------------------------------------------------
     let mut ebr_pool = pools.remove(&SiteClass::Ebr).unwrap_or_default();
-    for ebr in &packed.ebrs {
-        let site = alloc_bel(&mut ebr_pool, "EBR", &ebr.name)?;
+    for ram in &packed.rams {
+        let site = alloc_bel(&mut ebr_pool, "EBR", &ram.name)?;
         out.ebrs.push(PlacedEbr {
-            name: ebr.name.clone(),
-            params: ebr.params.clone(),
-            nets: ebr.nets.clone(),
+            name: ram.name.clone(),
+            // v1: the pack worker carries 9-bit INIT words and no width
+            // attributes; the bitstream worker only supports DATA_WIDTH 9.
+            params: EbrParams {
+                width_a: 9,
+                width_b: 9,
+            },
+            nets: Vec::new(),
             site,
         });
     }
     let mut dsp_slices = group_dsp_slices(pools.remove(&SiteClass::Dsp).unwrap_or_default());
     for dsp in &packed.dsps {
-        let site = alloc_dsp(&mut dsp_slices, dsp.kind, &dsp.name)?;
+        // v1: the pack worker only infers MULT18X18D.
+        let site = alloc_dsp(&mut dsp_slices, DspKind::Mult18x18, &dsp.name)?;
+        let mut nets = vec![dsp.a_net.clone(), dsp.b_net.clone()];
+        if let Some(c) = &dsp.c_net {
+            nets.push(c.clone());
+        }
+        nets.push(dsp.p_net.clone());
         out.dsps.push(PlacedDsp {
             name: dsp.name.clone(),
-            kind: dsp.kind,
-            nets: dsp.nets.clone(),
+            kind: DspKind::Mult18x18,
+            nets,
             site,
         });
     }
@@ -1080,7 +975,7 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
         out.plls.push(PlacedPll {
             name: pll.name.clone(),
             ref_net: pll.ref_net.clone(),
-            out_nets: pll.out_nets.clone(),
+            out_nets: vec![pll.out_net.clone()],
             site,
         });
     }
@@ -1091,16 +986,16 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
     const MAX_CHAIN_BITS: usize = 44; // 11-PFU longest PLC2 column run x 4
     let mut chain_luts: HashMap<usize, Vec<usize>> = HashMap::new();
     for (li, lut) in packed.luts.iter().enumerate() {
-        if let Some(cb) = lut.carry {
-            if cb.chain >= packed.carry_chains.len() {
+        if let Some(alu) = lut.alu.as_ref() {
+            if alu.chain >= packed.alu_chains.len() {
                 return Err(format!(
                     "place: LUT {} references carry chain {} but only {} chains exist",
                     lut.name,
-                    cb.chain,
-                    packed.carry_chains.len()
+                    alu.chain,
+                    packed.alu_chains.len()
                 ));
             }
-            chain_luts.entry(cb.chain).or_default().push(li);
+            chain_luts.entry(alu.chain).or_default().push(li);
         }
     }
     let mut chain_ids: Vec<usize> = chain_luts.keys().copied().collect();
@@ -1110,14 +1005,22 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
     let mut carry_slot: HashMap<usize, HalfSlot> = HashMap::new();
     let mut locked_slices: HashSet<(usize, u8)> = HashSet::new();
     for cid in chain_ids {
-        let chain = &packed.carry_chains[cid];
+        let chain = &packed.alu_chains[cid];
+        let chain_name = format!("alu_chain_{cid}");
         let mut lis = chain_luts[&cid].clone();
-        lis.sort_by_key(|&li| packed.luts[li].carry.map(|c| c.seq).unwrap_or(usize::MAX));
+        lis.sort_by_key(|&li| {
+            packed.luts[li]
+                .alu
+                .as_ref()
+                .map(|a| a.bit)
+                .unwrap_or(usize::MAX)
+        });
         for (s, &li) in lis.iter().enumerate() {
-            if packed.luts[li].carry != Some(CarryBit { chain: cid, seq: s }) {
+            let contiguous = matches!(&packed.luts[li].alu, Some(a) if a.chain == cid && a.bit == s);
+            if !contiguous {
                 return Err(format!(
                     "place: carry chain {} ({}) has non-contiguous bit sequence",
-                    cid, chain.name
+                    cid, chain_name
                 ));
             }
         }
@@ -1125,7 +1028,7 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
         if nbits > MAX_CHAIN_BITS {
             return Err(format!(
                 "place: carry chain {} ({}) has {nbits} bits, max {MAX_CHAIN_BITS} fit one PLC2 column run",
-                cid, chain.name
+                cid, chain_name
             ));
         }
         let need_pfu = nbits.div_ceil(4) as u32;
@@ -1147,7 +1050,7 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
         let (_, col, start_row) = best.ok_or_else(|| {
             format!(
                 "place: no PLC2 column run of {need_pfu} PFUs for carry chain {} ({})",
-                cid, chain.name
+                cid, chain_name
             )
         })?;
         let mut bits = Vec::with_capacity(nbits);
@@ -1157,7 +1060,7 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
             let pfu = *pfu_index.get(&(row, col)).ok_or_else(|| {
                 format!(
                     "place: PLC2 tile ({row}, {col}) missing for carry chain {}",
-                    chain.name
+                    chain_name
                 )
             })?;
             let slot = HalfSlot {
@@ -1168,15 +1071,19 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
             if !locked_slices.insert((pfu, slice)) {
                 return Err(format!(
                     "place: carry chain {} ({}) collides on slice {slice} of PFU ({row}, {col})",
-                    cid, chain.name
+                    cid, chain_name
                 ));
             }
             carry_slot.insert(li, slot);
             bits.push(packed.luts[li].name.clone());
         }
         out.carry_chains.push(PlacedCarryChain {
-            name: chain.name.clone(),
-            cin: chain.cin,
+            name: chain_name,
+            cin: if chain.cin_one {
+                CarryIn::One
+            } else {
+                CarryIn::Zero
+            },
             bits,
         });
     }
@@ -1193,24 +1100,23 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
     let mut lut_unit = vec![usize::MAX; packed.luts.len()];
     // FF units first (a carry LUT's paired FF rides the locked half-slice).
     for (fi, ff) in packed.ffs.iter().enumerate() {
-        let mut nets = vec![ff.d.clone(), ff.q.clone(), ff.clk.clone()];
-        nets.extend(ff.ce.clone());
-        nets.extend(ff.sr.clone());
+        let mut nets = vec![ff.d_net.clone(), ff.q_net.clone(), ff.clk_net.clone()];
         let mut lut = None;
         let mut locked = false;
         if let Some(li) = ff_lut[fi] {
             let plut = &packed.luts[li];
-            nets.extend(plut.inputs.iter().flatten().cloned());
-            nets.push(plut.output.clone());
+            nets.extend(plut.input_nets.iter().flatten().cloned());
+            nets.push(plut.output_net.clone());
             lut = Some(li);
             lut_unit[li] = units.len();
-            locked = plut.carry.is_some();
+            locked = plut.alu.is_some();
         }
         units.push(Unit {
             lut,
             ff: Some(fi),
             nets,
-            ctrl: Some((ff.clk.clone(), ff.ce.clone(), ff.sr.clone())),
+            // v1: the pack worker models no clock-enable or set/reset.
+            ctrl: Some((ff.clk_net.clone(), None, None)),
             locked,
         });
     }
@@ -1219,15 +1125,15 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
         if lut_paired[li] {
             continue;
         }
-        let mut nets: Vec<String> = lut.inputs.iter().flatten().cloned().collect();
-        nets.push(lut.output.clone());
+        let mut nets: Vec<String> = lut.input_nets.iter().flatten().cloned().collect();
+        nets.push(lut.output_net.clone());
         lut_unit[li] = units.len();
         units.push(Unit {
             lut: Some(li),
             ff: None,
             nets,
             ctrl: None,
-            locked: lut.carry.is_some(),
+            locked: lut.alu.is_some(),
         });
     }
 
@@ -1406,9 +1312,15 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
             out.luts.push(PlacedLut {
                 name: lut.name.clone(),
                 init: lut.init,
-                inputs: lut.inputs.clone(),
-                output: lut.output.clone(),
-                carry: lut.carry,
+                inputs: lut.input_nets.clone(),
+                output: lut.output_net.clone(),
+                carry: lut
+                    .alu
+                    .as_ref()
+                    .map(|a| CarryBit {
+                        chain: a.chain,
+                        seq: a.bit,
+                    }),
                 site: site.clone(),
                 half: s.half,
             });
@@ -1417,11 +1329,12 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
             let ff = &packed.ffs[fi];
             out.ffs.push(PlacedFf {
                 name: ff.name.clone(),
-                d: ff.d.clone(),
-                q: ff.q.clone(),
-                clk: ff.clk.clone(),
-                ce: ff.ce.clone(),
-                sr: ff.sr.clone(),
+                d: ff.d_net.clone(),
+                q: ff.q_net.clone(),
+                clk: ff.clk_net.clone(),
+                // v1: the pack worker models no clock-enable or set/reset.
+                ce: None,
+                sr: None,
                 site,
                 half: s.half,
             });
@@ -1434,6 +1347,10 @@ pub fn place(device: &Device, packed: &PackedEcp5) -> Result<PlacedEcp5, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::{
+        AluBit, PackedEcp5AluChain, PackedEcp5Dsp, PackedEcp5Ff, PackedEcp5Io, PackedEcp5Lut,
+        PackedEcp5Pll, PackedEcp5Ram,
+    };
     use std::collections::BTreeSet;
 
     fn device() -> &'static Device {
@@ -1444,28 +1361,41 @@ mod tests {
     /// one clock.
     fn blinky_packed() -> PackedEcp5 {
         let mut luts = vec![
-            PackedLut {
+            PackedEcp5Lut {
                 name: "xor0".into(),
                 init: 0x6666,
-                inputs: [Some("q0".into()), Some("one".into()), None, None],
-                output: "d1".into(),
-                carry: None,
+                input_nets: [Some("q0".into()), Some("one".into()), None, None],
+                output_net: "d1".into(),
+                paired_ff: None,
+                alu: None,
             },
-            PackedLut {
+            PackedEcp5Lut {
                 name: "buf0".into(),
                 init: 0xAAAA,
-                inputs: [Some("d1".into()), None, None, None],
-                output: "led".into(),
-                carry: None,
+                input_nets: [Some("d1".into()), None, None, None],
+                output_net: "led".into(),
+                paired_ff: None,
+                alu: None,
             },
         ];
         for seq in 0..4 {
-            luts.push(PackedLut {
+            // input B is the dedicated carry wire, as the pack worker emits.
+            let carry_in = if seq == 0 {
+                "$carry$zero".to_string()
+            } else {
+                format!("$carry$c0b{}", seq - 1)
+            };
+            luts.push(PackedEcp5Lut {
                 name: format!("alu{seq}"),
                 init: 0x9999,
-                inputs: [Some(format!("a{seq}")), Some(format!("b{seq}")), None, None],
-                output: format!("s{seq}"),
-                carry: Some(CarryBit { chain: 0, seq }),
+                input_nets: [Some(format!("a{seq}")), Some(carry_in), None, None],
+                output_net: format!("s{seq}"),
+                paired_ff: None,
+                alu: Some(AluBit {
+                    chain: 0,
+                    bit: seq,
+                    di_net: Some(format!("a{seq}")),
+                }),
             });
         }
         PackedEcp5 {
@@ -1473,42 +1403,48 @@ mod tests {
             package: "CABGA381".into(),
             luts,
             ffs: vec![
-                PackedFf {
+                PackedEcp5Ff {
                     name: "ff0".into(),
-                    d: "d1".into(),
-                    q: "q0".into(),
-                    clk: "clk".into(),
-                    ce: None,
-                    sr: None,
+                    d_net: "d1".into(),
+                    q_net: "q0".into(),
+                    clk_net: "clk".into(),
+                    packed_lut: None,
                 },
-                PackedFf {
+                PackedEcp5Ff {
                     name: "ff1".into(),
-                    d: "q0".into(),
-                    q: "q1".into(),
-                    clk: "clk".into(),
-                    ce: None,
-                    sr: None,
+                    d_net: "q0".into(),
+                    q_net: "q1".into(),
+                    clk_net: "clk".into(),
+                    packed_lut: None,
                 },
             ],
             ios: vec![
-                PackedIo {
+                PackedEcp5Io {
                     name: "ib_clk".into(),
                     port: "clk".into(),
                     dir: IoDir::In,
                     net: "clk".into(),
                     pin: "A10".into(),
+                    bank: 0,
+                    pio_col: 63,
+                    pio_row: 0,
+                    pio: "A".into(),
                 },
-                PackedIo {
+                PackedEcp5Io {
                     name: "ob_led".into(),
                     port: "led".into(),
                     dir: IoDir::Out,
                     net: "led".into(),
                     pin: "A12".into(),
+                    bank: 1,
+                    pio_col: 76,
+                    pio_row: 0,
+                    pio: "A".into(),
                 },
             ],
-            carry_chains: vec![CarryChain {
-                name: "alu0".into(),
-                cin: CarryIn::Zero,
+            alu_chains: vec![PackedEcp5AluChain {
+                cin_one: false,
+                bits: 4,
             }],
             ..Default::default()
         }
@@ -1616,19 +1552,24 @@ mod tests {
         let mut packed = PackedEcp5 {
             top: "adder".into(),
             package: "CABGA381".into(),
-            carry_chains: vec![CarryChain {
-                name: "add8".into(),
-                cin: CarryIn::One,
+            alu_chains: vec![PackedEcp5AluChain {
+                cin_one: true,
+                bits: 8,
             }],
             ..Default::default()
         };
         for seq in 0..8 {
-            packed.luts.push(PackedLut {
+            packed.luts.push(PackedEcp5Lut {
                 name: format!("bit{seq}"),
                 init: 0x9999,
-                inputs: [Some(format!("a{seq}")), Some(format!("b{seq}")), None, None],
-                output: format!("s{seq}"),
-                carry: Some(CarryBit { chain: 0, seq }),
+                input_nets: [Some(format!("a{seq}")), Some(format!("$carry$c0b{seq}")), None, None],
+                output_net: format!("s{seq}"),
+                paired_ff: None,
+                alu: Some(AluBit {
+                    chain: 0,
+                    bit: seq,
+                    di_net: None,
+                }),
             });
         }
         let placed = place(dev, &packed).unwrap();
@@ -1668,13 +1609,12 @@ mod tests {
         let dev = device();
         let mut packed = blinky_packed();
         // Second clock domain.
-        packed.ffs.push(PackedFf {
+        packed.ffs.push(PackedEcp5Ff {
             name: "ff2".into(),
-            d: "d1".into(),
-            q: "q2".into(),
-            clk: "clk2".into(),
-            ce: None,
-            sr: None,
+            d_net: "d1".into(),
+            q_net: "q2".into(),
+            clk_net: "clk2".into(),
+            packed_lut: None,
         });
         let placed = place(dev, &packed).unwrap();
         assert_eq!(placed.clocks.len(), 2);
@@ -1700,10 +1640,11 @@ mod tests {
     fn pll_outputs_become_clocks() {
         let dev = device();
         let mut packed = blinky_packed();
-        packed.plls.push(PackedPll {
+        packed.plls.push(PackedEcp5Pll {
             name: "pll0".into(),
             ref_net: "clk".into(),
-            out_nets: vec!["pll_clk".into()],
+            out_net: "pll_clk".into(),
+            params: vec![],
         });
         let placed = place(dev, &packed).unwrap();
         // clk + pll_clk.
@@ -1720,24 +1661,24 @@ mod tests {
         let packed = PackedEcp5 {
             top: "m".into(),
             package: "CABGA381".into(),
-            ebrs: vec![PackedEbr {
+            rams: vec![PackedEcp5Ram {
                 name: "ram0".into(),
-                params: EbrParams {
-                    width_a: 18,
-                    width_b: 18,
-                },
-                nets: vec!["clk".into()],
+                init: vec![],
             }],
             dsps: vec![
-                PackedDsp {
+                PackedEcp5Dsp {
                     name: "mult0".into(),
-                    kind: DspKind::Mult18x18,
-                    nets: vec!["clk".into()],
+                    a_net: "a".into(),
+                    b_net: "b".into(),
+                    c_net: None,
+                    p_net: "p0".into(),
                 },
-                PackedDsp {
+                PackedEcp5Dsp {
                     name: "mult1".into(),
-                    kind: DspKind::Mult18x18,
-                    nets: vec!["clk".into()],
+                    a_net: "a".into(),
+                    b_net: "b".into(),
+                    c_net: None,
+                    p_net: "p1".into(),
                 },
             ],
             ..Default::default()
@@ -1790,13 +1731,9 @@ mod tests {
             ..Default::default()
         };
         for i in 0..213 {
-            packed.ebrs.push(PackedEbr {
+            packed.rams.push(PackedEcp5Ram {
                 name: format!("ram{i}"),
-                params: EbrParams {
-                    width_a: 18,
-                    width_b: 18,
-                },
-                nets: vec![],
+                init: vec![],
             });
         }
         let err = place(dev, &packed).unwrap_err();
@@ -1809,10 +1746,11 @@ mod tests {
             ..Default::default()
         };
         for i in 0..7 {
-            packed.plls.push(PackedPll {
+            packed.plls.push(PackedEcp5Pll {
                 name: format!("pll{i}"),
                 ref_net: "clk".into(),
-                out_nets: vec![format!("c{i}")],
+                out_net: format!("c{i}"),
+                params: vec![],
             });
         }
         let err = place(dev, &packed).unwrap_err();
@@ -1837,13 +1775,12 @@ mod tests {
             ..Default::default()
         };
         for i in 0..17 {
-            packed.ffs.push(PackedFf {
+            packed.ffs.push(PackedEcp5Ff {
                 name: format!("ff{i}"),
-                d: "d".into(),
-                q: format!("q{i}"),
-                clk: format!("clk{i}"),
-                ce: None,
-                sr: None,
+                d_net: "d".into(),
+                q_net: format!("q{i}"),
+                clk_net: format!("clk{i}"),
+                packed_lut: None,
             });
         }
         let err = place(dev, &packed).unwrap_err();
@@ -1856,12 +1793,13 @@ mod tests {
             ..Default::default()
         };
         for i in 0..83641 {
-            packed.luts.push(PackedLut {
+            packed.luts.push(PackedEcp5Lut {
                 name: format!("l{i}"),
                 init: 0,
-                inputs: [None, None, None, None],
-                output: format!("w{i}"),
-                carry: None,
+                input_nets: [None, None, None, None],
+                output_net: format!("w{i}"),
+                paired_ff: None,
+                alu: None,
             });
         }
         let err = place(dev, &packed).unwrap_err();
@@ -1871,19 +1809,24 @@ mod tests {
         let mut packed = PackedEcp5 {
             top: "t".into(),
             package: "CABGA381".into(),
-            carry_chains: vec![CarryChain {
-                name: "big".into(),
-                cin: CarryIn::Zero,
+            alu_chains: vec![PackedEcp5AluChain {
+                cin_one: false,
+                bits: 45,
             }],
             ..Default::default()
         };
         for seq in 0..45 {
-            packed.luts.push(PackedLut {
+            packed.luts.push(PackedEcp5Lut {
                 name: format!("b{seq}"),
                 init: 0,
-                inputs: [None, None, None, None],
-                output: format!("s{seq}"),
-                carry: Some(CarryBit { chain: 0, seq }),
+                input_nets: [None, None, None, None],
+                output_net: format!("s{seq}"),
+                paired_ff: None,
+                alu: Some(AluBit {
+                    chain: 0,
+                    bit: seq,
+                    di_net: None,
+                }),
             });
         }
         let err = place(dev, &packed).unwrap_err();
@@ -1959,20 +1902,20 @@ mod tests {
             ..Default::default()
         };
         for i in 0..40 {
-            packed.ffs.push(PackedFf {
+            packed.ffs.push(PackedEcp5Ff {
                 name: format!("ff{i}"),
-                d: format!("d{i}"),
-                q: format!("q{i}"),
-                clk: format!("clk{}", i % 2),
-                ce: None,
-                sr: None,
+                d_net: format!("d{i}"),
+                q_net: format!("q{i}"),
+                clk_net: format!("clk{}", i % 2),
+                packed_lut: None,
             });
-            packed.luts.push(PackedLut {
+            packed.luts.push(PackedEcp5Lut {
                 name: format!("l{i}"),
                 init: 0xAAAA,
-                inputs: [Some(format!("d{i}")), None, None, None],
-                output: format!("d{i}"),
-                carry: None,
+                input_nets: [Some(format!("d{i}")), None, None, None],
+                output_net: format!("d{i}"),
+                paired_ff: None,
+                alu: None,
             });
         }
         let placed = place(dev, &packed).unwrap();

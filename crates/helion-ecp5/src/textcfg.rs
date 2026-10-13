@@ -8,31 +8,30 @@
 //! vendored `bits.db` data before emission, and the output is fed to
 //! `ecppack` in tests.
 //!
-//! ## Input contract (mirror of the route worker's `RoutedEcp5`)
+//! ## Inputs
 //!
-//! The pack/place/route workers are landing in parallel. This module codes
-//! against the minimal local mirror [`RoutedDesign`] below, which carries
-//! exactly the concepts the emitter needs:
+//! [`emit_textcfg`] takes the real [`route::RoutedEcp5`] and
+//! [`place::PlacedEcp5`] plus the [`Device`]. [`build_design`] maps them
+//! onto the emitter's payload structs:
 //!
-//! - placed primitives on sites: [`PlacedLut`] (LUT4 + optional FF on a
-//!   `SLICE_A`..`SLICE_D` site), [`PlacedIo`] (PIO site + package pin
-//!   intent), hard blocks [`EbrBlock`], [`DspBlock`], [`PllBlock`],
-//!   [`DccBlock`];
-//! - routed nets as [`RoutedArc`] mux selections: `(tile_key, sink, source)`
+//! - [`PlacedLut`] (LUT4 + optional FF on a `SLICE_A`..`SLICE_D` site;
+//!   `tile_key` is the device tile-grid key, e.g. `"R2C62:PLC2"`),
+//!   [`PlacedIo`] (PIO site + electrical intent), hard blocks
+//!   [`EbrBlock`], [`DspBlock`], [`PllBlock`], [`DccBlock`];
+//! - routed nets as [`EmitArc`] mux selections: `(tile_key, sink, source)`
 //!   triples naming a Trellis routing mux output (`sink`) and the selected
-//!   input (`source`), in the tile entry (`tile_key`, a tilegrid key like
-//!   `"R2C62:PLC2"`) whose `bits.db` defines the mux.
+//!   input (`source`), in the tile entry whose `bits.db` defines the mux;
+//! - the router's [`route::ConfigEnumSetting`]s (e.g. `CLK0.CLKMUX`), emitted
+//!   as validated `enum:` lines.
 //!
-//! The coordinator adapts the real `RoutedEcp5` to [`RoutedDesign`] at
-//! integration time; field names below are the contract.
+//! ## Hard-block payloads (mapping from the pack worker's types)
 //!
-//! ## Hard-block payloads (contract with the pack worker)
-//!
-//! - [`EbrBlock`]: the pack worker assigns each DP16KD a `wid`
-//!   (`bram_init` index), autoincremented from 3 to match nextpnr/vendor
-//!   behaviour, and carries the 2048-word INIT image (`init[w]` = 9-bit
-//!   word at EBR address `w`, low 9 bits valid). v1 supports
-//!   `DATA_WIDTH_A/B = 9` only; anything else fails loudly.
+//! - [`EbrBlock`]: `wid` (the `.bram_init` index) is `3 +` the block's
+//!   index in placement order (the pack worker emits RAMs in nextpnr's
+//!   autoincrement order from 3); the INIT image is the pack worker's
+//!   9-bit words padded to 2048 (`init[w]` = word at EBR address `w`, low
+//!   9 bits valid). v1 supports `DATA_WIDTH_A/B = 9` only; anything else
+//!   fails loudly.
 //! - [`DspBlock`]: MULT18X18D site plus the full register/mux enum set
 //!   (defaults match nextpnr's).
 //! - [`PllBlock`]: PLL site plus divider words (`CLKI_DIV`, `CLKFB_DIV`,
@@ -55,13 +54,27 @@
 //! Bit positions are never hardcoded: all validation resolves through
 //! [`Device::tile_bits`] and the vendored `bits.db` texts.
 
-use crate::backend::BitstreamEcp5;
 use crate::device::Device;
-use std::collections::BTreeMap;
+use crate::pack::CARRY_NET_PREFIX;
+use crate::place;
+use crate::route;
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
-// Mirror input types (contract with pack/place/route workers)
+// Emitter payload types
 // ---------------------------------------------------------------------------
+// (Built from the real route/place types by `build_design`; the payload
+// structs below are the emitter's own contract, validated against the
+// vendored bits.db data before emission.)
+
+/// Final bitstream in Trellis text-configuration form: the interchange
+/// format `nextpnr-ecp5 --textcfg` emits and `ecppack` consumes, so Helion
+/// output stays diffable against the reference flow.
+#[derive(Clone, Debug, Default)]
+pub struct BitstreamEcp5 {
+    /// Trellis text configuration.
+    pub textcfg: String,
+}
 
 /// Slice within a `PLC2` tile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,7 +234,7 @@ pub struct PlacedIo {
 ///
 /// This mirrors nextpnr's `arc: <sink> <source>` textcfg lines (sink first).
 #[derive(Clone, Debug)]
-pub struct RoutedArc {
+pub(crate) struct EmitArc {
     pub tile_key: String,
     pub sink: String,
     pub source: String,
@@ -386,21 +399,20 @@ pub struct DccBlock {
     pub config_name: String,
 }
 
-/// The routed design: the local mirror of the route worker's `RoutedEcp5`.
-///
-/// The coordinator replaces this with the real `RoutedEcp5` at integration
-/// time; the concepts (placed primitives on sites, nets as mux selections)
-/// are the contract.
+/// The emitter's input bundle, built from the real [`route::RoutedEcp5`]
+/// and [`place::PlacedEcp5`] by [`build_design`]. Internal to the crate;
+/// the payload structs it carries are the emitter's validated contract.
 #[derive(Clone, Debug, Default)]
-pub struct RoutedDesign {
+pub(crate) struct EmitDesign {
     pub top: String,
     pub luts: Vec<PlacedLut>,
     pub ios: Vec<PlacedIo>,
-    pub arcs: Vec<RoutedArc>,
+    pub arcs: Vec<EmitArc>,
     pub ebrs: Vec<EbrBlock>,
     pub dsps: Vec<DspBlock>,
     pub plls: Vec<PllBlock>,
     pub dccs: Vec<DccBlock>,
+    pub config_enums: Vec<route::ConfigEnumSetting>,
 }
 
 // ---------------------------------------------------------------------------
@@ -443,9 +455,17 @@ pub(crate) fn tile_of<'a>(device: &'a Device, key: &str) -> Result<&'a crate::de
 /// level: ecppack later expands the arc to the DB's `F<B>F<B>` tokens.
 pub(crate) fn check_arc(device: &Device, tile_key: &str, sink: &str, source: &str) -> Result<(), String> {
     let tile = tile_of(device, tile_key)?;
-    let tb = device.tile_bits(&tile.tile_type)?;
-    let mux = tb
-        .muxes
+    // The router's parser keeps `-` (default, no-bit) inputs; db.rs drops
+    // them, which would false-positive on router-emitted default arcs
+    // like `F6 <- F6_SLICE`.
+    let text = crate::tiledata::bits_db(&tile.tile_type).ok_or_else(|| {
+        format!(
+            "textcfg: no vendored bits.db for tile type {}",
+            tile.tile_type
+        )
+    })?;
+    let muxes = crate::route::parse_muxes(text);
+    let mux = muxes
         .iter()
         .find(|m| m.dst == sink)
         .ok_or_else(|| {
@@ -739,11 +759,11 @@ impl<'a> Emitter<'a> {
         Ok(self.tiles.entry(key.to_string()).or_default())
     }
 
-    fn add_arc(&mut self, arc: &RoutedArc) -> Result<(), String> {
-        check_arc(self.device, &arc.tile_key, &arc.sink, &arc.source)?;
-        self.tile_entry(&arc.tile_key)?
+    fn add_arc(&mut self, tile_key: &str, sink: &str, source: &str) -> Result<(), String> {
+        check_arc(self.device, tile_key, sink, source)?;
+        self.tile_entry(tile_key)?
             .arcs
-            .push((arc.sink.clone(), arc.source.clone()));
+            .push((sink.to_string(), source.to_string()));
         Ok(())
     }
 
@@ -1202,18 +1222,464 @@ impl<'a> Emitter<'a> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// place/route -> payload mapping
+// ---------------------------------------------------------------------------
+
+/// Device tile-grid key (e.g. `"R2C62:PLC2"`, `"MIB_R70C4:MIB_EBR0"`) for a
+/// placed site address. This matches the route worker's `tile_key`
+/// convention exactly (it uses the same device tile keys).
+fn tile_key_of(
+    device: &Device,
+    site: &place::SiteAddr,
+    what: &str,
+) -> Result<String, String> {
+    device
+        .tiles()
+        .iter()
+        .find(|t| {
+            t.row == site.tile_row && t.col == site.tile_col && t.tile_type == site.tile_type
+        })
+        .map(|t| t.key.clone())
+        .ok_or_else(|| {
+            format!(
+                "textcfg: {what}: no tile at R{}C{} of type {}",
+                site.tile_row, site.tile_col, site.tile_type
+            )
+        })
+}
+
+/// Numeric slice index (0..3) from a slice site name.
+fn slice_idx(site: &str, what: &str) -> Result<u8, String> {
+    match site {
+        "SLICE_A" => Ok(0),
+        "SLICE_B" => Ok(1),
+        "SLICE_C" => Ok(2),
+        "SLICE_D" => Ok(3),
+        _ => Err(format!("textcfg: {what}: site '{site}' is not a slice")),
+    }
+}
+
+/// Which slice clock mux (`CLK0`/`CLK1`) the router programmed for an FF:
+/// read back from the routed clock's per-slice segments
+/// (`MUXCLK{slice} <- CLK{n}`). Defaults to 0 (local clocks).
+fn clk_sel_for(
+    routed: &route::RoutedEcp5,
+    ff_clk: &str,
+    tile_key: &str,
+    slice: u8,
+) -> u8 {
+    for clock in &routed.clocks {
+        if clock.net != ff_clk {
+            continue;
+        }
+        let want = format!("MUXCLK{slice}");
+        for seg in &clock.slices {
+            if seg.tile_key == tile_key && seg.dst == want {
+                if let Some(n) = seg.src.strip_prefix("CLK") {
+                    if let Ok(v) = n.parse::<u8>() {
+                        return v.min(1);
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Build the LUT payloads: one per placed LUT, plus a dummy `LOGIC` LUT
+/// for each unpaired FF's half-slice (an unused LUT programmed constant
+/// is harmless; the FF takes D from fabric).
+///
+/// `input_used[i]` is true when input `i` is driven by routing. The
+/// dedicated carry input (B) of a carry LUT counts as used: it must never
+/// be tied high.
+fn build_luts(
+    routed: &route::RoutedEcp5,
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<Vec<PlacedLut>, String> {
+    let mut ff_by_half: HashMap<(u32, u32, String, u8), &place::PlacedFf> = HashMap::new();
+    for ff in &placed.ffs {
+        ff_by_half.insert(
+            (
+                ff.site.tile_row,
+                ff.site.tile_col,
+                ff.site.site.clone(),
+                ff.half,
+            ),
+            ff,
+        );
+    }
+    let mut lut_halves: HashMap<(u32, u32, String, u8), &place::PlacedLut> = HashMap::new();
+    let mut out = Vec::with_capacity(placed.luts.len());
+    for lut in &placed.luts {
+        let what = format!("LUT {}", lut.name);
+        let tile_key = tile_key_of(device, &lut.site, &what)?;
+        let slice = slice_idx(&lut.site.site, &what)?;
+        if lut.half > 1 {
+            return Err(format!("textcfg: {what}: bad half {}", lut.half));
+        }
+        let slice_id = match slice {
+            0 => SliceId::A,
+            1 => SliceId::B,
+            2 => SliceId::C,
+            _ => SliceId::D,
+        };
+        let carry = lut.carry.is_some();
+        let mut input_used = [false; 4];
+        for (i, net) in lut.inputs.iter().enumerate() {
+            if let Some(n) = net {
+                if !n.starts_with(CARRY_NET_PREFIX) {
+                    input_used[i] = true;
+                }
+            }
+        }
+        if carry {
+            input_used[1] = true;
+        }
+        let key = (
+            lut.site.tile_row,
+            lut.site.tile_col,
+            lut.site.site.clone(),
+            lut.half,
+        );
+        lut_halves.insert(key.clone(), lut);
+        let ff = ff_by_half.get(&key).copied().map(|f| PlacedFf {
+            gsr_enabled: false,
+            set_on_reset: false,
+            clk_inverted: false,
+            ce_used: f.ce.is_some(),
+            lsr_used: f.sr.is_some(),
+            d_from_lut: f.d == lut.output,
+            clk_sel: clk_sel_for(routed, &f.clk, &tile_key, slice),
+            lsr_sel: 0,
+        });
+        out.push(PlacedLut {
+            tile_key,
+            slice: slice_id,
+            lut: lut.half,
+            init: lut.init,
+            carry,
+            input_used,
+            ff,
+        });
+    }
+    // Unpaired FFs: their half-slice has no LUT; emit a constant dummy so
+    // the FF config has a host. (Carry-locked slices never host unpaired
+    // FFs: the place worker excludes locked slices from the free pool.)
+    for ff in &placed.ffs {
+        let key = (
+            ff.site.tile_row,
+            ff.site.tile_col,
+            ff.site.site.clone(),
+            ff.half,
+        );
+        if lut_halves.contains_key(&key) {
+            continue;
+        }
+        let what = format!("FF {}", ff.name);
+        let tile_key = tile_key_of(device, &ff.site, &what)?;
+        let slice = slice_idx(&ff.site.site, &what)?;
+        let slice_id = match slice {
+            0 => SliceId::A,
+            1 => SliceId::B,
+            2 => SliceId::C,
+            _ => SliceId::D,
+        };
+        out.push(PlacedLut {
+            tile_key: tile_key.clone(),
+            slice: slice_id,
+            lut: ff.half,
+            init: 0,
+            carry: false,
+            input_used: [false; 4],
+            ff: Some(PlacedFf {
+                gsr_enabled: false,
+                set_on_reset: false,
+                clk_inverted: false,
+                ce_used: ff.ce.is_some(),
+                lsr_used: ff.sr.is_some(),
+                d_from_lut: false,
+                clk_sel: clk_sel_for(routed, &ff.clk, &tile_key, slice),
+                lsr_sel: 0,
+            }),
+        });
+    }
+    Ok(out)
+}
+
+/// Adjacent PIC tile key for a PIO site: same numeric suffix, `PIO` ->
+/// `PIC`, one step inward from the chip edge. (Verified: all 104 PIO tile
+/// entries of the LFE5U-85F resolve this way.)
+fn pic_tile_key(
+    device: &Device,
+    site: &place::SiteAddr,
+    what: &str,
+) -> Result<String, String> {
+    let pic_type = site
+        .tile_type
+        .strip_prefix("PIO")
+        .map(|rest| format!("PIC{rest}"))
+        .ok_or_else(|| {
+            format!(
+                "textcfg: {what}: PIO tile type {} has no PIC counterpart",
+                site.tile_type
+            )
+        })?;
+    let (row, col) = (site.tile_row, site.tile_col);
+    let (pr, pc) = if row == 0 {
+        (row + 1, col)
+    } else if row == 95 {
+        (row - 1, col)
+    } else if col == 0 {
+        (row, col + 1)
+    } else if col == 126 {
+        (row, col - 1)
+    } else {
+        return Err(format!(
+            "textcfg: {what}: PIO tile at R{row}C{col} is on no chip edge"
+        ));
+    };
+    device
+        .tiles()
+        .iter()
+        .find(|t| t.row == pr && t.col == pc && t.tile_type == pic_type)
+        .map(|t| t.key.clone())
+        .ok_or_else(|| {
+            format!("textcfg: {what}: no PIC tile {pic_type} at R{pr}C{pc}")
+        })
+}
+
+/// Build the IO payloads. Electrical intent is v1 defaults (the pack
+/// worker carries no IO-standard attributes): LVCMOS33, no pull, 8mA
+/// drive on outputs.
+fn build_ios(
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<Vec<PlacedIo>, String> {
+    let mut out = Vec::with_capacity(placed.ios.len());
+    for io in &placed.ios {
+        let what = format!("IO {}", io.name);
+        let pio = match io.site.site.as_str() {
+            "PIOA" => PioId::A,
+            "PIOB" => PioId::B,
+            "PIOC" => PioId::C,
+            "PIOD" => PioId::D,
+            s => return Err(format!("textcfg: {what}: site '{s}' is not a PIO")),
+        };
+        let dir = match io.dir {
+            crate::pack::IoDir::In => IoDir::Input,
+            crate::pack::IoDir::Out => IoDir::Output,
+        };
+        let pio_tile_key = tile_key_of(device, &io.site, &what)?;
+        let pic_tile_key = pic_tile_key(device, &io.site, &what)?;
+        out.push(PlacedIo {
+            pio_tile_key,
+            pic_tile_key,
+            pio,
+            dir,
+            io_type: "LVCMOS33".to_string(),
+            pull: IoPull::None,
+            drive_ma: 8,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the EBR payloads. `wid` is `3 +` the block's placement index
+/// (nextpnr autoincrements from 3); the INIT image is the pack worker's
+/// 9-bit words, zero-padded to 2048.
+fn build_ebrs(
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<Vec<EbrBlock>, String> {
+    let mut out = Vec::with_capacity(placed.ebrs.len());
+    for (i, ebr) in placed.ebrs.iter().enumerate() {
+        let what = format!("EBR {}", ebr.name);
+        let tile_key = tile_key_of(device, &ebr.site, &what)?;
+        let site = match ebr.site.site.as_str() {
+            "EBR0" => EbrSite::Ebr0,
+            "EBR1" => EbrSite::Ebr1,
+            "EBR2" => EbrSite::Ebr2,
+            "EBR3" => EbrSite::Ebr3,
+            s => return Err(format!("textcfg: {what}: site '{s}' is not an EBR")),
+        };
+        let ram = placed
+            .packed
+            .rams
+            .iter()
+            .find(|r| r.name == ebr.name)
+            .ok_or_else(|| format!("textcfg: {what}: no packed RAM with that name"))?;
+        if ram.init.len() > 2048 {
+            return Err(format!(
+                "textcfg: {what}: {} INIT words exceed the 2048-word DP16KD image",
+                ram.init.len()
+            ));
+        }
+        let mut init = vec![0u16; 2048];
+        for (w, word) in ram.init.iter().enumerate() {
+            init[w] = (word & 0x1ff) as u16;
+        }
+        out.push(EbrBlock::simple(
+            tile_key,
+            site,
+            ebr.site.bel_col,
+            ebr.site.bel_row,
+            3 + i as u32,
+            init,
+        ));
+    }
+    Ok(out)
+}
+
+/// Build the DSP payloads (plain unregistered multiply defaults).
+fn build_dsps(
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<Vec<DspBlock>, String> {
+    let mut out = Vec::with_capacity(placed.dsps.len());
+    for dsp in &placed.dsps {
+        let what = format!("DSP {}", dsp.name);
+        let tile_key = tile_key_of(device, &dsp.site, &what)?;
+        out.push(DspBlock::plain_multiply(
+            tile_key,
+            dsp.site.site.clone(),
+            dsp.site.bel_col,
+            dsp.site.bel_row,
+        ));
+    }
+    Ok(out)
+}
+
+/// Build the PLL payloads: divider words from the pack worker's
+/// parameters (`CLKI_DIV`/`CLKOP_DIV` required, `CLKFB_DIV` defaults to 1).
+fn build_plls(
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<Vec<PllBlock>, String> {
+    let mut out = Vec::with_capacity(placed.plls.len());
+    for pll in &placed.plls {
+        let what = format!("PLL {}", pll.name);
+        let tile_key = tile_key_of(device, &pll.site, &what)?;
+        let packed = placed
+            .packed
+            .plls
+            .iter()
+            .find(|p| p.name == pll.name)
+            .ok_or_else(|| format!("textcfg: {what}: no packed PLL with that name"))?;
+        let div = |key: &str, required: bool| -> Result<u32, String> {
+            match packed.params.iter().find(|(k, _)| k == key) {
+                Some((_, v)) => v.parse::<u32>().map_err(|_| {
+                    format!("textcfg: {what}: {key}='{v}' is not an integer divider")
+                }),
+                None if required => Err(format!("textcfg: {what}: missing {key} parameter")),
+                None => Ok(1),
+            }
+        };
+        out.push(PllBlock {
+            tile_key,
+            bel_col: pll.site.bel_col,
+            bel_row: pll.site.bel_row,
+            clki_div: div("CLKI_DIV", true)?,
+            clkfb_div: div("CLKFB_DIV", false)?,
+            clkop_div: div("CLKOP_DIV", true)?,
+            clkop_enable: "ENABLED".to_string(),
+            feedbk_path: "INT_OP".to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Build the DCC payloads from the routed clocks. The config-name side
+/// letter comes from the host tile type (`TMID_*` -> `T`, ...); the v1
+/// router only programs `TMID_0`.
+fn build_dccs(
+    routed: &route::RoutedEcp5,
+    device: &Device,
+) -> Result<Vec<DccBlock>, String> {
+    let mut out = Vec::with_capacity(routed.clocks.len());
+    for clock in &routed.clocks {
+        let tile_key = clock.dcc_input.tile_key.clone();
+        let tile = tile_of(device, &tile_key)?;
+        let side = if tile.tile_type.starts_with("TMID") {
+            "T"
+        } else if tile.tile_type.starts_with("BMID") {
+            "B"
+        } else if tile.tile_type.starts_with("LMID") {
+            "L"
+        } else if tile.tile_type.starts_with("RMID") {
+            "R"
+        } else {
+            return Err(format!(
+                "textcfg: clock '{}': DCC tile type {} has no known side",
+                clock.net, tile.tile_type
+            ));
+        };
+        out.push(DccBlock {
+            tile_key,
+            config_name: format!("DCC_{side}{}", clock.dcc),
+        });
+    }
+    Ok(out)
+}
+
+/// Map the real routed + placed designs onto the emitter's payload bundle.
+pub(crate) fn build_design(
+    routed: &route::RoutedEcp5,
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<EmitDesign, String> {
+    let mut arcs = Vec::new();
+    for net in &routed.nets {
+        for seg in &net.segments {
+            // Empty `bits` is the `-` default input: the arc is still
+            // emitted (the bitstream starts cleared).
+            arcs.push(EmitArc {
+                tile_key: seg.tile_key.clone(),
+                sink: seg.dst.clone(),
+                source: seg.src.clone(),
+            });
+        }
+    }
+    Ok(EmitDesign {
+        top: routed.top.clone(),
+        luts: build_luts(routed, placed, device)?,
+        ios: build_ios(placed, device)?,
+        arcs,
+        ebrs: build_ebrs(placed, device)?,
+        dsps: build_dsps(placed, device)?,
+        plls: build_plls(placed, device)?,
+        dccs: build_dccs(routed, device)?,
+        config_enums: routed.config_enums.clone(),
+    })
+}
+
 /// Emit Trellis textcfg for a routed design.
 ///
-/// `design` is the local mirror of the route worker's `RoutedEcp5` (see
-/// [`RoutedDesign`]); `device` is the ECP5 device model used for
-/// validation and tile-group construction. Returns the textcfg text in
-/// [`BitstreamEcp5`], ready for `ecppack`.
+/// `routed` is the real [`route::RoutedEcp5`], `placed` the real
+/// [`place::PlacedEcp5`] (site payloads), `device` the ECP5 device model
+/// used for validation and tile-group construction. Returns the textcfg
+/// text in [`BitstreamEcp5`], ready for `ecppack`.
 ///
 /// Fails loudly (`Err`) on any unrepresentable config: unknown tile keys,
 /// mux sinks/sources missing from `bits.db`, unknown enum names/values,
 /// unknown words or wrong value widths, bad EBR payloads. Nothing is
 /// silently dropped.
-pub fn emit_textcfg(design: &RoutedDesign, device: &Device) -> Result<BitstreamEcp5, String> {
+pub fn emit_textcfg(
+    routed: &route::RoutedEcp5,
+    placed: &place::PlacedEcp5,
+    device: &Device,
+) -> Result<BitstreamEcp5, String> {
+    let design = build_design(routed, placed, device)?;
+    emit_design(&design, device)
+}
+
+/// Emit textcfg for an already-built [`EmitDesign`] bundle.
+pub(crate) fn emit_design(
+    design: &EmitDesign,
+    device: &Device,
+) -> Result<BitstreamEcp5, String> {
     let mut em = Emitter::new(device);
     for lut in &design.luts {
         em.emit_lut(lut)?;
@@ -1222,7 +1688,7 @@ pub fn emit_textcfg(design: &RoutedDesign, device: &Device) -> Result<BitstreamE
         em.emit_io(io)?;
     }
     for arc in &design.arcs {
-        em.add_arc(arc)?;
+        em.add_arc(&arc.tile_key, &arc.sink, &arc.source)?;
     }
     for ebr in &design.ebrs {
         em.emit_ebr(ebr)?;
@@ -1235,6 +1701,9 @@ pub fn emit_textcfg(design: &RoutedDesign, device: &Device) -> Result<BitstreamE
     }
     for dcc in &design.dccs {
         em.emit_dcc(dcc)?;
+    }
+    for ce in &design.config_enums {
+        em.add_enum(&ce.tile_key, &ce.name, &ce.value)?;
     }
     Ok(BitstreamEcp5 {
         textcfg: em.render(&design.top),

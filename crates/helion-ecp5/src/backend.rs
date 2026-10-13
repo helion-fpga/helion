@@ -4,57 +4,26 @@
 //! [`Ecp5Backend::open`]; the trait stage methods need no side-channel
 //! driver. Everything a stage needs lives in `self`.
 //!
-//! Stage status (v1 skeleton): the stage *types* below are scaffolding that
-//! the pack/place/route/bitstream workers will replace with real shapes, and
-//! the stage *methods* fail loudly until those workers land. Each is marked
-//! `SCAFFOLD`.
+//! Stage wiring: [`crate::pack::pack`] -> [`crate::place::place`] ->
+//! [`crate::route::route_on_device`] -> [`crate::textcfg::emit_textcfg`].
+//! The [`helion_backend::Backend`] trait threads only the routed design
+//! into `bitstream()`; the placed design (needed for the textcfg site
+//! payloads) is cached at `place()` time. Calling `bitstream()` without a
+//! preceding `place()` fails loudly.
 
 use crate::device::Device;
 use helion_backend::{Backend, NetlistIr, TimingModel};
-
-// SCAFFOLD (pack worker): replace with the real packed representation
-// (LUT4/FF slice packing, carry chains, EBR/DSP inference, IO packing).
-/// Packed netlist: cells grouped into ECP5 sites.
-#[derive(Clone, Debug, Default)]
-pub struct PackedEcp5 {
-    /// Top module name, carried through the stages.
-    pub top: String,
-}
-
-// SCAFFOLD (place worker): replace with the real placed representation
-// (site assignments on the tile grid).
-/// Placed packed netlist: a device site chosen for each packed element.
-#[derive(Clone, Debug, Default)]
-pub struct PlacedEcp5 {
-    /// Top module name, carried through the stages.
-    pub top: String,
-}
-
-// SCAFFOLD (route worker): replace with the real routed representation
-// (per-net routing resource assignments from the Trellis mux graph).
-/// Routed placed netlist: nets assigned to routing resources.
-#[derive(Clone, Debug, Default)]
-pub struct RoutedEcp5 {
-    /// Top module name, carried through the stages.
-    pub top: String,
-}
-
-// SCAFFOLD (bitstream worker): fill with the real Trellis text config.
-// The interchange format is Trellis text configuration (`.config` text),
-// the same format `nextpnr-ecp5 --textcfg` emits and `ecppack` consumes,
-// so Helion output stays diffable against the reference flow.
-/// Final bitstream in Trellis text-configuration form.
-#[derive(Clone, Debug, Default)]
-pub struct BitstreamEcp5 {
-    /// Trellis text configuration.
-    pub textcfg: String,
-}
+use std::cell::RefCell;
 
 /// ECP5 backend. Currently targets the LFE5U-85F (`"LFE5U-85F"`).
 #[derive(Debug)]
 pub struct Ecp5Backend {
     part: String,
     device: Device,
+    /// The placed design from the last `place()` call, for `bitstream()`'s
+    /// textcfg payload mapping. The `Backend` trait does not thread it
+    /// through; `run()` always calls `place()` before `bitstream()`.
+    placed_cache: RefCell<Option<crate::place::PlacedEcp5>>,
 }
 
 impl Ecp5Backend {
@@ -70,7 +39,11 @@ impl Ecp5Backend {
             ));
         }
         let device = Device::open()?;
-        Ok(Self { part, device })
+        Ok(Self {
+            part,
+            device,
+            placed_cache: RefCell::new(None),
+        })
     }
 
     /// Borrow the owned device model.
@@ -80,10 +53,10 @@ impl Ecp5Backend {
 }
 
 impl Backend for Ecp5Backend {
-    type Packed = PackedEcp5;
-    type Placed = PlacedEcp5;
-    type Routed = RoutedEcp5;
-    type Bitstream = BitstreamEcp5;
+    type Packed = crate::pack::PackedEcp5;
+    type Placed = crate::place::PlacedEcp5;
+    type Routed = crate::route::RoutedEcp5;
+    type Bitstream = crate::textcfg::BitstreamEcp5;
 
     fn name(&self) -> &str {
         "ecp5"
@@ -93,28 +66,26 @@ impl Backend for Ecp5Backend {
         &self.part
     }
 
-    // SCAFFOLD (pack worker): implement LUT4/FF packing into slices.
     fn pack(&self, netlist: &NetlistIr) -> Result<Self::Packed, String> {
-        let _ = netlist;
-        Err("not yet implemented: ECP5 pack worker has not landed".to_string())
+        crate::pack::pack(netlist)
     }
 
-    // SCAFFOLD (place worker): implement site assignment on the tile grid.
     fn place(&self, packed: &Self::Packed) -> Result<Self::Placed, String> {
-        let _ = packed;
-        Err("not yet implemented: ECP5 place worker has not landed".to_string())
+        let placed = crate::place::place(self.device(), packed)?;
+        self.placed_cache.replace(Some(placed.clone()));
+        Ok(placed)
     }
 
-    // SCAFFOLD (route worker): implement routing on the Trellis mux graph.
     fn route(&self, placed: &Self::Placed) -> Result<Self::Routed, String> {
-        let _ = placed;
-        Err("not yet implemented: ECP5 route worker has not landed".to_string())
+        crate::route::route_on_device(self.device(), placed)
     }
 
-    // SCAFFOLD (bitstream worker): implement Trellis textcfg emission.
     fn bitstream(&self, routed: &Self::Routed) -> Result<Self::Bitstream, String> {
-        let _ = routed;
-        Err("not yet implemented: ECP5 bitstream worker has not landed".to_string())
+        let cache = self.placed_cache.borrow();
+        let placed = cache.as_ref().ok_or_else(|| {
+            "ecp5 bitstream: no placed design cached (call place() before bitstream())".to_string()
+        })?;
+        crate::textcfg::emit_textcfg(routed, placed, self.device())
     }
 
     fn timing_model(&self) -> TimingModel {
@@ -125,16 +96,7 @@ impl Backend for Ecp5Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn assert_stage_types<
-        B: Backend<
-            Packed = PackedEcp5,
-            Placed = PlacedEcp5,
-            Routed = RoutedEcp5,
-            Bitstream = BitstreamEcp5,
-        >,
-    >() {
-    }
+    use crate::{pack, place, route, textcfg};
 
     #[test]
     fn name_is_ecp5() {
@@ -155,31 +117,24 @@ mod tests {
     }
 
     #[test]
-    fn stage_types_compile() {
-        assert_stage_types::<Ecp5Backend>();
-    }
-
-    #[test]
     fn device_model_is_owned() {
         let b = Ecp5Backend::open("LFE5U-85F").unwrap();
         assert_eq!(b.device().counts().pfu_tiles, 10455);
     }
 
     #[test]
-    fn stages_fail_loud_until_workers_land() {
+    fn stage_types_are_the_real_ones() {
+        fn assert_types<B: Backend<Packed = pack::PackedEcp5, Placed = place::PlacedEcp5, Routed = route::RoutedEcp5, Bitstream = textcfg::BitstreamEcp5>>() {
+        }
+        assert_types::<Ecp5Backend>();
+    }
+
+    #[test]
+    fn bitstream_without_place_fails_loud() {
         let b = Ecp5Backend::open("LFE5U-85F").unwrap();
-        let nl = NetlistIr::new("top");
-        let e = b.pack(&nl).unwrap_err();
-        assert!(e.contains("not yet implemented"));
-        let e = b.place(&PackedEcp5::default()).unwrap_err();
-        assert!(e.contains("not yet implemented"));
-        let e = b.route(&PlacedEcp5::default()).unwrap_err();
-        assert!(e.contains("not yet implemented"));
-        let e = b.bitstream(&RoutedEcp5::default()).unwrap_err();
-        assert!(e.contains("not yet implemented"));
-        // The provided run() driver propagates the failure instead of
-        // silently succeeding.
-        assert!(b.run(&nl).is_err());
+        let routed = route::RoutedEcp5::default();
+        let err = b.bitstream(&routed).unwrap_err();
+        assert!(err.contains("place()"), "unexpected error: {err}");
     }
 
     #[test]

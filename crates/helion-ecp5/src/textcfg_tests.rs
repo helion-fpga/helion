@@ -4,9 +4,9 @@
 
 use crate::device::Device;
 use crate::textcfg::{
-    bit_reverse, check_arc, check_enum_on_type, check_word_on_type, emit_textcfg, parse_config_words,
-    word_bin, DccBlock, DspBlock, EbrBlock, EbrSite, IoDir, IoPull, PioId, PlacedFf, PlacedIo,
-    PlacedLut, PllBlock, RoutedArc, RoutedDesign, SliceId,
+    bit_reverse, check_arc, check_enum_on_type, check_word_on_type, emit_design, parse_config_words,
+    word_bin, DccBlock, DspBlock, EbrBlock, EbrSite, EmitArc, EmitDesign, IoDir, IoPull, PioId,
+    PlacedFf, PlacedIo, PlacedLut, PllBlock, SliceId,
 };
 
 fn dev() -> Device {
@@ -134,9 +134,9 @@ fn word_validation_checks_name_width_and_chars() {
 #[test]
 fn lut_emission_matches_nextpnr_shape() {
     let device = dev();
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.luts.push(test_lut());
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     let t = &bs.textcfg;
     assert!(t.starts_with(".device LFE5U-85F\n"));
     assert!(t.contains(".tile R2C62:PLC2\n"));
@@ -156,7 +156,7 @@ fn lut_emission_matches_nextpnr_shape() {
 #[test]
 fn io_config_emits_both_tiles() {
     let device = dev();
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.ios.push(PlacedIo {
         pio_tile_key: "MIB_R0C64:PIOT1".to_string(),
         pic_tile_key: "MIB_R1C64:PICT1".to_string(),
@@ -166,7 +166,7 @@ fn io_config_emits_both_tiles() {
         pull: IoPull::None,
         drive_ma: 4,
     });
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     let t = &bs.textcfg;
     assert!(t.contains(".tile MIB_R0C64:PIOT1\n"));
     assert!(t.contains(".tile MIB_R1C64:PICT1\n"));
@@ -184,7 +184,7 @@ fn ebr_group_matches_nextpnr_reference() {
     for (w, v) in init.iter_mut().enumerate() {
         *v = (w & 0x1ff) as u16;
     }
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.ebrs.push(EbrBlock::simple(
         "MIB_R70C4:MIB_EBR0".to_string(),
         EbrSite::Ebr0,
@@ -193,7 +193,7 @@ fn ebr_group_matches_nextpnr_reference() {
         3,
         init,
     ));
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     let t = &bs.textcfg;
     assert!(
         t.contains(".tile_group MIB_R70C4:MIB_EBR0 MIB_R70C5:MIB_EBR1\n"),
@@ -229,7 +229,7 @@ fn ebr_init_matches_nextpnr_bit_order() {
     for (w, v) in init.iter_mut().enumerate() {
         *v = (w & 0x1ff) as u16;
     }
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.ebrs.push(EbrBlock::simple(
         "MIB_R70C4:MIB_EBR0".to_string(),
         EbrSite::Ebr0,
@@ -238,7 +238,7 @@ fn ebr_init_matches_nextpnr_bit_order() {
         3,
         init,
     ));
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     let sec: Vec<&str> = bs
         .textcfg
         .lines()
@@ -258,7 +258,7 @@ fn ebr_init_matches_nextpnr_bit_order() {
 fn ebr_rejects_bad_payload() {
     let device = dev();
     // Wrong init length.
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.ebrs.push(EbrBlock::simple(
         "MIB_R70C4:MIB_EBR0".to_string(),
         EbrSite::Ebr0,
@@ -267,9 +267,9 @@ fn ebr_rejects_bad_payload() {
         3,
         vec![0u16; 100],
     ));
-    assert!(emit_textcfg(&d, &device).is_err());
+    assert!(emit_design(&d, &device).is_err());
     // Unsupported width.
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     let mut e = EbrBlock::simple(
         "MIB_R70C4:MIB_EBR0".to_string(),
         EbrSite::Ebr0,
@@ -280,10 +280,10 @@ fn ebr_rejects_bad_payload() {
     );
     e.data_width_a = 18;
     d.ebrs.push(e);
-    let err = emit_textcfg(&d, &device).unwrap_err();
+    let err = emit_design(&d, &device).unwrap_err();
     assert!(err.contains("DATA_WIDTH 9/9"), "{err}");
     // Duplicate wid.
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     for _ in 0..2 {
         d.ebrs.push(EbrBlock::simple(
             "MIB_R70C4:MIB_EBR0".to_string(),
@@ -294,7 +294,7 @@ fn ebr_rejects_bad_payload() {
             vec![0u16; 2048],
         ));
     }
-    assert!(emit_textcfg(&d, &device).is_err());
+    assert!(emit_design(&d, &device).is_err());
 }
 
 #[test]
@@ -310,9 +310,9 @@ fn dsp_group_matches_nextpnr_reference() {
         .find(|(_, s)| s.name == "MULT18_0")
         .map(|(k, s)| (k, s.bel_col, s.bel_row))
         .expect("MULT18_0 site");
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.dsps.push(DspBlock::plain_multiply(key, "MULT18_0".to_string(), bel_col, bel_row));
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     let t = &bs.textcfg;
     let gline = t
         .lines()
@@ -329,13 +329,13 @@ fn dsp_group_matches_nextpnr_reference() {
 fn pll_group_matches_nextpnr_reference() {
     // Reference pll.textcfg: `.tile_group MIB_R4C126:PLL0_UR MIB_R5C126:PLL1_UR`.
     let device = dev();
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.plls.push(PllBlock::ehxplll(
         "MIB_R4C126:PLL0_UR".to_string(),
         126,
         22,
     ));
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     let t = &bs.textcfg;
     assert!(
         t.contains(".tile_group MIB_R4C126:PLL0_UR MIB_R5C126:PLL1_UR\n"),
@@ -356,12 +356,12 @@ fn dcc_emits_mode_enum() {
         .find(|t| t.tile_type == "TMID_0")
         .map(|t| t.key.clone())
         .expect("TMID_0 tile");
-    let mut d = RoutedDesign::default();
+    let mut d = EmitDesign::default();
     d.dccs.push(DccBlock {
         tile_key: key,
         config_name: "DCC_T0".to_string(),
     });
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
     assert!(bs.textcfg.contains("enum: DCC_T0.MODE DCCA\n"));
 }
 
@@ -377,7 +377,7 @@ fn ecppack_accepts_emitted_textcfg() {
         "/home/hatch/workspace/.jarvis/idea-executions/1f8b45d9-076b-4729-8a42-f43021b85826/scratch/oss/oss-cad-suite/bin/ecppack".to_string()
     });
     let device = dev();
-    let mut d = RoutedDesign {
+    let mut d = EmitDesign {
         top: "top".to_string(),
         ..Default::default()
     };
@@ -391,17 +391,17 @@ fn ecppack_accepts_emitted_textcfg() {
         pull: IoPull::None,
         drive_ma: 4,
     });
-    d.arcs.push(RoutedArc {
+    d.arcs.push(EmitArc {
         tile_key: "R2C62:PLC2".to_string(),
         sink: "C4".to_string(),
         source: "Q4".to_string(),
     });
-    d.arcs.push(RoutedArc {
+    d.arcs.push(EmitArc {
         tile_key: "R2C62:PLC2".to_string(),
         sink: "CLK0".to_string(),
         source: "G_HPBX0000".to_string(),
     });
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
 
     let dir = std::env::temp_dir().join("helion_ecp5_textcfg_test");
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -444,7 +444,7 @@ fn ecppack_accepts_hard_blocks() {
         .find(|(_, s)| s.name == "MULT18_0")
         .map(|(k, s)| (k, s.bel_col, s.bel_row))
         .expect("MULT18_0 site");
-    let mut d = RoutedDesign {
+    let mut d = EmitDesign {
         top: "top".to_string(),
         ..Default::default()
     };
@@ -467,7 +467,7 @@ fn ecppack_accepts_hard_blocks() {
         126,
         22,
     ));
-    let bs = emit_textcfg(&d, &device).unwrap();
+    let bs = emit_design(&d, &device).unwrap();
 
     let dir = std::env::temp_dir().join("helion_ecp5_textcfg_test");
     std::fs::create_dir_all(&dir).expect("create temp dir");

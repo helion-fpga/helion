@@ -1,4 +1,4 @@
-//! Route stage: [`PlacedEcp5`] -> [`RoutedEcp5`] for the Lattice ECP5 (LFE5U-85F).
+//! Route stage: [`place::PlacedEcp5`] -> [`RoutedEcp5`] for the Lattice ECP5 (LFE5U-85F).
 //!
 //! A* router over the Trellis `bits.db` mux graph, plus dedicated handling
 //! for the global clock network (DCC -> DCS -> quadrant PCLK spine).
@@ -30,7 +30,7 @@
 //!
 //! # Clocks
 //!
-//! Clock nets listed in [`PlacedEcp5::clocks`] ride the global network:
+//! Clock nets listed in [`place::PlacedEcp5::clocks`] ride the global network:
 //! the DCC input mux (`G_TDCC{i}CLKI` in `TMID_0`) selects the placer-given
 //! dedicated source wire (a clock-pad wire like `G_JTRQPCLKCIB1` or a PLL
 //! output like `G_JULCPLL0CLKOP`); the DCC output (`G_VPFN{ii}00`) feeds the
@@ -68,16 +68,17 @@
 //! * Nets are never silently dropped: every [`PlacedNet`] appears in the
 //!   output (signal nets with their segments, carry/const nets with none).
 //!
-//! # Coordinator notes (integration)
+//! # Integration notes
 //!
-//! * [`PlacedEcp5`] here is the route worker's minimal mirror, built from
-//!   the documented concepts only (cell kind, tile row/col, bel name,
-//!   pin->net list, net list, clock list). Reconcile field names with the
-//!   place worker's real `PlacedEcp5`.
-//! * `lib.rs` re-exports [`PlacedEcp5`] and [`RoutedEcp5`] from this module,
-//!   shadowing `backend.rs`'s scaffolds (that file is untouched; its
-//!   `Backend` impl still references its own scaffold types until the
-//!   coordinator rewires it).
+//! * The public entry points take the real [`place::PlacedEcp5`].
+//!   [`build_model`] lowers it to the router's internal [`RouteModel`]
+//!   (cells, nets, clocks); the A* core below only ever sees the model.
+//! * Nets starting with [`pack::CARRY_NET_PREFIX`] are dedicated CCU2
+//!   wires: the model builder skips them on LUT inputs (no fabric load),
+//!   and classifies them [`NetKind::Carry`] (or `Const0`/`Const1` for
+//!   `$carry$zero`/`$carry$one`).
+//! * `lib.rs` re-exports [`RoutedEcp5`] (and [`NetKind`], which appears in
+//!   the public [`RoutedNet`]) from this module.
 //! * Slice wiring assumptions (validated against nextpnr-ecp5 `--textcfg`):
 //!   LUT/FF index `i` (0..7) uses fabric wires `A{i}`..`D{i}` (inputs),
 //!   `F{i}_SLICE` (LUT output), `Q{i}` (FF output); slice `i/2` uses
@@ -89,6 +90,8 @@
 //!   new but uses validated muxes.
 
 use crate::device::Device;
+use crate::pack::CARRY_NET_PREFIX;
+use crate::place;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -101,26 +104,24 @@ pub use crate::db::BitReq;
 // Public API: placed mirror (route worker's minimal view of placement)
 // ---------------------------------------------------------------------------
 
-/// Minimal mirror of the place worker's output: cells on concrete sites,
-/// nets connecting their pins, and the clock->global assignments.
-///
-/// Field names are the route worker's choice; the coordinator reconciles
-/// them with the place worker's real `PlacedEcp5`.
+/// The router's internal design model, lowered from [`place::PlacedEcp5`]
+/// by [`build_model`]. Cells carry concrete tile/bel positions and pin->net
+/// connections; the A* core only ever sees this model.
 #[derive(Clone, Debug, Default)]
-pub struct PlacedEcp5 {
+struct RouteModel {
     /// Top module name, carried through to [`RoutedEcp5`].
-    pub top: String,
+    top: String,
     /// Placed cells.
-    pub cells: Vec<PlacedCell>,
-    /// Nets (every net referenced by a pin must be listed).
-    pub nets: Vec<PlacedNet>,
+    cells: Vec<PlacedCell>,
+    /// Nets (every net referenced by a pin is listed).
+    nets: Vec<PlacedNet>,
     /// Clocks assigned to the global network.
-    pub clocks: Vec<PlacedClock>,
+    clocks: Vec<PlacedClock>,
 }
 
 /// One placed cell.
 #[derive(Clone, Debug)]
-pub struct PlacedCell {
+struct PlacedCell {
     /// Instance name (for error messages).
     pub name: String,
     /// Cell kind.
@@ -137,15 +138,16 @@ pub struct PlacedCell {
     ///
     /// Pin names: LUT uses `"A"`,`"B"`,`"C"`,`"D"` (inputs) and `"Q"`
     /// (output); FF uses `"Q"` (output), `"CLK"`, `"CE"`, `"LSR"`
-    /// (optional inputs; `"D"` is the dedicated slice LUT output and is
-    /// ignored by the router); IO input uses `"O"` (output); IO output
-    /// uses `"I"` (input).
+    /// (optional inputs); a `"D"` pin appears only for unpaired FFs and is
+    /// routed from fabric (a paired FF's D is the dedicated slice LUT
+    /// output, so the model builder omits it); IO input uses `"O"`
+    /// (output); IO output uses `"I"` (input).
     pub pins: Vec<CellPin>,
 }
 
 /// One pin->net connection.
 #[derive(Clone, Debug)]
-pub struct CellPin {
+struct CellPin {
     /// Pin name (see [`PlacedCell::pins`]).
     pub pin: String,
     /// Net name.
@@ -154,7 +156,7 @@ pub struct CellPin {
 
 /// Placed cell kinds supported by the v1 router.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CellKind {
+enum CellKind {
     /// 4-LUT.
     Lut,
     /// Flip-flop (paired with its slice LUT; `D` is dedicated).
@@ -167,7 +169,7 @@ pub enum CellKind {
 
 /// One net.
 #[derive(Clone, Debug)]
-pub struct PlacedNet {
+struct PlacedNet {
     /// Net name.
     pub name: String,
     /// Net kind.
@@ -188,10 +190,10 @@ pub enum NetKind {
     Const1,
 }
 
-/// One clock assigned to the global network by the place worker.
+/// One clock assigned to the global network.
 #[derive(Clone, Debug)]
-pub struct PlacedClock {
-    /// Clock net name (must be listed in [`PlacedEcp5::nets`]).
+struct PlacedClock {
+    /// Clock net name (listed in the model's nets).
     pub net: String,
     /// Global DCC index, 0..5 (the `TMID_0` DCC inputs in v1).
     pub dcc: u8,
@@ -220,7 +222,7 @@ pub struct RoutedEcp5 {
     pub top: String,
     /// Routed nets (one entry per [`PlacedNet`], same order).
     pub nets: Vec<RoutedNet>,
-    /// Routed global clocks (same order as [`PlacedEcp5::clocks`]).
+    /// Routed global clocks (same order as the model's clocks).
     pub clocks: Vec<RoutedClock>,
     /// Non-routing config enums the router programmed (currently the
     /// `CLK{0,1}.CLKMUX` settings for global clocks).
@@ -360,18 +362,18 @@ fn parse_wire_ref(name: &str) -> WireRef {
 /// One mux input: setting `bits` connects `src` to the mux output.
 /// `bits` is empty for `-` (default, no bits to program).
 #[derive(Clone, Debug)]
-struct CachedMuxInput {
-    src: String,
+pub(crate) struct CachedMuxInput {
+    pub(crate) src: String,
     src_ref: WireRef,
-    bits: Vec<BitReq>,
+    pub(crate) bits: Vec<BitReq>,
 }
 
 /// One routing mux with its inputs.
 #[derive(Clone, Debug)]
-struct CachedMux {
-    dst: String,
+pub(crate) struct CachedMux {
+    pub(crate) dst: String,
     dst_ref: WireRef,
-    inputs: Vec<CachedMuxInput>,
+    pub(crate) inputs: Vec<CachedMuxInput>,
 }
 
 /// Parsed mux data for one tile type.
@@ -408,7 +410,7 @@ fn parse_bits(toks: &[&str]) -> Option<Vec<BitReq>> {
 /// Parse the `.mux` sections of one `bits.db` text. Mirrors
 /// `db::parse_bits_db`'s control flow exactly, except `-` inputs are kept
 /// as empty bit lists instead of being dropped.
-fn parse_muxes(text: &str) -> Vec<CachedMux> {
+pub(crate) fn parse_muxes(text: &str) -> Vec<CachedMux> {
     let mut muxes = Vec::new();
     let mut cur: Option<CachedMux> = None;
     for raw in text.lines() {
@@ -1332,16 +1334,16 @@ impl<'a> Router<'a> {
     /// clock-net -> FF loads for the global clock path.
     fn collect_endpoints(
         &mut self,
-        placed: &'a PlacedEcp5,
+        model: &'a RouteModel,
     ) -> Result<EndpointMaps<'a>, String> {
         let mut kinds: HashMap<&'a str, NetKind> = HashMap::new();
-        for n in &placed.nets {
+        for n in &model.nets {
             if kinds.insert(n.name.as_str(), n.kind).is_some() {
                 return Err(format!("route: duplicate net '{}'", n.name));
             }
         }
         let mut clock_dccs: HashSet<u8> = HashSet::new();
-        for c in &placed.clocks {
+        for c in &model.clocks {
             if !kinds.contains_key(c.net.as_str()) {
                 return Err(format!(
                     "route: clock '{}': net not listed in placed nets",
@@ -1356,12 +1358,12 @@ impl<'a> Router<'a> {
             }
         }
         let clock_set: HashSet<&'a str> =
-            placed.clocks.iter().map(|c| c.net.as_str()).collect();
+            model.clocks.iter().map(|c| c.net.as_str()).collect();
 
         let mut works: HashMap<&'a str, NetWork<'a>> = HashMap::new();
         let mut clock_ff_loads: HashMap<&'a str, Vec<(u32, u8)>> = HashMap::new();
 
-        for cell in &placed.cells {
+        for cell in &model.cells {
             let entry = find_entry(self, cell.tile_row, cell.tile_col, &cell.bel)?;
             let tile_type = self.device.tiles()[entry as usize].tile_type.clone();
             match cell.kind {
@@ -1515,7 +1517,24 @@ impl<'a> Router<'a> {
                                 work.loads.push((node, describe(cell, &pin.pin)));
                             }
                             "D" => {
-                                // Dedicated slice LUT output; not routed.
+                                // The model builder only emits a `D` pin for
+                                // unpaired FFs (a paired FF's D is the
+                                // dedicated slice connection to its LUT).
+                                // Route it from fabric through the `D{index}`
+                                // mux.
+                                let work = works
+                                    .entry(pin.net.as_str())
+                                    .or_insert_with(|| NetWork {
+                                        name: pin.net.as_str(),
+                                        driver: None,
+                                        loads: Vec::new(),
+                                    });
+                                let node = self.load_node(
+                                    entry,
+                                    &format!("D{}", cell.index),
+                                    &describe(cell, &pin.pin),
+                                )?;
+                                work.loads.push((node, describe(cell, &pin.pin)));
                             }
                             _ => {
                                 return Err(format!(
@@ -1626,7 +1645,7 @@ impl<'a> Router<'a> {
     /// Returns (routed clocks, net name -> segments, config enums).
     fn try_order(
         &mut self,
-        placed: &'a PlacedEcp5,
+        model: &'a RouteModel,
         works: &HashMap<&'a str, NetWork<'a>>,
         clock_ff_loads: &HashMap<&'a str, Vec<(u32, u8)>>,
         order: &[&'a str],
@@ -1634,7 +1653,7 @@ impl<'a> Router<'a> {
         let mut state = RouteState::default();
         let mut config_enums = Vec::new();
         let mut routed_clocks = Vec::new();
-        for (ord, clock) in placed.clocks.iter().enumerate() {
+        for (ord, clock) in model.clocks.iter().enumerate() {
             let ff: &[(u32, u8)] = clock_ff_loads
                 .get(clock.net.as_str())
                 .map(Vec::as_slice)
@@ -1664,8 +1683,8 @@ impl<'a> Router<'a> {
 
     /// Route the whole design: clocks first, then signal nets ordered by
     /// decreasing fanout (one rip-up retry in reverse order on failure).
-    fn route_design(&mut self, placed: &'a PlacedEcp5) -> Result<RoutedEcp5, String> {
-        let (kinds, works, clock_ff_loads) = self.collect_endpoints(placed)?;
+    fn route_design(&mut self, model: &'a RouteModel) -> Result<RoutedEcp5, String> {
+        let (kinds, works, clock_ff_loads) = self.collect_endpoints(model)?;
 
         let mut sig_names: Vec<&'a str> = works
             .keys()
@@ -1675,18 +1694,18 @@ impl<'a> Router<'a> {
         sig_names.sort_by_key(|n| (std::cmp::Reverse(works[*n].loads.len()), *n));
 
         let (routed_clocks, seg_map, config_enums) =
-            match self.try_order(placed, &works, &clock_ff_loads, &sig_names) {
+            match self.try_order(model, &works, &clock_ff_loads, &sig_names) {
                 Ok(r) => r,
                 Err(_) => {
                     // Rip-up retry: reverse net order.
                     let mut rev = sig_names.clone();
                     rev.reverse();
-                    self.try_order(placed, &works, &clock_ff_loads, &rev)?
+                    self.try_order(model, &works, &clock_ff_loads, &rev)?
                 }
             };
 
-        let mut nets = Vec::with_capacity(placed.nets.len());
-        for pn in &placed.nets {
+        let mut nets = Vec::with_capacity(model.nets.len());
+        for pn in &model.nets {
             let segments = match pn.kind {
                 NetKind::Signal => seg_map.get(&pn.name).cloned().unwrap_or_default(),
                 // Carry/const nets: validated/collected above, no segments.
@@ -1700,7 +1719,7 @@ impl<'a> Router<'a> {
         }
 
         Ok(RoutedEcp5 {
-            top: placed.top.clone(),
+            top: model.top.clone(),
             nets,
             clocks: routed_clocks,
             config_enums,
@@ -1712,15 +1731,352 @@ impl<'a> Router<'a> {
 // Public entry points
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// place::PlacedEcp5 -> RouteModel bridge
+// ---------------------------------------------------------------------------
+
+/// Slice index (0..3) from a Trellis slice site name (`"SLICE_A"`..`"SLICE_D"`).
+fn slice_index(site: &str, what: &str) -> Result<u8, String> {
+    match site {
+        "SLICE_A" => Ok(0),
+        "SLICE_B" => Ok(1),
+        "SLICE_C" => Ok(2),
+        "SLICE_D" => Ok(3),
+        _ => Err(format!("route: {what}: site '{site}' is not a slice")),
+    }
+}
+
+/// PIO letter from a PIO site name (`"PIOA"` -> `'A'`).
+fn pio_letter_of(site: &str, what: &str) -> Result<char, String> {
+    match site {
+        "PIOA" => Ok('A'),
+        "PIOB" => Ok('B'),
+        "PIOC" => Ok('C'),
+        "PIOD" => Ok('D'),
+        _ => Err(format!("route: {what}: site '{site}' is not a PIO")),
+    }
+}
+
+/// Classify a net for the model. Nets starting with
+/// [`CARRY_NET_PREFIX`] are dedicated CCU2 wires: `$carry$zero`/`$carry$one`
+/// are the chain-head constant carry-ins, the rest are carry-cascade nets.
+/// The router never routes fabric to any of them.
+fn classify_net(name: &str) -> NetKind {
+    if name == "$carry$zero" {
+        NetKind::Const0
+    } else if name == "$carry$one" {
+        NetKind::Const1
+    } else if name.starts_with(CARRY_NET_PREFIX) {
+        NetKind::Carry
+    } else {
+        NetKind::Signal
+    }
+}
+
+impl Router<'_> {
+    /// Input wires of the `G_TDCC{dcc}CLKI` mux in the `TMID_0` tile,
+    /// straight from the vendored `bits.db` (no hardcoded table).
+    fn dcc_clki_inputs(&self, dcc: u8) -> Result<Vec<String>, String> {
+        let entry = self.tmid0_entry()?;
+        let g = self.graph(entry);
+        let dst = format!("G_TDCC{dcc}CLKI");
+        let mi = g.mux_by_dst.get(&dst).ok_or_else(|| {
+            format!("route: TMID_0 tile has no mux {dst}")
+        })?;
+        Ok(g.muxes[*mi].inputs.iter().map(|i| i.src.clone()).collect())
+    }
+}
+
+/// The DCC input wire for a clock net, derived from the clock's driver.
+///
+/// * Input pad: the pad's `pio_metadata` `function` names its PCLK tap
+///   (e.g. `"PCLKT0_1"`); the DCC input wire is `G_JPCLKT01`. Only `PCLKT`
+///   pins are supported in v1 (other PCLK functions fail loud).
+/// * Anything else (PLL output, fabric-driven clock) fails loud: PLL
+///   reference-clock routing is not modeled in v1, and v1 cannot feed a
+///   fabric net into a DCC input mux.
+fn clock_source_wire(
+    device: &Device,
+    placed: &place::PlacedEcp5,
+    net: &str,
+) -> Result<String, String> {
+    // Through a ClockBuf, the pad drives the buffer's input net.
+    let mut pad_net = net;
+    if let Some(cb) = placed.packed.clks.iter().find(|c| c.out_net == net) {
+        pad_net = cb.in_net.as_str();
+    }
+    if let Some(io) = placed
+        .ios
+        .iter()
+        .find(|io| io.dir == crate::pack::IoDir::In && io.net == pad_net)
+    {
+        // pio_metadata is keyed by the package pin's (col, pio, row), the
+        // same key the pack worker uses.
+        let pkg_pins = device.package_pins(&placed.package).ok_or_else(|| {
+            format!(
+                "route: clock pad {}: unknown package {:?}",
+                io.name, placed.package
+            )
+        })?;
+        let pp = pkg_pins.get(&io.pin).ok_or_else(|| {
+            format!(
+                "route: clock pad {}: pin {} not in package {:?}",
+                io.name, io.pin, placed.package
+            )
+        })?;
+        let meta = device
+            .pio_metadata()
+            .iter()
+            .find(|m| m.col == pp.col && m.row == pp.row && m.pio == pp.pio)
+            .ok_or_else(|| {
+                format!(
+                    "route: clock pad {} (pin {}) has no pio_metadata row",
+                    io.name, io.pin
+                )
+            })?;
+        let func = meta.function.as_deref().ok_or_else(|| {
+            format!(
+                "route: clock pad {} (pin {}) is not a PCLK-capable pin",
+                io.name, io.pin
+            )
+        })?;
+        let tap = func.strip_prefix("PCLKT").ok_or_else(|| {
+            format!(
+                "route: clock pad {} (pin {}): PCLK function {func:?} is not PCLKT (v1 limitation)",
+                io.name, io.pin
+            )
+        })?;
+        let (a, b) = tap.split_once('_').ok_or_else(|| {
+            format!(
+                "route: clock pad {} (pin {}): bad PCLKT function {func:?}",
+                io.name, io.pin
+            )
+        })?;
+        return Ok(format!("G_JPCLKT{a}{b}"));
+    }
+    // (PLL outputs: PLL blocks fail loud in build_model, since their
+    // reference-clock input has no v1 routing model.)
+    Err(format!(
+        "route: clock '{net}': v1 needs an input-pad driver for DCC promotion"
+    ))
+}
+
+/// Lower [`place::PlacedEcp5`] to the router's [`RouteModel`].
+///
+/// Fail-loud v1 limits: EBR/DSP/PLL blocks have no routing model yet
+/// (their nets cannot be routed), and clocks need a pad/PLL driver with a
+/// DCC input wire resolvable from the DB.
+fn build_model(router: &Router, placed: &place::PlacedEcp5) -> Result<RouteModel, String> {
+    if !placed.ebrs.is_empty() {
+        return Err(format!(
+            "route: {} EBR block(s): hard-block routing is not supported in v1",
+            placed.ebrs.len()
+        ));
+    }
+    if !placed.dsps.is_empty() {
+        return Err(format!(
+            "route: {} DSP block(s): hard-block routing is not supported in v1",
+            placed.dsps.len()
+        ));
+    }
+    if !placed.plls.is_empty() {
+        return Err(format!(
+            "route: {} PLL block(s): PLL reference-clock routing is not supported in v1",
+            placed.plls.len()
+        ));
+    }
+
+    let mut cells: Vec<PlacedCell> = Vec::new();
+    let mut net_names: HashSet<String> = HashSet::new();
+
+    // LUTs.
+    for lut in &placed.luts {
+        if lut.half > 1 {
+            return Err(format!(
+                "route: LUT {}: bad half {} (want 0/1)",
+                lut.name, lut.half
+            ));
+        }
+        let slice = slice_index(&lut.site.site, &format!("LUT {}", lut.name))?;
+        let index = slice * 2 + lut.half;
+        let mut pins = Vec::new();
+        for (i, net) in lut.inputs.iter().enumerate() {
+            if let Some(n) = net {
+                // Dedicated CCU2 carry wires are listed but get no fabric
+                // pin: the router must skip them.
+                net_names.insert(n.clone());
+                if n.starts_with(CARRY_NET_PREFIX) {
+                    continue;
+                }
+                let pin = ["A", "B", "C", "D"][i].to_string();
+                pins.push(CellPin {
+                    pin,
+                    net: n.clone(),
+                });
+                net_names.insert(n.clone());
+            }
+        }
+        pins.push(CellPin {
+            pin: "Q".to_string(),
+            net: lut.output.clone(),
+        });
+        net_names.insert(lut.output.clone());
+        cells.push(PlacedCell {
+            name: lut.name.clone(),
+            kind: CellKind::Lut,
+            tile_row: lut.site.tile_row,
+            tile_col: lut.site.tile_col,
+            bel: lut.site.site.clone(),
+            index,
+            pins,
+        });
+    }
+
+    // FFs.
+    for ff in &placed.ffs {
+        if ff.half > 1 {
+            return Err(format!(
+                "route: FF {}: bad half {} (want 0/1)",
+                ff.name, ff.half
+            ));
+        }
+        let slice = slice_index(&ff.site.site, &format!("FF {}", ff.name))?;
+        let index = slice * 2 + ff.half;
+        // Paired with the driver LUT in the same half-slice: D is the
+        // dedicated slice connection and needs no routing. Otherwise D
+        // comes from fabric through the D{index} mux.
+        let paired = placed.luts.iter().any(|l| {
+            l.site == ff.site && l.half == ff.half && l.output == ff.d
+        });
+        let mut pins = vec![
+            CellPin {
+                pin: "Q".to_string(),
+                net: ff.q.clone(),
+            },
+            CellPin {
+                pin: "CLK".to_string(),
+                net: ff.clk.clone(),
+            },
+        ];
+        net_names.insert(ff.q.clone());
+        net_names.insert(ff.clk.clone());
+        net_names.insert(ff.d.clone());
+        if !paired {
+            pins.push(CellPin {
+                pin: "D".to_string(),
+                net: ff.d.clone(),
+            });
+        }
+        cells.push(PlacedCell {
+            name: ff.name.clone(),
+            kind: CellKind::Ff,
+            tile_row: ff.site.tile_row,
+            tile_col: ff.site.tile_col,
+            bel: ff.site.site.clone(),
+            index,
+            pins,
+        });
+    }
+
+    // IOs.
+    for io in &placed.ios {
+        let pio = pio_letter_of(&io.site.site, &format!("IO {}", io.name))?;
+        let _ = pio;
+        let (kind, pin) = match io.dir {
+            crate::pack::IoDir::In => (CellKind::IoIn, "O"),
+            crate::pack::IoDir::Out => (CellKind::IoOut, "I"),
+        };
+        cells.push(PlacedCell {
+            name: io.name.clone(),
+            kind,
+            tile_row: io.site.tile_row,
+            tile_col: io.site.tile_col,
+            bel: io.site.site.clone(),
+            index: 0,
+            pins: vec![CellPin {
+                pin: pin.to_string(),
+                net: io.net.clone(),
+            }],
+        });
+        net_names.insert(io.net.clone());
+    }
+
+    // Clocks: resolve each to a (dcc, source_wire), preferring place's DCC
+    // assignment, then the lowest free DCC whose CLKI mux lists the wire.
+    let mut used_dccs: HashSet<u8> = HashSet::new();
+    let mut clocks = Vec::with_capacity(placed.clocks.len());
+    for clock in &placed.clocks {
+        let wire = clock_source_wire(router.device, placed, &clock.net)?;
+        let preferred: Option<u8> = clock
+            .dcc
+            .strip_prefix("DCC")
+            .and_then(|n| n.parse::<u8>().ok())
+            .filter(|&n| n <= 5);
+        let mut candidates: Vec<u8> = Vec::new();
+        if let Some(d) = preferred {
+            candidates.push(d);
+        }
+        for d in 0..6u8 {
+            if Some(d) != preferred {
+                candidates.push(d);
+            }
+        }
+        let mut picked = None;
+        for dcc in candidates {
+            if used_dccs.contains(&dcc) {
+                continue;
+            }
+            if router.dcc_clki_inputs(dcc)?.iter().any(|s| s == &wire) {
+                picked = Some(dcc);
+                break;
+            }
+        }
+        let dcc = picked.ok_or_else(|| {
+            format!(
+                "route: clock '{}': source wire '{wire}' is an input of no DCC0..5 CLKI mux",
+                clock.net
+            )
+        })?;
+        used_dccs.insert(dcc);
+        clocks.push(PlacedClock {
+            net: clock.net.clone(),
+            dcc,
+            source_wire: wire,
+        });
+        net_names.insert(clock.net.clone());
+    }
+
+    let mut nets: Vec<PlacedNet> = net_names
+        .into_iter()
+        .map(|name| {
+            let kind = classify_net(&name);
+            PlacedNet { name, kind }
+        })
+        .collect();
+    nets.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(RouteModel {
+        top: placed.top.clone(),
+        cells,
+        nets,
+        clocks,
+    })
+}
+
 /// Route a placed ECP5 design on the process-wide device model.
-pub fn route(placed: &PlacedEcp5) -> Result<RoutedEcp5, String> {
+pub fn route(placed: &place::PlacedEcp5) -> Result<RoutedEcp5, String> {
     let device = Device::global()?;
     route_on_device(device, placed)
 }
 
 /// Route a placed ECP5 design on an explicit device model.
-pub fn route_on_device(device: &Device, placed: &PlacedEcp5) -> Result<RoutedEcp5, String> {
-    Router::new(device)?.route_design(placed)
+pub fn route_on_device(
+    device: &Device,
+    placed: &place::PlacedEcp5,
+) -> Result<RoutedEcp5, String> {
+    let mut router = Router::new(device)?;
+    let model = build_model(&router, placed)?;
+    router.route_design(&model)
 }
 
 #[cfg(test)]
@@ -1742,63 +2098,201 @@ mod tests {
         (t.row, t.col)
     }
 
-    /// Does the tile type have a usable `JDIA` input mux (direct pad wire)?
-    fn has_jdia_mux(tt: &str) -> bool {
-        type_graphs()
+    /// Site address for a slice of the PLC2 tile at `(row, col)`, with bel
+    /// coordinates from the device model.
+    fn slice_site(d: &Device, row: u32, col: u32, slice: &str) -> place::SiteAddr {
+        let t = d
+            .tiles()
             .iter()
-            .find(|(n, _)| n == tt)
-            .map(|(_, g)| g.mux_by_dst.contains_key("JDIA"))
-            .unwrap_or(false)
+            .find(|t| t.row == row && t.col == col && t.tile_type == "PLC2")
+            .unwrap();
+        let s = t.sites.iter().find(|s| s.name == slice).unwrap();
+        place::SiteAddr {
+            tile_row: row,
+            tile_col: col,
+            tile_type: "PLC2".to_string(),
+            site: slice.to_string(),
+            bel_col: s.bel_col,
+            bel_row: s.bel_row,
+        }
     }
 
-    /// (row, col) of a PIC tile with all four PIOs and a `JDIA` input mux.
-    /// `skip` excludes an already-used position.
-    fn pic_rc(d: &Device, skip: Option<(u32, u32)>) -> (u32, u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn placed_lut(
+        d: &Device,
+        name: &str,
+        row: u32,
+        col: u32,
+        slice: &str,
+        half: u8,
+        inputs: [Option<&str>; 4],
+        output: &str,
+    ) -> place::PlacedLut {
+        place::PlacedLut {
+            name: name.to_string(),
+            init: 0xAAAA,
+            inputs: inputs.map(|n| n.map(str::to_string)),
+            output: output.to_string(),
+            carry: None,
+            site: slice_site(d, row, col, slice),
+            half,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn placed_ff(
+        d: &Device,
+        name: &str,
+        row: u32,
+        col: u32,
+        slice: &str,
+        half: u8,
+        dm: &str,
+        q: &str,
+        clk: &str,
+    ) -> place::PlacedFf {
+        place::PlacedFf {
+            name: name.to_string(),
+            d: dm.to_string(),
+            q: q.to_string(),
+            clk: clk.to_string(),
+            ce: None,
+            sr: None,
+            site: slice_site(d, row, col, slice),
+            half,
+        }
+    }
+
+    /// A real PCLK-capable package pin and its PIO site address:
+    /// (pin name, site). Uses pin A10 (`PCLKT0_1`): the bridge derives the
+    /// DCC input wire `G_JPCLKT01`, a real input of the `G_TDCC0CLKI` mux.
+    fn pclk_pio(d: &Device) -> (String, place::SiteAddr) {
+        let meta = d
+            .pio_metadata()
+            .iter()
+            .find(|m| m.function.as_deref() == Some("PCLKT0_1"))
+            .unwrap();
+        let (pin_name, _) = d
+            .package_pins("CABGA381")
+            .unwrap()
+            .iter()
+            .find(|(_, p)| p.col == meta.col && p.row == meta.row && p.pio == meta.pio)
+            .unwrap();
+        let (site, _) = pio_site_for_pin(d, pin_name);
+        (pin_name.clone(), site)
+    }
+
+    /// A PIO site for an arbitrary (non-clock) package pin.
+    fn pio_site_for_pin(d: &Device, pin: &str) -> (place::SiteAddr, String) {
+        let (_, p) = d
+            .package_pins("CABGA381")
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == &pin)
+            .unwrap();
+        let pio_name = format!("PIO{}", p.pio);
+        // Bel position from the place worker's rule (mirrors
+        // place::pio_bel_candidates for the common edges).
+        let (bc, br) = if p.row == 0 {
+            let idx = match p.pio.as_str() {
+                "A" => 0,
+                "B" => 1,
+                "C" => 2,
+                _ => 3,
+            };
+            (p.col as i32, 19 - idx)
+        } else if p.row == 95 {
+            let idx = match p.pio.as_str() {
+                "A" => 0,
+                "B" => 1,
+                "C" => 2,
+                _ => 3,
+            };
+            (p.col as i32, 114 - idx)
+        } else {
+            panic!("test helper only handles top/bottom edge pins");
+        };
         let t = d
             .tiles()
             .iter()
             .find(|t| {
-                t.tile_type.starts_with("PIC")
-                    && ["PIOA", "PIOB", "PIOC", "PIOD"]
-                        .iter()
-                        .all(|p| t.sites.iter().any(|s| &s.name == p))
-                    && has_jdia_mux(&t.tile_type)
-                    && Some((t.row, t.col)) != skip
+                t.sites
+                    .iter()
+                    .any(|s| s.name == pio_name && s.bel_col == bc && s.bel_row == br)
             })
             .unwrap();
-        (t.row, t.col)
+        let s = t
+            .sites
+            .iter()
+            .find(|s| s.name == pio_name && s.bel_col == bc && s.bel_row == br)
+            .unwrap();
+        (
+            place::SiteAddr {
+                tile_row: t.row,
+                tile_col: t.col,
+                tile_type: t.tile_type.clone(),
+                site: s.name.clone(),
+                bel_col: s.bel_col,
+                bel_row: s.bel_row,
+            },
+            pio_name,
+        )
     }
 
-    fn cell(
+    fn placed_io(
+        d: &Device,
         name: &str,
-        kind: CellKind,
-        row: u32,
-        col: u32,
-        bel: &str,
-        index: u8,
-        pins: &[(&str, &str)],
-    ) -> PlacedCell {
-        PlacedCell {
+        port: &str,
+        dir: crate::pack::IoDir,
+        net: &str,
+        pin: &str,
+    ) -> place::PlacedIo {
+        let (site, _) = pio_site_for_pin(d, pin);
+        place::PlacedIo {
             name: name.to_string(),
-            kind,
-            tile_row: row,
-            tile_col: col,
-            bel: bel.to_string(),
-            index,
-            pins: pins
-                .iter()
-                .map(|(p, n)| CellPin {
-                    pin: p.to_string(),
-                    net: n.to_string(),
-                })
-                .collect(),
+            port: port.to_string(),
+            dir,
+            net: net.to_string(),
+            pin: pin.to_string(),
+            site,
         }
     }
 
-    fn net(name: &str, kind: NetKind) -> PlacedNet {
-        PlacedNet {
+    fn placed_io_on_site(
+        name: &str,
+        port: &str,
+        dir: crate::pack::IoDir,
+        net: &str,
+        pin: &str,
+        site: place::SiteAddr,
+    ) -> place::PlacedIo {
+        place::PlacedIo {
             name: name.to_string(),
-            kind,
+            port: port.to_string(),
+            dir,
+            net: net.to_string(),
+            pin: pin.to_string(),
+            site,
+        }
+    }
+
+    fn clock_assign(net: &str, dcc: &str) -> place::ClockAssignment {
+        place::ClockAssignment {
+            net: net.to_string(),
+            dcc: dcc.to_string(),
+            // Unused by the route bridge (it derives everything from the
+            // net's driver); filled for struct completeness.
+            site: place::SiteAddr {
+                tile_row: 0,
+                tile_col: 0,
+                tile_type: "TMID_0".to_string(),
+                site: "DCC0".to_string(),
+                bel_col: 0,
+                bel_row: 0,
+            },
+            quadrant: "UL".to_string(),
+            tap: "C58".to_string(),
+            spine: "UL58".to_string(),
         }
     }
 
@@ -1972,29 +2466,31 @@ mod tests {
 
     /// Small multi-LUT design: 2 LUTs + FF + IO, local clock. Routes 100%
     /// of nets; every segment validates against bits.db.
+    ///
+    /// `f0` shares its half-slice with its driver LUT `l1`, so `n2` needs
+    /// no fabric segments (dedicated slice connection). `clocks` is empty,
+    /// so the clock routes as an ordinary fabric net to `MUXCLK0`.
     #[test]
     fn route_small_design() {
         let d = dev();
         let (pr, pc) = plc2_rc(d);
-        let (ir, ic) = pic_rc(d, None);
-        let (or, oc) = pic_rc(d, Some((ir, ic)));
-        let placed = PlacedEcp5 {
+        let placed = place::PlacedEcp5 {
             top: "top".to_string(),
-            cells: vec![
-                cell("l0", CellKind::Lut, pr, pc, "SLICE_A", 0, &[("A", "a"), ("B", "b"), ("Q", "n1")]),
-                cell("l1", CellKind::Lut, pr, pc, "SLICE_A", 1, &[("A", "n1"), ("B", "c"), ("Q", "n2")]),
-                cell("f0", CellKind::Ff, pr, pc, "SLICE_A", 0, &[("Q", "q"), ("CLK", "clk"), ("D", "n2")]),
-                cell("ina", CellKind::IoIn, ir, ic, "PIOA", 0, &[("O", "a")]),
-                cell("inb", CellKind::IoIn, ir, ic, "PIOB", 0, &[("O", "b")]),
-                cell("inc", CellKind::IoIn, ir, ic, "PIOC", 0, &[("O", "c")]),
-                cell("clkpad", CellKind::IoIn, ir, ic, "PIOD", 0, &[("O", "clk")]),
-                cell("outq", CellKind::IoOut, or, oc, "PIOA", 0, &[("I", "q")]),
+            package: "CABGA381".to_string(),
+            luts: vec![
+                placed_lut(d, "l0", pr, pc, "SLICE_A", 0, [Some("a"), Some("b"), None, None], "n1"),
+                placed_lut(d, "l1", pr, pc, "SLICE_A", 1, [Some("n1"), Some("c"), None, None], "n2"),
             ],
-            nets: ["a", "b", "c", "n1", "n2", "q", "clk"]
-                .iter()
-                .map(|n| net(n, NetKind::Signal))
-                .collect(),
+            ffs: vec![placed_ff(d, "f0", pr, pc, "SLICE_A", 1, "n2", "q", "clk")],
+            ios: vec![
+                placed_io(d, "ina", "a", crate::pack::IoDir::In, "a", "A10"),
+                placed_io(d, "inb", "b", crate::pack::IoDir::In, "b", "A11"),
+                placed_io(d, "inc", "c", crate::pack::IoDir::In, "c", "A12"),
+                placed_io(d, "clkpad", "clk", crate::pack::IoDir::In, "clk", "A13"),
+                placed_io(d, "outq", "q", crate::pack::IoDir::Out, "q", "A14"),
+            ],
             clocks: vec![],
+            ..Default::default()
         };
         let r = route_on_device(d, &placed).unwrap();
         assert_eq!(r.top, "top");
@@ -2023,28 +2519,28 @@ mod tests {
     }
 
     /// Global clock: DCC input mux, quadrant PCLK spines, slice CLK muxes.
+    ///
+    /// The bridge derives the DCC input wire from the clock pad's PCLK
+    /// function (`PCLKT0_1` -> `G_JPCLKT01`) and picks DCC0, whose CLKI mux
+    /// lists it.
     #[test]
     fn global_clock_uses_dcc_and_spine() {
         let d = dev();
         let (pr, pc) = plc2_rc(d);
-        let (ir, ic) = pic_rc(d, None);
-        let placed = PlacedEcp5 {
+        let (clk_pin, clk_site) = pclk_pio(d);
+        let placed = place::PlacedEcp5 {
             top: "top".to_string(),
-            cells: vec![
-                cell("f0", CellKind::Ff, pr, pc, "SLICE_A", 0, &[("Q", "q"), ("CLK", "gclk"), ("D", "d0")]),
-                cell("clkpad", CellKind::IoIn, ir, ic, "PIOA", 0, &[("O", "gclk")]),
-                cell("d0src", CellKind::Lut, pr, pc, "SLICE_A", 0, &[("A", "a"), ("Q", "d0")]),
-                cell("ina", CellKind::IoIn, ir, ic, "PIOB", 0, &[("O", "a")]),
+            package: "CABGA381".to_string(),
+            luts: vec![
+                placed_lut(d, "d0src", pr, pc, "SLICE_A", 0, [Some("a"), None, None, None], "d0"),
             ],
-            nets: ["gclk", "q", "d0", "a"]
-                .iter()
-                .map(|n| net(n, NetKind::Signal))
-                .collect(),
-            clocks: vec![PlacedClock {
-                net: "gclk".to_string(),
-                dcc: 0,
-                source_wire: "G_JTRQPCLKCIB1".to_string(),
-            }],
+            ffs: vec![placed_ff(d, "f0", pr, pc, "SLICE_A", 0, "d0", "q", "gclk")],
+            ios: vec![
+                placed_io_on_site("clkpad", "gclk", crate::pack::IoDir::In, "gclk", &clk_pin, clk_site),
+                placed_io(d, "ina", "a", crate::pack::IoDir::In, "a", "A12"),
+            ],
+            clocks: vec![clock_assign("gclk", "DCC0")],
+            ..Default::default()
         };
         let r = route_on_device(d, &placed).unwrap();
         assert_eq!(r.clocks.len(), 1);
@@ -2053,7 +2549,7 @@ mod tests {
         assert_eq!(c.pclk, 0);
         // DCC input mux.
         assert_eq!(c.dcc_input.dst, "G_TDCC0CLKI");
-        assert_eq!(c.dcc_input.src, "G_JTRQPCLKCIB1");
+        assert_eq!(c.dcc_input.src, "G_JPCLKT01");
         assert!(c.dcc_input.tile_key.ends_with(":TMID_0"));
         // Four quadrant PCLK spines, all from DCC0's output wire.
         assert_eq!(c.spine.len(), 4);
@@ -2078,22 +2574,24 @@ mod tests {
     fn congestion_fails_loud() {
         let d = dev();
         let (pr, pc) = plc2_rc(d);
-        let (ir, ic) = pic_rc(d, None);
         // Two FFs in the same slice share MUXCLK0; their clocks are
-        // different local nets driven by different pads.
-        let placed = PlacedEcp5 {
+        // different local nets driven by different pads (`clocks` is
+        // empty, so both route as fabric).
+        let placed = place::PlacedEcp5 {
             top: "top".to_string(),
-            cells: vec![
-                cell("f0", CellKind::Ff, pr, pc, "SLICE_A", 0, &[("Q", "q0"), ("CLK", "clk1")]),
-                cell("f1", CellKind::Ff, pr, pc, "SLICE_A", 1, &[("Q", "q1"), ("CLK", "clk2")]),
-                cell("p1", CellKind::IoIn, ir, ic, "PIOA", 0, &[("O", "clk1")]),
-                cell("p2", CellKind::IoIn, ir, ic, "PIOB", 0, &[("O", "clk2")]),
+            package: "CABGA381".to_string(),
+            ffs: vec![
+                placed_ff(d, "f0", pr, pc, "SLICE_A", 0, "d0", "q0", "clk1"),
+                placed_ff(d, "f1", pr, pc, "SLICE_A", 1, "d1", "q1", "clk2"),
             ],
-            nets: ["clk1", "clk2", "q0", "q1"]
-                .iter()
-                .map(|n| net(n, NetKind::Signal))
-                .collect(),
+            ios: vec![
+                placed_io(d, "p1", "clk1", crate::pack::IoDir::In, "clk1", "A10"),
+                placed_io(d, "p2", "clk2", crate::pack::IoDir::In, "clk2", "A11"),
+                placed_io(d, "pd0", "d0", crate::pack::IoDir::In, "d0", "A12"),
+                placed_io(d, "pd1", "d1", crate::pack::IoDir::In, "d1", "A13"),
+            ],
             clocks: vec![],
+            ..Default::default()
         };
         let err = route_on_device(d, &placed).unwrap_err();
         // One of the two clock nets must lose the MUXCLK0 mux.
@@ -2108,101 +2606,196 @@ mod tests {
     fn driverless_net_fails_loud() {
         let d = dev();
         let (pr, pc) = plc2_rc(d);
-        let placed = PlacedEcp5 {
+        let placed = place::PlacedEcp5 {
             top: "top".to_string(),
-            cells: vec![
-                cell("l0", CellKind::Lut, pr, pc, "SLICE_A", 0, &[("A", "a"), ("Q", "n1")]),
+            package: "CABGA381".to_string(),
+            luts: vec![
+                placed_lut(d, "l0", pr, pc, "SLICE_A", 0, [Some("a"), None, None, None], "n1"),
             ],
-            nets: [net("a", NetKind::Signal), net("n1", NetKind::Signal)].to_vec(),
-            clocks: vec![],
+            ..Default::default()
         };
         let err = route_on_device(d, &placed).unwrap_err();
         assert!(err.contains("'a'"), "unexpected error: {err}");
     }
 
-    /// Carry nets stay on the dedicated cascade (no segments); a carry net
-    /// spanning tiles fails loud.
+    /// Carry nets stay on the dedicated cascade: the bridge skips
+    /// `$carry$` nets on LUT inputs (no fabric loads), so they route with
+    /// no segments. `$carry$zero`/`$carry$one` classify as const nets.
     #[test]
     fn carry_nets_use_dedicated_cascade() {
         let d = dev();
         let (pr, pc) = plc2_rc(d);
-        let (qr, qc) = {
-            let t = d
-                .tiles()
-                .iter()
-                .find(|t| t.tile_type == "PLC2" && (t.row, t.col) != (pr, pc))
-                .unwrap();
-            (t.row, t.col)
-        };
-        // Same-tile carry: fine, no segments.
-        let placed = PlacedEcp5 {
+        let placed = place::PlacedEcp5 {
             top: "top".to_string(),
-            cells: vec![
-                cell("l0", CellKind::Lut, pr, pc, "SLICE_A", 0, &[("Q", "cy")]),
-                cell("l1", CellKind::Lut, pr, pc, "SLICE_A", 1, &[("A", "cy")]),
+            package: "CABGA381".to_string(),
+            luts: vec![
+                placed_lut(
+                    d, "l0", pr, pc, "SLICE_A", 0,
+                    [Some("a0"), Some("$carry$zero"), None, None], "s0",
+                ),
+                placed_lut(
+                    d, "l1", pr, pc, "SLICE_A", 1,
+                    [Some("a1"), Some("$carry$c0b0"), None, None], "s1",
+                ),
             ],
-            nets: vec![net("cy", NetKind::Carry)],
-            clocks: vec![],
+            ios: vec![
+                placed_io(d, "pa0", "a0", crate::pack::IoDir::In, "a0", "A10"),
+                placed_io(d, "pa1", "a1", crate::pack::IoDir::In, "a1", "A11"),
+                placed_io(d, "ps0", "s0", crate::pack::IoDir::Out, "s0", "A12"),
+                placed_io(d, "ps1", "s1", crate::pack::IoDir::Out, "s1", "A13"),
+            ],
+            ..Default::default()
         };
         let r = route_on_device(d, &placed).unwrap();
-        let cy = r.nets.iter().find(|n| n.name == "cy").unwrap();
-        assert_eq!(cy.kind, NetKind::Carry);
-        assert!(cy.segments.is_empty());
-
-        // Cross-tile carry: pack/place error, fail loud.
-        let placed = PlacedEcp5 {
-            top: "top".to_string(),
-            cells: vec![
-                cell("l0", CellKind::Lut, pr, pc, "SLICE_A", 0, &[("Q", "cy")]),
-                cell("l1", CellKind::Lut, qr, qc, "SLICE_A", 1, &[("A", "cy")]),
-            ],
-            nets: vec![net("cy", NetKind::Carry)],
-            clocks: vec![],
-        };
-        let err = route_on_device(d, &placed).unwrap_err();
-        assert!(err.contains("'cy'"), "unexpected error: {err}");
+        let cy0 = r.nets.iter().find(|n| n.name == "$carry$c0b0").unwrap();
+        assert_eq!(cy0.kind, NetKind::Carry);
+        assert!(cy0.segments.is_empty());
+        let zero = r.nets.iter().find(|n| n.name == "$carry$zero").unwrap();
+        assert_eq!(zero.kind, NetKind::Const0);
+        assert!(zero.segments.is_empty());
+        // No segment was programmed for a carry input: the router never
+        // touched the dedicated cascade.
+        for n in &r.nets {
+            for s in &n.segments {
+                assert!(
+                    !s.dst.starts_with('B'),
+                    "carry input got fabric routing: {} <- {}",
+                    s.dst, s.src
+                );
+            }
+        }
+        validate_routed(d, &r).unwrap();
     }
 
-    /// Bad clock source wire fails loud.
+    /// A clock with no input-pad driver cannot be promoted to the DCC
+    /// network: fail loud, naming the net.
     #[test]
-    fn bad_clock_source_fails_loud() {
+    fn clock_without_pad_driver_fails_loud() {
         let d = dev();
         let (pr, pc) = plc2_rc(d);
-        let placed = PlacedEcp5 {
+        let placed = place::PlacedEcp5 {
             top: "top".to_string(),
-            cells: vec![
-                cell("f0", CellKind::Ff, pr, pc, "SLICE_A", 0, &[("Q", "q"), ("CLK", "gclk")]),
+            package: "CABGA381".to_string(),
+            ffs: vec![placed_ff(d, "f0", pr, pc, "SLICE_A", 0, "d0", "q", "gclk")],
+            ios: vec![
+                placed_io(d, "pd0", "d0", crate::pack::IoDir::In, "d0", "A10"),
             ],
-            nets: [net("gclk", NetKind::Signal), net("q", NetKind::Signal)].to_vec(),
-            clocks: vec![PlacedClock {
-                net: "gclk".to_string(),
-                dcc: 0,
-                source_wire: "NOT_A_WIRE".to_string(),
-            }],
-        };
-        let err = route_on_device(d, &placed).unwrap_err();
-        assert!(err.contains("G_TDCC0CLKI") || err.contains("'gclk'"), "unexpected: {err}");
-    }
-
-    /// DCC index beyond the v1 range fails loud.
-    #[test]
-    fn dcc_out_of_range_fails_loud() {
-        let d = dev();
-        let (pr, pc) = plc2_rc(d);
-        let placed = PlacedEcp5 {
-            top: "top".to_string(),
-            cells: vec![
-                cell("f0", CellKind::Ff, pr, pc, "SLICE_A", 0, &[("Q", "q"), ("CLK", "gclk")]),
-            ],
-            nets: [net("gclk", NetKind::Signal), net("q", NetKind::Signal)].to_vec(),
-            clocks: vec![PlacedClock {
-                net: "gclk".to_string(),
-                dcc: 9,
-                source_wire: "G_JTRQPCLKCIB1".to_string(),
-            }],
+            clocks: vec![clock_assign("gclk", "DCC0")],
+            ..Default::default()
         };
         let err = route_on_device(d, &placed).unwrap_err();
         assert!(err.contains("'gclk'"), "unexpected: {err}");
+    }
+
+    /// A clock pad that is not PCLK-capable cannot feed a DCC: fail loud.
+    /// (Pin A12 has no PCLK function in the Trellis DB.)
+    #[test]
+    fn non_pclk_clock_pin_fails_loud() {
+        let d = dev();
+        let (pr, pc) = plc2_rc(d);
+        let placed = place::PlacedEcp5 {
+            top: "top".to_string(),
+            package: "CABGA381".to_string(),
+            ffs: vec![placed_ff(d, "f0", pr, pc, "SLICE_A", 0, "d0", "q", "gclk")],
+            ios: vec![
+                placed_io(d, "clkpad", "gclk", crate::pack::IoDir::In, "gclk", "A12"),
+                placed_io(d, "pd0", "d0", crate::pack::IoDir::In, "d0", "A10"),
+            ],
+            clocks: vec![clock_assign("gclk", "DCC0")],
+            ..Default::default()
+        };
+        let err = route_on_device(d, &placed).unwrap_err();
+        assert!(err.contains("PCLK"), "unexpected: {err}");
+    }
+
+    /// An unpaired FF (D driven by another FF's Q, not a LUT in its
+    /// half-slice) gets its D routed from fabric through the `D{index}`
+    /// mux.
+    #[test]
+    fn unpaired_ff_d_routes_from_fabric() {
+        let d = dev();
+        let (pr, pc) = plc2_rc(d);
+        let placed = place::PlacedEcp5 {
+            top: "top".to_string(),
+            package: "CABGA381".to_string(),
+            // f1.D = f0.Q: no LUT drives it in f1's half-slice, so f1 is
+            // unpaired and D1 must come from fabric.
+            ffs: vec![
+                placed_ff(d, "f0", pr, pc, "SLICE_A", 0, "d0", "q0", "clk"),
+                placed_ff(d, "f1", pr, pc, "SLICE_A", 1, "q0", "q1", "clk"),
+            ],
+            ios: vec![
+                placed_io(d, "pd0", "d0", crate::pack::IoDir::In, "d0", "A10"),
+                placed_io(d, "pclk", "clk", crate::pack::IoDir::In, "clk", "A11"),
+                placed_io(d, "pq1", "q1", crate::pack::IoDir::Out, "q1", "A12"),
+            ],
+            clocks: vec![],
+            ..Default::default()
+        };
+        let r = route_on_device(d, &placed).unwrap();
+        let q0 = r.nets.iter().find(|n| n.name == "q0").unwrap();
+        assert!(
+            q0.segments.iter().any(|s| s.dst == "D1"),
+            "unpaired FF D did not route from fabric: {:?}",
+            q0.segments.iter().map(|s| &s.dst).collect::<Vec<_>>()
+        );
+        validate_routed(d, &r).unwrap();
+    }
+
+    /// Hard blocks have no v1 routing model: fail loud, not silent.
+    #[test]
+    fn hard_blocks_fail_loud() {
+        let d = dev();
+        let dummy_site = || place::SiteAddr {
+            tile_row: 0,
+            tile_col: 0,
+            tile_type: "MIB_EBR0".to_string(),
+            site: "EBR0".to_string(),
+            bel_col: 0,
+            bel_row: 0,
+        };
+        for (what, mut placed) in [
+            (
+                "EBR",
+                place::PlacedEcp5 {
+                    ebrs: vec![place::PlacedEbr {
+                        name: "ram0".into(),
+                        params: place::EbrParams { width_a: 9, width_b: 9 },
+                        nets: vec![],
+                        site: dummy_site(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                "DSP",
+                place::PlacedEcp5 {
+                    dsps: vec![place::PlacedDsp {
+                        name: "dsp0".into(),
+                        kind: place::DspKind::Mult18x18,
+                        nets: vec![],
+                        site: dummy_site(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                "PLL",
+                place::PlacedEcp5 {
+                    plls: vec![place::PlacedPll {
+                        name: "pll0".into(),
+                        ref_net: "clk".into(),
+                        out_nets: vec!["pll_clk".into()],
+                        site: dummy_site(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = route_on_device(d, &placed).unwrap_err();
+            assert!(err.contains(what), "unexpected error for {what}: {err}");
+            placed.top = "t".to_string();
+        }
     }
 
     /// Reference check: every one of these (tile type, dst, src) triples
