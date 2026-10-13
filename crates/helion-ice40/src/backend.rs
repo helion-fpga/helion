@@ -60,7 +60,7 @@ impl Backend for Ice40Backend {
     }
 
     fn bitstream(&self, routed: &Self::Routed) -> Result<Self::Bitstream, String> {
-        Ok(emit_asc(self.router(), routed))
+        emit_asc(self.router(), routed)
     }
 }
 
