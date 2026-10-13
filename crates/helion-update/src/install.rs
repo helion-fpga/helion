@@ -145,7 +145,7 @@ pub fn plan_install(release: &ReleaseInfo) -> Result<InstallPlan, UpdateError> {
     let asset = select_asset(
         &release.assets,
         &release.version,
-        &target,
+        target,
         in_bundle.is_some(),
     )?;
 

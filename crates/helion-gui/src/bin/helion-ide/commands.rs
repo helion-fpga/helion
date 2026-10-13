@@ -61,6 +61,7 @@ enum Command {
     ExampleXdc,
     ToggleWelcome,
     Cheatsheet,
+    CheckForUpdates,
     ToggleTheme,
     ToggleDensity,
     ToggleSidebar,
@@ -106,6 +107,7 @@ impl Command {
         cmds.push(Command::ExampleXdc);
         cmds.push(Command::ToggleWelcome);
         cmds.push(Command::Cheatsheet);
+        cmds.push(Command::CheckForUpdates);
         cmds.push(Command::PaletteFiles);
         cmds.push(Command::PaletteCommands);
         cmds.push(Command::ToggleSidebar);
@@ -130,6 +132,7 @@ impl Command {
             Command::ExampleXdc => "Read example constraints (counter.sdc)".to_string(),
             Command::ToggleWelcome => "Show welcome page".to_string(),
             Command::Cheatsheet => "Keyboard shortcuts".to_string(),
+            Command::CheckForUpdates => "Check for updates".to_string(),
             Command::ToggleTheme => "Toggle dark / light theme".to_string(),
             Command::ToggleDensity => "Toggle compact / comfortable density".to_string(),
             Command::ToggleSidebar => "Toggle sidebar".to_string(),
@@ -211,6 +214,7 @@ fn run_command(app: &mut HelionIde, cmd: Command) {
             }
         }
         Command::Cheatsheet => app.show_cheatsheet = true,
+        Command::CheckForUpdates => app.start_update_check(true),
         Command::ToggleTheme => toggle_theme(app),
         Command::ToggleDensity => toggle_density(app),
         Command::ToggleSidebar => app.sidebar_hidden = !app.sidebar_hidden,
@@ -806,6 +810,7 @@ fn menu_tools(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
 fn menu_help(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
     menu_cmd(ui, theme, app, Command::Cheatsheet, "Keyboard shortcuts…");
     menu_cmd(ui, theme, app, Command::ToggleWelcome, "Welcome page");
+    menu_cmd(ui, theme, app, Command::CheckForUpdates, "Check for updates…");
 }
 
 /// Menu bar (File / Edit / View / Flow / Tools / Help), painted inside the

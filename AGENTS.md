@@ -19,6 +19,20 @@ When updating this file, preserve this bar for all agents and keep entries conci
 
 `bin/helion-ide/toasts.rs`: small auto-dismissing notices, bottom-right above the status bar. Wall-clock expiry (5s) via `Instant` + `request_repaint_after` — never frame counts (the UI is reactive; frame-based timers linger while idle). Max 360px wide with wrapping, max 4 stacked, deduped. Job *progress* lives in the status bar; toasts are completions/errors only. No "Started" toasts.
 
+## In-app updater
+
+`crates/helion-update` (pure logic) + `bin/helion-ide/update_ui.rs` (UI).
+Check runs once on fresh session startup, on a background thread; no periodic
+checks while running. `HELION_NO_UPDATE_CHECK=1` skips it. GitHub Releases via
+`self_update` 0.42 (pinned: 1.x needs Rust 1.88, workspace MSRV is 1.85);
+SHA256SUMS verification is manual with `sha2` (0.42 has no checksums feature).
+In-place install only when the install dir is user-writable (probed with a
+tempfile, not permission bits); otherwise download-only to `~/Downloads`.
+macOS `.app` installs swap the whole bundle (replacing one binary would break
+the ad-hoc signature); Developer ID-signed bundles refuse in-place and fall
+back to download-only. Restart saves the editor, spawns the new binary with
+the same args, then closes. Menu: Help -> "Check for updates…".
+
 ## macOS release signing
 
 The `.app` is ad-hoc signed (`codesign --deep --force -s -`, in `scripts/build-macos-app.sh` + verified in `release.yml`), not Apple-notarized. Without the ad-hoc signature, Sequoia-era Gatekeeper reports the download as "damaged". First launch still needs the quarantine cleared once: `xattr -cr /Applications/Helion.app` (documented in README Quickstart). Full notarization needs a paid Apple Developer ID — not set up.

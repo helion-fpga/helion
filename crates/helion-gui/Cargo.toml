@@ -28,6 +28,8 @@ helion-drc = { workspace = true }
 helion-bd = { workspace = true }
 helion-ipxact = { workspace = true }
 helion-place = { workspace = true }
+helion-update = { workspace = true }
+tempfile = "3"
 helion-pack = { workspace = true }
 helion-route = { workspace = true }
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
