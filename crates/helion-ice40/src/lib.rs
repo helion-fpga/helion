@@ -10,6 +10,7 @@ pub mod backend;
 pub mod db;
 pub mod device;
 pub mod flow;
+pub mod gclk;
 pub mod pack;
 pub mod place;
 pub mod route;
