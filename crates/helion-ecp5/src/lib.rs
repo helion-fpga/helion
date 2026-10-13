@@ -27,6 +27,7 @@
 pub mod backend;
 pub mod db;
 pub mod device;
+pub mod pack;
 pub mod tiledata;
 
 pub use backend::{BitstreamEcp5, Ecp5Backend, PackedEcp5, PlacedEcp5, RoutedEcp5};
