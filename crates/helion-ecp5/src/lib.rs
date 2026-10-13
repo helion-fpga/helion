@@ -27,7 +27,12 @@
 pub mod backend;
 pub mod db;
 pub mod device;
+pub mod route;
 pub mod tiledata;
 
-pub use backend::{BitstreamEcp5, Ecp5Backend, PackedEcp5, PlacedEcp5, RoutedEcp5};
+pub use backend::{BitstreamEcp5, Ecp5Backend, PackedEcp5};
+// PlacedEcp5/RoutedEcp5: the route worker's real types (route.rs). They
+// shadow backend.rs's scaffolds, which that file's Backend impl still uses
+// internally until the coordinator rewires it.
+pub use route::{PlacedEcp5, RoutedEcp5};
 pub use device::Device;
