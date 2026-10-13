@@ -2082,12 +2082,20 @@ impl SchematicView {
             return self.instance_member_cells(inst);
         }
         if self.path_only && !self.highlight_cells.is_empty() {
-            return self
+            let matched: HashSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| self.highlight_cells.contains(&n.name))
                 .map(|n| n.name.clone())
                 .collect();
+            // Guard against the black void: stale highlight names (timing
+            // list rebuilt, naming mismatch between STA cells and schematic
+            // nodes) match nothing. Returning the empty set blanks the whole
+            // sheet; fall through to the full sheet instead so the view
+            // always renders something.
+            if !matched.is_empty() {
+                return matched;
+            }
         }
         let mut names: HashSet<String> = self.nodes.iter().map(|n| n.name.clone()).collect();
         // Single-instance full-cover (hier.sv): collapse the child into its
@@ -30589,6 +30597,63 @@ endmodule
             "Next walks forward to Zoom Fit: {next}"
         );
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
+    }
+
+    /// Priority repro (Saksham): selecting items in sequence must never blank
+    /// the schematic to a black void. When path_only isolation is armed but
+    /// the highlight names are stale (timing list rebuilt, STA/schematic
+    /// naming mismatch), the filter matches nothing; the sheet must fall
+    /// back to the full node set, never the empty set.
+    #[test]
+    fn schematic_stale_path_highlight_never_blanks_sheet() {
+        fn node(name: &str) -> SchematicNode {
+            SchematicNode {
+                name: name.to_string(),
+                kind: "LUT".to_string(),
+                pins: Vec::new(),
+            }
+        }
+        let mut view = SchematicView::default();
+        view.nodes = vec![node("u_a"), node("u_b"), node("u_c")];
+
+        // Normal case: matching highlights isolate the path.
+        view.path_only = true;
+        view.highlight_cells = ["u_a", "u_b"].iter().map(|s| s.to_string()).collect();
+        let names = view.sheet_cell_names();
+        assert_eq!(names.len(), 2, "matching highlights isolate");
+        assert!(names.contains("u_a") && names.contains("u_b"));
+
+        // Stale case: highlight names match nothing. Must NOT return empty.
+        view.highlight_cells = ["stale_1", "stale_2"].iter().map(|s| s.to_string()).collect();
+        let names = view.sheet_cell_names();
+        assert_eq!(
+            names.len(),
+            3,
+            "stale highlights must fall back to the full sheet, not a black void"
+        );
+
+        // Randomized selection sequences: path_only on/off with arbitrary
+        // highlight sets; the sheet must never come back empty while nodes exist.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        for seq in 0..200u64 {
+            let mut h = DefaultHasher::new();
+            seq.hash(&mut h);
+            let r = h.finish();
+            view.path_only = r & 1 == 1;
+            view.highlight_cells = (0..(r % 5))
+                .map(|i| format!("cell_{}_{}", seq, i))
+                .collect();
+            // Sprinkle in a real name sometimes.
+            if r % 3 == 0 {
+                view.highlight_cells.insert("u_b".to_string());
+            }
+            let names = view.sheet_cell_names();
+            assert!(
+                !names.is_empty(),
+                "sheet went empty on randomized selection sequence {seq}"
+            );
+        }
     }
 
     /// Priority repro (Saksham): mouse interaction on the timing view must
