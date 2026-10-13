@@ -63,7 +63,7 @@ fn iob_pintype_bits(kind: TileKind) -> HashMap<(u8, u8), (u8, u8)> {
 }
 
 /// Emit the `.asc` text for a routed design.
-pub fn emit_asc(router: &Router, routed: &RoutedIce) -> String {
+pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
     let placed = &routed.placed;
 
     // Allocate all tiles.
@@ -127,7 +127,8 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> String {
         io_by_tile.entry((io.x, io.y)).or_default().push(io);
     }
     for ((x, y), ios) in &io_by_tile {
-        let kind = tile_kind(*x, *y).unwrap();
+        let kind = tile_kind(*x, *y)
+            .ok_or_else(|| format!("ice40: IO placed at ({x}, {y}) is not a known tile"))?;
         let pintype_bits = iob_pintype_bits(kind);
         if let Some(t) = tiles.get_mut(&(*x, *y)) {
             for io in ios {
@@ -184,5 +185,5 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> String {
     render(&mut out, &tiles, &logic_tiles, "logic_tile");
     render(&mut out, &tiles, &ramb_tiles, "ramb_tile");
     render(&mut out, &tiles, &ramt_tiles, "ramt_tile");
-    out
+    Ok(out)
 }

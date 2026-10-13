@@ -113,18 +113,18 @@ pub struct PackedIce {
 /// Returns `(luts, top_output_net)`: the list of LUT4s (with fresh internal
 /// nets) and the net carrying the function output. Uses at most 7 LUT4s;
 /// fewer when the function ignores inputs.
-fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Vec<PackedLut> {
+fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Result<Vec<PackedLut>, String> {
     // Collect the actually-used input positions.
     let used: Vec<usize> = (0..6).filter(|&i| inputs[i].is_some()).collect();
     if used.is_empty() {
         // Constant function: single LUT4 tied off.
         let out = (init & 1) != 0;
-        return vec![PackedLut {
+        return Ok(vec![PackedLut {
             name: format!("{name}$const"),
             init: if out { 0xFFFF } else { 0x0000 },
             input_nets: [None, None, None, None],
             output_net: format!("{name}$O"),
-        }];
+        }]);
     }
     if used.len() <= 4 {
         // Direct map onto one LUT4, remapping the truth table.
@@ -145,17 +145,19 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Vec<Pa
         for (k, &pos) in used.iter().enumerate() {
             in_nets[k] = inputs[pos].clone();
         }
-        return vec![PackedLut {
+        return Ok(vec![PackedLut {
             name: format!("{name}$lut"),
             init: lut_init,
             input_nets: in_nets,
             output_net: format!("{name}$O"),
-        }];
+        }]);
     }
     // Shannon decomposition on the highest used input.
     // f = sel ? f1 : f0, each cofactor has one fewer input.
     let sel_pos = used[used.len() - 1];
-    let sel_net = inputs[sel_pos].clone().unwrap();
+    let sel_net = inputs[sel_pos].clone().ok_or_else(|| {
+        format!("ice40: LUT {name} input I{sel_pos} vanished during decomposition")
+    })?;
     // Cofactor truth tables, with the sel bit compressed out: for each
     // minterm where f = 1, drop bit sel_pos to get the 5-bit cofactor
     // address, and set it in c0 (sel = 0) or c1 (sel = 1).
@@ -179,10 +181,18 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Vec<Pa
     let mut in1 = inputs.clone();
     in0[sel_pos] = None;
     in1[sel_pos] = None;
-    let mut luts = decompose_lut6(&format!("{name}$f0"), c0, &in0);
-    let out0 = luts.last().unwrap().output_net.clone();
-    let mut luts1 = decompose_lut6(&format!("{name}$f1"), c1, &in1);
-    let out1 = luts1.last().unwrap().output_net.clone();
+    let mut luts = decompose_lut6(&format!("{name}$f0"), c0, &in0)?;
+    let out0 = luts
+        .last()
+        .ok_or_else(|| format!("ice40: decomposition of {name}$f0 produced no LUTs"))?
+        .output_net
+        .clone();
+    let mut luts1 = decompose_lut6(&format!("{name}$f1"), c1, &in1)?;
+    let out1 = luts1
+        .last()
+        .ok_or_else(|| format!("ice40: decomposition of {name}$f1 produced no LUTs"))?
+        .output_net
+        .clone();
     luts.append(&mut luts1);
     // Mux: sel ? out1 : out0. LUT4(sel, out0, out1) = (sel & out1) | (!sel & out0).
     // init bit n (n = in_2*4 + in_1*2 + in_0): in_0=sel, in_1=out0, in_2=out1.
@@ -202,7 +212,7 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Vec<Pa
         input_nets: [Some(sel_net), Some(out0), Some(out1), None],
         output_net: format!("{name}$O"),
     });
-    luts
+    Ok(luts)
 }
 
 /// Pack a [`Design`] into iCE40 primitives.
@@ -223,7 +233,7 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                     .net_on(&cell.name, "O")
                     .ok_or_else(|| format!("pack: LUT {} has no O net", cell.name))?
                     .to_string();
-                let mut luts = decompose_lut6(&cell.name, *init, &inputs);
+                let mut luts = decompose_lut6(&cell.name, *init, &inputs)?;
                 // Rename the top output net to the real one.
                 if let Some(top) = luts.last_mut() {
                     top.output_net = output_net;
@@ -467,7 +477,7 @@ mod tests {
             None,
             None,
         ];
-        let luts = decompose_lut6("u", init, &inputs);
+        let luts = decompose_lut6("u", init, &inputs).unwrap();
         assert_eq!(luts.len(), 1);
         // LUT4(a) = a: init bit n = (n>>0)&1.
         assert_eq!(luts[0].init, 0xAAAA);
@@ -491,7 +501,7 @@ mod tests {
             Some("i4".into()),
             Some("i5".into()),
         ];
-        let luts = decompose_lut6("x", init, &inputs);
+        let luts = decompose_lut6("x", init, &inputs).unwrap();
         // Evaluate: map net name -> value.
         for a in 0..64u64 {
             let mut vals: std::collections::HashMap<String, bool> = (0..6)
