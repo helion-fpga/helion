@@ -1513,6 +1513,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-ice40"
+version = "3.0.0"
+dependencies = [
+ "helion-backend",
+ "helion-ir",
+ "helion-sv",
+]
+
+[[package]]
 name = "helion-ipxact"
 version = "3.0.0"
 

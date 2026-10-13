@@ -1,18 +1,16 @@
-//! Thin driver for the iCE40 backend: pack → place → route → bitstream.
+//! Thin driver for the iCE40 backend.
 //!
-//! Kept deliberately small so it migrates trivially once the `Backend`
-//! trait hardens. All device knowledge lives in the stage modules.
+//! The [`helion_backend::Backend`] trait owns the flow now
+//! ([`Backend::run`](helion_backend::Backend::run) drives
+//! pack → place → route → bitstream). These helpers are convenience shims
+//! over it so callers do not need to construct [`Ice40Backend`] themselves.
 
 use crate::backend::{BitstreamIce, Ice40Backend};
 use helion_backend::{Backend, NetlistIr};
 
 /// Run the full flow for `part` (e.g. `"ice40-hx8k"`), returning `.asc` text.
 pub fn run_for_part(part: &str, netlist: &NetlistIr) -> Result<BitstreamIce, String> {
-    let backend = Ice40Backend::new(part);
-    let packed = backend.pack(netlist)?;
-    let placed = backend.place(&packed)?;
-    let routed = backend.route(&placed)?;
-    backend.bitstream(&routed)
+    Ice40Backend::new(part).run(netlist)
 }
 
 /// Run the full flow for the default HX8K target.

@@ -3,7 +3,7 @@
 //! The stage types are the coordinator-owned stage modules
 //! ([`crate::pack`], [`crate::place`], [`crate::route`], [`crate::asc`]).
 
-use helion_backend::{Backend, NetlistIr};
+use helion_backend::{Backend, NetlistIr, TimingModel};
 use std::sync::OnceLock;
 
 pub use crate::asc::emit_asc;
@@ -61,6 +61,10 @@ impl Backend for Ice40Backend {
 
     fn bitstream(&self, routed: &Self::Routed) -> Result<Self::Bitstream, String> {
         emit_asc(self.router(), routed)
+    }
+
+    fn timing_model(&self) -> TimingModel {
+        TimingModel::ice40_hx8k()
     }
 }
 
