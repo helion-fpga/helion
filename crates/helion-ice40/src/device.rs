@@ -115,16 +115,22 @@ type SpanKey = (u8, u8, String);
 /// plus the documented intra-tile through-connections). All [`SpanKey`]
 /// triples that are the same physical copper share one id.
 pub fn span_aliases() -> &'static HashMap<SpanKey, u32> {
-    static MAP: OnceLock<HashMap<(u8, u8, String), u32>> = OnceLock::new();
+    static MAP: OnceLock<HashMap<SpanKey, u32>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
         for line in include_str!("../data/span_aliases.txt").lines() {
             let mut p = line.split_whitespace();
-            let wid: u32 = p.next().unwrap().parse().unwrap();
-            let x: u8 = p.next().unwrap().parse().unwrap();
-            let y: u8 = p.next().unwrap().parse().unwrap();
-            let name = p.next().unwrap().to_string();
-            m.insert((x, y, name), wid);
+            // Skip malformed lines; the data file is generated and validated
+            // by tests, but parsing stays infallible.
+            let (wid, x, y, name) = match (p.next(), p.next(), p.next(), p.next()) {
+                (Some(w), Some(x), Some(y), Some(n)) => (w, x, y, n),
+                _ => continue,
+            };
+            if let (Ok(wid), Ok(x), Ok(y)) =
+                (wid.parse::<u32>(), x.parse::<u8>(), y.parse::<u8>())
+            {
+                m.insert((x, y, name.to_string()), wid);
+            }
         }
         m
     })
@@ -150,13 +156,28 @@ pub fn io_span_map() -> &'static HashMap<SpanKey, SpanKey> {
         let mut m = HashMap::new();
         for line in include_str!("../data/io_span_map.txt").lines() {
             let mut p = line.split_whitespace();
-            let ix: u8 = p.next().unwrap().parse().unwrap();
-            let iy: u8 = p.next().unwrap().parse().unwrap();
-            let inode = p.next().unwrap().to_string();
-            let lx: u8 = p.next().unwrap().parse().unwrap();
-            let ly: u8 = p.next().unwrap().parse().unwrap();
-            let lnode = p.next().unwrap().to_string();
-            m.insert((ix, iy, inode), (lx, ly, lnode));
+            let (ix, iy, inode, lx, ly, lnode) = match (
+                p.next(),
+                p.next(),
+                p.next(),
+                p.next(),
+                p.next(),
+                p.next(),
+            ) {
+                (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+                _ => continue,
+            };
+            if let (Ok(ix), Ok(iy), Ok(lx), Ok(ly)) = (
+                ix.parse::<u8>(),
+                iy.parse::<u8>(),
+                lx.parse::<u8>(),
+                ly.parse::<u8>(),
+            ) {
+                m.insert(
+                    (ix, iy, inode.to_string()),
+                    (lx, ly, lnode.to_string()),
+                );
+            }
         }
         m
     })
