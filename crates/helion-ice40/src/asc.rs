@@ -6,6 +6,7 @@
 
 use crate::device::{tile_db, tile_kind, TileKind, PINTYPE_INPUT, PINTYPE_OUTPUT};
 use crate::pack::{lut4_init_to_lc_bits, IoDir};
+use crate::place::CarryMuxMode;
 use crate::route::{RoutedIce, Router};
 use std::collections::{HashMap, HashSet};
 
@@ -62,6 +63,34 @@ fn iob_pintype_bits(kind: TileKind) -> HashMap<(u8, u8), (u8, u8)> {
     m
 }
 
+/// Config bits to set for a buffer `(src -> dst)` in a logic tile.
+/// Returns an error if the DB has no such entry (a bug, not a silent skip).
+fn buffer_set_bits(src: &str, dst: &str) -> Result<Vec<(u8, u8)>, String> {
+    let entry = tile_db(TileKind::Logic).iter().find(|e| {
+        matches!(e.func, crate::db::DbFunc::Buffer) && e.src == src && e.dst == dst
+    });
+    match entry {
+        Some(e) => Ok(e
+            .bits
+            .iter()
+            .filter(|b| b.val)
+            .map(|b| (b.row, b.bit))
+            .collect()),
+        None => Err(format!(
+            "ice40: no buffer DB entry for {src} -> {dst} (carry wiring)"
+        )),
+    }
+}
+
+/// The `CarryInSet` bit (B1[50]).
+fn carry_in_set_bit() -> Result<(u8, u8), String> {
+    tile_db(TileKind::Logic)
+        .iter()
+        .find(|e| matches!(&e.func, crate::db::DbFunc::Other(f) if f == "CarryInSet"))
+        .and_then(|e| e.bits.iter().find(|b| b.val).map(|b| (b.row, b.bit)))
+        .ok_or_else(|| "ice40: no CarryInSet DB entry".to_string())
+}
+
 /// Emit the `.asc` text for a routed design.
 pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
     let placed = &routed.placed;
@@ -92,30 +121,68 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
     // Map (x, y, lc) -> (lut init, has_ff).
     let mut lc_lut: HashMap<(u8, u8, u8), u16> = HashMap::new();
     let mut lc_ff: HashSet<(u8, u8, u8)> = HashSet::new();
+    let mut lc_carry: HashSet<(u8, u8, u8)> = HashSet::new();
     for lut in &placed.luts {
         lc_lut.insert((lut.x, lut.y, lut.lc), lut.init);
+        if lut.carry {
+            lc_carry.insert((lut.x, lut.y, lut.lc));
+        }
     }
     for ff in &placed.ffs {
         lc_ff.insert((ff.x, ff.y, ff.lc));
     }
     for (&(x, y, lc), &init) in &lc_lut {
         let mut bits = lut4_init_to_lc_bits(init);
-        // Bit 9: DffEnable. Bit 8: CarryEnable (v1: off).
+        // Bit 9: DffEnable. Bit 8: CarryEnable.
         bits[9] = lc_ff.contains(&(x, y, lc));
-        bits[8] = false;
+        bits[8] = lc_carry.contains(&(x, y, lc));
         // Bits 18, 19: set/reset config (v1: synchronous reset, off).
         bits[18] = false;
         bits[19] = false;
         if let Some(t) = tiles.get_mut(&(x, y)) {
+            // LC_i[j] lives at bank 2i bit (36+j) for j<10, bank 2i+1 bit
+            // (36+j-10) for j>=10 (IceStorm logic-tile documentation table).
             for (j, &b) in bits.iter().enumerate().take(10) {
                 if b {
-                    t.set(2 * lc, 45 - j as u8);
+                    t.set(2 * lc, 36 + j as u8);
                 }
             }
             for (j, &b) in bits.iter().enumerate().skip(10) {
                 if b {
-                    t.set(2 * lc + 1, 45 - (j - 10) as u8);
+                    t.set(2 * lc + 1, 36 + (j - 10) as u8);
                 }
+            }
+        }
+    }
+
+    // 2b. Carry wiring bits.
+    // in_3 of each carry LC selects the carry: carry_in_mux for LC0,
+    // the previous LC's cout otherwise (dedicated carry needs no bits).
+    for &(x, y, lc) in &lc_carry {
+        let (src, dst) = if lc == 0 {
+            ("carry_in_mux".to_string(), "lutff_0/in_3".to_string())
+        } else {
+            (
+                format!("lutff_{}/cout", lc - 1),
+                format!("lutff_{lc}/in_3"),
+            )
+        };
+        let set_bits = buffer_set_bits(&src, &dst)?;
+        if let Some(t) = tiles.get_mut(&(x, y)) {
+            for &(bank, bit) in &set_bits {
+                t.set(bank, bit);
+            }
+        }
+    }
+    // carry_in_mux source per tile.
+    for mux in &placed.carry_mux {
+        let set_bits = match mux.mode {
+            CarryMuxMode::One => vec![carry_in_set_bit()?],
+            CarryMuxMode::FromBelow => buffer_set_bits("carry_in", "carry_in_mux")?,
+        };
+        if let Some(t) = tiles.get_mut(&(mux.x, mux.y)) {
+            for &(bank, bit) in &set_bits {
+                t.set(bank, bit);
             }
         }
     }
