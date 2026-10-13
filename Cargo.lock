@@ -1477,6 +1477,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-hl10t"
+version = "3.0.0"
+dependencies = [
+ "helion-backend",
+ "helion-bits",
+ "helion-device",
+ "helion-ir",
+ "helion-pack",
+ "helion-place",
+ "helion-route",
+ "helion-sv",
+]
+
+[[package]]
 name = "helion-hls"
 version = "3.0.0"
 dependencies = [
@@ -1598,6 +1612,7 @@ name = "helion-sta"
 version = "3.0.0"
 dependencies = [
  "criterion",
+ "helion-backend",
  "helion-device",
  "helion-ir",
  "helion-pack",

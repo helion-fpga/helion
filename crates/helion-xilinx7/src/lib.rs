@@ -24,6 +24,7 @@ pub mod frames;
 pub mod pack;
 pub mod place;
 pub mod route;
+pub mod timing;
 pub mod xdevice;
 pub use xdevice::{build_node_map, XDevice};
 

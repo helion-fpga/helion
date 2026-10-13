@@ -22,6 +22,53 @@ pub trait EmitDevice {
     fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
 }
 
+/// IBUF `.IN` feature prefix for an IOSTANDARD, from
+/// `segbits_liob33.db`. The prefix encodes which standards share the same
+/// configuration bits; an unknown standard is a loud error, not a default.
+fn ibuf_in_prefix(iostandard: &str) -> Result<&'static str, String> {
+    match iostandard.to_ascii_uppercase().as_str() {
+        "LVCMOS12" | "LVCMOS15" | "LVCMOS18" => Ok("LVCMOS12_LVCMOS15_LVCMOS18"),
+        "LVCMOS25" | "LVCMOS33" | "LVTTL" => Ok("LVCMOS25_LVCMOS33_LVTTL"),
+        "LVDS_25" | "SSTL135" | "SSTL15" => Ok("LVDS_25_SSTL135_SSTL15"),
+        "TMDS_33" => Ok("TMDS_33"),
+        other => Err(format!("emit: unsupported input IOSTANDARD {other}")),
+    }
+}
+
+/// OBUF `.DRIVE` feature prefix for an (IOSTANDARD, DRIVE) pair, from
+/// `segbits_liob33.db`. Xilinx groups standards that share drive-strength
+/// bits; the prefix is NOT always the bare standard name. Unknown
+/// combinations are a loud error, not a guessed feature.
+fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, String> {
+    let std = iostandard.to_ascii_uppercase();
+    let drv = drive.to_ascii_uppercase();
+    let prefix = match (std.as_str(), drv.as_str()) {
+        ("LVCMOS12", "I4" | "I12") => "LVCMOS12",
+        ("LVCMOS12", "I8") => "LVCMOS12_LVCMOS25",
+        ("LVCMOS15", "I8" | "I12") => "LVCMOS15",
+        ("LVCMOS15", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
+        ("LVCMOS15", "I16") => "LVCMOS15_SSTL15",
+        ("LVCMOS18", "I12" | "I16" | "I24") => "LVCMOS18",
+        ("LVCMOS18", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
+        ("LVCMOS25", "I12" | "I16") => "LVCMOS25",
+        ("LVCMOS25", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
+        ("LVCMOS25", "I8") => "LVCMOS12_LVCMOS25",
+        ("LVCMOS33", "I16") => "LVCMOS33",
+        ("LVCMOS33", "I4" | "I12") => "LVCMOS33_LVTTL",
+        ("LVTTL", "I24") => "LVTTL",
+        ("LVTTL", "I4" | "I12") => "LVCMOS33_LVTTL",
+        ("LVDS_25", "I") => "LVDS_25",
+        ("SSTL135", "I") => "SSTL135",
+        ("TMDS_33", "I") => "TMDS_33",
+        _ => {
+            return Err(format!(
+                "emit: unsupported (IOSTANDARD, DRIVE) = ({iostandard}, {drive})"
+            ))
+        }
+    };
+    Ok(prefix)
+}
+
 /// Backend-owned bitstream: FASM text plus assembled configuration frames.
 #[derive(Clone, Debug, Default)]
 pub struct Bitstream7 {
@@ -77,12 +124,12 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         })?;
         match iob.dir {
             IobDir::In => {
-                // IBUF: input buffer. The IN feature lives under a combined
-                // iostandard prefix; IN_ONLY disables the output driver.
-                lines.push(format!(
-                    "{}.{}.LVCMOS25_LVCMOS33_LVTTL.IN",
-                    iob.tile, site_rel
-                ));
+                // IBUF: input buffer. The IN feature lives under an
+                // iostandard-specific prefix (see ibuf_in_prefix), e.g.
+                // "RIOB33_X0Y0.IOB_Y1.LVCMOS25_LVCMOS33_LVTTL.IN".
+                // IN_ONLY disables the output driver.
+                let prefix = ibuf_in_prefix(&p.iostandard)?;
+                lines.push(format!("{}.{}.{}.IN", iob.tile, site_rel, prefix));
                 lines.push(format!(
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY",
                     iob.tile, site_rel
@@ -90,17 +137,23 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             }
             IobDir::Out => {
                 // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
-                // Default I16: the X-Ray DB only has segbits for I16
-                // (LVCMOS33 also allows 4/8/12/24 in silicon).
+                // The DRIVE feature prefix depends on the (standard, drive)
+                // pair (see obuf_drive_prefix).
                 let drive = p.drive.as_deref().unwrap_or("I16");
+                let prefix = obuf_drive_prefix(&p.iostandard, drive)?;
                 lines.push(format!(
                     "{}.{}.{}.DRIVE.{}",
-                    iob.tile, site_rel, p.iostandard, drive
+                    iob.tile,
+                    site_rel,
+                    prefix,
+                    drive.to_ascii_uppercase()
                 ));
                 let slew = p.slew.as_deref().unwrap_or("SLOW");
                 lines.push(format!(
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.{}",
-                    iob.tile, site_rel, slew
+                    iob.tile,
+                    site_rel,
+                    slew.to_ascii_uppercase()
                 ));
             }
         }
@@ -114,6 +167,30 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             .ok_or_else(|| format!("emit: no rel site for {} {}", bufg.tile, bufg.site))?;
         lines.push(format!("{}.BUFGCTRL.{}.IN_USE", bufg.tile, site_rel));
         lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED", bufg.tile, site_rel));
+    }
+
+    // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
+    // programming from the IR's Bram18 words is not yet emitted; the
+    // block_ram.db bit mapping is future work.
+    for bram in &placed.brams {
+        let site_rel = device
+            .site_rel(&bram.tile, &bram.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", bram.tile, bram.site))?;
+        lines.push(format!("{}.RAMB18.{}.IN_USE", bram.tile, site_rel));
+    }
+
+    // DSP48E1s: placed on sites but configuration FASM not yet emitted.
+    // Full DSP configuration (USE_MULT, OPMODE, ALUMODE, INMODE, pipeline
+    // registers) requires the detailed attribute bit mapping; future work.
+    let _ = &placed.dsps;
+
+    // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.IN_USE. The carry chain
+    // muxing (CYINIT, CI) is not yet emitted; minimal placement only.
+    for carry in &placed.carries {
+        let site_rel = device
+            .site_rel(&carry.tile, &carry.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
+        lines.push(format!("{}.{}.CARRY4.IN_USE", carry.tile, site_rel));
     }
 
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
@@ -207,6 +284,8 @@ mod tests {
                 Some(if site.ends_with("Y0") { "SLICEL_X0".into() } else { "SLICEL_X1".into() })
             } else if tile.starts_with("RIOB") {
                 Some("IOB_Y1".into())
+            } else if tile.starts_with("BRAM") {
+                Some("RAMB18_X0Y0".into())
             } else {
                 Some("BUFGCTRL_X0Y0".into())
             }
@@ -235,6 +314,9 @@ mod tests {
                 drive: None, slew: None,
             }],
             bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -242,6 +324,9 @@ mod tests {
             ffs: vec![PlacedFf { name: "u_ff".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into() }],
             iobs: vec![PlacedIob { name: "u_obuf".into(), port: "led".into(), dir: IobDir::Out, tile: "RIOB33_X0Y0".into(), site: "IOB_X0Y0".into() }],
             bufgs: vec![],
+            brams: vec![],
+            dsps: vec![],
+            carries: vec![],
         };
         Routed7 {
             placed,
@@ -264,5 +349,34 @@ mod tests {
         assert_eq!(lut_bel("A6LUT").unwrap(), "ALUT");
         assert_eq!(lut_bel("D6LUT").unwrap(), "DLUT");
         assert!(lut_bel("X6LUT").is_err());
+    }
+
+    #[test]
+    fn emit_bram_fasm() {
+        use crate::pack::PackedBram;
+        use crate::place::PlacedBram;
+        let packed = Packed7 {
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![PackedBram { name: "u_bram".into(), init: vec![] }],
+            dsps: vec![],
+            carries: vec![],
+        };
+        let placed = Placed7 {
+            packed: packed.clone(),
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![PlacedBram { name: "u_bram".into(), tile: "BRAM_L_X0Y0".into(), site: "RAMB18_X0Y0".into() }],
+            dsps: vec![],
+            carries: vec![],
+        };
+        let routed = Routed7 { placed, nets: vec![] };
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("BRAM_L_X0Y0.RAMB18.RAMB18_X0Y0.IN_USE"), "got:\n{text}");
     }
 }
