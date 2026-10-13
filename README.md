@@ -96,8 +96,8 @@ All from real runs. Numbers are the tool's own output, not mockups.
 ## The full tour
 
 <p align="center">
-  <video src="docs/screenshots/demo-run.mp4" width="800" controls></video><br>
-  <em>65 seconds, no audio, no time tricks: editor, implement flow at real speed, device view, schematic, timing reports, waveform sim on complex.sv</em>
+  <a href="docs/screenshots/demo-run.mp4"><img src="docs/screenshots/demo-poster.png" alt="Helion IDE full-flow tour: editor, implement, device view, schematic, timing, waveform" width="800"></a><br>
+  <em>65 seconds, no audio, no time tricks: editor, implement flow at real speed, device view, schematic, timing reports, waveform sim on complex.sv. Click to watch.</em>
 </p>
 
 ## Quickstart
