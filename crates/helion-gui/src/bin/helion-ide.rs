@@ -7026,12 +7026,6 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     ui.heading("Bitstream");
     ui.add_space(6.0);
     let report = model.bitstream_report();
-    if report.frames == 0 && report.bytes == 0 {
-        if paint_remaining_cta(ui, "No bitstream yet.", "Generate Bitstream", theme) {
-            let _ = model.exec("write_bitstream");
-        }
-        return;
-    }
     ui.horizontal(|ui| {
         if ui.button("Generate Bitstream").clicked() {
             let _ = model.exec("write_bitstream");
@@ -7041,6 +7035,10 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         }
     });
     ui.add_space(6.0);
+    if report.frames == 0 && report.bytes == 0 {
+        ui.label(egui::RichText::new("No bitstream yet.").color(theme.dim));
+        return;
+    }
     ui.label(format!(
         "{} · {} frames · {} B · id {:#010x}",
         if report.configured != 0 {

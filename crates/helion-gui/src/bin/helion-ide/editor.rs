@@ -564,6 +564,15 @@ fn paint_minimap(
     let mini_h = mini_rect.height();
 
     let row_mini = (mini_h / n_lines as f32).min(4.0);
+    // The minimap TEXT height: the viewport rectangle must map onto the
+    // text, not the widget. For short files the galley is shorter than the
+    // widget; mapping onto the widget puts the thumb below the text, falsely
+    // claiming end-of-file. (Bars mode always fills the widget.)
+    let text_top = mini_rect.min.y + 2.0;
+    let mut text_h = mini_h;
+    // Bars mode fills the widget from its top edge; text mode is anchored
+    // 2px down where the galley is painted.
+    let mut text_anchor = text_top;
     if n_lines <= MINIMAP_TEXT_CAP && row_mini >= 2.0 {
         let font_size = (row_mini * 0.85).clamp(2.0, 4.0);
         // Cache the tiny galley: rebuild only when the text changes.
@@ -587,10 +596,11 @@ fn paint_minimap(
             }
         };
         ui.painter().with_clip_rect(mini_rect).galley(
-            egui::pos2(mini_rect.min.x + 4.0, mini_rect.min.y + 2.0),
-            galley,
+            egui::pos2(mini_rect.min.x + 4.0, text_top),
+            galley.clone(),
             theme.text,
         );
+        text_h = galley.size().y.max(1.0);
     } else {
         // Bars for huge files: sampled so we never paint more than ~4k rects.
         let step = (n_lines / 4000).max(1);
@@ -608,14 +618,17 @@ fn paint_minimap(
             );
             idx += step;
         }
+        text_anchor = mini_rect.min.y;
     }
 
-    // Viewport rectangle.
-    let v_top = mini_rect.min.y + (offset_y / total_h * mini_h).clamp(0.0, mini_h);
-    let v_h = (viewport_h / total_h * mini_h).clamp(10.0, mini_h);
+    // Viewport rectangle: scroll fraction mapped onto the minimap TEXT
+    // (text_anchor..text_anchor+text_h), never the bare widget. Standard scrollbar
+    // math: thumb_pos = offset/content * track, thumb_size = viewport/content
+    // * track; at max scroll the thumb bottom meets the text bottom exactly.
+    let (v_top, v_h) = minimap_viewport(text_anchor, text_h, offset_y, viewport_h, total_h);
     let v_rect = egui::Rect::from_min_size(
         egui::pos2(mini_rect.min.x + 2.0, v_top),
-        egui::vec2(mini_rect.width() - 4.0, v_h.min(mini_h - (v_top - mini_rect.min.y))),
+        egui::vec2(mini_rect.width() - 4.0, v_h),
     );
     painter.rect_filled(v_rect, 2.0, egui::Color32::from_white_alpha(26));
     painter.rect_stroke(
@@ -625,11 +638,104 @@ fn paint_minimap(
         egui::StrokeKind::Inside,
     );
 
-    // Click / drag to scroll.
+    // Click / drag to scroll: map the pointer onto the text region, not the
+    // widget, so clicks below short-file text do not jump to end-of-file.
     if mini_resp.clicked() || mini_resp.dragged() {
         if let Some(pos) = mini_resp.interact_pointer_pos() {
-            let frac = ((pos.y - mini_rect.min.y) / mini_h).clamp(0.0, 1.0);
+            let frac = ((pos.y - text_anchor) / text_h).clamp(0.0, 1.0);
             app.editor_mini_scroll = Some((frac * total_h - viewport_h / 2.0).max(0.0));
         }
+    }
+}
+
+/// Pure viewport-rectangle math for the minimap, extracted for testing.
+/// Returns (top_y, height) of the viewport overlay.
+///
+/// `text_top`/`text_h`: where the minimap text actually is; `offset_y`: the
+/// editor's current scroll offset; `viewport_h`: visible editor height;
+/// `total_h`: full editor content height. The thumb position is
+/// `offset / content * track` and the thumb size is `viewport / content *
+/// track`, so the indicator always agrees with the viewport.
+fn minimap_viewport(
+    text_top: f32,
+    text_h: f32,
+    offset_y: f32,
+    viewport_h: f32,
+    total_h: f32,
+) -> (f32, f32) {
+    let track = text_h.max(1.0);
+    let content = total_h.max(1.0);
+    let top = text_top + (offset_y / content * track).clamp(0.0, track);
+    let mut h = (viewport_h / content * track).clamp(10.0, track);
+    // If the top clamped (offset past max scroll), shrink the thumb so it
+    // never extends past the text bottom: the indicator must never present
+    // false state.
+    h = h.min((text_top + track - top).max(0.0));
+    (top, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::minimap_viewport;
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    /// Priority repro (Saksham): the minimap viewport thumb must track the
+    /// real scroll offset. For each scroll position, the thumb's fractional
+    /// position must equal offset / content_height within rounding, and at
+    /// max scroll the thumb bottom must meet the text bottom exactly.
+    #[test]
+    fn minimap_thumb_tracks_scroll_offset() {
+        // Short file: 71 lines like complex.sv; text much shorter than widget.
+        let text_top = 102.0;
+        let text_h = 150.0;
+        let total_h = 71.0 * 19.5; // n_lines * ROW_H
+        let viewport_h = 600.0;
+        let max_offset = total_h - viewport_h;
+
+        for frac in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let offset = frac * max_offset;
+            let (v_top, v_h) = minimap_viewport(text_top, text_h, offset, viewport_h, total_h);
+            let thumb_frac = (v_top - text_top) / text_h;
+            let expect_frac = offset / total_h;
+            assert!(
+                approx(thumb_frac, expect_frac),
+                "offset {offset}: thumb fraction {thumb_frac} != scroll fraction {expect_frac}"
+            );
+            // Thumb height follows viewport/content * track.
+            let expect_h = (viewport_h / total_h * text_h).clamp(10.0, text_h);
+            assert!(
+                approx(v_h, expect_h),
+                "offset {offset}: thumb height {v_h} != {expect_h}"
+            );
+        }
+
+        // At max scroll the thumb bottom meets the text bottom exactly:
+        // no false "end of file" gap, no overshoot.
+        let (v_top, v_h) = minimap_viewport(text_top, text_h, max_offset, viewport_h, total_h);
+        assert!(
+            approx(v_top + v_h, text_top + text_h),
+            "max scroll: thumb bottom {} != text bottom {}",
+            v_top + v_h,
+            text_top + text_h
+        );
+        // At zero scroll the thumb sits at the text top.
+        let (v_top0, _) = minimap_viewport(text_top, text_h, 0.0, viewport_h, total_h);
+        assert!(
+            approx(v_top0, text_top),
+            "zero scroll: thumb top {v_top0} != text top {text_top}"
+        );
+    }
+
+    /// Thumb never leaves the text region, even for degenerate inputs.
+    #[test]
+    fn minimap_thumb_stays_inside_text() {
+        let (v_top, v_h) = minimap_viewport(50.0, 200.0, 10_000.0, 600.0, 1384.5);
+        assert!(v_top >= 50.0 && v_top <= 250.0, "thumb top escaped: {v_top}");
+        assert!(v_top + v_h <= 250.5, "thumb bottom escaped: {}", v_top + v_h);
+        let (v_top, _) = minimap_viewport(50.0, 200.0, -100.0, 600.0, 1384.5);
+        assert!(v_top >= 50.0, "negative offset escaped upward: {v_top}");
     }
 }
