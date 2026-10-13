@@ -2,25 +2,27 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="theme-color" content="#0a0c10" />
+  <meta name="theme-color" content="#fbfbfa" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Helion: original FPGA family and CAD</title>
-  <meta name="description" content="Helion is an original FPGA device family plus the in-repo CAD (synth, pack, place, PathFinder route, STA, bitstream) and desktop IDE that target that family. Not a vendor-tool wrapper. Gold: empty-XDC counter.sv WNS_PS=9640." />
+  <title>Helion: the full FPGA flow in one binary</title>
+  <meta name="description" content="Helion is an FPGA CAD suite: synth, pack, place, route, timing, bitstream in one Rust binary. Targets HL10T and Xilinx 7-series. Deterministic, fail-loud, measured. Gold: WNS_PS=9640." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=docs1" />
-  <meta property="og:title" content="Helion: original FPGA family and CAD" />
-  <meta property="og:image" content="https://helion-fpga.github.io/helion/brand/hero-die.jpg" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css?v=v4" />
+  <meta property="og:title" content="Helion: the full FPGA flow in one binary" />
+  <meta property="og:image" content="https://helion-fpga.github.io/helion/screenshots/ide-physview.png" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
-  <header class="bar">
-    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
+
+  <header class="pill-nav" id="pillNav">
+    <a class="brand" href="index.html"><img src="brand/mark.png" alt="" width="30" height="30" /><span>Helion</span></a>
     <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
     <nav id="site-nav">
+      <span class="limelight" aria-hidden="true"></span>
       <a href="index.html">Home</a>
       <a href="use.html">Use</a>
       <a href="start.html">Start</a>
@@ -33,100 +35,108 @@
   </header>
 
   <main id="main">
-    <section class="hero" id="hero-stage">
-      <div class="hero-media">
-        <img src="brand/hero-wave.jpg" alt="" />
-        <video id="hero-vid" autoplay muted loop playsinline poster="brand/hero-die.jpg" aria-hidden="true">
-          <source src="brand/die-pulse.mp4?v=wrap" type="video/mp4" />
-        </video>
-        <button type="button" class="anim-toggle" id="anim-toggle" aria-pressed="true" title="Pause die video">II</button>
-      </div>
-      <div class="hero-copy">
-        <h1>Original FPGA family, and the CAD that targets it.</h1>
-        <p class="lede">
-          Helion is not a wrapper around a vendor tool. It is an original FPGA
-          device family (<code>HL10T-C32-1</code> in the Helion Architecture Database)
-          plus the in-repo CAD: synth, pack, place, PathFinder route, STA, DRC,
-          FeatureMap bitstream, fabric sim, and a desktop IDE
-          (<code>helion-ide</code>) that paints that same Session.
-          Empty-XDC <code>counter.sv</code> gold is <span class="gold">WNS_PS=9640</span>.
+    <section class="hero">
+      <div class="bg-stage" aria-hidden="true"></div>
+      <div class="hero-inner">
+        <a class="announce reveal" href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">
+          <span class="dot"></span> v3.0.0: Xilinx 7-series backend, SAT equivalence, SVA, CDC <span class="arrow">&rarr;</span>
+        </a>
+        <h1 class="reveal" style="--d:.08s">One binary. The whole FPGA flow. <span class="chrome-text">Two device families.</span></h1>
+        <p class="lede reveal" style="--d:.16s">
+          Helion is an FPGA CAD suite, not a vendor-tool wrapper. Write SystemVerilog or
+          VHDL, run one command, and get a placed, routed, timing-closed bitstream for the
+          HL10T die or Xilinx 7-series parts. Deterministic, fail-loud, and measured.
         </p>
-        <p class="cta">
-          <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 2.1.0</a>
+        <div class="cta-row reveal" style="--d:.24s">
+          <a class="btn" href="https://github.com/helion-fpga/helion/releases/latest">Download 3.0.0</a>
           <a class="btn ghost" href="use.html">Use Helion</a>
           <a class="btn ghost" href="roadmap.html">Roadmap</a>
-        </p>
+        </div>
+      </div>
+      <div class="hero-shot reveal" style="--d:.32s">
+        <div class="wordmark" aria-hidden="true">SYNTHESIZE</div>
+        <div class="shot-frame">
+          <img src="screenshots/ide-physview.png" alt="Helion IDE Physical View 2.0: placed complex.sv on the HL10T die with layer controls and inspector" width="1280" height="800" />
+        </div>
+        <p class="shot-caption">Physical View 2.0: a real <code>complex.sv</code> run, 71 LUTFF + 22 IOB placed and routed, WNS_PS=8740</p>
+      </div>
+    </section>
+
+    <section class="stats" aria-label="Measured results">
+      <div class="stats-inner">
+        <div class="reveal"><div class="stat-num" data-count="98" data-suffix="%"></div><div class="stat-label">fewer frontend allocations, perf campaign</div></div>
+        <div class="reveal" style="--d:.08s"><div class="stat-num" data-count="42" data-suffix="%"></div><div class="stat-label">fewer LUTs on uart, area campaign</div></div>
+        <div class="reveal" style="--d:.16s"><div class="stat-num" data-count="9640" data-suffix=" ps"></div><div class="stat-label">gold WNS, empty-XDC counter.sv</div></div>
+        <div class="reveal" style="--d:.24s"><div class="stat-num" data-count="2" data-suffix=""></div><div class="stat-label">device families: HL10T, Xilinx 7-series</div></div>
       </div>
     </section>
 
     <div class="page">
-      <div class="split">
-        <section>
-          <h2>What it is</h2>
-          <p>
-            One repository ships the part description and the tools that compile
-            onto it. Device facts come from HAD TOML
-            (<code>devices/helion/parts/HL10T-C32-1.toml</code>): 32&times;32 interior
-            CLB, IO ring, clock spine at x=1, 32 user IO, 8 BRAM18, speed 1,
-            idcode <code>0x00011A1F</code>. The CAD must query that file. It does
-            not hardcode a die.
-          </p>
-          <p>
-            Front ends: SystemVerilog (<code>helion-sv</code>: sv-parser, AIG, FlowMap LUT6),
-            VHDL-2008 elaborator (<code>helion-vhdl</code>), C subset HLS (<code>helion-hls</code>).
-            Then pack, timing-driven place, PathFinder A* route, graph STA, DRC,
-            sparse <code>.hbits</code>, and cycle-accurate fabric sim. The desktop IDE
-            is an eframe shell over <code>IdeModel</code>. Native desktop target is
-            Apple Silicon; Linux CI runs the CLI and headless IDE.
-          </p>
-        </section>
-        <section>
-          <h2>What it is not</h2>
-          <p>
-            Not Project X-Ray, not UNISIM, not vendor Tcl, not an AMD / Intel / Lattice
-            bitstream backend. No vendor bitstream. Buses in Helion IP are Helion-MM
-            and Helion-ST, never AXI as a Helion product. License is Apache-2.0 OR MIT.
-          </p>
-          <p>
-            Fitting a full SoC such as <code>examples/ysyx_ibex.sv</code> onto
-            <code>HL10T-C32-1</code> is not the synth bar. The 1.0 bar is
-            <code>cargo test --workspace</code> (no board) and the gold counter:
-            4 LUTFF, 1 IOB, <span class="gold">WNS_PS=9640</span>, LED waveform
-            <code>0000000111111110</code> over 16 cycles (LED = cnt[3]).
-          </p>
-        </section>
-      </div>
-
       <section class="section">
-        <h2>CAD pipeline</h2>
-        <p class="lede">Each step is a crate. Tcl Session commands drive the same engines the CLI uses.</p>
-        <div class="table-wrap wide-table"><table>
-          <thead><tr><th>Step</th><th>Crate</th><th>What it does</th></tr></thead>
-          <tbody>
-            <tr><td>synth</td><td><code>helion-sv</code></td><td>sv-parser + AIG + FlowMap LUT6</td></tr>
-            <tr><td>vhdl</td><td><code>helion-vhdl</code></td><td>VHDL-2008 elaborator, same LUT/FF path as SV</td></tr>
-            <tr><td>hls</td><td><code>helion-hls</code></td><td>C subset scheduled onto LUT / FF / DSP</td></tr>
-            <tr><td>pack</td><td><code>helion-pack</code></td><td>LUTFF + IOB + MAC27 + BRAM18</td></tr>
-            <tr><td>place</td><td><code>helion-place</code></td><td>timing-driven vs wirelength, BLE overflow</td></tr>
-            <tr><td>route</td><td><code>helion-route</code></td><td>PathFinder A* with hop delay in the cost</td></tr>
-            <tr><td>sta</td><td><code>helion-sta</code></td><td>XDC clocks / I-O delay / false path, WNS + hold</td></tr>
-            <tr><td>drc</td><td><code>helion-drc</code></td><td>occupancy, unrouted IO, clocks</td></tr>
-            <tr><td>bits</td><td><code>helion-bits</code></td><td>FeatureMap frames + sparse <code>.hbits</code></td></tr>
-            <tr><td>sim</td><td><code>helion-fabric</code> / <code>helion-sim</code></td><td>6-input IMUX LUT + FF + IOB; event kernel agrees</td></tr>
-            <tr><td>hw</td><td><code>helion-hw</code></td><td>IEEE 1149.1 TAP, sim cable, partial program</td></tr>
-            <tr><td>IDE</td><td><code>helion-gui</code></td><td><code>helion-ide</code> paints the Session; does not reimplement CAD</td></tr>
-          </tbody>
-        </table></div>
-        <p><a href="architecture.html">Crate map, HAD die, HNF, Tcl Session</a>.</p>
+        <div class="section-head reveal">
+          <h2>What it does</h2>
+          <p class="lede">Each step is a crate. The Tcl session drives the same engines the CLI uses.</p>
+        </div>
+        <div class="cards">
+          <div class="card reveal"><h3><span class="k">Compile</span>Synth to bitstream</h3><p>SystemVerilog / VHDL frontend, AIG-based synthesis with ABC-style rewriting, LUT6/FF/DSP/BRAM packing, simulated-annealing placement, PathFinder routing, graph-based STA with WNS/TNS and hold checks.</p></div>
+          <div class="card reveal" style="--d:.08s"><h3><span class="k">Xilinx 7-series</span>Second backend</h3><p>xc7a35t device model from open bitstream databases. Pack, place, route, FASM emission, frames to <code>.bit</code>, all in Rust, zero vendor tools. FASM output byte-identical to prjxray's encoder.</p></div>
+          <div class="card reveal" style="--d:.16s"><h3><span class="k">Verify</span>Prove it, don't eyeball it</h3><p>SAT-based combinational equivalence checking, SystemVerilog assertions (immediate and concurrent), and clock-domain-crossing structural analysis with 11 violation classes, integrated in the IDE.</p></div>
+          <div class="card reveal" style="--d:.24s"><h3><span class="k">Inspect</span>See everything</h3><p>Physical View 2.0 with heat maps and inspector, schematic level-of-detail for large designs, waveform viewer, cross-probing, real Tcl console, integrated logic analyzer, VCD-driven power.</p></div>
+        </div>
       </section>
 
       <section class="section">
-        <h2>Gold on HL10T-C32-1 (10.000 ns clock)</h2>
-        <p class="lede">
-          Measured by <code>helion qor</code>. A LUT, WNS, bitstream-size, or wall-time
-          regression fails the build until the table is updated in the same commit with a reason.
-        </p>
-        <div class="table-wrap"><table>
+        <div class="section-head reveal">
+          <h2>The IDE</h2>
+          <p class="lede">Real interface, real runs. No marketing renders.</p>
+        </div>
+        <div class="gallery">
+          <figure class="reveal">
+            <div class="shot-frame"><img src="screenshots/ide-schematic.png" alt="Schematic with level-of-detail blocks" width="1440" height="900" loading="lazy" /></div>
+            <figcaption><strong>Schematic LOD.</strong> Level-of-detail blocks keep a 12,174-cell Ibex readable.</figcaption>
+          </figure>
+          <figure class="reveal" style="--d:.08s">
+            <div class="shot-frame"><img src="screenshots/ide-waveform.png" alt="Waveform viewer" width="1280" height="800" loading="lazy" /></div>
+            <figcaption><strong>Waveform viewer.</strong> Comfortable and Compact density, hierarchy browser.</figcaption>
+          </figure>
+          <figure class="reveal">
+            <div class="shot-frame"><img src="screenshots/ide-crossprobe.png" alt="Cross-probing a cell on the die" width="1280" height="800" loading="lazy" /></div>
+            <figcaption><strong>Cross-probing.</strong> Click a timing path, it lights up in the device view.</figcaption>
+          </figure>
+          <figure class="reveal" style="--d:.08s">
+            <div class="shot-frame"><img src="screenshots/ide-tcl.png" alt="Tcl console" width="1440" height="405" loading="lazy" /></div>
+            <figcaption><strong>Tcl console.</strong> <code>synth_design</code>, <code>place_design</code>, <code>write_bitstream</code>, <code>get_cells</code>.</figcaption>
+          </figure>
+          <figure class="reveal">
+            <div class="shot-frame"><img src="screenshots/ide-qor.png" alt="QoR suggestions engine" width="1440" height="900" loading="lazy" /></div>
+            <figcaption><strong>QoR suggestions.</strong> Ranked by measured impact, not vibes.</figcaption>
+          </figure>
+          <figure class="reveal" style="--d:.08s">
+            <div class="shot-frame"><video src="screenshots/demo-run.mp4" controls preload="metadata" width="1280" height="800"></video></div>
+            <figcaption><strong>Watch a run.</strong> Full implement flow on <code>complex.sv</code>, 47 seconds, no cuts.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head reveal">
+          <h2>Why Helion</h2>
+        </div>
+        <ul class="why">
+          <li class="reveal"><span class="tick">&#10003;</span><div><strong>One binary, whole flow.</strong><p><code>helion implement design.prj</code> runs synthesis through bitstream. No toolchain stitching.</p></div></li>
+          <li class="reveal" style="--d:.06s"><span class="tick">&#10003;</span><div><strong>Deterministic.</strong><p>Same RTL in, same bits out. The QoR gate fails the build if LUT counts, WNS, or bitstream bytes move without a reason recorded in the same commit.</p></div></li>
+          <li class="reveal" style="--d:.12s"><span class="tick">&#10003;</span><div><strong>Fail-loud.</strong><p>Over-capacity designs error instead of emitting a clipped bitstream. Congested routing is refused, never silently clipped.</p></div></li>
+          <li class="reveal" style="--d:.18s"><span class="tick">&#10003;</span><div><strong>Measured, not claimed.</strong><p>Every number on this page traces to the benchmark report or a pushed commit.</p></div></li>
+          <li class="reveal" style="--d:.24s"><span class="tick">&#10003;</span><div><strong>Multi-vendor by design.</strong><p><code>NetlistIR</code> plus a <code>Backend</code> trait. HL10T and Xilinx 7-series are the first two backends, not the only ones.</p></div></li>
+        </ul>
+      </section>
+
+      <section class="section">
+        <div class="section-head reveal">
+          <h2>Gold on HL10T-C32-1</h2>
+          <p class="lede">Measured by <code>helion qor</code>. A LUT, WNS, bitstream-size, or wall-time regression fails the build until the table is updated in the same commit with a reason.</p>
+        </div>
+        <div class="table-wrap reveal"><table>
           <thead><tr><th>Design</th><th>LUTFF</th><th>WNS_PS</th><th>.hbits B</th></tr></thead>
           <tbody>
             <tr><td><code>blinky.sv</code></td><td>1</td><td>9700</td><td>153</td></tr>
@@ -134,44 +144,35 @@
             <tr><td><code>hier.sv</code></td><td>1</td><td>9700</td><td>153</td></tr>
           </tbody>
         </table></div>
-        <p>
-          Each gold design uses 1 IOB. Gold waveform:
-          <code>helion run examples/counter.sv --cycles 16</code>
-          prints <code>LED[16]=0000000111111110</code> (LED = cnt[3]), identical in
-          the fabric model and the event simulator. Headless IDE gate:
-          <code>helion-ide --headless examples/counter.sv</code> prints
-          <span class="gold">WNS_PS=9640</span>.
-        </p>
+        <p class="reveal" style="margin-top:18px;color:var(--muted)">Each gold design uses 1 IOB. <code>helion run examples/counter.sv --cycles 16</code> prints <code>LED[16]=0000000111111110</code>, identical in the fabric model and the event simulator.</p>
       </section>
 
       <section class="section">
-        <h2>Get it</h2>
-        <p>
-          GitHub Releases publish <code>Helion.app</code> (unsigned Apple Silicon),
-          a darwin-arm64 tarball with CLI + IDE + HAD + examples, a Linux x86_64
-          tarball (CLI + headless IDE), and <code>SHA256SUMS.txt</code>.
-          Gatekeeper will warn on macOS until notarization exists.
-        </p>
-        <pre><code>git clone https://github.com/helion-fpga/helion.git
+        <div class="section-head reveal">
+          <h2>Get it</h2>
+          <p class="lede">Prebuilt binaries on the <a href="https://github.com/helion-fpga/helion/releases/latest">releases page</a>: Linux x86_64, macOS arm64, plus <code>SHA256SUMS.txt</code>. Or build from source with Rust 1.85+.</p>
+        </div>
+        <pre class="reveal"><code>git clone https://github.com/helion-fpga/helion.git
 cd helion
 cargo test --workspace
-cargo run -p helion-cli -- doctor
-cargo run -p helion-cli -- run examples/counter.sv --cycles 16
-cargo run -p helion-gui --bin helion-ide -- --headless examples/counter.sv</code></pre>
-        <p class="cta">
+cargo run -p helion-cli -- run examples/counter.sv --cycles 16</code></pre>
+        <p class="reveal" style="color:var(--muted);font-size:15px">macOS note: the app is ad-hoc signed, not notarized. Clear the quarantine flag once: <code>xattr -cr /Applications/Helion.app</code></p>
+        <p class="cta reveal">
           <a class="btn" href="start.html">Build from source</a>
           <a class="btn ghost" href="use.html">IDE and CLI guide</a>
-          <a class="btn ghost" href="roadmap.html">Roadmap</a>
+          <a class="btn ghost" href="architecture.html">Architecture</a>
           <a class="btn ghost" href="legal.html">Legal fence</a>
         </p>
       </section>
     </div>
   </main>
 
-  <footer class="site">
-    <span>Apache-2.0 OR MIT · <a href="https://github.com/saksham-45">@saksham-45</a> · <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-    <span><a href="legal.html">Legal</a> · <a href="start.html">Start</a></span>
+  <footer class="site-foot">
+    <div class="foot-inner">
+      <span>Apache-2.0 OR MIT &middot; <a href="https://github.com/saksham-45">@saksham-45</a> &middot; <a href="https://github.com/helion-fpga">helion-fpga</a></span>
+      <span><a href="legal.html">Legal</a> &middot; <a href="start.html">Start</a> &middot; <a href="https://github.com/helion-fpga/helion">GitHub</a></span>
+    </div>
   </footer>
-  <script src="site.js?v=docs1"></script>
+  <script src="site.js?v=v4"></script>
 </body>
 </html>

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="theme-color" content="#0a0c10" />
+  <meta name="theme-color" content="#fbfbfa" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Roadmap: Helion 2.0 shipped; 2.0.x grind</title>
   <meta name="description" content="Helion FM-HEL-14 roadmap: 1.4 to 2.0 shipped; 2.0.x post-bar STA/bitgen/place/synth/parse grind. Current v2.0.4. Gold WNS_PS=9640." />
@@ -10,22 +10,22 @@
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Red+Hat+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=docs1" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css?v=v4" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to main content</a>
-  <header class="bar">
-    <a class="mark" href="index.html"><img src="brand/mark.png" alt="" width="36" height="36" /><span class="word">Helion</span></a>
+  <header class="pill-nav" id="pillNav">
+    <a class="brand" href="index.html"><img src="brand/mark.png" alt="" width="30" height="30" /><span>Helion</span></a>
     <button type="button" class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span></button>
     <nav id="site-nav">
+      <span class="limelight" aria-hidden="true"></span>
       <a href="index.html">Home</a>
       <a href="use.html">Use</a>
       <a href="start.html">Start</a>
       <a href="architecture.html">Architecture</a>
       <a href="wiki.html">Wiki</a>
       <a href="benchmarks.html">Benchmarks</a>
-      <a href="roadmap.html">Roadmap</a>
       <a href="get-involved.html">Get involved</a>
       <a href="https://github.com/helion-fpga/helion">GitHub</a>
     </nav>
@@ -133,7 +133,6 @@
 
       <h2>2.0.x: post-bar runtime / QoR grind</h2>
       <p>
-        <strong>Current tip: <a href="https://github.com/helion-fpga/helion/releases/tag/v2.0.4">v2.0.4</a>.</strong>
         Patch line after the 2.0 bar: measured STA / bitgen / place-legalize /
         synth_rtl / parse cuts without moving gold. SOFT &ne; PASS.
         Empty-XDC counter stays <span class="gold">WNS_PS=9640</span>.
@@ -141,6 +140,26 @@
         parse 416→353 ms, synth_rtl 670→524 ms, place legalize 213→23 ms,
         imux_skip 158→123. Table:
         <a href="https://github.com/helion-fpga/helion/blob/master/docs/perf-2.0.4.md">docs/perf-2.0.4.md</a>.
+      </p>
+
+      <h2>2.5: best-in-market IDE</h2>
+      <p>
+        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v2.5.0">v2.5.0</a>.</strong>
+        Cross-probing, real Tcl console, design runs with strategy sweep,
+        checkpoints, testbench runner, constraints wizard, QoR suggestions engine,
+        VCD-driven power, integrated logic analyzer, plus toast/macOS fixes and
+        the UX/editor batch.
+      </p>
+
+      <h2>3.0: second backend, verification</h2>
+      <p>
+        <strong>Shipped as <a href="https://github.com/helion-fpga/helion/releases/tag/v3.0.0">v3.0.0</a>.</strong>
+        Xilinx 7-series backend (xc7a35t: pack, place, route, FASM, frames,
+        <code>.bit</code>, zero vendor tools, open bitstream databases only),
+        verification track (SAT-based equivalence checking, SystemVerilog
+        assertions, CDC structural analysis), Physical View 2.0, 12 review
+        criticals fixed, debug-build stack-overflow fix. Gold
+        <span class="gold">WNS_PS=9640</span> untouched throughout.
       </p>
 
       <p class="cta">
@@ -151,10 +170,12 @@
     </div>
   </main>
 
-  <footer>
-    <span>Apache-2.0 OR MIT · Owner <a href="https://github.com/saksham-45">@saksham-45</a> · org <a href="https://github.com/helion-fpga">helion-fpga</a></span>
-    <span><a href="legal.html">Legal fence</a></span>
+  <footer class="site-foot">
+    <div class="foot-inner">
+      <span>Apache-2.0 OR MIT &middot; <a href="https://github.com/saksham-45">@saksham-45</a> &middot; <a href="https://github.com/helion-fpga">helion-fpga</a></span>
+      <span><a href="legal.html">Legal</a> &middot; <a href="start.html">Start</a> &middot; <a href="https://github.com/helion-fpga/helion">GitHub</a></span>
+    </div>
   </footer>
-  <script src="site.js?v=docs1"></script>
+  <script src="site.js?v=v4"></script>
 </body>
 </html>

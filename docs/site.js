@@ -1,289 +1,178 @@
-/* Nav drawer, die-video pause, live HL10T die. */
+/* Helion v4: living canvas background, limelight nav, reveals, counters. */
 (function () {
-  var path = location.pathname.split("/").pop() || "index.html";
-  if (path === "" || path === "/") path = "index.html";
+  "use strict";
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var shotMode = /(?:\?|&)shot=1/.test(location.search); /* deterministic screenshots */
+  if (shotMode) reduced = true;
+
+  /* ---------- active nav link ---------- */
+  var path = (location.pathname.split("/").pop() || "index.html");
   document.querySelectorAll("#site-nav a").forEach(function (a) {
     var href = a.getAttribute("href") || "";
-    if (href === path) a.setAttribute("aria-current", "page");
+    if (href === path) a.classList.add("active");
   });
 
-  var bar = document.querySelector(".bar");
-  var toggleNav = document.querySelector(".nav-toggle");
-  if (toggleNav && bar) {
-    toggleNav.addEventListener("click", function () {
-      var open = bar.classList.toggle("is-open");
-      toggleNav.setAttribute("aria-expanded", open ? "true" : "false");
-      toggleNav.setAttribute("aria-label", open ? "Close menu" : "Open menu");
-    });
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "Escape" && bar.classList.contains("is-open")) {
-        bar.classList.remove("is-open");
-        toggleNav.setAttribute("aria-expanded", "false");
-        toggleNav.setAttribute("aria-label", "Open menu");
-        toggleNav.focus();
-      }
+  /* ---------- mobile drawer ---------- */
+  var pill = document.getElementById("pillNav");
+  var toggle = document.querySelector(".nav-toggle");
+  if (toggle && pill) {
+    toggle.addEventListener("click", function () {
+      var open = pill.classList.toggle("open");
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
     });
   }
 
-  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var animOn = !reduce;
-  var toggle = document.getElementById("anim-toggle");
-  function syncAnim() {
-    document.documentElement.setAttribute("data-anim", animOn ? "on" : "off");
-    if (toggle) {
-      toggle.hidden = false;
-      toggle.textContent = animOn ? "II" : "▶";
-      toggle.title = animOn ? "Pause die video" : "Play die video";
-      toggle.setAttribute("aria-pressed", animOn ? "true" : "false");
-    }
-    var plate = document.getElementById("hero-vid");
-    if (plate) {
-      if (animOn) {
-        var p = plate.play();
-        if (p && p.catch) p.catch(function () {});
-      } else {
-        plate.pause();
-      }
-    }
+  /* ---------- slim nav on scroll ---------- */
+  if (pill) {
+    var onScroll = function () { pill.classList.toggle("scrolled", window.scrollY > 40); };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
   }
-  if (toggle) {
-    if (!document.getElementById("hero-vid")) {
-      toggle.hidden = true;
-    } else {
-      toggle.addEventListener("click", function () {
-        animOn = !animOn;
-        syncAnim();
+
+  /* ---------- limelight spotlight follows hovered nav item ---------- */
+  var nav = document.getElementById("site-nav");
+  var light = nav ? nav.querySelector(".limelight") : null;
+  if (nav && light && !reduced) {
+    var move = function (el) {
+      if (!el) { light.style.opacity = "0"; return; }
+      light.style.opacity = "1";
+      light.style.width = el.offsetWidth + "px";
+      light.style.transform = "translateX(" + el.offsetLeft + "px)";
+    };
+    nav.querySelectorAll("a").forEach(function (a) {
+      a.addEventListener("mouseenter", function () { move(a); });
+      a.addEventListener("focus", function () { move(a); });
+    });
+    nav.addEventListener("mouseleave", function () { move(nav.querySelector("a.active")); });
+    move(nav.querySelector("a.active"));
+    setTimeout(function () { if (!nav.matches(":hover")) light.style.opacity = "0"; }, 1200);
+  }
+
+  /* ---------- scroll reveals ---------- */
+  var revealEls = document.querySelectorAll(".reveal");
+  if (revealEls.length && !reduced && "IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.12, rootMargin: "0px 0px -40px 0px" });
+    revealEls.forEach(function (el) { io.observe(el); });
+  } else {
+    revealEls.forEach(function (el) { el.classList.add("in"); });
+  }
+
+  /* ---------- animated counters ---------- */
+  var counters = document.querySelectorAll("[data-count]");
+  var runCounter = function (el) {
+    var target = parseFloat(el.getAttribute("data-count"));
+    var prefix = el.getAttribute("data-prefix") || "";
+    var suffix = el.getAttribute("data-suffix") || "";
+    if (reduced) { el.innerHTML = prefix + target.toLocaleString("en-US") + '<span class="unit">' + suffix + "</span>"; return; }
+    var dur = 1400, t0 = null;
+    var step = function (t) {
+      if (!t0) t0 = t;
+      var p = Math.min(1, (t - t0) / dur);
+      var eased = 1 - Math.pow(1 - p, 3);
+      var val = Math.round(target * eased).toLocaleString("en-US");
+      el.innerHTML = prefix + val + '<span class="unit">' + suffix + "</span>";
+      if (p < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  };
+  if (counters.length && "IntersectionObserver" in window && !reduced) {
+    var cio = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { runCounter(e.target); cio.unobserve(e.target); }
+      });
+    }, { threshold: 0.4 });
+    counters.forEach(function (el) { cio.observe(el); });
+  } else {
+    counters.forEach(runCounter);
+  }
+
+  /* ---------- living background: drifting blobs + flow field ---------- */
+  var stage = document.querySelector(".bg-stage");
+  if (!stage) return;
+  var canvas = document.createElement("canvas");
+  canvas.setAttribute("aria-hidden", "true");
+  stage.appendChild(canvas);
+  var ctx = canvas.getContext("2d");
+
+  var blobs = [
+    { x: 0.22, y: 0.30, r: 0.42, c: "156,193,231", sx: 0.045, sy: 0.030, p: 0.0 },   /* periwinkle */
+    { x: 0.78, y: 0.22, r: 0.38, c: "196,181,253", sx: 0.038, sy: 0.042, p: 2.1 },   /* violet */
+    { x: 0.55, y: 0.55, r: 0.46, c: "122,168,224", sx: 0.030, sy: 0.036, p: 4.2 },   /* blue */
+    { x: 0.88, y: 0.62, r: 0.30, c: "232,180,138", sx: 0.050, sy: 0.028, p: 1.2 },   /* copper whisper */
+    { x: 0.10, y: 0.66, r: 0.32, c: "174,206,240", sx: 0.042, sy: 0.034, p: 5.4 }    /* pale blue */
+  ];
+
+  var parts = [];
+  var W = 0, H = 0, DPR = 1;
+  var resize = function () {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = stage.clientWidth; H = stage.clientHeight;
+    canvas.width = Math.max(1, W * DPR); canvas.height = Math.max(1, H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    parts = [];
+    var n = Math.floor((W * H) / 26000);
+    for (var i = 0; i < n; i++) {
+      parts.push({
+        x: Math.random() * W, y: Math.random() * H,
+        s: 0.6 + Math.random() * 1.4,
+        a: 0.05 + Math.random() * 0.10,
+        seed: Math.random() * 1000
       });
     }
-  }
-  syncAnim();
+  };
+  resize();
+  window.addEventListener("resize", resize);
 
-  var host = document.getElementById("die");
-  if (!host || /^(H1|H2|H3|A)$/.test(host.tagName)) return;
+  var draw = function (t) {
+    ctx.clearRect(0, 0, W, H);
+    /* blobs: soft radial washes drifting on slow sine paths */
+    blobs.forEach(function (b) {
+      var bx = (b.x + Math.sin(t * b.sx + b.p) * 0.06) * W;
+      var by = (b.y + Math.cos(t * b.sy + b.p * 1.7) * 0.06) * H;
+      var br = b.r * Math.max(W, H) * (1 + 0.05 * Math.sin(t * 0.11 + b.p));
+      var g = ctx.createRadialGradient(bx, by, 0, bx, by, br);
+      g.addColorStop(0, "rgba(" + b.c + ",0.42)");
+      g.addColorStop(0.55, "rgba(" + b.c + ",0.16)");
+      g.addColorStop(1, "rgba(" + b.c + ",0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(bx - br, by - br, br * 2, br * 2);
+    });
+    /* flow field: faint particles riding a slow pseudo-noise field */
+    ctx.fillStyle = "#5b6b8c";
+    parts.forEach(function (p) {
+      var ang = Math.sin(p.x * 0.004 + t * 0.25 + p.seed) + Math.cos(p.y * 0.005 - t * 0.2);
+      p.x += Math.cos(ang) * 0.35; p.y += Math.sin(ang) * 0.35;
+      if (p.x < -8) p.x = W + 8; if (p.x > W + 8) p.x = -8;
+      if (p.y < -8) p.y = H + 8; if (p.y > H + 8) p.y = -8;
+      ctx.globalAlpha = p.a;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.s, 0, 6.2832); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  };
 
-  var COLS = 35, ROWS = 34;
-  var NS = "http://www.w3.org/2000/svg";
-  var svg = document.createElementNS(NS, "svg");
-  svg.setAttribute("viewBox", "0 0 " + COLS + " " + ROWS);
-  svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", "Live HL10T-C32-1. Current on the IO ring, clock spine, and CLBs.");
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
-
-  var defs = document.createElementNS(NS, "defs");
-  defs.innerHTML =
-    '<filter id="pulseGlow" x="-80%" y="-80%" width="260%" height="260%">' +
-    '<feGaussianBlur stdDeviation="0.28" result="b"/>' +
-    '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
-    '<filter id="clkGlow" x="-40%" y="-40%" width="180%" height="180%">' +
-    '<feGaussianBlur stdDeviation="0.14" result="b"/>' +
-    '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>';
-  svg.appendChild(defs);
-
-  function kind(x, y) {
-    if (x === 0 || x === COLS - 1 || y === 0 || y === ROWS - 1) return "IO";
-    if (x === 1) return "CLK";
-    return "CLB";
-  }
-  function baseFill(k, x, y) {
-    if (k === "IO") return [196, 122, 58];
-    if (k === "CLK") return [226, 180, 58];
-    return (x + y) % 2 === 0 ? [36, 56, 46] : [26, 44, 36];
-  }
-  function rgb(c, boost) {
-    var t = Math.min(1, boost);
-    return "rgb(" +
-      Math.round(c[0] + (255 - c[0]) * t) + "," +
-      Math.round(c[1] + (255 - c[1]) * t) + "," +
-      Math.round(c[2] + (220 - c[2]) * t) + ")";
-  }
-
-  var rects = [];
-  var energy = [];
-  var bases = [];
-  for (var y = 0; y < ROWS; y++) {
-    rects[y] = [];
-    energy[y] = [];
-    bases[y] = [];
-    for (var x = 0; x < COLS; x++) {
-      var k = kind(x, y);
-      var r = document.createElementNS(NS, "rect");
-      r.setAttribute("x", (x + 0.08).toFixed(2));
-      r.setAttribute("y", (y + 0.08).toFixed(2));
-      r.setAttribute("width", "0.84");
-      r.setAttribute("height", "0.84");
-      var b = baseFill(k, x, y);
-      bases[y][x] = b;
-      energy[y][x] = 0;
-      r.setAttribute("fill", rgb(b, 0));
-      if (k === "CLK") r.setAttribute("filter", "url(#clkGlow)");
-      svg.appendChild(r);
-      rects[y][x] = r;
+  if (reduced) {
+    draw(8.4); /* one calm static frame */
+  } else {
+    var start = null, last = 0;
+    var running = true;
+    var frame = function (now) {
+      if (!running) return;
+      if (!start) start = now;
+      if (now - last > 66) { draw((now - start) / 1000); last = now; } /* ~15fps, cheap */
+      requestAnimationFrame(frame);
+    };
+    /* pause when the hero is off-screen */
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (entries) {
+        var vis = entries[0].isIntersecting;
+        if (vis && !running) { running = true; requestAnimationFrame(frame); }
+        else running = vis;
+      }).observe(stage);
     }
+    requestAnimationFrame(frame);
   }
-
-  function ioPath() {
-    var p = [];
-    var x, y;
-    for (x = 0; x < COLS; x++) p.push([x, 0]);
-    for (y = 1; y < ROWS; y++) p.push([COLS - 1, y]);
-    for (x = COLS - 2; x >= 0; x--) p.push([x, ROWS - 1]);
-    for (y = ROWS - 2; y >= 1; y--) p.push([0, y]);
-    return p;
-  }
-  function clkPath() {
-    var p = [];
-    for (var y = 1; y <= 32; y++) p.push([1, y]);
-    return p;
-  }
-  function rowPath(y) {
-    var p = [];
-    for (var x = 2; x <= 33; x++) p.push([x, y]);
-    return p;
-  }
-
-  var io = ioPath();
-  var clk = clkPath();
-  var rows = [];
-  for (var ry = 2; ry <= 31; ry += 3) rows.push(rowPath(ry));
-
-  function addDot() {
-    var c = document.createElementNS(NS, "circle");
-    c.setAttribute("r", "0.42");
-    c.setAttribute("filter", "url(#pulseGlow)");
-    c.setAttribute("fill", "#fff6c2");
-    svg.appendChild(c);
-    return c;
-  }
-
-  var pulses = [];
-  function spawn(path, speed, i0, color) {
-    var d = addDot();
-    if (color) d.setAttribute("fill", color);
-    pulses.push({ path: path, i: i0 || 0, speed: speed, el: d, alive: true });
-  }
-  spawn(io, 0.35, 0, "#ffd089");
-  spawn(io, 0.28, io.length * 0.33, "#ffe8a8");
-  spawn(io, 0.42, io.length * 0.66, "#fff4c0");
-  spawn(clk, 0.22, 0, "#fff1a0");
-  spawn(clk, 0.18, 12, "#ffe07a");
-  rows.forEach(function (rp, i) {
-    spawn(rp, 0.3 + (i % 3) * 0.05, (i * 7) % rp.length, "#d7ffc8");
-  });
-
-  var hi = document.createElementNS(NS, "rect");
-  hi.setAttribute("width", "1"); hi.setAttribute("height", "1");
-  hi.setAttribute("fill", "none"); hi.setAttribute("stroke", "#f3f0ea");
-  hi.setAttribute("stroke-width", "0.12");
-  hi.style.display = "none";
-  svg.appendChild(hi);
-
-  var pinEl = document.createElementNS(NS, "rect");
-  pinEl.setAttribute("width", "1"); pinEl.setAttribute("height", "1");
-  pinEl.setAttribute("fill", "none"); pinEl.setAttribute("stroke", "#e2b43a");
-  pinEl.setAttribute("stroke-width", "0.14");
-  pinEl.style.display = "none";
-  svg.appendChild(pinEl);
-
-  var read = document.getElementById("die-read");
-  var pinned = null;
-
-  function cellAt(ev) {
-    var ctm = svg.getScreenCTM();
-    if (!ctm) return null;
-    var pt = svg.createSVGPoint();
-    pt.x = ev.clientX; pt.y = ev.clientY;
-    pt = pt.matrixTransform(ctm.inverse());
-    var x = Math.floor(pt.x), y = Math.floor(pt.y);
-    if (x < 0 || y < 0 || x >= COLS || y >= ROWS) return null;
-    return { x: x, y: y, k: kind(x, y) };
-  }
-  function describe(c, extra) {
-    var bits = [c.k, "x=" + c.x, "y=" + c.y, "part=HL10T-C32-1"];
-    if (c.k === "CLB") bits.push("BLE×8");
-    if (c.k === "IO") bits.push("pad");
-    if (c.k === "CLK") bits.push("gclk");
-    if (extra) bits.push(extra);
-    return bits.join("  ·  ");
-  }
-  function idle() {
-    if (read) read.textContent = pinned
-      ? describe(pinned, "pinned")
-      : "Current on the ring, spine, and fabric · hover a tile · click to pin";
-  }
-
-  svg.addEventListener("pointermove", function (ev) {
-    var c = cellAt(ev);
-    if (!c) { hi.style.display = "none"; idle(); return; }
-    hi.setAttribute("x", String(c.x));
-    hi.setAttribute("y", String(c.y));
-    hi.style.display = "";
-    if (read) read.textContent = describe(c, pinned && pinned.x === c.x && pinned.y === c.y ? "pinned" : "");
-  });
-  svg.addEventListener("pointerleave", function () {
-    hi.style.display = "none";
-    idle();
-  });
-  svg.addEventListener("click", function (ev) {
-    var c = cellAt(ev);
-    if (!c) return;
-    if (pinned && pinned.x === c.x && pinned.y === c.y) {
-      pinned = null; pinEl.style.display = "none";
-      if (read) read.textContent = describe(c);
-      return;
-    }
-    pinned = c;
-    pinEl.setAttribute("x", String(c.x));
-    pinEl.setAttribute("y", String(c.y));
-    pinEl.style.display = "";
-    if (read) read.textContent = describe(c, "pinned");
-  });
-
-  host.appendChild(svg);
-  idle();
-
-  var last = performance.now();
-  function tick(now) {
-    var dt = Math.min(0.05, (now - last) / 1000);
-    last = now;
-    if (animOn) {
-      var y, x;
-      for (y = 0; y < ROWS; y++) {
-        for (x = 0; x < COLS; x++) {
-          energy[y][x] *= 0.86;
-        }
-      }
-      pulses.forEach(function (p) {
-        p.i += p.speed;
-        if (p.i >= p.path.length) p.i -= p.path.length;
-        var i0 = Math.floor(p.i) % p.path.length;
-        var i1 = (i0 + 1) % p.path.length;
-        var f = p.i - Math.floor(p.i);
-        var a = p.path[i0], b = p.path[i1];
-        var px = a[0] + (b[0] - a[0]) * f + 0.5;
-        var py = a[1] + (b[1] - a[1]) * f + 0.5;
-        p.el.setAttribute("cx", px.toFixed(3));
-        p.el.setAttribute("cy", py.toFixed(3));
-        var cx = a[0], cy = a[1];
-        if (energy[cy] && energy[cy][cx] !== undefined) energy[cy][cx] = Math.min(1, energy[cy][cx] + 0.85);
-        if (kind(cx, cy) === "CLK" && Math.random() < 0.04) {
-          var row = rows[cy % rows.length];
-          if (row) {
-            var burst = Math.min(row.length - 1, Math.floor(Math.random() * 8) + 2);
-            for (var k = 0; k < burst; k++) {
-              var t = row[k];
-              energy[t[1]][t[0]] = Math.min(1, energy[t[1]][t[0]] + 0.55 * (1 - k / burst));
-            }
-          }
-        }
-      });
-      for (y = 0; y < ROWS; y++) {
-        for (x = 0; x < COLS; x++) {
-          rects[y][x].setAttribute("fill", rgb(bases[y][x], energy[y][x]));
-        }
-      }
-    }
-    var _ = dt;
-    requestAnimationFrame(tick);
-  }
-  requestAnimationFrame(tick);
 })();
