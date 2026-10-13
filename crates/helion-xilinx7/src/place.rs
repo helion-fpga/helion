@@ -16,6 +16,8 @@ pub trait DeviceQuery {
     fn iob_site_for_pin(&self, pin: &str) -> Option<(String, String)>;
     /// A BUFGCTRL site: `(tile, site)`.
     fn bufg_site(&self) -> Option<(String, String)>;
+    /// A RAMB18E1 site: `(tile, site)`.
+    fn ramb_site(&self) -> Option<(String, String)>;
     /// Grid coordinates of a tile (for distance estimates).
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)>;
     /// A free SLICEL site near `(x, y)`; `used` holds taken site names.
@@ -61,6 +63,14 @@ pub struct PlacedBufg {
     pub site: String,
 }
 
+/// A placed RAMB18E1.
+#[derive(Clone, Debug)]
+pub struct PlacedBram {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
 /// Backend-owned placed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Placed7 {
@@ -69,6 +79,7 @@ pub struct Placed7 {
     pub ffs: Vec<PlacedFf>,
     pub iobs: Vec<PlacedIob>,
     pub bufgs: Vec<PlacedBufg>,
+    pub brams: Vec<PlacedBram>,
 }
 
 /// BEL letters within a slice: A, B, C, D.
@@ -114,6 +125,19 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         used_sites.insert(site.clone());
         out.bufgs.push(PlacedBufg {
             name: bufg.name.clone(),
+            tile,
+            site,
+        });
+    }
+
+    // 2b. RAMB18E1s.
+    for bram in &packed.brams {
+        let (tile, site) = device
+            .ramb_site()
+            .ok_or_else(|| format!("place: no RAMB18E1 site for {}", bram.name))?;
+        used_sites.insert(site.clone());
+        out.brams.push(PlacedBram {
+            name: bram.name.clone(),
             tile,
             site,
         });
@@ -218,6 +242,9 @@ mod tests {
         fn bufg_site(&self) -> Option<(String, String)> {
             Some(("CLK_BUFG_X0Y0".into(), "BUFGCTRL_X0Y0".into()))
         }
+        fn ramb_site(&self) -> Option<(String, String)> {
+            Some(("BRAM_X0Y0".into(), "RAMB18_X0Y0".into()))
+        }
         fn tile_xy(&self, _tile: &str) -> Option<(i32, i32)> {
             Some((10, 10))
         }
@@ -275,6 +302,7 @@ mod tests {
                 in_net: "clk_ibuf".into(),
                 out_net: "clk_bufg".into(),
             }],
+            brams: vec![],
         }
     }
 

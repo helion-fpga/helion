@@ -581,6 +581,16 @@ impl Device {
         self.sites_of_types(&["BUFGCTRL"])
     }
 
+    /// All RAMB18E1 sites: `(tile_name, site_name)`.
+    pub fn ramb_sites(&self) -> Vec<(String, String)> {
+        self.sites_of_types(&["RAMB18E1"])
+    }
+
+    /// All DSP48E1 sites: `(tile_name, site_name)`.
+    pub fn dsp_sites(&self) -> Vec<(String, String)> {
+        self.sites_of_types(&["DSP48E1"])
+    }
+
     fn sites_of_types(&self, types: &[&str]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for t in &self.tiles {

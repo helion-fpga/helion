@@ -67,6 +67,21 @@ pub struct PackedBufg {
     pub out_net: String,
 }
 
+/// A packed block RAM (RAMB18E1).
+///
+/// The IR's [`helion_ir::CellKind::Bram18`] is a memory block with INIT data
+/// but no pin-level interface yet; the 7-series backend places it on a
+/// RAMB18E1 site and programs the INIT features. Pin-level memory interface
+/// modeling (address/data/clock/enable routing) is future work at the IR
+/// level.
+#[derive(Clone, Debug)]
+pub struct PackedBram {
+    /// Source IR cell name.
+    pub name: String,
+    /// Initialization words (up to 1024 64-bit words for 18Kb).
+    pub init: Vec<u64>,
+}
+
 /// Backend-owned packed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Packed7 {
@@ -74,6 +89,7 @@ pub struct Packed7 {
     pub ffs: Vec<PackedFf>,
     pub iobs: Vec<PackedIob>,
     pub bufgs: Vec<PackedBufg>,
+    pub brams: Vec<PackedBram>,
 }
 
 /// Pack a [`Design`] into 7-series packable units.
@@ -183,6 +199,20 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     name: cell.name.clone(),
                     in_net,
                     out_net,
+                });
+            }
+            CellKind::Bram18 => {
+                let init = cell
+                    .attrs
+                    .get("INIT")
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
+                    .collect();
+                out.brams.push(PackedBram {
+                    name: cell.name.clone(),
+                    init,
                 });
             }
             other => {
