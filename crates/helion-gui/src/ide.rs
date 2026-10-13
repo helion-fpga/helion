@@ -5022,13 +5022,12 @@ pub enum WorkspaceTab {
     Hierarchy,
     Find,
     Package,
-    Checkpoints,
     Bitstream,
     Testbench,
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 31] = [
+    pub const ALL: [WorkspaceTab; 30] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -5057,7 +5056,6 @@ impl WorkspaceTab {
         WorkspaceTab::Hierarchy,
         WorkspaceTab::Find,
         WorkspaceTab::Package,
-        WorkspaceTab::Checkpoints,
         WorkspaceTab::Bitstream,
         WorkspaceTab::Testbench,
     ];
@@ -5082,8 +5080,7 @@ impl WorkspaceTab {
             | WorkspaceTab::Methodology
             | WorkspaceTab::Qor
             | WorkspaceTab::Drc
-            | WorkspaceTab::Utilization
-            | WorkspaceTab::Checkpoints => WorkspaceTab::Reports,
+            | WorkspaceTab::Utilization => WorkspaceTab::Reports,
             other => other,
         }
     }
@@ -5156,7 +5153,6 @@ impl WorkspaceTab {
             WorkspaceTab::Hierarchy => "Hierarchy",
             WorkspaceTab::Find => "Find Results",
             WorkspaceTab::Package => "Package",
-            WorkspaceTab::Checkpoints => "Checkpoints",
             WorkspaceTab::Bitstream => "Bitstream",
             WorkspaceTab::Testbench => "Testbench",
         }
@@ -5973,7 +5969,7 @@ impl IdeModel {
             package_pins: Vec::new(),
             package: PackageDrawing::default(),
             pblocks: Vec::new(),
-            target: GadgetTarget::Workspace(WorkspaceTab::Device),
+            workspace: WorkspaceTab::Device,
             bottom_tab: BottomTab::Tcl,
             message_filter: None,
             selected_message: None,
@@ -40870,7 +40866,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 31);
+        assert_eq!(WorkspaceTab::ALL.len(), 30);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(

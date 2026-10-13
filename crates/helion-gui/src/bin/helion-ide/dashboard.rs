@@ -809,7 +809,7 @@ fn paint_runs_body(
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new("No runs yet — create one from the Design Runs tab.")
+                egui::RichText::new("No runs yet - create one from the Jobs tab.")
                     .size(13.0)
                     .color(theme.dim),
             );

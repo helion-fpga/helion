@@ -1884,7 +1884,7 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 /// Clickable status bar (P1-5, VS Code style). Every segment is an action:
 /// breadcrumb → Files, WNS chip → Timing canvas, error/warning counts →
-/// Messages panel, LUTFF → Utilization, run name → Runs tab. Background jobs
+/// Messages panel, LUTFF → Utilization, run name → Jobs tab. Background jobs
 /// show a spinner; job completion also toasts (see `toasts.rs`).
 /// One status-bar segment (§3.7): 12px mono text, 8px side padding, 1px left
 /// divider (except the first segment), hover highlight when clickable.
@@ -2322,14 +2322,20 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
 
 /// Z6 Jobs tab (grammar R12/R13, P4): run management lives in the bottom panel
 /// next to the Tcl console and Messages that drive it (Vivado Results Windows
-/// Area pattern). Every action the runs view had in Z5 keeps working here;
-/// checkpoints join this tab in R13.
+/// Area pattern). Runs table first, checkpoints below: checkpoints are
+/// snapshots of runs, managed alongside them, not read as reports.
+/// Every action paint_runs / paint_checkpoints had in Z5 keeps working here.
 fn paint_jobs(ui: &mut egui::Ui, app: &mut HelionIde) {
     egui::ScrollArea::vertical()
         .id_salt("jobs_tab")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             paint_runs(ui, app);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            let theme = app.theme;
+            paint_checkpoints(ui, &mut app.model, &theme);
         });
 }
 
@@ -2834,7 +2840,6 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspacePane::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspacePane::Testbench => paint_testbench(ui, app),
         WorkspacePane::Wave
         | WorkspacePane::Ila
@@ -2893,7 +2898,6 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         return;
     }
     match app.model.workspace {
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
         WorkspaceTab::Reports => {
             // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
@@ -2912,7 +2916,6 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         return;
     }
     match app.model.workspace {
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
