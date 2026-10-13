@@ -4456,6 +4456,36 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
 }
 
+/// One quick-set property button row under the I/O ports table (the six
+/// property rows were copy-pasted; PACKAGE_PIN keeps its own row with the
+/// text edit). IOSTANDARD feeds `set_iostd`, everything else feeds `set_io`.
+#[allow(clippy::too_many_arguments)]
+fn io_prop_button_row(
+    ui: &mut egui::Ui,
+    key: &'static str,
+    values: &[&'static str],
+    btn_w: f32,
+    port: &str,
+    set_iostd: &mut Option<(String, &'static str)>,
+    set_io: &mut Option<(String, &'static str, &'static str)>,
+) {
+    ui.horizontal(|ui| {
+        ui.weak(key);
+        for &v in values {
+            if ui
+                .add_sized([btn_w, chrome::HIT_SIDEBAR], egui::Button::new(v))
+                .clicked()
+            {
+                if key == "IOSTANDARD" {
+                    *set_iostd = Some((port.to_string(), v));
+                } else {
+                    *set_io = Some((port.to_string(), key, v));
+                }
+            }
+        }
+    });
+}
+
 fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'static str) {
     ui.label(RichText::new("I/O Ports").strong());
     let _assigned = model
@@ -4701,89 +4731,37 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 }
             }
         });
-        ui.horizontal(|ui| {
-            ui.weak("IOSTANDARD");
-            for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
-                if ui
-                    .add_sized([64.0, chrome::HIT_SIDEBAR], egui::Button::new(std))
-                    .clicked()
-                {
-                    set_iostd = Some((port.clone(), std));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("DRIVE");
-            for ma in ["4", "8", "12", "16"] {
-                if ui
-                    .add_sized([40.0, chrome::HIT_SIDEBAR], egui::Button::new(ma))
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "DRIVE", ma));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("SLEW");
-            for s in ["SLOW", "FAST"] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "SLEW", s));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("PULLTYPE");
-            for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "PULLTYPE", s));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("DIFF_TERM");
-            for s in ["FALSE", "TRUE"] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "DIFF_TERM", s));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("IN_TERM");
-            for s in [
-                "NONE",
-                "UNTUNED_SPLIT_40",
-                "UNTUNED_SPLIT_50",
-                "UNTUNED_SPLIT_60",
-            ] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "IN_TERM", s));
-                }
-            }
-        });
+        let w56 = ui.spacing().interact_size.x.max(56.0);
+        io_prop_button_row(
+            ui,
+            "IOSTANDARD",
+            &["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"],
+            64.0,
+            &port,
+            &mut set_iostd,
+            &mut set_io,
+        );
+        io_prop_button_row(ui, "DRIVE", &["4", "8", "12", "16"], 40.0, &port, &mut set_iostd, &mut set_io);
+        io_prop_button_row(ui, "SLEW", &["SLOW", "FAST"], w56, &port, &mut set_iostd, &mut set_io);
+        io_prop_button_row(
+            ui,
+            "PULLTYPE",
+            &["NONE", "PULLUP", "PULLDOWN", "KEEPER"],
+            w56,
+            &port,
+            &mut set_iostd,
+            &mut set_io,
+        );
+        io_prop_button_row(ui, "DIFF_TERM", &["FALSE", "TRUE"], w56, &port, &mut set_iostd, &mut set_io);
+        io_prop_button_row(
+            ui,
+            "IN_TERM",
+            &["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"],
+            w56,
+            &port,
+            &mut set_iostd,
+            &mut set_io,
+        );
     }
     if let Some((port, std)) = set_iostd {
         // ComboBox / button Set → set_iostandard (HNF + constraints); exec syncs the table.
