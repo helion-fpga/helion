@@ -627,6 +627,10 @@ impl HelionIde {
         let mut s = self.snapshot();
         apply_activity(&mut s, a);
         self.restore(s);
+        // Dismiss app-level dialogs on navigation: a dialog opened from one
+        // activity must not linger as a stale window over another.
+        self.show_create_project = false;
+        self.show_examples = false;
         if a == Activity::Files {
             self.model.layout = LayoutKind::Default;
         }
@@ -2952,6 +2956,9 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
     let mut s = app.snapshot();
     apply_more(&mut s, tab);
     app.restore(s);
+    // Dismiss app-level dialogs on navigation, same as set_activity.
+    app.show_create_project = false;
+    app.show_examples = false;
     let pane = central_pane(&app.snapshot());
     let expected = pane_for_workspace(tab);
     app.log_click(tab.label(), &format!("{expected:?}"));
