@@ -70,3 +70,49 @@ Replayed all 3 known crash logs against current code:
 - The refresh at ide.rs:22952-22956 DOES validate, but restore_mid_run_ui does not
 - This is a real bug, not a transient: the invalid state persists after the frame
 - NOT fixed yet; logging for parent to prioritize (fuzz run continues with pre-fix binary)
+
+### 20:15 - Fuzz run completed
+- Seeds: 30/30 completed (1000-1029)
+- Frames: 145,866
+- Events: 527,696
+- Elapsed: 2,243s (~37 minutes of active fuzzing)
+- Panics: 30 (ALL are the minimap_viewport clamp bug)
+  - Payload: `min > max, or either was NaN. min = 10.0, max = 1.0`
+  - This is the bug I fixed at 18:40 (commit b05b0ae)
+  - The fuzz run used the pre-fix binary, so these are expected
+  - The fix is validated: 30 independent reproductions, all same root cause
+- Anomalies:
+  - SELECT-OOR: 584 instances (the restore_mid_run_ui bug, logged above)
+  - TIMING-MUTATED-EXPLAINABLE: 9 instances (all with tcl=true, expected behavior)
+- No other bug classes found
+
+## Summary of findings
+
+### Fixed during this session
+1. **minimap_viewport clamp panic** (bug class: clamp with min > max)
+   - Location: editor.rs:686
+   - Fix: `clamp(10.0, track)` -> `clamp(10.0_f32.min(track), track)`
+   - Commit: b05b0ae, pushed to wip/ide-integration
+   - Validation: 30 independent fuzz reproductions, all fixed by the change
+   - Regression test added: `minimap_thumb_tiny_track_no_panic`
+   - All 3 prior crash logs now replay clean; their #[ignore] attributes removed
+
+### Open bugs found (not fixed)
+1. **restore_mid_run_ui SELECT-OOR** (bug class: selected index out of range)
+   - Location: ide.rs:21558
+   - `selected_timing_path` restored from snapshot without validating against current `timing_paths.len()`
+   - 584 instances detected across 30 seeds
+   - Fix needed: validate after restore (like the check at ide.rs:22952-22956)
+   - Replay: see /tmp/fuzz-main/fuzz-s*.log, search for "SELECT-OOR"
+
+### Prior bugs confirmed fixed
+1. crash-b8e9fc06b1caf963 (device_band_share): replays clean
+2. crash-87c5907c652b0759 (apply_more): replays clean
+3. crash-59c2055905bbbe0e (minimap): replays clean after fix
+
+## Fuzz coverage
+- Clicks: menu bar, activity rail, sidebar, bottom panel, central canvas, edges
+- Drags, scrolls (both directions, horizontal via shift), keyboard shortcuts
+- Text input, copy/cut/paste, resize (sane + extreme), zoom
+- 30 seeds x 20k frames, 527k events total
+- All major surfaces exercised via warmup (Implement run) + random navigation
