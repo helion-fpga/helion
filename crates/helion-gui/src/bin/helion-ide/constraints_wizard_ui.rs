@@ -873,17 +873,20 @@ pub fn paint(ui: &mut egui::Ui, app: &mut HelionIde) {
         return;
     }
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        match step {
-            wiz::WizardStep::Clocks => paint_clocks(ui, app),
-            wiz::WizardStep::InputDelays => paint_io_delays(ui, app, true),
-            wiz::WizardStep::OutputDelays => paint_io_delays(ui, app, false),
-            wiz::WizardStep::Exceptions => paint_exceptions(ui, app),
-            wiz::WizardStep::Review => paint_review(ui, app),
-        }
-        let errors = app.constraints_wizard.as_ref().unwrap().errors.clone();
-        error_box(ui, &errors);
-    });
+    // No inner ScrollArea here: the wizard is page flow content, always painted
+    // inside the Timing page scroll (timing_canvas_v6), which owns scrolling.
+    // A nested area would shrink to its content and never trap the wheel, so
+    // wheeling the form would scroll the page instead (nested-scroll fix).
+    // (The editor uses the same one-outer-scroll architecture.)
+    match step {
+        wiz::WizardStep::Clocks => paint_clocks(ui, app),
+        wiz::WizardStep::InputDelays => paint_io_delays(ui, app, true),
+        wiz::WizardStep::OutputDelays => paint_io_delays(ui, app, false),
+        wiz::WizardStep::Exceptions => paint_exceptions(ui, app),
+        wiz::WizardStep::Review => paint_review(ui, app),
+    }
+    let errors = app.constraints_wizard.as_ref().unwrap().errors.clone();
+    error_box(ui, &errors);
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
