@@ -5586,6 +5586,104 @@ impl BottomTab {
     }
 }
 
+/// UI-owned state captured when a job is submitted and restored when it
+/// finishes. The engine thread runs on a model clone; adopting the finished
+/// clone wholesale would discard everything the user did mid-run (console
+/// input, SDC edits, selections, navigation). The snapshot preserves the
+/// user's work while the job's engine results flow through.
+///
+/// Append-only streams (console/messages/log/journal) are merged, not
+/// replaced: the job's additions plus the user's mid-run additions.
+#[derive(Clone, Debug)]
+pub struct MidRunUi {
+    // Navigation / view.
+    pub workspace: WorkspaceTab,
+    pub nav: NavSection,
+    pub layout: LayoutKind,
+    pub bottom_tab: BottomTab,
+    // Console input (the stream itself merges separately).
+    pub input: String,
+    pub input_history: Vec<String>,
+    pub input_hist_idx: Option<usize>,
+    pub console_find: String,
+    pub console_selected: Option<usize>,
+    pub console_find_hits: Vec<usize>,
+    // Selections.
+    pub selected: Option<String>,
+    pub properties: Vec<(String, String)>,
+    pub selected_property: Option<String>,
+    pub selected_scope: Option<String>,
+    pub selected_object: Option<String>,
+    pub selected_memory: Option<String>,
+    pub selected_memory_addr: Option<usize>,
+    pub selected_breakpoint: Option<usize>,
+    pub selected_force: Option<String>,
+    pub selected_local: Option<String>,
+    pub selected_source_line: Option<usize>,
+    pub selected_qor: Option<String>,
+    pub selected_timing_path: Option<usize>,
+    pub selected_timing_pin: Option<String>,
+    pub selected_ip: Option<String>,
+    pub selected_find: Option<usize>,
+    pub selected_source: Option<String>,
+    pub selected_netlist: Option<String>,
+    pub selected_io_port: Option<String>,
+    pub selected_pblock: Option<String>,
+    pub selected_clock_region: Option<String>,
+    pub selected_setting: Option<String>,
+    pub selected_sim_setting: Option<String>,
+    pub selected_message: Option<usize>,
+    pub selected_drc: Option<String>,
+    pub selected_methodology: Option<String>,
+    pub selected_cdc: Option<String>,
+    pub selected_clock_interaction: Option<String>,
+    pub selected_clock_network: Option<String>,
+    pub selected_timing_summary: Option<String>,
+    pub selected_power: Option<String>,
+    pub selected_utilization: Option<String>,
+    pub selected_report: Option<String>,
+    pub selected_summary: Option<String>,
+    pub selected_log: Option<usize>,
+    pub selected_sim_log: Option<usize>,
+    pub selected_eco: Option<String>,
+    pub selected_incremental: Option<String>,
+    pub selected_wave_marker: Option<String>,
+    pub selected_wave_cursor: Option<String>,
+    pub selected_virtual_bus: Option<String>,
+    // Constraints editor buffer.
+    pub sdc_editor_path: Option<std::path::PathBuf>,
+    pub sdc_editor_text: String,
+    pub sdc_editor_dirty: bool,
+    // Filters / sorts.
+    pub message_filter: Option<MsgSeverity>,
+    pub timing_path_sort: Option<(TimingPathSortCol, bool)>,
+    pub timing_path_filter: String,
+    // Simulation settings (user config, not results).
+    pub sim_timescale_ps: u64,
+    pub sim_runtime_cycles: u32,
+    pub sim_log_all_signals: bool,
+    pub sim_fileset: String,
+    pub sim_top: Option<String>,
+    pub sim_include_path: String,
+    pub sim_define: String,
+    pub sim_param: String,
+    pub sim_elab_debug: String,
+    pub sim_elab_snapshot: String,
+    pub sim_compile_modules: Vec<String>,
+    pub active_fileset: String,
+    // Misc UI state.
+    pub checkpoint_name: String,
+    pub auto_checkpoint: bool,
+    pub tb_vcd_enabled: bool,
+    pub tb_manual: Vec<std::path::PathBuf>,
+    pub package_pin_draft: String,
+    pub run_editor: RunEditorState,
+    // Stream lengths at submit, for the append-merge.
+    pub console_len: usize,
+    pub messages_len: usize,
+    pub log_len: usize,
+}
+
 /// The whole application model. One `Session` is shared by the console and the rail,
 /// and it is the same `Session` type the CLI drives, so both hit the same engines.
 #[derive(Clone, Debug)]
@@ -5820,9 +5918,6 @@ pub struct IdeModel {
     pub tb_last_dut_instance: String,
     /// Last run's VCD path, if any (for "open in waveform viewer").
     pub tb_last_vcd: Option<std::path::PathBuf>,
-    /// VCD queued for the waveform viewer (stub hook until the VCD-power
-    /// feature ships the real viewer; single integration call site).
-    pub tb_waveform_pending: Option<std::path::PathBuf>,
     /// UG893/UG986 ECO Changes selected cell name.
     pub selected_eco: Option<String>,
     /// UG986 Incremental Compile rows (HNF vs checkpoint).
@@ -5835,7 +5930,8 @@ pub struct IdeModel {
     pub selected_wave_cursor: Option<String>,
     /// UG900 Virtual Bus selected Name.
     pub selected_virtual_bus: Option<String>,
-    /// Constraints pane SDC/XDC text editor path (examples/counter.sdc, sibling .sdc, …).
+    /// Constraints pane SDC/XDC text editor path (project .sdc resolved by
+    /// `project_sdc_path`, never the examples directory).
     pub sdc_editor_path: Option<PathBuf>,
     /// Editable SDC/XDC buffer shown in the Constraints workspace.
     pub sdc_editor_text: String,
@@ -6009,7 +6105,6 @@ impl IdeModel {
             tb_last_dut_module: String::new(),
             tb_last_dut_instance: String::new(),
             tb_last_vcd: None,
-            tb_waveform_pending: None,
             selected_eco: None,
             incremental_rows: Vec::new(),
             selected_incremental: None,
@@ -6329,9 +6424,9 @@ impl IdeModel {
         } else if t == "tb_wave" || t.starts_with("tb_wave ") {
             let v = t.strip_prefix("tb_wave").unwrap_or("").trim();
             if !v.is_empty() {
-                Ok(self.tb_open_vcd_in_waveform(Path::new(v)))
+                self.tb_open_vcd_in_waveform(Path::new(v))
             } else if let Some(p) = self.tb_last_vcd.clone() {
-                Ok(self.tb_open_vcd_in_waveform(&p))
+                self.tb_open_vcd_in_waveform(&p)
             } else {
                 Err("tb_wave: no VCD from the last run (enable VCD dump and run first)".to_string())
             }
@@ -6927,13 +7022,13 @@ impl IdeModel {
         } else if let Some(path) = t.strip_prefix("open_sdc_editor ") {
             let p = path.trim();
             let pb = if p.is_empty() {
-                helion_device::Device::examples_dir().join("counter.sdc")
+                self.project_sdc_path()
             } else {
                 PathBuf::from(p)
             };
             self.open_sdc_editor(&pb)
         } else if t == "open_sdc_editor" {
-            let pb = helion_device::Device::examples_dir().join("counter.sdc");
+            let pb = self.project_sdc_path();
             self.open_sdc_editor(&pb)
         } else if t == "save_sdc_editor" {
             self.save_sdc_editor()
@@ -19012,9 +19107,9 @@ impl IdeModel {
     fn insert_methodology_sdc_template(&mut self, template: &str) {
         self.ensure_sdc_editor_populated();
         if self.sdc_editor_path.is_none() {
-            let p = helion_device::Device::examples_dir().join("counter.sdc");
+            let p = self.project_sdc_path();
             // Load on-disk create_clock (etc.) before appending, so a later
-            // save_sdc_editor does not clobber the stock SDC with only the Fix.
+            // save_sdc_editor does not clobber the SDC with only the Fix.
             if self.sdc_editor_text.is_empty() {
                 if let Ok(text) = std::fs::read_to_string(&p) {
                     self.sdc_editor_text = text;
@@ -20253,11 +20348,57 @@ impl IdeModel {
         }
     }
 
+    /// The SDC file for the current project: the editor's current path if one
+    /// is open, else an existing `.sdc`/`.xdc` in the project directory,
+    /// else `<project-stem>.sdc` in the project directory (created on open),
+    /// else a sibling of the first source, else `./constraints.sdc`.
+    /// Never the examples directory: the constraints editor belongs to the
+    /// open project.
+    pub fn project_sdc_path(&self) -> PathBuf {
+        if let Some(p) = &self.sdc_editor_path {
+            return p.clone();
+        }
+        if let Some(prj) = &self.last_project_path {
+            if let Some(dir) = prj.parent() {
+                // Prefer an existing constraints file in the project dir.
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    let mut cands: Vec<PathBuf> = entries
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .filter(|p| {
+                            matches!(
+                                p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str(),
+                                "sdc" | "xdc"
+                            )
+                        })
+                        .collect();
+                    cands.sort();
+                    if let Some(p) = cands.into_iter().next() {
+                        return p;
+                    }
+                }
+                let stem = prj
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("constraints");
+                return dir.join(format!("{stem}.sdc"));
+            }
+        }
+        // No project: sibling of the first source, like the wizard's target.
+        if let Some(src) = self.tree.sources.first() {
+            let q = PathBuf::from(src);
+            if let Some(parent) = q.parent() {
+                let stem = q.file_stem().and_then(|s| s.to_str()).unwrap_or("constraints");
+                return parent.join(format!("{stem}.sdc"));
+            }
+        }
+        PathBuf::from("constraints.sdc")
+    }
+
     /// Open an SDC/XDC file in the Constraints text editor and apply it to STA.
     pub fn open_sdc_editor(&mut self, path: &Path) -> Result<String, String> {
         let path = path.to_path_buf();
         if !path.is_file() {
-            // Create examples/counter.sdc (or any missing path) with the stock 10 ns clock.
+            // Create the missing file with the stock 10 ns clock.
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("open_sdc_editor {}: {e}", path.display()))?;
@@ -21046,15 +21187,226 @@ impl IdeModel {
         ))
     }
 
-    /// Placeholder hook: hand a VCD to the waveform viewer. The real viewer
-    /// ships with the VCD-power feature; until then the pending path is
-    /// recorded here so the integration has a single call site.
-    pub fn tb_open_vcd_in_waveform(&mut self, path: &Path) -> String {
-        self.tb_waveform_pending = Some(path.to_path_buf());
-        format!(
-            "waveform viewer (stub): queued {} - the full viewer ships with VCD power",
+    /// Load a VCD into the waveform viewer: parse the dump into [`WaveTrace`]s
+    /// on the viewer's uniform grid and navigate to the Wave pane. Malformed
+    /// VCD fails loud with a clear error, never a silent empty view.
+    pub fn tb_open_vcd_in_waveform(&mut self, path: &Path) -> Result<String, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("tb_wave: cannot read {}: {e}", path.display()))?;
+        let import = crate::vcd_wave::import_vcd_waves(&text)
+            .map_err(|e| format!("tb_wave {}: {e}", path.display()))?;
+        if import.traces.is_empty() {
+            return Err(format!("tb_wave {}: no signals in VCD", path.display()));
+        }
+        let n_traces = import.traces.len();
+        let n_samples = import.traces.first().map(|t| t.samples.len()).unwrap_or(0);
+        self.wave.traces = import.traces;
+        self.wave.timescale_ps = import.timescale_ps;
+        self.wave.cursor = 0;
+        self.wave.cursor_a = None;
+        self.wave.cursor_b = None;
+        self.wave.markers.clear();
+        self.wave.virtual_buses.clear();
+        self.workspace = WorkspaceTab::Wave;
+        let trunc = if import.truncated { " (signal list truncated)" } else { "" };
+        Ok(format!(
+            "tb_wave: {n_traces} signals, {n_samples} samples, {} ps/sample from {}{trunc}",
+            import.timescale_ps,
             path.display()
-        )
+        ))
+    }
+
+    /// Capture the UI-owned state before a job is submitted to the engine
+    /// thread. The job runs on a clone; this snapshot is restored on
+    /// completion so mid-run user work survives.
+    pub fn capture_mid_run_ui(&self) -> MidRunUi {
+        MidRunUi {
+            workspace: self.workspace.clone(),
+            nav: self.nav.clone(),
+            layout: self.layout.clone(),
+            bottom_tab: self.bottom_tab.clone(),
+            input: self.input.clone(),
+            input_history: self.input_history.clone(),
+            input_hist_idx: self.input_hist_idx,
+            console_find: self.console_find.clone(),
+            console_selected: self.console_selected,
+            console_find_hits: self.console_find_hits.clone(),
+            selected: self.selected.clone(),
+            properties: self.properties.clone(),
+            selected_property: self.selected_property.clone(),
+            selected_scope: self.selected_scope.clone(),
+            selected_object: self.selected_object.clone(),
+            selected_memory: self.selected_memory.clone(),
+            selected_memory_addr: self.selected_memory_addr,
+            selected_breakpoint: self.selected_breakpoint,
+            selected_force: self.selected_force.clone(),
+            selected_local: self.selected_local.clone(),
+            selected_source_line: self.selected_source_line,
+            selected_qor: self.selected_qor.clone(),
+            selected_timing_path: self.selected_timing_path,
+            selected_timing_pin: self.selected_timing_pin.clone(),
+            selected_ip: self.selected_ip.clone(),
+            selected_find: self.selected_find,
+            selected_source: self.selected_source.clone(),
+            selected_netlist: self.selected_netlist.clone(),
+            selected_io_port: self.selected_io_port.clone(),
+            selected_pblock: self.selected_pblock.clone(),
+            selected_clock_region: self.selected_clock_region.clone(),
+            selected_setting: self.selected_setting.clone(),
+            selected_sim_setting: self.selected_sim_setting.clone(),
+            selected_message: self.selected_message,
+            selected_drc: self.selected_drc.clone(),
+            selected_methodology: self.selected_methodology.clone(),
+            selected_cdc: self.selected_cdc.clone(),
+            selected_clock_interaction: self.selected_clock_interaction.clone(),
+            selected_clock_network: self.selected_clock_network.clone(),
+            selected_timing_summary: self.selected_timing_summary.clone(),
+            selected_power: self.selected_power.clone(),
+            selected_utilization: self.selected_utilization.clone(),
+            selected_report: self.selected_report.clone(),
+            selected_summary: self.selected_summary.clone(),
+            selected_log: self.selected_log,
+            selected_sim_log: self.selected_sim_log,
+            selected_eco: self.selected_eco.clone(),
+            selected_incremental: self.selected_incremental.clone(),
+            selected_wave_marker: self.selected_wave_marker.clone(),
+            selected_wave_cursor: self.selected_wave_cursor.clone(),
+            selected_virtual_bus: self.selected_virtual_bus.clone(),
+            sdc_editor_path: self.sdc_editor_path.clone(),
+            sdc_editor_text: self.sdc_editor_text.clone(),
+            sdc_editor_dirty: self.sdc_editor_dirty,
+            message_filter: self.message_filter.clone(),
+            timing_path_sort: self.timing_path_sort.clone(),
+            timing_path_filter: self.timing_path_filter.clone(),
+            sim_timescale_ps: self.sim_timescale_ps,
+            sim_runtime_cycles: self.sim_runtime_cycles,
+            sim_log_all_signals: self.sim_log_all_signals,
+            sim_fileset: self.sim_fileset.clone(),
+            sim_top: self.sim_top.clone(),
+            sim_include_path: self.sim_include_path.clone(),
+            sim_define: self.sim_define.clone(),
+            sim_param: self.sim_param.clone(),
+            sim_elab_debug: self.sim_elab_debug.clone(),
+            sim_elab_snapshot: self.sim_elab_snapshot.clone(),
+            sim_compile_modules: self.sim_compile_modules.clone(),
+            active_fileset: self.active_fileset.clone(),
+            checkpoint_name: self.checkpoint_name.clone(),
+            auto_checkpoint: self.auto_checkpoint,
+            tb_vcd_enabled: self.tb_vcd_enabled,
+            tb_manual: self.tb_manual.clone(),
+            package_pin_draft: self.package_pin_draft.clone(),
+            run_editor: self.run_editor.clone(),
+            console_len: self.console.len(),
+            messages_len: self.messages.len(),
+            log_len: self.log.len(),
+        }
+    }
+
+    /// Restore mid-run UI state after adopting a finished job model.
+    /// `self` is the job's finished model; `live` is the model the user
+    /// interacted with while the job ran. UI fields come from the snapshot;
+    /// append-only streams merge the job's additions with the user's.
+    pub fn restore_mid_run_ui(&mut self, snap: MidRunUi, live: &IdeModel) {
+        self.workspace = snap.workspace;
+        self.nav = snap.nav;
+        self.layout = snap.layout;
+        self.bottom_tab = snap.bottom_tab;
+        self.input = snap.input;
+        self.input_history = snap.input_history;
+        self.input_hist_idx = snap.input_hist_idx;
+        self.console_find = snap.console_find;
+        self.console_selected = snap.console_selected;
+        self.console_find_hits = snap.console_find_hits;
+        self.selected = snap.selected;
+        self.properties = snap.properties;
+        self.selected_property = snap.selected_property;
+        self.selected_scope = snap.selected_scope;
+        self.selected_object = snap.selected_object;
+        self.selected_memory = snap.selected_memory;
+        self.selected_memory_addr = snap.selected_memory_addr;
+        self.selected_breakpoint = snap.selected_breakpoint;
+        self.selected_force = snap.selected_force;
+        self.selected_local = snap.selected_local;
+        self.selected_source_line = snap.selected_source_line;
+        self.selected_qor = snap.selected_qor;
+        self.selected_timing_path = snap.selected_timing_path;
+        self.selected_timing_pin = snap.selected_timing_pin;
+        self.selected_ip = snap.selected_ip;
+        self.selected_find = snap.selected_find;
+        self.selected_source = snap.selected_source;
+        self.selected_netlist = snap.selected_netlist;
+        self.selected_io_port = snap.selected_io_port;
+        self.selected_pblock = snap.selected_pblock;
+        self.selected_clock_region = snap.selected_clock_region;
+        self.selected_setting = snap.selected_setting;
+        self.selected_sim_setting = snap.selected_sim_setting;
+        self.selected_message = snap.selected_message;
+        self.selected_drc = snap.selected_drc;
+        self.selected_methodology = snap.selected_methodology;
+        self.selected_cdc = snap.selected_cdc;
+        self.selected_clock_interaction = snap.selected_clock_interaction;
+        self.selected_clock_network = snap.selected_clock_network;
+        self.selected_timing_summary = snap.selected_timing_summary;
+        self.selected_power = snap.selected_power;
+        self.selected_utilization = snap.selected_utilization;
+        self.selected_report = snap.selected_report;
+        self.selected_summary = snap.selected_summary;
+        self.selected_log = snap.selected_log;
+        self.selected_sim_log = snap.selected_sim_log;
+        self.selected_eco = snap.selected_eco;
+        self.selected_incremental = snap.selected_incremental;
+        self.selected_wave_marker = snap.selected_wave_marker;
+        self.selected_wave_cursor = snap.selected_wave_cursor;
+        self.selected_virtual_bus = snap.selected_virtual_bus;
+        self.sdc_editor_path = snap.sdc_editor_path;
+        self.sdc_editor_text = snap.sdc_editor_text;
+        self.sdc_editor_dirty = snap.sdc_editor_dirty;
+        self.message_filter = snap.message_filter;
+        self.timing_path_sort = snap.timing_path_sort;
+        self.timing_path_filter = snap.timing_path_filter;
+        self.sim_timescale_ps = snap.sim_timescale_ps;
+        self.sim_runtime_cycles = snap.sim_runtime_cycles;
+        self.sim_log_all_signals = snap.sim_log_all_signals;
+        self.sim_fileset = snap.sim_fileset;
+        self.sim_top = snap.sim_top;
+        self.sim_include_path = snap.sim_include_path;
+        self.sim_define = snap.sim_define;
+        self.sim_param = snap.sim_param;
+        self.sim_elab_debug = snap.sim_elab_debug;
+        self.sim_elab_snapshot = snap.sim_elab_snapshot;
+        self.sim_compile_modules = snap.sim_compile_modules;
+        self.active_fileset = snap.active_fileset;
+        self.checkpoint_name = snap.checkpoint_name;
+        self.auto_checkpoint = snap.auto_checkpoint;
+        self.tb_vcd_enabled = snap.tb_vcd_enabled;
+        self.tb_manual = snap.tb_manual;
+        self.package_pin_draft = snap.package_pin_draft;
+        self.run_editor = snap.run_editor;
+        // Append-only streams: the job's additions (self) plus the user's
+        // mid-run additions (live beyond the snapshot mark). If the user
+        // cleared mid-run (live shorter than the mark), the cleared live
+        // view wins and the job's new output appends after it.
+        Self::merge_stream(&mut self.console, &live.console, snap.console_len);
+        Self::merge_stream(&mut self.messages, &live.messages, snap.messages_len);
+        Self::merge_stream(&mut self.log, &live.log, snap.log_len);
+    }
+
+    /// Merge an append-only stream: `job` holds submit-time prefix + job
+    /// additions; `live` holds submit-time prefix + user additions (or a
+    /// user-cleared stream). Never loses the job's new output.
+    fn merge_stream<T: Clone>(job: &mut Vec<T>, live: &[T], snap_len: usize) {
+        if live.len() >= snap_len {
+            // Normal: user appended mid-run; their tail follows the job's.
+            job.extend_from_slice(&live[snap_len.min(live.len())..]);
+        } else {
+            // User cleared mid-run: cleared live view wins, job's new output
+            // (which the user has not seen) appends after it.
+            let mut merged = live.to_vec();
+            if job.len() > snap_len {
+                merged.extend_from_slice(&job[snap_len..]);
+            }
+            *job = merged;
+        }
     }
 
     /// Merge a finished engine-thread run into the live model. Log lines and
@@ -21074,7 +21426,6 @@ impl IdeModel {
         self.tb_last_dut_module = done.tb_last_dut_module.clone();
         self.tb_last_dut_instance = done.tb_last_dut_instance.clone();
         self.tb_last_vcd = done.tb_last_vcd.clone();
-        self.tb_waveform_pending = done.tb_waveform_pending.clone();
         // The streamed log is authoritative for the live view; the finished
         // model's copy is identical, so keep whichever is longer.
         if done.tb_log.len() > self.tb_log.len() {
@@ -41946,12 +42297,130 @@ endmodule
         let err = m.exec("tb_sch 0").unwrap_err();
         assert!(err.contains("synth the DUT first"), "err={err}");
 
-        // The waveform hook records the pending path (stub until VCD power).
+        // tb_wave with no VCD from any run: honest error.
         let err = m.exec("tb_wave").unwrap_err();
         assert!(err.contains("no VCD"), "err={err}");
-        let msg = m.exec(&format!("tb_wave {}", dir.join("run.vcd").display())).unwrap();
-        assert!(msg.contains("waveform viewer"), "msg={msg}");
-        assert_eq!(m.tb_waveform_pending, Some(dir.join("run.vcd")));
+        // tb_wave with an explicit path loads the VCD into the waveform viewer.
+        let vcd_path = dir.join("run.vcd");
+        std::fs::write(
+            &vcd_path,
+            "$timescale 1ns $end\n$scope module dut $end\n$var wire 1 ! y $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n$end\n#10\n1!\n#20\n0!\n",
+        )
+        .unwrap();
+        let msg = m.exec(&format!("tb_wave {}", vcd_path.display())).unwrap();
+        assert!(msg.contains("1 signals"), "msg={msg}");
+        assert_eq!(m.wave.traces.len(), 1);
+        assert_eq!(m.wave.traces[0].name, "dut.y");
+        assert_eq!(m.wave.traces[0].samples[10], 1);
+        assert_eq!(m.workspace, WorkspaceTab::Wave);
+        // Malformed VCD fails loud, never a silent empty view.
+        std::fs::write(&vcd_path, "not a vcd").unwrap();
+        let err = m.exec(&format!("tb_wave {}", vcd_path.display())).unwrap_err();
+        assert!(err.contains("tb_wave"), "err={err}");
+    }
+
+    /// `open_sdc_editor` with no path opens the current project's SDC, never
+    /// the examples directory. A missing project SDC is created with the
+    /// stock clock; dirty state tracks edits and save round-trips.
+    #[test]
+    fn open_sdc_editor_uses_project_sdc() {
+        let dir = std::env::temp_dir().join(format!(
+            "helion-sdc-proj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("top.sv"), "module top(input logic clk, output logic led); assign led = clk; endmodule\n").unwrap();
+        let prj = dir.join("top.prj");
+        std::fs::write(&prj, "part = \"HL10T-C32-1\"\n").unwrap();
+
+        let mut m = IdeModel::new();
+        // Simulate an opened project: last_project_path points at the .prj.
+        m.last_project_path = Some(prj.clone());
+
+        // No SDC yet: path resolves to <project-dir>/top.sdc (created on open).
+        let p = m.project_sdc_path();
+        assert_eq!(p, dir.join("top.sdc"), "project SDC path: {}", p.display());
+        assert!(!p.is_file());
+
+        let msg = m.exec("open_sdc_editor").unwrap();
+        assert!(msg.contains("top.sdc"), "msg={msg}");
+        assert!(p.is_file(), "missing project SDC is created");
+        assert!(!m.sdc_editor_dirty, "freshly opened file is not dirty");
+        assert!(m.sdc_editor_text.contains("create_clock"), "stock clock template");
+
+        // Edit marks dirty; save clears it and persists.
+        m.sdc_editor_text.push_str("set_false_path -from [get_ports clk]\n");
+        m.sdc_editor_dirty = true;
+        m.save_sdc_editor().unwrap();
+        assert!(!m.sdc_editor_dirty);
+        let disk = std::fs::read_to_string(&p).unwrap();
+        assert!(disk.contains("set_false_path"), "save persists edits");
+
+        // An existing project SDC is preferred over creating a new one.
+        let mut m2 = IdeModel::new();
+        m2.last_project_path = Some(prj);
+        assert_eq!(m2.project_sdc_path(), dir.join("top.sdc"));
+
+        // The examples directory is never implied.
+        assert!(!m.project_sdc_path().to_string_lossy().contains("examples"));
+    }
+
+    /// Mid-run UI work survives job completion: the snapshot/restore in
+    /// poll_job preserves console input, SDC edits, selections, and
+    /// navigation while the job's engine results flow through.
+    #[test]
+    fn mid_run_ui_survives_job_completion() {
+        let mut live = IdeModel::new();
+        // User works while the job runs.
+        live.input = "report_timing".to_string();
+        live.input_history.push("synth_design".to_string());
+        live.sdc_editor_text = "create_clock -period 5 [get_ports clk]\n".to_string();
+        live.sdc_editor_dirty = true;
+        live.selected = Some("u_lut0".to_string());
+        live.workspace = WorkspaceTab::Device;
+        live.console.push(crate::ide::ConsoleLine {
+            cmd: "user_cmd".to_string(),
+            out: "user output".to_string(),
+            ok: true,
+        });
+
+        let snap = live.capture_mid_run_ui();
+
+        // The job runs on a clone: engine results land, UI stays stale.
+        let mut done = live.clone();
+        done.input.clear();
+        done.sdc_editor_text.clear();
+        done.sdc_editor_dirty = false;
+        done.selected = None;
+        done.workspace = WorkspaceTab::Reports;
+        done.steps[FlowStep::Synthesis.index()] = StepState::Done;
+        done.console.push(crate::ide::ConsoleLine {
+            cmd: "synth_design".to_string(),
+            out: "job output".to_string(),
+            ok: true,
+        });
+
+        // poll_job adopts the finished model, then restores.
+        let live_model = std::mem::replace(&mut live, done);
+        live.restore_mid_run_ui(snap, &live_model);
+
+        // User work preserved.
+        assert_eq!(live.input, "report_timing");
+        assert_eq!(live.input_history, vec!["synth_design".to_string()]);
+        assert!(live.sdc_editor_text.contains("create_clock -period 5"));
+        assert!(live.sdc_editor_dirty);
+        assert_eq!(live.selected, Some("u_lut0".to_string()));
+        assert_eq!(live.workspace, WorkspaceTab::Device);
+        // Job results applied.
+        assert_eq!(live.steps[FlowStep::Synthesis.index()], StepState::Done);
+        // Streams merge: job's line and the user's line both present.
+        let cmds: Vec<&str> = live.console.iter().map(|c| c.cmd.as_str()).collect();
+        assert!(cmds.contains(&"synth_design"), "{cmds:?}");
+        assert!(cmds.contains(&"user_cmd"), "{cmds:?}");
     }
 
     /// No placeholder text may leak into the UI. Scans every helion-gui
