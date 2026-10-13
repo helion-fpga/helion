@@ -41,8 +41,8 @@ impl Default for PhysViewState {
     fn default() -> Self {
         Self {
             layers: LayerModel::default(),
-            show_display_control: true,
-            show_inspector: true,
+            show_display_control: false,
+            show_inspector: false,
             rulers: Vec::new(),
             ruler_tool: false,
             ruler_anchor: None,
