@@ -1,0 +1,22 @@
+[package]
+name = "helion-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "In-app update check and installer for Helion (GitHub Releases backend)"
+license.workspace = true
+
+[dependencies]
+# Pinned to 0.42: self_update 1.x requires Rust 1.88, but the workspace MSRV
+# is 1.85.0. 0.42 has no `checksums` feature, so SHA256SUMS verification is
+# done manually with the `sha2` crate (see verify.rs).
+self_update = { version = "=0.42.0", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+semver = "1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
