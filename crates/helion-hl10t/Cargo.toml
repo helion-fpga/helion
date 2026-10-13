@@ -1,0 +1,17 @@
+[package]
+name = "helion-hl10t"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-ir = { workspace = true }
+helion-backend = { workspace = true }
+helion-device = { workspace = true }
+helion-pack = { workspace = true }
+helion-place = { workspace = true }
+helion-route = { workspace = true }
+helion-bits = { workspace = true }
+
+[dev-dependencies]
+helion-sv = { workspace = true }
