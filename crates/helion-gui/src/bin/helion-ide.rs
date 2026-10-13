@@ -8147,105 +8147,128 @@ fn paint_device_toolbar(
     pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
-    ui.horizontal(|ui| {
-        if ui.button("Fit").on_hover_text("Zoom the die to fit (F)").clicked() {
-            let _ = model.device_zoom_fit();
+    let dbg_net = model.selected_debug_net();
+    let dbg_enabled = dbg_net.is_some();
+    let md_label = match &dbg_net {
+        Some(n) => format!("Mark Debug {n}"),
+        None => "Mark Debug".into(),
+    };
+    let ruler_text = if pv.ruler_tool { "Ruler [on]" } else { "Ruler" }.to_string();
+    let layers_text = if pv.show_display_control {
+        "Layers [-]"
+    } else {
+        "Layers [+]"
+    }
+    .to_string();
+    let inspector_text = if pv.show_inspector {
+        "Inspector [-]"
+    } else {
+        "Inspector [+]"
+    }
+    .to_string();
+    let zoom_label = format!("Zoom {:.0}%", model.device_zoom * 100.0);
+    // Narrow windows: items that do not fit move into a ">>" overflow menu
+    // (the same house pattern as the schematic toolbar; VS Code collapses
+    // view-title actions into "..." the same way) instead of clipping past
+    // the pane edge.
+    // One label list drives both the inline row and the overflow menu, so the
+    // two can never drift apart.
+    let item_labels: [String; 12] = [
+        "Fit".into(),
+        "Find...".into(),
+        ruler_text,
+        "Clear".into(),
+        layers_text,
+        inspector_text,
+        "Zoom to selection".into(),
+        "Zoom In".into(),
+        "Zoom Out".into(),
+        "Zoom Fit".into(),
+        md_label.clone(),
+        "Add Probe".into(),
+    ];
+    let widths = chrome::device_toolbar_widths(&item_labels[10], &zoom_label);
+    let m = &mut *model;
+    let p = &mut *pv;
+    let zt = &mut *zoom_target;
+    chrome::overflow_toolbar(ui, &widths, |ui, idx, in_menu| {
+        if idx == 12 {
+            // Informational zoom readout: a label in both modes, never a button.
+            ui.label(RichText::new(&zoom_label).small().weak());
+            return;
         }
-        if ui
-            .button("Find...")
-            .on_hover_text("Find a site, cell, or net (Ctrl+K)")
-            .clicked()
-        {
-            pv.find_open = true;
-            pv.find_query.clear();
-            pv.find_selected = 0;
-            pv.find_needs_focus = true;
-        }
-        let ruler_text = if pv.ruler_tool { "Ruler [on]" } else { "Ruler" };
-        if ui
-            .button(ruler_text)
-            .on_hover_text("Ruler tool: click-drag on the die to measure (R)")
-            .clicked()
-        {
-            pv.ruler_tool = !pv.ruler_tool;
-            pv.ruler_anchor = None;
-        }
-        if ui
-            .button("Clear")
-            .on_hover_text("Clear selection, rulers, and solo (Esc)")
-            .clicked()
-        {
-            clear_physview_selection(model, pv);
-        }
-        ui.separator();
-        if ui
-            .small_button(if pv.show_display_control {
-                "Layers [-]"
-            } else {
-                "Layers [+]"
-            })
-            .on_hover_text("Toggle the Display Control dock")
-            .clicked()
-        {
-            pv.show_display_control = !pv.show_display_control;
-        }
-        if ui
-            .small_button(if pv.show_inspector {
-                "Inspector [-]"
-            } else {
-                "Inspector [+]"
-            })
-            .on_hover_text("Toggle the Inspector dock")
-            .clicked()
-        {
-            pv.show_inspector = !pv.show_inspector;
-        }
-        ui.separator();
-        if ui
-            .button("Zoom to selection")
-            .on_hover_text("Zoom the die to the selected site/net")
-            .clicked()
-        {
-            if let Some((x, y)) = selected_site_xy(model) {
-                model.device_zoom = 2.5;
-                *zoom_target = Some((x, y));
-            }
-        }
-        if ui.button("Zoom In").clicked() {
-            let _ = model.device_zoom_in();
-        }
-        if ui.button("Zoom Out").clicked() {
-            let _ = model.device_zoom_out();
-        }
-        if ui.button("Zoom Fit").clicked() {
-            let _ = model.device_zoom_fit();
-        }
-        let dbg_net = model.selected_debug_net();
-        ui.add_enabled_ui(dbg_net.is_some(), |ui| {
-            let md = match &dbg_net {
-                Some(n) => format!("Mark Debug {n}"),
-                None => "Mark Debug".into(),
+        let enabled = dbg_enabled || idx < 10;
+        let label = item_labels[idx].as_str();
+        let clicked = if in_menu {
+            ui.add_enabled(enabled, egui::Button::new(label)).clicked()
+        } else {
+            let hover = match idx {
+                0 => "Zoom the die to fit (F)",
+                1 => "Find a site, cell, or net (Ctrl+K)",
+                2 => "Ruler tool: click-drag on the die to measure (R)",
+                3 => "Clear selection, rulers, and solo (Esc)",
+                4 => "Toggle the Display Control dock",
+                5 => "Toggle the Inspector dock",
+                6 => "Zoom the die to the selected site/net",
+                10 => "UG908 Mark Debug on the selected Device route/net",
+                11 => "UG908 Add Probe to ILA dashboard",
+                _ => "",
             };
-            if ui
-                .button(md)
-                .on_hover_text("UG908 Mark Debug on the selected Device route/net")
-                .clicked()
-            {
-                let _ = model.exec("mark_debug");
+            let btn = if idx == 4 || idx == 5 {
+                ui.small_button(label)
+            } else if idx == 10 || idx == 11 {
+                ui.add_enabled(dbg_enabled, egui::Button::new(label))
+            } else {
+                ui.button(label)
+            };
+            btn.on_hover_text(hover).clicked()
+        };
+        if !clicked || !enabled {
+            return;
+        }
+        match idx {
+            0 => {
+                let _ = m.device_zoom_fit();
             }
-            if ui
-                .button("Add Probe")
-                .on_hover_text("UG908 Add Probe to ILA dashboard")
-                .clicked()
-            {
-                let _ = model.exec("add_probe");
+            1 => {
+                p.find_open = true;
+                p.find_query.clear();
+                p.find_selected = 0;
+                p.find_needs_focus = true;
             }
-        });
-        ui.label(
-            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
-                .small()
-                .weak(),
-        );
+            2 => {
+                p.ruler_tool = !p.ruler_tool;
+                p.ruler_anchor = None;
+            }
+            3 => clear_physview_selection(&mut *m, &mut *p),
+            4 => {
+                p.show_display_control = !p.show_display_control;
+            }
+            5 => {
+                p.show_inspector = !p.show_inspector;
+            }
+            6 => {
+                if let Some((x, y)) = selected_site_xy(m) {
+                    m.device_zoom = 2.5;
+                    *zt = Some((x, y));
+                }
+            }
+            7 => {
+                let _ = m.device_zoom_in();
+            }
+            8 => {
+                let _ = m.device_zoom_out();
+            }
+            9 => {
+                let _ = m.device_zoom_fit();
+            }
+            10 => {
+                let _ = m.exec("mark_debug");
+            }
+            _ => {
+                let _ = m.exec("add_probe");
+            }
+        }
     });
 }
 
@@ -10396,11 +10419,14 @@ fn paint_ila(
         );
     }
 
-    // Setup: probes (left) + trigger (right).
+    // Setup: probes (left) + trigger (right). The probes column keeps a
+    // proportional share (VS Code debug panels share space via sashes with
+    // minimums); a fixed 340px clipped the trigger column on narrow panes.
     ui.horizontal(|ui| {
+        let probes_w = chrome::ila_probes_share(ui.available_width());
         ui.vertical(|ui| {
-            ui.set_min_width(340.0);
-            ui.set_max_width(340.0);
+            ui.set_min_width(probes_w);
+            ui.set_max_width(probes_w);
             ui.label(RichText::new("Probes").strong());
             ui.horizontal(|ui| {
                 ui.label("Search");

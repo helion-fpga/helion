@@ -20,10 +20,14 @@ use std::sync::Arc;
 
 /// Must match the `line_height` forced in the editor layouter.
 const ROW_H: f32 = 13.0 * 1.5;
-const GUTTER_W: f32 = 56.0;
-const MINIMAP_W: f32 = 110.0;
 /// Above this many lines the minimap degrades from tiny text to bars.
 const MINIMAP_TEXT_CAP: usize = 1500;
+// Gutter / minimap geometry lives in chrome (layout math is tested there);
+// import the shared constants.
+use helion_gui::chrome::{
+    editor_minimap_visible, EDITOR_GUTTER_W as GUTTER_W, EDITOR_MIN_TEXT_W as MIN_TEXT_W,
+    EDITOR_MINIMAP_W as MINIMAP_W,
+};
 
 /// Load the open file into the edit buffer when the selection changes.
 fn sync_editor_buffer(app: &mut HelionIde) {
@@ -347,23 +351,36 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
     // ---- main row: gutter | text scroll | minimap ----
     let avail = ui.available_size();
     let wrap = app.editor_wrap;
+    // Narrow pane: the minimap hides (VS Code never lets it overflow the
+    // editor viewport) and the text takes the whole leftover.
+    let show_minimap = editor_minimap_visible(avail.x);
     ui.horizontal_top(|ui| {
         let gutter_resp = ui.allocate_exact_size(
             egui::vec2(GUTTER_W, avail.y),
             egui::Sense::click(),
         );
-        let text_w = (ui.available_width() - MINIMAP_W - ui.spacing().item_spacing.x).max(160.0);
+        let text_w = if show_minimap {
+            (ui.available_width() - MINIMAP_W - ui.spacing().item_spacing.x).max(MIN_TEXT_W)
+        } else {
+            ui.available_width().max(120.0)
+        };
         let scroll_resp = ui.allocate_ui(egui::vec2(text_w, avail.y), |ui| {
             paint_editor_text(ui, app, theme, lang, n_lines, wrap)
         });
-        let mini_resp = ui.allocate_exact_size(
-            egui::vec2(MINIMAP_W, avail.y),
-            egui::Sense::click_and_drag(),
-        );
+        let mini_resp = if show_minimap {
+            Some(ui.allocate_exact_size(
+                egui::vec2(MINIMAP_W, avail.y),
+                egui::Sense::click_and_drag(),
+            ))
+        } else {
+            None
+        };
 
         let scroll_out = &scroll_resp.inner;
         paint_gutter_overlay(ui, app, theme, &gutter_resp.1, scroll_out, n_lines, wrap);
-        paint_minimap(ui, app, theme, &mini_resp.1, scroll_out, n_lines, wrap, lang);
+        if let Some(mini_resp) = mini_resp {
+            paint_minimap(ui, app, theme, &mini_resp.1, scroll_out, n_lines, wrap, lang);
+        }
         handle_gutter_click(app, &gutter_resp.1, scroll_out, n_lines, wrap);
     });
 }
