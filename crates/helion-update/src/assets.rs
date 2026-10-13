@@ -68,7 +68,7 @@ pub fn select_asset(
             name: a.name.clone(),
             download_url: a.download_url.clone(),
         })
-        .ok_or_else(|| UpdateError::NoAsset(want))
+        .ok_or(UpdateError::NoAsset(want))
 }
 
 /// Find the SHA256SUMS.txt asset in a release.

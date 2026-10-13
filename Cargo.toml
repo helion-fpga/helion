@@ -60,6 +60,7 @@ helion-vhdl = { path = "crates/helion-vhdl" }
 helion-hls = { path = "crates/helion-hls" }
 helion-backend = { path = "crates/helion-backend" }
 helion-xilinx7 = { path = "crates/helion-xilinx7" }
+helion-update = { path = "crates/helion-update" }
 criterion = "0.5"
 
 [profile.bench]

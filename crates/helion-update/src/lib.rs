@@ -34,3 +34,9 @@ pub use check::{check_for_update, current_version, is_newer, latest_stable, pars
 pub use error::UpdateError;
 pub use install::{current_exe_path, dir_writable, download_to_file, find_app_bundle, install_binary_from_tarball, install_bundle_from_zip, plan_install, InstallKind, InstallMode, InstallPlan};
 pub use verify::{fetch_sha256sums, lookup_checksum, parse_sha256sums, verify_bytes};
+
+/// Rust target triple of this build, e.g. "x86_64-unknown-linux-gnu".
+/// Used to pick the matching release asset.
+pub fn target_triple() -> String {
+    self_update::get_target().to_string()
+}

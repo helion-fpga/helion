@@ -48,6 +48,8 @@ mod schem_lod;
 mod theme;
 #[path = "helion-ide/toasts.rs"]
 mod toasts;
+#[path = "helion-ide/update_ui.rs"]
+mod update_ui;
 #[path = "helion-ide/welcome.rs"]
 mod welcome;
 
@@ -346,6 +348,12 @@ struct HelionIde {
     theme_dirty: bool,
     /// Toast notifications (P1-5).
     toasts: toasts::ToastQueue,
+    /// In-app update state: startup check (fresh session only), dialog,
+    /// manual check. The check thread is spawned lazily on the first frame.
+    update_flow: update_ui::UpdateFlow,
+    update_check_rx: Option<mpsc::Receiver<update_ui::CheckResult>>,
+    update_install_rx: Option<mpsc::Receiver<update_ui::InstallEvent>>,
+    update_check_started: bool,
     /// Layout preset + persisted chrome (P1-1).
     layout_state: layouts::LayoutState,
     /// Welcome page dismissed this session.
@@ -431,6 +439,10 @@ impl HelionIde {
             theme: theme::Theme::dark(),
             theme_dirty: true,
             toasts: toasts::ToastQueue::default(),
+            update_flow: update_ui::UpdateFlow::default(),
+            update_check_rx: None,
+            update_install_rx: None,
+            update_check_started: false,
             layout_state: layouts::LayoutState::default(),
             welcome_dismissed: false,
             physview: physview_panels::PhysViewState::default(),
@@ -864,6 +876,123 @@ impl HelionIde {
         self.board_detect.as_ref().expect("board detect cached")
     }
 
+    /// Start the update check on a background thread (once per session).
+    /// `manual` is true for Help-menu checks, which report the outcome via
+    /// toast; the startup check stays silent unless an update is found.
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_check_rx.is_some() {
+            return;
+        }
+        self.update_check_rx = Some(update_ui::spawn_check());
+        self.update_flow = update_ui::UpdateFlow::Checking { manual };
+        if manual {
+            self.toasts
+                .push(toasts::ToastKind::Ok, "Checking for updates…");
+        }
+    }
+
+    /// Poll the update check / install threads; paint the update dialog.
+    /// The startup check is spawned lazily here so `HelionIde::new()` stays
+    /// side-effect free (tests construct it without network).
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        if !self.update_check_started {
+            self.update_check_started = true;
+            if std::env::var("HELION_NO_UPDATE_CHECK").is_err() {
+                self.start_update_check(false);
+            }
+        }
+        if let Some(rx) = self.update_check_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(Some((release, plan)))) => {
+                    self.update_check_rx = None;
+                    self.update_flow = update_ui::UpdateFlow::Available { release, plan };
+                }
+                Ok(Ok(None)) => {
+                    self.update_check_rx = None;
+                    if matches!(
+                        self.update_flow,
+                        update_ui::UpdateFlow::Checking { manual: true }
+                    ) {
+                        self.toasts.push(
+                            toasts::ToastKind::Ok,
+                            format!(
+                                "Helion {} is the latest version.",
+                                env!("CARGO_PKG_VERSION")
+                            ),
+                        );
+                    }
+                    self.update_flow = update_ui::UpdateFlow::Idle;
+                }
+                Ok(Err(e)) => {
+                    self.update_check_rx = None;
+                    // Startup check failures stay silent (no network is not
+                    // worth a popup); manual checks report via toast.
+                    if matches!(
+                        self.update_flow,
+                        update_ui::UpdateFlow::Checking { manual: true }
+                    ) {
+                        self.toasts
+                            .push(toasts::ToastKind::Warn, format!("Update check failed: {e}"));
+                    }
+                    self.update_flow = update_ui::UpdateFlow::Idle;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_check_rx = None;
+                    self.update_flow = update_ui::UpdateFlow::Idle;
+                }
+            }
+        }
+        if let Some(rx) = self.update_install_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(update_ui::InstallEvent::Stage(stage)) => {
+                    if let update_ui::UpdateFlow::Working { stage: s, .. } =
+                        &mut self.update_flow
+                    {
+                        *s = stage.to_string();
+                    }
+                }
+                Ok(update_ui::InstallEvent::Done(outcome)) => {
+                    self.update_install_rx = None;
+                    match outcome {
+                        update_ui::InstallOutcome::Restart { exe } => {
+                            // Clean restart: save the editor first, then spawn
+                            // the new binary and close this window.
+                            if self.editor_dirty {
+                                editor::save_editor(self);
+                            }
+                            update_ui::restart_with(&exe, ctx, &mut self.toasts);
+                            self.update_flow = update_ui::UpdateFlow::Idle;
+                        }
+                        update_ui::InstallOutcome::Downloaded { path } => {
+                            let version = match &self.update_flow {
+                                update_ui::UpdateFlow::Working { version, .. } => {
+                                    version.clone()
+                                }
+                                _ => String::new(),
+                            };
+                            self.update_flow = update_ui::UpdateFlow::Downloaded {
+                                path,
+                                version,
+                            };
+                        }
+                    }
+                }
+                Ok(update_ui::InstallEvent::Failed(e)) => {
+                    self.update_install_rx = None;
+                    self.update_flow = update_ui::UpdateFlow::Failed(e);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_install_rx = None;
+                    self.update_flow =
+                        update_ui::UpdateFlow::Failed("installer thread died".to_string());
+                }
+            }
+        }
+        update_ui::paint_update_dialog(ctx, self);
+    }
+
     fn remember(&mut self, path: PathBuf) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.recent.retain(|p| p != &path);
@@ -978,6 +1107,7 @@ impl eframe::App for HelionIde {
         }
         self.poll_job(ctx);
         self.poll_ila(ctx);
+        self.poll_update(ctx);
         // Menu bar (P1-6): standard File/Edit/View/Flow/Tools/Help, driven by
         // the same command registry as the palette.
         egui::TopBottomPanel::top("menu_bar")
