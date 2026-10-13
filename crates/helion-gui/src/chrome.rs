@@ -67,6 +67,15 @@ pub const IDLE_CPU_SOFT_PCT: u32 = 1;
 /// Soft budget: no uncapped animation timer; paint only on egui events.
 pub const IDLE_ANIM_HZ: u32 = 0;
 
+/// Spacing scale (px). Every add_space, padding, and gap uses these - never
+/// magic numbers. 4px base unit; 8px standard gap; 12px section gap; 16px
+/// panel padding; 24px major section.
+pub const SPACE_XS: f32 = 4.0;
+pub const SPACE_SM: f32 = 8.0;
+pub const SPACE_MD: f32 = 12.0;
+pub const SPACE_LG: f32 = 16.0;
+pub const SPACE_XL: f32 = 24.0;
+
 /// Legacy alias - canvas expands; do not use as a max cap.
 pub const DRAWING_MAX_HEIGHT: f32 = DRAWING_MIN_HEIGHT;
 /// Minimum column width used to decide whether a grid clips its last column.
