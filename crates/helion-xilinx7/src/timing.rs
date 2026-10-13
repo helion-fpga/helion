@@ -286,6 +286,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
+            carries: vec![],
         };
         let routed = Routed7 {
             placed: Placed7 {
@@ -301,6 +302,7 @@ mod tests {
                 bufgs: vec![],
                 brams: vec![],
             dsps: vec![],
+            carries: vec![],
             },
             nets: vec![],
         };

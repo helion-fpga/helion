@@ -184,6 +184,15 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
     // registers) requires the detailed attribute bit mapping; future work.
     let _ = &placed.dsps;
 
+    // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.IN_USE. The carry chain
+    // muxing (CYINIT, CI) is not yet emitted; minimal placement only.
+    for carry in &placed.carries {
+        let site_rel = device
+            .site_rel(&carry.tile, &carry.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", carry.tile, carry.site))?;
+        lines.push(format!("{}.{}.CARRY4.IN_USE", carry.tile, site_rel));
+    }
+
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
     // connections (e.g. OLOGIC bypass): traversed for connectivity but
     // never emitted (no configuration bits).
@@ -307,6 +316,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
+            carries: vec![],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -316,6 +326,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
+            carries: vec![],
         };
         Routed7 {
             placed,
@@ -351,6 +362,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![PackedBram { name: "u_bram".into(), init: vec![] }],
             dsps: vec![],
+            carries: vec![],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -360,6 +372,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![PlacedBram { name: "u_bram".into(), tile: "BRAM_L_X0Y0".into(), site: "RAMB18_X0Y0".into() }],
             dsps: vec![],
+            carries: vec![],
         };
         let routed = Routed7 { placed, nets: vec![] };
         let bs = emit_fasm(&routed, &FakeEmit).unwrap();

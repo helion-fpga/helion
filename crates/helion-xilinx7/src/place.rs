@@ -81,6 +81,14 @@ pub struct PlacedDsp {
     pub site: String,
 }
 
+/// A placed CARRY4 (in a SLICE).
+#[derive(Clone, Debug)]
+pub struct PlacedCarry {
+    pub name: String,
+    pub tile: String,
+    pub site: String,
+}
+
 /// Backend-owned placed netlist for xc7a35t.
 #[derive(Clone, Debug, Default)]
 pub struct Placed7 {
@@ -91,6 +99,7 @@ pub struct Placed7 {
     pub bufgs: Vec<PlacedBufg>,
     pub brams: Vec<PlacedBram>,
     pub dsps: Vec<PlacedDsp>,
+    pub carries: Vec<PlacedCarry>,
 }
 
 /// BEL letters within a slice: A, B, C, D.
@@ -167,6 +176,21 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
         });
     }
 
+    // 2d. CARRY4s. Placed in SLICE sites; the carry chain connects
+    // vertically within the column. Minimal: place on free slices.
+    let (ax, ay) = anchor.unwrap_or((0, 0));
+    for carry in &packed.carries {
+        let (tile, site) = device
+            .slice_near(ax, ay, &used_sites)
+            .ok_or_else(|| format!("place: no SLICE site for CARRY4 {}", carry.name))?;
+        used_sites.insert(site.clone());
+        out.carries.push(PlacedCarry {
+            name: carry.name.clone(),
+            tile,
+            site,
+        });
+    }
+
     // 3. Pair FFs with their driving LUTs (FF.D == LUT.O) into one slice.
     let lut_by_output: HashMap<&str, usize> = packed
         .luts
@@ -177,8 +201,6 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
     let mut lut_placed: HashSet<usize> = HashSet::new();
     // BEL occupancy per site: site -> letters used.
     let mut site_bels: HashMap<String, HashSet<char>> = HashMap::new();
-
-    let (ax, ay) = anchor.unwrap_or((0, 0));
 
     // Allocate a (tile, site, BEL-letter), reusing a slice with free BELs
     // before opening a new one.
@@ -331,6 +353,7 @@ mod tests {
             }],
             brams: vec![],
             dsps: vec![],
+            carries: vec![],
         }
     }
 
