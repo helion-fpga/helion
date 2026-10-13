@@ -52,7 +52,7 @@ pub use ide::{
     DeviceSiteView, DeviceView, FindHit, FlowStep, HierBox, HierarchyDrawing, HierarchyView,
     HwManager, HwStatReport, HwStatRow, IdeMessage,
     IdeModel, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
-    SimIla, SimIlaStatus,
+    Ila, IlaStatus,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
     ConstraintRow, ConstraintSection,
     Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
