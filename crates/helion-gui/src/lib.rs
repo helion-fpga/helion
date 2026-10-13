@@ -15,6 +15,7 @@ pub mod ide;
 pub mod ila;
 pub mod power;
 pub mod vcd;
+pub mod vcd_wave;
 pub mod learner_l1;pub mod learner_l2;
 pub mod open_dialog;
 pub mod physview;
@@ -54,7 +55,7 @@ pub use ide::{
     IdeModel, IlaDashboard, IlaTrigger, IoPortView, IpCatalogRow, LayoutKind, LocalRow, MemoryBlock,
     SimIla, SimIlaStatus,
     MemoryWordRow, BreakpointRow, ForceRow, EditorMarker, MsgSeverity, NavAction, NavSection, SourceLine,
-    ConstraintRow, ConstraintSection,
+    ConstraintRow, ConstraintSection, MidRunUi,
     Pblock, ProjectSummaryGadget, PropertyRow, ProbeSelection, ReportCatalogRow,
     NetlistRow, NetlistTree, PackageDrawing, PackagePin, SchematicCamera, SchematicDrawing, SchematicPin,
     SchematicSymbol, SchematicView, SchematicWire, ScopeNode, SimLogRow, SimObject, EcoRow, IncrementalRow, StepState, TimingPath,
