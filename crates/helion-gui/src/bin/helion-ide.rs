@@ -33,6 +33,9 @@ mod dashboard;
 mod editor;
 #[path = "helion-ide/flow_nav.rs"]
 mod flow_nav;
+#[path = "helion-ide/fuzz.rs"]
+#[cfg(test)]
+mod fuzz;
 #[path = "helion-ide/hierarchy.rs"]
 mod hierarchy;
 #[path = "helion-ide/highlight.rs"]
@@ -981,6 +984,16 @@ impl eframe::App for HelionIde {
     /// Idle policy: reactive eframe only - never `request_repaint` / Continuous here.
     /// Synth/implement run on the engine thread via submit_job / queue_flow.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_inner(ctx);
+    }
+}
+
+impl HelionIde {
+    /// The real per-frame work, factored out of `eframe::App::update` (which
+    /// ignores its `&mut eframe::Frame`) so headless drivers - the in-process
+    /// event fuzzer in `helion-ide/fuzz.rs` - can run the exact same frame
+    /// path without duplicating it.
+    fn update_inner(&mut self, ctx: &egui::Context) {
         handle_shortcuts(ctx, self);
         if self.theme_dirty {
             self.theme.apply(ctx);
