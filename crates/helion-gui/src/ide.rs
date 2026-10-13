@@ -5019,7 +5019,6 @@ pub enum WorkspaceTab {
     Qor,
     Drc,
     Utilization,
-    Hierarchy,
     Find,
     Package,
     Runs,
@@ -5029,7 +5028,7 @@ pub enum WorkspaceTab {
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 32] = [
+    pub const ALL: [WorkspaceTab; 31] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -5055,7 +5054,6 @@ impl WorkspaceTab {
         WorkspaceTab::Qor,
         WorkspaceTab::Drc,
         WorkspaceTab::Utilization,
-        WorkspaceTab::Hierarchy,
         WorkspaceTab::Find,
         WorkspaceTab::Package,
         WorkspaceTab::Runs,
@@ -5156,7 +5154,6 @@ impl WorkspaceTab {
             WorkspaceTab::Qor => "QoR Suggestions",
             WorkspaceTab::Drc => "DRC",
             WorkspaceTab::Utilization => "Utilization",
-            WorkspaceTab::Hierarchy => "Hierarchy",
             WorkspaceTab::Find => "Find Results",
             WorkspaceTab::Package => "Package",
             WorkspaceTab::Runs => "Design Runs",
@@ -6471,10 +6468,11 @@ impl IdeModel {
             let spec = t.strip_prefix("select_find").unwrap_or("").trim();
             self.select_find(spec)
         } else if t == "hierarchy" {
-            self.workspace = WorkspaceTab::Hierarchy;
+            // Grammar R15: the hierarchy tree is a Z3 sidebar section now, not
+            // a central pane. The command returns its text dump; navigation
+            // is unnecessary because the tree is always one rail click away.
             Ok(self.hierarchy_text())
         } else if t == "hierarchy_drawing" {
-            self.workspace = WorkspaceTab::Hierarchy;
             Ok(self.hierarchy_drawing_text())
         } else if t == "run_synthesis" {
             self.run_step(FlowStep::Synthesis)
@@ -7646,8 +7644,11 @@ impl IdeModel {
             return Some(obj.to_string());
         }
         if self.hierarchy.has(obj) {
+            // Grammar R15: hierarchy is a Z3 sidebar section, not a central
+            // pane. The selection drives the sidebar tree highlight, the
+            // breadcrumb, and the Z4 inspector; the center stays where the
+            // user was (e.g. the Utilization report they clicked from).
             self.selected = Some(obj.to_string());
-            self.workspace = WorkspaceTab::Hierarchy;
             return Some(obj.to_string());
         }
         None
@@ -28120,7 +28121,12 @@ end architecture;
             ide.hierarchy.nodes
         );
         let text = ide.exec("hierarchy").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Hierarchy);
+        assert_eq!(
+            ide.workspace,
+            WorkspaceTab::Device,
+            "grammar R15: hierarchy is a Z3 sidebar section; the command returns \
+             its dump without moving the center pane"
+        );
         assert!(text.contains("u0:instance:tog"), "{text}");
         assert!(text.contains("top=hier"), "{text}");
 
@@ -30288,7 +30294,12 @@ endmodule
         let mut hier = IdeModel::new();
         hier.open_source(&example("hier.sv")).unwrap();
         let dump = hier.exec("hierarchy_drawing").unwrap();
-        assert_eq!(hier.workspace, WorkspaceTab::Hierarchy);
+        assert_eq!(
+            hier.workspace,
+            WorkspaceTab::Device,
+            "grammar R15: hierarchy is a Z3 sidebar section; the command returns \
+             its dump without moving the center pane"
+        );
         assert!(
             dump.contains("box="),
             "block view is boxes, not a list: {dump}"
@@ -30355,7 +30366,12 @@ endmodule
         let mut hier = IdeModel::new();
         hier.open_source(&example("hier.sv")).unwrap();
         let dump = hier.exec("hierarchy_drawing").unwrap();
-        assert_eq!(hier.workspace, WorkspaceTab::Hierarchy);
+        assert_eq!(
+            hier.workspace,
+            WorkspaceTab::Device,
+            "grammar R15: hierarchy is a Z3 sidebar section; the command returns \
+             its dump without moving the center pane"
+        );
         assert!(dump.contains("box="), "exec dump is for tests: {dump}");
         let d = hier.hierarchy.drawing();
         assert!(
@@ -35131,7 +35147,12 @@ endmodule
         assert!(hier.contains("NAME=counter"), "{hier}");
         assert_eq!(ide.selected_utilization.as_deref(), Some("hier:counter"));
         assert_eq!(ide.selected.as_deref(), Some("counter"));
-        assert_eq!(ide.workspace, WorkspaceTab::Hierarchy);
+        assert_eq!(
+            ide.workspace,
+            WorkspaceTab::Schematic,
+            "grammar R15: hierarchy cross-probe selects but no longer steals the \
+             center pane; the previous pane stays visible"
+        );
         assert!(
             ide.properties
                 .iter()
@@ -40855,7 +40876,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 32);
+        assert_eq!(WorkspaceTab::ALL.len(), 31);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(
