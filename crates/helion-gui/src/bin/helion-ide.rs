@@ -1006,6 +1006,11 @@ impl eframe::App for HelionIde {
         if !self.sidebar_hidden {
             paint_sidebar(ctx, self);
         }
+        // Z4 inspector (grammar R14, P9): selection detail in the right dock,
+        // never in the navigation sidebar. Shown only when a selection exists.
+        if inspector_visible(&self.model) {
+            paint_inspector(ctx, self);
+        }
         // Consume the re-share flag here - not inside the sidebar painter, which
         // runs after paint_bottom and never runs when the sidebar is hidden.
         // A stuck flag pinned the bottom console every frame and killed dragging.
@@ -1645,6 +1650,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     drag_dx = resp.drag_delta().x;
                 }
             });
+
         });
     // Left panel: dragging the right edge right (positive x) grows the panel.
     if drag_dx != 0.0 {
@@ -1654,6 +1660,28 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
     if hover_resize {
         ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
+}
+
+/// Z4 visibility (grammar R14): the inspector shows if and only if a
+/// selection exists. One predicate shared by the frame and the tests, so the
+/// "on selection only" contract cannot drift between them.
+fn inspector_visible(model: &IdeModel) -> bool {
+    model.selected.is_some()
+        || model.selected_source.is_some()
+        || model.selected_io_port.is_some()
+}
+
+/// Z4 inspector (grammar R14, rules P1/P9): selection detail lives in the
+/// right dock, never in the navigation sidebar. 220px (PROPERTIES_WIDTH),
+/// painted only when `inspector_visible`.
+fn paint_inspector(ctx: &egui::Context, app: &mut HelionIde) {
+    egui::SidePanel::right("inspector_z4")
+        .default_width(chrome::PROPERTIES_WIDTH)
+        .show_separator_line(true)
+        .show(ctx, |ui| {
+            ui.set_width(ui.available_width());
+            paint_properties(ui, &mut app.model);
+        });
 }
 
 fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
@@ -2244,7 +2272,8 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
     }
 }
 fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
-    ui.separator();
+    // Z4 order (grammar section 4): heading, selection-scoped actions, then
+    // the Name/Value grid. Actions before data.
     ui.label(RichText::new("Properties").strong());
     if let Some(net) = model.selected_debug_net() {
         ui.horizontal(|ui| {
@@ -12679,6 +12708,85 @@ mod nested_scroll_tests {
             "wheel over a bottom-pinned inner list must chain to the outer page: inner={:?} outer={:?}",
             probe.1,
             probe.2
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grammar R14: the Z4 inspector shows if and only if a selection exists.
+    /// The frame gates `paint_inspector` on this predicate; the sidebar never
+    /// consults it (properties no longer live in Z3).
+    #[test]
+    fn inspector_visible_iff_selection_exists() {
+        let mut m = IdeModel::new();
+        assert!(
+            !inspector_visible(&m),
+            "no selection -> no inspector (Z4 hidden)"
+        );
+        m.selected = Some("u0".to_string());
+        assert!(inspector_visible(&m), "cell selection shows the inspector");
+        m.selected = None;
+        m.selected_source = Some("top.sv".to_string());
+        assert!(inspector_visible(&m), "source selection shows the inspector");
+        m.selected_source = None;
+        m.selected_io_port = Some("led".to_string());
+        assert!(inspector_visible(&m), "IO port selection shows the inspector");
+        m.selected_io_port = None;
+        assert!(
+            !inspector_visible(&m),
+            "cleared selection hides the inspector again"
+        );
+    }
+
+    /// Grammar R14/P1: properties render in the Z4 right dock, never in the
+    /// Z3 navigation sidebar. Headless frame: paint the sidebar (and the
+    /// inspector when the gate allows), then locate the "Properties" heading
+    /// in the tessellated shapes. With a selection it must sit in the right
+    /// dock (x > 1000 on a 1600px window); the sidebar occupies x < 500.
+    /// Without a selection there must be no Properties heading at all.
+    #[test]
+    fn properties_paint_in_inspector_not_sidebar() {
+        fn properties_heading_xs(selected: Option<&str>) -> Vec<f32> {
+            let ctx = egui::Context::default();
+            let mut app = HelionIde::new();
+            app.model.selected = selected.map(str::to_string);
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            // Mirror the frame's zone order: sidebar, then Z4 on selection.
+            let out = ctx.run(raw, |ctx| {
+                paint_sidebar(ctx, &mut app);
+                if inspector_visible(&app.model) {
+                    paint_inspector(ctx, &mut app);
+                }
+            });
+            out.shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Text(ts) if ts.galley.text() == "Properties" => {
+                        Some(ts.pos.x)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let xs = properties_heading_xs(Some("u0"));
+        assert_eq!(xs.len(), 1, "one Properties heading, in the inspector");
+        assert!(
+            xs[0] > 1000.0,
+            "Properties heading must be in the right dock, got x={}",
+            xs[0]
+        );
+        let none = properties_heading_xs(None);
+        assert!(
+            none.is_empty(),
+            "no selection -> no Properties heading anywhere, got {none:?}"
+
         );
     }
 }
