@@ -8341,8 +8341,7 @@ fn paint_device_toolbar(
     // the pane edge.
     // One label list drives both the inline row and the overflow menu, so the
     // two can never drift apart.
-    let item_labels: [String; 12] = [
-        "Fit".into(),
+    let item_labels: [String; 11] = [
         "Find...".into(),
         ruler_text,
         "Clear".into(),
@@ -8355,37 +8354,37 @@ fn paint_device_toolbar(
         md_label.clone(),
         "Add Probe".into(),
     ];
-    let widths = chrome::device_toolbar_widths(&item_labels[10], &zoom_label);
+    let widths = chrome::device_toolbar_widths(&item_labels[9], &zoom_label);
     let m = &mut *model;
     let p = &mut *pv;
     let zt = &mut *zoom_target;
     chrome::overflow_toolbar(ui, &widths, |ui, idx, in_menu| {
-        if idx == 12 {
+        if idx == 11 {
             // Informational zoom readout: a label in both modes, never a button.
             ui.label(RichText::new(&zoom_label).small().weak());
             return;
         }
-        let enabled = dbg_enabled || idx < 10;
+        let enabled = dbg_enabled || idx < 9;
         let label = item_labels[idx].as_str();
         let clicked = if in_menu {
             ui.add_enabled(enabled, egui::Button::new(label)).clicked()
         } else {
             let hover = match idx {
-                0 => "Zoom the die to fit (F)",
-                1 => "Find a site, cell, or net (Ctrl+K)",
-                2 => "Ruler tool: click-drag on the die to measure (R)",
-                3 => "Clear selection, rulers, and solo (Esc)",
-                4 => "Toggle the Display Control dock",
-                5 => "Toggle the Inspector dock",
-                6 => "Zoom the die to the selected site/net",
-                10 => "UG908 Mark Debug on the selected Device route/net",
-                11 => "UG908 Add Probe to ILA dashboard",
+                0 => "Find a site, cell, or net (Ctrl+K)",
+                1 => "Ruler tool: click-drag on the die to measure (R)",
+                2 => "Clear selection, rulers, and solo (Esc)",
+                3 => "Toggle the Display Control dock",
+                4 => "Toggle the Inspector dock",
+                5 => "Zoom the die to the selected site/net",
+                8 => "Zoom the die to fit (F)",
+                9 => "UG908 Mark Debug on the selected Device route/net",
+                10 => "UG908 Add Probe to ILA dashboard",
                 _ => "",
 
             };
-            let btn = if idx == 4 || idx == 5 {
+            let btn = if idx == 3 || idx == 4 {
                 ui.small_button(label)
-            } else if idx == 10 || idx == 11 {
+            } else if idx == 9 || idx == 10 {
                 ui.add_enabled(dbg_enabled, egui::Button::new(label))
             } else {
                 ui.button(label)
@@ -8397,41 +8396,38 @@ fn paint_device_toolbar(
         }
         match idx {
             0 => {
-                let _ = m.device_zoom_fit();
-            }
-            1 => {
                 p.find_open = true;
                 p.find_query.clear();
                 p.find_selected = 0;
                 p.find_needs_focus = true;
             }
-            2 => {
+            1 => {
                 p.ruler_tool = !p.ruler_tool;
                 p.ruler_anchor = None;
             }
-            3 => clear_physview_selection(&mut *m, &mut *p),
-            4 => {
+            2 => clear_physview_selection(&mut *m, &mut *p),
+            3 => {
                 p.show_display_control = !p.show_display_control;
             }
-            5 => {
+            4 => {
                 p.show_inspector = !p.show_inspector;
             }
-            6 => {
+            5 => {
                 if let Some((x, y)) = selected_site_xy(m) {
                     m.device_zoom = 2.5;
                     *zt = Some((x, y));
                 }
             }
-            7 => {
+            6 => {
                 let _ = m.device_zoom_in();
             }
-            8 => {
+            7 => {
                 let _ = m.device_zoom_out();
             }
-            9 => {
+            8 => {
                 let _ = m.device_zoom_fit();
             }
-            10 => {
+            9 => {
                 let _ = m.exec("mark_debug");
             }
             _ => {

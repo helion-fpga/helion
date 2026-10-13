@@ -290,7 +290,6 @@ pub fn ila_probes_share(pane_w: f32) -> f32 {
 /// overflow menu first on narrow windows.
 pub fn device_toolbar_widths(mark_debug_label: &str, zoom_label: &str) -> Vec<OverflowItem> {
     let mut items: Vec<OverflowItem> = [
-        "Fit",
         "Find...",
         "Ruler",
         "Clear",
