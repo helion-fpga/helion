@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="theme-color" content="#fbfbfa" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Helion benchmarks: measured, not claimed</title>
+  <title>Helion benchmarks: measured</title>
   <meta name="description" content="Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5 on 10 real designs, identical RTL. Real numbers with the caveats printed next to them." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
@@ -39,7 +39,7 @@
           10 real designs, identical RTL, Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5,
           measured 2026-10-10. Helion targeted its HL10T die (8,192 LUT6); the baseline
           targeted a Lattice LFE5U-25F (24k LUT4). Every number below is measured.
-          The caveats are printed next to the numbers, because that is how it should be.
+          Every number below is measured. Caveats are printed next to the numbers.
         </p>
         <div class="table-wrap wide-table"><table>
           <thead><tr>
@@ -66,7 +66,7 @@
       </section>
 
       <section class="section">
-        <h2>Read honestly</h2>
+        <h2>Caveats</h2>
         <ul>
           <li><strong>Different fabrics.</strong> Helion targets its own LUT6 HL10T die; the baseline targets Lattice ECP5 (LUT4). Absolute LUT counts are not silicon-to-silicon comparable.</li>
           <li><strong>Speed.</strong> Helion runs 3-100x faster wall-clock on identical RTL (AES-128: 1.9 s vs ~5.5 min). Helion is a straight pipeline with no heavy optimization passes; Yosys spends its time in ABC and nextpnr in simulated-annealing placement.</li>

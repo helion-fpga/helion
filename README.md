@@ -30,7 +30,7 @@ Helion is an FPGA CAD suite: write SystemVerilog or VHDL, run one command, and g
 
 ## Screenshots
 
-All from real runs. Numbers are the tool's own output, not mockups.
+All from real runs.
 
 <p align="center">
   <img src="docs/screenshots/ide-physview.png" alt="Physical View 2.0: device view with heat maps, inspector, and layer controls" width="800"><br>
@@ -67,7 +67,7 @@ All from real runs. Numbers are the tool's own output, not mockups.
 - **One binary, whole flow.** `helion implement design.prj` runs synthesis, packing, placement, PathFinder routing, STA, bitstream. No toolchain stitching.
 - **Deterministic.** Same RTL in, same bits out. The QoR gate fails the build if LUT counts, WNS, or bitstream bytes move without a reason recorded in the same commit.
 - **Fail-loud.** Over-capacity designs error instead of emitting a clipped bitstream; congested routing is refused, never silently clipped.
-- **Measured, not claimed.** Frontend allocations fell 24.2M to 409k (down 98%) across the perf campaign; the area campaign cut uart 420 to 244 LUTs (down 42%). Every number traces to the benchmark report or a pushed commit.
+- **Measured.** Frontend allocations fell 24.2M to 409k (down 98%) across the perf campaign; the area campaign cut uart 420 to 244 LUTs (down 42%). Every number traces to the benchmark report or a pushed commit.
 - **Multi-vendor by design.** `NetlistIR` plus a `Backend` trait. HL10T and Xilinx 7-series are the first two backends, not the only ones.
 
 ## Features

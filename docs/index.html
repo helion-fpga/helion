@@ -80,15 +80,15 @@
         <div class="cards">
           <div class="card reveal"><h3><span class="k">Compile</span>Synth to bitstream</h3><p>SystemVerilog / VHDL frontend, AIG-based synthesis with ABC-style rewriting, LUT6/FF/DSP/BRAM packing, simulated-annealing placement, PathFinder routing, graph-based STA with WNS/TNS and hold checks.</p></div>
           <div class="card reveal" style="--d:.08s"><h3><span class="k">Xilinx 7-series</span>Second backend</h3><p>xc7a35t device model from open bitstream databases. Pack, place, route, FASM emission, frames to <code>.bit</code>, all in Rust, zero vendor tools. FASM output byte-identical to prjxray's encoder.</p></div>
-          <div class="card reveal" style="--d:.16s"><h3><span class="k">Verify</span>Prove it, don't eyeball it</h3><p>SAT-based combinational equivalence checking, SystemVerilog assertions (immediate and concurrent), and clock-domain-crossing structural analysis with 11 violation classes, integrated in the IDE.</p></div>
-          <div class="card reveal" style="--d:.24s"><h3><span class="k">Inspect</span>See everything</h3><p>Physical View 2.0 with heat maps and inspector, schematic level-of-detail for large designs, waveform viewer, cross-probing, real Tcl console, integrated logic analyzer, VCD-driven power.</p></div>
+          <div class="card reveal" style="--d:.16s"><h3><span class="k">Verify</span>Equivalence, assertions, CDC</h3><p>SAT-based combinational equivalence checking, SystemVerilog assertions (immediate and concurrent), and clock-domain-crossing structural analysis with 11 violation classes, integrated in the IDE.</p></div>
+          <div class="card reveal" style="--d:.24s"><h3><span class="k">Inspect</span>Device, schematic, waveform</h3><p>Physical View 2.0 with heat maps and inspector, schematic level-of-detail for large designs, waveform viewer, cross-probing, real Tcl console, integrated logic analyzer, VCD-driven power.</p></div>
         </div>
       </section>
 
       <section class="section">
         <div class="section-head reveal">
           <h2>The IDE</h2>
-          <p class="lede">Real interface, real runs. No marketing renders.</p>
+          <p class="lede">Interface screenshots from real runs.</p>
         </div>
         <div class="gallery">
           <figure class="reveal">
@@ -109,11 +109,11 @@
           </figure>
           <figure class="reveal">
             <div class="shot-frame"><img src="screenshots/ide-qor.png" alt="QoR suggestions engine" width="1440" height="900" loading="lazy" /></div>
-            <figcaption><strong>QoR suggestions.</strong> Ranked by measured impact, not vibes.</figcaption>
+            <figcaption><strong>QoR suggestions.</strong> Ranked by measured impact.</figcaption>
           </figure>
           <figure class="reveal" style="--d:.08s">
             <div class="shot-frame"><video src="screenshots/demo-run.mp4" poster="screenshots/demo-poster.png" controls preload="metadata" width="1280" height="800"></video></div>
-            <figcaption><strong>Watch a run.</strong> Full implement flow on <code>complex.sv</code>, 47 seconds, no cuts.</figcaption>
+            <figcaption><strong>Watch a run.</strong> Full implement flow on <code>complex.sv</code>, 65 seconds.</figcaption>
           </figure>
         </div>
       </section>
@@ -126,7 +126,7 @@
           <li class="reveal"><span class="tick">&#10003;</span><div><strong>One binary, whole flow.</strong><p><code>helion implement design.prj</code> runs synthesis through bitstream. No toolchain stitching.</p></div></li>
           <li class="reveal" style="--d:.06s"><span class="tick">&#10003;</span><div><strong>Deterministic.</strong><p>Same RTL in, same bits out. The QoR gate fails the build if LUT counts, WNS, or bitstream bytes move without a reason recorded in the same commit.</p></div></li>
           <li class="reveal" style="--d:.12s"><span class="tick">&#10003;</span><div><strong>Fail-loud.</strong><p>Over-capacity designs error instead of emitting a clipped bitstream. Congested routing is refused, never silently clipped.</p></div></li>
-          <li class="reveal" style="--d:.18s"><span class="tick">&#10003;</span><div><strong>Measured, not claimed.</strong><p>Every number on this page traces to the benchmark report or a pushed commit.</p></div></li>
+          <li class="reveal" style="--d:.18s"><span class="tick">&#10003;</span><div><strong>Measured.</strong><p>Every number on this page traces to the benchmark report or a pushed commit.</p></div></li>
           <li class="reveal" style="--d:.24s"><span class="tick">&#10003;</span><div><strong>Multi-vendor by design.</strong><p><code>NetlistIR</code> plus a <code>Backend</code> trait. HL10T and Xilinx 7-series are the first two backends, not the only ones.</p></div></li>
         </ul>
       </section>
