@@ -216,6 +216,11 @@ pub enum CellKind {
     Ila { net: String },
     /// Block RAM 18Kb (true dual-port primitive).
     Bram18,
+    /// Xilinx 7-series CARRY4 fast carry chain (4 bits). Backend-neutral
+    /// marker; the 7-series backend maps it to CARRY4 sites. Synth inference
+    /// from adder logic is future work; currently only explicitly
+    /// instantiated Carry4 cells are packed.
+    Carry4,
     /// Hierarchical black box (unelaborated IP / DFX partition).
     BlackBox { module: String },
 }
@@ -684,6 +689,7 @@ impl Design {
                 CellKind::Mac27 => s.push_str(&format!("cell {} Mac27\n", c.name)),
                 CellKind::Ila { net } => s.push_str(&format!("cell {} Ila {net}\n", c.name)),
                 CellKind::Bram18 => s.push_str(&format!("cell {} Bram18\n", c.name)),
+                CellKind::Carry4 => s.push_str(&format!("cell {} Carry4\n", c.name)),
                 CellKind::BlackBox { module } => {
                     s.push_str(&format!("cell {} BlackBox {module}\n", c.name))
                 }

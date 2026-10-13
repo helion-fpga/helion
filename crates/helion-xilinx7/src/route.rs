@@ -341,6 +341,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
+            carries: vec![],
         };
         Placed7 {
             packed,
@@ -352,6 +353,7 @@ mod tests {
             bufgs: vec![],
             brams: vec![],
             dsps: vec![],
+            carries: vec![],
         }
     }
 
