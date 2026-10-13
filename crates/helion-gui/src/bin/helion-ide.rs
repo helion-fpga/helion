@@ -16,6 +16,7 @@ use helion_gui::{
     MethodologySeverity, MsgSeverity, PathGroupKind, PowerSeverity, ProbeSelection, QorAction,
     QorSeverity, RunCol, SimIlaStatus, SourceLine, StepState, TbFailure, TbLogLine, TbRunRequest,
     TbSev, TbStatus, TbStreamEvent, TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane,
+    MidRunUi,
     WorkspaceTab, best_run_index, sort_run_indices, sweep_wns_stats,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -329,6 +330,9 @@ struct HelionIde {
     board_detect: Option<helion_hw::DetectReport>,
     trace: UiTrace,
     job: Option<JobHandle>,
+    /// UI state captured at job submit; restored on completion so mid-run
+    /// user work (console input, SDC edits, selections) survives.
+    ui_snapshot: Option<MidRunUi>,
     /// Simulation-ILA background capture result channel (progress atomics live in the model).
     ila_rx: Option<std::sync::mpsc::Receiver<Result<ila::IlaCapture, String>>>,
     busy: bool,
@@ -421,6 +425,7 @@ impl HelionIde {
             board_detect: None,
             trace: UiTrace::from_env(),
             job: None,
+            ui_snapshot: None,
             ila_rx: None,
             busy: false,
             progress: String::new(),
@@ -664,6 +669,10 @@ impl HelionIde {
             class: EventClass::Ok,
         });
         let model = self.model.clone();
+        // Snapshot UI state first: the job runs on the clone above, and on
+        // completion the finished model is adopted. Without the snapshot,
+        // everything the user does mid-run would be discarded with the clone.
+        self.ui_snapshot = Some(self.model.capture_mid_run_ui());
         // No "Started" toast: job progress already lives in the status bar
         // (busy spinner + progress segment). Toasts are for completions only.
         self.job = Some(spawn_job(model, kind));
@@ -732,21 +741,25 @@ impl HelionIde {
                     }
                     return;
                 }
-                // The job ran on a model clone: merge back live design-run
-                // state (queue edits, newly created runs) before adopting
-                // the clone, so mid-flight panel edits are never lost.
-                let live_queue = std::mem::take(&mut self.model.run_queue);
-                let live_runs = std::mem::take(&mut self.model.runs);
-                self.model = out.model;
-                for name in live_queue {
+                // The job ran on a model clone: adopt the finished model, but
+                // preserve mid-run UI work. The live model (user's mid-run
+                // state) swaps out; the snapshot restores UI fields and
+                // merges the append-only streams, so console input, SDC
+                // edits, selections, and navigation survive.
+                let live = std::mem::replace(&mut self.model, out.model);
+                let ui_snapshot = self.ui_snapshot.take();
+                for name in live.run_queue {
                     if !self.model.run_queue.iter().any(|q| q == &name) {
                         self.model.run_queue.push_back(name);
                     }
                 }
-                for r in live_runs {
+                for r in live.runs {
                     if !self.model.runs.iter().any(|e| e.name == r.name) {
                         self.model.runs.push(r);
                     }
+                }
+                if let Some(snap) = ui_snapshot {
+                    self.model.restore_mid_run_ui(snap, &live);
                 }
                 self.busy = false;
                 self.progress = match &out.result {
@@ -5145,12 +5158,12 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
                     "False path",
                     "set_false_path -from [get_ports clk] -to [get_ports led]",
                 ),
-                ("Read counter.sdc", "__read_sdc__"),
+                ("Open project SDC", "__open_project_sdc__"),
             ];
             for (name, tcl) in recipes {
                 if ui.button(*name).clicked() {
-                    if *tcl == "__read_sdc__" {
-                        let p = helion_device::Device::examples_dir().join("counter.sdc");
+                    if *tcl == "__open_project_sdc__" {
+                        let p = model.project_sdc_path();
                         let _ = model.open_sdc_editor(&p);
                     } else {
                         let _ = model.exec(tcl);
@@ -5160,27 +5173,12 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
             }
         });
         // Label + target follow the actual file: the editor's current path,
-        // else a sibling .sdc/.xdc on the sources list (same fallback as
-        // ensure_sdc_editor_populated), else the counter example.
-        let sdc_path = model
-            .sdc_editor_path
-            .clone()
-            .or_else(|| {
-                model.tree.sources.iter().find_map(|src| {
-                    let q = PathBuf::from(src);
-                    let ext = q
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    ((ext == "sdc" || ext == "xdc") && q.is_file()).then(|| q)
-                })
-            })
-            .unwrap_or_else(|| helion_device::Device::examples_dir().join("counter.sdc"));
+        // else the project's SDC (existing or to be created).
+        let sdc_path = model.project_sdc_path();
         let sdc_name = sdc_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("counter.sdc");
+            .unwrap_or("constraints.sdc");
         if ui.button(format!("Open {sdc_name}")).clicked() {
             let _ = model.open_sdc_editor(&sdc_path);
         }
@@ -5195,7 +5193,7 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
         .as_ref()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
-        .unwrap_or("counter.sdc")
+        .unwrap_or("constraints.sdc")
         .to_string();
     let dirty = model.sdc_editor_dirty;
     ui.horizontal(|ui| {
@@ -12477,7 +12475,13 @@ fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
                         ui.end_row();
                     }
                     if let Some(vcd) = open_wave {
-                        app.progress = app.model.tb_open_vcd_in_waveform(&vcd);
+                        match app.model.tb_open_vcd_in_waveform(&vcd) {
+                            Ok(msg) => app.progress = msg,
+                            Err(e) => {
+                                app.progress = e.clone();
+                                app.toasts.push(toasts::ToastKind::Error, e);
+                            }
+                        }
                     }
                 });
         });
