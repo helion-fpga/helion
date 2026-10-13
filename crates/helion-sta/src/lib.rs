@@ -655,6 +655,43 @@ impl PowerReport {
     }
 }
 
+/// Serialize a [`Clock`] back to the SDC line [`load_xdc`] parses, so a
+/// project file can round-trip console-entered clocks (`create_clock` /
+/// `create_generated_clock`) without the original `.sdc` file.
+pub fn clock_sdc_line(c: &Clock) -> String {
+    if !c.generated {
+        return format!(
+            "create_clock -name {} -period {:.3} [get_ports {}]",
+            c.name,
+            c.period_ps as f64 / 1000.0,
+            c.source
+        );
+    }
+    let mut s = format!(
+        "create_generated_clock -name {} -source [get_ports {}] -divide_by {} -multiply_by {}",
+        c.name,
+        c.master.as_deref().unwrap_or(&c.source),
+        c.divide_by.max(1),
+        c.multiply_by.max(1),
+    );
+    if c.invert {
+        s.push_str(" -invert");
+    }
+    if !c.edges.is_empty() {
+        s.push_str(" -edges {");
+        s.push_str(
+            &c.edges
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        s.push('}');
+    }
+    s.push_str(&format!(" [get_pins {}]", c.source));
+    s
+}
+
 pub fn create_clock(clocks: &mut Vec<Clock>, name: &str, period_ps: u64, source: &str) {
     clocks.push(Clock {
         name: name.into(),
@@ -4113,6 +4150,36 @@ mod tests {
         assert_eq!(r.clocks.len(), 2);
         // non-vacuous: path delay is counted
         assert_ne!(r.wns_ps, clks[0].period_ps as i64);
+    }
+
+    #[test]
+    fn clock_sdc_line_round_trips_load_xdc() {
+        let mut clks = Vec::new();
+        create_clock(&mut clks, "clk", 10_000, "clk");
+        // Note: load_xdc truncates hierarchical pin names at '/' (pre-existing
+        // tcl_name limitation), so the round-trip source stays hierarchy-free.
+        create_generated_clock_with(
+            &mut clks, "clk_div2", "clk", 2, 1, true, &[1, 3, 5], "q_pin",
+        )
+        .unwrap();
+        let blob: String = clks
+            .iter()
+            .map(|c| format!("{}\n", clock_sdc_line(c)))
+            .collect();
+        let back = load_xdc(&blob).expect("re-parse serialized clocks");
+        assert_eq!(back.clocks.len(), 2, "{blob}");
+        assert_eq!(back.clocks[0].name, "clk");
+        assert_eq!(back.clocks[0].period_ps, 10_000);
+        assert_eq!(back.clocks[0].source, "clk");
+        assert!(!back.clocks[0].generated);
+        let g = &back.clocks[1];
+        assert!(g.generated, "{blob}");
+        assert_eq!(g.name, "clk_div2");
+        assert_eq!(g.master.as_deref(), Some("clk"));
+        assert_eq!(g.divide_by, 2);
+        assert!(g.invert);
+        assert_eq!(g.edges, vec![1, 3, 5]);
+        assert_eq!(g.period_ps, 20_000);
     }
 
     #[test]
