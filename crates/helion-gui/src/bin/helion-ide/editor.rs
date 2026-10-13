@@ -683,7 +683,10 @@ fn minimap_viewport(
     let track = text_h.max(1.0);
     let content = total_h.max(1.0);
     let top = text_top + (offset_y / content * track).clamp(0.0, track);
-    let mut h = (viewport_h / content * track).clamp(10.0, track);
+    // Thumb wants to be >= 10px for visibility, but never larger than the
+    // track itself: on tiny minimaps (track < 10) clamp(10, track) would
+    // panic with min > max.
+    let mut h = (viewport_h / content * track).clamp(10.0_f32.min(track), track);
     // If the top clamped (offset past max scroll), shrink the thumb so it
     // never extends past the text bottom: the indicator must never present
     // false state.
@@ -722,7 +725,7 @@ mod tests {
                 "offset {offset}: thumb fraction {thumb_frac} != scroll fraction {expect_frac}"
             );
             // Thumb height follows viewport/content * track.
-            let expect_h = (viewport_h / total_h * text_h).clamp(10.0, text_h);
+            let expect_h = (viewport_h / total_h * text_h).clamp(10.0_f32.min(text_h), text_h);
             assert!(
                 approx(v_h, expect_h),
                 "offset {offset}: thumb height {v_h} != {expect_h}"
@@ -754,5 +757,17 @@ mod tests {
         assert!(v_top + v_h <= 250.5, "thumb bottom escaped: {}", v_top + v_h);
         let (v_top, _) = minimap_viewport(50.0, 200.0, -100.0, 600.0, 1384.5);
         assert!(v_top >= 50.0, "negative offset escaped upward: {v_top}");
+    }
+
+    /// Tiny minimap (text_h < 10px): the 10px minimum thumb must not panic
+    /// with min > max in the clamp. Fuzz-found via crash-59c2055905bbbe0e
+    /// replay (frame 357).
+    #[test]
+    fn minimap_thumb_tiny_track_no_panic() {
+        for text_h in [1.0, 5.0, 9.9] {
+            let (v_top, v_h) = minimap_viewport(0.0, text_h, 0.0, 600.0, 1384.5);
+            assert!(v_h <= text_h + 0.5, "thumb {v_h} exceeds tiny track {text_h}");
+            assert!(v_top >= 0.0, "thumb top escaped: {v_top}");
+        }
     }
 }
