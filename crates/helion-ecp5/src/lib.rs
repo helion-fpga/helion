@@ -36,11 +36,17 @@ pub mod db;
 pub mod device;
 pub mod pack;
 pub mod place;
+pub mod route;
 pub mod tiledata;
 
-pub use backend::{BitstreamEcp5, Ecp5Backend, PackedEcp5, RoutedEcp5};
+pub use backend::{BitstreamEcp5, Ecp5Backend};
+// Real stage types (each shadows the scaffold struct of the same name in
+// backend.rs, which gets rewired at integration).
+pub use pack::PackedEcp5;
 pub use device::Device;
 /// The real placed type; see [`place::PlacedEcp5`]. (This shadows the
 /// scaffold struct of the same name in [`backend`], which the coordinator
 /// will rewire at integration.)
 pub use place::PlacedEcp5;
+/// The real routed type; see [`route::RoutedEcp5`].
+pub use route::RoutedEcp5;
