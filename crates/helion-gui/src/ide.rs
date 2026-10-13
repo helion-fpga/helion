@@ -5064,14 +5064,12 @@ pub enum WorkspaceTab {
     Hierarchy,
     Find,
     Package,
-    Runs,
-    Checkpoints,
     Bitstream,
     Testbench,
 }
 
 impl WorkspaceTab {
-    pub const ALL: [WorkspaceTab; 32] = [
+    pub const ALL: [WorkspaceTab; 30] = [
         WorkspaceTab::Summary,
         WorkspaceTab::Reports,
         WorkspaceTab::Settings,
@@ -5100,8 +5098,6 @@ impl WorkspaceTab {
         WorkspaceTab::Hierarchy,
         WorkspaceTab::Find,
         WorkspaceTab::Package,
-        WorkspaceTab::Runs,
-        WorkspaceTab::Checkpoints,
         WorkspaceTab::Bitstream,
         WorkspaceTab::Testbench,
     ];
@@ -5126,9 +5122,7 @@ impl WorkspaceTab {
             | WorkspaceTab::Methodology
             | WorkspaceTab::Qor
             | WorkspaceTab::Drc
-            | WorkspaceTab::Utilization
-            | WorkspaceTab::Runs
-            | WorkspaceTab::Checkpoints => WorkspaceTab::Reports,
+            | WorkspaceTab::Utilization => WorkspaceTab::Reports,
             other => other,
         }
     }
@@ -5201,8 +5195,6 @@ impl WorkspaceTab {
             WorkspaceTab::Hierarchy => "Hierarchy",
             WorkspaceTab::Find => "Find Results",
             WorkspaceTab::Package => "Package",
-            WorkspaceTab::Runs => "Design Runs",
-            WorkspaceTab::Checkpoints => "Checkpoints",
             WorkspaceTab::Bitstream => "Bitstream",
             WorkspaceTab::Testbench => "Testbench",
         }
@@ -5230,6 +5222,14 @@ impl ReportCatalogRow {
     }
 }
 
+/// Where a Project Summary gadget drills: a Z5 workspace pane, or a Z6
+/// bottom-panel tab (the Design Runs gadget targets the Jobs tab, grammar R12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GadgetTarget {
+    Workspace(WorkspaceTab),
+    Bottom(BottomTab),
+}
+
 /// One clickable gadget in the UG893 Project Summary dashboard (not a dump).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSummaryGadget {
@@ -5237,7 +5237,7 @@ pub struct ProjectSummaryGadget {
     pub name: String,
     pub status: String,
     pub value: String,
-    pub workspace: WorkspaceTab,
+    pub target: GadgetTarget,
 }
 
 impl ProjectSummaryGadget {
@@ -5589,23 +5589,29 @@ pub enum BottomTab {
     Messages,
     Log,
     SimLog,
+    /// Grammar R12/R13 (P4): run management (design runs + checkpoints) lives
+    /// in the bottom panel, tabbed next to the console that drives it.
+    Jobs,
 }
 
 impl BottomTab {
-    pub const ALL: [BottomTab; 4] = [
+    pub const ALL: [BottomTab; 5] = [
         BottomTab::Tcl,
         BottomTab::Messages,
         BottomTab::Log,
         BottomTab::SimLog,
+        BottomTab::Jobs,
     ];
 
     /// Painted bottom tabs (MUST 11). Log is the console; Sim log is Simulate-only.
-    pub const HOME: [BottomTab; 2] = [BottomTab::Tcl, BottomTab::Messages];
+    /// Grammar Z6 order: Console, Messages, Sim log (Simulate only), Jobs.
+    pub const HOME: [BottomTab; 3] = [BottomTab::Tcl, BottomTab::Messages, BottomTab::Jobs];
 
     pub fn paint_label(self) -> &'static str {
         match self {
             BottomTab::Tcl => "Console",
             BottomTab::Log => "Console",
+            BottomTab::Jobs => "Jobs",
             other => other.label(),
         }
     }
@@ -5616,6 +5622,7 @@ impl BottomTab {
             BottomTab::Messages => "Messages",
             BottomTab::Log => "Log",
             BottomTab::SimLog => "Simulation Log",
+            BottomTab::Jobs => "Jobs",
         }
     }
 }
@@ -6856,10 +6863,10 @@ impl IdeModel {
             let spec = t.strip_prefix("select_device_route").unwrap_or("").trim();
             self.select_device_route(spec)
         } else if t == "design_runs" {
-            self.workspace = WorkspaceTab::Runs;
+            self.bottom_tab = BottomTab::Jobs;
             Ok(self.runs_text())
         } else if t == "compare_runs" {
-            self.workspace = WorkspaceTab::Runs;
+            self.bottom_tab = BottomTab::Jobs;
             Ok(self.compare_runs_text())
         } else if let Some(name) = t.strip_prefix("select_run ") {
             self.select_run(name.trim())
@@ -6958,7 +6965,7 @@ impl IdeModel {
             let hops: u32 = p.next().unwrap_or("3").parse().unwrap_or(3);
             self.shell.session.fix_route(net, hops)
         } else if t == "check_eco" {
-            self.workspace = WorkspaceTab::Runs;
+            self.bottom_tab = BottomTab::Jobs;
             self.nav = NavSection::Implementation;
             self.shell.session.check_eco()
         } else if t == "eco_changes" {
@@ -10124,7 +10131,7 @@ impl IdeModel {
         };
         self.selected = Some(format!("run:{}", run.name));
         self.properties = Self::design_run_properties(&run);
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         Ok(format!(
             "run NAME={} STEP={} STRATEGY={} STATUS={} WNS_PS={} RUNTIME_MS={} HASH={} LUTFF={} REUSE={}",
             run.name,
@@ -12532,11 +12539,11 @@ impl IdeModel {
                 self.layout = LayoutKind::Simulation;
             }
             "eco_changes" | "select_eco" | "check_eco" | "insert_eco_lut" => {
-                self.workspace = WorkspaceTab::Runs;
+                self.bottom_tab = BottomTab::Jobs;
             }
             "incremental_impl" | "incremental_place" | "incremental_report"
             | "select_incremental" => {
-                self.workspace = WorkspaceTab::Runs;
+                self.bottom_tab = BottomTab::Jobs;
             }
             _ => {}
         }
@@ -13741,7 +13748,7 @@ impl IdeModel {
 
     /// Launch a named run on the real engines (not a status lamp).
     pub fn launch_runs(&mut self, name: &str) -> Result<String, String> {
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         match name.trim().to_ascii_lowercase().as_str() {
             "synth_1" | "synth" | "synthesis" => {
                 self.run_step(FlowStep::Synthesis)?;
@@ -14058,7 +14065,7 @@ impl IdeModel {
             run.strategy = strategy.label().into();
         }
         self.runs.push(run);
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         Ok(format!("create_run {name}"))
     }
 
@@ -14090,7 +14097,7 @@ impl IdeModel {
             r.reuse_pct = Some(report.cell_pct());
             r.status = "Complete".into();
         }
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         Ok(format!("incremental_impl {}", report.text()))
     }
 
@@ -14109,7 +14116,7 @@ impl IdeModel {
         if let Some(r) = self.runs.iter_mut().find(|r| r.name == "impl_1") {
             r.reuse_pct = Some(report.cell_pct());
         }
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         Ok(format!("incremental_place {}", report.text()))
     }
 
@@ -14266,7 +14273,7 @@ impl IdeModel {
 
     pub fn open_incremental_report(&mut self) -> Result<String, String> {
         self.nav = NavSection::Implementation;
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         Ok(self.incremental_report_text())
     }
 
@@ -14300,11 +14307,12 @@ impl IdeModel {
         self.selected_incremental = Some(row.name.clone());
         self.selected = Some(format!("incremental:{}", row.name));
         self.nav = NavSection::Implementation;
-        self.workspace = if row.kind == "resource" {
-            WorkspaceTab::Runs
+        if row.kind == "resource" {
+            // Incremental report lives in the Z6 Jobs tab (grammar R12).
+            self.bottom_tab = BottomTab::Jobs;
         } else {
-            WorkspaceTab::Device
-        };
+            self.workspace = WorkspaceTab::Device;
+        }
         self.properties = vec![
             ("NAME".into(), row.name.clone()),
             ("TYPE".into(), "incremental".into()),
@@ -14547,7 +14555,7 @@ impl IdeModel {
 
     pub fn open_eco_changes(&mut self) -> Result<String, String> {
         self.nav = NavSection::Implementation;
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         Ok(self.eco_changes_text())
     }
 
@@ -14694,7 +14702,7 @@ impl IdeModel {
 
     /// UG893 `reset_run`: drop Session impl (and synth) artifacts, not a status lamp.
     pub fn reset_runs(&mut self, name: &str) -> Result<String, String> {
-        self.workspace = WorkspaceTab::Runs;
+        self.bottom_tab = BottomTab::Jobs;
         match name.trim().to_ascii_lowercase().as_str() {
             "impl_1" | "impl" | "implementation" => {
                 self.shell.session.reset_impl();
@@ -15453,7 +15461,7 @@ impl IdeModel {
                     "Not started".into()
                 },
                 value: project_val,
-                workspace: WorkspaceTab::Settings,
+                target: GadgetTarget::Workspace(WorkspaceTab::Settings),
             },
             ProjectSummaryGadget {
                 id: "timing".into(),
@@ -15464,7 +15472,7 @@ impl IdeModel {
                     "Not generated".into()
                 },
                 value: if timing_ready { timing_val } else { "-".into() },
-                workspace: WorkspaceTab::Reports,
+                target: GadgetTarget::Workspace(WorkspaceTab::Reports),
             },
             ProjectSummaryGadget {
                 id: "utilization".into(),
@@ -15475,14 +15483,14 @@ impl IdeModel {
                     "Not generated".into()
                 },
                 value: if util_ready { util_val } else { "-".into() },
-                workspace: WorkspaceTab::Utilization,
+                target: GadgetTarget::Workspace(WorkspaceTab::Utilization),
             },
             ProjectSummaryGadget {
                 id: "run".into(),
                 name: "Design Runs".into(),
                 status: run_status.into(),
                 value: run_val,
-                workspace: WorkspaceTab::Runs,
+                target: GadgetTarget::Bottom(BottomTab::Jobs),
             },
             ProjectSummaryGadget {
                 id: "bitstream".into(),
@@ -15493,7 +15501,7 @@ impl IdeModel {
                     "Not generated".into()
                 },
                 value: if bits_ready { bits_val } else { "-".into() },
-                workspace: WorkspaceTab::Bitstream,
+                target: GadgetTarget::Workspace(WorkspaceTab::Bitstream),
             },
             ProjectSummaryGadget {
                 id: "drc".into(),
@@ -15504,7 +15512,7 @@ impl IdeModel {
                     "Not generated".into()
                 },
                 value: if drc_ready { drc_val } else { "-".into() },
-                workspace: WorkspaceTab::Drc,
+                target: GadgetTarget::Workspace(WorkspaceTab::Drc),
             },
         ]
     }
@@ -15576,7 +15584,10 @@ impl IdeModel {
             self.selected_report = Some("report_timing_summary".into());
         }
         self.properties = self.project_summary_properties(&row);
-        self.workspace = row.workspace;
+        match row.target {
+            GadgetTarget::Workspace(tab) => self.workspace = tab,
+            GadgetTarget::Bottom(tab) => self.bottom_tab = tab,
+        }
         Ok(format!("project_summary {}", row.row_text()))
     }
 
@@ -28189,7 +28200,7 @@ end architecture;
     fn design_runs_pane_tracks_engine_progress() {
         let mut ide = IdeModel::new();
         let dump = ide.exec("design_runs").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(dump.contains("synth_1 Synthesis Not started"), "{dump}");
         assert!(dump.contains("impl_1 Implementation Not started"), "{dump}");
 
@@ -28207,7 +28218,7 @@ end architecture;
         assert!(impl_r.bitstream_hash.is_none());
 
         let out = ide.exec("launch_runs impl_1").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(out.contains("impl_1 Implementation Complete"), "{out}");
         let impl_r = ide.runs.iter().find(|r| r.name == "impl_1").unwrap();
         assert_eq!(impl_r.status, "Complete");
@@ -28248,7 +28259,7 @@ end architecture;
         assert_eq!(ide.step_state(FlowStep::Bitstream), StepState::Done);
 
         let out = ide.exec("reset_runs impl_1").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(out.contains("impl_1 Implementation Not started"), "{out}");
         assert!(
             ide.session().bitstream.is_none(),
@@ -28402,7 +28413,7 @@ end architecture;
         assert!(missing.contains("no row"), "{missing}");
 
         let table = ide.exec("design_runs").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(table.contains("design_runs n="), "{table}");
         assert!(
             table.contains('\n'),
@@ -28424,7 +28435,7 @@ end architecture;
         assert!(sel.contains("WNS_PS=-"), "{sel}");
         assert!(sel.contains("HASH=-"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("run:impl_1"));
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(
             ide.properties
                 .iter()
@@ -28482,7 +28493,7 @@ end architecture;
         ide.exec("create_run impl_phys -strategy PhysOpt").unwrap();
         ide.exec("launch_runs impl_phys").unwrap();
         let cmp = ide.exec("compare_runs").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(cmp.contains("compare_runs n=3"), "{cmp}");
         assert!(cmp.contains("NAME=impl_1"), "{cmp}");
         assert!(cmp.contains("NAME=impl_runtime"), "{cmp}");
@@ -38449,7 +38460,7 @@ endmodule
 
         let rsel = ide.exec("select_project_summary run").unwrap();
         assert!(rsel.contains("impl_1=Complete"), "{rsel}");
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(
             ide.properties
                 .iter()
@@ -39725,7 +39736,7 @@ endmodule
             "empty click must refuse"
         );
         let empty = ide.exec("eco_changes").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert_eq!(ide.nav, NavSection::Implementation);
         assert!(empty.contains("eco_changes empty"), "{empty}");
         assert!(
@@ -39745,7 +39756,7 @@ endmodule
         let gold = ide.wns_ps().expect("STA after impl");
         assert_eq!(gold, 9640, "empty XDC counter gold WNS");
         let table = ide.exec("eco_changes").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(table.contains("eco_changes n="), "{table}");
         assert!(table.contains("engine=helion-place"), "{table}");
         assert!(table.contains("NAME=u_lut0"), "{table}");
@@ -39806,7 +39817,7 @@ endmodule
         );
         let chk = ide.exec("check_eco").unwrap();
         assert!(chk.contains("ECO_LUT3"), "{chk}");
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
 
         let sel = ide.exec("select_eco ECO_LUT3").unwrap();
         assert!(sel.contains("STATUS=Missing"), "{sel}");
@@ -39975,7 +39986,7 @@ endmodule
             "empty click must refuse"
         );
         let empty = ide.exec("incremental_report").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert_eq!(ide.nav, NavSection::Implementation);
         assert!(empty.contains("incremental_report empty"), "{empty}");
         assert!(
@@ -39997,7 +40008,7 @@ endmodule
         let dump = ide.exec("incremental_impl").unwrap();
         assert!(dump.contains("reuse cells="), "{dump}");
         let table = ide.exec("incremental_report").unwrap();
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(table.contains("incremental_report n="), "{table}");
         assert!(table.contains("engine=helion-place"), "{table}");
         assert!(table.contains("NAME=cells"), "{table}");
@@ -40037,7 +40048,7 @@ endmodule
         let cells = ide.exec("select_incremental cells").unwrap();
         assert!(cells.contains("KIND=resource"), "{cells}");
         assert!(cells.contains("PCT="), "{cells}");
-        assert_eq!(ide.workspace, WorkspaceTab::Runs);
+        assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(
             ide.properties
                 .iter()
@@ -40905,7 +40916,7 @@ endmodule
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 32);
+        assert_eq!(WorkspaceTab::ALL.len(), 30);
 
         let avail = chrome::DESKTOP_WIDTH - chrome::side_chrome_width();
         assert!(
@@ -40971,7 +40982,7 @@ endmodule
         assert!(plan.rail_mode.keeps_trailing());
         assert_ne!(plan.rail_mode, OverflowMode::Clip);
 
-        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages"]);
+        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages", "Jobs"]);
         assert!(!plan.bottom_tabs.contains(&"Tcl Console"));
         assert!(!plan.bottom_tabs.contains(&"Log"));
         assert!(!plan.bottom_tabs.contains(&"Simulation Log"));
