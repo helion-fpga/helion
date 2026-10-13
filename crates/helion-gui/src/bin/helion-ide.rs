@@ -1615,9 +1615,14 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                             flow_nav::paint_flow_nav(ui, app);
                             ui.separator();
                             paint_files_tree(ui, app);
+                             // Grammar R15: hierarchy tree (Quartus Project Navigator
+                             // pattern) - RTL hierarchy under Files.
+                             paint_hierarchy_section(ui, app);
                         }
                         Activity::Device => {
                             paint_io_ports_table(ui, &mut app.model, "sidebar_io");
+                             // Grammar R15: netlist/placed hierarchy tree under Device.
+                             paint_hierarchy_section(ui, app);
                         }
                         Activity::Timing => {
                             paint_timing_paths(ui, &mut app.model, &app.theme);
@@ -1651,6 +1656,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                 }
             });
 
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         });
     // Left panel: dragging the right edge right (positive x) grows the panel.
     if drag_dx != 0.0 {
@@ -2950,7 +2956,6 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
     match pane_for_workspace(app.model.workspace) {
         WorkspacePane::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspacePane::Package => paint_package(ui, &mut app.model, &app.theme),
-        WorkspacePane::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
         WorkspacePane::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
         WorkspacePane::Hardware => paint_hw(ui, app),
         WorkspacePane::Ip => paint_ip(ui, &mut app.model, &app.theme),
@@ -2977,18 +2982,52 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         | WorkspacePane::SimSettings => paint_sim_workspace(ui, app),
         WorkspacePane::ReportsCatalog => paint_reports_detail(ui, app),
         WorkspacePane::Editor => {
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
             let theme = app.theme;
             editor::paint_editor(ui, app, &theme)
         }
-        WorkspacePane::Device => paint_device(
+        WorkspaceTab::Device => paint_device(
             ui,
             &mut app.model,
             &app.theme,
             &mut app.physview,
             &mut app.device_zoom_target,
         ),
-        WorkspacePane::Timing => paint_timing_only(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Reports => paint_reports_detail(ui, app),
+        WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Hardware => paint_hw(ui, app),
+        WorkspaceTab::Ip => paint_ip(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Find => paint_find(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
+        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
+        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
+        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
+        WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Runs => paint_runs(ui, app),
+        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
+        WorkspaceTab::Testbench => paint_testbench(ui, app),
+        WorkspaceTab::Wave
+        | WorkspaceTab::Ila
+        | WorkspaceTab::Source
+        | WorkspaceTab::Memory
+        | WorkspaceTab::Breakpoints
+        | WorkspaceTab::Locals
+        | WorkspaceTab::Forces
+        | WorkspaceTab::SimSettings => paint_sim_workspace(ui, app),
     }
+}
+
+/// More ... destinations fill the central pane with their real UI - never Timing-only, never a stub heading.
+fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
+    paint_tab_pane(ui, app, app.model.workspace);
 }
 
 /// Timing ⌘3 / Timing rail: WNS + paths only - never Reports catalog.
@@ -3034,6 +3073,7 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = other;
             paint_timing_canvas_body(ui, app);
         }
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
     }
 }
 
@@ -3044,13 +3084,13 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
     match app.model.workspace {
         WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
         WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
         WorkspaceTab::Hardware => paint_hw(ui, app),
         WorkspaceTab::Ip => paint_ip(ui, &mut app.model, &app.theme),
         WorkspaceTab::Find => paint_find(ui, &mut app.model, &app.theme),
         WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         _ => {
             paint_timing_summary(ui, &mut app.model, &app.theme);
             ui.add_space(8.0);
@@ -4521,8 +4561,15 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     }
 }
 
-fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    hierarchy::paint_hierarchy(ui, model, theme);
+/// Z3 hierarchy section (grammar R15): the netlist tree is structural
+/// navigation, so it lives in the navigation sidebar - under Files (RTL
+/// hierarchy) and under Device (netlist/placed hierarchy). Selection
+/// cross-probes into the Z5 canvas: a click selects through the shared
+/// selection identity (sidebar highlight, Z4 inspector, Device canvas);
+/// double-click opens the hierarchy sheet in Schematic.
+fn paint_hierarchy_section(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.separator();
+    hierarchy::paint_hierarchy(ui, &mut app.model, &app.theme);
 }
 
 fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
