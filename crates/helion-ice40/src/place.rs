@@ -19,6 +19,9 @@ pub struct PlacedLut {
     pub x: u8,
     pub y: u8,
     pub lc: u8,
+    /// True when this LC's carry unit is enabled (CarryEnable bit).
+    /// `in_3` is then the dedicated carry, not a routable input.
+    pub carry: bool,
 }
 
 /// A placed flip-flop.
@@ -62,6 +65,23 @@ pub struct PlacedPll {
     pub y: u8,
 }
 
+/// Carry `carry_in_mux` configuration for one logic tile.
+#[derive(Clone, Debug)]
+pub struct PlacedCarryMux {
+    pub x: u8,
+    pub y: u8,
+    pub mode: CarryMuxMode,
+}
+
+/// How a tile's `carry_in_mux` is driven.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarryMuxMode {
+    /// Constant 1 (`CarryInSet` bit).
+    One,
+    /// `lutff_7/cout` of the tile below (`carry_in -> carry_in_mux` buffer).
+    FromBelow,
+}
+
 /// Backend-owned placed netlist for the HX8K.
 #[derive(Clone, Debug, Default)]
 pub struct PlacedIce {
@@ -71,6 +91,8 @@ pub struct PlacedIce {
     pub ios: Vec<PlacedIo>,
     pub rams: Vec<PlacedRam>,
     pub plls: Vec<PlacedPll>,
+    /// Tiles whose `carry_in_mux` needs configuration (constant 0 needs no bits).
+    pub carry_mux: Vec<PlacedCarryMux>,
 }
 
 /// A logic-cell slot.
@@ -178,6 +200,7 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
                     init: 0xAAAA, // f(in_0) = in_0
                     input_nets: [Some(ff.d_net.clone()), None, None, None],
                     output_net: buf_out.clone(),
+                    carry: None,
                 });
                 ff.d_net = buf_out;
             }
@@ -194,6 +217,7 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
             init: 0x0000,
             input_nets: [None, None, None, None],
             output_net: "$gnd".to_string(),
+            carry: None,
         });
         for lut in packed.luts.iter_mut() {
             if lut.name == "$gnd" {
@@ -317,18 +341,137 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
     for &t in &ordered {
         domain_tiles[tile_clock[&t]].push(t);
     }
+
+    // 5b. Carry chains: place each chain's bits in vertically adjacent LCs
+    //     of one column (carry flows upward: LC i -> LC i+1, then the tile
+    //     above via carry_in_mux). Chains take fresh tiles from the
+    //     anchor-ordered list starting at LC0; their slots are locked so the
+    //     seeder and annealer leave them alone.
+    let mut locked: HashSet<Slot> = HashSet::new();
+    let mut carry_slot: HashMap<usize, Slot> = HashMap::new(); // unit_idx -> Slot
+    {
+        // Group carry LUTs by chain.
+        let mut chain_luts: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (li, lut) in packed.luts.iter().enumerate() {
+            if let Some(c) = &lut.carry {
+                chain_luts.entry(c.chain).or_default().push(li);
+            }
+        }
+        let mut chain_ids: Vec<usize> = chain_luts.keys().copied().collect();
+        chain_ids.sort();
+        for cid in chain_ids {
+            let mut lis = chain_luts[&cid].clone();
+            lis.sort_by_key(|&li| packed.luts[li].carry.as_ref().map(|c| c.seq).unwrap_or(usize::MAX));
+            let nbits = lis.len();
+            if nbits == 0 {
+                continue;
+            }
+            // Sanity: seq must be 0..nbits.
+            for (s, &li) in lis.iter().enumerate() {
+                let seq = packed.luts[li].carry.as_ref().map(|c| c.seq).unwrap_or(usize::MAX);
+                if seq != s {
+                    return Err(format!(
+                        "place: carry chain {cid} has non-contiguous bit sequence"
+                    ));
+                }
+            }
+            let chain_info = packed.carry_chains.get(cid).ok_or_else(|| {
+                format!("place: carry chain {cid} missing from packed.carry_chains")
+            })?;
+            // Allocate ceil(nbits/8) VERTICALLY ADJACENT tiles: the carry
+            // crosses tiles via carry_in_mux from the tile directly below.
+            // Find the anchor-nearest column run of enough logic tiles.
+            let tiles_needed = nbits.div_ceil(8);
+            let mut start: Option<(u8, u8)> = None;
+            for &(x, y) in &ordered {
+                if y.checked_add(tiles_needed as u8 - 1).is_none_or(|y1| y1 > 33) {
+                    continue;
+                }
+                let mut ok = true;
+                for k in 0..tiles_needed {
+                    let yy = y + k as u8;
+                    if !is_logic_tile(x, yy) || locked.contains(&Slot { x, y: yy, lc: 0 }) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    start = Some((x, y));
+                    break;
+                }
+            }
+            let (sx, sy) = start.ok_or("place: no vertical tile run for carry chain")?;
+            let mut slots: Vec<Slot> = Vec::new();
+            for k in 0..tiles_needed {
+                let (x, y) = (sx, sy + k as u8);
+                if k == 0 {
+                    if chain_info.cin_one {
+                        out.carry_mux.push(PlacedCarryMux {
+                            x,
+                            y,
+                            mode: CarryMuxMode::One,
+                        });
+                    }
+                    // cin_zero needs no bits (carry_in_mux defaults low).
+                } else {
+                    out.carry_mux.push(PlacedCarryMux {
+                        x,
+                        y,
+                        mode: CarryMuxMode::FromBelow,
+                    });
+                }
+                for lc in 0..8u8 {
+                    if slots.len() < nbits {
+                        let s = Slot { x, y, lc };
+                        slots.push(s);
+                        locked.insert(s);
+                    }
+                }
+            }
+            for (&li, &slot) in lis.iter().zip(slots.iter()) {
+                let ui = lut_unit[li];
+                if ui == usize::MAX {
+                    return Err(format!(
+                        "place: carry LUT {} is in no unit",
+                        packed.luts[li].name
+                    ));
+                }
+                if carry_slot.insert(ui, slot).is_some() {
+                    return Err(format!(
+                        "place: carry chain {cid} maps two bits to one unit"
+                    ));
+                }
+                locked.insert(slot);
+            }
+        }
+    }
+
+    // Free slots per domain (locked carry slots excluded).
+    let mut domain_free: Vec<Vec<Slot>> = vec![Vec::new(); clocks.len()];
+    for (d, tiles_d) in domain_tiles.iter().enumerate() {
+        for &(x, y) in tiles_d {
+            for lc in 0..8u8 {
+                let s = Slot { x, y, lc };
+                if !locked.contains(&s) {
+                    domain_free[d].push(s);
+                }
+            }
+        }
+    }
     let mut domain_cursor = vec![0usize; clocks.len()];
-    let mut unit_slot: Vec<Slot> = Vec::with_capacity(units.len());
-    for &d in &unit_domain {
-        let cursor = &mut domain_cursor[d];
-        let tiles_d = &domain_tiles[d];
-        let (x, y) = tiles_d
-            .get(*cursor / 8)
-            .copied()
-            .ok_or("place: out of LC slots in clock domain")?;
-        let lc = (*cursor % 8) as u8;
-        *cursor += 1;
-        unit_slot.push(Slot { x, y, lc });
+    let mut unit_slot: Vec<Slot> = vec![Slot { x: 0, y: 0, lc: 0 }; units.len()];
+    for (ui, &d) in unit_domain.iter().enumerate() {
+        if let Some(&s) = carry_slot.get(&ui) {
+            unit_slot[ui] = s;
+        } else {
+            let cursor = &mut domain_cursor[d];
+            let s = domain_free[d]
+                .get(*cursor)
+                .copied()
+                .ok_or("place: out of LC slots in clock domain")?;
+            *cursor += 1;
+            unit_slot[ui] = s;
+        }
     }
 
     // Net -> units, for wirelength.
@@ -364,8 +507,12 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
     let iters = (units.len() * 200).clamp(2000, 60000);
     let mut temp = 4.0f64;
     // Units grouped by domain so swaps never cross clock partitions.
+    // Carry-chain units are fixed (their slots are locked); exclude them.
     let mut domain_units: Vec<Vec<usize>> = vec![Vec::new(); clocks.len()];
     for (ui, &d) in unit_domain.iter().enumerate() {
+        if carry_slot.contains_key(&ui) {
+            continue;
+        }
         domain_units[d].push(ui);
     }
     for it in 0..iters {
@@ -410,6 +557,7 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
                 x: s.x,
                 y: s.y,
                 lc: s.lc,
+                carry: lut.carry.is_some(),
             });
         }
         for &fi in &u.ffs {
@@ -441,6 +589,7 @@ mod tests {
                 init: 0xAAAA,
                 input_nets: [Some("a".into()), None, None, None],
                 output_net: "w".into(),
+                carry: None,
             }],
             ffs: vec![PackedFf {
                 name: "ff0".into(),
