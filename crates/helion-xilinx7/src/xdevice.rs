@@ -119,6 +119,10 @@ impl<'a> DeviceQuery for XDevice<'a> {
         self.device.bufg_sites().into_iter().next()
     }
 
+    fn ramb_site(&self) -> Option<(String, String)> {
+        self.device.ramb_sites().into_iter().next()
+    }
+
     fn tile_xy(&self, tile: &str) -> Option<(i32, i32)> {
         self.tile_idx(tile)
             .and_then(|i| self.device.tile(i))

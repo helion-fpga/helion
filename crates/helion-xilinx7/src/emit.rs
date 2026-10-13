@@ -169,6 +169,16 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.BUFGCTRL.{}.IS_IGNORE0_INVERTED", bufg.tile, site_rel));
     }
 
+    // RAMB18E1s. Feature path: TILE.RAMB18.<site>.IN_USE. INIT data
+    // programming from the IR's Bram18 words is not yet emitted; the
+    // block_ram.db bit mapping is future work.
+    for bram in &placed.brams {
+        let site_rel = device
+            .site_rel(&bram.tile, &bram.site)
+            .ok_or_else(|| format!("emit: no rel site for {} {}", bram.tile, bram.site))?;
+        lines.push(format!("{}.RAMB18.{}.IN_USE", bram.tile, site_rel));
+    }
+
     // Routing pips: TILE.DST.SRC. Pseudo-pips are always-on hard
     // connections (e.g. OLOGIC bypass): traversed for connectivity but
     // never emitted (no configuration bits).
@@ -260,6 +270,8 @@ mod tests {
                 Some(if site.ends_with("Y0") { "SLICEL_X0".into() } else { "SLICEL_X1".into() })
             } else if tile.starts_with("RIOB") {
                 Some("IOB_Y1".into())
+            } else if tile.starts_with("BRAM") {
+                Some("RAMB18_X0Y0".into())
             } else {
                 Some("BUFGCTRL_X0Y0".into())
             }
@@ -288,6 +300,7 @@ mod tests {
                 drive: None, slew: None,
             }],
             bufgs: vec![],
+            brams: vec![],
         };
         let placed = Placed7 {
             packed: packed.clone(),
@@ -295,6 +308,7 @@ mod tests {
             ffs: vec![PlacedFf { name: "u_ff".into(), tile: "CLBLL_L_X0Y0".into(), site: "SLICE_X0Y0".into(), bel: "AFF".into() }],
             iobs: vec![PlacedIob { name: "u_obuf".into(), port: "led".into(), dir: IobDir::Out, tile: "RIOB33_X0Y0".into(), site: "IOB_X0Y0".into() }],
             bufgs: vec![],
+            brams: vec![],
         };
         Routed7 {
             placed,
@@ -317,5 +331,30 @@ mod tests {
         assert_eq!(lut_bel("A6LUT").unwrap(), "ALUT");
         assert_eq!(lut_bel("D6LUT").unwrap(), "DLUT");
         assert!(lut_bel("X6LUT").is_err());
+    }
+
+    #[test]
+    fn emit_bram_fasm() {
+        use crate::pack::PackedBram;
+        use crate::place::PlacedBram;
+        let packed = Packed7 {
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![PackedBram { name: "u_bram".into(), init: vec![] }],
+        };
+        let placed = Placed7 {
+            packed: packed.clone(),
+            luts: vec![],
+            ffs: vec![],
+            iobs: vec![],
+            bufgs: vec![],
+            brams: vec![PlacedBram { name: "u_bram".into(), tile: "BRAM_L_X0Y0".into(), site: "RAMB18_X0Y0".into() }],
+        };
+        let routed = Routed7 { placed, nets: vec![] };
+        let bs = emit_fasm(&routed, &FakeEmit).unwrap();
+        let text = bs.fasm.join("\n");
+        assert!(text.contains("BRAM_L_X0Y0.RAMB18.RAMB18_X0Y0.IN_USE"), "got:\n{text}");
     }
 }
