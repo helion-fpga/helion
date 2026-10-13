@@ -12419,3 +12419,173 @@ fn paint_tb_help(ui: &mut egui::Ui, theme: &theme::Theme) {
         },
     );
 }
+
+
+#[cfg(test)]
+mod nested_scroll_tests {
+    use eframe::egui;
+
+    /// Priority repro (Saksham): a scrollable list nested inside a scrollable
+    /// page must trap the wheel anywhere over the list - including the empty
+    /// area right of short rows - until it reaches its own top/bottom edge;
+    /// only then does the outer page take over (standard scroll chaining).
+    ///
+    /// Root cause this guards: egui's default `auto_shrink([true, true])`
+    /// shrinks an inner ScrollArea to its content width, so the wheel-hover
+    /// rect is only as wide as the text. Wheeling the empty part of the list
+    /// then scrolled the outer page instead of the list. The fix (see
+    /// `data_scroll`) is `auto_shrink([false, true])` plus a `max_height`
+    /// bound on every nested list; this test mirrors that configuration
+    /// exactly and fails if either property regresses.
+    #[test]
+    fn nested_list_traps_wheel_over_empty_area() {
+        let ctx = egui::Context::default();
+        // Returns (wheel target point, inner offset, outer offset).
+        let frame = |ctx: &egui::Context,
+                     events: Vec<egui::Event>|
+         -> (egui::Pos2, egui::Vec2, egui::Vec2) {
+            let mut probe = (egui::Pos2::ZERO, egui::Vec2::ZERO, egui::Vec2::ZERO);
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Outer: the scrollable page (mirrors timing_canvas_v6).
+                    let page = egui::ScrollArea::vertical()
+                        .id_salt("test_page")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for i in 0..20 {
+                                ui.label(format!("page header {i}"));
+                            }
+                            // Inner: a nested report table (mirrors data_scroll).
+                            let list = egui::ScrollArea::both()
+                                .id_salt("test_nested_table")
+                                .auto_shrink([false, true])
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    // Short rows: content far narrower than the viewport.
+                                    for i in 0..60 {
+                                        ui.label(format!("r{i}"));
+                                    }
+                                });
+                            // Aim at the EMPTY area right of the short rows:
+                            // the exact spot where the bug stole the wheel.
+                            let r = list.inner_rect;
+                            probe.0 = egui::pos2(r.right() - 20.0, r.center().y);
+                            probe.1 = list.state.offset;
+                            for i in 0..40 {
+                                ui.label(format!("page footer {i}"));
+                            }
+                        });
+                    probe.2 = page.state.offset;
+                });
+            });
+            probe
+        };
+        frame(&ctx, vec![]);
+        let laid_out = frame(&ctx, vec![]);
+        // Small Point-unit delta: applied without multi-frame smoothing.
+        let probe = frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(laid_out.0),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -5.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert!(
+            probe.1.y > 0.0,
+            "nested list must trap the wheel (inner offset moved): inner={:?} outer={:?}",
+            probe.1,
+            probe.2
+        );
+        assert_eq!(
+            probe.2.y, 0.0,
+            "outer page must not move while the nested list can scroll: inner={:?} outer={:?}",
+            probe.1,
+            probe.2
+        );
+    }
+
+    /// Chaining still works at the edge: once the inner list is pinned to its
+    /// bottom, further wheel-down gestures chain out to the outer page.
+    #[test]
+    fn nested_list_chains_to_outer_at_bottom_edge() {
+        let ctx = egui::Context::default();
+        // Returns (wheel target point, inner offset, outer offset).
+        let frame = |ctx: &egui::Context,
+                     events: Vec<egui::Event>|
+         -> (egui::Pos2, egui::Vec2, egui::Vec2) {
+            let mut probe = (egui::Pos2::ZERO, egui::Vec2::ZERO, egui::Vec2::ZERO);
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let page = egui::ScrollArea::vertical()
+                        .id_salt("test_page_edge")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for i in 0..20 {
+                                ui.label(format!("page header {i}"));
+                            }
+                            // Pin the inner list to its bottom edge.
+                            let list = egui::ScrollArea::both()
+                                .id_salt("test_nested_table_edge")
+                                .auto_shrink([false, true])
+                                .max_height(180.0)
+                                .vertical_scroll_offset(1.0e6)
+                                .show(ui, |ui| {
+                                    for i in 0..60 {
+                                        ui.label(format!("r{i}"));
+                                    }
+                                });
+                            probe.0 = list.inner_rect.center();
+                            probe.1 = list.state.offset;
+                            for i in 0..40 {
+                                ui.label(format!("page footer {i}"));
+                            }
+                        });
+                    probe.2 = page.state.offset;
+                });
+            });
+            probe
+        };
+        frame(&ctx, vec![]);
+        let laid_out = frame(&ctx, vec![]);
+        assert!(
+            laid_out.1.y > 100.0,
+            "test setup: inner list should be pinned near its bottom edge: inner={:?}",
+            laid_out.1
+        );
+        frame(&ctx, vec![egui::Event::PointerMoved(laid_out.0)]);
+        let probe = frame(
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -5.0),
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            probe.2.y > 0.0,
+            "wheel over a bottom-pinned inner list must chain to the outer page: inner={:?} outer={:?}",
+            probe.1,
+            probe.2
+        );
+    }
+}
