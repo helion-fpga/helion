@@ -1381,6 +1381,11 @@ fn run_seed(cfg: &Config, seed: u64) -> SeedStats {
                 n = cfg.frames,
             );
         }
+        // Flush the event log periodically so a hang or kill never loses the
+        // prefix needed to reproduce it.
+        if frame % 500 == 499 {
+            flush_seed_log(cfg, seed, &header, &frames_log);
+        }
     }
 
     // Flush this seed's full event log.
