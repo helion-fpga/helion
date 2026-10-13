@@ -325,9 +325,12 @@ pub fn paint_inspector(
                     }
                 }
                 if ui.small_button("Show in Hierarchy").clicked() {
+                    // Grammar R15: the hierarchy tree is a Z3 sidebar section
+                    // (Device activity). Selecting reveals the node there -
+                    // the tree auto-expands to the selection - and the Z4
+                    // inspector shows its properties.
                     if let Some(cell) = occupant {
                         model.selected = Some(cell);
-                        model.workspace = WorkspaceTab::Hierarchy;
                     }
                 }
             });

@@ -1348,7 +1348,6 @@ pub enum WorkspacePane {
     ReportsCatalog,
     Schematic,
     Package,
-    Hierarchy,
     Bitstream,
     Hardware,
     Ip,
@@ -1383,7 +1382,6 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::Reports => WorkspacePane::ReportsCatalog,
         WorkspaceTab::Schematic => WorkspacePane::Schematic,
         WorkspaceTab::Package => WorkspacePane::Package,
-        WorkspaceTab::Hierarchy => WorkspacePane::Hierarchy,
         WorkspaceTab::Bitstream => WorkspacePane::Bitstream,
         WorkspaceTab::Hardware => WorkspacePane::Hardware,
         WorkspaceTab::Ip => WorkspacePane::Ip,
@@ -1455,7 +1453,8 @@ mod tests {
         let labels = workspace_tab_labels();
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 30);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
@@ -1910,7 +1909,8 @@ mod tests {
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
-        assert_eq!(WorkspaceTab::ALL.len(), 30);
+        assert_eq!(WorkspaceTab::ALL.len(), 29);
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Schematic),
             WorkspacePane::Schematic
@@ -1923,10 +1923,9 @@ mod tests {
             pane_for_workspace(WorkspaceTab::Package),
             WorkspacePane::Package
         );
-        assert_eq!(
-            pane_for_workspace(WorkspaceTab::Hierarchy),
-            WorkspacePane::Hierarchy
-        );
+        // Grammar R15: Hierarchy is a Z3 sidebar section, not a tab. No
+        // WorkspaceTab routes to a hierarchy central pane anymore.
+        assert!(WorkspaceTab::parse_label("Hierarchy").is_none());
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Summary),
             WorkspacePane::Summary
@@ -1966,7 +1965,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(more, 27, "30 tabs − 3 canvases");
+        assert_eq!(more, 26, "29 tabs − 3 canvases");
+(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         assert!(is_report_detail(WorkspaceTab::Utilization));
         assert!(!is_report_detail(WorkspaceTab::Schematic));
         assert_eq!(
