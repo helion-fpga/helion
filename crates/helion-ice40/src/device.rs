@@ -207,14 +207,29 @@ pub fn tile_db(kind: TileKind) -> &'static [DbEntry] {
         entries
     }
 
+    // 8k RAM tiles address their block through `inputN_M` nets; map those
+    // to `ram/RADDR_*` (Ramb) / `ram/WADDR_*` (Ramt) per icebox.py
+    // netname_normalize (ramb_8k/ramt_8k). Without this the router cannot
+    // find the RAM address inputs.
+    fn load_ram(text: &str, ramb: bool) -> Vec<DbEntry> {
+        let mut entries = load(text);
+        for e in &mut entries {
+            if matches!(e.func, DbFunc::Buffer | DbFunc::Routing) {
+                e.src = crate::db::normalize_ram_input(&e.src, ramb);
+                e.dst = crate::db::normalize_ram_input(&e.dst, ramb);
+            }
+        }
+        entries
+    }
+
     match kind {
         TileKind::Logic => LOGIC.get_or_init(|| load(include_str!("../data/logic_8k.txt"))),
         TileKind::IoLeft => IO_L.get_or_init(|| load(include_str!("../data/io_l.txt"))),
         TileKind::IoRight => IO_R.get_or_init(|| load(include_str!("../data/io_r.txt"))),
         TileKind::IoTop => IO_T.get_or_init(|| load(include_str!("../data/io_t.txt"))),
         TileKind::IoBottom => IO_B.get_or_init(|| load(include_str!("../data/io_b.txt"))),
-        TileKind::Ramb => RAMB.get_or_init(|| load(include_str!("../data/ramb_8k.txt"))),
-        TileKind::Ramt => RAMT.get_or_init(|| load(include_str!("../data/ramt_8k.txt"))),
+        TileKind::Ramb => RAMB.get_or_init(|| load_ram(include_str!("../data/ramb_8k.txt"), true)),
+        TileKind::Ramt => RAMT.get_or_init(|| load_ram(include_str!("../data/ramt_8k.txt"), false)),
     }
 }
 

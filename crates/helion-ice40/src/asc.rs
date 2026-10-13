@@ -5,7 +5,7 @@
 //! directions. The `.asc` is converted to binary with IceStorm's `icepack`.
 
 use crate::device::{tile_db, tile_kind, TileKind, PINTYPE_INPUT, PINTYPE_OUTPUT};
-use crate::pack::{lut4_init_to_lc_bits, IoDir};
+use crate::pack::{lut4_init_to_lc_bits, IoDir, PackedPll, PllKind};
 use crate::place::CarryMuxMode;
 use crate::route::{RoutedIce, Router};
 use std::collections::{HashMap, HashSet};
@@ -89,6 +89,76 @@ fn carry_in_set_bit() -> Result<(u8, u8), String> {
         .find(|e| matches!(&e.func, crate::db::DbFunc::Other(f) if f == "CarryInSet"))
         .and_then(|e| e.bits.iter().find(|b| b.val).map(|b| (b.row, b.bit)))
         .ok_or_else(|| "ice40: no CarryInSet DB entry".to_string())
+}
+
+/// `(bank, bit)` for a `RamConfig <name>` entry (`PowerUp`, `CBIT_0`..)
+/// in a RAM tile DB.
+fn ram_config_bit(kind: TileKind, name: &str) -> Result<(u8, u8), String> {
+    tile_db(kind)
+        .iter()
+        .find(|e| {
+            matches!(&e.func, crate::db::DbFunc::Other(f) if f == "RamConfig") && e.src == name
+        })
+        .and_then(|e| e.bits.iter().find(|b| b.val).map(|b| (b.row, b.bit)))
+        .ok_or_else(|| format!("ice40: no RamConfig {name} DB entry"))
+}
+
+/// `(bank, bit)` for a `PLL PLLCONFIG_<n>` entry in an IO tile DB.
+fn pll_config_bit(kind: TileKind, n: u8) -> Result<(u8, u8), String> {
+    let want = format!("PLLCONFIG_{n}");
+    tile_db(kind)
+        .iter()
+        .find(|e| {
+            matches!(&e.func, crate::db::DbFunc::Other(f) if f == "PLL") && e.src == want
+        })
+        .and_then(|e| e.bits.iter().find(|b| b.val).map(|b| (b.row, b.bit)))
+        .ok_or_else(|| format!("ice40: no PLL {want} DB entry"))
+}
+
+/// SB_PLL40 config bits as `(tile_x, PLLCONFIG_n, value)`.
+///
+/// Bit placement is IceStorm `icebox.py` `pllinfo_db` `"8k_0"` (bottom PLL
+/// site, y=0) / `"8k_1"` (top PLL site, y=33): the y coordinate is supplied
+/// by the caller, the x coordinates and PLLCONFIG numbers are fixed by the
+/// table. Field values follow the iCE40 PLL usage:
+/// PLLTYPE 3'b010 = SB_PLL40_PAD, 3'b011 = SB_PLL40_CORE;
+/// FEEDBACK_PATH 3'b001 = SIMPLE; DIVR 4 bits; DIVF 7 bits; DIVQ 3 bits;
+/// FILTER_RANGE 3 bits.
+fn pll_config_bits(pll: &PackedPll) -> Vec<(u8, u8, bool)> {
+    let mut bits: Vec<(u8, u8, bool)> = Vec::new();
+    let mut push = |x: u8, cfg: u8, val: bool| bits.push((x, cfg, val));
+    // PLLTYPE_0..2.
+    let plltype: u8 = match pll.kind {
+        PllKind::Pad => 0b010,
+        PllKind::Core => 0b011,
+    };
+    push(16, 5, plltype & 1 != 0);
+    push(18, 1, plltype & 2 != 0);
+    push(18, 3, plltype & 4 != 0);
+    // FEEDBACK_PATH_0..2 = 3'b001 (SIMPLE).
+    push(18, 5, true);
+    push(15, 9, false);
+    push(16, 1, false);
+    // DIVR_0..3.
+    for i in 0..4 {
+        push(14, 1 + i, (pll.divr >> i) & 1 != 0);
+    }
+    // DIVF_0..4, DIVF_5..6.
+    for i in 0..5 {
+        push(14, 5 + i, (pll.divf >> i) & 1 != 0);
+    }
+    for i in 0..2 {
+        push(15, 1 + i, (pll.divf >> (5 + i)) & 1 != 0);
+    }
+    // DIVQ_0..2.
+    for i in 0..3 {
+        push(15, 3 + i, (pll.divq >> i) & 1 != 0);
+    }
+    // FILTER_RANGE_0..2.
+    for i in 0..3 {
+        push(15, 6 + i, (pll.filter_range >> i) & 1 != 0);
+    }
+    bits
 }
 
 /// Emit the `.asc` text for a routed design.
@@ -187,6 +257,61 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
         }
     }
 
+    // 2c. RAM config bits.
+    // PowerUp lives in the RAMB tile; the CBITs in the RAMT tile
+    // (WRITE_MODE[0]->CBIT_0, WRITE_MODE[1]->CBIT_1, READ_MODE[0]->CBIT_2,
+    // READ_MODE[1]->CBIT_3 per the IceStorm RAM tile documentation).
+    // Bit positions come from the tile DBs, not hardcoded.
+    let mut ram_inits: Vec<((u8, u8), [u16; 256])> = Vec::new();
+    for (ri, ram) in placed.packed.rams.iter().enumerate() {
+        let pr = placed.rams.get(ri).ok_or_else(|| {
+            format!("ice40: placed RAM {} missing for packed RAM {}", ri, ram.name)
+        })?;
+        let (bank, bit) = ram_config_bit(TileKind::Ramb, "PowerUp")?;
+        if let Some(t) = tiles.get_mut(&(pr.x, pr.y)) {
+            t.set(bank, bit);
+        }
+        let modes = [
+            (ram.write_mode, 0u8, 0u8),
+            (ram.write_mode, 1, 1),
+            (ram.read_mode, 0, 2),
+            (ram.read_mode, 1, 3),
+        ];
+        for (mode, bit_idx, cbit) in modes {
+            if (mode >> bit_idx) & 1 == 1 {
+                let (bank, bit) =
+                    ram_config_bit(TileKind::Ramt, &format!("CBIT_{cbit}"))?;
+                if let Some(t) = tiles.get_mut(&(pr.x, pr.y + 1)) {
+                    t.set(bank, bit);
+                }
+            }
+        }
+        ram_inits.push(((pr.x, pr.y), ram.init));
+    }
+
+    // 2d. PLL config bits.
+    // The site row comes from the placed position (bottom y=0 / top y=33);
+    // the bit layout is IceStorm icebox.py pllinfo_db "8k_0"/"8k_1".
+    for pll in &placed.packed.plls {
+        let yb = match pll.kind {
+            PllKind::Pad => 0u8,
+            PllKind::Core => 33u8,
+        };
+        let io_kind = match pll.kind {
+            PllKind::Pad => TileKind::IoBottom,
+            PllKind::Core => TileKind::IoTop,
+        };
+        for (x, cfg, val) in pll_config_bits(pll) {
+            if !val {
+                continue;
+            }
+            let (bank, bit) = pll_config_bit(io_kind, cfg)?;
+            if let Some(t) = tiles.get_mut(&(x, yb)) {
+                t.set(bank, bit);
+            }
+        }
+    }
+
     // 3. IO PINTYPE bits.
     // Group IOs by tile to get the kind.
     let mut io_by_tile: HashMap<(u8, u8), Vec<&crate::place::PlacedIo>> = HashMap::new();
@@ -252,5 +377,23 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
     render(&mut out, &tiles, &logic_tiles, "logic_tile");
     render(&mut out, &tiles, &ramb_tiles, "ramb_tile");
     render(&mut out, &tiles, &ramt_tiles, "ramt_tile");
+
+    // 5. RAM init data, after the tiles (as arachne-pnr emits it).
+    // `.ram_data <x> <y>` uses the RAMB tile coordinates; 16 lines of 64
+    // hex chars hold flat bits 0..4095, line L holding bits L*256..L*256+255
+    // with the leftmost char = the highest bit (verified against
+    // arachne-pnr output and icepack's bit parser).
+    for ((x, y), init) in &ram_inits {
+        out.push_str(&format!(".ram_data {x} {y}\n"));
+        let bit = |b: usize| (init[b / 16] >> (b % 16)) & 1;
+        for line in 0..16usize {
+            for ci in 0..64usize {
+                let hi = line * 256 + 255 - 4 * ci;
+                let d = (bit(hi) << 3) | (bit(hi - 1) << 2) | (bit(hi - 2) << 1) | bit(hi - 3);
+                out.push(b"0123456789abcdef"[d as usize] as char);
+            }
+            out.push('\n');
+        }
+    }
     Ok(out)
 }

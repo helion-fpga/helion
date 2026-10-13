@@ -78,6 +78,79 @@ pub enum IoDir {
     Out,
 }
 
+/// Compute SB_PLL40 divider settings with the IceStorm `icepll` algorithm
+/// (SIMPLE feedback path, `icepll.cc::analyze`):
+/// `f_pfd = f_in/(divr+1)` in 10..133 MHz, `f_vco = f_pfd*(divf+1)` in
+/// 533..1066 MHz, `divq` in 1..=6, minimizing `|fout - target|` where
+/// `fout = f_vco / 2^divq`. Ties break toward smaller divr, then divf,
+/// then divq (first strictly-better wins, as in icepll).
+/// Returns `(divr, divf, divq, filter_range)`.
+fn pll_dividers(name: &str, ref_hz: u64, out_hz: u64) -> Result<(u8, u8, u8, u8), String> {
+    let f_in = ref_hz as f64 / 1e6;
+    let f_target = out_hz as f64 / 1e6;
+    if !(10.0..=133.0).contains(&f_in) {
+        return Err(format!(
+            "pack: PLL {name}: reference frequency {f_in:.3} MHz is outside the 10-133 MHz PLL input range"
+        ));
+    }
+    if !(16.0..=275.0).contains(&f_target) {
+        return Err(format!(
+            "pack: PLL {name}: output frequency {f_target:.3} MHz is outside the 16-275 MHz PLL output range"
+        ));
+    }
+    let mut best: Option<(f64, u8, u8, u8)> = None;
+    for divr in 0..=15u8 {
+        let f_pfd = f_in / f64::from(divr + 1);
+        if !(10.0..=133.0).contains(&f_pfd) {
+            continue;
+        }
+        for divf in 0..=127u8 {
+            let f_vco = f_pfd * f64::from(divf + 1);
+            if !(533.0..=1066.0).contains(&f_vco) {
+                continue;
+            }
+            for divq in 1..=6u8 {
+                let fout = f_vco / 2f64.powi(i32::from(divq));
+                let better = match best {
+                    None => true,
+                    Some((best_fout, _, _, _)) => {
+                        (fout - f_target).abs() < (best_fout - f_target).abs()
+                    }
+                };
+                if better {
+                    best = Some((fout, divr, divf, divq));
+                }
+            }
+        }
+    }
+    let (_, divr, divf, divq) = best.ok_or_else(|| {
+        format!("pack: PLL {name}: no valid divider setting for {f_in:.3} MHz -> {f_target:.3} MHz")
+    })?;
+    // Filter range from f_pfd, per icepll.cc.
+    let f_pfd = f_in / f64::from(divr + 1);
+    let filter_range = if f_pfd < 17.0 {
+        1
+    } else if f_pfd < 26.0 {
+        2
+    } else if f_pfd < 44.0 {
+        3
+    } else if f_pfd < 66.0 {
+        4
+    } else if f_pfd < 101.0 {
+        5
+    } else {
+        6
+    };
+    Ok((divr, divf, divq, filter_range))
+}
+
+/// Parse a frequency attribute (Hz, integer) for a PLL cell.
+fn parse_pll_freq(name: &str, attr: &str, v: &str) -> Result<u64, String> {
+    v.trim().parse::<u64>().map_err(|_| {
+        format!("pack: PLL {name}: {attr}='{v}' is not an integer frequency in Hz")
+    })
+}
+
 /// A packed global clock: the net driven onto `lutff_global/clk`.
 #[derive(Clone, Debug)]
 pub struct PackedClk {
@@ -93,8 +166,20 @@ pub struct PackedClk {
 pub struct PackedRam {
     pub name: String,
     /// 16-bit write/read mode: 0 = 16-bit, 1 = 8-bit, 2 = 4-bit, 3 = 2-bit.
+    /// From the optional `WRITE_MODE` / `READ_MODE` cell attributes
+    /// (yosys SB_RAM40_4K param spelling: `0`..`3` or `00`..`11`); default 0.
     pub write_mode: u8,
     pub read_mode: u8,
+    /// 256x16 physical init words. `init[w]` is the 16-bit word at flat
+    /// address `w`; flat bit `w*16+b` lands in the `.ram_data` bitstream at
+    /// flat bit `w*16+b` (bit 0 = LSB of the word).
+    ///
+    /// Parsed from the optional `INIT_0`..`INIT_F` cell attributes, using
+    /// yosys's SB_RAM40_4K param semantics: each attribute is a hex string
+    /// of up to 256 bits, leftmost char = bit 255, and `INIT_x` bit `p` is
+    /// flat bit `x*256+p`. `x`/`z` chars are treated as 0 (as arachne-pnr
+    /// does); absent attributes mean all-zero init.
+    pub init: [u16; 256],
     pub rdata_net: [String; 16],
     pub wdata_net: [String; 16],
     pub raddr_net: [String; 11],
@@ -112,8 +197,16 @@ pub struct PackedPll {
     pub kind: PllKind,
     pub ref_net: String,
     pub out_net: String,
-    /// Desired output frequency in Hz (from the `FREQ` attribute, if any).
+    /// Desired output frequency in Hz (from the `FREQ` cell attribute).
     pub out_freq_hz: u64,
+    /// Reference clock frequency in Hz (from the `REF_FREQ` cell attribute).
+    pub ref_freq_hz: u64,
+    /// Divider settings computed from the two frequencies with the
+    /// IceStorm `icepll` algorithm (SIMPLE feedback path).
+    pub divr: u8,
+    pub divf: u8,
+    pub divq: u8,
+    pub filter_range: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,7 +433,7 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                 });
             }
             CellKind::Bram18 => {
-                out.rams.push(pack_ram(&cell.name, &pins)?);
+                out.rams.push(pack_ram(&cell.name, &pins, &cell.attrs)?);
             }
             CellKind::BlackBox { module } if module.starts_with("SB_PLL40") => {
                 let kind = if module.contains("PAD") {
@@ -358,12 +451,37 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                     .or_else(|| pins.net_on(&cell.name, "O"))
                     .ok_or_else(|| format!("pack: PLL {} has no output", cell.name))?
                     .to_string();
+                let out_freq_hz = match cell.attrs.get("FREQ") {
+                    Some(v) => parse_pll_freq(&cell.name, "FREQ", v)?,
+                    None => {
+                        return Err(format!(
+                            "pack: PLL {} needs a FREQ attribute (desired output frequency in Hz)",
+                            cell.name
+                        ))
+                    }
+                };
+                let ref_freq_hz = match cell.attrs.get("REF_FREQ") {
+                    Some(v) => parse_pll_freq(&cell.name, "REF_FREQ", v)?,
+                    None => {
+                        return Err(format!(
+                            "pack: PLL {} needs a REF_FREQ attribute (reference clock frequency in Hz)",
+                            cell.name
+                        ))
+                    }
+                };
+                let (divr, divf, divq, filter_range) =
+                    pll_dividers(&cell.name, ref_freq_hz, out_freq_hz)?;
                 out.plls.push(PackedPll {
                     name: cell.name.clone(),
                     kind,
                     ref_net,
                     out_net,
-                    out_freq_hz: 0,
+                    out_freq_hz,
+                    ref_freq_hz,
+                    divr,
+                    divf,
+                    divq,
+                    filter_range,
                 });
             }
             CellKind::Mac27 => {
@@ -439,10 +557,63 @@ fn resolve_pin(netlist: &Design, port: &str) -> Result<String, String> {
     ))
 }
 
+/// Parse one SB_RAM40_4K `INIT_x` attribute (yosys param semantics: hex
+/// string of up to 256 bits, leftmost char = bit 255) into the 16 init
+/// words it covers (`INIT_x` bit `p` = flat bit `x*256+p`).
+/// `x`/`z` chars count as 0, matching arachne-pnr.
+fn parse_init_attr(name: &str, attr: &str, x: usize, init: &mut [u16; 256]) -> Result<(), String> {
+    let s = attr.trim();
+    if s.len() > 64 {
+        return Err(format!(
+            "pack: RAM {name}: INIT_{x:X} has {} hex chars, more than 256 bits",
+            s.len()
+        ));
+    }
+    // Left-pad with zeros to 256 bits.
+    let padded = format!("{:0>64}", s);
+    for (ci, ch) in padded.chars().enumerate() {
+        let digit = match ch {
+            '0'..='9' => ch as u8 - b'0',
+            'a'..='f' => ch as u8 - b'a' + 10,
+            'A'..='F' => ch as u8 - b'A' + 10,
+            'x' | 'X' | 'z' | 'Z' => 0,
+            _ => {
+                return Err(format!(
+                    "pack: RAM {name}: INIT_{x:X} has invalid char '{ch}'"
+                ))
+            }
+        };
+        // Char ci (0 = leftmost) covers bits 255-4*ci-3 .. 255-4*ci;
+        // digit bit b (0 = LSB) is flat bit 255-4*ci-3+b.
+        for b in 0..4 {
+            if (digit >> b) & 1 == 1 {
+                let p = 255 - 4 * ci - 3 + b;
+                let word = x * 16 + p / 16;
+                init[word] |= 1 << (p % 16);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `WRITE_MODE` / `READ_MODE` attribute: `0`..`3` or `00`..`11`.
+fn parse_ram_mode(name: &str, attr_name: &str, v: &str) -> Result<u8, String> {
+    match v.trim() {
+        "0" | "00" => Ok(0),
+        "1" | "01" => Ok(1),
+        "2" | "10" => Ok(2),
+        "3" | "11" => Ok(3),
+        other => Err(format!(
+            "pack: RAM {name}: {attr_name}='{other}' is not a valid mode (0..3)"
+        )),
+    }
+}
+
 /// Pack a Bram18 cell into SB_RAM40_4K shape.
 fn pack_ram(
     name: &str,
     pins: &helion_ir::PinIndex,
+    attrs: &helion_ir::Attrs,
 ) -> Result<PackedRam, String> {
     let bus = |prefix: &str, n: usize| -> Result<[String; 16], String> {
         let mut arr: [String; 16] = Default::default();
@@ -475,8 +646,24 @@ fn pack_ram(
     };
     Ok(PackedRam {
         name: name.to_string(),
-        write_mode: 0,
-        read_mode: 0,
+        write_mode: match attrs.get("WRITE_MODE") {
+            Some(v) => parse_ram_mode(name, "WRITE_MODE", v)?,
+            None => 0,
+        },
+        read_mode: match attrs.get("READ_MODE") {
+            Some(v) => parse_ram_mode(name, "READ_MODE", v)?,
+            None => 0,
+        },
+        init: {
+            let mut init = [0u16; 256];
+            for x in 0..16 {
+                let attr = format!("INIT_{x:X}");
+                if let Some(v) = attrs.get(&attr) {
+                    parse_init_attr(name, v, x, &mut init)?;
+                }
+            }
+            init
+        },
         rdata_net: bus("DO", 16)?,
         wdata_net: bus("DI", 16)?,
         raddr_net: addr("RADDR")?,
@@ -924,5 +1111,55 @@ mod tests {
         // init = all ones -> 16 bits set.
         let bits = lut4_init_to_lc_bits(0xFFFF);
         assert_eq!(bits.iter().filter(|&&b| b).count(), 16);
+    }
+
+    #[test]
+    fn pll_dividers_match_icepll() {
+        // Vectors verified with the real `icepll` tool (SIMPLE feedback).
+        // (ref_hz, out_hz, divr, divf, divq, filter_range).
+        for (r, o, dr, df, dq, fr) in [
+            (12_000_000u64, 48_000_000u64, 0u8, 63u8, 4u8, 1u8),
+            (12_000_000, 100_000_000, 0, 66, 3, 1),
+            (12_000_000, 60_000_000, 0, 79, 4, 1),
+            (25_000_000, 100_000_000, 0, 31, 3, 2),
+            (16_000_000, 50_000_000, 0, 49, 4, 1),
+            (48_000_000, 120_000_000, 0, 19, 3, 4),
+        ] {
+            assert_eq!(
+                pll_dividers("test", r, o).unwrap(),
+                (dr, df, dq, fr),
+                "mismatch for {r} -> {o}"
+            );
+        }
+        // Out-of-range frequencies fail loud.
+        assert!(pll_dividers("test", 12_000_000, 500_000_000).is_err());
+        assert!(pll_dividers("test", 5_000_000, 48_000_000).is_err());
+    }
+
+    #[test]
+    fn ram_init_attr_parsing() {
+        let mut init = [0u16; 256];
+        // "1" = bit 0 -> word 0 bit 0.
+        parse_init_attr("r", "1", 0, &mut init).unwrap();
+        assert_eq!(init[0], 0x0001);
+        // Leftmost char = bit 255.
+        parse_init_attr(
+            "r",
+            "8000000000000000000000000000000000000000000000000000000000000000",
+            3,
+            &mut init,
+        )
+        .unwrap();
+        assert_eq!(init[3 * 16 + 15], 0x8000);
+        // x chars count as 0.
+        parse_init_attr("r", "x", 5, &mut init).unwrap();
+        assert_eq!(init[5 * 16], 0x0000);
+        // Too long / bad char fail loud.
+        assert!(parse_init_attr("r", &"0".repeat(65), 0, &mut init).is_err());
+        assert!(parse_init_attr("r", "qq", 0, &mut init).is_err());
+        // Mode parsing.
+        assert_eq!(parse_ram_mode("r", "WRITE_MODE", "01").unwrap(), 1);
+        assert_eq!(parse_ram_mode("r", "READ_MODE", "3").unwrap(), 3);
+        assert!(parse_ram_mode("r", "READ_MODE", "4").is_err());
     }
 }
