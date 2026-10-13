@@ -12,7 +12,7 @@ use helion_gui::surface::{
 };
 use helion_gui::{
     doctor, ila, open_hdl_dialog, open_vcd_dialog, pane_for_workspace, BottomTab, CdcSeverity,
-    ClockRelation, ConstraintSection, DrcSeverity, FlowStep, IdeModel, LayoutKind,
+    ClockRelation, ConsoleLine, ConstraintSection, DrcSeverity, FlowStep, IdeModel, LayoutKind,
     MethodologySeverity, MsgSeverity, PathGroupKind, PowerSeverity, ProbeSelection, QorAction,
     QorSeverity, RunCol, IlaStatus, SourceLine, StepState, TbFailure, TbLogLine, TbRunRequest,
     TbSev, TbStatus, TbStreamEvent, TimingPathSortCol, WaveRadix, WaveStyle, WorkspacePane,
@@ -751,14 +751,14 @@ impl HelionIde {
                 // edits, selections, and navigation survive.
                 let live = std::mem::replace(&mut self.model, out.model);
                 let ui_snapshot = self.ui_snapshot.take();
-                for name in live.run_queue {
-                    if !self.model.run_queue.iter().any(|q| q == &name) {
-                        self.model.run_queue.push_back(name);
+                for name in &live.run_queue {
+                    if !self.model.run_queue.iter().any(|q| q == name) {
+                        self.model.run_queue.push_back(name.clone());
                     }
                 }
-                for r in live.runs {
+                for r in &live.runs {
                     if !self.model.runs.iter().any(|e| e.name == r.name) {
-                        self.model.runs.push(r);
+                        self.model.runs.push(r.clone());
                     }
                 }
                 if let Some(snap) = ui_snapshot {
@@ -1669,7 +1669,6 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                 }
             });
 
-(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         });
     // Left panel: dragging the right edge right (positive x) grows the panel.
     if drag_dx != 0.0 {
@@ -2967,6 +2966,14 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
 /// More ... destinations fill the central pane with their real UI - never Timing-only, never a stub heading.
 fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
     match pane_for_workspace(app.model.workspace) {
+        WorkspacePane::Device => paint_device(
+            ui,
+            &mut app.model,
+            &app.theme,
+            &mut app.physview,
+            &mut app.device_zoom_target,
+        ),
+        WorkspacePane::Timing => paint_timing_only(ui, &mut app.model, &app.theme),
         WorkspacePane::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspacePane::Package => paint_package(ui, &mut app.model, &app.theme),
         WorkspacePane::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
@@ -2995,52 +3002,10 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         | WorkspacePane::SimSettings => paint_sim_workspace(ui, app),
         WorkspacePane::ReportsCatalog => paint_reports_detail(ui, app),
         WorkspacePane::Editor => {
-(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
             let theme = app.theme;
             editor::paint_editor(ui, app, &theme)
         }
-        WorkspaceTab::Device => paint_device(
-            ui,
-            &mut app.model,
-            &app.theme,
-            &mut app.physview,
-            &mut app.device_zoom_target,
-        ),
-        WorkspaceTab::Reports => paint_reports_detail(ui, app),
-        WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Bitstream => paint_bitstream(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Hardware => paint_hw(ui, app),
-        WorkspaceTab::Ip => paint_ip(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Find => paint_find(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
-        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
-        WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, app),
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Testbench => paint_testbench(ui, app),
-        WorkspaceTab::Wave
-        | WorkspaceTab::Ila
-        | WorkspaceTab::Source
-        | WorkspaceTab::Memory
-        | WorkspaceTab::Breakpoints
-        | WorkspaceTab::Locals
-        | WorkspaceTab::Forces
-        | WorkspaceTab::SimSettings => paint_sim_workspace(ui, app),
     }
-}
-
-/// More ... destinations fill the central pane with their real UI - never Timing-only, never a stub heading.
-fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
-    paint_tab_pane(ui, app, app.model.workspace);
 }
 
 /// Timing ⌘3 / Timing rail: WNS + paths only - never Reports catalog.
@@ -3086,7 +3051,6 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = other;
             paint_timing_canvas_body(ui, app);
         }
-(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
     }
 }
 
@@ -3103,7 +3067,6 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Find => paint_find(ui, &mut app.model, &app.theme),
         WorkspaceTab::Settings => paint_project_settings(ui, &mut app.model, &app.theme),
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
-(ide: R15 move Hierarchy Z5 -> Z3 navigation sidebar)
         _ => {
             paint_timing_summary(ui, &mut app.model, &app.theme);
             ui.add_space(8.0);
@@ -12418,7 +12381,17 @@ fn paint_tb_detail(ui: &mut egui::Ui, app: &mut HelionIde, busy: bool, full_h: f
                     .on_hover_text(format!("Open {} in the waveform viewer", vcd.display()))
                     .clicked()
                 {
-                    app.progress = app.model.tb_open_vcd_in_waveform(&vcd);
+                    match app.model.tb_open_vcd_in_waveform(&vcd) {
+                        Ok(msg) => app.progress = msg,
+                        Err(e) => {
+                            app.progress = format!("VCD import failed: {e}");
+                            app.model.console.push(ConsoleLine {
+                                cmd: "tb_wave".to_string(),
+                                out: e,
+                                ok: false,
+                            });
+                        }
+                    }
                 }
             }
         });
@@ -12768,6 +12741,9 @@ mod nested_scroll_tests {
             "wheel over a bottom-pinned inner list must chain to the outer page: inner={:?} outer={:?}",
             probe.1,
             probe.2
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
