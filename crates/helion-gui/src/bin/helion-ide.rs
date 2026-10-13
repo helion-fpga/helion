@@ -1266,7 +1266,20 @@ fn tip(name: &str, shortcut: &str, tcl: &str) -> String {
     }
 }
 
-fn data_scroll(id: &'static str) -> egui::ScrollArea {
+/// ScrollArea for an embedded table/list that lives inside another scrollable
+/// region (e.g. a report table inside the scrollable Timing page).
+///
+/// Two properties are load-bearing for correct nested scrolling, and every
+/// call site must keep them (do not hand-roll a replacement):
+/// * `auto_shrink([false, true])`: the area fills the available width, so the
+///   wheel-hover rect covers the whole list. With egui's default
+///   `auto_shrink([true, true])` the area shrinks to its content width and the
+///   wheel only registers over the text itself - wheeling the empty right part
+///   of the list scrolls the outer container instead.
+/// * `max_height(TABLE_MAX_HEIGHT)`: bounds the viewport so the list scrolls
+///   internally and traps the wheel until it reaches its own top/bottom edge,
+///   at which point egui chains the gesture to the outer container.
+fn data_scroll(id: &str) -> egui::ScrollArea {
     let p = chrome::table_scroll_policy(10, chrome::DESKTOP_WIDTH);
     let sa = if p.x && p.y {
         egui::ScrollArea::both()
@@ -6082,7 +6095,10 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     let selected = model.selected.clone();
     let mut pick: Option<(String, String)> = None;
     let mut pick_obj: Option<String> = None;
-    egui::ScrollArea::both().id_salt("clock_interaction_scroll").show(ui, |ui| {
+    // Nested table: data_scroll traps the wheel (auto_shrink + max_height);
+    // a bare ScrollArea::both() here shrinks to content and never scrolls,
+    // so the wheel would scroll the outer Timing page instead.
+    data_scroll("clock_interaction_scroll").show(ui, |ui| {
         // Fixed 120px columns (Vivado matrix): headers center over their
         // cells instead of ragged content-sized labels.
         const CELL_W: f32 = 120.0;
@@ -6234,7 +6250,8 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         }
         return;
     }
-    egui::ScrollArea::both().id_salt("cdc_scroll").show(ui, |ui| {
+    // Nested table: data_scroll traps the wheel (see clock_interaction_scroll).
+    data_scroll("cdc_scroll").show(ui, |ui| {
         egui::Grid::new("cdc_table")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
@@ -6795,7 +6812,8 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         // ID (severity-colored button) | Category | Objects | Message. The old
         // Severity text column duplicated the button's encoding.
         let col_w = chrome::stretched_col_w_gap(4, ui.available_width(), 8.0);
-        egui::ScrollArea::both().id_salt("methodology_scroll").show(ui, |ui| {
+        // Nested table: data_scroll traps the wheel (see clock_interaction_scroll).
+        data_scroll("methodology_scroll").show(ui, |ui| {
             egui::Grid::new("methodology_table")
                 .spacing([8.0, row_gap])
                 .min_col_width(col_w)
@@ -6925,7 +6943,10 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         let n_f = n as f32;
         let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
         let col_w = chrome::stretched_col_w_gap(6, ui.available_width(), 8.0);
-        egui::ScrollArea::both().show(ui, |ui| {
+        // Nested table: data_scroll traps the wheel (see clock_interaction_scroll);
+        // it also supplies the id_salt this ScrollArea was missing (salt-less
+        // areas share one persistent id, leaking scroll offsets between views).
+        data_scroll("qor_table_scroll").show(ui, |ui| {
             egui::Grid::new("qor_table")
                 .spacing([8.0, row_gap])
                 .min_col_width(col_w)
@@ -7149,7 +7170,13 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
-    egui::ScrollArea::vertical().id_salt("drc_scroll").show(ui, |ui| {
+    // Nested list: bounded + full-width hover rect so the wheel traps here
+    // instead of scrolling the outer Timing page (see clock_interaction_scroll).
+    egui::ScrollArea::vertical()
+        .id_salt("drc_scroll")
+        .auto_shrink([false, true])
+        .max_height(chrome::TABLE_MAX_HEIGHT)
+        .show(ui, |ui| {
         let w = ui.available_width();
         // ID (severity-colored badge) | Objects | Message. The old Severity
         // text column duplicated the badge's encoding, so it is gone; its
