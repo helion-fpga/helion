@@ -509,16 +509,12 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
     // any order).
     emit_carry_chains(netlist, &carry_cells, &mut out)?;
 
-    // The ClockBuf is a logical global-clock marker. This backend routes
-    // clocks as ordinary nets (via local tracks to lutff_global/clk), so
-    // merge each ClockBuf's output net into its input net.
-    for clk in &out.clks {
-        for ff in out.ffs.iter_mut() {
-            if ff.clk_net == clk.out_net {
-                ff.clk_net = clk.in_net.clone();
-            }
-        }
-    }
+    // Global-clock re-entry buffers (see below).
+    insert_glb_reentry_buffers(&mut out);
+
+    // ClockBufs stay as markers: route.rs assigns each to a global network
+    // (source -> global buffer -> glb_netwk -> per-tile lutff_global/clk)
+    // instead of merging the net into the fabric.
 
     // Pair each FF with its driver LUT when the driver is a packed LUT4 with
     // no other loads: they share one logic cell (LUT -> FF in the same LC).
@@ -1024,6 +1020,115 @@ fn emit_carry_chains(
         });
     }
     Ok(())
+}
+
+/// Insert a feedthrough buffer LUT for each global clock net (ClockBuf
+/// `out_net`, PLL `out_net`) that has non-clock fabric loads.
+///
+/// A `glb_netwk` wire only reaches fabric through `glb2local` -> local
+/// tracks (which feed LC inputs, never spans or IO pins) and through the
+/// per-tile clock buffers (FF `lutff_global/clk`, RAM `RCLK`/`WCLK`).
+/// A global clock feeding anything else (LUT inputs, IO outputs, FF D,
+/// RAM data/address inputs) therefore needs one shared re-entry buffer:
+/// the buffer's input routes from the glb wire, its output drives the
+/// original loads. Clock pins keep the global net directly and need no
+/// buffer.
+fn insert_glb_reentry_buffers(out: &mut PackedIce) {
+    let global_nets: Vec<String> = out
+        .clks
+        .iter()
+        .map(|c| c.out_net.clone())
+        .chain(out.plls.iter().map(|p| p.out_net.clone()))
+        .collect();
+    for net in &global_nets {
+        let mut loaded = false;
+        for lut in &out.luts {
+            if lut.input_nets.iter().flatten().any(|n| n == net) {
+                loaded = true;
+                break;
+            }
+        }
+        if !loaded {
+            for io in &out.ios {
+                if io.dir == IoDir::Out && io.net == *net {
+                    loaded = true;
+                    break;
+                }
+            }
+        }
+        if !loaded {
+            for ff in &out.ffs {
+                if ff.d_net == *net {
+                    loaded = true;
+                    break;
+                }
+            }
+        }
+        if !loaded {
+            for ram in &out.rams {
+                let mut data_addr = ram
+                    .wdata_net
+                    .iter()
+                    .chain(ram.waddr_net.iter())
+                    .chain(ram.raddr_net.iter());
+                if data_addr.any(|n| n == net)
+                    || ram.re_net.as_deref() == Some(net.as_str())
+                    || ram.we_net.as_deref() == Some(net.as_str())
+                {
+                    loaded = true;
+                    break;
+                }
+            }
+        }
+        if !loaded {
+            continue;
+        }
+        let buf_out = format!("{net}$glb");
+        // Rewrite the non-clock loads onto the buffer output (before the
+        // buffer exists, so its own input keeps the global net).
+        for lut in out.luts.iter_mut() {
+            for slot in lut.input_nets.iter_mut() {
+                if slot.as_deref() == Some(net.as_str()) {
+                    *slot = Some(buf_out.clone());
+                }
+            }
+        }
+        for io in out.ios.iter_mut() {
+            if io.dir == IoDir::Out && io.net == *net {
+                io.net = buf_out.clone();
+            }
+        }
+        for ff in out.ffs.iter_mut() {
+            if ff.d_net == *net {
+                ff.d_net = buf_out.clone();
+            }
+        }
+        for ram in out.rams.iter_mut() {
+            for slot in ram
+                .wdata_net
+                .iter_mut()
+                .chain(ram.waddr_net.iter_mut())
+                .chain(ram.raddr_net.iter_mut())
+            {
+                if slot == net {
+                    *slot = buf_out.clone();
+                }
+            }
+            if ram.re_net.as_deref() == Some(net.as_str()) {
+                ram.re_net = Some(buf_out.clone());
+            }
+            if ram.we_net.as_deref() == Some(net.as_str()) {
+                ram.we_net = Some(buf_out.clone());
+            }
+        }
+        out.luts.push(PackedLut {
+            name: buf_out.clone(),
+            init: 0xAAAA, // f(in_0) = in_0
+            input_nets: [Some(net.clone()), None, None, None],
+            output_net: buf_out,
+            carry: None,
+        });
+    }
 }
 
 /// Map a LUT4 16-bit init to the 20 LC config bits.
