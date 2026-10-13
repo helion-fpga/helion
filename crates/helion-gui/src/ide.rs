@@ -30597,9 +30597,53 @@ endmodule
     /// click -> timing_path_sort, pin click -> select_timing_pin, filter
     /// typing -> timing_path_filter, double-click -> exec select_timing_path,
     /// empty-space click -> clear_probe) and asserts the underlying timing
-    /// data is bit-identical before and after.
+    /// data is bit-identical before and after. Selection/sort/filter are
+    /// view state and may change; slack/delay/pin values may not.
     #[test]
     fn timing_mouse_interaction_never_mutates_timing_values() {
+        // Timing VALUES only (not selection/sort/filter view state).
+        fn snapshot(
+            ide: &IdeModel,
+        ) -> Vec<(
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Vec<String>,
+            Vec<String>,
+            Vec<(String, String, i64, i64, String, usize, String)>,
+        )> {
+            ide.timing_paths
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.startpoint.clone(),
+                        p.endpoint.clone(),
+                        p.slack_ps,
+                        p.delay_ps,
+                        p.cells.clone(),
+                        p.nets.clone(),
+                        p.pins
+                            .iter()
+                            .map(|pin| {
+                                (
+                                    pin.pin.clone(),
+                                    pin.delay_type.clone(),
+                                    pin.incr_ps,
+                                    pin.path_ps,
+                                    pin.net.clone(),
+                                    pin.fanout,
+                                    pin.location.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.exec("report_timing").unwrap();
@@ -30607,7 +30651,7 @@ endmodule
             !ide.timing_paths.is_empty(),
             "need timing paths to test against"
         );
-        let before = ide.timing_path_table_text();
+        let before = snapshot(&ide);
         let wns_before = ide.timing.as_ref().map(|t| t.wns_ps);
 
         // Header click: cycle sort through every sortable column, both directions.
@@ -30644,11 +30688,19 @@ endmodule
         // Double-click: exec select_timing_path.
         let _ = ide.exec("select_timing_path 0");
 
-        let after = ide.timing_path_table_text();
+        // Recompute must also be stable: report_timing twice gives same values.
+        ide.exec("report_timing").unwrap();
+        let after_recompute = snapshot(&ide);
+        assert_eq!(
+            before, after_recompute,
+            "report_timing recompute changed timing values"
+        );
+
+        let after = snapshot(&ide);
         let wns_after = ide.timing.as_ref().map(|t| t.wns_ps);
         assert_eq!(
             before, after,
-            "mouse interaction changed timing values:\nbefore:\n{before}\nafter:\n{after}"
+            "mouse interaction changed timing values"
         );
         assert_eq!(wns_before, wns_after, "WNS changed under mouse interaction");
     }
