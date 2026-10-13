@@ -22,6 +22,53 @@ pub trait EmitDevice {
     fn site_rel(&self, tile: &str, site: &str) -> Option<String>;
 }
 
+/// IBUF `.IN` feature prefix for an IOSTANDARD, from
+/// `segbits_liob33.db`. The prefix encodes which standards share the same
+/// configuration bits; an unknown standard is a loud error, not a default.
+fn ibuf_in_prefix(iostandard: &str) -> Result<&'static str, String> {
+    match iostandard.to_ascii_uppercase().as_str() {
+        "LVCMOS12" | "LVCMOS15" | "LVCMOS18" => Ok("LVCMOS12_LVCMOS15_LVCMOS18"),
+        "LVCMOS25" | "LVCMOS33" | "LVTTL" => Ok("LVCMOS25_LVCMOS33_LVTTL"),
+        "LVDS_25" | "SSTL135" | "SSTL15" => Ok("LVDS_25_SSTL135_SSTL15"),
+        "TMDS_33" => Ok("TMDS_33"),
+        other => Err(format!("emit: unsupported input IOSTANDARD {other}")),
+    }
+}
+
+/// OBUF `.DRIVE` feature prefix for an (IOSTANDARD, DRIVE) pair, from
+/// `segbits_liob33.db`. Xilinx groups standards that share drive-strength
+/// bits; the prefix is NOT always the bare standard name. Unknown
+/// combinations are a loud error, not a guessed feature.
+fn obuf_drive_prefix(iostandard: &str, drive: &str) -> Result<&'static str, String> {
+    let std = iostandard.to_ascii_uppercase();
+    let drv = drive.to_ascii_uppercase();
+    let prefix = match (std.as_str(), drv.as_str()) {
+        ("LVCMOS12", "I4" | "I12") => "LVCMOS12",
+        ("LVCMOS12", "I8") => "LVCMOS12_LVCMOS25",
+        ("LVCMOS15", "I8" | "I12") => "LVCMOS15",
+        ("LVCMOS15", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
+        ("LVCMOS15", "I16") => "LVCMOS15_SSTL15",
+        ("LVCMOS18", "I12" | "I16" | "I24") => "LVCMOS18",
+        ("LVCMOS18", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
+        ("LVCMOS25", "I12" | "I16") => "LVCMOS25",
+        ("LVCMOS25", "I4") => "LVCMOS15_LVCMOS18_LVCMOS25",
+        ("LVCMOS25", "I8") => "LVCMOS12_LVCMOS25",
+        ("LVCMOS33", "I16") => "LVCMOS33",
+        ("LVCMOS33", "I4" | "I12") => "LVCMOS33_LVTTL",
+        ("LVTTL", "I24") => "LVTTL",
+        ("LVTTL", "I4" | "I12") => "LVCMOS33_LVTTL",
+        ("LVDS_25", "I") => "LVDS_25",
+        ("SSTL135", "I") => "SSTL135",
+        ("TMDS_33", "I") => "TMDS_33",
+        _ => {
+            return Err(format!(
+                "emit: unsupported (IOSTANDARD, DRIVE) = ({iostandard}, {drive})"
+            ))
+        }
+    };
+    Ok(prefix)
+}
+
 /// Backend-owned bitstream: FASM text plus assembled configuration frames.
 #[derive(Clone, Debug, Default)]
 pub struct Bitstream7 {
@@ -77,12 +124,12 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         })?;
         match iob.dir {
             IobDir::In => {
-                // IBUF: input buffer. The IN feature lives under a combined
-                // iostandard prefix; IN_ONLY disables the output driver.
-                lines.push(format!(
-                    "{}.{}.LVCMOS25_LVCMOS33_LVTTL.IN",
-                    iob.tile, site_rel
-                ));
+                // IBUF: input buffer. The IN feature lives under an
+                // iostandard-specific prefix (see ibuf_in_prefix), e.g.
+                // "RIOB33_X0Y0.IOB_Y1.LVCMOS25_LVCMOS33_LVTTL.IN".
+                // IN_ONLY disables the output driver.
+                let prefix = ibuf_in_prefix(&p.iostandard)?;
+                lines.push(format!("{}.{}.{}.IN", iob.tile, site_rel, prefix));
                 lines.push(format!(
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY",
                     iob.tile, site_rel
@@ -90,17 +137,23 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
             }
             IobDir::Out => {
                 // OBUF: output driver enabled by DRIVE select (no IN_ONLY).
-                // Default I16: the X-Ray DB only has segbits for I16
-                // (LVCMOS33 also allows 4/8/12/24 in silicon).
+                // The DRIVE feature prefix depends on the (standard, drive)
+                // pair (see obuf_drive_prefix).
                 let drive = p.drive.as_deref().unwrap_or("I16");
+                let prefix = obuf_drive_prefix(&p.iostandard, drive)?;
                 lines.push(format!(
                     "{}.{}.{}.DRIVE.{}",
-                    iob.tile, site_rel, p.iostandard, drive
+                    iob.tile,
+                    site_rel,
+                    prefix,
+                    drive.to_ascii_uppercase()
                 ));
                 let slew = p.slew.as_deref().unwrap_or("SLOW");
                 lines.push(format!(
                     "{}.{}.LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.{}",
-                    iob.tile, site_rel, slew
+                    iob.tile,
+                    site_rel,
+                    slew.to_ascii_uppercase()
                 ));
             }
         }
