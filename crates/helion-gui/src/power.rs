@@ -8,25 +8,25 @@
 //! P_dynamic = Σ  α · C · V² · f
 //! ```
 //!
-//! * **α** — activity factor, P(0→1) per clock cycle. From VCD: `rising / cycles`.
+//! * **α** - activity factor, P(0→1) per clock cycle. From VCD: `rising / cycles`.
 //!   Vectorless fallback: clocks 1.0, data nets 0.125, IO 0.1, BRAM/DSP 0.2.
 //!   The clock tree is scaled by the *detected clock's* α: when the VCD shows
 //!   no free-running clock (gated off, or clock not dumped), the tree
-//!   contributes nothing — so a zero-activity dump yields ~0 dynamic power.
+//!   contributes nothing - so a zero-activity dump yields ~0 dynamic power.
 //!   Vectorless mode keeps the classic always-on clock assumption.
-//! * **C** — switched capacitance: cell-internal cap + routing (`base + fanout·k`).
-//! * **V** — core voltage from operating conditions (default 1.0 V).
-//! * **f** — clock frequency from the fastest STA clock, else the VCD clock.
+//! * **C** - switched capacitance: cell-internal cap + routing (`base + fanout·k`).
+//! * **V** - core voltage from operating conditions (default 1.0 V).
+//! * **f** - clock frequency from the fastest STA clock, else the VCD clock.
 //!
 //! Static power is per-resource leakage scaled by `V · (1 + 0.008·(T−25))`.
 //!
-//! ## Capacitance table — MODELED, not silicon
+//! ## Capacitance table - MODELED, not silicon
 //!
 //! The HL10T is a fictional 28nm-class FPGA. Every capacitance and leakage
 //! number below is **modeled**: scaled from published 7-series XPE proportions
 //! and typical 28nm FPGA literature values, rounded to 1–2 significant
 //! figures. They are suitable for relative comparison, budgeting, and
-//! "what toggles most" analysis — **never for signoff**. If you have measured
+//! "what toggles most" analysis - **never for signoff**. If you have measured
 //! HL10T data, replace [`CapTable::modeled_hl10t`] and [`LeakTable::modeled_hl10t`].
 
 use crate::vcd::VcdActivity;
@@ -59,7 +59,7 @@ pub struct CapTable {
 }
 
 impl CapTable {
-    /// Modeled HL10T capacitances. See module docs — not silicon data.
+    /// Modeled HL10T capacitances. See module docs - not silicon data.
     pub fn modeled_hl10t() -> Self {
         Self {
             lut_internal_ff: 12.0,
@@ -94,7 +94,7 @@ pub struct LeakTable {
 }
 
 impl LeakTable {
-    /// Modeled HL10T leakage. See module docs — not silicon data.
+    /// Modeled HL10T leakage. See module docs - not silicon data.
     pub fn modeled_hl10t() -> Self {
         Self {
             lut_used_uw: 3.0,
@@ -306,9 +306,9 @@ fn hier_block(cell: &str) -> &str {
 
 /// Analyze power for `design`.
 ///
-/// * `activity` — `Some` for VCD-driven analysis, `None` for the vectorless
+/// * `activity` - `Some` for VCD-driven analysis, `None` for the vectorless
 ///   fallback (default toggle rates; report is labeled `vectorless`).
-/// * `vcd_path` — shown in the report header only.
+/// * `vcd_path` - shown in the report header only.
 pub fn analyze_power(
     design: &Design,
     cfg: &PowerConfig,
@@ -461,7 +461,7 @@ pub fn analyze_power(
 
     // Clock-tree activity factor: the tree switches with the detected clock.
     // When the dump shows no free-running clock (gated off, or the clock was
-    // not dumped), the tree contributes nothing — which is what makes a
+    // not dumped), the tree contributes nothing - which is what makes a
     // zero-activity dump yield ~0 dynamic power. Vectorless keeps the classic
     // always-on assumption (α = 1.0).
     let clock_alpha = if vectorless {
@@ -596,13 +596,13 @@ pub fn analyze_power(
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
                 message: format!(
-                    "net '{net}' toggles almost every cycle (α={alpha:.2}) — consider clock gating or re-encoding"
+                    "net '{net}' toggles almost every cycle (α={alpha:.2}) - consider clock gating or re-encoding"
                 ),
             });
         }
     }
 
-    // BRAM / DSP: no per-pin activity in this kernel — modeled active-cycle term.
+    // BRAM / DSP: no per-pin activity in this kernel - modeled active-cycle term.
     let bram_alpha = if vectorless { rates.bram_dsp } else { 0.2 };
     let dsp_alpha = if vectorless { rates.bram_dsp } else { 0.2 };
     let dyn_bram = n_bram as f64 * bram_alpha * cfg.caps.bram_active_ff * 1e-15 * v2 * f;
@@ -694,19 +694,19 @@ pub fn analyze_power(
     if vectorless {
         warnings.push(PowerWarning {
             severity: PowerSeverity::Info,
-            message: "vectorless estimate: default toggle rates used — load a VCD (read_vcd) for measured switching activity".into(),
+            message: "vectorless estimate: default toggle rates used - load a VCD (read_vcd) for measured switching activity".into(),
         });
     } else if let Some(a) = activity {
         if a.signals.iter().all(|s| s.toggles == 0) {
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
-                message: "VCD shows zero toggles — check the dump window covers active simulation time".into(),
+                message: "VCD shows zero toggles - check the dump window covers active simulation time".into(),
             });
         }
         if a.truncated {
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
-                message: "VCD signal cap hit — activity is partial".into(),
+                message: "VCD signal cap hit - activity is partial".into(),
             });
         }
         let pct = 100.0 * nets_matched as f64 / nets_total.max(1) as f64;
@@ -714,13 +714,13 @@ pub fn analyze_power(
             warnings.push(PowerWarning {
                 severity: PowerSeverity::Warning,
                 message: format!(
-                    "VCD activity covers only {pct:.0}% of nets ({nets_matched}/{nets_total}) — \
+                    "VCD activity covers only {pct:.0}% of nets ({nets_matched}/{nets_total}) - \
                      check signal name mapping (hierarchical scope?)"
                 ),
             });
         }
         // Cross-check: the VCD's own measured clock period vs the configured
-        // one. A mismatch means `cycles` (and hence every α) is off — usually
+        // one. A mismatch means `cycles` (and hence every α) is off - usually
         // the operating-conditions clock doesn't match the dump's timescale.
         let vcd_half_period = clock_nets
             .iter()
@@ -743,7 +743,7 @@ pub fn analyze_power(
                 warnings.push(PowerWarning {
                     severity: PowerSeverity::Warning,
                     message: format!(
-                        "VCD clock period ~{vcd_period} ps differs from configured {cfg_p} ps — \
+                        "VCD clock period ~{vcd_period} ps differs from configured {cfg_p} ps - \
                          activity factors may be off; check operating conditions"
                     ),
                 });
@@ -754,7 +754,7 @@ pub fn analyze_power(
         warnings.push(PowerWarning {
             severity: PowerSeverity::Warning,
             message: format!(
-                "clock tree is {:.0}% of dynamic power — consider clock gating enables",
+                "clock tree is {:.0}% of dynamic power - consider clock gating enables",
                 100.0 * dyn_clk / dynamic_w
             ),
         });
@@ -909,7 +909,7 @@ endmodule
     }
 
     /// Coverage: VCD covers one of two nets, plus a stray signal that matches
-    /// nothing — the report must count coverage and list the stray signal.
+    /// nothing - the report must count coverage and list the stray signal.
     #[test]
     fn coverage_lists_unmatched_vcd_signals() {
         let mut d = Design::new("t");

@@ -944,7 +944,7 @@ mod tests {
         // Trigger at sample 4 < pre=8: only 4 pre samples exist.
         assert_eq!(cap.len(), ti + 1 + cfg.post());
         // Missed trigger: clk reads 1 at every posedge sample, so value 0
-        // never fires — the capture honestly reports the last depth samples.
+        // never fires - the capture honestly reports the last depth samples.
         cfg.probes.push(IlaProbeCfg::scalar("clk", "clk"));
         cfg.trigger = IlaTrigger {
             probe: 1,
@@ -1148,7 +1148,7 @@ mod tests {
         assert!(text.contains("$enddefinitions $end"));
         let ti = cap.trigger_sample.unwrap();
         assert!(text.contains(&format!("$comment trigger sample {ti}")));
-        // Values: q0's id is '!' — both 0! and 1! transitions must appear.
+        // Values: q0's id is '!' - both 0! and 1! transitions must appear.
         assert!(text.contains("0!\n"));
         assert!(text.contains("1!\n"));
         // Timestamps: timescale is "10 ns", so sample s lands on #(10*s).

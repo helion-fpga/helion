@@ -1,7 +1,7 @@
 //! Self-correction loop: chrome state, event isolation, geometry probes, engine offload.
 //!
 //! The IDE binary and the tests drive the **same** `ChromeState` transitions.
-//! Paint in `helion-ide` must follow [`central_pane`] — if a click updates state
+//! Paint in `helion-ide` must follow [`central_pane`] - if a click updates state
 //! but the pane is still Timing, tests fail.
 
 use crate::chrome::{self, Activity, Canvas, WorkspacePane};
@@ -188,7 +188,7 @@ pub fn apply_activity(s: &mut ChromeState, a: Activity) {
             s.workspace = WorkspaceTab::Reports;
         }
         Activity::Simulate => {
-            // Do not leave Timing/Device canvas selected — Waveform is the pane.
+            // Do not leave Timing/Device canvas selected - Waveform is the pane.
             s.canvas = Canvas::Editor;
             if !s.workspace.sim_only() {
                 s.workspace = WorkspaceTab::Wave;
@@ -324,7 +324,7 @@ pub fn geometry_at(window_w: f32, window_h: f32, sidebar: f32, console: f32) -> 
     }
 }
 
-/// Heavy CAD work — never run inside an egui frame.
+/// Heavy CAD work - never run inside an egui frame.
 #[derive(Clone, Debug)]
 pub enum JobKind {
     Open(PathBuf),
@@ -367,7 +367,7 @@ impl JobKind {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| p.display().to_string())
             ),
-            JobKind::Implement => "Implementing — synthesis, opt, place, route…".into(),
+            JobKind::Implement => "Implementing - synthesis, opt, place, route…".into(),
             JobKind::Step(s) => format!("Running {}…", s.label()),
             JobKind::SimRun(n) => format!("Running simulation ({n} cycles)…"),
             JobKind::DesignRun { name } => format!("Running design run {name}…"),

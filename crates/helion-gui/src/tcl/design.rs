@@ -733,7 +733,7 @@ fn format_util_table(shell: &GpuiShell, dev: &Device) -> Result<String, String> 
     ));
     for (r, used, total) in rows {
         let pct = if total == 0 {
-            "—".to_string()
+            "-".to_string()
         } else {
             format!("{:.1}%", used as f64 * 100.0 / total as f64)
         };
@@ -2097,7 +2097,7 @@ mod tests {
     #[test]
     fn demo_analysis_script_end_to_end() {
         // A realistic user script through the real entry point: query the
-        // object model, filter in Tcl, and summarize — no direct eval_host.
+        // object model, filter in Tcl, and summarize - no direct eval_host.
         let mut sh = shell_with_counter();
         let r = crate::tcl_eval(
             &mut sh,

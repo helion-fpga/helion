@@ -1,7 +1,7 @@
 //! Design tokens for `helion-ide` (P0-4).
 //!
 //! Single source of truth for color, typography, and spacing. All paint code
-//! consumes [`Theme`] fields — never hardcode `Color32::from_rgb` literals in
+//! consumes [`Theme`] fields - never hardcode `Color32::from_rgb` literals in
 //! the shell. Dark is the default; [`Theme::light`] overrides the same names.
 //!
 //! Token values follow `~/workspace/helion-research/ide-ux-plan.md` §5:
@@ -29,7 +29,7 @@ pub struct Theme {
     pub dim: Color32,
     pub faint: Color32,
     pub accent: Color32,
-    /// Accent at ~25% over surface — selection fill.
+    /// Accent at ~25% over surface - selection fill.
     pub sel: Color32,
     /// Accent dimmed for active-but-muted glyphs.
     pub accent_dim: Color32,
@@ -242,12 +242,12 @@ pub fn font_ui(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }
 
-/// UI typeface, medium weight — headings, rail labels, wordmark.
+/// UI typeface, medium weight - headings, rail labels, wordmark.
 pub fn font_ui_medium(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-medium".into()))
 }
 
-/// UI typeface, semibold — primary buttons, section titles.
+/// UI typeface, semibold - primary buttons, section titles.
 #[allow(dead_code)]
 pub fn font_ui_semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-semibold".into()))

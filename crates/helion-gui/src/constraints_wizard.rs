@@ -365,7 +365,7 @@ fn get_obj(name: &str, is_clock: bool) -> String {
 /// `helion_sta::load_xdc`) before it is ever written to disk.
 pub fn generate_sdc(input: &WizardInput, design_name: &str) -> String {
     let mut out = String::new();
-    out.push_str("# Helion Constraints Wizard — generated SDC\n");
+    out.push_str("# Helion Constraints Wizard - generated SDC\n");
     out.push_str(&format!("# Design: {design_name}\n"));
     out.push_str("# Edit freely; the Constraints tab re-parses this file on save.\n");
 
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn golden_sdc_generation() {
         let text = generate_sdc(&sample_input(), "sample");
-        let expected = "# Helion Constraints Wizard — generated SDC\n\
+        let expected = "# Helion Constraints Wizard - generated SDC\n\
 # Design: sample\n\
 # Edit freely; the Constraints tab re-parses this file on save.\n\
 \n\

@@ -244,7 +244,7 @@ fn paint_section_body(
 }
 
 /// Label:value row: fixed ~190px label column (12px dim), 13px text value.
-/// Painted with `painter.text` — `add_sized`+`Label` centers text (egui
+/// Painted with `painter.text` - `add_sized`+`Label` centers text (egui
 /// uses a centered-and-justified layout there), which breaks the column.
 fn kv_row(ui: &mut egui::Ui, theme: &theme::Theme, label: &str, value: &str) {
     let w = ui.available_width();
@@ -481,13 +481,13 @@ fn paint_design_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Them
         ui,
         theme,
         "Top module",
-        m.tree.top.as_deref().unwrap_or("—"),
+        m.tree.top.as_deref().unwrap_or("-"),
     );
     let src = app
         .recent
         .first()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "—".into());
+        .unwrap_or_else(|| "-".into());
     kv_row(ui, theme, "Source file", &truncate_str(&src, 42));
 }
 
@@ -502,16 +502,16 @@ fn paint_synth_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
                 ui,
                 theme,
                 "Cells",
-                &run.cells.map(|c| c.to_string()).unwrap_or_else(|| "—".into()),
+                &run.cells.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
             );
             kv_row(ui, theme, "Runtime", &fmt_duration(run.runtime_ms));
         }
         None => {
             status_row(ui, theme, "Status", "Not started");
-            kv_row(ui, theme, "Strategy", "—");
+            kv_row(ui, theme, "Strategy", "-");
             kv_row(ui, theme, "Part", app.model.part());
-            kv_row(ui, theme, "Cells", "—");
-            kv_row(ui, theme, "Runtime", "—");
+            kv_row(ui, theme, "Cells", "-");
+            kv_row(ui, theme, "Runtime", "-");
         }
     }
 }
@@ -528,7 +528,7 @@ fn paint_impl_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme)
                 "Worst Negative Slack (WNS)",
                 &run.wns_ps
                     .map(|w| format!("{w} ps"))
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             );
             kv_row(
                 ui,
@@ -537,7 +537,7 @@ fn paint_impl_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme)
                 &run
                     .lutff
                     .map(|c| c.to_string())
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             );
             kv_row(ui, theme, "Runtime", &fmt_duration(run.runtime_ms));
             kv_row(
@@ -547,17 +547,17 @@ fn paint_impl_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme)
                 &run
                     .bitstream_hash
                     .map(|h| format!("{h:08x}"))
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             );
         }
         None => {
             status_row(ui, theme, "Status", "Not started");
             for (l, v) in [
-                ("Strategy", "—"),
-                ("Worst Negative Slack (WNS)", "—"),
-                ("LUT+FF", "—"),
-                ("Runtime", "—"),
-                ("Bitstream", "—"),
+                ("Strategy", "-"),
+                ("Worst Negative Slack (WNS)", "-"),
+                ("LUT+FF", "-"),
+                ("Runtime", "-"),
+                ("Bitstream", "-"),
             ] {
                 kv_row(ui, theme, l, v);
             }
@@ -843,13 +843,13 @@ fn paint_runs_body(
                 Cell::num(
                     run.wns_ps
                         .map(|w| format!("{w} ps"))
-                        .unwrap_or_else(|| "—".into()),
+                        .unwrap_or_else(|| "-".into()),
                     theme.text,
                 ),
                 Cell::num(
                     run.lutff
                         .map(|c| c.to_string())
-                        .unwrap_or_else(|| "—".into()),
+                        .unwrap_or_else(|| "-".into()),
                     theme.text,
                 ),
                 Cell::num(fmt_duration(run.runtime_ms), theme.text),
@@ -896,12 +896,12 @@ fn design_name(model: &IdeModel) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-/// `None` runtime -> "—"; <1s -> "N ms"; else "N.N s".
+/// `None` runtime -> "-"; <1s -> "N ms"; else "N.N s".
 fn fmt_duration(ms: Option<u64>) -> String {
     match ms {
         Some(m) if m >= 1000 => format!("{:.1} s", m as f64 / 1000.0),
         Some(m) => format!("{m} ms"),
-        None => "—".into(),
+        None => "-".into(),
     }
 }
 
@@ -945,7 +945,7 @@ pub fn paint_slack_histogram(ui: &mut egui::Ui, model: &IdeModel, theme: &theme:
             .color(theme.text),
     );
     if model.timing_paths.is_empty() {
-        ui.label(egui::RichText::new("No timing paths — run Implement").color(theme.faint));
+        ui.label(egui::RichText::new("No timing paths - run Implement").color(theme.faint));
         return;
     }
     const BINS: usize = 20;

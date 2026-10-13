@@ -2,7 +2,7 @@
 //! status bar (VS Code style).
 //!
 //! Job *progress* lives in the status bar; toasts are only for completions,
-//! warnings and errors. They dismiss on a wall-clock timer — never on frame
+//! warnings and errors. They dismiss on a wall-clock timer - never on frame
 //! count, so they vanish even when the UI is idle.
 
 use eframe::egui::{self, Color32};

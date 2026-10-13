@@ -302,7 +302,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity, String> {
             if tok == "$dumpon" || tok == "$dumpall" {
                 skip_region = false;
                 if tok == "$dumpall" {
-                    // $dumpall <changes> $end — fall through to change parsing below
+                    // $dumpall <changes> $end - fall through to change parsing below
                     // by rewinding one token.
                     i -= 1;
                     skip_region = false;
