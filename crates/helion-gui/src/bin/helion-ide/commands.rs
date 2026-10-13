@@ -565,7 +565,9 @@ fn paint_palette_rows(
     app.palette.selected = sel;
     let mut clicked = None;
     egui::ScrollArea::vertical()
+        .id_salt("palette_results_scroll")
         .max_height(15.0 * PALETTE_ROW_H)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
                 if paint_palette_row(ui, app, theme, row, i) {
@@ -942,7 +944,9 @@ pub fn paint_shortcut_cheatsheet(ctx: &egui::Context, app: &mut HelionIde) {
                         close = true;
                     }
                     egui::ScrollArea::vertical()
+                        .id_salt("cheatsheet_scroll")
                         .max_height(400.0)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             paint_shortcut_rows(ui, &theme, "Global", SHORTCUTS, &query);
                             paint_shortcut_rows(

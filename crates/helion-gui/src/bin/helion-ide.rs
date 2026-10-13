@@ -4482,12 +4482,16 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 pick_port = Some(p.name.clone());
             }
         }
+        // Salts derive from grid_id: this table is painted both in the sidebar
+        // ("sidebar_io") and in the Package view ("io_ports_package"), and
+        // fixed salts would collide (shared scroll offset) when both are
+        // visible at once.
         egui::CollapsingHeader::new("Pin properties")
             .default_open(false)
-            .id_salt("sidebar_io_props")
+            .id_salt(format!("{grid_id}_props"))
             .show(ui, |ui| {
                 egui::ScrollArea::horizontal()
-                    .id_salt("sidebar_io_props_scroll")
+                    .id_salt(format!("{grid_id}_props_scroll"))
                     .show(ui, |ui| {
                         ui.set_min_width(420.0);
                         for p in &rows {
@@ -4508,7 +4512,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                     });
             });
     } else {
-        data_scroll("io_ports_table_scroll").show(ui, |ui| {
+        data_scroll(&format!("{grid_id}_table_scroll")).show(ui, |ui| {
             egui::Grid::new(grid_id).spacing([8.0, 4.0]).show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Dir").strong());
