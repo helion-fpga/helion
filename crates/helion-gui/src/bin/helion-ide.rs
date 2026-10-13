@@ -1921,7 +1921,7 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 /// Clickable status bar (P1-5, VS Code style). Every segment is an action:
 /// breadcrumb → Files, WNS chip → Timing canvas, error/warning counts →
-/// Messages panel, LUTFF → Utilization, run name → Runs tab. Background jobs
+/// Messages panel, LUTFF → Utilization, run name → Jobs tab. Background jobs
 /// show a spinner; job completion also toasts (see `toasts.rs`).
 /// One status-bar segment (§3.7): 12px mono text, 8px side padding, 1px left
 /// divider (except the first segment), hover highlight when clickable.
@@ -2146,8 +2146,8 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             spec(
                 run.clone(),
                 theme.dim,
-                "Open Runs tab",
-                Some(Go::Tab(WorkspaceTab::Runs)),
+                "Open Jobs tab",
+                Some(Go::Bottom(BottomTab::Jobs)),
             );
             if !board_crumb.is_empty() {
                 spec(board_crumb.to_string(), theme.faint, "", None);
@@ -2387,11 +2387,22 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
                     app.model.bottom_tab = BottomTab::SimLog;
                 }
             }
+            // Grammar R12/R13 (P4): run management lives in the bottom panel,
+            // tabbed next to the console that drives it (Vivado Results
+            // Windows Area pattern). Tab order: Console, Messages, Sim log, Jobs.
+            let j = ui.add_sized(
+                [72.0, chrome::HIT_SIDEBAR],
+                egui::Button::selectable(app.model.bottom_tab == BottomTab::Jobs, "Jobs"),
+            );
+            if j.clicked() {
+                app.model.bottom_tab = BottomTab::Jobs;
+            }
         });
         match app.model.bottom_tab {
             BottomTab::Tcl | BottomTab::Log => paint_tcl_console(ui, app),
             BottomTab::Messages => paint_messages(ui, &mut app.model, &app.theme),
             BottomTab::SimLog => paint_sim_log(ui, &mut app.model, &app.theme),
+            BottomTab::Jobs => paint_jobs(ui, app),
         }
     });
     // Bottom panel: dragging the top edge up (negative y) grows the panel.
@@ -2402,6 +2413,25 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
     if hover_resize {
         ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
+}
+
+/// Z6 Jobs tab (grammar R12/R13, P4): run management lives in the bottom panel
+/// next to the Tcl console and Messages that drive it (Vivado Results Windows
+/// Area pattern). Runs table first, checkpoints below: checkpoints are
+/// snapshots of runs, managed alongside them, not read as reports.
+/// Every action paint_runs / paint_checkpoints had in Z5 keeps working here.
+fn paint_jobs(ui: &mut egui::Ui, app: &mut HelionIde) {
+    egui::ScrollArea::vertical()
+        .id_salt("jobs_tab")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            paint_runs(ui, app);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            let theme = app.theme;
+            paint_checkpoints(ui, &mut app.model, &theme);
+        });
 }
 
 fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
@@ -2907,8 +2937,6 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspacePane::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspacePane::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspacePane::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspacePane::Runs => paint_runs(ui, app),
-        WorkspacePane::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspacePane::Testbench => paint_testbench(ui, app),
         WorkspacePane::Wave
         | WorkspacePane::Ila
@@ -2941,9 +2969,12 @@ fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     paint_timing_paths(ui, model, theme);
 }
 
-/// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
-fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
-    match app.model.workspace {
+/// Shared report-detail bodies (grammar Z5): the timing/power/QoR/DRC/utilization
+/// family paints identically under the Reports rail and the Timing canvas.
+/// Returns false when `tab` is not a report detail so the caller can run its
+/// own fallback. Single-sourced so the two dispatchers cannot drift apart.
+fn paint_report_detail_tab(ui: &mut egui::Ui, app: &mut HelionIde, tab: WorkspaceTab) -> bool {
+    match tab {
         WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
         WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
         WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
@@ -2953,8 +2984,17 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
         WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
         WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, app),
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
+        _ => return false,
+    }
+    true
+}
+
+/// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
+fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
+    if paint_report_detail_tab(ui, app, app.model.workspace) {
+        return;
+    }
+    match app.model.workspace {
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
         WorkspaceTab::Reports => {
             // Sidebar owns the catalog (MUST: no dual full tables). Center is the first report.
@@ -2969,18 +3009,10 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
+    if paint_report_detail_tab(ui, app, app.model.workspace) {
+        return;
+    }
     match app.model.workspace {
-        WorkspaceTab::Constraints => paint_constraints_tab(ui, app),
-        WorkspaceTab::ClockInteraction => paint_clock_interaction(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Cdc => paint_cdc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::ClockNetworks => paint_clock_networks(ui, &mut app.model),
-        WorkspaceTab::Power => paint_power(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Methodology => paint_methodology(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Qor => paint_qor(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Drc => paint_drc(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Utilization => paint_utilization(ui, &mut app.model, &app.theme),
-        WorkspaceTab::Runs => paint_runs(ui, app),
-        WorkspaceTab::Checkpoints => paint_checkpoints(ui, &mut app.model, &app.theme),
         WorkspaceTab::Schematic => paint_schematic(ui, &mut app.model, &app.theme),
         WorkspaceTab::Package => paint_package(ui, &mut app.model, &app.theme),
         WorkspaceTab::Hierarchy => paint_hierarchy(ui, &mut app.model, &app.theme),
@@ -7100,7 +7132,7 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         if id.action == Some(QorAction::OpenRuns) {
             ui.add_space(4.0);
             if ui.button("Open Design Runs").clicked() {
-                model.workspace = WorkspaceTab::Runs;
+                model.bottom_tab = BottomTab::Jobs;
             }
         }
     }

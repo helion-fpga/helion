@@ -14,6 +14,7 @@ use eframe::egui;
 
 use super::open_more_workspace;
 use super::theme;
+use super::BottomTab;
 use super::HelionIde;
 use super::IdeModel;
 use super::WorkspaceTab;
@@ -803,12 +804,11 @@ fn paint_runs_body(
     app: &mut HelionIde,
     theme: &theme::Theme,
 ) -> Option<WorkspaceTab> {
-    let mut go = None;
     if app.model.runs.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new("No runs yet — create one from the Design Runs tab.")
+                egui::RichText::new("No runs yet - create one from the Jobs tab.")
                     .size(13.0)
                     .color(theme.dim),
             );
@@ -878,10 +878,11 @@ fn paint_runs_body(
             theme,
             &format!("View all {} runs", app.model.runs.len()),
         ) {
-            go = Some(WorkspaceTab::Runs);
+            // Runs live in the Z6 Jobs tab (grammar R12), not a Z5 pane.
+            app.model.bottom_tab = BottomTab::Jobs;
         }
     }
-    go
+    None
 }
 
 /// Design/top name: explicit top override, else the loaded design, else "-".

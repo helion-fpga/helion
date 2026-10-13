@@ -44,7 +44,7 @@ impl QorSeverity {
 /// suggestion carries a `fix_hint` string and `action` stays `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QorAction {
-    /// Navigate to the Design Runs tab so the user can launch a sweep.
+    /// Navigate to the Jobs tab so the user can launch a sweep.
     OpenRuns,
 }
 
