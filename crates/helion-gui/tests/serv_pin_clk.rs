@@ -62,7 +62,12 @@ fn serv_pin_wrap_clk_package_pin_and_ila() {
     let arm = ide.exec("ila arm").unwrap();
     eprintln!("ila_arm={arm}");
     let cap = ide.ila.capture.as_ref().expect("unified ILA capture");
-    let bits: String = cap.samples.iter().map(|s| if s[0] == 1 { '1' } else { '0' }).collect();
+    let bits: String = cap
+        .samples
+        .iter()
+        .flat_map(|s| s.iter())
+        .map(|&b| if b == 1 { '1' } else { '0' })
+        .collect();
     eprintln!("ila_bits={bits}");
     assert!(
         bits.contains('0') && bits.contains('1'),
