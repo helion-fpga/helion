@@ -1,6 +1,6 @@
 // Helion 1.0 SV counter — 4-bit incrementer, LED = cnt[3]
-module counter (
-    input  logic clk,
+module counter (A'
+
     output logic led
 );
     logic [3:0] cnt;
