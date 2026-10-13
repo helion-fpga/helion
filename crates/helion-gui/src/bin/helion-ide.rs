@@ -1612,7 +1612,10 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
         .show_separator_line(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                    ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
                     ui.set_max_width(ui.available_width());
                     let title = match app.activity {
@@ -1661,7 +1664,8 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                     {
                         paint_properties(ui, &mut app.model);
                     }
-                });
+                    }); // end ui.vertical
+                    }); // end ScrollArea
                 // Draggable strip at the panel's right edge.
                 let (_, resp) = ui.allocate_exact_size(
                     egui::vec2(chrome::SPLITTER_GRAB_PX, ui.available_height()),
