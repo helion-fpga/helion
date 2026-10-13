@@ -1549,77 +1549,85 @@ fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
     let share = chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
-    let mut width = app
+    let width = app
         .sidebar_width
         .clamp(share.sidebar_floor, share.sidebar_cap);
-    let mut panel = egui::SidePanel::left("sidebar_v3")
-        .resizable(true)
-        .default_width(width);
-    if app.force_share {
-        // Re-share frame: snap to the shared width once. The flag itself is
-        // cleared at the end of the frame (not here), so a hidden sidebar
-        // can't leave it stuck on.
-        panel = panel.exact_width(width);
-    }
-    let inner = panel
-        .width_range({
-            let share =
-                chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
-            share.sidebar_floor..=share.sidebar_cap
-        })
+    // Manual resize handle. egui's SidePanel::resizable stores the CONTENT
+    // rect (not the panel rect) as its persisted width, so a panel dragged
+    // wider than its content snaps back on the next frame. We own the width
+    // in app.sidebar_width, drive the panel with exact_width, and handle the
+    // drag ourselves. (Same bug class as the console panel.)
+    let mut drag_dx = 0.0f32;
+    let mut hover_resize = false;
+    let _ = egui::SidePanel::left("sidebar_v3")
+        .exact_width(width)
         .show_separator_line(true)
         .show(ctx, |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_max_width(ui.available_width());
-            let title = match app.activity {
-                Activity::Files => "Files",
-                Activity::Device => "Device",
-                Activity::Timing => "Timing",
-                Activity::Simulate => "Simulate",
-                Activity::Program => "Program",
-                Activity::Reports => "Reports",
-            };
-            ui.label(RichText::new(title).strong().size(14.0));
-            ui.add_space(4.0);
-            match app.activity {
-                Activity::Files => {
-                    // Flow Navigator first (Vivado mental model), then the file
-                    // tree below. Both live in the Files sidebar.
-                    flow_nav::paint_flow_nav(ui, app);
-                    ui.separator();
-                    paint_files_tree(ui, app);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
+                    let title = match app.activity {
+                        Activity::Files => "Files",
+                        Activity::Device => "Device",
+                        Activity::Timing => "Timing",
+                        Activity::Simulate => "Simulate",
+                        Activity::Program => "Program",
+                        Activity::Reports => "Reports",
+                    };
+                    ui.label(RichText::new(title).strong().size(14.0));
+                    ui.add_space(4.0);
+                    match app.activity {
+                        Activity::Files => {
+                            // Flow Navigator first (Vivado mental model), then the file
+                            // tree below. Both live in the Files sidebar.
+                            flow_nav::paint_flow_nav(ui, app);
+                            ui.separator();
+                            paint_files_tree(ui, app);
+                        }
+                        Activity::Device => {
+                            paint_io_ports_table(ui, &mut app.model, "sidebar_io");
+                        }
+                        Activity::Timing => {
+                            paint_timing_paths(ui, &mut app.model, &app.theme);
+                        }
+                        Activity::Reports => {
+                            // Timing Analysis report catalog (P1-4): regroups the
+                            // timing/power/quality tabs with badges - replaces the
+                            // flat report list.
+                            dashboard::paint_timing_catalog(ui, app);
+                        }
+                        Activity::Program => {
+                            paint_program_side(ui, app);
+                        }
+                        Activity::Simulate => {}
+                    }
+                    if app.model.selected.is_some()
+                        || app.model.selected_source.is_some()
+                        || app.model.selected_io_port.is_some()
+                    {
+                        paint_properties(ui, &mut app.model);
+                    }
+                });
+                // Draggable strip at the panel's right edge.
+                let (_, resp) = ui.allocate_exact_size(
+                    egui::vec2(chrome::SPLITTER_GRAB_PX, ui.available_height()),
+                    egui::Sense::drag(),
+                );
+                hover_resize = resp.hovered() || resp.dragged();
+                if resp.dragged() {
+                    drag_dx = resp.drag_delta().x;
                 }
-                Activity::Device => {
-                    paint_io_ports_table(ui, &mut app.model, "sidebar_io");
-                }
-                Activity::Timing => {
-                    paint_timing_paths(ui, &mut app.model, &app.theme);
-                }
-                Activity::Reports => {
-                    // Timing Analysis report catalog (P1-4): regroups the
-                    // timing/power/quality tabs with badges - replaces the
-                    // flat report list.
-                    dashboard::paint_timing_catalog(ui, app);
-                }
-                Activity::Program => {
-                    paint_program_side(ui, app);
-                }
-                Activity::Simulate => {}
-            }
-            if app.model.selected.is_some()
-                || app.model.selected_source.is_some()
-                || app.model.selected_io_port.is_some()
-            {
-                paint_properties(ui, &mut app.model);
-            }
-            width = ui.max_rect().width();
+            });
         });
-    app.sidebar_width = inner
-        .response
-        .rect
-        .width()
-        .clamp(share.sidebar_floor, share.sidebar_cap);
-    let _ = width;
+    // Left panel: dragging the right edge right (positive x) grows the panel.
+    if drag_dx != 0.0 {
+        app.sidebar_width =
+            (app.sidebar_width + drag_dx).clamp(share.sidebar_floor, share.sidebar_cap);
+    }
+    if hover_resize {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
 }
 
 fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
@@ -2266,22 +2274,30 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         // frame, so the resize handle keeps working.
         app.console_height = app.console_height.min(share.console_h);
     }
-    let mut console = egui::TopBottomPanel::bottom("console")
-        .resizable(true)
-        .default_height(app.console_height)
-        .min_height(share.console_floor)
-        .max_height(share.console_cap);
-    if app.force_share {
-        // Re-share frame (window resized, or first frame): snap to the current
-        // console_height once. apply_shared_chrome already reset it to the
-        // default share on real resizes, and the first frame honors any
-        // HELION_CONSOLE_HEIGHT override. The flag is cleared at the end of
-        // the frame, so it can never get stuck on and pin the panel - a stuck
-        // flag is what made the user's drag snap back / go dead.
-        console = console.exact_height(app.console_height);
-    }
-    let inner = console.show_separator_line(true).show(ctx, |ui| {
-        ui.horizontal(|ui| {
+    // Manual resize handle. egui's TopBottomPanel::resizable stores the
+    // CONTENT rect (not the panel rect) as its persisted height, so a panel
+    // dragged taller than its content snaps back to content height on the
+    // next frame. We own the height in app.console_height, drive the panel
+    // with exact_height, and handle the drag ourselves.
+    let panel_h = app
+        .console_height
+        .clamp(share.console_floor, share.console_cap);
+    let mut drag_dy = 0.0f32;
+    let mut hover_resize = false;
+    let _ = egui::TopBottomPanel::bottom("console")
+        .exact_height(panel_h)
+        .show_separator_line(true)
+        .show(ctx, |ui| {
+            // Draggable strip at the panel's top edge.
+            let (_, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), chrome::SPLITTER_GRAB_PX),
+                egui::Sense::drag(),
+            );
+            hover_resize = resp.hovered() || resp.dragged();
+            if resp.dragged() {
+                drag_dy = resp.drag_delta().y;
+            }
+            ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let console_on =
                 app.model.bottom_tab == BottomTab::Tcl || app.model.bottom_tab == BottomTab::Log;
@@ -2319,11 +2335,14 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
             BottomTab::SimLog => paint_sim_log(ui, &mut app.model, &app.theme),
         }
     });
-    app.console_height = inner
-        .response
-        .rect
-        .height()
-        .clamp(share.console_floor, share.console_cap);
+    // Bottom panel: dragging the top edge up (negative y) grows the panel.
+    if drag_dy != 0.0 {
+        app.console_height = (app.console_height - drag_dy)
+            .clamp(share.console_floor, share.console_cap);
+    }
+    if hover_resize {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
 }
 
 fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
@@ -11993,6 +12012,96 @@ mod recent_tests {
         let loaded = load_recent_from(&store);
         assert_eq!(loaded, vec![prj]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Priority repro (Saksham): dragging the console panel's resize handle must
+/// persist after mouse release. Root cause was egui's TopBottomPanel::resizable
+/// storing the CONTENT rect (not the panel rect) as its persisted height, so a
+/// dragged-taller panel snapped back to content height on the next frame.
+/// paint_bottom now owns the height in app.console_height with a manual drag
+/// handle. This test drives paint_bottom headless through press/drag/release.
+#[cfg(test)]
+mod console_drag_tests {
+    use super::*;
+
+    fn screen_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn paint_one(app: &mut HelionIde, ctx: &egui::Context, input: egui::RawInput) {
+        ctx.begin_pass(input);
+        paint_bottom(ctx, app);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn console_drag_resize_persists_after_release() {
+        let ctx = egui::Context::default();
+        let mut app = HelionIde::new();
+        app.console_height = 144.0;
+        app.force_share = false;
+
+        // Settle: panel must hold the app-owned height, not collapse.
+        for _ in 0..2 {
+            paint_one(&mut app, &ctx, screen_input());
+        }
+        assert!(
+            (app.console_height - 144.0).abs() < 5.0,
+            "panel must hold 144, got {}",
+            app.console_height
+        );
+
+        // Press on the drag strip at the panel's top edge.
+        let handle_y = 800.0 - app.console_height + 3.0;
+        let mut input = screen_input();
+        input.events.push(egui::Event::PointerMoved(egui::pos2(
+            640.0, handle_y,
+        )));
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(640.0, handle_y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        paint_one(&mut app, &ctx, input);
+
+        // Drag up to grow the panel. Note: console_cap is ~189px (26% of body),
+        // so the drag clamps there; the point is it grows and persists.
+        for _ in 0..3 {
+            let mut input = screen_input();
+            input.events.push(egui::Event::PointerMoved(egui::pos2(640.0, 500.0)));
+            paint_one(&mut app, &ctx, input);
+        }
+        let dragged_h = app.console_height;
+        assert!(
+            dragged_h > 170.0,
+            "drag should grow the panel, got {dragged_h}"
+        );
+
+        // Release, then idle frames: the height must persist, not snap back.
+        let mut input = screen_input();
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(640.0, 500.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        paint_one(&mut app, &ctx, input);
+        for _ in 0..3 {
+            paint_one(&mut app, &ctx, screen_input());
+        }
+        assert!(
+            (app.console_height - dragged_h).abs() < 5.0,
+            "console height snapped back: {} vs dragged {dragged_h}",
+            app.console_height
+        );
     }
 }
 
