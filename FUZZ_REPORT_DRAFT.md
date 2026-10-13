@@ -19,10 +19,10 @@ body was factored into `HelionIde::update_inner` (the `&mut eframe::Frame`
 was ignored).
 
 ## Totals
-- Frames run: ~6,500+ (8-seed long run: 6,112 frames / 22,084 events; plus
-  smoke tests and hang-repro runs)
-- Events generated: ~24,000+
-- Unique crashes: 2 reproducible bugs (3 crash signatures) + 1 flaky hang
+- Frames run: ~8,500+ (8-seed long run: 6,112 frames / 22,084 events; seed-1
+  deep run: 1,992 frames / 7,207 events; plus smoke tests and repro runs)
+- Events generated: ~31,000+
+- Unique crashes: 2 reproducible bugs (5 crash logs) + 1 flaky hang
 - Regression tests added: 3 (all #[ignore]d while bugs are open)
 - Invariant anomalies: 0 (after fixing the checker's bounds mirror)
 
@@ -74,6 +74,10 @@ the repro prefix.
 - `debug_assert!`s only fire in debug (test) builds; release builds would
   silently misbehave instead of panicking for bug #2.
 - The fuzzer cannot detect visual glitches (only programmatic invariants).
+- File isolation: the warmup opens a scratch copy of the design
+  (`<logdir>/fuzz_design_scratch.sv`), never the repo file, because the
+  fuzzer types in the editor and the app auto-saves. (Without this, early
+  runs corrupted `examples/blinky.sv` and `examples/hier.sv`; restored.)
 
 ## Code health
 
