@@ -9,6 +9,15 @@ use crate::{ide::WaveDensity, BottomTab, WorkspaceTab};
 /// Typical desktop inner size.
 pub const DESKTOP_WIDTH: f32 = 1440.0;
 pub const DESKTOP_HEIGHT: f32 = 900.0;
+/// Minimum window inner size, used by `run_gui` for `with_min_inner_size`.
+/// VS Code sets no hard window minimum either; its parts declare minimums
+/// instead (activity bar 48px, sidebar 170px, panel collapses by priority) and
+/// the grid never overlaps. 720x400 is Helion's analog: at 720 the chrome
+/// budget is rail 88 + sidebar floor 128, leaving the central pane 604px wide;
+/// at 400 the console clamps to its 36px floor and the timing canvas scrolls.
+/// Every surface has a tested reflow path at this size (see the resize tests).
+pub const MIN_WINDOW_W: f32 = 720.0;
+pub const MIN_WINDOW_H: f32 = 400.0;
 /// Activity rail - letter above the full name. 48px clipped "Device"/"Program"/"Reports".
 pub const RAIL_WIDTH: f32 = 88.0;
 /// Tall enough for letter glyph + full name under it (hit ≥28px).
@@ -163,6 +172,172 @@ pub fn overflow_toolbar(
         .response
         .on_hover_text("More toolbar actions");
     });
+}
+
+/// Status bar segment visibility (VS Code pattern: status bar items declare a
+/// priority; when the bar is too narrow, low-priority items are hidden, never
+/// painted over each other or the right-side indicator). `widths` are the
+/// measured segment widths in paint order; the first segment (the location
+/// crumb) is always kept. `limit` is the x coordinate where the reserved
+/// right-side indicator begins. Returns the number of leading segments that
+/// stay visible; the rest are skipped, not overlapped.
+pub fn status_visible_count(widths: &[f32], limit: f32) -> usize {
+    if widths.is_empty() {
+        return 0;
+    }
+    let mut x = 0.0f32;
+    let mut n = 0usize;
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 && x + w > limit {
+            break;
+        }
+        x += w;
+        n = i + 1;
+    }
+    n
+}
+
+/// Sim workspace nav/wave split. A fixed 220px nav left the wave pane with a
+/// negative width on narrow windows; the nav now keeps a proportional share
+/// (VS Code's GridView scales children proportionally when the container
+/// shrinks), between a 160px floor and the usual 220px, never wider than the
+/// pane itself.
+pub fn sim_nav_share(pane_w: f32) -> f32 {
+    (pane_w * 0.32)
+        .clamp(160.0, SIDEBAR_WIDTH)
+        .min(pane_w.max(0.0))
+}
+
+/// Sim workspace rect split: (nav_w, sep_w, wave_w) for a pane of `pane_w`.
+/// The three always sum to the pane: on absurdly narrow panes the separator
+/// yields first (it is parent-clipped anyway), then the wave pane, so egui
+/// never gets an inverted rect.
+pub fn sim_split(pane_w: f32) -> (f32, f32, f32) {
+    let w = pane_w.max(0.0);
+    let nav = sim_nav_share(w);
+    let sep = SPLITTER_GRAB_PX.min((w - nav).max(0.0));
+    let wave = (w - nav - sep).max(0.0);
+    (nav, sep, wave)
+}
+
+/// Spec-style table column widths that always sum to exactly `avail`, so the
+/// last column is never clipped on narrow windows. `fixed` holds each column's
+/// spec width in order (`None` = fill column, each at least `fill_min`).
+/// Above the floor the fixed columns keep their widths and fill columns share
+/// the leftover; below the floor every column scales together - VS Code's
+/// Problems panel likewise never scrolls horizontally, its rows shrink instead.
+pub fn spec_col_widths(fixed: &[Option<f32>], fill_min: f32, avail: f32) -> Vec<f32> {
+    let fixed_sum: f32 = fixed.iter().filter_map(|c| *c).sum();
+    let n_fill = fixed.iter().filter(|c| c.is_none()).count().max(1) as f32;
+    let full = fixed_sum + n_fill * fill_min;
+    let w = avail.max(1.0);
+    if w >= full {
+        let fill = (w - fixed_sum) / n_fill;
+        fixed.iter().map(|c| c.unwrap_or(fill)).collect()
+    } else {
+        let scale = w / full;
+        fixed.iter().map(|c| c.unwrap_or(fill_min) * scale).collect()
+    }
+}
+
+/// DRC violations table: fixed 80px ID badge plus Objects/Message fill columns
+/// in a 35/65 split. Same never-clip contract as `spec_col_widths`: the split
+/// holds above the floor, everything scales together below it.
+pub fn drc_col_widths(avail: f32) -> [f32; 3] {
+    const ID: f32 = 80.0;
+    const FILL_MIN: f32 = 90.0;
+    let w = avail.max(1.0);
+    let full = ID + 2.0 * FILL_MIN;
+    if w >= full {
+        let obj = ((w - ID) * 0.35).max(FILL_MIN);
+        let msg = (w - ID - obj).max(FILL_MIN);
+        [ID, obj, msg]
+    } else {
+        let scale = w / full;
+        [ID * scale, FILL_MIN * scale, FILL_MIN * scale]
+    }
+}
+
+/// Timing path table column widths that always sum to the pane width.
+/// Column order: # | From | To | Launch clock | Capture clock | Slack | Levels | Path group.
+pub fn timing_path_col_widths(avail: f32) -> Vec<f32> {
+    spec_col_widths(
+        &[
+            Some(40.0),
+            None,
+            None,
+            Some(110.0),
+            Some(110.0),
+            Some(96.0),
+            Some(64.0),
+            Some(96.0),
+        ],
+        80.0,
+        avail,
+    )
+}
+
+/// ILA setup pane: the probes column keeps a proportional share (VS Code's
+/// debug panels share space through sashes with minimums) instead of a fixed
+/// 340px that clipped the trigger column on narrow panes.
+pub fn ila_probes_share(pane_w: f32) -> f32 {
+    (pane_w * 0.42).clamp(220.0, 340.0).min(pane_w.max(0.0))
+}
+
+/// Device toolbar items as width estimates for `overflow_toolbar` (the same
+/// house pattern the schematic toolbar uses): estimated button widths in
+/// paint order. The "Zoom NN%" readout is informational and drops into the
+/// overflow menu first on narrow windows.
+pub fn device_toolbar_widths(mark_debug_label: &str, zoom_label: &str) -> Vec<OverflowItem> {
+    let mut items: Vec<OverflowItem> = [
+        "Fit",
+        "Find...",
+        "Ruler",
+        "Clear",
+        "Layers [+]",
+        "Inspector [+]",
+        "Zoom to selection",
+        "Zoom In",
+        "Zoom Out",
+        "Zoom Fit",
+        mark_debug_label,
+        "Add Probe",
+    ]
+    .iter()
+    .map(|l| OverflowItem {
+        width: text_button_w(l),
+    })
+    .collect();
+    items.push(OverflowItem {
+        width: text_button_w(zoom_label),
+    });
+    items
+}
+
+/// Editor gutter / minimap geometry for the reflow rule below.
+pub const EDITOR_GUTTER_W: f32 = 56.0;
+pub const EDITOR_MINIMAP_W: f32 = 110.0;
+/// Text floor below which the minimap would push the text out of the pane.
+pub const EDITOR_MIN_TEXT_W: f32 = 160.0;
+
+/// The minimap is a fixed 110px dock that must never push the text out of the
+/// pane (VS Code: the minimap never overflows the editor viewport). Below this
+/// pane width the minimap hides and the text takes the leftover.
+pub fn editor_minimap_visible(pane_w: f32) -> bool {
+    pane_w >= EDITOR_GUTTER_W + EDITOR_MIN_TEXT_W + EDITOR_MINIMAP_W + 4.0
+}
+
+/// Welcome column width: centered up to 620px, but never wider than the pane
+/// (a 320px floor painted past the pane edge on narrow windows).
+pub fn welcome_col_w(avail_w: f32) -> f32 {
+    (avail_w - 64.0).clamp(0.0, 620.0)
+}
+
+/// Welcome primary actions stack vertically when a three-across row would crush
+/// them below a readable width (VS Code's welcome page likewise reflows its
+/// action rows instead of clipping).
+pub fn welcome_stack_actions(col_w: f32) -> bool {
+    (col_w - 2.0 * 12.0) / 3.0 < 110.0
 }
 
 /// Vivado Autohide Pins / Quartus hide instance pins: unconnected pins stay
@@ -1931,5 +2106,177 @@ mod idle_budget_tests {
         assert_eq!(super::IDLE_PAINT_POLICY, "reactive-no-request_repaint");
         assert_eq!(super::IDLE_ANIM_HZ, 0);
         assert!(super::IDLE_CPU_SOFT_PCT <= 5);
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    /// Minimum window keeps a usable central pane (VS Code pattern: parts
+    /// declare minimums, the grid never overlaps). At 720x400 the chrome
+    /// budget is rail 88 + sidebar floor, leaving the pane room to breathe.
+    #[test]
+    fn min_window_keeps_usable_central_pane() {
+        assert_eq!(MIN_WINDOW_W, 720.0);
+        assert_eq!(MIN_WINDOW_H, 400.0);
+        let share = share_available(MIN_WINDOW_W, MIN_WINDOW_H);
+        let central = MIN_WINDOW_W - RAIL_WIDTH - share.sidebar_floor;
+        assert!(
+            central >= 500.0,
+            "central pane {central} too narrow at minimum window"
+        );
+        // Console still has its floor; the timing canvas scrolls below it.
+        assert!(share.console_floor <= 40.0);
+        assert!(share.console_h <= MIN_WINDOW_H);
+    }
+
+    /// Status bar: low-priority segments hide instead of overlapping the
+    /// right-side indicator (VS Code priority-hide pattern).
+    #[test]
+    fn status_bar_hides_low_priority_segments_when_narrow() {
+        let widths = [120.0, 90.0, 90.0, 90.0, 90.0];
+        // Wide: everything fits.
+        assert_eq!(status_visible_count(&widths, 2000.0), 5);
+        // Narrow: the crumb always survives; later segments drop.
+        assert_eq!(status_visible_count(&widths, 250.0), 2);
+        assert_eq!(status_visible_count(&widths, 119.0), 1);
+        // Empty input: nothing to show.
+        assert_eq!(status_visible_count(&[], 2000.0), 0);
+        // A segment that exactly fits the limit stays.
+        assert_eq!(status_visible_count(&[100.0, 100.0], 200.0), 2);
+    }
+
+    /// Sim nav keeps a proportional share; nav + separator + wave always sum
+    /// to the pane, so egui never gets an inverted rect.
+    #[test]
+    fn sim_split_stays_valid_at_every_pane_width() {
+        for pane_w in [1440.0, 720.0, 504.0, 300.0, 200.0, 166.0, 100.0, 0.0] {
+            let (nav, sep, wave) = sim_split(pane_w);
+            assert!(nav >= 0.0 && nav <= pane_w.max(0.0), "nav {nav} at {pane_w}");
+            assert!(sep >= 0.0 && sep <= SPLITTER_GRAB_PX, "sep {sep} at {pane_w}");
+            assert!(wave >= 0.0, "wave {wave} at {pane_w}");
+            assert!(
+                (nav + sep + wave - pane_w.max(0.0)).abs() < 0.01,
+                "split sums {} at {pane_w}",
+                nav + sep + wave
+            );
+        }
+        // Wide pane: the usual 220px nav.
+        let (nav, sep, _) = sim_split(1200.0);
+        assert!((nav - SIDEBAR_WIDTH).abs() < 0.01, "nav {nav}");
+        assert!((sep - SPLITTER_GRAB_PX).abs() < 0.01, "sep {sep}");
+        // Narrow pane: proportional, floored at 160.
+        let (nav, _, wave) = sim_split(500.0);
+        assert!((nav - 160.0).abs() < 0.01, "nav {nav}");
+        assert!(wave > 300.0, "wave {wave}");
+    }
+
+    /// Spec tables always sum to the pane width: fixed widths when wide,
+    /// proportional shrink when narrow. No clipped last column.
+    #[test]
+    fn spec_col_widths_sum_to_pane_at_every_width() {
+        for avail in [1440.0, 1200.0, 900.0, 676.0, 500.0, 442.0, 300.0, 212.0] {
+            let ws = timing_path_col_widths(avail);
+            assert_eq!(ws.len(), 8);
+            let sum: f32 = ws.iter().sum();
+            assert!(
+                (sum - avail.max(1.0)).abs() < 1.0,
+                "cols sum {sum} != pane {avail}"
+            );
+            assert!(ws.iter().all(|w| *w >= 0.0), "negative width at {avail}");
+        }
+        // Wide: spec widths intact, fill columns share the leftover.
+        let ws = timing_path_col_widths(1200.0);
+        assert!((ws[0] - 40.0).abs() < 0.01);
+        assert!((ws[3] - 110.0).abs() < 0.01);
+        assert!((ws[1] - 342.0).abs() < 1.0, "fill {:?}", ws[1]);
+        // At the 676 floor the fills are exactly their 80px minimum.
+        let ws = timing_path_col_widths(676.0);
+        assert!((ws[1] - 80.0).abs() < 0.01);
+        // Below the floor everything scales together.
+        let ws = timing_path_col_widths(338.0);
+        assert!((ws[0] - 20.0).abs() < 0.01, "hash {:?}", ws[0]);
+        // Pin-detail table uses the same contract.
+        let ws = spec_col_widths(
+            &[None, Some(110.0), Some(90.0), Some(90.0), None, Some(70.0), Some(150.0)],
+            80.0,
+            442.0,
+        );
+        let sum: f32 = ws.iter().sum();
+        assert!((sum - 442.0).abs() < 1.0, "pin detail sum {sum}");
+    }
+
+    /// ILA probes column: proportional share with a 340px cap and 220px
+    /// floor; never wider than the pane itself.
+    #[test]
+    fn ila_probes_share_adapts_to_pane() {
+        assert!((ila_probes_share(1200.0) - 340.0).abs() < 0.01);
+        assert!((ila_probes_share(700.0) - 294.0).abs() < 1.0);
+        assert!((ila_probes_share(400.0) - 220.0).abs() < 0.01);
+        assert!((ila_probes_share(150.0) - 150.0).abs() < 0.01);
+    }
+
+    /// Device toolbar: estimated widths overflow a minimum-window pane (so the
+    /// ">>" menu engages) and fit a wide one.
+    #[test]
+    fn device_toolbar_overflows_only_when_narrow() {
+        let items = device_toolbar_widths("Mark Debug clk", "Zoom 100%");
+        assert_eq!(items.len(), 13);
+        let total: f32 = items.iter().map(|i| i.width).sum();
+        let narrow_avail = 720.0 - side_chrome_width();
+        assert!(
+            total > narrow_avail,
+            "toolbar {total} should overflow the {narrow_avail}px pane at min window"
+        );
+        let wide_avail = 1600.0 - side_chrome_width();
+        assert!(
+            total < wide_avail,
+            "toolbar {total} should fit the {wide_avail}px pane at 1600"
+        );
+    }
+
+    /// Editor minimap hides below the width where it would push the text out
+    /// of the pane (VS Code: the minimap never overflows the viewport).
+    #[test]
+    fn editor_minimap_hides_before_it_can_overflow() {
+        let floor = EDITOR_GUTTER_W + EDITOR_MIN_TEXT_W + EDITOR_MINIMAP_W + 4.0;
+        assert!(!editor_minimap_visible(floor - 0.1));
+        assert!(editor_minimap_visible(floor));
+        assert!(editor_minimap_visible(1440.0));
+        assert!(!editor_minimap_visible(200.0));
+    }
+
+    /// Welcome column never exceeds the pane; actions stack when a row would
+    /// crush them.
+    #[test]
+    fn welcome_column_reflows_at_narrow_panes() {
+        assert!((welcome_col_w(1600.0) - 620.0).abs() < 0.01);
+        assert!((welcome_col_w(400.0) - 336.0).abs() < 0.01);
+        assert!(welcome_col_w(200.0) <= 200.0);
+        assert!(!welcome_stack_actions(620.0));
+        assert!(welcome_stack_actions(336.0));
+        assert!(welcome_stack_actions(200.0));
+    }
+
+    /// DRC table keeps its 35/65 Objects/Message split when wide and sums to
+    /// the pane width when narrow.
+    #[test]
+    fn drc_col_widths_sum_to_pane_at_every_width() {
+        for avail in [1200.0, 900.0, 500.0, 260.0, 200.0, 130.0] {
+            let ws = drc_col_widths(avail);
+            let sum: f32 = ws.iter().sum();
+            assert!(
+                (sum - avail.max(1.0)).abs() < 1.0,
+                "drc cols sum {sum} != pane {avail}"
+            );
+            if avail >= 260.0 {
+                assert!((ws[0] - 80.0).abs() < 0.01, "id badge {:?}", ws[0]);
+            }
+        }
+        // Wide: the 35/65 split holds.
+        let ws = drc_col_widths(1000.0);
+        assert!((ws[1] - 322.0).abs() < 1.0, "objects {:?}", ws[1]);
+        assert!((ws[2] - 598.0).abs() < 1.0, "message {:?}", ws[2]);
     }
 }
