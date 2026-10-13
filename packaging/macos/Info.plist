@@ -34,5 +34,9 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 Helion. Apache-2.0 OR MIT.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Helion needs Apple Events to support automation.</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>Helion supports accessibility for UI automation.</string>
 </dict>
 </plist>
