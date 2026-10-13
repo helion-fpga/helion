@@ -40932,7 +40932,7 @@ endmodule
         assert!(plan.rail_mode.keeps_trailing());
         assert_ne!(plan.rail_mode, OverflowMode::Clip);
 
-        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages"]);
+        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages", "Jobs"]);
         assert!(!plan.bottom_tabs.contains(&"Tcl Console"));
         assert!(!plan.bottom_tabs.contains(&"Log"));
         assert!(!plan.bottom_tabs.contains(&"Simulation Log"));
