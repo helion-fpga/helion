@@ -231,8 +231,8 @@ fn set_bits(asc: &str) -> std::collections::HashSet<(String, u32, u32, usize, us
     let mut y = 0u32;
     let mut bank = 0usize;
     for line in asc.lines() {
-        if line.starts_with('.') {
-            let mut it = line[1..].split_whitespace();
+        if let Some(rest) = line.strip_prefix('.') {
+            let mut it = rest.split_whitespace();
             kind = it.next().unwrap_or("").to_string();
             x = it.next().unwrap_or("0").parse().unwrap_or(0);
             y = it.next().unwrap_or("0").parse().unwrap_or(0);
@@ -300,7 +300,7 @@ fn counter_12bit_carry_spans_tiles() {
     assert!(packed.carry_chains[0].cin_one);
 
     let placed = backend.place(&packed).expect("place");
-    let mut carry_cells: Vec<_> = placed
+    let carry_cells: Vec<_> = placed
         .luts
         .iter()
         .filter(|l| l.carry)
