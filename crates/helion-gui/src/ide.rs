@@ -20,17 +20,18 @@ use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ipxact::{IpCore, catalog as ipxact_catalog, to_xml};
 use helion_ir::{CellKind, Design, PortDir};
 use helion_proj::{
-    CheckpointMeta, CheckpointSummary, ImplStrategy, Mode, ProjectFile, ReuseReport, Session,
-    delete_checkpoint, diff_metas, expand_ip_packages, format_prj, get_cells, get_nets,
-    list_checkpoints, load_checkpoint, load_prj, resolve_prj_path, save_checkpoint, stage_of,
+    CheckpointMeta, CheckpointSummary, ImplStrategy, Mode, PrjImplRun, PrjPblock, ProjectFile,
+    ReuseReport, Session, delete_checkpoint, diff_metas, expand_ip_packages, format_prj, get_cells,
+    get_nets, list_checkpoints, load_checkpoint, load_prj, resolve_prj_path, save_checkpoint,
+    stage_of,
 };
 use helion_sim::{Sim, SimLocal};
 use helion_sta::{
     CdcReport, ClockInteraction, ClockNetworkReport, Constraints, FF_CKQ_PS, LUT_PS,
     MethodologyReport, MethodologySeverity, PIN_PS, PowerReport, SETUP_PS, TimingResult,
-    TimingSummary, clock_network_delay_ps, create_clock, iostandard_pad_ps, load_xdc, port_pad_ps,
-    report_cdc, report_clock_interaction, report_clock_networks, report_methodology, report_power,
-    report_timing_routed_xdc, report_timing_summary,
+    TimingSummary, clock_network_delay_ps, clock_sdc_line, create_clock, iostandard_pad_ps,
+    load_xdc, port_pad_ps, report_cdc, report_clock_interaction, report_clock_networks,
+    report_methodology, report_power, report_timing_routed_xdc, report_timing_summary,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2788,6 +2789,21 @@ impl Pblock {
 
     pub fn site_count(&self, sites: &[DeviceSiteView]) -> usize {
         sites.iter().filter(|s| self.contains(s.x, s.y)).count()
+    }
+
+    /// Rebuild a model pblock from the `.prj` form. Bitstream frames/bytes are
+    /// derived by `bitgen_pblock`, never persisted.
+    pub fn from_prj(pb: &PrjPblock) -> Self {
+        Pblock {
+            name: pb.name.clone(),
+            x0: pb.x0,
+            y0: pb.y0,
+            x1: pb.x1,
+            y1: pb.y1,
+            cells: pb.cells.clone(),
+            ranged: pb.ranged,
+            ..Default::default()
+        }
     }
 
     /// Clickable-grid dump row: UG893 Floorplanning columns + Objects over bitgen_pblock.
@@ -5857,6 +5873,36 @@ impl Default for IdeModel {
     }
 }
 
+/// Validate a project name for Create Project / Save Project As: it becomes
+/// `<name>/<name>.prj` on disk, so it must be a single path segment.
+/// `what` prefixes the error (`"create_project"`, `"save_project_as"`).
+fn check_project_name(what: &str, name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("{what}: project name required"));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(format!("{what}: name must be a single path segment"));
+    }
+    Ok(name.to_string())
+}
+
+/// Write `<name>.prj`: the `# Helion project - <name> (<tag>)` header plus
+/// the [`format_prj`] body. Shared by Create Project and Save Project As so
+/// the two can never emit different file shapes.
+fn write_prj_commented(
+    prj_path: &Path,
+    name: &str,
+    tag: &str,
+    pf: &ProjectFile,
+) -> Result<(), String> {
+    let mut commented = String::new();
+    commented.push_str(&format!("# Helion project - {name} ({tag})\n"));
+    commented.push_str(&format_prj(pf));
+    std::fs::write(prj_path, &commented)
+        .map_err(|e| format!("write_prj {}: {e}", prj_path.display()))
+}
+
 impl IdeModel {
     pub fn new() -> Self {
         let mut m = Self {
@@ -8146,6 +8192,195 @@ impl IdeModel {
         self.surface_stage_error(id, text);
     }
 
+    /// Reset every design/session-derived field to a fresh project context.
+    /// Shared by Close Project and Open Project so the two can never drift
+    /// apart: Open used to leak the previous project's constraints, pblocks,
+    /// and impl runs into the newly opened project.
+    ///
+    /// Keeps the console journal (`console` / `log` / `messages`), the Recent
+    /// list, and `last_project_path`: closing or opening never erases history.
+    fn clear_project_state(&mut self) {
+        self.shell.session.reset_synth();
+        self.tree = NetlistTree::default();
+        self.timing = None;
+        self.utilization = None;
+        self.user_sdc = false;
+        self.constraints = Constraints::default();
+        self.steps = [StepState::Pending; 5];
+        let part = self.part().to_string();
+        self.runs = vec![
+            DesignRun::new("synth_1", "Synthesis"),
+            DesignRun::new("impl_1", "Implementation"),
+        ];
+        for r in &mut self.runs {
+            r.part = part.clone();
+        }
+        self.selected_source = None;
+        self.selected_netlist = None;
+        self.selected = None;
+        self.sdc_editor_path = None;
+        self.sdc_editor_text.clear();
+        self.sdc_editor_dirty = false;
+        self.schematic = SchematicView::default();
+        self.hierarchy = HierarchyView::default();
+        self.timing_paths.clear();
+        self.selected_timing_path = None;
+        self.selected_timing_pin = None;
+        self.drc = None;
+        self.io_ports.clear();
+        self.pblocks.clear();
+        self.package_pins.clear();
+        self.source_lines.clear();
+        self.selected_source_line = None;
+        self.find_results.clear();
+        self.selected_find = None;
+        self.incremental_rows.clear();
+        self.selected_incremental = None;
+        self.selected_eco = None;
+        self.selected_utilization = None;
+        self.selected_report = None;
+        self.selected_summary = None;
+        self.selected_drc = None;
+        self.selected_methodology = None;
+        self.selected_cdc = None;
+        self.selected_clock_interaction = None;
+        self.selected_clock_network = None;
+        self.selected_timing_summary = None;
+        self.selected_power = None;
+        self.selected_io_port = None;
+        self.selected_pblock = None;
+        self.selected_clock_region = None;
+        self.package_pin_draft.clear();
+        self.block_design = None;
+        self.generated_ip_xml = None;
+        self.last_report_export = None;
+        self.event_sim = None;
+        self.fabric_sim = None;
+        self.methodology_cache = RefCell::new(None);
+    }
+
+    /// Build the `.prj` body from live model state: part, top, pin/IO
+    /// properties, pblocks, impl runs, console-entered clocks, and mark_debug
+    /// probes. Callers fill `sources` / `constraint_files` (Save As copies the
+    /// files into the project dir; Create references the picked files).
+    /// Single source of truth for the model → file direction; `open_project`
+    /// mirrors it with [`IdeModel::apply_project_file`].
+    fn project_file_from_state(&self) -> ProjectFile {
+        let mut pf = ProjectFile {
+            part: self.part().to_string(),
+            top: self
+                .shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| d.name.clone())
+                .or_else(|| self.tree.top.clone()),
+            ..Default::default()
+        };
+        let c = &self.constraints;
+        let pairs = |m: &std::collections::BTreeMap<String, String>| {
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        pf.package_pins = pairs(&c.package_pins);
+        pf.iostandards = pairs(&c.iostandards);
+        pf.drives = pairs(&c.drives);
+        pf.slews = pairs(&c.slews);
+        pf.pulltypes = pairs(&c.pulltypes);
+        pf.diff_terms = pairs(&c.diff_terms);
+        pf.in_terms = pairs(&c.in_terms);
+        pf.pblocks = self
+            .pblocks
+            .iter()
+            .map(|p| PrjPblock {
+                name: p.name.clone(),
+                x0: p.x0,
+                y0: p.y0,
+                x1: p.x1,
+                y1: p.y1,
+                ranged: p.ranged,
+                cells: p.cells.clone(),
+            })
+            .collect();
+        pf.impl_runs = self
+            .runs
+            .iter()
+            .map(|r| PrjImplRun {
+                name: r.name.clone(),
+                strategy: r.strategy.clone(),
+                spec: r.spec.clone(),
+            })
+            .collect();
+        // Console-entered clocks (create_clock / create_generated_clock with
+        // no backing .sdc file). Non-generated first: generated clocks
+        // reference their master by name when the file is re-parsed.
+        let mut clocks: Vec<_> = c.clocks.iter().collect();
+        clocks.sort_by_key(|k| k.generated);
+        pf.sdc = clocks.iter().map(|k| clock_sdc_line(k)).collect();
+        pf.mark_debug = self
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.marked_debug_nets())
+            .unwrap_or_default();
+        pf
+    }
+
+    /// Mirror of [`IdeModel::project_file_from_state`]: load pin/IO
+    /// properties, pblocks, and impl runs from a parsed `.prj` into the model.
+    /// Runs before synthesis so `Constraints::apply` stamps the LOCs onto the
+    /// fresh design right after elaboration. Debug probes need the elaborated
+    /// netlist and are applied separately by
+    /// [`IdeModel::apply_project_debug_nets`].
+    fn apply_project_file(&mut self, prj: &ProjectFile) {
+        let mut pins = Constraints::default();
+        pins.package_pins = prj.package_pins.iter().cloned().collect();
+        pins.iostandards = prj.iostandards.iter().cloned().collect();
+        pins.drives = prj.drives.iter().cloned().collect();
+        pins.slews = prj.slews.iter().cloned().collect();
+        pins.pulltypes = prj.pulltypes.iter().cloned().collect();
+        pins.diff_terms = prj.diff_terms.iter().cloned().collect();
+        pins.in_terms = prj.in_terms.iter().cloned().collect();
+        self.merge_constraints(pins);
+        self.pblocks = prj.pblocks.iter().map(Pblock::from_prj).collect();
+        // Impl runs: the defaults (synth_1 / impl_1) are already in place from
+        // clear_project_state; update matching names in place so synth_1 keeps
+        // its Synthesis step, and append any extra runs as Implementation.
+        for r in &prj.impl_runs {
+            let strategy = if r.strategy.is_empty() {
+                "Default"
+            } else {
+                r.strategy.as_str()
+            };
+            if let Some(existing) = self.runs.iter_mut().find(|e| e.name == r.name) {
+                existing.strategy = strategy.into();
+                existing.spec = r.spec.clone();
+            } else {
+                let mut run = DesignRun::new(&r.name, "Implementation");
+                run.part = self.part().to_string();
+                run.strategy = strategy.into();
+                run.spec = r.spec.clone();
+                self.runs.push(run);
+            }
+        }
+    }
+
+    /// Re-arm mark_debug probes once synthesis has elaborated the netlist.
+    /// Best-effort: a stale net name is reported, never fails the open.
+    fn apply_project_debug_nets(&mut self, prj: &ProjectFile) -> Option<String> {
+        let mut skipped = Vec::new();
+        for net in &prj.mark_debug {
+            if let Err(e) = self.shell.session.mark_debug(net) {
+                skipped.push(format!("{net} ({e})"));
+            }
+        }
+        if skipped.is_empty() {
+            None
+        } else {
+            Some(format!("mark_debug skipped: {}", skipped.join(", ")))
+        }
+    }
+
     /// Add an RTL source and elaborate it (Vivado "Add Sources" + synth).
     pub fn open_source(&mut self, path: &Path) -> Result<String, String> {
         let r = self.open_source_impl(path);
@@ -8177,6 +8412,9 @@ impl IdeModel {
     ///
     /// Files lists this project's sources (`.sv`/`.v`/…) and constraint files (`.sdc`/`.xdc`)
     /// - prior Sources rows are replaced so Recent → Open `.prj` matches Create Project.
+    ///
+    /// Restores everything Save Project As persists: pin/IO properties,
+    /// pblocks, impl runs, inline clocks, and mark_debug probes.
     pub fn open_project(&mut self, path: &Path) -> Result<String, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("open_project {}: {e}", path.display()))?;
@@ -8184,9 +8422,13 @@ impl IdeModel {
         let _ = expand_ip_packages(&mut prj, path)?;
         self.set_part(&prj.part)?;
 
-        // Fresh project context (Open / Recent / create_project all land here).
-        self.tree.sources.clear();
-        self.selected_source = None;
+        // Fresh project context (Open / Recent / create_project / Save As all
+        // land here): no leaking the previous project's constraints, pblocks,
+        // or impl runs. Then apply the .prj's own pin/IO properties, pblocks,
+        // and runs before synthesis so Constraints::apply stamps the LOCs onto
+        // the fresh design right after elaboration.
+        self.clear_project_state();
+        self.apply_project_file(&prj);
 
         let mut rtl_paths: Vec<PathBuf> = Vec::new();
         for src in &prj.sources {
@@ -8253,13 +8495,24 @@ impl IdeModel {
                 }
             }
         }
+        // Debug probes need the elaborated netlist; re-arm best-effort.
+        let probe_note = self.apply_project_debug_nets(&prj);
+        // Pin/IO properties that arrived via read_xdc files merged after
+        // synthesis stamped the design; stamp them now so place honors the
+        // LOCs (mirrors the post-synth apply in run_step_inner), then refresh
+        // the I/O Ports view which was built before the files were read.
+        if let Some(d) = self.shell.session.design.as_mut() {
+            let _ = self.constraints.apply(d);
+        }
+        self.refresh_io_ports();
 
         self.last_project_path = Some(path.to_path_buf());
         Ok(format!(
-            "open_project {} part={} sources={} constraints={n_xdc} {msg}",
+            "open_project {} part={} sources={} constraints={n_xdc}{} {msg}",
             path.display(),
             self.part(),
-            rtl_paths.len()
+            rtl_paths.len(),
+            probe_note.map(|n| format!(" {n}")).unwrap_or_default(),
         ))
     }
 
@@ -8273,13 +8526,7 @@ impl IdeModel {
         sources: &[PathBuf],
         constraints: &[PathBuf],
     ) -> Result<String, String> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("create_project: project name required".into());
-        }
-        if name.contains('/') || name.contains('\\') || name.contains('\0') {
-            return Err("create_project: name must be a single path segment".into());
-        }
+        let name = check_project_name("create_project", name)?;
         if sources.is_empty() {
             return Err("create_project: add at least one RTL source (.sv/.v/.vhd)".into());
         }
@@ -8291,7 +8538,7 @@ impl IdeModel {
         // Validate part early.
         let _ = Device::load_part(part)?;
 
-        let proj_dir = directory.join(name);
+        let proj_dir = directory.join(&name);
         std::fs::create_dir_all(&proj_dir)
             .map_err(|e| format!("create_project mkdir {}: {e}", proj_dir.display()))?;
         let prj_path = proj_dir.join(format!("{name}.prj"));
@@ -8325,10 +8572,7 @@ impl IdeModel {
             pf.constraint_files.push(abs.to_string_lossy().into_owned());
         }
 
-        let mut commented = String::new();
-        commented.push_str(&format!("# Helion project - {name}\n"));
-        commented.push_str(&format_prj(&pf));
-        std::fs::write(&prj_path, &commented)
+        write_prj_commented(&prj_path, &name, "Create Project", &pf)
             .map_err(|e| format!("create_project write {}: {e}", prj_path.display()))?;
 
         let opened = self.open_project(&prj_path)?;
@@ -8340,59 +8584,7 @@ impl IdeModel {
     /// `last_project_path` so Open / Recent can reopen the same `.prj`.
     /// Alias on the console: `close`.
     pub fn close_project(&mut self) -> Result<String, String> {
-        self.shell.session.reset_synth();
-        self.tree = NetlistTree::default();
-        self.timing = None;
-        self.utilization = None;
-        self.user_sdc = false;
-        self.constraints = Constraints::default();
-        self.steps = [StepState::Pending; 5];
-        self.runs = vec![
-            DesignRun::new("synth_1", "Synthesis"),
-            DesignRun::new("impl_1", "Implementation"),
-        ];
-        self.selected_source = None;
-        self.selected_netlist = None;
-        self.selected = None;
-        self.sdc_editor_path = None;
-        self.sdc_editor_text.clear();
-        self.sdc_editor_dirty = false;
-        self.schematic = SchematicView::default();
-        self.hierarchy = HierarchyView::default();
-        self.timing_paths.clear();
-        self.selected_timing_path = None;
-        self.selected_timing_pin = None;
-        self.drc = None;
-        self.io_ports.clear();
-        self.pblocks.clear();
-        self.package_pins.clear();
-        self.source_lines.clear();
-        self.selected_source_line = None;
-        self.find_results.clear();
-        self.selected_find = None;
-        self.incremental_rows.clear();
-        self.selected_incremental = None;
-        self.selected_eco = None;
-        self.selected_utilization = None;
-        self.selected_report = None;
-        self.selected_summary = None;
-        self.selected_drc = None;
-        self.selected_methodology = None;
-        self.selected_cdc = None;
-        self.selected_clock_interaction = None;
-        self.selected_clock_network = None;
-        self.selected_timing_summary = None;
-        self.selected_power = None;
-        self.selected_io_port = None;
-        self.selected_pblock = None;
-        self.selected_clock_region = None;
-        self.package_pin_draft.clear();
-        self.block_design = None;
-        self.generated_ip_xml = None;
-        self.last_report_export = None;
-        self.event_sim = None;
-        self.fabric_sim = None;
-        self.methodology_cache = RefCell::new(None);
+        self.clear_project_state();
         // Keep messages / log journal; Recent path stays for reopen.
         self.status = "idle".into();
         self.nav = NavSection::ProjectManager;
@@ -8404,7 +8596,10 @@ impl IdeModel {
 
     /// Vivado-shaped Save Project As / `write_project`: copy RTL + SDC into
     /// `dest_dir/<name>/`, write a self-contained `<name>.prj` with relative
-    /// `read_sv` / `read_xdc`, then [`open_project`] the new `.prj`.
+    /// `read_sv` / `read_xdc` plus the live project state (pin + I/O
+    /// properties, pblocks, impl runs, console-entered clocks, mark_debug
+    /// probes), then [`open_project`] the new `.prj`. The user's layout
+    /// (nav/workspace/bottom tab) survives the trailing open.
     pub fn save_project_as(
         &mut self,
         dest_dir: &Path,
@@ -8445,30 +8640,23 @@ impl IdeModel {
             .or_else(|| self.tree.top.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "project".into());
-        let name = name
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(default_name.as_str());
-        if name.contains('/') || name.contains('\\') || name.contains('\0') {
-            return Err("save_project_as: name must be a single path segment".into());
-        }
+        let name = check_project_name(
+            "save_project_as",
+            name.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(default_name.as_str()),
+        )?;
 
-        let proj_dir = dest_dir.join(name);
+        let proj_dir = dest_dir.join(&name);
         std::fs::create_dir_all(&proj_dir)
             .map_err(|e| format!("save_project_as mkdir {}: {e}", proj_dir.display()))?;
         let prj_path = proj_dir.join(format!("{name}.prj"));
 
-        let mut pf = ProjectFile {
-            part: self.part().to_string(),
-            top: self
-                .shell
-                .session
-                .design
-                .as_ref()
-                .map(|d| d.name.clone())
-                .or_else(|| self.tree.top.clone()),
-            ..Default::default()
-        };
+        // Everything Save As persists (part/top, pin + I/O properties,
+        // pblocks, impl runs, console-entered clocks, mark_debug probes) comes
+        // from one place; Open mirrors it. Sources / constraint files are
+        // filled in below as the files are copied into the project dir.
+        let mut pf = self.project_file_from_state();
 
         let mut used_names: HashSet<String> = HashSet::new();
         for src in &rtl {
@@ -8546,13 +8734,14 @@ impl IdeModel {
             pf.constraint_files.push(dest_name);
         }
 
-        let mut commented = String::new();
-        commented.push_str(&format!("# Helion project - {name} (Save Project As)\n"));
-        commented.push_str(&format_prj(&pf));
-        std::fs::write(&prj_path, &commented)
+        write_prj_commented(&prj_path, &name, "Save Project As", &pf)
             .map_err(|e| format!("save_project_as write {}: {e}", prj_path.display()))?;
 
+        // Save As keeps the user's layout: the trailing open_project re-runs
+        // set_part, which parks the workspace on Settings.
+        let layout = (self.nav, self.layout, self.workspace, self.bottom_tab);
         let opened = self.open_project(&prj_path)?;
+        (self.nav, self.layout, self.workspace, self.bottom_tab) = layout;
         let summary = format!(
             "save_project_as {} sources={} constraints={} {opened}",
             prj_path.display(),
@@ -41368,6 +41557,416 @@ endmodule
             "Recent reopen counter.prj must hold gold WNS: {timing}"
         );
     }
+
+    // --- File menu round trips (New / Open / Save / Save As / Close / Recent) ---
+
+    /// Build the File-menu repro state: placed design, pblock, ILA probe,
+    /// pin assignments, pad settings, console-entered clock, impl run.
+    /// Mirrors the photo: clk/led pinned, pblock_0 on X1Y1, mark_debug led.
+    fn file_menu_rich_project(ide: &mut IdeModel) {
+        // RTL-only copy: no sibling .sdc auto-load, so the console-entered
+        // clock below is the only clock and round-trips through the .prj.
+        let rtl = example_rtl_only("counter.sv");
+        ide.open_source(&rtl).expect("open counter.sv");
+        ide.exec("set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]")
+            .expect("pin led");
+        ide.exec("set_property IOSTANDARD LVCMOS33 [get_ports led]")
+            .expect("iostandard");
+        ide.exec("create_clock -name clk -period 10 [get_ports clk]")
+            .expect("clock");
+        ide.exec("create_pblock pblock_0").expect("pblock");
+        ide.exec("resize_pblock pblock_0 -add CLOCKREGION_X1Y1")
+            .expect("resize");
+        ide.exec("add_cells_to_pblock pblock_0").expect("cells");
+        ide.exec("create_run impl_fast -strategy RuntimeOpt")
+            .expect("run");
+        ide.exec("mark_debug led").expect("mark_debug");
+        ide.implement().expect("implement");
+    }
+
+    fn file_menu_tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "helion-filemenu-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir
+    }
+
+    #[test]
+    fn file_menu_new_project_creates_and_opens() {
+        let dir = file_menu_tmp("new");
+        let rtl = example_rtl_only("counter.sv");
+        let mut ide = IdeModel::new();
+        let out = ide
+            .create_project("newproj", &dir, "HL10T-C32-1", &[rtl.clone()], &[])
+            .expect("create_project");
+        assert!(out.contains("create_project"), "{out}");
+        let prj = dir.join("newproj/newproj.prj");
+        assert!(prj.is_file(), "missing {}", prj.display());
+        assert!(ide.design().is_some(), "new project must open");
+        assert_eq!(ide.part(), "HL10T-C32-1");
+        assert!(
+            ide.tree.sources.iter().any(|s| s.ends_with("counter.sv")),
+            "{:?}",
+            ide.tree.sources
+        );
+        // Fresh project context: no leaked runs beyond the defaults.
+        assert_eq!(ide.runs.len(), 2);
+        assert!(ide.pblocks.is_empty());
+        // Bad names are rejected, never a partial directory.
+        assert!(ide
+            .create_project("a/b", &dir, "", &[rtl], &[])
+            .is_err());
+        assert!(!dir.join("a").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_menu_open_restores_prj_pins_pblocks_probes_runs() {
+        let dir = file_menu_tmp("open");
+        let rtl = example_rtl_only("counter.sv");
+        std::fs::copy(&rtl, dir.join("counter.sv")).unwrap();
+        let prj = dir.join("hand.prj");
+        std::fs::write(
+            &prj,
+            "part HL10T-C32-1\n\
+             read_sv counter.sv\n\
+             set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]\n\
+             set_property IOSTANDARD LVCMOS33 [get_ports led]\n\
+             create_clock -name clk -period 10 [get_ports clk]\n\
+             create_pblock pblock_0\n\
+             resize_pblock pblock_0 -add {CLB_X1Y1:CLB_X4Y4}\n\
+             mark_debug led\n\
+             create_run impl_fast -strategy RuntimeOpt\n",
+        )
+        .unwrap();
+
+        let mut ide = IdeModel::new();
+        // A previous project's state must not leak into the opened one.
+        ide.exec("create_clock -name stale -period 25 [get_ports clk]")
+            .expect("stale clock");
+        ide.exec("create_pblock stale_block").expect("stale pblock");
+        let out = ide.open_project(&prj).expect("open_project");
+        assert!(out.contains("open_project"), "{out}");
+
+        assert_eq!(
+            ide.constraints.package_pins.get("led").map(String::as_str),
+            Some("IOB_X2Y0")
+        );
+        assert_eq!(
+            ide.constraints.iostandards.get("led").map(String::as_str),
+            Some("LVCMOS33")
+        );
+        // Stale clock from the previous session is gone.
+        assert!(
+            ide.constraints.clocks.iter().all(|c| c.name != "stale"),
+            "{:?}",
+            ide.constraints.clocks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            ide.constraints
+                .clocks
+                .iter()
+                .any(|c| c.name == "clk" && c.period_ps == 10_000),
+            "inline clock restored"
+        );
+        assert_eq!(ide.pblocks.len(), 1);
+        let pb = &ide.pblocks[0];
+        assert_eq!(pb.name, "pblock_0");
+        assert!(pb.ranged);
+        assert_eq!((pb.x0, pb.y0, pb.x1, pb.y1), (1, 1, 4, 4));
+        assert!(
+            !ide.pblocks.iter().any(|p| p.name == "stale_block"),
+            "stale pblock must not leak into the opened project"
+        );
+        let d = ide.shell.session.design.as_ref().expect("design");
+        assert_eq!(d.marked_debug_nets(), vec!["led".to_string()]);
+        // LOC stamped onto the fresh design by Constraints::apply at synth.
+        let loc = d
+            .ports
+            .iter()
+            .find(|p| p.name == "led")
+            .and_then(|p| p.attrs.get("LOC"))
+            .map(|s| s.to_string());
+        assert_eq!(loc.as_deref(), Some("IOB_X2Y0"));
+        let runs: Vec<(&str, &str)> = ide
+            .runs
+            .iter()
+            .map(|r| (r.name.as_str(), r.strategy.as_str()))
+            .collect();
+        assert!(runs.contains(&("synth_1", "Default")), "{runs:?}");
+        assert!(runs.contains(&("impl_1", "Default")), "{runs:?}");
+        assert!(
+            runs.contains(&("impl_fast", "RuntimeOpt")),
+            "{runs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_menu_save_as_round_trips_full_project_state() {
+        let mut ide = IdeModel::new();
+        file_menu_rich_project(&mut ide);
+
+        // Snapshot the live state before the round trip.
+        let part = ide.part().to_string();
+        let pins = ide.constraints.package_pins.clone();
+        let iostandards = ide.constraints.iostandards.clone();
+        let clocks: Vec<(String, u64)> = ide
+            .constraints
+            .clocks
+            .iter()
+            .map(|c| (c.name.clone(), c.period_ps))
+            .collect();
+        let pblocks: Vec<(String, u32, u32, u32, u32, bool, Vec<String>)> = ide
+            .pblocks
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.x0,
+                    p.y0,
+                    p.x1,
+                    p.y1,
+                    p.ranged,
+                    p.cells.clone(),
+                )
+            })
+            .collect();
+        let probes = ide
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.marked_debug_nets())
+            .unwrap_or_default();
+        let runs: Vec<(String, String, String, String)> = ide
+            .runs
+            .iter()
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.step.clone(),
+                    r.strategy.clone(),
+                    r.spec.clone(),
+                )
+            })
+            .collect();
+        let wns_before = ide.wns_ps();
+        assert!(wns_before.is_some(), "implement must produce timing");
+        assert!(!pblocks.is_empty(), "need a pblock: {pblocks:?}");
+        assert!(!probes.is_empty(), "need a probe: {probes:?}");
+        // Distinctive layout: Save As must not disturb it.
+        ide.nav = NavSection::ProjectManager;
+        ide.workspace = WorkspaceTab::Device;
+        ide.bottom_tab = BottomTab::Tcl;
+
+        let dest = file_menu_tmp("saveas");
+        let out = ide
+            .save_project_as(&dest, Some("richproj"))
+            .expect("save_project_as");
+        assert!(out.contains("save_project_as"), "{out}");
+        let prj = dest.join("richproj/richproj.prj");
+        assert!(prj.is_file(), "missing {}", prj.display());
+        let body = std::fs::read_to_string(&prj).unwrap();
+        assert!(body.contains("set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]"), "{body}");
+        assert!(body.contains("set_property IOSTANDARD LVCMOS33 [get_ports led]"), "{body}");
+        assert!(body.contains("create_clock -name clk -period 10.000 [get_ports clk]"), "{body}");
+        assert!(body.contains("create_pblock pblock_0"), "{body}");
+        assert!(body.contains("set_property MARK_DEBUG true [get_nets led]"), "{body}");
+        assert!(body.contains("create_run impl_fast -strategy RuntimeOpt"), "{body}");
+        // Layout survives Save As (the trailing open used to park on Settings).
+        assert_eq!(ide.nav, NavSection::ProjectManager);
+        assert_eq!(ide.workspace, WorkspaceTab::Device);
+        assert_eq!(ide.bottom_tab, BottomTab::Tcl);
+
+        // Close, then reopen in a FRESH model: the .prj alone must restore it.
+        ide.close_project().expect("close");
+        assert!(ide.design().is_none());
+        assert!(ide.pblocks.is_empty());
+
+        let mut fresh = IdeModel::new();
+        let reopen = fresh.open_project(&prj).expect("reopen");
+        assert!(reopen.contains("open_project"), "{reopen}");
+        assert_eq!(fresh.part(), part);
+        assert_eq!(fresh.constraints.package_pins, pins);
+        assert_eq!(fresh.constraints.iostandards, iostandards);
+        let fresh_clocks: Vec<(String, u64)> = fresh
+            .constraints
+            .clocks
+            .iter()
+            .map(|c| (c.name.clone(), c.period_ps))
+            .collect();
+        assert_eq!(fresh_clocks, clocks);
+        let fresh_pblocks: Vec<(String, u32, u32, u32, u32, bool, Vec<String>)> =
+            fresh
+                .pblocks
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.x0,
+                        p.y0,
+                        p.x1,
+                        p.y1,
+                        p.ranged,
+                        p.cells.clone(),
+                    )
+                })
+                .collect();
+        assert_eq!(fresh_pblocks, pblocks);
+        let fresh_probes = fresh
+            .shell
+            .session
+            .design
+            .as_ref()
+            .map(|d| d.marked_debug_nets())
+            .unwrap_or_default();
+        assert_eq!(fresh_probes, probes);
+        let fresh_runs: Vec<(String, String, String, String)> = fresh
+            .runs
+            .iter()
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.step.clone(),
+                    r.strategy.clone(),
+                    r.spec.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(fresh_runs, runs);
+        // Design files: the RTL was copied into the project dir.
+        assert!(dest.join("richproj/counter.sv").is_file());
+        assert!(
+            fresh
+                .tree
+                .sources
+                .iter()
+                .any(|s| s.ends_with("richproj/counter.sv")),
+            "{:?}",
+            fresh.tree.sources
+        );
+        // Device state: re-implement reproduces the same placement/timing.
+        fresh.implement().expect("re-implement");
+        assert_eq!(
+            fresh.wns_ps(),
+            wns_before,
+            "re-implemented WNS must match the saved session"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn file_menu_close_clears_design_state_keeps_journal_and_recent() {
+        let mut ide = IdeModel::new();
+        let prj = example("counter.prj");
+        ide.open_source(&prj).expect("open");
+        ide.exec("set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]")
+            .expect("pin");
+        ide.exec("create_pblock pblock_0").expect("pblock");
+        ide.exec("create_clock -name clk -period 10 [get_ports clk]")
+            .expect("clock");
+        assert!(!ide.pblocks.is_empty());
+        assert!(!ide.constraints.package_pins.is_empty());
+        let (nc, nl, nm) = (ide.console.len(), ide.log.len(), ide.messages.len());
+        assert!(nc > 0, "need journal entries");
+
+        ide.close_project().expect("close_project");
+        assert!(ide.design().is_none(), "design must clear");
+        assert!(ide.tree.sources.is_empty(), "sources must clear");
+        assert!(ide.pblocks.is_empty(), "pblocks must clear");
+        assert!(ide.constraints.package_pins.is_empty());
+        assert!(ide.constraints.clocks.is_empty());
+        assert!(ide.timing.is_none());
+        assert_eq!(ide.runs.len(), 2, "runs reset to defaults");
+        // Journal and Recent survive the close.
+        assert_eq!(ide.console.len(), nc, "console journal kept");
+        assert_eq!(ide.log.len(), nl, "log journal kept");
+        assert_eq!(ide.messages.len(), nm, "messages kept");
+        assert_eq!(
+            ide.last_project_path.as_deref(),
+            Some(prj.as_path()),
+            "Recent path kept for reopen"
+        );
+    }
+
+    #[test]
+    fn file_menu_recent_reopen_restores_saved_state() {
+        let mut ide = IdeModel::new();
+        file_menu_rich_project(&mut ide);
+        let dest = file_menu_tmp("recent");
+        ide.save_project_as(&dest, Some("recentproj"))
+            .expect("save_project_as");
+        let prj = ide
+            .last_project_path
+            .clone()
+            .expect("Recent path remembered");
+        assert_eq!(prj, dest.join("recentproj/recentproj.prj"));
+
+        // Recent → click the remembered .prj (fresh model, like a new process).
+        let mut fresh = IdeModel::new();
+        let out = fresh.open_source(&prj).expect("recent reopen");
+        assert!(out.contains("open_project"), "{out}");
+        assert_eq!(
+            fresh.constraints.package_pins, ide.constraints.package_pins,
+            "pins survive Recent reopen"
+        );
+        assert_eq!(fresh.pblocks.len(), ide.pblocks.len());
+        assert_eq!(
+            fresh
+                .shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| d.marked_debug_nets())
+                .unwrap_or_default(),
+            ide.shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| d.marked_debug_nets())
+                .unwrap_or_default(),
+            "probes survive Recent reopen"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn file_menu_save_editor_round_trips_source_text() {
+        // ⌘S in the File menu saves the open editor file: the bin writes the
+        // buffer to disk, the model refreshes from disk. Model half here.
+        let mut ide = IdeModel::new();
+        let rtl = example_rtl_only("counter.sv");
+        ide.open_source(&rtl).expect("open");
+        let before = ide.source_lines.len();
+        assert!(before > 0);
+        ide.editor_bookmarks.push(3);
+        ide.selected_source_line = Some(2);
+
+        // What save_editor does: write the buffer, then refresh.
+        let mut text = std::fs::read_to_string(&rtl).unwrap();
+        text.push_str("\n// saved by ⌘S round-trip test\n");
+        std::fs::write(&rtl, &text).unwrap();
+        ide.refresh_source_text(&rtl.to_string_lossy());
+
+        assert!(
+            ide.source_lines.len() > before,
+            "model must see the saved edit"
+        );
+        assert!(
+            ide.source_lines
+                .iter()
+                .any(|l| l.text.contains("round-trip test")),
+            "saved line visible in model"
+        );
+        // Refresh preserves editor chrome, not just text.
+        assert_eq!(ide.editor_bookmarks, vec![3]);
+        assert_eq!(ide.selected_source_line, Some(2));
+    }
+
 
     #[test]
     fn native_open_dialog_is_not_a_none_stub() {
