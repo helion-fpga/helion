@@ -1272,7 +1272,7 @@ fn paint_remaining_cta(
             ui.vertical_centered(|ui| {
                 ui.add_space((rect.height() * 0.38).max(24.0));
                 ui.label(RichText::new(message).size(14.0).color(theme.dim));
-                ui.add_space(10.0);
+                ui.add_space(chrome::SPACE_MD);
                 if primary_button(ui, action).clicked() {
                     clicked = true;
                 }
@@ -1337,7 +1337,7 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                ui.add_space(6.0);
+                ui.add_space(chrome::SPACE_SM);
                 let new_proj = ui
                     .add_sized(
                         chrome::toolbar_ctrl_size("New Project…"),
@@ -1531,7 +1531,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
         .resizable(false)
         .show_separator_line(true)
         .show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(chrome::SPACE_XS);
             ui.spacing_mut().item_spacing.y = 4.0;
             let theme = app.theme;
             let mut pick = None;
@@ -1620,7 +1620,7 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                         Activity::Reports => "Reports",
                     };
                     ui.label(RichText::new(title).strong().size(14.0));
-                    ui.add_space(4.0);
+                    ui.add_space(chrome::SPACE_XS);
                     match app.activity {
                         Activity::Files => {
                             // Flow Navigator first (Vivado mental model), then the file
@@ -1739,7 +1739,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
                 .color(theme.ok)
                 .small(),
         );
-        ui.add_space(6.0);
+        ui.add_space(chrome::SPACE_SM);
     }
 
     let bits_done = app.model.step_state(FlowStep::Bitstream) == StepState::Done;
@@ -1771,7 +1771,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
             app.submit_job(JobKind::Step(FlowStep::Bitstream));
         }
     }
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
 
     let hw = app.model.hw_stat_report();
     if hw.open {
@@ -1791,7 +1791,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
                 .color(theme.dim),
         );
     }
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
 
     let cable_needs_phys = matches!(
         app.program_cable.as_str(),
@@ -1855,7 +1855,7 @@ fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     });
 
     if let Some((ok, msg)) = &app.program_status {
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.separator();
         let is_scan = msg.starts_with("scan USB=");
         let heading = if is_scan {
@@ -2473,9 +2473,9 @@ fn paint_jobs(ui: &mut egui::Ui, app: &mut HelionIde) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             paint_runs(ui, app);
-            ui.add_space(8.0);
+            ui.add_space(chrome::SPACE_SM);
             ui.separator();
-            ui.add_space(4.0);
+            ui.add_space(chrome::SPACE_XS);
             let theme = app.theme;
             paint_checkpoints(ui, &mut app.model, &theme);
         });
@@ -2553,7 +2553,7 @@ fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
                             .desired_width(360.0)
                             .hint_text("project_1"),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(chrome::SPACE_SM);
                     ui.label("Project directory");
                     ui.horizontal(|ui| {
                         ui.add(
@@ -3011,7 +3011,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
 /// Timing ⌘3 / Timing rail: WNS + paths only - never Reports catalog.
 fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     paint_timing_summary(ui, model, theme);
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     paint_timing_paths(ui, model, theme);
 }
 
@@ -3069,7 +3069,7 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
         WorkspaceTab::Summary => dashboard::paint_dashboard(ui, app),
         _ => {
             paint_timing_summary(ui, &mut app.model, &app.theme);
-            ui.add_space(8.0);
+            ui.add_space(chrome::SPACE_SM);
             // Paths stay reachable: Timing nav lists them; detail still shows pin delay table.
             paint_timing_paths(ui, &mut app.model, &app.theme);
         }
@@ -3080,7 +3080,7 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.vertical_centered(|ui| {
         ui.add_space(48.0);
         ui.label(RichText::new("No sources yet.").size(16.0));
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         if primary_button(ui, "New Project…")
             .on_hover_text(tip("New Project", "", "create_project"))
             .clicked()
@@ -3088,14 +3088,14 @@ fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
             app.create_wizard = CreateProjectWizard::default();
             app.show_create_project = true;
         }
-        ui.add_space(6.0);
+        ui.add_space(chrome::SPACE_SM);
         if primary_button(ui, "Open HDL…")
             .on_hover_text(tip("Open", "⌘O", "open_source"))
             .clicked()
         {
             native_open(app);
         }
-        ui.add_space(6.0);
+        ui.add_space(chrome::SPACE_SM);
         if primary_button(ui, "Examples")
             .on_hover_text("Open an example HDL file")
             .clicked()
@@ -3132,7 +3132,7 @@ fn paint_clipped_select(
 }
 
 fn paint_sim_nav_body(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     let on_tb = model.workspace == WorkspaceTab::Testbench;
     if ui
         .selectable_label(on_tb, RichText::new("Testbenches").strong())
@@ -3778,7 +3778,7 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
     let mut notice: Option<(toasts::ToastKind, String)> = None;
     let model = &mut app.model;
     ui.heading("Runs");
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
 
     // --- Queue actions -----------------------------------------------------
     let pending = model.run_queue.len();
@@ -3868,7 +3868,7 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
                 .color(theme.dim),
         );
     }
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
 
     // --- New run: strategy editor ------------------------------------------
     egui::CollapsingHeader::new("New run - strategy")
@@ -3973,7 +3973,7 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
                 model.run_editor.name.clear();
             }
         });
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
 
     // --- Seed sweep ----------------------------------------------------------
     egui::CollapsingHeader::new("Seed sweep")
@@ -4017,7 +4017,7 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
                     .color(theme.dim),
             );
         });
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
 
     // --- Results table (sortable, best-in-column highlighted) ----------------
     ui.label(RichText::new("Results").strong());
@@ -4126,7 +4126,7 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = model.select_run(&name);
         }
     }
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
 
     // --- Sweep summary -------------------------------------------------------
     {
@@ -4144,9 +4144,9 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
         }
     }
 
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     paint_incremental_report(ui, model, &theme);
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     paint_eco_changes(ui, model, &theme);
 
     // Flush deferred user feedback now that the model borrow has ended.
@@ -4206,7 +4206,7 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                 ));
         });
     });
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
 
     // Save row.
     ui.horizontal(|ui| {
@@ -4234,7 +4234,7 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                 .color(theme.dim),
         );
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
 
     // Table.
     let mut toggle: Option<String> = None;
@@ -4295,7 +4295,7 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
             model.checkpoint_sel.push(name);
         }
     }
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
 
     // Actions.
     ui.horizontal(|ui| {
@@ -4351,7 +4351,7 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
 
     // Diff.
     if model.checkpoint_sel.len() == 2 {
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.label(RichText::new("Diff (second minus first)").strong());
         if let Some(text) = model.checkpoint_diff_text() {
             ui.label(RichText::new(text).monospace().size(13.0));
@@ -5258,7 +5258,7 @@ fn paint_constraints_tab(ui: &mut egui::Ui, app: &mut HelionIde) {
         }
         ui.weak("Guided: clocks → I/O delays → exceptions → SDC");
     });
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     paint_constraints(ui, &mut app.model);
 }
 
@@ -5310,7 +5310,7 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
             let _ = model.save_sdc_editor();
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     // Vivado-shaped SDC/XDC text editor (monospace). Keep tables below.
     let file_label = model
         .sdc_editor_path
@@ -5335,7 +5335,7 @@ fn paint_constraints(ui: &mut egui::Ui, model: &mut IdeModel) {
     if resp.changed() {
         model.sdc_editor_dirty = true;
     }
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     paint_constraints_tables(ui, model);
 }
 
@@ -5377,7 +5377,7 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
         .show(ui, |ui| {
     for (title, section, grid) in sections {
         let sect: Vec<_> = rows.iter().filter(|r| r.section == section).collect();
-        ui.add_space(6.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.label(RichText::new(title).strong());
         if sect.is_empty() {
             ui.weak("-");
@@ -5605,7 +5605,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
         if let Some(id) = model.selected.clone() {
             let hits = model.paths_through(&id);
             if !hits.is_empty() {
-                ui.add_space(6.0);
+                ui.add_space(chrome::SPACE_SM);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!(
@@ -5639,7 +5639,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
                 if let Some(hi) = probe_pick {
                     model.set_probe(ProbeSelection::Path(hi));
                 }
-                ui.add_space(4.0);
+                ui.add_space(chrome::SPACE_XS);
             }
         }
     }
@@ -5653,7 +5653,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
                     .size(13.0)
                     .color(theme.dim),
             );
-            ui.add_space(6.0);
+            ui.add_space(chrome::SPACE_SM);
             if primary_button(ui, "Report timing").clicked() {
                 let _ = model.exec("report_timing");
             }
@@ -5662,9 +5662,9 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
     }
 
     // Endpoint slack histogram (§3.3.3) sits above the path table.
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     dashboard::paint_slack_histogram(ui, model, theme);
-    ui.add_space(10.0);
+    ui.add_space(chrome::SPACE_MD);
 
     // Filter (From / To / group, case-insensitive) then sort.
     let filt = model.timing_path_filter.trim().to_lowercase();
@@ -5706,7 +5706,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
         paint_timing_path_table(ui, model, theme, &order);
     }
 
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     ui.label(
         egui::RichText::new("Double-click a row to cross-probe Device + Source.")
             .size(11.0)
@@ -5899,7 +5899,7 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     let Some(path) = path else {
         return;
     };
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.label(
         egui::RichText::new("Pin Delay")
             .font(theme::font_ui_semibold(13.0))
@@ -5917,7 +5917,7 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .size(12.0)
         .color(theme.dim),
     );
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
 
     // Cross-probe element strip: ordered cells/nets with per-element
     // arrival; click one to probe it alone in Device + Schematic.
@@ -5954,7 +5954,7 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         if let Some(id) = el_pick {
             model.set_probe(ProbeSelection::Object(id));
         }
-        ui.add_space(4.0);
+        ui.add_space(chrome::SPACE_XS);
     }
 
     // (title, fixed width | None = fill, numeric)
@@ -6044,7 +6044,7 @@ fn slack_label(v: Option<i64>) -> String {
 
 fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.label(RichText::new("Timing Summary").strong());
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     ui.horizontal(|ui| {
         if ui.button("Report timing summary").clicked() {
             let _ = model.exec("report_timing_summary");
@@ -6085,7 +6085,7 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
         }
         return;
     }
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     ui.label(
         egui::RichText::new("Design Timing Summary")
             .font(theme::font_ui_semibold(13.0))
@@ -6157,7 +6157,7 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
         if rows.is_empty() {
             continue;
         }
-        ui.add_space(6.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.label(RichText::new(title).strong());
         let path_col = chrome::stretched_col_w_gap(8, ui.available_width(), 8.0);
         egui::Grid::new(format!("timing_summary_{}", kind.as_str()))
@@ -6232,13 +6232,13 @@ fn clock_relation_color(theme: &theme::Theme, rel: ClockRelation) -> Color32 {
 
 fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Clock Interaction");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Report clock interaction").clicked() {
             let _ = model.exec("report_clock_interaction");
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     let report = model.clock_interaction();
     if report.clocks.is_empty() {
         ui.label("No clocks yet.");
@@ -6354,13 +6354,13 @@ fn cdc_severity_color(theme: &theme::Theme, sev: CdcSeverity) -> Color32 {
 
 fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("CDC");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Report CDC").clicked() {
             let _ = model.exec("report_cdc");
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     let report = model.cdc_report();
     if report.clocks.is_empty() {
         ui.label("No clocks yet.");
@@ -6469,13 +6469,13 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
 
 fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.heading("Clock Networks");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Report clock networks").clicked() {
             let _ = model.exec("report_clock_networks");
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     let report = model.clock_networks();
     if report.clocks.is_empty() {
         ui.label("No clocks yet.");
@@ -6543,13 +6543,13 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
 
 fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Power");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Report power").clicked() {
             let _ = model.exec("report_power");
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     let report = model.power_report();
     if report.part.is_empty() {
         if paint_remaining_cta(ui, "No design yet.", "Run Synthesis", theme) {
@@ -6558,11 +6558,11 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         return;
     }
     paint_vcd_power_section(ui, model, theme);
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.separator();
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     ui.label(RichText::new("Rails (vectorless STA)").strong());
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     ui.label(format!(
         "part={} VOLTAGE_MV={} TEMP_C={} F_MHZ={}",
         report.part, report.voltage_mv, report.temperature_c, report.f_mhz
@@ -6626,7 +6626,7 @@ fn paint_power(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                             ui.end_row();
                         }
                     });
-                ui.add_space(8.0);
+                ui.add_space(chrome::SPACE_SM);
                 ui.label(RichText::new("Utilization Details").strong());
                 let details_bar = chrome::occupancy_bar_w(
                     (ui.available_width() - chrome::occupancy_label_reserve(3)).max(80.0),
@@ -6694,10 +6694,10 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
             let _ = model.exec("clear_vcd");
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     if let Some(err) = model.vcd_error.clone() {
         ui.label(RichText::new(format!("VCD error: {err}")).color(theme.danger));
-        ui.add_space(4.0);
+        ui.add_space(chrome::SPACE_XS);
     }
     let Some(r) = model.vcd_power_report() else {
         return;
@@ -6768,7 +6768,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
             );
         }
     }
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         for (label, mw) in [
             ("Total", r.total_mw),
@@ -6790,7 +6790,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
             );
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.label(RichText::new("By resource").strong());
     let max_mw = r
         .by_resource
@@ -6819,7 +6819,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         });
     });
     if !r.by_hierarchy.is_empty() {
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.label(RichText::new("By hierarchy").strong());
         egui::Grid::new("vcd_power_hier")
             .spacing([8.0, 2.0])
@@ -6837,7 +6837,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                 }
             });
     }
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.label(RichText::new("Top toggling nets").strong());
     // auto_shrink([false, true]): full-width wheel-hover rect so the wheel
     // traps anywhere over the list, not just over the text (nested-scroll fix).
@@ -6880,7 +6880,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                 });
         });
     if !r.warnings.is_empty() {
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.label(RichText::new("Findings").strong());
         for w in &r.warnings {
             let color = match w.severity {
@@ -6904,7 +6904,7 @@ fn methodology_severity_color(theme: &theme::Theme, sev: MethodologySeverity) ->
 
 fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Methodology");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Report methodology").clicked() {
             let _ = model.exec("report_methodology");
@@ -6930,7 +6930,7 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
             }
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     if model.tree.top.is_none() {
         if paint_remaining_cta(ui, "No design yet.", "Run Synthesis", theme) {
             queue_flow(FlowStep::Synthesis);
@@ -7047,7 +7047,7 @@ fn qor_severity_color(theme: &theme::Theme, sev: QorSeverity) -> Color32 {
 /// cited objects via the master selection API.
 fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("QoR Suggestions");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Re-run analysis").clicked() {
             let msg = model.refresh_qor();
@@ -7059,7 +7059,7 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 .color(theme.dim),
         );
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     if model.tree.top.is_none() {
         if paint_remaining_cta(ui, "No design yet.", "Run Synthesis", theme) {
             queue_flow(FlowStep::Synthesis);
@@ -7092,7 +7092,7 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                 .strong(),
         );
     });
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     if report.suggestions.is_empty() {
         ui.label(
             RichText::new("No suggestions - the design meets every QoR check.")
@@ -7170,19 +7170,19 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     });
     // Detail of the selected suggestion: full explanation + fix hint.
     if let Some(id) = selected_qor.as_deref().and_then(|id| report.suggestion(id)) {
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         ui.separator();
-        ui.add_space(4.0);
+        ui.add_space(chrome::SPACE_XS);
         ui.label(RichText::new(format!("{} - {}", id.id, id.title)).strong());
         ui.add_space(2.0);
         ui.label(RichText::new(&id.explanation).color(theme.text));
-        ui.add_space(4.0);
+        ui.add_space(chrome::SPACE_XS);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Fix:").strong());
             ui.label(RichText::new(&id.fix_hint).color(theme.dim));
         });
         if id.action == Some(QorAction::OpenRuns) {
-            ui.add_space(4.0);
+            ui.add_space(chrome::SPACE_XS);
             if ui.button("Open Design Runs").clicked() {
                 model.bottom_tab = BottomTab::Jobs;
             }
@@ -7217,7 +7217,7 @@ fn bitstream_block_color(theme: &theme::Theme, block: &str) -> Color32 {
 #[allow(dead_code)] // intentional: WIP panel kept for upcoming canvas wiring
 fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Bitstream");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     let report = model.bitstream_report();
     ui.horizontal(|ui| {
         if ui.button("Generate Bitstream").clicked() {
@@ -7227,7 +7227,7 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             let _ = model.exec("report_bitstream");
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     if report.frames == 0 && report.bytes == 0 {
         ui.label(egui::RichText::new("No bitstream yet.").color(theme.dim));
         return;
@@ -7306,7 +7306,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                     .size(13.0)
                     .color(theme.dim),
             );
-            ui.add_space(6.0);
+            ui.add_space(chrome::SPACE_SM);
             if primary_button(ui, "Report DRC").clicked() {
                 let _ = model.exec("report_drc");
             }
@@ -7314,7 +7314,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         return;
     }
     let report = model.drc.clone().unwrap_or_else(|| model.drc_report());
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
     ui.label(
         egui::RichText::new(format!(
             "{} violations · {} errors",
@@ -7324,7 +7324,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         .size(12.0)
         .color(theme.dim),
     );
-    ui.add_space(4.0);
+    ui.add_space(chrome::SPACE_XS);
 
     if report.ok() {
         ui.add_space(16.0);
@@ -7455,7 +7455,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
 }
 fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.heading("Utilization");
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         if ui.button("Report utilization").clicked() {
             let _ = model.exec("report_utilization");
@@ -7469,7 +7469,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     if let Some(exp) = model.last_report_export.clone() {
         ui.label(RichText::new(exp).monospace().size(12.0).color(theme.dim));
     }
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     let report = model.utilization_report();
     if report.part.is_empty() {
         if paint_remaining_cta(ui, "No placed design yet.", "Place", theme) {
@@ -7542,7 +7542,7 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                         }
                     });
                 if !report.hierarchy.is_empty() {
-                    ui.add_space(8.0);
+                    ui.add_space(chrome::SPACE_SM);
                     ui.label(RichText::new("Hierarchical").strong());
                     let hier_col = chrome::stretched_col_w_gap(6, ui.available_width(), 8.0);
                     egui::Grid::new("utilization_hierarchy")
@@ -11730,7 +11730,7 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = model.exec("open_hw_manager");
         }
     }
-    ui.add_space(8.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.horizontal(|ui| {
         ui.label(RichText::new("Logic Analyzer").strong());
         ui.weak("probes, triggers, and captures live in the ILA view");
@@ -12005,7 +12005,7 @@ fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
     if rows.is_empty() {
         return;
     }
-    ui.add_space(6.0);
+    ui.add_space(chrome::SPACE_SM);
     ui.label(
         RichText::new("Generated HDL - instance table from helion-bd emit_sv, not a source dump")
             .strong(),
@@ -12285,7 +12285,7 @@ fn paint_testbench(ui: &mut egui::Ui, app: &mut HelionIde) {
             )
             .color(theme.dim),
         );
-        ui.add_space(8.0);
+        ui.add_space(chrome::SPACE_SM);
         paint_tb_help(ui, &theme);
         return;
     }
