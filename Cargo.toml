@@ -25,6 +25,7 @@ members = [
     "crates/helion-hls",
     "crates/helion-backend",
     "crates/helion-xilinx7",
+    "crates/helion-hl10t",
 ]
 
 [workspace.package]
