@@ -102,6 +102,29 @@ impl TimingModel {
             hold_req_ps: 500,
         }
     }
+
+    /// Lattice ECP5 LFE5U-85F.
+    ///
+    /// Preliminary calibration, NOT correlated against nextpnr-ecp5 or
+    /// Lattice Diamond yet. Order-of-magnitude placeholders for a mid speed
+    /// grade device: LUT4 arc a few hundred ps, FF clock-to-Q in the same
+    /// range, IOB pad delay under a nanosecond, per-tile routing hops around
+    /// a hundred ps. Treat every number here as a placeholder until a timing
+    /// correlation campaign against nextpnr-ecp5 placed reference designs
+    /// lands. A correlation harness should: run N reference designs through
+    /// nextpnr-ecp5, extract per-arc delays from its timing reports, and fit
+    /// these fields.
+    pub fn ecp5_85f() -> Self {
+        Self {
+            lut_ps: 350,
+            ff_ckq_ps: 250,
+            setup_ps: 150,
+            pin_ps: 50,
+            iob_ps: 800,
+            hop_ps: 100,
+            hold_req_ps: 80,
+        }
+    }
 }
 
 /// A complete FPGA implementation flow for one device family.
