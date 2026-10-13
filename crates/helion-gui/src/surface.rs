@@ -218,6 +218,23 @@ pub fn apply_more(s: &mut ChromeState, tab: WorkspaceTab) {
         return;
     }
     match chrome::pane_for_workspace(tab) {
+        WorkspacePane::Device => {
+            // Canvas tabs must sync the canvas, not just the workspace.
+            // The fuzzer caught "More Device" leaving canvas=Editor (stale).
+            s.activity = Activity::Device;
+            s.canvas = Canvas::Device;
+            s.sidebar_hidden = false;
+        }
+        WorkspacePane::Editor => {
+            s.activity = Activity::Files;
+            s.canvas = Canvas::Editor;
+            s.sidebar_hidden = false;
+        }
+        WorkspacePane::Timing => {
+            s.activity = Activity::Timing;
+            s.canvas = Canvas::Timing;
+            s.sidebar_hidden = false;
+        }
         WorkspacePane::Package => {
             s.activity = Activity::Device;
             s.canvas = Canvas::Device;
