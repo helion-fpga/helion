@@ -271,9 +271,23 @@ narrow APIs):
 
 ## Status
 
-- Analysis phase: no UI/production code changed.
+- Analysis phase: no UI/production code changed, no modules refactored.
+  Per the phase rule (fixes land after the layout grammar), every
+  structural problem below is logged for phase 2 WITH the refactor shape,
+  so the fix is never a hack on messy code:
+  - WF3.1 (VCD→waveform importer): new `vcd_to_wave` importer in `vcd.rs`
+    (extend `parse_vcd` to retain time series or parse on demand), wired
+    into `tb_open_vcd_in_waveform`; delete the write-only
+    `tb_waveform_pending` field.
+  - WF1.5 (surgical job state transfer): jobs take `Session`/engine state,
+    not a whole-`IdeModel` clone; `HelionIde` keeps view state
+    (`input`, `console`, `sdc_editor_text`, `SimIla` text fields…).
+  - WF5.1 (unify ILA): retire `IlaDashboard` + `capture_ila` from ide.rs;
+    re-home `add_probe`/`ila_arm`/`ila_dashboard` verbs onto `sim_ila`
+    (`ila.rs` stays the single backend).
+  - WF4.1 (unify SDC target): one `resolve_sdc_target()` on the model used
+    by the exec verb, the Constraints tab, and the wizard's `target_path`.
+  - `exec()` God-function (306 branches): command table/registry, one verb
+    per small fn, grouped by domain module.
 - Driver: `crates/helion-gui/tests/workflow_walk.rs` (scratch; not committed).
-- Fixes: none landed in this phase. WF3.1 (VCD→waveform importer), WF1.5
-  (surgical job state transfer), WF5.1 (unify ILA), WF4.1 (unify SDC target)
-  are all structural and belong to phase 2 with refactors, per the
-  code-quality rule.
+- Fixes: none landed in this phase.
