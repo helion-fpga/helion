@@ -11,7 +11,7 @@ use crate::qor::{QorInputs, QorReport, analyze_qor};
 use crate::{GpuiShell, ila, tcl_eval};
 use helion_bd::{BlockDesign, emit_sv, validate};
 use helion_debug::{
-    IlaArmConfig, IlaCapture, IlaCaptureDeep, IlaTriggerKind, insert_arm_capture,
+    IlaArmConfig, insert_arm_capture,
     insert_arm_capture_deep,
 };
 use helion_device::{Device, Far, Site, SiteKind};
@@ -4012,89 +4012,10 @@ impl IoPortView {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IlaTrigger {
-    Immediate,
-    Rising,
-    Falling,
-}
-
-impl IlaTrigger {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "immediate" | "any" | "now" => Ok(IlaTrigger::Immediate),
-            "rising" | "rise" | "posedge" => Ok(IlaTrigger::Rising),
-            "falling" | "fall" | "negedge" => Ok(IlaTrigger::Falling),
-            other => Err(format!("ila_trigger: unknown {other}")),
-        }
-    }
-
-    pub fn tcl(self) -> &'static str {
-        match self {
-            IlaTrigger::Immediate => "immediate",
-            IlaTrigger::Rising => "rising",
-            IlaTrigger::Falling => "falling",
-        }
-    }
-
-    /// Sample index of the trigger in a captured bit stream (fabric ILA).
-    pub fn index(self, samples: &[bool]) -> Option<usize> {
-        match self {
-            IlaTrigger::Immediate => {
-                if samples.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                }
-            }
-            IlaTrigger::Rising => samples
-                .windows(2)
-                .position(|w| !w[0] && w[1])
-                .map(|i| i + 1),
-            IlaTrigger::Falling => samples
-                .windows(2)
-                .position(|w| w[0] && !w[1])
-                .map(|i| i + 1),
-        }
-    }
-}
-
-/// UG900 Hardware Manager ILA dashboard: probe, window, trigger, capture on wave.
-#[derive(Clone, Debug)]
-pub struct IlaDashboard {
-    pub net: String,
-    pub window: usize,
-    pub trigger: IlaTrigger,
-    pub armed: bool,
-    pub bits: String,
-    pub trigger_at: Option<usize>,
-    /// Samples kept before trigger in deep fabric-BRAM arm (`ila_arm_deep`).
-    pub pre_trigger: usize,
-    /// soft_ble_out | jtag_usr1_match_fsm_rle
-    pub backend: String,
-    /// Multi-probe nets from last deep arm (single-net soft arm → one entry).
-    pub probes: Vec<String>,
-}
-
-impl Default for IlaDashboard {
-    fn default() -> Self {
-        Self {
-            net: String::new(),
-            window: 16,
-            trigger: IlaTrigger::Rising,
-            armed: false,
-            bits: String::new(),
-            trigger_at: None,
-            pre_trigger: 0,
-            backend: "soft_ble_out".into(),
-            probes: Vec::new(),
-        }
-    }
-}
 
 /// Capture lifecycle for the simulation-based ILA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SimIlaStatus {
+pub enum IlaStatus {
     Idle,
     Capturing,
     Done,
@@ -4106,10 +4027,10 @@ pub enum SimIlaStatus {
 /// thread's result channel lives in the binary (`HelionIde::ila_rx`); only the
 /// progress atomics live here so `IdeModel` stays `Clone`.
 #[derive(Clone, Debug)]
-pub struct SimIla {
+pub struct Ila {
     pub config: ila::IlaConfig,
     pub capture: Option<ila::IlaCapture>,
-    pub status: SimIlaStatus,
+    pub status: IlaStatus,
     pub progress: Option<std::sync::Arc<ila::IlaRunProgress>>,
     /// Net search text in the probe picker.
     pub search: String,
@@ -4126,12 +4047,12 @@ pub struct SimIla {
     pub last_error: Option<String>,
 }
 
-impl Default for SimIla {
+impl Default for Ila {
     fn default() -> Self {
         Self {
             config: ila::IlaConfig::default(),
             capture: None,
-            status: SimIlaStatus::Idle,
+            status: IlaStatus::Idle,
             progress: None,
             search: String::new(),
             group: Vec::new(),
@@ -4145,7 +4066,7 @@ impl Default for SimIla {
     }
 }
 
-impl SimIla {
+impl Ila {
     /// Nets available as probes: real net names, mark_debug first, then all.
     pub fn probe_net_list(&self, design: &helion_ir::Design) -> Vec<String> {
         let d = design;
@@ -4200,7 +4121,7 @@ impl SimIla {
     pub fn add_probe(&mut self, design: &helion_ir::Design, net: &str) -> Result<String, String> {
         let net = net.trim();
         if net.is_empty() {
-            return Err("ila_sim_add: empty net".into());
+            return Err("ila add: empty net".into());
         }
         let d = design;
         if self.config.probes.iter().any(|p| p.nets == [net]) {
@@ -4218,10 +4139,10 @@ impl SimIla {
     pub fn add_bus(&mut self, design: &helion_ir::Design, name: &str, nets: &[String]) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("ila_sim_bus: empty name".into());
+            return Err("ila bus: empty name".into());
         }
         if nets.is_empty() {
-            return Err("ila_sim_bus: no nets".into());
+            return Err("ila bus: no nets".into());
         }
         let d = design;
         let probe = ila::IlaProbeCfg {
@@ -4381,7 +4302,7 @@ impl SimIla {
             None => "samples=0".into(),
         };
         let prog = match (&self.status, &self.progress) {
-            (SimIlaStatus::Capturing, Some(p)) => {
+            (IlaStatus::Capturing, Some(p)) => {
                 use std::sync::atomic::Ordering;
                 format!(" progress_cycles={}", p.cycles.load(Ordering::Relaxed))
             }
@@ -4412,7 +4333,7 @@ impl SimIla {
         self.config.validate(&d)?;
         let handle = ila::spawn_sim_ila_capture(d, self.config.clone());
         self.progress = Some(handle.progress);
-        self.status = SimIlaStatus::Capturing;
+        self.status = IlaStatus::Capturing;
         self.last_error = None;
         Ok(handle.rx)
     }
@@ -4436,11 +4357,11 @@ impl SimIla {
                     self.viewer.cursor = Some(ti);
                 }
                 self.capture = Some(cap);
-                self.status = SimIlaStatus::Done;
+                self.status = IlaStatus::Done;
                 self.last_error = None;
             }
             Err(e) => {
-                self.status = SimIlaStatus::Error;
+                self.status = IlaStatus::Error;
                 self.last_error = Some(e);
             }
         }
@@ -4451,7 +4372,7 @@ impl SimIla {
     /// progress tick and returns the partial ring as a missed trigger.
     pub fn disarm(&mut self) -> Result<String, String> {
         match (&self.status, &self.progress) {
-            (SimIlaStatus::Capturing, Some(p)) => {
+            (IlaStatus::Capturing, Some(p)) => {
                 p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok("ila capture stopping…".into())
             }
@@ -4478,7 +4399,129 @@ impl SimIla {
             self.viewer.cursor = Some(ti);
         }
         self.capture = Some(cap);
-        self.status = SimIlaStatus::Done;
+        self.status = IlaStatus::Done;
+        self.last_error = None;
+        Ok(msg)
+    }
+
+
+    /// Hardware-backed capture on the unified ILA model.
+    ///
+    /// Runs the helion-debug arm engines over the configured probes and
+    /// stores the result as a normal [`ila::IlaCapture`], so hardware
+    /// captures display in the same viewer as sim captures. `deep` selects
+    /// the JTAG/BRAM engine (needs hardware; fails loud without it);
+    /// otherwise the soft fabric-model engine is used.
+    pub fn capture_hw(
+        &mut self,
+        dev: &helion_device::Device,
+        design: &helion_ir::Design,
+        deep: bool,
+    ) -> Result<String, String> {
+        if self.config.probes.is_empty() {
+            return Err("ila arm: no probes configured (ila add <net>)".into());
+        }
+        let hw_trigger = match self.config.trigger.kind {
+            ila::IlaTriggerKind::Immediate => helion_debug::IlaTriggerKind::Immediate,
+            ila::IlaTriggerKind::Rising => helion_debug::IlaTriggerKind::Rising,
+            ila::IlaTriggerKind::Falling => helion_debug::IlaTriggerKind::Falling,
+            ila::IlaTriggerKind::ValueMatch { .. } => {
+                return Err(
+                    "ila arm: value-match triggers need the sim capture path (ila capture)"
+                        .into(),
+                )
+            }
+        };
+        let depth = self.config.depth.max(1);
+        let trig_probe = self.config.trigger.probe;
+        let cap = if deep {
+            let nets: Vec<String> = self
+                .config
+                .probes
+                .iter()
+                .flat_map(|p| p.nets.clone())
+                .collect();
+            let trigger_net = self
+                .config
+                .probes
+                .get(trig_probe)
+                .and_then(|p| p.nets.first())
+                .cloned()
+                .unwrap_or_else(|| nets[0].clone());
+            let cfg = IlaArmConfig {
+                nets: nets.clone(),
+                window: depth,
+                trigger: hw_trigger,
+                trigger_net,
+                pre_trigger: 0,
+            };
+            let dcap = insert_arm_capture_deep(dev, design, &cfg)?;
+            let probes: Vec<ila::IlaProbeCfg> = dcap
+                .probes
+                .iter()
+                .map(|n| ila::IlaProbeCfg::scalar(n, n))
+                .collect();
+            let samples: Vec<Vec<u64>> = (0..dcap.probes.len())
+                .map(|pi| dcap.samples.iter().map(|s| s[pi] as u64).collect())
+                .collect();
+            let n = samples.first().map(|s| s.len()).unwrap_or(0);
+            ila::IlaCapture {
+                probes,
+                samples,
+                valid: vec![vec![true; n]; dcap.probes.len()],
+                timescale_ps: self.config.timescale_ps,
+                clock_net: self.config.clock_net.clone(),
+                trigger_sample: dcap.trigger_at,
+                cycles_run: n as u32,
+                found_trigger: dcap.trigger_at.is_some(),
+            }
+        } else {
+            let mut probes = Vec::new();
+            let mut samples: Vec<Vec<u64>> = Vec::new();
+            for p in &self.config.probes {
+                for net in &p.nets {
+                    let hcap = insert_arm_capture(dev, design, net, depth)?;
+                    probes.push(ila::IlaProbeCfg::scalar(net, net));
+                    samples.push(hcap.samples.iter().map(|b| *b as u64).collect());
+                }
+            }
+            let trig_idx = trig_probe.min(samples.len().saturating_sub(1));
+            let trigger_sample = samples
+                .get(trig_idx)
+                .and_then(|s| ila::find_trigger(s, &self.config.trigger.kind));
+            let n = samples.first().map(|s| s.len()).unwrap_or(0);
+            let np = samples.len();
+            ila::IlaCapture {
+                probes,
+                samples,
+                valid: vec![vec![true; n]; np],
+                timescale_ps: self.config.timescale_ps,
+                clock_net: self.config.clock_net.clone(),
+                trigger_sample,
+                cycles_run: n as u32,
+                found_trigger: trigger_sample.is_some(),
+            }
+        };
+        if cap.is_empty() {
+            self.status = IlaStatus::Error;
+            self.last_error = Some("ila arm: capture returned no samples".into());
+            return Err("ila arm: capture returned no samples".into());
+        }
+        let msg = format!(
+            "ila arm probes={} samples={} trigger={} deep={}",
+            cap.probes.len(),
+            cap.len(),
+            cap.trigger_sample
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into()),
+            deep,
+        );
+        self.viewer = ila::IlaViewer::fit(cap.len().max(1), 800.0);
+        if let Some(ti) = cap.trigger_sample {
+            self.viewer.cursor = Some(ti);
+        }
+        self.capture = Some(cap);
+        self.status = IlaStatus::Done;
         self.last_error = None;
         Ok(msg)
     }
@@ -4534,7 +4577,7 @@ impl SimIla {
                     800.0,
                 );
                 self.capture = s.capture;
-                self.status = SimIlaStatus::Done;
+                self.status = IlaStatus::Done;
                 self.session_path = path.clone();
                 return Err(format!("ila session loaded with warnings: {e}"));
             }
@@ -4547,9 +4590,9 @@ impl SimIla {
         );
         self.capture = s.capture;
         self.status = if self.capture.is_some() {
-            SimIlaStatus::Done
+            IlaStatus::Done
         } else {
-            SimIlaStatus::Idle
+            IlaStatus::Idle
         };
         self.last_error = None;
         self.session_path = path.clone();
@@ -4675,15 +4718,6 @@ impl HwStatReport {
         }
         s
     }
-}
-
-/// One ILA capture sample (fabric bit at the armed net, not a lamp).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IlaSampleRow {
-    pub sample: usize,
-    pub time_ps: u64,
-    pub value: char,
-    pub trigger: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -5775,7 +5809,6 @@ pub struct IdeModel {
     pub console_find_hits: Vec<usize>,
     pub io_ports: Vec<IoPortView>,
     pub hw: HwManager,
-    pub ila: IlaDashboard,
     pub ip_catalog: Vec<IpCore>,
     /// UG893 IP Catalog selected core name.
     pub selected_ip: Option<String>,
@@ -5952,7 +5985,7 @@ pub struct IdeModel {
     event_sim: Option<Sim>,
     fabric_sim: Option<Fabric>,
     /// Simulation-based ILA (logic analyzer): probes, trigger, capture, viewer.
-    pub sim_ila: SimIla,
+    pub ila: Ila,
 }
 
 impl Default for IdeModel {
@@ -6028,7 +6061,6 @@ impl IdeModel {
             console_find_hits: Vec::new(),
             io_ports: Vec::new(),
             hw: HwManager::default(),
-            ila: IlaDashboard::default(),
             ip_catalog: ipxact_catalog(),
             selected_ip: None,
             generated_ip_xml: None,
@@ -6122,7 +6154,7 @@ impl IdeModel {
             auto_checkpoint: false,
             event_sim: None,
             fabric_sim: None,
-            sim_ila: SimIla::default(),
+            ila: Ila::default(),
         };
         // Vivado shows the part floorplan before sources exist - HAD
         // sites, not empty chrome.
@@ -6386,6 +6418,158 @@ impl IdeModel {
         self.utilization_report().text()
     }
 
+    /// Unified `ila` Tcl namespace. One model, one trigger config, one
+    /// viewer: `capture` runs the sim engine, `arm`/`arm_deep` run the
+    /// hardware engines, all landing in the same [`ila::IlaCapture`].
+    pub fn exec_ila(&mut self, rest: &str) -> Result<String, String> {
+        let mut parts = rest.split_whitespace();
+        let sub = parts.next().unwrap_or("status");
+        let arg = rest.strip_prefix(sub).unwrap_or("").trim();
+        match sub {
+            "add" => {
+                let net = arg.to_string();
+                let d = self
+                    .shell
+                    .session
+                    .design
+                    .clone()
+                    .ok_or_else(|| "ila: no design".to_string())?;
+                let r = self.ila.add_probe(&d, &net);
+                self.workspace = WorkspaceTab::Ila;
+                r
+            }
+            "bus" => {
+                let mut p = arg.split_whitespace();
+                let name = p.next().unwrap_or("").to_string();
+                let nets: Vec<String> = p.map(|s| s.to_string()).collect();
+                let d = self
+                    .shell
+                    .session
+                    .design
+                    .clone()
+                    .ok_or_else(|| "ila: no design".to_string())?;
+                let r = self.ila.add_bus(&d, &name, &nets);
+                self.workspace = WorkspaceTab::Ila;
+                r
+            }
+            "remove" => {
+                let idx: usize = arg
+                    .parse()
+                    .map_err(|_| format!("ila remove: bad index {arg}"))?;
+                self.ila.remove_probe(idx)
+            }
+            "trigger" => {
+                let mut p = arg.split_whitespace();
+                let kind = p.next().unwrap_or("immediate");
+                let probe = p.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                self.ila.set_trigger_probe(probe)?;
+                let k = ila::IlaTriggerKind::parse(kind)?;
+                if let ila::IlaTriggerKind::ValueMatch { .. } = k {
+                    if let Some(v) = p.next() {
+                        self.ila.trig_value_text = v.to_string();
+                    }
+                    if let Some(m) = p.next() {
+                        self.ila.trig_mask_text = m.to_string();
+                    }
+                }
+                self.ila.set_trigger_kind(k)
+            }
+            "trigger_at" => {
+                let mut p = arg.split_whitespace();
+                let probe: usize = p
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("ila trigger_at: need <probe> <sample>")?;
+                let sample: usize = p
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("ila trigger_at: need <probe> <sample>")?;
+                self.ila.set_trigger_from_wave(probe, sample)
+            }
+            "depth" => {
+                let n: usize = arg
+                    .parse()
+                    .map_err(|_| format!("ila depth: bad depth {arg}"))?;
+                self.ila.config.depth = n;
+                Ok(format!("ila depth {n}"))
+            }
+            "preratio" => {
+                let r: f32 = arg
+                    .parse()
+                    .map_err(|_| format!("ila preratio: bad ratio {arg}"))?;
+                self.ila.config.pre_ratio = r;
+                Ok(format!("ila pre_ratio {r}"))
+            }
+            "clock" => {
+                self.ila.config.clock_net = arg.to_string();
+                Ok(format!("ila clock {arg}"))
+            }
+            "radix" => {
+                let mut p = arg.split_whitespace();
+                let idx: usize = p
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("ila radix: need <probe> <bin|hex|dec>")?;
+                let radix = ila::IlaRadix::parse(p.next().unwrap_or("bin"))?;
+                let pr = self
+                    .ila
+                    .config
+                    .probes
+                    .get_mut(idx)
+                    .ok_or_else(|| format!("ila radix: no probe {idx}"))?;
+                pr.radix = radix;
+                Ok(format!("ila radix {} {}", pr.name, radix.label()))
+            }
+            "capture" => {
+                let d = self
+                    .shell
+                    .session
+                    .design
+                    .clone()
+                    .ok_or_else(|| "ila: no design".to_string())?;
+                let r = self.ila.capture_sync(&d);
+                self.workspace = WorkspaceTab::Ila;
+                r
+            }
+            "arm" | "arm_deep" => {
+                let d = self
+                    .shell
+                    .session
+                    .design
+                    .clone()
+                    .ok_or_else(|| "ila: no design".to_string())?;
+                let dev = self.device()?;
+                let r = self.ila.capture_hw(&dev, &d, sub == "arm_deep");
+                self.workspace = WorkspaceTab::Ila;
+                r
+            }
+            "disarm" => self.ila.disarm(),
+            "status" => Ok(self.ila.status_text()),
+            "save" => {
+                let pp = self.last_project_path.clone();
+                self.ila.save_session(pp.as_deref(), arg)
+            }
+            "load" => {
+                let d = self.shell.session.design.clone();
+                let pp = self.last_project_path.clone();
+                let r = self.ila.load_session(d.as_ref(), pp.as_deref(), arg);
+                self.workspace = WorkspaceTab::Ila;
+                r
+            }
+            "export_vcd" => {
+                let cap = self
+                    .ila
+                    .capture
+                    .clone()
+                    .ok_or_else(|| "ila: no capture to export".to_string())?;
+                ila::export_vcd(std::path::Path::new(arg), &cap)?;
+                Ok(format!("ila vcd exported {arg}"))
+            }
+            other => Err(format!(
+                "ila: unknown subcommand {other} (add, bus, remove, trigger, trigger_at, depth, preratio, clock, radix, capture, arm, arm_deep, disarm, status, save, load, export_vcd)"
+            )),
+        }
+    }
     /// Console entry point: a raw command string routed onto the real Session.
     pub fn exec(&mut self, cmd: &str) -> Result<String, String> {
         let t = cmd.trim();
@@ -7062,161 +7246,12 @@ impl IdeModel {
                 let _ = self.create_block_design();
             }
             Ok(self.bd_hdl_text())
-        } else if let Some(rest) = t.strip_prefix("ila_capture ") {
-            let mut parts = rest.split_whitespace();
-            let net = parts.next().unwrap_or("led");
-            let n = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(self.ila.window);
-            self.capture_ila(net, n)
-        } else if let Some(rest) = t.strip_prefix("ila_sim_add ") {
-            let net = rest.trim().to_string();
-            let d = self
-                .shell
-                .session
-                .design
-                .clone()
-                .ok_or_else(|| "ila: no design".to_string())?;
-            let r = self.sim_ila.add_probe(&d, &net);
-            self.workspace = WorkspaceTab::Ila;
-            r
-        } else if let Some(rest) = t.strip_prefix("ila_sim_bus ") {
-            let mut parts = rest.split_whitespace();
-            let name = parts.next().unwrap_or("").to_string();
-            let nets: Vec<String> = parts.map(|s| s.to_string()).collect();
-            let d = self
-                .shell
-                .session
-                .design
-                .clone()
-                .ok_or_else(|| "ila: no design".to_string())?;
-            let r = self.sim_ila.add_bus(&d, &name, &nets);
-            self.workspace = WorkspaceTab::Ila;
-            r
-        } else if let Some(rest) = t.strip_prefix("ila_sim_remove ") {
-            let idx: usize = rest
-                .trim()
-                .parse()
-                .map_err(|_| format!("ila_sim_remove: bad index {rest}"))?;
-            self.sim_ila.remove_probe(idx)
-        } else if let Some(rest) = t.strip_prefix("ila_sim_trigger ") {
-            let mut parts = rest.split_whitespace();
-            let kind = parts.next().unwrap_or("immediate");
-            let probe = parts
-                .next()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-            self.sim_ila.set_trigger_probe(probe)?;
-            let k = ila::IlaTriggerKind::parse(kind)?;
-            if let ila::IlaTriggerKind::ValueMatch { .. } = k {
-                if let Some(v) = parts.next() {
-                    self.sim_ila.trig_value_text = v.to_string();
-                }
-                if let Some(m) = parts.next() {
-                    self.sim_ila.trig_mask_text = m.to_string();
-                }
-            }
-            self.sim_ila.set_trigger_kind(k)
-        } else if let Some(rest) = t.strip_prefix("ila_sim_depth ") {
-            let n: usize = rest
-                .trim()
-                .parse()
-                .map_err(|_| format!("ila_sim_depth: bad depth {rest}"))?;
-            self.sim_ila.config.depth = n;
-            Ok(format!("ila depth {n}"))
-        } else if let Some(rest) = t.strip_prefix("ila_sim_preratio ") {
-            let r: f32 = rest
-                .trim()
-                .parse()
-                .map_err(|_| format!("ila_sim_preratio: bad ratio {rest}"))?;
-            self.sim_ila.config.pre_ratio = r;
-            Ok(format!("ila pre_ratio {r}"))
-        } else if let Some(rest) = t.strip_prefix("ila_sim_clock ") {
-            self.sim_ila.config.clock_net = rest.trim().to_string();
-            Ok(format!("ila clock {}", rest.trim()))
-        } else if let Some(rest) = t.strip_prefix("ila_sim_radix ") {
-            let mut parts = rest.split_whitespace();
-            let idx: usize = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or("ila_sim_radix: need <probe> <bin|hex|dec>")?;
-            let radix = ila::IlaRadix::parse(parts.next().unwrap_or("bin"))?;
-            let p = self
-                .sim_ila
-                .config
-                .probes
-                .get_mut(idx)
-                .ok_or_else(|| format!("ila_sim_radix: no probe {idx}"))?;
-            p.radix = radix;
-            Ok(format!("ila radix {} {}", p.name, radix.label()))
-        } else if t == "ila_sim_capture" {
-            let d = self
-                .shell
-                .session
-                .design
-                .clone()
-                .ok_or_else(|| "ila: no design".to_string())?;
-            let r = self.sim_ila.capture_sync(&d);
-            self.workspace = WorkspaceTab::Ila;
-            r
-        } else if t == "ila_sim_disarm" {
-            self.sim_ila.disarm()
-        } else if let Some(rest) = t.strip_prefix("ila_sim_trigger_at ") {
-            let mut parts = rest.split_whitespace();
-            let probe: usize = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or("ila_sim_trigger_at: need <probe> <sample>")?;
-            let sample: usize = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or("ila_sim_trigger_at: need <probe> <sample>")?;
-            self.sim_ila.set_trigger_from_wave(probe, sample)
-        } else if let Some(rest) = t.strip_prefix("ila_sim_export_vcd ") {
-            let path = rest.trim().to_string();
-            let cap = self
-                .sim_ila
-                .capture
-                .clone()
-                .ok_or_else(|| "ila: no capture to export".to_string())?;
-            ila::export_vcd(std::path::Path::new(&path), &cap)?;
-            Ok(format!("ila vcd exported {path}"))
-        } else if t == "ila_sim_status" {
-            Ok(self.sim_ila.status_text())
-        } else if let Some(rest) = t.strip_prefix("ila_sim_save ") {
-            let path = rest.trim().to_string();
-            let pp = self.last_project_path.clone();
-            self.sim_ila.save_session(pp.as_deref(), &path)
-        } else if t == "ila_sim_save" {
-            let pp = self.last_project_path.clone();
-            let path = self.sim_ila.default_session_path(pp.as_deref());
-            self.sim_ila.save_session(pp.as_deref(), &path)
-        } else if let Some(rest) = t.strip_prefix("ila_sim_load ") {
-            let path = rest.trim().to_string();
-            let d = self.shell.session.design.clone();
-            let pp = self.last_project_path.clone();
-            let r = self.sim_ila.load_session(d.as_ref(), pp.as_deref(), &path);
-            self.workspace = WorkspaceTab::Ila;
-            r
-        } else if t == "ila_sim_load" {
-            let pp = self.last_project_path.clone();
-            let path = self.sim_ila.default_session_path(pp.as_deref());
-            let d = self.shell.session.design.clone();
-            let r = self.sim_ila.load_session(d.as_ref(), pp.as_deref(), &path);
-            self.workspace = WorkspaceTab::Ila;
-            r
-        } else if t == "ila_arm_deep" || t.starts_with("ila_arm_deep ") {
-            self.ila_arm_deep(t.strip_prefix("ila_arm_deep").unwrap_or("").trim())
-        } else if t == "ila_arm" || t.starts_with("ila_arm ") {
-            self.ila_arm(t.strip_prefix("ila_arm").unwrap_or("").trim())
+        } else if t == "ila" || t.starts_with("ila ") {
+            self.exec_ila(t.strip_prefix("ila").unwrap_or("").trim())
         } else if t == "mark_debug" || t.starts_with("mark_debug ") {
             self.mark_debug_net(t.strip_prefix("mark_debug").unwrap_or("").trim())
         } else if t == "add_probe" || t.starts_with("add_probe ") {
             self.add_probe(t.strip_prefix("add_probe").unwrap_or("").trim())
-        } else if t == "ila_dashboard" {
-            self.workspace = WorkspaceTab::Hardware;
-            Ok(self.ila_dashboard_text())
         } else if t == "open_hw_manager" {
             let r = tcl_eval(&mut self.shell, t);
             self.workspace = WorkspaceTab::Hardware;
@@ -7245,16 +7280,6 @@ impl IdeModel {
             self.select_hw_stat(spec.trim())
         } else if t == "select_hw_stat" {
             self.select_hw_stat("")
-        } else if let Some(spec) = t.strip_prefix("select_ila_sample ") {
-            self.select_ila_sample(spec.trim())
-        } else if t == "select_ila_sample" {
-            self.select_ila_sample("0")
-        } else if let Some(rest) = t.strip_prefix("ila_trigger ") {
-            self.set_ila_trigger(rest)
-        } else if let Some(rest) = t.strip_prefix("ila_pre_trigger ") {
-            self.set_ila_pre_trigger(rest)
-        } else if let Some(rest) = t.strip_prefix("ila_window ") {
-            self.set_ila_window(rest)
         } else if t == "expand_cone" || t.starts_with("expand_cone ") {
             self.expand_cone(t.strip_prefix("expand_cone").unwrap_or("").trim())
         } else if t == "collapse_cone" {
@@ -22394,160 +22419,9 @@ impl IdeModel {
         }
     }
 
-    pub fn capture_ila(&mut self, net: &str, n: usize) -> Result<String, String> {
-        let d = self
-            .shell
-            .session
-            .design
-            .clone()
-            .ok_or("ila_capture: no design")?;
-        let dev = self.device()?;
-        let n = n.max(1);
-        self.ila.armed = true;
-        let cap: IlaCapture = insert_arm_capture(&dev, &d, net, n)?;
-        let bits: String = cap
-            .samples
-            .iter()
-            .map(|b| if *b { '1' } else { '0' })
-            .collect();
-        let tname = format!("ila:{}", cap.net);
-        let samples: Vec<u64> = cap.samples.iter().map(|b| u64::from(*b)).collect();
-        if let Some(t) = self.wave.traces.iter_mut().find(|t| t.name == tname) {
-            t.samples = samples;
-            t.width = 1;
-        } else {
-            let mut t = WaveTrace::scalar(tname);
-            t.samples = samples;
-            self.wave.traces.push(t);
-        }
-        self.ila.net = cap.net.clone();
-        self.ila.window = cap.samples.len();
-        self.ila.bits = bits.clone();
-        self.ila.armed = false;
-        self.ila.backend = "soft_ble_out".into();
-        self.ila.probes = vec![cap.net.clone()];
-        self.ila.pre_trigger = 0;
-        self.apply_ila_trigger_to_wave();
-        self.workspace = WorkspaceTab::Hardware;
-        self.hw.open = true;
-        let at = self
-            .ila
-            .trigger_at
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "-".into());
-        Ok(format!(
-            "ila_capture net={} samples={} bits={bits} trigger={} trigger_at={at}",
-            cap.net,
-            cap.samples.len(),
-            self.ila.trigger.tcl()
-        ))
-    }
 
-    pub fn ila_dashboard_text(&self) -> String {
-        let at = self
-            .ila
-            .trigger_at
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "-".into());
-        let captured = if self.ila.bits.is_empty() {
-            0
-        } else {
-            self.ila.bits.len()
-        };
-        let probes = if self.ila.probes.is_empty() {
-            "-".into()
-        } else {
-            self.ila.probes.join(",")
-        };
-        let mut s = format!(
-            "ila dashboard net={} window={} trigger={} armed={} captured={} trigger_at={} pre_trigger={} backend={} probes={} bits={}",
-            if self.ila.net.is_empty() {
-                "-"
-            } else {
-                self.ila.net.as_str()
-            },
-            self.ila.window,
-            self.ila.trigger.tcl(),
-            u8::from(self.ila.armed),
-            captured,
-            at,
-            self.ila.pre_trigger,
-            if self.ila.backend.is_empty() {
-                "-"
-            } else {
-                self.ila.backend.as_str()
-            },
-            probes,
-            if self.ila.bits.is_empty() {
-                "-"
-            } else {
-                self.ila.bits.as_str()
-            }
-        );
-        for r in self.ila_sample_rows() {
-            s.push_str(&format!(
-                "\n{} SAMPLE={} TIME_PS={} VALUE={} MARKER={}",
-                r.sample,
-                r.sample,
-                r.time_ps,
-                r.value,
-                if r.trigger { "TRIGGER" } else { "-" }
-            ));
-        }
-        s
-    }
 
-    /// UG900 ILA dashboard rows: each fabric sample of the armed net.
-    pub fn ila_sample_rows(&self) -> Vec<IlaSampleRow> {
-        let ts = self.wave.timescale_ps.max(1);
-        self.ila
-            .bits
-            .chars()
-            .enumerate()
-            .map(|(i, value)| IlaSampleRow {
-                sample: i,
-                time_ps: i as u64 * ts,
-                value,
-                trigger: self.ila.trigger_at == Some(i),
-            })
-            .collect()
-    }
 
-    pub fn select_ila_sample(&mut self, spec: &str) -> Result<String, String> {
-        let rows = self.ila_sample_rows();
-        if rows.is_empty() {
-            return Err("select_ila_sample: no capture".into());
-        }
-        let spec = spec.trim();
-        let i: usize = if spec.is_empty() {
-            0
-        } else {
-            spec.parse()
-                .map_err(|_| format!("select_ila_sample: bad sample {spec}"))?
-        };
-        let row = rows
-            .get(i)
-            .ok_or_else(|| format!("select_ila_sample: no sample {spec}"))?;
-        self.wave.set_cursor(row.sample);
-        self.workspace = WorkspaceTab::Hardware;
-        self.selected = Some(format!("ila:{}", self.ila.net));
-        self.properties = vec![
-            ("NAME".into(), format!("ila:{}", self.ila.net)),
-            ("TYPE".into(), "ila_sample".into()),
-            ("SAMPLE".into(), row.sample.to_string()),
-            ("TIME_PS".into(), row.time_ps.to_string()),
-            ("VALUE".into(), row.value.to_string()),
-            ("TRIGGER".into(), u8::from(row.trigger).to_string()),
-            ("NET".into(), self.ila.net.clone()),
-        ];
-        Ok(format!(
-            "ila_sample SAMPLE={} TIME_PS={} VALUE={} MARKER={}",
-            row.sample,
-            row.time_ps,
-            row.value,
-            if row.trigger { "TRIGGER" } else { "-" }
-        ))
-    }
 
     /// UG893 Hardware Manager STAT table from helion-hw TAP / fabric Stat.
     /// Program with explicit cable (`auto|sim|usb|ofl|native`) via helion-hw backends.
@@ -22654,155 +22528,10 @@ impl IdeModel {
         ))
     }
 
-    pub fn set_ila_trigger(&mut self, spec: &str) -> Result<String, String> {
-        self.ila.trigger = IlaTrigger::parse(spec)?;
-        self.apply_ila_trigger_to_wave();
-        self.workspace = WorkspaceTab::Hardware;
-        Ok(self.ila_dashboard_text())
-    }
 
-    pub fn set_ila_window(&mut self, spec: &str) -> Result<String, String> {
-        let n: usize = spec
-            .trim()
-            .parse()
-            .map_err(|_| format!("ila_window: not a count {spec}"))?;
-        if n == 0 {
-            return Err("ila_window: need >= 1".into());
-        }
-        self.ila.window = n;
-        self.workspace = WorkspaceTab::Hardware;
-        Ok(self.ila_dashboard_text())
-    }
 
-    pub fn set_ila_pre_trigger(&mut self, spec: &str) -> Result<String, String> {
-        let n: usize = spec
-            .trim()
-            .parse()
-            .map_err(|_| format!("ila_pre_trigger: not a count {spec}"))?;
-        if n >= self.ila.window {
-            return Err(format!(
-                "ila_pre_trigger: need < window ({})",
-                self.ila.window
-            ));
-        }
-        self.ila.pre_trigger = n;
-        self.workspace = WorkspaceTab::Hardware;
-        Ok(self.ila_dashboard_text())
-    }
 
-    /// Deep arm: match-unit/FSM IP + fabric BRAM fill + IR_USR1 JTAG DR upload.
-    pub fn capture_ila_deep(&mut self, nets: &[String], n: usize) -> Result<String, String> {
-        let d = self
-            .shell
-            .session
-            .design
-            .clone()
-            .ok_or("ila_arm_deep: no design")?;
-        let dev = self.device()?;
-        let n = n.max(1);
-        let nets: Vec<String> = if nets.is_empty() {
-            vec![self.default_ila_probe()]
-        } else {
-            nets.to_vec()
-        };
-        let trigger = match self.ila.trigger {
-            IlaTrigger::Immediate => IlaTriggerKind::Immediate,
-            IlaTrigger::Rising => IlaTriggerKind::Rising,
-            IlaTrigger::Falling => IlaTriggerKind::Falling,
-        };
-        let trigger_net = nets[0].clone();
-        let cfg = IlaArmConfig {
-            nets: nets.clone(),
-            window: n,
-            trigger,
-            trigger_net: trigger_net.clone(),
-            pre_trigger: self.ila.pre_trigger,
-        };
-        self.ila.armed = true;
-        let cap: IlaCaptureDeep = insert_arm_capture_deep(&dev, &d, &cfg)?;
-        let trig_idx = cap
-            .probes
-            .iter()
-            .position(|p| p == &trigger_net)
-            .unwrap_or(0);
-        let bits: String = cap
-            .samples
-            .iter()
-            .map(|s| {
-                if s.get(trig_idx).copied().unwrap_or(false) {
-                    '1'
-                } else {
-                    '0'
-                }
-            })
-            .collect();
-        // Primary trigger probe on wave; extra probes as ila:<net>.
-        for (pi, pname) in cap.probes.iter().enumerate() {
-            let tname = format!("ila:{pname}");
-            let samples: Vec<u64> = cap
-                .samples
-                .iter()
-                .map(|s| u64::from(s.get(pi).copied().unwrap_or(false)))
-                .collect();
-            if let Some(t) = self.wave.traces.iter_mut().find(|t| t.name == tname) {
-                t.samples = samples;
-                t.width = 1;
-            } else {
-                let mut t = WaveTrace::scalar(tname);
-                t.samples = samples;
-                self.wave.traces.push(t);
-            }
-        }
-        self.ila.net = trigger_net;
-        self.ila.window = cap.samples.len();
-        self.ila.bits = bits.clone();
-        self.ila.armed = false;
-        self.ila.backend = cap.backend.into();
-        self.ila.probes = cap.probes.clone();
-        self.ila.pre_trigger = cap.pre_trigger;
-        self.ila.trigger_at = cap.trigger_at;
-        if let Some(i) = self.ila.trigger_at {
-            self.wave.set_cursor(i);
-        }
-        self.workspace = WorkspaceTab::Hardware;
-        self.hw.open = true;
-        let at = self
-            .ila
-            .trigger_at
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "-".into());
-        Ok(format!(
-            "ila_arm_deep net={} probes={} samples={} bits={bits} trigger={} trigger_at={at} pre_trigger={} backend={} bram_major={} upload_dr={} upload_raw={}",
-            self.ila.net,
-            cap.probes.join(","),
-            cap.samples.len(),
-            self.ila.trigger.tcl(),
-            cap.pre_trigger,
-            cap.backend,
-            cap.bram_major,
-            cap.upload_dr_scans,
-            cap.upload_raw_scans
-        ))
-    }
 
-    pub fn ila_arm_deep(&mut self, spec: &str) -> Result<String, String> {
-        let mut nets = Vec::new();
-        let mut window = None;
-        for tok in spec.split_whitespace() {
-            if let Ok(n) = tok.parse::<usize>() {
-                window = Some(n);
-            } else {
-                for part in tok.split(',') {
-                    let p = part.trim();
-                    if !p.is_empty() {
-                        nets.push(p.to_string());
-                    }
-                }
-            }
-        }
-        let n = window.unwrap_or(self.ila.window);
-        self.capture_ila_deep(&nets, n)
-    }
 
     /// Prefer mark_debug nets, then last armed, then cnt_3/q3/led if present in the design.
     pub fn default_ila_probe(&self) -> String {
@@ -22811,20 +22540,13 @@ impl IdeModel {
             if let Some(n) = marked.first() {
                 return n.clone();
             }
-            if !self.ila.net.is_empty() && d.nets.iter().any(|n| n.name == self.ila.net) {
-                return self.ila.net.clone();
-            }
             for cand in ["cnt_3", "q3", "led", "q", "cnt_0", "q0"] {
                 if d.nets.iter().any(|n| n.name == cand) {
                     return cand.to_string();
                 }
             }
         }
-        if self.ila.net.is_empty() {
-            "led".into()
-        } else {
-            self.ila.net.clone()
-        }
+        "led".into()
     }
 
     /// Net selected on Device / Schematic / Netlist for UG908 Mark Debug / Add Probe.
@@ -22867,7 +22589,7 @@ impl IdeModel {
         Ok(format!("mark_debug {net}"))
     }
 
-    /// UG908 Add Probe: ensure mark_debug, bind ILA probe, open Hardware.
+    /// UG908 Add Probe: ensure mark_debug, bind ILA probe, open the ILA view.
     pub fn add_probe(&mut self, spec: &str) -> Result<String, String> {
         let net = {
             let s = spec.trim();
@@ -22893,9 +22615,11 @@ impl IdeModel {
         if !already {
             self.shell.session.mark_debug(&net)?;
         }
-        self.ila.net = net.clone();
+        if let Some(d) = self.shell.session.design.clone() {
+            let _ = self.ila.add_probe(&d, &net);
+        }
         self.select(&net);
-        self.workspace = WorkspaceTab::Hardware;
+        self.workspace = WorkspaceTab::Ila;
         Ok(format!("add_probe net={net}"))
     }
 
@@ -22915,41 +22639,19 @@ impl IdeModel {
         } else {
             format!("md:{}(+{}) ", md[0], md.len() - 1)
         };
-        if self.ila.armed {
-            let net = if self.ila.net.is_empty() {
-                "…"
-            } else {
-                self.ila.net.as_str()
-            };
-            return format!("{md_part}ILA arming {net}");
-        }
-        if !self.ila.bits.is_empty() {
-            return format!("{md_part}ILA {}×{}", self.ila.net, self.ila.bits.len());
-        }
-        format!("{md_part}ILA -")
+        let ila_part = match self.ila.status {
+            IlaStatus::Capturing => "ILA capturing".to_string(),
+            IlaStatus::Done => {
+                let n = self.ila.capture.as_ref().map(|c| c.len()).unwrap_or(0);
+                format!("ILA {n} samples")
+            }
+            IlaStatus::Error => "ILA error".to_string(),
+            IlaStatus::Idle => "ILA -".to_string(),
+        };
+        format!("{md_part}{ila_part}")
     }
 
-    pub fn ila_arm(&mut self, spec: &str) -> Result<String, String> {
-        let mut parts = spec.split_whitespace();
-        let net = parts
-            .next()
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.default_ila_probe());
-        let n = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.ila.window);
-        self.capture_ila(&net, n)
-    }
 
-    fn apply_ila_trigger_to_wave(&mut self) {
-        let samples: Vec<bool> = self.ila.bits.chars().map(|c| c == '1').collect();
-        self.ila.trigger_at = self.ila.trigger.index(&samples);
-        if let Some(i) = self.ila.trigger_at {
-            self.wave.set_cursor(i);
-        }
-    }
 
     /// Independent fabric LED string, same path as `helion run`.
     pub fn fabric_led_bits(&self, cycles: u32) -> Result<String, String> {
@@ -24742,26 +24444,6 @@ impl IdeModel {
                 props.push(("IR".into(), format!("{:#04x}", report.ir)));
                 props.push(("PROGRAMMED".into(), u8::from(report.programmed).to_string()));
             }
-            if let Some(net) = id.strip_prefix("ila:") {
-                if net == self.ila.net {
-                    if let Some(row) = self
-                        .ila_sample_rows()
-                        .into_iter()
-                        .find(|r| r.sample == self.wave.cursor)
-                    {
-                        if !props.iter().any(|(k, _)| k == "TYPE") {
-                            props.retain(|(k, _)| k != "NAME");
-                            props.insert(0, ("NAME".into(), id.clone()));
-                            props.insert(1, ("TYPE".into(), "ila_sample".into()));
-                        }
-                        props.push(("SAMPLE".into(), row.sample.to_string()));
-                        props.push(("TIME_PS".into(), row.time_ps.to_string()));
-                        props.push(("VALUE".into(), row.value.to_string()));
-                        props.push(("TRIGGER".into(), u8::from(row.trigger).to_string()));
-                        props.push(("NET".into(), self.ila.net.clone()));
-                    }
-                }
-            }
         }
         if self.workspace == WorkspaceTab::Constraints {
             if let Some(row) = self.constraint_rows().into_iter().find(|r| r.id == id) {
@@ -25299,7 +24981,7 @@ mod tests {
     /// Sim ILA: exec-driven probe setup, trigger config, sync capture, and
     /// session save/load round-trip on the real synthesized counter design.
     #[test]
-    fn sim_ila_exec_flow_captures_trigger_and_roundtrips_session() {
+    fn ila_exec_flow_captures_trigger_and_roundtrips_session() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
@@ -25309,48 +24991,48 @@ mod tests {
         );
 
         // Probe setup: scalar + bus.
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        assert!(ide.exec("ila_sim_add cnt_3").unwrap().contains("(already)"));
-        ide.exec("ila_sim_bus cntbus cnt_3 cnt_2 cnt_1 cnt_0").unwrap();
-        assert_eq!(ide.sim_ila.config.probes.len(), 2);
-        assert_eq!(ide.sim_ila.config.probes[1].width(), 4);
+        ide.exec("ila add cnt_3").unwrap();
+        assert!(ide.exec("ila add cnt_3").unwrap().contains("(already)"));
+        ide.exec("ila bus cntbus cnt_3 cnt_2 cnt_1 cnt_0").unwrap();
+        assert_eq!(ide.ila.config.probes.len(), 2);
+        assert_eq!(ide.ila.config.probes[1].width(), 4);
 
         // Trigger: rising edge on probe 0 (q3).
-        ide.exec("ila_sim_trigger rising 0").unwrap();
-        ide.exec("ila_sim_depth 32").unwrap();
-        ide.exec("ila_sim_preratio 0.25").unwrap();
-        ide.exec("ila_sim_radix 1 hex").unwrap();
+        ide.exec("ila trigger rising 0").unwrap();
+        ide.exec("ila depth 32").unwrap();
+        ide.exec("ila preratio 0.25").unwrap();
+        ide.exec("ila radix 1 hex").unwrap();
         assert_eq!(
-            ide.sim_ila.config.probes[1].radix,
+            ide.ila.config.probes[1].radix,
             crate::ila::IlaRadix::Hex
         );
 
         // Capture (synchronous in the exec path).
-        let msg = ide.exec("ila_sim_capture").unwrap();
+        let msg = ide.exec("ila capture").unwrap();
         assert!(msg.contains("samples="), "{msg}");
-        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        let cap = ide.ila.capture.as_ref().expect("capture");
         assert!(cap.found_trigger, "cnt_3 must rise within max_cycles");
         let ti = cap.trigger_sample.expect("trigger index");
         // Trigger at sample 7 < pre=8: window is 7 + 1 + 23.
-        assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+        assert_eq!(cap.len(), ti + 1 + ide.ila.config.post());
         assert_eq!(cap.samples[0][ti - 1], 0);
         assert_eq!(cap.samples[0][ti], 1);
         assert_eq!(cap.samples[1][ti], 8, "bus counts, trigger at count 8");
-        assert_eq!(ide.sim_ila.status, SimIlaStatus::Done);
-        assert_eq!(ide.sim_ila.viewer.cursor, Some(ti));
+        assert_eq!(ide.ila.status, IlaStatus::Done);
+        assert_eq!(ide.ila.viewer.cursor, Some(ti));
 
-        let st = ide.exec("ila_sim_status").unwrap();
+        let st = ide.exec("ila status").unwrap();
         assert!(st.contains("probes=2"), "{st}");
         assert!(st.contains("status=Done"), "{st}");
 
         // Value-match trigger via text fields.
-        ide.exec("ila_sim_trigger value 1 5 0xF").unwrap();
-        let msg = ide.exec("ila_sim_capture").unwrap();
+        ide.exec("ila trigger value 1 5 0xF").unwrap();
+        let msg = ide.exec("ila capture").unwrap();
         assert!(msg.contains("samples="), "{msg}");
-        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        let cap = ide.ila.capture.as_ref().expect("capture");
         let ti = cap.trigger_sample.expect("value trigger");
         assert_eq!(cap.samples[1][ti], 5);
-        assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+        assert_eq!(cap.len(), ti + 1 + ide.ila.config.post());
 
         // Session round-trip.
         let dir = std::env::temp_dir().join(format!(
@@ -25362,71 +25044,71 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.json");
-        ide.exec(&format!("ila_sim_save {}", path.display())).unwrap();
-        ide.sim_ila.config.probes.clear();
-        ide.sim_ila.capture = None;
-        ide.exec(&format!("ila_sim_load {}", path.display())).unwrap();
-        assert_eq!(ide.sim_ila.config.probes.len(), 2);
-        let reloaded = ide.sim_ila.capture.as_ref().expect("reloaded capture");
-        assert_eq!(reloaded.len(), reloaded.trigger_sample.unwrap() + 1 + ide.sim_ila.config.post());
+        ide.exec(&format!("ila save {}", path.display())).unwrap();
+        ide.ila.config.probes.clear();
+        ide.ila.capture = None;
+        ide.exec(&format!("ila load {}", path.display())).unwrap();
+        assert_eq!(ide.ila.config.probes.len(), 2);
+        let reloaded = ide.ila.capture.as_ref().expect("reloaded capture");
+        assert_eq!(reloaded.len(), reloaded.trigger_sample.unwrap() + 1 + ide.ila.config.post());
 
         // Fail loud, never half-configured.
-        assert!(ide.exec("ila_sim_add no_such_net").is_err());
-        assert!(ide.exec("ila_sim_trigger banana 0").is_err());
-        assert!(ide.exec("ila_sim_remove 9").is_err());
-        assert!(ide.exec("ila_sim_radix 0 oct").is_err());
+        assert!(ide.exec("ila add no_such_net").is_err());
+        assert!(ide.exec("ila trigger banana 0").is_err());
+        assert!(ide.exec("ila remove 9").is_err());
+        assert!(ide.exec("ila radix 0 oct").is_err());
     }
 
     /// Sim ILA: background (threaded) capture merges through finish_capture.
     #[test]
-    fn sim_ila_background_capture_merges() {
+    fn ila_background_capture_merges() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        ide.exec("ila_sim_trigger rising 0").unwrap();
-        ide.exec("ila_sim_depth 64").unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila trigger rising 0").unwrap();
+        ide.exec("ila depth 64").unwrap();
         let d = ide.shell.session.design.clone().expect("design");
-        let rx = ide.sim_ila.start_capture(&d).expect("arm");
-        assert_eq!(ide.sim_ila.status, SimIlaStatus::Capturing);
+        let rx = ide.ila.start_capture(&d).expect("arm");
+        assert_eq!(ide.ila.status, IlaStatus::Capturing);
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("capture done");
-        ide.sim_ila.finish_capture(r);
-        assert_eq!(ide.sim_ila.status, SimIlaStatus::Done);
-        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        ide.ila.finish_capture(r);
+        assert_eq!(ide.ila.status, IlaStatus::Done);
+        let cap = ide.ila.capture.as_ref().expect("capture");
         assert!(cap.found_trigger);
         let ti = cap.trigger_sample.expect("trigger index");
-        assert_eq!(cap.len(), ti + 1 + ide.sim_ila.config.post());
+        assert_eq!(cap.len(), ti + 1 + ide.ila.config.post());
     }
 
     /// Sim ILA: click-an-edge trigger and VCD export through the exec path.
     #[test]
-    fn sim_ila_trigger_from_wave_and_vcd_export() {
+    fn ila_trigger_from_wave_and_vcd_export() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        ide.exec("ila_sim_add cnt_0").unwrap();
-        ide.exec("ila_sim_depth 32").unwrap();
-        ide.exec("ila_sim_capture").unwrap();
-        let cap = ide.sim_ila.capture.as_ref().expect("capture");
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila add cnt_0").unwrap();
+        ide.exec("ila depth 32").unwrap();
+        ide.exec("ila capture").unwrap();
+        let cap = ide.ila.capture.as_ref().expect("capture");
         let ti = cap.trigger_sample.expect("immediate trigger at 0");
         // cnt_3 rises at sample 7: edge-from-wave picks the rising edge.
-        let msg = ide.exec("ila_sim_trigger_at 0 7").unwrap();
+        let msg = ide.exec("ila trigger_at 0 7").unwrap();
         assert!(msg.contains("Rising edge"), "{msg}");
-        assert_eq!(ide.sim_ila.config.trigger.probe, 0);
+        assert_eq!(ide.ila.config.trigger.probe, 0);
         assert_eq!(
-            ide.sim_ila.config.trigger.kind,
+            ide.ila.config.trigger.kind,
             crate::ila::IlaTriggerKind::Rising
         );
         // No edge at sample 0 for cnt_3 -> value match on current value.
-        let msg = ide.exec("ila_sim_trigger_at 0 1").unwrap();
+        let msg = ide.exec("ila trigger_at 0 1").unwrap();
         assert!(msg.contains("Value match"), "{msg}");
-        assert!(ide.sim_ila.trig_value_text == "0");
+        assert!(ide.ila.trig_value_text == "0");
         // Out-of-range sample fails loud.
-        assert!(ide.exec("ila_sim_trigger_at 0 99999").is_err());
-        assert!(ide.exec("ila_sim_trigger_at 9 0").is_err());
+        assert!(ide.exec("ila trigger_at 0 99999").is_err());
+        assert!(ide.exec("ila trigger_at 9 0").is_err());
 
         // VCD export: real file with GTKWave structure.
         let dir = std::env::temp_dir().join(format!(
@@ -25439,7 +25121,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ila.vcd");
         let msg = ide
-            .exec(&format!("ila_sim_export_vcd {}", path.display()))
+            .exec(&format!("ila export_vcd {}", path.display()))
             .unwrap();
         assert!(msg.contains("ila.vcd"), "{msg}");
         let text = std::fs::read_to_string(&path).unwrap();
@@ -25448,33 +25130,33 @@ mod tests {
         assert!(text.contains("cnt_3"));
         assert!(text.contains(&format!("$comment trigger sample {ti}")));
         // Export with no capture fails loud.
-        ide.sim_ila.capture = None;
-        assert!(ide.exec("ila_sim_export_vcd /tmp/nowhere.vcd").is_err());
+        ide.ila.capture = None;
+        assert!(ide.exec("ila export_vcd /tmp/nowhere.vcd").is_err());
     }
 
     /// Sim ILA: disarm stops a capture in flight; disarm at idle fails loud.
     #[test]
-    fn sim_ila_disarm_stops_background_capture() {
+    fn ila_disarm_stops_background_capture() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
-        ide.exec("ila_sim_add cnt_3").unwrap();
-        ide.exec("ila_sim_add clk").unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila add clk").unwrap();
         // clk reads 1 at every posedge sample: value 0 never fires, so the
         // disarm deterministically wins the race.
-        ide.exec("ila_sim_trigger value 1 0 1").unwrap();
-        ide.exec("ila_sim_depth 1024").unwrap();
-        assert!(ide.exec("ila_sim_disarm").is_err(), "idle disarm fails loud");
+        ide.exec("ila trigger value 1 0 1").unwrap();
+        ide.exec("ila depth 1024").unwrap();
+        assert!(ide.exec("ila disarm").is_err(), "idle disarm fails loud");
         let d = ide.shell.session.design.clone().expect("design");
-        let rx = ide.sim_ila.start_capture(&d).expect("arm");
-        ide.exec("ila_sim_disarm").unwrap();
+        let rx = ide.ila.start_capture(&d).expect("arm");
+        ide.exec("ila disarm").unwrap();
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("capture done");
-        ide.sim_ila.finish_capture(r);
-        let cap = ide.sim_ila.capture.as_ref().expect("partial capture");
+        ide.ila.finish_capture(r);
+        let cap = ide.ila.capture.as_ref().expect("partial capture");
         assert!(!cap.found_trigger, "cancelled capture reports missed trigger");
-        assert_eq!(ide.sim_ila.status, SimIlaStatus::Done);
+        assert_eq!(ide.ila.status, IlaStatus::Done);
     }
 
     /// The console widget must be a pipe onto the real engines: `report_timing` has to
@@ -26468,20 +26150,18 @@ end architecture;
         let hash1 = ide.bitstream_hash().expect("hash after eco");
         assert_ne!(hash1, hash0, "ECO LUT INIT must change the bitstream hash");
 
-        let ila = ide.exec("ila_capture cnt_3 8").unwrap();
-        assert!(ila.contains("ila_capture"), "{ila}");
+        let ila = ide.exec("ila add cnt_3").unwrap();
+        assert!(ila.contains("cnt_3"), "{ila}");
+        let arm = ide.exec("ila arm").unwrap();
+        assert!(arm.contains("probes=1"), "{arm}");
+        let cap = ide.ila.capture.as_ref().expect("unified ILA capture");
+        assert_eq!(cap.probes.len(), 1);
+        assert_eq!(cap.probes[0].name, "cnt_3");
+        let s0: String = cap.samples[0].iter().map(|b| if *b == 1 {'1'} else {'0'}).collect();
         assert!(
-            ide.wave.has_trace("ila:cnt_3"),
-            "ILA capture lands on the waveform: {:?}",
-            ide.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
+            s0.contains('0') && s0.contains('1'),
+            "ILA samples the marked net, not a constant: {s0}"
         );
-        let ibits = ide.wave.bits_of("ila:cnt_3").unwrap();
-        assert!(
-            ibits.contains('0') && ibits.contains('1'),
-            "ILA samples the marked net, not a constant: {ibits}"
-        );
-        assert_eq!(ide.ila.bits, ibits);
-        assert_eq!(ide.ila.net, "cnt_3");
 
         let bd = ide.exec("create_bd").unwrap();
         assert!(bd.contains("system"), "{bd}");
@@ -29976,7 +29656,7 @@ endmodule
         );
     }
 
-    /// Real flow: mark_debug → (re)implement → ila_arm on counter.sv (no bitstream-unchanged no-op).
+    /// Real flow: mark_debug → (re)implement → ila arm on counter.sv (no bitstream-unchanged no-op).
     #[test]
     fn ila_status_crumb_surfaces_mark_debug_and_capture() {
         let mut ide = IdeModel::new();
@@ -29984,7 +29664,7 @@ endmodule
         ide.run_step(FlowStep::Opt).unwrap();
         let idle = ide.ila_status_crumb();
         assert!(idle.contains("ILA"), "{idle}");
-        assert!(!idle.contains("×"), "no capture yet: {idle}");
+        assert!(!idle.contains("samples"), "no capture yet: {idle}");
         ide.exec("mark_debug cnt_3").unwrap();
         let md = ide.ila_status_crumb();
         assert!(md.contains("md:cnt_3"), "{md}");
@@ -29993,21 +29673,23 @@ endmodule
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
         ide.run_step(FlowStep::Bitstream).unwrap();
-        ide.exec("ila_window 8").unwrap();
-        let arm = ide.exec("ila_arm cnt_3").unwrap();
-        assert!(arm.contains("net=cnt_3"), "{arm}");
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila depth 8").unwrap();
+        let arm = ide.exec("ila arm").unwrap();
+        assert!(arm.contains("probes=1"), "{arm}");
         assert!(arm.contains("samples=8"), "{arm}");
+        let cap = ide.ila.capture.as_ref().expect("unified capture");
+        let s0: String = cap.samples[0]
+            .iter()
+            .map(|b| if *b == 1 { '1' } else { '0' })
+            .collect();
         assert!(
-            ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
-            "fabric capture after mark→impl→arm: {}",
-            ide.ila.bits
+            s0.contains('0') && s0.contains('1'),
+            "fabric capture after mark→impl→arm: {s0}"
         );
-        let cap = ide.ila_status_crumb();
-        assert!(cap.contains("md:cnt_3"), "{cap}");
-        assert!(
-            cap.contains("ILA cnt_3×8") || cap.contains("ILA cnt_3×"),
-            "{cap}"
-        );
+        let crumb = ide.ila_status_crumb();
+        assert!(crumb.contains("md:cnt_3"), "{crumb}");
+        assert!(crumb.contains("ILA 8 samples"), "{crumb}");
     }
 
     /// Device/Schematic net selection → Mark Debug / Add Probe → ILA (UG908 cross-probe).
@@ -30046,8 +29728,7 @@ endmodule
         assert_eq!(ide.selected_debug_net().as_deref(), Some("cnt_3"));
         let ap = ide.exec("add_probe").unwrap();
         assert!(ap.contains("net=cnt_3"), "{ap}");
-        assert_eq!(ide.ila.net, "cnt_3");
-        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
 
         let ap2 = ide.exec("add_probe cnt_3").unwrap();
         assert!(ap2.contains("net=cnt_3"), "{ap2}");
@@ -30056,7 +29737,7 @@ endmodule
     /// FM-HEL-CONT one-flow: marked cnt_3 → Add Probe → Program sim → Arm/Capture → filled ILA bits.
     /// Mirrors HELION_FLOW=implement (no write_bitstream) then the Program/ILA dashboard path.
     #[test]
-    fn mark_add_probe_program_sim_ila_arm_one_flow() {
+    fn mark_add_probe_program_ila_arm_one_flow() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         // Same as HELION_FLOW=implement: synth→opt→place→route, no bitstream yet.
@@ -30072,9 +29753,12 @@ endmodule
 
         let ap = ide.exec("add_probe").unwrap();
         assert!(ap.contains("net=cnt_3"), "{ap}");
-        assert_eq!(ide.ila.net, "cnt_3");
-        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
         assert_eq!(ide.default_ila_probe(), "cnt_3");
+        assert!(
+            ide.ila.config.probes.iter().any(|p| p.name == "cnt_3"),
+            "add_probe binds the unified ILA probe"
+        );
 
         let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(
@@ -30087,32 +29771,24 @@ endmodule
         );
         assert!(ide.hw.open || ide.shell.session.hw_open, "hw manager open");
 
-        ide.exec("ila_window 16").unwrap();
-        ide.exec("ila_trigger rising").unwrap();
-        let arm = ide.exec("ila_arm").unwrap();
-        assert!(
-            arm.contains("net=cnt_3"),
-            "Add Probe must bind Arm default: {arm}"
-        );
+        ide.exec("ila depth 16").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        let arm = ide.exec("ila arm").unwrap();
+        assert!(arm.contains("probes=1"), "{arm}");
         assert!(arm.contains("samples=16"), "{arm}");
-        assert_eq!(ide.ila.bits.len(), 16);
+        let cap = ide.ila.capture.as_ref().expect("unified capture");
+        assert_eq!(cap.len(), 16);
+        let s0: String = cap.samples[0]
+            .iter()
+            .map(|b| if *b == 1 { '1' } else { '0' })
+            .collect();
         assert!(
-            ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
-            "ILA waveform filled bits for cnt_3: {}",
-            ide.ila.bits
+            s0.contains('0') && s0.contains('1'),
+            "ILA waveform filled bits for cnt_3: {s0}"
         );
-        assert_eq!(
-            ide.ila.bits, "0000000111111110",
-            "cnt_3 MSB gold window=16: {}",
-            ide.ila.bits
-        );
-        assert_eq!(ide.ila.trigger_at, Some(7), "rising at first 0→1");
-        assert!(
-            ide.wave.has_trace("ila:cnt_3"),
-            "wave must show ila:cnt_3: {:?}",
-            ide.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
-        );
-        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        assert_eq!(s0, "0000000111111110", "cnt_3 MSB gold window=16: {s0}");
+        assert_eq!(cap.trigger_sample, Some(7), "rising at first 0→1");
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
     }
 
     /// FM-HEL-CONT: complex mid-net x → Simulate + Mark/Add Probe → Program sim → ILA Arm filled bits.
@@ -30163,8 +29839,7 @@ endmodule
 
         let ap = ide.exec("add_probe").unwrap();
         assert!(ap.contains("net=x"), "{ap}");
-        assert_eq!(ide.ila.net, "x");
-        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
 
         let prog = ide.exec("program_hw cable=sim").unwrap();
         assert!(
@@ -30172,24 +29847,22 @@ endmodule
             "Program sim: {prog}"
         );
 
-        ide.exec("ila_window 16").unwrap();
-        ide.exec("ila_trigger rising").unwrap();
-        let arm = ide.exec("ila_arm").unwrap();
-        assert!(arm.contains("net=x"), "Arm default mid-net: {arm}");
+        ide.exec("ila add x").unwrap();
+        ide.exec("ila depth 16").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        let arm = ide.exec("ila arm").unwrap();
+        assert!(arm.contains("probes=1"), "{arm}");
         assert!(arm.contains("samples=16"), "{arm}");
-        assert_eq!(ide.ila.bits.len(), 16);
-        assert_eq!(
-            ide.ila.bits, "0101010101010101",
-            "complex mid-net x gold window=16: {}",
-            ide.ila.bits
-        );
-        assert_eq!(ide.ila.trigger_at, Some(1), "rising at first 0→1");
-        assert!(
-            ide.wave.has_trace("ila:x"),
-            "wave must show ila:x: {:?}",
-            ide.wave.traces.iter().map(|t| &t.name).collect::<Vec<_>>()
-        );
-        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
+        let cap = ide.ila.capture.as_ref().expect("unified capture");
+        assert_eq!(cap.probes[0].name, "x", "Arm uses the marked mid-net probe");
+        assert_eq!(cap.len(), 16);
+        let s0: String = cap.samples[0]
+            .iter()
+            .map(|b| if *b == 1 { '1' } else { '0' })
+            .collect();
+        assert_eq!(s0, "0101010101010101", "complex mid-net x gold window=16: {s0}");
+        assert_eq!(cap.trigger_sample, Some(1), "rising at first 0→1");
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
 
         // Counter gold untouched.
         let mut gold = IdeModel::new();
@@ -30199,8 +29872,9 @@ endmodule
     }
 
     /// UG900 ILA dashboard: trigger/window from fabric samples on the wave, not a lamp.
+    /// Unified ILA: hardware arm lands in the same model/viewer as sim captures.
     #[test]
-    fn ila_dashboard_trigger_window_from_fabric_samples() {
+    fn ila_hw_arm_uses_unified_model() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
@@ -30208,116 +29882,34 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         ide.run_step(FlowStep::Bitstream).unwrap();
 
-        let win = ide.exec("ila_window 8").unwrap();
-        assert!(win.contains("window=8"), "{win}");
-        assert_eq!(ide.workspace, WorkspaceTab::Hardware);
-        ide.exec("ila_trigger rising").unwrap();
-
-        let out = ide.exec("ila_arm cnt_3").unwrap();
-        assert!(out.contains("net=cnt_3"), "{out}");
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila depth 8").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        let out = ide.exec("ila arm").unwrap();
+        assert!(out.contains("probes=1"), "{out}");
         assert!(out.contains("samples=8"), "{out}");
-        assert_eq!(ide.ila.net, "cnt_3");
-        assert_eq!(ide.ila.window, 8);
-        assert_eq!(ide.ila.bits.len(), 8);
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
+        let cap = ide.ila.capture.as_ref().expect("unified capture set");
+        assert_eq!(cap.probes.len(), 1);
+        assert_eq!(cap.len(), 8);
+        // Fabric-backed, not constant.
+        let s0 = &cap.samples[0];
         assert!(
-            ide.ila.bits.contains('0') && ide.ila.bits.contains('1'),
-            "capture is fabric ILA, not constant: {}",
-            ide.ila.bits
+            s0.contains(&0) && s0.contains(&1),
+            "hardware capture varies: {s0:?}"
         );
-        let rise = ide
-            .ila
-            .bits
-            .as_bytes()
-            .windows(2)
-            .position(|w| w[0] == b'0' && w[1] == b'1')
-            .map(|i| i + 1);
-        assert_eq!(
-            ide.ila.trigger_at, rise,
-            "rising trigger_at is the first 0→1 in engine bits {}",
-            ide.ila.bits
-        );
-        if let Some(i) = rise {
-            assert_eq!(ide.wave.cursor, i, "wave cursor tracks ILA trigger");
-        }
-        let dump = ide.exec("ila_dashboard").unwrap();
-        assert!(dump.contains("trigger=rising"), "{dump}");
-        assert!(dump.contains(&format!("bits={}", ide.ila.bits)), "{dump}");
-        match rise {
-            Some(i) => assert!(dump.contains(&format!("trigger_at={i}")), "{dump}"),
-            None => assert!(dump.contains("trigger_at=-"), "{dump}"),
-        }
-
-        let fall_at = ide
-            .ila
-            .bits
-            .as_bytes()
-            .windows(2)
-            .position(|w| w[0] == b'1' && w[1] == b'0')
-            .map(|i| i + 1);
-        let fall = ide.exec("ila_trigger falling").unwrap();
-        assert_eq!(ide.ila.trigger, IlaTrigger::Falling);
-        assert_eq!(ide.ila.trigger_at, fall_at);
-        assert!(fall.contains("trigger=falling"), "{fall}");
-        if rise.is_some() && fall_at.is_some() {
-            assert_ne!(
-                rise, fall_at,
-                "rising vs falling must pick different engine edges: {}",
-                ide.ila.bits
-            );
-        }
-
-        let bits8 = ide.ila.bits.clone();
-        ide.exec("ila_window 16").unwrap();
-        ide.exec("ila_arm cnt_3").unwrap();
-        assert_eq!(ide.ila.bits.len(), 16, "window is the capture length");
-        assert!(
-            ide.ila.bits.starts_with(&bits8),
-            "longer window continues the same fabric stream: {} vs {bits8}",
-            ide.ila.bits
-        );
-
-        let mut blinky = IdeModel::new();
-        blinky.open_source(&example("blinky.sv")).unwrap();
-        blinky.run_step(FlowStep::Opt).unwrap();
-        blinky.run_step(FlowStep::Place).unwrap();
-        blinky.run_step(FlowStep::Route).unwrap();
-        blinky.run_step(FlowStep::Bitstream).unwrap();
-        blinky.exec("ila_window 8").unwrap();
-        blinky.exec("ila_arm led").unwrap();
-        assert_eq!(blinky.ila.net, "led");
-        assert_ne!(
-            blinky.ila.net, ide.ila.net,
-            "probe net is the armed HNF net"
-        );
-        assert!(
-            blinky.wave.has_trace("ila:led"),
-            "{:?}",
-            blinky
-                .wave
-                .traces
-                .iter()
-                .map(|t| &t.name)
-                .collect::<Vec<_>>()
-        );
-        assert!(!blinky.wave.has_trace("ila:cnt_3"));
-        assert_eq!(
-            blinky
-                .runs
-                .iter()
-                .find(|r| r.name == "impl_1")
-                .unwrap()
-                .lutff,
-            Some(1)
-        );
-        assert_eq!(
-            ide.runs.iter().find(|r| r.name == "impl_1").unwrap().lutff,
-            Some(4)
-        );
+        // Trigger found at the first 0->1, same rule as the sim path.
+        let rise = s0.windows(2).position(|w| w[0] == 0 && w[1] == 1).map(|i| i + 1);
+        assert_eq!(cap.trigger_sample, rise);
+        assert_eq!(cap.found_trigger, rise.is_some());
+        // Viewer follows the unified capture.
+        assert_eq!(ide.ila.viewer.cursor, rise);
     }
 
     /// Deep path: match-unit/FSM + IR_USR1 RLE upload + pre-trigger + multi-probe (soft ila_arm unchanged).
+    /// Unified ILA: deep arm (match-unit/FSM + TAP upload) lands in the same model.
     #[test]
-    fn ila_arm_deep_bram_pretrigger_multiprobe() {
+    fn ila_hw_arm_deep_unified_multiprobe() {
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         ide.run_step(FlowStep::Opt).unwrap();
@@ -30326,51 +29918,67 @@ endmodule
         ide.run_step(FlowStep::Bitstream).unwrap();
         assert_eq!(ide.wns_ps(), Some(9640), "counter gold WNS_PS");
 
-        ide.exec("ila_window 16").unwrap();
-        ide.exec("ila_trigger rising").unwrap();
-        ide.exec("ila_pre_trigger 4").unwrap();
-        let out = ide.exec("ila_arm_deep cnt_3,cnt_0").unwrap();
-        assert!(out.contains("backend=jtag_usr1_match_fsm_rle"), "{out}");
-        assert!(out.contains("upload_dr="), "{out}");
-        assert!(out.contains("upload_raw=16"), "{out}");
-        assert!(out.contains("pre_trigger=4"), "{out}");
-        assert!(
-            out.contains("probes=cnt_3,cnt_0") || out.contains("probes=cnt_3"),
-            "{out}"
-        );
-        assert_eq!(ide.ila.backend, "jtag_usr1_match_fsm_rle");
-        assert_eq!(ide.ila.bits.len(), 16);
-        let at = ide.ila.trigger_at.expect("deep rising trigger_at");
-        assert!(at >= 1, "trigger_at={at} bits={}", ide.ila.bits);
-        assert_eq!(&ide.ila.bits[at - 1..at + 1], "01");
-        assert!(ide.wave.has_trace("ila:cnt_3"));
-        let dump = ide.exec("ila_dashboard").unwrap();
-        assert!(dump.contains("backend=jtag_usr1_match_fsm_rle"), "{dump}");
-        assert!(dump.contains("pre_trigger=4"), "{dump}");
-        // Multiprobe with toggling LSB often has no RLE runs; still report honest DR counts.
-        let dr = out
-            .split_whitespace()
-            .find_map(|t| {
-                t.strip_prefix("upload_dr=")
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .expect("upload_dr");
-        let raw = out
-            .split_whitespace()
-            .find_map(|t| {
-                t.strip_prefix("upload_raw=")
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .expect("upload_raw");
-        assert_eq!(raw, 16, "{out}");
-        assert!(dr >= 1, "header+tokens: {out}");
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila add cnt_0").unwrap();
+        ide.exec("ila depth 16").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        let out = ide.exec("ila arm_deep").unwrap();
+        assert!(out.contains("deep=true"), "{out}");
+        assert!(out.contains("probes=2"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Ila);
+        let cap = ide.ila.capture.as_ref().expect("unified capture set");
+        assert_eq!(cap.probes.len(), 2);
+        assert_eq!(cap.len(), 16);
+        // Both probes sampled every cycle.
+        assert!(cap.samples.iter().all(|s| s.len() == 16));
+    }
 
-        // Soft path gold still holds on plain ila_arm.
-        ide.exec("ila_trigger rising").unwrap();
-        ide.exec("ila_arm cnt_3").unwrap();
-        assert_eq!(ide.ila.backend, "soft_ble_out");
-        assert_eq!(ide.ila.bits, "0000000111111110");
-        assert_eq!(ide.wns_ps(), Some(9640));
+    #[test]
+    fn ila_arm_no_probes_fails_loud() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        let err = ide.exec("ila arm").expect_err("arm with no probes must fail loud");
+        assert!(err.contains("no probes"), "{err}");
+        assert!(ide.ila.capture.is_none(), "no silent empty capture");
+    }
+
+    #[test]
+    fn ila_trigger_valuematch_hw_arm_fails_loud() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.run_step(FlowStep::Place).unwrap();
+        ide.run_step(FlowStep::Route).unwrap();
+        ide.run_step(FlowStep::Bitstream).unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila trigger value 0 10 15").unwrap();
+        let err = ide.exec("ila arm").expect_err("value-match arm must fail loud");
+        assert!(err.contains("value-match"), "{err}");
+        assert!(ide.ila.capture.is_none(), "no silent partial capture");
+    }
+
+    #[test]
+    fn ila_e2e_sim_capture_opens_viewer() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.run_step(FlowStep::Opt).unwrap();
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila depth 16").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        let out = ide.exec("ila capture").unwrap();
+        assert!(out.contains("samples=16"), "{out}");
+        assert_eq!(ide.workspace, WorkspaceTab::Ila, "capture opens the ILA viewer");
+        let cap = ide.ila.capture.as_ref().expect("capture present");
+        assert_eq!(cap.len(), 16);
+        assert_eq!(
+            ide.ila.viewer.cursor,
+            cap.trigger_sample,
+            "viewer cursor tracks the trigger sample"
+        );
     }
 
     /// UG893 Device is a HAD die occupancy grid, not a list of occupied site names.
@@ -36635,36 +36243,19 @@ endmodule
             assert_eq!(row.value, bit.value);
         }
 
-        ide.exec("ila_window 8").unwrap();
-        ide.exec("ila_trigger rising").unwrap();
-        ide.exec("ila_arm cnt_3").unwrap();
-        let samples = ide.ila_sample_rows();
-        assert_eq!(samples.len(), ide.ila.bits.len());
-        assert_eq!(samples.len(), 8);
-        for (i, row) in samples.iter().enumerate() {
-            assert_eq!(row.sample, i);
-            assert_eq!(row.value, ide.ila.bits.chars().nth(i).unwrap());
-            assert_eq!(row.trigger, ide.ila.trigger_at == Some(i));
-            assert_eq!(row.time_ps, i as u64 * ide.wave.timescale_ps.max(1));
-        }
-        let dash = ide.exec("ila_dashboard").unwrap();
-        assert!(dash.contains("SAMPLE="), "ILA is a sample table: {dash}");
-        assert!(dash.contains(&format!("bits={}", ide.ila.bits)), "{dash}");
-        let trig = samples.iter().find(|r| r.trigger);
-        if let Some(t) = trig {
-            let hit = ide
-                .exec(&format!("select_ila_sample {}", t.sample))
-                .unwrap();
-            assert!(hit.contains("MARKER=TRIGGER"), "{hit}");
-            assert_eq!(ide.wave.cursor, t.sample);
-            assert!(
-                ide.properties
-                    .iter()
-                    .any(|(k, v)| k == "TYPE" && v == "ila_sample"),
-                "{:?}",
-                ide.properties
-            );
-        }
+        ide.exec("ila add cnt_3").unwrap();
+        ide.exec("ila depth 8").unwrap();
+        ide.exec("ila trigger rising").unwrap();
+        ide.exec("ila arm").unwrap();
+        let cap = ide.ila.capture.as_ref().expect("unified capture");
+        assert_eq!(cap.len(), 8);
+        assert_eq!(cap.probes.len(), 1);
+        assert_eq!(cap.probes[0].name, "cnt_3");
+        // Trigger sample matches the first 0->1 in the unified capture.
+        let s0 = &cap.samples[0];
+        let rise = s0.windows(2).position(|w| w[0] == 0 && w[1] == 1).map(|i| i + 1);
+        assert_eq!(cap.trigger_sample, rise);
+        assert_eq!(ide.ila.viewer.cursor, rise);
 
         assert_eq!(
             ide.wns_ps(),
@@ -36683,28 +36274,19 @@ endmodule
         let br = blinky.hw_stat_report();
         assert_eq!(br.word, Stat::STARTUP_WORD);
         assert_eq!(br.idcode, started.idcode);
-        blinky.exec("ila_window 8").unwrap();
-        blinky.exec("ila_arm led").unwrap();
-        assert_eq!(blinky.ila.net, "led");
+        blinky.exec("ila add led").unwrap();
+        blinky.exec("ila depth 8").unwrap();
+        blinky.exec("ila arm").unwrap();
+        let bcap = blinky.ila.capture.as_ref().expect("blinky capture");
+        assert_eq!(bcap.probes[0].name, "led");
         assert_ne!(
-            blinky.ila.net, ide.ila.net,
-            "probe net is the armed HNF net"
+            bcap.probes[0].name, cap.probes[0].name,
+            "probe net is the armed net per design"
         );
-        let b_rows = blinky.ila_sample_rows();
-        assert_eq!(b_rows.len(), blinky.ila.bits.len());
-        assert_eq!(
-            b_rows.iter().map(|r| r.value).collect::<String>(),
-            blinky.ila.bits,
-            "blinky ILA rows are that design's fabric bits"
-        );
-        assert_eq!(
-            samples.iter().map(|r| r.value).collect::<String>(),
-            ide.ila.bits,
-            "counter ILA rows are that design's fabric bits"
-        );
+        assert_eq!(bcap.len(), 8);
         assert!(
-            blinky.wave.has_trace("ila:led") && ide.wave.has_trace("ila:cnt_3"),
-            "ILA samples land on per-design wave traces"
+            bcap.probes[0].name == "led" && cap.probes[0].name == "cnt_3",
+            "ILA captures are per-design in the unified model"
         );
         assert_eq!(
             ide.wns_ps(),
