@@ -7,6 +7,7 @@
 //! / `route_with_guide`. helion-cli and helion-proj still call unguided
 //! `place_with` / `route_with` until a later crate lock wires that through.
 
+use helion_backend::TimingModel;
 use helion_device::Device;
 use helion_ir::{CellKind, Design, PortDir};
 use helion_place::Placed;
@@ -744,8 +745,6 @@ pub const SETUP_PS: i64 = 50;
 pub const PIN_PS: i64 = 20;
 /// HAD default I/O pad (LVCMOS18). Gold WNS for counter uses this.
 pub const IOB_PS: i64 = 100;
-const HOP_PS: i64 = 40;
-const HOLD_REQ_PS: i64 = 20;
 
 /// I/O pad delay for a Helion IOSTANDARD. Unset / LVCMOS18 keeps gold STA.
 pub fn iostandard_pad_ps(std: Option<&str>) -> i64 {
@@ -829,7 +828,7 @@ pub fn port_pad_ps(
         + in_term_pad_delta_ps(in_term)
 }
 
-fn iob_pad_ps(design: &Design) -> i64 {
+fn iob_pad_ps(design: &Design, tm: &TimingModel) -> i64 {
     design
         .ports
         .iter()
@@ -845,7 +844,7 @@ fn iob_pad_ps(design: &Design) -> i64 {
             )
         })
         .max()
-        .unwrap_or(IOB_PS)
+        .unwrap_or(tm.iob_ps)
 }
 
 fn lut_fanin_idx(idx: &helion_ir::PinIndex<'_>, lut: &str) -> i64 {
@@ -854,7 +853,7 @@ fn lut_fanin_idx(idx: &helion_ir::PinIndex<'_>, lut: &str) -> i64 {
     PINS.iter().filter(|p| idx.net_on(lut, p).is_some()).count() as i64
 }
 
-fn r2r_ps(design: &Design) -> i64 {
+fn r2r_ps(design: &Design, tm: &TimingModel) -> i64 {
     // FM-HEL-TOP: Design::net_on is O(nets); Ibex-scale r2r walked every LUT×6
     // pins that way (~6.8s under debug). PinIndex is O(1) after one build.
     let idx = design.pin_index();
@@ -864,13 +863,22 @@ fn r2r_ps(design: &Design) -> i64 {
             continue;
         }
         let pins = lut_fanin_idx(&idx, &c.name);
-        max_ps = max_ps.max(FF_CKQ_PS + LUT_PS + pins * PIN_PS + SETUP_PS);
+        max_ps = max_ps.max(tm.ff_ckq_ps + tm.lut_ps + pins * tm.pin_ps + tm.setup_ps);
     }
-    max_ps.max(FF_CKQ_PS + LUT_PS + SETUP_PS)
+    max_ps.max(tm.ff_ckq_ps + tm.lut_ps + tm.setup_ps)
 }
 
 /// Unit-delay STA from netlist arity (no placement).
 pub fn report_timing(design: &Design, clocks: &[Clock]) -> Result<TimingResult, String> {
+    report_timing_with_model(design, clocks, &TimingModel::hl10t())
+}
+
+/// Unit-delay STA from netlist arity (no placement), using `tm` delays.
+pub fn report_timing_with_model(
+    design: &Design,
+    clocks: &[Clock],
+    tm: &TimingModel,
+) -> Result<TimingResult, String> {
     if clocks.is_empty() {
         return Err("no clocks".into());
     }
@@ -902,7 +910,7 @@ pub fn report_timing(design: &Design, clocks: &[Clock]) -> Result<TimingResult, 
             clk_net_ps: 0,
         });
     }
-    let r2r = r2r_ps(design);
+    let r2r = r2r_ps(design, tm);
     let wns = clk.period_ps as i64 - r2r;
     Ok(TimingResult {
         clocks: clocks.to_vec(),
@@ -912,8 +920,8 @@ pub fn report_timing(design: &Design, clocks: &[Clock]) -> Result<TimingResult, 
         r2r_ps: r2r,
         iob_ps: 0,
         setup_ps: r2r,
-        hold_ps: FF_CKQ_PS,
-        hold_slack_ps: FF_CKQ_PS - HOLD_REQ_PS,
+        hold_ps: tm.ff_ckq_ps,
+        hold_slack_ps: tm.ff_ckq_ps - tm.hold_req_ps,
         route_ps: 0,
         clk_net_ps: 0,
     })
@@ -925,7 +933,17 @@ pub fn report_timing_placed(
     placed: &Placed,
     clocks: &[Clock],
 ) -> Result<TimingResult, String> {
-    let mut r = report_timing(design, clocks)?;
+    report_timing_placed_with_model(design, placed, clocks, &TimingModel::hl10t())
+}
+
+/// Placement-aware STA: r2r plus IOB Manhattan, using `tm` delays.
+pub fn report_timing_placed_with_model(
+    design: &Design,
+    placed: &Placed,
+    clocks: &[Clock],
+    tm: &TimingModel,
+) -> Result<TimingResult, String> {
+    let mut r = report_timing_with_model(design, clocks, tm)?;
     if r.endpoints == 0 {
         return Ok(r);
     }
@@ -943,7 +961,10 @@ pub fn report_timing_placed(
         .filter_map(|((site, _), lf)| {
             let iob = placed.iob_sites.first()?;
             if iob_from_nets.contains(lf.q_net.as_str()) {
-                Some(FF_CKQ_PS + site.y.abs_diff(iob.y) as i64 * HOP_PS + iob_pad_ps(design))
+                Some(
+                    tm.ff_ckq_ps + site.y.abs_diff(iob.y) as i64 * tm.hop_ps
+                        + iob_pad_ps(design, tm),
+                )
             } else {
                 None
             }
@@ -953,12 +974,12 @@ pub fn report_timing_placed(
     r.iob_ps = iob_ps;
     let path = r.r2r_ps.max(iob_ps);
     r.setup_ps = path;
-    r.hold_ps = FF_CKQ_PS + iob_ps.min(path);
+    r.hold_ps = tm.ff_ckq_ps + iob_ps.min(path);
     r.route_ps = 0;
-    r.clk_net_ps = clock_network_delay_ps(placed);
+    r.clk_net_ps = clock_network_delay_ps_with(placed, tm);
     r.wns_ps = clocks[0].period_ps as i64 - path;
     r.tns_ps = r.wns_ps.min(0);
-    r.hold_slack_ps = r.hold_ps - HOLD_REQ_PS;
+    r.hold_slack_ps = r.hold_ps - tm.hold_req_ps;
     Ok(r)
 }
 
@@ -968,25 +989,41 @@ pub fn report_timing_routed(
     routed: &Routed,
     clocks: &[Clock],
 ) -> Result<TimingResult, String> {
-    let mut r = report_timing_placed(design, &routed.placed, clocks)?;
+    report_timing_routed_with_model(design, routed, clocks, &TimingModel::hl10t())
+}
+
+/// STA using PathFinder hop delay so WNS/hold/setup move with placement,
+/// using `tm` delays.
+pub fn report_timing_routed_with_model(
+    design: &Design,
+    routed: &Routed,
+    clocks: &[Clock],
+    tm: &TimingModel,
+) -> Result<TimingResult, String> {
+    let mut r = report_timing_placed_with_model(design, &routed.placed, clocks, tm)?;
     if r.endpoints == 0 {
         return Ok(r);
     }
     let route_ps = routed.iob_src.iter().map(|x| x.delay_ps).max().unwrap_or(0);
     r.route_ps = route_ps;
-    r.clk_net_ps = clock_network_delay_ps(&routed.placed);
-    r.iob_ps = FF_CKQ_PS + route_ps + iob_pad_ps(design);
+    r.clk_net_ps = clock_network_delay_ps_with(&routed.placed, tm);
+    r.iob_ps = tm.ff_ckq_ps + route_ps + iob_pad_ps(design, tm);
     r.setup_ps = r.r2r_ps.max(r.iob_ps);
-    r.hold_ps = FF_CKQ_PS + route_ps;
+    r.hold_ps = tm.ff_ckq_ps + route_ps;
     r.wns_ps = clocks[0].period_ps as i64 - r.setup_ps;
     r.tns_ps = r.wns_ps.min(0);
-    r.hold_slack_ps = r.hold_ps - HOLD_REQ_PS;
+    r.hold_slack_ps = r.hold_ps - tm.hold_req_ps;
     Ok(r)
 }
 
 /// UG903 `set_propagated_clock`: fabric hop delay from the clock IOB row to each FF CLK pin.
 /// Ideal clocks keep this at 0 in the WNS math; the value is always measured from place.
 pub fn clock_network_delay_ps(placed: &Placed) -> i64 {
+    clock_network_delay_ps_with(placed, &TimingModel::hl10t())
+}
+
+/// [`clock_network_delay_ps`] using `tm` delays.
+pub fn clock_network_delay_ps_with(placed: &Placed, tm: &TimingModel) -> i64 {
     let clk_y = placed.iob_sites.first().map(|s| s.y).unwrap_or(0);
     let clk_x = placed
         .lutff_sites
@@ -997,7 +1034,7 @@ pub fn clock_network_delay_ps(placed: &Placed) -> i64 {
     placed
         .lutff_sites
         .iter()
-        .map(|(s, _)| (s.x.abs_diff(clk_x) + s.y.abs_diff(clk_y)) as i64 * HOP_PS)
+        .map(|(s, _)| (s.x.abs_diff(clk_x) + s.y.abs_diff(clk_y)) as i64 * tm.hop_ps)
         .max()
         .unwrap_or(0)
 }
@@ -3689,6 +3726,16 @@ pub fn apply_xdc(design: &mut Design, xdc: &Constraints) -> Result<(), String> {
 /// `create_generated_clock -invert` are a half-cycle setup; `-stop_propagation`
 /// keeps ideal (0) insertion. Empty constraints keep gold WNS.
 pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64) {
+    apply_xdc_delays_with(r, xdc, period_ps, &TimingModel::hl10t())
+}
+
+/// [`apply_xdc_delays`] using `tm` delays for the hold requirement.
+pub fn apply_xdc_delays_with(
+    r: &mut TimingResult,
+    xdc: &Constraints,
+    period_ps: u64,
+    tm: &TimingModel,
+) {
     let false_out =
         !xdc.false_paths.is_empty() || xdc.clock_groups_false_path() || xdc.arcs_disabled();
     let out_d = xdc.output_delay_ps.values().copied().max().unwrap_or(0);
@@ -3724,7 +3771,7 @@ pub fn apply_xdc_delays(r: &mut TimingResult, xdc: &Constraints, period_ps: u64)
         let hold_mult = xdc.hold_mult();
         if hold_mult > 0 || xdc.path_early_milli() != 1000 {
             r.hold_slack_ps =
-                hold - HOLD_REQ_PS - (period_ps as i64).saturating_mul(hold_mult as i64);
+                hold - tm.hold_req_ps - (period_ps as i64).saturating_mul(hold_mult as i64);
         }
     }
     r.hold_slack_ps -= xdc.uncertainty_hold_ps()
@@ -3872,6 +3919,16 @@ fn walk_iob_path(design: &Design, iob: &str) -> (String, Vec<String>, Vec<String
 
 /// Place/route-backed timing paths with HAD site/BEL IDs on endpoints.
 pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -> Vec<TimingPath> {
+    timing_paths_routed_with(design, routed, t, &TimingModel::hl10t())
+}
+
+/// [`timing_paths_routed`] using `tm` delays.
+pub fn timing_paths_routed_with(
+    design: &Design,
+    routed: &Routed,
+    t: &TimingResult,
+    tm: &TimingModel,
+) -> Vec<TimingPath> {
     let placed = &routed.placed;
     let mut paths = Vec::new();
     for c in &design.cells {
@@ -3915,8 +3972,8 @@ pub fn timing_paths_routed(design: &Design, routed: &Routed, t: &TimingResult) -
                         .any(|io| io.cell == c.name && io.from_net == r.net)
             })
             .map(|r| {
-                let ckq = if r.from_ff { FF_CKQ_PS } else { 0 };
-                ckq + r.delay_ps + iob_pad_ps(design)
+                let ckq = if r.from_ff { tm.ff_ckq_ps } else { 0 };
+                ckq + r.delay_ps + iob_pad_ps(design, tm)
             })
             .unwrap_or(t.iob_ps);
         paths.push(TimingPath {
@@ -6209,6 +6266,20 @@ set_data_check -from [get_pins A] -to [get_pins B] 0.3
                 "resolved {id} missing from highlight {hl:?}"
             );
         }
+    }
+
+    #[test]
+    fn timing_model_hl10t_matches_gold_consts() {
+        // The model is the single source of truth; the pub consts are the
+        // stable API. If these drift apart, WNS_PS=9640 moves silently.
+        let tm = TimingModel::hl10t();
+        assert_eq!(tm.lut_ps, LUT_PS);
+        assert_eq!(tm.ff_ckq_ps, FF_CKQ_PS);
+        assert_eq!(tm.setup_ps, SETUP_PS);
+        assert_eq!(tm.pin_ps, PIN_PS);
+        assert_eq!(tm.iob_ps, IOB_PS);
+        assert_eq!(tm.hop_ps, 40, "HL10T hop delay");
+        assert_eq!(tm.hold_req_ps, 20, "HL10T hold requirement");
     }
 
     #[test]
