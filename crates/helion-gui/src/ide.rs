@@ -41888,4 +41888,106 @@ endmodule
         assert!(msg.contains("waveform viewer"), "msg={msg}");
         assert_eq!(m.tb_waveform_pending, Some(dir.join("run.vcd")));
     }
+
+    /// No placeholder text may leak into the UI. Scans every helion-gui
+    /// source file for "???" (and friends) inside string literals: a
+    /// literal "???" in the Device view's Clock Regions table was rendering
+    /// as literal question marks (font glyph issue, since fixed with
+    /// monospace), and placeholder text must never reach the user.
+    #[test]
+    fn no_placeholder_text_in_ui_strings() {
+        // Build the pattern dynamically so this test's own source does not
+        // trip the scan.
+        let q = "?".repeat(3);
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src = manifest.join("src");
+        let mut hits: Vec<String> = Vec::new();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_rs(&src, &mut files);
+        // Also scan the binary sources (helion-ide.rs and its modules).
+        collect_rs(&src.join("bin"), &mut files);
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim();
+                // Skip comments: placeholders in comments are fine.
+                if t.starts_with("//") || t.starts_with('*') {
+                    continue;
+                }
+                // Look for ??? inside a string literal (not in a comment).
+                if let Some(code) = t.split("//").next() {
+                    if code.contains("\"") && code.contains(&q) {
+                        // Skip this test's own pattern-construction lines.
+                        if t.contains("repeat(3)") || t.contains("contains(&q)") {
+                            continue;
+                        }
+                        hits.push(format!("{}:{}: {}", path.display(), i + 1, t));
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "placeholder '{}' in UI strings:\n{}",
+            q,
+            hits.join("\n")
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_rs(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// The Device toolbar must have exactly one zoom control group.
+    /// Regression: "Fit" and "Zoom Fit" both called device_zoom_fit() (same
+    /// action, two labels), and an older build had a second zoom row above
+    /// the toolbar. One zoom group, in one place.
+    #[test]
+    fn device_toolbar_has_single_zoom_group() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("src/bin/helion-ide.rs");
+        let text = std::fs::read_to_string(&path).expect("helion-ide.rs readable");
+        // Extract paint_device_toolbar's body (to its closing brace at col 0).
+        let start = text
+            .find("fn paint_device_toolbar(")
+            .expect("paint_device_toolbar exists");
+        let body = &text[start..];
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, c) in body.char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        let toolbar = &body[..end];
+        // Zoom actions: each must appear exactly once in the toolbar.
+        for label in ["Zoom to selection", "Zoom In", "Zoom Out", "Zoom Fit"] {
+            let count = toolbar.matches(&format!("\"{label}\"")).count();
+            assert_eq!(
+                count, 1,
+                "device toolbar must have exactly one {label:?} button, found {count}"
+            );
+        }
+        // The old duplicate "Fit" (same action as "Zoom Fit") must be gone.
+        assert!(
+            !toolbar.contains("\"Fit\""),
+            "device toolbar must not contain the duplicate \"Fit\" button"
+        );
+    }
 }

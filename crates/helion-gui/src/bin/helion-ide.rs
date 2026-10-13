@@ -1368,8 +1368,8 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                         });
                     });
                 });
-                ui.separator();
-                paint_progress_strip(ui, app);
+                // R16: progress strip moved to Z7 status bar (job progress
+                // lives in the status bar, not the toolbar).
                 ui.separator();
                 // Layout presets (P1-1): task-curated chrome arrangements.
                 ui.label(RichText::new("Layout").small().color(app.theme.dim))
@@ -1423,40 +1423,42 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
     });
 }
 
-fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
-    let theme = app.theme;
+fn paint_progress_strip(ui: &mut egui::Ui, theme: &theme::Theme, model: &IdeModel) -> Option<FlowStep> {
     const STEPS: [FlowStep; 4] = [
         FlowStep::Synthesis,
         FlowStep::Opt,
         FlowStep::Place,
         FlowStep::Route,
     ];
+    // R16: lives in the 22px status bar (Z7), so chips are compact text
+    // with a state dot, not the 36px toolbar chips.
+    let mut clicked: Option<FlowStep> = None;
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = 6.0;
         let n = STEPS.len();
         for (i, step) in STEPS.iter().copied().enumerate() {
-            let state = app.model.step_state(step);
-            let blocked = app.model.step_blocked(step);
-            let (fill, stroke, text) = match state {
-                StepState::Pending => (theme.surface, theme.faint, theme.text),
-                StepState::Done => (theme.ok.gamma_multiply(0.28), theme.ok, theme.text),
-                StepState::Failed => (theme.danger.gamma_multiply(0.3), theme.danger, theme.text),
+            let state = model.step_state(step);
+            let blocked = model.step_blocked(step);
+            let (dot, text) = match state {
+                StepState::Pending => (theme.faint, theme.text),
+                StepState::Done => (theme.ok, theme.text),
+                StepState::Failed => (theme.danger, theme.text),
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
-                let chip = chrome::flow_chip_size();
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(chip[0], chip[1]), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(64.0, 18.0),
+                    egui::Sense::click(),
+                );
                 if ui.is_rect_visible(rect) {
-                    ui.painter().rect(
-                        rect,
-                        2.0,
-                        fill,
-                        Stroke::new(1.0_f32, stroke),
-                        egui::StrokeKind::Inside,
+                    // State dot + label.
+                    ui.painter().circle_filled(
+                        rect.left_center() + egui::vec2(5.0, 0.0),
+                        3.0,
+                        dot,
                     );
                     ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
+                        rect.left_center() + egui::vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
                         step.label(),
                         egui::FontId::proportional(11.0),
                         text,
@@ -1468,7 +1470,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
                 };
                 let resp = resp.on_hover_text(hover);
                 if resp.clicked() && blocked.is_none() {
-                    app.submit_job(JobKind::Step(step));
+                    clicked = Some(step);
                 }
             });
             if i + 1 < n {
@@ -1476,6 +1478,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
             }
         }
     });
+    clicked
 }
 
 fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
@@ -2023,6 +2026,7 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         Bottom(BottomTab),
     }
     let mut go: Option<Go> = None;
+    let mut go_step: Option<FlowStep> = None;
 
     egui::TopBottomPanel::bottom("status")
         .exact_height(chrome::STATUS_HEIGHT)
@@ -2119,8 +2123,9 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
                 seg(ui, &status, theme.dim, "", None);
             }
-            // Right side: background-job spinner + progress, or idle indicator.
-            let right_w = 190.0;
+            // Right side: flow progress chips (R16: Z1 -> Z7) + background-job
+            // spinner/progress, or idle indicator.
+            let right_w = 340.0;
             let right_rect = egui::Rect::from_min_size(
                 egui::pos2(bar.right() - right_w - 8.0, bar.top()),
                 egui::vec2(right_w, bar.height()),
@@ -2148,9 +2153,21 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
                                 .color(theme.faint),
                         );
                     }
+                    ui.separator();
+                    // R16: flow step chips live in the status bar, not the toolbar.
+                    // paint_progress_strip returns the clicked step; the job
+                    // is submitted after the panel closure (borrow rules).
+                    if let Some(step) = paint_progress_strip(ui, &theme, model) {
+                        go_step = Some(step);
+                    }
                 });
             });
         });
+
+    // R16: flow chip click from the status bar.
+    if let Some(step) = go_step {
+        app.submit_job(JobKind::Step(step));
+    }
 
     match go {
         Some(Go::Activity(a)) => app.set_activity(a),
@@ -8108,10 +8125,49 @@ fn paint_device_toolbar(
     pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
+    // Device toolbar, grouped by function (layout grammar: one group per
+    // purpose, separators between groups, primary view controls first).
+    // Zoom lives ONLY here; there is no second zoom group elsewhere.
     ui.horizontal(|ui| {
-        if ui.button("Fit").on_hover_text("Zoom the die to fit (F)").clicked() {
+        // View: zoom controls.
+        if ui
+            .button("Zoom to selection")
+            .on_hover_text("Zoom the die to the selected site/net")
+            .clicked()
+        {
+            if let Some((x, y)) = selected_site_xy(model) {
+                model.device_zoom = 2.5;
+                *zoom_target = Some((x, y));
+            }
+        }
+        if ui
+            .button("Zoom In")
+            .on_hover_text("Zoom in (+)")
+            .clicked()
+        {
+            let _ = model.device_zoom_in();
+        }
+        if ui
+            .button("Zoom Out")
+            .on_hover_text("Zoom out (-)")
+            .clicked()
+        {
+            let _ = model.device_zoom_out();
+        }
+        if ui
+            .button("Zoom Fit")
+            .on_hover_text("Zoom the die to fit (F)")
+            .clicked()
+        {
             let _ = model.device_zoom_fit();
         }
+        ui.label(
+            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
+                .small()
+                .weak(),
+        );
+        ui.separator();
+        // Tools: find, measure, clear.
         if ui
             .button("Find...")
             .on_hover_text("Find a site, cell, or net (Ctrl+K)")
@@ -8139,6 +8195,7 @@ fn paint_device_toolbar(
             clear_physview_selection(model, pv);
         }
         ui.separator();
+        // Panels: dock toggles.
         if ui
             .small_button(if pv.show_display_control {
                 "Layers [-]"
@@ -8162,25 +8219,7 @@ fn paint_device_toolbar(
             pv.show_inspector = !pv.show_inspector;
         }
         ui.separator();
-        if ui
-            .button("Zoom to selection")
-            .on_hover_text("Zoom the die to the selected site/net")
-            .clicked()
-        {
-            if let Some((x, y)) = selected_site_xy(model) {
-                model.device_zoom = 2.5;
-                *zoom_target = Some((x, y));
-            }
-        }
-        if ui.button("Zoom In").clicked() {
-            let _ = model.device_zoom_in();
-        }
-        if ui.button("Zoom Out").clicked() {
-            let _ = model.device_zoom_out();
-        }
-        if ui.button("Zoom Fit").clicked() {
-            let _ = model.device_zoom_fit();
-        }
+        // Debug: actions on the selected net (disabled with no debug net).
         let dbg_net = model.selected_debug_net();
         ui.add_enabled_ui(dbg_net.is_some(), |ui| {
             let md = match &dbg_net {
@@ -8202,11 +8241,6 @@ fn paint_device_toolbar(
                 let _ = model.exec("add_probe");
             }
         });
-        ui.label(
-            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
-                .small()
-                .weak(),
-        );
     });
 }
 
