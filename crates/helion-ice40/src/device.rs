@@ -36,20 +36,20 @@ pub fn tile_kind(x: u8, y: u8) -> Option<TileKind> {
         return None;
     }
     // IO ring first.
-    if y == 0 && x >= 1 && x < MAX_X {
+    if y == 0 && (1..MAX_X).contains(&x) {
         return Some(TileKind::IoBottom);
     }
-    if y == MAX_Y && x >= 1 && x < MAX_X {
+    if y == MAX_Y && (1..MAX_X).contains(&x) {
         return Some(TileKind::IoTop);
     }
-    if x == 0 && y >= 1 && y < MAX_Y {
+    if x == 0 && (1..MAX_Y).contains(&y) {
         return Some(TileKind::IoLeft);
     }
-    if x == MAX_X && y >= 1 && y < MAX_Y {
+    if x == MAX_X && (1..MAX_Y).contains(&y) {
         return Some(TileKind::IoRight);
     }
     // Interior.
-    if x >= 1 && x < MAX_X && y >= 1 && y < MAX_Y {
+    if (1..MAX_X).contains(&x) && (1..MAX_Y).contains(&y) {
         if RAM_COLS.contains(&x) {
             if y % 2 == 1 {
                 return Some(TileKind::Ramb);
@@ -107,12 +107,14 @@ pub const PINTYPE_INPUT: &str = "100000";
 /// PINTYPE value for a plain push-pull output pin (empirical).
 pub const PINTYPE_OUTPUT: &str = "100110";
 
-/// Span-wire alias map: `(x, y, local_name)` -> canonical wire id.
+/// Span-wire alias map key: `(tile_x, tile_y, local_net_name)`.
+type SpanKey = (u8, u8, String);
+/// Span-wire alias map: [`SpanKey`] -> canonical wire id.
 ///
 /// Precomputed from IceStorm's geometric net-following (`pos_follow_net`
-/// plus the documented intra-tile through-connections). All `(x, y, name)`
+/// plus the documented intra-tile through-connections). All [`SpanKey`]
 /// triples that are the same physical copper share one id.
-pub fn span_aliases() -> &'static HashMap<(u8, u8, String), u32> {
+pub fn span_aliases() -> &'static HashMap<SpanKey, u32> {
     static MAP: OnceLock<HashMap<(u8, u8, String), u32>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
@@ -140,10 +142,10 @@ pub fn span_wire_count() -> u32 {
     })
 }
 
-/// IO-tile span to fabric span mapping: `(io_x, io_y, io_name)` ->
-/// `(logic_x, logic_y, logic_name)`. Precomputed via `pos_follow_net`.
-pub fn io_span_map() -> &'static HashMap<(u8, u8, String), (u8, u8, String)> {
-    static MAP: OnceLock<HashMap<(u8, u8, String), (u8, u8, String)>> = OnceLock::new();
+/// IO-tile span to fabric span mapping: [`SpanKey`] -> [`SpanKey`].
+/// Precomputed via `pos_follow_net`.
+pub fn io_span_map() -> &'static HashMap<SpanKey, SpanKey> {
+    static MAP: OnceLock<HashMap<SpanKey, SpanKey>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
         for line in include_str!("../data/io_span_map.txt").lines() {

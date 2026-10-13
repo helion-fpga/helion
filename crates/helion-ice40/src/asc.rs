@@ -107,13 +107,13 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> String {
         bits[18] = false;
         bits[19] = false;
         if let Some(t) = tiles.get_mut(&(x, y)) {
-            for j in 0..10 {
-                if bits[j] {
+            for (j, &b) in bits.iter().enumerate().take(10) {
+                if b {
                     t.set(2 * lc, 45 - j as u8);
                 }
             }
-            for j in 10..20 {
-                if bits[j] {
+            for (j, &b) in bits.iter().enumerate().skip(10) {
+                if b {
                     t.set(2 * lc + 1, 45 - (j - 10) as u8);
                 }
             }

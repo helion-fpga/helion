@@ -137,8 +137,7 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
     for ram in &packed.rams {
         let site = (1..33u8)
             .flat_map(|y| [8u8, 25u8].into_iter().map(move |x| (x, y)))
-            .filter(|&(x, y)| y % 2 == 1 && !used_ram.contains(&(x, y)))
-            .next()
+            .find(|&(x, y)| y % 2 == 1 && !used_ram.contains(&(x, y)))
             .ok_or_else(|| format!("place: no free RAM40 site for {}", ram.name))?;
         used_ram.insert(site);
         out.rams.push(PlacedRam {
@@ -320,8 +319,7 @@ pub fn place(packed: &PackedIce) -> Result<PlacedIce, String> {
     }
     let mut domain_cursor = vec![0usize; clocks.len()];
     let mut unit_slot: Vec<Slot> = Vec::with_capacity(units.len());
-    for ui in 0..units.len() {
-        let d = unit_domain[ui];
+    for &d in &unit_domain {
         let cursor = &mut domain_cursor[d];
         let tiles_d = &domain_tiles[d];
         let (x, y) = tiles_d

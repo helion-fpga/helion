@@ -386,7 +386,63 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
             }
         }
     }
-    // TODO: RAM and PLL pins (when those pack paths are exercised).
+    // RAM blocks: SB_RAM40_4K spans a RAMB tile (x, y) and RAMT tile (x, y+1).
+    // Lower data bits (0..7) live on RAMT, upper bits (8..15) on RAMB.
+    for (ri, ram) in placed.packed.rams.iter().enumerate() {
+        let placed_ram = &placed.rams[ri];
+        let (x, y) = (placed_ram.x, placed_ram.y);
+        let ram_pack = &placed.packed.rams[ri];
+        // Read data outputs.
+        for i in 0..8 {
+            let n = router.lookup(x, y + 1, &format!("ram/RDATA_{i}"));
+            add_ep(&ram_pack.rdata_net[i], n, true, &format!("RAM {} RDATA{i}", ram_pack.name))?;
+        }
+        for i in 8..16 {
+            let n = router.lookup(x, y, &format!("ram/RDATA_{i}"));
+            add_ep(&ram_pack.rdata_net[i], n, true, &format!("RAM {} RDATA{i}", ram_pack.name))?;
+        }
+        // Write data inputs.
+        for i in 0..8 {
+            let n = router.lookup(x, y + 1, &format!("ram/WDATA_{i}"));
+            add_ep(&ram_pack.wdata_net[i], n, false, &format!("RAM {} WDATA{i}", ram_pack.name))?;
+        }
+        for i in 8..16 {
+            let n = router.lookup(x, y, &format!("ram/WDATA_{i}"));
+            add_ep(&ram_pack.wdata_net[i], n, false, &format!("RAM {} WDATA{i}", ram_pack.name))?;
+        }
+        // Addresses and clocks.
+        for i in 0..11 {
+            let n = router.lookup(x, y, &format!("ram/RADDR_{i}"));
+            add_ep(&ram_pack.raddr_net[i], n, false, &format!("RAM {} RADDR{i}", ram_pack.name))?;
+            let n = router.lookup(x, y + 1, &format!("ram/WADDR_{i}"));
+            add_ep(&ram_pack.waddr_net[i], n, false, &format!("RAM {} WADDR{i}", ram_pack.name))?;
+        }
+        let n = router.lookup(x, y, "ram/RCLK");
+        add_ep(&ram_pack.rclk_net, n, false, &format!("RAM {} RCLK", ram_pack.name))?;
+        let n = router.lookup(x, y + 1, "ram/WCLK");
+        add_ep(&ram_pack.wclk_net, n, false, &format!("RAM {} WCLK", ram_pack.name))?;
+        if let Some(re) = &ram_pack.re_net {
+            let n = router.lookup(x, y, "ram/RE");
+            add_ep(re, n, false, &format!("RAM {} RE", ram_pack.name))?;
+        }
+        if let Some(we) = &ram_pack.we_net {
+            let n = router.lookup(x, y + 1, "ram/WE");
+            add_ep(we, n, false, &format!("RAM {} WE", ram_pack.name))?;
+        }
+        let _ = ram;
+    }
+    // PLLs: reference clock input and global clock output.
+    // (v1: PLL output routes as a plain net; full global-network support TBD.)
+    for (pi, pll) in placed.packed.plls.iter().enumerate() {
+        let placed_pll = &placed.plls[pi];
+        // Reference clock: driven from fabric (or a pin). Treat as a load
+        // that must be driven; the driver is the net's source.
+        // Output: drives the out_net.
+        // For v1, we require the ref_net to have a driver elsewhere and the
+        // out_net to be loaded elsewhere; the PLL itself is a pass-through
+        // marker. Full PLL config bits are TBD.
+        let _ = (pll, placed_pll);
+    }
 
     // Route each net: driver -> all loads via a shared tree.
     let mut routed = Vec::new();
