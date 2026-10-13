@@ -3,15 +3,26 @@
 //! A* router over the HX8K routing graph. The graph is built from the
 //! IceStorm intra-tile databases (buffer/routing entries) plus the
 //! precomputed span-wire aliasing and IO↔fabric span maps. Span wires that
-//! are the same physical copper share one node id.
+//! are the same physical copper share one node id, as do the eight
+//! `glb_netwk` wires (one canonical node each). Neighbor-output wires
+//! (`neigh_op_*`/`logic_op_*`) are geometrically aliased to the driving
+//! tile's LC output (or IO input) per IceStorm `follow_funcnet`.
+//!
+//! Global clocks ([`PackedClk`](crate::pack::PackedClk) markers, PLL
+//! outputs) ride the global network: source -> global buffer (`fabout` of
+//! a `gbufin` IO tile, or the `padin_glb_netwk` extra bit for PLLs) ->
+//! `glb_netwk` -> per-tile `lutff_global/clk`. See [`crate::gclk`].
 
 use crate::device::{io_span_map, span_aliases, tile_db, tile_kind, TileKind};
+use crate::gclk;
 use crate::place::PlacedIce;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
 
 /// A routing-graph node id. Ids below `span_count` are canonical span wires;
-/// higher ids are interned `(x, y, name)` triples.
+/// the next 8 are the canonical `glb_netwk_0`..`glb_netwk_7` wires (every
+/// tile's `glb_netwk_N` is the same physical net); higher ids are interned
+/// `(x, y, name)` triples.
 pub type NodeId = u32;
 
 /// A directed routing edge. `rel` indexes the tile-kind-relative edge table
@@ -36,6 +47,8 @@ struct RelEdge {
 /// The routing graph.
 pub struct Router {
     span_count: u32,
+    /// First node id of the 8 canonical `glb_netwk_N` wires (= span_count).
+    glb_base: u32,
     /// wire id -> bounding box of members (for the A* heuristic).
     span_bbox: Vec<(i32, i32, i32, i32)>,
     /// interned (x, y, name) -> node id.
@@ -55,6 +68,63 @@ fn kind_idx(k: TileKind) -> usize {
         TileKind::IoBottom => 4,
         TileKind::IoLeft => 5,
         TileKind::IoRight => 6,
+    }
+}
+
+/// Parse a `glb_netwk_N` wire name to its index (0..7).
+fn parse_glb_netwk(name: &str) -> Option<u8> {
+    let n: u8 = name.strip_prefix("glb_netwk_")?.parse().ok()?;
+    (n < 8).then_some(n)
+}
+
+/// Geometric alias for a neighbor-output wire: inverts IceStorm
+/// `icebox.py::follow_funcnet`. Tile `(x, y)`'s `neigh_op_<dir>_<n>`
+/// (logic tiles) or `logic_op_<dir>_<n>` (IO tiles) is driven by the
+/// neighboring tile's `lutff_<n>/out` (logic neighbor) or `io_<m>/D_IN_<k>`
+/// (IO neighbor, per `rlookup_funcnet`'s func mapping).
+/// Returns `None` when the driver is not representable (RAM neighbor,
+/// off-chip edge); the caller then keeps the wire as an unconnected node,
+/// exactly like the old exclusion did.
+fn neigh_op_alias(x: u8, y: u8, name: &str) -> Option<(u8, u8, String)> {
+    let rest = name
+        .strip_prefix("neigh_op_")
+        .or_else(|| name.strip_prefix("logic_op_"))?;
+    let (dir, n) = rest.split_once('_')?;
+    let n: u8 = n.parse().ok()?;
+    if n > 7 {
+        return None;
+    }
+    // Inverse of follow_funcnet's do_direction table.
+    let (dx, dy) = match dir {
+        "bot" => (x as i16, y as i16 - 1),
+        "bnl" => (x as i16 - 1, y as i16 - 1),
+        "bnr" => (x as i16 + 1, y as i16 - 1),
+        "top" => (x as i16, y as i16 + 1),
+        "tnl" => (x as i16 - 1, y as i16 + 1),
+        "tnr" => (x as i16 + 1, y as i16 + 1),
+        "lft" => (x as i16 - 1, y as i16),
+        "rgt" => (x as i16 + 1, y as i16),
+        _ => return None,
+    };
+    if !(0..=33).contains(&dx) || !(0..=33).contains(&dy) {
+        return None;
+    }
+    let (dx, dy) = (dx as u8, dy as u8);
+    match tile_kind(dx, dy) {
+        Some(TileKind::Logic) => Some((dx, dy, format!("lutff_{n}/out"))),
+        Some(TileKind::IoTop | TileKind::IoBottom | TileKind::IoLeft | TileKind::IoRight) => {
+            // icebox.py rlookup_funcnet: io_0/D_IN_0 <- {0,4},
+            // io_0/D_IN_1 <- {1,5}, io_1/D_IN_0 <- {2,6}, io_1/D_IN_1 <- {3,7}.
+            let (m, k) = match n {
+                0 | 4 => (0, 0),
+                1 | 5 => (0, 1),
+                2 | 6 => (1, 0),
+                3 | 7 => (1, 1),
+                _ => return None,
+            };
+            Some((dx, dy, format!("io_{m}/D_IN_{k}")))
+        }
+        _ => None,
     }
 }
 
@@ -95,9 +165,10 @@ impl Router {
                 ) {
                     continue;
                 }
-                if e.src.contains("neigh_op") || e.dst.contains("neigh_op") {
-                    continue; // v1: spans carry everything
-                }
+                // Neighbor-output (`neigh_op_*`/`logic_op_*`) edges are
+                // included: `resolve` aliases them to the driving tile's
+                // LC output (or IO input), so they are live short-hop
+                // edges, not dead ends.
                 let bits: Vec<(u8, u8)> = e
                     .bits
                     .iter()
@@ -115,14 +186,16 @@ impl Router {
 
         let mut r = Router {
             span_count,
+            glb_base: span_count,
             span_bbox,
             node_ids: HashMap::new(),
             node_xy: Vec::new(),
             adj: Vec::new(),
             rel_edges,
         };
-        // Size adjacency for span wires + room for interned nodes.
-        r.adj.resize(span_count as usize + 4096, Vec::new());
+        // Size adjacency for span wires + 8 canonical glb wires + room for
+        // interned nodes.
+        r.adj.resize(span_count as usize + 8 + 4096, Vec::new());
 
         // Helper closures need &mut r; inline the logic instead.
         // Resolve (x, y, name) -> NodeId, creating interned nodes.
@@ -171,6 +244,16 @@ impl Router {
         aliases: &HashMap<(u8, u8, String), u32>,
         io_map: &HashMap<(u8, u8, String), (u8, u8, String)>,
     ) -> NodeId {
+        // Canonical global-network wires: every tile's glb_netwk_N is the
+        // same physical net (IceStorm icebox_vlog joins them the same way).
+        if let Some(n) = parse_glb_netwk(name) {
+            return self.glb_base + u32::from(n);
+        }
+        // Neighbor-output wires are geometric aliases of the neighboring
+        // tile's LC output (or IO input); see `neigh_op_alias`.
+        if let Some((dx, dy, dname)) = neigh_op_alias(x, y, name) {
+            return self.resolve(dx, dy, &dname, aliases, io_map);
+        }
         // Span wire in the fabric?
         if let Some(wid) = aliases.get(&(x, y, name.to_string())) {
             return *wid;
@@ -186,19 +269,34 @@ impl Router {
         if let Some(id) = self.node_ids.get(&key) {
             return *id;
         }
-        let id = self.span_count + self.node_xy.len() as u32;
+        let id = self.glb_base + 8 + self.node_xy.len() as u32;
         self.node_ids.insert(key, id);
         self.node_xy.push((x, y));
         id
     }
 
     pub fn node_count(&self) -> u32 {
-        self.span_count + self.node_xy.len() as u32
+        self.glb_base + 8 + self.node_xy.len() as u32
     }
 
     /// Config bits for a routed edge (to program in the source tile).
     pub fn edge_bits(&self, kind_idx: usize, rel_idx: usize) -> &[(u8, u8)] {
         &self.rel_edges[kind_idx][rel_idx].bits
+    }
+
+    /// Source net name of a routing-graph edge (for asc emission and tests).
+    pub fn rel_src(&self, kind_idx: usize, rel_idx: usize) -> &str {
+        &self.rel_edges[kind_idx][rel_idx].src
+    }
+
+    /// Destination net name of a routing-graph edge (for tests).
+    pub fn rel_dst(&self, kind_idx: usize, rel_idx: usize) -> &str {
+        &self.rel_edges[kind_idx][rel_idx].dst
+    }
+
+    /// Canonical node id of the `glb_netwk_N` wire.
+    pub fn glb_node(&self, n: u8) -> NodeId {
+        self.glb_base + u32::from(n)
     }
 
     /// Position of a node for the A* heuristic.
@@ -207,8 +305,11 @@ impl Router {
             let b = self.span_bbox[id as usize];
             // Center of the bounding box.
             ((b.0 + b.1) / 2, (b.2 + b.3) / 2)
+        } else if id < self.span_count + 8 {
+            // A global-network wire spans the whole chip.
+            (16, 16)
         } else {
-            let (x, y) = self.node_xy[(id - self.span_count) as usize];
+            let (x, y) = self.node_xy[(id - self.span_count - 8) as usize];
             (x as i32, y as i32)
         }
     }
@@ -216,6 +317,12 @@ impl Router {
     /// Public node lookup for net endpoints. Returns `None` for span wires
     /// that do not exist (should not happen for valid names).
     pub fn lookup(&self, x: u8, y: u8, name: &str) -> Option<NodeId> {
+        if let Some(n) = parse_glb_netwk(name) {
+            return Some(self.glb_base + u32::from(n));
+        }
+        if let Some((dx, dy, dname)) = neigh_op_alias(x, y, name) {
+            return self.lookup(dx, dy, &dname);
+        }
         let aliases = span_aliases();
         if let Some(wid) = aliases.get(&(x, y, name.to_string())) {
             return Some(*wid);
@@ -323,10 +430,49 @@ pub struct RoutedEdge {
 pub struct RoutedIce {
     pub placed: PlacedIce,
     pub nets: Vec<RoutedNet>,
+    /// Global clocks: per-tile `glb_netwk -> lutff_global/clk` programming,
+    /// `ColBufCtrl` bits, and `padin_glb_netwk` extra bits are emitted from
+    /// this (see [`asc`](crate::asc)).
+    pub glb_clocks: Vec<GlbClock>,
+}
+
+/// One routed global clock.
+#[derive(Clone, Debug)]
+pub struct GlbClock {
+    /// Global net index 0..7.
+    pub glb: u8,
+    /// Logic tiles whose FFs take this clock: program
+    /// `glb_netwk_{glb} -> lutff_global/clk` here, plus the `ColBufCtrl`
+    /// bit in the covering column-buffer tile.
+    pub tiles: Vec<(u8, u8)>,
+    /// RAM clock pins on this clock: `(x, y, is_wclk)`; program
+    /// `glb_netwk_{glb} -> ram/RCLK` (RAMB tile) or `-> ram/WCLK`
+    /// (RAMT tile).
+    pub ram_clks: Vec<(u8, u8, bool)>,
+    /// `padin_glb_netwk` extra bit `(bank, row, bit)` for PLL-driven clocks.
+    pub extra_bit: Option<(u8, u16, u16)>,
 }
 
 /// Route the placed design. Returns the routed nets with their edges.
+///
+/// Global clocks ([`PackedClk`](crate::pack::PackedClk) markers and PLL
+/// outputs) are assigned to `glb_netwk` wires by [`gclk::plan`]: their FF
+/// clock pins bypass fabric routing (the per-tile
+/// `glb_netwk -> lutff_global/clk` buffer is programmed from
+/// [`RoutedIce::glb_clocks`]), and any other loads route from the canonical
+/// `glb_netwk` node.
 pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
+    // Assign global clocks first: each PackedClk marker and each PLL output
+    // gets one of the 8 glb nets (fails loud when over-subscribed).
+    let plans = gclk::plan(placed)?;
+    // Net name -> plan index.
+    let mut net_plan: HashMap<String, usize> = HashMap::new();
+    for (i, p) in plans.iter().enumerate() {
+        for n in &p.nets {
+            net_plan.insert(n.clone(), i);
+        }
+    }
+
     // Build net -> (drivers, loads).
     // Driver/load endpoints as node ids.
     struct Endpoint {
@@ -334,6 +480,10 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
         is_driver: bool,
     }
     let mut net_eps: HashMap<String, Vec<Endpoint>> = HashMap::new();
+    // Logic tiles taking each global clock (for glb_clocks).
+    let mut glb_tiles: HashMap<usize, Vec<(u8, u8)>> = HashMap::new();
+    // RAM clock pins taking each global clock: (x, y, is_wclk).
+    let mut glb_ram_clks: HashMap<usize, Vec<(u8, u8, bool)>> = HashMap::new();
     let mut add_ep = |net: &str, node: Option<NodeId>, is_driver: bool, what: &str| -> Result<(), String> {
         let node = node.ok_or_else(|| format!("route: no routing node for {what}"))?;
         net_eps
@@ -375,9 +525,15 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
         // Q driver at the LC output.
         let n = router.lookup(ff.x, ff.y, &format!("lutff_{}/out", ff.lc));
         add_ep(&ff.q_net, n, true, &format!("FF {} q", ff.name))?;
-        // Clock is a load on lutff_global/clk.
-        let n = router.lookup(ff.x, ff.y, "lutff_global/clk");
-        add_ep(&ff.clk_net, n, false, &format!("FF {} clk", ff.name))?;
+        // Clock: on a global net the pin bypasses fabric routing; the
+        // per-tile glb_netwk -> lutff_global/clk buffer is programmed from
+        // glb_clocks instead. Other clocks keep the local-track path.
+        if let Some(&pi) = net_plan.get(&ff.clk_net) {
+            glb_tiles.entry(pi).or_default().push((ff.x, ff.y));
+        } else {
+            let n = router.lookup(ff.x, ff.y, "lutff_global/clk");
+            add_ep(&ff.clk_net, n, false, &format!("FF {} clk", ff.name))?;
+        }
     }
     for io in &placed.ios {
         match io.dir {
@@ -438,9 +594,24 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
             add_ram_ep(&ram_pack.waddr_net[i], n, false, &format!("RAM {} WADDR{i}", ram_pack.name))?;
         }
         let n = router.lookup(x, y, "ram/RCLK");
-        add_ram_ep(&ram_pack.rclk_net, n, false, &format!("RAM {} RCLK", ram_pack.name))?;
+        // A global clock drives RCLK straight from the glb wire (the RAM
+        // tile has a glb_netwk -> ram/RCLK buffer); other clocks route as
+        // ordinary nets.
+        if ram_pack.rclk_net != "gnd" {
+            if let Some(&pi) = net_plan.get(&ram_pack.rclk_net) {
+                glb_ram_clks.entry(pi).or_default().push((x, y, false));
+            } else {
+                add_ram_ep(&ram_pack.rclk_net, n, false, &format!("RAM {} RCLK", ram_pack.name))?;
+            }
+        }
         let n = router.lookup(x, y + 1, "ram/WCLK");
-        add_ram_ep(&ram_pack.wclk_net, n, false, &format!("RAM {} WCLK", ram_pack.name))?;
+        if ram_pack.wclk_net != "gnd" {
+            if let Some(&pi) = net_plan.get(&ram_pack.wclk_net) {
+                glb_ram_clks.entry(pi).or_default().push((x, y + 1, true));
+            } else {
+                add_ram_ep(&ram_pack.wclk_net, n, false, &format!("RAM {} WCLK", ram_pack.name))?;
+            }
+        }
         if let Some(re) = &ram_pack.re_net {
             let n = router.lookup(x, y, "ram/RE");
             add_ram_ep(re, n, false, &format!("RAM {} RE", ram_pack.name))?;
@@ -457,15 +628,14 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
     // the local-track -> fabout buffer, as arachne-pnr does.
     //
     // The PLL output (PLLOUTGLOBAL) physically drives the dedicated global
-    // clock network via the padin_glb_netwk extra bit, which this backend
-    // does not emit yet. For v1 the output is driven as a plain net from a
-    // logic-cell output node in the tile adjacent to the PLL site so the
-    // design routes structurally; see asc.rs for the config-bit emission.
+    // clock network via the padin_glb_netwk extra bit (emitted from
+    // glb_clocks). Its routing driver is the canonical glb_netwk node,
+    // added generically below; no fabric driver exists.
     for (pi, pll) in placed.packed.plls.iter().enumerate() {
         let placed_pll = &placed.plls[pi];
-        let (ref_tile, drv_tile) = match placed_pll.kind {
-            crate::pack::PllKind::Pad => ((13u8, 0u8), (16u8, 1u8)),
-            crate::pack::PllKind::Core => ((13u8, 33u8), (16u8, 32u8)),
+        let ref_tile = match placed_pll.kind {
+            crate::pack::PllKind::Pad => (13u8, 0u8),
+            crate::pack::PllKind::Core => (13u8, 33u8),
         };
         let n = router.lookup(ref_tile.0, ref_tile.1, "fabout");
         add_ep(
@@ -474,13 +644,23 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
             false,
             &format!("PLL {} REFERENCECLK", pll.name),
         )?;
-        let n = router.lookup(drv_tile.0, drv_tile.1, "lutff_0/out");
-        add_ep(
-            &pll.out_net,
-            n,
-            true,
-            &format!("PLL {} PLLOUTGLOBAL", pll.name),
-        )?;
+    }
+
+    // Global-clock sources: route each source net to the `fabout` of its
+    // assigned global-buffer IO tile (arachne-pnr's path). PLL-driven
+    // clocks need no routing (padin_glb_netwk extra bit).
+    for p in &plans {
+        if let (Some(src_net), gclk::ClockSource::GlobalBuffer { gx, gy }) =
+            (&p.source_net, p.source)
+        {
+            let n = router.lookup(gx, gy, "fabout");
+            add_ep(
+                src_net,
+                n,
+                false,
+                &format!("global clock source -> fabout {gx},{gy}"),
+            )?;
+        }
     }
 
     // Route each net: driver -> all loads via a shared tree.
@@ -493,12 +673,26 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
     for (name, eps) in nets {
         let drivers: Vec<NodeId> = eps.iter().filter(|e| e.is_driver).map(|e| e.node).collect();
         let loads: Vec<NodeId> = eps.iter().filter(|e| !e.is_driver).map(|e| e.node).collect();
-        if drivers.is_empty() {
-            return Err(format!("route: net '{name}' has no driver"));
-        }
-        if drivers.len() > 1 {
-            return Err(format!("route: net '{name}' has {} drivers", drivers.len()));
-        }
+        // A global clock net is driven by its canonical glb_netwk wire
+        // (the source reached it via the global buffer / padin bit); a
+        // fabric driver on the same net is a design bug.
+        let drivers = if let Some(&pi) = net_plan.get(&name) {
+            if !drivers.is_empty() {
+                return Err(format!(
+                    "route: global clock net '{name}' has {} fabric drivers",
+                    drivers.len()
+                ));
+            }
+            vec![router.glb_node(plans[pi].glb)]
+        } else {
+            if drivers.is_empty() {
+                return Err(format!("route: net '{name}' has no driver"));
+            }
+            if drivers.len() > 1 {
+                return Err(format!("route: net '{name}' has {} drivers", drivers.len()));
+            }
+            drivers
+        };
         if loads.is_empty() {
             continue; // no loads: nothing to route
         }
@@ -558,8 +752,78 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
         });
     }
 
+    let mut glb_clocks: Vec<GlbClock> = Vec::new();
+    for (i, p) in plans.iter().enumerate() {
+        let mut tiles = glb_tiles.remove(&i).unwrap_or_default();
+        tiles.sort();
+        tiles.dedup();
+        let mut ram_clks = glb_ram_clks.remove(&i).unwrap_or_default();
+        ram_clks.sort();
+        ram_clks.dedup();
+        glb_clocks.push(GlbClock {
+            glb: p.glb,
+            tiles,
+            ram_clks,
+            extra_bit: p.extra_bit,
+        });
+    }
+
     Ok(RoutedIce {
         placed: placed.clone(),
         nets: routed,
+        glb_clocks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neigh_op_edges_alias_neighbor_lc_outputs() {
+        // IceStorm follow_funcnet inverse: tile (5,6)'s neigh_op_bot_0 is
+        // tile (5,5)'s lutff_0/out. The graph must contain live edges from
+        // that driver node, programmed in tile (5,6).
+        let r = Router::build();
+        let driver = r.lookup(5, 5, "lutff_0/out").expect("driver node");
+        // lookup aliases the same way the graph builder does.
+        assert_eq!(r.lookup(5, 6, "neigh_op_bot_0"), Some(driver));
+        assert_eq!(r.lookup(6, 6, "neigh_op_bnl_0"), Some(driver));
+        assert_eq!(r.lookup(5, 4, "neigh_op_top_0"), Some(driver));
+        // An edge from the driver node must exist with the neigh_op buffer
+        // bits in the neighbor tile.
+        let li = kind_idx(TileKind::Logic);
+        let mut found = false;
+        for (ri, re) in r.rel_edges[li].iter().enumerate() {
+            if re.src == "neigh_op_bot_0" {
+                found |= r.adj[driver as usize].iter().any(|e| {
+                    e.tile_x == 5 && e.tile_y == 6 && e.kind_idx == li && e.rel_idx == ri
+                });
+            }
+        }
+        assert!(found, "no live neigh_op_bot_0 edge from (5,5) lutff_0/out");
+    }
+
+    #[test]
+    fn neigh_op_alias_rejects_unrepresentable_drivers() {
+        // Off-chip and RAM-neighbor drivers stay unaliased (dead nodes,
+        // like the old exclusion): no panic, no bogus tile.
+        assert_eq!(neigh_op_alias(5, 0, "neigh_op_bot_0"), None);
+        assert_eq!(neigh_op_alias(7, 5, "neigh_op_rgt_0"), None); // (8,5) is RAMB
+        assert_eq!(neigh_op_alias(5, 5, "neigh_op_xx_0"), None);
+        assert_eq!(neigh_op_alias(5, 5, "slf_op_0"), None);
+        // IO-tile neighbor: logic_op_ aliases to the logic LC output.
+        let a = neigh_op_alias(0, 16, "logic_op_rgt_2").expect("aliased");
+        assert_eq!(a, (1, 16, "lutff_2/out".to_string()));
+    }
+
+    #[test]
+    fn glb_wires_are_canonical() {
+        let r = Router::build();
+        // Every tile's glb_netwk_6 is the same node.
+        let a = r.lookup(5, 5, "glb_netwk_6").expect("glb node");
+        let b = r.lookup(20, 20, "glb_netwk_6").expect("glb node");
+        assert_eq!(a, b);
+        assert_eq!(a, r.glb_node(6));
+    }
 }

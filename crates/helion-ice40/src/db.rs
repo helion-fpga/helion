@@ -141,11 +141,17 @@ pub fn normalize_netname(net: &str) -> String {
     n = n.replace("wire_mult/", "");
     n = n.replace("wire_con_box/", "");
     n = n.replace("wire_bram/", "");
-    // (logic|neigh)_op_XXX_N -> neigh_op_XXX_N  (except slf_op)
-    if let Some(rest) = n.strip_prefix("logic_op_") {
-        n = format!("neigh_op_{rest}");
-    } else if let Some(rest) = n.strip_prefix("neigh_op_") {
-        n = format!("neigh_op_{rest}");
+    // XXX_op_REST -> neigh_op_XXX_REST (except slf_op), matching icebox.py
+    // netname_normalize's re.match(r"(...)_op_(.*)", netname): exactly three
+    // characters before "_op_". So logic-tile "bnl_op_0" becomes
+    // "neigh_op_bnl_0", while IO-tile "logic_op_bnr_0" is left unchanged.
+    if n.len() > 6 {
+        let (prefix, rest) = n.split_at(3);
+        if let Some(rest) = rest.strip_prefix("_op_") {
+            if prefix != "slf" {
+                n = format!("neigh_op_{prefix}_{rest}");
+            }
+        }
     }
     if n.starts_with("lutff_7/cen") || n.starts_with("lutff_7/clk") || n.starts_with("lutff_7/s_r") {
         n = n.replacen("lutff_7/", "lutff_global/", 1);
@@ -203,7 +209,12 @@ mod tests {
         assert_eq!(normalize_netname("wire_logic_cluster/lc_3/out"), "lutff_3/out");
         assert_eq!(normalize_netname("lc_trk_g1_2"), "local_g1_2");
         assert_eq!(normalize_netname("input_2_5"), "lutff_5/in_2");
-        assert_eq!(normalize_netname("logic_op_lft_0"), "neigh_op_lft_0");
+        // icebox.py netname_normalize: (...)_op_ with exactly 3 leading chars.
+        assert_eq!(normalize_netname("bnl_op_0"), "neigh_op_bnl_0");
+        assert_eq!(normalize_netname("top_op_7"), "neigh_op_top_7");
+        assert_eq!(normalize_netname("slf_op_7"), "slf_op_7");
+        // "logic_op_" is longer than 3 chars: left unchanged by icebox.
+        assert_eq!(normalize_netname("logic_op_lft_0"), "logic_op_lft_0");
         assert_eq!(normalize_netname("lutff_7/clk"), "lutff_global/clk");
     }
 

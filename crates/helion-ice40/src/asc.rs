@@ -2,9 +2,13 @@
 //!
 //! Sets routing bits from the routed edges, LC config bits (LUT truth
 //! tables, DffEnable) from placement, and IO PINTYPE bits from the pin
-//! directions. The `.asc` is converted to binary with IceStorm's `icepack`.
+//! directions. Global clocks program the per-tile
+//! `glb_netwk -> lutff_global/clk` buffers, the `ColBufCtrl` column-buffer
+//! bits, and the `padin_glb_netwk` extra bits. The `.asc` is converted to
+//! binary with IceStorm's `icepack`.
 
 use crate::device::{tile_db, tile_kind, TileKind, PINTYPE_INPUT, PINTYPE_OUTPUT};
+use crate::gclk::colbuf_src_y;
 use crate::pack::{lut4_init_to_lc_bits, IoDir, PackedPll, PllKind};
 use crate::place::CarryMuxMode;
 use crate::route::{RoutedIce, Router};
@@ -80,6 +84,60 @@ fn buffer_set_bits(src: &str, dst: &str) -> Result<Vec<(u8, u8)>, String> {
             "ice40: no buffer DB entry for {src} -> {dst} (carry wiring)"
         )),
     }
+}
+
+/// Config bits selecting `glb_netwk_N` as a logic tile's clock
+/// (`glb_netwk_N -> lutff_global/clk`).
+fn glb_clk_buffer_bits(glb: u8) -> Result<Vec<(u8, u8)>, String> {
+    let src = format!("glb_netwk_{glb}");
+    let entry = tile_db(TileKind::Logic).iter().find(|e| {
+        matches!(e.func, crate::db::DbFunc::Buffer)
+            && e.src == src
+            && e.dst == "lutff_global/clk"
+    });
+    match entry {
+        Some(e) => Ok(e
+            .bits
+            .iter()
+            .filter(|b| b.val)
+            .map(|b| (b.row, b.bit))
+            .collect()),
+        None => Err(format!(
+            "ice40: no buffer DB entry for glb_netwk_{glb} -> lutff_global/clk"
+        )),
+    }
+}
+
+/// Config bits selecting `glb_netwk_N` as a RAM tile's clock
+/// (`glb_netwk_N -> ram/RCLK` in the RAMB tile, `-> ram/WCLK` in RAMT).
+fn glb_ram_clk_buffer_bits(kind: TileKind, glb: u8, dst: &str) -> Result<Vec<(u8, u8)>, String> {
+    let src = format!("glb_netwk_{glb}");
+    let entry = tile_db(kind).iter().find(|e| {
+        matches!(e.func, crate::db::DbFunc::Buffer) && e.src == src && e.dst == dst
+    });
+    match entry {
+        Some(e) => Ok(e
+            .bits
+            .iter()
+            .filter(|b| b.val)
+            .map(|b| (b.row, b.bit))
+            .collect()),
+        None => Err(format!("ice40: no buffer DB entry for glb_netwk_{glb} -> {dst}")),
+    }
+}
+
+/// The `ColBufCtrl` bit enabling `glb_netwk_N` in a column-buffer tile of
+/// the given kind (bit positions differ per tile kind; read from the DB).
+fn colbufctrl_bit(kind: TileKind, glb: u8) -> Result<(u8, u8), String> {
+    let src = format!("glb_netwk_{glb}");
+    tile_db(kind)
+        .iter()
+        .find(|e| {
+            matches!(&e.func, crate::db::DbFunc::Other(f) if f == "ColBufCtrl")
+                && e.src == src
+        })
+        .and_then(|e| e.bits.iter().find(|b| b.val).map(|b| (b.row, b.bit)))
+        .ok_or_else(|| format!("ice40: no ColBufCtrl glb_netwk_{glb} DB entry"))
 }
 
 /// The `CarryInSet` bit (B1[50]).
@@ -257,6 +315,61 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
         }
     }
 
+    // 2b2. Global clock network.
+    // Each global clock programs, in every logic tile with FFs on it, the
+    // `glb_netwk_N -> lutff_global/clk` buffer. The `ColBufCtrl` bit for
+    // `glb_netwk_N` is set in the column-buffer tile covering each consumer
+    // tile (IceStorm colbuf_db "8k": buffer rows 8, 9, 24, 25). Tiles where
+    // a routed edge taps the global net (`glb_netwk_N -> glb2local_*` for a
+    // non-clock load) need their column buffer as well.
+    let mut colbuf_need: HashSet<(u8, u8, u8)> = HashSet::new(); // (x, y, glb)
+    for gc in &routed.glb_clocks {
+        let clk_bits = glb_clk_buffer_bits(gc.glb)?;
+        for &(x, y) in &gc.tiles {
+            if let Some(t) = tiles.get_mut(&(x, y)) {
+                for &(bank, bit) in &clk_bits {
+                    t.set(bank, bit);
+                }
+            }
+            colbuf_need.insert((x, y, gc.glb));
+        }
+        for &(x, y, is_wclk) in &gc.ram_clks {
+            let (kind, dst) = if is_wclk {
+                (TileKind::Ramt, "ram/WCLK")
+            } else {
+                (TileKind::Ramb, "ram/RCLK")
+            };
+            let bits = glb_ram_clk_buffer_bits(kind, gc.glb, dst)?;
+            if let Some(t) = tiles.get_mut(&(x, y)) {
+                for &(bank, bit) in &bits {
+                    t.set(bank, bit);
+                }
+            }
+            colbuf_need.insert((x, y, gc.glb));
+        }
+    }
+    for net in &routed.nets {
+        for e in &net.edges {
+            let src = router.rel_src(e.kind_idx, e.rel_idx);
+            if let Some(glb) = src
+                .strip_prefix("glb_netwk_")
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|&g| g < 8)
+            {
+                colbuf_need.insert((e.tile_x, e.tile_y, glb));
+            }
+        }
+    }
+    for (x, y, glb) in colbuf_need {
+        let by = colbuf_src_y(y);
+        let kind = tile_kind(x, by)
+            .ok_or_else(|| format!("ice40: no tile at column-buffer ({x}, {by})"))?;
+        let (bank, bit) = colbufctrl_bit(kind, glb)?;
+        if let Some(t) = tiles.get_mut(&(x, by)) {
+            t.set(bank, bit);
+        }
+    }
+
     // 2c. RAM config bits.
     // PowerUp lives in the RAMB tile; the CBITs in the RAMT tile
     // (WRITE_MODE[0]->CBIT_0, WRITE_MODE[1]->CBIT_1, READ_MODE[0]->CBIT_2,
@@ -394,6 +507,19 @@ pub fn emit_asc(router: &Router, routed: &RoutedIce) -> Result<String, String> {
             }
             out.push('\n');
         }
+    }
+
+    // 6. padin_glb_netwk extra bits (PLL-driven global clocks), after the
+    // ram_data sections (matches IceStorm icebox.py write order).
+    let mut extra_bits: Vec<(u8, u16, u16)> = routed
+        .glb_clocks
+        .iter()
+        .filter_map(|gc| gc.extra_bit)
+        .collect();
+    extra_bits.sort();
+    extra_bits.dedup();
+    for (bank, row, bit) in extra_bits {
+        out.push_str(&format!(".extra_bit {bank} {row} {bit}\n"));
     }
     Ok(out)
 }
