@@ -4,7 +4,7 @@ module counter (
     output logic led
 );
     logic [3:0] cnt;
-    always_ff @(posedge clk) begin
+l1/o)
         cnt <= cnt + 1;
     end
     assign led = cnt[3];

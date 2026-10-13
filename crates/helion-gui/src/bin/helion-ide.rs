@@ -3078,7 +3078,7 @@ fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 fn paint_empty_editor(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.vertical_centered(|ui| {
-        ui.add_space(48.0);
+        ui.add_space(chrome::SPACE_XL * 2.0);
         ui.label(RichText::new("No sources yet.").size(16.0));
         ui.add_space(chrome::SPACE_SM);
         if primary_button(ui, "New Project…")
@@ -5646,7 +5646,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
 
     if model.timing_paths.is_empty() {
         // Designed empty state (§3.8): centered dim text + action, never a bare rect.
-        ui.add_space(28.0);
+        ui.add_space(chrome::SPACE_XL + chrome::SPACE_XS);
         ui.vertical_centered(|ui| {
             ui.label(
                 egui::RichText::new("No timing paths yet.")
@@ -6779,7 +6779,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                 ui.label(RichText::new(format!("{mw:.3} mW")).strong().size(18.0));
                 ui.label(RichText::new(label).color(theme.dim).small());
             });
-            ui.add_space(28.0);
+            ui.add_space(chrome::SPACE_XL + chrome::SPACE_XS);
         }
         ui.vertical(|ui| {
             ui.label(
@@ -7299,7 +7299,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
     if model.utilization.is_none() && model.drc.is_none() {
         // Designed empty state (§3.8): centered dim text + action.
-        ui.add_space(28.0);
+        ui.add_space(chrome::SPACE_XL + chrome::SPACE_XS);
         ui.vertical_centered(|ui| {
             ui.label(
                 egui::RichText::new("No DRC results yet.")
@@ -7327,7 +7327,7 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     ui.add_space(chrome::SPACE_XS);
 
     if report.ok() {
-        ui.add_space(16.0);
+        ui.add_space(chrome::SPACE_LG);
         ui.vertical_centered(|ui| {
             ui.label(
                 egui::RichText::new("No violations.")
@@ -9808,11 +9808,11 @@ fn paint_memory(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let list_h = (remain * 0.55).clamp(120.0, remain - 80.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("Name").strong());
-        ui.add_space(48.0);
+        ui.add_space(chrome::SPACE_XL * 2.0);
         ui.label(RichText::new("Type").strong());
-        ui.add_space(24.0);
+        ui.add_space(chrome::SPACE_XL);
         ui.label(RichText::new("Data").strong());
-        ui.add_space(24.0);
+        ui.add_space(chrome::SPACE_XL);
         ui.label(RichText::new("W").strong());
         ui.label(RichText::new("D").strong());
     });
@@ -10193,11 +10193,11 @@ fn paint_wave(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         ui.add_space(80.0);
         ui.label(RichText::new("Value").strong().monospace());
         if model.wave.cursor_a.is_some() {
-            ui.add_space(12.0);
+            ui.add_space(chrome::SPACE_MD);
             ui.label(RichText::new("A").strong().monospace().color(theme.danger));
         }
         if model.wave.cursor_b.is_some() {
-            ui.add_space(12.0);
+            ui.add_space(chrome::SPACE_MD);
             ui.label(RichText::new("B").strong().monospace().color(theme.trace_b));
         }
         ui.add_space(40.0);
@@ -12276,7 +12276,7 @@ fn paint_testbench(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.separator();
 
     if app.model.tb_files.is_empty() {
-        ui.add_space(12.0);
+        ui.add_space(chrome::SPACE_MD);
         ui.label(RichText::new("No testbenches found.").strong());
         ui.label(
             RichText::new(
