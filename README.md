@@ -23,7 +23,7 @@
 
 <p align="center">
   <a href="docs/screenshots/demo-run.mp4"><img src="docs/screenshots/demo-teaser.gif" alt="Helion IDE: full implement flow on complex.sv, synth through route, device view, schematic, timing, waveform" width="800"></a><br>
-  <em>It moves. A real 65-second tour: editor, synth to route, device view, schematic, timing reports, waveform. <a href="docs/screenshots/demo-run.mp4">Watch the full video</a>, every frame is real tool output at real speed.</em>
+  <em>65-second tour: editor, synth to route, device view, schematic, timing reports, waveform. <a href="docs/screenshots/demo-run.mp4">Watch the full video</a>.</em>
 </p>
 
 Helion is an FPGA CAD suite: write SystemVerilog or VHDL, run one command, and get a placed, routed, timing-closed bitstream. No vendor tools, no black boxes. It targets its own HL10T die and Xilinx 7-series parts (xc7a35t today), and it is architected for more: the compiler emits a vendor-neutral netlist IR, and each device family is a backend.
@@ -97,7 +97,7 @@ All from real runs. Numbers are the tool's own output, not mockups.
 
 <p align="center">
   <a href="docs/screenshots/demo-run.mp4"><img src="docs/screenshots/demo-poster.png" alt="Helion IDE full-flow tour: editor, implement, device view, schematic, timing, waveform" width="800"></a><br>
-  <em>65 seconds, no audio, no time tricks: editor, implement flow at real speed, device view, schematic, timing reports, waveform sim on complex.sv. Click to watch.</em>
+  <em>65 seconds, no audio: editor, implement flow, device view, schematic, timing reports, waveform sim on complex.sv. Click to watch.</em>
 </p>
 
 ## Quickstart
@@ -159,7 +159,7 @@ cargo test --workspace
 | UART | 379 | 9600 | 0.3 s | 5.8 s |
 | SPI | 62 | 9580 | 0.03 s | 3.6 s |
 
-Read honestly: Helion targets its own LUT6 fabric while the baseline targets Lattice LUT4, so absolute LUT counts are not silicon-to-silicon. Yosys+ABC still produces 2 to 5x fewer LUTs; the area gap is real and being closed (uart 420 to 244 LUTs so far). Helion's delay model is simpler and more optimistic than signoff STA; calibration is on the roadmap.
+Caveat: Helion targets its own LUT6 fabric while the baseline targets Lattice LUT4, so absolute LUT counts are not silicon-to-silicon. Yosys+ABC produces 2 to 5x fewer LUTs (uart 420 to 244 LUTs so far). Helion's delay model is simpler and more optimistic than signoff STA; calibration is on the roadmap.
 
 ## Architecture
 
