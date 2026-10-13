@@ -271,6 +271,8 @@ pub fn paint_inspector(
         InspectorKind::Empty => String::new(),
     };
     if matches!(kind, InspectorKind::Empty) {
+        // Wrap so the hint is never truncated mid-word in a narrow dock.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.label(RichText::new("Click a site, net, pblock, or clock region.").color(theme.faint));
         return;
     }

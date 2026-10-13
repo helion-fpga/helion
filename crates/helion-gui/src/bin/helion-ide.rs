@@ -1368,8 +1368,8 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
                         });
                     });
                 });
-                ui.separator();
-                paint_progress_strip(ui, app);
+                // R16: progress strip moved to Z7 status bar (job progress
+                // lives in the status bar, not the toolbar).
                 ui.separator();
                 // Layout presets (P1-1): task-curated chrome arrangements.
                 ui.label(RichText::new("Layout").small().color(app.theme.dim))
@@ -1423,40 +1423,42 @@ fn paint_toolbar(ctx: &egui::Context, app: &mut HelionIde) {
     });
 }
 
-fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
-    let theme = app.theme;
+fn paint_progress_strip(ui: &mut egui::Ui, theme: &theme::Theme, model: &IdeModel) -> Option<FlowStep> {
     const STEPS: [FlowStep; 4] = [
         FlowStep::Synthesis,
         FlowStep::Opt,
         FlowStep::Place,
         FlowStep::Route,
     ];
+    // R16: lives in the 22px status bar (Z7), so chips are compact text
+    // with a state dot, not the 36px toolbar chips.
+    let mut clicked: Option<FlowStep> = None;
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = 6.0;
         let n = STEPS.len();
         for (i, step) in STEPS.iter().copied().enumerate() {
-            let state = app.model.step_state(step);
-            let blocked = app.model.step_blocked(step);
-            let (fill, stroke, text) = match state {
-                StepState::Pending => (theme.surface, theme.faint, theme.text),
-                StepState::Done => (theme.ok.gamma_multiply(0.28), theme.ok, theme.text),
-                StepState::Failed => (theme.danger.gamma_multiply(0.3), theme.danger, theme.text),
+            let state = model.step_state(step);
+            let blocked = model.step_blocked(step);
+            let (dot, text) = match state {
+                StepState::Pending => (theme.faint, theme.text),
+                StepState::Done => (theme.ok, theme.text),
+                StepState::Failed => (theme.danger, theme.text),
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
-                let chip = chrome::flow_chip_size();
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(chip[0], chip[1]), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(64.0, 18.0),
+                    egui::Sense::click(),
+                );
                 if ui.is_rect_visible(rect) {
-                    ui.painter().rect(
-                        rect,
-                        2.0,
-                        fill,
-                        Stroke::new(1.0_f32, stroke),
-                        egui::StrokeKind::Inside,
+                    // State dot + label.
+                    ui.painter().circle_filled(
+                        rect.left_center() + egui::vec2(5.0, 0.0),
+                        3.0,
+                        dot,
                     );
                     ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
+                        rect.left_center() + egui::vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
                         step.label(),
                         egui::FontId::proportional(11.0),
                         text,
@@ -1468,7 +1470,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
                 };
                 let resp = resp.on_hover_text(hover);
                 if resp.clicked() && blocked.is_none() {
-                    app.submit_job(JobKind::Step(step));
+                    clicked = Some(step);
                 }
             });
             if i + 1 < n {
@@ -1476,6 +1478,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, app: &mut HelionIde) {
             }
         }
     });
+    clicked
 }
 
 fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
@@ -1546,77 +1549,85 @@ fn paint_sidebar(ctx: &egui::Context, app: &mut HelionIde) {
 
 fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
     let share = chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
-    let mut width = app
+    let width = app
         .sidebar_width
         .clamp(share.sidebar_floor, share.sidebar_cap);
-    let mut panel = egui::SidePanel::left("sidebar_v3")
-        .resizable(true)
-        .default_width(width);
-    if app.force_share {
-        // Re-share frame: snap to the shared width once. The flag itself is
-        // cleared at the end of the frame (not here), so a hidden sidebar
-        // can't leave it stuck on.
-        panel = panel.exact_width(width);
-    }
-    let inner = panel
-        .width_range({
-            let share =
-                chrome::share_available(ctx.screen_rect().width(), ctx.screen_rect().height());
-            share.sidebar_floor..=share.sidebar_cap
-        })
+    // Manual resize handle. egui's SidePanel::resizable stores the CONTENT
+    // rect (not the panel rect) as its persisted width, so a panel dragged
+    // wider than its content snaps back on the next frame. We own the width
+    // in app.sidebar_width, drive the panel with exact_width, and handle the
+    // drag ourselves. (Same bug class as the console panel.)
+    let mut drag_dx = 0.0f32;
+    let mut hover_resize = false;
+    let _ = egui::SidePanel::left("sidebar_v3")
+        .exact_width(width)
         .show_separator_line(true)
         .show(ctx, |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_max_width(ui.available_width());
-            let title = match app.activity {
-                Activity::Files => "Files",
-                Activity::Device => "Device",
-                Activity::Timing => "Timing",
-                Activity::Simulate => "Simulate",
-                Activity::Program => "Program",
-                Activity::Reports => "Reports",
-            };
-            ui.label(RichText::new(title).strong().size(14.0));
-            ui.add_space(4.0);
-            match app.activity {
-                Activity::Files => {
-                    // Flow Navigator first (Vivado mental model), then the file
-                    // tree below. Both live in the Files sidebar.
-                    flow_nav::paint_flow_nav(ui, app);
-                    ui.separator();
-                    paint_files_tree(ui, app);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_max_width(ui.available_width());
+                    let title = match app.activity {
+                        Activity::Files => "Files",
+                        Activity::Device => "Device",
+                        Activity::Timing => "Timing",
+                        Activity::Simulate => "Simulate",
+                        Activity::Program => "Program",
+                        Activity::Reports => "Reports",
+                    };
+                    ui.label(RichText::new(title).strong().size(14.0));
+                    ui.add_space(4.0);
+                    match app.activity {
+                        Activity::Files => {
+                            // Flow Navigator first (Vivado mental model), then the file
+                            // tree below. Both live in the Files sidebar.
+                            flow_nav::paint_flow_nav(ui, app);
+                            ui.separator();
+                            paint_files_tree(ui, app);
+                        }
+                        Activity::Device => {
+                            paint_io_ports_table(ui, &mut app.model, "sidebar_io");
+                        }
+                        Activity::Timing => {
+                            paint_timing_paths(ui, &mut app.model, &app.theme);
+                        }
+                        Activity::Reports => {
+                            // Timing Analysis report catalog (P1-4): regroups the
+                            // timing/power/quality tabs with badges - replaces the
+                            // flat report list.
+                            dashboard::paint_timing_catalog(ui, app);
+                        }
+                        Activity::Program => {
+                            paint_program_side(ui, app);
+                        }
+                        Activity::Simulate => {}
+                    }
+                    if app.model.selected.is_some()
+                        || app.model.selected_source.is_some()
+                        || app.model.selected_io_port.is_some()
+                    {
+                        paint_properties(ui, &mut app.model);
+                    }
+                });
+                // Draggable strip at the panel's right edge.
+                let (_, resp) = ui.allocate_exact_size(
+                    egui::vec2(chrome::SPLITTER_GRAB_PX, ui.available_height()),
+                    egui::Sense::drag(),
+                );
+                hover_resize = resp.hovered() || resp.dragged();
+                if resp.dragged() {
+                    drag_dx = resp.drag_delta().x;
                 }
-                Activity::Device => {
-                    paint_io_ports_table(ui, &mut app.model, "sidebar_io");
-                }
-                Activity::Timing => {
-                    paint_timing_paths(ui, &mut app.model, &app.theme);
-                }
-                Activity::Reports => {
-                    // Timing Analysis report catalog (P1-4): regroups the
-                    // timing/power/quality tabs with badges - replaces the
-                    // flat report list.
-                    dashboard::paint_timing_catalog(ui, app);
-                }
-                Activity::Program => {
-                    paint_program_side(ui, app);
-                }
-                Activity::Simulate => {}
-            }
-            if app.model.selected.is_some()
-                || app.model.selected_source.is_some()
-                || app.model.selected_io_port.is_some()
-            {
-                paint_properties(ui, &mut app.model);
-            }
-            width = ui.max_rect().width();
+            });
         });
-    app.sidebar_width = inner
-        .response
-        .rect
-        .width()
-        .clamp(share.sidebar_floor, share.sidebar_cap);
-    let _ = width;
+    // Left panel: dragging the right edge right (positive x) grows the panel.
+    if drag_dx != 0.0 {
+        app.sidebar_width =
+            (app.sidebar_width + drag_dx).clamp(share.sidebar_floor, share.sidebar_cap);
+    }
+    if hover_resize {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
 }
 
 fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
@@ -2023,6 +2034,7 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         Bottom(BottomTab),
     }
     let mut go: Option<Go> = None;
+    let mut go_step: Option<FlowStep> = None;
 
     egui::TopBottomPanel::bottom("status")
         .exact_height(chrome::STATUS_HEIGHT)
@@ -2119,8 +2131,9 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
                 seg(ui, &status, theme.dim, "", None);
             }
-            // Right side: background-job spinner + progress, or idle indicator.
-            let right_w = 190.0;
+            // Right side: flow progress chips (R16: Z1 -> Z7) + background-job
+            // spinner/progress, or idle indicator.
+            let right_w = 340.0;
             let right_rect = egui::Rect::from_min_size(
                 egui::pos2(bar.right() - right_w - 8.0, bar.top()),
                 egui::vec2(right_w, bar.height()),
@@ -2148,9 +2161,21 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
                                 .color(theme.faint),
                         );
                     }
+                    ui.separator();
+                    // R16: flow step chips live in the status bar, not the toolbar.
+                    // paint_progress_strip returns the clicked step; the job
+                    // is submitted after the panel closure (borrow rules).
+                    if let Some(step) = paint_progress_strip(ui, &theme, model) {
+                        go_step = Some(step);
+                    }
                 });
             });
         });
+
+    // R16: flow chip click from the status bar.
+    if let Some(step) = go_step {
+        app.submit_job(JobKind::Step(step));
+    }
 
     match go {
         Some(Go::Activity(a)) => app.set_activity(a),
@@ -2249,22 +2274,30 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
         // frame, so the resize handle keeps working.
         app.console_height = app.console_height.min(share.console_h);
     }
-    let mut console = egui::TopBottomPanel::bottom("console")
-        .resizable(true)
-        .default_height(app.console_height)
-        .min_height(share.console_floor)
-        .max_height(share.console_cap);
-    if app.force_share {
-        // Re-share frame (window resized, or first frame): snap to the current
-        // console_height once. apply_shared_chrome already reset it to the
-        // default share on real resizes, and the first frame honors any
-        // HELION_CONSOLE_HEIGHT override. The flag is cleared at the end of
-        // the frame, so it can never get stuck on and pin the panel - a stuck
-        // flag is what made the user's drag snap back / go dead.
-        console = console.exact_height(app.console_height);
-    }
-    let inner = console.show_separator_line(true).show(ctx, |ui| {
-        ui.horizontal(|ui| {
+    // Manual resize handle. egui's TopBottomPanel::resizable stores the
+    // CONTENT rect (not the panel rect) as its persisted height, so a panel
+    // dragged taller than its content snaps back to content height on the
+    // next frame. We own the height in app.console_height, drive the panel
+    // with exact_height, and handle the drag ourselves.
+    let panel_h = app
+        .console_height
+        .clamp(share.console_floor, share.console_cap);
+    let mut drag_dy = 0.0f32;
+    let mut hover_resize = false;
+    let _ = egui::TopBottomPanel::bottom("console")
+        .exact_height(panel_h)
+        .show_separator_line(true)
+        .show(ctx, |ui| {
+            // Draggable strip at the panel's top edge.
+            let (_, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), chrome::SPLITTER_GRAB_PX),
+                egui::Sense::drag(),
+            );
+            hover_resize = resp.hovered() || resp.dragged();
+            if resp.dragged() {
+                drag_dy = resp.drag_delta().y;
+            }
+            ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let console_on =
                 app.model.bottom_tab == BottomTab::Tcl || app.model.bottom_tab == BottomTab::Log;
@@ -2302,11 +2335,14 @@ fn paint_bottom(ctx: &egui::Context, app: &mut HelionIde) {
             BottomTab::SimLog => paint_sim_log(ui, &mut app.model, &app.theme),
         }
     });
-    app.console_height = inner
-        .response
-        .rect
-        .height()
-        .clamp(share.console_floor, share.console_cap);
+    // Bottom panel: dragging the top edge up (negative y) grows the panel.
+    if drag_dy != 0.0 {
+        app.console_height = (app.console_height - drag_dy)
+            .clamp(share.console_floor, share.console_cap);
+    }
+    if hover_resize {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
 }
 
 fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
@@ -7026,12 +7062,6 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     ui.heading("Bitstream");
     ui.add_space(6.0);
     let report = model.bitstream_report();
-    if report.frames == 0 && report.bytes == 0 {
-        if paint_remaining_cta(ui, "No bitstream yet.", "Generate Bitstream", theme) {
-            let _ = model.exec("write_bitstream");
-        }
-        return;
-    }
     ui.horizontal(|ui| {
         if ui.button("Generate Bitstream").clicked() {
             let _ = model.exec("write_bitstream");
@@ -7041,6 +7071,10 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         }
     });
     ui.add_space(6.0);
+    if report.frames == 0 && report.bytes == 0 {
+        ui.label(egui::RichText::new("No bitstream yet.").color(theme.dim));
+        return;
+    }
     ui.label(format!(
         "{} · {} frames · {} B · id {:#010x}",
         if report.configured != 0 {
@@ -8110,10 +8144,49 @@ fn paint_device_toolbar(
     pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
+    // Device toolbar, grouped by function (layout grammar: one group per
+    // purpose, separators between groups, primary view controls first).
+    // Zoom lives ONLY here; there is no second zoom group elsewhere.
     ui.horizontal(|ui| {
-        if ui.button("Fit").on_hover_text("Zoom the die to fit (F)").clicked() {
+        // View: zoom controls.
+        if ui
+            .button("Zoom to selection")
+            .on_hover_text("Zoom the die to the selected site/net")
+            .clicked()
+        {
+            if let Some((x, y)) = selected_site_xy(model) {
+                model.device_zoom = 2.5;
+                *zoom_target = Some((x, y));
+            }
+        }
+        if ui
+            .button("Zoom In")
+            .on_hover_text("Zoom in (+)")
+            .clicked()
+        {
+            let _ = model.device_zoom_in();
+        }
+        if ui
+            .button("Zoom Out")
+            .on_hover_text("Zoom out (-)")
+            .clicked()
+        {
+            let _ = model.device_zoom_out();
+        }
+        if ui
+            .button("Zoom Fit")
+            .on_hover_text("Zoom the die to fit (F)")
+            .clicked()
+        {
             let _ = model.device_zoom_fit();
         }
+        ui.label(
+            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
+                .small()
+                .weak(),
+        );
+        ui.separator();
+        // Tools: find, measure, clear.
         if ui
             .button("Find...")
             .on_hover_text("Find a site, cell, or net (Ctrl+K)")
@@ -8141,6 +8214,7 @@ fn paint_device_toolbar(
             clear_physview_selection(model, pv);
         }
         ui.separator();
+        // Panels: dock toggles.
         if ui
             .small_button(if pv.show_display_control {
                 "Layers [-]"
@@ -8164,25 +8238,7 @@ fn paint_device_toolbar(
             pv.show_inspector = !pv.show_inspector;
         }
         ui.separator();
-        if ui
-            .button("Zoom to selection")
-            .on_hover_text("Zoom the die to the selected site/net")
-            .clicked()
-        {
-            if let Some((x, y)) = selected_site_xy(model) {
-                model.device_zoom = 2.5;
-                *zoom_target = Some((x, y));
-            }
-        }
-        if ui.button("Zoom In").clicked() {
-            let _ = model.device_zoom_in();
-        }
-        if ui.button("Zoom Out").clicked() {
-            let _ = model.device_zoom_out();
-        }
-        if ui.button("Zoom Fit").clicked() {
-            let _ = model.device_zoom_fit();
-        }
+        // Debug: actions on the selected net (disabled with no debug net).
         let dbg_net = model.selected_debug_net();
         ui.add_enabled_ui(dbg_net.is_some(), |ui| {
             let md = match &dbg_net {
@@ -8204,11 +8260,6 @@ fn paint_device_toolbar(
                 let _ = model.exec("add_probe");
             }
         });
-        ui.label(
-            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
-                .small()
-                .weak(),
-        );
     });
 }
 
@@ -11961,6 +12012,96 @@ mod recent_tests {
         let loaded = load_recent_from(&store);
         assert_eq!(loaded, vec![prj]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Priority repro (Saksham): dragging the console panel's resize handle must
+/// persist after mouse release. Root cause was egui's TopBottomPanel::resizable
+/// storing the CONTENT rect (not the panel rect) as its persisted height, so a
+/// dragged-taller panel snapped back to content height on the next frame.
+/// paint_bottom now owns the height in app.console_height with a manual drag
+/// handle. This test drives paint_bottom headless through press/drag/release.
+#[cfg(test)]
+mod console_drag_tests {
+    use super::*;
+
+    fn screen_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn paint_one(app: &mut HelionIde, ctx: &egui::Context, input: egui::RawInput) {
+        ctx.begin_pass(input);
+        paint_bottom(ctx, app);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn console_drag_resize_persists_after_release() {
+        let ctx = egui::Context::default();
+        let mut app = HelionIde::new();
+        app.console_height = 144.0;
+        app.force_share = false;
+
+        // Settle: panel must hold the app-owned height, not collapse.
+        for _ in 0..2 {
+            paint_one(&mut app, &ctx, screen_input());
+        }
+        assert!(
+            (app.console_height - 144.0).abs() < 5.0,
+            "panel must hold 144, got {}",
+            app.console_height
+        );
+
+        // Press on the drag strip at the panel's top edge.
+        let handle_y = 800.0 - app.console_height + 3.0;
+        let mut input = screen_input();
+        input.events.push(egui::Event::PointerMoved(egui::pos2(
+            640.0, handle_y,
+        )));
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(640.0, handle_y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        paint_one(&mut app, &ctx, input);
+
+        // Drag up to grow the panel. Note: console_cap is ~189px (26% of body),
+        // so the drag clamps there; the point is it grows and persists.
+        for _ in 0..3 {
+            let mut input = screen_input();
+            input.events.push(egui::Event::PointerMoved(egui::pos2(640.0, 500.0)));
+            paint_one(&mut app, &ctx, input);
+        }
+        let dragged_h = app.console_height;
+        assert!(
+            dragged_h > 170.0,
+            "drag should grow the panel, got {dragged_h}"
+        );
+
+        // Release, then idle frames: the height must persist, not snap back.
+        let mut input = screen_input();
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(640.0, 500.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        paint_one(&mut app, &ctx, input);
+        for _ in 0..3 {
+            paint_one(&mut app, &ctx, screen_input());
+        }
+        assert!(
+            (app.console_height - dragged_h).abs() < 5.0,
+            "console height snapped back: {} vs dragged {dragged_h}",
+            app.console_height
+        );
     }
 }
 

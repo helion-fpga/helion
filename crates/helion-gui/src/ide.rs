@@ -2082,12 +2082,20 @@ impl SchematicView {
             return self.instance_member_cells(inst);
         }
         if self.path_only && !self.highlight_cells.is_empty() {
-            return self
+            let matched: HashSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| self.highlight_cells.contains(&n.name))
                 .map(|n| n.name.clone())
                 .collect();
+            // Guard against the black void: stale highlight names (timing
+            // list rebuilt, naming mismatch between STA cells and schematic
+            // nodes) match nothing. Returning the empty set blanks the whole
+            // sheet; fall through to the full sheet instead so the view
+            // always renders something.
+            if !matched.is_empty() {
+                return matched;
+            }
         }
         let mut names: HashSet<String> = self.nodes.iter().map(|n| n.name.clone()).collect();
         // Single-instance full-cover (hier.sv): collapse the child into its
@@ -30591,6 +30599,177 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
     }
 
+    /// Priority repro (Saksham): selecting items in sequence must never blank
+    /// the schematic to a black void. When path_only isolation is armed but
+    /// the highlight names are stale (timing list rebuilt, STA/schematic
+    /// naming mismatch), the filter matches nothing; the sheet must fall
+    /// back to the full node set, never the empty set.
+    #[test]
+    fn schematic_stale_path_highlight_never_blanks_sheet() {
+        fn node(name: &str) -> SchematicNode {
+            SchematicNode {
+                name: name.to_string(),
+                kind: "LUT".to_string(),
+                pins: Vec::new(),
+            }
+        }
+        let mut view = SchematicView::default();
+        view.nodes = vec![node("u_a"), node("u_b"), node("u_c")];
+
+        // Normal case: matching highlights isolate the path.
+        view.path_only = true;
+        view.highlight_cells = ["u_a", "u_b"].iter().map(|s| s.to_string()).collect();
+        let names = view.sheet_cell_names();
+        assert_eq!(names.len(), 2, "matching highlights isolate");
+        assert!(names.contains("u_a") && names.contains("u_b"));
+
+        // Stale case: highlight names match nothing. Must NOT return empty.
+        view.highlight_cells = ["stale_1", "stale_2"].iter().map(|s| s.to_string()).collect();
+        let names = view.sheet_cell_names();
+        assert_eq!(
+            names.len(),
+            3,
+            "stale highlights must fall back to the full sheet, not a black void"
+        );
+
+        // Randomized selection sequences: path_only on/off with arbitrary
+        // highlight sets; the sheet must never come back empty while nodes exist.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        for seq in 0..200u64 {
+            let mut h = DefaultHasher::new();
+            seq.hash(&mut h);
+            let r = h.finish();
+            view.path_only = r & 1 == 1;
+            view.highlight_cells = (0..(r % 5))
+                .map(|i| format!("cell_{}_{}", seq, i))
+                .collect();
+            // Sprinkle in a real name sometimes.
+            if r % 3 == 0 {
+                view.highlight_cells.insert("u_b".to_string());
+            }
+            let names = view.sheet_cell_names();
+            assert!(
+                !names.is_empty(),
+                "sheet went empty on randomized selection sequence {seq}"
+            );
+        }
+    }
+
+    /// Priority repro (Saksham): mouse interaction on the timing view must
+    /// never mutate timing values. Simulates every mouse-equivalent model
+    /// mutation the timing painters perform (row click -> set_probe, header
+    /// click -> timing_path_sort, pin click -> select_timing_pin, filter
+    /// typing -> timing_path_filter, double-click -> exec select_timing_path,
+    /// empty-space click -> clear_probe) and asserts the underlying timing
+    /// data is bit-identical before and after. Selection/sort/filter are
+    /// view state and may change; slack/delay/pin values may not.
+    #[test]
+    fn timing_mouse_interaction_never_mutates_timing_values() {
+        // Timing VALUES only (not selection/sort/filter view state).
+        fn snapshot(
+            ide: &IdeModel,
+        ) -> Vec<(
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Vec<String>,
+            Vec<String>,
+            Vec<(String, String, i64, i64, String, usize, String)>,
+        )> {
+            ide.timing_paths
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        p.startpoint.clone(),
+                        p.endpoint.clone(),
+                        p.slack_ps,
+                        p.delay_ps,
+                        p.cells.clone(),
+                        p.nets.clone(),
+                        p.pins
+                            .iter()
+                            .map(|pin| {
+                                (
+                                    pin.pin.clone(),
+                                    pin.delay_type.clone(),
+                                    pin.incr_ps,
+                                    pin.path_ps,
+                                    pin.net.clone(),
+                                    pin.fanout,
+                                    pin.location.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(
+            !ide.timing_paths.is_empty(),
+            "need timing paths to test against"
+        );
+        let before = snapshot(&ide);
+        let wns_before = ide.timing.as_ref().map(|t| t.wns_ps);
+
+        // Header click: cycle sort through every sortable column, both directions.
+        for col in [
+            TimingPathSortCol::From,
+            TimingPathSortCol::To,
+            TimingPathSortCol::Slack,
+            TimingPathSortCol::Levels,
+        ] {
+            ide.timing_path_sort = Some((col, true));
+            ide.timing_path_sort = Some((col, false));
+        }
+        ide.timing_path_sort = None;
+
+        // Filter typing.
+        ide.timing_path_filter = "clk".into();
+        let _ = ide.timing_path_table_text();
+        ide.timing_path_filter.clear();
+
+        // Row click: probe every path, then an object, then clear.
+        for i in 0..ide.timing_paths.len() {
+            ide.set_probe(ProbeSelection::Path(i));
+        }
+        if let Some(cell) = ide.timing_paths[0].cells.first().cloned() {
+            ide.set_probe(ProbeSelection::Object(cell));
+        }
+        ide.clear_probe();
+
+        // Pin click: select the first pin of the first path.
+        if let Some(pin) = ide.timing_paths[0].pins.first().map(|p| p.pin.clone()) {
+            let _ = ide.select_timing_pin(&pin);
+        }
+
+        // Double-click: exec select_timing_path.
+        let _ = ide.exec("select_timing_path 0");
+
+        // Recompute must also be stable: report_timing twice gives same values.
+        ide.exec("report_timing").unwrap();
+        let after_recompute = snapshot(&ide);
+        assert_eq!(
+            before, after_recompute,
+            "report_timing recompute changed timing values"
+        );
+
+        let after = snapshot(&ide);
+        let wns_after = ide.timing.as_ref().map(|t| t.wns_ps);
+        assert_eq!(
+            before, after,
+            "mouse interaction changed timing values"
+        );
+        assert_eq!(wns_before, wns_after, "WNS changed under mouse interaction");
+    }
+
     /// Fig. 59: selecting a report_timing path highlights THAT path's STA cells/nets.
     #[test]
     fn schematic_highlights_selected_sta_timing_path() {
@@ -41773,5 +41952,107 @@ endmodule
         let msg = m.exec(&format!("tb_wave {}", dir.join("run.vcd").display())).unwrap();
         assert!(msg.contains("waveform viewer"), "msg={msg}");
         assert_eq!(m.tb_waveform_pending, Some(dir.join("run.vcd")));
+    }
+
+    /// No placeholder text may leak into the UI. Scans every helion-gui
+    /// source file for "???" (and friends) inside string literals: a
+    /// literal "???" in the Device view's Clock Regions table was rendering
+    /// as literal question marks (font glyph issue, since fixed with
+    /// monospace), and placeholder text must never reach the user.
+    #[test]
+    fn no_placeholder_text_in_ui_strings() {
+        // Build the pattern dynamically so this test's own source does not
+        // trip the scan.
+        let q = "?".repeat(3);
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src = manifest.join("src");
+        let mut hits: Vec<String> = Vec::new();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_rs(&src, &mut files);
+        // Also scan the binary sources (helion-ide.rs and its modules).
+        collect_rs(&src.join("bin"), &mut files);
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim();
+                // Skip comments: placeholders in comments are fine.
+                if t.starts_with("//") || t.starts_with('*') {
+                    continue;
+                }
+                // Look for ??? inside a string literal (not in a comment).
+                if let Some(code) = t.split("//").next() {
+                    if code.contains("\"") && code.contains(&q) {
+                        // Skip this test's own pattern-construction lines.
+                        if t.contains("repeat(3)") || t.contains("contains(&q)") {
+                            continue;
+                        }
+                        hits.push(format!("{}:{}: {}", path.display(), i + 1, t));
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "placeholder '{}' in UI strings:\n{}",
+            q,
+            hits.join("\n")
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_rs(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// The Device toolbar must have exactly one zoom control group.
+    /// Regression: "Fit" and "Zoom Fit" both called device_zoom_fit() (same
+    /// action, two labels), and an older build had a second zoom row above
+    /// the toolbar. One zoom group, in one place.
+    #[test]
+    fn device_toolbar_has_single_zoom_group() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("src/bin/helion-ide.rs");
+        let text = std::fs::read_to_string(&path).expect("helion-ide.rs readable");
+        // Extract paint_device_toolbar's body (to its closing brace at col 0).
+        let start = text
+            .find("fn paint_device_toolbar(")
+            .expect("paint_device_toolbar exists");
+        let body = &text[start..];
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, c) in body.char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        let toolbar = &body[..end];
+        // Zoom actions: each must appear exactly once in the toolbar.
+        for label in ["Zoom to selection", "Zoom In", "Zoom Out", "Zoom Fit"] {
+            let count = toolbar.matches(&format!("\"{label}\"")).count();
+            assert_eq!(
+                count, 1,
+                "device toolbar must have exactly one {label:?} button, found {count}"
+            );
+        }
+        // The old duplicate "Fit" (same action as "Zoom Fit") must be gone.
+        assert!(
+            !toolbar.contains("\"Fit\""),
+            "device toolbar must not contain the duplicate \"Fit\" button"
+        );
     }
 }

@@ -512,8 +512,16 @@ pub fn analyze_power(
         dyn_clk = clock_alpha * c_tree_ff * 1e-15 * v2 * f;
     }
 
-    for (net, info) in &nets {
-        let net: &str = *net;
+    // Deterministic net order. `nets` is a HashMap with a per-instance
+    // random seed, so iterating it directly reshuffles push order
+    // (top_nets, warnings) and perturbs float accumulation order on every
+    // call. The power view repaints on mouse movement, so the old code made
+    // displayed values jump as the mouse moved. Sorted order makes the
+    // report bit-identical across calls for identical inputs.
+    let mut net_names: Vec<&str> = nets.keys().copied().collect();
+    net_names.sort_unstable();
+    for net in net_names {
+        let info = &nets[net];
         let is_clock = clock_nets.iter().any(|c| c.as_str() == net);
         let (toggles, rising) = net_signal
             .get(net)
@@ -645,15 +653,26 @@ pub fn analyze_power(
         ResourcePower { name: "dsp".into(), mw: w2mw(dyn_dsp) },
         ResourcePower { name: "static".into(), mw: w2mw(static_w) },
     ];
-    by_resource.sort_by(|a, b| b.mw.partial_cmp(&a.mw).unwrap_or(std::cmp::Ordering::Equal));
+    // Tiebreak by name: equal mW must not reshuffle on repaint.
+    by_resource.sort_by(|a, b| {
+        b.mw.partial_cmp(&a.mw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let mut by_hierarchy: Vec<HierPower> = hier_mw
         .into_iter()
         .map(|(name, (w, cells))| HierPower { name, mw: w2mw(w), cells })
         .collect();
-    by_hierarchy.sort_by(|a, b| b.mw.partial_cmp(&a.mw).unwrap_or(std::cmp::Ordering::Equal));
+    // Tiebreak by name: equal mW must not reshuffle on repaint.
+    by_hierarchy.sort_by(|a, b| {
+        b.mw.partial_cmp(&a.mw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
-    top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles));
+    // Tiebreak by name: equal toggle counts must not reshuffle on repaint.
+    top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles).then_with(|| a.name.cmp(&b.name)));
     // VCD-only clocks (not design nets) still belong in the toggle table.
     if let Some(a) = activity {
         for name in &vcd_clock_names {
@@ -667,7 +686,7 @@ pub fn analyze_power(
                 });
             }
         }
-        top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles));
+        top_nets.sort_by(|a, b| b.toggles.cmp(&a.toggles).then_with(|| a.name.cmp(&b.name)));
     }
     top_nets.truncate(20);
 
@@ -974,4 +993,44 @@ endmodule
         assert!((r.static_mw - 4.0).abs() < 1e-9, "static: {}", r.static_mw);
         assert_eq!(r.dynamic_mw, r.resource("clocks"), "only clock tree (no FFs)");
     }
+
+    /// Mouse-invariance: the power view repaints on every mouse movement,
+    /// and each paint recomputes the report via `analyze_power`. The report
+    /// must be bit-identical across recomputes for identical inputs, or the
+    /// displayed values visibly jump as the mouse moves. Regression test
+    /// for Saksham's report: "moving the mouse in the power window changes
+    /// the displayed power values."
+    #[test]
+    fn power_report_stable_across_repaints() {
+        let d = counter_design();
+        let cfg = cfg_100mhz();
+        // Build a VCD with several nets at the same toggle count (ties).
+        let vcd = "$timescale 1ns $end\n$scope module counter $end\n$var wire 1 ! clk $end\n$var wire 1 \" a $end\n$var wire 1 # b $end\n$var wire 1 $ c $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n0\"\n0#\n0$\n$end\n#5\n1\"\n#10\n1!\n0\"\n1#\n#15\n1\"\n#20\n0!\n0\"\n0#\n1$\n#25\n1\"\n#30\n1!\n0\"\n#35\n1\"\n#40\n0!\n0\"\n";
+        let a = parse_vcd(vcd).expect("parse");
+        let r1 = analyze_power(&d, &cfg, Some(&a), None);
+        let mut order_changed = false;
+        let mut value_changed = false;
+        for _ in 0..20 {
+            let r2 = analyze_power(&d, &cfg, Some(&a), None);
+            let o1: Vec<&str> = r1.top_nets.iter().map(|n| n.name.as_str()).collect();
+            let o2: Vec<&str> = r2.top_nets.iter().map(|n| n.name.as_str()).collect();
+            if o1 != o2 {
+                order_changed = true;
+            }
+            if r1.total_mw.to_bits() != r2.total_mw.to_bits()
+                || r1.dynamic_mw.to_bits() != r2.dynamic_mw.to_bits()
+            {
+                value_changed = true;
+            }
+            let h1: Vec<&str> = r1.by_hierarchy.iter().map(|h| h.name.as_str()).collect();
+            let h2: Vec<&str> = r2.by_hierarchy.iter().map(|h| h.name.as_str()).collect();
+            if h1 != h2 {
+                order_changed = true;
+            }
+        }
+        println!("order_changed={order_changed} value_changed={value_changed}");
+        assert!(!order_changed, "top_nets/by_hierarchy order changed between identical calls");
+        assert!(!value_changed, "power values changed between identical calls");
+    }
+
 }

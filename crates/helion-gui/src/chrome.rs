@@ -898,7 +898,11 @@ pub fn device_band_share(window_w: f32, window_h: f32, after_legend: f32) -> Dev
     let tables_floor = if short { 72.0 } else { DEVICE_TABLE_FLOOR_H };
     let die_want = if short {
         // Leftover after the floors is Zoom Fit. Do not invent a slab past that leftover.
-        (after - tables_floor - clock_h - 10.0).clamp(64.0, after)
+        // For very short windows (after < 64), clamp bounds must stay valid:
+        // f32::clamp panics when min > max. Floor the die at 1px, not 64px.
+        let lo = 1.0_f32.min(after.max(1.0));
+        let hi = after.max(1.0);
+        (after - tables_floor - clock_h - 10.0).clamp(lo, hi)
     } else {
         DEVICE_DIE_MIN_H.min((after * 0.50).max(120.0))
     };
