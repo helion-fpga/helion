@@ -1013,6 +1013,26 @@ fn panic_sig(p: &Box<dyn std::any::Any + Send>, bt_dbg: &str) -> String {
     format!("{msg}\n{}", frames.join("\n"))
 }
 
+/// Triaged panics the fuzzer pushes past instead of aborting on, so a seed
+/// can reach deeper code after hitting a known shallow bug. Matched on
+/// (payload substring, backtrace-frame substring) so value variations (e.g.
+/// different window heights in a clamp message) and different UI paths to
+/// the same assertion all count as known. Keep in sync with the regression
+/// tests in `crash_regression` below.
+fn is_known_panic(payload: &str, bt_dbg: &str) -> bool {
+    const KNOWN: &[(&str, &str)] = &[
+        // chrome::device_band_share clamps (64.0, after) with after < 64 on
+        // very short windows.
+        ("min > max, or either was NaN", "device_band_share"),
+        // open_more_workspace debug assertion: apply_more(Device) sets
+        // workspace but leaves canvas stale.
+        ("updated workspace but painted", "open_more_workspace"),
+    ];
+    KNOWN
+        .iter()
+        .any(|(p, f)| payload.contains(p) && bt_dbg.contains(f))
+}
+
 fn sighash(sig: &str) -> String {
     // FNV-1a 64, hex, 12 chars.
     let mut h: u64 = 0xcbf29ce484222325;
@@ -1328,18 +1348,27 @@ fn run_seed(cfg: &Config, seed: u64) -> SeedStats {
                     ev.join(" | ")
                 ));
                 say(cfg, &format!("fuzz PANIC @frame {frame} sigh={sigh}: {payload}"));
-                if seen.insert(sig) {
-                    let path = write_crash_log(&sigh, &header, &frames_log, frame);
-                    say(cfg, &format!("fuzz: crash replay written to {}", path.display()));
-                    stats.crashes.push(path);
+                if is_known_panic(&payload, &bt_dbg) {
+                    // Triaged already: count it and keep fuzzing past it so the
+                    // seed can reach deeper code. The replay path skips known
+                    // panics the same way, so a later NEW crash still gets a
+                    // clean replay prefix.
+                    *stats.anomalies.entry("KNOWN-PANIC").or_insert(0) += 1;
+                    log_line(&format!("KNOWN-PANIC frame={frame} sigh={sigh}"));
+                } else {
+                    if seen.insert(sig) {
+                        let path = write_crash_log(&sigh, &header, &frames_log, frame);
+                        say(cfg, &format!("fuzz: crash replay written to {}", path.display()));
+                        stats.crashes.push(path);
+                    }
+                    // Stop this seed after a NEW panic: continuing on a
+                    // half-unwound app/ctx would pollute the replay prefix (a
+                    // later crash's log would contain this earlier panicking
+                    // frame). The outer loop moves on to the next seed.
+                    flush_seed_log(cfg, seed, &header, &frames_log);
+                    stats.aborted = true;
+                    break;
                 }
-                // Stop this seed after a panic: continuing on a half-unwound
-                // app/ctx would pollute the replay prefix (a later crash's log
-                // would contain this earlier panicking frame). The outer loop
-                // moves on to the next seed.
-                flush_seed_log(cfg, seed, &header, &frames_log);
-                stats.aborted = true;
-                break;
             }
         }
 
@@ -1449,7 +1478,12 @@ fn parse_replay(text: &str) -> Option<ReplayLog> {
 
 /// Feed the first `nframes` of a replay log through a fresh app.
 /// Returns `Some((frame, payload))` on the first panicking frame.
-fn replay_frames(log: &ReplayLog, nframes: usize, quiet: bool) -> Option<(usize, String)> {
+fn replay_frames(
+    log: &ReplayLog,
+    nframes: usize,
+    quiet: bool,
+    skip_known: bool,
+) -> Option<(usize, String)> {
     let (ctx, mut app) = setup_app();
     let cfg_like = Config {
         seeds: vec![],
@@ -1472,7 +1506,18 @@ fn replay_frames(log: &ReplayLog, nframes: usize, quiet: bool) -> Option<(usize,
         }
         let raw = raw_input(rf.w, rf.h, rf.t, egui_events);
         if let Err(p) = pump_frame(&ctx, &mut app, raw) {
-            return Some((frame, panic_payload_str(&p)));
+            // Push past triaged panics the same way the live fuzzer does, so
+            // a replay still reaches a later NEW crash. Regression tests pass
+            // skip_known=false so they still fail while their bug is open.
+            let payload = panic_payload_str(&p);
+            let bt_dbg = take_panic_bt().unwrap_or_default();
+            if skip_known && is_known_panic(&payload, &bt_dbg) {
+                if !quiet {
+                    println!("fuzz: replay skipping known panic at frame {frame}");
+                }
+                continue;
+            }
+            return Some((frame, payload));
         }
     }
     None
@@ -1482,7 +1527,7 @@ fn replay_frames(log: &ReplayLog, nframes: usize, quiet: bool) -> Option<(usize,
 #[allow(dead_code)]
 fn replay_str(text: &str) -> Option<(usize, String)> {
     let log = parse_replay(text)?;
-    replay_frames(&log, log.frames.len(), true)
+    replay_frames(&log, log.frames.len(), true, false)
 }
 
 /// Binary-search the smallest frame prefix that still reproduces the panic,
@@ -1495,7 +1540,7 @@ fn minimize_crash(path: &std::path::Path) {
         return;
     }
     println!("fuzz: minimizing {} ({n} frames)...", path.display());
-    if replay_frames(&log, n, true).is_none() {
+    if replay_frames(&log, n, true, true).is_none() {
         println!("fuzz: full prefix no longer reproduces; keeping original");
         return;
     }
@@ -1503,7 +1548,7 @@ fn minimize_crash(path: &std::path::Path) {
     let mut hi = n;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        match replay_frames(&log, mid, true) {
+        match replay_frames(&log, mid, true, true) {
             Some(_) => hi = mid,
             None => lo = mid + 1,
         }
@@ -1597,7 +1642,7 @@ fn run_replay(cfg: &Config, path: &std::path::Path) {
         log.frames.len(),
         log.warmup
     );
-    match replay_frames(&log, log.frames.len(), cfg.quiet) {
+    match replay_frames(&log, log.frames.len(), cfg.quiet, false) {
         Some((frame, payload)) => println!("fuzz: REPRODUCED panic at frame {frame}: {payload}"),
         None => println!("fuzz: replay clean, no panic"),
     }
@@ -1642,6 +1687,39 @@ mod crash_regression {
             None => {}
             Some((frame, payload)) => panic!(
                 "fuzz regression crash-b8e9fc06b1caf963.log reproduced panic at frame {frame}: {payload}"
+            ),
+        }
+    }
+
+    /// crash-87c5907c652b0759: the "More Device" command-palette entry calls
+    /// `open_more_workspace(Device)`, whose debug assertion fires because
+    /// `apply_more` sets `workspace = Device` but leaves `canvas = Editor`,
+    /// so the central pane keeps painting the editor. Fuzzer seed 3,
+    /// frame 138. Remove the `ignore` once `apply_more` syncs the canvas;
+    /// the test then guards the fix.
+    #[test]
+    #[ignore = "bug open: apply_more(Device) leaves canvas=Editor, tripping the open_more_workspace assertion"]
+    fn replay_more_device_palette_assertion() {
+        let text = include_str!("../../../fuzz_crashes/crash-87c5907c652b0759.log");
+        match super::replay_str(text) {
+            None => {}
+            Some((frame, payload)) => panic!(
+                "fuzz regression crash-87c5907c652b0759.log reproduced panic at frame {frame}: {payload}"
+            ),
+        }
+    }
+
+    /// crash-59c2055905bbbe0e: same root cause as above, reached through the
+    /// flow-navigator sidebar instead of the palette. Fuzzer seed 6,
+    /// frame 515. Remove the `ignore` together with the palette-path test.
+    #[test]
+    #[ignore = "bug open: apply_more(Device) leaves canvas=Editor, tripping the open_more_workspace assertion"]
+    fn replay_more_device_flownav_assertion() {
+        let text = include_str!("../../../fuzz_crashes/crash-59c2055905bbbe0e.log");
+        match super::replay_str(text) {
+            None => {}
+            Some((frame, payload)) => panic!(
+                "fuzz regression crash-59c2055905bbbe0e.log reproduced panic at frame {frame}: {payload}"
             ),
         }
     }
