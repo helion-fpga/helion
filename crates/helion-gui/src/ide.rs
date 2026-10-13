@@ -21615,6 +21615,14 @@ impl IdeModel {
         Self::merge_stream(&mut self.console, &live.console, snap.console_len);
         Self::merge_stream(&mut self.messages, &live.messages, snap.messages_len);
         Self::merge_stream(&mut self.log, &live.log, snap.log_len);
+        // Validate restored selection indices against current data. The
+        // snapshot may reference a timing path that no longer exists.
+        if let Some(i) = self.selected_timing_path {
+            if i >= self.timing_paths.len() {
+                self.selected_timing_path = None;
+                self.selected_timing_pin = None;
+            }
+        }
     }
 
     /// Merge an append-only stream: `job` holds submit-time prefix + job
