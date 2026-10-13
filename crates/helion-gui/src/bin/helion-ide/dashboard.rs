@@ -804,7 +804,6 @@ fn paint_runs_body(
     app: &mut HelionIde,
     theme: &theme::Theme,
 ) -> Option<WorkspaceTab> {
-    let mut go = None;
     if app.model.runs.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
@@ -883,7 +882,7 @@ fn paint_runs_body(
             app.model.bottom_tab = BottomTab::Jobs;
         }
     }
-    go
+    None
 }
 
 /// Design/top name: explicit top override, else the loaded design, else "-".

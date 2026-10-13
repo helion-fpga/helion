@@ -1322,7 +1322,7 @@ mod tests {
         assert_eq!(plan.nav_sections.len(), 6);
         assert_ne!(plan.nav_sections.len(), 9);
 
-        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages"]);
+        assert_eq!(plan.bottom_tabs, vec!["Console", "Messages", "Jobs"]);
         assert!(!plan.bottom_tabs.contains(&"Tcl Console"));
         assert!(!plan.bottom_tabs.contains(&"Log"));
         assert!(!plan.bottom_tabs.contains(&"Simulation Log"));
