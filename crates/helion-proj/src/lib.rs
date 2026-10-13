@@ -908,9 +908,16 @@ impl Session {
     }
 
     pub fn mark_debug(&mut self, net: &str) -> Result<(), String> {
-        let d = self.design.as_mut().ok_or("mark_debug: no design")?;
-        d.mark_debug(net)?;
-        insert_ila(d, net)?;
+        {
+            let d = self.design.as_mut().ok_or("mark_debug: no design")?;
+            d.mark_debug(net)?;
+            insert_ila(d, net)?;
+        }
+        // The netlist gained ILA cells: placed/routed/bitstream results are
+        // stale (Vivado invalidates impl runs on netlist edits). `implement`
+        // re-runs from Place; without this, refresh_steps sees session.placed
+        // and implement() silently keeps the pre-ILA placement.
+        self.reset_impl();
         Ok(())
     }
 
@@ -1425,7 +1432,8 @@ impl PrjImplRun {
 
 /// Drop const-0 LUT+FF pairs that do not drive an IOB.
 /// Vivado-like project file: `part`, `read_sv` (multi), `read_xdc`/`read_sdc`,
-/// `create_clock`, `set_property PACKAGE_PIN` / `TOP`, pblock, impl run, `.hckp`.
+/// `create_clock`, `set_property PACKAGE_PIN` / `TOP` / `MARK_DEBUG`, pblock,
+/// impl run, `.hckp`.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectFile {
     pub part: String,
@@ -1448,6 +1456,9 @@ pub struct ProjectFile {
     pub pblocks: Vec<PrjPblock>,
     /// Implementation runs (`create_run impl_1 -strategy Default`).
     pub impl_runs: Vec<PrjImplRun>,
+    /// Debug nets (`mark_debug <net>` / `set_property MARK_DEBUG`): ILA probes
+    /// re-armed on open.
+    pub mark_debug: Vec<String>,
     /// Disk checkpoint path (`write_checkpoint path.hckp`).
     pub checkpoint_path: Option<String>,
 }
@@ -1509,6 +1520,27 @@ fn pblock_named_mut<'a>(p: &'a mut ProjectFile, name: &str) -> &'a mut PrjPblock
     p.pblocks.last_mut().unwrap()
 }
 
+/// Split `set_property <PROP> <value> [get_ports <port>]` into (value, port).
+/// PACKAGE_PIN carries its site as the value; MARK_DEBUG addresses nets via
+/// `get_nets` instead of `get_ports`. Returns `None` when no target survives.
+fn prj_set_prop_parts(rest: &[&str]) -> Option<(String, String)> {
+    let val = rest.get(1)?.to_string();
+    let joined = rest.get(2..)?.join(" ");
+    let target = joined
+        .split_once("get_ports")
+        .or_else(|| joined.split_once("get_nets"))
+        .and_then(|(_, r)| {
+            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .find(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string();
+    if target.is_empty() {
+        return None;
+    }
+    Some((val, target))
+}
+
 pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
     let mut p = ProjectFile {
         part: "HL10T-C32-1".into(),
@@ -1560,103 +1592,36 @@ pub fn load_prj(text: &str) -> Result<ProjectFile, String> {
                     {
                         p.top = Some(name);
                     }
-                } else if rest.first().copied() == Some("PACKAGE_PIN") && rest.len() >= 2 {
-                    let site = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    if !port.is_empty() {
-                        p.package_pins.push((port, site));
+                } else if let Some(prop) = rest.first().copied() {
+                    // PACKAGE_PIN carries the site as its value; every other
+                    // property carries its setting. MARK_DEBUG targets nets
+                    // (`get_nets`) rather than ports.
+                    if let Some((val, target)) = prj_set_prop_parts(&rest) {
+                        match prop {
+                            "PACKAGE_PIN" => p.package_pins.push((target, val)),
+                            "IOSTANDARD" => p.iostandards.push((target, val)),
+                            "DRIVE" => p.drives.push((target, val)),
+                            "SLEW" => p.slews.push((target, val)),
+                            "PULLTYPE" => p.pulltypes.push((target, val)),
+                            "DIFF_TERM" => p.diff_terms.push((target, val)),
+                            "IN_TERM" => p.in_terms.push((target, val)),
+                            "MARK_DEBUG" => {
+                                if !p.mark_debug.contains(&target) {
+                                    p.mark_debug.push(target);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                } else if rest.first().copied() == Some("IOSTANDARD") && rest.len() >= 2 {
-                    let std = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
+                }
+            }
+            "mark_debug" => {
+                if let Some(v) = toks.next() {
+                    let net = v
+                        .trim_matches(|c: char| "[]{}".contains(c))
                         .to_string();
-                    if !port.is_empty() {
-                        p.iostandards.push((port, std));
-                    }
-                } else if rest.first().copied() == Some("DRIVE") && rest.len() >= 2 {
-                    let val = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    if !port.is_empty() {
-                        p.drives.push((port, val));
-                    }
-                } else if rest.first().copied() == Some("SLEW") && rest.len() >= 2 {
-                    let val = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    if !port.is_empty() {
-                        p.slews.push((port, val));
-                    }
-                } else if rest.first().copied() == Some("PULLTYPE") && rest.len() >= 2 {
-                    let val = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    if !port.is_empty() {
-                        p.pulltypes.push((port, val));
-                    }
-                } else if rest.first().copied() == Some("DIFF_TERM") && rest.len() >= 2 {
-                    let val = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    if !port.is_empty() {
-                        p.diff_terms.push((port, val));
-                    }
-                } else if rest.first().copied() == Some("IN_TERM") && rest.len() >= 2 {
-                    let val = rest[1].to_string();
-                    let joined = rest[2..].join(" ");
-                    let port = joined
-                        .split_once("get_ports")
-                        .and_then(|(_, r)| {
-                            r.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                                .find(|s| !s.is_empty())
-                        })
-                        .unwrap_or("")
-                        .to_string();
-                    if !port.is_empty() {
-                        p.in_terms.push((port, val));
+                    if !net.is_empty() && !p.mark_debug.contains(&net) {
+                        p.mark_debug.push(net);
                     }
                 }
             }
@@ -1890,6 +1855,44 @@ pub fn format_prj(prj: &ProjectFile) -> String {
         if !line.ends_with('\n') {
             out.push('\n');
         }
+    }
+    // I/O Planning properties: the same `set_property` lines `load_prj`
+    // parses, so a project file round-trips pin assignments and pad settings.
+    for (port, site) in &prj.package_pins {
+        out.push_str(&format!(
+            "set_property PACKAGE_PIN {site} [get_ports {port}]\n"
+        ));
+    }
+    for (port, std) in &prj.iostandards {
+        out.push_str(&format!(
+            "set_property IOSTANDARD {std} [get_ports {port}]\n"
+        ));
+    }
+    for (port, val) in &prj.drives {
+        out.push_str(&format!("set_property DRIVE {val} [get_ports {port}]\n"));
+    }
+    for (port, val) in &prj.slews {
+        out.push_str(&format!("set_property SLEW {val} [get_ports {port}]\n"));
+    }
+    for (port, val) in &prj.pulltypes {
+        out.push_str(&format!(
+            "set_property PULLTYPE {val} [get_ports {port}]\n"
+        ));
+    }
+    for (port, val) in &prj.diff_terms {
+        out.push_str(&format!(
+            "set_property DIFF_TERM {val} [get_ports {port}]\n"
+        ));
+    }
+    for (port, val) in &prj.in_terms {
+        out.push_str(&format!(
+            "set_property IN_TERM {val} [get_ports {port}]\n"
+        ));
+    }
+    for net in &prj.mark_debug {
+        out.push_str(&format!(
+            "set_property MARK_DEBUG true [get_nets {net}]\n"
+        ));
     }
     for pb in &prj.pblocks {
         out.push_str(&format!("create_pblock {}\n", pb.name));
@@ -2410,6 +2413,46 @@ write_checkpoint counter.hckp
         assert_eq!(again.checkpoint_path, prj.checkpoint_path);
         assert_eq!(again.sources, prj.sources);
         assert_eq!(again.constraint_files, prj.constraint_files);
+    }
+
+    #[test]
+    fn format_prj_round_trips_io_props_and_mark_debug() {
+        let prj = load_prj(
+            r#"
+part HL10T-C32-1
+read_sv examples/counter.sv
+set_property PACKAGE_PIN IOB_X2Y0 [get_ports led]
+set_property IOSTANDARD LVCMOS33 [get_ports led]
+set_property DRIVE 12 [get_ports led]
+set_property SLEW FAST [get_ports led]
+set_property PULLTYPE PULLUP [get_ports btn]
+set_property DIFF_TERM TRUE [get_ports clk_p]
+set_property IN_TERM UNTUNED_SPLIT_40 [get_ports clk_p]
+set_property MARK_DEBUG true [get_nets led]
+mark_debug cnt_3
+"#,
+        )
+        .unwrap();
+        assert_eq!(prj.package_pins, vec![("led".into(), "IOB_X2Y0".into())]);
+        assert_eq!(prj.iostandards, vec![("led".into(), "LVCMOS33".into())]);
+        assert_eq!(prj.drives, vec![("led".into(), "12".into())]);
+        assert_eq!(prj.slews, vec![("led".into(), "FAST".into())]);
+        assert_eq!(prj.pulltypes, vec![("btn".into(), "PULLUP".into())]);
+        assert_eq!(prj.diff_terms, vec![("clk_p".into(), "TRUE".into())]);
+        assert_eq!(prj.in_terms, vec![("clk_p".into(), "UNTUNED_SPLIT_40".into())]);
+        assert_eq!(prj.mark_debug, vec!["led".to_string(), "cnt_3".to_string()]);
+
+        // format_prj must emit every property so the file round-trips.
+        let text = format_prj(&prj);
+        let again = load_prj(&text).unwrap();
+        assert_eq!(again.package_pins, prj.package_pins, "{text}");
+        assert_eq!(again.iostandards, prj.iostandards, "{text}");
+        assert_eq!(again.drives, prj.drives, "{text}");
+        assert_eq!(again.slews, prj.slews, "{text}");
+        assert_eq!(again.pulltypes, prj.pulltypes, "{text}");
+        assert_eq!(again.diff_terms, prj.diff_terms, "{text}");
+        assert_eq!(again.in_terms, prj.in_terms, "{text}");
+        assert_eq!(again.mark_debug, prj.mark_debug, "{text}");
     }
 
     #[test]
