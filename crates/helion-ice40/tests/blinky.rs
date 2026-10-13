@@ -45,21 +45,21 @@ fn blinky_design() -> Design {
         lut_init(&|a| bit(a, 2) ^ (bit(a, 0) & bit(a, 1))),
         lut_init(&|a| bit(a, 3) ^ (bit(a, 0) & bit(a, 1) & bit(a, 2))),
     ];
-    for i in 0..4 {
+    for (i, &init) in inits.iter().enumerate() {
         let lut = format!("next{i}_lut");
         let ff = format!("bit{i}_ff");
         let next = format!("next{i}");
         let q = format!("q{i}");
-        d.add_cell(&lut, CellKind::Lut6 { init: inits[i] });
-        d.add_cell(&ff, CellKind::Hff);
+        d.add_cell(lut.clone(), CellKind::Lut6 { init });
+        d.add_cell(ff.clone(), CellKind::Hff);
         // LUT inputs: connect q0..qi.
         for j in 0..=i {
-            d.connect(&format!("q{j}"), &lut, &format!("I{j}"));
+            d.connect(format!("q{j}"), lut.clone(), format!("I{j}"));
         }
-        d.connect(&next, &lut, "O");
-        d.connect(&next, &ff, "D");
-        d.connect(&q, &ff, "Q");
-        d.connect("clk_global", &ff, "CLK");
+        d.connect(next.clone(), lut, "O");
+        d.connect(next, ff.clone(), "D");
+        d.connect(q, ff.clone(), "Q");
+        d.connect("clk_global", ff, "CLK");
     }
 
     // LED output.

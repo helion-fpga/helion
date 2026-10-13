@@ -188,7 +188,7 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Vec<Pa
     // init bit n (n = in_2*4 + in_1*2 + in_0): in_0=sel, in_1=out0, in_2=out1.
     let mut mux_init: u16 = 0;
     for n in 0..16u16 {
-        let sel = (n >> 0) & 1;
+        let sel = n & 1;
         let a = (n >> 1) & 1;
         let b = (n >> 2) & 1;
         let o = if sel == 1 { b } else { a };
