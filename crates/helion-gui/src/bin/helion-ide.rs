@@ -5608,10 +5608,10 @@ fn paint_timing_path_table(
         ("Path group", Some(96.0), false, None),
     ];
     let w = ui.available_width();
-    let fixed: f32 = cols.iter().filter_map(|c| c.1).sum();
-    let n_fill = cols.iter().filter(|c| c.1.is_none()).count().max(1) as f32;
-    let fill_w = ((w - fixed) / n_fill).max(80.0);
-    let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
+    // Columns always sum to the pane width (chrome::timing_path_col_widths):
+    // fixed widths above the 676px floor, proportional shrink below it, so
+    // the last column is never clipped on narrow windows.
+    let widths = chrome::timing_path_col_widths(w);
 
     // Header row: 28px, 11px dim semibold, click to sort.
     let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
@@ -5838,10 +5838,12 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         ("Location", Some(150.0), false),
     ];
     let w = ui.available_width();
-    let fixed: f32 = cols.iter().filter_map(|c| c.1).sum();
-    let n_fill = cols.iter().filter(|c| c.1.is_none()).count().max(1) as f32;
-    let fill_w = ((w - fixed) / n_fill).max(80.0);
-    let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
+    // Same reflow contract as the path table: columns sum to the pane width.
+    let widths = chrome::spec_col_widths(
+        &[None, Some(110.0), Some(90.0), Some(90.0), None, Some(70.0), Some(150.0)],
+        80.0,
+        w,
+    );
 
     let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
     let cells: Vec<SpecCell> = cols
@@ -7188,10 +7190,10 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         let w = ui.available_width();
         // ID (severity-colored badge) | Objects | Message. The old Severity
         // text column duplicated the badge's encoding, so it is gone; its
-        // width goes to the message column.
-        let obj_w = ((w - 80.0) * 0.35).max(90.0);
-        let msg_w = (w - 80.0 - obj_w).max(90.0);
-        let widths = [80.0f32, obj_w, msg_w];
+        // width goes to the message column. Columns always sum to the pane
+        // width (chrome::drc_col_widths) - the message wraps instead of clipping.
+        let widths = chrome::drc_col_widths(w);
+        let msg_w = widths[2];
 
         let (hrect, _) =
             ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
