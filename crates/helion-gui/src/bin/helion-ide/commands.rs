@@ -180,7 +180,7 @@ impl Command {
 }
 
 /// Run one registry command. Call only from discrete UI handlers (palette
-/// Enter/click, menu items) — never per-frame: flow steps and Tcl exec block.
+/// Enter/click, menu items) - never per-frame: flow steps and Tcl exec block.
 fn run_command(app: &mut HelionIde, cmd: Command) {
     match cmd {
         Command::Workspace(tab) => open_more_workspace(app, tab),
@@ -229,7 +229,7 @@ fn open_palette(app: &mut HelionIde, mode: PaletteMode) {
 }
 
 /// Run one Tcl recipe through the model; journal + status on success, toast on
-/// failure. Blocking — handler-only.
+/// failure. Blocking - handler-only.
 fn exec_tcl(app: &mut HelionIde, tcl: &str) {
     match app.model.exec(tcl) {
         Ok(out) => app.progress = out,
@@ -482,7 +482,7 @@ fn paint_palette_header(
     });
     ui.add_space(2.0);
     let hint = match mode {
-        PaletteMode::Files => "Type to filter files — prefix with > for commands",
+        PaletteMode::Files => "Type to filter files - prefix with > for commands",
         PaletteMode::Commands => "Type to filter commands",
     };
     let resp = ui.add(
@@ -812,7 +812,7 @@ fn menu_help(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
 
 /// Menu bar (File / Edit / View / Flow / Tools / Help), painted inside the
 /// toolbar row via `ui.menu_button`. Every item calls the same `run_command`
-/// as the palette. Additive only — no existing toolbar behavior changes.
+/// as the palette. Additive only - no existing toolbar behavior changes.
 pub fn paint_menu_bar(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
     ui.horizontal(|ui| {
