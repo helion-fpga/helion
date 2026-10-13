@@ -27,6 +27,7 @@ members = [
     "crates/helion-xilinx7",
     "crates/helion-hl10t",
     "crates/helion-ice40",
+    "crates/helion-ecp5",
 ]
 
 [workspace.package]
@@ -61,6 +62,7 @@ helion-hls = { path = "crates/helion-hls" }
 helion-backend = { path = "crates/helion-backend" }
 helion-xilinx7 = { path = "crates/helion-xilinx7" }
 helion-ice40 = { path = "crates/helion-ice40" }
+helion-ecp5 = { path = "crates/helion-ecp5" }
 criterion = "0.5"
 
 [profile.bench]
