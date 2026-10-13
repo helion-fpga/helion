@@ -417,6 +417,7 @@ fn primitive_of(kind: &CellKind) -> String {
         CellKind::Mac27 => "MAC27".into(),
         CellKind::Ila { .. } => "ILA".into(),
         CellKind::Bram18 => "BRAM18".into(),
+        CellKind::Carry4 => "CARRY4".into(),
         CellKind::BlackBox { module } => format!("BLACKBOX:{module}"),
     }
 }
@@ -14085,6 +14086,7 @@ impl IdeModel {
                         CellKind::Mac27 => "DSP",
                         CellKind::Ila { .. } => "ILA",
                         CellKind::Bram18 => "BRAM",
+                        CellKind::Carry4 => "CARRY",
                         CellKind::BlackBox { .. } => "BOX",
                     };
                     IncrementalRow {
@@ -14377,6 +14379,7 @@ impl IdeModel {
                     CellKind::Mac27 => ("DSP", "-".into()),
                     CellKind::Ila { .. } => ("ILA", "-".into()),
                     CellKind::Bram18 => ("BRAM", "-".into()),
+                    CellKind::Carry4 => ("CARRY", "-".into()),
                     CellKind::BlackBox { .. } => ("BOX", "-".into()),
                 };
                 let (status, site) = match sites.get(&c.name) {
@@ -21485,6 +21488,7 @@ impl IdeModel {
                     CellKind::Ila { .. } => "ila".into(),
                     CellKind::Mac27 => "dsp".into(),
                     CellKind::Bram18 => "bram".into(),
+                    CellKind::Carry4 => "carry".into(),
                     CellKind::BlackBox { .. } => "instance".into(),
                 };
             }
