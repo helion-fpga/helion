@@ -30591,6 +30591,68 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
     }
 
+    /// Priority repro (Saksham): mouse interaction on the timing view must
+    /// never mutate timing values. Simulates every mouse-equivalent model
+    /// mutation the timing painters perform (row click -> set_probe, header
+    /// click -> timing_path_sort, pin click -> select_timing_pin, filter
+    /// typing -> timing_path_filter, double-click -> exec select_timing_path,
+    /// empty-space click -> clear_probe) and asserts the underlying timing
+    /// data is bit-identical before and after.
+    #[test]
+    fn timing_mouse_interaction_never_mutates_timing_values() {
+        let mut ide = IdeModel::new();
+        ide.open_source(&example("counter.sv")).unwrap();
+        ide.exec("report_timing").unwrap();
+        assert!(
+            !ide.timing_paths.is_empty(),
+            "need timing paths to test against"
+        );
+        let before = ide.timing_path_table_text();
+        let wns_before = ide.timing.as_ref().map(|t| t.wns_ps);
+
+        // Header click: cycle sort through every sortable column, both directions.
+        for col in [
+            TimingPathSortCol::From,
+            TimingPathSortCol::To,
+            TimingPathSortCol::Slack,
+            TimingPathSortCol::Levels,
+        ] {
+            ide.timing_path_sort = Some((col, true));
+            ide.timing_path_sort = Some((col, false));
+        }
+        ide.timing_path_sort = None;
+
+        // Filter typing.
+        ide.timing_path_filter = "clk".into();
+        let _ = ide.timing_path_table_text();
+        ide.timing_path_filter.clear();
+
+        // Row click: probe every path, then an object, then clear.
+        for i in 0..ide.timing_paths.len() {
+            ide.set_probe(ProbeSelection::Path(i));
+        }
+        if let Some(cell) = ide.timing_paths[0].cells.first().cloned() {
+            ide.set_probe(ProbeSelection::Object(cell));
+        }
+        ide.clear_probe();
+
+        // Pin click: select the first pin of the first path.
+        if let Some(pin) = ide.timing_paths[0].pins.first().map(|p| p.pin.clone()) {
+            let _ = ide.select_timing_pin(&pin);
+        }
+
+        // Double-click: exec select_timing_path.
+        let _ = ide.exec("select_timing_path 0");
+
+        let after = ide.timing_path_table_text();
+        let wns_after = ide.timing.as_ref().map(|t| t.wns_ps);
+        assert_eq!(
+            before, after,
+            "mouse interaction changed timing values:\nbefore:\n{before}\nafter:\n{after}"
+        );
+        assert_eq!(wns_before, wns_after, "WNS changed under mouse interaction");
+    }
+
     /// Fig. 59: selecting a report_timing path highlights THAT path's STA cells/nets.
     #[test]
     fn schematic_highlights_selected_sta_timing_path() {
