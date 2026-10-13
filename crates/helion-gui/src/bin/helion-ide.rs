@@ -1279,7 +1279,20 @@ fn tip(name: &str, shortcut: &str, tcl: &str) -> String {
     }
 }
 
-fn data_scroll(id: &'static str) -> egui::ScrollArea {
+/// ScrollArea for an embedded table/list that lives inside another scrollable
+/// region (e.g. a report table inside the scrollable Timing page).
+///
+/// Two properties are load-bearing for correct nested scrolling, and every
+/// call site must keep them (do not hand-roll a replacement):
+/// * `auto_shrink([false, true])`: the area fills the available width, so the
+///   wheel-hover rect covers the whole list. With egui's default
+///   `auto_shrink([true, true])` the area shrinks to its content width and the
+///   wheel only registers over the text itself - wheeling the empty right part
+///   of the list scrolls the outer container instead.
+/// * `max_height(TABLE_MAX_HEIGHT)`: bounds the viewport so the list scrolls
+///   internally and traps the wheel until it reaches its own top/bottom edge,
+///   at which point egui chains the gesture to the outer container.
+fn data_scroll(id: &str) -> egui::ScrollArea {
     let p = chrome::table_scroll_policy(10, chrome::DESKTOP_WIDTH);
     let sa = if p.x && p.y {
         egui::ScrollArea::both()
@@ -3908,9 +3921,11 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
         let selected = model.selected.clone();
         let mut pick: Option<String> = None;
         let mut sort_click: Option<RunCol> = None;
+        // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
         egui::ScrollArea::both()
             .id_salt("design_runs_results")
             .max_height(260.0)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 egui::Grid::new("design_runs_table")
                     .spacing([10.0, 4.0])
@@ -4109,9 +4124,11 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
 
     // Table.
     let mut toggle: Option<String> = None;
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::both()
         .id_salt("checkpoints_table")
         .max_height(260.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("checkpoints_grid")
                 .spacing([8.0, 4.0])
@@ -4255,9 +4272,11 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel, theme: &the
         }
         return;
     }
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::both()
         .id_salt("ug986_incremental_report")
         .max_height(180.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("incremental_report_table")
                 .spacing([8.0, 4.0])
@@ -4350,9 +4369,11 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         }
         return;
     }
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::both()
         .id_salt("ug893_eco_changes")
         .max_height(180.0)
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("eco_changes_table")
                 .spacing([8.0, 4.0])
@@ -4510,12 +4531,16 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 pick_port = Some(p.name.clone());
             }
         }
+        // Salts derive from grid_id: this table is painted both in the sidebar
+        // ("sidebar_io") and in the Package view ("io_ports_package"), and
+        // fixed salts would collide (shared scroll offset) when both are
+        // visible at once.
         egui::CollapsingHeader::new("Pin properties")
             .default_open(false)
-            .id_salt("sidebar_io_props")
+            .id_salt(format!("{grid_id}_props"))
             .show(ui, |ui| {
                 egui::ScrollArea::horizontal()
-                    .id_salt("sidebar_io_props_scroll")
+                    .id_salt(format!("{grid_id}_props_scroll"))
                     .show(ui, |ui| {
                         ui.set_min_width(420.0);
                         for p in &rows {
@@ -4536,7 +4561,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                     });
             });
     } else {
-        data_scroll("io_ports_table_scroll").show(ui, |ui| {
+        data_scroll(&format!("{grid_id}_table_scroll")).show(ui, |ui| {
             egui::Grid::new(grid_id).spacing([8.0, 4.0]).show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Dir").strong());
@@ -5857,9 +5882,11 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
 
     let selected_pin = model.selected_timing_pin.clone();
     let mut pick_pin: Option<String> = None;
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
     egui::ScrollArea::vertical()
         .id_salt("timing_pin_details")
         .max_height(280.0)
+        .auto_shrink([false, true])
         .hscroll(true)
         .show(ui, |ui| {
             for pin in &path.pins {
@@ -6116,7 +6143,10 @@ fn paint_clock_interaction(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     let selected = model.selected.clone();
     let mut pick: Option<(String, String)> = None;
     let mut pick_obj: Option<String> = None;
-    egui::ScrollArea::both().id_salt("clock_interaction_scroll").show(ui, |ui| {
+    // Nested table: data_scroll traps the wheel (auto_shrink + max_height);
+    // a bare ScrollArea::both() here shrinks to content and never scrolls,
+    // so the wheel would scroll the outer Timing page instead.
+    data_scroll("clock_interaction_scroll").show(ui, |ui| {
         // Fixed 120px columns (Vivado matrix): headers center over their
         // cells instead of ragged content-sized labels.
         const CELL_W: f32 = 120.0;
@@ -6268,7 +6298,8 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         }
         return;
     }
-    egui::ScrollArea::both().id_salt("cdc_scroll").show(ui, |ui| {
+    // Nested table: data_scroll traps the wheel (see clock_interaction_scroll).
+    data_scroll("cdc_scroll").show(ui, |ui| {
         egui::Grid::new("cdc_table")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
@@ -6687,9 +6718,12 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     }
     ui.add_space(8.0);
     ui.label(RichText::new("Top toggling nets").strong());
+    // auto_shrink([false, true]): full-width wheel-hover rect so the wheel
+    // traps anywhere over the list, not just over the text (nested-scroll fix).
     egui::ScrollArea::vertical()
         .max_height(220.0)
         .id_salt("vcd_top_nets")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("vcd_top_nets_grid")
                 .spacing([8.0, 2.0])
@@ -6829,7 +6863,8 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         // ID (severity-colored button) | Category | Objects | Message. The old
         // Severity text column duplicated the button's encoding.
         let col_w = chrome::stretched_col_w_gap(4, ui.available_width(), 8.0);
-        egui::ScrollArea::both().id_salt("methodology_scroll").show(ui, |ui| {
+        // Nested table: data_scroll traps the wheel (see clock_interaction_scroll).
+        data_scroll("methodology_scroll").show(ui, |ui| {
             egui::Grid::new("methodology_table")
                 .spacing([8.0, row_gap])
                 .min_col_width(col_w)
@@ -6959,7 +6994,10 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         let n_f = n as f32;
         let row_gap = ((ui.available_height() - 28.0) / n_f - 18.0).clamp(4.0, 28.0);
         let col_w = chrome::stretched_col_w_gap(6, ui.available_width(), 8.0);
-        egui::ScrollArea::both().show(ui, |ui| {
+        // Nested table: data_scroll traps the wheel (see clock_interaction_scroll);
+        // it also supplies the id_salt this ScrollArea was missing (salt-less
+        // areas share one persistent id, leaking scroll offsets between views).
+        data_scroll("qor_table_scroll").show(ui, |ui| {
             egui::Grid::new("qor_table")
                 .spacing([8.0, row_gap])
                 .min_col_width(col_w)
@@ -7086,7 +7124,12 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
     ));
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
-    egui::ScrollArea::both().id_salt("bitstream_scroll").max_height(280.0).show(ui, |ui| {
+    // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
+    egui::ScrollArea::both()
+        .id_salt("bitstream_scroll")
+        .max_height(280.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
         egui::Grid::new("bitstream_far_table")
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
@@ -7181,7 +7224,13 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
-    egui::ScrollArea::vertical().id_salt("drc_scroll").show(ui, |ui| {
+    // Nested list: bounded + full-width hover rect so the wheel traps here
+    // instead of scrolling the outer Timing page (see clock_interaction_scroll).
+    egui::ScrollArea::vertical()
+        .id_salt("drc_scroll")
+        .auto_shrink([false, true])
+        .max_height(chrome::TABLE_MAX_HEIGHT)
+        .show(ui, |ui| {
         let w = ui.available_width();
         // ID (severity-colored badge) | Objects | Message. The old Severity
         // text column duplicated the badge's encoding, so it is gone; its
@@ -7636,9 +7685,11 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
             .show(ui, |ui| {
                 let mut pick_path = None;
                 let selected_path = model.selected_timing_path;
+                // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
                 egui::ScrollArea::vertical()
                     .id_salt("schematic_timing_paths_scroll")
                     .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
                         egui::Grid::new("schematic_timing_paths")
                             .spacing([8.0, 4.0])
@@ -12379,4 +12430,174 @@ fn paint_tb_help(ui: &mut egui::Ui, theme: &theme::Theme) {
             );
         },
     );
+}
+
+
+#[cfg(test)]
+mod nested_scroll_tests {
+    use eframe::egui;
+
+    /// Priority repro (Saksham): a scrollable list nested inside a scrollable
+    /// page must trap the wheel anywhere over the list - including the empty
+    /// area right of short rows - until it reaches its own top/bottom edge;
+    /// only then does the outer page take over (standard scroll chaining).
+    ///
+    /// Root cause this guards: egui's default `auto_shrink([true, true])`
+    /// shrinks an inner ScrollArea to its content width, so the wheel-hover
+    /// rect is only as wide as the text. Wheeling the empty part of the list
+    /// then scrolled the outer page instead of the list. The fix (see
+    /// `data_scroll`) is `auto_shrink([false, true])` plus a `max_height`
+    /// bound on every nested list; this test mirrors that configuration
+    /// exactly and fails if either property regresses.
+    #[test]
+    fn nested_list_traps_wheel_over_empty_area() {
+        let ctx = egui::Context::default();
+        // Returns (wheel target point, inner offset, outer offset).
+        let frame = |ctx: &egui::Context,
+                     events: Vec<egui::Event>|
+         -> (egui::Pos2, egui::Vec2, egui::Vec2) {
+            let mut probe = (egui::Pos2::ZERO, egui::Vec2::ZERO, egui::Vec2::ZERO);
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Outer: the scrollable page (mirrors timing_canvas_v6).
+                    let page = egui::ScrollArea::vertical()
+                        .id_salt("test_page")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for i in 0..20 {
+                                ui.label(format!("page header {i}"));
+                            }
+                            // Inner: a nested report table (mirrors data_scroll).
+                            let list = egui::ScrollArea::both()
+                                .id_salt("test_nested_table")
+                                .auto_shrink([false, true])
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    // Short rows: content far narrower than the viewport.
+                                    for i in 0..60 {
+                                        ui.label(format!("r{i}"));
+                                    }
+                                });
+                            // Aim at the EMPTY area right of the short rows:
+                            // the exact spot where the bug stole the wheel.
+                            let r = list.inner_rect;
+                            probe.0 = egui::pos2(r.right() - 20.0, r.center().y);
+                            probe.1 = list.state.offset;
+                            for i in 0..40 {
+                                ui.label(format!("page footer {i}"));
+                            }
+                        });
+                    probe.2 = page.state.offset;
+                });
+            });
+            probe
+        };
+        frame(&ctx, vec![]);
+        let laid_out = frame(&ctx, vec![]);
+        // Small Point-unit delta: applied without multi-frame smoothing.
+        let probe = frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(laid_out.0),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -5.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert!(
+            probe.1.y > 0.0,
+            "nested list must trap the wheel (inner offset moved): inner={:?} outer={:?}",
+            probe.1,
+            probe.2
+        );
+        assert_eq!(
+            probe.2.y, 0.0,
+            "outer page must not move while the nested list can scroll: inner={:?} outer={:?}",
+            probe.1,
+            probe.2
+        );
+    }
+
+    /// Chaining still works at the edge: once the inner list is pinned to its
+    /// bottom, further wheel-down gestures chain out to the outer page.
+    #[test]
+    fn nested_list_chains_to_outer_at_bottom_edge() {
+        let ctx = egui::Context::default();
+        // Returns (wheel target point, inner offset, outer offset).
+        let frame = |ctx: &egui::Context,
+                     events: Vec<egui::Event>|
+         -> (egui::Pos2, egui::Vec2, egui::Vec2) {
+            let mut probe = (egui::Pos2::ZERO, egui::Vec2::ZERO, egui::Vec2::ZERO);
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let page = egui::ScrollArea::vertical()
+                        .id_salt("test_page_edge")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for i in 0..20 {
+                                ui.label(format!("page header {i}"));
+                            }
+                            // Pin the inner list to its bottom edge.
+                            let list = egui::ScrollArea::both()
+                                .id_salt("test_nested_table_edge")
+                                .auto_shrink([false, true])
+                                .max_height(180.0)
+                                .vertical_scroll_offset(1.0e6)
+                                .show(ui, |ui| {
+                                    for i in 0..60 {
+                                        ui.label(format!("r{i}"));
+                                    }
+                                });
+                            probe.0 = list.inner_rect.center();
+                            probe.1 = list.state.offset;
+                            for i in 0..40 {
+                                ui.label(format!("page footer {i}"));
+                            }
+                        });
+                    probe.2 = page.state.offset;
+                });
+            });
+            probe
+        };
+        frame(&ctx, vec![]);
+        let laid_out = frame(&ctx, vec![]);
+        assert!(
+            laid_out.1.y > 100.0,
+            "test setup: inner list should be pinned near its bottom edge: inner={:?}",
+            laid_out.1
+        );
+        frame(&ctx, vec![egui::Event::PointerMoved(laid_out.0)]);
+        let probe = frame(
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -5.0),
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            probe.2.y > 0.0,
+            "wheel over a bottom-pinned inner list must chain to the outer page: inner={:?} outer={:?}",
+            probe.1,
+            probe.2
+        );
+    }
 }
