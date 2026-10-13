@@ -78,6 +78,30 @@ impl TimingModel {
             hold_req_ps: 100,
         }
     }
+
+    /// iCE40-HX8K.
+    ///
+    /// Preliminary calibration, NOT correlated against iCECube2 or nextpnr
+    /// yet. Datasheet-anchored magnitudes (FPGA-DS-02029, HX8K): tPD
+    /// (pin-LUT-pin through one LUT4) 7.30ns max, PIO tCO 5.41ns, PIO tH
+    /// 2.38ns, fMAX_GBUF 275MHz, global skew 300ps. The internal cell arcs
+    /// below are order-of-magnitude splits of those external numbers, not
+    /// measured cell delays. Treat every number here as a placeholder until
+    /// a timing correlation campaign against nextpnr-ice40 placed reference
+    /// designs lands. A correlation harness should: run N reference designs
+    /// through nextpnr-ice40, extract per-arc delays from its timing reports,
+    /// and fit these fields.
+    pub fn ice40_hx8k() -> Self {
+        Self {
+            lut_ps: 1000,
+            ff_ckq_ps: 500,
+            setup_ps: 300,
+            pin_ps: 100,
+            iob_ps: 2500,
+            hop_ps: 200,
+            hold_req_ps: 500,
+        }
+    }
 }
 
 /// A complete FPGA implementation flow for one device family.

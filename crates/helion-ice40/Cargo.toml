@@ -1,0 +1,12 @@
+[package]
+name = "helion-ice40"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+helion-ir = { workspace = true }
+helion-backend = { workspace = true }
+
+[dev-dependencies]
+helion-sv = { workspace = true }
