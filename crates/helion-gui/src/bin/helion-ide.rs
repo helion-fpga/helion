@@ -231,7 +231,7 @@ fn run_gui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([iw, ih])
-            .with_min_inner_size([720.0, 400.0])
+            .with_min_inner_size([chrome::MIN_WINDOW_W, chrome::MIN_WINDOW_H])
             .with_title("Helion"),
         ..Default::default()
     };
@@ -2067,51 +2067,54 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         .show_separator_line(true)
         .show(ctx, |ui| {
             let w = ui.available_width();
+            // Reserve for the right-side job indicator; segments never paint into it.
+            let right_w = 190.0;
             let (bar, _) = ui.allocate_exact_size(
                 egui::vec2(w, chrome::STATUS_HEIGHT),
                 egui::Sense::hover(),
             );
-            let mut x = bar.left() + 8.0;
-            let mut first = true;
-            let mut idx = 0usize;
-            let mut seg = |ui: &mut egui::Ui,
-                           label: &str,
-                           color: Color32,
-                           hover: &str,
-                           g: Option<Go>| {
-                idx += 1;
-                if status_seg(ui, &theme, bar, &mut x, &mut first, idx, label, color, hover, g.is_some())
-                    .clicked()
-                {
-                    go = g;
-                }
+            let x_limit = bar.right() - right_w - 8.0;
+            // Segments are spec'd first, then measured, then the visible
+            // leading run is painted (chrome::status_visible_count): narrow
+            // windows hide low-priority segments instead of overlapping them
+            // (VS Code's status bar priority pattern).
+            struct SegSpec {
+                label: String,
+                color: Color32,
+                hover: String,
+                go: Option<Go>,
+            }
+            let mut specs: Vec<SegSpec> = Vec::new();
+            let mut spec = |label: String, color: Color32, hover: &str, go: Option<Go>| {
+                specs.push(SegSpec {
+                    label,
+                    color,
+                    hover: hover.to_string(),
+                    go,
+                });
             };
-            seg(
-                ui,
-                &crumb,
+            spec(
+                crumb.clone(),
                 theme.dim,
                 "Go to Files (project view)",
                 Some(Go::Activity(Activity::Files)),
             );
             // No standalone part picker exists; the Device view is the honest
             // target for the part segment.
-            seg(
-                ui,
-                &model.part(),
+            spec(
+                model.part().to_string(),
                 theme.dim,
                 "Open Device view",
                 Some(Go::Activity(Activity::Device)),
             );
-            seg(
-                ui,
-                &wns,
+            spec(
+                wns.clone(),
                 wns_color,
                 "Open Timing canvas (timing summary + paths)",
                 Some(Go::Activity(Activity::Timing)),
             );
-            seg(
-                ui,
-                &format!("provenance={provenance}"),
+            spec(
+                format!("provenance={provenance}"),
                 theme.faint,
                 "",
                 None,
@@ -2128,38 +2131,68 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             } else {
                 theme.dim
             };
-            seg(
-                ui,
-                &issue_label,
+            spec(
+                issue_label,
                 issue_color,
                 "Open Messages panel",
                 Some(Go::Bottom(BottomTab::Messages)),
             );
-            seg(
-                ui,
-                &format!("LUTFF {lutff}"),
+            spec(
+                format!("LUTFF {lutff}"),
                 theme.dim,
                 "Open Utilization report",
                 Some(Go::Tab(WorkspaceTab::Utilization)),
             );
-            seg(
-                ui,
-                &run,
+            spec(
+                run.clone(),
                 theme.dim,
                 "Open Runs tab",
                 Some(Go::Tab(WorkspaceTab::Runs)),
             );
             if !board_crumb.is_empty() {
-                seg(ui, board_crumb, theme.faint, "", None);
+                spec(board_crumb.to_string(), theme.faint, "", None);
             }
             if !progress.is_empty() {
-                seg(ui, &progress, theme.accent_dim, "", None);
+                spec(progress.clone(), theme.accent_dim, "", None);
             } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
-                seg(ui, &status, theme.dim, "", None);
+                spec(status.clone(), theme.dim, "", None);
+            }
+            let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+            let widths: Vec<f32> = specs
+                .iter()
+                .map(|sp| {
+                    ui.painter()
+                        .layout_no_wrap(sp.label.clone(), font.clone(), sp.color)
+                        .size()
+                        .x
+                        + 16.0
+                })
+                .collect();
+            let n_visible = chrome::status_visible_count(&widths, x_limit);
+            let mut x = bar.left() + 8.0;
+            let mut first = true;
+            for (idx, sp) in specs.iter().take(n_visible).enumerate() {
+                if status_seg(
+                    ui,
+                    &theme,
+                    bar,
+                    &mut x,
+                    &mut first,
+                    idx + 1,
+                    &sp.label,
+                    sp.color,
+                    &sp.hover,
+                    sp.go.is_some(),
+                )
+                .clicked()
+                {
+                    go = sp.go;
+                }
             }
             // Right side: flow progress chips (R16: Z1 -> Z7) + background-job
             // spinner/progress, or idle indicator.
             let right_w = 340.0;
+
             let right_rect = egui::Rect::from_min_size(
                 egui::pos2(bar.right() - right_w - 8.0, bar.top()),
                 egui::vec2(right_w, bar.height()),
@@ -2795,17 +2828,19 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     // Absolute rect split - clip both sides so long HNF names cannot paint over Memory.
     let full = ui.available_rect_before_wrap();
     let h = full.height().max(200.0);
-    let nav_w = chrome::SIDEBAR_WIDTH;
-    let rule = chrome::SPLITTER_GRAB_PX;
+    // Proportional nav share (VS Code GridView pattern): a fixed 220px nav
+    // left the wave pane with a negative width on narrow windows.
+    let (nav_w, sep_w, wave_w) = chrome::sim_split(full.width());
     let _ = ui.allocate_rect(full, Sense::hover());
     let nav_rect = egui::Rect::from_min_size(full.min, egui::vec2(nav_w, h));
     let sep_rect = egui::Rect::from_min_size(
         egui::pos2(full.min.x + nav_w, full.min.y),
-        egui::vec2(rule, h),
+        egui::vec2(sep_w, h),
     );
-    let wave_rect = egui::Rect::from_min_max(
-        egui::pos2(full.min.x + nav_w + rule, full.min.y),
-        egui::pos2(full.max.x, full.min.y + h),
+    let wave_left = full.min.x + nav_w + sep_w;
+    let wave_rect = egui::Rect::from_min_size(
+        egui::pos2(wave_left, full.min.y),
+        egui::vec2(wave_w, h),
     );
     ui.painter().rect_filled(nav_rect, 0.0, theme.panel);
     ui.painter().rect_filled(sep_rect, 0.0, theme.line);
@@ -3308,7 +3343,9 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
     egui::ScrollArea::both()
         .id_salt("tcl_journal_scroll")
         .stick_to_bottom(true)
-        .max_height(ui.available_height() - 28.0)
+        // Short console (floor 36-40px): available_height() - 28 can go
+        // negative, which egui treats as an invalid max size.
+        .max_height((ui.available_height() - 28.0).max(0.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("tcl_console_table")
@@ -4491,6 +4528,36 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
 }
 
+/// One quick-set property button row under the I/O ports table (the six
+/// property rows were copy-pasted; PACKAGE_PIN keeps its own row with the
+/// text edit). IOSTANDARD feeds `set_iostd`, everything else feeds `set_io`.
+#[allow(clippy::too_many_arguments)]
+fn io_prop_button_row(
+    ui: &mut egui::Ui,
+    key: &'static str,
+    values: &[&'static str],
+    btn_w: f32,
+    port: &str,
+    set_iostd: &mut Option<(String, &'static str)>,
+    set_io: &mut Option<(String, &'static str, &'static str)>,
+) {
+    ui.horizontal(|ui| {
+        ui.weak(key);
+        for &v in values {
+            if ui
+                .add_sized([btn_w, chrome::HIT_SIDEBAR], egui::Button::new(v))
+                .clicked()
+            {
+                if key == "IOSTANDARD" {
+                    *set_iostd = Some((port.to_string(), v));
+                } else {
+                    *set_io = Some((port.to_string(), key, v));
+                }
+            }
+        }
+    });
+}
+
 fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'static str) {
     ui.label(RichText::new("I/O Ports").strong());
     let _assigned = model
@@ -4740,89 +4807,37 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 }
             }
         });
-        ui.horizontal(|ui| {
-            ui.weak("IOSTANDARD");
-            for std in ["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"] {
-                if ui
-                    .add_sized([64.0, chrome::HIT_SIDEBAR], egui::Button::new(std))
-                    .clicked()
-                {
-                    set_iostd = Some((port.clone(), std));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("DRIVE");
-            for ma in ["4", "8", "12", "16"] {
-                if ui
-                    .add_sized([40.0, chrome::HIT_SIDEBAR], egui::Button::new(ma))
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "DRIVE", ma));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("SLEW");
-            for s in ["SLOW", "FAST"] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "SLEW", s));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("PULLTYPE");
-            for s in ["NONE", "PULLUP", "PULLDOWN", "KEEPER"] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "PULLTYPE", s));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("DIFF_TERM");
-            for s in ["FALSE", "TRUE"] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "DIFF_TERM", s));
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.weak("IN_TERM");
-            for s in [
-                "NONE",
-                "UNTUNED_SPLIT_40",
-                "UNTUNED_SPLIT_50",
-                "UNTUNED_SPLIT_60",
-            ] {
-                if ui
-                    .add_sized(
-                        [ui.spacing().interact_size.x.max(56.0), chrome::HIT_SIDEBAR],
-                        egui::Button::new(s),
-                    )
-                    .clicked()
-                {
-                    set_io = Some((port.clone(), "IN_TERM", s));
-                }
-            }
-        });
+        let w56 = ui.spacing().interact_size.x.max(56.0);
+        io_prop_button_row(
+            ui,
+            "IOSTANDARD",
+            &["LVCMOS18", "LVCMOS33", "LVCMOS12", "SSTL15"],
+            64.0,
+            &port,
+            &mut set_iostd,
+            &mut set_io,
+        );
+        io_prop_button_row(ui, "DRIVE", &["4", "8", "12", "16"], 40.0, &port, &mut set_iostd, &mut set_io);
+        io_prop_button_row(ui, "SLEW", &["SLOW", "FAST"], w56, &port, &mut set_iostd, &mut set_io);
+        io_prop_button_row(
+            ui,
+            "PULLTYPE",
+            &["NONE", "PULLUP", "PULLDOWN", "KEEPER"],
+            w56,
+            &port,
+            &mut set_iostd,
+            &mut set_io,
+        );
+        io_prop_button_row(ui, "DIFF_TERM", &["FALSE", "TRUE"], w56, &port, &mut set_iostd, &mut set_io);
+        io_prop_button_row(
+            ui,
+            "IN_TERM",
+            &["NONE", "UNTUNED_SPLIT_40", "UNTUNED_SPLIT_50", "UNTUNED_SPLIT_60"],
+            w56,
+            &port,
+            &mut set_iostd,
+            &mut set_io,
+        );
     }
     if let Some((port, std)) = set_iostd {
         // ComboBox / button Set → set_iostandard (HNF + constraints); exec syncs the table.
@@ -5270,6 +5285,12 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
             "constraints_io_placement",
         ),
     ];
+    // Dense data grid: horizontal scroll keeps long names/values reachable on
+    // narrow windows (the same sanctioned fallback the methodology/QoR grids use).
+    egui::ScrollArea::horizontal()
+        .id_salt("constraints_tables_hscroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     for (title, section, grid) in sections {
         let sect: Vec<_> = rows.iter().filter(|r| r.section == section).collect();
         ui.add_space(6.0);
@@ -5309,6 +5330,7 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
             }
         });
     }
+    });
     if let Some(id) = pick {
         let _ = model.select_constraint(&id);
     }
@@ -5632,10 +5654,10 @@ fn paint_timing_path_table(
         ("Path group", Some(96.0), false, None),
     ];
     let w = ui.available_width();
-    let fixed: f32 = cols.iter().filter_map(|c| c.1).sum();
-    let n_fill = cols.iter().filter(|c| c.1.is_none()).count().max(1) as f32;
-    let fill_w = ((w - fixed) / n_fill).max(80.0);
-    let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
+    // Columns always sum to the pane width (chrome::timing_path_col_widths):
+    // fixed widths above the 676px floor, proportional shrink below it, so
+    // the last column is never clipped on narrow windows.
+    let widths = chrome::timing_path_col_widths(w);
 
     // Header row: 28px, 11px dim semibold, click to sort.
     let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
@@ -5862,10 +5884,12 @@ fn paint_timing_pin_detail(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         ("Location", Some(150.0), false),
     ];
     let w = ui.available_width();
-    let fixed: f32 = cols.iter().filter_map(|c| c.1).sum();
-    let n_fill = cols.iter().filter(|c| c.1.is_none()).count().max(1) as f32;
-    let fill_w = ((w - fixed) / n_fill).max(80.0);
-    let widths: Vec<f32> = cols.iter().map(|c| c.1.unwrap_or(fill_w)).collect();
+    // Same reflow contract as the path table: columns sum to the pane width.
+    let widths = chrome::spec_col_widths(
+        &[None, Some(110.0), Some(90.0), Some(90.0), None, Some(70.0), Some(150.0)],
+        80.0,
+        w,
+    );
 
     let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
     let cells: Vec<SpecCell> = cols
@@ -6384,6 +6408,12 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected.clone();
     let mut pick: Option<String> = None;
     let mut pick_obj: Option<String> = None;
+    // Dense data grid: horizontal scroll keeps long clock/source names
+    // reachable on narrow windows.
+    egui::ScrollArea::horizontal()
+        .id_salt("clock_networks_hscroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     egui::Grid::new("clock_networks_table")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -6418,6 +6448,7 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
                 ui.end_row();
             }
         });
+    });
     if let Some(name) = pick_obj {
         let _ = model.select_clock_network(&name);
         let _ = model.select_clock_network_object(&name);
@@ -6683,6 +6714,11 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .map(|x| x.mw)
         .fold(0.0f64, f64::max)
         .max(1e-9);
+    // Horizontal scroll keeps long resource names reachable on narrow panes.
+    egui::ScrollArea::horizontal()
+        .id_salt("vcd_power_resources_hscroll")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
     egui::Grid::new("vcd_power_resources")
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
@@ -6697,6 +6733,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
                 ui.end_row();
             }
         });
+    });
     if !r.by_hierarchy.is_empty() {
         ui.add_space(8.0);
         ui.label(RichText::new("By hierarchy").strong());
@@ -7234,10 +7271,10 @@ fn paint_drc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         let w = ui.available_width();
         // ID (severity-colored badge) | Objects | Message. The old Severity
         // text column duplicated the badge's encoding, so it is gone; its
-        // width goes to the message column.
-        let obj_w = ((w - 80.0) * 0.35).max(90.0);
-        let msg_w = (w - 80.0 - obj_w).max(90.0);
-        let widths = [80.0f32, obj_w, msg_w];
+        // width goes to the message column. Columns always sum to the pane
+        // width (chrome::drc_col_widths) - the message wraps instead of clipping.
+        let widths = chrome::drc_col_widths(w);
+        let msg_w = widths[2];
 
         let (hrect, _) =
             ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
@@ -7686,7 +7723,8 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                 let mut pick_path = None;
                 let selected_path = model.selected_timing_path;
                 // auto_shrink([false, true]): full-width wheel-hover rect (nested-scroll fix).
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
+
                     .id_salt("schematic_timing_paths_scroll")
                     .max_height(chrome::DEVICE_TABLES_MAX_HEIGHT)
                     .auto_shrink([false, true])
@@ -8193,122 +8231,130 @@ fn paint_device_toolbar(
     pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
-    // Device toolbar, grouped by function (layout grammar: one group per
-    // purpose, separators between groups, primary view controls first).
-    // Zoom lives ONLY here; there is no second zoom group elsewhere.
-    ui.horizontal(|ui| {
-        // View: zoom controls.
-        if ui
-            .button("Zoom to selection")
-            .on_hover_text("Zoom the die to the selected site/net")
-            .clicked()
-        {
-            if let Some((x, y)) = selected_site_xy(model) {
-                model.device_zoom = 2.5;
-                *zoom_target = Some((x, y));
-            }
+    let dbg_net = model.selected_debug_net();
+    let dbg_enabled = dbg_net.is_some();
+    let md_label = match &dbg_net {
+        Some(n) => format!("Mark Debug {n}"),
+        None => "Mark Debug".into(),
+    };
+    let ruler_text = if pv.ruler_tool { "Ruler [on]" } else { "Ruler" }.to_string();
+    let layers_text = if pv.show_display_control {
+        "Layers [-]"
+    } else {
+        "Layers [+]"
+    }
+    .to_string();
+    let inspector_text = if pv.show_inspector {
+        "Inspector [-]"
+    } else {
+        "Inspector [+]"
+    }
+    .to_string();
+    let zoom_label = format!("Zoom {:.0}%", model.device_zoom * 100.0);
+    // Narrow windows: items that do not fit move into a ">>" overflow menu
+    // (the same house pattern as the schematic toolbar; VS Code collapses
+    // view-title actions into "..." the same way) instead of clipping past
+    // the pane edge.
+    // One label list drives both the inline row and the overflow menu, so the
+    // two can never drift apart.
+    let item_labels: [String; 12] = [
+        "Fit".into(),
+        "Find...".into(),
+        ruler_text,
+        "Clear".into(),
+        layers_text,
+        inspector_text,
+        "Zoom to selection".into(),
+        "Zoom In".into(),
+        "Zoom Out".into(),
+        "Zoom Fit".into(),
+        md_label.clone(),
+        "Add Probe".into(),
+    ];
+    let widths = chrome::device_toolbar_widths(&item_labels[10], &zoom_label);
+    let m = &mut *model;
+    let p = &mut *pv;
+    let zt = &mut *zoom_target;
+    chrome::overflow_toolbar(ui, &widths, |ui, idx, in_menu| {
+        if idx == 12 {
+            // Informational zoom readout: a label in both modes, never a button.
+            ui.label(RichText::new(&zoom_label).small().weak());
+            return;
         }
-        if ui
-            .button("Zoom In")
-            .on_hover_text("Zoom in (+)")
-            .clicked()
-        {
-            let _ = model.device_zoom_in();
-        }
-        if ui
-            .button("Zoom Out")
-            .on_hover_text("Zoom out (-)")
-            .clicked()
-        {
-            let _ = model.device_zoom_out();
-        }
-        if ui
-            .button("Zoom Fit")
-            .on_hover_text("Zoom the die to fit (F)")
-            .clicked()
-        {
-            let _ = model.device_zoom_fit();
-        }
-        ui.label(
-            RichText::new(format!("Zoom {:.0}%", model.device_zoom * 100.0))
-                .small()
-                .weak(),
-        );
-        ui.separator();
-        // Tools: find, measure, clear.
-        if ui
-            .button("Find...")
-            .on_hover_text("Find a site, cell, or net (Ctrl+K)")
-            .clicked()
-        {
-            pv.find_open = true;
-            pv.find_query.clear();
-            pv.find_selected = 0;
-            pv.find_needs_focus = true;
-        }
-        let ruler_text = if pv.ruler_tool { "Ruler [on]" } else { "Ruler" };
-        if ui
-            .button(ruler_text)
-            .on_hover_text("Ruler tool: click-drag on the die to measure (R)")
-            .clicked()
-        {
-            pv.ruler_tool = !pv.ruler_tool;
-            pv.ruler_anchor = None;
-        }
-        if ui
-            .button("Clear")
-            .on_hover_text("Clear selection, rulers, and solo (Esc)")
-            .clicked()
-        {
-            clear_physview_selection(model, pv);
-        }
-        ui.separator();
-        // Panels: dock toggles.
-        if ui
-            .small_button(if pv.show_display_control {
-                "Layers [-]"
-            } else {
-                "Layers [+]"
-            })
-            .on_hover_text("Toggle the Display Control dock")
-            .clicked()
-        {
-            pv.show_display_control = !pv.show_display_control;
-        }
-        if ui
-            .small_button(if pv.show_inspector {
-                "Inspector [-]"
-            } else {
-                "Inspector [+]"
-            })
-            .on_hover_text("Toggle the Inspector dock")
-            .clicked()
-        {
-            pv.show_inspector = !pv.show_inspector;
-        }
-        ui.separator();
-        // Debug: actions on the selected net (disabled with no debug net).
-        let dbg_net = model.selected_debug_net();
-        ui.add_enabled_ui(dbg_net.is_some(), |ui| {
-            let md = match &dbg_net {
-                Some(n) => format!("Mark Debug {n}"),
-                None => "Mark Debug".into(),
+        let enabled = dbg_enabled || idx < 10;
+        let label = item_labels[idx].as_str();
+        let clicked = if in_menu {
+            ui.add_enabled(enabled, egui::Button::new(label)).clicked()
+        } else {
+            let hover = match idx {
+                0 => "Zoom the die to fit (F)",
+                1 => "Find a site, cell, or net (Ctrl+K)",
+                2 => "Ruler tool: click-drag on the die to measure (R)",
+                3 => "Clear selection, rulers, and solo (Esc)",
+                4 => "Toggle the Display Control dock",
+                5 => "Toggle the Inspector dock",
+                6 => "Zoom the die to the selected site/net",
+                10 => "UG908 Mark Debug on the selected Device route/net",
+                11 => "UG908 Add Probe to ILA dashboard",
+                _ => "",
+
             };
-            if ui
-                .button(md)
-                .on_hover_text("UG908 Mark Debug on the selected Device route/net")
-                .clicked()
-            {
-                let _ = model.exec("mark_debug");
+            let btn = if idx == 4 || idx == 5 {
+                ui.small_button(label)
+            } else if idx == 10 || idx == 11 {
+                ui.add_enabled(dbg_enabled, egui::Button::new(label))
+            } else {
+                ui.button(label)
+            };
+            btn.on_hover_text(hover).clicked()
+        };
+        if !clicked || !enabled {
+            return;
+        }
+        match idx {
+            0 => {
+                let _ = m.device_zoom_fit();
             }
-            if ui
-                .button("Add Probe")
-                .on_hover_text("UG908 Add Probe to ILA dashboard")
-                .clicked()
-            {
-                let _ = model.exec("add_probe");
+            1 => {
+                p.find_open = true;
+                p.find_query.clear();
+                p.find_selected = 0;
+                p.find_needs_focus = true;
             }
-        });
+            2 => {
+                p.ruler_tool = !p.ruler_tool;
+                p.ruler_anchor = None;
+            }
+            3 => clear_physview_selection(&mut *m, &mut *p),
+            4 => {
+                p.show_display_control = !p.show_display_control;
+            }
+            5 => {
+                p.show_inspector = !p.show_inspector;
+            }
+            6 => {
+                if let Some((x, y)) = selected_site_xy(m) {
+                    m.device_zoom = 2.5;
+                    *zt = Some((x, y));
+                }
+            }
+            7 => {
+                let _ = m.device_zoom_in();
+            }
+            8 => {
+                let _ = m.device_zoom_out();
+            }
+            9 => {
+                let _ = m.device_zoom_fit();
+            }
+            10 => {
+                let _ = m.exec("mark_debug");
+            }
+            _ => {
+                let _ = m.exec("add_probe");
+            }
+        }
+
     });
 }
 
@@ -10459,11 +10505,14 @@ fn paint_ila(
         );
     }
 
-    // Setup: probes (left) + trigger (right).
+    // Setup: probes (left) + trigger (right). The probes column keeps a
+    // proportional share (VS Code debug panels share space via sashes with
+    // minimums); a fixed 340px clipped the trigger column on narrow panes.
     ui.horizontal(|ui| {
+        let probes_w = chrome::ila_probes_share(ui.available_width());
         ui.vertical(|ui| {
-            ui.set_min_width(340.0);
-            ui.set_max_width(340.0);
+            ui.set_min_width(probes_w);
+            ui.set_max_width(probes_w);
             ui.label(RichText::new("Probes").strong());
             ui.horizontal(|ui| {
                 ui.label("Search");
