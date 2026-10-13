@@ -23,6 +23,31 @@ pub struct PackedLut {
     pub input_nets: [Option<String>; 4],
     /// Net on out.
     pub output_net: String,
+    /// Set for carry-chain sum LUTs: placement must put this LUT in the
+    /// chain's `seq`-th logic cell (vertically adjacent, same column).
+    /// `in_3` is a placeholder carry net; the router skips it and asc.rs
+    /// programs the dedicated in_3 carry buffer directly.
+    pub carry: Option<CarryCell>,
+}
+
+/// Placement hint for a carry-chain sum LUT.
+#[derive(Clone, Debug)]
+pub struct CarryCell {
+    /// Index into [`PackedIce::carry_chains`].
+    pub chain: usize,
+    /// Bit position within the chain (0 = bottom, carry flows upward).
+    pub seq: usize,
+}
+
+/// A chain of one or more [`helion_ir::CellKind::Carry4`] cells, in bit
+/// order. Placed as that many vertically adjacent logic cells.
+#[derive(Clone, Debug)]
+pub struct CarryChain {
+    /// True when the bottom bit's carry_in is constant 1 (CarryInSet);
+    /// false for constant 0. Chained cells share the head's setting.
+    pub cin_one: bool,
+    /// Number of carry bits (4 per Carry4 cell).
+    pub bits: usize,
 }
 
 /// A packed iCE40 flip-flop (one logic cell, sequential).
@@ -106,6 +131,9 @@ pub struct PackedIce {
     pub clks: Vec<PackedClk>,
     pub rams: Vec<PackedRam>,
     pub plls: Vec<PackedPll>,
+    /// Carry chains, in the order their sum LUTs reference via
+    /// [`CarryCell::chain`].
+    pub carry_chains: Vec<CarryChain>,
 }
 
 /// Decompose a 6-LUT truth table into LUT4s via Shannon decomposition.
@@ -124,6 +152,7 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Result
             init: if out { 0xFFFF } else { 0x0000 },
             input_nets: [None, None, None, None],
             output_net: format!("{name}$O"),
+            carry: None,
         }]);
     }
     if used.len() <= 4 {
@@ -150,6 +179,7 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Result
             init: lut_init,
             input_nets: in_nets,
             output_net: format!("{name}$O"),
+            carry: None,
         }]);
     }
     // Shannon decomposition on the highest used input.
@@ -211,6 +241,7 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Result
         init: mux_init,
         input_nets: [Some(sel_net), Some(out0), Some(out1), None],
         output_net: format!("{name}$O"),
+        carry: None,
     });
     Ok(luts)
 }
@@ -219,9 +250,15 @@ fn decompose_lut6(name: &str, init: u64, inputs: &[Option<String>; 6]) -> Result
 pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
     let pins = netlist.pin_index();
     let mut out = PackedIce::default();
+    // Carry4 cells are collected first: chains reference each other via
+    // CI/CO[3] regardless of cell order; emission happens after the loop.
+    let mut carry_cells: Vec<Carry4Data> = Vec::new();
 
     for cell in &netlist.cells {
         match &cell.kind {
+            CellKind::Carry4 => {
+                carry_cells.push(parse_carry4(&cell.name, &pins, netlist)?);
+            }
             CellKind::Lut6 { init } => {
                 let mut inputs: [Option<String>; 6] = Default::default();
                 for (i, slot) in inputs.iter_mut().enumerate() {
@@ -350,6 +387,10 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
         }
     }
 
+    // Emit carry chains after all cells are parsed (chains link cells in
+    // any order).
+    emit_carry_chains(netlist, &carry_cells, &mut out)?;
+
     // The ClockBuf is a logical global-clock marker. This backend routes
     // clocks as ordinary nets (via local tracks to lutff_global/clk), so
     // merge each ClockBuf's output net into its input net.
@@ -447,12 +488,362 @@ fn pack_ram(
     })
 }
 
+/// Carry-chain support: [`helion_ir::CellKind::Carry4`] on iCE40.
+///
+/// Pin convention follows Xilinx CARRY4 (the IR names it a "Xilinx 7-series
+/// CARRY4 fast carry chain"): inputs `CI`, `CYINIT`, `DI0`..`DI3`,
+/// `S0`..`S3`; outputs `O0`..`O3` (sums), `CO0`..`CO3` (carry outs).
+///
+/// iCE40 mapping (truthful to the IceStorm logic-tile documentation):
+/// the LC carry unit computes `cout = majority(in_1, in_2, carry_in)`.
+/// Xilinx's MUXCY computes `co[i] = S[i] ? carry[i] : DI[i]`. These agree
+/// exactly when `in_1 = DI[i]` and `in_2 = S[i] ^ DI[i]` (when `S[i]=0`,
+/// MUXCY = `DI[i]` = majority(`DI[i]`,`DI[i]`,c); when `S[i]=1`, MUXCY = `c`
+/// = majority(`DI[i]`,`~DI[i]`,c)).
+/// So each bit gets an (often optimized away) XOR LUT for `S[i] ^ DI[i]`,
+/// and the LC's own LUT computes the sum `O[i] = S[i] ^ carry[i]`
+/// (init `0x55AA` = `in_0 ^ in_3`, with `in_0 = S[i]`, `in_3 = carry[i]`).
+///
+/// `carry[0]` is the tile `carry_in_mux`: constant 0 (default), constant 1
+/// (`CarryInSet`), or the tile-below `lutff_7/cout` for chained tiles.
+/// `carry[i] = cout[i-1]` is a dedicated wire (no config bits).
+/// `in_3` of each carry LC is driven from the carry (for the sum LUT) via
+/// the documented `lutff_{i-1}/cout -> lutff_i/in_3` / `carry_in_mux ->
+/// lutff_0/in_3` buffers, programmed directly by asc.rs.
+///
+/// `cout` is not routable to general fabric (IceStorm docs: only the
+/// post-FF signal leaves the logic block), so `CO0`..`CO2` must be
+/// unconnected and `CO3` may only drive another Carry4's `CI`.
+/// Carry input source for a Carry4 cell.
+#[derive(Clone, Debug)]
+enum CarryIn {
+    Zero,
+    One,
+    /// Chained from the named Carry4 cell's CO[3].
+    Prev(String),
+}
+
+/// A parsed Carry4 cell; per-bit nets are `None` when unconnected
+/// (treated as constant 0).
+struct Carry4Data {
+    name: String,
+    cin: CarryIn,
+    s: [Option<String>; 4],
+    di: [Option<String>; 4],
+    o: [Option<String>; 4],
+    co: [Option<String>; 4],
+}
+
+fn is_const1(net: Option<&str>) -> bool {
+    matches!(net, Some("1" | "vcc" | "VCC" | "$true"))
+}
+
+fn is_const0(net: Option<&str>) -> bool {
+    matches!(net, None | Some("0" | "gnd" | "GND" | "$false"))
+}
+
+/// Find the Carry4 cell driving `net` via its CO[3] pin.
+fn carry_co3_driver(netlist: &Design, net: &str) -> Option<String> {
+    let n = netlist.nets.iter().find(|n| n.name == net)?;
+    for e in &n.endpoints {
+        if e.pin != "CO3" {
+            continue;
+        }
+        if let Some(cell) = netlist.cells.iter().find(|c| c.name == e.cell) {
+            if matches!(cell.kind, CellKind::Carry4) {
+                return Some(cell.name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Lazily-created constant drivers for carry logic.
+#[derive(Default)]
+struct ConstDrivers {
+    zero: Option<String>,
+    one: Option<String>,
+}
+
+impl ConstDrivers {
+    fn zero(&mut self, out: &mut PackedIce) -> String {
+        if let Some(n) = &self.zero {
+            return n.clone();
+        }
+        let n = "$carry$zero".to_string();
+        out.luts.push(PackedLut {
+            name: n.clone(),
+            init: 0x0000,
+            input_nets: [None, None, None, None],
+            output_net: n.clone(),
+            carry: None,
+        });
+        self.zero = Some(n.clone());
+        n
+    }
+
+    fn one(&mut self, out: &mut PackedIce) -> String {
+        if let Some(n) = &self.one {
+            return n.clone();
+        }
+        let n = "$carry$one".to_string();
+        out.luts.push(PackedLut {
+            name: n.clone(),
+            init: 0xFFFF,
+            input_nets: [None, None, None, None],
+            output_net: n.clone(),
+            carry: None,
+        });
+        self.one = Some(n.clone());
+        n
+    }
+
+    /// Resolve a maybe-constant net to a driven net name.
+    fn resolve(&mut self, net: Option<&str>, out: &mut PackedIce) -> String {
+        match net {
+            Some(n) if is_const1(Some(n)) => self.one(out),
+            Some(n) if is_const0(Some(n)) => self.zero(out),
+            Some(n) => n.to_string(),
+            // Unconnected counts as constant 0.
+            None => self.zero(out),
+        }
+    }
+}
+
+/// Parse and validate one Carry4 cell.
+fn parse_carry4(
+    name: &str,
+    pins: &helion_ir::PinIndex,
+    netlist: &Design,
+) -> Result<Carry4Data, String> {
+    let cyinit = pins.net_on(name, "CYINIT");
+    let ci = pins.net_on(name, "CI");
+    // The iCE40 carry_in_mux supports only constant 0/1 or the tile-below
+    // carry; a general net on CYINIT/CI is unrepresentable.
+    let cin = if is_const1(cyinit) {
+        if !is_const0(ci) {
+            return Err(format!(
+                "pack: Carry4 {name}: CYINIT=1 with a driven CI is ambiguous"
+            ));
+        }
+        CarryIn::One
+    } else if is_const1(ci) {
+        if !is_const0(cyinit) {
+            return Err(format!(
+                "pack: Carry4 {name}: CI=1 with a driven CYINIT is ambiguous"
+            ));
+        }
+        CarryIn::One
+    } else if let Some(ci_net) = ci {
+        if !is_const0(cyinit) {
+            return Err(format!(
+                "pack: Carry4 {name}: chained CI with a driven CYINIT is unsupported"
+            ));
+        }
+        let prev = carry_co3_driver(netlist, ci_net).ok_or_else(|| {
+            format!(
+                "pack: Carry4 {name}: CI net '{ci_net}' is not driven by a Carry4 CO[3]; \
+                 iCE40 carry_in supports only constant 0/1 or a chained carry"
+            )
+        })?;
+        if prev == name {
+            return Err(format!("pack: Carry4 {name}: CI chained to itself"));
+        }
+        CarryIn::Prev(prev)
+    } else {
+        if !is_const0(cyinit) {
+            return Err(format!(
+                "pack: Carry4 {name}: CYINIT must be constant 0/1 or unconnected"
+            ));
+        }
+        CarryIn::Zero
+    };
+
+    let mut s: [Option<String>; 4] = Default::default();
+    let mut di: [Option<String>; 4] = Default::default();
+    let mut o: [Option<String>; 4] = Default::default();
+    let mut co: [Option<String>; 4] = Default::default();
+    for i in 0..4 {
+        s[i] = pins.net_on(name, &format!("S{i}")).map(|n| n.to_string());
+        di[i] = pins.net_on(name, &format!("DI{i}")).map(|n| n.to_string());
+        o[i] = pins.net_on(name, &format!("O{i}")).map(|n| n.to_string());
+        co[i] = pins.net_on(name, &format!("CO{i}")).map(|n| n.to_string());
+    }
+    // CO[0..2] are internal to the dedicated chain; cout is not routable to
+    // general fabric, so observing them is unrepresentable.
+    for (i, co_i) in co.iter().enumerate().take(3) {
+        if co_i.is_some() {
+            return Err(format!(
+                "pack: Carry4 {name}: CO{i} is internal to the carry chain and \
+                 cannot be observed (iCE40 cout is not routable to fabric)"
+            ));
+        }
+    }
+    Ok(Carry4Data {
+        name: name.to_string(),
+        cin,
+        s,
+        di,
+        o,
+        co,
+    })
+}
+
+/// Order Carry4 cells into chains, validate CO[3] usage, and emit the sum
+/// LUTs plus [`CarryChain`] records.
+fn emit_carry_chains(
+    netlist: &Design,
+    cells: &[Carry4Data],
+    out: &mut PackedIce,
+) -> Result<(), String> {
+    let idx: std::collections::HashMap<&str, usize> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), i))
+        .collect();
+    // next[i] = cell chained after i via CO[3] -> CI.
+    let mut next: Vec<Option<usize>> = vec![None; cells.len()];
+    for (i, cell) in cells.iter().enumerate() {
+        if let CarryIn::Prev(prev_name) = &cell.cin {
+            let &pi = idx.get(prev_name.as_str()).ok_or_else(|| {
+                format!(
+                    "pack: Carry4 {}: previous cell '{prev_name}' not found",
+                    cell.name
+                )
+            })?;
+            if next[pi].is_some() {
+                return Err(format!(
+                    "pack: Carry4 {}: CO[3] fans out to multiple carry chains; \
+                     the dedicated carry wire is point-to-point",
+                    cells[pi].name
+                ));
+            }
+            next[pi] = Some(i);
+        }
+    }
+    // CO[3] may only drive the chained Carry4's CI (or be unconnected).
+    for (i, cell) in cells.iter().enumerate() {
+        if let Some(co3) = &cell.co[3] {
+            let net = netlist
+                .nets
+                .iter()
+                .find(|n| &n.name == co3)
+                .ok_or_else(|| format!("pack: Carry4 {}: CO3 net vanished", cell.name))?;
+            let allowed_ci = next[i].map(|n| cells[n].name.as_str());
+            for e in &net.endpoints {
+                if e.cell == cell.name && e.pin == "CO3" {
+                    continue;
+                }
+                if e.pin == "CI" && Some(e.cell.as_str()) == allowed_ci {
+                    continue;
+                }
+                return Err(format!(
+                    "pack: Carry4 {}: CO[3] net '{co3}' drives {}.{} which is not the \
+                     chained carry; iCE40 cout is not routable to general fabric",
+                    cell.name, e.cell, e.pin
+                ));
+            }
+        }
+    }
+    // Order into chains from heads (Zero/One). A cell with no head
+    // reachable is a cycle.
+    let mut in_chain = vec![false; cells.len()];
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if !matches!(cell.cin, CarryIn::Zero | CarryIn::One) {
+            continue;
+        }
+        let mut chain = vec![i];
+        in_chain[i] = true;
+        let mut cur = i;
+        while let Some(nxt) = next[cur] {
+            if in_chain[nxt] {
+                return Err(format!(
+                    "pack: Carry4 {}: carry chain cycle detected",
+                    cells[nxt].name
+                ));
+            }
+            chain.push(nxt);
+            in_chain[nxt] = true;
+            cur = nxt;
+        }
+        chains.push(chain);
+    }
+    for (i, cell) in cells.iter().enumerate() {
+        if !in_chain[i] {
+            return Err(format!(
+                "pack: Carry4 {}: carry chain has no head (cycle or dangling CI)",
+                cell.name
+            ));
+        }
+    }
+
+    let mut consts = ConstDrivers::default();
+    for chain in &chains {
+        let head = &cells[chain[0]];
+        let cin_one = matches!(head.cin, CarryIn::One);
+        let chain_idx = out.carry_chains.len();
+        let mut seq = 0;
+        for &ci in chain {
+            let cell = &cells[ci];
+            for bit in 0..4 {
+                let s = cell.s[bit].as_deref();
+                let di = cell.di[bit].as_deref();
+                let s_net = consts.resolve(s, out);
+                let di_net = consts.resolve(di, out);
+                // in_2 = S[i] ^ DI[i]; constant-fold the trivial cases.
+                let x_net = if is_const0(s) {
+                    di_net.clone()
+                } else if is_const0(di) {
+                    s_net.clone()
+                } else {
+                    let xor_out = format!("{}${bit}$xor", cell.name);
+                    out.luts.push(PackedLut {
+                        name: format!("{}${bit}$xor", cell.name),
+                        init: 0x6666, // in_0 ^ in_1
+                        input_nets: [Some(di_net.clone()), Some(s_net.clone()), None, None],
+                        output_net: xor_out.clone(),
+                        carry: None,
+                    });
+                    xor_out
+                };
+                // Sum LUT: O[i] = S[i] ^ carry[i]; in_3 is a placeholder,
+                // the router skips it and asc.rs programs the dedicated
+                // in_3 carry buffer.
+                let o_net = cell.o[bit]
+                    .clone()
+                    .unwrap_or_else(|| format!("{}${bit}$o", cell.name));
+                out.luts.push(PackedLut {
+                    name: format!("{}${bit}$sum", cell.name),
+                    init: 0x55AA, // in_0 ^ in_3
+                    input_nets: [
+                        Some(s_net),
+                        Some(di_net),
+                        Some(x_net),
+                        Some(format!("{}${bit}$cin", cell.name)),
+                    ],
+                    output_net: o_net,
+                    carry: Some(CarryCell {
+                        chain: chain_idx,
+                        seq,
+                    }),
+                });
+                seq += 1;
+            }
+        }
+        out.carry_chains.push(CarryChain {
+            cin_one,
+            bits: chain.len() * 4,
+        });
+    }
+    Ok(())
+}
+
 /// Map a LUT4 16-bit init to the 20 LC config bits.
 ///
 /// Truth-table row `n` (n = in_3*8+in_2*4+in_1*2+in_0) lives at the LC bit
 /// given by the IceStorm logic-tile documentation table.
-pub fn lut4_init_to_lc_bits(init: u16) -> [bool; 20] {
-    // row n -> LC bit index, from the docs table.
+pub fn lut4_init_to_lc_bits(init: u16) -> [bool; 20] {    // row n -> LC bit index, from the docs table.
     const ROW_TO_LC: [usize; 16] = [4, 14, 15, 5, 6, 16, 17, 7, 3, 13, 12, 2, 1, 11, 10, 0];
     let mut bits = [false; 20];
     for n in 0..16 {

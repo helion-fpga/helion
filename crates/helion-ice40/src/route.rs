@@ -361,6 +361,11 @@ pub fn route(router: &Router, placed: &PlacedIce) -> Result<RoutedIce, String> {
         }
         for (k, net) in lut.input_nets.iter().enumerate() {
             if let Some(net) = net {
+                // Carry LCs: in_3 is the dedicated carry (previous cout /
+                // carry_in_mux), programmed directly by asc.rs, not routed.
+                if lut.carry && k == 3 {
+                    continue;
+                }
                 let n = router.lookup(lut.x, lut.y, &format!("lutff_{}/in_{k}", lut.lc));
                 add_ep(net, n, false, &format!("LUT {} in_{k}", lut.name))?;
             }
