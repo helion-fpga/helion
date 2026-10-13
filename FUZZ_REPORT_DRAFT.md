@@ -1,4 +1,4 @@
-# FUZZER Final Report — Helion IDE Bug Hunt
+# FUZZER Final Report: Helion IDE Bug Hunt
 
 ## Driving mechanism
 **Chosen: in-process egui event fuzzing.** A test-only harness
