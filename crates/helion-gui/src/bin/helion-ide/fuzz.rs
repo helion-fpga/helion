@@ -1690,10 +1690,8 @@ mod crash_regression {
     /// Device canvas is showing panics in `chrome::device_band_share`
     /// (`(after - tables_floor - clock_h - 10.0).clamp(64.0, after)` with
     /// `after < 64.0`; fuzzer seed 11400714819323198485, frame 410,
-    /// `EV resize 3840.0 200.0`). Remove the `ignore` once the clamp is fixed;
-    /// the test then guards the fix.
+    /// `EV resize 3840.0 200.0`). Fixed; this test guards the fix.
     #[test]
-    #[ignore = "bug open: device_band_share clamps (64.0, after) with after < 64 on short windows"]
     fn replay_device_band_share_short_window() {
         let text = include_str!("../../../fuzz_crashes/crash-b8e9fc06b1caf963.log");
         match super::replay_str(text) {
@@ -1708,10 +1706,8 @@ mod crash_regression {
     /// `open_more_workspace(Device)`, whose debug assertion fires because
     /// `apply_more` sets `workspace = Device` but leaves `canvas = Editor`,
     /// so the central pane keeps painting the editor. Fuzzer seed 3,
-    /// frame 138. Remove the `ignore` once `apply_more` syncs the canvas;
-    /// the test then guards the fix.
+    /// frame 138. Fixed; this test guards the fix.
     #[test]
-    #[ignore = "bug open: apply_more(Device) leaves canvas=Editor, tripping the open_more_workspace assertion"]
     fn replay_more_device_palette_assertion() {
         let text = include_str!("../../../fuzz_crashes/crash-87c5907c652b0759.log");
         match super::replay_str(text) {
@@ -1724,9 +1720,9 @@ mod crash_regression {
 
     /// crash-59c2055905bbbe0e: same root cause as above, reached through the
     /// flow-navigator sidebar instead of the palette. Fuzzer seed 6,
-    /// frame 515. Remove the `ignore` together with the palette-path test.
+    /// frame 515 (now frame 357 with minimap_viewport clamp fix).
+    /// Fixed; this test guards the fix.
     #[test]
-    #[ignore = "bug open: apply_more(Device) leaves canvas=Editor, tripping the open_more_workspace assertion"]
     fn replay_more_device_flownav_assertion() {
         let text = include_str!("../../../fuzz_crashes/crash-59c2055905bbbe0e.log");
         match super::replay_str(text) {
