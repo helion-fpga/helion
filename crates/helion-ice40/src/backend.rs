@@ -98,4 +98,43 @@ mod tests {
     fn stage_types_are_the_coordinator_stage_modules() {
         assert_stage_types::<Ice40Backend>();
     }
+
+    /// The provided `Backend::run` driver must drive the full flow.
+    #[test]
+    fn run_driver_produces_asc() {
+        use helion_ir::{CellKind, PortDir};
+        let mut d = NetlistIr::new("buf");
+        d.ports.push(helion_ir::Port {
+            name: "clk".to_string(),
+            dir: PortDir::In,
+            attrs: Default::default(),
+        });
+        d.ports.push(helion_ir::Port {
+            name: "led0".to_string(),
+            dir: PortDir::Out,
+            attrs: Default::default(),
+        });
+        d.add_cell("ib", CellKind::IobIn);
+        d.connect("a_net", "ib", "O");
+        d.connect("clk", "ib", "PAD");
+        d.add_cell("lut", CellKind::Lut6 { init: 0xAAAAAAAAAAAAAAAA });
+        d.connect("a_net", "lut", "I0");
+        d.connect("y_net", "lut", "O");
+        d.add_cell("ob", CellKind::IobOut);
+        d.connect("y_net", "ob", "I");
+        d.connect("led0", "ob", "PAD");
+
+        let b = Ice40Backend::new("ice40-hx8k");
+        let asc = b.run(&d).expect("Backend::run");
+        assert!(asc.starts_with(".device 8k\n"));
+        assert!(asc.contains(".logic_tile"));
+    }
+
+    #[test]
+    fn timing_model_is_ice40_hx8k() {
+        let b = Ice40Backend::new("ice40-hx8k");
+        let m = b.timing_model();
+        assert_eq!(m, TimingModel::ice40_hx8k());
+        assert!(m.lut_ps > 0 && m.iob_ps > m.lut_ps);
+    }
 }
