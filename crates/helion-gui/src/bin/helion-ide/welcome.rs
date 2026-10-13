@@ -10,6 +10,7 @@ use eframe::egui::{self, RichText};
 
 use super::theme::{font_ui, font_ui_medium, Theme};
 use super::HelionIde;
+use helion_gui::chrome::{welcome_col_w, welcome_stack_actions};
 
 /// True when the IDE launched empty: no sources, no project.
 pub fn should_show(app: &HelionIde) -> bool {
@@ -104,6 +105,30 @@ fn recent_row(ui: &mut egui::Ui, theme: &Theme, name: &str, parent: &str, w: f32
     resp.clicked()
 }
 
+/// One welcome action button: accent-filled for the primary CTA, plain
+/// otherwise. Shared by the horizontal row and the stacked narrow layout so
+/// the two can never drift apart.
+fn action_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    hover: &str,
+    primary: bool,
+    size: [f32; 2],
+) -> egui::Response {
+    let btn = if primary {
+        egui::Button::new(
+            RichText::new(label)
+                .font(font_ui_medium(14.0))
+                .color(theme.bg),
+        )
+        .fill(theme.accent)
+    } else {
+        egui::Button::new(RichText::new(label).font(font_ui(14.0)))
+    };
+    ui.add_sized(size, btn).on_hover_text(hover)
+}
+
 pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
     // Deferred actions (applied after the paint borrows end).
     let mut dismiss = false;
@@ -118,7 +143,7 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let avail_w = ui.available_width();
-            let col_w = 620.0_f32.min(avail_w - 64.0).max(320.0);
+            let col_w = welcome_col_w(avail_w);
             let side = ((avail_w - col_w) / 2.0).max(0.0);
             ui.horizontal(|ui| {
                 ui.add_space(side);
@@ -152,53 +177,64 @@ pub fn paint_welcome(ui: &mut egui::Ui, app: &mut HelionIde, theme: &Theme) {
                     ui.add_space(28.0);
 
                     // ---- ONE primary-actions row; the gold flow is the CTA ----
+                    // Narrow pane: the actions stack vertically instead of
+                    // crushing to unreadable slivers.
                     let gap = 12.0;
                     let bw = (col_w - 2.0 * gap) / 3.0;
                     let bh = 44.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        if ui
-                            .add_sized(
-                                [bw, bh],
-                                egui::Button::new(RichText::new("Open file…").font(font_ui(14.0))),
-                            )
-                            .on_hover_text("Open an HDL source file or project")
-                            .clicked()
-                        {
-                            super::native_open(app);
-                            dismiss = true;
+                    // (label, hover, emphasized CTA)
+                    let actions: [(&str, &str, bool); 3] = [
+                        ("Open file…", "Open an HDL source file or project", false),
+                        ("New project…", "Create a new Helion project", false),
+                        (
+                            "▶  Run gold flow",
+                            "counter.sv → synth → place → route → bitstream",
+                            true,
+                        ),
+                    ];
+                    let mut picked = 0usize;
+                    let mut any = false;
+                    if welcome_stack_actions(col_w) {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = gap;
+                            for (i, (label, hover, primary)) in actions.iter().enumerate() {
+                                if action_button(ui, theme, label, hover, *primary, [col_w, bh])
+                                    .clicked()
+                                {
+                                    picked = i;
+                                    any = true;
+                                }
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for (i, (label, hover, primary)) in actions.iter().enumerate() {
+                                if action_button(ui, theme, label, hover, *primary, [bw, bh])
+                                    .clicked()
+                                {
+                                    picked = i;
+                                    any = true;
+                                }
+                            }
+                        });
+                    }
+                    if any {
+                        match picked {
+                            0 => {
+                                super::native_open(app);
+                                dismiss = true;
+                            }
+                            1 => {
+                                app.show_create_project = true;
+                                dismiss = true;
+                            }
+                            _ => {
+                                run_gold = true;
+                                dismiss = true;
+                            }
                         }
-                        if ui
-                            .add_sized(
-                                [bw, bh],
-                                egui::Button::new(
-                                    RichText::new("New project…").font(font_ui(14.0)),
-                                ),
-                            )
-                            .on_hover_text("Create a new Helion project")
-                            .clicked()
-                        {
-                            app.show_create_project = true;
-                            dismiss = true;
-                        }
-                        // Emphasized CTA: accent fill, dark label.
-                        if ui
-                            .add_sized(
-                                [bw, bh],
-                                egui::Button::new(
-                                    RichText::new("▶  Run gold flow")
-                                        .font(font_ui_medium(14.0))
-                                        .color(theme.bg),
-                                )
-                                .fill(theme.accent),
-                            )
-                            .on_hover_text("counter.sv → synth → place → route → bitstream")
-                            .clicked()
-                        {
-                            run_gold = true;
-                            dismiss = true;
-                        }
-                    });
+                    }
                     ui.add_space(32.0);
 
                     // ---- Examples: a real card grid ----
