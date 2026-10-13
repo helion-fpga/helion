@@ -1193,7 +1193,6 @@ pub enum WorkspacePane {
     Qor,
     Drc,
     Utilization,
-    Runs,
     Checkpoints,
     Testbench,
 }
@@ -1230,7 +1229,6 @@ pub fn pane_for_workspace(tab: WorkspaceTab) -> WorkspacePane {
         WorkspaceTab::Qor => WorkspacePane::Qor,
         WorkspaceTab::Drc => WorkspacePane::Drc,
         WorkspaceTab::Utilization => WorkspacePane::Utilization,
-        WorkspaceTab::Runs => WorkspacePane::Runs,
         WorkspaceTab::Checkpoints => WorkspacePane::Checkpoints,
         WorkspaceTab::Testbench => WorkspacePane::Testbench,
     }
@@ -1254,7 +1252,6 @@ pub fn is_report_detail(tab: WorkspaceTab) -> bool {
             | WorkspaceTab::Qor
             | WorkspaceTab::Drc
             | WorkspaceTab::Utilization
-            | WorkspaceTab::Runs
             | WorkspaceTab::Checkpoints
     )
 }
@@ -1282,7 +1279,7 @@ mod tests {
         let labels = workspace_tab_labels();
         assert_eq!(labels, vec!["Editor", "Device", "Timing"]);
         assert_eq!(labels.len(), 3);
-        assert_eq!(WorkspaceTab::ALL.len(), 32);
+        assert_eq!(WorkspaceTab::ALL.len(), 31);
         assert_eq!(WorkspaceTab::CANVASES.len(), 3);
 
         let avail = DESKTOP_WIDTH - side_chrome_width();
@@ -1737,7 +1734,7 @@ mod tests {
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
-        assert_eq!(WorkspaceTab::ALL.len(), 32);
+        assert_eq!(WorkspaceTab::ALL.len(), 31);
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Schematic),
             WorkspacePane::Schematic
@@ -1793,9 +1790,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(more, 29, "32 tabs − 3 canvases");
+        assert_eq!(more, 28, "31 tabs − 3 canvases");
         assert!(is_report_detail(WorkspaceTab::Utilization));
         assert!(!is_report_detail(WorkspaceTab::Schematic));
+        // Grammar R12: Design Runs no longer routes to Z5 at all.
         assert_eq!(
             pane_for_workspace(WorkspaceTab::Reports),
             WorkspacePane::ReportsCatalog
@@ -1808,6 +1806,31 @@ mod tests {
             pane_for_workspace(WorkspaceTab::Device),
             WorkspacePane::Device
         );
+    }
+
+    /// Grammar R12 (P4): run management lives in the Z6 bottom panel as the
+    /// Jobs tab, next to the console that drives it. Design Runs must not
+    /// exist as a Z5 workspace tab or report detail. (Checkpoints follows in
+    /// R13; until then it stays a Z5 report detail.)
+    #[test]
+    fn runs_live_in_z6_jobs_not_z5() {
+        use crate::BottomTab;
+        use crate::WorkspaceTab;
+        // Z6: the Jobs tab exists, ordered after Console/Messages (grammar section 4).
+        assert!(BottomTab::ALL.contains(&BottomTab::Jobs));
+        assert_eq!(BottomTab::Jobs.paint_label(), "Jobs");
+        assert_eq!(BottomTab::Jobs.label(), "Jobs");
+        let home: Vec<&str> = BottomTab::HOME.iter().map(|t| t.paint_label()).collect();
+        assert_eq!(home, vec!["Console", "Messages", "Jobs"]);
+        // Z5: no workspace tab routes to a runs/checkpoints pane.
+        for tab in WorkspaceTab::ALL {
+            assert_ne!(
+                format!("{tab:?}"),
+                "Runs",
+                "WorkspaceTab::Runs must not exist (R12)"
+            );
+        }
+        assert!(WorkspaceTab::parse_label("Design Runs").is_none());
     }
 
     #[test]
