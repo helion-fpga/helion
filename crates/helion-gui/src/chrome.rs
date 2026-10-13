@@ -2242,7 +2242,7 @@ mod resize_tests {
     #[test]
     fn device_toolbar_overflows_only_when_narrow() {
         let items = device_toolbar_widths("Mark Debug clk", "Zoom 100%");
-        assert_eq!(items.len(), 13);
+        assert_eq!(items.len(), 12);
         let total: f32 = items.iter().map(|i| i.width).sum();
         let narrow_avail = 720.0 - side_chrome_width();
         assert!(
