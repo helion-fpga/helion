@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// Extensions the Open HDL dialog accepts.
 pub const HDL_EXTENSIONS: &[&str] = &["sv", "v", "svh", "vhd", "vhdl", "sdc", "xdc", "prj"];
 
-/// Dialog backend id — always rfd, never osascript / HTML / silent no-op.
+/// Dialog backend id - always rfd, never osascript / HTML / silent no-op.
 pub fn dialog_backend() -> &'static str {
     "rfd"
 }

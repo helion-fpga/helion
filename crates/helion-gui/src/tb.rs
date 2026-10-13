@@ -1040,7 +1040,7 @@ impl<'a> Parser<'a> {
             }
             // begin/end as a statement: wrap into a synthetic block via Repeat(1)?
             // Simpler: represent as nested stmts through a dedicated path in the
-            // interpreter — here we flatten into a Block pseudo-stmt using Repeat.
+            // interpreter - here we flatten into a Block pseudo-stmt using Repeat.
             return Ok(Stmt::Repeat {
                 count: Expr::Num(1, 32),
                 body: stmts,
@@ -1074,7 +1074,7 @@ impl<'a> Parser<'a> {
             let cond = self.parse_expr()?;
             self.expect(&Tok::RParen)?;
             let then_b = vec![self.parse_stmt()?];
-            // `@(posedge clk); else …` — the event control leaves its `;`.
+            // `@(posedge clk); else …` - the event control leaves its `;`.
             if self.peek() == Some(&Tok::Semi) {
                 self.pos += 1;
             }
@@ -1728,7 +1728,7 @@ impl<'a> Interp<'a> {
 
     /// Resolve a testbench signal to (value, width, has_x).
     fn resolve(&self, name: &str) -> Result<(u64, u32, bool), TbError> {
-        // DUT outputs are always sampled live from the kernel — a declared
+        // DUT outputs are always sampled live from the kernel - a declared
         // TB reg of the same name is just a placeholder.
         if let Some(port) = self.tb_to_dut.get(name) {
             if self.dut_outputs.contains(port) {

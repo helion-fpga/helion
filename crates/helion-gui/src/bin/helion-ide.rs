@@ -2316,7 +2316,7 @@ fn paint_properties(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     data_scroll("properties_table_scroll").show(ui, |ui| {
         egui::Grid::new("properties_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Value").strong());
@@ -3330,7 +3330,7 @@ fn paint_messages(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("messages_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("#").strong());
                     ui.label(RichText::new("Severity").strong());
@@ -3426,7 +3426,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("tcl_console_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("#").strong());
                     ui.label(RichText::new("Status").strong());
@@ -3548,7 +3548,7 @@ fn paint_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("log_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("#").strong());
                     ui.label(RichText::new("Status").strong());
@@ -3626,7 +3626,7 @@ fn paint_sim_log(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) 
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("sim_log_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("#").strong());
                     ui.label(RichText::new("Time").strong());
@@ -3698,7 +3698,7 @@ fn paint_project_settings(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("project_settings_table")
-                    .spacing([12.0, row_gap])
+                    .spacing([chrome::SPACE_MD, row_gap])
                     .min_col_width(col_w)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Name").strong());
@@ -3740,7 +3740,7 @@ fn paint_sim_settings(ui: &mut egui::Ui, model: &mut IdeModel) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("sim_settings_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Name").strong());
                     ui.label(RichText::new("Value").strong());
@@ -4042,7 +4042,7 @@ fn paint_runs(ui: &mut egui::Ui, app: &mut HelionIde) {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 egui::Grid::new("design_runs_table")
-                    .spacing([10.0, 4.0])
+                    .spacing([chrome::SPACE_MD, chrome::SPACE_XS])
                     .striped(true)
                     .show(ui, |ui| {
                         for col in RunCol::ALL {
@@ -4245,7 +4245,7 @@ fn paint_checkpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("checkpoints_grid")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     for h in [
                         "Name", "Stage", "Created", "LUT", "FF", "IOB", "DSP", "BRAM",
@@ -4393,7 +4393,7 @@ fn paint_incremental_report(ui: &mut egui::Ui, model: &mut IdeModel, theme: &the
         .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("incremental_report_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Name").strong());
                     ui.label(RichText::new("Kind").strong());
@@ -4490,7 +4490,7 @@ fn paint_eco_changes(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
         .auto_shrink([false, true])
         .show(ui, |ui| {
             egui::Grid::new("eco_changes_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Name").strong());
                     ui.label(RichText::new("Kind").strong());
@@ -4577,7 +4577,7 @@ fn paint_find(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("find_results_table")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Name").strong());
                     ui.label(RichText::new("Type").strong());
@@ -4713,7 +4713,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
             });
     } else {
         data_scroll(&format!("{grid_id}_table_scroll")).show(ui, |ui| {
-            egui::Grid::new(grid_id).spacing([8.0, 4.0]).show(ui, |ui| {
+            egui::Grid::new(grid_id).spacing([chrome::SPACE_SM, chrome::SPACE_XS]).show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Dir").strong());
                 ui.label(RichText::new("Package Pin").strong());
@@ -5020,7 +5020,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     data_scroll("pblocks_table_scroll").show(ui, |ui| {
         egui::Grid::new("pblocks_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Range").strong());
@@ -5383,7 +5383,7 @@ fn paint_constraints_tables(ui: &mut egui::Ui, model: &mut IdeModel) {
             ui.weak("-");
             continue;
         }
-        egui::Grid::new(grid).spacing([8.0, 4.0]).show(ui, |ui| {
+        egui::Grid::new(grid).spacing([chrome::SPACE_SM, chrome::SPACE_XS]).show(ui, |ui| {
             ui.label(RichText::new("Name").strong());
             ui.label(RichText::new("Kind").strong());
             ui.label(RichText::new("From").strong());
@@ -6161,7 +6161,7 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
         ui.label(RichText::new(title).strong());
         let path_col = chrome::stretched_col_w_gap(8, ui.available_width(), 8.0);
         egui::Grid::new(format!("timing_summary_{}", kind.as_str()))
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .min_col_width(path_col)
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
@@ -6409,7 +6409,7 @@ fn paint_cdc(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     // Nested table: data_scroll traps the wheel (see clock_interaction_scroll).
     data_scroll("cdc_scroll").show(ui, |ui| {
         egui::Grid::new("cdc_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("From").strong());
                 ui.label(RichText::new("To").strong());
@@ -6499,7 +6499,7 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
     egui::Grid::new("clock_networks_table")
-        .spacing([8.0, 4.0])
+        .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
         .show(ui, |ui| {
             ui.label(RichText::new("Clock").strong());
             ui.label(RichText::new("Period_ps").strong());
@@ -6804,7 +6804,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .auto_shrink([false, true])
         .show(ui, |ui| {
     egui::Grid::new("vcd_power_resources")
-        .spacing([8.0, 4.0])
+        .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
         .show(ui, |ui| {
             for res in &r.by_resource {
                 ui.label(RichText::new(&res.name).monospace());
@@ -7174,7 +7174,7 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
         ui.separator();
         ui.add_space(chrome::SPACE_XS);
         ui.label(RichText::new(format!("{} - {}", id.id, id.title)).strong());
-        ui.add_space(2.0);
+        ui.add_space(chrome::SPACE_XS);
         ui.label(RichText::new(&id.explanation).color(theme.text));
         ui.add_space(chrome::SPACE_XS);
         ui.horizontal(|ui| {
@@ -7252,7 +7252,7 @@ fn paint_bitstream(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
         .auto_shrink([false, true])
         .show(ui, |ui| {
         egui::Grid::new("bitstream_far_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("FAR").strong());
                 ui.label(RichText::new("Block").strong());
@@ -7814,7 +7814,7 @@ fn paint_schematic(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         egui::Grid::new("schematic_timing_paths")
-                            .spacing([8.0, 4.0])
+                            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                             .show(ui, |ui| {
                                 ui.label(RichText::new("Name").strong());
                                 ui.label(RichText::new("From").strong());
@@ -8530,7 +8530,7 @@ fn paint_device(
                 ui.set_min_width(pane_w.max(640.0));
                 paint_pblocks_table(ui, model);
             });
-        ui.add_space(2.0);
+        ui.add_space(chrome::SPACE_XS);
         // Clock-region viewport is whole rows only so the last line is not sliced.
         egui::ScrollArea::both()
             .id_salt("device_clock_regions_block")
@@ -9405,7 +9405,7 @@ fn paint_clock_regions(ui: &mut egui::Ui, model: &mut IdeModel) {
     ui.label(RichText::new("Clock Regions").strong());
     data_scroll("ug893_clock_regions_scroll").show(ui, |ui| {
         egui::Grid::new("ug893_clock_regions")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("X0").strong());
@@ -9926,7 +9926,7 @@ fn paint_breakpoints(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
     }
     data_scroll("ug900_breakpoints").show(ui, |ui| {
         egui::Grid::new("ug900_breakpoints_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Id").strong());
                 ui.label(RichText::new("Enabled").strong());
@@ -9999,7 +9999,7 @@ fn paint_forces(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
     }
     data_scroll("ug900_forces").show(ui, |ui| {
         egui::Grid::new("ug900_forces_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Kind").strong());
@@ -10062,7 +10062,7 @@ fn paint_locals(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     data_scroll("ug900_locals_ws").show(ui, |ui| {
         egui::Grid::new("ug900_locals_ws_table")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Type").strong());
@@ -11356,7 +11356,7 @@ fn paint_wave_markers(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     data_scroll("ug900_wave_markers_scroll").show(ui, |ui| {
         egui::Grid::new("ug900_wave_markers")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Sample").strong());
@@ -11391,7 +11391,7 @@ fn paint_wave_cursors(ui: &mut egui::Ui, model: &mut IdeModel) {
     let mut pick: Option<String> = None;
     data_scroll("ug900_wave_cursors_scroll").show(ui, |ui| {
         egui::Grid::new("ug900_wave_cursors")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Sample").strong());
@@ -11434,7 +11434,7 @@ fn paint_virtual_buses(ui: &mut egui::Ui, model: &mut IdeModel) {
     }
     data_scroll("ug900_virtual_buses_scroll").show(ui, |ui| {
         egui::Grid::new("ug900_virtual_buses")
-            .spacing([8.0, 4.0])
+            .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("Members").strong());
@@ -11805,7 +11805,7 @@ fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
             if !drawing.addresses.is_empty() {
                 ui.label(RichText::new("Address Map (Helion-MM)").strong());
                 egui::Grid::new("bd_addr_map")
-                    .spacing([8.0, 4.0])
+                    .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                     .show(ui, |ui| {
                         ui.label(RichText::new("Slave").strong());
                         ui.label(RichText::new("Offset").strong());
@@ -12013,7 +12013,7 @@ fn paint_bd_hdl(ui: &mut egui::Ui, model: &mut IdeModel) {
     let selected = model.selected_ip.clone();
     let mut pick: Option<String> = None;
     egui::Grid::new("bd_hdl_table")
-        .spacing([8.0, 4.0])
+        .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
         .show(ui, |ui| {
             ui.label(RichText::new("Instance").strong());
             ui.label(RichText::new("Module").strong());
@@ -12507,7 +12507,7 @@ fn paint_tb_history(ui: &mut egui::Ui, app: &mut HelionIde) {
         .max_height(150.0)
         .show(ui, |ui| {
             egui::Grid::new("tb_history_grid")
-                .spacing([8.0, 4.0])
+                .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
                 .min_col_width(col_w.min(150.0))
                 .show(ui, |ui| {
                     for h in ["Testbench", "Result", "Sim time", "Wall", "Errors", "VCD", "Waveform"] {

@@ -3,7 +3,7 @@
 //! Five implementation stages (Synthesis / Opt / Place / Route / Bitstream),
 //! each a collapsing header with Run / Settings / Open-results rows. Stage
 //! state dots come from `IdeModel::step_state`; runs are queued on the engine
-//! thread via `submit_job` — never executed synchronously inside a frame.
+//! thread via `submit_job` - never executed synchronously inside a frame.
 
 use eframe::egui::{self, Color32, RichText, Sense};
 
@@ -64,7 +64,7 @@ fn paint_stage_entry(ui: &mut egui::Ui, app: &mut HelionIde, step: FlowStep) {
 fn stage_hover(app: &HelionIde, step: FlowStep) -> String {
     match app.model.step_blocked(step) {
         Some(why) => why.to_string(),
-        None => format!("{} — {}", step.label(), step.tcl()),
+        None => format!("{} - {}", step.label(), step.tcl()),
     }
 }
 

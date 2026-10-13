@@ -3,7 +3,7 @@
 //! Task-curated arrangements of activity / canvas / workspace / sidebar, plus
 //! `~/.helion/chrome.ini` persistence for the window chrome (preset, sidebar
 //! width, console height, theme, density). File IO happens only on explicit
-//! user action — never per frame.
+//! user action - never per frame.
 
 use eframe::egui;
 use helion_gui::chrome::{self, Activity, Canvas};
@@ -188,7 +188,7 @@ fn parse_chrome_ini(text: &str) -> ChromeIni {
 }
 
 /// Persist sidebar width, console height, layout preset, theme and density.
-/// Call only on user action — never per frame.
+/// Call only on user action - never per frame.
 pub fn save_chrome_state(app: &HelionIde) {
     let Some(path) = chrome_store_path() else {
         return;

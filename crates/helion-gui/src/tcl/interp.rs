@@ -1604,7 +1604,7 @@ impl<'a> ExprParser<'a> {
             && self.chars[self.pos..end].iter().collect::<String>() == op
             && self.chars.get(end).is_none_or(|c| !c.is_ascii_alphanumeric() && *c != '_')
         {
-            // Also require the char before to be an operator boundary — skip_ws
+            // Also require the char before to be an operator boundary - skip_ws
             // already guarantees we are at a token start.
             self.pos = end;
             true
@@ -1668,7 +1668,7 @@ impl<'a> ExprParser<'a> {
         loop {
             if self.eat("*") {
                 // `**` handled in parse_pow; a second `*` here would be a
-                // syntax error in real Tcl too — treat as multiply and let the
+                // syntax error in real Tcl too - treat as multiply and let the
                 // next parse fail naturally.
                 if self.peek() == Some('*') {
                     return Err(self.err("expr: unexpected **"));
