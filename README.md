@@ -26,7 +26,7 @@
   <em>65-second tour: editor, synth to route, device view, schematic, timing reports, waveform. <a href="docs/screenshots/demo-run.mp4">Watch the full video</a>.</em>
 </p>
 
-Helion is an FPGA CAD suite: write SystemVerilog or VHDL, run one command, and get a placed, routed, timing-closed bitstream. No vendor tools, no black boxes. It targets its own HL10T die, Xilinx 7-series parts (xc7a35t today), and iCE40 (HX8K), and it is architected for more: the compiler emits a vendor-neutral netlist IR, and each device family is a backend.
+Helion is an FPGA CAD suite: write SystemVerilog or VHDL, run one command, and get a placed, routed, timing-closed bitstream. No vendor tools, no black boxes. It targets its own HL10T die, Xilinx 7-series parts (xc7a35t today), iCE40 (HX8K), and ECP5 (LFE5U-85F), and it is architected for more: the compiler emits a vendor-neutral netlist IR, and each device family is a backend.
 
 ## Screenshots
 
@@ -68,7 +68,7 @@ All from real runs.
 - **Deterministic.** Same RTL in, same bits out. The QoR gate fails the build if LUT counts, WNS, or bitstream bytes move without a reason recorded in the same commit.
 - **Fail-loud.** Over-capacity designs error instead of emitting a clipped bitstream; congested routing is refused, never silently clipped.
 - **Measured.** Frontend allocations fell 24.2M to 409k (down 98%) across the perf campaign; the area campaign cut uart 420 to 244 LUTs (down 42%). Every number traces to the benchmark report or a pushed commit.
-- **Multi-vendor by design.** `NetlistIR` plus a `Backend` trait. HL10T, Xilinx 7-series, and iCE40 are the first three backends, not the only ones.
+- **Multi-vendor by design.** `NetlistIR` plus a `Backend` trait. HL10T, Xilinx 7-series, iCE40, and ECP5 are the first four backends, not the only ones.
 
 ## Features
 
@@ -89,6 +89,11 @@ All from real runs.
 - LUT6 to LUT4 Shannon decomposition, bit-exact against arachne-pnr
 - SB_CARRY chains, SB_RAM40_4K INIT (bit-exact vs arachne-pnr), SB_PLL40 config (exact vs arachne-pnr), global clock network
 - `.asc` output round-trips bit-perfect through icepack/iceunpack
+
+**ECP5 backend**
+- LFE5U-85F from the Project Trellis open bitstream database; pack, place, A* route, textcfg emission, all in Rust, zero vendor tools
+- CCU2 carry chains (Xilinx MUXCY semantics preserved bit-for-bit), DP16KD block RAM with INIT, MULT18X18D DSP, PLL, DCC global clocks
+- 24-bit counter blinky end to end: yosys to textcfg (852 arcs), accepted by `ecppack` with a valid ECP5 preamble
 
 **Verification (v3.0)**
 - SAT-based combinational equivalence checking (miter + Tseitin, FFs cut to pseudo-IOs)
@@ -182,11 +187,10 @@ The compiler never knows what a LUT is *for*. `NetlistIR` is vendor-neutral; eac
 
 ## Roadmap
 
-- ECP5 backend on Project Trellis
 - Timing-model calibration, then timing-driven pack/place/route
 - Interactive Tcl console (autocomplete, design-database introspection)
 
-Done: backend hardening (trait driver, per-device timing models, 7-series hard blocks, big-design place and route proof), iCE40 backend on Project IceStorm.
+Done: backend hardening (trait driver, per-device timing models, 7-series hard blocks, big-design place and route proof), iCE40 backend on Project IceStorm, ECP5 backend on Project Trellis.
 
 ## Contributing
 
