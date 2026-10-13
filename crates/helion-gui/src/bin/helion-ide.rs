@@ -230,7 +230,7 @@ fn run_gui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([iw, ih])
-            .with_min_inner_size([720.0, 400.0])
+            .with_min_inner_size([chrome::MIN_WINDOW_W, chrome::MIN_WINDOW_H])
             .with_title("Helion"),
         ..Default::default()
     };
@@ -2029,51 +2029,54 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         .show_separator_line(true)
         .show(ctx, |ui| {
             let w = ui.available_width();
+            // Reserve for the right-side job indicator; segments never paint into it.
+            let right_w = 190.0;
             let (bar, _) = ui.allocate_exact_size(
                 egui::vec2(w, chrome::STATUS_HEIGHT),
                 egui::Sense::hover(),
             );
-            let mut x = bar.left() + 8.0;
-            let mut first = true;
-            let mut idx = 0usize;
-            let mut seg = |ui: &mut egui::Ui,
-                           label: &str,
-                           color: Color32,
-                           hover: &str,
-                           g: Option<Go>| {
-                idx += 1;
-                if status_seg(ui, &theme, bar, &mut x, &mut first, idx, label, color, hover, g.is_some())
-                    .clicked()
-                {
-                    go = g;
-                }
+            let x_limit = bar.right() - right_w - 8.0;
+            // Segments are spec'd first, then measured, then the visible
+            // leading run is painted (chrome::status_visible_count): narrow
+            // windows hide low-priority segments instead of overlapping them
+            // (VS Code's status bar priority pattern).
+            struct SegSpec {
+                label: String,
+                color: Color32,
+                hover: String,
+                go: Option<Go>,
+            }
+            let mut specs: Vec<SegSpec> = Vec::new();
+            let mut spec = |label: String, color: Color32, hover: &str, go: Option<Go>| {
+                specs.push(SegSpec {
+                    label,
+                    color,
+                    hover: hover.to_string(),
+                    go,
+                });
             };
-            seg(
-                ui,
-                &crumb,
+            spec(
+                crumb.clone(),
                 theme.dim,
                 "Go to Files (project view)",
                 Some(Go::Activity(Activity::Files)),
             );
             // No standalone part picker exists; the Device view is the honest
             // target for the part segment.
-            seg(
-                ui,
-                &model.part(),
+            spec(
+                model.part().to_string(),
                 theme.dim,
                 "Open Device view",
                 Some(Go::Activity(Activity::Device)),
             );
-            seg(
-                ui,
-                &wns,
+            spec(
+                wns.clone(),
                 wns_color,
                 "Open Timing canvas (timing summary + paths)",
                 Some(Go::Activity(Activity::Timing)),
             );
-            seg(
-                ui,
-                &format!("provenance={provenance}"),
+            spec(
+                format!("provenance={provenance}"),
                 theme.faint,
                 "",
                 None,
@@ -2090,37 +2093,65 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             } else {
                 theme.dim
             };
-            seg(
-                ui,
-                &issue_label,
+            spec(
+                issue_label,
                 issue_color,
                 "Open Messages panel",
                 Some(Go::Bottom(BottomTab::Messages)),
             );
-            seg(
-                ui,
-                &format!("LUTFF {lutff}"),
+            spec(
+                format!("LUTFF {lutff}"),
                 theme.dim,
                 "Open Utilization report",
                 Some(Go::Tab(WorkspaceTab::Utilization)),
             );
-            seg(
-                ui,
-                &run,
+            spec(
+                run.clone(),
                 theme.dim,
                 "Open Runs tab",
                 Some(Go::Tab(WorkspaceTab::Runs)),
             );
             if !board_crumb.is_empty() {
-                seg(ui, board_crumb, theme.faint, "", None);
+                spec(board_crumb.to_string(), theme.faint, "", None);
             }
             if !progress.is_empty() {
-                seg(ui, &progress, theme.accent_dim, "", None);
+                spec(progress.clone(), theme.accent_dim, "", None);
             } else if status != "idle" && !status.is_empty() && !status.ends_with(": ok") {
-                seg(ui, &status, theme.dim, "", None);
+                spec(status.clone(), theme.dim, "", None);
+            }
+            let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+            let widths: Vec<f32> = specs
+                .iter()
+                .map(|sp| {
+                    ui.painter()
+                        .layout_no_wrap(sp.label.clone(), font.clone(), sp.color)
+                        .size()
+                        .x
+                        + 16.0
+                })
+                .collect();
+            let n_visible = chrome::status_visible_count(&widths, x_limit);
+            let mut x = bar.left() + 8.0;
+            let mut first = true;
+            for (idx, sp) in specs.iter().take(n_visible).enumerate() {
+                if status_seg(
+                    ui,
+                    &theme,
+                    bar,
+                    &mut x,
+                    &mut first,
+                    idx + 1,
+                    &sp.label,
+                    sp.color,
+                    &sp.hover,
+                    sp.go.is_some(),
+                )
+                .clicked()
+                {
+                    go = sp.go;
+                }
             }
             // Right side: background-job spinner + progress, or idle indicator.
-            let right_w = 190.0;
             let right_rect = egui::Rect::from_min_size(
                 egui::pos2(bar.right() - right_w - 8.0, bar.top()),
                 egui::vec2(right_w, bar.height()),
@@ -2733,17 +2764,19 @@ fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
     // Absolute rect split - clip both sides so long HNF names cannot paint over Memory.
     let full = ui.available_rect_before_wrap();
     let h = full.height().max(200.0);
-    let nav_w = chrome::SIDEBAR_WIDTH;
-    let rule = chrome::SPLITTER_GRAB_PX;
+    // Proportional nav share (VS Code GridView pattern): a fixed 220px nav
+    // left the wave pane with a negative width on narrow windows.
+    let (nav_w, sep_w, wave_w) = chrome::sim_split(full.width());
     let _ = ui.allocate_rect(full, Sense::hover());
     let nav_rect = egui::Rect::from_min_size(full.min, egui::vec2(nav_w, h));
     let sep_rect = egui::Rect::from_min_size(
         egui::pos2(full.min.x + nav_w, full.min.y),
-        egui::vec2(rule, h),
+        egui::vec2(sep_w, h),
     );
-    let wave_rect = egui::Rect::from_min_max(
-        egui::pos2(full.min.x + nav_w + rule, full.min.y),
-        egui::pos2(full.max.x, full.min.y + h),
+    let wave_left = full.min.x + nav_w + sep_w;
+    let wave_rect = egui::Rect::from_min_size(
+        egui::pos2(wave_left, full.min.y),
+        egui::vec2(wave_w, h),
     );
     ui.painter().rect_filled(nav_rect, 0.0, theme.panel);
     ui.painter().rect_filled(sep_rect, 0.0, theme.line);
@@ -3246,7 +3279,9 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
     egui::ScrollArea::both()
         .id_salt("tcl_journal_scroll")
         .stick_to_bottom(true)
-        .max_height(ui.available_height() - 28.0)
+        // Short console (floor 36-40px): available_height() - 28 can go
+        // negative, which egui treats as an invalid max size.
+        .max_height((ui.available_height() - 28.0).max(0.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("tcl_console_table")
