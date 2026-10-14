@@ -1,4 +1,4 @@
-use helion_ir::CellKind;
+use helion_ir::{resolve, CellKind};
 use helion_sv::synth_sv;
 use std::fs;
 
@@ -67,7 +67,7 @@ endmodule
 fn bus_n3_soft_diag() {
     let src = fs::read_to_string("/tmp/bus_n3.sv").expect("src");
     let d = synth_sv(&src, "bus_n3.sv").expect("bus");
-    eprintln!("BUS name={} cells={}", d.name, d.cells.len());
+    eprintln!("BUS name={} cells={}", resolve(d.name), d.cells.len());
     for k in ["WIDE_CONE", "ASSIGN_NOT_LOWERED"] {
         if let Some(v) = d.attrs.get(k) {
             eprintln!("ATTR {k}={v}");
