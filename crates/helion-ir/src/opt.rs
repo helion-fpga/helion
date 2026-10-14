@@ -167,23 +167,32 @@ impl Design {
     }
 
     fn sweep_dead_luts_inner(&mut self) -> usize {
-        let out_net = self.lut_output_nets();
+        // Zero-allocation: iterate nets directly instead of building
+        // a HashMap of LUT -> net. For each net with a single LUT driver
+        // and no other endpoints, that LUT is dead.
         let ila = self.ila_nets();
         let mut dead: Vec<usize> = Vec::new();
-        for (ci, c) in self.cells.iter().enumerate() {
-            if !matches!(c.kind, CellKind::Lut6 { .. }) {
-                continue;
+        // Build cell index once for O(1) lookups (uses existing cell_ix).
+        for (ni, n) in self.nets.iter().enumerate() {
+            // Find the driver (pin == "O")
+            let mut driver_ci: Option<usize> = None;
+            let mut driver_is_lut = false;
+            for e in &n.endpoints {
+                if e.pin == "O" {
+                    if let Some(&ci) = self.cell_ix.get(&e.cell) {
+                        if matches!(self.cells[ci].kind, CellKind::Lut6 { .. }) {
+                            driver_ci = Some(ci);
+                            driver_is_lut = true;
+                        }
+                    }
+                    break;
+                }
             }
-            let Some(&ni) = out_net.get(c.name.as_str()) else {
-                continue;
-            };
-            if self.driver_guarded(ci, ni, &ila) {
-                continue;
-            }
-            let n = &self.nets[ni];
+            let Some(ci) = driver_ci else { continue };
+            if !driver_is_lut { continue; }
+            // Dead if the net has only the driver endpoint
             if n.endpoints.len() == 1 {
-                let e = &n.endpoints[0];
-                if e.cell == c.name && e.pin == "O" {
+                if !self.driver_guarded(ci, ni, &ila) {
                     dead.push(ci);
                 }
             }
