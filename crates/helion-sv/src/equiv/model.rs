@@ -19,7 +19,7 @@ use crate::aig_opt::merge_cones;
 use crate::equiv::lut_bridge::{instantiate, LutCache};
 use crate::equiv::EquivError;
 use crate::{Aig, Lit};
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{CellKind, Design, PortDir, Spur, intern, resolve};
 use std::collections::{HashMap, HashSet};
 
 /// Combinational model of one side of an equivalence check.
@@ -67,7 +67,7 @@ impl EquivModel {
                 other => {
                     return Err(EquivError::UnsupportedCell(format!(
                         "cell '{}' has unsupported kind {other:?}",
-                        c.name
+                        resolve(c.name)
                     )));
                 }
             }
@@ -79,7 +79,7 @@ impl EquivModel {
             .ports
             .iter()
             .filter(|p| matches!(p.dir, PortDir::In | PortDir::Inout))
-            .map(|p| p.name.clone())
+            .map(|p| resolve(p.name).to_string())
             .collect();
 
         // 3. FF cut: Q net -> pseudo-PI, D net -> pseudo-output.
@@ -89,15 +89,15 @@ impl EquivModel {
             if !matches!(c.kind, CellKind::Hff) {
                 continue;
             }
-            let q = d.net_on(&c.name, "Q").ok_or_else(|| {
-                EquivError::UnsupportedCell(format!("Hff cell '{}' has no net on Q", c.name))
+            let q = d.net_on(c.name, intern("Q")).ok_or_else(|| {
+                EquivError::UnsupportedCell(format!("Hff cell '{}' has no net on Q", resolve(c.name)))
             })?;
-            let dn = d.net_on(&c.name, "D").ok_or_else(|| {
-                EquivError::UnsupportedCell(format!("Hff cell '{}' has no net on D", c.name))
+            let dn = d.net_on(c.name, intern("D")).ok_or_else(|| {
+                EquivError::UnsupportedCell(format!("Hff cell '{}' has no net on D", resolve(c.name)))
             })?;
-            ff_q_net.insert(q.to_string(), c.name.clone());
-            inputs.push(format!("ff.{}.Q", c.name));
-            ff_d_outputs.push((format!("ff.{}.D", c.name), dn.to_string()));
+            ff_q_net.insert(resolve(q).to_string(), resolve(c.name).to_string());
+            inputs.push(format!("ff.{}.Q", resolve(c.name)));
+            ff_d_outputs.push((format!("ff.{}.D", resolve(c.name)), resolve(dn).to_string()));
         }
 
         // 4. AIG with every PI interned up front (keeps the PIs-first node-id
@@ -112,8 +112,8 @@ impl EquivModel {
         let mut driver: HashMap<String, (String, u64)> = HashMap::new();
         for c in &d.cells {
             if let CellKind::Lut6 { init } = c.kind {
-                if let Some(net) = d.net_on(&c.name, "O") {
-                    driver.entry(net.to_string()).or_insert((c.name.clone(), init));
+                if let Some(net) = d.net_on(c.name, intern("O")) {
+                    driver.entry(resolve(net).to_string()).or_insert((resolve(c.name).to_string(), init));
                 }
             }
         }
@@ -163,15 +163,15 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
             if !matches!(c.kind, CellKind::IobOut) {
                 continue;
             }
-            let pad = d.net_on(&c.name, "PAD");
-            if pad == Some(p.name.as_str()) {
-                let i = d.net_on(&c.name, "I").ok_or_else(|| {
+            let pad = d.net_on(c.name, intern("PAD"));
+            if pad == Some(p.name) {
+                let i = d.net_on(c.name, intern("I")).ok_or_else(|| {
                     EquivError::UnsupportedCell(format!(
                         "IobOut cell '{}' has no net on I",
                         c.name
                     ))
                 })?;
-                iobs.push((c.name.as_str(), i));
+                iobs.push((c.name, i));
             }
         }
         if iobs.is_empty() {
@@ -185,7 +185,7 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
             out.push((p.name.clone(), iobs[0].1.to_string()));
         } else {
             for (i, (_, net)) in iobs.iter().enumerate() {
-                out.push((format!("{}_{}", p.name, i), net.to_string()));
+                out.push((format!("{}_{}", resolve(p.name), i), net.to_string()));
             }
         }
     }
