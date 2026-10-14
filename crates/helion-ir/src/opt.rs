@@ -163,6 +163,10 @@ impl Design {
     /// Complexity: O(cells + nets + endpoints).
     pub fn sweep_dead_luts(&mut self) -> usize {
         self.rebuild_indexes();
+        self.sweep_dead_luts_inner()
+    }
+
+    fn sweep_dead_luts_inner(&mut self) -> usize {
         let out_net = self.lut_output_nets();
         let ila = self.ila_nets();
         let mut dead: Vec<usize> = Vec::new();
@@ -221,9 +225,13 @@ impl Design {
     ///
     /// Complexity: O(cells + nets + endpoints + 64 * folded pins).
     pub fn fold_lut_consts(&mut self) -> usize {
+        self.rebuild_indexes();
+        self.fold_lut_consts_inner()
+    }
+
+    fn fold_lut_consts_inner(&mut self) -> usize {
         let mut folds: Vec<ConstFold> = Vec::new();
         {
-            self.rebuild_indexes();
             let out_net = self.lut_output_nets();
             let cell_idx = self.cell_index();
             let ila = self.ila_nets();
@@ -309,9 +317,13 @@ impl Design {
     ///
     /// Complexity: O(cells + nets + endpoints + 64 * absorbed pins).
     pub fn absorb_lut_inverters(&mut self) -> usize {
+        self.rebuild_indexes();
+        self.absorb_lut_inverters_inner()
+    }
+
+    fn absorb_lut_inverters_inner(&mut self) -> usize {
         let mut folds: Vec<InvFold> = Vec::new();
         {
-            self.rebuild_indexes();
             let out_net = self.lut_output_nets();
             let cell_idx = self.cell_index();
             let ila = self.ila_nets();
@@ -402,9 +414,18 @@ impl Design {
     pub fn peephole_opt_luts(&mut self) -> LutOptStats {
         let mut st = LutOptStats::default();
         for _ in 0..16 {
-            let f = self.fold_lut_consts();
-            let a = self.absorb_lut_inverters();
-            let s = self.sweep_dead_luts();
+            // Rebuild indexes once at round start. Only rebuild between passes
+            // if the previous pass actually modified the netlist.
+            self.rebuild_indexes();
+            let f = self.fold_lut_consts_inner();
+            if f > 0 {
+                self.rebuild_indexes();
+            }
+            let a = self.absorb_lut_inverters_inner();
+            if a > 0 {
+                self.rebuild_indexes();
+            }
+            let s = self.sweep_dead_luts_inner();
             st.consts_folded += f;
             st.inverters_absorbed += a;
             st.dead_swept += s;
