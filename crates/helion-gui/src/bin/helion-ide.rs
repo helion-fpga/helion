@@ -2913,6 +2913,7 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 fn paint_sim_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.set_width(ui.available_width());
     let theme = app.theme;
     // Absolute rect split - clip both sides so long HNF names cannot paint over Memory.
     let full = ui.available_rect_before_wrap();
@@ -2980,6 +2981,7 @@ fn open_more_workspace(app: &mut HelionIde, tab: WorkspaceTab) {
 
 /// More ... destinations fill the central pane with their real UI - never Timing-only, never a stub heading.
 fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.set_width(ui.available_width());
     match pane_for_workspace(app.model.workspace) {
         WorkspacePane::Device => paint_device(
             ui,
@@ -3025,6 +3027,7 @@ fn paint_more_pane(ui: &mut egui::Ui, app: &mut HelionIde) {
 
 /// Timing ⌘3 / Timing rail: WNS + paths only - never Reports catalog.
 fn paint_timing_only(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
+    ui.set_width(ui.available_width());
     paint_timing_summary(ui, model, theme);
     ui.add_space(chrome::SPACE_SM);
     paint_timing_paths(ui, model, theme);
@@ -3052,6 +3055,7 @@ fn paint_report_detail_tab(ui: &mut egui::Ui, app: &mut HelionIde, tab: Workspac
 
 /// Reports rail: selected report body only (catalog is in the SidePanel). No Timing twin chrome.
 fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.set_width(ui.available_width());
     if paint_report_detail_tab(ui, app, app.model.workspace) {
         return;
     }
@@ -3070,6 +3074,7 @@ fn paint_reports_detail(ui: &mut egui::Ui, app: &mut HelionIde) {
 }
 
 fn paint_timing_canvas_body(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.set_width(ui.available_width());
     if paint_report_detail_tab(ui, app, app.model.workspace) {
         return;
     }
@@ -8520,6 +8525,7 @@ fn paint_device(
     pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
+    ui.set_width(ui.available_width());
     ui.heading("Device");
     paint_device_toolbar(ui, model, theme, pv, zoom_target);
     device_shortcuts(ui, model, pv);
@@ -11601,6 +11607,7 @@ fn hw_stat_bit_color(theme: &theme::Theme, name: &str, value: bool) -> Color32 {
 }
 
 fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
+    ui.set_width(ui.available_width());
     let theme = app.theme;
     ui.heading("Hardware Manager");
     let det = app.boards(false).clone();
