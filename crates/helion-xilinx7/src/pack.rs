@@ -5,7 +5,7 @@
 //! is device-independent except for site-kind choices (SLICEL vs SLICEM is
 //! resolved at place time from the device model).
 
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 
 /// A packed 6-LUT.
 #[derive(Clone, Debug)]
@@ -132,14 +132,14 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 let mut input_nets: [Option<String>; 6] = Default::default();
                 for (i, slot) in input_nets.iter_mut().enumerate() {
                     let pin = format!("I{i}");
-                    *slot = pins.net_on(&cell.name, &pin).map(|s| s.to_string());
+                    *slot = pins.net_on(resolve(cell.name), &pin).map(|s| resolve(s).to_string());
                 }
-                let output_net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("pack: LUT {} has no O net", cell.name))?
-                    .to_string();
+                let output_net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("pack: LUT {} has no O net", resolve(cell.name)))?)
+                .to_string();
                 out.luts.push(PackedLut {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     init: *init,
                     input_nets,
                     output_net,
@@ -147,34 +147,34 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
             }
             CellKind::Hff => {
                 let need = |pin: &str| {
-                    pins.net_on(&cell.name, pin)
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| format!("pack: FF {} has no {pin} net", cell.name))
+                    pins.net_on(resolve(cell.name), pin)
+                        .map(|s| resolve(s).to_string())
+                        .ok_or_else(|| format!("pack: FF {} has no {pin} net", resolve(cell.name)))
                 };
                 out.ffs.push(PackedFf {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     d_net: need("D")?,
                     q_net: need("Q")?,
                     clk_net: need("CLK")?,
-                    ce_net: pins.net_on(&cell.name, "CE").map(|s| s.to_string()),
+                    ce_net: pins.net_on(resolve(cell.name), "CE").map(|s| resolve(s).to_string()),
                     sr_net: pins
-                        .net_on(&cell.name, "SR")
-                        .or_else(|| pins.net_on(&cell.name, "RST"))
-                        .map(|s| s.to_string()),
+                        .net_on(resolve(cell.name), "SR")
+                        .or_else(|| pins.net_on(resolve(cell.name), "RST"))
+                        .map(|s| resolve(s).to_string()),
                 });
             }
             CellKind::IobOut => {
-                let net = pins
-                    .net_on(&cell.name, "I")
-                    .ok_or_else(|| format!("pack: IOB {} has no I net", cell.name))?
-                    .to_string();
-                let port = pins
-                    .net_on(&cell.name, "PAD")
-                    .unwrap_or(&cell.name)
-                    .to_string();
-                let port_def = netlist.ports.iter().find(|p| p.name == port);
+                let net = resolve(pins
+                    .net_on(resolve(cell.name), "I")
+                    .ok_or_else(|| format!("pack: IOB {} has no I net", resolve(cell.name)))?)
+                .to_string();
+                let port = resolve(pins
+                    .net_on(resolve(cell.name), "PAD")
+                    .unwrap_or(cell.name))
+                .to_string();
+                let port_def = netlist.ports.iter().find(|p| resolve(p.name) == port);
                 out.iobs.push(PackedIob {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     loc: port_def.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string())),
                     iostandard: port_def
                         .and_then(|p| p.attrs.get("IOSTANDARD"))
@@ -188,17 +188,17 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 });
             }
             CellKind::IobIn => {
-                let net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("pack: IBUF {} has no O net", cell.name))?
-                    .to_string();
-                let port = pins
-                    .net_on(&cell.name, "PAD")
-                    .unwrap_or(&cell.name)
-                    .to_string();
-                let port_def = netlist.ports.iter().find(|p| p.name == port);
+                let net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("pack: IBUF {} has no O net", resolve(cell.name)))?)
+                .to_string();
+                let port = resolve(pins
+                    .net_on(resolve(cell.name), "PAD")
+                    .unwrap_or(cell.name))
+                .to_string();
+                let port_def = netlist.ports.iter().find(|p| resolve(p.name) == port);
                 out.iobs.push(PackedIob {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     loc: port_def.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string())),
                     iostandard: port_def
                         .and_then(|p| p.attrs.get("IOSTANDARD"))
@@ -212,16 +212,16 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                 });
             }
             CellKind::ClockBuf => {
-                let in_net = pins
-                    .net_on(&cell.name, "I")
-                    .ok_or_else(|| format!("pack: BUFG {} has no I net", cell.name))?
-                    .to_string();
-                let out_net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("pack: BUFG {} has no O net", cell.name))?
-                    .to_string();
+                let in_net = resolve(pins
+                    .net_on(resolve(cell.name), "I")
+                    .ok_or_else(|| format!("pack: BUFG {} has no I net", resolve(cell.name)))?)
+                .to_string();
+                let out_net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("pack: BUFG {} has no O net", resolve(cell.name)))?)
+                .to_string();
                 out.bufgs.push(PackedBufg {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     in_net,
                     out_net,
                 });
@@ -236,24 +236,24 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
                     .collect();
                 out.brams.push(PackedBram {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     init,
                 });
             }
             CellKind::Mac27 => {
                 out.dsps.push(PackedDsp {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                 });
             }
             CellKind::Carry4 => {
                 out.carries.push(PackedCarry {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                 });
             }
             other => {
                 return Err(format!(
                     "pack: unsupported CellKind {other:?} for 7-series (cell {})",
-                    cell.name
+                    resolve(cell.name)
                 ));
             }
         }
@@ -288,18 +288,18 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
         let port = netlist
             .ports
             .iter()
-            .find(|p| p.dir == PortDir::In && p.name == clk_net)
+            .find(|p| p.dir == PortDir::In && p.name == intern(&clk_net))
             .ok_or_else(|| {
                 format!("pack: clock net `{clk_net}` has no matching top-level input port")
             })?;
-        let bufg_out = format!("{}_bufg", port.name);
+        let bufg_out = format!("{}_bufg", resolve(port.name));
         for ff in &mut packed.ffs {
             if ff.clk_net == clk_net {
                 ff.clk_net = bufg_out.clone();
             }
         }
         packed.iobs.push(PackedIob {
-            name: format!("ibuf_{}", port.name),
+            name: format!("ibuf_{}", resolve(port.name)),
             loc: port.attrs.get("LOC").map(|s| s.to_string()),
             iostandard: port
                 .attrs
@@ -308,13 +308,13 @@ fn insert_clock_spine(netlist: &Design, packed: &mut Packed7) -> Result<(), Stri
                 .unwrap_or_else(|| "LVCMOS33".to_string()),
             drive: None,
             slew: None,
-            port: port.name.clone(),
+            port: resolve(port.name).to_string(),
             dir: IobDir::In,
-            net: format!("{}_ibuf", port.name),
+            net: format!("{}_ibuf", resolve(port.name)),
         });
         packed.bufgs.push(PackedBufg {
-            name: format!("bufg_{}", port.name),
-            in_net: format!("{}_ibuf", port.name),
+            name: format!("bufg_{}", resolve(port.name)),
+            in_net: format!("{}_ibuf", resolve(port.name)),
             out_net: bufg_out,
         });
     }
