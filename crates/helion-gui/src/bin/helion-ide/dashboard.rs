@@ -11,6 +11,7 @@
 //! report catalog regroup + endpoint-slack histogram.
 
 use eframe::egui;
+use helion_gui::chrome;
 
 use super::open_more_workspace;
 use super::theme;
@@ -781,7 +782,7 @@ fn paint_power_body(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         let pct = uw as f64 / total as f64 * 100.0;
         ui.horizontal(|ui| {
             let (srect, _) =
-                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(chrome::STATUS_DOT_SIZE, chrome::STATUS_DOT_SIZE), egui::Sense::hover());
             ui.painter().rect_filled(srect, 2.0, swatch);
             ui.label(egui::RichText::new(label).size(13.0).color(theme.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

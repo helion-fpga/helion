@@ -1452,6 +1452,61 @@ pub fn splitter_can_travel(min: f32, max: f32) -> bool {
     max - min >= SPLITTER_MIN_DELTA_PX
 }
 
+// ---------------------------------------------------------------------------
+// Dialog and wizard dimensions (Rule 8: no magic numbers in layout code).
+// ---------------------------------------------------------------------------
+
+/// Create Project wizard: project name text field width.
+pub const WIZARD_NAME_FIELD_W: f32 = 360.0;
+/// Create Project wizard: project directory text field width.
+pub const WIZARD_DIR_FIELD_W: f32 = 320.0;
+/// Create Project wizard: source and constraint path draft field width.
+pub const WIZARD_PATH_FIELD_W: f32 = 300.0;
+/// Command palette dialog width.
+pub const PALETTE_WIDTH: f32 = 616.0;
+/// Keyboard cheatsheet dialog width.
+pub const CHEATSHEET_WIDTH: f32 = 520.0;
+/// Console find field width.
+pub const CONSOLE_FIND_FIELD_W: f32 = 180.0;
+/// Device view: Display Control panel inner content minimum width.
+pub const DEVICE_DISPLAY_CONTROL_INNER_MIN_W: f32 = 216.0;
+/// Device view: Inspector panel inner content minimum width.
+pub const DEVICE_INSPECTOR_INNER_MIN_W: f32 = 252.0;
+/// Property grids: minimum width for name/value scroll content.
+pub const PROPS_GRID_MIN_W: f32 = 420.0;
+/// Device view: package pin draft field width.
+pub const PACKAGE_PIN_FIELD_W: f32 = 120.0;
+/// Device view: find dialog query field width.
+pub const FIND_DIALOG_QUERY_W: f32 = 400.0;
+/// Timing Paths: filter field width.
+pub const TIMING_FILTER_FIELD_W: f32 = 170.0;
+/// Power report: per-resource bar width.
+pub const POWER_BAR_W: f32 = 160.0;
+/// Power report: per-resource bar height.
+pub const POWER_BAR_H: f32 = 10.0;
+/// Flow Navigator: step chip click target width.
+pub const FLOW_STEP_CHIP_W: f32 = 64.0;
+/// Flow Navigator: step chip click target height.
+pub const FLOW_STEP_CHIP_H: f32 = 18.0;
+/// Activity rail: icon paint size (square).
+pub const RAIL_ICON_SIZE: f32 = 26.0;
+/// Constraints wizard: clock period field width.
+pub const CONSTRAINT_PERIOD_FIELD_W: f32 = 80.0;
+/// Constraints wizard: duty cycle field width.
+pub const CONSTRAINT_DUTY_FIELD_W: f32 = 60.0;
+/// Constraints wizard: divide/multiply numeric field width.
+pub const CONSTRAINT_DIV_FIELD_W: f32 = 50.0;
+/// Constraints wizard: min/max delay numeric field width.
+pub const CONSTRAINT_DELAY_FIELD_W: f32 = 70.0;
+/// Flow Navigator: stage icon paint size (square).
+pub const FLOW_STAGE_ICON_SIZE: f32 = 20.0;
+/// Status dot indicator size (square) used in catalog rows and layer lists.
+pub const STATUS_DOT_SIZE: f32 = 10.0;
+/// Device Display Control: occupancy bar width.
+pub const DISPLAY_OCCUPANCY_BAR_W: f32 = 120.0;
+/// Device Display Control: occupancy bar height.
+pub const DISPLAY_OCCUPANCY_BAR_H: f32 = 10.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;

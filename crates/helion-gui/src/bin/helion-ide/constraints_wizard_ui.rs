@@ -7,7 +7,7 @@
 use super::HelionIde;
 use eframe::egui::{self};
 use helion_gui::constraints_wizard as wiz;
-use helion_gui::{IdeModel, JobKind};
+use helion_gui::{chrome, IdeModel, JobKind};
 use helion_ir::PortDir;
 use std::path::PathBuf;
 
@@ -505,9 +505,9 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
             });
             ui.horizontal(|ui| {
                 ui.label("Period (ns)");
-                ui.add(egui::TextEdit::singleline(&mut c.period_ns).desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut c.period_ns).desired_width(chrome::CONSTRAINT_PERIOD_FIELD_W));
                 ui.label("Duty (%)");
-                ui.add(egui::TextEdit::singleline(&mut c.duty_pct).desired_width(60.0));
+                ui.add(egui::TextEdit::singleline(&mut c.duty_pct).desired_width(chrome::CONSTRAINT_DUTY_FIELD_W));
                 ui.weak("waveform recorded for export; STA keys off period");
             });
             ui.checkbox(&mut c.generated, "Generated clock (create_generated_clock)");
@@ -523,9 +523,9 @@ fn paint_clocks(ui: &mut egui::Ui, app: &mut HelionIde) {
                             }
                         });
                     ui.label("÷");
-                    ui.add(egui::TextEdit::singleline(&mut c.divide_by).desired_width(50.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.divide_by).desired_width(chrome::CONSTRAINT_DIV_FIELD_W));
                     ui.label("×");
-                    ui.add(egui::TextEdit::singleline(&mut c.multiply_by).desired_width(50.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.multiply_by).desired_width(chrome::CONSTRAINT_DIV_FIELD_W));
                     ui.checkbox(&mut c.invert, "Invert");
                 });
             }
@@ -600,9 +600,9 @@ fn paint_io_delays(ui: &mut egui::Ui, app: &mut HelionIde, is_input: bool) {
                         }
                     });
                 ui.label("Min (ns)");
-                ui.add(egui::TextEdit::singleline(&mut d.min_ns).desired_width(70.0).hint_text("hold"));
+                ui.add(egui::TextEdit::singleline(&mut d.min_ns).desired_width(chrome::CONSTRAINT_DELAY_FIELD_W).hint_text("hold"));
                 ui.label("Max (ns)");
-                ui.add(egui::TextEdit::singleline(&mut d.max_ns).desired_width(70.0).hint_text("setup"));
+                ui.add(egui::TextEdit::singleline(&mut d.max_ns).desired_width(chrome::CONSTRAINT_DELAY_FIELD_W).hint_text("setup"));
             });
         });
         ui.add_space(6.0);
@@ -685,7 +685,7 @@ fn paint_exceptions(ui: &mut egui::Ui, app: &mut HelionIde) {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Delay (ns)");
-                        ui.add(egui::TextEdit::singleline(delay_ns).desired_width(80.0));
+                        ui.add(egui::TextEdit::singleline(delay_ns).desired_width(chrome::CONSTRAINT_PERIOD_FIELD_W));
                         ui.checkbox(datapath_only, "-datapath_only");
                     });
                 }

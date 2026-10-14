@@ -103,7 +103,7 @@ fn paint_stage_header(
     ));
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 30.0, rect.center().y),
-        egui::vec2(20.0, 20.0),
+        egui::vec2(chrome::FLOW_STAGE_ICON_SIZE, chrome::FLOW_STAGE_ICON_SIZE),
     );
     icons::paint_stage(p, icon_rect, step, theme.dim);
     p.text(

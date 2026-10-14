@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, RichText};
-use helion_gui::chrome::{Activity, Canvas};
+use helion_gui::chrome::{self, Activity, Canvas};
 use helion_gui::{BottomTab, FlowStep, WorkspaceTab};
 
 use super::layouts::LayoutPreset;
@@ -606,7 +606,7 @@ pub fn paint_palette(ctx: &egui::Context, app: &mut HelionIde) {
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
-                    ui.set_width(616.0);
+                    ui.set_width(chrome::PALETTE_WIDTH);
                     paint_palette_header(ui, app, &theme, mode, just_opened);
                     ui.add_space(6.0);
                     if let Some(p) = paint_palette_rows(ui, app, &theme, &rows, nav) {
@@ -939,7 +939,7 @@ pub fn paint_shortcut_cheatsheet(ctx: &egui::Context, app: &mut HelionIde) {
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(16, 12))
                 .show(ui, |ui| {
-                    ui.set_width(520.0);
+                    ui.set_width(chrome::CHEATSHEET_WIDTH);
                     if paint_cheatsheet_header(ui, &theme, &mut query) {
                         close = true;
                     }

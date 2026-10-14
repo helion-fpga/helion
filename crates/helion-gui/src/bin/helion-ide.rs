@@ -1494,7 +1494,7 @@ fn paint_progress_strip(ui: &mut egui::Ui, theme: &theme::Theme, model: &IdeMode
             };
             ui.add_enabled_ui(blocked.is_none(), |ui| {
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(64.0, 18.0),
+                    egui::vec2(chrome::FLOW_STEP_CHIP_W, chrome::FLOW_STEP_CHIP_H),
                     egui::Sense::click(),
                 );
                 if ui.is_rect_visible(rect) {
@@ -1561,7 +1561,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                         ui.painter(),
                         egui::Rect::from_center_size(
                             egui::pos2(c.x, c.y - 10.0),
-                            egui::vec2(26.0, 26.0),
+                            egui::vec2(chrome::RAIL_ICON_SIZE, chrome::RAIL_ICON_SIZE),
                         ),
                         act,
                         icon_color,
@@ -2562,7 +2562,7 @@ fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.label("Project name");
                     ui.add(
                         egui::TextEdit::singleline(&mut app.create_wizard.name)
-                            .desired_width(360.0)
+                            .desired_width(chrome::WIZARD_NAME_FIELD_W)
                             .hint_text("project_1"),
                     );
                     ui.add_space(chrome::SPACE_SM);
@@ -2570,7 +2570,7 @@ fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut app.create_wizard.directory)
-                                .desired_width(320.0)
+                                .desired_width(chrome::WIZARD_DIR_FIELD_W)
                                 .hint_text("/tmp/helion-projects"),
                         );
                         if ui.button("Browse…").clicked() {
@@ -2621,7 +2621,7 @@ fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut app.create_wizard.source_draft)
-                                .desired_width(300.0)
+                                .desired_width(chrome::WIZARD_PATH_FIELD_W)
                                 .hint_text("Absolute path to .sv"),
                         );
                         if ui.button("Add").clicked() {
@@ -2660,7 +2660,7 @@ fn paint_create_project_wizard(ctx: &egui::Context, app: &mut HelionIde) {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut app.create_wizard.constraint_draft)
-                                .desired_width(300.0)
+                                .desired_width(chrome::WIZARD_PATH_FIELD_W)
                                 .hint_text("Absolute path to .sdc"),
                         );
                         if ui.button("Add").clicked() {
@@ -3419,7 +3419,7 @@ fn paint_tcl_console(ui: &mut egui::Ui, app: &mut HelionIde) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Find").small());
         let find = egui::TextEdit::singleline(&mut model.console_find)
-            .desired_width(180.0)
+            .desired_width(chrome::CONSOLE_FIND_FIELD_W)
             .hint_text("find in journal")
             .font(egui::TextStyle::Monospace);
         let resp = ui.add(find);
@@ -4715,7 +4715,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
                 egui::ScrollArea::horizontal()
                     .id_salt(format!("{grid_id}_props_scroll"))
                     .show(ui, |ui| {
-                        ui.set_min_width(420.0);
+                        ui.set_min_width(chrome::PROPS_GRID_MIN_W);
                         for p in &rows {
                             ui.label(
                                 RichText::new(format!(
@@ -4885,7 +4885,7 @@ fn paint_io_ports_table(ui: &mut egui::Ui, model: &mut IdeModel, grid_id: &'stat
         ui.horizontal(|ui| {
             ui.weak("PACKAGE_PIN");
             let edit = egui::TextEdit::singleline(&mut model.package_pin_draft)
-                .desired_width(120.0)
+                .desired_width(chrome::PACKAGE_PIN_FIELD_W)
                 .hint_text("IOB_X…");
             let resp = ui.add(edit);
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -5027,7 +5027,7 @@ fn paint_pblocks_table(ui: &mut egui::Ui, model: &mut IdeModel) {
             // One complete line. Horizontal scroll keeps the sentence; wrap would crush the die.
             ui.horizontal(|ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                ui.set_min_width(420.0);
+                ui.set_min_width(chrome::PROPS_GRID_MIN_W);
                 ui.label("No pblocks yet. Create one, then resize it on the die.");
             });
         } else {
@@ -5585,7 +5585,7 @@ fn paint_timing_paths(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Th
         ui.add(
             egui::TextEdit::singleline(&mut model.timing_path_filter)
                 .hint_text("Filter...")
-                .desired_width(170.0),
+                .desired_width(chrome::TIMING_FILTER_FIELD_W),
         );
         if ui.button("Report timing").clicked() {
             do_report = true;
@@ -6830,7 +6830,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
             for res in &r.by_resource {
                 ui.label(RichText::new(&res.name).monospace());
                 num_cell(ui, &format!("{:.3} mW", res.mw));
-                let (bar, _) = ui.allocate_exact_size(egui::vec2(160.0, 10.0), Sense::hover());
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(chrome::POWER_BAR_W, chrome::POWER_BAR_H), Sense::hover());
                 ui.painter().rect_filled(bar, 2.0, theme.surface);
                 let frac = (res.mw / max_mw).clamp(0.0, 1.0) as f32;
                 let fill = bar.with_max_x(bar.left() + bar.width() * frac);
@@ -8602,7 +8602,7 @@ fn paint_device(
                         egui::ScrollArea::vertical()
                             .id_salt("pv_display_control")
                             .show(ui, |ui| {
-                                ui.set_min_width(216.0);
+                                ui.set_min_width(chrome::DEVICE_DISPLAY_CONTROL_INNER_MIN_W);
                                 physview_panels::paint_display_control(ui, pv, model, theme);
                             });
                     },
@@ -8638,7 +8638,7 @@ fn paint_device(
                         egui::ScrollArea::vertical()
                             .id_salt("pv_inspector")
                             .show(ui, |ui| {
-                                ui.set_min_width(252.0);
+                                ui.set_min_width(chrome::DEVICE_INSPECTOR_INNER_MIN_W);
                                 physview_panels::paint_inspector(ui, model, pv, theme, zoom_target);
                             });
                     },
@@ -8657,7 +8657,7 @@ fn paint_device(
             egui::Window::new("Display Control")
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
-                    ui.set_min_width(216.0);
+                    ui.set_min_width(chrome::DEVICE_DISPLAY_CONTROL_INNER_MIN_W);
                     physview_panels::paint_display_control(ui, pv, model, theme);
                 });
         }
@@ -8665,7 +8665,7 @@ fn paint_device(
             egui::Window::new("Inspector")
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
-                    ui.set_min_width(252.0);
+                    ui.set_min_width(chrome::DEVICE_INSPECTOR_INNER_MIN_W);
                     physview_panels::paint_inspector(ui, model, pv, theme, zoom_target);
                 });
         }
