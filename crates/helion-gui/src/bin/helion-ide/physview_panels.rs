@@ -8,6 +8,7 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 
 use super::theme;
+use helion_gui::chrome;
 use super::IdeModel;
 use super::WorkspaceTab;
 use helion_gui::physview::{
@@ -93,7 +94,7 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
         let solo = pv.layers.solo() == Some(layer);
         ui.horizontal(|ui| {
             // Color swatch.
-            let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            let (r, _) = ui.allocate_exact_size(egui::vec2(chrome::STATUS_DOT_SIZE, chrome::STATUS_DOT_SIZE), egui::Sense::hover());
             ui.painter().rect_filled(r, 2.0, swatch);
             if ui.checkbox(&mut on, layer.label()).changed() {
                 pv.layers.set_visible(layer, on);
@@ -152,7 +153,7 @@ pub fn paint_display_control(ui: &mut egui::Ui, pv: &mut PhysViewState, model: &
                     ("<0 viol", physview::slack_color(physview::SlackBucket::Violating)),
                 ] {
                     let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(chrome::STATUS_DOT_SIZE, chrome::STATUS_DOT_SIZE), egui::Sense::hover());
                     ui.painter().rect_filled(r, 2.0, c);
                     ui.label(RichText::new(label).small().color(theme.faint));
                 }
@@ -188,7 +189,7 @@ fn paint_ramp_legend(ui: &mut egui::Ui, theme: &theme::Theme, labels: &str) {
     ui.horizontal(|ui| {
         let steps = 24;
         let w = 120.0 / steps as f32;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(chrome::DISPLAY_OCCUPANCY_BAR_W, chrome::DISPLAY_OCCUPANCY_BAR_H), egui::Sense::hover());
         for i in 0..steps {
             let t = i as f32 / (steps - 1) as f32;
             let rgb = physview::congestion_ramp(t);
@@ -395,11 +396,11 @@ pub fn paint_find_dialog(
         .resizable(false)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
         .show(ctx, |ui| {
-            ui.set_min_width(420.0);
+            ui.set_min_width(chrome::PROPS_GRID_MIN_W);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut pv.find_query)
                     .hint_text("site, cell, or net name")
-                    .desired_width(400.0),
+                    .desired_width(chrome::FIND_DIALOG_QUERY_W),
             );
             // Focus the query box when the dialog opens.
             if pv.find_needs_focus {
