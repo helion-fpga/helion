@@ -8536,9 +8536,15 @@ impl IdeModel {
             return self.open_project(path);
         }
         let p = path.to_string_lossy().into_owned();
-        if !self.tree.sources.contains(&p) {
-            self.tree.sources.push(p.clone());
-        }
+        // Opening a single source replaces the source list: the new file is the
+        // design. Without this, switching examples accumulates stale sources
+        // and synthesis/hierarchy show the old design (e.g. blinky) while the
+        // editor shows the new file (e.g. counter.sv).
+        self.tree.sources.clear();
+        self.tree.sources.push(p.clone());
+        // Clear design-dependent state so hierarchy, netlist, and reports
+        // cannot show the previous design's data.
+        self.hierarchy = HierarchyView::default();
         self.load_rtl_source(&p);
         self.run_step_from(FlowStep::Synthesis, Some(PathBuf::from(path)))
     }
