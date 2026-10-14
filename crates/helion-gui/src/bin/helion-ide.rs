@@ -8854,6 +8854,25 @@ fn paint_device_die(
                 rect.left() + chrome::FLOORPLAN_LEFT + origin_dx,
                 rect.top() + chrome::FLOORPLAN_TOP + origin_dy,
             );
+            // Robust UI pattern: single source of truth for screen<->die math.
+            // All drawing and hit-testing must use these closures, never inline
+            // `origin.x + dx as f32 * cell_w`. This prevents the "breaks after zoom"
+            // bug class where scattered math drifts out of sync.
+            let to_screen = |dx: u32, dy: u32| {
+                egui::pos2(
+                    origin.x + dx as f32 * cell_w,
+                    origin.y + dy as f32 * cell_h,
+                )
+            };
+            let to_tile = |pos: egui::Pos2| -> Option<(u32, u32)> {
+                let dx = ((pos.x - origin.x) / cell_w).floor() as i32;
+                let dy = ((pos.y - origin.y) / cell_h).floor() as i32;
+                if dx < 0 || dy < 0 || dx >= cols as i32 || dy >= rows as i32 {
+                    None
+                } else {
+                    Some((dx as u32, dy as u32))
+                }
+            };
             let p = ui.painter();
             p.rect_filled(rect, 0.0, theme.die_bg);
             // Physical View 2.0: congestion heat map paints under the sites
@@ -8878,8 +8897,9 @@ fn paint_device_die(
                             let rgb = helion_gui::physview::congestion_ramp(
                                 helion_gui::physview::congestion_t(u, max_u),
                             );
-                            let px = origin.x + dxx as f32 * cell_w;
-                            let py = origin.y + dyy as f32 * cell_h;
+                            let tile_pos = to_screen(dxx, dyy);
+                            let px = tile_pos.x;
+                            let py = tile_pos.y;
                             let htile = egui::Rect::from_min_size(
                                 egui::pos2(px + 0.5, py + 0.5),
                                 egui::vec2((cell_w - 1.0).max(1.0), (cell_h - 1.0).max(1.0)),
