@@ -1533,7 +1533,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
     egui::SidePanel::left("activity_rail")
         .exact_width(chrome::RAIL_WIDTH)
         .resizable(false)
-        .show_separator_line(true)
+        .show_separator_line(false)
         .show(ctx, |ui| {
             ui.add_space(chrome::SPACE_XS);
             ui.spacing_mut().item_spacing.y = 4.0;
