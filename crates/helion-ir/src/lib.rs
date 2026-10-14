@@ -5,6 +5,44 @@ mod opt;
 pub use opt::LutOptStats;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
+
+use lasso::{Spur, ThreadedRode};
+
+/// Global string interner for netlist names.
+/// 
+/// Cell names, net names, port names, and pin names are interned as `Spur`
+/// (a `u32` ID) instead of `String`. This eliminates thousands of string
+/// allocations and clones in hot loops:
+/// - `Spur` is `Copy` (4 bytes), `String` is 24 bytes + heap allocation
+/// - `Spur == Spur` is a single u32 compare, `String == String` is O(n)
+/// - No cloning needed, just copy the `Spur`
+///
+/// The interner is global because names are created in many places
+/// (parsing, elaboration, optimization) and need to be comparable.
+/// `ThreadedRode` is thread-safe for future parallelization.
+static INTERNER: OnceLock<ThreadedRode> = OnceLock::new();
+
+/// Get the global string interner.
+fn interner() -> &'static ThreadedRode {
+    INTERNER.get_or_init(ThreadedRode::default)
+}
+
+/// Intern a string, returning its `Spur` ID.
+/// 
+/// If the string was already interned, returns the existing ID.
+/// Otherwise, inserts it and returns the new ID.
+pub fn intern(s: &str) -> Spur {
+    interner().get_or_intern(s)
+}
+
+/// Resolve a `Spur` back to its string.
+/// 
+/// Panics if the `Spur` was not interned (should never happen for
+/// valid netlist names).
+pub fn resolve(s: Spur) -> &'static str {
+    interner().resolve(&s)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Attrs {
