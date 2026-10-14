@@ -25,7 +25,7 @@
 use crate::db::PackagePin;
 use crate::device::Device;
 use helion_backend::NetlistIr;
-use helion_ir::{Attrs, CellKind, Design, PinIndex, PortDir};
+use helion_ir::{intern, resolve, Attrs, CellKind, Design, PinIndex, PortDir, Spur};
 use std::collections::{HashMap, HashSet};
 
 /// ECP5 sysMEM block size in bits (`DP16KD` = 18Kb).
@@ -232,7 +232,7 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
 
     let pins = netlist.pin_index();
     let mut out = PackedEcp5 {
-        top: netlist.name.clone(),
+        top: resolve(netlist.name).to_string(),
         package: package.clone(),
         ..Default::default()
     };
@@ -247,14 +247,14 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
                 let mut inputs: [Option<String>; 6] = Default::default();
                 for (i, slot) in inputs.iter_mut().enumerate() {
                     *slot = pins
-                        .net_on(&cell.name, &format!("I{i}"))
-                        .map(|s| s.to_string());
+                        .net_on(resolve(cell.name), &format!("I{i}"))
+                        .map(|s| resolve(s).to_string());
                 }
-                let output_net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("ecp5 pack: LUT {} has no O net", cell.name))?
-                    .to_string();
-                let mut luts = decompose_lut6(&cell.name, *init, &inputs)?;
+                let output_net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("ecp5 pack: LUT {} has no O net", resolve(cell.name)))?)
+                .to_string();
+                let mut luts = decompose_lut6(resolve(cell.name), *init, &inputs)?;
                 // Rename the top output net to the real one.
                 if let Some(top) = luts.last_mut() {
                     top.output_net = output_net;
@@ -263,12 +263,12 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
             }
             CellKind::Hff => {
                 let need = |pin: &str| {
-                    pins.net_on(&cell.name, pin)
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| format!("ecp5 pack: FF {} has no {pin} net", cell.name))
+                    pins.net_on(resolve(cell.name), pin)
+                        .map(|s| resolve(s).to_string())
+                        .ok_or_else(|| format!("ecp5 pack: FF {} has no {pin} net", resolve(cell.name)))
                 };
                 out.ffs.push(PackedEcp5Ff {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     d_net: need("D")?,
                     q_net: need("Q")?,
                     clk_net: need("CLK")?,
@@ -279,7 +279,7 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
                 out.ios.push(pack_io(
                     netlist,
                     &pins,
-                    &cell.name,
+                    resolve(cell.name),
                     IoDir::Out,
                     &package,
                     pkg_pins,
@@ -290,7 +290,7 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
                 out.ios.push(pack_io(
                     netlist,
                     &pins,
-                    &cell.name,
+                    resolve(cell.name),
                     IoDir::In,
                     &package,
                     pkg_pins,
@@ -298,45 +298,46 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
                 )?);
             }
             CellKind::ClockBuf => {
-                let in_net = pins
-                    .net_on(&cell.name, "I")
-                    .ok_or_else(|| format!("ecp5 pack: CLKBUF {} has no I net", cell.name))?
-                    .to_string();
-                let out_net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("ecp5 pack: CLKBUF {} has no O net", cell.name))?
-                    .to_string();
+                let in_net = resolve(pins
+                    .net_on(resolve(cell.name), "I")
+                    .ok_or_else(|| format!("ecp5 pack: CLKBUF {} has no I net", resolve(cell.name)))?)
+                .to_string();
+                let out_net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("ecp5 pack: CLKBUF {} has no O net", resolve(cell.name)))?)
+                .to_string();
                 out.clks.push(PackedEcp5Clk {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     in_net,
                     out_net,
                 });
             }
             CellKind::Bram18 => {
-                out.rams.push(pack_ram(&cell.name, &cell.attrs)?);
+                out.rams.push(pack_ram(resolve(cell.name), &cell.attrs)?);
             }
             CellKind::Mac27 => {
-                out.dsps.push(pack_dsp(&cell.name, &pins, &cell.attrs)?);
+                out.dsps.push(pack_dsp(resolve(cell.name), &pins, &cell.attrs)?);
             }
             CellKind::Carry4 => {
-                carry_cells.push(parse_carry4(&cell.name, &pins, netlist)?);
+                carry_cells.push(parse_carry4(resolve(cell.name), &pins, netlist)?);
             }
             CellKind::BlackBox { module }
-                if module.starts_with("PLLB") || module.starts_with("EHXPLL") =>
+                if resolve(*module).starts_with("PLLB") || resolve(*module).starts_with("EHXPLL") =>
             {
-                out.plls.push(pack_pll(&cell.name, module, &pins, &cell.attrs)?);
+                out.plls.push(pack_pll(resolve(cell.name), resolve(*module), &pins, &cell.attrs)?);
             }
             CellKind::BlackBox { module } => {
                 return Err(format!(
-                    "ecp5 pack: unsupported black box '{module}' (cell {}); \
+                    "ecp5 pack: unsupported black box '{}' (cell {}); \
                      only PLLB*/EHXPLL* black boxes map to ECP5 primitives",
-                    cell.name
+                    resolve(*module),
+                    resolve(cell.name)
                 ));
             }
             CellKind::Ila { .. } => {
                 return Err(format!(
                     "ecp5 pack: ILA {} unsupported on the ECP5 backend v1",
-                    cell.name
+                    resolve(cell.name)
                 ));
             }
         }
@@ -478,7 +479,7 @@ fn decompose_lut6(
 #[allow(clippy::too_many_arguments)]
 fn pack_io(
     netlist: &Design,
-    pins: &PinIndex<'_>,
+    pins: &PinIndex,
     cell_name: &str,
     dir: IoDir,
     package: &str,
@@ -493,18 +494,18 @@ fn pack_io(
         IoDir::Out => "OBUF",
         IoDir::In => "IBUF",
     };
-    let net = pins
+    let net = resolve(pins
         .net_on(cell_name, fab_pin)
-        .ok_or_else(|| format!("ecp5 pack: {kind} {cell_name} has no {fab_pin} net"))?
-        .to_string();
-    let port = pins
+        .ok_or_else(|| format!("ecp5 pack: {kind} {cell_name} has no {fab_pin} net"))?)
+    .to_string();
+    let port = resolve(pins
         .net_on(cell_name, "PAD")
-        .unwrap_or(cell_name)
-        .to_string();
+        .unwrap_or(intern(cell_name)))
+    .to_string();
     let pdef = netlist
         .ports
         .iter()
-        .find(|p| p.name == port)
+        .find(|p| p.name == intern(&port))
         .ok_or_else(|| {
             format!("ecp5 pack: {kind} {cell_name}: port '{port}' is not a top-level port")
         })?;
@@ -568,7 +569,7 @@ fn pack_ram(name: &str, attrs: &Attrs) -> Result<PackedEcp5Ram, String> {
 }
 
 /// Pack a `Mac27` cell into `MULT18X18D` shape.
-fn pack_dsp(name: &str, pins: &PinIndex<'_>, attrs: &Attrs) -> Result<PackedEcp5Dsp, String> {
+fn pack_dsp(name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedEcp5Dsp, String> {
     for (attr, what) in [("WIDTH_A", "A"), ("WIDTH_B", "B")] {
         if let Some(v) = attrs.get(attr) {
             let w: u32 = v.trim().parse().map_err(|_| {
@@ -584,14 +585,14 @@ fn pack_dsp(name: &str, pins: &PinIndex<'_>, attrs: &Attrs) -> Result<PackedEcp5
     }
     let need = |pin: &str| {
         pins.net_on(name, pin)
-            .map(|s| s.to_string())
+            .map(|s| resolve(s).to_string())
             .ok_or_else(|| format!("ecp5 pack: DSP {name} has no {pin} net"))
     };
     Ok(PackedEcp5Dsp {
         name: name.to_string(),
         a_net: need("A")?,
         b_net: need("B")?,
-        c_net: pins.net_on(name, "C").map(|s| s.to_string()),
+        c_net: pins.net_on(name, "C").map(|s| resolve(s).to_string()),
         p_net: need("P")?,
     })
 }
@@ -601,21 +602,21 @@ fn pack_dsp(name: &str, pins: &PinIndex<'_>, attrs: &Attrs) -> Result<PackedEcp5
 fn pack_pll(
     name: &str,
     module: &str,
-    pins: &PinIndex<'_>,
+    pins: &PinIndex,
     attrs: &Attrs,
 ) -> Result<PackedEcp5Pll, String> {
-    let ref_net = pins
+    let ref_net = resolve(pins
         .net_on(name, "CLKI")
         .or_else(|| pins.net_on(name, "REFERENCECLK"))
         .or_else(|| pins.net_on(name, "I"))
-        .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKI net"))?
-        .to_string();
-    let out_net = pins
+        .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKI net"))?)
+    .to_string();
+    let out_net = resolve(pins
         .net_on(name, "CLKOP")
         .or_else(|| pins.net_on(name, "PLLOUTGLOBAL"))
         .or_else(|| pins.net_on(name, "O"))
-        .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKOP net"))?
-        .to_string();
+        .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKOP net"))?)
+    .to_string();
     for req in ["CLKI_DIV", "CLKOP_DIV"] {
         if attrs.get(req).is_none() {
             return Err(format!(
@@ -650,7 +651,7 @@ enum CarryIn {
 /// A parsed Carry4 cell; per-bit nets are `None` when unconnected
 /// (treated as constant 0).
 struct Carry4Data {
-    name: String,
+    name: Spur,
     cin: CarryIn,
     s: [Option<String>; 4],
     di: [Option<String>; 4],
@@ -658,24 +659,33 @@ struct Carry4Data {
     co: [Option<String>; 4],
 }
 
-fn is_const1(net: Option<&str>) -> bool {
-    matches!(net, Some("1" | "vcc" | "VCC" | "$true"))
+fn is_const1(net: Option<Spur>) -> bool {
+    matches!(net, Some(s) if {
+        let r = resolve(s);
+        r == "1" || r == "vcc" || r == "VCC" || r == "$true"
+    })
 }
 
-fn is_const0(net: Option<&str>) -> bool {
-    matches!(net, None | Some("0" | "gnd" | "GND" | "$false"))
+fn is_const0(net: Option<Spur>) -> bool {
+    match net {
+        None => true,
+        Some(s) => {
+            let r = resolve(s);
+            r == "0" || r == "gnd" || r == "GND" || r == "$false"
+        }
+    }
 }
 
 /// Find the Carry4 cell driving `net` via its CO[3] pin.
-fn carry_co3_driver(netlist: &Design, net: &str) -> Option<String> {
+fn carry_co3_driver(netlist: &Design, net: helion_ir::Spur) -> Option<String> {
     let n = netlist.nets.iter().find(|n| n.name == net)?;
     for e in &n.endpoints {
-        if e.pin != "CO3" {
+        if e.pin != intern("CO3") {
             continue;
         }
         if let Some(cell) = netlist.cells.iter().find(|c| c.name == e.cell) {
             if matches!(cell.kind, CellKind::Carry4) {
-                return Some(cell.name.clone());
+                return Some(resolve(cell.name).to_string());
             }
         }
     }
@@ -714,7 +724,7 @@ impl ConstDrivers {
 /// Pin convention follows Xilinx CARRY4 (the IR's backend-neutral marker):
 /// inputs `CI`, `CYINIT`, `DI0`..`DI3`, `S0`..`S3`; outputs `O0`..`O3`
 /// (sums), `CO0`..`CO3` (carry outs).
-fn parse_carry4(name: &str, pins: &PinIndex<'_>, netlist: &Design) -> Result<Carry4Data, String> {
+fn parse_carry4(name: &str, pins: &PinIndex, netlist: &Design) -> Result<Carry4Data, String> {
     let cyinit = pins.net_on(name, "CYINIT");
     let ci = pins.net_on(name, "CI");
     // The CCU2 carry_in supports only constant 0/1 or the dedicated
@@ -742,8 +752,9 @@ fn parse_carry4(name: &str, pins: &PinIndex<'_>, netlist: &Design) -> Result<Car
         }
         let prev = carry_co3_driver(netlist, ci_net).ok_or_else(|| {
             format!(
-                "ecp5 pack: Carry4 {name}: CI net '{ci_net}' is not driven by a Carry4 CO[3]; \
-                 the CCU2 carry_in supports only constant 0/1 or a chained carry"
+                "ecp5 pack: Carry4 {name}: CI net '{}' is not driven by a Carry4 CO[3]; \
+                 the CCU2 carry_in supports only constant 0/1 or a chained carry",
+                resolve(ci_net)
             )
         })?;
         if prev == name {
@@ -763,10 +774,10 @@ fn parse_carry4(name: &str, pins: &PinIndex<'_>, netlist: &Design) -> Result<Car
     let mut o: [Option<String>; 4] = Default::default();
     let mut co: [Option<String>; 4] = Default::default();
     for i in 0..4 {
-        s[i] = pins.net_on(name, &format!("S{i}")).map(|n| n.to_string());
-        di[i] = pins.net_on(name, &format!("DI{i}")).map(|n| n.to_string());
-        o[i] = pins.net_on(name, &format!("O{i}")).map(|n| n.to_string());
-        co[i] = pins.net_on(name, &format!("CO{i}")).map(|n| n.to_string());
+        s[i] = pins.net_on(name, &format!("S{i}")).map(|n| resolve(n).to_string());
+        di[i] = pins.net_on(name, &format!("DI{i}")).map(|n| resolve(n).to_string());
+        o[i] = pins.net_on(name, &format!("O{i}")).map(|n| resolve(n).to_string());
+        co[i] = pins.net_on(name, &format!("CO{i}")).map(|n| resolve(n).to_string());
     }
     // CO[0..2] are internal to the dedicated chain: the CCU2 carry is not
     // routable to general fabric, so observing them is unrepresentable.
@@ -779,7 +790,7 @@ fn parse_carry4(name: &str, pins: &PinIndex<'_>, netlist: &Design) -> Result<Car
         }
     }
     Ok(Carry4Data {
-        name: name.to_string(),
+        name: intern(name),
         cin,
         s,
         di,
@@ -806,7 +817,7 @@ fn emit_alu_chains(
     let idx: HashMap<&str, usize> = cells
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.name.as_str(), i))
+        .map(|(i, c)| (resolve(c.name), i))
         .collect();
     // next[i] = cell chained after i via CO[3] -> CI.
     let mut next: Vec<Option<usize>> = vec![None; cells.len()];
@@ -815,14 +826,14 @@ fn emit_alu_chains(
             let &pi = idx.get(prev_name.as_str()).ok_or_else(|| {
                 format!(
                     "ecp5 pack: Carry4 {}: previous cell '{prev_name}' not found",
-                    cell.name
+                    resolve(cell.name)
                 )
             })?;
             if next[pi].is_some() {
                 return Err(format!(
                     "ecp5 pack: Carry4 {}: CO[3] fans out to multiple carry chains; \
                      the dedicated carry wire is point-to-point",
-                    cells[pi].name
+                    resolve(cells[pi].name)
                 ));
             }
             next[pi] = Some(i);
@@ -835,20 +846,20 @@ fn emit_alu_chains(
             let net = netlist
                 .nets
                 .iter()
-                .find(|n| &n.name == co3)
-                .ok_or_else(|| format!("ecp5 pack: Carry4 {}: CO3 net vanished", cell.name))?;
-            let allowed_ci = next[i].map(|n| cells[n].name.as_str());
+                .find(|n| n.name == intern(co3))
+                .ok_or_else(|| format!("ecp5 pack: Carry4 {}: CO3 net vanished", resolve(cell.name)))?;
+            let allowed_ci = next[i].map(|n| resolve(cells[n].name));
             for e in &net.endpoints {
-                if e.cell == cell.name && e.pin == "CO3" {
+                if e.cell == cell.name && e.pin == intern("CO3") {
                     continue;
                 }
-                if e.pin == "CI" && Some(e.cell.as_str()) == allowed_ci {
+                if e.pin == intern("CI") && Some(resolve(e.cell)) == allowed_ci {
                     continue;
                 }
                 return Err(format!(
                     "ecp5 pack: Carry4 {}: CO[3] net '{co3}' drives {}.{} which is not the \
                      chained carry; the chain-top carry is not routable to fabric in v1",
-                    cell.name, e.cell, e.pin
+                    resolve(cell.name), resolve(e.cell), resolve(e.pin)
                 ));
             }
         }
@@ -868,7 +879,7 @@ fn emit_alu_chains(
             if in_chain[nxt] {
                 return Err(format!(
                     "ecp5 pack: Carry4 {}: carry chain cycle detected",
-                    cells[nxt].name
+                    resolve(cells[nxt].name)
                 ));
             }
             chain.push(nxt);
@@ -881,7 +892,7 @@ fn emit_alu_chains(
         if !in_chain[i] {
             return Err(format!(
                 "ecp5 pack: Carry4 {}: carry chain has no head (cycle or dangling CI)",
-                cell.name
+                resolve(cell.name)
             ));
         }
     }
@@ -894,10 +905,10 @@ fn emit_alu_chains(
         for &ci in chain {
             let cell = &cells[ci];
             for b in 0..4 {
-                let s_net = match cell.s[b].as_deref() {
+                let s_net = match cell.s[b].as_deref().map(|s| intern(s)) {
                     Some(n) if is_const1(Some(n)) => consts.net(true, out),
                     Some(n) if is_const0(Some(n)) => consts.net(false, out),
-                    Some(n) => n.to_string(),
+                    Some(n) => resolve(n).to_string(),
                     None => consts.net(false, out),
                 };
                 let carry_net = if bit == 0 {
@@ -915,9 +926,9 @@ fn emit_alu_chains(
                 // CCU2 carry path directly.
                 let o_net = cell.o[b]
                     .clone()
-                    .unwrap_or_else(|| format!("{}${b}$o", cell.name));
+                    .unwrap_or_else(|| format!("{}${b}$o", resolve(cell.name)));
                 out.luts.push(PackedEcp5Lut {
-                    name: format!("{}${b}$alu", cell.name),
+                    name: format!("{}${b}$alu", resolve(cell.name)),
                     init: 0x6666, // A ^ B
                     input_nets: [Some(s_net), Some(carry_net), None, None],
                     output_net: o_net,
