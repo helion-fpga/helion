@@ -9,7 +9,7 @@
 //!   `SB_PLL40*` becomes a PLL.
 //! - `Mac27` and `Ila` are loud errors: HX8K has no DSP blocks and no ILA.
 
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 
 /// A packed iCE40 LUT4 (one logic cell, combinational).
 #[derive(Clone, Debug)]
@@ -350,20 +350,20 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
     for cell in &netlist.cells {
         match &cell.kind {
             CellKind::Carry4 => {
-                carry_cells.push(parse_carry4(&cell.name, &pins, netlist)?);
+                carry_cells.push(parse_carry4(resolve(cell.name), &pins, netlist)?);
             }
             CellKind::Lut6 { init } => {
                 let mut inputs: [Option<String>; 6] = Default::default();
                 for (i, slot) in inputs.iter_mut().enumerate() {
                     *slot = pins
-                        .net_on(&cell.name, &format!("I{i}"))
-                        .map(|s| s.to_string());
+                        .net_on(resolve(cell.name), &format!("I{i}"))
+                        .map(|s| resolve(s).to_string());
                 }
-                let output_net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("pack: LUT {} has no O net", cell.name))?
-                    .to_string();
-                let mut luts = decompose_lut6(&cell.name, *init, &inputs)?;
+                let output_net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("pack: LUT {} has no O net", resolve(cell.name)))?)
+                .to_string();
+                let mut luts = decompose_lut6(resolve(cell.name), *init, &inputs)?;
                 // Rename the top output net to the real one.
                 if let Some(top) = luts.last_mut() {
                     top.output_net = output_net;
@@ -372,28 +372,28 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
             }
             CellKind::Hff => {
                 let need = |pin: &str| {
-                    pins.net_on(&cell.name, pin)
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| format!("pack: FF {} has no {pin} net", cell.name))
+                    pins.net_on(resolve(cell.name), pin)
+                        .map(|s| resolve(s).to_string())
+                        .ok_or_else(|| format!("pack: FF {} has no {pin} net", resolve(cell.name)))
                 };
                 out.ffs.push(PackedFf {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     d_net: need("D")?,
                     q_net: need("Q")?,
                     clk_net: need("CLK")?,
                 });
             }
             CellKind::IobOut => {
-                let net = pins
-                    .net_on(&cell.name, "I")
-                    .ok_or_else(|| format!("pack: OBUF {} has no I net", cell.name))?
-                    .to_string();
-                let port = pins
-                    .net_on(&cell.name, "PAD")
-                    .unwrap_or(&cell.name)
-                    .to_string();
+                let net = resolve(pins
+                    .net_on(resolve(cell.name), "I")
+                    .ok_or_else(|| format!("pack: OBUF {} has no I net", resolve(cell.name)))?)
+                .to_string();
+                let port = resolve(pins
+                    .net_on(resolve(cell.name), "PAD")
+                    .unwrap_or(cell.name))
+                .to_string();
                 out.ios.push(PackedIo {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     pin: resolve_pin(netlist, &port)?,
                     port,
                     dir: IoDir::Out,
@@ -401,16 +401,16 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                 });
             }
             CellKind::IobIn => {
-                let net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("pack: IBUF {} has no O net", cell.name))?
-                    .to_string();
-                let port = pins
-                    .net_on(&cell.name, "PAD")
-                    .unwrap_or(&cell.name)
-                    .to_string();
+                let net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("pack: IBUF {} has no O net", resolve(cell.name)))?)
+                .to_string();
+                let port = resolve(pins
+                    .net_on(resolve(cell.name), "PAD")
+                    .unwrap_or(cell.name))
+                .to_string();
                 out.ios.push(PackedIo {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     pin: resolve_pin(netlist, &port)?,
                     port,
                     dir: IoDir::In,
@@ -418,61 +418,61 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                 });
             }
             CellKind::ClockBuf => {
-                let in_net = pins
-                    .net_on(&cell.name, "I")
-                    .ok_or_else(|| format!("pack: CLKBUF {} has no I net", cell.name))?
-                    .to_string();
-                let out_net = pins
-                    .net_on(&cell.name, "O")
-                    .ok_or_else(|| format!("pack: CLKBUF {} has no O net", cell.name))?
-                    .to_string();
+                let in_net = resolve(pins
+                    .net_on(resolve(cell.name), "I")
+                    .ok_or_else(|| format!("pack: CLKBUF {} has no I net", resolve(cell.name)))?)
+                .to_string();
+                let out_net = resolve(pins
+                    .net_on(resolve(cell.name), "O")
+                    .ok_or_else(|| format!("pack: CLKBUF {} has no O net", resolve(cell.name)))?)
+                .to_string();
                 out.clks.push(PackedClk {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     in_net,
                     out_net,
                 });
             }
             CellKind::Bram18 => {
-                out.rams.push(pack_ram(&cell.name, &pins, &cell.attrs)?);
+                out.rams.push(pack_ram(resolve(cell.name), &pins, &cell.attrs)?);
             }
-            CellKind::BlackBox { module } if module.starts_with("SB_PLL40") => {
-                let kind = if module.contains("PAD") {
+            CellKind::BlackBox { module } if resolve(*module).starts_with("SB_PLL40") => {
+                let kind = if resolve(*module).contains("PAD") {
                     PllKind::Pad
                 } else {
                     PllKind::Core
                 };
-                let ref_net = pins
-                    .net_on(&cell.name, "REFERENCECLK")
-                    .or_else(|| pins.net_on(&cell.name, "I"))
-                    .ok_or_else(|| format!("pack: PLL {} has no clock input", cell.name))?
-                    .to_string();
-                let out_net = pins
-                    .net_on(&cell.name, "PLLOUTGLOBAL")
-                    .or_else(|| pins.net_on(&cell.name, "O"))
-                    .ok_or_else(|| format!("pack: PLL {} has no output", cell.name))?
-                    .to_string();
+                let ref_net = resolve(pins
+                    .net_on(resolve(cell.name), "REFERENCECLK")
+                    .or_else(|| pins.net_on(resolve(cell.name), "I"))
+                    .ok_or_else(|| format!("pack: PLL {} has no clock input", resolve(cell.name)))?)
+                .to_string();
+                let out_net = resolve(pins
+                    .net_on(resolve(cell.name), "PLLOUTGLOBAL")
+                    .or_else(|| pins.net_on(resolve(cell.name), "O"))
+                    .ok_or_else(|| format!("pack: PLL {} has no output", resolve(cell.name)))?)
+                .to_string();
                 let out_freq_hz = match cell.attrs.get("FREQ") {
-                    Some(v) => parse_pll_freq(&cell.name, "FREQ", v)?,
+                    Some(v) => parse_pll_freq(resolve(cell.name), "FREQ", v)?,
                     None => {
                         return Err(format!(
                             "pack: PLL {} needs a FREQ attribute (desired output frequency in Hz)",
-                            cell.name
+                            resolve(cell.name)
                         ))
                     }
                 };
                 let ref_freq_hz = match cell.attrs.get("REF_FREQ") {
-                    Some(v) => parse_pll_freq(&cell.name, "REF_FREQ", v)?,
+                    Some(v) => parse_pll_freq(resolve(cell.name), "REF_FREQ", v)?,
                     None => {
                         return Err(format!(
                             "pack: PLL {} needs a REF_FREQ attribute (reference clock frequency in Hz)",
-                            cell.name
+                            resolve(cell.name)
                         ))
                     }
                 };
                 let (divr, divf, divq, filter_range) =
-                    pll_dividers(&cell.name, ref_freq_hz, out_freq_hz)?;
+                    pll_dividers(resolve(cell.name), ref_freq_hz, out_freq_hz)?;
                 out.plls.push(PackedPll {
-                    name: cell.name.clone(),
+                    name: resolve(cell.name).to_string(),
                     kind,
                     ref_net,
                     out_net,
@@ -487,19 +487,19 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
             CellKind::Mac27 => {
                 return Err(format!(
                     "pack: MAC27 {} unsupported: iCE40 HX8K has no DSP blocks",
-                    cell.name
+                    resolve(cell.name)
                 ));
             }
             CellKind::Ila { .. } => {
                 return Err(format!(
                     "pack: ILA {} unsupported on the iCE40 backend",
-                    cell.name
+                    resolve(cell.name)
                 ));
             }
             other => {
                 return Err(format!(
                     "pack: unsupported CellKind {other:?} for iCE40 (cell {})",
-                    cell.name
+                    resolve(cell.name)
                 ));
             }
         }
@@ -525,7 +525,7 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
 
 /// Resolve a top-level port to a CT256 package pin.
 fn resolve_pin(netlist: &Design, port: &str) -> Result<String, String> {
-    if let Some(def) = netlist.ports.iter().find(|p| p.name == port) {
+    if let Some(def) = netlist.ports.iter().find(|p| p.name == intern(port)) {
         if let Some(loc) = def.attrs.get("LOC") {
             return Ok(loc.to_string());
         }
@@ -617,8 +617,8 @@ fn pack_ram(
             if i < n {
                 *slot = pins
                     .net_on(name, &format!("{prefix}{i}"))
-                    .unwrap_or("gnd")
-                    .to_string();
+                    .map(|s| resolve(s).to_string())
+                    .unwrap_or("gnd".to_string());
             } else {
                 *slot = "gnd".to_string();
             }
@@ -630,14 +630,14 @@ fn pack_ram(
         for (i, slot) in arr.iter_mut().enumerate() {
             *slot = pins
                 .net_on(name, &format!("{prefix}{i}"))
-                .unwrap_or("gnd")
-                .to_string();
+                .map(|s| resolve(s).to_string())
+                .unwrap_or("gnd".to_string());
         }
         Ok(arr)
     };
     let need = |pin: &str| {
         pins.net_on(name, pin)
-            .map(|s| s.to_string())
+            .map(|s| resolve(s).to_string())
             .ok_or_else(|| format!("pack: RAM {name} has no {pin} net"))
     };
     Ok(PackedRam {
@@ -666,8 +666,8 @@ fn pack_ram(
         waddr_net: addr("WADDR")?,
         rclk_net: need("RCLK").unwrap_or_else(|_| "gnd".to_string()),
         wclk_net: need("WCLK").unwrap_or_else(|_| "gnd".to_string()),
-        re_net: pins.net_on(name, "RE").map(|s| s.to_string()),
-        we_net: pins.net_on(name, "WE").map(|s| s.to_string()),
+        re_net: pins.net_on(name, "RE").map(|s| resolve(s).to_string()),
+        we_net: pins.net_on(name, "WE").map(|s| resolve(s).to_string()),
     })
 }
 
@@ -709,7 +709,7 @@ enum CarryIn {
 /// A parsed Carry4 cell; per-bit nets are `None` when unconnected
 /// (treated as constant 0).
 struct Carry4Data {
-    name: String,
+    name: helion_ir::Spur,
     cin: CarryIn,
     s: [Option<String>; 4],
     di: [Option<String>; 4],
@@ -717,24 +717,33 @@ struct Carry4Data {
     co: [Option<String>; 4],
 }
 
-fn is_const1(net: Option<&str>) -> bool {
-    matches!(net, Some("1" | "vcc" | "VCC" | "$true"))
+fn is_const1(net: Option<helion_ir::Spur>) -> bool {
+    matches!(net, Some(s) if {
+        let r = resolve(s);
+        r == "1" || r == "vcc" || r == "VCC" || r == "$true"
+    })
 }
 
-fn is_const0(net: Option<&str>) -> bool {
-    matches!(net, None | Some("0" | "gnd" | "GND" | "$false"))
+fn is_const0(net: Option<helion_ir::Spur>) -> bool {
+    match net {
+        None => true,
+        Some(s) => {
+            let r = resolve(s);
+            r == "0" || r == "gnd" || r == "GND" || r == "$false"
+        }
+    }
 }
 
 /// Find the Carry4 cell driving `net` via its CO[3] pin.
-fn carry_co3_driver(netlist: &Design, net: &str) -> Option<String> {
+fn carry_co3_driver(netlist: &Design, net: helion_ir::Spur) -> Option<String> {
     let n = netlist.nets.iter().find(|n| n.name == net)?;
     for e in &n.endpoints {
-        if e.pin != "CO3" {
+        if e.pin != intern("CO3") {
             continue;
         }
         if let Some(cell) = netlist.cells.iter().find(|c| c.name == e.cell) {
             if matches!(cell.kind, CellKind::Carry4) {
-                return Some(cell.name.clone());
+                return Some(resolve(cell.name).to_string());
             }
         }
     }
@@ -782,11 +791,11 @@ impl ConstDrivers {
     }
 
     /// Resolve a maybe-constant net to a driven net name.
-    fn resolve(&mut self, net: Option<&str>, out: &mut PackedIce) -> String {
+    fn resolve(&mut self, net: Option<helion_ir::Spur>, out: &mut PackedIce) -> String {
         match net {
             Some(n) if is_const1(Some(n)) => self.one(out),
             Some(n) if is_const0(Some(n)) => self.zero(out),
-            Some(n) => n.to_string(),
+            Some(n) => resolve(n).to_string(),
             // Unconnected counts as constant 0.
             None => self.zero(out),
         }
@@ -825,8 +834,9 @@ fn parse_carry4(
         }
         let prev = carry_co3_driver(netlist, ci_net).ok_or_else(|| {
             format!(
-                "pack: Carry4 {name}: CI net '{ci_net}' is not driven by a Carry4 CO[3]; \
-                 iCE40 carry_in supports only constant 0/1 or a chained carry"
+                "pack: Carry4 {name}: CI net '{}' is not driven by a Carry4 CO[3]; \
+                 iCE40 carry_in supports only constant 0/1 or a chained carry",
+                resolve(ci_net)
             )
         })?;
         if prev == name {
@@ -847,10 +857,10 @@ fn parse_carry4(
     let mut o: [Option<String>; 4] = Default::default();
     let mut co: [Option<String>; 4] = Default::default();
     for i in 0..4 {
-        s[i] = pins.net_on(name, &format!("S{i}")).map(|n| n.to_string());
-        di[i] = pins.net_on(name, &format!("DI{i}")).map(|n| n.to_string());
-        o[i] = pins.net_on(name, &format!("O{i}")).map(|n| n.to_string());
-        co[i] = pins.net_on(name, &format!("CO{i}")).map(|n| n.to_string());
+        s[i] = pins.net_on(name, &format!("S{i}")).map(|n| resolve(n).to_string());
+        di[i] = pins.net_on(name, &format!("DI{i}")).map(|n| resolve(n).to_string());
+        o[i] = pins.net_on(name, &format!("O{i}")).map(|n| resolve(n).to_string());
+        co[i] = pins.net_on(name, &format!("CO{i}")).map(|n| resolve(n).to_string());
     }
     // CO[0..2] are internal to the dedicated chain; cout is not routable to
     // general fabric, so observing them is unrepresentable.
@@ -863,7 +873,7 @@ fn parse_carry4(
         }
     }
     Ok(Carry4Data {
-        name: name.to_string(),
+        name: intern(name),
         cin,
         s,
         di,
@@ -882,7 +892,7 @@ fn emit_carry_chains(
     let idx: std::collections::HashMap<&str, usize> = cells
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.name.as_str(), i))
+        .map(|(i, c)| (resolve(c.name), i))
         .collect();
     // next[i] = cell chained after i via CO[3] -> CI.
     let mut next: Vec<Option<usize>> = vec![None; cells.len()];
@@ -891,14 +901,14 @@ fn emit_carry_chains(
             let &pi = idx.get(prev_name.as_str()).ok_or_else(|| {
                 format!(
                     "pack: Carry4 {}: previous cell '{prev_name}' not found",
-                    cell.name
+                    resolve(cell.name)
                 )
             })?;
             if next[pi].is_some() {
                 return Err(format!(
                     "pack: Carry4 {}: CO[3] fans out to multiple carry chains; \
                      the dedicated carry wire is point-to-point",
-                    cells[pi].name
+                    resolve(cells[pi].name)
                 ));
             }
             next[pi] = Some(i);
@@ -910,20 +920,20 @@ fn emit_carry_chains(
             let net = netlist
                 .nets
                 .iter()
-                .find(|n| &n.name == co3)
-                .ok_or_else(|| format!("pack: Carry4 {}: CO3 net vanished", cell.name))?;
-            let allowed_ci = next[i].map(|n| cells[n].name.as_str());
+                .find(|n| n.name == intern(co3))
+                .ok_or_else(|| format!("pack: Carry4 {}: CO3 net vanished", resolve(cell.name)))?;
+            let allowed_ci = next[i].map(|n| resolve(cells[n].name));
             for e in &net.endpoints {
-                if e.cell == cell.name && e.pin == "CO3" {
+                if e.cell == cell.name && e.pin == intern("CO3") {
                     continue;
                 }
-                if e.pin == "CI" && Some(e.cell.as_str()) == allowed_ci {
+                if e.pin == intern("CI") && Some(resolve(e.cell)) == allowed_ci {
                     continue;
                 }
                 return Err(format!(
                     "pack: Carry4 {}: CO[3] net '{co3}' drives {}.{} which is not the \
                      chained carry; iCE40 cout is not routable to general fabric",
-                    cell.name, e.cell, e.pin
+                    resolve(cell.name), resolve(e.cell), resolve(e.pin)
                 ));
             }
         }
@@ -943,7 +953,7 @@ fn emit_carry_chains(
             if in_chain[nxt] {
                 return Err(format!(
                     "pack: Carry4 {}: carry chain cycle detected",
-                    cells[nxt].name
+                    resolve(cells[nxt].name)
                 ));
             }
             chain.push(nxt);
@@ -956,7 +966,7 @@ fn emit_carry_chains(
         if !in_chain[i] {
             return Err(format!(
                 "pack: Carry4 {}: carry chain has no head (cycle or dangling CI)",
-                cell.name
+                resolve(cell.name)
             ));
         }
     }
@@ -970,8 +980,8 @@ fn emit_carry_chains(
         for &ci in chain {
             let cell = &cells[ci];
             for bit in 0..4 {
-                let s = cell.s[bit].as_deref();
-                let di = cell.di[bit].as_deref();
+                let s = cell.s[bit].as_deref().map(|s| intern(s));
+                let di = cell.di[bit].as_deref().map(|s| intern(s));
                 let s_net = consts.resolve(s, out);
                 let di_net = consts.resolve(di, out);
                 // in_2 = S[i] ^ DI[i]; constant-fold the trivial cases.
@@ -980,9 +990,9 @@ fn emit_carry_chains(
                 } else if is_const0(di) {
                     s_net.clone()
                 } else {
-                    let xor_out = format!("{}${bit}$xor", cell.name);
+                    let xor_out = format!("{}${bit}$xor", resolve(cell.name));
                     out.luts.push(PackedLut {
-                        name: format!("{}${bit}$xor", cell.name),
+                        name: format!("{}${bit}$xor", resolve(cell.name)),
                         init: 0x6666, // in_0 ^ in_1
                         input_nets: [Some(di_net.clone()), Some(s_net.clone()), None, None],
                         output_net: xor_out.clone(),
@@ -995,15 +1005,15 @@ fn emit_carry_chains(
                 // in_3 carry buffer.
                 let o_net = cell.o[bit]
                     .clone()
-                    .unwrap_or_else(|| format!("{}${bit}$o", cell.name));
+                    .unwrap_or_else(|| format!("{}${bit}$o", resolve(cell.name)));
                 out.luts.push(PackedLut {
-                    name: format!("{}${bit}$sum", cell.name),
+                    name: format!("{}${bit}$sum", resolve(cell.name)),
                     init: 0x55AA, // in_0 ^ in_3
                     input_nets: [
                         Some(s_net),
                         Some(di_net),
                         Some(x_net),
-                        Some(format!("{}${bit}$cin", cell.name)),
+                        Some(format!("{}${bit}$cin", resolve(cell.name))),
                     ],
                     output_net: o_net,
                     carry: Some(CarryCell {
