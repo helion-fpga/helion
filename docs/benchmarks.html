@@ -5,7 +5,7 @@
   <meta name="theme-color" content="#0a0c10" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Helion benchmarks: measured, not claimed</title>
-  <meta name="description" content="Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5 on 10 real designs, identical RTL. Real numbers with the caveats printed next to them." />
+  <meta name="description" content="Helion v3.0.0 vs Yosys 0.33 synthesis benchmarks on real RISC-V designs, plus v2.0.5 full-flow numbers. Real numbers with the caveats printed next to them." />
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -35,10 +35,43 @@
       <section class="section">
         <h1>Benchmarks</h1>
         <p class="lede">
-          10 real designs, identical RTL, Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5,
-          measured 2026-10-10. Helion targeted its HL10T die (8,192 LUT6); the baseline
-          targeted a Lattice LFE5U-25F (24k LUT4). Every number below is measured.
-          The caveats are printed next to the numbers, because that is how it should be.
+          Helion v3.0.0 vs Yosys 0.33, synthesis only, generic 6-LUT mapping,
+          measured 2026-10-14 with GNU time (3 runs, median). Same RTL, same target,
+          same stage. Every number below is measured. The caveats are printed next
+          to the numbers, because that is how it should be.
+        </p>
+        <div class="table-wrap"><table>
+          <thead><tr>
+            <th>Design</th><th>Helion time</th><th>Yosys time</th><th>Speedup</th>
+            <th>Helion mem</th><th>Yosys mem</th><th>Helion LUTs</th><th>Yosys LUTs</th>
+          </tr></thead>
+          <tbody>
+            <tr><td>PicoRV32</td><td>1.02 s</td><td>9.12 s</td><td><strong>8.9x</strong></td><td>31 MB</td><td>63 MB</td><td>1,697</td><td>1,932 (-12%)</td></tr>
+            <tr><td>SERV</td><td>0.06 s</td><td>2.73 s</td><td><strong>45x</strong></td><td>16 MB</td><td>37 MB</td><td>323</td><td>217 (+49%)</td></tr>
+            <tr><td>Ibex</td><td>0.01 s</td><td>0.60 s</td><td><strong>60x</strong></td><td>7 MB</td><td>37 MB</td><td>1,112</td><td>1,110 (tie)</td></tr>
+          </tbody>
+        </table></div>
+        <p>
+          Method: <code>/usr/bin/time -v</code>, 3 runs each, median.
+          Helion: <code>helion synth &lt;design&gt;.v</code> (commit 072b2ce).
+          Yosys: <code>yosys -p "read_verilog &lt;d&gt;.v; synth -top &lt;top&gt;; abc -lut 6; stat"</code>.
+        </p>
+        <p>
+          <strong>Honesty check:</strong> On SERV, Yosys produces 33% fewer LUTs than Helion.
+          That QoR gap is the next optimization target. On PicoRV32 Helion uses 12% fewer LUTs.
+          Speed and memory wins are consistent; area is mixed.
+        </p>
+        <p>
+          <img src="screenshots/benchmark-v3.png" alt="Helion v3.0.0 vs Yosys 0.33: synthesis time, peak memory, and LUT counts across PicoRV32, SERV, and Ibex" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        </p>
+      </section>
+
+      <section class="section">
+        <h2>v2.0.5 full-flow numbers (2026-10-10)</h2>
+        <p class="lede">
+          10 real designs, identical RTL, Helion v2.0.5 vs Yosys 0.69 + nextpnr-ecp5.
+          Helion targeted its HL10T die (8,192 LUT6); the baseline
+          targeted a Lattice LFE5U-25F (24k LUT4).
         </p>
         <div class="table-wrap wide-table"><table>
           <thead><tr>
