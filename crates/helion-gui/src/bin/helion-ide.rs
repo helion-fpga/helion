@@ -8596,7 +8596,7 @@ fn paint_device(
         ui.horizontal(|ui| {
             if pv.show_display_control {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(234.0, band_h),
+                    egui::vec2(chrome::DEVICE_DISPLAY_CONTROL_W, band_h),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         egui::ScrollArea::vertical()
@@ -8616,7 +8616,11 @@ fn paint_device(
             }
             // Die fills the middle.
             {
-                let insp_w = if pv.show_inspector { 272.0 } else { 30.0 };
+                let insp_w = if pv.show_inspector {
+                    chrome::DEVICE_INSPECTOR_W
+                } else {
+                    chrome::DEVICE_COLLAPSED_STRIP_W
+                };
                 let w = (ui.available_width() - insp_w).max(220.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(w, band_h),
@@ -8628,7 +8632,7 @@ fn paint_device(
             }
             if pv.show_inspector {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(268.0, band_h),
+                    egui::vec2(chrome::DEVICE_INSPECTOR_W, band_h),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         egui::ScrollArea::vertical()
