@@ -7,39 +7,40 @@ pub use opt::LutOptStats;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-use lasso::{Spur, ThreadedRode};
+use lasso::{Spur, ThreadedRodeo};
 
 /// Global string interner for netlist names.
-/// 
+///
 /// Cell names, net names, port names, and pin names are interned as `Spur`
 /// (a `u32` ID) instead of `String`. This eliminates thousands of string
 /// allocations and clones in hot loops:
-/// - `Spur` is `Copy` (4 bytes), `String` is 24 bytes + heap allocation
-/// - `Spur == Spur` is a single u32 compare, `String == String` is O(n)
-/// - No cloning needed, just copy the `Spur`
+/// - `Spur` is `Copy` (4 bytes); `String` is 24 bytes plus a heap allocation.
+/// - `Spur == Spur` is a single u32 compare; `String == String` is O(n).
+/// - No cloning needed: just copy the `Spur`.
 ///
 /// The interner is global because names are created in many places
-/// (parsing, elaboration, optimization) and need to be comparable.
-/// `ThreadedRode` is thread-safe for future parallelization.
-static INTERNER: OnceLock<ThreadedRode> = OnceLock::new();
+/// (parsing, elaboration, optimization) and must be comparable.
+/// `ThreadedRodeo` is thread-safe for future parallelization.
+static INTERNER: OnceLock<ThreadedRodeo> = OnceLock::new();
 
 /// Get the global string interner.
-fn interner() -> &'static ThreadedRode {
-    INTERNER.get_or_init(ThreadedRode::default)
+fn interner() -> &'static ThreadedRodeo {
+    INTERNER.get_or_init(ThreadedRodeo::default)
 }
 
 /// Intern a string, returning its `Spur` ID.
-/// 
-/// If the string was already interned, returns the existing ID.
-/// Otherwise, inserts it and returns the new ID.
+///
+/// Returns the existing ID if the string was already interned.
+#[inline]
 pub fn intern(s: &str) -> Spur {
     interner().get_or_intern(s)
 }
 
 /// Resolve a `Spur` back to its string.
-/// 
-/// Panics if the `Spur` was not interned (should never happen for
-/// valid netlist names).
+///
+/// Panics if the `Spur` was not interned (cannot happen for IDs
+/// produced by [`intern`]).
+#[inline]
 pub fn resolve(s: Spur) -> &'static str {
     interner().resolve(&s)
 }
@@ -97,18 +98,18 @@ impl SoftSpan {
 /// `children` nests child softs (e.g. `child_soft_incomplete` under a parent wrap).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SoftDiag {
-    pub name: String,
-    pub module: String,
+    pub name: Spur,
+    pub module: Spur,
     pub detail: Option<String>,
     pub span: SoftSpan,
     pub children: Vec<SoftDiag>,
 }
 
 impl SoftDiag {
-    pub fn new(name: impl Into<String>, module: impl Into<String>) -> Self {
+    pub fn new(name: &str, module: &str) -> Self {
         Self {
-            name: name.into(),
-            module: module.into(),
+            name: intern(name),
+            module: intern(module),
             detail: None,
             span: SoftSpan::default(),
             children: Vec::new(),
@@ -131,7 +132,7 @@ impl SoftDiag {
 
     /// One-line table row (headless / Reports). Does not claim PASS.
     pub fn table_line(&self) -> String {
-        let mut s = format!("soft name={} module={}", self.name, self.module);
+        let mut s = format!("soft name={} module={}", resolve(self.name), resolve(self.module));
         if let Some(d) = &self.detail {
             s.push_str(&format!(" detail={d}"));
         }
@@ -195,7 +196,7 @@ pub type NetlistIr = Design;
 
 #[derive(Clone, Debug)]
 pub struct Design {
-    pub name: String,
+    pub name: Spur,
     pub ports: Vec<Port>,
     pub cells: Vec<Cell>,
     pub nets: Vec<Net>,
@@ -203,16 +204,16 @@ pub struct Design {
     pub attrs: Attrs,
     /// Name → index in `nets`. `connect` / `merge_net` keep this in sync so
     /// Ibex-scale stitch is O(1) per net, not a linear scan of every net.
-    net_ix: HashMap<String, usize>,
+    net_ix: HashMap<Spur, usize>,
     /// cell → pin → net index. Makes `net_on` O(1) instead of scanning every net.
-    pin_ix: HashMap<String, HashMap<String, usize>>,
+    pin_ix: HashMap<Spur, HashMap<Spur, usize>>,
     /// Name → index in `cells`.
-    cell_ix: HashMap<String, usize>,
+    cell_ix: HashMap<Spur, usize>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Port {
-    pub name: String,
+    pub name: Spur,
     pub dir: PortDir,
     pub attrs: Attrs,
 }
@@ -226,7 +227,7 @@ pub enum PortDir {
 
 #[derive(Clone, Debug)]
 pub struct Cell {
-    pub name: String,
+    pub name: Spur,
     pub kind: CellKind,
     pub attrs: Attrs,
 }
@@ -251,7 +252,7 @@ pub enum CellKind {
     /// DSP MAC27 (pre-add * mul + acc). Site primitive.
     Mac27,
     /// Inserted ILA core capturing `net`.
-    Ila { net: String },
+    Ila { net: Spur },
     /// Block RAM 18Kb (true dual-port primitive).
     Bram18,
     /// Xilinx 7-series CARRY4 fast carry chain (4 bits). Backend-neutral
@@ -260,27 +261,27 @@ pub enum CellKind {
     /// instantiated Carry4 cells are packed.
     Carry4,
     /// Hierarchical black box (unelaborated IP / DFX partition).
-    BlackBox { module: String },
+    BlackBox { module: Spur },
 }
 
 #[derive(Clone, Debug)]
 pub struct Net {
-    pub name: String,
+    pub name: Spur,
     pub endpoints: Vec<Endpoint>,
     pub attrs: Attrs,
 }
 
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    pub cell: String,
-    pub pin: String,
+    pub cell: Spur,
+    pub pin: Spur,
 }
 
 #[derive(Clone, Debug)]
 pub struct Instance {
-    pub name: String,
-    pub module: String,
-    pub conns: Vec<(String, String)>,
+    pub name: Spur,
+    pub module: Spur,
+    pub conns: Vec<(Spur, Spur)>,
     pub attrs: Attrs,
 }
 
@@ -294,20 +295,20 @@ pub const INC4_INIT: [u64; 4] = [
 ];
 
 /// Fast (cell, pin) → net lookup built by [`Design::pin_index`].
-pub struct PinIndex<'a> {
-    pin_to_net: HashMap<(&'a str, &'a str), &'a str>,
+pub struct PinIndex {
+    pin_to_net: HashMap<(Spur, Spur), Spur>,
 }
 
-impl<'a> PinIndex<'a> {
-    pub fn net_on(&self, cell: &str, pin: &str) -> Option<&'a str> {
+impl PinIndex {
+    pub fn net_on(&self, cell: Spur, pin: Spur) -> Option<Spur> {
         self.pin_to_net.get(&(cell, pin)).copied()
     }
 }
 
 impl Design {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
-            name: name.into(),
+            name: intern(name),
             ports: Vec::new(),
             cells: Vec::new(),
             nets: Vec::new(),
@@ -377,11 +378,11 @@ impl Design {
         }
     }
 
-    fn index_pin(&mut self, cell: &str, pin: &str, net_i: usize) {
+    fn index_pin(&mut self, cell: Spur, pin: Spur, net_i: usize) {
         self.pin_ix
-            .entry(cell.to_string())
+            .entry(cell)
             .or_default()
-            .insert(pin.to_string(), net_i);
+            .insert(pin, net_i);
     }
 
     /// Merge `net` into this design by name (O(1) index). Used by hierarchy stitch.
@@ -389,7 +390,7 @@ impl Design {
         self.ensure_net_ix();
         if let Some(&i) = self.net_ix.get(&net.name) {
             for e in &net.endpoints {
-                self.index_pin(&e.cell, &e.pin, i);
+                self.index_pin(e.cell, e.pin, i);
             }
             self.nets[i].endpoints.extend(net.endpoints);
             return;
@@ -397,22 +398,22 @@ impl Design {
         let i = self.nets.len();
         self.net_ix.insert(net.name.clone(), i);
         for e in &net.endpoints {
-            self.index_pin(&e.cell, &e.pin, i);
+            self.index_pin(e.cell, e.pin, i);
         }
         self.nets.push(net);
     }
 
-    pub fn add_port(&mut self, name: impl Into<String>, dir: PortDir) {
+    pub fn add_port(&mut self, name: &str, dir: PortDir) {
         self.ports.push(Port {
-            name: name.into(),
+            name: intern(name),
             dir,
             attrs: Attrs::default(),
         });
     }
 
-    pub fn add_cell(&mut self, name: impl Into<String>, kind: CellKind) {
+    pub fn add_cell(&mut self, name: &str, kind: CellKind) {
         self.push_cell(Cell {
-            name: name.into(),
+            name: intern(name),
             kind,
             attrs: Attrs::default(),
         });
@@ -436,10 +437,10 @@ impl Design {
         }
     }
 
-    pub fn add_instance(&mut self, name: impl Into<String>, module: impl Into<String>) {
+    pub fn add_instance(&mut self, name: &str, module: &str) {
         self.instances.push(Instance {
-            name: name.into(),
-            module: module.into(),
+            name: intern(name),
+            module: intern(module),
             conns: Vec::new(),
             attrs: Attrs::default(),
         });
@@ -447,22 +448,22 @@ impl Design {
 
     pub fn connect(
         &mut self,
-        net: impl Into<String>,
-        cell: impl Into<String>,
-        pin: impl Into<String>,
+        net: &str,
+        cell: &str,
+        pin: &str,
     ) {
-        let net_name = net.into();
+        let net_name = intern(net);
         self.ensure_net_ix();
-        let cell = cell.into();
-        let pin = pin.into();
+        let cell = intern(cell);
+        let pin = intern(pin);
         if let Some(&i) = self.net_ix.get(&net_name) {
-            self.index_pin(&cell, &pin, i);
+            self.index_pin(cell, pin, i);
             self.nets[i].endpoints.push(Endpoint { cell, pin });
             return;
         }
         let i = self.nets.len();
-        self.net_ix.insert(net_name.clone(), i);
-        self.index_pin(&cell, &pin, i);
+        self.net_ix.insert(net_name, i);
+        self.index_pin(cell, pin, i);
         self.nets.push(Net {
             name: net_name,
             endpoints: vec![Endpoint { cell, pin }],
@@ -470,58 +471,63 @@ impl Design {
         });
     }
 
-    pub fn net_on(&self, cell: &str, pin: &str) -> Option<&str> {
-        if let Some(&i) = self.pin_ix.get(cell).and_then(|m| m.get(pin)) {
-            return self.nets.get(i).map(|n| n.name.as_str());
+    pub fn net_on(&self, cell: Spur, pin: Spur) -> Option<Spur> {
+        if let Some(&i) = self.pin_ix.get(&cell).and_then(|m| m.get(&pin)) {
+            return self.nets.get(i).map(|n| n.name);
         }
         self.nets.iter().find_map(|n| {
             n.endpoints
                 .iter()
                 .any(|e| e.cell == cell && e.pin == pin)
-                .then_some(n.name.as_str())
+                .then_some(n.name)
         })
     }
 
     /// O(|endpoints|) index for repeated `net_on` (Ibex-scale pack).
-    pub fn pin_index(&self) -> PinIndex<'_> {
+    pub fn pin_index(&self) -> PinIndex {
         let mut pin_to_net =
             HashMap::with_capacity(self.nets.iter().map(|n| n.endpoints.len()).sum());
         for n in &self.nets {
             for e in &n.endpoints {
-                pin_to_net.insert((e.cell.as_str(), e.pin.as_str()), n.name.as_str());
+                pin_to_net.insert((e.cell, e.pin), n.name);
             }
         }
         PinIndex { pin_to_net }
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {
-        if let Some(&i) = self.cell_ix.get(name) {
-            return self.cells.get(i).filter(|c| c.name == name);
+        let key = intern(name);
+        if let Some(&i) = self.cell_ix.get(&key) {
+            return self.cells.get(i).filter(|c| c.name == key);
         }
-        self.cells.iter().find(|c| c.name == name)
+        self.cells.iter().find(|c| c.name == key)
     }
 
     pub fn cell_mut(&mut self, name: &str) -> Option<&mut Cell> {
         self.ensure_cell_ix();
-        let i = *self.cell_ix.get(name)?;
+        let key = intern(name);
+        let i = *self.cell_ix.get(&key)?;
         self.cells.get_mut(i)
     }
 
     pub fn net(&self, name: &str) -> Option<&Net> {
-        if let Some(&i) = self.net_ix.get(name) {
-            return self.nets.get(i).filter(|n| n.name == name);
+        let key = intern(name);
+        if let Some(&i) = self.net_ix.get(&key) {
+            return self.nets.get(i).filter(|n| n.name == key);
         }
-        self.nets.iter().find(|n| n.name == name)
+        self.nets.iter().find(|n| n.name == key)
     }
 
     pub fn net_mut(&mut self, name: &str) -> Option<&mut Net> {
         self.ensure_net_ix();
-        let i = *self.net_ix.get(name)?;
+        let key = intern(name);
+        let i = *self.net_ix.get(&key)?;
         self.nets.get_mut(i)
     }
 
     pub fn port_mut(&mut self, name: &str) -> Option<&mut Port> {
-        self.ports.iter_mut().find(|p| p.name == name)
+        let key = intern(name);
+        self.ports.iter_mut().find(|p| p.name == key)
     }
 
     pub fn set_cell_attr(
@@ -604,40 +610,40 @@ impl Design {
             .collect()
     }
 
-    pub fn marked_debug_nets(&self) -> Vec<String> {
+    pub fn marked_debug_nets(&self) -> Vec<Spur> {
         self.nets
             .iter()
             .filter(|n| n.attrs.flag("mark_debug"))
-            .map(|n| n.name.clone())
+            .map(|n| n.name)
             .collect()
     }
 
     /// Prefix all cell/net names (hierarchy flatten).
     pub fn prefix(&mut self, pfx: &str) {
         for c in &mut self.cells {
-            c.name = format!("{pfx}{}", c.name);
+            c.name = intern(&format!("{pfx}{}", resolve(c.name)));
         }
         for n in &mut self.nets {
-            n.name = format!("{pfx}{}", n.name);
+            n.name = intern(&format!("{pfx}{}", resolve(n.name)));
             for e in &mut n.endpoints {
-                e.cell = format!("{pfx}{}", e.cell);
+                e.cell = intern(&format!("{pfx}{}", resolve(e.cell)));
             }
         }
         for i in &mut self.instances {
-            i.name = format!("{pfx}{}", i.name);
+            i.name = intern(&format!("{pfx}{}", resolve(i.name)));
         }
         self.rebuild_indexes();
     }
 
     /// Inline `child` as instance `inst`. Port `conns` map child-port → parent-net.
-    pub fn instantiate(&mut self, inst: &str, mut child: Design, conns: &[(String, String)]) {
+    pub fn instantiate(&mut self, inst: &str, mut child: Design, conns: &[(Spur, Spur)]) {
         let pfx = format!("{inst}_");
         child.prefix(&pfx);
         for (cport, pnet) in conns {
-            let cname = format!("{pfx}{cport}");
+            let cname = intern(&format!("{pfx}{}", resolve(*cport)));
             for n in &mut child.nets {
                 if n.name == cname {
-                    n.name = pnet.clone();
+                    n.name = *pnet;
                 }
             }
         }
@@ -647,7 +653,7 @@ impl Design {
         }
         self.rebuild_cell_ix();
         self.instances.push(Instance {
-            name: inst.into(),
+            name: intern(inst),
             module: child.name,
             conns: conns.to_vec(),
             attrs: Attrs::default(),
@@ -684,14 +690,14 @@ impl Design {
         d.add_port("clk", PortDir::In);
         d.add_port("led", PortDir::Out);
         for i in 0..4 {
-            d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init: INC4_INIT[i] });
-            d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-            d.connect("clk", format!("u_ff{i}"), "CLK");
-            d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-            d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-            d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
+            d.add_cell(&format!("u_lut{i}"), CellKind::Lut6 { init: INC4_INIT[i] });
+            d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+            d.connect("clk", &format!("u_ff{i}"), "CLK");
+            d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+            d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+            d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
             for pin in 0..=i {
-                d.connect(format!("q{pin}"), format!("u_lut{i}"), format!("I{pin}"));
+                d.connect(&format!("q{pin}"), &format!("u_lut{i}"), &format!("I{pin}"));
             }
         }
         d.add_cell("u_iob", CellKind::IobOut);
@@ -702,7 +708,7 @@ impl Design {
 
     /// Helion Netlist Format text (round-trip with [`from_hnf`]).
     pub fn to_hnf(&self) -> String {
-        let mut s = format!("HNF 1\ndesign {}\n", self.name);
+        let mut s = format!("HNF 1\ndesign {}\n", resolve(self.name));
         for (k, v) in &self.attrs.map {
             s.push_str(&format!("dattr {k} {v}\n"));
         }
@@ -712,50 +718,50 @@ impl Design {
                 PortDir::Out => "out",
                 PortDir::Inout => "inout",
             };
-            s.push_str(&format!("port {} {d}\n", p.name));
+            s.push_str(&format!("port {} {d}\n", resolve(p.name)));
             for (k, v) in &p.attrs.map {
-                s.push_str(&format!("pattr {} {k} {v}\n", p.name));
+                s.push_str(&format!("pattr {} {k} {v}\n", resolve(p.name)));
             }
         }
         for c in &self.cells {
             match &c.kind {
-                CellKind::Lut6 { init } => s.push_str(&format!("cell {} Lut6 {init:#x}\n", c.name)),
-                CellKind::Hff => s.push_str(&format!("cell {} Hff\n", c.name)),
-                CellKind::IobOut => s.push_str(&format!("cell {} IobOut\n", c.name)),
-                CellKind::IobIn => s.push_str(&format!("cell {} IobIn\n", c.name)),
-                CellKind::ClockBuf => s.push_str(&format!("cell {} ClockBuf\n", c.name)),
-                CellKind::Mac27 => s.push_str(&format!("cell {} Mac27\n", c.name)),
-                CellKind::Ila { net } => s.push_str(&format!("cell {} Ila {net}\n", c.name)),
-                CellKind::Bram18 => s.push_str(&format!("cell {} Bram18\n", c.name)),
-                CellKind::Carry4 => s.push_str(&format!("cell {} Carry4\n", c.name)),
+                CellKind::Lut6 { init } => s.push_str(&format!("cell {} Lut6 {init:#x}\n", resolve(c.name))),
+                CellKind::Hff => s.push_str(&format!("cell {} Hff\n", resolve(c.name))),
+                CellKind::IobOut => s.push_str(&format!("cell {} IobOut\n", resolve(c.name))),
+                CellKind::IobIn => s.push_str(&format!("cell {} IobIn\n", resolve(c.name))),
+                CellKind::ClockBuf => s.push_str(&format!("cell {} ClockBuf\n", resolve(c.name))),
+                CellKind::Mac27 => s.push_str(&format!("cell {} Mac27\n", resolve(c.name))),
+                CellKind::Ila { net } => s.push_str(&format!("cell {} Ila {}\n", resolve(c.name), resolve(*net))),
+                CellKind::Bram18 => s.push_str(&format!("cell {} Bram18\n", resolve(c.name))),
+                CellKind::Carry4 => s.push_str(&format!("cell {} Carry4\n", resolve(c.name))),
                 CellKind::BlackBox { module } => {
-                    s.push_str(&format!("cell {} BlackBox {module}\n", c.name))
+                    s.push_str(&format!("cell {} BlackBox {}\n", resolve(c.name), resolve(*module)))
                 }
             }
             for (k, v) in &c.attrs.map {
-                s.push_str(&format!("cattr {} {k} {v}\n", c.name));
+                s.push_str(&format!("cattr {} {k} {v}\n", resolve(c.name)));
             }
         }
         for n in &self.nets {
             let eps: String = n
                 .endpoints
                 .iter()
-                .map(|e| format!("{}/{}", e.cell, e.pin))
+                .map(|e| format!("{}/{}", resolve(e.cell), resolve(e.pin)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            s.push_str(&format!("net {} {eps}\n", n.name));
+            s.push_str(&format!("net {} {eps}\n", resolve(n.name)));
             for (k, v) in &n.attrs.map {
-                s.push_str(&format!("nattr {} {k} {v}\n", n.name));
+                s.push_str(&format!("nattr {} {k} {v}\n", resolve(n.name)));
             }
         }
         for i in &self.instances {
             let c: String = i
                 .conns
                 .iter()
-                .map(|(p, n)| format!("{p}:{n}"))
+                .map(|(p, n)| format!("{}:{}", resolve(*p), resolve(*n)))
                 .collect::<Vec<_>>()
                 .join(",");
-            s.push_str(&format!("inst {} {} {c}\n", i.name, i.module));
+            s.push_str(&format!("inst {} {} {c}\n", resolve(i.name), resolve(i.module)));
         }
         s
     }
@@ -785,7 +791,7 @@ impl Design {
                         "inout" => PortDir::Inout,
                         _ => PortDir::In,
                     };
-                    d.as_mut().ok_or("no design")?.add_port(n, dir);
+                    d.as_mut().ok_or("no design")?.add_port(&n, dir);
                 }
                 "pattr" => {
                     let n = it.next().ok_or("pattr")?;
@@ -812,12 +818,12 @@ impl Design {
                         "IobIn" => CellKind::IobIn,
                         "ClockBuf" => CellKind::ClockBuf,
                         "Mac27" => CellKind::Mac27,
-                        "Ila" => CellKind::Ila { net: rest },
+                        "Ila" => CellKind::Ila { net: intern(&rest) },
                         "Bram18" => CellKind::Bram18,
-                        "BlackBox" => CellKind::BlackBox { module: rest },
+                        "BlackBox" => CellKind::BlackBox { module: intern(&rest) },
                         other => return Err(format!("unknown kind {other}")),
                     };
-                    d.as_mut().ok_or("no design")?.add_cell(n, ck);
+                    d.as_mut().ok_or("no design")?.add_cell(&n, ck);
                 }
                 "cattr" => {
                     let n = it.next().ok_or("cattr")?;
@@ -834,7 +840,7 @@ impl Design {
                     }
                     if des.net(&n).is_none() {
                         des.merge_net(Net {
-                            name: n,
+                            name: intern(&n),
                             endpoints: vec![],
                             attrs: Attrs::default(),
                         });
@@ -850,15 +856,15 @@ impl Design {
                     let n = it.next().ok_or("inst")?.to_string();
                     let m = it.next().ok_or("imod")?.to_string();
                     let mut inst = Instance {
-                        name: n,
-                        module: m,
+                        name: intern(&n),
+                        module: intern(&m),
                         conns: vec![],
                         attrs: Attrs::default(),
                     };
                     if let Some(rest) = it.next() {
                         for pair in rest.split(',') {
                             if let Some((a, b)) = pair.split_once(':') {
-                                inst.conns.push((a.into(), b.into()));
+                                inst.conns.push((intern(a), intern(b)));
                             }
                         }
                     }
@@ -882,10 +888,10 @@ mod tests {
         d.connect("q", "ff", "Q");
         let mut c = d.clone_data();
         assert!(c.cell("ff").is_some());
-        assert_eq!(c.net_on("ff", "Q"), Some("q"));
+        assert_eq!(c.net_on(intern("ff"), intern("Q")), Some(intern("q")));
         c.rebuild_indexes();
-        assert_eq!(c.cell("ff").map(|x| x.name.as_str()), Some("ff"));
-        assert_eq!(c.net_on("ff", "Q"), Some("q"));
+        assert_eq!(c.cell("ff").map(|x| resolve(x.name)), Some("ff"));
+        assert_eq!(c.net_on(intern("ff"), intern("Q")), Some(intern("q")));
     }
 
     #[test]
@@ -893,12 +899,12 @@ mod tests {
         let mut d = Design::new("wide");
         let t0 = std::time::Instant::now();
         for i in 0..20_000u32 {
-            d.add_cell(format!("c{i}"), CellKind::Hff);
-            d.connect(format!("n{i}"), format!("c{i}"), "Q");
+            d.add_cell(&format!("c{i}"), CellKind::Hff);
+            d.connect(&format!("n{i}"), &format!("c{i}"), "Q");
         }
         let ms = t0.elapsed().as_millis();
         assert_eq!(d.nets.len(), 20_000);
-        assert_eq!(d.net("n19999").map(|n| n.name.as_str()), Some("n19999"));
+        assert_eq!(d.net("n19999").map(|n| resolve(n.name)), Some("n19999"));
         assert!(
             ms < 800,
             "connect must stay O(1) per net (HashMap index), took {ms}ms for 20k"
@@ -907,14 +913,14 @@ mod tests {
         let mut hits = 0usize;
         for i in 0..20_000u32 {
             let cell = format!("c{i}");
-            if d.net_on(&cell, "Q").is_some() {
+            if d.net_on(intern(&cell), intern("Q")).is_some() {
                 hits += 1;
             }
         }
         let lookup_ms = t1.elapsed().as_millis();
         assert_eq!(hits, 20_000);
-        assert_eq!(d.net_on("c0", "Q"), Some("n0"));
-        assert_eq!(d.net_on("c19999", "Q"), Some("n19999"));
+        assert_eq!(d.net_on(intern("c0"), intern("Q")), Some(intern("n0")));
+        assert_eq!(d.net_on(intern("c19999"), intern("Q")), Some(intern("n19999")));
         assert!(
             lookup_ms < 800,
             "20k net_on lookups must stay O(1), took {lookup_ms}ms"
@@ -926,21 +932,21 @@ mod tests {
         let mut d = Design::new("merge");
         let t0 = std::time::Instant::now();
         for i in 0..20_000u32 {
-            d.add_cell(format!("c{i}"), CellKind::Hff);
+            d.add_cell(&format!("c{i}"), CellKind::Hff);
             d.merge_net(Net {
-                name: format!("n{i}"),
+                name: intern(&format!("n{i}")),
                 endpoints: vec![Endpoint {
-                    cell: format!("c{i}"),
-                    pin: "Q".into(),
+                    cell: intern(&format!("c{i}")),
+                    pin: intern("Q"),
                 }],
                 attrs: Attrs::default(),
             });
         }
         let merge_ms = t0.elapsed().as_millis();
         assert_eq!(d.nets.len(), 20_000);
-        assert_eq!(d.net_on("c0", "Q"), Some("n0"));
-        assert_eq!(d.net_on("c19999", "Q"), Some("n19999"));
-        assert_eq!(d.cell("c19999").map(|c| c.name.as_str()), Some("c19999"));
+        assert_eq!(d.net_on(intern("c0"), intern("Q")), Some(intern("n0")));
+        assert_eq!(d.net_on(intern("c19999"), intern("Q")), Some(intern("n19999")));
+        assert_eq!(d.cell("c19999").map(|c| resolve(c.name)), Some("c19999"));
         assert!(
             merge_ms < 800,
             "merge_net must stay O(1) per net, took {merge_ms}ms for 20k"
@@ -949,7 +955,7 @@ mod tests {
         let mut top = Design::new("top");
         let t1 = std::time::Instant::now();
         for i in 0..2_000u32 {
-            let mut child = Design::new(format!("m{i}"));
+            let mut child = Design::new(&format!("m{i}"));
             child.add_cell("ff", CellKind::Hff);
             child.connect("q", "ff", "Q");
             top.instantiate(&format!("u{i}"), child, &[]);
@@ -957,7 +963,7 @@ mod tests {
         let inst_ms = t1.elapsed().as_millis();
         assert_eq!(top.cells.len(), 2_000);
         assert!(top.cell("u1999_ff").is_some());
-        assert_eq!(top.net_on("u1999_ff", "Q"), Some("u1999_q"));
+        assert_eq!(top.net_on(intern("u1999_ff"), intern("Q")), Some(intern("u1999_q")));
         assert!(
             inst_ms < 1500,
             "instantiate of 2k children must stay subquadratic, took {inst_ms}ms"
@@ -986,8 +992,8 @@ mod tests {
                 assert_ne!(inits[i], inits[j], "bit {i} INIT must differ from bit {j}");
             }
         }
-        assert_eq!(d.net_on("u_lut3", "I3"), Some("q3"));
-        assert_eq!(d.net_on("u_iob", "I"), Some("q3"));
+        assert_eq!(d.net_on(intern("u_lut3"), intern("I3")), Some(intern("q3")));
+        assert_eq!(d.net_on(intern("u_iob"), intern("I")), Some(intern("q3")));
     }
 
     #[test]
@@ -1006,14 +1012,14 @@ mod tests {
         let text = d.to_hnf();
         assert!(text.starts_with("HNF 1"), "{text}");
         let back = Design::from_hnf(&text).unwrap();
-        assert_eq!(back.name, "blinky");
+        assert_eq!(resolve(back.name), "blinky");
         assert_eq!(back.lut_inits(), d.lut_inits());
         assert!(back.net("q").unwrap().attrs.flag("mark_debug"));
         assert!(back.cell("u_lut").unwrap().attrs.flag("DONT_TOUCH"));
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("LOC"),
@@ -1022,7 +1028,7 @@ mod tests {
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("IOSTANDARD"),
@@ -1031,7 +1037,7 @@ mod tests {
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("DRIVE"),
@@ -1040,7 +1046,7 @@ mod tests {
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("SLEW"),
@@ -1049,7 +1055,7 @@ mod tests {
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("PULLTYPE"),
@@ -1058,7 +1064,7 @@ mod tests {
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("DIFF_TERM"),
@@ -1067,13 +1073,13 @@ mod tests {
         assert_eq!(
             back.ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .unwrap()
                 .attrs
                 .get("IN_TERM"),
             Some("NONE")
         );
-        assert_eq!(back.net_on("u_lut", "I0"), Some("q"));
+        assert_eq!(back.net_on(intern("u_lut"), intern("I0")), Some(intern("q")));
     }
 
     #[test]
@@ -1085,11 +1091,11 @@ mod tests {
         top.instantiate(
             "u0",
             child,
-            &[("clk".into(), "clk".into()), ("led".into(), "led".into())],
+            &[(intern("clk"), intern("clk")), (intern("led"), intern("led"))],
         );
         assert!(top.cell("u0_u_lut").is_some());
         assert!(top.cell("u_lut").is_none());
-        assert_eq!(top.instances[0].module, "blinky");
+        assert_eq!(resolve(top.instances[0].module), "blinky");
         assert!(top.cells.len() >= 3);
     }
 }
@@ -1151,6 +1157,6 @@ mod multibackend_cell_tests {
     #[test]
     fn netlist_ir_alias_is_design() {
         let d: NetlistIr = Design::structural_counter();
-        assert_eq!(d.name, "counter");
+        assert_eq!(resolve(d.name), "counter");
     }
 }

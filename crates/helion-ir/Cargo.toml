@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-lasso = "0.7.3"
+lasso = { version = "0.7.3", features = ["multi-threaded"] }
