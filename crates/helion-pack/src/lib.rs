@@ -1,7 +1,7 @@
 //! Pack logical cells into Helion site primitives (LUTFF + IOB + MAC27 + BRAM18 + ILA).
 
 use helion_device::{Device, Site};
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design, Spur};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -82,64 +82,67 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
         if matches!(c.kind, CellKind::IobIn) {
             return Err(format!(
                 "cell {} is IobIn (input IOB): unsupported for HL10T pack (multi-backend flow only)",
-                c.name
+                resolve(c.name)
             ));
         }
         if matches!(c.kind, CellKind::ClockBuf) {
             return Err(format!(
                 "cell {} is ClockBuf (global clock buffer): unsupported for HL10T pack (multi-backend flow only)",
-                c.name
+                resolve(c.name)
             ));
         }
     }
     // Ibex-scale: linear scans via Design::net_on are O(n^3). Index once.
     let pins = design.pin_index();
-    let mut d_driver: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    let mut q_driver: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut d_driver: std::collections::HashMap<Spur, Spur> = std::collections::HashMap::new();
+    let mut q_driver: std::collections::HashMap<Spur, Spur> = std::collections::HashMap::new();
     for c in &design.cells {
         if matches!(c.kind, CellKind::Hff) {
-            if let Some(d) = pins.net_on(&c.name, "D") {
-                d_driver.entry(d).or_insert(c.name.as_str());
+            if let Some(d) = pins.net_on(resolve(c.name), "D") {
+                d_driver.entry(d).or_insert(c.name);
             }
-            if let Some(q) = pins.net_on(&c.name, "Q") {
-                q_driver.insert(q, c.name.as_str());
+            if let Some(q) = pins.net_on(resolve(c.name), "Q") {
+                q_driver.insert(q, c.name);
             }
         }
     }
     let mut lutffs = Vec::new();
-    let mut used_ff = std::collections::HashSet::new();
+    let mut used_ff = std::collections::HashSet::<Spur>::new();
     for c in &design.cells {
         let CellKind::Lut6 { init } = c.kind else {
             continue;
         };
-        let Some(o_net) = pins.net_on(&c.name, "O") else {
+        let Some(o_net) = pins.net_on(resolve(c.name), "O") else {
             continue;
         };
         // Comb LUTs (no FF on O) pack as LUT-only: empty ff_cell, q_net = O so
         // IOB/route match the LUT output. Registered LUTs keep the FF cluster.
         let ff_name = d_driver
-            .get(o_net)
+            .get(&o_net)
             .copied()
-            .filter(|n| !used_ff.contains(*n));
+            .filter(|n| !used_ff.contains(n));
         if let Some(n) = ff_name {
-            used_ff.insert(n.to_string());
+            used_ff.insert(n);
         }
         let mut lut_pins = Vec::new();
         const IPINS: [&str; 6] = ["I0", "I1", "I2", "I3", "I4", "I5"];
         for (pin, key) in IPINS.iter().enumerate() {
-            if let Some(net) = pins.net_on(&c.name, key) {
-                if let Some(src) = q_driver.get(net) {
-                    lut_pins.push((pin as u8, (*src).to_string()));
+            if let Some(net) = pins.net_on(resolve(c.name), key) {
+                if let Some(src) = q_driver.get(&net) {
+                    lut_pins.push((pin as u8, resolve(*src).to_string()));
                 }
             }
         }
         let (ff_cell, q_net) = if let Some(n) = ff_name {
-            (n.to_string(), pins.net_on(n, "Q").unwrap_or("").to_string())
+            (
+                resolve(n).to_string(),
+                pins.net_on(resolve(n), "Q").map(resolve).unwrap_or("").to_string(),
+            )
         } else {
-            (String::new(), o_net.to_string())
+            (String::new(), resolve(o_net).to_string())
         };
         lutffs.push(PackedLutFf {
-            lut_cell: c.name.clone(),
+            lut_cell: resolve(c.name).to_string(),
             ff_cell,
             init,
             lut_pins,
@@ -150,14 +153,14 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     for c in &design.cells {
         if matches!(c.kind, CellKind::IobOut) {
             let net = pins
-                .net_on(&c.name, "I")
-                .ok_or_else(|| format!("IOB {} has no I net", c.name))?;
-            let pad = pins.net_on(&c.name, "PAD").unwrap_or("");
+                .net_on(resolve(c.name), "I")
+                .ok_or_else(|| format!("IOB {} has no I net", resolve(c.name)))?;
+            let pad = pins.net_on(resolve(c.name), "PAD").unwrap_or(intern(""));
             let port = design.ports.iter().find(|p| p.name == pad);
             let loc = port.and_then(|p| p.attrs.get("LOC").map(|s| s.to_string()));
             iobs.push(PackedIob {
-                cell: c.name.clone(),
-                from_net: net.to_string(),
+                cell: resolve(c.name).to_string(),
+                from_net: resolve(net).to_string(),
                 loc,
                 drive: port.and_then(|p| p.attrs.get("DRIVE").map(|s| s.to_string())),
                 slew: port.and_then(|p| p.attrs.get("SLEW").map(|s| s.to_string())),
@@ -171,7 +174,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     for c in &design.cells {
         if matches!(c.kind, CellKind::Mac27) {
             macs.push(PackedMac {
-                cell: c.name.clone(),
+                cell: resolve(c.name).to_string(),
             });
         }
     }
@@ -187,7 +190,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
                 .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
                 .collect();
             brams.push(PackedBram {
-                cell: c.name.clone(),
+                cell: resolve(c.name).to_string(),
                 init,
             });
         }
@@ -205,10 +208,10 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
 pub fn apply_iob_electrical(design: &Design, iobs: &mut [PackedIob]) {
     let pins = design.pin_index();
     let ports: std::collections::HashMap<&str, &helion_ir::Port> =
-        design.ports.iter().map(|p| (p.name.as_str(), p)).collect();
+        design.ports.iter().map(|p| (resolve(p.name), p)).collect();
     for iob in iobs.iter_mut() {
-        let pad = pins.net_on(&iob.cell, "PAD").unwrap_or("");
-        if let Some(p) = ports.get(pad) {
+        let pad = pins.net_on(&iob.cell, "PAD").unwrap_or(intern(""));
+        if let Some(p) = ports.get(resolve(pad)) {
             iob.drive = p.attrs.get("DRIVE").map(|s| s.to_string());
             iob.slew = p.attrs.get("SLEW").map(|s| s.to_string());
             iob.pulltype = p.attrs.get("PULLTYPE").map(|s| s.to_string());
@@ -316,10 +319,10 @@ mod tests {
             );
             d.add_cell(&ff, CellKind::Hff);
             d.connect("clk", &ff, "CLK");
-            d.connect(format!("d{i}"), &lut, "O");
-            d.connect(format!("d{i}"), &ff, "D");
-            d.connect(format!("q{i}"), &ff, "Q");
-            d.connect(format!("q{i}"), &lut, "I0");
+            d.connect(&format!("d{i}"), &lut, "O");
+            d.connect(&format!("d{i}"), &ff, "D");
+            d.connect(&format!("q{i}"), &ff, "Q");
+            d.connect(&format!("q{i}"), &lut, "I0");
         }
         let t0 = std::time::Instant::now();
         let p = pack(&d, &dev).unwrap();
