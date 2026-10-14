@@ -224,6 +224,10 @@ fn gutter_tick_color(theme: &theme::Theme, kind: &str) -> Option<egui::Color32> 
 
 pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme) {
     sync_editor_buffer(app);
+    // Force the editor to fill the available width. Without this, the
+    // editor can leave a black gap on the right when the central panel
+    // is wider than the content's natural size.
+    ui.set_width(ui.available_width());
 
     // ---- header (filename, dirty dot, breadcrumbs, toggles) ----
     // Short borrows only: the header buttons act on `app`, so `model` must
