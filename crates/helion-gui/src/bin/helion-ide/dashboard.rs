@@ -892,7 +892,14 @@ fn design_name(model: &IdeModel) -> String {
         .tree
         .top
         .clone()
-        .or_else(|| model.shell.session.design.as_ref().map(|d| d.name.clone()))
+        .or_else(|| {
+            model
+                .shell
+                .session
+                .design
+                .as_ref()
+                .map(|d| helion_ir::resolve(d.name).to_string())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "-".into())
 }

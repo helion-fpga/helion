@@ -8,7 +8,7 @@ use super::HelionIde;
 use eframe::egui::{self};
 use helion_gui::constraints_wizard as wiz;
 use helion_gui::{chrome, IdeModel, JobKind};
-use helion_ir::PortDir;
+use helion_ir::{intern, resolve, PortDir};
 use std::path::PathBuf;
 
 /// Screenshot affordance: `HELION_CONSTRAINTS_WIZARD=1` auto-opens the wizard,
@@ -92,7 +92,7 @@ impl WizardUi {
     pub fn new(model: &IdeModel) -> Self {
         let ports: Vec<String> = model
             .design()
-            .map(|d| d.ports.iter().map(|p| p.name.clone()).collect())
+            .map(|d| d.ports.iter().map(|p| resolve(p.name).to_string()).collect())
             .unwrap_or_default();
         let default_port = ports
             .iter()
@@ -131,7 +131,7 @@ impl WizardUi {
                     d.ports
                         .iter()
                         .filter(|p| matches!(p.dir, PortDir::In | PortDir::Inout))
-                        .map(|p| p.name.clone())
+                        .map(|p| resolve(p.name).to_string())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -141,7 +141,7 @@ impl WizardUi {
                     d.ports
                         .iter()
                         .filter(|p| matches!(p.dir, PortDir::Out | PortDir::Inout))
-                        .map(|p| p.name.clone())
+                        .map(|p| resolve(p.name).to_string())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -202,7 +202,7 @@ impl WizardUi {
                         Some(PortDir::Out) => matches!(p.dir, PortDir::Out | PortDir::Inout),
                         Some(PortDir::Inout) => matches!(p.dir, PortDir::Inout),
                     })
-                    .map(|p| p.name.clone())
+                    .map(|p| resolve(p.name).to_string())
                     .collect()
             })
             .unwrap_or_default()
@@ -345,7 +345,7 @@ impl WizardUi {
         let ok = keep.is_empty();
         self.errors = keep;
         if only.is_none() && ok {
-            let text = wiz::generate_sdc(&input, &design.name);
+            let text = wiz::generate_sdc(&input, resolve(design.name));
             match wiz::validate_sdc(&text) {
                 Ok(()) => self.preview = Some(text),
                 Err(e) => {
