@@ -158,7 +158,7 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
         if !matches!(p.dir, PortDir::Out) {
             continue;
         }
-        let mut iobs: Vec<(&str, &str)> = Vec::new(); // (cell, I net)
+        let mut iobs: Vec<(Spur, Spur)> = Vec::new(); // (cell, I net)
         for c in &d.cells {
             if !matches!(c.kind, CellKind::IobOut) {
                 continue;
@@ -168,7 +168,7 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
                 let i = d.net_on(c.name, intern("I")).ok_or_else(|| {
                     EquivError::UnsupportedCell(format!(
                         "IobOut cell '{}' has no net on I",
-                        c.name
+                        resolve(c.name)
                     ))
                 })?;
                 iobs.push((c.name, i));
@@ -177,7 +177,7 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
         if iobs.is_empty() {
             return Err(EquivError::UnsupportedCell(format!(
                 "output port '{}' has no IobOut driver",
-                p.name
+                resolve(p.name)
             )));
         }
         iobs.sort_by_key(|(cell, _)| iob_bit_index(cell));
@@ -194,8 +194,9 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
 
 /// Bit index encoded in an IOB cell name: `u_iob` -> 0, `u_iobN` -> N.
 /// Non-conforming names sort last, by name (deterministic fallback).
-fn iob_bit_index(cell: &str) -> (u64, &str) {
-    if let Some(rest) = cell.strip_prefix("u_iob") {
+fn iob_bit_index(cell: Spur) -> (u64, Spur) {
+    let cell_str = resolve(cell);
+    if let Some(rest) = cell_str.strip_prefix("u_iob") {
         if rest.is_empty() {
             return (0, cell);
         }
