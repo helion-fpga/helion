@@ -244,7 +244,14 @@ pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::T
     ui.horizontal(|ui| {
         ui.heading("Hierarchy");
         ui.add_space(12.0);
-        if ui.button("Show in Schematic").clicked() {
+        if ui
+            .add_sized(
+                egui::vec2(ui.available_width(), 0.0),
+                egui::Button::new("Show in Schematic"),
+            )
+            .on_hover_text("Open hierarchy in schematic viewer")
+            .clicked()
+        {
             let _ = model.exec("open_hierarchy_sheet");
         }
     });

@@ -116,3 +116,106 @@ Replayed all 3 known crash logs against current code:
 - Text input, copy/cut/paste, resize (sane + extreme), zoom
 - 30 seeds x 20k frames, 527k events total
 - All major surfaces exercised via warmup (Implement run) + random navigation
+
+## Visual fuzz session 2026-10-13 20:17 EDT (subagent)
+- Target: Helion Design Suite, window 1447, pid 8833, 886x1130 @ (914,39)
+- Note: running build predates latest branch fixes (Inspector default-open, stale design state, black-gap sweep, report split, editor fill-width all pushed but NOT in this binary).
+- Method: live Mac automation, flaky connection; act in bursts.
+
+### 20:17+ Reports/Methodology
+- Actions: Reports activity > click Methodology row
+- BUG text-cutoff: Message column truncates mid-word: "Missing set_output_d" (should be "Missing set_output_delay"), "No set_clock_uncerta" (should be "No set_clock_uncertainty"). Column too narrow, no wrap/tooltip visible.
+- BUG black-gap: large empty area below methodology table, content does not fill.
+- Screenshot: /home/hatch/workspace/nodes/b8d0d35d-7aaa-4752-b75a-8cb2bed831d2/screen-window.jpg
+
+### 20:17+ Reports/DRC
+- Actions: Reports activity > click DRC row > click "Report DRC" button
+- OK: empty state "No DRC results yet." is clean and honest.
+- OK: clicking Report DRC runs the command; console shows error "report_drc: place or route first". Honest fail-loud, good.
+- BUG black-gap: large empty area below DRC empty state.
+- Screenshot: /home/hatch/workspace/nodes/3636e2c4-6ad9-44e2-8b39-c93b9569a88f/screen-window.jpg
+
+### 20:17+ Reports navigation
+- Actions: click each report row in Reports sidebar
+- OK: Timing Summary, Methodology, DRC rows respond and switch center pane.
+- BUG buttons-dead: Power row (162,290) and Utilization row (173,378) do NOT respond to clicks. No view change after multiple clicks. Timing Paths, Clock Interaction, CDC, Clock Networks not yet tested.
+- BUG text-cutoff: "Reporttiming summary" button missing space (should be "Report timing summary").
+- BUG redundant: Timing Summary shows both "not routed cells=3 (no timing: ... not a closed WNS)" AND "Not a closed WNS." on separate lines. Redundant.
+
+### 20:17+ Files/Editor
+- BUG stale-state: breadcrumb "counter.sv > blinky", hierarchy shows blinky, netlist shows u_lut/u_ff from blinky, but editor shows counter.sv. Console shows "synth_design blinky". Full design/editor divergence.
+- BUG text-cutoff: "Show in Schemati" button truncated (should be "Show in Schematic").
+- BUG black-gap: editor does not fill width, black area on right.
+- Screenshot: /home/hatch/workspace/nodes/ec2a2606-e974-4f60-bf72-a1c8bede564d/screen-window.jpg
+
+### 20:17+ Flow Navigator / Project Settings
+- Actions: Files activity > expand Opt section > click Run
+- Result: Project Settings opened as tab. (Unclear if Run or Settings was hit.)
+- BUG stale-state: TOP = blinky while counter.sv is the open file. Project top does not follow open example.
+- BUG black-gap: empty area below settings table.
+- Screenshot: /home/hatch/workspace/nodes/a15a395b-5304-4607-b12b-133bf085b07e/screen-window.jpg
+
+### 20:17+ Simulate/Waveform
+- BUG text-cutoff: "Cu" at top right (should be "Cursor B"), cut off by window edge.
+- BUG text-cutoff: "Wave · run simulat" hint truncated at bottom right.
+- OK: empty states clean ("No scopes yet.", "No objects. Select a scope.", "No waveform yet.").
+- Screenshot: /home/hatch/workspace/nodes/103deee6-f66f-474c-a3f7-ac0e24079d05/screen-window.jpg
+
+### 20:17+ Simulate/Run Simulation
+- Actions: Simulate activity > click "Run Simulation"
+- OK: simulation actually ran, waveform rendered with real clk/led toggles. Objects tree populated (blinky module, led port, u_ff reg, clk port). "Simulate finished" toast shown.
+- Screenshot: /home/hatch/workspace/nodes/fa2d0281-4402-4d3e-9952-5fb661e6423a/screen-window.jpg
+
+### 20:17+ Simulate/Source pane
+- Actions: Simulate activity > click Source pane
+- OK: source debugger shows code with BP/PC/Kind/Text columns, current PC marker ">" on line 8.
+- BUG text-cutoff: Text column truncates code: "// Helion 0.2 SV b", "always_ff @(posedg". Column too narrow.
+- Screenshot: /home/hatch/workspace/nodes/f65d8538-c3f0-4d3d-b3be-2bb138aabbba/screen-window.jpg
+
+### 20:17+ Program activity STALE CANVAS (MAJOR)
+- Actions: Simulate activity (ran simulation) > click Program in activity rail
+- BUG stale-canvas: Activity rail shows Program selected, left sidebar shows Program content (Cable, Bitstream, Detect), BUT center pane still shows Simulate UI (Testbenches, Scopes, Objects, Panes). Activity/sidebar and central canvas disagree.
+- BUG text-cutoff: "openFPGALoader backend (binary not o", "Hardware Manager closed - Program op", "usb/ofl" tab cut off.
+- BUG black-gap: black area between Program sidebar and stale Simulate center.
+- Screenshot: /home/hatch/workspace/nodes/3fd6c479-9da8-4161-a7b9-49c10c5733b1/screen-window.jpg
+
+### 20:17+ Create Project wizard STUCK (CRITICAL)
+- Actions: File menu > New Project > wizard opens > click Next, Cancel, X, Browse
+- BUG dialog-dead: Create Project wizard is completely unresponsive. Next, Cancel, X close button, and Browse buttons do NOT respond to clicks. Wizard cannot be dismissed. Blocks all further UI interaction.
+- This is a modal dialog trap. User would be stuck.
+- Screenshot: /home/hatch/workspace/nodes/2eb9a62b-37f0-4c52-80d8-2ddd09e74c2b/screen-window.jpg
+
+### 20:17+ Device/Inspector uninvited (CONFIRMED)
+- Actions: navigate to Device activity
+- BUG popup-uninvited: Inspector panel opens automatically without user action, covering the device die. "hide" button present but panel should never auto-open.
+- Also: partial "Project" dialog visible behind Inspector (wizard remnant?).
+- Screenshot: /home/hatch/workspace/nodes/c0bfe008-b428-4b08-9a22-13a97c890242/screen-window.jpg
+
+### 20:17+ Device/Inspector site select (OK)
+- Actions: Device activity > click on die
+- OK: site CLB_X24Y4 selected, Inspector shows Kind/Site/Occupant/BELs/Clock region/Pblock/Fanout/Fanin/Through nets/Highlighted. "Zoom to", "Show in Schematic", "Show in Hierarchy" buttons present. Die highlights selected site.
+- Screenshot: /home/hatch/workspace/nodes/5988a979-7d86-4ada-8e40-2570444ee0eb/screen-window.jpg
+
+## Summary 2026-10-13 20:17 EDT visual fuzz (subagent)
+Tested: Reports (all rows), Files/Editor, Flow Navigator, Simulate (run, waveform, source pane), Program, Device (die select, Inspector), Create Project wizard, Console.
+Binary predates branch fixes; findings below are against the running build.
+
+CONFIRMED BUGS:
+1. [stale-canvas MAJOR] Program activity shows Simulate center pane. Activity/sidebar and central canvas disagree after Simulate>Program navigation.
+2. [dialog-dead CRITICAL] Create Project wizard Next/Cancel/X/Browse do not respond to clicks; wizard traps user (dismissible only via activity navigation).
+3. [stale-state] Editor shows counter.sv, breadcrumb "counter.sv > blinky", hierarchy/netlist/console show blinky. Full design/editor divergence.
+4. [stale-state] Project Settings TOP=blinky while counter.sv open.
+5. [popup-uninvited] Inspector auto-opens on Device activity, covering die.
+6. [buttons-dead] Reports Power and Utilization rows do not respond to clicks (Timing Summary, Methodology, DRC work).
+7. [text-cutoff] Multiple: "Show in Schemati", "Missing set_output_d", "No set_clock_uncerta", "Reporttiming summary" (missing space), "Cu" (Cursor B), "Wave · run simulat", "openFPGALoader backend (binary not o", "Hardware Manager closed - Program op", Source pane Text column truncations.
+8. [redundant] Timing Summary shows "not a closed WNS" twice.
+9. [black-gap] Empty areas below content in Reports, Methodology, DRC, Project Settings, editor right side.
+
+WORKING WELL:
+- Simulate runs real simulation, renders correct clk/led waveforms, "Simulate finished" toast.
+- DRC empty state honest; Report DRC fail-loud "place or route first".
+- Device die site select works; Inspector shows correct site properties.
+- Flow Navigator expand/collapse works; Opt/Synth sections functional.
+- Console logging works (synth_design ok, report_drc error).
+
+Screenshots in /home/hatch/workspace/nodes/*/screen-window.jpg (see log entries above).
