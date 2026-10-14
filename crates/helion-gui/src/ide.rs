@@ -18,7 +18,7 @@ use helion_device::{Device, Far, Site, SiteKind};
 use helion_drc::{Drc, DrcSeverity, check_placed, check_routed};
 use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ipxact::{IpCore, catalog as ipxact_catalog, to_xml};
-use helion_ir::{CellKind, Design, PortDir, Spur, intern, resolve};
+use helion_ir::{CellKind, Design, PortDir, intern, resolve};
 use helion_proj::{
     CheckpointMeta, CheckpointSummary, ImplStrategy, Mode, PrjImplRun, PrjPblock, ProjectFile,
     ReuseReport, Session, delete_checkpoint, diff_metas, expand_ip_packages, format_prj, get_cells,
@@ -14963,7 +14963,7 @@ impl IdeModel {
             .top
             .clone()
             .or_else(|| self.tree.top.clone())
-            .or_else(|| self.shell.session.design.as_ref().map(|d| d.name.clone()))
+            .or_else(|| self.shell.session.design.as_ref().map(|d| resolve(d.name).to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".into())
     }
@@ -15494,7 +15494,7 @@ impl IdeModel {
         self.tree
             .top
             .clone()
-            .or_else(|| self.shell.session.design.as_ref().map(|d| d.name.clone()))
+            .or_else(|| self.shell.session.design.as_ref().map(|d| resolve(d.name).to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".into())
     }
@@ -16114,7 +16114,7 @@ impl IdeModel {
         self.tree
             .top
             .clone()
-            .or_else(|| self.shell.session.design.as_ref().map(|d| d.name.clone()))
+            .or_else(|| self.shell.session.design.as_ref().map(|d| resolve(d.name).to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".into())
     }
@@ -18397,7 +18397,7 @@ impl IdeModel {
         let cycles = cycles.clamp(1, 100_000);
         let timescale_ps = self.sim_timescale_ps.max(1);
         let vcd = helion_sim::vcd::dump_vcd(&design, cycles, timescale_ps);
-        let path = std::env::temp_dir().join(format!("helion-{}-{cycles}cyc.vcd", design.name));
+        let path = std::env::temp_dir().join(format!("helion-{}-{cycles}cyc.vcd", resolve(design.name)));
         std::fs::write(&path, vcd).map_err(|e| format!("dump_vcd: {e}"))?;
         let s = path.to_string_lossy().into_owned();
         self.push_sim_log(
@@ -18629,7 +18629,7 @@ impl IdeModel {
 
     fn hierarchical_occupancy(design: &Design) -> Vec<HierOccupancy> {
         let mut top = HierOccupancy {
-            name: design.name.clone(),
+            name: resolve(design.name).to_string(),
             lut: 0,
             ff: 0,
             iob: 0,
@@ -18641,9 +18641,9 @@ impl IdeModel {
         }
         let mut out = vec![top];
         for inst in &design.instances {
-            let pfx = format!("{}_", inst.name);
+            let pfx = format!("{}_", resolve(inst.name));
             let mut h = HierOccupancy {
-                name: inst.name.clone(),
+                name: resolve(inst.name).to_string(),
                 lut: 0,
                 ff: 0,
                 iob: 0,
@@ -18651,7 +18651,7 @@ impl IdeModel {
                 dsp: 0,
             };
             for c in &design.cells {
-                if c.name == inst.name || c.name.starts_with(&pfx) {
+                if c.name == inst.name || resolve(c.name).starts_with(&pfx) {
                     Self::bump_hier_cell(&mut h, &c.kind);
                 }
             }
@@ -20787,13 +20787,13 @@ impl IdeModel {
             if !matches!(c.kind, helion_ir::CellKind::Hff) {
                 continue;
             }
-            let Some(net) = d.net_on(&c.name, "CLK") else {
+            let Some(net) = d.net_on(c.name, intern("CLK")) else {
                 continue;
             };
-            if net.is_empty() {
+            if resolve(net).is_empty() {
                 continue;
             }
-            *counts.entry(net.to_string()).or_default() += 1;
+            *counts.entry(resolve(net).to_string()).or_default() += 1;
         }
         let max = counts.values().copied().max()?;
         let cands: Vec<&String> = counts
@@ -20827,7 +20827,7 @@ impl IdeModel {
         let Some(d) = self.shell.session.design.as_ref() else {
             return "led".into();
         };
-        if d.ports.iter().any(|p| p.name == "led") {
+        if d.ports.iter().any(|p| resolve(p.name) == "led") {
             return "led".into();
         }
         // Prefer routed/packed IOB-driven net when present.
@@ -20962,21 +20962,21 @@ impl IdeModel {
             if d.attrs.get("SIM_ONLY") == Some("1") || d.attrs.get("NO_BODY") == Some("1") {
                 return Ok(format!(
                     "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
-                    d.name,
+                    resolve(d.name),
                     d.cells.len()
                 ));
             }
             if let Some(why) = Self::timing_incomplete_reason(d) {
                 return Ok(format!(
                     "report_timing {} timing_incomplete cells={} ({why})",
-                    d.name,
+                    resolve(d.name),
                     d.cells.len()
                 ));
             }
             if n_logic == 0 {
                 return Ok(format!(
                     "report_timing {} no_logic cells={} (no timing: empty shell or no logic; not a closed WNS)",
-                    d.name,
+                    resolve(d.name),
                     d.cells.len()
                 ));
             }
@@ -20987,7 +20987,7 @@ impl IdeModel {
             if !clock_path {
                 return Ok(format!(
                     "report_timing {} no_clock_path cells={} (no timing: no clock path; not a closed WNS)",
-                    d.name,
+                    resolve(d.name),
                     d.cells.len()
                 ));
             }
@@ -21030,7 +21030,7 @@ impl IdeModel {
         };
         Ok(format!(
             "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={} CLK_NET_PS={}{period_note}{path}",
-            d.name,
+            resolve(d.name),
             t.wns_ps,
             t.tns_ps,
             t.setup_ps,
@@ -21768,25 +21768,25 @@ impl IdeModel {
             .clone()
             .ok_or("sim: no design (synth first)")?;
         self.scopes = vec![ScopeNode {
-            name: d.name.clone(),
+            name: resolve(d.name).to_string(),
             kind: "module".into(),
         }];
         for inst in &d.instances {
             self.scopes.push(ScopeNode {
-                name: inst.name.clone(),
-                kind: format!("instance:{}", inst.module),
+                name: resolve(inst.name).to_string(),
+                kind: format!("instance:{}", resolve(inst.module)),
             });
         }
-        if self.selected_scope.as_deref() != Some(d.name.as_str())
+        if self.selected_scope.as_deref() != Some(resolve(d.name))
             && !self
                 .scopes
                 .iter()
                 .any(|s| Some(s.name.as_str()) == self.selected_scope.as_deref())
         {
-            self.selected_scope = Some(d.name.clone());
+            self.selected_scope = Some(resolve(d.name).to_string());
         }
         if self.selected_scope.is_none() {
-            self.selected_scope = Some(d.name.clone());
+            self.selected_scope = Some(resolve(d.name).to_string());
         }
         if let (Some(bits), Some(r)) = (
             self.shell.session.bitstream.clone(),
@@ -21832,7 +21832,7 @@ impl IdeModel {
         self.rearm_active_forces();
         let (name, cells, luts, ffs) = if let Some(d) = self.shell.session.design.as_ref() {
             (
-                d.name.clone(),
+                resolve(d.name).to_string(),
                 d.cells.len(),
                 d.cells
                     .iter()
@@ -22100,13 +22100,13 @@ impl IdeModel {
             }
         }
         if let Some(d) = self.shell.session.design.as_ref() {
-            if d.ports.iter().any(|p| p.name == name) {
+            if d.ports.iter().any(|p| resolve(p.name) == name) {
                 return "port".into();
             }
-            if d.nets.iter().any(|n| n.name == name) {
+            if d.nets.iter().any(|n| resolve(n.name) == name) {
                 return "net".into();
             }
-            if let Some(c) = d.cells.iter().find(|c| c.name == name) {
+            if let Some(c) = d.cells.iter().find(|c| resolve(c.name) == name) {
                 return match &c.kind {
                     CellKind::Hff => "reg".into(),
                     CellKind::Lut6 { .. } => "net".into(),
@@ -22140,26 +22140,30 @@ impl IdeModel {
             }
             // ILA/Objects: expose design Q-net names (`hb_0`) alongside FF cells (`u_ff0`).
             if let Some(d) = self.shell.session.design.as_ref() {
-                let marked: HashSet<String> = d.marked_debug_nets().into_iter().collect();
+                let marked: HashSet<String> = d
+                    .marked_debug_nets()
+                    .into_iter()
+                    .map(|s| resolve(s).to_string())
+                    .collect();
                 for n in &d.nets {
-                    let Some(ff) = n.endpoints.iter().find(|e| e.pin == "Q") else {
+                    let Some(ff) = n.endpoints.iter().find(|e| e.pin == intern("Q")) else {
                         continue;
                     };
-                    if !(marked.contains(&n.name) || self.wave.has_trace(&n.name)) {
+                    if !(marked.contains(resolve(n.name)) || self.wave.has_trace(resolve(n.name))) {
                         continue;
                     }
                     let value = sim
                         .ff_q
-                        .get(&ff.cell)
+                        .get(resolve(ff.cell))
                         .map(|b| if *b { "1" } else { "0" }.to_string())
                         .unwrap_or_else(|| "-".into());
-                    push(&mut v, &mut seen, n.name.clone(), value);
+                    push(&mut v, &mut seen, resolve(n.name).to_string(), value);
                 }
             }
         } else if let Some(d) = self.shell.session.design.as_ref() {
             // Pre-sim: still list mark_debug Q-nets so add_wave hb_0 works after Implement.
             for n in d.marked_debug_nets() {
-                push(&mut v, &mut seen, n, "-".into());
+                push(&mut v, &mut seen, resolve(n).to_string(), "-".into());
             }
         }
         let cur = self.wave.cursor;
@@ -22184,10 +22188,10 @@ impl IdeModel {
             for p in &d.ports {
                 let val = self
                     .wave
-                    .trace(&p.name)
+                    .trace(resolve(p.name))
                     .map(|t| t.value_at(cur))
                     .unwrap_or_else(|| "-".into());
-                push(&mut v, &mut seen, p.name.clone(), val);
+                push(&mut v, &mut seen, resolve(p.name).to_string(), val);
             }
         }
         v
@@ -22377,7 +22381,7 @@ impl IdeModel {
                         Self::upsert_memory(
                             &mut blocks,
                             MemoryBlock {
-                                name: c.name.clone(),
+                                name: resolve(c.name).to_string(),
                                 kind: "lut_init".into(),
                                 width: 1,
                                 words: (0..64).map(|a| (init >> a) & 1).collect(),
@@ -22782,10 +22786,10 @@ impl IdeModel {
         if let Some(d) = self.shell.session.design.as_ref() {
             let marked = d.marked_debug_nets();
             if let Some(n) = marked.first() {
-                return n.clone();
+                return resolve(*n).to_string();
             }
             for cand in ["cnt_3", "q3", "led", "q", "cnt_0", "q0"] {
-                if d.nets.iter().any(|n| n.name == cand) {
+                if d.nets.iter().any(|n| resolve(n.name) == cand) {
                     return cand.to_string();
                 }
             }
@@ -22803,7 +22807,7 @@ impl IdeModel {
                 return Some(id.to_string());
             }
             if let Some(d) = self.shell.session.design.as_ref() {
-                if d.nets.iter().any(|n| n.name == id) {
+                if d.nets.iter().any(|n| resolve(n.name) == id) {
                     return Some(id.to_string());
                 }
             }
@@ -22854,7 +22858,7 @@ impl IdeModel {
             .session
             .design
             .as_ref()
-            .map(|d| d.marked_debug_nets().iter().any(|n| n == &net))
+            .map(|d| d.marked_debug_nets().iter().any(|n| resolve(*n) == net))
             .unwrap_or(false);
         if !already {
             self.shell.session.mark_debug(&net)?;
@@ -22869,12 +22873,17 @@ impl IdeModel {
 
     /// Status-bar / Messages crumb: mark_debug nets + last ILA capture (no layout).
     pub fn ila_status_crumb(&self) -> String {
-        let md = self
+        let md: Vec<String> = self
             .shell
             .session
             .design
             .as_ref()
-            .map(|d| d.marked_debug_nets())
+            .map(|d| {
+                d.marked_debug_nets()
+                    .iter()
+                    .map(|s| resolve(*s).to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let md_part = if md.is_empty() {
             String::new()
@@ -22949,11 +22958,11 @@ impl IdeModel {
             self.tree.nets.clear();
             return;
         };
-        self.tree.top = Some(d.name.clone());
+        self.tree.top = Some(resolve(d.name).to_string());
         self.tree.cells = d
             .cells
             .iter()
-            .map(|c| (c.name.clone(), primitive_of(&c.kind)))
+            .map(|c| (resolve(c.name).to_string(), primitive_of(&c.kind)))
             .collect();
         self.tree.nets = get_nets(&d, None);
         debug_assert_eq!(self.tree.cells.len(), get_cells(&d, None).len());
@@ -23046,15 +23055,18 @@ impl IdeModel {
             return;
         };
         let mut nodes = Vec::new();
-        nodes.push((d.name.clone(), "module".into()));
+        nodes.push((resolve(d.name).to_string(), "module".into()));
         for inst in &d.instances {
-            nodes.push((inst.name.clone(), format!("instance:{}", inst.module)));
+            nodes.push((
+                resolve(inst.name).to_string(),
+                format!("instance:{}", resolve(inst.module)),
+            ));
         }
         for c in &d.cells {
-            nodes.push((c.name.clone(), primitive_of(&c.kind)));
+            nodes.push((resolve(c.name).to_string(), primitive_of(&c.kind)));
         }
         self.hierarchy = HierarchyView {
-            top: Some(d.name.clone()),
+            top: Some(resolve(d.name).to_string()),
             nodes,
             drawing_cache: RefCell::new(None),
         };
@@ -23142,12 +23154,12 @@ impl IdeModel {
         let mut pins: HashMap<String, Vec<SchematicPin>> = HashMap::new();
         for n in &d.nets {
             for e in &n.endpoints {
-                let list = pins.entry(e.cell.clone()).or_default();
-                if !list.iter().any(|p| p.name == e.pin) {
+                let list = pins.entry(resolve(e.cell).to_string()).or_default();
+                if !list.iter().any(|p| p.name == resolve(e.pin)) {
                     list.push(SchematicPin {
-                        name: e.pin.clone(),
-                        net: n.name.clone(),
-                        output: pin_is_output(&e.pin),
+                        name: resolve(e.pin).to_string(),
+                        net: resolve(n.name).to_string(),
+                        output: pin_is_output(resolve(e.pin)),
                     });
                 }
             }
@@ -23158,9 +23170,9 @@ impl IdeModel {
             .map(|c| {
                 let kind = primitive_of(&c.kind);
                 SchematicNode {
-                    name: c.name.clone(),
+                    name: resolve(c.name).to_string(),
                     kind: kind.clone(),
-                    pins: merge_canonical_pins(&kind, pins.remove(&c.name).unwrap_or_default()),
+                    pins: merge_canonical_pins(&kind, pins.remove(resolve(c.name)).unwrap_or_default()),
                 }
             })
             .collect();
@@ -23169,29 +23181,29 @@ impl IdeModel {
                 .conns
                 .iter()
                 .map(|(p, net)| SchematicPin {
-                    name: p.clone(),
-                    net: net.clone(),
-                    output: pin_is_output(p)
-                        || p.eq_ignore_ascii_case("q")
-                        || p.eq_ignore_ascii_case("led")
-                        || p.eq_ignore_ascii_case("out"),
+                    name: resolve(*p).to_string(),
+                    net: resolve(*net).to_string(),
+                    output: pin_is_output(resolve(*p))
+                        || resolve(*p).eq_ignore_ascii_case("q")
+                        || resolve(*p).eq_ignore_ascii_case("led")
+                        || resolve(*p).eq_ignore_ascii_case("out"),
                 })
                 .collect();
             nodes.push(SchematicNode {
-                name: inst.name.clone(),
-                kind: format!("instance:{}", inst.module),
+                name: resolve(inst.name).to_string(),
+                kind: format!("instance:{}", resolve(inst.module)),
                 pins: ipins,
             });
         }
         let mut edges = Vec::new();
         for n in &d.nets {
-            edges.extend(schematic_star_edges(&n.name, &n.endpoints));
+            edges.extend(schematic_star_edges(resolve(n.name), &n.endpoints));
         }
         let ports = d
             .ports
             .iter()
             .map(|p| SchematicPort {
-                name: p.name.clone(),
+                name: resolve(p.name).to_string(),
                 dir: match p.dir {
                     PortDir::In => "IN".into(),
                     PortDir::Out => "OUT".into(),
@@ -23199,7 +23211,11 @@ impl IdeModel {
                 },
             })
             .collect();
-        let instances = d.instances.iter().map(|i| i.name.clone()).collect();
+        let instances = d
+            .instances
+            .iter()
+            .map(|i| resolve(i.name).to_string())
+            .collect();
         // Preserve the cross-probe auto-fit preference across rebuilds.
         let auto_fit_on_probe = self.schematic.auto_fit_on_probe;
         let zoom_to_path_pending = self.schematic.zoom_to_path_pending;
@@ -23278,14 +23294,14 @@ impl IdeModel {
         let mut used: HashSet<(u32, u32)> = pl.iob_sites.iter().map(|s| (s.x, s.y)).collect();
         let mut out = Vec::new();
         for p in &d.ports {
-            if p.dir != PortDir::In || !names.contains(&p.name) {
+            if p.dir != PortDir::In || !names.contains(resolve(p.name)) {
                 continue;
             }
             let packed = pl
                 .packed
                 .iobs
                 .iter()
-                .any(|iob| iob.cell == p.name || iob.cell.contains(&p.name));
+                .any(|iob| iob.cell == resolve(p.name) || iob.cell.contains(resolve(p.name)));
             if packed {
                 continue;
             }
@@ -23294,14 +23310,14 @@ impl IdeModel {
             let pin = p.attrs.get("LOC").or_else(|| {
                 self.constraints
                     .package_pins
-                    .get(&p.name)
+                    .get(resolve(p.name))
                     .map(|s| s.as_str())
             });
             if let Some(pin) = pin {
                 if let Ok((x, y)) = parse_site_xy(pin) {
                     if dev.iob_major(x, y).is_some() {
                         used.insert((x, y));
-                        out.push((p.name.clone(), x, y));
+                        out.push((resolve(p.name).to_string(), x, y));
                         continue;
                     }
                 }
@@ -23310,7 +23326,7 @@ impl IdeModel {
                 break;
             };
             used.insert((site.x, site.y));
-            out.push((p.name.clone(), site.x, site.y));
+            out.push((resolve(p.name).to_string(), site.x, site.y));
         }
         out
     }
@@ -23345,7 +23361,7 @@ impl IdeModel {
                     .session
                     .design
                     .as_ref()
-                    .and_then(|d| d.ports.iter().find(|p| p.name == name))
+                    .and_then(|d| d.ports.iter().find(|p| resolve(p.name) == name))
                     .and_then(|p| p.attrs.get("LOC"))
                     .is_some();
             if pin_forced {
@@ -23540,44 +23556,45 @@ impl IdeModel {
                     .attrs
                     .get("LOC")
                     .map(|s| s.to_string())
-                    .or_else(|| locs.get(&p.name).cloned());
+                    .or_else(|| locs.get(resolve(p.name)).cloned());
                 let iostandard = p
                     .attrs
                     .get("IOSTANDARD")
                     .map(|s| s.to_string())
-                    .or_else(|| iostds.get(&p.name).cloned());
+                    .or_else(|| iostds.get(resolve(p.name)).cloned());
                 let drive = p
                     .attrs
                     .get("DRIVE")
                     .map(|s| s.to_string())
-                    .or_else(|| drives.get(&p.name).cloned());
+                    .or_else(|| drives.get(resolve(p.name)).cloned());
                 let slew = p
                     .attrs
                     .get("SLEW")
                     .map(|s| s.to_string())
-                    .or_else(|| slews.get(&p.name).cloned());
+                    .or_else(|| slews.get(resolve(p.name)).cloned());
                 let pulltype = p
                     .attrs
                     .get("PULLTYPE")
                     .map(|s| s.to_string())
-                    .or_else(|| pulls.get(&p.name).cloned());
+                    .or_else(|| pulls.get(resolve(p.name)).cloned());
                 let diff_term = p
                     .attrs
                     .get("DIFF_TERM")
                     .map(|s| s.to_string())
-                    .or_else(|| diffs.get(&p.name).cloned());
+                    .or_else(|| diffs.get(resolve(p.name)).cloned());
                 let in_term = p
                     .attrs
                     .get("IN_TERM")
                     .map(|s| s.to_string())
-                    .or_else(|| interms.get(&p.name).cloned());
+                    .or_else(|| interms.get(resolve(p.name)).cloned());
                 let site = placed_iobs
                     .as_ref()
                     .and_then(|v| {
                         // Match output port to IOB cell by net name or first IOB for `led`.
                         v.iter()
                             .find(|(cell, _)| {
-                                cell.contains(&p.name) || (p.name == "led" && cell.contains("iob"))
+                                cell.contains(resolve(p.name))
+                                    || (resolve(p.name) == "led" && cell.contains("iob"))
                             })
                             .map(|(_, s)| s.clone())
                             .or_else(|| {
@@ -23588,9 +23605,9 @@ impl IdeModel {
                                 }
                             })
                     })
-                    .or_else(|| clock_sites.get(&p.name).cloned());
+                    .or_else(|| clock_sites.get(resolve(p.name)).cloned());
                 IoPortView {
-                    name: p.name.clone(),
+                    name: resolve(p.name).to_string(),
                     dir: dir.into(),
                     site,
                     package_pin,
@@ -24342,7 +24359,7 @@ impl IdeModel {
         }
         let mut props = vec![("NAME".into(), id.clone())];
         if let Some(d) = self.shell.session.design.as_ref() {
-            if let Some(c) = d.cells.iter().find(|c| c.name == id) {
+            if let Some(c) = d.cells.iter().find(|c| resolve(c.name) == id) {
                 let prim = primitive_of(&c.kind);
                 props.push(("PRIMITIVE".into(), prim.clone()));
                 if !props.iter().any(|(k, _)| k == "TYPE") {
@@ -24356,7 +24373,7 @@ impl IdeModel {
                         props.push(("INIT".into(), format!("{init:#018x}")));
                     }
                     CellKind::Ila { net } => {
-                        props.push(("ILA_NET".into(), net.clone()));
+                        props.push(("ILA_NET".into(), resolve(*net).to_string()));
                     }
                     _ => {}
                 }
@@ -24364,7 +24381,7 @@ impl IdeModel {
                     props.push((k.clone(), v.clone()));
                 }
             }
-            if let Some(n) = d.nets.iter().find(|n| n.name == id) {
+            if let Some(n) = d.nets.iter().find(|n| resolve(n.name) == id) {
                 props.push(("TYPE".into(), "net".into()));
                 props.push(("ENDPOINTS".into(), n.endpoints.len().to_string()));
                 for (k, v) in &n.attrs.map {
@@ -24373,7 +24390,7 @@ impl IdeModel {
                     }
                 }
             }
-            if let Some(p) = d.ports.iter().find(|p| p.name == id) {
+            if let Some(p) = d.ports.iter().find(|p| resolve(p.name) == id) {
                 props.push(("TYPE".into(), "port".into()));
                 props.push((
                     "DIR".into(),
@@ -24952,10 +24969,11 @@ fn is_hff(design: &Design, name: &str) -> bool {
 }
 
 /// HFF clock pin is `CLK` (not UNISIM `C`). Fall back to `C` then leftover `clk`.
-fn hff_clk_net<'a>(design: &'a Design, cell: &str) -> &'a str {
+fn hff_clk_net(design: &Design, cell: &str) -> &'static str {
     design
-        .net_on(cell, "CLK")
-        .or_else(|| design.net_on(cell, "C"))
+        .net_on(intern(cell), intern("CLK"))
+        .or_else(|| design.net_on(intern(cell), intern("C")))
+        .map(resolve)
         .unwrap_or("clk")
 }
 
@@ -24980,7 +24998,10 @@ fn r2r_pin_rows(
             net_fanout(design, clk_net),
             site_of(device, start),
         );
-        let qnet = design.net_on(start, "Q").unwrap_or("");
+        let qnet = design
+            .net_on(intern(start), intern("Q"))
+            .map(resolve)
+            .unwrap_or("");
         push_timing_pin(
             &mut pins,
             start,
@@ -24995,7 +25016,7 @@ fn r2r_pin_rows(
     if let Some(lut) = lut {
         for i in 0..6u8 {
             let pn = format!("I{i}");
-            if let Some(inet) = design.net_on(lut, &pn) {
+            if let Some(inet) = design.net_on(intern(lut), intern(&pn)).map(resolve) {
                 push_timing_pin(
                     &mut pins,
                     lut,
@@ -25008,7 +25029,7 @@ fn r2r_pin_rows(
                 );
             }
         }
-        let onet = design.net_on(lut, "O").unwrap_or("");
+        let onet = design.net_on(intern(lut), intern("O")).map(resolve).unwrap_or("");
         push_timing_pin(
             &mut pins,
             lut,
@@ -25020,7 +25041,10 @@ fn r2r_pin_rows(
             site_of(device, lut),
         );
     }
-    let dnet = design.net_on(endpoint, "D").unwrap_or("");
+    let dnet = design
+        .net_on(intern(endpoint), intern("D"))
+        .map(resolve)
+        .unwrap_or("");
     push_timing_pin(
         &mut pins,
         endpoint,
@@ -25059,7 +25083,10 @@ fn iob_pin_rows(
             net_fanout(design, clk_net),
             site_of(device, start),
         );
-        let qnet = design.net_on(start, "Q").unwrap_or("");
+        let qnet = design
+            .net_on(intern(start), intern("Q"))
+            .map(resolve)
+            .unwrap_or("");
         push_timing_pin(
             &mut pins,
             start,
@@ -25071,7 +25098,10 @@ fn iob_pin_rows(
             site_of(device, start),
         );
     }
-    let inet = design.net_on(iob, "I").unwrap_or("");
+    let inet = design
+        .net_on(intern(iob), intern("I"))
+        .map(resolve)
+        .unwrap_or("");
     push_timing_pin(
         &mut pins,
         iob,
@@ -25082,7 +25112,10 @@ fn iob_pin_rows(
         net_fanout(design, inet),
         site_of(device, iob),
     );
-    let pad = design.net_on(iob, "PAD").unwrap_or("");
+    let pad = design
+        .net_on(intern(iob), intern("PAD"))
+        .map(resolve)
+        .unwrap_or("");
     push_timing_pin(
         &mut pins,
         iob,
@@ -25104,28 +25137,30 @@ fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) 
         if !matches!(c.kind, CellKind::Hff) {
             continue;
         }
-        let mut cells = vec![c.name.clone()];
+        let mut cells = vec![resolve(c.name).to_string()];
         let mut nets = Vec::new();
-        let mut start = hff_clk_net(design, &c.name).to_string();
+        let mut start = hff_clk_net(design, resolve(c.name)).to_string();
         let mut lut = None;
-        if let Some(dnet) = design.net_on(&c.name, "D") {
-            nets.push(dnet.to_string());
+        if let Some(dnet) = design.net_on(c.name, intern("D")) {
+            nets.push(resolve(dnet).to_string());
             if let Some(n) = design.nets.iter().find(|n| n.name == dnet) {
                 for e in &n.endpoints {
-                    if e.pin == "O" && !cells.contains(&e.cell) {
-                        cells.push(e.cell.clone());
-                        lut = Some(e.cell.clone());
+                    if e.pin == intern("O") && !cells.contains(&resolve(e.cell).to_string()) {
+                        cells.push(resolve(e.cell).to_string());
+                        lut = Some(resolve(e.cell).to_string());
                         for i in 0..6u8 {
                             let pin = format!("I{i}");
-                            if let Some(inet) = design.net_on(&e.cell, &pin) {
-                                if !nets.iter().any(|x| x == inet) {
-                                    nets.push(inet.to_string());
+                            if let Some(inet) = design.net_on(e.cell, intern(&pin)) {
+                                if !nets.contains(&resolve(inet).to_string()) {
+                                    nets.push(resolve(inet).to_string());
                                 }
                                 if let Some(nn) = design.nets.iter().find(|n| n.name == inet) {
                                     for ee in &nn.endpoints {
-                                        if ee.pin == "Q" && !cells.contains(&ee.cell) {
-                                            cells.push(ee.cell.clone());
-                                            start = ee.cell.clone();
+                                        if ee.pin == intern("Q")
+                                            && !cells.contains(&resolve(ee.cell).to_string())
+                                        {
+                                            cells.push(resolve(ee.cell).to_string());
+                                            start = resolve(ee.cell).to_string();
                                         }
                                     }
                                 }
@@ -25135,12 +25170,12 @@ fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) 
                 }
             }
         }
-        let pins = r2r_pin_rows(design, device, &start, lut.as_deref(), &c.name);
+        let pins = r2r_pin_rows(design, device, &start, lut.as_deref(), resolve(c.name));
         let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.r2r_ps);
         paths.push(TimingPath {
-            name: format!("{start}->{}", c.name),
+            name: format!("{start}->{}", resolve(c.name)),
             startpoint: start,
-            endpoint: c.name.clone(),
+            endpoint: resolve(c.name).to_string(),
             cells,
             nets,
             delay_ps,
@@ -25153,31 +25188,31 @@ fn extract_timing_paths(design: &Design, t: &TimingResult, device: &DeviceView) 
         if !matches!(c.kind, CellKind::IobOut) {
             continue;
         }
-        let mut cells = vec![c.name.clone()];
+        let mut cells = vec![resolve(c.name).to_string()];
         let mut nets = Vec::new();
-        let mut start = c.name.clone();
-        if let Some(inet) = design.net_on(&c.name, "I") {
-            nets.push(inet.to_string());
+        let mut start = resolve(c.name).to_string();
+        if let Some(inet) = design.net_on(c.name, intern("I")) {
+            nets.push(resolve(inet).to_string());
             if let Some(n) = design.nets.iter().find(|n| n.name == inet) {
                 for e in &n.endpoints {
-                    if e.pin == "Q" && !cells.contains(&e.cell) {
-                        cells.push(e.cell.clone());
-                        start = e.cell.clone();
+                    if e.pin == intern("Q") && !cells.contains(&resolve(e.cell).to_string()) {
+                        cells.push(resolve(e.cell).to_string());
+                        start = resolve(e.cell).to_string();
                     }
                 }
             }
         }
-        if let Some(pad) = design.net_on(&c.name, "PAD") {
-            if !nets.iter().any(|x| x == pad) {
-                nets.push(pad.to_string());
+        if let Some(pad) = design.net_on(c.name, intern("PAD")) {
+            if !nets.contains(&resolve(pad).to_string()) {
+                nets.push(resolve(pad).to_string());
             }
         }
-        let pins = iob_pin_rows(design, device, t, &start, &c.name);
+        let pins = iob_pin_rows(design, device, t, &start, resolve(c.name));
         let delay_ps = pins.last().map(|p| p.path_ps).unwrap_or(t.iob_ps);
         paths.push(TimingPath {
-            name: format!("{start}->{}", c.name),
+            name: format!("{start}->{}", resolve(c.name)),
             startpoint: start,
-            endpoint: c.name.clone(),
+            endpoint: resolve(c.name).to_string(),
             cells,
             nets,
             delay_ps,

@@ -1203,10 +1203,10 @@ fn native_save_project_as(app: &mut HelionIde) {
     let default_name = app
         .model
         .design()
-        .map(|d| d.name.clone())
+        .map(|d| helion_ir::resolve(d.name).to_string())
         .or_else(|| app.model.tree.top.clone())
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "project".into());
+        .unwrap_or_else(|| "project".to_string());
     let start = default_projects_dir();
     let start_s = start.to_string_lossy().into_owned();
     let Some(dir) = pick_directory_dialog(&start_s) else {
