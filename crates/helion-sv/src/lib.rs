@@ -18539,8 +18539,8 @@ endmodule
         };
         let mut dst = Design::new("top");
         super::stitch_child(&mut dst, &child, &named);
-        assert_eq!(dst.net_on("u_n_ff", "D"), Some("pa"));
-        assert_eq!(dst.net_on("u_n_ff", "Q"), Some("pq"));
+        assert_eq!(dst.net_on(intern("u_n_ff"), intern("D")), Some(intern("pa")));
+        assert_eq!(dst.net_on(intern("u_n_ff"), intern("Q")), Some(intern("pq")));
         let pos = Inst {
             module: "leaf".into(),
             name: "u_p".into(),
@@ -18548,8 +18548,8 @@ endmodule
             params: vec![],
         };
         super::stitch_child(&mut dst, &child, &pos);
-        assert_eq!(dst.net_on("u_p_ff", "D"), Some("xa"));
-        assert_eq!(dst.net_on("u_p_ff", "Q"), Some("xq"));
+        assert_eq!(dst.net_on(intern("u_p_ff"), intern("D")), Some(intern("xa")));
+        assert_eq!(dst.net_on(intern("u_p_ff"), intern("Q")), Some(intern("xq")));
     }
 
     #[test]
@@ -18579,7 +18579,7 @@ endmodule
         }
         let ms = t0.elapsed().as_millis();
         assert_eq!(hits, N as usize, "every stitched cell must hit cell_ix");
-        assert_eq!(dst.cell("keep").map(|c| c.name.as_str()), Some("keep"));
+        assert_eq!(dst.cell("keep").map(|c| resolve(c.name)), Some("keep"));
         assert!(
             ms < 800,
             "3k stitch + 3k cell() lookups must stay O(1) per cell, took {ms}ms"
@@ -18605,8 +18605,8 @@ endmodule
         fn net_value(d: &Design, vals: &HashMap<String, bool>, cell: &str, pin: &str) -> bool {
             for net in &d.nets {
                 for ep in &net.endpoints {
-                    if ep.cell == cell && ep.pin == pin {
-                        return vals.get(&net.name).copied().unwrap_or(false);
+                    if ep.cell == intern(cell) && ep.pin == intern(pin) {
+                        return vals.get(resolve(net.name)).copied().unwrap_or(false);
                     }
                 }
             }
@@ -18622,15 +18622,15 @@ endmodule
             };
             let mut addr = 0u64;
             for pin_i in 0..6 {
-                if net_value(d, &vals, &cell.name, &format!("I{pin_i}")) {
+                if net_value(d, &vals, resolve(cell.name), &format!("I{pin_i}")) {
                     addr |= 1 << pin_i;
                 }
             }
             let out = (init >> addr) & 1 == 1;
             for net in &d.nets {
                 for ep in &net.endpoints {
-                    if ep.cell == cell.name && ep.pin == "O" {
-                        vals.insert(net.name.clone(), out);
+                    if ep.cell == cell.name && ep.pin == intern("O") {
+                        vals.insert(resolve(net.name).to_string(), out);
                     }
                 }
             }
@@ -18819,7 +18819,7 @@ endmodule
             INC4_INIT.to_vec(),
             "synth incrementer INIT {inits:#x?}"
         );
-        assert_eq!(d.net_on("u_iob", "I"), Some("cnt_3"));
+        assert_eq!(d.net_on(intern("u_iob"), intern("I")), Some(intern("cnt_3")));
         assert_eq!(
             d.cells
                 .iter()
@@ -18863,7 +18863,7 @@ endmodule
             inits[0], INC4_INIT[0],
             "rst must occupy a LUT pin so INIT is not the bare incrementer"
         );
-        assert!(d.ports.iter().any(|p| p.name == "rst"));
+        assert!(d.ports.iter().any(|p| p.name == intern("rst")));
     }
 
     #[test]
@@ -18886,10 +18886,10 @@ endmodule
             "clear/en MAC must map Mac27, cells={}",
             d.cells.len()
         );
-        assert_eq!(d.net_on("u_mac0", "A"), Some("a"));
-        assert_eq!(d.net_on("u_mac0", "B"), Some("b"));
-        assert_eq!(d.net_on("u_mac0", "C"), Some("c"));
-        assert_eq!(d.net_on("u_mac0", "P"), Some("c"));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("A")), Some(intern("a")));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("B")), Some(intern("b")));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("C")), Some(intern("c")));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("P")), Some(intern("c")));
     }
 
     #[test]
@@ -18924,9 +18924,9 @@ endmodule
             "comb a*b must map Mac27, cells={}",
             d.cells.len()
         );
-        assert_eq!(d.net_on("u_mac0", "A"), Some("a"));
-        assert_eq!(d.net_on("u_mac0", "B"), Some("b"));
-        assert_eq!(d.net_on("u_mac0", "P"), Some("out"));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("A")), Some(intern("a")));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("B")), Some(intern("b")));
+        assert_eq!(d.net_on(intern("u_mac0"), intern("P")), Some(intern("out")));
     }
 
     #[test]
@@ -18991,12 +18991,12 @@ module top(input logic clk, output logic led);
 endmodule
 "#;
         let d = synth_sv(src, "h.sv").unwrap();
-        assert_eq!(d.name, "top");
+        assert_eq!(d.name, intern("top"));
         let inits = d.lut_inits();
         assert_eq!(inits, vec![0x5555_5555_5555_5555]);
         assert_eq!(d.instances.len(), 1, "{:?}", d.instances);
-        assert_eq!(d.instances[0].name, "u0");
-        assert_eq!(d.instances[0].module, "tog");
+        assert_eq!(d.instances[0].name, intern("u0"));
+        assert_eq!(d.instances[0].module, intern("tog"));
     }
 
     #[test]
@@ -19072,7 +19072,7 @@ endmodule
 "#;
         let d = synth_sv(src, "md.sv").unwrap();
         assert!(
-            d.marked_debug_nets().iter().any(|n| n == "q"),
+            d.marked_debug_nets().iter().any(|n| *n == intern("q")),
             "{:?}",
             d.marked_debug_nets()
         );
@@ -19092,7 +19092,7 @@ endmodule
 "#;
         let d = synth_sv(src, "md_comb.sv").unwrap();
         assert!(
-            d.marked_debug_nets().iter().any(|n| n == "x"),
+            d.marked_debug_nets().iter().any(|n| *n == intern("x")),
             "comb mark_debug lost: {:?}",
             d.marked_debug_nets()
         );
@@ -19115,7 +19115,7 @@ endmodule
 "#;
         let d = synth_sv(src, "md_hier.sv").unwrap();
         assert!(
-            d.marked_debug_nets().iter().any(|n| n == "x"),
+            d.marked_debug_nets().iter().any(|n| *n == intern("x")),
             "hier mid-net mark_debug lost: {:?}",
             d.marked_debug_nets()
         );
@@ -19335,7 +19335,7 @@ module top(input logic clk, output logic led);
 endmodule
 "#;
         let d = synth_sv_sources(&[("child.sv", child), ("top.sv", top)]).unwrap();
-        assert_eq!(d.name, "top");
+        assert_eq!(d.name, intern("top"));
         assert_eq!(
             d.lut_inits().len(),
             4,
@@ -19364,7 +19364,7 @@ endmodule
         let b = d.lut_inits()[0];
         assert_eq!(a, 0x5555_5555_5555_5555);
         assert_ne!(a, b, "enable must change INIT vs bare inverter {b:#x}");
-        assert!(d.ports.iter().any(|p| p.name == "en"));
+        assert!(d.ports.iter().any(|p| p.name == intern("en")));
     }
 
     #[test]
@@ -19532,7 +19532,7 @@ module m(input logic clk, output logic led);
 endmodule
 "#;
         let d = synth_sv(src, "pkg.sv").unwrap();
-        assert_eq!(d.name, "m");
+        assert_eq!(d.name, intern("m"));
         assert_eq!(d.lut_inits(), vec![0x5555_5555_5555_5555]);
     }
 
@@ -19877,14 +19877,14 @@ endmodule
             .count();
         eprintln!(
             "synth_sv_path Ok name={} ports={} cells={} luts={} ffs={} elapsed_ms={}",
-            d.name,
+            resolve(d.name),
             d.ports.len(),
             d.cells.len(),
             luts,
             ffs,
             t0.elapsed().as_millis()
         );
-        assert_eq!(d.name, "ysyx_ibex");
+        assert_eq!(d.name, intern("ysyx_ibex"));
         assert!(!d.ports.is_empty(), "ysyx_ibex ports from ANSI list");
         assert!(
             !d.cells.is_empty(),
@@ -20260,8 +20260,8 @@ endmodule
             .find(|c| {
                 matches!(c.kind, CellKind::Lut6 { .. })
                     && d.nets.iter().any(|n| {
-                        n.name == "prg_is_ram"
-                            && n.endpoints.iter().any(|e| e.cell == c.name && e.pin == "O")
+                        n.name == intern("prg_is_ram")
+                            && n.endpoints.iter().any(|e| e.cell == c.name && e.pin == intern("O"))
                     })
             })
             .expect("prg_is_ram must drive a LUT");
@@ -20271,8 +20271,8 @@ endmodule
         };
         let mut pins = Vec::new();
         for i in 0..6 {
-            if let Some(net) = d.net_on(&lut.name, &format!("I{i}")) {
-                pins.push(net.to_string());
+            if let Some(net) = d.net_on(lut.name, intern(&format!("I{i}"))) {
+                pins.push(resolve(net).to_string());
             }
         }
         pins.sort();
@@ -20296,8 +20296,8 @@ endmodule
         };
         let mut pin_at = [""; 3];
         for i in 0..6 {
-            if let Some(net) = d.net_on(&lut.name, &format!("I{i}")) {
-                pin_at[i] = net;
+            if let Some(net) = d.net_on(lut.name, intern(&format!("I{i}"))) {
+                pin_at[i] = resolve(net);
             }
         }
         for addr in 0..8u64 {
@@ -20335,7 +20335,7 @@ endmodule
         );
         assert!(
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Lut6 { .. })
-                && d.net_on(&c.name, "O") == Some("prg_is_ram")),
+                && d.net_on(c.name, intern("O")) == Some(intern("prg_is_ram"))),
             "dead prg_is_ram LUT must be swept"
         );
         assert_eq!(
@@ -20367,7 +20367,7 @@ module cdc_sync(
 endmodule
 "#;
         let d = synth_sv(src, "cdc_sync").expect("synth");
-        let clk_of = |ff: &str| d.net_on(ff, "CLK").unwrap_or("?").to_string();
+        let clk_of = |ff: &Spur| d.net_on(*ff, intern("CLK")).map(|s| resolve(s).to_string()).unwrap_or("?".to_string());
         let ffs: Vec<_> = d
             .cells
             .iter()
@@ -20405,11 +20405,11 @@ endmodule
         let invented = d
             .nets
             .iter()
-            .any(|n| n.name == "int_clk" && n.endpoints.iter().any(|e| e.pin == "O"));
+            .any(|n| n.name == intern("int_clk") && n.endpoints.iter().any(|e| e.pin == intern("O")));
         assert!(
             !invented,
             "clock mux must not be lowered as a data LUT, nets={:?}",
-            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+            d.nets.iter().map(|n| resolve(n.name)).collect::<Vec<_>>()
         );
     }
 
@@ -20438,11 +20438,11 @@ endmodule
         let invented = d
             .nets
             .iter()
-            .any(|n| n.name == "gclk" && n.endpoints.iter().any(|e| e.pin == "O"));
+            .any(|n| n.name == intern("gclk") && n.endpoints.iter().any(|e| e.pin == intern("O")));
         assert!(
             !invented,
             "clock gate must not be lowered as a data LUT, nets={:?}",
-            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+            d.nets.iter().map(|n| resolve(n.name)).collect::<Vec<_>>()
         );
     }
 
@@ -20469,20 +20469,20 @@ endmodule
         assert!(
             d.ports
                 .iter()
-                .any(|p| p.name == "ena" && matches!(p.dir, PortDir::In)),
+                .any(|p| p.name == intern("ena") && matches!(p.dir, PortDir::In)),
             "read-only inout is the load-enable input, not a bus"
         );
         let ff = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("q"))
+            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(c.name, intern("Q")) == Some(intern("q")))
             .expect("q must be an Hff");
-        assert_eq!(d.net_on(&ff.name, "CLK"), Some("clk"));
+        assert_eq!(d.net_on(ff.name, intern("CLK")), Some(intern("clk")));
         let on_ena = d.nets.iter().any(|n| {
-            n.name == "ena"
+            n.name == intern("ena")
                 && n.endpoints
                     .iter()
-                    .any(|e| e.pin.starts_with('I') || (e.cell == ff.name && e.pin == "D"))
+                    .any(|e| resolve(e.pin).starts_with('I') || (e.cell == ff.name && e.pin == intern("D")))
         });
         assert!(on_ena, "ena must connect into the enable path of D");
     }
@@ -20516,11 +20516,11 @@ endmodule
         let ff = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("csr_dout"))
+            .find(|c| matches!(c.kind, CellKind::Hff) && d.net_on(c.name, intern("Q")) == Some(intern("csr_dout")))
             .expect("csr_dout must be an Hff Q");
         assert_eq!(
-            d.net_on(&ff.name, "CLK"),
-            Some("csr_clk"),
+            d.net_on(ff.name, intern("CLK")),
+            Some(intern("csr_clk")),
             "negedge clock is csr_clk"
         );
     }
@@ -20562,10 +20562,10 @@ endmodule
         };
         assert_ne!(init, 0, "unknown/split wire name must not fold to const 0");
         let on_y = d.nets.iter().any(|n| {
-            n.name == "y"
+            n.name == intern("y")
                 && n.endpoints
                     .iter()
-                    .any(|e| e.cell == lut.name && e.pin == "O")
+                    .any(|e| e.cell == lut.name && e.pin == intern("O"))
         });
         assert!(on_y, "split wire assign must drive y, nets={:?}", d.nets);
     }
@@ -20593,7 +20593,7 @@ endmodule
             "module data_generator(input wire CLK, input wire CE, output wire D1);\n  reg [129:0] ring1;\n  initial ring1 <= 130'b{bits};\n  always @(posedge CLK)\n    if (CE) ring1 <= {{ring1[0], ring1[129:1]}};\n  assign D1 = ring1[0];\nendmodule\n"
         );
         let d = synth_sv(&src, "wide_lit.sv").expect("wide literal must not panic");
-        assert_eq!(d.name, "data_generator");
+        assert_eq!(d.name, intern("data_generator"));
         assert_ne!(
             d.attrs.get("NO_BODY"),
             Some("1"),
@@ -20635,7 +20635,7 @@ module clip #(parameter bits_in=0, parameter bits_out=0)
 endmodule
 "#;
         let d = synth_sv(src, "clip0.sv").expect("zero-width range must not panic");
-        assert_eq!(d.name, "clip");
+        assert_eq!(d.name, intern("clip"));
         assert_eq!(d.attrs.get("WIDTH_OVERFLOW"), Some("1"));
         let logic = d
             .cells
@@ -20670,7 +20670,7 @@ module rw_manager_bitcheck(ck, read_data);
 endmodule
 "#;
         let d = synth_sv(src, "str_width.sv").expect("string width must not panic");
-        assert_eq!(d.name, "rw_manager_bitcheck");
+        assert_eq!(d.name, intern("rw_manager_bitcheck"));
         let logic = d
             .cells
             .iter()
@@ -20769,7 +20769,7 @@ endmodule
         let d = synth_sv(src, "crc.v").expect("lift function");
         let luts = d.cells.iter().filter(|c| matches!(c.kind, CellKind::Lut6 { .. })).count();
         assert_eq!(luts, 0, "dead lifted cone must be swept, luts={luts} cells={:?}", d.cells);
-        assert!(d.ports.iter().any(|p| p.name == "nextCRC" && matches!(p.dir, PortDir::Out)));
+        assert!(d.ports.iter().any(|p| p.name == intern("nextCRC") && matches!(p.dir, PortDir::Out)));
     }
 
     #[test]
@@ -20858,7 +20858,7 @@ endmodule
             .filter(|c| matches!(c.kind, CellKind::Hff))
             .collect();
         assert_eq!(hffs.len(), 16, "16-bit add, one stage, got {}", hffs.len());
-        assert!(hffs.iter().all(|c| d.net_on(&c.name, "CLK") == Some("clk")));
+        assert!(hffs.iter().all(|c| d.net_on(c.name, intern("CLK")) == Some(intern("clk"))));
         let luts = d
             .cells
             .iter()
@@ -20869,18 +20869,18 @@ endmodule
             "16-bit ripple adder LUTs, not leftover bits, luts={luts}"
         );
         let aliased = d.nets.iter().any(|n| {
-            n.name == "res_w0_0"
-                && n.endpoints.iter().any(|e| e.pin == "Q")
-                && n.endpoints.iter().any(|e| e.pin == "I")
+            n.name == intern("res_w0_0")
+                && n.endpoints.iter().any(|e| e.pin == intern("Q"))
+                && n.endpoints.iter().any(|e| e.pin == intern("I"))
         });
         assert!(
             aliased,
             "q aliases res[0], nets={:?}",
-            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+            d.nets.iter().map(|n| resolve(n.name)).collect::<Vec<_>>()
         );
         assert!(
             !d.cells.iter().any(|c| {
-                matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("res_w1_0")
+                matches!(c.kind, CellKind::Hff) && d.net_on(c.name, intern("Q")) == Some(intern("res_w1_0"))
             }),
             "cycles=1 must not invent a second pipeline word"
         );
@@ -20918,53 +20918,54 @@ endmodule
             .filter(|c| matches!(c.kind, CellKind::Hff))
             .collect();
         assert_eq!(hffs.len(), 16, "2*width Hffs, got {}", hffs.len());
-        assert!(hffs.iter().all(|c| d.net_on(&c.name, "CLK") == Some("clk")));
+        assert!(hffs.iter().all(|c| d.net_on(c.name, intern("CLK")) == Some(intern("clk"))));
         for bit in 0..8 {
             let q0 = format!("res_w0_{bit}");
             let q1 = format!("res_w1_{bit}");
             let ff0 = hffs
                 .iter()
-                .find(|c| d.net_on(&c.name, "Q") == Some(q0.as_str()))
+                .find(|c| d.net_on(c.name, intern("Q")) == Some(intern(&q0)))
                 .unwrap_or_else(|| panic!("word 0 bit {bit}"));
-            let d0 = d.net_on(&ff0.name, "D").unwrap_or("");
+            let d0 = d.net_on(ff0.name, intern("D")).unwrap_or(intern(""));
             assert!(
-                d0.starts_with("u_add0_"),
-                "add only into word 0, bit {bit} D={d0}"
+                resolve(d0).starts_with("u_add0_"),
+                "add only into word 0, bit {bit} D={}",
+                resolve(d0)
             );
             let ff1 = hffs
                 .iter()
-                .find(|c| d.net_on(&c.name, "Q") == Some(q1.as_str()))
+                .find(|c| d.net_on(c.name, intern("Q")) == Some(intern(&q1)))
                 .unwrap_or_else(|| panic!("word 1 bit {bit}"));
             assert_eq!(
-                d.net_on(&ff1.name, "D"),
-                Some(q0.as_str()),
+                d.net_on(ff1.name, intern("D")),
+                Some(intern(&q0)),
                 "word 1 D from res[0]"
             );
         }
         assert!(
             !d.cells.iter().any(|c| {
-                matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some("res_w2_0")
+                matches!(c.kind, CellKind::Hff) && d.net_on(c.name, intern("Q")) == Some(intern("res_w2_0"))
             }),
             "cycles=2 must not invent a third pipeline word"
         );
         assert!(
-            !d.nets.iter().any(|n| n.name.starts_with("u_add1_")),
+            !d.nets.iter().any(|n| resolve(n.name).starts_with("u_add1_")),
             "no adder into word 1"
         );
         let aliased = d.nets.iter().any(|n| {
-            n.name == "res_w1_0"
-                && n.endpoints.iter().any(|e| e.pin == "Q")
-                && n.endpoints.iter().any(|e| e.pin == "I")
+            n.name == intern("res_w1_0")
+                && n.endpoints.iter().any(|e| e.pin == intern("Q"))
+                && n.endpoints.iter().any(|e| e.pin == intern("I"))
         });
         assert!(
             aliased,
             "q aliases res[1], the last word, nets={:?}",
-            d.nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>()
+            d.nets.iter().map(|n| resolve(n.name)).collect::<Vec<_>>()
         );
         let word0_is_q = d
             .nets
             .iter()
-            .any(|n| n.name == "res_w0_0" && n.endpoints.iter().any(|e| e.pin == "I"));
+            .any(|n| n.name == intern("res_w0_0") && n.endpoints.iter().any(|e| e.pin == intern("I")));
         assert!(!word0_is_q, "q must not alias word 0 when cycles=2");
     }
 
@@ -20998,15 +20999,15 @@ endmodule
         assert!(
             !d.cells.iter().any(|c| {
                 matches!(c.kind, CellKind::Hff)
-                    && d.net_on(&c.name, "Q")
-                        .is_some_and(|q| q.starts_with("res_w1_"))
+                    && d.net_on(c.name, intern("Q"))
+                        .is_some_and(|q| resolve(q).starts_with("res_w1_"))
             }),
             "cycles=5 must not invent word 1"
         );
         let aliased = d
             .nets
             .iter()
-            .any(|n| n.name.starts_with("res_w4_") && n.endpoints.iter().any(|e| e.pin == "I"));
+            .any(|n| resolve(n.name).starts_with("res_w4_") && n.endpoints.iter().any(|e| e.pin == intern("I")));
         assert!(!aliased, "cap must not alias q onto a missing last word");
     }
 
@@ -21030,7 +21031,7 @@ endmodule
         let aliased = d
             .nets
             .iter()
-            .any(|n| n.name == "bus_0" && n.endpoints.iter().any(|e| e.pin == "I"));
+            .any(|n| n.name == intern("bus_0") && n.endpoints.iter().any(|e| e.pin == intern("I")));
         assert!(aliased, "y[2] aliases bus[0], nets={:?}", d.nets);
     }
 
@@ -21055,7 +21056,7 @@ endmodule
         let aliased = d
             .nets
             .iter()
-            .any(|n| n.name == "data_2" && n.endpoints.iter().any(|e| e.pin == "I"));
+            .any(|n| n.name == intern("data_2") && n.endpoints.iter().any(|e| e.pin == intern("I")));
         assert!(aliased, "o_dbus_adr[2] aliases data[2], nets={:?}", d.nets);
     }
 
@@ -21235,7 +21236,7 @@ endmodule
             let driven = d
                 .nets
                 .iter()
-                .any(|n| n.name == name && n.endpoints.iter().any(|e| e.pin == "O"));
+                .any(|n| n.name == intern(&name) && n.endpoints.iter().any(|e| e.pin == intern("O")));
             assert!(driven, "bit {bit} must lower");
         }
     }
@@ -21284,7 +21285,7 @@ endmodule
         let driven = d
             .nets
             .iter()
-            .any(|n| n.name == "branch_address_0" && n.endpoints.iter().any(|e| e.pin == "O"));
+            .any(|n| n.name == intern("branch_address_0") && n.endpoints.iter().any(|e| e.pin == intern("O")));
         assert!(driven, "sum bit 0 is a LUT, not a wide cone");
     }
 
@@ -21309,12 +21310,12 @@ endmodule
             let driven = d
                 .nets
                 .iter()
-                .any(|n| n.name == name && n.endpoints.iter().any(|e| e.pin == "O"));
+                .any(|n| n.name == intern(&name) && n.endpoints.iter().any(|e| e.pin == intern("O")));
             assert!(driven, "bit {bit} must lower, not a skipped cone");
         }
         // Carry uses the bus bit itself. No invented 32-bit addend.
         let addend = d.nets.iter().any(|n| {
-            n.name.starts_with("k_") || n.name.starts_with("const_") || n.name.contains("_addend")
+            resolve(n.name).starts_with("k_") || resolve(n.name).starts_with("const_") || resolve(n.name).contains("_addend")
         });
         assert!(!addend, "must not invent a second 32-bit operand bus");
         let lut_ins: Vec<_> = d
@@ -21323,9 +21324,9 @@ endmodule
             .filter(|n| {
                 n.endpoints
                     .iter()
-                    .any(|e| e.pin.starts_with('I') && e.cell.starts_with("u_rac_"))
+                    .any(|e| resolve(e.pin).starts_with('I') && resolve(e.cell).starts_with("u_rac_"))
             })
-            .map(|n| n.name.as_str())
+            .map(|n| resolve(n.name))
             .collect();
         assert!(
             lut_ins
@@ -21537,15 +21538,15 @@ endmodule
             let driven = d
                 .nets
                 .iter()
-                .any(|n| n.name == name && n.endpoints.iter().any(|e| e.pin == "O"));
+                .any(|n| n.name == intern(&name) && n.endpoints.iter().any(|e| e.pin == intern("O")));
             assert!(driven, "bit {bit} must lower, not a skipped cone");
         }
         // Borrow uses the bus bit or a carry net. No invented subtrahend.
         let addend = d.nets.iter().any(|n| {
-            n.name.starts_with("k_")
-                || n.name.starts_with("const_")
-                || n.name.contains("_addend")
-                || n.name.contains("_subtrahend")
+            resolve(n.name).starts_with("k_")
+                || resolve(n.name).starts_with("const_")
+                || resolve(n.name).contains("_addend")
+                || resolve(n.name).contains("_subtrahend")
         });
         assert!(!addend, "must not invent a second operand bus");
         let lut_ins: Vec<_> = d
@@ -21554,9 +21555,9 @@ endmodule
             .filter(|n| {
                 n.endpoints
                     .iter()
-                    .any(|e| e.pin.starts_with('I') && e.cell.starts_with("u_rsc_"))
+                    .any(|e| resolve(e.pin).starts_with('I') && resolve(e.cell).starts_with("u_rsc_"))
             })
-            .map(|n| n.name.as_str())
+            .map(|n| resolve(n.name))
             .collect();
         assert!(
             lut_ins
@@ -21630,7 +21631,7 @@ endmodule
         let cout = d
             .nets
             .iter()
-            .any(|n| n.name == "adder_result_ext_o_33" && n.endpoints.iter().any(|e| e.pin == "O"));
+            .any(|n| n.name == intern("adder_result_ext_o_33") && n.endpoints.iter().any(|e| e.pin == intern("O")));
         assert!(cout, "carry-out bit 33 must be driven");
     }
 
@@ -21737,7 +21738,7 @@ endmodule
         assert!(
             d.nets
                 .iter()
-                .any(|n| n.name == "valid" || n.name.starts_with("valid")),
+                .any(|n| n.name == intern("valid") || resolve(n.name).starts_with("valid")),
             "valid net must be driven"
         );
     }
@@ -21811,7 +21812,7 @@ endmodule
             let driven = d
                 .nets
                 .iter()
-                .any(|n| n.name == name && n.endpoints.iter().any(|e| e.pin == "O"));
+                .any(|n| n.name == intern(&name) && n.endpoints.iter().any(|e| e.pin == intern("O")));
             assert!(driven, "y[{i}] must be driven");
         }
     }
@@ -22233,7 +22234,7 @@ endmodule
             assert!(lut_driven(&d, &net), "{net} must be driven");
             assert!(
                 d.cells.iter().any(|c| matches!(c.kind, CellKind::IobOut)
-                    && d.net_on(&c.name, "I") == Some(net.as_str())),
+                    && d.net_on(c.name, intern("I")) == Some(intern(&net))),
                 "IobOut must connect to driven net {net}"
             );
         }
@@ -22551,8 +22552,8 @@ endmodule
         assert!(
             !d.cells.iter().any(|c| {
                 matches!(c.kind, CellKind::Lut6 { .. })
-                    && d.net_on(&c.name, "O")
-                        .is_some_and(|o| o.starts_with("pc_jump"))
+                    && d.net_on(c.name, intern("O"))
+                        .is_some_and(|o| resolve(o).starts_with("pc_jump"))
             }),
             "pc_jump concat must not be a LUT"
         );
@@ -22569,10 +22570,10 @@ endmodule
 "#;
         let d = synth_sv(src, "vidx.v").expect("vidx");
         let aliased = d.nets.iter().any(|n| {
-            n.name.starts_with("res_w0_")
+            resolve(n.name).starts_with("res_w0_")
                 && n.endpoints
                     .iter()
-                    .any(|e| e.pin == "I" && e.cell.starts_with("u_iob"))
+                    .any(|e| e.pin == intern("I") && resolve(e.cell).starts_with("u_iob"))
         });
         assert!(!aliased, "signal index must not alias q onto res[0]");
         assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
@@ -22613,7 +22614,7 @@ endmodule
         assert!(
             d.nets
                 .iter()
-                .any(|n| n.name == "hit" && n.endpoints.iter().any(|e| e.pin == "O")),
+                .any(|n| n.name == intern("hit") && n.endpoints.iter().any(|e| e.pin == intern("O"))),
             "hit must be driven"
         );
     }
@@ -22621,15 +22622,15 @@ endmodule
     fn lut_driven(d: &Design, name: &str) -> bool {
         d.nets
             .iter()
-            .any(|n| n.name == name && n.endpoints.iter().any(|e| e.pin == "O"))
+            .any(|n| n.name == intern(&name) && n.endpoints.iter().any(|e| e.pin == intern("O")))
     }
 
     fn hff_on_clk(d: &Design, q: &str, clk: &str) -> bool {
         d.cells.iter().any(|c| {
             matches!(c.kind, CellKind::Hff)
-                && d.net_on(&c.name, "Q") == Some(q)
-                && d.net_on(&c.name, "CLK") == Some(clk)
-                && d.net_on(&c.name, "D").is_some()
+                && d.net_on(c.name, intern("Q")) == Some(intern(q))
+                && d.net_on(c.name, intern("CLK")) == Some(intern(clk))
+                && d.net_on(c.name, intern("D")).is_some()
         })
     }
 
@@ -22817,12 +22818,12 @@ endmodule
                 d.cells
                     .iter()
                     .find(|c| matches!(c.kind, CellKind::Hff)
-                        && d.net_on(&c.name, "Q") == Some("r_state_1"))
-                    .map(|c| c.name.as_str())
-                    .unwrap_or(""),
-                "D"
+                        && d.net_on(c.name, intern("Q")) == Some(intern("r_state_1")))
+                    .map(|c| c.name)
+                    .unwrap_or(intern("")),
+                intern("D")
             )
-            .is_some_and(|n| n != "r_state_1"),
+            .is_some_and(|n| n != intern("r_state_1")),
             "r_state[1] D must be driven (LUT), not a self-Q loop"
         );
         let luts = d
@@ -22859,7 +22860,7 @@ endmodule
         ];
         eprintln!(
             "WRAP_DIAG name={} cells={} ms={}",
-            d.name,
+            resolve(d.name),
             d.cells.len(),
             t0.elapsed().as_millis()
         );
@@ -22895,7 +22896,7 @@ endmodule
         let c = synth_sv_path(&root.join("ysyx_ibex.sv")).expect("bare ibex");
         eprintln!(
             "CHILD_DIAG name={} cells={} ms={}",
-            c.name,
+            resolve(c.name),
             c.cells.len(),
             t1.elapsed().as_millis()
         );
@@ -22915,7 +22916,7 @@ endmodule
             .filter(|x| matches!(x.kind, CellKind::Hff))
             .count();
         eprintln!("CHILD_CELLS luts={cl} ffs={cf} total={}", c.cells.len());
-        assert_eq!(d.name, "ibex_pin_wrap");
+        assert_eq!(d.name, intern("ibex_pin_wrap"));
         assert!(!d.cells.is_empty());
         assert!(
             !generate_not_lowered_for("ibex_if_stage"),
@@ -23019,7 +23020,7 @@ endmodule
             d.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
         assert!(
-            hffs.iter().any(|c| d.net_on(&c.name, "CLK") == Some("clk")),
+            hffs.iter().any(|c| d.net_on(c.name, intern("CLK")) == Some(intern("clk"))),
             "Hff must sit on clk"
         );
         assert!(
@@ -23483,11 +23484,11 @@ endmodule
         // Both cycle-path stitches happened: cyc_b's own logic appears under
         // each of cyc_a's two instance prefixes.
         assert!(
-            d.cells.iter().any(|c| c.name.starts_with("u1_u1_")),
+            d.cells.iter().any(|c| resolve(c.name).starts_with("u1_u1_")),
             "first instance stitch missing"
         );
         assert!(
-            d.cells.iter().any(|c| c.name.starts_with("u1_u2_")),
+            d.cells.iter().any(|c| resolve(c.name).starts_with("u1_u2_")),
             "second instance stitch missing"
         );
     }
@@ -23534,7 +23535,7 @@ endmodule
             let cell = d
                 .cells
                 .iter()
-                .find(|c| c.name == name)
+                .find(|c| c.name == intern(&name))
                 .unwrap_or_else(|| panic!("cell {name} missing"));
             match cell.kind {
                 CellKind::Lut6 { init } => init,
@@ -23596,7 +23597,7 @@ endmodule
 "#;
         let d = synth_sv(src, "inv_n.v").expect("inverter");
         assert!(
-            !d.cells.iter().any(|c| c.name.contains("u_prio_")),
+            !d.cells.iter().any(|c| resolve(c.name).contains("u_prio_")),
             "bitwise inverter must not get a priority cascade"
         );
         assert!(
@@ -23605,7 +23606,7 @@ endmodule
             d.lut_inits()
         );
         assert!(
-            d.nets.iter().any(|n| n.name == "flag"),
+            d.nets.iter().any(|n| n.name == intern("flag")),
             "unrelated 1-bit wire must keep its logic"
         );
     }
