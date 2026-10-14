@@ -51,6 +51,9 @@ pub const HIT_SIDEBAR_ROW: f32 = HIT_SIDEBAR;
 pub const OCCUPANCY_BAR_H: f32 = 20.0;
 /// Calm splitter grab radius (4–6px ship; not neon QA slab).
 pub const SPLITTER_GRAB_PX: f32 = 6.0;
+/// Console log cap: bounded VecDeque so long runs don't grow memory without limit.
+/// Oldest entries are dropped when the cap is reached.
+pub const CONSOLE_LOG_MAX_LINES: usize = 5000;
 /// Sidebar may shrink/grow; the drag must be able to move ≥40px and keep the size.
 pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;

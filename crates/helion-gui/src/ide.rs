@@ -8119,6 +8119,10 @@ impl IdeModel {
             text: out.to_string(),
         });
         self.log.push(format!("helion% {cmd}\n{out}"));
+        if self.log.len() > crate::chrome::CONSOLE_LOG_MAX_LINES {
+            let excess = self.log.len() - crate::chrome::CONSOLE_LOG_MAX_LINES;
+            self.log.drain(0..excess);
+        }
         self.console.push(ConsoleLine {
             cmd: cmd.to_string(),
             out: out.to_string(),
@@ -8314,6 +8318,10 @@ impl IdeModel {
                 text: text.to_string(),
             });
             self.log.push(format!("helion% {id}\n{text}"));
+            if self.log.len() > crate::chrome::CONSOLE_LOG_MAX_LINES {
+                let excess = self.log.len() - crate::chrome::CONSOLE_LOG_MAX_LINES;
+                self.log.drain(0..excess);
+            }
             self.console.push(ConsoleLine {
                 cmd: id.to_string(),
                 out: text.to_string(),
