@@ -34,7 +34,7 @@ fn aig_rewrite_on() -> bool {
     AIG_REWRITE_ON.with(|c| c.get())
 }
 
-use helion_ir::{Cell, CellKind, Design, Endpoint, Net, PortDir};
+use helion_ir::{intern, resolve, Cell, CellKind, Design, Endpoint, Net, PortDir, Spur};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -2139,7 +2139,7 @@ fn negedge_d_net(rtl: &Rtl, signal: &str, bit: Option<usize>, rhs: &RExpr<'_>) -
 fn hff_q_is(d: &Design, signal: &str) -> bool {
     d.cells
         .iter()
-        .any(|c| matches!(c.kind, CellKind::Hff) && d.net_on(&c.name, "Q") == Some(signal))
+        .any(|c| matches!(c.kind, CellKind::Hff) && d.net_on(c.name, intern("Q")) == Some(intern(signal)))
 }
 
 /// One Hff per negedge-only always when the write is a 1-bit flop on a named
@@ -2149,10 +2149,10 @@ fn lower_negedge_hffs(d: &mut Design, rtl: &Rtl) {
         if hff_q_is(d, signal) && is_input_port(rtl, clk) {
             if let Some(ff) = d.cells.iter().find(|c| {
                 matches!(c.kind, CellKind::Hff)
-                    && d.net_on(&c.name, "Q") == Some(signal)
-                    && d.net_on(&c.name, "CLK") == Some(clk)
+                    && d.net_on(c.name, intern("Q")) == Some(intern(signal))
+                    && d.net_on(c.name, intern("CLK")) == Some(intern(clk))
             }) {
-                eprintln!("hff_path cell={} CLK={} Q={}", ff.name, clk, signal);
+                eprintln!("hff_path cell={} CLK={} Q={}", resolve(ff.name), clk, signal);
                 continue;
             }
         }
@@ -2414,7 +2414,7 @@ fn inout_load_enables(rtl: &Rtl) -> Vec<String> {
     out
 }
 
-fn enabled_q_names(rtl: &Rtl, en: &str) -> HashSet<String> {
+fn enabled_q_names(rtl: &Rtl, en: &str) -> HashSet<Spur> {
     let mut q = HashSet::new();
     for (lhs, bit, rhs) in &rtl.nbas {
         if !mux_cond_mentions(rhs, en) {
@@ -2422,10 +2422,10 @@ fn enabled_q_names(rtl: &Rtl, en: &str) -> HashSet<String> {
         }
         let w = sig_width(rtl, lhs).max(1);
         if let Some(b) = bit {
-            q.insert(bit_name(lhs, w, *b));
+            q.insert(intern(&bit_name(lhs, w, *b)));
         } else {
             for i in 0..w {
-                q.insert(bit_name(lhs, w, i));
+                q.insert(intern(&bit_name(lhs, w, i)));
             }
         }
     }
@@ -2435,12 +2435,12 @@ fn enabled_q_names(rtl: &Rtl, en: &str) -> HashSet<String> {
 /// Comb cone feeding `ff` D. Returns the cell pin where `want` is connected.
 /// Does not walk through Hff Q, and does not invent a net.
 fn d_cone_connect(d: &Design, ff: &str, want: &str) -> Option<(String, String)> {
-    let start = d.net_on(ff, "D")?;
-    if start == want {
+    let start = d.net_on(intern(ff), intern("D"))?;
+    if start == intern(want) {
         return Some((ff.to_string(), "D".into()));
     }
     let mut seen: HashSet<String> = HashSet::new();
-    let mut stack = vec![start.to_string()];
+    let mut stack = vec![resolve(start).to_string()];
     let mut steps = 0usize;
     while let Some(net) = stack.pop() {
         if steps > 256 {
@@ -2454,18 +2454,19 @@ fn d_cone_connect(d: &Design, ff: &str, want: &str) -> Option<(String, String)> 
             continue;
         };
         for ep in &nrec.endpoints {
-            if ep.pin != "O" {
+            if ep.pin != intern("O") {
                 continue;
             }
             for i in 0..6 {
                 let pin = format!("I{i}");
-                let Some(inode) = d.net_on(&ep.cell, &pin) else {
+                let pin_spur = intern(&pin);
+                let Some(inode) = d.net_on(ep.cell, pin_spur) else {
                     continue;
                 };
-                if inode == want {
-                    return Some((ep.cell.clone(), pin));
+                if inode == intern(want) {
+                    return Some((resolve(ep.cell).to_string(), pin));
                 }
-                stack.push(inode.to_string());
+                stack.push(resolve(inode).to_string());
             }
         }
     }
@@ -2495,9 +2496,9 @@ fn prove_inout_load_enables(d: &Design, rtl: &Rtl) -> bool {
             .iter()
             .filter(|c| matches!(c.kind, CellKind::Hff))
             .filter_map(|c| {
-                let q = d.net_on(&c.name, "Q")?;
-                if qnames.contains(q) {
-                    Some(c.name.clone())
+                let q = d.net_on(c.name, intern("Q"))?;
+                if qnames.contains(&q) {
+                    Some(resolve(c.name).to_string())
                 } else {
                     None
                 }
@@ -2513,9 +2514,15 @@ fn prove_inout_load_enables(d: &Design, rtl: &Rtl) -> bool {
             match d_cone_connect(d, ff, &en_net) {
                 Some((cell, pin)) => {
                     if proof.is_none() {
-                        let clk = d.net_on(ff, "CLK").unwrap_or("clk").to_string();
-                        let dnet = d.net_on(ff, "D").unwrap_or("").to_string();
-                        let qnet = d.net_on(ff, "Q").unwrap_or("").to_string();
+                        let clk =
+                            resolve(d.net_on(intern(ff), intern("CLK")).unwrap_or(intern("clk")))
+                                .to_string();
+                        let dnet =
+                            resolve(d.net_on(intern(ff), intern("D")).unwrap_or(intern("")))
+                                .to_string();
+                        let qnet =
+                            resolve(d.net_on(intern(ff), intern("Q")).unwrap_or(intern("")))
+                                .to_string();
                         proof = Some((
                             ff.clone(),
                             clk,
@@ -3084,26 +3091,26 @@ fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
     Ok(d)
 }
 
-fn inst_port_map<'a>(child: &'a Design, inst: &'a Inst) -> HashMap<&'a str, &'a str> {
-    let mut by_name: HashMap<&str, &str> = HashMap::with_capacity(inst.conns.len());
-    let mut by_pos: HashMap<usize, &str> = HashMap::new();
+fn inst_port_map(child: &Design, inst: &Inst) -> HashMap<Spur, Spur> {
+    let mut by_name: HashMap<Spur, Spur> = HashMap::with_capacity(inst.conns.len());
+    let mut by_pos: HashMap<usize, Spur> = HashMap::new();
     for (pn, net) in &inst.conns {
         if let Some(rest) = pn.strip_prefix('#') {
             if let Ok(i) = rest.parse::<usize>() {
-                by_pos.insert(i, *net);
+                by_pos.insert(i, intern(net));
                 continue;
             }
         }
-        by_name.insert(*pn, *net);
+        by_name.insert(intern(pn), intern(net));
     }
-    let mut port_map: HashMap<&str, &str> = HashMap::with_capacity(child.ports.len());
+    let mut port_map: HashMap<Spur, Spur> = HashMap::with_capacity(child.ports.len());
     for (i, p) in child.ports.iter().enumerate() {
         if let Some(n) = by_name
-            .get(p.name.as_str())
+            .get(&p.name)
             .copied()
             .or_else(|| by_pos.get(&i).copied())
         {
-            port_map.insert(p.name.as_str(), n);
+            port_map.insert(p.name, n);
         }
     }
     port_map
@@ -3113,21 +3120,23 @@ fn inst_port_map<'a>(child: &'a Design, inst: &'a Inst) -> HashMap<&'a str, &'a 
 fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
     let prefix = format!("{}_", inst.name);
     let port_map = inst_port_map(child, inst);
-    let map_net = |n: &str| -> String {
-        if let Some(p) = port_map.get(n) {
-            return (*p).to_string();
+    let map_net = |n: Spur| -> String {
+        if let Some(p) = port_map.get(&n) {
+            return resolve(*p).to_string();
         }
-        let mut s = String::with_capacity(prefix.len() + n.len());
+        let ns = resolve(n);
+        let mut s = String::with_capacity(prefix.len() + ns.len());
         s.push_str(&prefix);
-        s.push_str(n);
+        s.push_str(ns);
         s
     };
     for c in &child.cells {
-        let mut name = String::with_capacity(prefix.len() + c.name.len());
+        let cname = resolve(c.name);
+        let mut name = String::with_capacity(prefix.len() + cname.len());
         name.push_str(&prefix);
-        name.push_str(&c.name);
+        name.push_str(cname);
         dst.push_cell(Cell {
-            name,
+            name: intern(&name),
             kind: c.kind.clone(),
             attrs: c.attrs.clone(),
         });
@@ -3137,17 +3146,18 @@ fn stitch_child(dst: &mut Design, child: &Design, inst: &Inst) {
             .endpoints
             .iter()
             .map(|e| {
-                let mut cell = String::with_capacity(prefix.len() + e.cell.len());
+                let ecell = resolve(e.cell);
+                let mut cell = String::with_capacity(prefix.len() + ecell.len());
                 cell.push_str(&prefix);
-                cell.push_str(&e.cell);
+                cell.push_str(ecell);
                 Endpoint {
-                    cell,
-                    pin: e.pin.clone(),
+                    cell: intern(&cell),
+                    pin: e.pin,
                 }
             })
             .collect();
         dst.merge_net(Net {
-            name: map_net(&n.name),
+            name: intern(&map_net(n.name)),
             endpoints,
             attrs: n.attrs.clone(),
         });
@@ -3161,30 +3171,30 @@ fn stitch_child_owned(dst: &mut Design, mut child: Design, inst: &Inst) {
     let prefix = format!("{}_", inst.name);
     // Resolve port map before mutably renaming child (borrowck). Parent already
     // keyed the instance conns; this is one small map per stitch, not per-net.
-    let port_map: HashMap<String, String> = inst_port_map(&child, inst)
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+    let port_map: HashMap<Spur, Spur> = inst_port_map(&child, inst);
     for c in &mut child.cells {
-        let mut name = String::with_capacity(prefix.len() + c.name.len());
+        let cname = resolve(c.name);
+        let mut name = String::with_capacity(prefix.len() + cname.len());
         name.push_str(&prefix);
-        name.push_str(&c.name);
-        c.name = name;
+        name.push_str(cname);
+        c.name = intern(&name);
     }
     for n in &mut child.nets {
-        if let Some(p) = port_map.get(n.name.as_str()) {
-            n.name.clone_from(p);
+        if let Some(p) = port_map.get(&n.name) {
+            n.name = *p;
         } else {
-            let mut name = String::with_capacity(prefix.len() + n.name.len());
+            let nname = resolve(n.name);
+            let mut name = String::with_capacity(prefix.len() + nname.len());
             name.push_str(&prefix);
-            name.push_str(&n.name);
-            n.name = name;
+            name.push_str(nname);
+            n.name = intern(&name);
         }
         for e in &mut n.endpoints {
-            let mut cell = String::with_capacity(prefix.len() + e.cell.len());
+            let ecell = resolve(e.cell);
+            let mut cell = String::with_capacity(prefix.len() + ecell.len());
             cell.push_str(&prefix);
-            cell.push_str(&e.cell);
-            e.cell = cell;
+            cell.push_str(ecell);
+            e.cell = intern(&cell);
         }
     }
     dst.append_cells(&mut child.cells);
@@ -3294,17 +3304,18 @@ fn abs_inst_port_map(
     let raw = inst_port_map(child, inst);
     let mut out: HashMap<String, String> = HashMap::with_capacity(raw.len());
     for (port, net) in raw {
-        let abs = if let Some(p) = parent_ports.get(net) {
+        let nets = resolve(net);
+        let abs = if let Some(p) = parent_ports.get(nets) {
             p.clone()
         } else if parent_prefix.is_empty() {
-            net.to_string()
+            nets.to_string()
         } else {
-            let mut s = String::with_capacity(parent_prefix.len() + net.len());
+            let mut s = String::with_capacity(parent_prefix.len() + nets.len());
             s.push_str(parent_prefix);
-            s.push_str(net);
+            s.push_str(nets);
             s
         };
-        out.insert(port.to_string(), abs);
+        out.insert(resolve(port).to_string(), abs);
     }
     out
 }
@@ -3317,41 +3328,44 @@ fn stitch_own_into(
 ) {
     let t0 = std::time::Instant::now();
     for c in &own.cells {
-        let mut name = String::with_capacity(prefix.len() + c.name.len());
+        let cname = resolve(c.name);
+        let mut name = String::with_capacity(prefix.len() + cname.len());
         name.push_str(prefix);
-        name.push_str(&c.name);
+        name.push_str(cname);
         dst.push_cell(Cell {
-            name,
+            name: intern(&name),
             kind: c.kind.clone(),
             attrs: c.attrs.clone(),
         });
     }
     for n in &own.nets {
-        let abs_name = if let Some(p) = port_map.get(n.name.as_str()) {
+        let nname = resolve(n.name);
+        let abs_name = if let Some(p) = port_map.get(nname) {
             p.clone()
         } else if prefix.is_empty() {
-            n.name.clone()
+            nname.to_string()
         } else {
-            let mut s = String::with_capacity(prefix.len() + n.name.len());
+            let mut s = String::with_capacity(prefix.len() + nname.len());
             s.push_str(prefix);
-            s.push_str(&n.name);
+            s.push_str(nname);
             s
         };
         let endpoints = n
             .endpoints
             .iter()
             .map(|e| {
-                let mut cell = String::with_capacity(prefix.len() + e.cell.len());
+                let ecell = resolve(e.cell);
+                let mut cell = String::with_capacity(prefix.len() + ecell.len());
                 cell.push_str(prefix);
-                cell.push_str(&e.cell);
+                cell.push_str(ecell);
                 Endpoint {
-                    cell,
-                    pin: e.pin.clone(),
+                    cell: intern(&cell),
+                    pin: e.pin,
                 }
             })
             .collect();
         dst.merge_net(Net {
-            name: abs_name,
+            name: intern(&abs_name),
             endpoints,
             attrs: n.attrs.clone(),
         });
@@ -3620,7 +3634,7 @@ fn assemble_module(
     }
     let summary = emit_module_into(mods, name, "", &port_map, &mut d, visiting)?;
     apply_soft_to_design(&mut d, &summary);
-    d.name = proto.module.to_string();
+    d.name = intern(proto.module);
     Ok(d)
 }
 
@@ -12419,7 +12433,7 @@ impl LutShare {
         d.add_cell(&cell, CellKind::Lut6 { init });
         d.connect(&net, &cell, "O");
         for (i, p) in pins.iter().enumerate() {
-            d.connect(p, &cell, format!("I{i}"));
+            d.connect(p, &cell, &format!("I{i}"));
         }
         self.by_fn.entry(key).or_insert_with(|| net.clone());
         net
@@ -13274,7 +13288,7 @@ fn emit_and(
     d.add_cell(&cell, CellKind::Lut6 { init });
     d.connect(&out, &cell, "O");
     for (i, p) in pins.iter().enumerate() {
-        d.connect(p, &cell, format!("I{i}"));
+        d.connect(p, &cell, &format!("I{i}"));
     }
     out
 }
@@ -15764,7 +15778,7 @@ fn emit_small_lut(d: &mut Design, cell: &str, out: &str, expr: &Expr) -> bool {
     d.add_cell(cell, CellKind::Lut6 { init });
     d.connect(out, cell, "O");
     for (pin, pi) in aig.pis.iter().enumerate() {
-        d.connect(pi, cell, format!("I{pin}"));
+        d.connect(pi, cell, &format!("I{pin}"));
     }
     true
 }
@@ -16656,7 +16670,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 d.add_cell(&lut, CellKind::Lut6 { init });
                 d.connect(&bn, &lut, "O");
                 for (pin, pi) in pis.iter().enumerate() {
-                    d.connect(pi, &lut, format!("I{pin}"));
+                    d.connect(pi, &lut, &format!("I{pin}"));
                 }
                 continue;
             }
@@ -16897,7 +16911,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         d.connect(&dnet, &ff, "D");
         d.connect(&qnet, &ff, "Q");
         for (pin, pi) in aig.pis.iter().enumerate() {
-            d.connect(pi, &lut, format!("I{pin}"));
+            d.connect(pi, &lut, &format!("I{pin}"));
         }
         if keep_bits.contains(bitn) {
             let _ = d.dont_touch(&ff);
@@ -17096,7 +17110,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         d.add_cell(&lut, CellKind::Lut6 { init });
         d.connect(bitn, &lut, "O");
         for (pin, pi) in aig.pis.iter().enumerate() {
-            d.connect(pi, &lut, format!("I{pin}"));
+            d.connect(pi, &lut, &format!("I{pin}"));
         }
         if md_bits.contains(bitn) {
             let _ = d.mark_debug(bitn);
@@ -17142,7 +17156,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
 
     // Parent / instance-port wires with (* mark_debug *) and leftover md bits.
     for name in &md_bits {
-        if d.nets.iter().any(|n| n.name == *name) {
+        if d.nets.iter().any(|n| n.name == intern(name)) {
             let _ = d.mark_debug(name);
         }
     }
@@ -17955,7 +17969,7 @@ fn synth_from_parsed_top(
         };
         (nbas, assigns, d)
     };
-    d.name = top_name.clone();
+    d.name = intern(&top_name);
     let (own_ms, stitch_ms, hash_ms) = synth_sub_snapshot();
     eprintln!(
         "hang_diag synth_rtl cells={} ms={}",
@@ -17989,14 +18003,14 @@ fn synth_from_parsed_top(
         d.attrs.set("NO_BODY", "1");
         eprintln!(
             "diagnostic no_body module={} cells=0 (ports only or unknown vendor instance; no gates invented)",
-            d.name
+            resolve(d.name)
         );
     } else if n_logic == 0 && d.attrs.get("FLATTEN_CAP") == Some("1") {
         // Flatten cone refused: no gates invented. QA scores cells=0 + no_body as SOFT.
         d.attrs.set("NO_BODY", "1");
         eprintln!(
             "diagnostic no_body module={} cells=0 (flatten_cap; cone not bit-blasted; no gates invented)",
-            d.name
+            resolve(d.name)
         );
     } else if n_logic == 0
         && d.attrs.get("FLATTEN_CAP") != Some("1")
@@ -18005,7 +18019,7 @@ fn synth_from_parsed_top(
     {
         eprintln!(
             "diagnostic no_logic module={} cells={} (behavioral body present; no LUT/FF mapped under hang guards)",
-            d.name,
+            resolve(d.name),
             d.cells.len()
         );
     }
@@ -18028,7 +18042,7 @@ fn synth_from_parsed_top(
         .count();
     eprintln!(
         "synth_design {} cells={} luts={}",
-        d.name,
+        resolve(d.name),
         d.cells.len(),
         n_luts
     );
@@ -18061,12 +18075,12 @@ fn record_instances_vis(
             format!("{pfx}{}", inst.name)
         };
         d.instances.push(helion_ir::Instance {
-            name: name.clone(),
-            module: inst.module.to_string(),
+            name: intern(&name),
+            module: intern(inst.module),
             conns: inst
                 .conns
                 .iter()
-                .map(|(p, n)| (p.to_string(), n.to_string()))
+                .map(|(p, n)| (intern(p), intern(n)))
                 .collect(),
             attrs: helion_ir::Attrs::default(),
         });
@@ -18119,7 +18133,7 @@ pub fn compile_sv_path(path: &Path, opts: &SvCompileOpts) -> Result<Vec<String>,
 
 fn elab_report(d: &Design) -> SvElabReport {
     SvElabReport {
-        top: d.name.clone(),
+        top: resolve(d.name).to_string(),
         cells: d.cells.len(),
         luts: d
             .cells
