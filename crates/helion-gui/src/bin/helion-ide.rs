@@ -2866,16 +2866,18 @@ fn paint_workspace(ui: &mut egui::Ui, app: &mut HelionIde) {
         });
     });
     ui.separator();
+    // Activity takes precedence over workspace: if the user clicked Program,
+    // show Program even if the workspace was previously a sim view.
+    if app.activity == Activity::Program {
+        paint_hw(ui, app);
+        return;
+    }
     if app.model.workspace.sim_only() || app.activity == Activity::Simulate {
         paint_sim_workspace(ui, app);
         return;
     }
     if chrome::is_more_destination(app.model.workspace) {
         paint_more_pane(ui, app);
-        return;
-    }
-    if app.activity == Activity::Program {
-        paint_hw(ui, app);
         return;
     }
     match app.canvas {
@@ -6088,7 +6090,6 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
             .color(if closed { theme.ok } else { theme.gold }),
     );
     if !closed {
-        ui.label("Not a closed WNS.");
         let pane = model.timing_text();
         if pane != honest {
             ui.label(RichText::new(pane).monospace().size(13.0));
