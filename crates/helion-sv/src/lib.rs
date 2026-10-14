@@ -12382,7 +12382,7 @@ const BUF_INIT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
 /// LUT6 identity: same INIT + pin nets → one cell. Intermediates (`out=None`)
 /// share; a required output net always gets its own driver (no pin alias).
 struct LutShare {
-    by_fn: HashMap<(u64, Vec<String>), String>,
+    by_fn: HashMap<(u64, Vec<String>), (String, String)>,
     n: usize,
 }
 
@@ -12419,9 +12419,15 @@ impl LutShare {
             }
         }
         let key = (init, pins.to_vec());
-        if out.is_none() {
-            if let Some(existing) = self.by_fn.get(&key) {
-                return existing.clone();
+        if let Some((existing_cell, existing_net)) = self.by_fn.get(&key) {
+            match out {
+                None => return existing_net.clone(),
+                Some(o) => {
+                    // Share the existing LUT: connect the requested output
+                    // net to the existing cell's output pin.
+                    d.connect(o, existing_cell, "O");
+                    return o.to_string();
+                }
             }
         }
         let cell = format!("{prefix}s{}", self.n);
@@ -12435,7 +12441,9 @@ impl LutShare {
         for (i, p) in pins.iter().enumerate() {
             d.connect(p, &cell, &format!("I{i}"));
         }
-        self.by_fn.entry(key).or_insert_with(|| net.clone());
+        self.by_fn
+            .entry(key)
+            .or_insert_with(|| (cell.clone(), net.clone()));
         net
     }
 
@@ -16893,7 +16901,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         let init = aig.flowmap_lut6();
-        let (lut, ff, dnet, qnet) = if single_q {
+        let (_lut, ff, dnet, qnet) = if single_q {
             ("u_lut".into(), "u_ff".into(), "d".into(), "q".into())
         } else {
             (
@@ -16903,16 +16911,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
                 bitn.clone(),
             )
         };
-        d.add_cell(&lut, CellKind::Lut6 { init });
+        let pis: Vec<String> = aig.pis.iter().cloned().collect();
+        share.lut6(&mut d, "u_lut", Some(&dnet), init, &pis);
         d.add_cell(&ff, CellKind::Hff);
         let bit_clk = seq_clk_for(&rtl.module, bitn, clk);
         d.connect(&bit_clk, &ff, "CLK");
-        d.connect(&dnet, &lut, "O");
         d.connect(&dnet, &ff, "D");
         d.connect(&qnet, &ff, "Q");
-        for (pin, pi) in aig.pis.iter().enumerate() {
-            d.connect(pi, &lut, &format!("I{pin}"));
-        }
         if keep_bits.contains(bitn) {
             let _ = d.dont_touch(&ff);
         }
@@ -17106,12 +17111,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         let init = aig.flowmap_lut6();
-        let lut = format!("u_clut{i}");
-        d.add_cell(&lut, CellKind::Lut6 { init });
-        d.connect(bitn, &lut, "O");
-        for (pin, pi) in aig.pis.iter().enumerate() {
-            d.connect(pi, &lut, &format!("I{pin}"));
-        }
+        let pis: Vec<String> = aig.pis.iter().cloned().collect();
+        share.lut6(&mut d, "u_clut", Some(bitn), init, &pis);
         if md_bits.contains(bitn) {
             let _ = d.mark_debug(bitn);
         }
