@@ -12382,7 +12382,7 @@ const BUF_INIT: u64 = 0xAAAA_AAAA_AAAA_AAAA;
 /// LUT6 identity: same INIT + pin nets → one cell. Intermediates (`out=None`)
 /// share; a required output net always gets its own driver (no pin alias).
 struct LutShare {
-    by_fn: HashMap<(u64, Vec<String>), (String, String)>,
+    by_fn: HashMap<(u64, Vec<String>), String>,
     n: usize,
 }
 
@@ -12419,15 +12419,14 @@ impl LutShare {
             }
         }
         let key = (init, pins.to_vec());
-        if let Some((existing_cell, existing_net)) = self.by_fn.get(&key) {
-            match out {
-                None => return existing_net.clone(),
-                Some(o) => {
-                    // Share the existing LUT: connect the requested output
-                    // net to the existing cell's output pin.
-                    d.connect(o, existing_cell, "O");
-                    return o.to_string();
-                }
+        // Only share when the caller doesn't need a specific named output.
+        // Sharing with named outputs would require net aliasing (merging the
+        // requested net with the existing net), which the Design API doesn't
+        // support safely. Connecting two nets to the same output pin corrupts
+        // the pin_ix mapping.
+        if out.is_none() {
+            if let Some(existing) = self.by_fn.get(&key) {
+                return existing.clone();
             }
         }
         let cell = format!("{prefix}s{}", self.n);
@@ -12441,9 +12440,7 @@ impl LutShare {
         for (i, p) in pins.iter().enumerate() {
             d.connect(p, &cell, &format!("I{i}"));
         }
-        self.by_fn
-            .entry(key)
-            .or_insert_with(|| (cell.clone(), net.clone()));
+        self.by_fn.entry(key).or_insert_with(|| net.clone());
         net
     }
 
@@ -18262,10 +18259,13 @@ pub fn synth_sv_path_with_siblings(path: &Path) -> Result<Design, String> {
 }
 
 pub fn lut_init_of(source: &str) -> Result<u64, String> {
-    match synth_sv(source, "t.sv")?.cell("u_lut").unwrap().kind {
-        CellKind::Lut6 { init } => Ok(init),
-        _ => Err("no lut".into()),
+    let d = synth_sv(source, "t.sv")?;
+    for cell in d.cells.iter() {
+        if let CellKind::Lut6 { init } = cell.kind {
+            return Ok(init);
+        }
     }
+    Err("no lut".into())
 }
 
 
