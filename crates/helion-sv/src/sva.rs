@@ -13,7 +13,7 @@
 //! [`eval`]. `helion-sim` resolves the probes at attach time and samples
 //! each posedge.
 
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -580,9 +580,9 @@ fn classify_probe(
     sig: &str,
 ) -> Result<SvaProbe, String> {
     if let Some(n) = design.net(net) {
-        if let Some(q) = n.endpoints.iter().find(|e| e.pin == "Q") {
+        if let Some(q) = n.endpoints.iter().find(|e| e.pin == intern("Q")) {
             let is_ff = design
-                .cell(&q.cell)
+                .cell(resolve(q.cell))
                 .map(|c| matches!(c.kind, CellKind::Hff))
                 .unwrap_or(false);
             if is_ff {
@@ -595,7 +595,7 @@ fn classify_probe(
     if design
         .ports
         .iter()
-        .any(|p| p.name == net && matches!(p.dir, PortDir::In | PortDir::Inout))
+        .any(|p| p.name == intern(net) && matches!(p.dir, PortDir::In | PortDir::Inout))
     {
         return Ok(SvaProbe::InputBit {
             name: net.to_string(),
