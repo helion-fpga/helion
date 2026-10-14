@@ -8,7 +8,7 @@
 //! failures. First-failure time is the signal; checking is report-and-continue
 //! with a stored-failure cap (128) while the total count is unbounded.
 
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 use helion_sv::sva::{eval, SvaExpr, SvaImmProp, SvaProbe, SvaProperty, SvaSeverity};
 use std::collections::{HashMap, VecDeque};
 
@@ -73,8 +73,8 @@ fn bind_probes(
             SvaProbe::FfBit { net } => {
                 let cell = design
                     .net(net)
-                    .and_then(|n| n.endpoints.iter().find(|e| e.pin == "Q"))
-                    .map(|e| e.cell.clone())
+                    .and_then(|n| n.endpoints.iter().find(|e| e.pin == intern("Q")))
+                    .map(|e| resolve(e.cell).to_string())
                     .filter(|c| {
                         design
                             .cell(c)
@@ -92,7 +92,7 @@ fn bind_probes(
                 let is_input = design
                     .ports
                     .iter()
-                    .any(|p| p.name == *name && matches!(p.dir, PortDir::In | PortDir::Inout));
+                    .any(|p| p.name == intern(name) && matches!(p.dir, PortDir::In | PortDir::Inout));
                 if is_input {
                     Ok(ProbeBind::Input(name.clone()))
                 } else {

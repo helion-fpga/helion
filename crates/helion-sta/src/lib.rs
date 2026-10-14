@@ -9,7 +9,7 @@
 
 use helion_backend::TimingModel;
 use helion_device::Device;
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir, Spur};
 use helion_place::Placed;
 use helion_route::Routed;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -884,7 +884,7 @@ fn iob_pad_ps(design: &Design, tm: &TimingModel) -> i64 {
         .unwrap_or(tm.iob_ps)
 }
 
-fn lut_fanin_idx(idx: &helion_ir::PinIndex<'_>, lut: &str) -> i64 {
+fn lut_fanin_idx(idx: &helion_ir::PinIndex, lut: &str) -> i64 {
     // Static pin names avoid per-call format! in the r2r hot loop.
     const PINS: [&str; 6] = ["I0", "I1", "I2", "I3", "I4", "I5"];
     PINS.iter().filter(|p| idx.net_on(lut, p).is_some()).count() as i64
@@ -899,7 +899,7 @@ fn r2r_ps(design: &Design, tm: &TimingModel) -> i64 {
         if !matches!(c.kind, CellKind::Lut6 { .. }) {
             continue;
         }
-        let pins = lut_fanin_idx(&idx, &c.name);
+        let pins = lut_fanin_idx(&idx, resolve(c.name));
         max_ps = max_ps.max(tm.ff_ckq_ps + tm.lut_ps + pins * tm.pin_ps + tm.setup_ps);
     }
     max_ps.max(tm.ff_ckq_ps + tm.lut_ps + tm.setup_ps)
@@ -2496,11 +2496,11 @@ fn clock_pin_names(clocks: &[Clock], xdc: &Constraints) -> BTreeSet<String> {
 
 fn lut_drives_clock(design: &Design) -> Vec<(String, String, String)> {
     let pins = design.pin_index();
-    let mut lut_o: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut lut_o: HashMap<Spur, Vec<Spur>> = HashMap::new();
     for c in &design.cells {
         if matches!(c.kind, CellKind::Lut6 { .. }) {
-            if let Some(o) = pins.net_on(&c.name, "O") {
-                lut_o.entry(o).or_default().push(c.name.as_str());
+            if let Some(o) = pins.net_on(resolve(c.name), "O") {
+                lut_o.entry(o).or_default().push(c.name);
             }
         }
     }
@@ -2510,14 +2510,18 @@ fn lut_drives_clock(design: &Design) -> Vec<(String, String, String)> {
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        let Some(clk_net) = pins.net_on(&ff.name, "CLK") else {
+        let Some(clk_net) = pins.net_on(resolve(ff.name), "CLK") else {
             continue;
         };
-        let Some(luts) = lut_o.get(clk_net) else {
+        let Some(luts) = lut_o.get(&clk_net) else {
             continue;
         };
         for lut in luts {
-            hits.push(((*lut).to_string(), ff.name.clone(), clk_net.to_string()));
+            hits.push((
+                resolve(*lut).to_string(),
+                resolve(ff.name).to_string(),
+                resolve(clk_net).to_string(),
+            ));
         }
     }
     hits
@@ -2525,14 +2529,14 @@ fn lut_drives_clock(design: &Design) -> Vec<(String, String, String)> {
 
 fn q_used_as_clock(design: &Design) -> Vec<(String, String, String)> {
     let pins = design.pin_index();
-    let mut clk_loads: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut clk_loads: HashMap<Spur, Vec<Spur>> = HashMap::new();
     for dst in design
         .cells
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        if let Some(clk) = pins.net_on(&dst.name, "CLK") {
-            clk_loads.entry(clk).or_default().push(dst.name.as_str());
+        if let Some(clk) = pins.net_on(resolve(dst.name), "CLK") {
+            clk_loads.entry(clk).or_default().push(dst.name);
         }
     }
     let mut hits = Vec::new();
@@ -2541,15 +2545,19 @@ fn q_used_as_clock(design: &Design) -> Vec<(String, String, String)> {
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        let Some(q_net) = pins.net_on(&src.name, "Q") else {
+        let Some(q_net) = pins.net_on(resolve(src.name), "Q") else {
             continue;
         };
-        let Some(dsts) = clk_loads.get(q_net) else {
+        let Some(dsts) = clk_loads.get(&q_net) else {
             continue;
         };
         for dst in dsts {
-            if *dst != src.name.as_str() {
-                hits.push((src.name.clone(), (*dst).to_string(), q_net.to_string()));
+            if *dst != src.name {
+                hits.push((
+                    resolve(src.name).to_string(),
+                    resolve(*dst).to_string(),
+                    resolve(q_net).to_string(),
+                ));
             }
         }
     }
@@ -2583,30 +2591,31 @@ pub fn report_methodology(
     let clock_pins = clock_pin_names(clocks, xdc);
     let implicit_clk = clock_pins.is_empty();
     for p in &d.ports {
-        let is_clk =
-            clock_pins.contains(&p.name) || (implicit_clk && p.name == "clk") || p.name == "clk";
+        let is_clk = clock_pins.contains(resolve(p.name))
+            || (implicit_clk && p.name == intern("clk"))
+            || p.name == intern("clk");
         match p.dir {
             PortDir::In | PortDir::Inout if !is_clk => {
-                if !xdc.input_delay_ps.contains_key(&p.name) {
+                if !xdc.input_delay_ps.contains_key(resolve(p.name)) {
                     methodology_push(
                         &mut checks,
                         "TIMING-6",
                         MethodologySeverity::Warning,
                         "TIMING",
-                        &p.name,
-                        format!("Missing set_input_delay on input port {}", p.name),
+                        resolve(p.name),
+                        format!("Missing set_input_delay on input port {}", resolve(p.name)),
                     );
                 }
             }
             PortDir::Out | PortDir::Inout => {
-                if !xdc.output_delay_ps.contains_key(&p.name) {
+                if !xdc.output_delay_ps.contains_key(resolve(p.name)) {
                     methodology_push(
                         &mut checks,
                         "TIMING-7",
                         MethodologySeverity::Warning,
                         "TIMING",
-                        &p.name,
-                        format!("Missing set_output_delay on output port {}", p.name),
+                        resolve(p.name),
+                        format!("Missing set_output_delay on output port {}", resolve(p.name)),
                     );
                 }
             }
@@ -3901,23 +3910,25 @@ fn walk_ff_path(design: &Design, ff: &str) -> (String, Vec<String>, Vec<String>)
     let mut nets = Vec::new();
     // Startpoint is the FF until a real driving cell is found — never a clock net name.
     let mut start = ff.to_string();
-    if let Some(dnet) = design.net_on(ff, "D") {
-        nets.push(dnet.to_string());
-        if let Some(n) = design.net(dnet) {
+    if let Some(dnet) = design.net_on(intern(ff), intern("D")) {
+        nets.push(resolve(dnet).to_string());
+        if let Some(n) = design.net(resolve(dnet)) {
             for e in &n.endpoints {
-                if e.pin == "O" && !cells.contains(&e.cell) {
-                    cells.push(e.cell.clone());
+                if e.pin == intern("O") && !cells.iter().any(|x| x.as_str() == resolve(e.cell)) {
+                    cells.push(resolve(e.cell).to_string());
                     for i in 0..6u8 {
                         let pin = format!("I{i}");
-                        if let Some(inet) = design.net_on(&e.cell, &pin) {
-                            if !nets.iter().any(|x| x == inet) {
-                                nets.push(inet.to_string());
+                        if let Some(inet) = design.net_on(e.cell, intern(&pin)) {
+                            if !nets.iter().any(|x| x.as_str() == resolve(inet)) {
+                                nets.push(resolve(inet).to_string());
                             }
-                            if let Some(nn) = design.net(inet) {
+                            if let Some(nn) = design.net(resolve(inet)) {
                                 for ee in &nn.endpoints {
-                                    if ee.pin == "Q" && !cells.contains(&ee.cell) {
-                                        cells.push(ee.cell.clone());
-                                        start = ee.cell.clone();
+                                    if ee.pin == intern("Q")
+                                        && !cells.iter().any(|x| x.as_str() == resolve(ee.cell))
+                                    {
+                                        cells.push(resolve(ee.cell).to_string());
+                                        start = resolve(ee.cell).to_string();
                                     }
                                 }
                             }
@@ -3934,21 +3945,23 @@ fn walk_iob_path(design: &Design, iob: &str) -> (String, Vec<String>, Vec<String
     let mut cells = vec![iob.to_string()];
     let mut nets = Vec::new();
     let mut start = iob.to_string();
-    if let Some(inet) = design.net_on(iob, "I") {
-        nets.push(inet.to_string());
-        if let Some(n) = design.net(inet) {
+    if let Some(inet) = design.net_on(intern(iob), intern("I")) {
+        nets.push(resolve(inet).to_string());
+        if let Some(n) = design.net(resolve(inet)) {
             for e in &n.endpoints {
                 // Registered Q or comb LUT O may drive the IOB I pin.
-                if (e.pin == "Q" || e.pin == "O") && !cells.contains(&e.cell) {
-                    cells.push(e.cell.clone());
-                    start = e.cell.clone();
+                if (e.pin == intern("Q") || e.pin == intern("O"))
+                    && !cells.iter().any(|x| x.as_str() == resolve(e.cell))
+                {
+                    cells.push(resolve(e.cell).to_string());
+                    start = resolve(e.cell).to_string();
                 }
             }
         }
     }
-    if let Some(pad) = design.net_on(iob, "PAD") {
-        if !nets.iter().any(|x| x == pad) {
-            nets.push(pad.to_string());
+    if let Some(pad) = design.net_on(intern(iob), intern("PAD")) {
+        if !nets.iter().any(|x| x.as_str() == resolve(pad)) {
+            nets.push(resolve(pad).to_string());
         }
     }
     (start, cells, nets)
@@ -3972,13 +3985,13 @@ pub fn timing_paths_routed_with(
         if !matches!(c.kind, CellKind::Hff) {
             continue;
         }
-        let endpoint = endpoint_from_placed(placed, &c.name);
+        let endpoint = endpoint_from_placed(placed, resolve(c.name));
         if endpoint.site_id.is_empty() {
             continue;
         }
-        let (start, cells, nets) = walk_ff_path(design, &c.name);
+        let (start, cells, nets) = walk_ff_path(design, resolve(c.name));
         paths.push(TimingPath {
-            name: format!("{start}->{}", c.name),
+            name: format!("{start}->{}", resolve(c.name)),
             startpoint: endpoint_from_placed(placed, &start),
             endpoint,
             cells,
@@ -3991,11 +4004,11 @@ pub fn timing_paths_routed_with(
         if !matches!(c.kind, CellKind::IobOut) {
             continue;
         }
-        let endpoint = endpoint_from_placed(placed, &c.name);
+        let endpoint = endpoint_from_placed(placed, resolve(c.name));
         if endpoint.site_id.is_empty() {
             continue;
         }
-        let (start, cells, nets) = walk_iob_path(design, &c.name);
+        let (start, cells, nets) = walk_iob_path(design, resolve(c.name));
         // Same scale as report_timing_routed: CkQ (if FF) + hop route + pad.
         let delay_ps = routed
             .iob_src
@@ -4006,7 +4019,7 @@ pub fn timing_paths_routed_with(
                         .packed
                         .iobs
                         .iter()
-                        .any(|io| io.cell == c.name && io.from_net == r.net)
+                        .any(|io| io.cell.as_str() == resolve(c.name) && io.from_net == r.net)
             })
             .map(|r| {
                 let ckq = if r.from_ff { tm.ff_ckq_ps } else { 0 };
@@ -4014,7 +4027,7 @@ pub fn timing_paths_routed_with(
             })
             .unwrap_or(t.iob_ps);
         paths.push(TimingPath {
-            name: format!("{start}->{}", c.name),
+            name: format!("{start}->{}", resolve(c.name)),
             startpoint: endpoint_from_placed(placed, &start),
             endpoint,
             cells,

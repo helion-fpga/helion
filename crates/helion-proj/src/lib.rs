@@ -5,7 +5,7 @@ use helion_bits::{Bitstream, bitgen, bitgen_pblock, eco_lut};
 use helion_debug::insert_ila;
 use helion_device::{Device, Site};
 use helion_hw::{CableBackend, prog_sim, program_hbits_with_cable, resolve_cable};
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir, Spur};
 use helion_pack::{Packed, apply_iob_electrical, pack};
 use helion_place::{PlaceOpts, Placed, place_incremental, place_with};
 use helion_route::{HOP_DELAY_PS, RouteOpts, Routed, route_with};
@@ -637,7 +637,7 @@ impl Session {
         let reused_cells = d
             .cells
             .iter()
-            .filter(|c| prev_cells.contains(c.name.as_str()))
+            .filter(|c| prev_cells.contains(resolve(c.name)))
             .count();
         let prev_nets: std::collections::HashSet<&str> = prev
             .packed
@@ -648,7 +648,7 @@ impl Session {
         let reused_nets = d
             .nets
             .iter()
-            .filter(|n| prev_nets.contains(n.name.as_str()))
+            .filter(|n| prev_nets.contains(resolve(n.name)))
             .count();
         let report = ReuseReport {
             cells: d.cells.len(),
@@ -720,7 +720,7 @@ impl Session {
         let missing: Vec<&str> = d
             .cells
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| resolve(c.name))
             .filter(|n| !have.contains(n))
             .collect();
         Ok(format!(
@@ -733,19 +733,19 @@ impl Session {
     /// UG986 Lab 4: insert a LUT+FF pair named like ECO_LUT3 so pack can place it.
     pub fn insert_eco_lut(&mut self, name: &str, init: u64) -> Result<String, String> {
         let d = self.design.as_mut().ok_or("insert_eco_lut: no design")?;
-        if d.cells.iter().any(|c| c.name == name) {
+        if d.cells.iter().any(|c| c.name == intern(name)) {
             return Err(format!("insert_eco_lut: {name} exists"));
         }
         let ff = format!("{name}_ff");
         d.add_cell(name, CellKind::Lut6 { init });
         d.add_cell(&ff, CellKind::Hff);
-        if !d.ports.iter().any(|p| p.name == "clk") {
+        if !d.ports.iter().any(|p| p.name == intern("clk")) {
             d.add_port("clk", PortDir::In);
         }
         d.connect("clk", &ff, "CLK");
-        d.connect(format!("{name}_d"), name, "O");
-        d.connect(format!("{name}_d"), &ff, "D");
-        d.connect(format!("{name}_q"), &ff, "Q");
+        d.connect(&format!("{name}_d"), name, "O");
+        d.connect(&format!("{name}_d"), &ff, "D");
+        d.connect(&format!("{name}_q"), &ff, "Q");
         Ok(format!("insert_eco_lut {name} init={init:#x}"))
     }
 
@@ -803,7 +803,7 @@ impl Session {
         let t = report_timing_routed_xdc(d, r, &clks, xdc)?;
         Ok(format!(
             "report_timing {} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",
-            d.name,
+            resolve(d.name),
             t.wns_ps,
             t.tns_ps,
             t.setup_ps,
@@ -1361,16 +1361,16 @@ fn place_named_cells_in_region(
 pub fn get_cells(d: &Design, filter: Option<&str>) -> Vec<String> {
     d.cells
         .iter()
-        .filter(|c| filter.map(|f| c.name.contains(f)).unwrap_or(true))
-        .map(|c| c.name.clone())
+        .filter(|c| filter.map(|f| resolve(c.name).contains(f)).unwrap_or(true))
+        .map(|c| resolve(c.name).to_string())
         .collect()
 }
 
 pub fn get_nets(d: &Design, filter: Option<&str>) -> Vec<String> {
     d.nets
         .iter()
-        .filter(|n| filter.map(|f| n.name.contains(f)).unwrap_or(true))
-        .map(|n| n.name.clone())
+        .filter(|n| filter.map(|f| resolve(n.name).contains(f)).unwrap_or(true))
+        .map(|n| resolve(n.name).to_string())
         .collect()
 }
 
@@ -2000,17 +2000,17 @@ pub fn constraints_from_project(
 
 pub fn opt_design(d: &mut Design) -> usize {
     let pins = d.pin_index();
-    let iob_nets: std::collections::HashSet<&str> = d
+    let iob_nets: std::collections::HashSet<Spur> = d
         .cells
         .iter()
         .filter(|c| matches!(c.kind, CellKind::IobOut))
-        .filter_map(|c| pins.net_on(&c.name, "I"))
+        .filter_map(|c| pins.net_on(resolve(c.name), "I"))
         .collect();
-    let mut d_to_ff: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut d_to_ff: std::collections::HashMap<Spur, Spur> = std::collections::HashMap::new();
     for f in &d.cells {
         if matches!(f.kind, CellKind::Hff) {
-            if let Some(dnet) = pins.net_on(&f.name, "D") {
-                d_to_ff.entry(dnet).or_insert(f.name.as_str());
+            if let Some(dnet) = pins.net_on(resolve(f.name), "D") {
+                d_to_ff.entry(dnet).or_insert(f.name);
             }
         }
     }
@@ -2019,27 +2019,27 @@ pub fn opt_design(d: &mut Design) -> usize {
         let CellKind::Lut6 { init: 0 } = c.kind else {
             continue;
         };
-        let Some(o) = pins.net_on(&c.name, "O") else {
+        let Some(o) = pins.net_on(resolve(c.name), "O") else {
             continue;
         };
-        let Some(ff_name) = d_to_ff.get(o).copied() else {
+        let Some(ff_name) = d_to_ff.get(&o).copied() else {
             continue;
         };
-        let Some(ff) = d.cell(ff_name) else {
+        let Some(ff) = d.cell(resolve(ff_name)) else {
             continue;
         };
-        let q = pins.net_on(ff_name, "Q").unwrap_or("");
-        if iob_nets.contains(q) {
+        let q = pins.net_on(resolve(ff_name), "Q").unwrap_or(intern(""));
+        if iob_nets.contains(&q) {
             continue;
         }
         if c.attrs.flag("DONT_TOUCH") || c.attrs.flag("keep") || ff.attrs.flag("DONT_TOUCH") {
             continue;
         }
-        drop.insert(c.name.clone());
-        drop.insert(ff.name.clone());
+        drop.insert(resolve(c.name).to_string());
+        drop.insert(resolve(ff.name).to_string());
     }
     let n = drop.len() / 2;
-    d.cells.retain(|c| !drop.contains(&c.name));
+    d.cells.retain(|c| !drop.contains(resolve(c.name)));
     d.rebuild_indexes();
     n
 }
@@ -2048,7 +2048,7 @@ pub fn opt_design(d: &mut Design) -> usize {
 mod tests {
     use super::*;
     use helion_device::Device;
-    use helion_ir::{CellKind, Design, PortDir};
+    use helion_ir::{CellKind, Design, PortDir, Spur};
 
     #[test]
     fn dual_mode_same_hash_and_ckpt() {

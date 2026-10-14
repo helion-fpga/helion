@@ -3,7 +3,7 @@
 //! when/else, generate, process if/elsif/case/for, generics, port maps, and
 //! IEEE casts all become SV that `helion_sv` maps.
 
-use helion_ir::{Design, MapResult, SoftDiag, SoftSpan};
+use helion_ir::{intern, Design, MapResult, SoftDiag, SoftSpan};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -284,7 +284,7 @@ fn vhdl_to_sv_with_softs(source: &str, origin: &str) -> Result<(String, Vec<Soft
     let mut nested_as_child: HashSet<String> = HashSet::new();
     for softs in full_softs.values() {
         for s in softs {
-            if s.name == "child_soft_incomplete" {
+            if s.name == intern("child_soft_incomplete") {
                 if let Some(d) = &s.detail {
                     nested_as_child.insert(d.to_ascii_lowercase());
                 }

@@ -11,7 +11,7 @@
 //! VCD measures architectural switching, not post-route glitch power.
 
 use crate::Sim;
-use helion_ir::Design;
+use helion_ir::{resolve, Design};
 
 /// Upper bound on dumped signals. Ibex-scale designs would otherwise produce
 /// gigabyte VCDs from this behavioral kernel; extra nets are silently
@@ -70,7 +70,7 @@ pub fn dump_vcd(design: &Design, cycles: u32, timescale_ps: u64) -> String {
     // half-period are already in ps), so no tick-unit conversion exists to
     // get wrong.
     out.push_str("$timescale 1ps $end\n");
-    out.push_str(&format!("$scope module {} $end\n", design.name));
+    out.push_str(&format!("$scope module {} $end\n", resolve(design.name)));
     for (name, id) in names.iter().zip(ids.iter()) {
         out.push_str(&format!("$var wire 1 {id} {name} $end\n"));
     }

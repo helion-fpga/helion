@@ -18,7 +18,7 @@ use helion_device::{Device, Far, Site, SiteKind};
 use helion_drc::{Drc, DrcSeverity, check_placed, check_routed};
 use helion_fabric::{Fabric, Stat, StatBit};
 use helion_ipxact::{IpCore, catalog as ipxact_catalog, to_xml};
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{CellKind, Design, PortDir, Spur, intern, resolve};
 use helion_proj::{
     CheckpointMeta, CheckpointSummary, ImplStrategy, Mode, PrjImplRun, PrjPblock, ProjectFile,
     ReuseReport, Session, delete_checkpoint, diff_metas, expand_ip_packages, format_prj, get_cells,
@@ -419,7 +419,7 @@ fn primitive_of(kind: &CellKind) -> String {
         CellKind::Ila { .. } => "ILA".into(),
         CellKind::Bram18 => "BRAM18".into(),
         CellKind::Carry4 => "CARRY4".into(),
-        CellKind::BlackBox { module } => format!("BLACKBOX:{module}"),
+        CellKind::BlackBox { module } => format!("BLACKBOX:{}", resolve(*module)),
     }
 }
 
@@ -1875,7 +1875,7 @@ pub fn schematic_star_edges(net: &str, endpoints: &[helion_ir::Endpoint]) -> Vec
     let mut drivers: Vec<&helion_ir::Endpoint> = Vec::new();
     let mut loads: Vec<&helion_ir::Endpoint> = Vec::new();
     for e in endpoints {
-        if pin_is_output(&e.pin) {
+        if pin_is_output(resolve(e.pin)) {
             drivers.push(e);
         } else {
             loads.push(e);
@@ -1888,10 +1888,10 @@ pub fn schematic_star_edges(net: &str, endpoints: &[helion_ir::Endpoint]) -> Vec
                 return;
             }
             edges.push(SchematicEdge {
-                src: a.cell.clone(),
-                src_pin: a.pin.clone(),
-                dst: b.cell.clone(),
-                dst_pin: b.pin.clone(),
+                src: resolve(a.cell).to_string(),
+                src_pin: resolve(a.pin).to_string(),
+                dst: resolve(b.cell).to_string(),
+                dst_pin: resolve(b.pin).to_string(),
                 net: net.to_string(),
             });
         };
@@ -4086,12 +4086,16 @@ impl Ila {
     /// Nets available as probes: real net names, mark_debug first, then all.
     pub fn probe_net_list(&self, design: &helion_ir::Design) -> Vec<String> {
         let d = design;
-        let mut marked = d.marked_debug_nets();
+        let mut marked: Vec<String> = d
+            .marked_debug_nets()
+            .iter()
+            .map(|s| resolve(*s).to_string())
+            .collect();
         marked.sort();
         let mut rest: Vec<String> = d
             .nets
             .iter()
-            .map(|n| n.name.clone())
+            .map(|n| resolve(n.name).to_string())
             .filter(|n| !marked.contains(n))
             .collect();
         rest.sort();
@@ -4113,15 +4117,16 @@ impl Ila {
         let mut out: Vec<String> = d
             .ports
             .iter()
-            .filter(|p| p.name.to_ascii_lowercase().contains("clk"))
-            .map(|p| p.name.clone())
+            .filter(|p| resolve(p.name).to_ascii_lowercase().contains("clk"))
+            .map(|p| resolve(p.name).to_string())
             .collect();
         let pin_ix = d.pin_index();
         for c in &d.cells {
             if matches!(c.kind, helion_ir::CellKind::Hff) {
-                if let Some(net) = pin_ix.net_on(&c.name, "CLK") {
-                    if !out.iter().any(|n| n == net) {
-                        out.push(net.to_string());
+                if let Some(net) = pin_ix.net_on(resolve(c.name), "CLK") {
+                    let net_str = resolve(net).to_string();
+                    if !out.contains(&net_str) {
+                        out.push(net_str);
                     }
                 }
             }
@@ -8417,7 +8422,7 @@ impl IdeModel {
                 .session
                 .design
                 .as_ref()
-                .map(|d| d.name.clone())
+                .map(|d| resolve(d.name).to_string())
                 .or_else(|| self.tree.top.clone()),
             ..Default::default()
         };
@@ -8465,7 +8470,12 @@ impl IdeModel {
             .session
             .design
             .as_ref()
-            .map(|d| d.marked_debug_nets())
+            .map(|d| {
+                d.marked_debug_nets()
+                    .iter()
+                    .map(|s| resolve(*s).to_string())
+                    .collect::<Vec<String>>()
+            })
             .unwrap_or_default();
         pf
     }
@@ -8786,7 +8796,7 @@ impl IdeModel {
             .session
             .design
             .as_ref()
-            .map(|d| d.name.clone())
+            .map(|d| resolve(d.name).to_string())
             .or_else(|| self.tree.top.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "project".into());
@@ -9133,7 +9143,7 @@ impl IdeModel {
                 self.last_sva_report.clear();
                 let mut msg = format!(
                     "synth_design {} cells={} luts={}",
-                    d.name,
+                    resolve(d.name),
                     d.cells.len(),
                     d.lut_inits().len()
                 );
@@ -9377,9 +9387,12 @@ impl IdeModel {
             }
         }
         let d = self.shell.session.design.as_ref()?;
-        let net = d.nets.iter().find(|n| n.name.eq_ignore_ascii_case(name))?;
-        let ff = net.endpoints.iter().find(|e| e.pin == "Q")?;
-        Some(ff.cell.clone())
+        let net = d
+            .nets
+            .iter()
+            .find(|n| resolve(n.name).eq_ignore_ascii_case(name))?;
+        let ff = net.endpoints.iter().find(|e| e.pin == intern("Q"))?;
+        Some(resolve(ff.cell).to_string())
     }
 
     /// True when `name` is a design Q-net (RTL/ILA probe name), HFF CLK net,
@@ -9395,17 +9408,21 @@ impl IdeModel {
             return true;
         }
         if let Some(d) = self.shell.session.design.as_ref() {
-            if d.ports.iter().any(|p| p.name == name) {
+            if d.ports.iter().any(|p| resolve(p.name) == name) {
                 return true;
             }
             if Self::hff_clock_net(d).as_deref() == Some(name) {
                 return true;
             }
-            if d.marked_debug_nets().iter().any(|n| n == name) {
+            if d.marked_debug_nets().iter().any(|n| resolve(*n) == name) {
                 return true;
             }
             if d.nets.iter().any(|n| {
-                n.name == name && n.endpoints.iter().any(|e| e.pin == "Q" || e.pin == "CLK")
+                resolve(n.name) == name
+                    && n
+                        .endpoints
+                        .iter()
+                        .any(|e| e.pin == intern("Q") || e.pin == intern("CLK"))
             }) {
                 return true;
             }
@@ -9420,14 +9437,18 @@ impl IdeModel {
         let mut bits: Vec<String> = d
             .nets
             .iter()
-            .filter(|n| n.name.starts_with(&pfx) && n.endpoints.iter().any(|e| e.pin == "Q"))
-            .map(|n| n.name.clone())
+            .filter(|n| {
+                resolve(n.name).starts_with(&pfx)
+                    && n.endpoints.iter().any(|e| e.pin == intern("Q"))
+            })
+            .map(|n| resolve(n.name).to_string())
             .collect();
         if bits.is_empty() {
             bits = d
                 .marked_debug_nets()
                 .into_iter()
-                .filter(|n| n.starts_with(&pfx))
+                .filter(|n| resolve(*n).starts_with(&pfx))
+                .map(|n| resolve(n).to_string())
                 .collect();
         }
         if bits.is_empty() {
@@ -10472,7 +10493,7 @@ impl IdeModel {
                         .session
                         .design
                         .as_ref()
-                        .and_then(|d| d.nets.iter().find(|n| n.name == name))
+                        .and_then(|d| d.nets.iter().find(|n| resolve(n.name) == name))
                         .map(|n| format!("fanout={}", n.endpoints.len()))
                         .unwrap_or_else(|| "net".into())
                 };
@@ -13191,7 +13212,7 @@ impl IdeModel {
             .session
             .design
             .as_ref()
-            .map(|d| d.ports.iter().map(|p| p.name.clone()).collect())
+            .map(|d| d.ports.iter().map(|p| resolve(p.name).to_string()).collect())
             .unwrap_or_default();
         let mut pins: Vec<(String, String)> = self
             .constraints
@@ -13299,7 +13320,7 @@ impl IdeModel {
                     .cells
                     .iter()
                     .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
-                    .map(|c| c.name.clone())
+                    .map(|c| resolve(c.name).to_string())
                     .collect();
             }
         }
@@ -13589,7 +13610,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property PACKAGE_PIN: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property PACKAGE_PIN: no port {port}"));
             }
             d.set_loc(port, pin)?;
@@ -13652,7 +13673,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property IOSTANDARD: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property IOSTANDARD: no port {port}"));
             }
             d.set_iostandard(port, &std_up)?;
@@ -13714,7 +13735,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property DRIVE: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property DRIVE: no port {port}"));
             }
             d.set_drive(port, &drive)?;
@@ -13753,7 +13774,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property SLEW: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property SLEW: no port {port}"));
             }
             d.set_slew(port, &slew_up)?;
@@ -13792,7 +13813,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property PULLTYPE: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property PULLTYPE: no port {port}"));
             }
             d.set_pulltype(port, &pull_up)?;
@@ -13830,7 +13851,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property DIFF_TERM: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property DIFF_TERM: no port {port}"));
             }
             d.set_diff_term(port, canon)?;
@@ -13868,7 +13889,7 @@ impl IdeModel {
                 .design
                 .as_mut()
                 .ok_or("set_property IN_TERM: no design")?;
-            if d.ports.iter().all(|p| p.name != port) {
+            if d.ports.iter().all(|p| resolve(p.name) != port) {
                 return Err(format!("set_property IN_TERM: no port {port}"));
             }
             d.set_in_term(port, canon)?;
@@ -13893,7 +13914,7 @@ impl IdeModel {
             .session
             .design
             .as_ref()
-            .and_then(|d| d.ports.iter().find(|p| p.name == port));
+            .and_then(|d| d.ports.iter().find(|p| resolve(p.name) == port));
         port_pad_ps(
             p.and_then(|p| p.attrs.get("IOSTANDARD")),
             p.and_then(|p| p.attrs.get("DRIVE")),
@@ -14022,7 +14043,7 @@ impl IdeModel {
         let lutff = side.placed.as_ref().map(|p| p.packed.lutffs.len());
         let cells = side.design.as_ref().map(|d| d.cells.len());
         let hash = side.blinky_hash();
-        let top = side.design.as_ref().map(|d| d.name.clone());
+        let top = side.design.as_ref().map(|d| resolve(d.name).to_string());
         let part = self.part().to_string();
         let r = &mut self.runs[idx];
         r.status = "Complete".into();
@@ -14113,7 +14134,7 @@ impl IdeModel {
             let part = self.part().to_string();
             let cells = side.design.as_ref().map(|d| d.cells.len());
             let bitstream_hash = side.blinky_hash();
-            let top = side.design.as_ref().map(|d| d.name.clone());
+            let top = side.design.as_ref().map(|d| resolve(d.name).to_string());
             let strategy_label = strategy.preset.clone();
             let spec = strategy.to_spec();
             let r = &mut self.runs[idx];
@@ -14415,7 +14436,7 @@ impl IdeModel {
                 .cells
                 .iter()
                 .map(|c| {
-                    let reused = prev_names.contains(&c.name);
+                    let reused = prev_names.contains(resolve(c.name));
                     let kind = match &c.kind {
                         CellKind::Lut6 { .. } => "LUT",
                         CellKind::Hff => "FF",
@@ -14429,14 +14450,14 @@ impl IdeModel {
                         CellKind::BlackBox { .. } => "BOX",
                     };
                     IncrementalRow {
-                        name: c.name.clone(),
+                        name: resolve(c.name).to_string(),
                         kind: kind.into(),
                         status: if reused {
                             "Reused".into()
                         } else {
                             "New".into()
                         },
-                        site: sites.get(&c.name).cloned().unwrap_or_else(|| "-".into()),
+                        site: sites.get(resolve(c.name)).cloned().unwrap_or_else(|| "-".into()),
                         reused: usize::from(reused),
                         total: 1,
                         pct: if reused { 100 } else { 0 },
@@ -14722,13 +14743,13 @@ impl IdeModel {
                     CellKind::Carry4 => ("CARRY", "-".into()),
                     CellKind::BlackBox { .. } => ("BOX", "-".into()),
                 };
-                let (status, site) = match sites.get(&c.name) {
+                let (status, site) = match sites.get(resolve(c.name)) {
                     Some(s) => ("Placed", s.clone()),
                     None if placed.is_some() => ("Missing", "-".into()),
                     None => ("Unplaced", "-".into()),
                 };
                 EcoRow {
-                    name: c.name.clone(),
+                    name: resolve(c.name).to_string(),
                     kind: kind.into(),
                     status: status.into(),
                     site,
@@ -15080,27 +15101,27 @@ impl IdeModel {
         let mut hits = Vec::new();
         if let Some(d) = self.shell.session.design.as_ref() {
             for c in &d.cells {
-                if c.name.to_ascii_lowercase().contains(&q) {
+                if resolve(c.name).to_ascii_lowercase().contains(&q) {
                     hits.push(FindHit {
                         kind: "cell".into(),
-                        name: c.name.clone(),
+                        name: resolve(c.name).to_string(),
                         primitive: primitive_of(&c.kind),
                         parent: parent.clone(),
                     });
                 }
             }
             for n in &d.nets {
-                if n.name.to_ascii_lowercase().contains(&q) {
+                if resolve(n.name).to_ascii_lowercase().contains(&q) {
                     hits.push(FindHit {
                         kind: "net".into(),
-                        name: n.name.clone(),
+                        name: resolve(n.name).to_string(),
                         primitive: format!("fanout={}", n.endpoints.len()),
                         parent: parent.clone(),
                     });
                 }
             }
             for p in &d.ports {
-                if p.name.to_ascii_lowercase().contains(&q) {
+                if resolve(p.name).to_ascii_lowercase().contains(&q) {
                     let dir = match p.dir {
                         PortDir::In => "IN",
                         PortDir::Out => "OUT",
@@ -15108,7 +15129,7 @@ impl IdeModel {
                     };
                     hits.push(FindHit {
                         kind: "port".into(),
-                        name: p.name.clone(),
+                        name: resolve(p.name).to_string(),
                         primitive: dir.into(),
                         parent: parent.clone(),
                     });

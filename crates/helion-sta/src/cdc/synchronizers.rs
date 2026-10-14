@@ -12,7 +12,7 @@
 //! FF whose `D` is driven directly by another domain's FF `Q` (no LUT) or
 //! by non-passthrough combinational logic has depth 0.
 
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use std::collections::{HashMap, HashSet};
 
 use super::domains::DomainMap;
@@ -55,27 +55,29 @@ fn is_buffer_init(init: u64, pin: u32) -> bool {
 /// direct-`Q` case and the passthrough-LUT case are distinguished because
 /// only the LUT link counts toward `sync_depth`.
 fn d_source(design: &Design, ff: &str) -> DSource {
-    let Some(d_net) = design.net_on(ff, "D") else {
+    let Some(d_net) = design.net_on(intern(ff), intern("D")) else {
         return DSource::Other;
     };
-    let Some(net) = design.net(d_net) else {
+    let Some(net) = design.net(resolve(d_net)) else {
         return DSource::Other;
     };
     let mut q_drivers: Vec<String> = Vec::new();
     let mut lut_drivers: Vec<String> = Vec::new();
     for e in &net.endpoints {
-        let Some(cell) = design.cell(&e.cell) else {
+        let Some(cell) = design.cell(resolve(e.cell)) else {
             continue;
         };
-        match (&cell.kind, e.pin.as_str()) {
+        match (&cell.kind, resolve(e.pin)) {
             (CellKind::Hff, "Q") => {
-                if !q_drivers.contains(&e.cell) {
-                    q_drivers.push(e.cell.clone());
+                let nm = resolve(e.cell).to_string();
+                if !q_drivers.contains(&nm) {
+                    q_drivers.push(nm);
                 }
             }
             (CellKind::Lut6 { .. }, "O") => {
-                if !lut_drivers.contains(&e.cell) {
-                    lut_drivers.push(e.cell.clone());
+                let nm = resolve(e.cell).to_string();
+                if !lut_drivers.contains(&nm) {
+                    lut_drivers.push(nm);
                 }
             }
             _ => {}
@@ -96,22 +98,22 @@ fn d_source(design: &Design, ff: &str) -> DSource {
     };
     let mut q_pin: Option<(u32, String)> = None;
     for (idx, pin) in ["I0", "I1", "I2", "I3", "I4", "I5"].iter().enumerate() {
-        let Some(pi) = design.net_on(&lut, pin) else {
+        let Some(pi) = design.net_on(intern(&lut), intern(pin)) else {
             continue;
         };
-        let Some(pin_net) = design.net(pi) else {
+        let Some(pin_net) = design.net(resolve(pi)) else {
             continue;
         };
         for e in &pin_net.endpoints {
-            if e.pin == "Q"
+            if e.pin == intern("Q")
                 && design
-                    .cell(&e.cell)
+                    .cell(resolve(e.cell))
                     .is_some_and(|c| matches!(c.kind, CellKind::Hff))
             {
                 match &q_pin {
-                    Some((_, s)) if s == &e.cell => {}
+                    Some((_, s)) if s.as_str() == resolve(e.cell) => {}
                     Some(_) => return DSource::Other,
-                    None => q_pin = Some((idx as u32, e.cell.clone())),
+                    None => q_pin = Some((idx as u32, resolve(e.cell).to_string())),
                 }
             }
         }
@@ -130,18 +132,18 @@ fn d_source(design: &Design, ff: &str) -> DSource {
 /// whose sole data PI is an FF Q. Multi-input LUTs are not passthrough.
 /// Moved verbatim from `helion-sta/src/lib.rs` (was `ff_d_source_ff`).
 pub(crate) fn ff_d_source_ff(design: &Design, ff: &str) -> Option<String> {
-    let d_net = design.net_on(ff, "D")?;
-    let net = design.net(d_net)?;
+    let d_net = design.net_on(intern(ff), intern("D"))?;
+    let net = design.net(resolve(d_net))?;
     let q_drivers: Vec<String> = net
         .endpoints
         .iter()
-        .filter(|e| e.pin == "Q")
+        .filter(|e| e.pin == intern("Q"))
         .filter(|e| {
             design
-                .cell(&e.cell)
+                .cell(resolve(e.cell))
                 .is_some_and(|c| matches!(c.kind, CellKind::Hff))
         })
-        .map(|e| e.cell.clone())
+        .map(|e| resolve(e.cell).to_string())
         .collect();
     if q_drivers.len() == 1 {
         return Some(q_drivers[0].clone());
@@ -149,13 +151,13 @@ pub(crate) fn ff_d_source_ff(design: &Design, ff: &str) -> Option<String> {
     let lut_drivers: Vec<String> = net
         .endpoints
         .iter()
-        .filter(|e| e.pin == "O")
+        .filter(|e| e.pin == intern("O"))
         .filter(|e| {
             design
-                .cell(&e.cell)
+                .cell(resolve(e.cell))
                 .is_some_and(|c| matches!(c.kind, CellKind::Lut6 { .. }))
         })
-        .map(|e| e.cell.clone())
+        .map(|e| resolve(e.cell).to_string())
         .collect();
     if lut_drivers.len() != 1 {
         return None;
@@ -163,20 +165,20 @@ pub(crate) fn ff_d_source_ff(design: &Design, ff: &str) -> Option<String> {
     let lut = &lut_drivers[0];
     let mut q_pis = Vec::new();
     for pin in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-        let Some(pi) = design.net_on(lut, pin) else {
+        let Some(pi) = design.net_on(intern(lut), intern(pin)) else {
             continue;
         };
-        let Some(pin_net) = design.net(pi) else {
+        let Some(pin_net) = design.net(resolve(pi)) else {
             continue;
         };
         for e in &pin_net.endpoints {
-            if e.pin == "Q"
+            if e.pin == intern("Q")
                 && design
-                    .cell(&e.cell)
+                    .cell(resolve(e.cell))
                     .is_some_and(|c| matches!(c.kind, CellKind::Hff))
-                && !q_pis.iter().any(|x| x == &e.cell)
+                && !q_pis.iter().any(|x| x == &resolve(e.cell).to_string())
             {
-                q_pis.push(e.cell.clone());
+                q_pis.push(resolve(e.cell).to_string());
             }
         }
     }
@@ -198,24 +200,24 @@ pub(crate) fn cdc_synchronizer(design: &Design, from_net: &str, to_net: &str) ->
         .cells
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
-        .filter(|c| design.net_on(&c.name, "CLK") == Some(to_net))
-        .map(|c| c.name.clone())
+        .filter(|c| design.net_on(c.name, intern("CLK")) == Some(intern(to_net)))
+        .map(|c| resolve(c.name).to_string())
         .collect();
     for ff in &dest_ffs {
         let Some(src) = ff_d_source_ff(design, ff) else {
             continue;
         };
-        let src_clk = design.net_on(&src, "CLK");
-        if src_clk == Some(from_net) {
+        let src_clk = design.net_on(intern(&src), intern("CLK"));
+        if src_clk == Some(intern(from_net)) {
             endpoints += 1;
             continue;
         }
-        if src_clk != Some(to_net) {
+        if src_clk != Some(intern(to_net)) {
             continue;
         }
         // Second stage of a 2FF sync: dest FF <- dest FF <- launch FF.
         if let Some(launch) = ff_d_source_ff(design, &src) {
-            if design.net_on(&launch, "CLK") == Some(from_net) {
+            if design.net_on(intern(&launch), intern("CLK")) == Some(intern(from_net)) {
                 endpoints += 1;
                 sync = true;
             }
@@ -254,15 +256,15 @@ impl SyncChain {
 fn q_load_ffs(design: &Design, domains: &DomainMap, src: &str, domain: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for cell in &design.cells {
-        if !matches!(cell.kind, CellKind::Hff) || cell.name == src {
+        if !matches!(cell.kind, CellKind::Hff) || resolve(cell.name) == src {
             continue;
         }
-        if domains.domain_of_ff(&cell.name) != Some(domain) {
+        if domains.domain_of_ff(resolve(cell.name)) != Some(domain) {
             continue;
         }
-        match d_source(design, &cell.name) {
-            DSource::DirectQ(q) if q == src => out.push(cell.name.clone()),
-            DSource::ViaLut { src: q, .. } if q == src => out.push(cell.name.clone()),
+        match d_source(design, resolve(cell.name)) {
+            DSource::DirectQ(q) if q == src => out.push(resolve(cell.name).to_string()),
+            DSource::ViaLut { src: q, .. } if q == src => out.push(resolve(cell.name).to_string()),
             _ => {}
         }
     }
@@ -279,29 +281,29 @@ fn q_confined_to_next_d_cone(
     next: &str,
     via_lut: Option<&str>,
 ) -> bool {
-    let Some(q_net) = design.net_on(stage, "Q") else {
+    let Some(q_net) = design.net_on(intern(stage), intern("Q")) else {
         return true;
     };
-    let Some(d_net) = design.net_on(next, "D") else {
+    let Some(d_net) = design.net_on(intern(next), intern("D")) else {
         return false;
     };
-    let Some(net) = design.net(q_net) else {
+    let Some(net) = design.net(resolve(q_net)) else {
         return true;
     };
     net.endpoints.iter().all(|e| {
-        if e.cell == next && e.pin == "D" {
+        if resolve(e.cell) == next && e.pin == intern("D") {
             return true;
         }
         if let Some(lut) = via_lut {
-            if e.cell == lut
-                && e.pin.starts_with('I')
-                && design.net_on(lut, "O") == Some(d_net)
+            if resolve(e.cell) == lut
+                && resolve(e.pin).starts_with('I')
+                && design.net_on(intern(lut), intern("O")) == Some(d_net)
             {
                 return true;
             }
         }
         // The stage's own Q pin is on this net; that is not a load.
-        e.cell == stage && e.pin == "Q"
+        resolve(e.cell) == stage && e.pin == intern("Q")
     })
 }
 
@@ -437,8 +439,8 @@ pub fn is_mux_select(init: u64, pin: u32) -> bool {
 pub(crate) fn d_fanin_cells(design: &Design, ff: &str) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = Vec::new();
-    if let Some(d) = design.net_on(ff, "D") {
-        stack.push(d.to_string());
+    if let Some(d) = design.net_on(intern(ff), intern("D")) {
+        stack.push(resolve(d).to_string());
     }
     let mut nets_done: HashSet<String> = HashSet::new();
     while let Some(net_name) = stack.pop() {
@@ -452,21 +454,21 @@ pub(crate) fn d_fanin_cells(design: &Design, ff: &str) -> HashSet<String> {
             continue;
         };
         for e in &net.endpoints {
-            let Some(cell) = design.cell(&e.cell) else {
+            let Some(cell) = design.cell(resolve(e.cell)) else {
                 continue;
             };
-            match (&cell.kind, e.pin.as_str()) {
+            match (&cell.kind, resolve(e.pin)) {
                 (CellKind::Hff, "Q") => {
-                    if seen.insert(e.cell.clone()) {
-                        if let Some(d) = design.net_on(&e.cell, "D") {
-                            stack.push(d.to_string());
+                    if seen.insert(resolve(e.cell).to_string()) {
+                        if let Some(d) = design.net_on(e.cell, intern("D")) {
+                            stack.push(resolve(d).to_string());
                         }
                     }
                 }
                 (CellKind::Lut6 { .. }, "O") => {
                     for p in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-                        if let Some(pn) = design.net_on(&e.cell, p) {
-                            stack.push(pn.to_string());
+                        if let Some(pn) = design.net_on(e.cell, intern(p)) {
+                            stack.push(resolve(pn).to_string());
                         }
                     }
                 }
@@ -484,8 +486,8 @@ pub(crate) fn q_fwd_cone(design: &Design, ff: &str) -> (HashSet<String>, HashSet
     let mut luts: HashSet<String> = HashSet::new();
     let mut ff_loads: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = Vec::new();
-    if let Some(q) = design.net_on(ff, "Q") {
-        stack.push(q.to_string());
+    if let Some(q) = design.net_on(intern(ff), intern("Q")) {
+        stack.push(resolve(q).to_string());
     }
     let mut nets_done: HashSet<String> = HashSet::new();
     while let Some(net_name) = stack.pop() {
@@ -499,19 +501,19 @@ pub(crate) fn q_fwd_cone(design: &Design, ff: &str) -> (HashSet<String>, HashSet
             continue;
         };
         for e in &net.endpoints {
-            let Some(cell) = design.cell(&e.cell) else {
+            let Some(cell) = design.cell(resolve(e.cell)) else {
                 continue;
             };
-            match (&cell.kind, e.pin.as_str()) {
-                (CellKind::Lut6 { .. }, _) if e.pin.starts_with('I') => {
-                    if luts.insert(e.cell.clone()) {
-                        if let Some(o) = design.net_on(&e.cell, "O") {
-                            stack.push(o.to_string());
+            match (&cell.kind, resolve(e.pin)) {
+                (CellKind::Lut6 { .. }, _) if resolve(e.pin).starts_with('I') => {
+                    if luts.insert(resolve(e.cell).to_string()) {
+                        if let Some(o) = design.net_on(e.cell, intern("O")) {
+                            stack.push(resolve(o).to_string());
                         }
                     }
                 }
                 (CellKind::Hff, "D") => {
-                    ff_loads.insert(e.cell.clone());
+                    ff_loads.insert(resolve(e.cell).to_string());
                 }
                 _ => {}
             }
@@ -524,8 +526,8 @@ pub(crate) fn q_fwd_cone(design: &Design, ff: &str) -> (HashSet<String>, HashSet
 /// any `Bram18` pin. Used by the async-FIFO heuristic.
 pub(crate) fn q_cone_hits_bram(design: &Design, ff: &str) -> bool {
     let mut stack: Vec<String> = Vec::new();
-    if let Some(q) = design.net_on(ff, "Q") {
-        stack.push(q.to_string());
+    if let Some(q) = design.net_on(intern(ff), intern("Q")) {
+        stack.push(resolve(q).to_string());
     }
     let mut nets_done: HashSet<String> = HashSet::new();
     let mut visited = 0usize;
@@ -541,14 +543,14 @@ pub(crate) fn q_cone_hits_bram(design: &Design, ff: &str) -> bool {
             continue;
         };
         for e in &net.endpoints {
-            let Some(cell) = design.cell(&e.cell) else {
+            let Some(cell) = design.cell(resolve(e.cell)) else {
                 continue;
             };
             match &cell.kind {
                 CellKind::Bram18 => return true,
-                CellKind::Lut6 { .. } if e.pin.starts_with('I') => {
-                    if let Some(o) = design.net_on(&e.cell, "O") {
-                        stack.push(o.to_string());
+                CellKind::Lut6 { .. } if resolve(e.pin).starts_with('I') => {
+                    if let Some(o) = design.net_on(e.cell, intern("O")) {
+                        stack.push(resolve(o).to_string());
                     }
                 }
                 _ => {}
@@ -578,19 +580,19 @@ pub(crate) fn net_driver_domains(
             continue;
         };
         for e in &netobj.endpoints {
-            let Some(cell) = design.cell(&e.cell) else {
+            let Some(cell) = design.cell(resolve(e.cell)) else {
                 continue;
             };
-            match (&cell.kind, e.pin.as_str()) {
+            match (&cell.kind, resolve(e.pin)) {
                 (CellKind::Hff, "Q") => {
-                    if let Some(d) = domains.domain_of_ff(&e.cell) {
+                    if let Some(d) = domains.domain_of_ff(resolve(e.cell)) {
                         out.insert(d);
                     }
                 }
                 (CellKind::Lut6 { .. }, "O") => {
                     for p in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-                        if let Some(pn) = design.net_on(&e.cell, p) {
-                            stack.push(pn.to_string());
+                        if let Some(pn) = design.net_on(e.cell, intern(p)) {
+                            stack.push(resolve(pn).to_string());
                         }
                     }
                 }
@@ -610,8 +612,8 @@ pub(crate) fn mux_select_hazard(
     from_domain: usize,
 ) -> Option<(String, u32)> {
     let mut stack: Vec<String> = Vec::new();
-    if let Some(d) = design.net_on(load_ff, "D") {
-        stack.push(d.to_string());
+    if let Some(d) = design.net_on(intern(load_ff), intern("D")) {
+        stack.push(resolve(d).to_string());
     }
     let mut done: HashSet<String> = HashSet::new();
     // Cache driver-domain sets per net; the cone walk revisits shared nets.
@@ -627,13 +629,13 @@ pub(crate) fn mux_select_hazard(
             continue;
         };
         for e in &netobj.endpoints {
-            let Some(cell) = design.cell(&e.cell) else {
+            let Some(cell) = design.cell(resolve(e.cell)) else {
                 continue;
             };
             let CellKind::Lut6 { init } = &cell.kind else {
                 continue;
             };
-            if e.pin != "O" {
+            if e.pin != intern("O") {
                 continue;
             }
             for pin in 0..6u32 {
@@ -641,19 +643,19 @@ pub(crate) fn mux_select_hazard(
                     continue;
                 }
                 let pin_name = format!("I{pin}");
-                let Some(pnet) = design.net_on(&e.cell, &pin_name) else {
+                let Some(pnet) = design.net_on(e.cell, intern(&pin_name)) else {
                     continue;
                 };
                 let doms = dom_cache
-                    .entry(pnet.to_string())
-                    .or_insert_with(|| net_driver_domains(design, domains, pnet));
+                    .entry(resolve(pnet).to_string())
+                    .or_insert_with(|| net_driver_domains(design, domains, resolve(pnet)));
                 if doms.contains(&from_domain) {
-                    return Some((e.cell.clone(), pin));
+                    return Some((resolve(e.cell).to_string(), pin));
                 }
             }
             for p in ["I0", "I1", "I2", "I3", "I4", "I5"] {
-                if let Some(pn) = design.net_on(&e.cell, p) {
-                    stack.push(pn.to_string());
+                if let Some(pn) = design.net_on(e.cell, intern(p)) {
+                    stack.push(resolve(pn).to_string());
                 }
             }
         }

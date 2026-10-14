@@ -7,7 +7,7 @@ use helion_hw::{
     CableBackend, ProgramOutcome, Tap, detect_boards, list_cables, prog_sim,
     program_hbits_with_cable, resolve_cable,
 };
-use helion_ir::Design;
+use helion_ir::{resolve, Design};
 use helion_pack::pack;
 use helion_place::{PlaceOpts, place, place_with};
 use helion_proj::{
@@ -334,7 +334,7 @@ fn cmd_synth(args: &[String]) {
     let luts = d.lut_inits();
     println!(
         "synth {} cells={} luts={} inits={luts:#x?} part={part}",
-        d.name,
+        resolve(d.name),
         d.cells.len(),
         luts.len()
     );
@@ -349,7 +349,7 @@ fn cmd_impl(args: &[String]) {
     });
     println!(
         "impl {} lutffs={} iobs={} brams={} pathfinder_iters={} hops={} frames={}",
-        c.design.name,
+        resolve(c.design.name),
         c.routed.placed.packed.lutffs.len(),
         c.routed.placed.packed.iobs.len(),
         c.routed.placed.packed.brams.len(),
@@ -389,7 +389,7 @@ fn cmd_run(args: &[String]) {
     let bits: String = wave.iter().map(|b| if *b { '1' } else { '0' }).collect();
     println!(
         "run {} part={} STAT INIT={} DONE={} EOS={} GWE={} GSR={} GTS={} CRC_ERR={}",
-        c.design.name,
+        resolve(c.design.name),
         c.dev.part,
         sim.stat.init as u8,
         sim.stat.done as u8,
@@ -432,14 +432,14 @@ fn cmd_timing(args: &[String]) {
     if c.routed.placed.packed.lutffs.is_empty() || timing.endpoints == 0 {
         println!(
             "report_timing {} no_body cells={} (no timing: empty shell or no logic; not a closed WNS)",
-            c.design.name,
+            resolve(c.design.name),
             c.design.cells.len()
         );
         return;
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name, timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
+        resolve(c.design.name), timing.wns_ps, timing.tns_ps, timing.endpoints, timing.r2r_ps, timing.iob_ps
     );
 }
 
@@ -453,7 +453,7 @@ fn cmd_util(args: &[String]) {
     let p = &c.routed.placed.packed;
     println!(
         "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
-        c.design.name,
+        resolve(c.design.name),
         p.lutffs.len(),
         c.dev.lut6_count(),
         p.iobs.len(),
@@ -518,7 +518,7 @@ fn cmd_reports(args: &[String]) {
     }
     println!(
         "report_timing {} WNS_PS={} TNS_PS={} endpoints={} r2r_ps={} iob_ps={}",
-        c.design.name,
+        resolve(c.design.name),
         c.timing.wns_ps,
         c.timing.tns_ps,
         c.timing.endpoints,
@@ -527,7 +527,7 @@ fn cmd_reports(args: &[String]) {
     );
     println!(
         "report_utilization {} LUTFF={}/{} IOB={}/{} BRAM={}/{} DSP={}/{}",
-        c.design.name,
+        resolve(c.design.name),
         lutff,
         c.dev.lut6_count(),
         iob,
@@ -540,7 +540,7 @@ fn cmd_reports(args: &[String]) {
     println!("{}", pwr.text());
     println!(
         "bitstream {} bytes={} match=LUTFF,IOB,BRAM,DSP,TOTAL_UW",
-        c.design.name,
+        resolve(c.design.name),
         c.bits.packets.len()
     );
 }
@@ -566,7 +566,7 @@ fn cmd_bits(args: &[String]) {
         });
         println!("wrote {p} {} bytes", c.bits.packets.len());
     } else {
-        println!("bitstream {} bytes={}", c.design.name, c.bits.packets.len());
+        println!("bitstream {} bytes={}", resolve(c.design.name), c.bits.packets.len());
     }
 }
 
@@ -623,7 +623,7 @@ fn cmd_qor(args: &[String]) {
     let p = &c.routed.placed.packed;
     println!(
         "qor {} part={} LUTFF={} IOB={} BRAM={} DSP={} WNS_PS={} R2R_PS={} IOB_PS={} FRAMES={} BYTES={} ELAPSED_MS={}",
-        c.design.name,
+        resolve(c.design.name),
         c.dev.part,
         p.lutffs.len(),
         p.iobs.len(),
@@ -771,7 +771,7 @@ fn cmd_project(args: &[String]) {
         let dname = session
             .design
             .as_ref()
-            .map(|d| d.name.clone())
+            .map(|d| resolve(d.name).to_string())
             .unwrap_or_default();
         let mut sim = Fabric::new(&dev);
         sim.program(bits).unwrap_or_else(|e| {
@@ -857,7 +857,7 @@ fn cmd_project_checkpoint_write(args: &[String]) {
     let dname = session
         .design
         .as_ref()
-        .map(|d| d.name.as_str())
+        .map(|d| resolve(d.name))
         .unwrap_or("-");
     let timing = format!(
         "report_timing {dname} WNS_PS={} TNS_PS={} SETUP_PS={} HOLD_PS={} HOLD_SLACK_PS={} endpoints={} r2r_ps={} iob_ps={} route_ps={}",

@@ -4,7 +4,7 @@
 //! pin. FFs on clock nets with no matching `create_clock` land in a shared
 //! `Unknown` domain per net (never silently assigned).
 
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use std::collections::HashMap;
 
 use crate::{Clock, Constraints};
@@ -59,12 +59,12 @@ impl DomainMap {
 /// from `helion-sta/src/lib.rs` (was `clock_net_name`).
 pub(crate) fn clock_net_name(design: &Design, clk: &Clock) -> String {
     if let Some((cell, pin)) = clk.source.split_once('/') {
-        if let Some(n) = design.net_on(cell, pin) {
-            return n.to_string();
+        if let Some(n) = design.net_on(intern(cell), intern(pin)) {
+            return resolve(n).to_string();
         }
     }
-    if let Some(n) = design.net_on(&clk.source, "Q") {
-        return n.to_string();
+    if let Some(n) = design.net_on(intern(&clk.source), intern("Q")) {
+        return resolve(n).to_string();
     }
     clk.source.clone()
 }
@@ -75,7 +75,7 @@ pub(crate) fn clock_ff_loads(design: &Design, net: &str) -> usize {
     design
         .cells
         .iter()
-        .filter(|c| matches!(c.kind, CellKind::Hff) && design.net_on(&c.name, "CLK") == Some(net))
+        .filter(|c| matches!(c.kind, CellKind::Hff) && design.net_on(c.name, intern("CLK")) == Some(intern(net)))
         .count()
 }
 
@@ -107,16 +107,16 @@ pub fn extract_domains(design: &Design, clocks: &[Clock], xdc: &Constraints) -> 
         if !matches!(cell.kind, CellKind::Hff) {
             continue;
         }
-        let Some(clk_net) = design.net_on(&cell.name, "CLK") else {
+        let Some(clk_net) = design.net_on(cell.name, intern("CLK")) else {
             continue;
         };
-        let idx = match map.domain_of_net(clk_net) {
+        let idx = match map.domain_of_net(resolve(clk_net)) {
             Some(i) => i,
-            None => *unknown.entry(clk_net.to_string()).or_insert_with(|| {
+            None => *unknown.entry(resolve(clk_net).to_string()).or_insert_with(|| {
                 let i = map.domains.len();
                 map.domains.push(ClockDomain {
-                    name: format!("unknown:{clk_net}"),
-                    net: clk_net.to_string(),
+                    name: format!("unknown:{}", resolve(clk_net)),
+                    net: resolve(clk_net).to_string(),
                     period_ps: 0,
                     kind: DomainKind::Unknown,
                     master: None,
@@ -124,7 +124,7 @@ pub fn extract_domains(design: &Design, clocks: &[Clock], xdc: &Constraints) -> 
                 i
             }),
         };
-        map.ff_domain.insert(cell.name.clone(), idx);
+        map.ff_domain.insert(resolve(cell.name).to_string(), idx);
     }
     map
 }
