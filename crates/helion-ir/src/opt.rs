@@ -33,7 +33,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{CellKind, Design, PortDir};
+use crate::{intern, CellKind, Design, PortDir};
+use lasso::Spur;
 
 /// `Lut6` INIT for `~I0` (I0 is the LSB of the LUT address).
 const INV_INIT: u64 = 0x5555_5555_5555_5555;
@@ -94,11 +95,11 @@ type InvFold = (usize, usize, Vec<FanoutPin>);
 
 impl Design {
     /// Net names observed by ILA cores (referenced by name, not by endpoint).
-    fn ila_nets(&self) -> HashSet<&str> {
+    fn ila_nets(&self) -> HashSet<Spur> {
         self.cells
             .iter()
             .filter_map(|c| match &c.kind {
-                CellKind::Ila { net } => Some(net.as_str()),
+                CellKind::Ila { net } => Some(*net),
                 _ => None,
             })
             .collect()
@@ -108,19 +109,19 @@ impl Design {
     /// Guards the exact port name; bit-blasted port nets use the
     /// `{port}_{bit}` convention and are covered by their IOB loads in real
     /// flows, so only the exact name is guarded here.
-    fn is_output_port_net(&self, net_name: &str) -> bool {
+    fn is_output_port_net(&self, net_name: Spur) -> bool {
         self.ports.iter().any(|p| {
             matches!(p.dir, PortDir::Out | PortDir::Inout) && p.name == net_name
         })
     }
 
     /// Map cell name -> index of the net on its `O` pin (LUT drivers).
-    fn lut_output_nets(&self) -> HashMap<&str, usize> {
+    fn lut_output_nets(&self) -> HashMap<Spur, usize> {
         let mut map = HashMap::new();
         for (ni, n) in self.nets.iter().enumerate() {
             for e in &n.endpoints {
-                if e.pin == "O" {
-                    map.insert(e.cell.as_str(), ni);
+                if e.pin == crate::intern("O") {
+                    map.insert(e.cell, ni);
                 }
             }
         }
@@ -128,17 +129,17 @@ impl Design {
     }
 
     /// Map cell name -> cell index.
-    fn cell_index(&self) -> HashMap<&str, usize> {
+    fn cell_index(&self) -> HashMap<Spur, usize> {
         let mut map = HashMap::with_capacity(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
-            map.insert(c.name.as_str(), i);
+            map.insert(c.name, i);
         }
         map
     }
 
     /// Shared guard: the driver LUT `cell_idx` with output net `ni` must not
     /// be optimized away when the net is externally observable.
-    fn driver_guarded(&self, cell_idx: usize, ni: usize, ila: &HashSet<&str>) -> bool {
+    fn driver_guarded(&self, cell_idx: usize, ni: usize, ila: &HashSet<Spur>) -> bool {
         let c = &self.cells[cell_idx];
         if c.attrs.flag("DONT_TOUCH") {
             return true;
@@ -147,10 +148,10 @@ impl Design {
         if n.attrs.flag("mark_debug") {
             return true;
         }
-        if ila.contains(n.name.as_str()) {
+        if ila.contains(&n.name) {
             return true;
         }
-        if self.is_output_port_net(&n.name) {
+        if self.is_output_port_net(n.name) {
             return true;
         }
         false
@@ -178,7 +179,7 @@ impl Design {
             let mut driver_ci: Option<usize> = None;
             let mut driver_is_lut = false;
             for e in &n.endpoints {
-                if e.pin == "O" {
+                if e.pin == intern("O") {
                     if let Some(&ci) = self.cell_ix.get(&e.cell) {
                         if matches!(self.cells[ci].kind, CellKind::Lut6 { .. }) {
                             driver_ci = Some(ci);
@@ -207,10 +208,10 @@ impl Design {
         if dead.is_empty() {
             return;
         }
-        let dead_names: HashSet<&str> =
-            dead.iter().map(|&i| self.cells[i].name.as_str()).collect();
+        let dead_names: HashSet<Spur> =
+            dead.iter().map(|&i| self.cells[i].name).collect();
         for net in self.nets.iter_mut() {
-            net.endpoints.retain(|e| !dead_names.contains(e.cell.as_str()));
+            net.endpoints.retain(|e| !dead_names.contains(&e.cell));
         }
         self.nets.retain(|n| !n.endpoints.is_empty());
         let dead_set: HashSet<usize> = dead.iter().copied().collect();
@@ -252,7 +253,7 @@ impl Design {
                 if init != 0 && init != u64::MAX {
                     continue;
                 }
-                let Some(&ni) = out_net.get(c.name.as_str()) else {
+                let Some(&ni) = out_net.get(&c.name) else {
                     continue;
                 };
                 if self.driver_guarded(ci, ni, &ila) {
@@ -262,16 +263,16 @@ impl Design {
                 let mut fanouts: Vec<(usize, usize)> = Vec::new();
                 let mut ok = true;
                 for e in &self.nets[ni].endpoints {
-                    if e.cell == c.name && e.pin == "O" {
+                    if e.cell == c.name && e.pin == intern("O") {
                         continue;
                     }
-                    let (fi, ii) = match cell_idx.get(e.cell.as_str()) {
+                    let (fi, ii) = match cell_idx.get(&e.cell) {
                         Some(&fi)
                             if matches!(self.cells[fi].kind, CellKind::Lut6 { .. })
                                 && !self.cells[fi].attrs.flag("DONT_TOUCH")
                                 && fi != ci =>
                         {
-                            match e.pin.strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
+                            match crate::resolve(e.pin).strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
                                 Some(i) if i < 6 => (fi, i),
                                 _ => {
                                     ok = false;
@@ -300,13 +301,13 @@ impl Design {
                 }
             }
             // Disconnect the folded pins from the const net.
-            let pins: HashSet<(String, String)> = fanouts
+            let pins: HashSet<(Spur, Spur)> = fanouts
                 .iter()
-                .map(|(fi, ii)| (self.cells[*fi].name.clone(), format!("I{ii}")))
+                .map(|(fi, ii)| (self.cells[*fi].name, intern(&format!("I{ii}"))))
                 .collect();
             if let Some(net) = self.nets.get_mut(ni) {
                 net.endpoints
-                    .retain(|e| !pins.contains(&(e.cell.clone(), e.pin.clone())));
+                    .retain(|e| !pins.contains(&(e.cell, e.pin)));
             }
             folded += 1;
         }
@@ -337,11 +338,11 @@ impl Design {
             let cell_idx = self.cell_index();
             let ila = self.ila_nets();
             // cell -> net idx for I0 pins, to check the inverter is driven
-            let mut i0_net: HashMap<&str, usize> = HashMap::new();
+            let mut i0_net: HashMap<Spur, usize> = HashMap::new();
             for (ni, n) in self.nets.iter().enumerate() {
                 for e in &n.endpoints {
-                    if e.pin == "I0" {
-                        i0_net.insert(e.cell.as_str(), ni);
+                    if e.pin == intern("I0") {
+                        i0_net.insert(e.cell, ni);
                     }
                 }
             }
@@ -350,10 +351,10 @@ impl Design {
                 if !is_inv {
                     continue;
                 }
-                if !i0_net.contains_key(c.name.as_str()) {
+                if !i0_net.contains_key(&c.name) {
                     continue; // undriven inverter: output undefined, do not touch
                 }
-                let Some(&ni) = out_net.get(c.name.as_str()) else {
+                let Some(&ni) = out_net.get(&c.name) else {
                     continue;
                 };
                 if self.driver_guarded(ci, ni, &ila) {
@@ -362,16 +363,16 @@ impl Design {
                 let mut fanouts: Vec<(usize, usize)> = Vec::new();
                 let mut ok = true;
                 for e in &self.nets[ni].endpoints {
-                    if e.cell == c.name && e.pin == "O" {
+                    if e.cell == c.name && e.pin == intern("O") {
                         continue;
                     }
-                    let (fi, ii) = match cell_idx.get(e.cell.as_str()) {
+                    let (fi, ii) = match cell_idx.get(&e.cell) {
                         Some(&fi)
                             if matches!(self.cells[fi].kind, CellKind::Lut6 { .. })
                                 && !self.cells[fi].attrs.flag("DONT_TOUCH")
                                 && fi != ci =>
                         {
-                            match e.pin.strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
+                            match crate::resolve(e.pin).strip_prefix('I').and_then(|s| s.parse::<usize>().ok()) {
                                 Some(i) if i < 6 => (fi, i),
                                 _ => {
                                     ok = false;
@@ -399,13 +400,13 @@ impl Design {
                     *init = absorb_init_invert(*init, *ii);
                 }
             }
-            let pins: HashSet<(String, String)> = fanouts
+            let pins: HashSet<(Spur, Spur)> = fanouts
                 .iter()
-                .map(|(fi, ii)| (self.cells[*fi].name.clone(), format!("I{ii}")))
+                .map(|(fi, ii)| (self.cells[*fi].name, intern(&format!("I{ii}"))))
                 .collect();
             if let Some(net) = self.nets.get_mut(ni) {
                 net.endpoints
-                    .retain(|e| !pins.contains(&(e.cell.clone(), e.pin.clone())));
+                    .retain(|e| !pins.contains(&(e.cell, e.pin)));
             }
             absorbed += 1;
         }
@@ -498,7 +499,7 @@ mod tests {
         // I1 fixed to 0: out[addr] = old[addr & !0b010]
         assert_eq!(init, fold_init_const(0x8888_8888_8888_8888, 1, false));
         // pin disconnected, const now dead (plus the pre-existing dead lut)
-        assert!(d.net_on("c_and", "I1").is_none());
+        assert!(d.net_on(intern("c_and"), intern("I1")).is_none());
         assert_eq!(d.sweep_dead_luts(), 2);
         assert!(d.cell("c_const").is_none());
         assert!(d.cell("c_dead").is_none());
@@ -514,7 +515,7 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(init, absorb_init_invert(0x8888_8888_8888_8888, 2));
-        assert!(d.net_on("c_and", "I2").is_none());
+        assert!(d.net_on(intern("c_and"), intern("I2")).is_none());
         assert_eq!(d.sweep_dead_luts(), 2);
         assert!(d.cell("c_inv").is_none());
         assert!(d.cell("c_dead").is_none());
@@ -533,7 +534,7 @@ mod tests {
         d.mark_debug("dbg").unwrap();
         // dead LUT on an ILA-observed net: kept
         d.add_cell("c_ila", CellKind::Lut6 { init: 0 });
-        d.add_cell("ila0", CellKind::Ila { net: "mon".into() });
+        d.add_cell("ila0", CellKind::Ila { net: intern("mon") });
         d.connect("mon", "c_ila", "O");
         assert_eq!(d.sweep_dead_luts(), 0);
         assert_eq!(d.fold_lut_consts(), 0);
