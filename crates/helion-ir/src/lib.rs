@@ -7,7 +7,8 @@ pub use opt::LutOptStats;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-use lasso::{Spur, ThreadedRodeo};
+use lasso::ThreadedRodeo;
+pub use lasso::Spur;
 
 /// Global string interner for netlist names.
 ///
@@ -44,6 +45,7 @@ pub fn intern(s: &str) -> Spur {
 pub fn resolve(s: Spur) -> &'static str {
     interner().resolve(&s)
 }
+
 
 #[derive(Clone, Debug, Default)]
 pub struct Attrs {
@@ -300,8 +302,10 @@ pub struct PinIndex {
 }
 
 impl PinIndex {
-    pub fn net_on(&self, cell: Spur, pin: Spur) -> Option<Spur> {
-        self.pin_to_net.get(&(cell, pin)).copied()
+    pub fn net_on(&self, cell: &str, pin: &str) -> Option<Spur> {
+        let c = intern(cell);
+        let p = intern(pin);
+        self.pin_to_net.get(&(c, p)).copied()
     }
 }
 
