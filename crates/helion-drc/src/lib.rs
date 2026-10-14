@@ -1,7 +1,7 @@
 //! Implementation DRC: overused sites, unrouted IO, missing clocks, occupancy.
 
 use helion_device::Device;
-use helion_ir::Design;
+use helion_ir::{intern, resolve, Design};
 use helion_place::Placed;
 use helion_route::Routed;
 use std::collections::{BTreeMap, HashSet};
@@ -166,11 +166,11 @@ pub fn check_placed(design: &Design, placed: &Placed, dev: &Device) -> Drc {
     if placed.iob_sites.len() != placed.packed.iobs.len() {
         d.add("IOB-1", "", "IOB placement mismatch");
     }
-    let has_clk = design.ports.iter().any(|p| p.name == "clk")
+    let has_clk = design.ports.iter().any(|p| p.name == intern("clk"))
         || design
             .nets
             .iter()
-            .any(|n| n.endpoints.iter().any(|e| e.pin == "CLK"));
+            .any(|n| n.endpoints.iter().any(|e| e.pin == intern("CLK")));
     let has_ff = placed.packed.lutffs.iter().any(|l| !l.ff_cell.is_empty());
     if has_ff && !has_clk {
         d.add("CLK-1", "", "no clock on registered design");
@@ -200,8 +200,8 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
         let Some(vcco) = Device::iostandard_vcco_mv(std) else {
             d.add(
                 "IOSTD-1",
-                &p.name,
-                format!("IOSTANDARD {std} on {} is not a HAD I/O standard", p.name),
+                resolve(p.name),
+                format!("IOSTANDARD {std} on {} is not a HAD I/O standard", resolve(p.name)),
             );
             continue;
         };
@@ -211,8 +211,8 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
                 .iter()
                 .zip(placed.packed.iobs.iter())
                 .find_map(|(s, i)| {
-                    let hit = i.cell.contains(&p.name)
-                        || i.from_net == p.name
+                    let hit = i.cell.contains(resolve(p.name))
+                        || i.from_net == resolve(p.name)
                         || i.loc.as_deref() == Some(p.attrs.get("LOC").unwrap_or(""));
                     hit.then_some((s.x, s.y))
                 })
@@ -222,7 +222,7 @@ fn check_iostandard(design: &Design, placed: &Placed, dev: &Device, d: &mut Drc)
                 by_bank
                     .entry(bank)
                     .or_default()
-                    .push((p.name.clone(), std.to_string(), vcco));
+                    .push((resolve(p.name).to_string(), std.to_string(), vcco));
             }
         }
     }
@@ -252,8 +252,8 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
             match Device::parse_drive(drv) {
                 None => d.add(
                     "DRIVE-1",
-                    &p.name,
-                    format!("DRIVE {drv} on {} is not a HAD drive strength", p.name),
+                    resolve(p.name),
+                    format!("DRIVE {drv} on {} is not a HAD drive strength", resolve(p.name)),
                 ),
                 Some(ma) => {
                     if !Device::drive_legal_for_iostandard(p.attrs.get("IOSTANDARD"), ma) {
@@ -263,8 +263,8 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
                             .unwrap_or(Device::DEFAULT_IOSTANDARD);
                         d.add(
                             "DRIVE-2",
-                            &p.name,
-                            format!("DRIVE {ma} not legal for IOSTANDARD {std} on {}", p.name),
+                            resolve(p.name),
+                            format!("DRIVE {ma} not legal for IOSTANDARD {std} on {}", resolve(p.name)),
                         );
                     }
                 }
@@ -274,8 +274,8 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
             if !Device::legal_slew(s) {
                 d.add(
                     "SLEW-1",
-                    &p.name,
-                    format!("SLEW {s} on {} is not a HAD slew (SLOW|FAST)", p.name),
+                    resolve(p.name),
+                    format!("SLEW {s} on {} is not a HAD slew (SLOW|FAST)", resolve(p.name)),
                 );
             }
         }
@@ -283,10 +283,10 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
             if !Device::legal_pulltype(pt) {
                 d.add(
                     "PULL-1",
-                    &p.name,
+                    resolve(p.name),
                     format!(
                         "PULLTYPE {pt} on {} is not a HAD pull (NONE|PULLUP|PULLDOWN|KEEPER)",
-                        p.name
+                        resolve(p.name)
                     ),
                 );
             }
@@ -295,10 +295,10 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
             if !Device::legal_diff_term(dt) {
                 d.add(
                     "DIFF-1",
-                    &p.name,
+                    resolve(p.name),
                     format!(
                         "DIFF_TERM {dt} on {} is not a HAD term (TRUE|FALSE)",
-                        p.name
+                        resolve(p.name)
                     ),
                 );
             } else if !Device::diff_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), dt) {
@@ -308,10 +308,10 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
                     .unwrap_or(Device::DEFAULT_IOSTANDARD);
                 d.add(
                     "DIFF-2",
-                    &p.name,
+                    resolve(p.name),
                     format!(
                         "DIFF_TERM {dt} not legal for IOSTANDARD {std} on {}",
-                        p.name
+                        resolve(p.name)
                     ),
                 );
             }
@@ -320,10 +320,10 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
             if !Device::legal_in_term(it) {
                 d.add(
                     "INTERM-1",
-                    &p.name,
+                    resolve(p.name),
                     format!(
                         "IN_TERM {it} on {} is not a HAD term (NONE|UNTUNED_SPLIT_40|UNTUNED_SPLIT_50|UNTUNED_SPLIT_60)",
-                        p.name
+                        resolve(p.name)
                     ),
                 );
             } else if !Device::in_term_legal_for_iostandard(p.attrs.get("IOSTANDARD"), it) {
@@ -333,8 +333,8 @@ fn check_io_electrical(design: &Design, d: &mut Drc) {
                     .unwrap_or(Device::DEFAULT_IOSTANDARD);
                 d.add(
                     "INTERM-2",
-                    &p.name,
-                    format!("IN_TERM {it} not legal for IOSTANDARD {std} on {}", p.name),
+                    resolve(p.name),
+                    format!("IN_TERM {it} not legal for IOSTANDARD {std} on {}", resolve(p.name)),
                 );
             }
         }
@@ -375,7 +375,7 @@ pub fn check_routed(design: &Design, routed: &Routed, dev: &Device) -> Drc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ir::Design;
+    use helion_ir::{intern, resolve, Design};
     use helion_pack::pack;
     use helion_place::place;
     use helion_route::route;

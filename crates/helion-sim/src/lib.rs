@@ -3,7 +3,7 @@
 //! Overlay / behavioral LED+waveform completion is labeled **`overlay` / `sim_DONE`**
 //! ([`OverlaySimReport`]) — never bare board DONE.
 
-use helion_ir::{CellKind, Design, PortDir};
+use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 use helion_sv::sva::{SvaImmProp, SvaProperty};
 use std::collections::HashMap;
 
@@ -79,7 +79,7 @@ impl Sim {
         let mut lut_init = HashMap::new();
         for c in &d.cells {
             if let CellKind::Lut6 { init } = c.kind {
-                lut_init.insert(c.name.clone(), init);
+                lut_init.insert(resolve(c.name).to_string(), init);
             }
         }
         let mut lut_pin_nets: HashMap<String, Vec<(u8, String)>> = HashMap::new();
@@ -87,28 +87,28 @@ impl Sim {
         let mut net_lut_o: HashMap<String, String> = HashMap::new();
         let mut ff_d_lut = HashMap::new();
         for n in &d.nets {
-            if let Some(q) = n.endpoints.iter().find(|e| e.pin == "Q") {
-                net_ff.insert(n.name.clone(), q.cell.clone());
+            if let Some(q) = n.endpoints.iter().find(|e| e.pin == intern("Q")) {
+                net_ff.insert(resolve(n.name).to_string(), resolve(q.cell).to_string());
             }
-            if let Some(o) = n.endpoints.iter().find(|e| e.pin == "O") {
-                net_lut_o.insert(n.name.clone(), o.cell.clone());
+            if let Some(o) = n.endpoints.iter().find(|e| e.pin == intern("O")) {
+                net_lut_o.insert(resolve(n.name).to_string(), resolve(o.cell).to_string());
             }
             for e in &n.endpoints {
-                if let Some(rest) = e.pin.strip_prefix('I') {
+                if let Some(rest) = resolve(e.pin).strip_prefix('I') {
                     if let Ok(pin) = rest.parse::<u8>() {
                         if pin < 6 {
                             lut_pin_nets
-                                .entry(e.cell.clone())
+                                .entry(resolve(e.cell).to_string())
                                 .or_default()
-                                .push((pin, n.name.clone()));
+                                .push((pin, resolve(n.name).to_string()));
                         }
                     }
                 }
             }
-            let lut_o = n.endpoints.iter().find(|e| e.pin == "O");
-            let ff_d = n.endpoints.iter().find(|e| e.pin == "D");
+            let lut_o = n.endpoints.iter().find(|e| e.pin == intern("O"));
+            let ff_d = n.endpoints.iter().find(|e| e.pin == intern("D"));
             if let (Some(l), Some(f)) = (lut_o, ff_d) {
-                ff_d_lut.insert(f.cell.clone(), l.cell.clone());
+                ff_d_lut.insert(resolve(f.cell).to_string(), resolve(l.cell).to_string());
             }
         }
         let pin_ix = d.pin_index();
@@ -116,30 +116,30 @@ impl Sim {
             if !matches!(c.kind, CellKind::IobOut) {
                 return None;
             }
-            let net = pin_ix.net_on(&c.name, "I")?;
-            d.net(net)?
+            let net = pin_ix.net_on(resolve(c.name), "I")?;
+            d.net(resolve(net))?
                 .endpoints
                 .iter()
-                .find(|e| e.pin == "Q")
-                .map(|e| e.cell.clone())
+                .find(|e| e.pin == intern("Q"))
+                .map(|e| resolve(e.cell).to_string())
         });
         let mut ff_q = HashMap::new();
         for c in &d.cells {
             if matches!(c.kind, CellKind::Hff) {
-                ff_q.insert(c.name.clone(), false);
+                ff_q.insert(resolve(c.name).to_string(), false);
             }
         }
         let mut ports = HashMap::new();
         for p in &d.ports {
-            ports.insert(p.name.clone(), p.dir);
+            ports.insert(resolve(p.name).to_string(), p.dir);
         }
         let mut iob_pad_to_i = HashMap::new();
         for c in &d.cells {
             if matches!(c.kind, CellKind::IobOut) {
                 if let (Some(pad), Some(i)) =
-                    (pin_ix.net_on(&c.name, "PAD"), pin_ix.net_on(&c.name, "I"))
+                    (pin_ix.net_on(resolve(c.name), "PAD"), pin_ix.net_on(resolve(c.name), "I"))
                 {
-                    iob_pad_to_i.insert(pad.to_string(), i.to_string());
+                    iob_pad_to_i.insert(resolve(pad).to_string(), resolve(i).to_string());
                 }
             }
         }
@@ -150,16 +150,16 @@ impl Sim {
             let driver = n
                 .endpoints
                 .iter()
-                .find(|e| e.pin == "Q")
-                .map(|e| NetDriver::Ff(e.cell.clone()))
+                .find(|e| e.pin == intern("Q"))
+                .map(|e| NetDriver::Ff(resolve(e.cell).to_string()))
                 .or_else(|| {
                     n.endpoints
                         .iter()
-                        .find(|e| e.pin == "O")
-                        .map(|e| NetDriver::Lut(e.cell.clone()))
+                        .find(|e| e.pin == intern("O"))
+                        .map(|e| NetDriver::Lut(resolve(e.cell).to_string()))
                 })
                 .unwrap_or(NetDriver::Undriven);
-            net_drivers.insert(n.name.clone(), driver);
+            net_drivers.insert(resolve(n.name).to_string(), driver);
         }
         let mut lut_input_nets: HashMap<String, [Option<String>; 6]> = HashMap::new();
         for c in &d.cells {
@@ -167,10 +167,10 @@ impl Sim {
                 let mut pins: [Option<String>; 6] = Default::default();
                 for (i, slot) in pins.iter_mut().enumerate() {
                     *slot = pin_ix
-                        .net_on(&c.name, &format!("I{i}"))
-                        .map(|s| s.to_string());
+                        .net_on(resolve(c.name), &format!("I{i}"))
+                        .map(|s| resolve(s).to_string());
                 }
-                lut_input_nets.insert(c.name.clone(), pins);
+                lut_input_nets.insert(resolve(c.name).to_string(), pins);
             }
         }
         Self {
@@ -540,20 +540,20 @@ impl Sim {
         for n in &d.nets {
             let mut val: Option<bool> = None;
             for e in &n.endpoints {
-                if e.pin == "Q" {
-                    if let Some(q) = self.ff_q.get(&e.cell) {
+                if e.pin == intern("Q") {
+                    if let Some(q) = self.ff_q.get(resolve(e.cell)) {
                         val = Some(*q);
                         break;
                     }
-                } else if e.pin == "O" {
-                    if let Some(o) = self.lut_output(&e.cell) {
+                } else if e.pin == intern("O") {
+                    if let Some(o) = self.lut_output(resolve(e.cell)) {
                         val = Some(o);
                         break;
                     }
                 }
             }
             if let Some(v) = val {
-                out.push((n.name.clone(), v));
+                out.push((resolve(n.name).to_string(), v));
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -727,7 +727,7 @@ pub fn run_tb(design: &Design, cycles: u32) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helion_ir::{CellKind, Design, PortDir};
+    use helion_ir::{intern, resolve, CellKind, Design, PortDir};
 
     #[test]
     fn overlay_sim_counter_led_gold_labeled_sim_done() {

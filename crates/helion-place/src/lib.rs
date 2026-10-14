@@ -428,19 +428,19 @@ pub fn hard_heartbeat() -> helion_ir::Design {
     d.add_port("led", PortDir::Out);
     for i in 0..8u32 {
         d.add_cell(
-            format!("u_lut{i}"),
+            &format!("u_lut{i}"),
             CellKind::Lut6 {
                 init: 0x5555_5555_5555_5555,
             },
         );
-        d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-        d.connect("clk", format!("u_ff{i}"), "CLK");
-        d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-        d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-        d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-        d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+        d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+        d.connect("clk", &format!("u_ff{i}"), "CLK");
+        d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+        d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+        d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
+        d.connect(&format!("q{i}"), &format!("u_lut{i}"), "I0");
         if i > 0 {
-            d.connect(format!("q{}", i - 1), format!("u_lut{i}"), "I1");
+            d.connect(&format!("q{}", i - 1), &format!("u_lut{i}"), "I1");
         }
     }
     d.add_cell("u_iob", CellKind::IobOut);

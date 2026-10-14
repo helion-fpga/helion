@@ -30,7 +30,7 @@
 //! HL10T data, replace [`CapTable::modeled_hl10t`] and [`LeakTable::modeled_hl10t`].
 
 use crate::vcd::VcdActivity;
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use std::collections::{HashMap, HashSet};
 
 /// Switched capacitances in femtofarads. See module docs: modeled, not measured.
@@ -346,24 +346,24 @@ pub fn analyze_power(
             drives_iob: false,
         };
         for e in &n.endpoints {
-            let is_driver = e.pin == "Q" || e.pin == "O";
+            let is_driver = e.pin == intern("Q") || e.pin == intern("O");
             if is_driver && info.driver.is_none() {
-                let kind = if e.pin == "Q" {
+                let kind = if e.pin == intern("Q") {
                     DriverKind::Ff
                 } else {
                     DriverKind::Lut
                 };
-                info.driver = Some((e.cell.clone(), kind));
+                info.driver = Some((resolve(e.cell).to_string(), kind));
             } else {
                 info.fanout += 1;
             }
-            if e.pin == "I" && design.cells.iter().any(|c| {
+            if e.pin == intern("I") && design.cells.iter().any(|c| {
                 c.name == e.cell && matches!(c.kind, CellKind::IobOut)
             }) {
                 info.drives_iob = true;
             }
         }
-        nets.insert(n.name.as_str(), info);
+        nets.insert(resolve(n.name), info);
     }
 
     // ---- activity lookup: VCD signal names may carry a scope prefix ----
@@ -609,7 +609,7 @@ pub fn analyze_power(
     let dyn_dsp = n_dsp as f64 * dsp_alpha * cfg.caps.dsp_active_ff * 1e-15 * v2 * f;
     // Attribute BRAM/DSP dynamic to hierarchy blocks by instance name when possible.
     for c in &design.cells {
-        let block = hier_block(&c.name).to_string();
+        let block = hier_block(resolve(c.name)).to_string();
         match c.kind {
             CellKind::Bram18 => {
                 let e = hier_mw.entry(block).or_insert((0.0, 0));

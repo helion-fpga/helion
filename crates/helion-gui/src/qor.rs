@@ -13,7 +13,7 @@
 //! [`QorInputs`] and paints the resulting [`QorReport`].
 
 use crate::ide::{TimingPath, Utilization};
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use helion_route::Routed;
 use helion_sta::{Clock, Constraints, TimingResult};
 
@@ -293,7 +293,7 @@ fn rule_fanout(inp: &QorInputs) -> Vec<QorSuggestion> {
         .design
         .nets
         .iter()
-        .map(|n| (n.name.as_str(), net_fanout(n)))
+        .map(|n| (resolve(n.name), net_fanout(n)))
         .filter(|(_, f)| *f >= INFO_FANOUT)
         .collect();
     hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -376,9 +376,9 @@ fn rule_unconstrained_clock(inp: &QorInputs) -> Vec<QorSuggestion> {
         .iter()
         .filter(|c| matches!(c.kind, CellKind::Hff))
     {
-        if let Some(net) = pins.net_on(&ff.name, "CLK") {
-            if !clk_nets.iter().any(|n| n == net) {
-                clk_nets.push(net.to_string());
+        if let Some(net) = pins.net_on(resolve(ff.name), "CLK") {
+            if !clk_nets.iter().any(|n| n.as_str() == resolve(net)) {
+                clk_nets.push(resolve(net).to_string());
             }
         }
     }
@@ -430,7 +430,7 @@ fn rule_macro_cascade(inp: &QorInputs) -> Vec<QorSuggestion> {
                 inp.design
                     .cells
                     .iter()
-                    .find(|cell| cell.name == **c)
+                    .find(|cell| cell.name == intern(c))
                     .is_some_and(|cell| {
                         matches!(cell.kind, CellKind::Bram18 | CellKind::Mac27 { .. })
                     })

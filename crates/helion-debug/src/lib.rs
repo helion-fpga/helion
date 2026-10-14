@@ -9,7 +9,7 @@ use helion_bits::bitgen;
 use helion_device::Device;
 use helion_fabric::{Fabric, IlaMatchKind};
 use helion_hw::Tap;
-use helion_ir::{CellKind, Design};
+use helion_ir::{intern, resolve, CellKind, Design};
 use helion_pack::pack;
 use helion_place::place;
 use helion_route::route;
@@ -111,39 +111,39 @@ fn ila_aux_nets(net: &str) -> [String; 2] {
 pub fn strip_ila(design: &mut Design, net: &str) {
     let cells = ila_cell_names(net);
     let aux = ila_aux_nets(net);
-    design.cells.retain(|c| !cells.iter().any(|n| n == &c.name));
-    design.nets.retain(|n| !aux.iter().any(|a| a == &n.name));
+    design.cells.retain(|c| !cells.iter().any(|n| resolve(c.name) == n.as_str()));
+    design.nets.retain(|n| !aux.iter().any(|a| resolve(n.name) == a.as_str()));
     for n in &mut design.nets {
-        n.endpoints.retain(|e| !cells.iter().any(|c| c == &e.cell));
+        n.endpoints.retain(|e| !cells.iter().any(|c| resolve(e.cell) == c.as_str()));
     }
 }
 
 /// Insert an ILA probe on `net`: identity LUT+FF so the bitstream gains BLE1 INIT.
 pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
-    if !design.nets.iter().any(|n| n.name == net) {
+    if !design.nets.iter().any(|n| n.name == intern(net)) {
         return Err(format!("mark_debug: no net {net}"));
     }
     if design
         .cells
         .iter()
-        .any(|c| matches!(&c.kind, CellKind::Ila { net: n } if n == net))
+        .any(|c| matches!(&c.kind, CellKind::Ila { net: n } if *n == intern(net)))
     {
         return Ok(());
     }
-    design.add_cell(format!("ila_{net}"), CellKind::Ila { net: net.into() });
+    design.add_cell(&format!("ila_{net}"), CellKind::Ila { net: intern(net) });
     // Buffer LUT: O = I0 → INIT 0xAAAA… so capture tracks the marked net.
     design.add_cell(
-        format!("ila_{net}_lut"),
+        &format!("ila_{net}_lut"),
         CellKind::Lut6 {
             init: 0xAAAA_AAAA_AAAA_AAAA,
         },
     );
-    design.add_cell(format!("ila_{net}_ff"), CellKind::Hff);
-    design.connect(net, format!("ila_{net}_lut"), "I0");
+    design.add_cell(&format!("ila_{net}_ff"), CellKind::Hff);
+    design.connect(net, &format!("ila_{net}_lut"), "I0");
     let dnet = format!("ila_{net}_d");
-    design.connect(&dnet, format!("ila_{net}_lut"), "O");
-    design.connect(&dnet, format!("ila_{net}_ff"), "D");
-    design.connect(format!("ila_{net}_q"), format!("ila_{net}_ff"), "Q");
+    design.connect(&dnet, &format!("ila_{net}_lut"), "O");
+    design.connect(&dnet, &format!("ila_{net}_ff"), "D");
+    design.connect(&format!("ila_{net}_q"), &format!("ila_{net}_ff"), "Q");
     Ok(())
 }
 
@@ -151,7 +151,7 @@ pub fn insert_ila(design: &mut Design, net: &str) -> Result<(), String> {
 pub fn insert_marked(design: &mut Design) -> Result<usize, String> {
     let nets = design.marked_debug_nets();
     for n in &nets {
-        insert_ila(design, n)?;
+        insert_ila(design, resolve(*n))?;
     }
     Ok(nets.len())
 }
@@ -214,7 +214,7 @@ pub fn insert_arm_capture(
 }
 
 pub fn strip_capture_bram(design: &mut Design) {
-    design.cells.retain(|c| c.name != CAPTURE_BRAM);
+    design.cells.retain(|c| c.name != intern(CAPTURE_BRAM));
 }
 
 /// Insert a Bram18 used as on-fabric ILA capture RAM (INIT sized to `words`).
@@ -229,7 +229,7 @@ pub fn insert_capture_bram(design: &mut Design, words: usize) -> Result<(), Stri
     let cell = design
         .cells
         .iter_mut()
-        .find(|c| c.name == CAPTURE_BRAM)
+        .find(|c| c.name == intern(CAPTURE_BRAM))
         .ok_or_else(|| "ila_capture_ram missing after insert".to_string())?;
     cell.attrs.set("INIT", init);
     Ok(())
@@ -256,12 +256,14 @@ fn match_unit_cell_names() -> [&'static str; 4] {
 
 pub fn strip_match_unit(design: &mut Design) {
     let names = match_unit_cell_names();
-    design.cells.retain(|c| !names.iter().any(|n| *n == c.name));
+    design.cells.retain(|c| !names.iter().any(|n| intern(n) == c.name));
     design.nets.retain(|n| {
-        n.name != MATCH_HIT_NET && n.name != MATCH_PREV_NET && n.name != "ila_match_delay_d"
+        n.name != intern(MATCH_HIT_NET)
+            && n.name != intern(MATCH_PREV_NET)
+            && n.name != intern("ila_match_delay_d")
     });
     for n in &mut design.nets {
-        n.endpoints.retain(|e| !names.iter().any(|c| *c == e.cell));
+        n.endpoints.retain(|e| !names.iter().any(|c| intern(c) == e.cell));
     }
 }
 
@@ -275,7 +277,7 @@ pub fn insert_match_unit(
     trigger_net: &str,
     kind: IlaTriggerKind,
 ) -> Result<(), String> {
-    if !design.nets.iter().any(|n| n.name == trigger_net) {
+    if !design.nets.iter().any(|n| n.name == intern(trigger_net)) {
         return Err(format!("match unit: no net {trigger_net}"));
     }
     strip_match_unit(design);
@@ -283,10 +285,10 @@ pub fn insert_match_unit(
     design.add_cell(
         TRIG_FSM_CELL,
         CellKind::BlackBox {
-            module: "h_ila_trig".into(),
+            module: intern("h_ila_trig"),
         },
     );
-    if let Some(c) = design.cells.iter_mut().find(|c| c.name == TRIG_FSM_CELL) {
+    if let Some(c) = design.cells.iter_mut().find(|c| c.name == intern(TRIG_FSM_CELL)) {
         c.attrs.set("MATCH", kind.as_str());
         c.attrs.set("NET", trigger_net);
         c.attrs.set("VLNV", "community:helion:h_ila_trig:1.0");
@@ -377,7 +379,7 @@ pub fn insert_arm_capture_deep(
         ));
     }
     for n in &cfg.nets {
-        if !design.nets.iter().any(|nn| nn.name == *n) {
+        if !design.nets.iter().any(|nn| nn.name == intern(n)) {
             return Err(format!("mark_debug: no net {n}"));
         }
     }
@@ -413,7 +415,7 @@ pub fn insert_arm_capture_deep(
     {
         return Err("ILA deep did not pack match-unit LUT".into());
     }
-    if !d.cells.iter().any(|c| c.name == TRIG_FSM_CELL) {
+    if !d.cells.iter().any(|c| c.name == intern(TRIG_FSM_CELL)) {
         return Err("ILA deep missing ila_trig_fsm IP marker".into());
     }
     let bram_major = routed
@@ -586,7 +588,7 @@ fn probe_site(
     if let Some(iob) = packed
         .iobs
         .iter()
-        .find(|iob| design.net_on(&iob.cell, "PAD") == Some(net))
+        .find(|iob| design.net_on(intern(&iob.cell), intern("PAD")) == Some(intern(net)))
     {
         if let Some(i) = packed.lutffs.iter().position(|l| l.q_net == iob.from_net) {
             return placed
