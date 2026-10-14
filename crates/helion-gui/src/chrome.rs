@@ -29,6 +29,12 @@ pub const NAV_WIDTH: f32 = RAIL_WIDTH;
 pub const TREE_WIDTH: f32 = SIDEBAR_WIDTH;
 /// Properties dock - shown on selection, not always-on.
 pub const PROPERTIES_WIDTH: f32 = 220.0;
+/// Device view: Display Control panel width (left dock).
+pub const DEVICE_DISPLAY_CONTROL_W: f32 = 234.0;
+/// Device view: Inspector panel width (right dock).
+pub const DEVICE_INSPECTOR_W: f32 = 268.0;
+/// Device view: collapsed panel button strip width.
+pub const DEVICE_COLLAPSED_STRIP_W: f32 = 30.0;
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const RAIL_MIN_HEIGHT: f32 = TOOLBAR_HEIGHT;
 pub const STATUS_HEIGHT: f32 = 22.0;
