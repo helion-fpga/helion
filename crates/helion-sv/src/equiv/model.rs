@@ -180,12 +180,12 @@ fn top_output_nets(d: &Design) -> Result<Vec<(String, String)>, EquivError> {
                 resolve(p.name)
             )));
         }
-        iobs.sort_by_key(|(cell, _)| iob_bit_index(cell));
+        iobs.sort_by_key(|(cell, _)| iob_bit_index(*cell));
         if iobs.len() == 1 {
-            out.push((p.name.clone(), iobs[0].1.to_string()));
+            out.push((resolve(p.name).to_string(), resolve(iobs[0].1).to_string()));
         } else {
             for (i, (_, net)) in iobs.iter().enumerate() {
-                out.push((format!("{}_{}", resolve(p.name), i), net.to_string()));
+                out.push((format!("{}_{}", resolve(p.name), i), resolve(*net).to_string()));
             }
         }
     }
@@ -249,7 +249,7 @@ fn cone_lit(ctx: &mut ConeCtx, net0: &str) -> Result<Lit, EquivError> {
                 })?;
                 let mut in_nets: [Option<String>; 6] = Default::default();
                 for (i, slot) in in_nets.iter_mut().enumerate() {
-                    *slot = ctx.d.net_on(&cell, &format!("I{i}")).map(|s| s.to_string());
+                    *slot = ctx.d.net_on(intern(&cell), intern(&format!("I{i}"))).map(|s| resolve(s).to_string());
                 }
                 stack.push(WorkItem::Build {
                     net: net.clone(),
