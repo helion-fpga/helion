@@ -11,6 +11,8 @@ mod preprocess;
 pub use preprocess::{expand_includes, preprocess_sv};
 mod aig_opt;
 pub mod equiv;
+/// NPN canonical table for 4-input functions (AIG rewriting Phase 2).
+pub mod npn_table;
 /// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
 pub mod sva;
 use sva::{
