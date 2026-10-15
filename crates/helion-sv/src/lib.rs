@@ -24075,5 +24075,28 @@ endmodule
             }
         }
     }
+
+    #[test]
+    fn npn_canonical_4_basic() {
+        // AND of 4 inputs: 0x8000
+        // Its NPN canonical should be <= 0x8000 (lexicographically smallest)
+        let and4 = 0x8000u16;
+        let canon = Aig::npn_canonical_4(and4);
+        assert!(canon <= and4, "canonical {canon:04x} should be <= {and4:04x}");
+
+        // OR of 4 inputs: 0xFFFE
+        // NPN equivalent to AND (by De Morgan), so same canonical
+        let or4 = 0xFFFEu16;
+        let canon_or = Aig::npn_canonical_4(or4);
+        assert_eq!(
+            canon, canon_or,
+            "AND and OR should have same NPN canonical"
+        );
+
+        // Constant 0 should map to 0
+        assert_eq!(Aig::npn_canonical_4(0x0000), 0x0000);
+        // Constant 1 should map to 0 (via output negation)
+        assert_eq!(Aig::npn_canonical_4(0xFFFF), 0x0000);
+    }
 }
 
