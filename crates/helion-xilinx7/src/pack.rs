@@ -68,18 +68,20 @@ pub struct PackedBufg {
 }
 
 /// A packed block RAM (RAMB18E1).
-///
-/// The IR's [`helion_ir::CellKind::Bram18`] is a memory block with INIT data
-/// but no pin-level interface yet; the 7-series backend places it on a
-/// RAMB18E1 site and programs the INIT features. Pin-level memory interface
-/// modeling (address/data/clock/enable routing) is future work at the IR
-/// level.
 #[derive(Clone, Debug)]
 pub struct PackedBram {
     /// Source IR cell name.
     pub name: String,
     /// Initialization words (up to 1024 64-bit words for 18Kb).
     pub init: Vec<u64>,
+    /// Read width port A.
+    pub read_width_a: u8,
+    /// Read width port B.
+    pub read_width_b: u8,
+    /// Write width port A.
+    pub write_width_a: u8,
+    /// Write width port B.
+    pub write_width_b: u8,
 }
 
 /// A packed DSP block (DSP48E1).
@@ -225,7 +227,7 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     out_net,
                 });
             }
-            CellKind::Bram18 => {
+            CellKind::Bram18 | CellKind::Bram18e1 { .. } => {
                 let init = cell
                     .attrs
                     .get("INIT")
@@ -234,9 +236,23 @@ pub fn pack(netlist: &Design) -> Result<Packed7, String> {
                     .filter(|t| !t.is_empty())
                     .map(|t| u64::from_str_radix(t.trim(), 16).unwrap_or(0))
                     .collect();
+                let (ra, rb, wa, wb) = match &cell.kind {
+                    CellKind::Bram18e1 {
+                        read_width_a,
+                        read_width_b,
+                        write_width_a,
+                        write_width_b,
+                    } => (*read_width_a, *read_width_b, *write_width_a, *write_width_b),
+                    // Legacy Bram18: default 18-bit.
+                    _ => (18, 18, 18, 18),
+                };
                 out.brams.push(PackedBram {
                     name: resolve(cell.name).to_string(),
                     init,
+                    read_width_a: ra,
+                    read_width_b: rb,
+                    write_width_a: wa,
+                    write_width_b: wb,
                 });
             }
             CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
