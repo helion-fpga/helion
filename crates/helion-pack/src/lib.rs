@@ -180,7 +180,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     }
     let mut brams = Vec::new();
     for c in &design.cells {
-        if matches!(c.kind, CellKind::Bram18) {
+        if matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }) {
             let init = c
                 .attrs
                 .get("INIT")
