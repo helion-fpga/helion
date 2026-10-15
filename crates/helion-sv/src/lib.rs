@@ -426,6 +426,10 @@ impl Aig {
     /// Rewrite trivial cuts: if a node's function (via any cut) is const,
     /// buffer, or inverter, replace the node with the trivial implementation.
     /// Returns number of nodes rewritten.
+    ///
+    /// Note: This currently only *detects* trivial nodes. Full rewriting
+    /// requires fanout tracking and AIG mutation, which is future work.
+    /// See docs/aig-rewriting-design.md Phase 1 for the full plan.
     pub fn rewrite_trivial_cuts(&mut self) -> usize {
         let cuts = self.enumerate_cuts(6);
         let n_pis = self.pis.len() as u32;
