@@ -19153,7 +19153,7 @@ module ram(input logic clk, input logic [7:0] din, input logic [8:0] addr);
 endmodule
 "#;
         let d = synth_sv(src, "ram.sv").unwrap();
-        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })));
     }
 
     #[test]
@@ -19642,7 +19642,7 @@ endmodule
         let bram = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .find(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
             .expect("must infer BRAM18");
         let init = bram.attrs.get("INIT").unwrap_or("");
         assert!(
@@ -20411,7 +20411,7 @@ endmodule
         assert_eq!(hffs, 32 * 7, "32x7 write-side Hffs, got {hffs}");
         assert_ne!(d.attrs.get("NO_BODY"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })));
     }
 
     #[test]
@@ -20792,7 +20792,7 @@ endmodule
             d.cells
         );
         assert!(
-            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })),
             "wide initial must not invent a BRAM, cells={:?}",
             d.cells
         );
@@ -21027,7 +21027,7 @@ endmodule
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })));
         let hffs: Vec<_> = d
             .cells
             .iter()
@@ -21087,7 +21087,7 @@ endmodule
         assert_ne!(d.attrs.get("WORD_PIPELINE_CAP"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })));
         let hffs: Vec<_> = d
             .cells
             .iter()
@@ -23226,7 +23226,7 @@ endmodule
         let bram = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .find(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
             .expect("must infer BRAM18 from $readmemh");
         let init = bram.attrs.get("INIT").unwrap_or("");
         assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
@@ -23253,7 +23253,7 @@ endmodule
         let bram = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .find(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
             .expect("must infer BRAM18 from $readmemb");
         let init = bram.attrs.get("INIT").unwrap_or("");
         assert!(init.contains("a5"), "INIT must carry 10100101, got {init}");
@@ -23271,7 +23271,7 @@ endmodule
 "#;
         let d = synth_sv(src, "bram_force.sv").expect("bram_force");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })),
             "ram_style=block must map Bram18, cells={:?}",
             d.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
@@ -23298,7 +23298,7 @@ endmodule
 "#;
         let d = synth_sv(src, "rom_missing.sv").expect("rom_missing");
         assert!(
-            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)),
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. })),
             "missing $readmemh file must not seed Bram18 INIT 0, cells={:?}",
             d.cells
                 .iter()
@@ -23339,7 +23339,7 @@ endmodule
         let bram = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .find(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
             .expect("origin-relative $readmemh must infer BRAM18");
         let init = bram.attrs.get("INIT").unwrap_or("");
         assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");
@@ -23368,7 +23368,7 @@ endmodule
         let bram = d
             .cells
             .iter()
-            .find(|c| matches!(c.kind, CellKind::Bram18))
+            .find(|c| matches!(c.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. }))
             .expect("include-parent $readmemh must infer BRAM18");
         let init = bram.attrs.get("INIT").unwrap_or("");
         assert!(init.contains("a5"), "INIT must carry mem[0]=A5, got {init}");

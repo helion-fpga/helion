@@ -274,7 +274,34 @@ pub enum CellKind {
     /// Inserted ILA core capturing `net`.
     Ila { net: Spur },
     /// Block RAM 18Kb (true dual-port primitive).
+    /// Deprecated: use Bram18e1 with explicit pins.
     Bram18,
+    /// Xilinx 7-series RAMB18E1 block RAM.
+    ///
+    /// Pin interface (bus nets):
+    /// - `ADDRARDADDR[13:0]`: Port A address (14-bit for 18Kb)
+    /// - `ADDRBWRADDR[13:0]`: Port B address
+    /// - `DIADI[15:0]`: Port A data in (16-bit)
+    /// - `DIBDI[15:0]`: Port B data in
+    /// - `DOADO[15:0]`: Port A data out
+    /// - `DOBDO[15:0]`: Port B data out
+    /// - `CLKARDCLK`: Port A clock
+    /// - `CLKBWRCLK`: Port B clock
+    /// - `ENARDEN`: Port A enable
+    /// - `ENBWREN`: Port B enable
+    /// - `WEA[1:0]`, `WEBWE[3:0]`: Write enables
+    ///
+    /// Only connected pins are used. Unconnected inputs read 0.
+    Bram18e1 {
+        /// Read width for port A (1, 2, 4, 9, 18, 36).
+        read_width_a: u8,
+        /// Read width for port B.
+        read_width_b: u8,
+        /// Write width for port A.
+        write_width_a: u8,
+        /// Write width for port B.
+        write_width_b: u8,
+    },
     /// Xilinx 7-series CARRY4 fast carry chain (4 bits). Backend-neutral
     /// marker; the 7-series backend maps it to CARRY4 sites. Synth inference
     /// from adder logic is future work; currently only explicitly
@@ -761,6 +788,19 @@ impl Design {
                 )),
                 CellKind::Ila { net } => s.push_str(&format!("cell {} Ila {}\n", resolve(c.name), resolve(*net))),
                 CellKind::Bram18 => s.push_str(&format!("cell {} Bram18\n", resolve(c.name))),
+                CellKind::Bram18e1 {
+                    read_width_a,
+                    read_width_b,
+                    write_width_a,
+                    write_width_b,
+                } => s.push_str(&format!(
+                    "cell {} Bram18e1 ra={} rb={} wa={} wb={}\n",
+                    resolve(c.name),
+                    read_width_a,
+                    read_width_b,
+                    write_width_a,
+                    write_width_b
+                )),
                 CellKind::Carry4 => s.push_str(&format!("cell {} Carry4\n", resolve(c.name))),
                 CellKind::BlackBox { module } => {
                     s.push_str(&format!("cell {} BlackBox {}\n", resolve(c.name), resolve(*module)))
@@ -861,6 +901,29 @@ impl Design {
                         }
                         "Ila" => CellKind::Ila { net: intern(&rest) },
                         "Bram18" => CellKind::Bram18,
+                        "Bram18e1" => {
+                            let mut ra = 18u8;
+                            let mut rb = 18u8;
+                            let mut wa = 18u8;
+                            let mut wb = 18u8;
+                            for part in rest.split_whitespace() {
+                                if let Some(v) = part.strip_prefix("ra=") {
+                                    ra = v.parse().unwrap_or(18);
+                                } else if let Some(v) = part.strip_prefix("rb=") {
+                                    rb = v.parse().unwrap_or(18);
+                                } else if let Some(v) = part.strip_prefix("wa=") {
+                                    wa = v.parse().unwrap_or(18);
+                                } else if let Some(v) = part.strip_prefix("wb=") {
+                                    wb = v.parse().unwrap_or(18);
+                                }
+                            }
+                            CellKind::Bram18e1 {
+                                read_width_a: ra,
+                                read_width_b: rb,
+                                write_width_a: wa,
+                                write_width_b: wb,
+                            }
+                        }
                         "BlackBox" => CellKind::BlackBox { module: intern(&rest) },
                         other => return Err(format!("unknown kind {other}")),
                     };

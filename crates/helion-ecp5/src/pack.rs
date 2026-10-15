@@ -312,7 +312,7 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
                     out_net,
                 });
             }
-            CellKind::Bram18 => {
+            CellKind::Bram18 | CellKind::Bram18e1 { .. } => {
                 out.rams.push(pack_ram(resolve(cell.name), &cell.attrs)?);
             }
             CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
