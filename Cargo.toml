@@ -28,6 +28,7 @@ members = [
     "crates/helion-hl10t",
     "crates/helion-ice40",
     "crates/helion-ecp5",
+    "crates/helion-sat",
 ]
 
 [workspace.package]
