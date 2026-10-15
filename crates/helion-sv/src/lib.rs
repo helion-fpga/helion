@@ -115,6 +115,9 @@ impl Aig {
         // with later PIs — that collision folded `q2 ^ (q0 & q1)` to const 0.
         a.collect_pis(e);
         a.output = a.expr(e);
+        // Rewrite trivial nodes (const/buffer/inverter) to simplify the AIG
+        // before LUT mapping. This is Phase 1 of ABC-style rewriting.
+        let _ = a.rewrite_trivial_cuts();
         a
     }
 
