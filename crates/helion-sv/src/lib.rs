@@ -16637,7 +16637,31 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             continue;
         }
         let cell = format!("u_bram{n_bram}");
-        d.add_cell(&cell, CellKind::Bram18);
+        // Determine data width for Bram18e1 config.
+        let width = sig_width(rtl, name).max(1) as u8;
+        // Clamp to valid BRAM widths: 1, 2, 4, 9, 18, 36.
+        let bram_width = if width <= 1 {
+            1
+        } else if width <= 2 {
+            2
+        } else if width <= 4 {
+            4
+        } else if width <= 9 {
+            9
+        } else if width <= 18 {
+            18
+        } else {
+            36
+        };
+        d.add_cell(
+            &cell,
+            CellKind::Bram18e1 {
+                read_width_a: bram_width,
+                read_width_b: bram_width,
+                write_width_a: bram_width,
+                write_width_b: bram_width,
+            },
+        );
         let mut words = vec![0u64; depth.max(1).min(1024)];
         if let Some(init) = rtl.mem_inits.get(name) {
             for (addr, val) in init {
