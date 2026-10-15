@@ -886,6 +886,57 @@ impl Aig {
         }
         result
     }
+
+    /// Instantiate a cone template with transformed inputs.
+    fn instantiate_cone(
+        &mut self,
+        template: &[(Lit, Lit, u32)],
+        input_map: &[Lit],
+        out_neg: bool,
+    ) -> Lit {
+        use std::collections::HashMap;
+        let mut node_map: HashMap<u32, Lit> = HashMap::new();
+        for (a, b, out_id) in template {
+            let new_a = self.map_lit(*a, &node_map, input_map);
+            let new_b = self.map_lit(*b, &node_map, input_map);
+            let new_lit = self.and_lit(new_a, new_b);
+            node_map.insert(*out_id, new_lit);
+        }
+        let (_, _, last_id) = template.last().expect("empty template");
+        let mut out_lit = *node_map.get(last_id).expect("missing output");
+        if out_neg {
+            out_lit.inv ^= true;
+        }
+        out_lit
+    }
+
+    /// Map a Lit from template space to new AIG space.
+    fn map_lit(
+        &self,
+        lit: Lit,
+        node_map: &std::collections::HashMap<u32, Lit>,
+        input_map: &[Lit],
+    ) -> Lit {
+        let n_pis = self.pis.len() as u32;
+        if lit.node == 0 {
+            Lit { node: 0, inv: lit.inv }
+        } else if lit.node <= n_pis {
+            let idx = (lit.node - 1) as usize;
+            if idx < input_map.len() {
+                let mut mapped = input_map[idx];
+                mapped.inv ^= lit.inv;
+                mapped
+            } else {
+                Lit { node: 0, inv: lit.inv }
+            }
+        } else if let Some(mapped) = node_map.get(&lit.node) {
+            let mut m = *mapped;
+            m.inv ^= lit.inv;
+            m
+        } else {
+            Lit { node: 0, inv: lit.inv }
+        }
+    }
 }
 
 /// Generate next lexicographic permutation for 4 elements.
