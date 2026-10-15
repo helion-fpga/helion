@@ -1686,12 +1686,8 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
                         }
                         Activity::Simulate => {}
                     }
-                    if app.model.selected.is_some()
-                        || app.model.selected_source.is_some()
-                        || app.model.selected_io_port.is_some()
-                    {
-                        paint_properties(ui, &mut app.model);
-                    }
+                    // R14/P1: selection detail lives in the Z4 inspector dock,
+                    // never in the navigation sidebar. paint_inspector owns it.
                     }); // end ui.vertical
                     }); // end ScrollArea
                 // Draggable strip at the panel's right edge.
