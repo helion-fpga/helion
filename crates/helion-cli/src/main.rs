@@ -9,7 +9,7 @@ use helion_hw::{
 };
 use helion_ir::{resolve, Design};
 use helion_pack::pack;
-use helion_place::{PlaceOpts, place, place_with};
+use helion_place::{PlaceOpts, place, place_with, place_with_guide};
 use helion_proj::{
     Mode, Session, constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path,
 };
@@ -121,7 +121,16 @@ fn compile_design_xdc(
         t0.elapsed().as_millis()
     );
     let t1 = std::time::Instant::now();
-    let placed = place_with(&packed, &dev, PlaceOpts { timing_weight, seed: 0 })?;
+    let guide = xdc.timing_guide();
+    let placed = place_with_guide(
+        &packed,
+        &dev,
+        PlaceOpts {
+            timing_weight,
+            seed: 0,
+        },
+        &guide,
+    )?;
     eprintln!(
         "hang_diag place lutff_sites={} ms={}",
         placed.lutff_sites.len(),
