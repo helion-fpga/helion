@@ -76,14 +76,27 @@ pub fn analyze_cdc(design: &Design) -> Vec<CdcViolation> {
 }
 
 /// Build clock domains from design FFs.
+/// Groups flip-flops by their clock net.
 fn build_clock_domains(design: &Design) -> Vec<ClockDomain> {
+    use helion_ir::{intern, CellKind};
+
     let mut clock_to_ffs: HashMap<Spur, HashSet<Spur>> = HashMap::new();
+    let clk_pin = intern("CLK");
 
     for cell in design.cells.iter() {
-        // Check if cell is a flip-flop (has clock pin)
-        // Simplified: look for cells with "CLK" pin
-        // In real implementation, check CellKind::Ff or similar
-        let _ = cell; // Placeholder
+        // Check if cell is a flip-flop
+        let is_ff = matches!(cell.kind, CellKind::Hff);
+        if !is_ff {
+            continue;
+        }
+
+        // Get the clock net for this FF
+        if let Some(clk_net) = design.net_on(cell.name, clk_pin) {
+            clock_to_ffs
+                .entry(clk_net)
+                .or_insert_with(HashSet::new)
+                .insert(cell.name);
+        }
     }
 
     clock_to_ffs
@@ -92,30 +105,131 @@ fn build_clock_domains(design: &Design) -> Vec<ClockDomain> {
         .collect()
 }
 
-/// Find which domain drives a net (placeholder).
+/// Find which domain drives a net.
+/// Traces the net driver back to a flip-flop output or primary input.
+/// Returns None for primary inputs or combinational drivers (no domain).
 fn find_driver_domain(
-    _design: &Design,
-    _domains: &[ClockDomain],
-    _net: Spur,
+    design: &Design,
+    domains: &[ClockDomain],
+    net: Spur,
 ) -> Option<ClockDomain> {
-    // TODO: Trace net driver back to FF or PI, determine its clock domain
+    use helion_ir::{intern, CellKind};
+
+    let q_pin = intern("Q");
+
+    // Find the cell that drives this net (has Q connected to net)
+    for cell in design.cells.iter() {
+        let is_ff = matches!(cell.kind, CellKind::Hff);
+        if !is_ff {
+            continue;
+        }
+        if let Some(q_net) = design.net_on(cell.name, q_pin) {
+            if q_net == net {
+                // This FF drives the net. Find its domain.
+                for domain in domains {
+                    if domain.ffs.contains(&cell.name) {
+                        return Some(domain.clone());
+                    }
+                }
+            }
+        }
+    }
+    // No FF driver found (could be PI or combinational)
     None
 }
 
-/// Find which domains load a net (placeholder).
+/// Find which domains load a net (sample it).
+/// Returns list of domains for FFs whose D pin connects to the net.
 fn find_load_domains(
-    _design: &Design,
-    _domains: &[ClockDomain],
-    _net: Spur,
+    design: &Design,
+    domains: &[ClockDomain],
+    net: Spur,
 ) -> Vec<ClockDomain> {
-    // TODO: Find all FFs/DFFs that sample this net, group by clock
-    Vec::new()
+    use helion_ir::{intern, CellKind};
+
+    let d_pin = intern("D");
+    let mut result = Vec::new();
+    let mut seen_clocks = HashSet::new();
+
+    for cell in design.cells.iter() {
+        let is_ff = matches!(cell.kind, CellKind::Hff);
+        if !is_ff {
+            continue;
+        }
+        if let Some(d_net) = design.net_on(cell.name, d_pin) {
+            if d_net == net {
+                // This FF samples the net. Find its domain.
+                for domain in domains {
+                    if domain.ffs.contains(&cell.name) && !seen_clocks.contains(&domain.clock) {
+                        seen_clocks.insert(domain.clock);
+                        result.push(domain.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
-/// Check if net has a 2-FF synchronizer in the destination domain (placeholder).
-fn has_synchronizer(_design: &Design, _net: Spur, _dst: &ClockDomain) -> bool {
-    // TODO: Look for 2 FFs in series, both clocked by dst.clock,
-    // with the net feeding the first FF's D pin
+/// Check if net has a 2-FF synchronizer in the destination domain.
+/// Looks for two flip-flops in series, both clocked by dst.clock,
+/// where the first FF's D is driven by the net, and the second FF's
+/// D is driven by the first FF's Q.
+fn has_synchronizer(design: &Design, net: Spur, dst: &ClockDomain) -> bool {
+    use helion_ir::{intern, CellKind};
+
+    let d_pin = intern("D");
+    let q_pin = intern("Q");
+    let clk_pin = intern("CLK");
+
+    // Find all FFs in the destination domain
+    for cell in design.cells.iter() {
+        // Check if it's a flip-flop
+        let is_ff = matches!(cell.kind, CellKind::Hff);
+        if !is_ff {
+            continue;
+        }
+
+        // Check if it's in the destination domain (clocked by dst.clock)
+        let clk_net = design.net_on(cell.name, clk_pin);
+        if clk_net != Some(dst.clock) {
+            continue;
+        }
+
+        // Check if this FF's D is driven by our net
+        let d_net = design.net_on(cell.name, d_pin);
+        if d_net != Some(net) {
+            continue;
+        }
+
+        // Found first FF (FF1). Now look for second FF (FF2) whose D is driven by FF1.Q
+        let ff1_q = design.net_on(cell.name, q_pin);
+        if let Some(q_net) = ff1_q {
+            for cell2 in design.cells.iter() {
+                let is_ff2 = matches!(cell2.kind, CellKind::Hff);
+                if !is_ff2 {
+                    continue;
+                }
+                // Skip the same cell
+                if cell2.name == cell.name {
+                    continue;
+                }
+                // Check clock
+                let clk2_net = design.net_on(cell2.name, clk_pin);
+                if clk2_net != Some(dst.clock) {
+                    continue;
+                }
+                // Check D input
+                let d2_net = design.net_on(cell2.name, d_pin);
+                if d2_net == Some(q_net) {
+                    // Found 2-FF synchronizer!
+                    return true;
+                }
+            }
+        }
+    }
+
     false
 }
 
