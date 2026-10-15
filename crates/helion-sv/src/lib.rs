@@ -523,17 +523,41 @@ impl Aig {
                     let tt4 = (tt & 0xFFFF) as u16;
                     let canon = Self::npn_canonical_4(tt4);
 
-                    // If we've seen this NPN class before, we could share
-                    // For now, just record it (full sharing needs LUT-level logic)
+                    // Check if function actually depends on all 4 inputs
+                    // If not, it's a simpler function that could be optimized
+                    if !Self::depends_on_all_4(tt4) {
+                        // Mark for potential simplification
+                        // (full implementation would replace with smaller cut)
+                    }
+
                     npn_map.entry(canon).or_insert((node_id, cut.clone()));
                 }
             }
         }
 
-        // TODO: Implement actual sharing/replacement based on NPN equivalence
-        // This requires LUT-level mapping integration
-
         rewritten
+    }
+
+    /// Check if a 4-input truth table actually depends on all 4 inputs.
+    /// Returns false if any input is don't-care.
+    fn depends_on_all_4(tt: u16) -> bool {
+        // Check each input: if flipping it never changes output, it's don't-care
+        for i in 0..4 {
+            let mut depends = false;
+            for m in 0..16u16 {
+                let m_flip = m ^ (1 << i);
+                let bit_m = (tt >> m) & 1;
+                let bit_flip = (tt >> m_flip) & 1;
+                if bit_m != bit_flip {
+                    depends = true;
+                    break;
+                }
+            }
+            if !depends {
+                return false;
+            }
+        }
+        true
     }
 
     /// Build fanout map: node_id -> list of (user_node_id, input_pos).
