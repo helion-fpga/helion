@@ -360,11 +360,17 @@ fn cmd_equiv(args: &[String]) {
         .cloned()
         .unwrap_or_else(|| "examples/blinky.sv".into());
 
-    let golden = synth_any(golden_path).unwrap_or_else(|e| {
+    // Synthesize golden and revised in parallel (independent work)
+    let (golden_res, revised_res) = rayon::join(
+        || synth_any(golden_path),
+        || synth_any(&revised_path),
+    );
+
+    let golden = golden_res.unwrap_or_else(|e| {
         eprintln!("equiv golden: {e}");
         std::process::exit(1);
     });
-    let revised = synth_any(&revised_path).unwrap_or_else(|e| {
+    let revised = revised_res.unwrap_or_else(|e| {
         eprintln!("equiv revised: {e}");
         std::process::exit(1);
     });

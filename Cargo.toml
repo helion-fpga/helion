@@ -64,6 +64,7 @@ helion-xilinx7 = { path = "crates/helion-xilinx7" }
 helion-ice40 = { path = "crates/helion-ice40" }
 helion-ecp5 = { path = "crates/helion-ecp5" }
 criterion = "0.5"
+rayon = "1.8"
 
 [profile.bench]
 inherits = "release"
