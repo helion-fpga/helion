@@ -264,6 +264,7 @@ fn main() {
         "gui" => cmd_gui(),
         "hw" => hw(args),
         "synth" => cmd_synth(&args),
+        "equiv" => cmd_equiv(&args),
         "impl" => cmd_impl(&args),
         "run" => cmd_run(&args),
         "report_timing" => cmd_timing(&args),
@@ -293,6 +294,7 @@ fn usage() {
   helion doctor
   helion gui
   helion synth <file.sv> [--part P]
+  helion equiv <golden.sv> <revised.sv> [--part P]
   helion impl <file.sv> [--part P]
   helion run <file.sv> [--cycles N] [--part P]
   helion report_timing <file.sv|.vhd> [--sdc f.sdc]
@@ -347,6 +349,52 @@ fn cmd_synth(args: &[String]) {
         d.cells.len(),
         luts.len()
     );
+}
+
+fn cmd_equiv(args: &[String]) {
+    let golden_path = positional(args).unwrap_or("examples/blinky.sv");
+    let revised_path = args
+        .iter()
+        .skip_while(|a| *a != golden_path)
+        .nth(1)
+        .cloned()
+        .unwrap_or_else(|| "examples/blinky.sv".into());
+
+    let golden = synth_any(golden_path).unwrap_or_else(|e| {
+        eprintln!("equiv golden: {e}");
+        std::process::exit(1);
+    });
+    let revised = synth_any(&revised_path).unwrap_or_else(|e| {
+        eprintln!("equiv revised: {e}");
+        std::process::exit(1);
+    });
+
+    let golden_model = helion_sv::equiv::EquivModel::from_design(&golden).unwrap_or_else(|e| {
+        eprintln!("equiv golden model: {e}");
+        std::process::exit(1);
+    });
+    let revised_model =
+        helion_sv::equiv::EquivModel::from_design(&revised).unwrap_or_else(|e| {
+            eprintln!("equiv revised model: {e}");
+            std::process::exit(1);
+        });
+
+    match helion_sv::equiv::prove_equivalent(&golden_model, &revised_model) {
+        Ok(helion_sv::equiv::EquivVerdict::Equivalent) => {
+            println!("equiv: EQUIVALENT");
+        }
+        Ok(helion_sv::equiv::EquivVerdict::Counterexample(ce)) => {
+            println!(
+                "equiv: NOT EQUIVALENT (differing output: {})",
+                ce.differing_output
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("equiv error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_impl(args: &[String]) {
