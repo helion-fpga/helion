@@ -566,7 +566,25 @@ pub fn place_with_guide(
         // Sites are recorded by PACKED index, never in visitation order:
         // lutff_sites[i] must match packed.lutffs[i] (INIT programming,
         // router IMUX, cell_bel, lutff_of all index by packed order).
-        let lutff_order = seeded_order(packed.lutffs.len(), opts.seed);
+        let lutff_order = {
+            // Timing-driven order: sort by criticality (descending) so critical
+            // cells are placed first in better locations. Falls back to seeded
+            // order if no criticality info available.
+            let mut order: Vec<usize> = (0..packed.lutffs.len()).collect();
+            // Check if guide has any criticality info
+            let has_criticality = !guide.net_criticality.is_empty();
+            if has_criticality {
+                order.sort_by(|&a, &b| {
+                    let crit_a = guide.net_criticality(&packed.lutffs[a].q_net);
+                    let crit_b = guide.net_criticality(&packed.lutffs[b].q_net);
+                    // Sort descending by criticality (higher first)
+                    crit_b.partial_cmp(&crit_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                order = seeded_order(packed.lutffs.len(), opts.seed);
+            }
+            order
+        };
         let mut site_of: Vec<Option<(Site, u8)>> = vec![None; packed.lutffs.len()];
         for &li in &lutff_order {
             let lf = &packed.lutffs[li];
