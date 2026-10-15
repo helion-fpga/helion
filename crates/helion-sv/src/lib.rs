@@ -307,6 +307,121 @@ impl Aig {
         }
         acc
     }
+
+    /// Enumerate k-cuts for all nodes (k=6 for LUT6).
+    /// Returns Vec where cuts[node_id] = list of cuts (each cut is sorted Vec<u32> of leaf node ids).
+    /// Node 0 is const, nodes 1..=n_pis are PIs, rest are ANDs.
+    pub fn enumerate_cuts(&self, k: usize) -> Vec<Vec<Vec<u32>>> {
+        let n_pis = self.pis.len() as u32;
+        let n_nodes = 1 + n_pis as usize + self.ands.len();
+        let mut cuts: Vec<Vec<Vec<u32>>> = vec![Vec::new(); n_nodes];
+
+        // Const node 0: empty cut (or single?)
+        // PI nodes: singleton cut
+        for i in 1..=n_pis {
+            cuts[i as usize].push(vec![i]);
+        }
+
+        // AND nodes: merge fanin cuts
+        for (idx, (a, b)) in self.ands.iter().enumerate() {
+            let node_id = 1 + n_pis + idx as u32;
+            let mut node_cuts: Vec<Vec<u32>> = Vec::new();
+
+            // Trivial cut: the node itself (for multi-level mapping)
+            // Actually for cut enumeration, we want cuts in terms of leaves
+
+            for ca in &cuts[a.node as usize] {
+                for cb in &cuts[b.node as usize] {
+                    // Merge cuts
+                    let mut merged: Vec<u32> = Vec::new();
+                    let mut i = 0;
+                    let mut j = 0;
+                    while i < ca.len() || j < cb.len() {
+                        let va = ca.get(i).copied().unwrap_or(u32::MAX);
+                        let vb = cb.get(j).copied().unwrap_or(u32::MAX);
+                        if va < vb {
+                            merged.push(va);
+                            i += 1;
+                        } else if vb < va {
+                            merged.push(vb);
+                            j += 1;
+                        } else {
+                            merged.push(va);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                    if merged.len() <= k {
+                        // Deduplicate
+                        if !node_cuts.contains(&merged) {
+                            node_cuts.push(merged);
+                        }
+                    }
+                }
+            }
+
+            // Keep only best cuts (priority cuts): smallest first, limit count
+            node_cuts.sort_by_key(|c| c.len());
+            node_cuts.truncate(8); // Keep top 8 cuts
+            cuts[node_id as usize] = node_cuts;
+        }
+
+        cuts
+    }
+
+    /// Compute truth table for a cut: given cut leaves and the node,
+    /// evaluate the node's function in terms of cut leaves.
+    /// Returns (init, leaf_order) where init is the truth table.
+    pub fn cut_truth_table(&self, node: u32, cut: &[u32]) -> Option<u64> {
+        if cut.len() > 6 {
+            return None;
+        }
+        // Map cut leaf node id -> cut index
+        let mut leaf_ix: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (i, &leaf) in cut.iter().enumerate() {
+            leaf_ix.insert(leaf, i);
+        }
+
+        let mut init = 0u64;
+        let n = cut.len();
+        for addr in 0..(1u64 << n) {
+            // Evaluate node with cut leaves set according to addr
+            if self.eval_with_cut(node, false, &leaf_ix, addr) {
+                init |= 1u64 << addr;
+            }
+        }
+        Some(init)
+    }
+
+    fn eval_with_cut(
+        &self,
+        node: u32,
+        inv: bool,
+        leaf_ix: &std::collections::HashMap<u32, usize>,
+        addr: u64,
+    ) -> bool {
+        if node == 0 {
+            return inv; // const 0, inverted = 1
+        }
+        if let Some(&idx) = leaf_ix.get(&node) {
+            let val = (addr >> idx) & 1 == 1;
+            return val ^ inv;
+        }
+        let n_pis = self.pis.len() as u32;
+        if node >= 1 && node <= n_pis {
+            // PI not in cut - shouldn't happen for valid cuts
+            return false;
+        }
+        // AND node
+        let and_idx = (node - 1 - n_pis) as usize;
+        if and_idx >= self.ands.len() {
+            return false;
+        }
+        let (a, b) = self.ands[and_idx];
+        let va = self.eval_with_cut(a.node, a.inv, leaf_ix, addr);
+        let vb = self.eval_with_cut(b.node, b.inv, leaf_ix, addr);
+        (va && vb) ^ inv
+    }
 }
 
 /// UG900 Compilation tab over helion-sv (include + `define), not xvlog.
