@@ -521,6 +521,7 @@ impl Aig {
         rewritten
     }
 
+
     /// Rewrite using NPN classification: for each 4-input cut, compute its
     /// NPN canonical form with transformation. If two nodes have NPN-equivalent
     /// cuts, the later node can be replaced by the earlier one (with input
@@ -751,6 +752,44 @@ impl Aig {
         }
 
         (best, best_neg, best_perm, best_out_neg)
+    }
+
+    /// Extract the AIG cone for a node as a list of AND operations in
+    /// topological order.
+    fn extract_cone(
+        &self,
+        node_id: u32,
+        cut_leaves: &[u32],
+    ) -> Vec<(Lit, Lit, u32)> {
+        use std::collections::{HashSet, VecDeque};
+        let leaf_set: HashSet<u32> = cut_leaves.iter().cloned().collect();
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(node_id);
+        let n_pis = self.pis.len() as u32;
+        while let Some(nid) = queue.pop_front() {
+            if nid == 0 || leaf_set.contains(&nid) || !visited.insert(nid) {
+                continue;
+            }
+            if nid > n_pis {
+                let idx = (nid - 1 - n_pis) as usize;
+                if idx < self.ands.len() {
+                    let (a, b) = self.ands[idx];
+                    queue.push_back(a.node);
+                    queue.push_back(b.node);
+                    order.push(nid);
+                }
+            }
+        }
+        order.reverse();
+        let mut result = Vec::new();
+        for nid in order {
+            let idx = (nid - 1 - n_pis) as usize;
+            let (a, b) = self.ands[idx];
+            result.push((a, b, nid));
+        }
+        result
     }
 }
 
