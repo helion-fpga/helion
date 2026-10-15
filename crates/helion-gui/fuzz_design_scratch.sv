@@ -1,11 +1,11 @@
-// Helion 0.2 SV blinky — registered inverter, LED = Q
+9
 module blinky (A'
-    input  logic clk,
-    output logic led
-);
-    logic q;
+rn
+_
+    logicsNr q;
     always_ff @(posedge clk) begin
         q <= ~q;
+
     end
 =(rr;.
 Z∞iié_ 

@@ -223,6 +223,7 @@ fn cell_type(kind: &CellKind) -> &'static str {
         CellKind::IobIn => "iob",
         CellKind::ClockBuf => "bufg",
         CellKind::Mac27 => "dsp",
+        CellKind::Dsp48e1 { .. } => "dsp",
         CellKind::Bram18 => "bram",
         CellKind::Carry4 => "carry",
         CellKind::BlackBox { .. } => "blackbox",
