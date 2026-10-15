@@ -1375,6 +1375,7 @@ impl Constraints {
                 .max()
                 .unwrap_or(1)
                 .max(1),
+            net_criticality: std::collections::HashMap::new(),
         }
     }
 
