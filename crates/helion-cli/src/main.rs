@@ -346,31 +346,47 @@ fn cmd_synth(args: &[String]) {
     let path = positional(args).unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
     let verify = args.iter().any(|a| a == "--verify");
+    // --verify: run SAT-based pre/post optimization equivalence checking.
+    // Sets HELION_PRESERVE_PRE_OPT so synth preserves the pre-opt Design,
+    // then proves equivalence between pre-opt and post-opt via varisat.
+    // SAFETY: Single-threaded CLI context; no threads spawned yet.
+    if verify {
+        unsafe { std::env::set_var("HELION_PRESERVE_PRE_OPT", "1") };
+    }
     let d = synth_any(path).unwrap_or_else(|e| {
         eprintln!("synth: {e}");
         std::process::exit(1);
     });
 
-    // --verify: run SAT-based equivalence check on the synthesized design
-    // (validates the equiv infrastructure on real designs; full pre/post
-    // opt verification requires synth flow changes to preserve pre-opt design)
     if verify {
-        let model = helion_sv::equiv::EquivModel::from_design(&d).unwrap_or_else(|e| {
-            eprintln!("verify: model build failed: {e}");
-            std::process::exit(1);
-        });
-        match helion_sv::equiv::prove_equivalent(&model, &model) {
-            Ok(helion_sv::equiv::EquivVerdict::Equivalent) => {
-                eprintln!("verify: EQUIVALENT (self-check passed)");
-            }
-            Ok(helion_sv::equiv::EquivVerdict::Counterexample(ce)) => {
-                eprintln!("verify: FAILED (self-check found diff at {})", ce.differing_output);
+        unsafe { std::env::remove_var("HELION_PRESERVE_PRE_OPT") };
+        if let Some(d_pre) = helion_sv::take_pre_opt_design() {
+            let golden = helion_sv::equiv::EquivModel::from_design(&d_pre).unwrap_or_else(|e| {
+                eprintln!("verify: pre-opt model build failed: {e}");
                 std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("verify: error: {e}");
+            });
+            let revised = helion_sv::equiv::EquivModel::from_design(&d).unwrap_or_else(|e| {
+                eprintln!("verify: post-opt model build failed: {e}");
                 std::process::exit(1);
+            });
+            match helion_sv::equiv::prove_equivalent(&golden, &revised) {
+                Ok(helion_sv::equiv::EquivVerdict::Equivalent) => {
+                    eprintln!("verify: PRE/POST EQUIVALENT (peephole opts preserved semantics)");
+                }
+                Ok(helion_sv::equiv::EquivVerdict::Counterexample(ce)) => {
+                    eprintln!(
+                        "verify: FAILED - pre/post differ at output {}",
+                        ce.differing_output
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("verify: error: {e}");
+                    std::process::exit(1);
+                }
             }
+        } else {
+            eprintln!("verify: warning - pre-opt design not preserved (synth may have failed)");
         }
     }
 
