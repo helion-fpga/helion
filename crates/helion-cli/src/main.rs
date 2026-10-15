@@ -13,7 +13,7 @@ use helion_place::{PlaceOpts, place, place_with, place_with_guide};
 use helion_proj::{
     Mode, Session, constraints_from_project, expand_ip_packages, load_prj, resolve_prj_path,
 };
-use helion_route::{RouteOpts, Routed, route_with};
+use helion_route::{RouteOpts, Routed, route_with, route_with_guide};
 use helion_sta::{
     Constraints, OperatingConditions, PowerReport, TimingResult, apply_xdc, create_clock, load_sdc,
     load_xdc, report_power, report_timing_routed, report_timing_routed_xdc,
@@ -141,7 +141,7 @@ fn compile_design_xdc(
         max_iters: if packed.lutffs.len() > 2000 { 24 } else { 8 },
         extra_hops: 0,
     };
-    let routed = route_with(&placed, &dev, route_opts)?;
+    let routed = route_with_guide(&placed, &dev, route_opts, &guide)?;
     eprintln!(
         "hang_diag route imux={} imux_skip={} pathfinder_iters={} overused={} ms={}",
         routed.imux.len(),
