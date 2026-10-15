@@ -508,7 +508,9 @@ impl Aig {
         let n_pis = self.pis.len() as u32;
         let mut rewritten = 0;
 
-        // Map NPN canonical form -> (node_id, cut) for 4-input cuts
+        // Map NPN canonical form -> count, for statistics
+        let mut npn_stats: HashMap<u16, usize> = HashMap::new();
+        // Map NPN canonical form -> (node_id, cut) for sharing candidates
         let mut npn_map: HashMap<u16, (u32, Vec<u32>)> = HashMap::new();
 
         for (idx, _) in self.ands.iter().enumerate() {
@@ -523,17 +525,15 @@ impl Aig {
                     let tt4 = (tt & 0xFFFF) as u16;
                     let canon = Self::npn_canonical_4(tt4);
 
-                    // Check if function actually depends on all 4 inputs
-                    // If not, it's a simpler function that could be optimized
-                    if !Self::depends_on_all_4(tt4) {
-                        // Mark for potential simplification
-                        // (full implementation would replace with smaller cut)
-                    }
-
+                    *npn_stats.entry(canon).or_insert(0) += 1;
                     npn_map.entry(canon).or_insert((node_id, cut.clone()));
                 }
             }
         }
+
+        // Log statistics (in debug builds)
+        #[cfg(debug_assertions)]
+        eprintln!("NPN stats: {} unique classes from cuts", npn_stats.len());
 
         rewritten
     }
