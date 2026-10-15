@@ -53,27 +53,45 @@ for dsp in &placed.dsps {
 - Need to verify FASM feature names against X-Ray db
 - Bitstream generation for DSP not yet tested
 
+## X-Ray Database Findings (2026-10-15)
+
+Cloned `https://github.com/SymbiFlow/prjxray` (shallow).
+Analyzed `fuzzers/100-dsp-mskpat/generate.py`.
+
+### Key Discoveries
+
+1. **Site naming**: DSP sites use `DSP_0` or `DSP_1` (not `DSP48E1_X0Y0`).
+   - Selection: `dsp = "DSP_0" if params['SITE'][-1] in "02468" else "DSP_1"`
+   - Even Y coordinate -> DSP_0, odd Y -> DSP_1
+
+2. **OPMODE/ALUMODE configuration**: Via `IS_*_INVERTED` parameters, not direct.
+   - `IS_OPMODE_INVERTED[6:0]` (7 bits)
+   - `IS_ALUMODE_INVERTED[3:0]` (4 bits)
+   - `IS_INMODE_INVERTED[4:0]` (5 bits)
+   - `IS_CARRYIN_INVERTED` (1 bit)
+
+3. **Tag format**: `{DSP_0|DSP_1}.Z{IS_OPMODE_INVERTED}[{bit}]`
+   - The `Z` prefix indicates inverted logic in X-Ray database
+   - Example from generate.py: `add(segmk, site, dsp, 'OPMODEREG', 0, ...)`
+
+4. **49 unique DSP tags** found in generate.py, including:
+   - Pipeline regs: `ADREG`, `ALUMODEREG`, `AREG`, `BREG`, `CREG`, `DREG`, `MREG`, `PREG`, `CARRYINREG`, `CARRYINSELREG`, `INMODEREG`, `OPMODEREG`
+   - Config: `AREG_0`, `AREG_2`, `BREG_0`, `BREG_2`, `ACASCREG`, `BCASCREG`
+   - Modes: `USE_MULT`, `USE_DPORT`, `USE_PATTERN_DETECT`, `USE_SIMD`
+
+### FASM Emission Strategy
+
+For `Dsp48e1 { opmode: u8, alumode: u8 }`:
+1. Determine site: `DSP_0` or `DSP_1` based on Y coordinate
+2. For each opmode bit i (0-6):
+   - If bit is 1: emit `{site}.ZIS_OPMODE_INVERTED[{i}]` (or omit if default?)
+   - If bit is 0: omit (or emit inverted?)
+3. Same for alumode bits 0-3 with `IS_ALUMODE_INVERTED`
+
+**TODO:** Verify exact FASM syntax by examining a real X-Ray generated FASM file,
+or by running the fuzzer (requires Vivado 2017.2, not available).
+
 ## References
 - UG479: 7 Series DSP48E1 User Guide
 - Project X-Ray: https://github.com/SymbiFlow/prjxray
-- X-Ray db: `database/artix7/` (check for DSP tiles)
-
-## X-Ray Feature Name Patterns (To Verify)
-
-### OPMODE[6:0]
-Based on X-Ray segbits database structure, expected patterns:
-- `DSP48E1_X0Y0.DSP48E1.OPMODE0` through `OPMODE6`
-- Each bit is a separate feature; set bits are listed in FASM
-
-### ALUMODE[3:0]
-- `DSP48E1_X0Y0.DSP48E1.ALUMODE0` through `ALUMODE3`
-
-### Pipeline Registers
-- `DSP48E1.AREG0`, `AREG1` (A input pipeline stages)
-- `DSP48E1.BREG0`, `BREG1` (B input pipeline stages)
-- `DSP48E1.CREG0` (C input pipeline)
-- `DSP48E1.MREG` (Multiplier pipeline)
-- `DSP48E1.PREG` (P output pipeline)
-
-**Verification needed:** Clone prjxray, check `database/artix7/segbits_dsp_*.db`
-for exact feature strings.
+- Fuzzer: `fuzzers/100-dsp-mskpat/generate.py` (analyzed 2026-10-15)
