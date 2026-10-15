@@ -172,7 +172,7 @@ pub fn pack(design: &Design, _dev: &Device) -> Result<Packed, String> {
     }
     let mut macs = Vec::new();
     for c in &design.cells {
-        if matches!(c.kind, CellKind::Mac27) {
+        if matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }) {
             macs.push(PackedMac {
                 cell: resolve(c.name).to_string(),
             });
