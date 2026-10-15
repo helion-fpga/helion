@@ -480,7 +480,7 @@ mod tests {
             ("led", PortDir::Out),
         ] {
             d.ports.push(helion_ir::Port {
-                name: name.into(),
+                name: intern(name),
                 dir,
                 attrs: Default::default(),
             });

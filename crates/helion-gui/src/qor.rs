@@ -959,8 +959,8 @@ mod tests {
         d.add_cell("src", CellKind::Hff);
         d.connect("hot", "src", "Q");
         for i in 0..40 {
-            d.add_cell(format!("sink{i}"), CellKind::Hff);
-            d.connect("hot", format!("sink{i}"), "D");
+            d.add_cell(&format!("sink{i}"), CellKind::Hff);
+            d.connect("hot", &format!("sink{i}"), "D");
         }
         let c = empty_constraints();
         let paths: Vec<TimingPath> = Vec::new();
