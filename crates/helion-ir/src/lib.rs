@@ -252,7 +252,25 @@ pub enum CellKind {
     /// "unsupported for HL10T" error; it is only legal for multi-backend flows.
     ClockBuf,
     /// DSP MAC27 (pre-add * mul + acc). Site primitive.
+    /// Deprecated: use Dsp48e1 with explicit pins.
     Mac27,
+    /// Xilinx 7-series DSP48E1 block.
+    ///
+    /// Pin interface (bus nets, LSB-first indexing):
+    /// - `A[29:0]`: 30-bit A input
+    /// - `B[17:0]`: 18-bit B input  
+    /// - `C[47:0]`: 48-bit C input (addend)
+    /// - `P[47:0]`: 48-bit P output
+    /// - `CLK`: clock (for registered modes)
+    ///
+    /// Only the pins needed for the configured opmode must be connected.
+    /// Unconnected inputs read 0.
+    Dsp48e1 {
+        /// 7-bit OPMODE (UG479). 0b0000101 = P = A*B + C (combinational).
+        opmode: u8,
+        /// 4-bit ALUMODE (UG479). 0b0000 = add.
+        alumode: u8,
+    },
     /// Inserted ILA core capturing `net`.
     Ila { net: Spur },
     /// Block RAM 18Kb (true dual-port primitive).
@@ -735,6 +753,12 @@ impl Design {
                 CellKind::IobIn => s.push_str(&format!("cell {} IobIn\n", resolve(c.name))),
                 CellKind::ClockBuf => s.push_str(&format!("cell {} ClockBuf\n", resolve(c.name))),
                 CellKind::Mac27 => s.push_str(&format!("cell {} Mac27\n", resolve(c.name))),
+                CellKind::Dsp48e1 { opmode, alumode } => s.push_str(&format!(
+                    "cell {} Dsp48e1 opmode={} alumode={}\n",
+                    resolve(c.name),
+                    opmode,
+                    alumode
+                )),
                 CellKind::Ila { net } => s.push_str(&format!("cell {} Ila {}\n", resolve(c.name), resolve(*net))),
                 CellKind::Bram18 => s.push_str(&format!("cell {} Bram18\n", resolve(c.name))),
                 CellKind::Carry4 => s.push_str(&format!("cell {} Carry4\n", resolve(c.name))),
@@ -822,6 +846,19 @@ impl Design {
                         "IobIn" => CellKind::IobIn,
                         "ClockBuf" => CellKind::ClockBuf,
                         "Mac27" => CellKind::Mac27,
+                        "Dsp48e1" => {
+                            // Format: Dsp48e1 opmode=X alumode=Y
+                            let mut opmode = 0u8;
+                            let mut alumode = 0u8;
+                            for part in rest.split_whitespace() {
+                                if let Some(v) = part.strip_prefix("opmode=") {
+                                    opmode = v.parse().unwrap_or(0);
+                                } else if let Some(v) = part.strip_prefix("alumode=") {
+                                    alumode = v.parse().unwrap_or(0);
+                                }
+                            }
+                            CellKind::Dsp48e1 { opmode, alumode }
+                        }
                         "Ila" => CellKind::Ila { net: intern(&rest) },
                         "Bram18" => CellKind::Bram18,
                         "BlackBox" => CellKind::BlackBox { module: intern(&rest) },

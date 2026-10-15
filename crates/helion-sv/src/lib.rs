@@ -11981,7 +11981,14 @@ fn mac_ab_c_from_rhs(e: &RExpr<'_>) -> (Option<String>, Option<String>, Option<S
 
 /// Infer Mac27 and wire A/B/(C)/P so schematic/HNF are not pin-NC islands.
 fn emit_mac27(d: &mut Design, cell: String, rhs: &RExpr<'_>, lhs: &str) {
-    d.add_cell(&cell, CellKind::Mac27);
+    // Use Dsp48e1 with OPMODE=0b0000101 (P = A*B + C), ALUMODE=0b0000 (add).
+    d.add_cell(
+        &cell,
+        CellKind::Dsp48e1 {
+            opmode: 0b0000101,
+            alumode: 0b0000,
+        },
+    );
     let (a, b, c) = mac_ab_c_from_rhs(rhs);
     if let Some(a) = a {
         d.connect(&a, &cell, "A");
@@ -18149,7 +18156,7 @@ fn synth_from_parsed_top(
         .filter(|c| {
             matches!(
                 c.kind,
-                CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Mac27 | CellKind::Bram18
+                CellKind::Lut6 { .. } | CellKind::Hff | CellKind::Mac27 | CellKind::Dsp48e1 { .. } | CellKind::Bram18
             )
         })
         .count();
@@ -18559,7 +18566,7 @@ endmodule
         assert_eq!(d.attrs.get("SIM_ONLY"), Some("1"));
         assert_eq!(d.attrs.get("NO_BODY"), Some("1"));
         assert!(
-            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            !d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "sim model must not invent a MAC"
         );
     }
@@ -19051,7 +19058,7 @@ endmodule
 "#;
         let d = synth_sv(src, "mac.sv").expect("synth");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "clear/en MAC must map Mac27, cells={}",
             d.cells.len()
         );
@@ -19072,7 +19079,7 @@ endmodule
 "#;
         let d = synth_sv(src, "mul.sv").expect("synth");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "OW=2*DW mul must map Mac27, cells={}",
             d.cells.len()
         );
@@ -19089,7 +19096,7 @@ endmodule
 "#;
         let d = synth_sv(src, "mul.sv").expect("synth");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "comb a*b must map Mac27, cells={}",
             d.cells.len()
         );
@@ -19112,7 +19119,7 @@ endmodule
 "#;
         let d = synth_sv(src, "mul.sv").expect("synth");
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "ranged comb mul must map Mac27, cells={}",
             d.cells.len()
         );
@@ -19127,7 +19134,7 @@ endmodule
 "#;
         let d = synth_sv(src, "m.sv").unwrap();
         assert!(
-            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "a*b must map to MAC27, cells {:?}",
             d.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
@@ -20308,7 +20315,7 @@ endmodule
             .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
             .count();
         assert!(
-            luts > 0 || d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)),
+            luts > 0 || d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })),
             "hswish must map LUTs or Mac27, cells={}",
             d.cells.len()
         );
@@ -21019,7 +21026,7 @@ endmodule
         let d = synth_sv(src, "addfxp.v").expect("addfxp");
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
         let hffs: Vec<_> = d
             .cells
@@ -21079,7 +21086,7 @@ endmodule
         let d = synth_sv(src, "addfxp2.v").expect("addfxp2");
         assert_ne!(d.attrs.get("WORD_PIPELINE_CAP"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Bram18)));
         let hffs: Vec<_> = d
             .cells
@@ -21440,7 +21447,7 @@ endmodule
         let d = synth_sv(src, "10162_1.v").expect("BranchAdder");
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         assert!(
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
             "combinational ripple has no clock and no Hff"
@@ -21469,7 +21476,7 @@ endmodule
         let d = synth_sv(src, "10174_1.v").expect("PCPlus4");
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         assert!(
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
             "combinational const add has no clock and no Hff"
@@ -21533,7 +21540,7 @@ endmodule
         assert_eq!(d.attrs.get("FLATTEN_CAP"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         assert!(
             !d.cells
                 .iter()
@@ -21697,7 +21704,7 @@ endmodule
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
         assert_ne!(d.attrs.get("FLATTEN_CAP"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         assert!(
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
             "combinational const subtract has no clock and no Hff"
@@ -21753,7 +21760,7 @@ endmodule
             "width>32 must not invent a shorter subtractor"
         );
         assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
     }
 
     #[test]
@@ -21773,7 +21780,7 @@ endmodule
                 .any(|c| matches!(c.kind, CellKind::Lut6 { .. })),
             "width>RIPPLE_ADD_MAX must not invent a shorter adder"
         );
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
     }
 
     #[test]
@@ -21790,7 +21797,7 @@ endmodule
         assert_ne!(d.attrs.get("GENERATE_NOT_LOWERED"), Some("1"));
         assert_ne!(d.attrs.get("ASSIGN_NOT_LOWERED"), Some("1"));
         assert_ne!(d.attrs.get("WIDE_CONE"), Some("1"));
-        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(!d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
         let luts = d
             .cells
             .iter()

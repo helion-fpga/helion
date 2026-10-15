@@ -326,7 +326,7 @@ pub fn analyze_power(
             CellKind::Lut6 { .. } => n_lut += 1,
             CellKind::Hff => n_ff += 1,
             CellKind::Bram18 => n_bram += 1,
-            CellKind::Mac27 => n_dsp += 1,
+            CellKind::Mac27 | CellKind::Dsp48e1 { .. } => n_dsp += 1,
             CellKind::IobOut => n_iob += 1,
             _ => {}
         }
@@ -616,7 +616,7 @@ pub fn analyze_power(
                 e.0 += bram_alpha * cfg.caps.bram_active_ff * 1e-15 * v2 * f;
                 e.1 += 1;
             }
-            CellKind::Mac27 => {
+            CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
                 let e = hier_mw.entry(block).or_insert((0.0, 0));
                 e.0 += dsp_alpha * cfg.caps.dsp_active_ff * 1e-15 * v2 * f;
                 e.1 += 1;
