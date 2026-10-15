@@ -179,10 +179,59 @@ pub fn emit_fasm(routed: &Routed7, device: &dyn EmitDevice) -> Result<Bitstream7
         lines.push(format!("{}.RAMB18.{}.IN_USE", bram.tile, site_rel));
     }
 
-    // DSP48E1s: placed on sites but configuration FASM not yet emitted.
-    // Full DSP configuration (USE_MULT, OPMODE, ALUMODE, INMODE, pipeline
-    // registers) requires the detailed attribute bit mapping; future work.
-    let _ = &placed.dsps;
+    // DSP48E1s: emit FASM configuration based on Project X-Ray findings.
+    // Site naming: DSP_0 (even Y) or DSP_1 (odd Y).
+    // OPMODE/ALUMODE via IS_*_INVERTED parameters; pipeline regs via *REG tags.
+    for dsp in &placed.dsps {
+        // Determine DSP_0 vs DSP_1 from site Y coordinate.
+        // Site format: DSP48E1_X<num>Y<num>
+        let dsp_site = if let Some(y_pos) = dsp.site.rfind('Y') {
+            let y_str = &dsp.site[y_pos + 1..];
+            let y: i32 = y_str.parse().unwrap_or(0);
+            if y % 2 == 0 { "DSP_0" } else { "DSP_1" }
+        } else {
+            "DSP_0"
+        };
+
+        // Pipeline registers: disable (use direct inputs, not registered)
+        // From X-Ray fuzzer: ADREG, ALUMODEREG, etc. with invert=1 means
+        // the Z-prefixed tag sets the bit to 0 (disabled).
+        lines.push(format!("{}.{}.ZADREG", dsp.tile, dsp_site));
+        lines.push(format!("{}.{}.ZALUMODEREG", dsp.tile, dsp_site));
+        lines.push(format!("{}.{}.ZOPMODEREG", dsp.tile, dsp_site));
+        lines.push(format!("{}.{}.ZCARRYINREG", dsp.tile, dsp_site));
+        lines.push(format!("{}.{}.ZCARRYINSELREG", dsp.tile, dsp_site));
+        lines.push(format!("{}.{}.ZINMODEREG", dsp.tile, dsp_site));
+
+        // OPMODE[6:0]: emit IS_OPMODE_INVERTED bits for 0-valued opmode bits.
+        // In X-Ray, the Z prefix with value 1 means the inversion bit is set,
+        // which corresponds to opmode bit = 0 (inverted from default 1).
+        // For simplicity, we emit the inversion bits directly:
+        // - opmode bit = 1 → IS_OPMODE_INVERTED = 0 → omit (default)
+        // - opmode bit = 0 → IS_OPMODE_INVERTED = 1 → emit ZIS_OPMODE_INVERTED
+        for i in 0..7 {
+            if ((dsp.opmode >> i) & 1) == 0 {
+                lines.push(format!(
+                    "{}.{}.ZIS_OPMODE_INVERTED[{}]",
+                    dsp.tile, dsp_site, i
+                ));
+            }
+        }
+        // ALUMODE[3:0]: same logic
+        for i in 0..4 {
+            if ((dsp.alumode >> i) & 1) == 0 {
+                lines.push(format!(
+                    "{}.{}.ZIS_ALUMODE_INVERTED[{}]",
+                    dsp.tile, dsp_site, i
+                ));
+            }
+        }
+
+        // Note: Full OPMODE/ALUMODE value tying to VCC/GND requires
+        // routing configuration, which is future work. The above sets
+        // the inversion bits; the actual OPMODE ports must be tied
+        // via the routing fabric (not yet implemented).
+    }
 
     // CARRY4s. Feature path: TILE.SLICEL_<X>.CARRY4.IN_USE. The carry chain
     // muxing (CYINIT, CI) is not yet emitted; minimal placement only.
