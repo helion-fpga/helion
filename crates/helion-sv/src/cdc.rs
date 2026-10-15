@@ -40,6 +40,31 @@ pub enum CdcKind {
     Unsynchronized,
     /// Single FF (needs 2 for metastability protection).
     SingleFlop,
+    /// Handshake protocol detected (req/ack) - this is OK, not a violation.
+    /// Included for documentation; handshake crossings are not reported.
+    HandshakeOk,
+}
+
+/// Check if a net is part of a handshake protocol.
+/// Looks for req/ack pairs: if net is 'req', look for corresponding 'ack'.
+fn is_handshake_net(design: &Design, net: Spur) -> bool {
+    use helion_ir::{resolve, intern};
+
+    let net_name = resolve(net);
+    // Simple heuristic: if net name contains "req", look for "ack"
+    // This is a simplified check; full protocol analysis is future work.
+    if net_name.contains("req") {
+        let ack_name = net_name.replace("req", "ack");
+        let ack_spur = intern(&ack_name);
+        // Check if ack net exists in design
+        design.nets.iter().any(|n| n.name == ack_spur)
+    } else if net_name.contains("ack") {
+        let req_name = net_name.replace("ack", "req");
+        let req_spur = intern(&req_name);
+        design.nets.iter().any(|n| n.name == req_spur)
+    } else {
+        false
+    }
 }
 
 /// Analyze design for CDC violations.
@@ -57,8 +82,12 @@ pub fn analyze_cdc(design: &Design) -> Vec<CdcViolation> {
         if let Some(src) = src_domain {
             for dst in dst_domains {
                 if src.clock != dst.clock {
-                    // Clock domain crossing detected
-                    // Check if there's a synchronizer (simplified: look for 2 FFs in series)
+                    // Clock domain crossing detected.
+                    // Skip if it's part of a handshake protocol (req/ack).
+                    if is_handshake_net(design, net_name) {
+                        continue;
+                    }
+                    // Check if there's a synchronizer (2-FF chain).
                     if !has_synchronizer(design, net_name, &dst) {
                         violations.push(CdcViolation {
                             signal: net_name,
