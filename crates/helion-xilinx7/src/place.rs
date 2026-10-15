@@ -79,6 +79,8 @@ pub struct PlacedDsp {
     pub name: String,
     pub tile: String,
     pub site: String,
+    pub opmode: u8,
+    pub alumode: u8,
 }
 
 /// A placed CARRY4 (in a SLICE).
@@ -173,6 +175,8 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             name: dsp.name.clone(),
             tile,
             site,
+            opmode: dsp.opmode,
+            alumode: dsp.alumode,
         });
     }
 
