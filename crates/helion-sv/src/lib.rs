@@ -17,6 +17,20 @@ pub mod npn_table;
 pub mod cdc;
 /// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
 pub mod sva;
+
+// Thread-local storage for pre-optimization Design (for --verify flag).
+// When HELION_PRESERVE_PRE_OPT is set, synth_from_parsed_top clones the
+// Design before peephole optimizations, enabling pre/post equivalence checking.
+use std::cell::RefCell;
+thread_local! {
+    static PRE_OPT_DESIGN: RefCell<Option<helion_ir::Design>> = RefCell::new(None);
+}
+
+/// Take the preserved pre-optimization Design, if any.
+/// Returns None if HELION_PRESERVE_PRE_OPT was not set during synth.
+pub fn take_pre_opt_design() -> Option<helion_ir::Design> {
+    PRE_OPT_DESIGN.with(|cell| cell.borrow_mut().take())
+}
 use sva::{
     conc_text, imm_text, rewrite_sva_bool, ConcPropAst, ImmAssertAst, SvaBool, SvaImplKind,
     SvaSeverity,
@@ -18505,6 +18519,14 @@ fn synth_from_parsed_top(
     // dead-LUT sweep, const folding, inverter absorption. See helion_ir::opt.
     // Dead-only by construction (no rewiring of live logic); observable nets
     // (mark_debug, ILA, top output ports) are never touched.
+    //
+    // For --verify: preserve pre-opt Design if HELION_PRESERVE_PRE_OPT is set.
+    // This enables SAT-based pre/post equivalence checking.
+    if std::env::var("HELION_PRESERVE_PRE_OPT").is_ok() {
+        PRE_OPT_DESIGN.with(|cell| {
+            *cell.borrow_mut() = Some(d.clone());
+        });
+    }
     let opt = d.peephole_opt_luts();
     if opt.total() + opt.consts_folded + opt.inverters_absorbed > 0 {
         eprintln!(
