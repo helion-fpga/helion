@@ -121,19 +121,22 @@ pub fn seeded_order(n: usize, seed: u64) -> Vec<usize> {
 /// Empty guide keeps gold south/mid pull from `timing_weight` alone.
 /// False-path / multicycle flags apply only to clusters that drive an
 /// excepted IOB/output net — internal LUT+FF keep `timing_weight` south pull.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct TimingGuide {
     /// `set_false_path` covers an IOB/output arc — do not pull that driver toward IOB.
     pub false_path_iob: bool,
     /// Setup multicycle for IOB arcs. 0 or 1 = single cycle (gold).
     pub iob_setup_mult: u32,
+    /// Per-net criticality (0.0 = non-critical, 1.0 = most critical).
+    /// Used for timing-driven placement: critical nets get higher weight.
+    pub net_criticality: std::collections::HashMap<String, f32>,
 }
 
 impl TimingGuide {
     /// PathFinder dogleg width (columns) for excepted IOB nets. 0 = gold
     /// shortest path. False path takes a wider detour than multicycle so the
     /// routed path/hops actually change (not a post-route hop pad).
-    pub fn iob_detour_cols(self) -> u32 {
+    pub fn iob_detour_cols(&self) -> u32 {
         if self.false_path_iob {
             2
         } else if self.iob_setup_mult > 1 {
@@ -144,8 +147,21 @@ impl TimingGuide {
     }
 
     /// True when this cluster's Q net drives an IOB that the guide excepts.
-    pub fn excepts_iob_driver(self, drives_iob: bool) -> bool {
+    pub fn excepts_iob_driver(&self, drives_iob: bool) -> bool {
         drives_iob && (self.false_path_iob || self.iob_setup_mult > 1)
+    }
+
+    /// Get criticality for a net (0.0 = non-critical, 1.0 = most critical).
+    /// Returns 0.0 if net not in map (default non-critical).
+    pub fn net_criticality(&self, net_name: &str) -> f32 {
+        self.net_criticality.get(net_name).copied().unwrap_or(0.0)
+    }
+
+    /// Get maximum criticality among a list of net names.
+    pub fn max_criticality(&self, nets: &[String]) -> f32 {
+        nets.iter()
+            .map(|n| self.net_criticality(n))
+            .fold(0.0f32, f32::max)
     }
 }
 
