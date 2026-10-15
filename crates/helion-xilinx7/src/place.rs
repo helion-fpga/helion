@@ -71,6 +71,10 @@ pub struct PlacedBram {
     pub name: String,
     pub tile: String,
     pub site: String,
+    pub read_width_a: u8,
+    pub read_width_b: u8,
+    pub write_width_a: u8,
+    pub write_width_b: u8,
 }
 
 /// A placed DSP48E1.
@@ -162,6 +166,10 @@ pub fn place(packed: &Packed7, device: &dyn DeviceQuery) -> Result<Placed7, Stri
             name: bram.name.clone(),
             tile,
             site,
+            read_width_a: bram.read_width_a,
+            read_width_b: bram.read_width_b,
+            write_width_a: bram.write_width_a,
+            write_width_b: bram.write_width_b,
         });
     }
 
