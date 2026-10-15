@@ -432,7 +432,7 @@ fn rule_macro_cascade(inp: &QorInputs) -> Vec<QorSuggestion> {
                     .iter()
                     .find(|cell| cell.name == intern(c))
                     .is_some_and(|cell| {
-                        matches!(cell.kind, CellKind::Bram18 | CellKind::Mac27 { .. })
+                        matches!(cell.kind, CellKind::Bram18 | CellKind::Bram18e1 { .. } | CellKind::Mac27 | CellKind::Dsp48e1 { .. })
                     })
             })
             .map(String::as_str)
