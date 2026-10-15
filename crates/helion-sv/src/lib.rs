@@ -15,6 +15,8 @@ pub mod equiv;
 pub mod npn_table;
 /// Clock Domain Crossing analysis (verification track).
 pub mod cdc;
+/// Parallel module elaboration (topological sort + rayon).
+pub mod parallel_elab;
 /// SystemVerilog Assertions, v3.0 subset (verification track, Part B).
 pub mod sva;
 
