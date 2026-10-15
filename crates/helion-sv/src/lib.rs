@@ -479,6 +479,27 @@ impl Aig {
 
         rewritten
     }
+
+    /// Build fanout map: node_id -> list of (user_node_id, input_pos).
+    /// Input pos: 0 = left fanin, 1 = right fanin, 2 = output.
+    /// Used by rewriting passes to update all users when a node is replaced.
+    pub fn fanout_map(&self) -> Vec<Vec<(u32, u8)>> {
+        let n_pis = self.pis.len() as u32;
+        let n_nodes = 1 + n_pis as usize + self.ands.len();
+        let mut fanouts: Vec<Vec<(u32, u8)>> = vec![Vec::new(); n_nodes];
+
+        for (idx, (a, b)) in self.ands.iter().enumerate() {
+            let node_id = 1 + n_pis + idx as u32;
+            fanouts[a.node as usize].push((node_id, 0));
+            fanouts[b.node as usize].push((node_id, 1));
+        }
+        // Output fanout (marked with u32::MAX)
+        if (self.output.node as usize) < n_nodes {
+            fanouts[self.output.node as usize].push((u32::MAX, 2));
+        }
+
+        fanouts
+    }
 }
 
 /// UG900 Compilation tab over helion-sv (include + `define), not xvlog.
