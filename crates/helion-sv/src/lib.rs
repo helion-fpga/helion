@@ -500,6 +500,48 @@ impl Aig {
 
         fanouts
     }
+
+    /// Replace all uses of `old_node` with `new_lit`.
+    /// Returns the number of replacements made.
+    /// Note: This does not remove the old node from `ands`; dead nodes are
+    /// cleaned up by a separate sweep pass.
+    pub fn replace_node(&mut self, old_node: u32, new_lit: Lit) -> usize {
+        let n_pis = self.pis.len() as u32;
+        let mut count = 0;
+
+        for (a, b) in self.ands.iter_mut() {
+            if a.node == old_node {
+                let new_inv = a.inv ^ new_lit.inv;
+                *a = Lit {
+                    node: new_lit.node,
+                    inv: new_inv,
+                };
+                count += 1;
+            }
+            if b.node == old_node {
+                let new_inv = b.inv ^ new_lit.inv;
+                *b = Lit {
+                    node: new_lit.node,
+                    inv: new_inv,
+                };
+                count += 1;
+            }
+        }
+
+        if self.output.node == old_node {
+            let new_inv = self.output.inv ^ new_lit.inv;
+            self.output = Lit {
+                node: new_lit.node,
+                inv: new_inv,
+            };
+            count += 1;
+        }
+
+        // Invalidate and_hash since structure changed
+        self.and_hash.clear();
+
+        count
+    }
 }
 
 /// UG900 Compilation tab over helion-sv (include + `define), not xvlog.
