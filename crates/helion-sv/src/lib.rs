@@ -118,6 +118,9 @@ impl Aig {
         // Rewrite trivial nodes (const/buffer/inverter) to simplify the AIG
         // before LUT mapping. This is Phase 1 of ABC-style rewriting.
         let _ = a.rewrite_trivial_cuts();
+        // NPN-based cut rewriting (Phase 2 scaffold). Currently builds NPN
+        // classification map; full sharing implementation is future work.
+        let _ = a.rewrite_npn_cuts();
         a
     }
 
