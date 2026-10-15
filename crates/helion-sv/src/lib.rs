@@ -426,14 +426,11 @@ impl Aig {
     /// Rewrite trivial cuts: if a node's function (via any cut) is const,
     /// buffer, or inverter, replace the node with the trivial implementation.
     /// Returns number of nodes rewritten.
-    ///
-    /// Note: This currently only *detects* trivial nodes. Full rewriting
-    /// requires fanout tracking and AIG mutation, which is future work.
-    /// See docs/aig-rewriting-design.md Phase 1 for the full plan.
     pub fn rewrite_trivial_cuts(&mut self) -> usize {
         let cuts = self.enumerate_cuts(6);
         let n_pis = self.pis.len() as u32;
         let mut rewritten = 0;
+        let mut to_replace: Vec<(u32, Lit)> = Vec::new();
 
         // For each AND node, check if it has a trivial cut
         for (idx, _) in self.ands.iter().enumerate() {
@@ -452,29 +449,43 @@ impl Aig {
 
                     // Const 0
                     if tt_masked == 0 {
-                        // Replace node with const 0
-                        // This is done by updating all fanouts, but for now
-                        // we just count it. Full implementation needs fanout tracking.
-                        rewritten += 1;
+                        to_replace.push((node_id, Lit::c0()));
                         break;
                     }
                     // Const 1
                     if tt_masked == mask {
-                        rewritten += 1;
+                        to_replace.push((node_id, Lit::c1()));
                         break;
                     }
-                    // Buffer (single input, identity)
+                    // Buffer (single input, identity): replace with the input
                     if n == 1 && tt_masked == 0b10 {
-                        rewritten += 1;
+                        to_replace.push((
+                            node_id,
+                            Lit {
+                                node: cut[0],
+                                inv: false,
+                            },
+                        ));
                         break;
                     }
                     // Inverter (single input, negation)
                     if n == 1 && tt_masked == 0b01 {
-                        rewritten += 1;
+                        to_replace.push((
+                            node_id,
+                            Lit {
+                                node: cut[0],
+                                inv: true,
+                            },
+                        ));
                         break;
                     }
                 }
             }
+        }
+
+        // Apply replacements
+        for (node_id, new_lit) in to_replace {
+            rewritten += self.replace_node(node_id, new_lit);
         }
 
         rewritten
