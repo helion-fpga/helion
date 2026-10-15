@@ -1,54 +1,51 @@
 # Vivado Parity Benchmark Script
 # Run with: vivado -mode batch -source vivado_bench.tcl
 # Target: xc7a35tcpg236-1 (Arty A7)
-# 
-# This script synthesizes the same designs as bench_helion.sh
-# and reports LUT/FF/DSP/BRAM counts for comparison.
 #
-# Saksham: Run this on the USF cluster or your machine with Vivado,
-# then paste back the results.
+# Synthesizes the same designs as bench_helion.sh and reports
+# LUT/FF/DSP/BRAM counts for Helion vs Vivado comparison.
 
+set part "xc7a35tcpg236-1"
+
+# Each entry: {name file top}
 set designs {
-    {blinky "examples/blinky.sv"}
-    {counter "examples/counter.sv"}
-    {hier "examples/hier.sv"}
-    {complex "examples/complex.sv"}
-    {picorv32 "third_party/picorv32/picorv32.v"}
-    {serv "examples/serv_pin_wrap.sv"}
+    {blinky   "blinky.sv"       "blinky"}
+    {counter  "counter.sv"      "counter"}
+    {hier     "hier.sv"         "hier"}
+    {complex  "complex.sv"      "complex"}
+    {picorv32 "picorv32.v"      "picorv32"}
+    {serv     "serv_pin_wrap.sv" "serv_pin_wrap"}
 }
 
 set results_file "bench_results_vivado.csv"
 set fp [open $results_file w]
 puts $fp "design,luts,ffs,dsps,brams"
 
-foreach {design file} $designs {
-    puts "Running $design..."
-    
-    # Create project
-    create_project -force bench_$design ./vivado_bench_$design -part xc7a35tcpg236-1
-    
-    # Add source
+foreach entry $designs {
+    set name [lindex $entry 0]
+    set file [lindex $entry 1]
+    set top  [lindex $entry 2]
+    puts "=== Running $name (top=$top) ==="
+
+    create_project -force bench_$name ./vivado_bench_$name -part $part
     add_files -norecurse $file
-    set_property top [lindex [split $design "_"] 0] [current_fileset]
-    # Note: May need to adjust top module name per design
-    
-    # Synthesize
-    synth_design -top [get_property top [current_fileset]]
-    
-    # Get utilization
-    set luts [get_property SLICE_LUTS [get_cells -hierarchical -filter {PRIMITIVE_TYPE =~ LUT.*}]]
-    # Actually, use report_utilization
-    set util [report_utilization -return_string]
-    
-    # Parse LUTs (simplified - adjust based on actual output)
-    puts "  $design: see detailed report"
-    
+    update_compile_order -fileset sources_1
+
+    synth_design -top $top -part $part
+
+    # Utilization numbers
+    set luts  [llength [get_cells -hierarchical -filter {PRIMITIVE_TYPE =~ LUT.*}]]
+    set ffs   [llength [get_cells -hierarchical -filter {PRIMITIVE_TYPE =~ FD.*}]]
+    set dsps  [llength [get_cells -hierarchical -filter {REF_NAME =~ DSP*}]]
+    set brams [llength [get_cells -hierarchical -filter {REF_NAME =~ RAMB*}]]
+
+    puts "$name: luts=$luts ffs=$ffs dsps=$dsps brams=$brams"
+    puts $fp "$name,$luts,$ffs,$dsps,$brams"
+
     close_project
+    file delete -force ./vivado_bench_$name
 }
 
 close $fp
-puts "Done. Results in $results_file"
 puts ""
-puts "NOTE: This is a template. Adjust top module names and parsing"
-puts "based on your Vivado version. Paste back the LUT counts for:"
-puts "  blinky, counter, hier, complex, picorv32, serv"
+puts "Done. Results in $results_file"
