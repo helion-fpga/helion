@@ -232,11 +232,18 @@ fn synth_project_sources(
         );
     }
     if let Some(t) = top {
-        let mut owned: Vec<(String, String)> = Vec::new();
-        for p in paths {
-            let src = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            owned.push((p.display().to_string(), src));
-        }
+        // Read source files in parallel (I/O bound, safe to parallelize)
+        let owned: Vec<(String, String)> = {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .map(|p| {
+                    let src = std::fs::read_to_string(p)
+                        .map_err(|e| format!("{}: {e}", p.display()))?;
+                    Ok::<(String, String), String>((p.display().to_string(), src))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
         let refs: Vec<(&str, &str)> = owned
             .iter()
             .map(|(a, b)| (a.as_str(), b.as_str()))
