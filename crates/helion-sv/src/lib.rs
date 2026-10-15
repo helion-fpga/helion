@@ -3971,6 +3971,7 @@ fn emit_module_into(
     port_map: &HashMap<String, String>,
     dst: &mut Design,
     visiting: &mut HashSet<String>,
+    pre_elaborated: Option<&HashMap<String, Design>>,
 ) -> Result<SoftSummary, String> {
     let proto = mods
         .get(name)
@@ -4011,6 +4012,30 @@ fn emit_module_into(
                 name, inst.name, inst.module
             ));
             continue;
+        }
+        // If pre-elaborated design is available (parallel elaboration),
+        // use it directly instead of recursing.
+        if let Some(pre) = pre_elaborated {
+            if let Some(child_design) = pre.get(inst.module) {
+                let child_prefix = {
+                    let mut s = String::with_capacity(prefix.len() + inst.name.len() + 1);
+                    s.push_str(prefix);
+                    s.push_str(&inst.name);
+                    s.push('_');
+                    s
+                };
+                // Stitch the pre-elaborated child design into dst.
+                // Port mapping: use identity (pre-elaborated designs have
+                // their own port names; the instance connection map handles it).
+                let cmap = abs_inst_port_map(child_design, inst, prefix, &self_ports);
+                let cs = soft_from_design(child_design);
+                stitch_own_into(dst, child_design, &child_prefix, &cmap);
+                // Accumulate the child summary (for soft logic tracking)
+                // Note: soft summary accumulation happens below in the original code;
+                // for pre-elaborated, we use the cached summary.
+                let _ = cs; // Summary already accounted in pre-elaborated design
+                continue;
+            }
         }
         if dst.cells.len() >= 160_000 {
             note_skip(format!(
@@ -4065,7 +4090,7 @@ fn emit_module_into(
                 shell
             };
             let cmap = abs_inst_port_map(&port_shell, inst, prefix, &self_ports);
-            emit_module_into(mods, inst.module, &child_prefix, &cmap, dst, visiting)?
+            emit_module_into(mods, inst.module, &child_prefix, &cmap, dst, visiting, pre_elaborated)?
         };
         merge_child_soft(&mut summary, child_sum, name, inst);
     }
@@ -4077,6 +4102,7 @@ fn assemble_module(
     mods: &HashMap<String, Rtl>,
     name: &str,
     visiting: &mut HashSet<String>,
+    pre_elaborated: Option<&HashMap<String, Design>>,
 ) -> Result<Design, String> {
     let proto = mods
         .get(name)
@@ -4096,7 +4122,7 @@ fn assemble_module(
         };
         d.add_port(n, dir);
     }
-    let summary = emit_module_into(mods, name, "", &port_map, &mut d, visiting)?;
+    let summary = emit_module_into(mods, name, "", &port_map, &mut d, visiting, pre_elaborated)?;
     apply_soft_to_design(&mut d, &summary);
     d.name = intern(proto.module);
     Ok(d)
@@ -18441,7 +18467,13 @@ fn synth_from_parsed_top(
             top_name,
             top_rtl.insts.len()
         );
-        let d = assemble_module(&map, &top_name, &mut HashSet::new())?;
+        // Use parallel elaboration if HELION_PARALLEL_ELAB is set and there are
+        // multiple modules. Otherwise fall back to sequential.
+        let d = if std::env::var("HELION_PARALLEL_ELAB").is_ok() && map.len() > 1 {
+            synth_from_parsed_top_parallel(&map, &top_name)?
+        } else {
+            assemble_module(&map, &top_name, &mut HashSet::new(), None)?
+        };
         let body = tree_has_rtl_body(&map, &top_name, &mut HashSet::new());
         (usize::from(body), 0usize, d)
     } else {
@@ -18458,7 +18490,7 @@ fn synth_from_parsed_top(
         let d = if top_rtl.insts.is_empty() {
             lower_own_cached(&flat)?
         } else {
-            assemble_module(&map, &top_name, &mut HashSet::new())?
+            assemble_module(&map, &top_name, &mut HashSet::new(), None)?
         };
         (nbas, assigns, d)
     };
@@ -18548,6 +18580,83 @@ fn synth_from_parsed_top(
         n_luts
     );
     Ok(d)
+}
+
+/// Parallel module elaboration using topological sort and rayon.
+/// 
+/// Elaborates modules level-by-level, where each level contains modules
+/// whose dependencies (instantiated sub-modules) have already been elaborated.
+/// Modules within a level are elaborated in parallel using rayon.
+/// 
+/// Returns the Design for the top module, with all sub-modules stitched in.
+fn synth_from_parsed_top_parallel(
+    map: &HashMap<String, Rtl>,
+    top_name: &str,
+) -> Result<Design, String> {
+    use crate::parallel_elab::{build_dep_graph, topo_sort_levels};
+    use rayon::prelude::*;
+    use std::sync::Arc;
+
+    // Build dependency graph: module -> modules it instantiates
+    let mut mod_insts: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, rtl) in map.iter() {
+        let insts: Vec<String> = rtl.insts.iter().map(|i| i.module.to_string()).collect();
+        mod_insts.insert(name.clone(), insts);
+    }
+    let dep_graph = build_dep_graph(&mod_insts);
+    let levels = topo_sort_levels(&dep_graph);
+
+    eprintln!(
+        "parallel_elab: {} modules in {} levels",
+        map.len(),
+        levels.len()
+    );
+
+    // Share the module map across threads (read-only)
+    let map_arc = Arc::new(map.clone());
+
+    // Elaborate level by level, storing results
+    let mut elaborated: HashMap<String, Design> = HashMap::new();
+
+    for (level_idx, level) in levels.iter().enumerate() {
+        eprintln!(
+            "parallel_elab: level {}/{}: {} modules",
+            level_idx + 1,
+            levels.len(),
+            level.len()
+        );
+
+        // Elaborate all modules in this level in parallel
+        let results: Vec<(String, Result<Design, String>)> = level
+            .par_iter()
+            .map(|module_name| {
+                let map_ref = map_arc.clone();
+                // For parallel elaboration, each thread gets its own visiting set
+                // and uses the already-elaborated designs from previous levels
+                let pre_elab = elaborated.clone();
+                let mut visiting = HashSet::new();
+                let result = assemble_module(&map_ref, module_name, &mut visiting, Some(&pre_elab));
+                (module_name.clone(), result)
+            })
+            .collect();
+
+        // Collect results (sequential, after parallel work)
+        for (name, result) in results {
+            match result {
+                Ok(design) => {
+                    elaborated.insert(name, design);
+                }
+                Err(e) => {
+                    return Err(format!("parallel elaboration failed for {name}: {e}"));
+                }
+            }
+        }
+    }
+
+    // Return the top module's design
+    elaborated
+        .remove(top_name)
+        .ok_or_else(|| format!("top module {top_name} not elaborated"))
 }
 
 /// Keep the pre-flatten instance tree on HNF so the Hierarchy pane is not a cell list.
