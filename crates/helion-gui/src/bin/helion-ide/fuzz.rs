@@ -38,6 +38,16 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+thread_local! {
+    /// Replays exercise the UI event path without invoking OS-modal pickers,
+    /// which cannot run from Rust's non-windowed test threads.
+    static FUZZ_DIALOGS_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn dialogs_suppressed() -> bool {
+    FUZZ_DIALOGS_SUPPRESSED.with(std::cell::Cell::get)
+}
+
 // ---------------------------------------------------------------------------
 // Seeded RNG (splitmix64; no new dependencies)
 // ---------------------------------------------------------------------------
@@ -876,6 +886,7 @@ fn say(cfg: &Config, s: &str) {
 // ---------------------------------------------------------------------------
 
 fn setup_app() -> (egui::Context, HelionIde) {
+    FUZZ_DIALOGS_SUPPRESSED.with(|suppressed| suppressed.set(true));
     let ctx = egui::Context::default();
     ctx.set_visuals(egui::Visuals::dark());
     theme::install_fonts(&ctx);
