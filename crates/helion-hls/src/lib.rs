@@ -733,7 +733,7 @@ void blinky(bool *led) {
 int mac(int a, int b) { return a * b; }
 "#;
         let d = synth_c(src).unwrap();
-        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27)));
+        assert!(d.cells.iter().any(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. })));
     }
 
     #[test]
@@ -793,13 +793,13 @@ int mac2(int a, int b) {
             .design
             .cells
             .iter()
-            .filter(|c| matches!(c.kind, CellKind::Mac27))
+            .filter(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
             .count();
         let n2 = m2
             .design
             .cells
             .iter()
-            .filter(|c| matches!(c.kind, CellKind::Mac27))
+            .filter(|c| matches!(c.kind, CellKind::Mac27 | CellKind::Dsp48e1 { .. }))
             .count();
         assert_eq!(n1, 1, "one mul → one DSP {}", m1.sv);
         assert_eq!(
