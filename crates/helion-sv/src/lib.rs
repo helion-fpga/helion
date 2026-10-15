@@ -632,7 +632,19 @@ impl Aig {
     /// NPN transformations (input negations, permutations, output negation).
     /// Used for cut-based rewriting (Phase 2).
     pub fn npn_canonical_4(tt: u16) -> u16 {
+        Self::npn_canonical_4_transform(tt).0
+    }
+
+    /// Compute NPN canonical form with the transformation that achieves it.
+    /// Returns (canonical, in_neg_mask, perm, out_neg):
+    /// - in_neg_mask: 4-bit mask, bit i set means input i was negated
+    /// - perm: permutation applied, new position i holds old input perm[i]
+    /// - out_neg: true if output was negated
+    pub fn npn_canonical_4_transform(tt: u16) -> (u16, u16, [usize; 4], bool) {
         let mut best = u16::MAX;
+        let mut best_neg = 0u16;
+        let mut best_perm = [0usize, 1, 2, 3];
+        let mut best_out_neg = false;
 
         // All input negation patterns (16)
         for neg in 0..16u16 {
@@ -664,10 +676,16 @@ impl Aig {
                 // Check both output polarities
                 if transformed < best {
                     best = transformed;
+                    best_neg = neg;
+                    best_perm = perm;
+                    best_out_neg = false;
                 }
                 let flipped = !transformed & 0xFFFF;
                 if flipped < best {
                     best = flipped;
+                    best_neg = neg;
+                    best_perm = perm;
+                    best_out_neg = true;
                 }
 
                 if !next_permutation_4(&mut perm) {
@@ -676,7 +694,7 @@ impl Aig {
             }
         }
 
-        best
+        (best, best_neg, best_perm, best_out_neg)
     }
 }
 
@@ -24181,6 +24199,49 @@ endmodule
         // For AND3 (inputs 0,1,2): output 1 when m=0b0111=7, and also when m=15 (bit3=1)
         let and3_ignoring_3 = 0x8080u16; // bits 7 and 15 set
         assert!(!Aig::depends_on_all_4(and3_ignoring_3));
+    }
+
+    #[test]
+    fn npn_transform_roundtrip() {
+        // For a set of test functions, verify that applying the returned
+        // transformation to the original truth table yields the canonical form.
+        let test_fns: [u16; 6] = [
+            0x8000, // AND4
+            0xFFFE, // OR4
+            0x6996, // XOR4 (parity)
+            0x8001, // AND4 with an extra minterm
+            0xABCD, // random
+            0x0000, // const 0
+        ];
+        for &tt in &test_fns {
+            let (canon, in_neg, perm, out_neg) = Aig::npn_canonical_4_transform(tt);
+            // Re-apply the transformation manually and check we get canon.
+            let mut rebuilt = 0u16;
+            for m in 0..16u16 {
+                let mut m_neg = m;
+                for i in 0..4 {
+                    if ((in_neg >> i) & 1) == 1 {
+                        m_neg ^= 1 << i;
+                    }
+                }
+                let mut m_perm = 0u16;
+                for i in 0..4 {
+                    if ((m_neg >> perm[i]) & 1) == 1 {
+                        m_perm |= 1 << i;
+                    }
+                }
+                if ((tt >> m) & 1) == 1 {
+                    rebuilt |= 1 << m_perm;
+                }
+            }
+            if out_neg {
+                rebuilt = !rebuilt & 0xFFFF;
+            }
+            assert_eq!(
+                rebuilt, canon,
+                "NPN roundtrip failed for tt={tt:04x}: rebuilt={rebuilt:04x} canon={canon:04x}"
+            );
+        }
     }
 }
 
