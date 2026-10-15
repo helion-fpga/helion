@@ -30,8 +30,9 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
         .show(ui, |ui| {
             let avail = ui.available_width();
             let cols = if avail >= 760.0 { 2 } else { 1 };
-            let gap = 16.0;
-            let sw = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
+            let gap = chrome::SPACE_LG;
+            let row_spacing = ui.spacing().item_spacing.x;
+            let sw = dashboard_column_width(avail, cols, gap, row_spacing);
             // Vertical fill: when the viewport is taller than the content,
             // distribute the slack across rows so no dead void remains.
             let viewport_h = ui.available_height();
@@ -87,6 +88,10 @@ pub fn paint_dashboard(ui: &mut egui::Ui, app: &mut HelionIde) {
                 open_more_workspace(app, tab);
             }
         });
+}
+
+fn dashboard_column_width(avail: f32, cols: usize, gap: f32, row_spacing: f32) -> f32 {
+    (avail - (gap + row_spacing) * cols.saturating_sub(1) as f32) / cols.max(1) as f32
 }
 
 /// Section container: 12px radius, --surface fill, 1px --line border.
@@ -1138,6 +1143,46 @@ fn timing_clock_rows(
         WorkspaceTab::ClockNetworks,
     ));
     rows
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{chrome, dashboard_column_width};
+
+    #[test]
+    fn project_summary_columns_stay_inside_every_viewport() {
+        for avail in [320.0, 719.0, 760.0, 1024.0, 1440.0, 2400.0] {
+            let cols = if avail >= 760.0 { 2 } else { 1 };
+            let gap = chrome::SPACE_LG;
+            let row_spacing = chrome::SPACE_SM;
+            let col_w = dashboard_column_width(avail, cols, gap, row_spacing);
+            let row_w = col_w * cols as f32
+                + (gap + row_spacing) * cols.saturating_sub(1) as f32;
+            assert!(col_w > 0.0);
+            assert!(row_w <= avail + f32::EPSILON, "{row_w} exceeds {avail}");
+            assert!(
+                (row_w - avail).abs() < 0.01,
+                "{row_w} leaves slack in {avail}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_bars_scale_with_width_and_keep_a_compact_height() {
+        assert_eq!(
+            chrome::power_report_bar_w(320.0),
+            320.0 * chrome::POWER_BAR_PANE_SHARE
+        );
+        assert!(chrome::power_report_bar_w(1440.0) > chrome::POWER_BAR_W);
+        assert_eq!(
+            chrome::power_report_bar_w(4000.0),
+            chrome::POWER_BAR_MAX_W
+        );
+        assert_eq!(
+            chrome::occupancy_bar_draw_h(120.0),
+            chrome::OCCUPANCY_BAR_H
+        );
+    }
 }
 
 /// Quality + power rows: power, methodology, DRC, utilization.

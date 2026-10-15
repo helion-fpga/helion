@@ -241,12 +241,11 @@ fn paint_chevron(p: &egui::Painter, center: egui::Pos2, expanded: bool, color: e
 /// Vivado Netlist-tree hierarchy section (Z3 sidebar). `model.selected` is the
 /// cross-view selection identity shared with Schematic/Device/Properties.
 pub fn paint_hierarchy(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
-    ui.horizontal(|ui| {
+    ui.vertical(|ui| {
         ui.heading("Hierarchy");
-        ui.add_space(12.0);
         if ui
             .add_sized(
-                egui::vec2(ui.available_width(), 0.0),
+                [ui.available_width(), super::chrome::HIT_SIDEBAR],
                 egui::Button::new("Show in Schematic"),
             )
             .on_hover_text("Open hierarchy in schematic viewer")

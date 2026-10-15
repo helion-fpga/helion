@@ -38,6 +38,8 @@ pub const DEVICE_COLLAPSED_STRIP_W: f32 = 30.0;
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const RAIL_MIN_HEIGHT: f32 = TOOLBAR_HEIGHT;
 pub const STATUS_HEIGHT: f32 = 22.0;
+/// Width reserved for right-aligned flow/job status indicators.
+pub const STATUS_RIGHT_WIDTH: f32 = 340.0;
 pub const HIT_PRIMARY: f32 = 32.0;
 /// Comfort primary (Implement / Open) - ≥44 where the toolbar has room.
 pub const HIT_COMFORT: f32 = 36.0;
@@ -325,6 +327,11 @@ pub fn device_toolbar_widths(mark_debug_label: &str, zoom_label: &str) -> Vec<Ov
         width: text_button_w(l),
     })
     .collect();
+    // Keep the visual group labels inside the same overflow calculation as
+    // their first control so headings never force a clipped toolbar.
+    for (index, label) in [(0, "Select"), (3, "Display"), (5, "Zoom"), (9, "Debug")] {
+        items[index].width += label.chars().count() as f32 * CHAR_PX + SPACE_SM;
+    }
     items.push(OverflowItem {
         width: text_button_w(zoom_label),
     });
@@ -1218,7 +1225,10 @@ pub fn hardware_dashboard_size(pane_w: f32, pane_h: f32, chrome_h: f32) -> (f32,
 pub fn stat_bit_grid(n_bits: usize, pane_w: f32, pane_h: f32) -> (u32, u32, f32, f32) {
     let n = n_bits.max(1) as u32;
     let aspect = (pane_w / pane_h.max(1.0)).clamp(0.25, 8.0);
-    let cols = ((n as f32 * aspect).sqrt().ceil() as u32).max(1);
+    // Never reserve empty columns when a short status row is wider than its
+    // item count. That left half the Program dashboard blank for three cable
+    // cards on a wide window.
+    let cols = ((n as f32 * aspect).sqrt().ceil() as u32).clamp(1, n);
     let rows = n.div_ceil(cols).max(1);
     let (cw, ch) = package_cell(cols, rows, pane_w, pane_h);
     (cols, rows, cw, ch)
@@ -1484,6 +1494,20 @@ pub const TIMING_FILTER_FIELD_W: f32 = 170.0;
 pub const POWER_BAR_W: f32 = 160.0;
 /// Power report: per-resource bar height.
 pub const POWER_BAR_H: f32 = 10.0;
+pub const POWER_BAR_MAX_W: f32 = 720.0;
+pub const POWER_BAR_PANE_SHARE: f32 = 0.58;
+
+/// Power resource charts grow with the report pane, while staying compact at
+/// small widths and bounded on ultrawide windows.
+pub fn power_report_bar_w(pane_w: f32) -> f32 {
+    (pane_w.max(0.0) * POWER_BAR_PANE_SHARE).clamp(POWER_BAR_W, POWER_BAR_MAX_W)
+}
+
+/// Utilization rows may spread through the pane, but the gauge remains a
+/// compact CAD table bar rather than a full-height slab.
+pub fn occupancy_bar_draw_h(row_h: f32) -> f32 {
+    row_h.min(OCCUPANCY_BAR_H)
+}
 /// Flow Navigator: step chip click target width.
 pub const FLOW_STEP_CHIP_W: f32 = 64.0;
 /// Flow Navigator: step chip click target height.
@@ -1977,6 +2001,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn more_destinations_never_fall_through_to_timing_pane() {
         use crate::WorkspaceTab;
@@ -2128,6 +2153,8 @@ mod tests {
         let hw = hardware_content_bbox(3, pane_w, pane_h);
         assert!(hw.fills(), "Program cards+ILA content bbox {hw:?}");
         let (tile_band, ila_h, _, _, _, ch) = program_layout(3, pane_w, pane_h);
+        let (cols, rows, _, _) = stat_bit_grid(3, pane_w, tile_band);
+        assert_eq!((cols, rows), (3, 1), "all three cable cards fill one row");
         assert!(
             ch <= 132.0 && tile_band <= 132.0,
             "empty-state cable cards must stay compact, ch={ch} band={tile_band}"
@@ -2238,6 +2265,17 @@ mod resize_tests {
         assert_eq!(status_visible_count(&[], 2000.0), 0);
         // A segment that exactly fits the limit stays.
         assert_eq!(status_visible_count(&[100.0, 100.0], 200.0), 2);
+    }
+
+    #[test]
+    fn status_left_segments_respect_the_right_indicator_dock() {
+        let bar_right = 1440.0;
+        let left_budget = bar_right - STATUS_RIGHT_WIDTH - 16.0;
+        let widths = [188.0, 112.0, 240.0, 160.0, 92.0, 128.0, 76.0];
+        let shown = status_visible_count(&widths, left_budget);
+        let used: f32 = widths[..shown].iter().sum();
+        assert!(used <= left_budget, "{used}px of status segments exceed {left_budget}px");
+        assert!(shown < widths.len(), "low-priority segments should yield before the dock");
     }
 
     /// Sim nav keeps a proportional share; nav + separator + wave always sum

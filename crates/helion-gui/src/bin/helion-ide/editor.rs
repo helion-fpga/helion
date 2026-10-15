@@ -184,16 +184,6 @@ fn build_minimap_galley(
     ui.fonts(|f| f.layout_job(job))
 }
 
-/// Total content height in the current wrap mode.
-fn content_height(n_lines: usize, wrap: bool, line_rows: &[usize]) -> f32 {
-    if wrap && line_rows.len() == n_lines {
-        line_rows.iter().map(|r| *r as f32 * ROW_H).sum()
-    } else {
-        n_lines as f32 * ROW_H
-    }
-    .max(ROW_H)
-}
-
 /// Map a content-space y to a 0-based logical line.
 fn y_to_line(y: f32, n_lines: usize, wrap: bool, line_rows: &[usize]) -> usize {
     if wrap && line_rows.len() == n_lines {
@@ -383,7 +373,7 @@ pub fn paint_editor(ui: &mut egui::Ui, app: &mut HelionIde, theme: &theme::Theme
         let scroll_out = &scroll_resp.inner;
         paint_gutter_overlay(ui, app, theme, &gutter_resp.1, scroll_out, n_lines, wrap);
         if let Some(mini_resp) = mini_resp {
-            paint_minimap(ui, app, theme, &mini_resp.1, scroll_out, n_lines, wrap, lang);
+            paint_minimap(ui, app, theme, &mini_resp.1, scroll_out, n_lines, lang);
         }
         handle_gutter_click(app, &gutter_resp.1, scroll_out, n_lines, wrap);
     });
@@ -569,7 +559,6 @@ fn paint_minimap(
     mini_resp: &egui::Response,
     scroll: &egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput>,
     n_lines: usize,
-    wrap: bool,
     lang: highlight::Lang,
 ) {
     let mini_rect = mini_resp.rect;
@@ -581,7 +570,10 @@ fn paint_minimap(
 
     let offset_y = scroll.state.offset.y;
     let viewport_h = scroll.inner_rect.height().max(1.0);
-    let total_h = content_height(n_lines, wrap, &app.editor_line_rows).max(1.0);
+    // Use the scroll area's measured content extent. Reconstructing this from
+    // line counts drifts from TextEdit's actual galley height and can pin the
+    // minimap thumb at the wrong end on short or wrapped files.
+    let total_h = scroll.content_size.y.max(1.0);
     let mini_h = mini_rect.height();
 
     let row_mini = (mini_h / n_lines as f32).min(4.0);
@@ -772,6 +764,35 @@ mod tests {
             let (v_top, v_h) = minimap_viewport(0.0, text_h, 0.0, 600.0, 1384.5);
             assert!(v_h <= text_h + 0.5, "thumb {v_h} exceeds tiny track {text_h}");
             assert!(v_top >= 0.0, "thumb top escaped: {v_top}");
+        }
+    }
+
+    /// Repaint determinism across real content/viewport ratios and window
+    /// heights. The measured content size is the ScrollAreaOutput's
+    /// `content_size.y`, passed directly to this geometry helper.
+    #[test]
+    fn minimap_thumb_is_bit_identical_across_repaints_and_sizes() {
+        let cases: [(f32, f32, f32); 4] = [
+            (96.0, 234.0, 510.0),
+            (620.0, 12_480.0, 740.0),
+            (1050.0, 18_525.0, 430.0),
+            (220.0, 2_418.0, 2_000.0),
+        ];
+        for (text_h, total_h, viewport_h) in cases {
+            let max_offset = (total_h - viewport_h).max(0.0_f32);
+            for position in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let offset = max_offset * position;
+                let first = minimap_viewport(13.0, text_h, offset, viewport_h, total_h);
+                for _ in 0..20 {
+                    let again = minimap_viewport(13.0, text_h, offset, viewport_h, total_h);
+                    assert_eq!(first.0.to_bits(), again.0.to_bits());
+                    assert_eq!(first.1.to_bits(), again.1.to_bits());
+                }
+                let expected_top = 13.0 + offset / total_h * text_h;
+                assert!(approx(first.0, expected_top));
+                assert!(first.0 >= 13.0);
+                assert!(first.0 + first.1 <= 13.0 + text_h + 0.5);
+            }
         }
     }
 }

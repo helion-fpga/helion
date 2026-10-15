@@ -1032,7 +1032,13 @@ impl HelionIde {
         // runs after paint_bottom and never runs when the sidebar is hidden.
         // A stuck flag pinned the bottom console every frame and killed dragging.
         self.force_share = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .fill(self.theme.bg)
+                    .inner_margin(0),
+            )
+            .show(ctx, |ui| {
             let theme = self.theme;
             if welcome::should_show(self) {
                 welcome::paint_welcome(ui, self, &theme);
@@ -1227,12 +1233,20 @@ fn native_save_project_as(app: &mut HelionIde) {
 }
 
 fn native_open(app: &mut HelionIde) {
+    #[cfg(test)]
+    if fuzz::dialogs_suppressed() {
+        return;
+    }
     if let Some(path) = native_open_dialog() {
         app.open_path_async(&path);
     }
 }
 
 fn native_open_dialog() -> Option<PathBuf> {
+    #[cfg(test)]
+    if fuzz::dialogs_suppressed() {
+        return None;
+    }
     open_hdl_dialog()
 }
 
@@ -1533,6 +1547,10 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
     egui::SidePanel::left("activity_rail")
         .exact_width(chrome::RAIL_WIDTH)
         .resizable(false)
+        // This rail has fixed-size icon buttons; default 8px panel margins
+        // leave less content width than those buttons need, so egui expands
+        // its response rect and leaves an unpainted strip before the next dock.
+        .frame(egui::Frame::NONE.fill(app.theme.panel).inner_margin(0))
         .show_separator_line(false)
         .show(ctx, |ui| {
             ui.add_space(chrome::SPACE_XS);
@@ -1543,7 +1561,7 @@ fn paint_activity_rail(ctx: &egui::Context, app: &mut HelionIde) {
                 let on = app.activity == act;
                 let fill = if on { theme.sel } else { Color32::TRANSPARENT };
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(chrome::RAIL_WIDTH - 4.0, chrome::HIT_RAIL),
+                    egui::vec2(chrome::RAIL_WIDTH - chrome::SPACE_XS, chrome::HIT_RAIL),
                     Sense::click(),
                 );
                 if ui.is_rect_visible(rect) {
@@ -1609,11 +1627,21 @@ fn paint_files_side(ctx: &egui::Context, app: &mut HelionIde) {
     let mut hover_resize = false;
     let _ = egui::SidePanel::left("sidebar_v3")
         .exact_width(width)
+        .frame(egui::Frame::side_top_panel(&ctx.style()).fill(app.theme.panel))
         .show_separator_line(true)
         .show(ctx, |ui| {
+            let body_height = ui.available_height();
             ui.horizontal(|ui| {
+                // The resize target is the boundary itself. Default horizontal
+                // item spacing here creates an unowned gap between this dock
+                // and the canvas.
+                ui.spacing_mut().item_spacing.x = 0.0;
                 egui::ScrollArea::vertical()
+                    .id_salt("files_sidebar_scroll")
+                    .max_width((ui.available_width() - chrome::SPLITTER_GRAB_PX).max(0.0))
                     .auto_shrink([false, false])
+                    .min_scrolled_height(body_height)
+                    .max_height(body_height)
                     .show(ui, |ui| {
                     ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
@@ -1713,24 +1741,27 @@ fn paint_inspector(ctx: &egui::Context, app: &mut HelionIde) {
 fn paint_program_side(ui: &mut egui::Ui, app: &mut HelionIde) {
     let theme = app.theme;
     let det = app.boards(false).clone();
-    ui.label(RichText::new("Cable").strong());
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        for (id, label) in [
-            ("auto", "auto"),
-            ("sim", "sim"),
-            ("usb", "usb/ofl"),
-            ("native", "native→ofl"),
-        ] {
-            let selected = app.program_cable == id;
-            let resp = ui.add_sized(
-                [72.0, chrome::HIT_SIDEBAR],
-                egui::Button::selectable(selected, label),
-            );
-            if resp.clicked() {
-                app.program_cable = id.to_string();
-            }
-        }
+        ui.label(RichText::new("Cable").strong());
+        let label = match app.program_cable.as_str() {
+            "sim" => "Simulation",
+            "usb" | "ofl" | "openfpgaloader" => "USB / openFPGALoader",
+            "native" | "ftdi" => "Native FTDI",
+            _ => "Automatic",
+        };
+        egui::ComboBox::from_id_salt("program_cable")
+            .selected_text(label)
+            .width((ui.available_width() - chrome::SPACE_XS).max(1.0))
+            .show_ui(ui, |ui| {
+                for (id, text) in [
+                    ("auto", "Automatic"),
+                    ("sim", "Simulation"),
+                    ("usb", "USB / openFPGALoader"),
+                    ("native", "Native FTDI"),
+                ] {
+                    ui.selectable_value(&mut app.program_cable, id.to_string(), text);
+                }
+            });
     });
     let resolved = helion_hw::resolve_cable_from(&app.program_cable, &det).ok();
     if let Some(c) = &resolved {
@@ -1903,9 +1934,7 @@ fn paint_files_tree(ui: &mut egui::Ui, app: &mut HelionIde) {
     }
     let selected_source = app.model.selected_source.clone();
     let mut pick_src: Option<String> = None;
-    data_scroll("files_sources")
-        .max_height(200.0)
-        .show(ui, |ui| {
+    data_scroll("files_sources").show(ui, |ui| {
             for (i, r) in src_rows.iter().enumerate() {
                 let on = selected_source.as_deref() == Some(r.parent.as_str())
                     || selected_source.as_deref() == Some(r.name.as_str());
@@ -2122,7 +2151,7 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
         .show(ctx, |ui| {
             let w = ui.available_width();
             // Reserve for the right-side job indicator; segments never paint into it.
-            let right_w = 190.0;
+            let right_w = chrome::STATUS_RIGHT_WIDTH;
             let (bar, _) = ui.allocate_exact_size(
                 egui::vec2(w, chrome::STATUS_HEIGHT),
                 egui::Sense::hover(),
@@ -2226,7 +2255,10 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
                         + 16.0
                 })
                 .collect();
-            let n_visible = chrome::status_visible_count(&widths, x_limit);
+            let n_visible = chrome::status_visible_count(
+                &widths,
+                (x_limit - (bar.left() + 8.0)).max(0.0),
+            );
             let mut x = bar.left() + 8.0;
             let mut first = true;
             for (idx, sp) in specs.iter().take(n_visible).enumerate() {
@@ -2249,7 +2281,7 @@ fn paint_status_bar(ctx: &egui::Context, app: &mut HelionIde) {
             }
             // Right side: flow progress chips (R16: Z1 -> Z7) + background-job
             // spinner/progress, or idle indicator.
-            let right_w = 340.0;
+            let right_w = chrome::STATUS_RIGHT_WIDTH;
 
             let right_rect = egui::Rect::from_min_size(
                 egui::pos2(bar.right() - right_w - 8.0, bar.top()),
@@ -2509,6 +2541,10 @@ fn paint_tcl_window(ctx: &egui::Context, app: &mut HelionIde) {
 }
 
 fn pick_rtl_dialog() -> Option<PathBuf> {
+    #[cfg(test)]
+    if fuzz::dialogs_suppressed() {
+        return None;
+    }
     rfd::FileDialog::new()
         .set_title("Add Sources")
         .add_filter("RTL", &["sv", "v", "vhd", "vhdl"])
@@ -2516,6 +2552,10 @@ fn pick_rtl_dialog() -> Option<PathBuf> {
 }
 
 fn pick_constraint_dialog() -> Option<PathBuf> {
+    #[cfg(test)]
+    if fuzz::dialogs_suppressed() {
+        return None;
+    }
     rfd::FileDialog::new()
         .set_title("Add Constraints")
         .add_filter("Constraints", &["sdc", "xdc"])
@@ -2523,6 +2563,10 @@ fn pick_constraint_dialog() -> Option<PathBuf> {
 }
 
 fn pick_directory_dialog(start: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if fuzz::dialogs_suppressed() {
+        return None;
+    }
     let mut d = rfd::FileDialog::new().set_title("Project Directory");
     let start_pb = PathBuf::from(start);
     if start_pb.is_dir() {
@@ -5275,7 +5319,7 @@ fn paint_constraints_tab(ui: &mut egui::Ui, app: &mut HelionIde) {
         return;
     }
     ui.horizontal(|ui| {
-        if ui.button("🧭 Constraints Wizard…").clicked() {
+        if ui.button("Constraints Wizard…").clicked() {
             app.constraints_wizard = Some(constraints_wizard_ui::WizardUi::new(&app.model));
         }
         ui.weak("Guided: clocks → I/O delays → exceptions → SDC");
@@ -6180,10 +6224,8 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
         }
         ui.add_space(chrome::SPACE_SM);
         ui.label(RichText::new(title).strong());
-        let path_col = chrome::stretched_col_w_gap(8, ui.available_width(), 8.0);
         egui::Grid::new(format!("timing_summary_{}", kind.as_str()))
             .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
-            .min_col_width(path_col)
             .show(ui, |ui| {
                 ui.label(RichText::new("Name").strong());
                 ui.label(RichText::new("From").strong());
@@ -6506,7 +6548,7 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
         return;
     }
     ui.label(format!(
-        "loads={} buffers={} INSERTION_PS={}",
+        "{} loads · {} buffers · {} ps maximum insertion",
         report.total_loads, report.total_buffers, report.max_insertion_ps
     ));
     let selected_cn = model.selected_clock_network.clone();
@@ -6523,13 +6565,13 @@ fn paint_clock_networks(ui: &mut egui::Ui, model: &mut IdeModel) {
         .spacing([chrome::SPACE_SM, chrome::SPACE_XS])
         .show(ui, |ui| {
             ui.label(RichText::new("Clock").strong());
-            ui.label(RichText::new("Period_ps").strong());
+            ui.label(RichText::new("Period (ps)").strong());
             ui.label(RichText::new("Source").strong());
             ui.label(RichText::new("Net").strong());
             ui.label(RichText::new("Loads").strong());
             ui.label(RichText::new("Buffers").strong());
             ui.label(RichText::new("Fanout").strong());
-            ui.label(RichText::new("Insertion_ps").strong());
+            ui.label(RichText::new("Insertion (ps)").strong());
             ui.end_row();
             for c in &report.clocks {
                 let on = selected_cn.as_deref() == Some(c.name.as_str());
@@ -6704,6 +6746,10 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
     ui.label(RichText::new("Switching activity").strong());
     ui.horizontal_wrapped(|ui| {
         if ui.button("Load VCD…").clicked() {
+            #[cfg(test)]
+            if fuzz::dialogs_suppressed() {
+                return;
+            }
             if let Some(p) = open_vcd_dialog() {
                 let _ = model.read_vcd(&p.to_string_lossy());
             }
@@ -6819,6 +6865,7 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
         .map(|x| x.mw)
         .fold(0.0f64, f64::max)
         .max(1e-9);
+    let resource_bar_w = chrome::power_report_bar_w(ui.available_width());
     // Horizontal scroll keeps long resource names reachable on narrow panes.
     egui::ScrollArea::horizontal()
         .id_salt("vcd_power_resources_hscroll")
@@ -6830,7 +6877,10 @@ fn paint_vcd_power_section(ui: &mut egui::Ui, model: &mut IdeModel, theme: &them
             for res in &r.by_resource {
                 ui.label(RichText::new(&res.name).monospace());
                 num_cell(ui, &format!("{:.3} mW", res.mw));
-                let (bar, _) = ui.allocate_exact_size(egui::vec2(chrome::POWER_BAR_W, chrome::POWER_BAR_H), Sense::hover());
+                let (bar, _) = ui.allocate_exact_size(
+                    egui::vec2(resource_bar_w, chrome::POWER_BAR_H),
+                    Sense::hover(),
+                );
                 ui.painter().rect_filled(bar, 2.0, theme.surface);
                 let frac = (res.mw / max_mw).clamp(0.0, 1.0) as f32;
                 let fill = bar.with_max_x(bar.left() + bar.width() * frac);
@@ -7041,7 +7091,8 @@ fn paint_methodology(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                                 pick_obj = Some(v.id.clone());
                             }
                         }
-                        ui.label(&v.message);
+                        ui.add(egui::Label::new(&v.message).wrap())
+                            .on_hover_text(&v.message);
                         ui.end_row();
                     }
                 });
@@ -7162,7 +7213,8 @@ fn paint_qor(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
                         }
                         ui.label(s.severity.as_str());
                         ui.label(s.category);
-                        ui.label(&s.title);
+                        ui.add(egui::Label::new(&s.title).wrap())
+                            .on_hover_text(&s.title);
                         ui.label(
                             s.gain_ps
                                 .map(|g| format!("+{g} ps"))
@@ -7553,8 +7605,13 @@ fn paint_utilization(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::The
                             } else {
                                 row.used as f32 / row.available as f32
                             };
-                            let (bar, _) =
+                            let (row, _) =
                                 ui.allocate_exact_size(egui::vec2(bar_span, bar_h), Sense::hover());
+                            let bar_h = chrome::occupancy_bar_draw_h(row.height());
+                            let bar = egui::Rect::from_center_size(
+                                row.center(),
+                                egui::vec2(row.width(), bar_h),
+                            );
                             ui.painter().rect_filled(bar, 2.0, theme.surface);
                             let fill =
                                 bar.with_max_x(bar.left() + bar.width() * frac.clamp(0.0, 1.0));
@@ -8376,6 +8433,7 @@ fn paint_device_toolbar(
         "Add Probe".into(),
     ];
     let widths = chrome::device_toolbar_widths(&item_labels[9], &zoom_label);
+    let groups = [(0, "Select"), (3, "Display"), (5, "Zoom"), (9, "Debug")];
     let m = &mut *model;
     let p = &mut *pv;
     let zt = &mut *zoom_target;
@@ -8384,6 +8442,14 @@ fn paint_device_toolbar(
             // Informational zoom readout: a label in both modes, never a button.
             ui.label(RichText::new(&zoom_label).small().weak());
             return;
+        }
+        if let Some((_, group)) = groups.iter().find(|(start, _)| *start == idx) {
+            if in_menu {
+                ui.label(RichText::new(*group).strong().small());
+            } else {
+                ui.label(RichText::new(*group).small().weak());
+                ui.add(egui::Separator::default().vertical());
+            }
         }
         let enabled = dbg_enabled || idx < 9;
         let label = item_labels[idx].as_str();
@@ -8774,6 +8840,10 @@ fn ruler_hit_at(
 
 /// The die canvas: tile grid, heat maps, sites, clock regions, pblocks,
 /// routes, rulers, hover tooltips, click/drag interaction.
+fn device_scroll_bottom_offset(content_extent: f32, viewport_extent: f32) -> f32 {
+    (content_extent - viewport_extent).max(0.0)
+}
+
 fn paint_device_die(
     ui: &mut egui::Ui,
     model: &mut IdeModel,
@@ -8781,6 +8851,38 @@ fn paint_device_die(
     pv: &mut physview_panels::PhysViewState,
     zoom_target: &mut Option<(u32, u32)>,
 ) {
+    if model.device.cols == 0 || model.device.rows == 0 {
+        // An absent device was previously coerced to a synthetic 1×1 die,
+        // leaving a dark, empty canvas with no explanation. Keep the viewport
+        // intact and tell the user what action populates it.
+        let size = ui.available_size().max(egui::vec2(1.0, 1.0));
+        let (viewport, _) = ui.allocate_exact_size(size, Sense::hover());
+        let card_size = egui::vec2(360.0_f32.min(viewport.width()), chrome::HIT_COMFORT * 3.0);
+        let card = egui::Rect::from_center_size(viewport.center(), card_size);
+        let painter = ui.painter();
+        painter.rect_filled(card, 6.0, theme.surface);
+        painter.rect_stroke(
+            card,
+            6.0,
+            egui::Stroke::new(1.0, theme.line),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(card.center().x, card.top() + chrome::SPACE_LG),
+            egui::Align2::CENTER_TOP,
+            "No device layout yet",
+            theme::font_ui(15.0),
+            theme.text,
+        );
+        painter.text(
+            egui::pos2(card.center().x, card.top() + chrome::SPACE_XL + chrome::SPACE_SM),
+            egui::Align2::CENTER_TOP,
+            "Run Place to populate the floorplan.",
+            theme::font_ui(12.0),
+            theme.dim,
+        );
+        return;
+    }
     let cols = model.device.cols.max(1);
     let rows = model.device.rows.max(1);
     let x0 = model.device.x0;
@@ -8812,18 +8914,13 @@ fn paint_device_die(
         die_w *= s;
         die_h *= s;
     }
-    let overflow = model.device_zoom > 1.001 && (die_w > view_w + 1.0 || die_h > view_h + 1.0);
-    let zoomed_in = overflow;
-    let draw_w = if overflow {
-        die_w.max(view_w + 8.0)
-    } else {
-        view_w.max(die_w)
-    };
-    let draw_h = if overflow {
-        die_h.max(view_h + 8.0)
-    } else {
-        view_h.max(die_h)
-    };
+    let overflow_x = model.device_zoom > 1.001 && die_w > view_w + 1.0;
+    let overflow_y = model.device_zoom > 1.001 && die_h > view_h + 1.0;
+    let zoomed_in = overflow_x || overflow_y;
+    // Content bounds stay exact: padding the non-overflowing axis creates a
+    // scrollbar with a false end position even though no die content exists.
+    let draw_w = view_w.max(die_w);
+    let draw_h = view_h.max(die_h);
     // Center the die in the viewport whenever it is smaller than it (fit /
     // letterbox); top-left only when zoomed past the viewport.
     let origin_dx = (view_w - die_w).max(0.0) * 0.5;
@@ -8839,13 +8936,12 @@ fn paint_device_die(
         .auto_shrink([false, false])
         .max_width(view_w)
         .max_height(view_h)
-        .scroll_bar_visibility(if zoomed_in {
-            egui::scroll_area::ScrollBarVisibility::AlwaysVisible
-        } else {
-            egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-        });
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
     if zoomed_in && std::env::var("HELION_DEVICE_SCROLL").ok().as_deref() == Some("bottom") {
-        scroller = scroller.vertical_scroll_offset(1.0e6);
+        // Keep the screenshot hook inside the measured content bounds. An
+        // arbitrary large offset makes egui land beyond content on first
+        // paint and reproduces the black false-bottom users reported.
+        scroller = scroller.vertical_scroll_offset(device_scroll_bottom_offset(draw_h, view_h));
     }
     scroller.show(ui, |ui| {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(draw_w, draw_h), Sense::click());
@@ -11777,14 +11873,22 @@ fn paint_hw(ui: &mut egui::Ui, app: &mut HelionIde) {
             let _ = model.exec("open_hw_manager");
         }
     }
-    ui.add_space(chrome::SPACE_SM);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Logic Analyzer").strong());
-        ui.weak("probes, triggers, and captures live in the ILA view");
-        if ui.button("Open ILA").clicked() {
-            model.workspace = WorkspaceTab::Ila;
-        }
-    });
+    let ila_area = ui.available_size().max(egui::vec2(1.0, 1.0));
+    ui.allocate_ui_with_layout(
+        ila_area,
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            let content_h = chrome::HIT_COMFORT * 2.0 + chrome::SPACE_XL;
+            ui.add_space(((ila_area.y - content_h).max(0.0)) * 0.5);
+            ui.label(RichText::new("Logic Analyzer").strong().size(16.0));
+            ui.add_space(chrome::SPACE_XS);
+            ui.label(RichText::new("Probes, triggers, and captures live in the ILA workspace.").color(theme.dim));
+            ui.add_space(chrome::SPACE_SM);
+            if primary_button(ui, "Open ILA").clicked() {
+                model.workspace = WorkspaceTab::Ila;
+            }
+        },
+    );
 }
 
 fn paint_ip(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::Theme) {
@@ -12791,6 +12895,115 @@ mod nested_scroll_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_sidebar_renders_all_flow_stages_in_its_full_viewport() {
+        let ctx = egui::Context::default();
+        let mut app = HelionIde::new();
+        app.set_activity(Activity::Files);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+                commands::paint_menu_bar(ui, &mut app);
+            });
+            paint_toolbar(ctx, &mut app);
+            apply_shared_chrome(ctx, &mut app);
+            paint_status_bar(ctx, &mut app);
+            paint_bottom(ctx, &mut app);
+            paint_activity_rail(ctx, &mut app);
+            paint_sidebar(ctx, &mut app);
+            egui::CentralPanel::default().show(ctx, |ui| paint_workspace(ui, &mut app));
+        });
+        let texts: Vec<(String, f32)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(ts) => Some((ts.galley.text().to_string(), ts.pos.y)),
+                _ => None,
+            })
+            .collect();
+        let heading_y = texts
+            .iter()
+            .find(|(text, _)| text == "Flow Navigator")
+            .map(|(_, y)| *y)
+            .expect("Files activity renders Flow Navigator");
+        let mut previous_y = heading_y;
+        for step in FlowStep::ALL {
+            let y = texts
+                .iter()
+                .filter(|(text, y)| text == step.label() && *y > heading_y && *y < 300.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(_, y)| *y)
+                .unwrap_or_else(|| panic!("Flow Navigator is missing {}: {texts:?}", step.label()));
+            assert!(y > previous_y, "flow stages must be vertically ordered: {texts:?}");
+            previous_y = y;
+        }
+    }
+
+    #[test]
+    fn workspace_views_never_render_placeholder_strings() {
+        for tab in WorkspaceTab::ALL {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let mut app = HelionIde::new();
+            if tab.is_canvas() {
+                app.model.workspace = tab;
+                app.canvas = match tab {
+                    WorkspaceTab::TextEditor => Canvas::Editor,
+                    WorkspaceTab::Device => Canvas::Device,
+                    _ => Canvas::Timing,
+                };
+            } else {
+                open_more_workspace(&mut app, tab);
+            }
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| paint_workspace(ui, &mut app));
+            });
+            for cs in &out.shapes {
+                if let egui::Shape::Text(ts) = &cs.shape {
+                    let text = ts.galley.text().to_string().to_ascii_lowercase();
+                    for forbidden in ["???", "todo!()", "unimplemented!()", "not implemented"] {
+                        assert!(
+                            !text.contains(forbidden),
+                            "{} rendered {forbidden:?} in {text:?}",
+                            tab.label()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_bottom_scroll_stays_within_real_content_bounds() {
+        for (content, viewport) in [
+            (480.0_f32, 480.0_f32),
+            (475.0_f32, 480.0_f32),
+            (960.0_f32, 480.0_f32),
+            (1440.0_f32, 640.0_f32),
+        ] {
+            let expected = (content - viewport).max(0.0_f32);
+            let first = device_scroll_bottom_offset(content, viewport);
+            for _ in 0..20 {
+                assert_eq!(first.to_bits(), device_scroll_bottom_offset(content, viewport).to_bits());
+            }
+            assert_eq!(first, expected);
+            assert!(first <= content - viewport || content <= viewport);
+        }
+    }
 
     /// Grammar R14: the Z4 inspector shows if and only if a selection exists.
     /// The frame gates `paint_inspector` on this predicate; the sidebar never
