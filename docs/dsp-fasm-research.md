@@ -57,3 +57,23 @@ for dsp in &placed.dsps {
 - UG479: 7 Series DSP48E1 User Guide
 - Project X-Ray: https://github.com/SymbiFlow/prjxray
 - X-Ray db: `database/artix7/` (check for DSP tiles)
+
+## X-Ray Feature Name Patterns (To Verify)
+
+### OPMODE[6:0]
+Based on X-Ray segbits database structure, expected patterns:
+- `DSP48E1_X0Y0.DSP48E1.OPMODE0` through `OPMODE6`
+- Each bit is a separate feature; set bits are listed in FASM
+
+### ALUMODE[3:0]
+- `DSP48E1_X0Y0.DSP48E1.ALUMODE0` through `ALUMODE3`
+
+### Pipeline Registers
+- `DSP48E1.AREG0`, `AREG1` (A input pipeline stages)
+- `DSP48E1.BREG0`, `BREG1` (B input pipeline stages)
+- `DSP48E1.CREG0` (C input pipeline)
+- `DSP48E1.MREG` (Multiplier pipeline)
+- `DSP48E1.PREG` (P output pipeline)
+
+**Verification needed:** Clone prjxray, check `database/artix7/segbits_dsp_*.db`
+for exact feature strings.
