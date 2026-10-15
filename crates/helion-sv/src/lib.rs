@@ -556,6 +556,77 @@ impl Aig {
 
         count
     }
+
+    /// Compute NPN canonical form for a 4-input truth table.
+    /// Returns the lexicographically smallest truth table among all
+    /// NPN transformations (input negations, permutations, output negation).
+    /// Used for cut-based rewriting (Phase 2).
+    pub fn npn_canonical_4(tt: u16) -> u16 {
+        let mut best = u16::MAX;
+
+        // All input negation patterns (16)
+        for neg in 0..16u16 {
+            // All input permutations (24)
+            let mut perm = [0usize, 1, 2, 3];
+            loop {
+                // Apply negation then permutation
+                let mut transformed = 0u16;
+                for m in 0..16u16 {
+                    // Apply input negation
+                    let mut m_neg = m;
+                    for i in 0..4 {
+                        if ((neg >> i) & 1) == 1 {
+                            m_neg ^= 1 << i;
+                        }
+                    }
+                    // Apply permutation
+                    let mut m_perm = 0u16;
+                    for i in 0..4 {
+                        if ((m_neg >> perm[i]) & 1) == 1 {
+                            m_perm |= 1 << i;
+                        }
+                    }
+                    // Copy truth table bit
+                    if ((tt >> m) & 1) == 1 {
+                        transformed |= 1 << m_perm;
+                    }
+                }
+                // Check both output polarities
+                if transformed < best {
+                    best = transformed;
+                }
+                let flipped = !transformed & 0xFFFF;
+                if flipped < best {
+                    best = flipped;
+                }
+
+                if !next_permutation_4(&mut perm) {
+                    break;
+                }
+            }
+        }
+
+        best
+    }
+}
+
+/// Generate next lexicographic permutation for 4 elements.
+/// Returns false when all permutations exhausted.
+fn next_permutation_4(perm: &mut [usize; 4]) -> bool {
+    let mut i = 3;
+    while i > 0 && perm[i - 1] >= perm[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let mut j = 3;
+    while perm[j] <= perm[i - 1] {
+        j -= 1;
+    }
+    perm.swap(i - 1, j);
+    perm[i..].reverse();
+    true
 }
 
 /// UG900 Compilation tab over helion-sv (include + `define), not xvlog.
