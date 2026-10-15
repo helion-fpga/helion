@@ -6154,55 +6154,47 @@ fn paint_timing_summary(ui: &mut egui::Ui, model: &mut IdeModel, theme: &theme::
     );
     // Full-word labels (§3.3.5) - never bare codes like WNS_PS.
     {
-        let headers = [
-            "Worst Negative Slack (WNS)",
-            "Total Negative Slack (TNS)",
-            "Worst Hold Slack (WHS)",
-            "Total Hold Slack (THS)",
-            "Failing Setup",
-            "Failing Hold",
-            "Endpoints",
-        ];
-        let widths = [220.0f32, 210.0, 200.0, 190.0, 130.0, 130.0, 110.0];
-        let total: f32 = widths.iter().sum();
-        let w = ui.available_width().max(total);
+        // Responsive metric strip: egui::Grid auto-sizes columns to content
+        // and wraps within the available width. No fixed pixel widths.
         let period = model.clock_period_ps;
-        egui::ScrollArea::horizontal().id_salt("timing_summary_hscroll").show(ui, |ui| {
-            let (hrect, _) =
-                ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
-            let hcells: Vec<SpecCell> = headers
-                .iter()
-                .map(|t| SpecCell {
-                    text: (*t).to_string(),
-                    color: theme.dim,
-                    right: true,
-                    mono: false,
-                })
-                .collect();
-            spec_paint_cells(ui, hrect, &widths, &hcells, true);
-            spec_divider(ui, theme, hrect);
-            let (rrect, _) =
-                ui.allocate_exact_size(egui::vec2(w, 27.0), egui::Sense::hover());
-            let wns_c = report
-                .wns_ps
-                .map(|v| slack_color(theme, v, period))
-                .unwrap_or(theme.dim);
-            let whs_c = report
-                .whs_ps
-                .map(|v| slack_color(theme, v, period))
-                .unwrap_or(theme.dim);
-            let rcells = vec![
-                SpecCell::num(slack_label(report.wns_ps), wns_c),
-                SpecCell::num(report.tns_ps.to_string(), theme.text),
-                SpecCell::num(slack_label(report.whs_ps), whs_c),
-                SpecCell::num(report.ths_ps.to_string(), theme.text),
-                SpecCell::num(report.failing_setup.to_string(), theme.text),
-                SpecCell::num(report.failing_hold.to_string(), theme.text),
-                SpecCell::num(report.endpoints.to_string(), theme.text),
-            ];
-            spec_paint_cells(ui, rrect, &widths, &rcells, false);
-            spec_divider(ui, theme, rrect);
-        });
+        let wns_c = report
+            .wns_ps
+            .map(|v| slack_color(theme, v, period))
+            .unwrap_or(theme.dim);
+        let whs_c = report
+            .whs_ps
+            .map(|v| slack_color(theme, v, period))
+            .unwrap_or(theme.dim);
+        egui::Grid::new("timing_summary_metrics")
+            .spacing([chrome::SPACE_MD, chrome::SPACE_XS])
+            .show(ui, |ui| {
+                for h in [
+                    "Worst Negative Slack (WNS)",
+                    "Total Negative Slack (TNS)",
+                    "Worst Hold Slack (WHS)",
+                    "Total Hold Slack (THS)",
+                    "Failing Setup",
+                    "Failing Hold",
+                    "Endpoints",
+                ] {
+                    ui.label(RichText::new(h).color(theme.dim));
+                }
+                ui.end_row();
+                ui.label(RichText::new(slack_label(report.wns_ps)).color(wns_c));
+                ui.label(RichText::new(report.tns_ps.to_string()).color(theme.text));
+                ui.label(RichText::new(slack_label(report.whs_ps)).color(whs_c));
+                ui.label(RichText::new(report.ths_ps.to_string()).color(theme.text));
+                ui.label(
+                    RichText::new(report.failing_setup.to_string()).color(theme.text),
+                );
+                ui.label(
+                    RichText::new(report.failing_hold.to_string()).color(theme.text),
+                );
+                ui.label(
+                    RichText::new(report.endpoints.to_string()).color(theme.text),
+                );
+                ui.end_row();
+            });
     }
     let selected_ts = model.selected_timing_summary.clone();
     let selected = model.selected.clone();
