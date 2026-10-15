@@ -432,7 +432,7 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                     out_net,
                 });
             }
-            CellKind::Bram18 => {
+            CellKind::Bram18 | CellKind::Bram18e1 { .. } => {
                 out.rams.push(pack_ram(resolve(cell.name), &pins, &cell.attrs)?);
             }
             CellKind::BlackBox { module } if resolve(*module).starts_with("SB_PLL40") => {
@@ -484,7 +484,7 @@ pub fn pack(netlist: &Design) -> Result<PackedIce, String> {
                     filter_range,
                 });
             }
-            CellKind::Mac27 => {
+            CellKind::Mac27 | CellKind::Dsp48e1 { .. } => {
                 return Err(format!(
                     "pack: MAC27 {} unsupported: iCE40 HX8K has no DSP blocks",
                     resolve(cell.name)
