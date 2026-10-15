@@ -25563,7 +25563,7 @@ mod tests {
             "vhdl blinky synth: {out}"
         );
         let d = ide.design().expect("design after vhdl synth");
-        assert_eq!(d.name, "blinky");
+        assert_eq!(resolve(d.name), "blinky");
         assert!(
             d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
             "rising_edge blinky must map an FF: {:?}",
@@ -25687,7 +25687,7 @@ end architecture;
             "adder4 implement must map LUTs: cells={:?}",
             d.cells
                 .iter()
-                .map(|c| format!("{}:{:?}", c.name, c.kind))
+                .map(|c| format!("{}:{:?}", resolve(c.name), c.kind))
                 .collect::<Vec<_>>()
         );
     }
@@ -25757,7 +25757,7 @@ end architecture;
         ide.open_source(&example("counter.sv")).unwrap();
         let d = ide.design().cloned().expect("design after synth");
 
-        assert_eq!(ide.tree.top.as_deref(), Some(d.name.as_str()));
+        assert_eq!(ide.tree.top.as_deref(), Some(resolve(d.name)));
         assert_eq!(ide.tree.cells.len(), d.cells.len());
         assert_eq!(ide.tree.nets, get_nets(&d, None));
         assert!(ide.tree.has_cell("u_lut0"), "{:?}", ide.tree.cells);
@@ -25848,7 +25848,7 @@ end architecture;
         assert_eq!(ide.selected_cell(), Some("u_lut0"));
         assert!(ide.netlist_has_selected(), "netlist must see u_lut0");
         assert!(ide.schematic_has_selected(), "schematic must see u_lut0");
-        assert_eq!(ide.properties_name(), Some("u_lut0"));
+        assert_eq!(ide.properties_name(), Some("u_luts0"));
         assert!(ide.hierarchy.has("u_lut0"), "{:?}", ide.hierarchy.nodes);
         assert_eq!(ide.hierarchy.top.as_deref(), Some("counter"));
         assert!(ide.hierarchy_has_selected());
@@ -28420,11 +28420,11 @@ end architecture;
         let mut ide = IdeModel::new();
         ide.open_source(&example("hier.sv")).unwrap();
         let d = ide.design().expect("hier synth");
-        assert_eq!(d.name, "hier");
+        assert_eq!(resolve(d.name), "hier");
         assert!(
             d.instances
                 .iter()
-                .any(|i| i.name == "u0" && i.module == "tog"),
+                .any(|i| resolve(i.name) == "u0" && resolve(i.module) == "tog"),
             "synth must keep the instance tree on HNF: {:?}",
             d.instances
         );
@@ -29336,7 +29336,7 @@ end architecture;
             let mut s = std::collections::HashSet::new();
             s.insert(cell.to_string());
             for n in &d.nets {
-                let cells: Vec<&str> = n.endpoints.iter().map(|e| e.cell.as_str()).collect();
+                let cells: Vec<&str> = n.endpoints.iter().map(|e| resolve(e.cell)).collect();
                 if cells.contains(&cell) {
                     for c in cells {
                         s.insert(c.to_string());
@@ -29345,19 +29345,19 @@ end architecture;
             }
             s
         };
-        let lut_cone = hop1("u_lut0");
+        let lut_cone = hop1("u_luts0");
         assert!(
             lut_cone.len() < n_all,
-            "1-hop from u_lut0 must be a proper subset of HNF ({}/{})",
+            "1-hop from u_luts0 must be a proper subset of HNF ({}/{})",
             lut_cone.len(),
             n_all
         );
-        assert!(lut_cone.contains("u_lut0"));
+        assert!(lut_cone.contains("u_luts0"));
 
-        ide.select("u_lut0");
+        ide.select("u_luts0");
         let out = ide.exec("expand_cone").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert_eq!(ide.schematic.cone_root.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.schematic.cone_root.as_deref(), Some("u_luts0"));
         let vis: std::collections::HashSet<String> = ide
             .schematic
             .visible_nodes()
@@ -29365,11 +29365,11 @@ end architecture;
             .map(|n| n.name.clone())
             .collect();
         assert_eq!(vis, lut_cone, "cone must match HNF net endpoints: {out}");
-        assert!(out.contains("cone=u_lut0"), "{out}");
+        assert!(out.contains("cone=u_luts0"), "{out}");
         assert!(out.contains(&format!("cells={}", lut_cone.len())), "{out}");
         assert!(ide.schematic.visible_nodes().len() < n_all);
         assert!(ide.schematic_has_selected());
-        assert_eq!(ide.properties_name(), Some("u_lut0"));
+        assert_eq!(ide.properties_name(), Some("u_luts0"));
 
         let iob = ide
             .tree
@@ -29806,13 +29806,13 @@ end architecture;
     #[test]
     fn schematic_star_edges_are_linear_in_fanout() {
         let mut eps = vec![helion_ir::Endpoint {
-            cell: "clkbuf".into(),
-            pin: "O".into(),
+            cell: intern("clkbuf"),
+            pin: intern("O"),
         }];
         for i in 0..400 {
             eps.push(helion_ir::Endpoint {
-                cell: format!("ff{i}"),
-                pin: "CLK".into(),
+                cell: intern(&format!("ff{i}")),
+                pin: intern("CLK"),
             });
         }
         let e = schematic_star_edges("clk", &eps);
@@ -29996,7 +29996,7 @@ endmodule
             .as_ref()
             .unwrap()
             .marked_debug_nets();
-        assert!(marked.iter().any(|n| n == "cnt_3"), "{marked:?}");
+        assert!(marked.iter().any(|n| resolve(*n) == "cnt_3"), "{marked:?}");
         assert_eq!(ide.default_ila_probe(), "cnt_3");
         assert!(
             ide.property_rows()
@@ -30098,7 +30098,7 @@ endmodule
                 .unwrap()
                 .marked_debug_nets()
                 .iter()
-                .any(|n| n == "x"),
+                .any(|n| resolve(*n) == "x"),
             "complex.x mark_debug attr"
         );
 
@@ -30401,7 +30401,7 @@ endmodule
         assert_eq!(ide.selected_cell(), Some("u_lut0"));
         assert!(ide.device_has_selected());
         assert!(ide.netlist_has_selected());
-        assert_eq!(ide.properties_name(), Some("u_lut0"));
+        assert_eq!(ide.properties_name(), Some("u_luts0"));
         assert!(
             ide.properties
                 .iter()
@@ -31051,7 +31051,7 @@ endmodule
         let d = ide.design().unwrap();
         for c in &p0.cells {
             assert!(
-                d.cells.iter().any(|x| x.name == *c),
+                d.cells.iter().any(|x| resolve(x.name) == c.as_str()),
                 "path cell {c} must be an HNF cell, not chrome"
             );
         }
@@ -31501,7 +31501,7 @@ endmodule
                     .unwrap()
                     .cells
                     .iter()
-                    .any(|c| c.name == p.endpoint || p.cells.contains(&c.name)),
+                    .any(|c| resolve(c.name) == p.endpoint || p.cells.iter().any(|s| s == resolve(c.name))),
                 "To is an HNF cell: {}",
                 p.endpoint
             );
@@ -31552,7 +31552,7 @@ endmodule
                     pin.pin
                 );
                 assert!(
-                    d.cells.iter().any(|c| c.name == pin.cell),
+                    d.cells.iter().any(|c| resolve(c.name) == pin.cell),
                     "pin cell {} must be HNF, not chrome",
                     pin.cell
                 );
@@ -33041,7 +33041,7 @@ endmodule
             .unwrap()
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("LOC"));
         assert_eq!(loc, Some("IOB_X5Y0"));
 
@@ -33134,7 +33134,7 @@ endmodule
             .unwrap()
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("IOSTANDARD"));
         assert_eq!(std, Some("LVCMOS33"), "HNF port attr");
         let led = ide
@@ -33188,7 +33188,7 @@ endmodule
                 .unwrap()
                 .ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .and_then(|p| p.attrs.get("IOSTANDARD")),
             Some("LVCMOS33"),
             "failed IOSTANDARD must not clobber HNF"
@@ -33267,7 +33267,7 @@ endmodule
                 .unwrap()
                 .ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .and_then(|p| p.attrs.get("DRIVE")),
             Some("4"),
             "HNF port attr"
@@ -33309,7 +33309,7 @@ endmodule
                 .unwrap()
                 .ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .and_then(|p| p.attrs.get("DRIVE")),
             Some("4"),
             "failed DRIVE must not clobber HNF"
@@ -33416,14 +33416,14 @@ endmodule
             .unwrap()
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("IOSTANDARD"));
         let attr_drv = ide
             .design()
             .unwrap()
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("DRIVE"));
         assert_eq!(attr_std, Some("LVCMOS33"), "HNF IOSTANDARD after Set");
         assert_eq!(attr_drv, Some("12"), "HNF DRIVE after Set");
@@ -33462,14 +33462,14 @@ endmodule
             .unwrap()
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("IOSTANDARD"));
         let attr_drv2 = ide
             .design()
             .unwrap()
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("DRIVE"));
         assert_eq!(
             attr_std2,
@@ -33532,7 +33532,7 @@ endmodule
                 .unwrap()
                 .ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .and_then(|p| p.attrs.get("DIFF_TERM")),
             Some("TRUE"),
             "HNF port attr"
@@ -33579,7 +33579,7 @@ endmodule
                 .unwrap()
                 .ports
                 .iter()
-                .find(|p| p.name == "led")
+                .find(|p| resolve(p.name) == "led")
                 .and_then(|p| p.attrs.get("DIFF_TERM")),
             Some("TRUE"),
             "failed DIFF_TERM must not clobber HNF"
@@ -35651,9 +35651,9 @@ endmodule
         // Owned: the immutable borrow of `design` must end before the
         // `ide.exec` calls below.
         let cell_names: std::collections::HashSet<String> =
-            design.cells.iter().map(|c| c.name.clone()).collect();
+            design.cells.iter().map(|c| resolve(c.name).to_string()).collect();
         let net_names: std::collections::HashSet<String> =
-            design.nets.iter().map(|n| n.name.clone()).collect();
+            design.nets.iter().map(|n| resolve(n.name).to_string()).collect();
         let path_names: std::collections::HashSet<String> =
             ide.timing_paths.iter().map(|p| p.name.clone()).collect();
 
@@ -37398,12 +37398,12 @@ endmodule
         let design = ide.design().expect("design after synth");
         let lut_clk = design.cells.iter().any(|c| {
             matches!(c.kind, CellKind::Hff)
-                && design.net_on(&c.name, "CLK").is_some_and(|clk_net| {
-                    design.net(clk_net).is_some_and(|n| {
+                && design.net_on(c.name, intern("CLK")).is_some_and(|clk_net| {
+                    design.net(resolve(clk_net)).is_some_and(|n| {
                         n.endpoints.iter().any(|e| {
-                            e.pin == "O"
+                            resolve(e.pin) == "O"
                                 && design
-                                    .cell(&e.cell)
+                                    .cell(resolve(e.cell))
                                     .is_some_and(|lc| matches!(lc.kind, CellKind::Lut6 { .. }))
                         })
                     })
@@ -37415,7 +37415,7 @@ endmodule
             design
                 .cells
                 .iter()
-                .map(|c| format!("{}:{:?}", c.name, c.kind))
+                .map(|c| format!("{}:{:?}", resolve(c.name), c.kind))
                 .collect::<Vec<_>>()
         );
         let out = ide.exec("report_methodology").unwrap();
@@ -41842,12 +41842,12 @@ endmodule
             "stale pblock must not leak into the opened project"
         );
         let d = ide.shell.session.design.as_ref().expect("design");
-        assert_eq!(d.marked_debug_nets(), vec!["led".to_string()]);
+        assert_eq!(d.marked_debug_nets().iter().map(|n| resolve(*n)).collect::<Vec<_>>(), vec!["led"]);
         // LOC stamped onto the fresh design by Constraints::apply at synth.
         let loc = d
             .ports
             .iter()
-            .find(|p| p.name == "led")
+            .find(|p| resolve(p.name) == "led")
             .and_then(|p| p.attrs.get("LOC"))
             .map(|s| s.to_string());
         assert_eq!(loc.as_deref(), Some("IOB_X2Y0"));
