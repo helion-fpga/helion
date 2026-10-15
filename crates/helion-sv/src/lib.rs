@@ -494,6 +494,45 @@ impl Aig {
         rewritten
     }
 
+    /// Rewrite using NPN classification: for each 4-input cut, compute its
+    /// NPN canonical form. If two nodes have NPN-equivalent cuts, they can
+    /// potentially share implementation. This is Phase 2 of ABC-style rewriting.
+    /// Returns number of nodes rewritten.
+    pub fn rewrite_npn_cuts(&mut self) -> usize {
+        use std::collections::HashMap;
+
+        let cuts = self.enumerate_cuts(6);
+        let n_pis = self.pis.len() as u32;
+        let mut rewritten = 0;
+
+        // Map NPN canonical form -> (node_id, cut) for 4-input cuts
+        let mut npn_map: HashMap<u16, (u32, Vec<u32>)> = HashMap::new();
+
+        for (idx, _) in self.ands.iter().enumerate() {
+            let node_id = 1 + n_pis + idx as u32;
+            let node_cuts = &cuts[node_id as usize];
+
+            for cut in node_cuts {
+                if cut.len() != 4 {
+                    continue;
+                }
+                if let Some(tt) = self.cut_truth_table(node_id, cut) {
+                    let tt4 = (tt & 0xFFFF) as u16;
+                    let canon = Self::npn_canonical_4(tt4);
+
+                    // If we've seen this NPN class before, we could share
+                    // For now, just record it (full sharing needs LUT-level logic)
+                    npn_map.entry(canon).or_insert((node_id, cut.clone()));
+                }
+            }
+        }
+
+        // TODO: Implement actual sharing/replacement based on NPN equivalence
+        // This requires LUT-level mapping integration
+
+        rewritten
+    }
+
     /// Build fanout map: node_id -> list of (user_node_id, input_pos).
     /// Input pos: 0 = left fanin, 1 = right fanin, 2 = output.
     /// Used by rewriting passes to update all users when a node is replaced.
