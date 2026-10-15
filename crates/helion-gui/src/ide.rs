@@ -417,7 +417,7 @@ fn primitive_of(kind: &CellKind) -> String {
         CellKind::ClockBuf => "BUFG".into(),
         CellKind::Mac27 | CellKind::Dsp48e1 { .. } => "MAC27".into(),
         CellKind::Ila { .. } => "ILA".into(),
-        CellKind::Bram18 => "BRAM18".into(),
+        CellKind::Bram18 | CellKind::Bram18e1 { .. } => "BRAM18".into(),
         CellKind::Carry4 => "CARRY4".into(),
         CellKind::BlackBox { module } => format!("BLACKBOX:{}", resolve(*module)),
     }
@@ -14445,7 +14445,7 @@ impl IdeModel {
                         CellKind::ClockBuf => "BUFG",
                         CellKind::Mac27 | CellKind::Dsp48e1 { .. } => "DSP",
                         CellKind::Ila { .. } => "ILA",
-                        CellKind::Bram18 => "BRAM",
+                        CellKind::Bram18 | CellKind::Bram18e1 { .. } => "BRAM",
                         CellKind::Carry4 => "CARRY",
                         CellKind::BlackBox { .. } => "BOX",
                     };
@@ -14739,7 +14739,7 @@ impl IdeModel {
                     CellKind::ClockBuf => ("BUFG", "-".into()),
                     CellKind::Mac27 | CellKind::Dsp48e1 { .. } => ("DSP", "-".into()),
                     CellKind::Ila { .. } => ("ILA", "-".into()),
-                    CellKind::Bram18 => ("BRAM", "-".into()),
+                    CellKind::Bram18 | CellKind::Bram18e1 { .. } => ("BRAM", "-".into()),
                     CellKind::Carry4 => ("CARRY", "-".into()),
                     CellKind::BlackBox { .. } => ("BOX", "-".into()),
                 };
@@ -18621,7 +18621,7 @@ impl IdeModel {
             CellKind::Lut6 { .. } => h.lut += 1,
             CellKind::Hff => h.ff += 1,
             CellKind::IobOut => h.iob += 1,
-            CellKind::Bram18 => h.bram += 1,
+            CellKind::Bram18 | CellKind::Bram18e1 { .. } => h.bram += 1,
             CellKind::Mac27 | CellKind::Dsp48e1 { .. } => h.dsp += 1,
             _ => {}
         }
@@ -22115,7 +22115,7 @@ impl IdeModel {
                     CellKind::ClockBuf => "net".into(),
                     CellKind::Ila { .. } => "ila".into(),
                     CellKind::Mac27 | CellKind::Dsp48e1 { .. } => "dsp".into(),
-                    CellKind::Bram18 => "bram".into(),
+                    CellKind::Bram18 | CellKind::Bram18e1 { .. } => "bram".into(),
                     CellKind::Carry4 => "carry".into(),
                     CellKind::BlackBox { .. } => "instance".into(),
                 };

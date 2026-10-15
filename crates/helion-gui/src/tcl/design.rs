@@ -224,7 +224,7 @@ fn cell_type(kind: &CellKind) -> &'static str {
         CellKind::ClockBuf => "bufg",
         CellKind::Mac27 => "dsp",
         CellKind::Dsp48e1 { .. } => "dsp",
-        CellKind::Bram18 => "bram",
+        CellKind::Bram18 | CellKind::Bram18e1 { .. } => "bram",
         CellKind::Carry4 => "carry",
         CellKind::BlackBox { .. } => "blackbox",
         CellKind::Ila { .. } => "ila",
