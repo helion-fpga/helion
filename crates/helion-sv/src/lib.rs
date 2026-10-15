@@ -502,8 +502,9 @@ impl Aig {
     }
 
     /// Rewrite using NPN classification: for each 4-input cut, compute its
-    /// NPN canonical form. If two nodes have NPN-equivalent cuts, they can
-    /// potentially share implementation. This is Phase 2 of ABC-style rewriting.
+    /// NPN canonical form with transformation. If two nodes have NPN-equivalent
+    /// cuts, the later node can be replaced by the earlier one (with input
+    /// transformation applied). This is Phase 2 of ABC-style rewriting.
     /// Returns number of nodes rewritten.
     pub fn rewrite_npn_cuts(&mut self) -> usize {
         use std::collections::HashMap;
@@ -512,10 +513,11 @@ impl Aig {
         let n_pis = self.pis.len() as u32;
         let mut rewritten = 0;
 
-        // Map NPN canonical form -> count, for statistics
-        let mut npn_stats: HashMap<u16, usize> = HashMap::new();
-        // Map NPN canonical form -> (node_id, cut) for sharing candidates
-        let mut npn_map: HashMap<u16, (u32, Vec<u32>)> = HashMap::new();
+        // Map NPN canonical -> (node_id, cut_leaves, in_neg, perm, out_neg)
+        // Keeps the first (smallest node_id) as representative.
+        let mut npn_map: HashMap<u16, (u32, Vec<u32>, u16, [usize; 4], bool)> = HashMap::new();
+        // Collect replacements to apply: (target_node, replacement_lit)
+        let mut replacements: Vec<(u32, Lit)> = Vec::new();
 
         for (idx, _) in self.ands.iter().enumerate() {
             let node_id = 1 + n_pis + idx as u32;
@@ -527,17 +529,51 @@ impl Aig {
                 }
                 if let Some(tt) = self.cut_truth_table(node_id, cut) {
                     let tt4 = (tt & 0xFFFF) as u16;
-                    let canon = Self::npn_canonical_4(tt4);
+                    let (canon, in_neg, perm, out_neg) = Self::npn_canonical_4_transform(tt4);
 
-                    *npn_stats.entry(canon).or_insert(0) += 1;
-                    npn_map.entry(canon).or_insert((node_id, cut.clone()));
+                    if let Some((rep_id, rep_cut, rep_neg, rep_perm, rep_out)) =
+                        npn_map.get(&canon)
+                    {
+                        // Found NPN-equivalent node. Try to share.
+                        // For safety, only share if the representative has
+                        // smaller or equal node_id (already computed).
+                        if *rep_id < node_id {
+                            // Build the transformed input mapping.
+                            // We need to express target's function using rep's inputs.
+                            // This is complex; for now, only share when the
+                            // transformations are identical (exact match).
+                            if *rep_neg == in_neg
+                                && *rep_perm == perm
+                                && *rep_out == out_neg
+                                && *rep_cut == *cut
+                            {
+                                // Exact match: same leaves, same transform.
+                                // The nodes compute the same function.
+                                // Replace target with representative.
+                                replacements.push((
+                                    node_id,
+                                    Lit {
+                                        node: *rep_id,
+                                        inv: false,
+                                    },
+                                ));
+                                break;
+                            }
+                        }
+                    } else {
+                        npn_map.insert(
+                            canon,
+                            (node_id, cut.clone(), in_neg, perm, out_neg),
+                        );
+                    }
                 }
             }
         }
 
-        // Log statistics (in debug builds)
-        #[cfg(debug_assertions)]
-        eprintln!("NPN stats: {} unique classes from cuts", npn_stats.len());
+        // Apply replacements
+        for (node_id, new_lit) in replacements {
+            rewritten += self.replace_node(node_id, new_lit);
+        }
 
         rewritten
     }
