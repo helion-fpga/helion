@@ -24164,5 +24164,19 @@ endmodule
         // Constant 1 should map to 0 (via output negation)
         assert_eq!(Aig::npn_canonical_4(0xFFFF), 0x0000);
     }
+
+    #[test]
+    fn depends_on_all_4_basic() {
+        // AND4 depends on all 4 inputs
+        assert!(Aig::depends_on_all_4(0x8000));
+        // OR4 depends on all 4 inputs
+        assert!(Aig::depends_on_all_4(0xFFFE));
+        // Function of only 3 inputs (ignores input 3): 0x00FF00FF pattern
+        // Actually 0xFF00 depends only on input 3 (bit 3)
+        // Let's use AND of first 3 inputs: truth table where bit 3 is don't-care
+        // For AND3 (inputs 0,1,2): output 1 when m=0b0111=7, and also when m=15 (bit3=1)
+        let and3_ignoring_3 = 0x8080u16; // bits 7 and 15 set
+        assert!(!Aig::depends_on_all_4(and3_ignoring_3));
+    }
 }
 
