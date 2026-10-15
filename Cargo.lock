@@ -1646,6 +1646,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "helion-sat"
+version = "3.0.0"
+
+[[package]]
 name = "helion-sim"
 version = "3.0.0"
 dependencies = [
