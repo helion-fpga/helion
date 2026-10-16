@@ -1346,6 +1346,10 @@ struct Rtl<'a> {
     params: Vec<(String, u128)>,
     toks: Vec<Tok<'a>>,
     mem_inits: HashMap<&'a str, BTreeMap<usize, u128>>,
+    /// Variable-address memory writes for BRAM inference:
+    /// (mem_name, addr_expr, data_expr). The address is preserved
+    /// instead of being discarded.
+    mem_writes: Vec<MemWrite<'a>>,
     /// Negedge-only always writes noted during parse (replaces the old
     /// NEGEDGE_WRITES thread-local; per-module data belongs on the module).
     negedge_writes: Vec<NegedgeWrite<'a>>,
@@ -6154,6 +6158,12 @@ enum LhsKind<'a> {
         lo: usize,
         width: usize,
     },
+    /// Variable-address memory write: `mem[addr_expr] <= data`.
+    /// The address expression is preserved for BRAM inference.
+    MemWrite {
+        name: &'a str,
+        addr: RExpr<'a>,
+    },
 }
 
 /// Encode unpacked word+bit so word 0 is distinct from packed bit 0.
@@ -6209,6 +6219,7 @@ fn lhs_kind_assigns<'a>(
     match kind {
         LhsKind::Whole(n) => vec![(n, None, rhs)],
         LhsKind::Bit(n, b) => vec![(n, Some(b), rhs)],
+        LhsKind::MemWrite { name, .. } => vec![(name, None, rhs)],
         LhsKind::Slice { name, lo, width } => {
             let w = width.max(1);
             (0..w)
@@ -6358,11 +6369,12 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: &'a str) -> Result<LhsKind<'a>,
                 }
                 Ok(LhsKind::Bit(name, idx))
             }
-            Some(Tok::Ident(_)) => {
+            Some(Tok::Ident(id)) => {
+                let addr = RExpr::Ident(p.arena.alloc_str(id));
                 if !p.eat_sym(']') {
                     return Err("]".into());
                 }
-                Ok(LhsKind::Whole(name))
+                Ok(LhsKind::MemWrite { name, addr })
             }
             _ => Err("lhs index".into()),
         }
@@ -6372,6 +6384,11 @@ fn parse_lhs_after_name<'a>(p: &mut P<'a>, name: &'a str) -> Result<LhsKind<'a>,
 }
 
 type Nba<'a> = (&'a str, Option<usize>, RExpr<'a>);
+
+/// Memory write with variable address: (mem_name, addr_expr, data_expr).
+/// Captured for BRAM inference; the address expression is preserved
+/// instead of being discarded like the old LhsKind::Whole fallback.
+type MemWrite<'a> = (&'a str, RExpr<'a>, RExpr<'a>);
 
 /// One sequential statement's parse output: either NBA assignments or an
 /// immediate SVA assertion (v3.0 subset). `parse_seq_item` additionally
@@ -6572,6 +6589,14 @@ fn parse_nba<'a>(p: &mut P<'a>) -> Result<Nba<'a>, String> {
         LhsKind::Unpacked { name, word, lo, .. } => {
             Ok((name, Some(encode_unpacked_bit(word, lo)), rhs))
         }
+        LhsKind::MemWrite { name, addr } => Ok((
+            name,
+            None,
+            RExpr::WordAt {
+                addr: p.arena.alloc(addr),
+                data: p.arena.alloc(rhs),
+            },
+        )),
     }
 }
 
@@ -9608,6 +9633,7 @@ fn parse_one_module<'a>(mut p: &mut P<'a>) -> Result<Rtl<'a>, String> {
         toks,
         mem_inits,
         negedge_writes,
+        mem_writes: vec![],
         sva_conc,
         sva_imm,
     })
@@ -10217,6 +10243,11 @@ fn parse_module_items<'a>(
                             for i in 0..width.max(1) {
                                 parts.push((name, Some(encode_unpacked_bit(word, lo + i))));
                             }
+                        }
+                        Ok(LhsKind::MemWrite { name, .. }) => {
+                            // Variable-address write in continuous assign:
+                            // not in subset, treat as whole (conservative).
+                            parts.push((name, None));
                         }
                         Err(_) => break,
                     }
@@ -18534,6 +18565,7 @@ fn flatten_module_ov_vis<'s>(
         toks: src.toks.clone(),
         mem_inits: src.mem_inits.clone(),
         negedge_writes: src.negedge_writes.clone(),
+        mem_writes: src.mem_writes.clone(),
         sva_conc: src.sva_conc.clone(),
         sva_imm: src.sva_imm.clone(),
     };
@@ -20608,6 +20640,7 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -20653,6 +20686,7 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -20692,6 +20726,7 @@ endmodule
             toks: vec![],
             mem_inits: Default::default(),
             negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
         };
@@ -24322,6 +24357,7 @@ endmodule
                 toks: vec![],
                 mem_inits,
                 negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: Vec::new(),
             sva_imm: Vec::new(),
             }
@@ -24389,6 +24425,7 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
         };
@@ -24480,6 +24517,7 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
         };
@@ -24626,6 +24664,7 @@ endmodule
             toks: vec![],
             mem_inits: HashMap::new(),
             negedge_writes: vec![],
+            mem_writes: vec![],
             sva_conc: vec![],
             sva_imm: vec![],
         };
