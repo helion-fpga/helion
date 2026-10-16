@@ -29566,7 +29566,7 @@ end architecture;
         for i in 0..n {
             let inn = format!("io_master_aw_payload_{i:02}");
             let out = format!("io_slave_r_payload_{i:02}");
-            let lut = format!("u_lut{i}");
+            let lut = format!("u_luts0{i}");
             v.ports.push(SchematicPort {
                 name: inn.clone(),
                 dir: "IN".into(),
@@ -30441,9 +30441,9 @@ endmodule
             "blinky die is not counter's canned occupants: {b_bels:?}"
         );
         assert!(dump.contains("occ u_luts0="), "{dump}");
-        assert!(bdump.contains("occ u_lut="), "{bdump}");
-        assert!(!bdump.contains("occ u_luts0="), "{bdump}");
-        assert!(blinky.device.occupant_of("u_lut").is_some());
+        assert!(bdump.contains("occ u_luts0="), "{bdump}");
+        assert!(!bdump.contains("occ u_luts3="), "{bdump}");
+        assert!(blinky.device.occupant_of("u_luts0").is_some());
         assert!(blinky.device.occupant_of("u_luts0").is_none());
     }
 
@@ -32141,7 +32141,7 @@ endmodule
             blinky
                 .memory_rows()
                 .iter()
-                .any(|m| m.name == "u_lut" && m.packed_word() == 0x5555_5555_5555_5555),
+                .any(|m| m.name == "u_luts0" && m.packed_word() == 0x5555_5555_5555_5555),
             "{:?}",
             blinky.memory_rows()
         );
@@ -32568,7 +32568,7 @@ endmodule
         assert!(!IdeModel::tcl_input_complete("foreach i {1 2 3} {\n puts $i"));
         assert!(!IdeModel::tcl_input_complete("set a \"hello"));
         assert!(!IdeModel::tcl_input_complete("expr {2+2"));
-        assert!(!IdeModel::tcl_input_complete("set b [get_cells u_lut"));
+        assert!(!IdeModel::tcl_input_complete("set b [get_cells u_luts0"));
         // unbalanced close: complete (the interpreter reports the error)
         assert!(IdeModel::tcl_input_complete("puts hi}"));
         // braces inside quotes don't count; quotes inside braces don't count
@@ -34213,7 +34213,7 @@ endmodule
         blinky.open_source(&example("blinky.sv")).unwrap();
         blinky.exec("create_pblock pblock_blinky").unwrap();
         blinky
-            .exec("add_cells_to_pblock pblock_blinky u_lut")
+            .exec("add_cells_to_pblock pblock_blinky u_luts0")
             .unwrap();
         assert!(
             blinky
@@ -38248,9 +38248,9 @@ endmodule
             !btable.contains("PARENT=counter") && !btable.contains("top=counter"),
             "blinky netlist is not counter: {btable}"
         );
-        let bsel = blinky.exec("select_netlist u_lut").unwrap();
-        assert!(bsel.contains("NAME=u_lut"), "{bsel}");
-        assert_eq!(blinky.selected.as_deref(), Some("u_lut"));
+        let bsel = blinky.exec("select_netlist u_luts0").unwrap();
+        assert!(bsel.contains("NAME=u_luts0"), "{bsel}");
+        assert_eq!(blinky.selected.as_deref(), Some("u_luts0"));
         assert!(
             blinky
                 .netlist_rows()
@@ -38360,9 +38360,9 @@ endmodule
                 .contains("no object"),
             "blinky Netlist is per-session, not canned counter LUT"
         );
-        let bsel = blinky.exec("select_netlist_object u_lut").unwrap();
-        assert!(bsel.contains("OBJECT=u_lut"), "{bsel}");
-        assert_eq!(blinky.selected.as_deref(), Some("u_lut"));
+        let bsel = blinky.exec("select_netlist_object u_luts0").unwrap();
+        assert!(bsel.contains("OBJECT=u_luts0"), "{bsel}");
+        assert_eq!(blinky.selected.as_deref(), Some("u_luts0"));
         assert_eq!(blinky.workspace, WorkspaceTab::Schematic);
     }
 
