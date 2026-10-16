@@ -17911,7 +17911,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
         // Generic wide-cone decomposition BEFORE wide_capped check.
         // Does not use AIG batch, so not subject to the cap.
-        if cone_pi_exceeds(&expr_rom, 6) {
+        // Skip relational operators (they stay assign_not_lowered by design).
+        if cone_pi_exceeds(&expr_rom, 6) && !rel_sig.contains_key(bitn) {
             if decompose_wide_cone(
                 &mut d,
                 &mut share,
@@ -17928,8 +17929,6 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
         }
         if wide_capped && cone_pi_exceeds(expr, 6) {
-            if bitn.contains("mem_la_read") {
-            }
             if let Some(sig) = rel_sig.get(bitn) {
                 note_assign_not_lowered(&rtl.module, sig);
             }
