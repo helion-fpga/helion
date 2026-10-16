@@ -1430,6 +1430,7 @@ dependencies = [
  "helion-sta",
  "helion-sv",
  "helion-vhdl",
+ "rayon",
 ]
 
 [[package]]
@@ -1646,10 +1647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helion-sat"
-version = "3.0.0"
-
-[[package]]
 name = "helion-sim"
 version = "3.0.0"
 dependencies = [
@@ -1690,6 +1687,7 @@ dependencies = [
  "helion-pack",
  "helion-place",
  "helion-route",
+ "rayon",
  "sv-parser",
  "varisat",
 ]
