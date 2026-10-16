@@ -2269,13 +2269,17 @@ mod resize_tests {
 
     #[test]
     fn status_left_segments_respect_the_right_indicator_dock() {
-        let bar_right = 1440.0;
+        // Tight budget: must yield low-priority segments before the dock.
+        let bar_right = 900.0;
         let left_budget = bar_right - STATUS_RIGHT_WIDTH - 16.0;
         let widths = [188.0, 112.0, 240.0, 160.0, 92.0, 128.0, 76.0];
         let shown = status_visible_count(&widths, left_budget);
         let used: f32 = widths[..shown].iter().sum();
         assert!(used <= left_budget, "{used}px of status segments exceed {left_budget}px");
         assert!(shown < widths.len(), "low-priority segments should yield before the dock");
+        // Wide budget: everything fits.
+        let wide_budget = 1440.0 - STATUS_RIGHT_WIDTH - 16.0;
+        assert_eq!(status_visible_count(&widths, wide_budget), widths.len());
     }
 
     /// Sim nav keeps a proportional share; nav + separator + wave always sum

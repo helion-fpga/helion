@@ -1025,7 +1025,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         "clear" => ("clear", "clear the console transcript"),
         "get_cells" => (
             "get_cells ?-hierarchical? ?-filter expr? ?-of_objects objs? ?-quiet? ?patterns...?",
-            "cells in the netlist (u_lut0, u_ff3…); -filter {TYPE == lut}",
+            "cells in the netlist (u_luts0, u_ff3…); -filter {TYPE == lut}",
         ),
         "get_nets" => (
             "get_nets ?-filter expr? ?-of_objects objs? ?patterns...?",
@@ -1033,7 +1033,7 @@ fn help_topic(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "get_pins" => (
             "get_pins ?-of_objects cells? ?patterns...?",
-            "pins as cell/pin (u_lut0/A)",
+            "pins as cell/pin (u_luts0/A)",
         ),
         "get_ports" => ("get_ports ?patterns...?", "top-level ports"),
         "get_clocks" => (

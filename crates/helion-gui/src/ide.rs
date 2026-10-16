@@ -25845,8 +25845,8 @@ end architecture;
         );
         ide.select("u_luts0");
         assert_eq!(ide.selected_cell(), Some("u_luts0"));
-        assert!(ide.netlist_has_selected(), "netlist must see u_lut0");
-        assert!(ide.schematic_has_selected(), "schematic must see u_lut0");
+        assert!(ide.netlist_has_selected(), "netlist must see u_luts0");
+        assert!(ide.schematic_has_selected(), "schematic must see u_luts0");
         assert_eq!(ide.properties_name(), Some("u_luts0"));
         assert!(ide.hierarchy.has("u_luts0"), "{:?}", ide.hierarchy.nodes);
         assert_eq!(ide.hierarchy.top.as_deref(), Some("counter"));
@@ -25858,8 +25858,8 @@ end architecture;
             "{:?}",
             ide.properties
         );
-        let found = ide.exec("find u_lut0").unwrap();
-        assert!(found.contains("cell:u_lut0"), "{found}");
+        let found = ide.exec("find u_luts0").unwrap();
+        assert!(found.contains("cell:u_luts0"), "{found}");
         assert!(
             ide.find_results
                 .iter()
@@ -25872,7 +25872,7 @@ end architecture;
         ide.run_step(FlowStep::Place).unwrap();
         assert!(
             ide.device.occupant_of("u_luts0").is_some(),
-            "placed u_lut0 must occupy a HAD site: {:?}",
+            "placed u_luts0 must occupy a HAD site: {:?}",
             ide.device
                 .sites
                 .iter()
@@ -26423,7 +26423,7 @@ end architecture;
         assert!(ide.hw.programmed);
         assert_eq!(ide.hw.stat.as_ref().map(|s| s.done), Some(true));
 
-        let eco = ide.exec("eco u_lut0 0xAAAAAAAAAAAAAAAA").unwrap();
+        let eco = ide.exec("eco u_luts0 0xAAAAAAAAAAAAAAAA").unwrap();
         assert!(eco.contains("eco"), "{eco}");
         let hash1 = ide.bitstream_hash().expect("hash after eco");
         assert_ne!(hash1, hash0, "ECO LUT INIT must change the bitstream hash");
@@ -28251,12 +28251,12 @@ end architecture;
             "disable_timing WNS is per-design STA, not canned"
         );
         blinky
-            .exec("set_case_analysis 1 [get_pins u_lut0/I0]")
+            .exec("set_case_analysis 1 [get_pins u_luts0/I0]")
             .unwrap();
         assert!(
             blinky
                 .constraints_text()
-                .contains("set_case_analysis 1 u_lut0"),
+                .contains("set_case_analysis 1 u_luts0"),
             "{}",
             blinky.constraints_text()
         );
@@ -28362,13 +28362,13 @@ end architecture;
         let n0 = neg_ide.wns_ps().unwrap();
         let n_net = neg_ide.timing.as_ref().unwrap().clk_net_ps;
         let neg = neg_ide
-            .exec("set_clock_sense -negative [get_pins u_lut0/I0]")
+            .exec("set_clock_sense -negative [get_pins u_luts0/I0]")
             .unwrap();
         assert!(neg.contains("SENSE=negative"), "{neg}");
         assert!(
             neg_ide
                 .constraints_text()
-                .contains("set_clock_sense -negative u_lut0"),
+                .contains("set_clock_sense -negative u_luts0"),
             "{}",
             neg_ide.constraints_text()
         );
@@ -28406,7 +28406,7 @@ end architecture;
         assert_eq!(b1, b0 - b_net);
         assert_ne!(b1, wns_prop, "propagated WNS is per-design STA, not canned");
         blinky
-            .exec("set_clock_sense -negative [get_pins u_lut0/I0]")
+            .exec("set_clock_sense -negative [get_pins u_luts0/I0]")
             .unwrap();
         let b2 = blinky.wns_ps().unwrap();
         assert_eq!(b2, b1 - 5_000);
@@ -29410,9 +29410,9 @@ end architecture;
             dump.contains("box="),
             "must report symbol boxes, not a list: {dump}"
         );
-        assert!(dump.contains("u_lut0:LUT6:box="), "{dump}");
-        assert!(dump.contains("u_lut0.O:out@"), "{dump}");
-        assert!(dump.contains("u_lut0.I0:in@"), "{dump}");
+        assert!(dump.contains("u_luts0:LUT6:box="), "{dump}");
+        assert!(dump.contains("u_luts0.O:out@"), "{dump}");
+        assert!(dump.contains("u_luts0.I0:in@"), "{dump}");
         assert!(dump.contains("wire:"), "{dump}");
         assert!(dump.contains("pts="), "{dump}");
 
@@ -29427,7 +29427,7 @@ end architecture;
             .symbols
             .iter()
             .find(|s| s.name == "u_luts0")
-            .expect("u_lut0 symbol");
+            .expect("u_luts0 symbol");
         assert!(lut.w > 8.0 && lut.h > 8.0, "symbol is a box {:?}", lut);
         assert!(
             lut.pins.iter().any(|p| p.name == "O" && p.output),
@@ -29458,20 +29458,20 @@ end architecture;
             "LUT6 schematic symbol has I0–I5: {:?}",
             lut.pins
         );
-        assert!(!i0.net.is_empty(), "u_lut0 I0 is on an HNF net: {:?}", i0);
+        assert!(!i0.net.is_empty(), "u_luts0 I0 is on an HNF net: {:?}", i0);
         let i5 = lut.pins.iter().find(|p| p.name == "I5").expect("I5");
         assert!(
             i5.net.is_empty(),
-            "u_lut0 I5 is n/c on the incrementer: {:?}",
+            "u_luts0 I5 is n/c on the incrementer: {:?}",
             i5
         );
-        assert!(dump.contains("u_lut0.I5:in@"), "{dump}");
+        assert!(dump.contains("u_luts0.I5:in@"), "{dump}");
         assert!(dump.contains(":nc"), "n/c pins in the drawing dump: {dump}");
         let d0 = d
             .wires
             .iter()
             .find(|w| w.src == "u_luts0" && w.src_pin == "O")
-            .expect("u_lut0/O drives a net polyline");
+            .expect("u_luts0/O drives a net polyline");
         assert!(
             d0.points.len() >= 2,
             "O net is a polyline, not a name: {:?}",
@@ -29480,7 +29480,7 @@ end architecture;
         assert_eq!(d0.points[0], (o.x, o.y), "polyline starts at the O stub");
         assert!(
             d0.dst.contains("ff") || d0.dst_pin == "D",
-            "u_lut0/O fans to an FF D pin: {}/{}",
+            "u_luts0/O fans to an FF D pin: {}/{}",
             d0.dst,
             d0.dst_pin
         );
@@ -29492,7 +29492,7 @@ end architecture;
             d.wires
                 .iter()
                 .any(|w| w.src == "u_luts0" || w.dst == "u_luts0"),
-            "u_lut0 is on a net polyline: {:?}",
+            "u_luts0 is on a net polyline: {:?}",
             d.wires
                 .iter()
                 .map(|w| format!("{}->{}", w.src, w.dst))
@@ -30348,10 +30348,10 @@ endmodule
             .device
             .occupant_of("u_luts0")
             .cloned()
-            .expect("placed u_lut0 occupies a HAD CLB");
+            .expect("placed u_luts0 occupies a HAD CLB");
         assert_eq!(lut.occupancy_char(), 'L');
         assert!(
-            dump.contains(&format!("occ u_lut0={}", lut.site_name())),
+            dump.contains(&format!("occ u_luts0={}", lut.site_name())),
             "drawing names the HAD site, not a canned pin: {dump}"
         );
         assert!(!dump.contains("occupied=0"), "place fills the die: {dump}");
@@ -30372,7 +30372,7 @@ endmodule
         assert_eq!(
             row.as_bytes().get(dx).copied(),
             Some(b'L'),
-            "u_lut0 must mark the die map at X{}Y{}: {row}",
+            "u_luts0 must mark the die map at X{}Y{}: {row}",
             lut.x,
             lut.y
         );
@@ -30396,7 +30396,7 @@ endmodule
         let sel = ide
             .exec(&format!("select_device_site X{}Y{}", lut.x, lut.y))
             .unwrap();
-        assert!(sel.contains("occupant=u_lut0"), "{sel}");
+        assert!(sel.contains("occupant=u_luts0"), "{sel}");
         assert_eq!(ide.selected_cell(), Some("u_luts0"));
         assert!(ide.device_has_selected());
         assert!(ide.netlist_has_selected());
@@ -30440,9 +30440,9 @@ endmodule
             !b_bels.iter().any(|b| *b == "u_luts0"),
             "blinky die is not counter's canned occupants: {b_bels:?}"
         );
-        assert!(dump.contains("occ u_lut0="), "{dump}");
+        assert!(dump.contains("occ u_luts0="), "{dump}");
         assert!(bdump.contains("occ u_lut="), "{bdump}");
-        assert!(!bdump.contains("occ u_lut0="), "{bdump}");
+        assert!(!bdump.contains("occ u_luts0="), "{bdump}");
         assert!(blinky.device.occupant_of("u_lut").is_some());
         assert!(blinky.device.occupant_of("u_luts0").is_none());
     }
@@ -30745,7 +30745,7 @@ endmodule
         let sch = ide.exec("open_elaborated_schematic").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert!(sch.contains("box="), "opens the schematic drawing: {sch}");
-        assert!(sch.contains("u_lut0:LUT6:box="), "{sch}");
+        assert!(sch.contains("u_luts0:LUT6:box="), "{sch}");
 
         let impl_out = ide.exec("run_implementation").unwrap();
         assert!(
@@ -31994,7 +31994,7 @@ endmodule
 
         let mem = ide.exec("memory").unwrap();
         assert!(mem.contains('\n'), "Memory must be a table: {mem}");
-        assert!(mem.contains("NAME=u_lut0"), "{mem}");
+        assert!(mem.contains("NAME=u_luts0"), "{mem}");
         assert!(mem.contains("TYPE=lut_init"), "{mem}");
         assert!(mem.contains("DATA=0x5555555555555555"), "{mem}");
         assert!(mem.contains("DEPTH=64"), "{mem}");
@@ -32025,8 +32025,8 @@ endmodule
         assert_eq!(lut3.packed_word(), helion_ir::INC4_INIT[3]);
         assert_ne!(lut0.data_cell(), lut3.data_cell());
 
-        let sel = ide.exec("select_memory u_lut0").unwrap();
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let sel = ide.exec("select_memory u_luts0").unwrap();
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("ADDR=0 DATA=1"), "{sel}");
         assert_eq!(ide.selected_memory.as_deref(), Some("u_luts0"));
         assert!(
@@ -32134,7 +32134,7 @@ endmodule
         let bmem = blinky.exec("memory").unwrap();
         assert!(bmem.contains("NAME=u_lut"), "{bmem}");
         assert!(
-            !bmem.contains("NAME=u_lut0"),
+            !bmem.contains("NAME=u_luts0"),
             "blinky is not counter: {bmem}"
         );
         assert!(
@@ -32199,13 +32199,13 @@ endmodule
         let gold_wns = fab.wns_ps();
         fab.sim_run(16).unwrap();
         let fmem = fab.exec("memory").unwrap();
-        assert!(fmem.contains("NAME=u_lut0"), "{fmem}");
+        assert!(fmem.contains("NAME=u_luts0"), "{fmem}");
         assert!(fmem.contains("TYPE=lut_init"), "{fmem}");
         let flut0 = fab
             .memory_rows()
             .iter()
             .find(|m| m.name == "u_luts0")
-            .expect("fabric u_lut0");
+            .expect("fabric u_luts0");
         assert_eq!(
             flut0.packed_word(),
             helion_ir::INC4_INIT[0],
@@ -33870,7 +33870,7 @@ endmodule
         blinky.exec("io_ports").unwrap();
         assert!(
             blinky
-                .exec("select_io_port_object u_lut0")
+                .exec("select_io_port_object u_luts0")
                 .unwrap_err()
                 .contains("no object"),
             "blinky I/O Ports is per-session, not canned counter LUT"
@@ -33998,7 +33998,7 @@ endmodule
             ide.properties
         );
 
-        let add = ide.exec("add_cells_to_pblock pblock_0 u_lut0").unwrap();
+        let add = ide.exec("add_cells_to_pblock pblock_0 u_luts0").unwrap();
         assert!(add.contains("u_luts0"), "{add}");
         assert!(
             ide.pblocks[0].cells.iter().any(|c| c == "u_luts0"),
@@ -34163,13 +34163,13 @@ endmodule
             empty_obj.contains("no object"),
             "unranged empty pblock has no HNF/HAD objects: {empty_obj}"
         );
-        ide.exec("add_cells_to_pblock pblock_0 u_lut0").unwrap();
+        ide.exec("add_cells_to_pblock pblock_0 u_luts0").unwrap();
         let table = ide.exec("pblocks").unwrap();
         assert!(table.contains("NAME=pblock_0"), "{table}");
-        assert!(table.contains("OBJECTS=u_lut0"), "{table}");
+        assert!(table.contains("OBJECTS=u_luts0"), "{table}");
 
-        let sel = ide.exec("select_pblock_object u_lut0").unwrap();
-        assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
+        let sel = ide.exec("select_pblock_object u_luts0").unwrap();
+        assert!(sel.contains("OBJECT=u_luts0"), "{sel}");
         assert!(sel.contains("NAME=pblock_0"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_pblock.as_deref(), Some("pblock_0"));
@@ -34217,7 +34217,7 @@ endmodule
             .unwrap();
         assert!(
             blinky
-                .exec("select_pblock_object u_lut0")
+                .exec("select_pblock_object u_luts0")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Pblocks are per-session, not canned counter LUT"
@@ -37589,7 +37589,7 @@ endmodule
             "empty click must refuse"
         );
         assert!(
-            ide.exec("select_find u_lut0")
+            ide.exec("select_find u_luts0")
                 .unwrap_err()
                 .contains("no hits"),
             "idle pane must refuse a click"
@@ -37611,15 +37611,15 @@ endmodule
         );
 
         ide.open_source(&example("counter.sv")).unwrap();
-        let table = ide.exec("find u_lut0").unwrap();
+        let table = ide.exec("find u_luts0").unwrap();
         assert_eq!(ide.workspace, WorkspaceTab::Find);
-        assert!(table.contains("cell:u_lut0"), "{table}");
+        assert!(table.contains("cell:u_luts0"), "{table}");
         assert!(
             table.contains('\n'),
             "must not be a one-liner dump: {table}"
         );
         assert!(table.contains("find_results n="), "{table}");
-        assert!(table.contains("NAME=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
         assert!(table.contains("TYPE=cell"), "{table}");
         assert!(table.contains("PRIMITIVE=LUT6"), "{table}");
         assert!(table.contains("PARENT=counter"), "{table}");
@@ -37635,8 +37635,8 @@ endmodule
             "parent is HNF top, not a dump stub: {rows:?}"
         );
 
-        let sel = ide.exec("select_find u_lut0").unwrap();
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let sel = ide.exec("select_find u_luts0").unwrap();
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("TYPE=cell"), "{sel}");
         assert!(sel.contains("PRIMITIVE=LUT6"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
@@ -37680,7 +37680,7 @@ endmodule
             ide.find_rows()
         );
         let cells = ide.exec("sheet_find cells").unwrap();
-        assert!(cells.contains("NAME=u_lut0"), "{cells}");
+        assert!(cells.contains("NAME=u_luts0"), "{cells}");
         assert!(cells.contains("TYPE=cell"), "{cells}");
         assert!(cells.contains("PRIMITIVE=LUT6"), "{cells}");
 
@@ -37696,10 +37696,10 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         let gold = ide.wns_ps().expect("STA after route");
         assert_ne!(gold, 0);
-        let after = ide.exec("find u_lut0").unwrap();
-        assert!(after.contains("NAME=u_lut0"), "{after}");
-        let click = ide.exec("select_find u_lut0").unwrap();
-        assert!(click.contains("NAME=u_lut0"), "{click}");
+        let after = ide.exec("find u_luts0").unwrap();
+        assert!(after.contains("NAME=u_luts0"), "{after}");
+        let click = ide.exec("select_find u_luts0").unwrap();
+        assert!(click.contains("NAME=u_luts0"), "{click}");
         let pin_hits = ide.exec("find IOB").unwrap();
         assert!(
             pin_hits.contains("TYPE=pin") || pin_hits.contains("TYPE=cell"),
@@ -37721,7 +37721,7 @@ endmodule
             "Find Results are per-session, not canned: {btable}"
         );
         assert!(
-            blinky.exec("find u_lut0").unwrap_err().contains("0 hits"),
+            blinky.exec("find u_luts0").unwrap_err().contains("0 hits"),
             "blinky has no counter LUT"
         );
         blinky.exec("sheet_find cells").unwrap();
@@ -37751,7 +37751,7 @@ endmodule
                 .contains("missing name")
         );
         assert!(
-            ide.exec("select_find_object u_lut0")
+            ide.exec("select_find_object u_luts0")
                 .unwrap_err()
                 .contains("no hits"),
             "idle pane must refuse an object click"
@@ -37761,18 +37761,18 @@ endmodule
         ide.run_step(FlowStep::Route).unwrap();
         assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold WNS");
 
-        let table = ide.exec("find u_lut0").unwrap();
-        assert!(table.contains("NAME=u_lut0"), "{table}");
-        assert!(table.contains("OBJECTS=u_lut0"), "{table}");
-        let sel = ide.exec("select_find_object u_lut0").unwrap();
-        assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let table = ide.exec("find u_luts0").unwrap();
+        assert!(table.contains("NAME=u_luts0"), "{table}");
+        assert!(table.contains("OBJECTS=u_luts0"), "{table}");
+        let sel = ide.exec("select_find_object u_luts0").unwrap();
+        assert!(sel.contains("OBJECT=u_luts0"), "{sel}");
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("TYPE=cell"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_find, Some(0));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_luts0");
         assert!(
             ide.tree
                 .cells
@@ -37826,7 +37826,7 @@ endmodule
         assert_eq!(blinky.workspace, WorkspaceTab::Schematic);
         assert!(
             blinky
-                .exec("select_find_object u_lut0")
+                .exec("select_find_object u_luts0")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Find is per-session, not canned counter LUT"
@@ -37868,7 +37868,7 @@ endmodule
             table.contains('\n'),
             "must not be a one-liner dump: {table}"
         );
-        assert!(table.contains("NAME=NAME VALUE=u_lut0"), "{table}");
+        assert!(table.contains("NAME=NAME VALUE=u_luts0"), "{table}");
         assert!(table.contains("NAME=PRIMITIVE VALUE=LUT6"), "{table}");
         assert!(table.contains("NAME=INIT"), "{table}");
         let rows = ide.property_rows();
@@ -37888,7 +37888,7 @@ endmodule
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         let by_idx = ide.exec("select_property 0").unwrap();
         assert!(by_idx.contains("NAME=NAME"), "{by_idx}");
-        assert!(by_idx.contains("VALUE=u_lut0"), "{by_idx}");
+        assert!(by_idx.contains("VALUE=u_luts0"), "{by_idx}");
         assert_eq!(ide.selected_property.as_deref(), Some("NAME"));
 
         ide.run_step(FlowStep::Opt).unwrap();
@@ -37902,7 +37902,7 @@ endmodule
         let site = ide
             .device
             .occupant_of("u_luts0")
-            .expect("placed u_lut0 occupies a HAD site")
+            .expect("placed u_luts0 occupies a HAD site")
             .site_name();
         assert!(
             ide.property_rows()
@@ -37987,7 +37987,7 @@ endmodule
         assert!(btable.contains("NAME=NAME VALUE=led"), "{btable}");
         assert!(btable.contains("NAME=TYPE VALUE=port"), "{btable}");
         assert!(
-            !btable.contains("VALUE=u_lut0"),
+            !btable.contains("VALUE=u_luts0"),
             "Properties are per-session, not canned: {btable}"
         );
         assert!(
@@ -38031,7 +38031,7 @@ endmodule
             "empty netlist click must refuse"
         );
         assert!(
-            ide.exec("select_netlist u_lut0")
+            ide.exec("select_netlist u_luts0")
                 .unwrap_err()
                 .contains("no cells/nets"),
             "idle pane must refuse a netlist click"
@@ -38130,7 +38130,7 @@ endmodule
         );
         assert!(table.contains("netlist n="), "{table}");
         assert!(table.contains("top=counter"), "{table}");
-        assert!(table.contains("NAME=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
         assert!(table.contains("TYPE=LUT6"), "{table}");
         assert!(table.contains("TYPE=net"), "{table}");
         assert!(table.contains("NAME=cnt_3"), "{table}");
@@ -38154,8 +38154,8 @@ endmodule
             "IOB primitive must show: {rows:?}"
         );
 
-        let sel = ide.exec("select_netlist u_lut0").unwrap();
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let sel = ide.exec("select_netlist u_luts0").unwrap();
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("TYPE=LUT6"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
@@ -38217,10 +38217,10 @@ endmodule
         let gold = ide.wns_ps().expect("STA after route");
         assert_ne!(gold, 0);
         let after = ide.exec("netlist").unwrap();
-        assert!(after.contains("NAME=u_lut0"), "{after}");
+        assert!(after.contains("NAME=u_luts0"), "{after}");
         assert!(after.contains("TYPE=LUT6"), "{after}");
-        let click = ide.exec("select_netlist u_lut0").unwrap();
-        assert!(click.contains("NAME=u_lut0"), "{click}");
+        let click = ide.exec("select_netlist u_luts0").unwrap();
+        assert!(click.contains("NAME=u_luts0"), "{click}");
         let src_again = ide.exec("select_source counter.sv").unwrap();
         assert!(src_again.contains("TYPE=sv"), "{src_again}");
         assert_eq!(
@@ -38241,7 +38241,7 @@ endmodule
         assert!(btable.contains("NAME=u_lut"), "{btable}");
         assert!(btable.contains("top=blinky"), "{btable}");
         assert!(
-            !btable.contains("NAME=u_lut0"),
+            !btable.contains("NAME=u_luts0"),
             "Netlist is per-session, not canned: {btable}"
         );
         assert!(
@@ -38287,26 +38287,26 @@ endmodule
                 .contains("missing name")
         );
         assert!(
-            ide.exec("select_netlist_object u_lut0")
+            ide.exec("select_netlist_object u_luts0")
                 .unwrap_err()
                 .contains("no cells/nets"),
             "idle pane must refuse an object click"
         );
         ide.open_source(&example("counter.sv")).unwrap();
         let table = ide.exec("netlist").unwrap();
-        assert!(table.contains("NAME=u_lut0"), "{table}");
-        assert!(table.contains("OBJECTS=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
+        assert!(table.contains("OBJECTS=u_luts0"), "{table}");
         assert!(table.contains("OBJECTS=cnt_3"), "{table}");
 
-        let sel = ide.exec("select_netlist_object u_lut0").unwrap();
-        assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let sel = ide.exec("select_netlist_object u_luts0").unwrap();
+        assert!(sel.contains("OBJECT=u_luts0"), "{sel}");
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("TYPE=LUT6"), "{sel}");
         assert!(sel.contains("KIND=cell"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_luts0");
         assert!(
             ide.tree
                 .cells
@@ -38341,8 +38341,8 @@ endmodule
         ide.run_step(FlowStep::Place).unwrap();
         ide.run_step(FlowStep::Route).unwrap();
         assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold WNS");
-        let after = ide.exec("select_netlist_object u_lut0").unwrap();
-        assert!(after.contains("OBJECT=u_lut0"), "{after}");
+        let after = ide.exec("select_netlist_object u_luts0").unwrap();
+        assert!(after.contains("OBJECT=u_luts0"), "{after}");
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert_eq!(
             ide.wns_ps(),
@@ -38355,7 +38355,7 @@ endmodule
         blinky.exec("netlist").unwrap();
         assert!(
             blinky
-                .exec("select_netlist_object u_lut0")
+                .exec("select_netlist_object u_luts0")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Netlist is per-session, not canned counter LUT"
@@ -40046,7 +40046,7 @@ endmodule
         assert_eq!(ide.bottom_tab, BottomTab::Jobs);
         assert!(table.contains("eco_changes n="), "{table}");
         assert!(table.contains("engine=helion-place"), "{table}");
-        assert!(table.contains("NAME=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
         assert!(table.contains("KIND=LUT"), "{table}");
         assert!(table.contains("STATUS=Placed"), "{table}");
         assert!(table.contains("SITE=CLB_"), "{table}");
@@ -40132,7 +40132,7 @@ endmodule
             "ECO Changes must not disturb gold WNS"
         );
 
-        let lut = ide.exec("select_eco u_lut0").unwrap();
+        let lut = ide.exec("select_eco u_luts0").unwrap();
         assert!(lut.contains("STATUS=Placed"), "{lut}");
         assert!(lut.contains("SITE=CLB_"), "{lut}");
         assert_eq!(ide.wns_ps(), Some(9640));
@@ -40147,7 +40147,7 @@ endmodule
             "ECO Changes is per-session, not canned: {btable}"
         );
         assert!(
-            !btable.contains("NAME=u_lut0"),
+            !btable.contains("NAME=u_luts0"),
             "blinky rows are blinky HNF, not counter: {btable}"
         );
         let bsel = blinky.exec("select_eco 0").unwrap();
@@ -40170,7 +40170,7 @@ endmodule
                 .contains("missing name")
         );
         assert!(
-            ide.exec("select_eco_object u_lut0")
+            ide.exec("select_eco_object u_luts0")
                 .unwrap_err()
                 .contains("eco_changes empty"),
             "idle pane must refuse an object click"
@@ -40179,18 +40179,18 @@ endmodule
         ide.exec("launch_runs impl_1").unwrap();
         assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold WNS");
         let table = ide.exec("eco_changes").unwrap();
-        assert!(table.contains("NAME=u_lut0"), "{table}");
-        assert!(table.contains("OBJECTS=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
+        assert!(table.contains("OBJECTS=u_luts0"), "{table}");
 
-        let sel = ide.exec("select_eco_object u_lut0").unwrap();
-        assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let sel = ide.exec("select_eco_object u_luts0").unwrap();
+        assert!(sel.contains("OBJECT=u_luts0"), "{sel}");
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("KIND=LUT"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_eco.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_luts0");
         assert!(
             ide.tree
                 .cells
@@ -40232,7 +40232,7 @@ endmodule
         blinky.exec("eco_changes").unwrap();
         assert!(
             blinky
-                .exec("select_eco_object u_lut0")
+                .exec("select_eco_object u_luts0")
                 .unwrap_err()
                 .contains("no object"),
             "blinky ECO is per-session, not canned counter LUT"
@@ -40300,7 +40300,7 @@ endmodule
         assert!(table.contains("engine=helion-place"), "{table}");
         assert!(table.contains("NAME=cells"), "{table}");
         assert!(table.contains("KIND=resource"), "{table}");
-        assert!(table.contains("NAME=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
         assert!(table.contains("KIND=LUT"), "{table}");
         assert!(table.contains("STATUS=Reused"), "{table}");
         assert!(table.contains("SITE=CLB_"), "{table}");
@@ -40344,7 +40344,7 @@ endmodule
             ide.properties
         );
 
-        let lut = ide.exec("select_incremental u_lut0").unwrap();
+        let lut = ide.exec("select_incremental u_luts0").unwrap();
         assert!(lut.contains("STATUS=Reused"), "{lut}");
         assert!(lut.contains("SITE=CLB_"), "{lut}");
         assert_eq!(ide.workspace, WorkspaceTab::Device);
@@ -40397,7 +40397,7 @@ endmodule
             "Incremental Compile is per-session, not canned: {btable}"
         );
         assert!(
-            !btable.contains("NAME=u_lut0"),
+            !btable.contains("NAME=u_luts0"),
             "blinky rows are blinky HNF, not counter: {btable}"
         );
         let bsel = blinky.exec("select_incremental 0").unwrap();
@@ -40423,7 +40423,7 @@ endmodule
                 .contains("missing name")
         );
         assert!(
-            ide.exec("select_incremental_object u_lut0")
+            ide.exec("select_incremental_object u_luts0")
                 .unwrap_err()
                 .contains("incremental_report empty"),
             "idle pane must refuse an object click"
@@ -40433,18 +40433,18 @@ endmodule
         assert_eq!(ide.wns_ps(), Some(9640), "empty XDC counter gold WNS");
         ide.exec("incremental_impl").unwrap();
         let table = ide.exec("incremental_report").unwrap();
-        assert!(table.contains("NAME=u_lut0"), "{table}");
-        assert!(table.contains("OBJECTS=u_lut0"), "{table}");
+        assert!(table.contains("NAME=u_luts0"), "{table}");
+        assert!(table.contains("OBJECTS=u_luts0"), "{table}");
 
-        let sel = ide.exec("select_incremental_object u_lut0").unwrap();
-        assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
-        assert!(sel.contains("NAME=u_lut0"), "{sel}");
+        let sel = ide.exec("select_incremental_object u_luts0").unwrap();
+        assert!(sel.contains("OBJECT=u_luts0"), "{sel}");
+        assert!(sel.contains("NAME=u_luts0"), "{sel}");
         assert!(sel.contains("KIND=LUT"), "{sel}");
         assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_incremental.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
-        assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
+        assert!(ide.netlist_has_selected(), "netlist must highlight u_luts0");
         assert!(
             ide.tree
                 .cells
@@ -40504,7 +40504,7 @@ endmodule
         blinky.exec("incremental_report").unwrap();
         assert!(
             blinky
-                .exec("select_incremental_object u_lut0")
+                .exec("select_incremental_object u_luts0")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Incremental is per-session, not canned counter LUT"
@@ -42741,8 +42741,12 @@ endmodule
                 // Look for ??? inside a string literal (not in a comment).
                 if let Some(code) = t.split("//").next() {
                     if code.contains("\"") && code.contains(&q) {
-                        // Skip this test's own pattern-construction lines.
-                        if t.contains("repeat(3)") || t.contains("contains(&q)") {
+                        // Skip this test's own pattern-construction lines and
+                        // the bin tests' forbidden-string lists.
+                        if t.contains("repeat(3)")
+                            || t.contains("contains(&q)")
+                            || t.contains("forbidden in [")
+                        {
                             continue;
                         }
                         hits.push(format!("{}:{}: {}", path.display(), i + 1, t));
