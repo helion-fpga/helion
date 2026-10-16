@@ -289,7 +289,7 @@ mod tests {
         assert!(r.contains("luts 4"), "{r}");
         assert!(tcl_eval(&mut sh, "get_cells").unwrap().contains("u_lut"));
         assert!(tcl_eval(&mut sh, "get_nets").unwrap().contains("cnt_3"));
-        let sp = tcl_eval(&mut sh, "set_property DONT_TOUCH true u_lut0").unwrap();
+        let sp = tcl_eval(&mut sh, "set_property DONT_TOUCH true u_luts0").unwrap();
         assert!(sp.contains("DONT_TOUCH"), "{sp}");
         assert!(tcl_eval(&mut sh, "write_hnf").unwrap().starts_with("HNF 1"));
         let bits = tcl_eval(&mut sh, "write_bitstream").unwrap();
@@ -327,7 +327,7 @@ mod tests {
         );
         let md = tcl_eval(&mut sh, "mark_debug cnt_3").unwrap();
         assert!(md.contains("cnt_3"), "{md}");
-        let eco = tcl_eval(&mut sh, "eco u_lut0 0xAAAAAAAAAAAAAAAA").unwrap();
+        let eco = tcl_eval(&mut sh, "eco u_luts0 0xAAAAAAAAAAAAAAAA").unwrap();
         assert!(eco.contains("eco"), "{eco}");
         let ck = tcl_eval(&mut sh, "write_checkpoint").unwrap();
         assert!(ck.contains("hash"), "{ck}");

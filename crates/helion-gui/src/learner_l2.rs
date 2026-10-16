@@ -176,7 +176,7 @@ mod tests {
             kind: SiteKind::Clb,
         };
         assert!(dev.contains_site(site), "fixture site in HAD");
-        let endpoints = vec![("u_lut0".into(), site)];
+        let endpoints = vec![("u_luts0".into(), site)];
         let hs =
             highlight_set_from_endpoints(&dev, &endpoints, &["clk".into(), "q".into()]).unwrap();
         assert_eq!(hs.sites, vec!["CLB_X2Y1".to_string()]);
