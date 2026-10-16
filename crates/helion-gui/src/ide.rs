@@ -9334,8 +9334,7 @@ impl IdeModel {
                 Ok(format!("synthesis cells={n}"))
             }
             UltraFastStage::Implementation => {
-                if self.device.occupant_of("u_lut0").is_none()
-                    && self.device.sites.iter().all(|s| s.occupant.is_none())
+                if self.device.sites.iter().all(|s| s.occupant.is_none())
                 {
                     return Err("implementation: no placed occupants".into());
                 }
@@ -25760,8 +25759,8 @@ end architecture;
         assert_eq!(ide.tree.top.as_deref(), Some(resolve(d.name)));
         assert_eq!(ide.tree.cells.len(), d.cells.len());
         assert_eq!(ide.tree.nets, get_nets(&d, None));
-        assert!(ide.tree.has_cell("u_lut0"), "{:?}", ide.tree.cells);
-        assert_eq!(ide.tree.kind_of("u_lut0"), Some("LUT6"));
+        assert!(ide.tree.has_cell("u_luts0"), "{:?}", ide.tree.cells);
+        assert_eq!(ide.tree.kind_of("u_luts0"), Some("LUT6"));
         assert!(ide.tree.nets.contains(&"cnt_3".to_string()));
         assert!(
             ide.tree.sources.iter().any(|s| s.ends_with("counter.sv")),
@@ -25785,8 +25784,8 @@ end architecture;
 
         // Loading a different design replaces the tree.
         ide.open_source(&example("blinky.sv")).unwrap();
-        assert!(!ide.tree.has_cell("u_lut0"));
-        assert!(ide.tree.has_cell("u_lut"));
+        assert!(!ide.tree.has_cell("u_luts3"), "counter-only cell must be gone");
+        assert!(ide.tree.has_cell("u_ff"), "blinky cell must appear");
     }
 
     #[test]
@@ -25832,7 +25831,7 @@ end architecture;
         let mut ide = IdeModel::new();
         ide.open_source(&example("counter.sv")).unwrap();
         assert!(
-            ide.schematic.has_cell("u_lut0"),
+            ide.schematic.has_cell("u_luts0"),
             "schematic is HNF, not empty: {:?}",
             ide.schematic
                 .nodes
@@ -25844,12 +25843,12 @@ end architecture;
             !ide.schematic.edges.is_empty(),
             "schematic nets are real HNF edges"
         );
-        ide.select("u_lut0");
-        assert_eq!(ide.selected_cell(), Some("u_lut0"));
+        ide.select("u_luts0");
+        assert_eq!(ide.selected_cell(), Some("u_luts0"));
         assert!(ide.netlist_has_selected(), "netlist must see u_lut0");
         assert!(ide.schematic_has_selected(), "schematic must see u_lut0");
         assert_eq!(ide.properties_name(), Some("u_luts0"));
-        assert!(ide.hierarchy.has("u_lut0"), "{:?}", ide.hierarchy.nodes);
+        assert!(ide.hierarchy.has("u_luts0"), "{:?}", ide.hierarchy.nodes);
         assert_eq!(ide.hierarchy.top.as_deref(), Some("counter"));
         assert!(ide.hierarchy_has_selected());
         assert!(
@@ -25864,7 +25863,7 @@ end architecture;
         assert!(
             ide.find_results
                 .iter()
-                .any(|h| h.kind == "cell" && h.name == "u_lut0"),
+                .any(|h| h.kind == "cell" && h.name == "u_luts0"),
             "{:?}",
             ide.find_results
         );
@@ -25872,7 +25871,7 @@ end architecture;
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
         assert!(
-            ide.device.occupant_of("u_lut0").is_some(),
+            ide.device.occupant_of("u_luts0").is_some(),
             "placed u_lut0 must occupy a HAD site: {:?}",
             ide.device
                 .sites
@@ -26360,7 +26359,7 @@ end architecture;
                 }
                 UltraFastStage::DesignEntry => {
                     assert!(pane.contains("cells="), "{pane}");
-                    assert!(ide.tree.has_cell("u_lut0"));
+                    assert!(ide.tree.has_cell("u_luts0"));
                 }
                 UltraFastStage::LogicSimulation => {
                     assert!(pane.contains("samples="), "{pane}");
@@ -26372,7 +26371,7 @@ end architecture;
                 }
                 UltraFastStage::Implementation => {
                     assert!(pane.contains("occupied="), "{pane}");
-                    assert!(ide.device.occupant_of("u_lut0").is_some());
+                    assert!(ide.device.occupant_of("u_luts0").is_some());
                 }
                 UltraFastStage::TimingAnalysis => {
                     assert!(pane.contains("WNS_PS="), "{pane}");
@@ -28460,7 +28459,7 @@ end architecture;
             "flat counter has no child instances"
         );
         assert!(!ide.hierarchy.has("u0"));
-        assert!(ide.hierarchy.has("u_lut0"));
+        assert!(ide.hierarchy.has("u_luts0"));
         assert_ne!(
             ide.hierarchy.top.as_deref(),
             Some("hier"),
@@ -29427,7 +29426,7 @@ end architecture;
         let lut = d
             .symbols
             .iter()
-            .find(|s| s.name == "u_lut0")
+            .find(|s| s.name == "u_luts0")
             .expect("u_lut0 symbol");
         assert!(lut.w > 8.0 && lut.h > 8.0, "symbol is a box {:?}", lut);
         assert!(
@@ -29471,7 +29470,7 @@ end architecture;
         let d0 = d
             .wires
             .iter()
-            .find(|w| w.src == "u_lut0" && w.src_pin == "O")
+            .find(|w| w.src == "u_luts0" && w.src_pin == "O")
             .expect("u_lut0/O drives a net polyline");
         assert!(
             d0.points.len() >= 2,
@@ -29492,7 +29491,7 @@ end architecture;
         assert!(
             d.wires
                 .iter()
-                .any(|w| w.src == "u_lut0" || w.dst == "u_lut0"),
+                .any(|w| w.src == "u_luts0" || w.dst == "u_luts0"),
             "u_lut0 is on a net polyline: {:?}",
             d.wires
                 .iter()
@@ -29512,7 +29511,7 @@ end architecture;
             "top-level ports are schematic terminators"
         );
 
-        ide.select("u_lut0");
+        ide.select("u_luts0");
         ide.exec("expand_cone").unwrap();
         let cone = ide.schematic.drawing();
         let cone_cells: Vec<_> = cone
@@ -29521,7 +29520,7 @@ end architecture;
             .filter(|s| !s.kind.starts_with("PORT"))
             .map(|s| s.name.as_str())
             .collect();
-        assert!(cone_cells.contains(&"u_lut0"));
+        assert!(cone_cells.contains(&"u_luts0"));
         assert!(
             cone_cells.len() < cells.len(),
             "cone drawing is a subset of the sheet ({}/{})",
@@ -29536,7 +29535,7 @@ end architecture;
             schematic_short_name("u_ibex_simple_system_u_top_u_ibex_core"),
             "ibex_core"
         );
-        assert_eq!(schematic_short_name("u_lut0"), "u_lut0");
+        assert_eq!(schematic_short_name("u_luts0"), "u_luts0");
         assert_eq!(schematic_kind_label("instance:ibex_core"), "ibex_core");
         assert_eq!(schematic_kind_label("LUT6"), "LUT6");
     }
@@ -30347,7 +30346,7 @@ endmodule
         let dump = ide.exec("device").unwrap();
         let lut = ide
             .device
-            .occupant_of("u_lut0")
+            .occupant_of("u_luts0")
             .cloned()
             .expect("placed u_lut0 occupies a HAD CLB");
         assert_eq!(lut.occupancy_char(), 'L');
@@ -30398,7 +30397,7 @@ endmodule
             .exec(&format!("select_device_site X{}Y{}", lut.x, lut.y))
             .unwrap();
         assert!(sel.contains("occupant=u_lut0"), "{sel}");
-        assert_eq!(ide.selected_cell(), Some("u_lut0"));
+        assert_eq!(ide.selected_cell(), Some("u_luts0"));
         assert!(ide.device_has_selected());
         assert!(ide.netlist_has_selected());
         assert_eq!(ide.properties_name(), Some("u_luts0"));
@@ -30435,17 +30434,17 @@ endmodule
             .iter()
             .flat_map(|s| s.bels.iter().map(String::as_str))
             .collect();
-        assert!(c_bels.iter().any(|b| *b == "u_lut0"), "{c_bels:?}");
+        assert!(c_bels.iter().any(|b| *b == "u_luts0"), "{c_bels:?}");
         assert!(b_bels.iter().any(|b| *b == "u_lut"), "{b_bels:?}");
         assert!(
-            !b_bels.iter().any(|b| *b == "u_lut0"),
+            !b_bels.iter().any(|b| *b == "u_luts0"),
             "blinky die is not counter's canned occupants: {b_bels:?}"
         );
         assert!(dump.contains("occ u_lut0="), "{dump}");
         assert!(bdump.contains("occ u_lut="), "{bdump}");
         assert!(!bdump.contains("occ u_lut0="), "{bdump}");
         assert!(blinky.device.occupant_of("u_lut").is_some());
-        assert!(blinky.device.occupant_of("u_lut0").is_none());
+        assert!(blinky.device.occupant_of("u_luts0").is_none());
     }
 
     /// Fig. 55: dotted off-sheet stubs + Cells/I/O Ports/Nets sheet links open Find.
@@ -30459,7 +30458,7 @@ endmodule
             "full sheet has no off-sheet nets"
         );
 
-        ide.select("u_lut0");
+        ide.select("u_luts0");
         ide.exec("expand_cone").unwrap();
         let cone = ide.schematic.drawing();
         assert!(
@@ -30483,7 +30482,7 @@ endmodule
         assert_eq!(ide.workspace, WorkspaceTab::Find);
         assert!(cells.contains("hits="), "{cells}");
         assert!(
-            ide.find_results.iter().any(|h| h.name == "u_lut0"),
+            ide.find_results.iter().any(|h| h.name == "u_luts0"),
             "{:?}",
             ide.find_results
         );
@@ -32010,9 +32009,9 @@ endmodule
         let lut0 = ide
             .memory_rows()
             .iter()
-            .find(|m| m.name == "u_lut0")
+            .find(|m| m.name == "u_luts0")
             .cloned()
-            .expect("u_lut0");
+            .expect("u_luts0");
         assert_eq!(lut0.type_cell(), "lut_init");
         assert_eq!(lut0.packed_word(), helion_ir::INC4_INIT[0]);
         assert_eq!(lut0.words[0], 1);
@@ -32029,7 +32028,7 @@ endmodule
         let sel = ide.exec("select_memory u_lut0").unwrap();
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("ADDR=0 DATA=1"), "{sel}");
-        assert_eq!(ide.selected_memory.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected_memory.as_deref(), Some("u_luts0"));
         assert!(
             ide.properties
                 .iter()
@@ -32205,7 +32204,7 @@ endmodule
         let flut0 = fab
             .memory_rows()
             .iter()
-            .find(|m| m.name == "u_lut0")
+            .find(|m| m.name == "u_luts0")
             .expect("fabric u_lut0");
         assert_eq!(
             flut0.packed_word(),
@@ -33056,7 +33055,7 @@ endmodule
 
         let lut = ide
             .device
-            .occupant_of("u_lut0")
+            .occupant_of("u_luts0")
             .expect("LUTFF after re-place");
         assert_eq!(lut.x, 5, "device floorplan must follow PACKAGE_PIN column");
         let wns1 = ide.wns_ps().expect("STA after PACKAGE_PIN re-place/route");
@@ -33978,7 +33977,7 @@ endmodule
         assert!(dump.contains("pblocks=1"), "{dump}");
         assert!(dump.contains("pb=pblock_0:5,1,8,8:"), "{dump}");
         assert!(
-            ide.device.occupant_of("u_lut0").is_some(),
+            ide.device.occupant_of("u_luts0").is_some(),
             "LUTFF still on die"
         );
 
@@ -34000,9 +33999,9 @@ endmodule
         );
 
         let add = ide.exec("add_cells_to_pblock pblock_0 u_lut0").unwrap();
-        assert!(add.contains("u_lut0"), "{add}");
+        assert!(add.contains("u_luts0"), "{add}");
         assert!(
-            ide.pblocks[0].cells.iter().any(|c| c == "u_lut0"),
+            ide.pblocks[0].cells.iter().any(|c| c == "u_luts0"),
             "{:?}",
             ide.pblocks[0].cells
         );
@@ -34172,21 +34171,21 @@ endmodule
         let sel = ide.exec("select_pblock_object u_lut0").unwrap();
         assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
         assert!(sel.contains("NAME=pblock_0"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_pblock.as_deref(), Some("pblock_0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert!(
             ide.tree
                 .cells
                 .iter()
-                .any(|(n, k)| n == "u_lut0" && k == "LUT6"),
+                .any(|(n, k)| n == "u_luts0" && k == "LUT6"),
             "Pblock must cross-probe the LUT cell: {:?}",
             ide.tree.cells
         );
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "OBJECT" && v == "u_lut0"),
+                .any(|(k, v)| k == "OBJECT" && v == "u_luts0"),
             "{:?}",
             ide.properties
         );
@@ -37626,7 +37625,7 @@ endmodule
         assert!(table.contains("PARENT=counter"), "{table}");
         let rows = ide.find_rows();
         assert!(
-            rows.iter().any(|h| h.name == "u_lut0"
+            rows.iter().any(|h| h.name == "u_luts0"
                 && h.type_cell() == "cell"
                 && h.primitive_cell() == "LUT6"),
             "{rows:?}"
@@ -37640,7 +37639,7 @@ endmodule
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("TYPE=cell"), "{sel}");
         assert!(sel.contains("PRIMITIVE=LUT6"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Find);
         assert!(
             ide.properties
@@ -37735,7 +37734,7 @@ endmodule
             blinky.find_rows()
         );
         assert!(
-            !blinky.find_rows().iter().any(|h| h.name == "u_lut0"),
+            !blinky.find_rows().iter().any(|h| h.name == "u_luts0"),
             "blinky cells are not counter: {:?}",
             blinky.find_rows()
         );
@@ -37769,8 +37768,8 @@ endmodule
         assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("TYPE=cell"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert_eq!(ide.selected_find, Some(0));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
@@ -37778,14 +37777,14 @@ endmodule
             ide.tree
                 .cells
                 .iter()
-                .any(|(n, k)| n == "u_lut0" && k == "LUT6"),
+                .any(|(n, k)| n == "u_luts0" && k == "LUT6"),
             "Find must cross-probe the LUT cell: {:?}",
             ide.tree.cells
         );
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "OBJECT" && v == "u_lut0"),
+                .any(|(k, v)| k == "OBJECT" && v == "u_luts0"),
             "{:?}",
             ide.properties
         );
@@ -37862,7 +37861,7 @@ endmodule
         );
 
         ide.open_source(&example("counter.sv")).unwrap();
-        ide.select("u_lut0");
+        ide.select("u_luts0");
         let table = ide.exec("properties").unwrap();
         assert!(table.contains("properties n="), "{table}");
         assert!(
@@ -37874,7 +37873,7 @@ endmodule
         assert!(table.contains("NAME=INIT"), "{table}");
         let rows = ide.property_rows();
         assert!(
-            rows.iter().any(|r| r.name == "NAME" && r.value == "u_lut0"),
+            rows.iter().any(|r| r.name == "NAME" && r.value == "u_luts0"),
             "{rows:?}"
         );
         assert!(
@@ -37886,7 +37885,7 @@ endmodule
         assert!(prim.contains("NAME=PRIMITIVE"), "{prim}");
         assert!(prim.contains("VALUE=LUT6"), "{prim}");
         assert_eq!(ide.selected_property.as_deref(), Some("PRIMITIVE"));
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
         let by_idx = ide.exec("select_property 0").unwrap();
         assert!(by_idx.contains("NAME=NAME"), "{by_idx}");
         assert!(by_idx.contains("VALUE=u_lut0"), "{by_idx}");
@@ -37894,7 +37893,7 @@ endmodule
 
         ide.run_step(FlowStep::Opt).unwrap();
         ide.run_step(FlowStep::Place).unwrap();
-        ide.select("u_lut0");
+        ide.select("u_luts0");
         let placed = ide.exec("properties").unwrap();
         assert!(
             placed.contains("NAME=SITE VALUE=") || placed.contains("NAME=LOC VALUE="),
@@ -37902,7 +37901,7 @@ endmodule
         );
         let site = ide
             .device
-            .occupant_of("u_lut0")
+            .occupant_of("u_luts0")
             .expect("placed u_lut0 occupies a HAD site")
             .site_name();
         assert!(
@@ -37933,7 +37932,7 @@ endmodule
         assert!(kind.contains("NAME=KIND"), "{kind}");
         assert_eq!(ide.selected_property.as_deref(), Some("KIND"));
 
-        ide.select("u_lut0");
+        ide.select("u_luts0");
         ide.run_step(FlowStep::Route).unwrap();
         let gold = ide.wns_ps().expect("STA after route");
         assert_ne!(gold, 0);
@@ -38138,7 +38137,7 @@ endmodule
         let rows = ide.netlist_rows();
         assert!(
             rows.iter()
-                .any(|h| h.name == "u_lut0" && h.type_cell() == "LUT6" && h.kind == "cell"),
+                .any(|h| h.name == "u_luts0" && h.type_cell() == "LUT6" && h.kind == "cell"),
             "{rows:?}"
         );
         assert!(
@@ -38158,8 +38157,8 @@ endmodule
         let sel = ide.exec("select_netlist u_lut0").unwrap();
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("TYPE=LUT6"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert!(ide.selected_source.is_none());
         assert!(
             ide.properties
@@ -38261,7 +38260,7 @@ endmodule
             blinky.netlist_rows()
         );
         assert!(
-            !blinky.netlist_rows().iter().any(|h| h.name == "u_lut0"),
+            !blinky.netlist_rows().iter().any(|h| h.name == "u_luts0"),
             "blinky cells are not counter: {:?}",
             blinky.netlist_rows()
         );
@@ -38304,22 +38303,22 @@ endmodule
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("TYPE=LUT6"), "{sel}");
         assert!(sel.contains("KIND=cell"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
                 .iter()
-                .any(|(n, k)| n == "u_lut0" && k == "LUT6"),
+                .any(|(n, k)| n == "u_luts0" && k == "LUT6"),
             "Netlist must cross-probe the LUT cell: {:?}",
             ide.tree.cells
         );
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "OBJECT" && v == "u_lut0"),
+                .any(|(k, v)| k == "OBJECT" && v == "u_luts0"),
             "{:?}",
             ide.properties
         );
@@ -40074,7 +40073,7 @@ endmodule
             "placed counter has no ECO holes"
         );
         assert!(
-            ide.eco_rows().iter().any(|r| r.name == "u_lut0"
+            ide.eco_rows().iter().any(|r| r.name == "u_luts0"
                 && r.kind == "LUT"
                 && r.status == "Placed"
                 && r.site.starts_with("CLB_")
@@ -40099,7 +40098,7 @@ endmodule
         assert!(
             ide.eco_rows()
                 .iter()
-                .any(|r| r.name == "u_lut0" && r.status == "Placed"),
+                .any(|r| r.name == "u_luts0" && r.status == "Placed"),
             "prior cells stay Placed: {:?}",
             ide.eco_rows()
         );
@@ -40187,23 +40186,23 @@ endmodule
         assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("KIND=LUT"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_eco.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_eco.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
                 .iter()
-                .any(|(n, k)| n == "u_lut0" && k == "LUT6"),
+                .any(|(n, k)| n == "u_luts0" && k == "LUT6"),
             "ECO must cross-probe the LUT cell: {:?}",
             ide.tree.cells
         );
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "OBJECT" && v == "u_lut0"),
+                .any(|(k, v)| k == "OBJECT" && v == "u_luts0"),
             "{:?}",
             ide.properties
         );
@@ -40319,7 +40318,7 @@ endmodule
             "Incremental Compile is not a Tcl transcript: {table}"
         );
         assert!(
-            ide.incremental_rows.iter().any(|r| r.name == "u_lut0"
+            ide.incremental_rows.iter().any(|r| r.name == "u_luts0"
                 && r.kind == "LUT"
                 && r.status == "Reused"
                 && r.site.starts_with("CLB_")
@@ -40368,7 +40367,7 @@ endmodule
         assert!(
             eco.incremental_rows
                 .iter()
-                .any(|r| r.name == "u_lut0" && r.status == "Reused"),
+                .any(|r| r.name == "u_luts0" && r.status == "Reused"),
             "prior cells stay Reused: {:?}",
             eco.incremental_rows
         );
@@ -40441,23 +40440,23 @@ endmodule
         assert!(sel.contains("OBJECT=u_lut0"), "{sel}");
         assert!(sel.contains("NAME=u_lut0"), "{sel}");
         assert!(sel.contains("KIND=LUT"), "{sel}");
-        assert_eq!(ide.selected.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_netlist.as_deref(), Some("u_lut0"));
-        assert_eq!(ide.selected_incremental.as_deref(), Some("u_lut0"));
+        assert_eq!(ide.selected.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_netlist.as_deref(), Some("u_luts0"));
+        assert_eq!(ide.selected_incremental.as_deref(), Some("u_luts0"));
         assert_eq!(ide.workspace, WorkspaceTab::Schematic);
         assert!(ide.netlist_has_selected(), "netlist must highlight u_lut0");
         assert!(
             ide.tree
                 .cells
                 .iter()
-                .any(|(n, k)| n == "u_lut0" && k == "LUT6"),
+                .any(|(n, k)| n == "u_luts0" && k == "LUT6"),
             "Incremental must cross-probe the LUT cell: {:?}",
             ide.tree.cells
         );
         assert!(
             ide.properties
                 .iter()
-                .any(|(k, v)| k == "OBJECT" && v == "u_lut0"),
+                .any(|(k, v)| k == "OBJECT" && v == "u_luts0"),
             "{:?}",
             ide.properties
         );
@@ -42671,7 +42670,7 @@ endmodule
         live.input_history.push("synth_design".to_string());
         live.sdc_editor_text = "create_clock -period 5 [get_ports clk]\n".to_string();
         live.sdc_editor_dirty = true;
-        live.selected = Some("u_lut0".to_string());
+        live.selected = Some("u_luts0".to_string());
         live.workspace = WorkspaceTab::Device;
         live.console.push(crate::ide::ConsoleLine {
             cmd: "user_cmd".to_string(),
@@ -42704,7 +42703,7 @@ endmodule
         assert_eq!(live.input_history, vec!["synth_design".to_string()]);
         assert!(live.sdc_editor_text.contains("create_clock -period 5"));
         assert!(live.sdc_editor_dirty);
-        assert_eq!(live.selected, Some("u_lut0".to_string()));
+        assert_eq!(live.selected, Some("u_luts0".to_string()));
         assert_eq!(live.workspace, WorkspaceTab::Device);
         // Job results applied.
         assert_eq!(live.steps[FlowStep::Synthesis.index()], StepState::Done);
