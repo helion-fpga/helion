@@ -30444,7 +30444,6 @@ endmodule
         assert!(bdump.contains("occ u_luts0="), "{bdump}");
         assert!(!bdump.contains("occ u_luts3="), "{bdump}");
         assert!(blinky.device.occupant_of("u_luts0").is_some());
-        assert!(blinky.device.occupant_of("u_luts0").is_none());
     }
 
     /// Fig. 55: dotted off-sheet stubs + Cells/I/O Ports/Nets sheet links open Find.
@@ -32019,9 +32018,9 @@ endmodule
         let lut3 = ide
             .memory_rows()
             .iter()
-            .find(|m| m.name == "u_lut3")
+            .find(|m| m.name == "u_luts3")
             .cloned()
-            .expect("u_lut3");
+            .expect("u_luts3");
         assert_eq!(lut3.packed_word(), helion_ir::INC4_INIT[3]);
         assert_ne!(lut0.data_cell(), lut3.data_cell());
 
@@ -34217,7 +34216,7 @@ endmodule
             .unwrap();
         assert!(
             blinky
-                .exec("select_pblock_object u_luts0")
+                .exec("select_pblock_object u_luts3")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Pblocks are per-session, not canned counter LUT"
@@ -37734,7 +37733,7 @@ endmodule
             blinky.find_rows()
         );
         assert!(
-            !blinky.find_rows().iter().any(|h| h.name == "u_luts0"),
+            !blinky.find_rows().iter().any(|h| h.name == "u_luts3"),
             "blinky cells are not counter: {:?}",
             blinky.find_rows()
         );
@@ -38260,7 +38259,7 @@ endmodule
             blinky.netlist_rows()
         );
         assert!(
-            !blinky.netlist_rows().iter().any(|h| h.name == "u_luts0"),
+            !blinky.netlist_rows().iter().any(|h| h.name == "u_luts3"),
             "blinky cells are not counter: {:?}",
             blinky.netlist_rows()
         );
@@ -40232,7 +40231,7 @@ endmodule
         blinky.exec("eco_changes").unwrap();
         assert!(
             blinky
-                .exec("select_eco_object u_luts0")
+                .exec("select_eco_object u_luts3")
                 .unwrap_err()
                 .contains("no object"),
             "blinky ECO is per-session, not canned counter LUT"
