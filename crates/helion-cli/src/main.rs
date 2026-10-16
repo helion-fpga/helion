@@ -342,8 +342,33 @@ fn positional(args: &[String]) -> Option<&str> {
     None
 }
 
+/// All positional args (for multi-file SoC support). Skips flags and their values.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-o" {
+            i += 2;
+            continue;
+        }
+        if args[i].starts_with("--") {
+            // Flags with values: --part, --sdc, etc. take next arg; boolean flags don't.
+            // Conservative: skip flag and next arg if it doesn't look like a flag.
+            i += 1;
+            if i < args.len() && !args[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(args[i].as_str());
+        i += 1;
+    }
+    out
+}
+
 fn cmd_synth(args: &[String]) {
-    let path = positional(args).unwrap_or("examples/blinky.sv");
+    let files = positionals(args);
+    let path = files.first().copied().unwrap_or("examples/blinky.sv");
     let part = take_flag(args, "--part").unwrap_or_else(|| "HL10T-C32-1".into());
     let verify = args.iter().any(|a| a == "--verify");
     // --verify: run SAT-based pre/post optimization equivalence checking.
@@ -353,10 +378,31 @@ fn cmd_synth(args: &[String]) {
     if verify {
         unsafe { std::env::set_var("HELION_PRESERVE_PRE_OPT", "1") };
     }
-    let d = synth_any(path).unwrap_or_else(|e| {
-        eprintln!("synth: {e}");
-        std::process::exit(1);
-    });
+    // Multi-file SoC support: if multiple .sv/.v files given, synthesize them together.
+    let d = if files.len() > 1 {
+        let paths: Vec<std::path::PathBuf> = files.iter().map(std::path::PathBuf::from).collect();
+        // All must be SV/Verilog for multi-file; otherwise fall back to single-file error.
+        let all_sv = paths.iter().all(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()).unwrap_or("sv").to_ascii_lowercase().as_str(),
+                "sv" | "v"
+            )
+        });
+        if !all_sv {
+            eprintln!("synth: multi-file only supports .sv/.v files");
+            std::process::exit(1);
+        }
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        helion_sv::synth_sv_files(&refs).unwrap_or_else(|e| {
+            eprintln!("synth: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        synth_any(path).unwrap_or_else(|e| {
+            eprintln!("synth: {e}");
+            std::process::exit(1);
+        })
+    };
 
     if verify {
         unsafe { std::env::remove_var("HELION_PRESERVE_PRE_OPT") };
