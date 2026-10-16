@@ -13069,4 +13069,115 @@ mod tests {
 
         );
     }
+
+    /// Gap closure: simulation pages must render live sim data, not an empty
+    /// state. Runs a real sim on counter.sv, dumps VCD, loads it into the
+    /// waveform viewer, and paints the wave page headless. Fails loud if the
+    /// sim produces no data or the paint path panics.
+    #[test]
+    fn waveform_renders_live_sim_data() {
+        let ctx = egui::Context::default();
+        let mut app = HelionIde::new();
+        let ex = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join("counter.sv");
+        app.model
+            .open_source(&ex)
+            .expect("open counter.sv");
+        // Synth first: dump_vcd needs a design.
+        app.model
+            .run_step(FlowStep::Synthesis)
+            .expect("synth counter");
+        let vcd_msg = app.model.dump_vcd(100).expect("sim + VCD dump");
+        assert!(
+            vcd_msg.contains("signals"),
+            "VCD dump must report signals, got: {vcd_msg}"
+        );
+        let vcd_path = app
+            .model
+            .vcd_path
+            .clone()
+            .expect("vcd_path set after dump");
+        app.model
+            .tb_open_vcd_in_waveform(std::path::Path::new(&vcd_path))
+            .expect("load VCD into waveform viewer");
+        assert!(
+            !app.model.wave.traces.is_empty(),
+            "waveform viewer must have traces after VCD load"
+        );
+        assert!(
+            app.model.wave.sample_len() > 0,
+            "waveform viewer must have samples after VCD load"
+        );
+        // Paint the wave page headless; panics here are the regression signal.
+        let theme = app.theme;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                paint_wave(ui, &mut app.model, &theme);
+            });
+        });
+        // The paint must have produced shapes (real rendering happened).
+        assert!(
+            !out.shapes.is_empty(),
+            "waveform paint must emit shapes"
+        );
+        // Waveform heading must be present in the rendered text.
+        let has_heading = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(ts) => Some(ts.galley.text()),
+                _ => None,
+            })
+            .any(|t| t == "Waveform");
+        assert!(has_heading, "waveform page must render its heading");
+    }
+
+    /// Gap closure: the Program page must render a clear no-programmer state,
+    /// not a crash or placeholder, when no USB programmer is present.
+    #[test]
+    fn program_page_renders_no_programmer_state() {
+        let ctx = egui::Context::default();
+        let mut app = HelionIde::new();
+        app.set_activity(Activity::Program);
+        let theme = app.theme;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                paint_program_side(ui, &mut app);
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "program page must render"
+        );
+        // No placeholder strings in the rendered output.
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(ts) => Some(ts.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        for forbidden in ["???", "todo!()", "unimplemented!()", "not implemented"] {
+            assert!(
+                !texts.iter().any(|t| t.contains(forbidden)),
+                "program page must not contain placeholder {forbidden:?}"
+            );
+        }
+    }
 }
