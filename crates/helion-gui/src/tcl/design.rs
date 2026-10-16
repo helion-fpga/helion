@@ -1759,11 +1759,11 @@ mod tests {
         let pins = eval_host(
             &mut i,
             "get_pins",
-            &["get_pins".into(), "-of_objects".into(), "u_lut0".into()],
+            &["get_pins".into(), "-of_objects".into(), "u_luts0".into()],
             1,
             &mut sh,
         );
-        assert!(matches!(&pins, Ctl::Value(s) if s.contains("u_lut0/")), "{pins:?}");
+        assert!(matches!(&pins, Ctl::Value(s) if s.contains("u_luts0/")), "{pins:?}");
     }
 
     #[test]
@@ -1774,7 +1774,7 @@ mod tests {
         let v = eval_host(
             &mut i,
             "get_property",
-            &["get_property".into(), "TYPE".into(), "u_lut0".into()],
+            &["get_property".into(), "TYPE".into(), "u_luts0".into()],
             1,
             &mut sh,
         );
@@ -1783,7 +1783,7 @@ mod tests {
         let v = eval_host(
             &mut i,
             "get_property",
-            &["get_property".into(), "u_lut0".into(), "TYPE".into()],
+            &["get_property".into(), "u_luts0".into(), "TYPE".into()],
             1,
             &mut sh,
         );
@@ -1792,7 +1792,7 @@ mod tests {
         let e = eval_host(
             &mut i,
             "get_property",
-            &["get_property".into(), "BOGUS".into(), "u_lut0".into()],
+            &["get_property".into(), "BOGUS".into(), "u_luts0".into()],
             1,
             &mut sh,
         );
@@ -1801,7 +1801,7 @@ mod tests {
         let lp = eval_host(
             &mut i,
             "list_property",
-            &["list_property".into(), "u_lut0".into()],
+            &["list_property".into(), "u_luts0".into()],
             1,
             &mut sh,
         );
@@ -1819,7 +1819,7 @@ mod tests {
                 "set_property".into(),
                 "KEEP".into(),
                 "TRUE".into(),
-                "u_lut0".into(),
+                "u_luts0".into(),
             ],
             1,
             &mut sh,
@@ -1828,7 +1828,7 @@ mod tests {
         let v = eval_host(
             &mut i,
             "get_property",
-            &["get_property".into(), "KEEP".into(), "u_lut0".into()],
+            &["get_property".into(), "KEEP".into(), "u_luts0".into()],
             1,
             &mut sh,
         );
@@ -1840,7 +1840,7 @@ mod tests {
             &[
                 "get_property".into(),
                 "DONT_TOUCH".into(),
-                "u_lut0".into(),
+                "u_luts0".into(),
             ],
             1,
             &mut sh,
@@ -1884,11 +1884,11 @@ mod tests {
         let s = eval_host(
             &mut i,
             "select_objects",
-            &["select_objects".into(), "u_lut0".into()],
+            &["select_objects".into(), "u_luts0".into()],
             1,
             &mut sh,
         );
-        assert!(matches!(&s, Ctl::Value(v) if v.contains("u_lut0")), "{s:?}");
+        assert!(matches!(&s, Ctl::Value(v) if v.contains("u_luts0")), "{s:?}");
         assert_eq!(i.selected.len(), 1);
         assert_eq!(i.selected[0].kind, "cell");
         let g = eval_host(
@@ -1898,7 +1898,7 @@ mod tests {
             1,
             &mut sh,
         );
-        assert!(matches!(&g, Ctl::Value(v) if v == "u_lut0"), "{g:?}");
+        assert!(matches!(&g, Ctl::Value(v) if v == "u_luts0"), "{g:?}");
         let bad = eval_host(
             &mut i,
             "select_objects",
@@ -1947,7 +1947,7 @@ mod tests {
             &[
                 "get_nets".into(),
                 "-of_objects".into(),
-                "u_lut0".into(),
+                "u_luts0".into(),
             ],
             1,
             &mut sh,
@@ -1963,7 +1963,7 @@ mod tests {
                 1,
                 &mut sh,
             );
-            assert!(matches!(&c, Ctl::Value(v) if v.contains("u_lut0")), "{c:?}");
+            assert!(matches!(&c, Ctl::Value(v) if v.contains("u_luts0")), "{c:?}");
         }
     }
 
@@ -2059,7 +2059,7 @@ mod tests {
         let mut sh = shell_with_counter();
         let mut i = TclInterp::new();
         for cmd in ["list_property", "list_properties"] {
-            let lp = eval_host(&mut i, cmd, &[cmd.into(), "u_lut0".into()], 1, &mut sh);
+            let lp = eval_host(&mut i, cmd, &[cmd.into(), "u_luts0".into()], 1, &mut sh);
             assert!(
                 matches!(&lp, Ctl::Value(s) if s.contains("TYPE")),
                 "{cmd}: {lp:?}"
@@ -2121,7 +2121,7 @@ mod tests {
         let s =
             crate::tcl_eval(&mut sh, "select_objects [get_cells u_lut*]; get_selected_objects")
                 .unwrap();
-        assert!(s.contains("u_lut0"), "{s}");
+        assert!(s.contains("u_luts0"), "{s}");
         assert_eq!(sh.tcl_interp.selected.len(), 4);
     }
 }
