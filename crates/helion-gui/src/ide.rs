@@ -32131,9 +32131,9 @@ endmodule
         let mut blinky = IdeModel::new();
         blinky.open_source(&example("blinky.sv")).unwrap();
         let bmem = blinky.exec("memory").unwrap();
-        assert!(bmem.contains("NAME=u_lut"), "{bmem}");
+        assert!(bmem.contains("NAME=u_luts0"), "{bmem}");
         assert!(
-            !bmem.contains("NAME=u_luts0"),
+            !bmem.contains("NAME=u_luts3"),
             "blinky is not counter: {bmem}"
         );
         assert!(
