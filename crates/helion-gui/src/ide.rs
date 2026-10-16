@@ -30435,9 +30435,9 @@ endmodule
             .flat_map(|s| s.bels.iter().map(String::as_str))
             .collect();
         assert!(c_bels.iter().any(|b| *b == "u_luts0"), "{c_bels:?}");
-        assert!(b_bels.iter().any(|b| *b == "u_lut"), "{b_bels:?}");
+        assert!(b_bels.iter().any(|b| *b == "u_ff"), "{b_bels:?}");
         assert!(
-            !b_bels.iter().any(|b| *b == "u_luts0"),
+            !b_bels.iter().any(|b| *b == "u_luts3"),
             "blinky die is not counter's canned occupants: {b_bels:?}"
         );
         assert!(dump.contains("occ u_luts0="), "{dump}");
@@ -31998,7 +31998,7 @@ endmodule
         assert!(mem.contains("TYPE=lut_init"), "{mem}");
         assert!(mem.contains("DATA=0x5555555555555555"), "{mem}");
         assert!(mem.contains("DEPTH=64"), "{mem}");
-        assert!(mem.contains("NAME=u_lut3"), "{mem}");
+        assert!(mem.contains("NAME=u_luts3"), "{mem}");
         assert!(
             !mem.contains("NAME=u_lut "),
             "counter memories are not blinky: {mem}"
@@ -34222,9 +34222,9 @@ endmodule
                 .contains("no object"),
             "blinky Pblocks are per-session, not canned counter LUT"
         );
-        let bsel = blinky.exec("select_pblock_object u_lut").unwrap();
-        assert!(bsel.contains("OBJECT=u_lut"), "{bsel}");
-        assert_eq!(blinky.selected.as_deref(), Some("u_lut"));
+        let bsel = blinky.exec("select_pblock_object u_luts0").unwrap();
+        assert!(bsel.contains("OBJECT=u_luts0"), "{bsel}");
+        assert_eq!(blinky.selected.as_deref(), Some("u_luts0"));
         assert_eq!(blinky.workspace, WorkspaceTab::Schematic);
     }
 
@@ -37721,7 +37721,7 @@ endmodule
             "Find Results are per-session, not canned: {btable}"
         );
         assert!(
-            blinky.exec("find u_luts0").unwrap_err().contains("0 hits"),
+            blinky.exec("find u_luts3").unwrap_err().contains("0 hits"),
             "blinky has no counter LUT"
         );
         blinky.exec("sheet_find cells").unwrap();
@@ -38238,10 +38238,10 @@ endmodule
             "Sources are per-session, not canned: {bsrc}"
         );
         let btable = blinky.exec("netlist").unwrap();
-        assert!(btable.contains("NAME=u_lut"), "{btable}");
+        assert!(btable.contains("NAME=u_ff"), "{btable}");
         assert!(btable.contains("top=blinky"), "{btable}");
         assert!(
-            !btable.contains("NAME=u_luts0"),
+            !btable.contains("NAME=u_luts3"),
             "Netlist is per-session, not canned: {btable}"
         );
         assert!(
@@ -38355,7 +38355,7 @@ endmodule
         blinky.exec("netlist").unwrap();
         assert!(
             blinky
-                .exec("select_netlist_object u_luts0")
+                .exec("select_netlist_object u_luts3")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Netlist is per-session, not canned counter LUT"
@@ -40147,7 +40147,7 @@ endmodule
             "ECO Changes is per-session, not canned: {btable}"
         );
         assert!(
-            !btable.contains("NAME=u_luts0"),
+            !btable.contains("NAME=u_luts3"),
             "blinky rows are blinky HNF, not counter: {btable}"
         );
         let bsel = blinky.exec("select_eco 0").unwrap();
@@ -40397,7 +40397,7 @@ endmodule
             "Incremental Compile is per-session, not canned: {btable}"
         );
         assert!(
-            !btable.contains("NAME=u_luts0"),
+            !btable.contains("NAME=u_luts3"),
             "blinky rows are blinky HNF, not counter: {btable}"
         );
         let bsel = blinky.exec("select_incremental 0").unwrap();
@@ -40504,7 +40504,7 @@ endmodule
         blinky.exec("incremental_report").unwrap();
         assert!(
             blinky
-                .exec("select_incremental_object u_luts0")
+                .exec("select_incremental_object u_luts3")
                 .unwrap_err()
                 .contains("no object"),
             "blinky Incremental is per-session, not canned counter LUT"
