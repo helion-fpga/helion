@@ -13319,6 +13319,55 @@ fn emit_lut_reduce(
     Some(net)
 }
 
+/// Decompose a >6-PI cone into a tree of LUT6s. Returns the output net name,
+/// or None if the cone cannot be decomposed (caller falls back to existing
+/// behavior). This is the proper fix for wide-cone F1 failures: instead of
+/// tying outputs to 0, we build a functionally correct LUT6 tree.
+fn decompose_wide_cone(
+    d: &mut Design,
+    share: &mut LutShare,
+    prefix: &str,
+    out: Option<&str>,
+    expr: &Expr,
+) -> Option<String> {
+    // Base case: fits in one LUT6.
+    if !cone_pi_exceeds(expr, 6) {
+        return share.lut6_from_expr(d, prefix, out, expr);
+    }
+    // Recursive case: break And/Or into leaves, decompose each, reduce.
+    match expr {
+        Expr::And(_, _) => {
+            let mut leaves = Vec::new();
+            collect_and_leaves_ref(expr, &mut leaves);
+            let mut nets = Vec::with_capacity(leaves.len());
+            for (li, leaf) in leaves.iter().enumerate() {
+                let p = format!("{prefix}ad{li}_");
+                nets.push(decompose_wide_cone(d, share, &p, None, leaf)?);
+            }
+            emit_lut_reduce(d, prefix, share, out, nets, true)
+        }
+        Expr::Or(_, _) => {
+            let mut leaves = Vec::new();
+            collect_or_leaves(expr, &mut leaves);
+            let mut nets = Vec::with_capacity(leaves.len());
+            for (li, leaf) in leaves.iter().enumerate() {
+                let p = format!("{prefix}or{li}_");
+                nets.push(decompose_wide_cone(d, share, &p, None, leaf)?);
+            }
+            emit_lut_reduce(d, prefix, share, out, nets, false)
+        }
+        Expr::Not(inner) => {
+            let p = format!("{prefix}n_");
+            let inner_net = decompose_wide_cone(d, share, &p, None, inner)?;
+            // Single-input inverter LUT6: O = ~I0.
+            let init = 0x5555555555555555u64;
+            Some(share.lut6(d, prefix, out, init, &[inner_net]))
+        }
+        // Xor/Var/Const: lut6_from_expr handles what it can; None otherwise.
+        _ => share.lut6_from_expr(d, prefix, out, expr),
+    }
+}
+
 fn expr_and_chain<'a>(leaves: &[&'a Expr<'a>], arena: &'a Bump) -> Option<Expr<'a>> {
     if leaves.is_empty() {
         return None;
@@ -17777,6 +17826,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // Soft-cone widen: map more assign bits per module (Ibex pin_wrap /
     // ALU / multdiv exceed 256). Named diagnostic when still capped.
     for (i, (bitn, expr)) in comb_bits.iter().enumerate() {
+        if bitn.contains("mem_la_read") {
+        }
         if i >= ASSIGN_BIT_CAP {
             if !assign_capped {
                 note_skip(format!(
@@ -17801,6 +17852,8 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             }
         }
         let huge = expr_node_count(expr) > 2_000;
+        if bitn.contains("mem_la_read") {
+        }
         if huge {
             // A wider cone is the VGA node_count storm: one wide_cone line.
             if try_map_xnor_and_tree(
@@ -17856,7 +17909,27 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             emit_wide_cone(&rtl.module, bitn, &mut wide_capped);
             continue;
         }
+        // Generic wide-cone decomposition BEFORE wide_capped check.
+        // Does not use AIG batch, so not subject to the cap.
+        if cone_pi_exceeds(&expr_rom, 6) {
+            if decompose_wide_cone(
+                &mut d,
+                &mut share,
+                &format!("u_wd{i}_"),
+                Some(bitn),
+                &expr_rom,
+            )
+            .is_some()
+            {
+                if md_bits.contains(bitn) {
+                    let _ = d.mark_debug(bitn);
+                }
+                continue;
+            }
+        }
         if wide_capped && cone_pi_exceeds(expr, 6) {
+            if bitn.contains("mem_la_read") {
+            }
             if let Some(sig) = rel_sig.get(bitn) {
                 note_assign_not_lowered(&rtl.module, sig);
             }
@@ -17926,7 +17999,11 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         )
         .is_some()
         {
+            if bitn.contains("mem_la_read") {
+            }
             continue;
+        }
+        if bitn.contains("mem_la_read") {
         }
         // Refuse Aig::from_expr on wide PI cones (arbiter hang-class ~30s).
         if cone_pi_exceeds(&expr_rom, WIDE_CONE_PI_CAP) {
@@ -18188,8 +18265,7 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // A net with no endpoints won't be written to HNF, so treat it
         // the same as a missing net. Some ports have phantom endpoints
         // from cells that get optimized away; force-fix those too.
-        let force = *pname == "mem_la_read"
-            || *pname == "pcpi_wait"
+        let force = *pname == "pcpi_wait"
             || *pname == "pcpi_ready"
             || *pname == "s_axil_awvalid"
             || *pname == "s_axil_wvalid"
