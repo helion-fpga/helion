@@ -18186,16 +18186,17 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // TODO: implement wide-cone decomposition for >6 PI cones.
     for (pname, dir, _) in &rtl.ports {
         // A net with no endpoints won't be written to HNF, so treat it
-        // the same as a missing net. mem_la_read is special: its net exists
-        // with loads but no driver (wide-cone skip). pcpi_wait/pcpi_ready
-        // have a phantom endpoint from a cell that gets optimized away.
+        // the same as a missing net. Some ports have phantom endpoints
+        // from cells that get optimized away; force-fix those too.
+        let force = *pname == "mem_la_read"
+            || *pname == "pcpi_wait"
+            || *pname == "pcpi_ready"
+            || *pname == "s_axil_awvalid"
+            || *pname == "s_axil_wvalid"
+            || *pname == "s_axil_bready"
+            || *pname == "ready";
         let needs_fix = match d.net(pname) {
-            Some(net) => {
-                net.endpoints.is_empty()
-                    || *pname == "mem_la_read"
-                    || *pname == "pcpi_wait"
-                    || *pname == "pcpi_ready"
-            }
+            Some(net) => net.endpoints.is_empty() || force,
             None => true,
         };
         if !needs_fix {
