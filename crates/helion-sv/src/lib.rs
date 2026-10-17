@@ -5176,6 +5176,10 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
                 .or_else(|| enum_const_default(&name))
                 .ok_or_else(|| format!("unknown param {name}"))
         }
+        Some(Tok::Str(s)) => {
+            p.bump();
+            Ok(str_param_hash(s))
+        }
         other => Err(format!("const atom {other:?}")),
     }
 }
@@ -8040,7 +8044,20 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         if !p.eat_sym('(') {
             return Err("if (".into());
         }
-        let cond = parse_rexpr(p)?;
+        // Try const evaluation first (for param string compares like
+        // RESET_STRATEGY == "NONE"). Save position in case it fails.
+        let save = p.i;
+        let cond_const = const_cond(p).ok();
+        let cond = if cond_const.is_some() {
+            // Const eval succeeded, but we need the RExpr for the non-const path.
+            // Re-parse as RExpr since const_cond consumed tokens.
+            p.i = save;
+            parse_rexpr(p)?
+        } else {
+            // Not a const, parse as RExpr
+            p.i = save;
+            parse_rexpr(p)?
+        };
         if !p.eat_sym(')') {
             return Err("if )".into());
         }
@@ -8060,11 +8077,53 @@ fn parse_seq_item<'a>(p: &mut P<'a>) -> Result<(SeqItemOut<'a>, Vec<ImmAssertAst
         nested.extend(nested_imms);
         // Parameter string compare (e.g. operation_mode == "dynamic") is
         // an elaboration constant — keep the taken branch, do not mux both.
-        if let RExpr::Const { val, care, .. } = &cond {
-            if *care & 1 == 1 {
-                let nbas = if *val != 0 { then_s } else { else_s };
-                return Ok((SeqItemOut::Nbas(nbas), nested));
+        // cond_const was evaluated via const_cond (generate-if evaluator)
+        // which handles param bindings correctly.
+        if let Some(taken) = cond_const {
+            let nbas = if taken { then_s } else { else_s };
+            return Ok((SeqItemOut::Nbas(nbas), nested));
+        }
+        // Also handle Eq/Ne where one side is a param Ident and the other
+        // is a Const (e.g. RESET_STRATEGY == "NONE").
+        let cond_val = match &cond {
+            RExpr::Const { val, care, .. } if *care & 1 == 1 => Some(*val != 0),
+            RExpr::Eq(a, b) => {
+                let l = match &**a {
+                    RExpr::Const { val, .. } => Some(*val),
+                    RExpr::Ident(name) => p.params.get(*name).copied(),
+                    _ => None,
+                };
+                let r = match &**b {
+                    RExpr::Const { val, .. } => Some(*val),
+                    RExpr::Ident(name) => p.params.get(*name).copied(),
+                    _ => None,
+                };
+                match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv == rv),
+                    _ => None,
+                }
             }
+            RExpr::Ne(a, b) => {
+                let l = match &**a {
+                    RExpr::Const { val, .. } => Some(*val),
+                    RExpr::Ident(name) => p.params.get(*name).copied(),
+                    _ => None,
+                };
+                let r = match &**b {
+                    RExpr::Const { val, .. } => Some(*val),
+                    RExpr::Ident(name) => p.params.get(*name).copied(),
+                    _ => None,
+                };
+                match (l, r) {
+                    (Some(lv), Some(rv)) => Some(lv != rv),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(taken) = cond_val {
+            let nbas = if taken { then_s } else { else_s };
+            return Ok((SeqItemOut::Nbas(nbas), nested));
         }
         let mut out = Vec::new();
         for (lhs, bit, rhs) in then_s {
@@ -8350,7 +8409,9 @@ fn parse_param_assigns<'a>(p: &mut P<'a>) -> Result<Vec<(String, u128)>, String>
                         p.params.insert(name.to_string(), effective);
                         out.push((name.to_string(), effective));
                     }
-                    Err(_) => skip_until_arg_end(p),
+                    Err(e) => {
+                        skip_until_arg_end(p)
+                    },
                 }
             } else {
                 skip_until_arg_end(p);
