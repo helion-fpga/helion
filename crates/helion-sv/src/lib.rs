@@ -9753,8 +9753,12 @@ fn push_decl_assign<'a>(
         return;
     }
     match parse_rexpr(p) {
-        Ok(rhs) => assigns.push((name, None, rhs)),
-        Err(_) => {
+        Ok(rhs) => {
+            assigns.push((name, None, rhs))
+        },
+        Err(e) => {
+            // Fix B: never silently drop. Emit diagnostic naming module and error.
+            eprintln!("SWALLOWED_ERROR module={} assign='{}' error='{}'", cur_mod(), name, e);
             note_assign_not_lowered(&cur_mod(), name);
             skip_until_arg_end(p);
         }
@@ -17732,9 +17736,43 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     // side), not a 16-PI cone and not a LUT. A nested concat inside an
     // add is not this form — that add stays wide_cone.
     let mut concat_align: Vec<(String, String, usize, usize)> = Vec::new();
-    let net_copies = collect_net_copies(&rtl.assigns);
+    // Expand whole-wire copy assigns (Ident/Bit/Range RHS) into per-bit
+    // assigns so they go through the net_copies path that already works.
+    // Without this, wire pc = a; is silently dropped.
+    let mut expanded_assigns: Vec<(&str, Option<usize>, RExpr)> = Vec::new();
+    for (lhs, bit, rhs) in &rtl.assigns {
+        if bit.is_none() {
+            match rhs {
+                RExpr::Ident(s) => {
+                    let w = sig_width(rtl, lhs).max(1);
+                    let sw = sig_width(rtl, s).max(1);
+                    for i in 0..w {
+                        let src_bit = if i < sw { i } else { sw - 1 };
+                        expanded_assigns.push((lhs, Some(i), RExpr::Bit(s, src_bit)));
+                    }
+                    continue;
+                }
+                RExpr::Bit(s, b) => {
+                    expanded_assigns.push((lhs, Some(0), RExpr::Bit(s, *b)));
+                    continue;
+                }
+                RExpr::Range(s, hi, lo) => {
+                    let w = sig_width(rtl, lhs).max(1);
+                    let range_w = (*hi).saturating_sub(*lo).saturating_add(1).max(1);
+                    for i in 0..w {
+                        let src_bit = if i < range_w { lo + i } else { *hi };
+                        expanded_assigns.push((lhs, Some(i), RExpr::Bit(s, src_bit)));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        expanded_assigns.push((lhs, *bit, rhs.clone()));
+    }
+    let net_copies = collect_net_copies(&expanded_assigns);
     let priority_grant = try_emit_priority_onehot_grant(&mut d, rtl);
-    for (lhs, bit, rhs0) in &rtl.assigns {
+    for (lhs, bit, rhs0) in &expanded_assigns {
         let rhs_sub = subst_net_copies(rhs0, &net_copies, &arena);
         let rhs = &rhs_sub;
         if clock_mux_sigs.contains(*lhs) || clock_gate_sigs.contains(*lhs) {
@@ -17778,7 +17816,8 @@ fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
             }
         }
         match rhs {
-            RExpr::Ident(_) | RExpr::Bit(_, _) | RExpr::Range(_, _, _) => continue,
+            // Ident/Bit/Range RHS are net copies, handled via net_copies substitution
+            // and direct net aliasing below. Do not skip.
             _ => {}
         }
         // width<=32 `assign y = bus + K` (K in 1..=16) is a ripple from that
