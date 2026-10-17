@@ -22484,17 +22484,30 @@ endmodule
             !d.cells.iter().any(|c| matches!(c.kind, CellKind::Hff)),
             "combinational ripple has no clock and no Hff"
         );
+        // Adder may use Carry4 cells (preferred) or LUT ripple.
+        // Either is a proper lowering, not a wide cone.
+        let carry4s = d
+            .cells
+            .iter()
+            .filter(|c| matches!(c.kind, CellKind::Carry4))
+            .count();
         let luts = d
             .cells
             .iter()
             .filter(|c| matches!(c.kind, CellKind::Lut6 { .. }))
             .count();
-        assert!(luts >= 63, "32-bit ripple of full adders, luts={luts}");
-        let driven = d
-            .nets
-            .iter()
-            .any(|n| n.name == intern("branch_address_0") && n.endpoints.iter().any(|e| e.pin == intern("O")));
-        assert!(driven, "sum bit 0 is a LUT, not a wide cone");
+        assert!(
+            carry4s >= 8 || luts >= 63,
+            "32-bit adder via Carry4 (8 cells) or LUT ripple (63+ LUTs), carry4s={carry4s} luts={luts}"
+        );
+        let driven = d.nets.iter().any(|n| {
+            n.name == intern("branch_address_0")
+                && n.endpoints.iter().any(|e| {
+                    let pin = resolve(e.pin);
+                    pin == "O" || pin == "O0"
+                })
+        });
+        assert!(driven, "sum bit 0 is driven, not a wide cone");
     }
 
     #[test]
