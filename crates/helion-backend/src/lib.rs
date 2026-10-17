@@ -41,6 +41,8 @@ pub struct TimingModel {
     pub hop_ps: i64,
     /// Hold requirement.
     pub hold_req_ps: i64,
+    /// Carry chain arc (CI to CO through Carry4). Much faster than LUT.
+    pub carry_ps: i64,
 }
 
 impl TimingModel {
@@ -55,6 +57,7 @@ impl TimingModel {
             iob_ps: 100,
             hop_ps: 40,
             hold_req_ps: 20,
+            carry_ps: 50,
         }
     }
 
@@ -76,6 +79,7 @@ impl TimingModel {
             iob_ps: 1000,
             hop_ps: 70,
             hold_req_ps: 100,
+            carry_ps: 60,
         }
     }
 
@@ -100,6 +104,7 @@ impl TimingModel {
             iob_ps: 2500,
             hop_ps: 200,
             hold_req_ps: 500,
+            carry_ps: 300,
         }
     }
 
@@ -123,6 +128,7 @@ impl TimingModel {
             iob_ps: 800,
             hop_ps: 100,
             hold_req_ps: 80,
+            carry_ps: 120,
         }
     }
 }
