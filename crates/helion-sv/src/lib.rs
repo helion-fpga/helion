@@ -15563,6 +15563,116 @@ const RIPPLE_INC_MAX: usize = 64;
 /// Unsigned bus-vs-bus `<` / `>=` ripple. Ibex timer interrupt_d is 64.
 const RIPPLE_CMP_MAX: usize = 64;
 
+/// Emit a Carry4-based adder for `sum = a + b`.
+/// Groups bits into 4-bit chunks, each mapped to a Carry4 cell with
+/// DI=A, S=A XOR B, CI chained from previous CO.
+/// Returns true if the adder was emitted via Carry4.
+fn emit_carry4_add(
+    d: &mut Design,
+    rtl: &Rtl,
+    sum: &str,
+    width: usize,
+    a: &str,
+    b: &str,
+    op_w: usize,
+    aw: usize,
+    bw: usize,
+) -> bool {
+    if op_w == 0 || op_w > RIPPLE_ADD_MAX {
+        return false;
+    }
+    // Need all operand bits
+    for bit in 0..op_w {
+        if bit < aw && op_bit_net(rtl, a, bit).is_none() {
+            return false;
+        }
+        if bit < bw && op_bit_net(rtl, b, bit).is_none() {
+            return false;
+        }
+    }
+    let mut carry_in: Option<String> = None;
+    let n_chunks = (op_w + 3) / 4;
+    for chunk in 0..n_chunks {
+        let base = chunk * 4;
+        let cell = format!("u_carry4_{sum}_{chunk}");
+        d.add_cell(&cell, CellKind::Carry4);
+        // CYINIT=0 for first chunk, CI chained thereafter
+        if chunk == 0 {
+            // CYINIT tied to 0 (no initial carry)
+            // CI can be left unconnected (reads 0)
+        } else if let Some(ci_net) = carry_in.take() {
+            d.connect(&ci_net, &cell, "CI");
+        }
+        for i in 0..4 {
+            let bit = base + i;
+            if bit >= op_w {
+                break;
+            }
+            let an = if bit < aw {
+                op_bit_net(rtl, a, bit)
+            } else {
+                None
+            };
+            let bn = if bit < bw {
+                op_bit_net(rtl, b, bit)
+            } else {
+                None
+            };
+            // DI = A bit
+            if let Some(an_net) = an {
+                d.connect(&an_net, &cell, &format!("DI{i}"));
+                // S = A XOR B (need XOR LUT)
+                let s_net = format!("n_carry4_{sum}_{chunk}_s{i}");
+                if let Some(bn_net) = bn {
+                    // Create XOR LUT for S
+                    let xor_cell = format!("u_carry4_{sum}_{chunk}_xor{i}");
+                    emit_lut_pins(
+                        d,
+                        &xor_cell,
+                        &s_net,
+                        lut6_xor2(),
+                        &[(an_net.as_str(), "I0"), (bn_net.as_str(), "I1")],
+                    );
+                } else {
+                    // B bit is 0 (zero-extended), S = A
+                    let buf_cell = format!("u_carry4_{sum}_{chunk}_buf{i}");
+                    emit_lut_pins(
+                        d,
+                        &buf_cell,
+                        &s_net,
+                        lut6_buf(),
+                        &[(an_net.as_str(), "I0")],
+                    );
+                }
+                d.connect(&s_net, &cell, &format!("S{i}"));
+            }
+            // O = sum bit
+            let sum_net = bit_name(sum, width, bit);
+            d.connect(&sum_net, &cell, &format!("O{i}"));
+        }
+        // CO[3] -> next CI
+        let co_net = format!("n_carry4_{sum}_{chunk}_co3");
+        d.connect(&co_net, &cell, "CO3");
+        carry_in = Some(co_net);
+    }
+    // Handle carry-out if width == op_w + 1
+    if width == op_w + 1 {
+        if let Some(cout) = carry_in {
+            let sum_net = bit_name(sum, width, op_w);
+            // Connect final carry to sum MSB via buffer
+            let buf_cell = format!("u_carry4_{sum}_cout_buf");
+            emit_lut_pins(
+                d,
+                &buf_cell,
+                &sum_net,
+                lut6_buf(),
+                &[(cout.as_str(), "I0")],
+            );
+        }
+    }
+    true
+}
+
 fn emit_ripple_add(d: &mut Design, rtl: &Rtl, sum: &str, width: usize, a: &str, b: &str) -> bool {
     if width == 0 || width > RIPPLE_ADD_MAX {
         return false;
@@ -15581,6 +15691,11 @@ fn emit_ripple_add(d: &mut Design, rtl: &Rtl, sum: &str, width: usize, a: &str, 
             || (bit < bw && op_bit_net(rtl, b, bit).is_none())
     }) {
         return false;
+    }
+    // Try Carry4 inference first: group bits into 4-bit chunks with
+    // dedicated carry chain. Falls back to LUT ripple if not applicable.
+    if emit_carry4_add(d, rtl, sum, width, a, b, op_w, aw, bw) {
+        return true;
     }
     let mut cin: Option<String> = None;
     for bit in 0..op_w {
