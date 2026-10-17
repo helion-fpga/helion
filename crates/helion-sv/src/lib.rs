@@ -5072,6 +5072,33 @@ fn const_atom<'a>(p: &mut P<'a>) -> Result<u128, String> {
         let n = const_atom(p)?;
         return Ok(0u128.wrapping_sub(n));
     }
+    // Unary reduction operators: `|x` (OR-reduce), `&x` (AND-reduce), `^x` (XOR-reduce).
+    // These are common in generate conditions like `if (|WITH_CSR)`.
+    if p.eat_sym('|') {
+        let n = const_atom(p)?;
+        return Ok(if n != 0 { 1 } else { 0 });
+    }
+    if p.eat_sym('&') {
+        let n = const_atom(p)?;
+        // AND-reduce: 1 if all bits are 1. For u128, check if n == MAX.
+        // For parameters, this is typically used with single-bit values.
+        return Ok(if n == u128::MAX { 1 } else { 0 });
+    }
+    if p.eat_sym('^') {
+        let n = const_atom(p)?;
+        // XOR-reduce: parity (1 if odd number of 1 bits).
+        return Ok((n.count_ones() % 2) as u128);
+    }
+    // Unary logical NOT `!x`
+    if p.eat_sym('!') {
+        let n = const_atom(p)?;
+        return Ok(if n == 0 { 1 } else { 0 });
+    }
+    // Bitwise NOT `~x`
+    if p.eat_sym('~') {
+        let n = const_atom(p)?;
+        return Ok(!n);
+    }
     if p.eat_sym('(') {
         let v = const_u(p)?;
         if !p.eat_sym(')') {
