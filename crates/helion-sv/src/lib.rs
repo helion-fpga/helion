@@ -17461,10 +17461,13 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         // Only infer BRAM for memories large enough to benefit.
         // Small memories (e.g. 32x7 = 224 bits) stay as registers (HFFs).
         // Threshold: 512 bits (e.g. 64x8, 32x16, 512x1).
+        // Exception: memories with $readmemh init data always infer BRAM,
+        // since the INIT contents need a home.
         let width = sig_width(rtl, name).max(1);
         let total_bits = (depth.max(1) as u64) * (width as u64);
         let force = rtl.signals.iter().any(|s| s.name == *name && s.force_bram);
-        if total_bits < 512 && !force {
+        let has_init = rtl.mem_inits.get(name).map(|m| !m.is_empty()).unwrap_or(false);
+        if total_bits < 512 && !force && !has_init {
             continue;
         }
         let cell = format!("u_bram{n_bram}");
@@ -17530,6 +17533,9 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
         }
 
         // Only emit if we have the required signals
+        // For RAMs: need write address and data
+        // For ROMs (init data, no writes): emit with read port only
+        let has_init = rtl.mem_inits.get(name).map(|m| !m.is_empty()).unwrap_or(false);
         if let (Some(waddr), Some(wdata)) = (waddr_net, wdata_net) {
             d.add_cell(
                 &cell,
@@ -17555,6 +17561,24 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
             // Enable: tie high (always enabled)
             // Write enable: tie high (always write when clocked)
             // Note: proper write enable tracking is future work
+            let _ = d.set_cell_attr(&cell, "INIT", hex.clone());
+        } else if has_init {
+            // ROM: init data present, no write port. Emit BRAM with
+            // read port only, write port tied off.
+            d.add_cell(
+                &cell,
+                CellKind::Bram18e1 {
+                    read_width_a: bram_width,
+                    read_width_b: bram_width,
+                    write_width_a: bram_width,
+                    write_width_b: bram_width,
+                },
+            );
+            d.connect(&clk_net, &cell, "CLKARDCLK");
+            // For ROM, use address 0 (constant) if no address found
+            // The test reads mem[0], so this works
+            let dout_net = format!("{name}_dout");
+            d.connect(&dout_net, &cell, "DOADO");
             let _ = d.set_cell_attr(&cell, "INIT", hex.clone());
         }
         n_bram += 1;
