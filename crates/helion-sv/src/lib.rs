@@ -3800,7 +3800,7 @@ fn lower_own_for_stitch(rtl: &Rtl) -> Result<OwnForStitch, String> {
     }
     own_cache_note_rebuilt(&rtl.module);
     let t0 = std::time::Instant::now();
-    let d = synth_rtl(rtl)?;
+    let d = synth_rtl_inner(rtl, false)?;
     synth_sub_add(t0.elapsed().as_millis(), 0, 0);
     if d.cells.len() <= 512 {
         own_cache_insert(key, Arc::new(d.clone_data()));
@@ -3838,9 +3838,10 @@ fn lower_own_cached(rtl: &Rtl) -> Result<Design, String> {
         d.rebuild_indexes();
         return Ok(d);
     }
+    // Second occurrence in lower_own_for_stitch (cached path)
     own_cache_note_rebuilt(&rtl.module);
     let t0 = std::time::Instant::now();
-    let d = synth_rtl(rtl)?;
+    let d = synth_rtl_inner(rtl, false)?;
     synth_sub_add(t0.elapsed().as_millis(), 0, 0);
     if d.cells.len() <= 512 {
         own_cache_insert(key, Arc::new(d.clone_data()));
@@ -17236,6 +17237,10 @@ fn propagate_const_wires<'a>(rtl: &mut Rtl<'a>, arena: &'a Bump) {
 }
 
 fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
+    synth_rtl_inner(rtl, true)
+}
+
+fn synth_rtl_inner(rtl: &Rtl, is_top: bool) -> Result<Design, String> {
     // FM-HEL-AREA-01: fold constant-driven wires before mapping so the AIG
     // builder sees `Expr::Const` (XNOR-with-const -> wire, AND-with-c0 -> c0).
     // Const-prop rebuilds RExpr subtrees; the scratch arena is leaked so new
@@ -18484,10 +18489,12 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // design (diagnostic GATE_PRIMITIVE), so no cells should be emitted.
     // Also skip for modules with no logic cells (empty shells like tap
     // cells): do not invent IOBs for a module with no body.
+    // Skip for submodules (not top-level): their ports get connected during
+    // flattening; running the fixup would create duplicate drivers (F2).
     let is_gate_primitive = d.attrs.get("GATE_PRIMITIVE") == Some("1");
     let has_logic = d.cells.iter().any(|c| !matches!(c.kind, CellKind::IobIn | CellKind::IobOut));
     for (pname, dir, _) in &rtl.ports {
-        if is_gate_primitive || !has_logic {
+        if is_gate_primitive || !has_logic || !is_top {
             continue;
         }
         // A net with no endpoints won't be written to HNF, so treat it
