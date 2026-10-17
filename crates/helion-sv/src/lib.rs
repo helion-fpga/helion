@@ -18456,7 +18456,16 @@ fn synth_rtl(rtl: &Rtl) -> Result<Design, String> {
     // the net with loads but no driver. Tying to 0 is functionally incorrect;
     // proper fix is wide-cone decomposition into multiple LUT6s.
     // TODO: implement wide-cone decomposition for >6 PI cones.
+    // Skip port fixup for gate primitive modules: they are not mapped by
+    // design (diagnostic GATE_PRIMITIVE), so no cells should be emitted.
+    // Also skip for modules with no logic cells (empty shells like tap
+    // cells): do not invent IOBs for a module with no body.
+    let is_gate_primitive = d.attrs.get("GATE_PRIMITIVE") == Some("1");
+    let has_logic = d.cells.iter().any(|c| !matches!(c.kind, CellKind::IobIn | CellKind::IobOut));
     for (pname, dir, _) in &rtl.ports {
+        if is_gate_primitive || !has_logic {
+            continue;
+        }
         // A net with no endpoints won't be written to HNF, so treat it
         // the same as a missing net. Some ports have phantom endpoints
         // from cells that get optimized away; force-fix those too.
