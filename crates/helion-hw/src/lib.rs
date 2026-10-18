@@ -39,6 +39,31 @@ pub use native_usb::{
     FTDI_VID, FtdiDeviceInfo, NativeUsbScan, enumerate_ftdi,
     feature_enabled as usb_native_feature_enabled,
 };
+pub mod bitstream_crypto;
+pub mod cfgmem;
+pub mod spi_flash;
+pub mod xvc;
+pub use bitstream_crypto::{
+    AUTH_BITSTREAM_MAGIC, CryptoStatBits, DeviceKeyStore, KeySource, aes256_encrypt_block,
+    derive_rolled_key, encrypt_and_sign_bitstream, hmac_sha256, program_authenticated_bitstream,
+    sha256_digest, verify_and_decrypt_bitstream,
+};
+pub use cfgmem::{
+    CFG_BUS_WIDTH_DETECT, CFG_BUS_WIDTH_SYNC, CFG_CMD_IPROG, CFG_DUMMY_WORD, CFG_SYNC_WORD,
+    CfgBusWidth, MULTIBOOT_HEADER_MAGIC, MultiBootConfig, MultiBootHeader, MultiBootLoadReport,
+    build_multiboot_flash_image, crc32_ieee, decode_multiboot_header, encode_multiboot_header,
+    parse_cfgmem_mcs, simulate_multiboot_load, swap_bits_in_byte, swap_byte_bits,
+    write_cfgmem_bin, write_cfgmem_mcs,
+};
+pub use spi_flash::{
+    DEFAULT_JEDEC_ID, FlashVerifyReport, JtagSpiBridge, SPI_CMD_BE, SPI_CMD_PP, SPI_CMD_QREAD,
+    SPI_CMD_RDID, SPI_CMD_RDSR, SPI_CMD_READ, SPI_CMD_SE, SPI_CMD_WRDI, SPI_CMD_WREN,
+    SPI_PAGE_SIZE, SPI_SECTOR_SIZE, SPI_STATUS_WEL, SPI_STATUS_WIP, SpiFlashSim,
+};
+pub use xvc::{
+    XVC_DEFAULT_MAX_VECTOR_LEN, XVC_DEFAULT_TCK_NS, XVC_VERSION, XvcClient, XvcServer,
+    XvcServerInfo, XvcTcpServerHandle, XvcTransport, spawn_xvc_tcp_server,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TapState {
@@ -1998,13 +2023,13 @@ mod tests {
             d.add_port("led", PortDir::Out);
             for i in 0..9u32 {
                 let init = if i == 8 { last } else { 0x5555_5555_5555_5555 };
-                d.add_cell(format!("u_lut{i}"), CellKind::Lut6 { init });
-                d.add_cell(format!("u_ff{i}"), CellKind::Hff);
-                d.connect("clk", format!("u_ff{i}"), "CLK");
-                d.connect(format!("d{i}"), format!("u_lut{i}"), "O");
-                d.connect(format!("d{i}"), format!("u_ff{i}"), "D");
-                d.connect(format!("q{i}"), format!("u_ff{i}"), "Q");
-                d.connect(format!("q{i}"), format!("u_lut{i}"), "I0");
+                d.add_cell(&format!("u_lut{i}"), CellKind::Lut6 { init });
+                d.add_cell(&format!("u_ff{i}"), CellKind::Hff);
+                d.connect("clk", &format!("u_ff{i}"), "CLK");
+                d.connect(&format!("d{i}"), &format!("u_lut{i}"), "O");
+                d.connect(&format!("d{i}"), &format!("u_ff{i}"), "D");
+                d.connect(&format!("q{i}"), &format!("u_ff{i}"), "Q");
+                d.connect(&format!("q{i}"), &format!("u_lut{i}"), "I0");
             }
             d.add_cell("u_iob", CellKind::IobOut);
             d.connect("q0", "u_iob", "I");
@@ -3199,5 +3224,181 @@ mod tests {
         assert!(line.contains("DONE=(no TAP STAT)"), "{line}");
         assert!(!line.contains("DONE=1"), "{line}");
         assert!(!line.to_ascii_lowercase().contains("stat=0x"), "{line}");
+    }
+
+    #[test]
+    fn xvc_getinfo_settck_shift_and_tcp_bitstream_program() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let tap = Tap::new(&dev);
+        let expected_idcode = tap.fabric().idcode;
+
+        // 1. In-process XVC protocol verification
+        let mut client = XvcClient::from_server(XvcServer::new(tap.clone()));
+        let info = client.get_info().unwrap();
+        assert_eq!(info.version, XVC_VERSION);
+        assert_eq!(info.max_vector_len, XVC_DEFAULT_MAX_VECTOR_LEN);
+        let applied_tck = client.set_tck(40).unwrap();
+        assert_eq!(applied_tck, 40);
+        assert_eq!(client.read_idcode().unwrap(), expected_idcode);
+
+        // 2. TCP loopback XVC 1.0 server + client full bitstream programming
+        let (addr, srv_handle) = spawn_xvc_tcp_server(tap, "127.0.0.1:0").unwrap();
+        let mut tcp_client = XvcClient::connect(addr).unwrap();
+        assert_eq!(tcp_client.set_tck(25).unwrap(), 25);
+        assert_eq!(tcp_client.read_idcode().unwrap(), expected_idcode);
+
+        let bits = Bitstream::empty(&dev);
+        let stat = tcp_client.program_bitstream(&bits).unwrap();
+        assert!(stat.done, "XVC TCP programming must set DONE=1");
+        assert!(!stat.crc_err);
+        drop(tcp_client);
+        let final_srv = srv_handle.shutdown();
+        assert!(final_srv.shift_ops > 5);
+        assert!(final_srv.tap().fabric().stat.done);
+    }
+
+    #[test]
+    fn cfgmem_mcs_intel_hex_and_multiboot_wbstar_fallback_recovery() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let golden_bits = Bitstream::empty(&dev);
+        let update_bits = Bitstream::empty(&dev);
+
+        let mb_cfg = MultiBootConfig {
+            golden_addr: 0x0000_0100,
+            wbstar_addr: 0x0001_0200, // Crosses 64 KiB boundary to exercise Intel HEX 04 ELA records
+            watchdog_timer: 0x0000_4000,
+            bus_width: CfgBusWidth::QspiX4,
+        };
+
+        let flash_img = build_multiboot_flash_image(&mb_cfg, &golden_bits, &update_bits).unwrap();
+        let mcs = write_cfgmem_mcs(&flash_img, 0, CfgBusWidth::QspiX4);
+        assert!(mcs.contains(":020000040000FA"), "MCS must contain ELA 0x0000 record");
+        assert!(mcs.contains(":020000040001F9"), "MCS must contain ELA 0x0001 record across 64KB");
+        assert!(mcs.ends_with(":00000001FF\n"), "MCS must end with EOF record");
+
+        let parsed_img = parse_cfgmem_mcs(&mcs, CfgBusWidth::QspiX4).unwrap();
+        assert_eq!(parsed_img, flash_img);
+
+        // Corrupted checksum in MCS must be rejected
+        let bad_mcs = mcs.replacen(":020000040000FA", ":020000040000FB", 1);
+        assert!(parse_cfgmem_mcs(&bad_mcs, CfgBusWidth::QspiX4).is_err());
+
+        // 1. Intact update image boots from WBSTAR
+        let mut fab1 = Fabric::new(&dev);
+        let rep_ok = simulate_multiboot_load(&mut fab1, &parsed_img, CfgBusWidth::QspiX4).unwrap();
+        assert!(rep_ok.booted_update_image);
+        assert!(!rep_ok.fallback_triggered);
+        assert_eq!(rep_ok.active_boot_addr, mb_cfg.wbstar_addr);
+        assert!(rep_ok.stat.done);
+
+        // 2. Corrupted update image at WBSTAR triggers CRC error and falls back to Golden image
+        let mut corrupted_img = parsed_img.clone();
+        corrupted_img[mb_cfg.wbstar_addr as usize + 8] ^= 0xFF;
+        let mut fab2 = Fabric::new(&dev);
+        let rep_fb =
+            simulate_multiboot_load(&mut fab2, &corrupted_img, CfgBusWidth::QspiX4).unwrap();
+        assert!(!rep_fb.booted_update_image);
+        assert!(rep_fb.fallback_triggered);
+        assert!(rep_fb.crc_error_detected);
+        assert_eq!(rep_fb.active_boot_addr, mb_cfg.golden_addr);
+        assert!(rep_fb.stat.done);
+
+        // 3. Erased update region (0xFF) triggers watchdog timeout and falls back to Golden image
+        let mut erased_update = parsed_img;
+        for b in &mut erased_update[mb_cfg.wbstar_addr as usize..] {
+            *b = 0xFF;
+        }
+        let mut fab3 = Fabric::new(&dev);
+        let rep_wdt =
+            simulate_multiboot_load(&mut fab3, &erased_update, CfgBusWidth::QspiX4).unwrap();
+        assert!(rep_wdt.fallback_triggered);
+        assert!(rep_wdt.watchdog_timeout_detected);
+        assert_eq!(rep_wdt.active_boot_addr, mb_cfg.golden_addr);
+        assert!(rep_wdt.stat.done);
+    }
+
+    #[test]
+    fn jtag_spi_flash_erase_program_verify_and_boot() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let mut tap = Tap::new(&dev);
+        let flash = SpiFlashSim::new(2 * SPI_SECTOR_SIZE);
+        let mut bridge = JtagSpiBridge::new(&mut tap, flash);
+
+        assert_eq!(bridge.read_jedec_id().unwrap(), DEFAULT_JEDEC_ID);
+
+        // Page program without WREN (0x06) must be rejected by flash state machine
+        assert!(bridge.flash.transfer(&[SPI_CMD_PP, 0, 0, 0, 0xAA]).is_err());
+
+        let bits = Bitstream::empty(&dev);
+        let img = write_cfgmem_bin(&bits, CfgBusWidth::SpiX1);
+
+        let report = bridge.erase_program_verify(0x0000_0100, &img, true).unwrap();
+        assert!(report.verified);
+        assert_eq!(report.jedec_id, DEFAULT_JEDEC_ID);
+        assert_eq!(report.bytes_programmed, img.len());
+        assert!(report.sectors_erased >= 1);
+        assert!(report.pages_programmed >= 1);
+        assert!(report.jtag_dr_scans > 0);
+        assert_eq!(report.expected_crc32, report.readback_crc32);
+        assert_eq!(report.expected_sha256, report.readback_sha256);
+
+        let boot_stat = bridge.boot_fabric_from_flash(0x0000_0100, img.len()).unwrap();
+        assert!(boot_stat.done);
+    }
+
+    #[test]
+    fn bitstream_crypto_aes256_hmac_key_rolling_and_tamper_rejection() {
+        let dev = Device::load_part("HL10T-C32-1").unwrap();
+        let bits = Bitstream::empty(&dev);
+
+        let efuse_key = [0x42u8; 32];
+        let bbram_key = [0x99u8; 32];
+        let hmac_key = [0xA5u8; 32];
+        let iv = [0x11u8; 12];
+
+        let auth_img = encrypt_and_sign_bitstream(
+            &bits,
+            KeySource::Efuse,
+            &efuse_key,
+            &hmac_key,
+            iv,
+            64, // Force multi-segment key rolling
+        );
+
+        let keystore = DeviceKeyStore::new(hmac_key)
+            .with_efuse_key(efuse_key)
+            .with_bbram_key(bbram_key)
+            .with_force_efuse_key(true);
+
+        // 1. Authentic bitstream verifies, rolls keys across segments, and programs TAP to DONE=1
+        let mut tap = Tap::new(&dev);
+        let (cstat, hw_res) = program_authenticated_bitstream(&mut tap, &auth_img, &keystore);
+        assert!(hw_res.is_ok());
+        assert!(cstat.done);
+        assert!(!cstat.has_tamper());
+        assert!(cstat.keys_rolled >= 2, "Expected multi-segment key rolling");
+        assert_eq!(cstat.key_source_active, Some(KeySource::Efuse));
+
+        // 2. 1-bit tamper in ciphertext/body -> rejected by SHA-256 HMAC before touching fabric
+        let mut tampered_body = auth_img.clone();
+        tampered_body[36] ^= 0x01;
+        let mut tap_tamper = Tap::new(&dev);
+        let (tstat, tres) =
+            program_authenticated_bitstream(&mut tap_tamper, &tampered_body, &keystore);
+        assert!(tres.is_err());
+        assert!(tstat.hmac_error);
+        assert!(tstat.sec_violation);
+        assert!(!tstat.done);
+        assert!(!tap_tamper.fabric().stat.done);
+
+        // 3. Wrong key source when force_efuse_key is set -> rejected with key_source_mismatch
+        let bbram_img =
+            encrypt_and_sign_bitstream(&bits, KeySource::Bbram, &bbram_key, &hmac_key, iv, 64);
+        let mut tap_ks = Tap::new(&dev);
+        let (kstat, kres) = program_authenticated_bitstream(&mut tap_ks, &bbram_img, &keystore);
+        assert!(kres.is_err());
+        assert!(kstat.key_source_mismatch);
+        assert!(kstat.sec_violation);
+        assert!(!kstat.done);
     }
 }
