@@ -144,10 +144,42 @@ pub struct PackedEcp5Clk {
 pub struct PackedEcp5Ram {
     pub name: String,
     /// INIT words from the IR `INIT` attribute (comma-separated hex, word
-    /// 0 = address 0). Empty = zero-initialized. The bitstream worker maps
-    /// these onto the `DP16KD` INIT bits and `DATA_WIDTH`/`WRITEMODE`
-    /// config; the IR carries no pin-level memory interface in v1.
+    /// 0 = address 0). Empty = zero-initialized.
     pub init: Vec<u64>,
+    /// `"DP16KD"` or `"PDPW16KD"`.
+    pub mode: String,
+    /// Port A data width (`1, 2, 4, 9, 18, 36`).
+    pub data_width_a: u8,
+    /// Port B / Read data width (`1, 2, 4, 9, 18, 36`).
+    pub data_width_b: u8,
+    /// Write mode A (`"NORMAL"`, `"READBEFOREWRITE"`, `"WRITETHROUGH"`).
+    pub writemode_a: String,
+    /// Write mode B (`"NORMAL"`, `"READBEFOREWRITE"`, `"WRITETHROUGH"`).
+    pub writemode_b: String,
+    /// 3-bit chip-select decode (`CSDECODE_A`, `CSDECODE_B`).
+    pub csdecode_a: u8,
+    pub csdecode_b: u8,
+    /// Cascade net chaining multiple EBR blocks.
+    pub cascade_in: Option<String>,
+    pub cascade_out: Option<String>,
+}
+
+impl Default for PackedEcp5Ram {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            init: Vec::new(),
+            mode: "DP16KD".to_string(),
+            data_width_a: 9,
+            data_width_b: 9,
+            writemode_a: "READBEFOREWRITE".to_string(),
+            writemode_b: "READBEFOREWRITE".to_string(),
+            csdecode_a: 0,
+            csdecode_b: 0,
+            cascade_in: None,
+            cascade_out: None,
+        }
+    }
 }
 
 impl PackedEcp5Ram {
@@ -158,43 +190,177 @@ impl PackedEcp5Ram {
 }
 
 /// A packed `MULT18X18D` DSP block.
-///
-/// The IR's [`helion_ir::CellKind::Mac27`] is a coarse multiply marker:
-/// `A`/`B`/`P` are bus-level net names and widths are unknown unless the
-/// optional `WIDTH_A`/`WIDTH_B` cell attributes are present.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PackedEcp5Dsp {
     pub name: String,
     pub a_net: String,
     pub b_net: String,
     pub c_net: Option<String>,
     pub p_net: String,
+    /// Dedicated shift-register cascade nets (`SRIA` -> `SROA`, `SRIB` -> `SROB`, `ROUTC`).
+    pub sria_net: Option<String>,
+    pub sroa_net: Option<String>,
+    pub srib_net: Option<String>,
+    pub srob_net: Option<String>,
+    pub routp_net: Option<String>,
 }
 
-/// A packed ECP5 PLL.
-///
-/// Divider parameters are passed through verbatim from the cell
-/// attributes (the Trellis `.config` words: `CLKI_DIV`, `CLKOP_DIV`,
-/// `CLKOS_DIV`, ...). `CLKI_DIV` and `CLKOP_DIV` are required; the rest
-/// is the bitstream worker's domain.
-#[derive(Clone, Debug)]
+/// A packed `ALU54B` 54-bit DSP ALU/accumulator block.
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5Alu54 {
+    pub name: String,
+    /// Feeding `MULT18X18D` product nets (`MA`/`MB` or `ROUTC`).
+    pub ma_net: Option<String>,
+    pub mb_net: Option<String>,
+    pub c_net: Option<String>,
+    /// Dedicated 54-bit accumulator cascade input (`CIN`) and output (`CO` / `CASC`).
+    pub cin_net: Option<String>,
+    pub co_net: Option<String>,
+    pub r_net: Option<String>,
+    /// 56-bit pattern words (`MCPAT`, `MASKPAT`, `MASK01`, `RNDPAT`).
+    pub mcpat: u64,
+    pub maskpat: u64,
+    pub mask01: u64,
+    pub rndpat: u64,
+    pub resetmode: String,
+}
+
+/// A packed ECP5 PLL (`EHXPLLL` / `PLLB`).
+#[derive(Clone, Debug, Default)]
 pub struct PackedEcp5Pll {
     pub name: String,
     /// Reference clock net (`CLKI` pin).
     pub ref_net: String,
     /// Primary output net (`CLKOP` pin).
     pub out_net: String,
-    /// All cell attributes, sorted by name (divider parameters).
+    /// Secondary output nets (`CLKOS`, `CLKOS2`, `CLKOS3`).
+    pub clkos_net: Option<String>,
+    pub clkos2_net: Option<String>,
+    pub clkos3_net: Option<String>,
+    /// Dynamic phase adjustment (`DPHASE_SOURCE` = `"ENABLED"` / `"DISABLED"`).
+    pub dphase_source: bool,
+    pub phasesel0_net: Option<String>,
+    pub phasesel1_net: Option<String>,
+    pub phasedir_net: Option<String>,
+    pub phasestep_net: Option<String>,
+    pub phaseloadreg_net: Option<String>,
+    /// All cell attributes, sorted by name (divider & phase parameters).
     pub params: Vec<(String, String)>,
 }
 
+/// A packed 5G SERDES Dual Channel Unit (`DCUA`).
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5Dcu {
+    pub name: String,
+    /// Dual index `0` (`DCU0`) or `1` (`DCU1`).
+    pub dcu_idx: u8,
+    pub ch0_mode: String,
+    pub ch1_mode: String,
+    /// Reference clock net (from `EXTREFB.REFCLKO` or dedicated pin).
+    pub refck_net: Option<String>,
+    /// High-speed serial differential pins (`CH0_HDINP/N`, `CH0_HDOUTP/N`, `CH1_HDINP/N`, `CH1_HDOUTP/N`).
+    pub ch0_rx_net: Option<String>,
+    pub ch0_tx_net: Option<String>,
+    pub ch1_rx_net: Option<String>,
+    pub ch1_tx_net: Option<String>,
+    /// All `D_*`, `CH0_*`, `CH1_*` attributes sorted by name.
+    pub params: Vec<(String, String)>,
+}
+
+/// A packed SERDES External Reference Clock Buffer (`EXTREFB`).
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5Extref {
+    pub name: String,
+    pub dcu_idx: u8,
+    pub refclkp_net: Option<String>,
+    pub refclkn_net: Option<String>,
+    pub refclko_net: String,
+    pub dcupdb: String,
+}
+
+/// A packed `DDRDLL` 90-degree DQS delay-locked loop.
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5Ddrdll {
+    pub name: String,
+    pub clk_net: String,
+    pub rst_net: Option<String>,
+    pub udcdzeln_net: Option<String>,
+    pub ddrdel_net: String,
+    pub lock_net: Option<String>,
+    pub force_max_delay: bool,
+    pub gsr: String,
+}
+
+/// A packed `DQSBUFM` DDR strobe centering and read/write pointer manager.
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5Dqs {
+    pub name: String,
+    pub dqsi_net: String,
+    pub sclk_net: String,
+    pub eclk_net: Option<String>,
+    pub ddrdel_net: Option<String>,
+    pub dqsr90_net: Option<String>,
+    pub dqsw_net: Option<String>,
+    pub dqsw270_net: Option<String>,
+    pub dqs_li_del_adj: String,
+    pub dqs_li_del_val: u8,
+    pub dqs_lo_del_adj: String,
+    pub dqs_lo_del_val: u8,
+    pub gsr: String,
+}
+
+/// High-speed IOLOGIC primitive kind (`IDDRX1F`, `ODDRX1F`, `IDDRX2F`, `ODDRX2F`, `DELAYG`, `DELAYF`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IologicKind {
+    #[default]
+    Iddrx1f,
+    Oddrx1f,
+    Iddrx2f,
+    Oddrx2f,
+    Delayg,
+    Delayf,
+}
+
+/// A packed high-speed I/O gearing or delay primitive on `IOLOGICA`/`IOLOGICB`.
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5Iologic {
+    pub name: String,
+    pub kind: IologicKind,
+    pub sclk_net: Option<String>,
+    pub eclk_net: Option<String>,
+    pub rst_net: Option<String>,
+    pub dqsr90_net: Option<String>,
+    pub dqsw_net: Option<String>,
+    pub dqsw270_net: Option<String>,
+    pub data_nets: Vec<String>,
+    pub pad_net: Option<String>,
+    pub del_value: u8,
+    pub wait_for_edge: bool,
+    pub gsr: String,
+}
+
+/// System configuration primitive kind (`USRMCLK`, `OSCG`, `DTR`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SysConfigKind {
+    #[default]
+    Usrmclk,
+    Oscg,
+    Dtr,
+}
+
+/// A packed system configuration primitive (`USRMCLK`, `OSCG`, or `DTR`).
+#[derive(Clone, Debug, Default)]
+pub struct PackedEcp5SysConfig {
+    pub name: String,
+    pub kind: SysConfigKind,
+    /// `OSC.DIV` divider (`2..=128`) for `OSCG`.
+    pub osc_div: u8,
+    pub in_net: Option<String>,
+    pub ts_net: Option<String>,
+    pub out_net: Option<String>,
+}
+
 /// Backend-owned packed netlist for the ECP5 LFE5U-85F.
-///
-/// The place worker consumes this: `luts`/`ffs` go to `PLC2` slice
-/// halves (`paired_ff`/`packed_lut` co-locate), `alu_chains` order the
-/// ALU LUTs into dedicated carry columns, `ios` carry their PIO site
-/// coordinates, and `rams`/`dsps`/`plls`/`clks` go to `EBR`/`DSP`/`PLL`
-/// sites and the global clock network.
 #[derive(Clone, Debug, Default)]
 pub struct PackedEcp5 {
     /// Top module name, carried through the stages.
@@ -208,7 +374,14 @@ pub struct PackedEcp5 {
     pub clks: Vec<PackedEcp5Clk>,
     pub rams: Vec<PackedEcp5Ram>,
     pub dsps: Vec<PackedEcp5Dsp>,
+    pub alu54s: Vec<PackedEcp5Alu54>,
     pub plls: Vec<PackedEcp5Pll>,
+    pub dcus: Vec<PackedEcp5Dcu>,
+    pub extrefs: Vec<PackedEcp5Extref>,
+    pub ddrdlls: Vec<PackedEcp5Ddrdll>,
+    pub dqs_blocks: Vec<PackedEcp5Dqs>,
+    pub iologics: Vec<PackedEcp5Iologic>,
+    pub sys_configs: Vec<PackedEcp5SysConfig>,
     /// Carry chains, in the order their ALU LUTs reference via
     /// [`AluBit::chain`].
     pub alu_chains: Vec<PackedEcp5AluChain>,
@@ -321,18 +494,14 @@ pub fn pack(netlist: &NetlistIr) -> Result<PackedEcp5, String> {
             CellKind::Carry4 => {
                 carry_cells.push(parse_carry4(resolve(cell.name), &pins, netlist)?);
             }
-            CellKind::BlackBox { module }
-                if resolve(*module).starts_with("PLLB") || resolve(*module).starts_with("EHXPLL") =>
-            {
-                out.plls.push(pack_pll(resolve(cell.name), resolve(*module), &pins, &cell.attrs)?);
-            }
             CellKind::BlackBox { module } => {
-                return Err(format!(
-                    "ecp5 pack: unsupported black box '{}' (cell {}); \
-                     only PLLB*/EHXPLL* black boxes map to ECP5 primitives",
+                pack_ecp5_blackbox(
+                    resolve(cell.name),
                     resolve(*module),
-                    resolve(cell.name)
-                ));
+                    &pins,
+                    &cell.attrs,
+                    &mut out,
+                )?;
             }
             CellKind::Ila { .. } => {
                 return Err(format!(
@@ -541,7 +710,7 @@ fn pack_io(
     })
 }
 
-/// Pack a `Bram18` cell into `DP16KD` shape.
+/// Pack a `Bram18` or `DP16KD`/`PDPW16KD` cell into `PackedEcp5Ram`.
 fn pack_ram(name: &str, attrs: &Attrs) -> Result<PackedEcp5Ram, String> {
     let mut init = Vec::new();
     if let Some(s) = attrs.get("INIT") {
@@ -555,6 +724,22 @@ fn pack_ram(name: &str, attrs: &Attrs) -> Result<PackedEcp5Ram, String> {
             init.push(w);
         }
     }
+    for i in 0..0x40u8 {
+        let key = format!("INITVAL_{i:02X}");
+        if let Some(v) = attrs.get(&key) {
+            let clean = v
+                .trim()
+                .strip_prefix("0x")
+                .or_else(|| v.trim().strip_prefix("0X"))
+                .unwrap_or(v.trim());
+            let hex_only: String = clean.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            if !hex_only.is_empty() {
+                let low = u64::from_str_radix(&hex_only[hex_only.len().saturating_sub(16)..], 16)
+                    .map_err(|_| format!("ecp5 pack: RAM {name}: bad {key}"))?;
+                init.push(low);
+            }
+        }
+    }
     if init.len() * 64 > EBR_BITS {
         return Err(format!(
             "ecp5 pack: RAM {name}: INIT is {} bits, exceeding one DP16KD (18Kb); \
@@ -562,13 +747,76 @@ fn pack_ram(name: &str, attrs: &Attrs) -> Result<PackedEcp5Ram, String> {
             init.len() * 64
         ));
     }
+    let mode = attrs
+        .get("MODE")
+        .unwrap_or("DP16KD")
+        .trim()
+        .to_ascii_uppercase();
+    if !matches!(mode.as_str(), "DP16KD" | "PDPW16KD") {
+        return Err(format!(
+            "ecp5 pack: RAM {name}: invalid MODE '{mode}' (expected DP16KD or PDPW16KD)"
+        ));
+    }
+    let parse_w = |key: &str, def: u8| -> Result<u8, String> {
+        let Some(v) = attrs.get(key) else {
+            return Ok(def);
+        };
+        let w: u8 = v
+            .trim()
+            .parse()
+            .map_err(|_| format!("ecp5 pack: RAM {name}: bad {key}='{v}'"))?;
+        if !matches!(w, 1 | 2 | 4 | 9 | 18 | 36) || (mode == "DP16KD" && w == 36) {
+            return Err(format!(
+                "ecp5 pack: RAM {name} ({mode}): illegal {key}={w}"
+            ));
+        }
+        Ok(w)
+    };
+    let data_width_a = parse_w("DATA_WIDTH_A", 9)?;
+    let data_width_b = if mode == "PDPW16KD" {
+        parse_w("DATA_WIDTH_R", 9)?
+    } else {
+        parse_w("DATA_WIDTH_B", 9)?
+    };
+    let parse_wm = |key: &str| -> Result<String, String> {
+        let wm = attrs
+            .get(key)
+            .unwrap_or("READBEFOREWRITE")
+            .trim()
+            .to_ascii_uppercase();
+        if !matches!(wm.as_str(), "NORMAL" | "READBEFOREWRITE" | "WRITETHROUGH") {
+            return Err(format!("ecp5 pack: RAM {name}: invalid {key}='{wm}'"));
+        }
+        Ok(wm)
+    };
+    let writemode_a = parse_wm("WRITEMODE_A")?;
+    let writemode_b = parse_wm("WRITEMODE_B")?;
+    let parse_cs = |key: &str| -> Result<u8, String> {
+        let Some(s) = attrs.get(key) else {
+            return Ok(0);
+        };
+        let clean = s.trim().strip_prefix("0b").unwrap_or(s.trim());
+        u8::from_str_radix(clean, 2)
+            .or_else(|_| clean.parse::<u8>())
+            .map(|v| v & 0b111)
+            .map_err(|_| format!("ecp5 pack: RAM {name}: bad {key}='{s}'"))
+    };
     Ok(PackedEcp5Ram {
         name: name.to_string(),
         init,
+        mode,
+        data_width_a,
+        data_width_b,
+        writemode_a,
+        writemode_b,
+        csdecode_a: parse_cs("CSDECODE_A")?,
+        csdecode_b: parse_cs("CSDECODE_B")?,
+        cascade_in: None,
+        cascade_out: None,
     })
 }
 
-/// Pack a `Mac27` cell into `MULT18X18D` shape.
+/// Pack a `Mac27` or `MULT18X18D` cell into `PackedEcp5Dsp`.
 fn pack_dsp(name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedEcp5Dsp, String> {
     for (attr, what) in [("WIDTH_A", "A"), ("WIDTH_B", "B")] {
         if let Some(v) = attrs.get(attr) {
@@ -583,48 +831,126 @@ fn pack_dsp(name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedEcp5Dsp,
             }
         }
     }
-    let need = |pin: &str| {
+    let need = |pin: &str, alt: &str| {
         pins.net_on(name, pin)
+            .or_else(|| pins.net_on(name, alt))
             .map(|s| resolve(s).to_string())
             .ok_or_else(|| format!("ecp5 pack: DSP {name} has no {pin} net"))
     };
     Ok(PackedEcp5Dsp {
         name: name.to_string(),
-        a_net: need("A")?,
-        b_net: need("B")?,
-        c_net: pins.net_on(name, "C").map(|s| resolve(s).to_string()),
-        p_net: need("P")?,
+        a_net: need("A", "A0")?,
+        b_net: need("B", "B0")?,
+        c_net: pins
+            .net_on(name, "C")
+            .or_else(|| pins.net_on(name, "C0"))
+            .map(|s| resolve(s).to_string()),
+        p_net: need("P", "P0")?,
+        sria_net: pins.net_on(name, "SRIA").map(|s| resolve(s).to_string()),
+        sroa_net: pins.net_on(name, "SROA").map(|s| resolve(s).to_string()),
+        srib_net: pins.net_on(name, "SRIB").map(|s| resolve(s).to_string()),
+        srob_net: pins.net_on(name, "SROB").map(|s| resolve(s).to_string()),
+        routp_net: pins.net_on(name, "ROUTC").map(|s| resolve(s).to_string()),
     })
 }
 
-/// Pack a `PLLB*`/`EHXPLL*` black box into a PLL with divider parameters
-/// passed through from the cell attributes.
+/// Pack an `ALU54B` 54-bit DSP ALU/accumulator block.
+fn pack_alu54(name: &str, pins: &PinIndex, attrs: &Attrs) -> Result<PackedEcp5Alu54, String> {
+    let parse_pat = |key: &str, def: u64| -> Result<u64, String> {
+        let Some(v) = attrs.get(key) else {
+            return Ok(def);
+        };
+        let s = v.trim();
+        let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+        u64::from_str_radix(hex, 16)
+            .or_else(|_| hex.parse::<u64>())
+            .map(|x| x & ((1u64 << 56) - 1))
+            .map_err(|_| format!("ecp5 pack: ALU54B {name}: bad {key}='{v}'"))
+    };
+    let resetmode = attrs
+        .get("RESETMODE")
+        .unwrap_or("SYNC")
+        .trim()
+        .to_ascii_uppercase();
+    if !matches!(resetmode.as_str(), "SYNC" | "ASYNC") {
+        return Err(format!(
+            "ecp5 pack: ALU54B {name}: invalid RESETMODE '{resetmode}'"
+        ));
+    }
+    Ok(PackedEcp5Alu54 {
+        name: name.to_string(),
+        ma_net: pins
+            .net_on(name, "MA")
+            .or_else(|| pins.net_on(name, "A"))
+            .map(|s| resolve(s).to_string()),
+        mb_net: pins
+            .net_on(name, "MB")
+            .or_else(|| pins.net_on(name, "B"))
+            .map(|s| resolve(s).to_string()),
+        c_net: pins.net_on(name, "C").map(|s| resolve(s).to_string()),
+        cin_net: pins.net_on(name, "CIN").map(|s| resolve(s).to_string()),
+        co_net: pins
+            .net_on(name, "CO")
+            .or_else(|| pins.net_on(name, "CASC"))
+            .map(|s| resolve(s).to_string()),
+        r_net: pins
+            .net_on(name, "R")
+            .or_else(|| pins.net_on(name, "P"))
+            .map(|s| resolve(s).to_string()),
+        mcpat: parse_pat("MCPAT", 0)?,
+        maskpat: parse_pat("MASKPAT", 0)?,
+        mask01: parse_pat("MASK01", 0)?,
+        rndpat: parse_pat("RNDPAT", 0)?,
+        resetmode,
+    })
+}
+
+/// Pack a `PLLB*`/`EHXPLL*` black box into a PLL with divider and dynamic phase parameters.
 fn pack_pll(
     name: &str,
     module: &str,
     pins: &PinIndex,
     attrs: &Attrs,
 ) -> Result<PackedEcp5Pll, String> {
-    let ref_net = resolve(pins
-        .net_on(name, "CLKI")
-        .or_else(|| pins.net_on(name, "REFERENCECLK"))
-        .or_else(|| pins.net_on(name, "I"))
-        .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKI net"))?)
+    let ref_net = resolve(
+        pins.net_on(name, "CLKI")
+            .or_else(|| pins.net_on(name, "REFERENCECLK"))
+            .or_else(|| pins.net_on(name, "I"))
+            .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKI net"))?,
+    )
     .to_string();
-    let out_net = resolve(pins
-        .net_on(name, "CLKOP")
-        .or_else(|| pins.net_on(name, "PLLOUTGLOBAL"))
-        .or_else(|| pins.net_on(name, "O"))
-        .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKOP net"))?)
+    let out_net = resolve(
+        pins.net_on(name, "CLKOP")
+            .or_else(|| pins.net_on(name, "PLLOUTGLOBAL"))
+            .or_else(|| pins.net_on(name, "O"))
+            .ok_or_else(|| format!("ecp5 pack: PLL {name}: no CLKOP net"))?,
+    )
     .to_string();
     for req in ["CLKI_DIV", "CLKOP_DIV"] {
-        if attrs.get(req).is_none() {
+        let Some(v) = attrs.get(req) else {
             return Err(format!(
                 "ecp5 pack: PLL {name} ({module}): missing {req} attribute; \
                  ECP5 PLLs need divider parameters (CLKI_DIV, CLKOP_DIV, ...)"
             ));
+        };
+        let d: u32 = v.trim().parse().map_err(|_| {
+            format!("ecp5 pack: PLL {name} ({module}): {req}='{v}' is not an integer")
+        })?;
+        if !(1..=128).contains(&d) {
+            return Err(format!(
+                "ecp5 pack: PLL {name} ({module}): {req}={d} out of range 1..=128"
+            ));
         }
     }
+    let dphase_source = matches!(
+        attrs
+            .get("DPHASE_SOURCE")
+            .unwrap_or("DISABLED")
+            .trim()
+            .to_ascii_uppercase()
+            .as_str(),
+        "ENABLED" | "TRUE" | "1"
+    );
     let mut params: Vec<(String, String)> = attrs
         .map
         .iter()
@@ -635,8 +961,322 @@ fn pack_pll(
         name: name.to_string(),
         ref_net,
         out_net,
+        clkos_net: pins.net_on(name, "CLKOS").map(|s| resolve(s).to_string()),
+        clkos2_net: pins.net_on(name, "CLKOS2").map(|s| resolve(s).to_string()),
+        clkos3_net: pins.net_on(name, "CLKOS3").map(|s| resolve(s).to_string()),
+        dphase_source,
+        phasesel0_net: pins
+            .net_on(name, "PHASESEL0")
+            .map(|s| resolve(s).to_string()),
+        phasesel1_net: pins
+            .net_on(name, "PHASESEL1")
+            .map(|s| resolve(s).to_string()),
+        phasedir_net: pins
+            .net_on(name, "PHASEDIR")
+            .map(|s| resolve(s).to_string()),
+        phasestep_net: pins
+            .net_on(name, "PHASESTEP")
+            .map(|s| resolve(s).to_string()),
+        phaseloadreg_net: pins
+            .net_on(name, "PHASELOADREG")
+            .map(|s| resolve(s).to_string()),
         params,
     })
+}
+
+fn pack_ecp5_blackbox(
+    name: &str,
+    module: &str,
+    pins: &PinIndex,
+    attrs: &Attrs,
+    out: &mut PackedEcp5,
+) -> Result<(), String> {
+    if module.starts_with("PLLB") || module.starts_with("EHXPLL") {
+        out.plls.push(pack_pll(name, module, pins, attrs)?);
+        return Ok(());
+    }
+    match module {
+        "DP16KD" | "PDPW16KD" => {
+            let mut a = attrs.clone();
+            if a.get("MODE").is_none() {
+                a.set("MODE", module);
+            }
+            let mut ram = pack_ram(name, &a)?;
+            ram.cascade_in = pins.net_on(name, "CASI").map(|s| resolve(s).to_string());
+            ram.cascade_out = pins.net_on(name, "CASO").map(|s| resolve(s).to_string());
+            out.rams.push(ram);
+        }
+        "MULT18X18D" => {
+            out.dsps.push(pack_dsp(name, pins, attrs)?);
+        }
+        "ALU54B" => {
+            out.alu54s.push(pack_alu54(name, pins, attrs)?);
+        }
+        "DCUA" => {
+            let dcu_idx: u8 = attrs
+                .get("DCU")
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .map_err(|_| format!("ecp5 pack: DCUA {name}: bad DCU index"))?;
+            if dcu_idx > 1 {
+                return Err(format!(
+                    "ecp5 pack: DCUA {name}: DCU index {dcu_idx} out of range 0..=1"
+                ));
+            }
+            let mut params: Vec<(String, String)> = attrs
+                .map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            params.sort();
+            out.dcus.push(PackedEcp5Dcu {
+                name: name.to_string(),
+                dcu_idx,
+                ch0_mode: attrs.get("CH0_PROTOCOL").unwrap_or("PCIE").to_string(),
+                ch1_mode: attrs.get("CH1_PROTOCOL").unwrap_or("PCIE").to_string(),
+                refck_net: pins
+                    .net_on(name, "D_REFCLKI")
+                    .map(|s| resolve(s).to_string()),
+                ch0_rx_net: pins
+                    .net_on(name, "CH0_HDINP")
+                    .map(|s| resolve(s).to_string()),
+                ch0_tx_net: pins
+                    .net_on(name, "CH0_HDOUTP")
+                    .map(|s| resolve(s).to_string()),
+                ch1_rx_net: pins
+                    .net_on(name, "CH1_HDINP")
+                    .map(|s| resolve(s).to_string()),
+                ch1_tx_net: pins
+                    .net_on(name, "CH1_HDOUTP")
+                    .map(|s| resolve(s).to_string()),
+                params,
+            });
+        }
+        "EXTREFB" => {
+            let dcu_idx: u8 = attrs
+                .get("DCU")
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .map_err(|_| format!("ecp5 pack: EXTREFB {name}: bad DCU index"))?;
+            let refclko_net = pins
+                .net_on(name, "REFCLKO")
+                .map(|s| resolve(s).to_string())
+                .ok_or_else(|| format!("ecp5 pack: EXTREFB {name} has no REFCLKO net"))?;
+            out.extrefs.push(PackedEcp5Extref {
+                name: name.to_string(),
+                dcu_idx,
+                refclkp_net: pins
+                    .net_on(name, "REFCLKP")
+                    .map(|s| resolve(s).to_string()),
+                refclkn_net: pins
+                    .net_on(name, "REFCLKN")
+                    .map(|s| resolve(s).to_string()),
+                refclko_net,
+                dcupdb: attrs.get("REFCK_DCBIAS_EN").unwrap_or("0b1").to_string(),
+            });
+        }
+        "DDRDLLA" | "DDRDLL" => {
+            let clk_net = pins
+                .net_on(name, "CLK")
+                .map(|s| resolve(s).to_string())
+                .ok_or_else(|| format!("ecp5 pack: DDRDLL {name} has no CLK net"))?;
+            let ddrdel_net = pins
+                .net_on(name, "DDRDEL")
+                .map(|s| resolve(s).to_string())
+                .ok_or_else(|| format!("ecp5 pack: DDRDLL {name} has no DDRDEL net"))?;
+            let force_max_delay = matches!(
+                attrs
+                    .get("FORCE_MAX_DELAY")
+                    .unwrap_or("NO")
+                    .trim()
+                    .to_ascii_uppercase()
+                    .as_str(),
+                "YES" | "TRUE" | "1"
+            );
+            let gsr = attrs
+                .get("GSR")
+                .unwrap_or("ENABLED")
+                .trim()
+                .to_ascii_uppercase();
+            if !matches!(gsr.as_str(), "ENABLED" | "DISABLED") {
+                return Err(format!("ecp5 pack: DDRDLL {name}: invalid GSR '{gsr}'"));
+            }
+            out.ddrdlls.push(PackedEcp5Ddrdll {
+                name: name.to_string(),
+                clk_net,
+                rst_net: pins.net_on(name, "RST").map(|s| resolve(s).to_string()),
+                udcdzeln_net: pins
+                    .net_on(name, "UDDCNTLN")
+                    .map(|s| resolve(s).to_string()),
+                ddrdel_net,
+                lock_net: pins.net_on(name, "LOCK").map(|s| resolve(s).to_string()),
+                force_max_delay,
+                gsr,
+            });
+        }
+        "DQSBUFM" => {
+            let dqsi_net = pins
+                .net_on(name, "DQSI")
+                .map(|s| resolve(s).to_string())
+                .ok_or_else(|| format!("ecp5 pack: DQSBUFM {name} has no DQSI net"))?;
+            let sclk_net = pins
+                .net_on(name, "SCLK")
+                .map(|s| resolve(s).to_string())
+                .ok_or_else(|| format!("ecp5 pack: DQSBUFM {name} has no SCLK net"))?;
+            let adj = |k: &str| -> Result<String, String> {
+                let v = attrs
+                    .get(k)
+                    .unwrap_or("PLUS")
+                    .trim()
+                    .to_ascii_uppercase();
+                if !matches!(v.as_str(), "PLUS" | "MINUS") {
+                    return Err(format!("ecp5 pack: DQSBUFM {name}: invalid {k}='{v}'"));
+                }
+                Ok(v)
+            };
+            let val = |k: &str| -> Result<u8, String> {
+                attrs
+                    .get(k)
+                    .unwrap_or("0")
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| format!("ecp5 pack: DQSBUFM {name}: bad {k}"))
+            };
+            out.dqs_blocks.push(PackedEcp5Dqs {
+                name: name.to_string(),
+                dqsi_net,
+                sclk_net,
+                eclk_net: pins.net_on(name, "ECLK").map(|s| resolve(s).to_string()),
+                ddrdel_net: pins.net_on(name, "DDRDEL").map(|s| resolve(s).to_string()),
+                dqsr90_net: pins.net_on(name, "DQSR90").map(|s| resolve(s).to_string()),
+                dqsw_net: pins.net_on(name, "DQSW").map(|s| resolve(s).to_string()),
+                dqsw270_net: pins
+                    .net_on(name, "DQSW270")
+                    .map(|s| resolve(s).to_string()),
+                dqs_li_del_adj: adj("DQS_LI_DEL_ADJ")?,
+                dqs_li_del_val: val("DQS_LI_DEL_VAL")?,
+                dqs_lo_del_adj: adj("DQS_LO_DEL_ADJ")?,
+                dqs_lo_del_val: val("DQS_LO_DEL_VAL")?,
+                gsr: attrs
+                    .get("GSR")
+                    .unwrap_or("ENABLED")
+                    .trim()
+                    .to_ascii_uppercase(),
+            });
+        }
+        "IDDRX1F" | "ODDRX1F" | "IDDRX2F" | "ODDRX2F" | "DELAYG" | "DELAYF" => {
+            let kind = match module {
+                "IDDRX1F" => IologicKind::Iddrx1f,
+                "ODDRX1F" => IologicKind::Oddrx1f,
+                "IDDRX2F" => IologicKind::Iddrx2f,
+                "ODDRX2F" => IologicKind::Oddrx2f,
+                "DELAYG" => IologicKind::Delayg,
+                _ => IologicKind::Delayf,
+            };
+            let del_value: u8 = attrs
+                .get("DEL_VALUE")
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .map_err(|_| format!("ecp5 pack: {module} {name}: bad DEL_VALUE"))?;
+            if del_value > 127 {
+                return Err(format!(
+                    "ecp5 pack: {module} {name}: DEL_VALUE={del_value} exceeds 7-bit max 127"
+                ));
+            }
+            let mut data_nets = Vec::new();
+            for p in ["Q0", "Q1", "Q2", "Q3", "D0", "D1", "D2", "D3", "Z"] {
+                if let Some(n) = pins.net_on(name, p) {
+                    data_nets.push(resolve(n).to_string());
+                }
+            }
+            out.iologics.push(PackedEcp5Iologic {
+                name: name.to_string(),
+                kind,
+                sclk_net: pins.net_on(name, "SCLK").map(|s| resolve(s).to_string()),
+                eclk_net: pins.net_on(name, "ECLK").map(|s| resolve(s).to_string()),
+                rst_net: pins.net_on(name, "RST").map(|s| resolve(s).to_string()),
+                dqsr90_net: pins.net_on(name, "DQSR90").map(|s| resolve(s).to_string()),
+                dqsw_net: pins.net_on(name, "DQSW").map(|s| resolve(s).to_string()),
+                dqsw270_net: pins
+                    .net_on(name, "DQSW270")
+                    .map(|s| resolve(s).to_string()),
+                data_nets,
+                pad_net: pins
+                    .net_on(name, "D")
+                    .or_else(|| pins.net_on(name, "Q"))
+                    .or_else(|| pins.net_on(name, "A"))
+                    .map(|s| resolve(s).to_string()),
+                del_value,
+                wait_for_edge: matches!(
+                    attrs
+                        .get("WAIT_FOR_EDGE")
+                        .unwrap_or("DISABLED")
+                        .trim()
+                        .to_ascii_uppercase()
+                        .as_str(),
+                    "ENABLED" | "TRUE" | "1"
+                ),
+                gsr: attrs
+                    .get("GSR")
+                    .unwrap_or("ENABLED")
+                    .trim()
+                    .to_ascii_uppercase(),
+            });
+        }
+        "USRMCLK" => {
+            out.sys_configs.push(PackedEcp5SysConfig {
+                name: name.to_string(),
+                kind: SysConfigKind::Usrmclk,
+                osc_div: 127,
+                in_net: pins.net_on(name, "USRMCLKI").map(|s| resolve(s).to_string()),
+                ts_net: pins
+                    .net_on(name, "USRMCLKTS")
+                    .map(|s| resolve(s).to_string()),
+                out_net: pins.net_on(name, "USRMCLKO").map(|s| resolve(s).to_string()),
+            });
+        }
+        "OSCG" => {
+            let div: u8 = attrs
+                .get("DIV")
+                .unwrap_or("128")
+                .trim()
+                .parse()
+                .map_err(|_| format!("ecp5 pack: OSCG {name}: bad DIV"))?;
+            if !(2..=128).contains(&div) {
+                return Err(format!(
+                    "ecp5 pack: OSCG {name}: DIV={div} out of legal range 2..=128"
+                ));
+            }
+            out.sys_configs.push(PackedEcp5SysConfig {
+                name: name.to_string(),
+                kind: SysConfigKind::Oscg,
+                osc_div: div,
+                in_net: None,
+                ts_net: None,
+                out_net: pins.net_on(name, "OSC").map(|s| resolve(s).to_string()),
+            });
+        }
+        "DTR" => {
+            out.sys_configs.push(PackedEcp5SysConfig {
+                name: name.to_string(),
+                kind: SysConfigKind::Dtr,
+                osc_div: 127,
+                in_net: pins.net_on(name, "STARTPULSE").map(|s| resolve(s).to_string()),
+                ts_net: None,
+                out_net: pins.net_on(name, "DTROUT0").map(|s| resolve(s).to_string()),
+            });
+        }
+        _ => {
+            return Err(format!(
+                "ecp5 pack: unsupported black box '{module}' (cell {name}); \
+                 only PLLB*/EHXPLL*/DCUA/EXTREFB/DDRDLL/DQSBUFM/IDDRX*/ODDRX*/DELAY*/ALU54B/DP16KD/PDPW16KD/USRMCLK/OSCG/DTR black boxes map to ECP5 primitives"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Carry input source for a Carry4 cell.
